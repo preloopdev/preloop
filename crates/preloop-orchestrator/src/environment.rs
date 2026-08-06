@@ -81,6 +81,17 @@ pub enum ToolchainLayer {
     Go(String),
 }
 
+impl std::fmt::Display for ToolchainLayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Node(version) => write!(f, "node {version}"),
+            Self::Rust(channel) => write!(f, "rust {channel}"),
+            Self::Python(version) => write!(f, "python {version}"),
+            Self::Go(version) => write!(f, "go {version}"),
+        }
+    }
+}
+
 impl ToolchainLayer {
     /// Return shell commands to install this toolchain in a SmolVM.
     ///
@@ -90,22 +101,44 @@ impl ToolchainLayer {
     pub fn install_commands(&self) -> Vec<Vec<String>> {
         match self {
             Self::Node(version) => {
-                let major = version
-                    .trim()
-                    .strip_prefix('v')
-                    .unwrap_or(version.trim())
-                    .split('.')
-                    .next()
-                    .unwrap_or("22");
+                // Exact-version tarball install, not the apt series: a workflow
+                // pinning `22.23.1` gets exactly that, and a major (`22`) or
+                // `lts/*` request resolves against the nodejs.org release
+                // index at bake time (GitHub's setup-node resolves the same
+                // way, so this matches hosted behavior instead of floating
+                // with the apt archive).
+                // The version is interpolated into a `sh -c` script, so it
+                // must be allowlisted (same `safe_component` the Rust and Go
+                // layers use): a workflow-controlled value carrying shell
+                // metacharacters would execute arbitrary commands in the
+                // provisioning VM.
+                let version = safe_component(version.trim().trim_start_matches('v'));
                 vec![
                     vec![
                         "sh".into(),
                         "-c".into(),
                         format!(
-                            "curl -fsSL https://deb.nodesource.com/setup_{major}.x | bash -"
+                            "set -e\n\
+                             WANT=v{version}\n\
+                             case '{version}' in lts/*) WANT='lts/*' ;; esac\n\
+                             VERSION=$(curl -fsSL https://nodejs.org/dist/index.json | python3 -c '\n\
+                             import json, sys\n\
+                             want = sys.argv[1]\n\
+                             idx = json.load(sys.stdin)\n\
+                             print(next((e[\"version\"] for e in idx if (want == \"lts/*\" and e[\"lts\"]) or e[\"version\"] == want or e[\"version\"].startswith(want + \".\")), \"\"))\n\
+                             ' \"$WANT\")\n\
+                             [ -n \"$VERSION\" ] || {{ echo \"no node release matching {version}\" >&2; exit 1; }}\n\
+                             arch=$(uname -m)\n\
+                             case \"$arch\" in\n\
+                               x86_64) NODE_ARCH=x64 ;;\n\
+                               aarch64|arm64) NODE_ARCH=arm64 ;;\n\
+                               *) echo \"unsupported arch: $arch\" >&2; exit 1 ;;\n\
+                             esac\n\
+                             curl -fsSL \"https://nodejs.org/dist/$VERSION/node-$VERSION-linux-$NODE_ARCH.tar.gz\" \\\n\
+                               | tar -xz --strip-components=1 -C /usr/local\n\
+                             node --version"
                         ),
                     ],
-                    vec!["apt-get".into(), "install".into(), "-y".into(), "nodejs".into()],
                 ]
             }
             Self::Rust(channel) => vec![
@@ -113,7 +146,24 @@ impl ToolchainLayer {
                     "sh".into(),
                     "-c".into(),
                     format!(
-                        "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain {}",
+                        // Pin the rustup installer itself (the `sh.rustup.rs`
+                        // wrapper floats with every rustup release). The
+                        // channel stays workflow-driven — `stable` resolves
+                        // at bake time exactly as GitHub resolves it at job
+                        // time — and the resolved version is recorded in the
+                        // golden's bake manifest.
+                        "set -e\n\
+                         arch=$(uname -m)\n\
+                         case \"$arch\" in\n\
+                           x86_64) RUST_ARCH=x86_64 ;;\n\
+                           aarch64|arm64) RUST_ARCH=aarch64 ;;\n\
+                           *) echo \"unsupported arch: $arch\" >&2; exit 1 ;;\n\
+                         esac\n\
+                         curl -fsSL \"https://static.rust-lang.org/rustup/archive/{}/$RUST_ARCH-unknown-linux-gnu/rustup-init\" -o /tmp/rustup-init\n\
+                         chmod +x /tmp/rustup-init\n\
+                         /tmp/rustup-init -y --default-toolchain {}\n\
+                         rm -f /tmp/rustup-init",
+                        crate::RUSTUP_VERSION,
                         safe_component(channel)
                     ),
                 ],
@@ -137,16 +187,78 @@ impl ToolchainLayer {
                     "python3-pip".into(),
                 ]]
             }
-            Self::Go(version) => vec![vec![
-                "sh".into(),
-                "-c".into(),
-                format!(
-                    "arch=$(uname -m); case \"$arch\" in aarch64) arch=arm64 ;; x86_64) arch=amd64 ;; esac; curl -fsSL https://go.dev/dl/go{}.linux-$arch.tar.gz | tar -C /usr/local -xzf -",
-                    safe_component(version)
-                ),
-            ]],
+            Self::Go(version) => vec![
+                vec![
+                    "sh".into(),
+                    "-c".into(),
+                    format!(
+                        // `go.mod` carries a minimum (`go 1.24`), not a tarball
+                        // version — resolve it against the go.dev release index
+                        // so `go1.24` becomes the newest 1.24.x and the install
+                        // is exact and reproducible.
+                        "set -e\n\
+                         WANT='{}'\n\
+                         VERSION=$(curl -fsSL 'https://go.dev/dl/?mode=json&include=all' | python3 -c '\n\
+                         import json, sys\n\
+                         want = sys.argv[1]\n\
+                         if not want.startswith(\"go\"):\n\
+                             want = \"go\" + want\n\
+                         idx = json.load(sys.stdin)\n\
+                         print(next((e[\"version\"] for e in idx if e[\"version\"] == want or e[\"version\"].startswith(want + \".\")), \"\"))\n\
+                         ' \"$WANT\")\n\
+                         [ -n \"$VERSION\" ] || {{ echo \"no go release matching $WANT\" >&2; exit 1; }}\n\
+                         arch=$(uname -m)\n\
+                         case \"$arch\" in aarch64) arch=arm64 ;; x86_64) arch=amd64 ;; esac\n\
+                         curl -fsSL \"https://go.dev/dl/$VERSION.linux-$arch.tar.gz\" | tar -C /usr/local -xzf -",
+                        safe_component(version)
+                    ),
+                ],
+                vec![
+                    "sh".into(),
+                    "-c".into(),
+                    // The Go tarball extracts to /usr/local/go/bin, which is
+                    // not on the default system PATH. Run steps execute with
+                    // `bash --noprofile --norc`, so profile.d PATH exports
+                    // are never sourced; symlink the binaries into
+                    // /usr/local/bin like the Rust layer does for cargo.
+                    "ln -sf /usr/local/go/bin/go /usr/local/bin/go; ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt".into(),
+                ],
+            ],
         }
     }
+
+    /// Binary that must exist on the default PATH once this layer is
+    /// installed. Verified after install so a provision interrupted mid-way
+    /// (or a toolchain that silently failed) fails the machine instead of
+    /// running the job without the tool it asked for.
+    pub fn verify_binary(&self) -> &'static str {
+        match self {
+            Self::Node(_) => "node",
+            Self::Rust(_) => "cargo",
+            Self::Python(_) => "python3",
+            Self::Go(_) => "go",
+        }
+    }
+}
+
+/// Digest-pinned Ubuntu base images.
+///
+/// The floating tags (`ubuntu:24.04`) move whenever Canonical publishes a
+/// point release, so two goldens baked a month apart would differ for no
+/// reason anyone recorded. These pins are the provenance: bumping one is a
+/// deliberate, reviewable change. Digests are the registry manifest-list
+/// digests, valid for both x86_64 and arm64 guests.
+/// Digest-pinned base images, declared in `versions.toml` (build.rs compiles
+/// the pins into constants — see `UBUNTU_24_04_BASE`/`UBUNTU_22_04_BASE`).
+pub const UBUNTU_24_04_PIN: &str = crate::UBUNTU_24_04_BASE;
+pub const UBUNTU_22_04_PIN: &str = crate::UBUNTU_22_04_BASE;
+
+/// The default base image for GitHub-runner-labelled jobs.
+pub const DEFAULT_BASE_IMAGE: &str = UBUNTU_24_04_PIN;
+
+/// The plain repository:tag of an image reference, ignoring any `@digest`.
+pub fn base_name(image_ref: &str) -> &str {
+    image_ref.split('@').next().unwrap_or(image_ref)
 }
 
 /// Resolved base image and toolchains for one job.
@@ -178,15 +290,15 @@ impl EnvironmentSpec {
             let label = label.to_ascii_lowercase();
             label.contains("ubuntu-24.04") || label.contains("ubuntu-latest")
         }) {
-            return "ubuntu:24.04".into();
+            return UBUNTU_24_04_PIN.into();
         }
         if runs_on
             .iter()
             .any(|label| label.to_ascii_lowercase().contains("ubuntu-22.04"))
         {
-            return "ubuntu:22.04".into();
+            return UBUNTU_22_04_PIN.into();
         }
-        "ubuntu:24.04".into()
+        UBUNTU_24_04_PIN.into()
     }
 
     fn from_parts(base: String, mut toolchains: Vec<ToolchainLayer>) -> Self {
@@ -458,6 +570,8 @@ mod tests {
             needs: Vec::new(),
             matrix: Default::default(),
             matrix_index: None,
+            matrix_total: None,
+            deferred_matrix: None,
             env: BTreeMap::new(),
             steps,
             if_condition: None,
@@ -481,6 +595,7 @@ mod tests {
             concurrency_group: None,
             concurrency_cancel_in_progress: None,
             concurrency_queue: None,
+            reusable_call: None,
         }
     }
 
@@ -547,8 +662,103 @@ mod tests {
             spec.toolchains.iter().cloned().collect::<BTreeSet<_>>(),
             expected
         );
-        assert_eq!(spec.base, "ubuntu:22.04");
+        assert_eq!(spec.base, UBUNTU_22_04_PIN);
         fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn default_base_returns_digest_pinned_images() {
+        assert_eq!(
+            EnvironmentSpec::default_base(&["ubuntu-latest".into()]),
+            UBUNTU_24_04_PIN
+        );
+        assert_eq!(
+            EnvironmentSpec::default_base(&["ubuntu-24.04".into()]),
+            UBUNTU_24_04_PIN
+        );
+        assert_eq!(
+            EnvironmentSpec::default_base(&["ubuntu-22.04".into()]),
+            UBUNTU_22_04_PIN
+        );
+        assert_eq!(
+            EnvironmentSpec::default_base(&["self-hosted".into()]),
+            UBUNTU_24_04_PIN
+        );
+    }
+
+    #[test]
+    fn base_name_strips_digest() {
+        assert_eq!(base_name("ubuntu:24.04@sha256:abc"), "ubuntu:24.04");
+        assert_eq!(base_name("ubuntu:24.04"), "ubuntu:24.04");
+        assert_eq!(base_name(""), "");
+    }
+
+    #[test]
+    fn node_layer_install_uses_pinned_tarball() {
+        // The Node layer must never resolve through apt: exact versions are
+        // installed verbatim and major/lts requests resolve via the nodejs.org
+        // index, never the floating apt series.
+        let commands = ToolchainLayer::Node("20.11.0".into()).install_commands();
+        let script = commands[0].join(" ");
+        assert!(script.contains("nodejs.org/dist/index.json"));
+        assert!(script.contains("node-$VERSION-linux-$NODE_ARCH.tar.gz"));
+        assert!(!script.contains("nodesource"));
+        assert!(!script.contains("apt-get"));
+    }
+
+    #[test]
+    fn node_layer_version_rejects_shell_metacharacters() {
+        // A workflow-controlled `node-version` is interpolated into the
+        // `sh -c` provisioning script (`WANT=v{version}`, the case pattern,
+        // and the error message), so shell metacharacters would execute
+        // arbitrary commands inside the bake VM. The version must be
+        // allowlisted through the same `safe_component` used by the Rust and
+        // Go layers.
+        let payload = "22; touch /tmp/pwned; #";
+        let commands = ToolchainLayer::Node(payload.into()).install_commands();
+        let script = commands[0].join(" ");
+        // The raw payload must not survive into the script...
+        assert!(!script.contains("touch /tmp/pwned"));
+        assert!(!script.contains("22;"));
+        // ...and the sanitized version is still interpolated everywhere the
+        // original was (WANT, case, error message), never silently dropped.
+        assert!(script.contains("WANT=v22touch/tmp/pwned"));
+        assert!(script.contains("no node release matching 22touch/tmp/pwned"));
+    }
+
+    #[test]
+    fn rust_layer_install_uses_pinned_rustup() {
+        let commands = ToolchainLayer::Rust("stable".into()).install_commands();
+        let script = commands[0].join(" ");
+        assert!(script.contains(&format!(
+            "static.rust-lang.org/rustup/archive/{}",
+            crate::RUSTUP_VERSION
+        )));
+        assert!(script.contains("--default-toolchain stable"));
+        assert!(!script.contains("sh.rustup.rs"));
+    }
+
+    #[test]
+    fn go_layer_install_resolves_minimum_version() {
+        let commands = ToolchainLayer::Go("1.24".into()).install_commands();
+        let script = commands[0].join(" ");
+        assert!(script.contains("go.dev/dl/?mode=json"));
+        assert!(script.contains("$VERSION.linux"));
+        assert!(!script.contains("go1.24.linux")); // never a raw minimum
+    }
+
+    #[test]
+    fn go_layer_puts_binary_on_default_path() {
+        // The Go tarball extracts to /usr/local/go/bin, which is not on the
+        // default PATH of `bash --noprofile --norc` step shells (the same
+        // problem the Rust layer's symlinks solve), so `go`/`gofmt` would be
+        // unresolvable in job steps. The layer must link them into
+        // /usr/local/bin.
+        let commands = ToolchainLayer::Go("1.24".into()).install_commands();
+        assert_eq!(commands.len(), 2);
+        let script = commands[1].join(" ");
+        assert!(script.contains("ln -sf /usr/local/go/bin/go /usr/local/bin/go"));
+        assert!(script.contains("ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt"));
     }
 
     #[test]

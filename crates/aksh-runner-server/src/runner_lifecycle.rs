@@ -35,6 +35,19 @@ pub(crate) async fn register_runner(
     Ok(Json(runner))
 }
 
+/// Wrapper for the native registration route: native-bearer gated, so the
+/// registration is engine-authorized and the fresh runner may be paired
+/// with a pending pool-assigned job immediately.
+pub(crate) async fn register_runner_native(
+    State(shared): State<Arc<SharedState>>,
+    Json(request): Json<RunnerRegistrationRequest>,
+) -> Result<Json<RegisteredRunner>, ApiError> {
+    let result = register_runner(State(shared.clone()), Json(request)).await?;
+    let mut inner = shared.state.inner.lock().await;
+    crate::runtime_scheduling::pair_registered_runner(&mut inner, result.0.id);
+    Ok(result)
+}
+
 pub(crate) async fn create_session(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<RunnerSessionRequest>,
@@ -82,6 +95,7 @@ use aksh_gha_protocol::crypto::RsaOaepHash;
 pub(crate) async fn create_session_disttask(
     State(shared): State<Arc<SharedState>>,
     Path(_pool_id): Path<i64>,
+    identity: Option<axum::Extension<RunnerIdentity>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     // For the AzDO message path, generate an unencrypted session key directly.
@@ -90,9 +104,24 @@ pub(crate) async fn create_session_disttask(
     let session_id = uuid::Uuid::new_v4();
     let session_enc = SessionEncryption::generate();
 
-    let runner_id = body
+    let requested_runner_id = body
         .pointer("/agent/id")
         .and_then(serde_json::Value::as_i64);
+    // A verified listen token decides the binding; the body's self-declared
+    // `agent.id` never elevates privilege. Without a token the legacy
+    // body-driven binding stays so older clients keep working — such sessions
+    // are treated as unverified at claim time, which is where the pool's
+    // assignment enforcement lives.
+    let verified = identity.and_then(|axum::Extension(id)| id.runner_id);
+    let runner_id = match (verified, requested_runner_id) {
+        (Some(verified), Some(requested)) if verified != requested => {
+            return Err(ApiError::forbidden(format!(
+                "listen token names runner {verified} but session body requests agent {requested}"
+            )));
+        }
+        (Some(verified), _) => Some(verified),
+        (None, requested) => requested,
+    };
 
     let use_fips_encryption = body
         .get("useFipsEncryption")
@@ -177,12 +206,112 @@ pub(crate) async fn delete_session(
 
 /// DELETE /runner/server/_apis/distributedtask/pools/:pool_id/agents/:agent_id
 /// Idempotent agent deregistration — the runner calls this on clean exit.
-/// aksh keeps no persistent agent registry so always succeeds.
+/// Purges everything the runner's identity was good for: OAuth client id,
+/// RSA key, sessions, and any job assignments it still held, so a stolen
+/// identity cannot mint tokens or receive work after the machine is gone.
+/// Jobs it was assigned but never claimed go back to pool-pending so the
+/// pool provisions a replacement machine for them.
 /// Returns null response body in JSON to match official.
 pub(crate) async fn delete_agent(
+    State(shared): State<Arc<SharedState>>,
     Path((_pool_id, _agent_id)): Path<(i64, i64)>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    purge_runner_identity(&shared, _agent_id).await;
     (StatusCode::NO_CONTENT, Json(serde_json::Value::Null))
+}
+
+/// Remove every trace of a runner identity: keys, client ids, sessions and
+/// assignments. Shared by agent deregistration and pool machine teardown.
+pub(crate) async fn purge_runner_identity(shared: &Arc<SharedState>, runner_id: i64) {
+    let mut inner = shared.state.inner.lock().await;
+    if inner.runners.remove(&runner_id).is_none()
+        && inner.runner_client_ids.values().all(|id| *id != runner_id)
+    {
+        // Unknown runner — keep behavior idempotent.
+    }
+    inner.runner_client_ids.retain(|_, id| *id != runner_id);
+    inner.runner_public_keys.remove(&runner_id);
+    inner.runner_rsa_public_keys.remove(&runner_id);
+    // Sessions claiming this runner: drop them so subsequent polls stop.
+    let doomed_sessions: Vec<String> = inner
+        .broker_session_runners
+        .iter()
+        .filter(|(_, id)| **id == runner_id)
+        .map(|(session, _)| session.clone())
+        .chain(
+            inner
+                .sessions
+                .iter()
+                .filter(|(_, session)| session.runner_id == runner_id)
+                .map(|(id, _)| id.clone()),
+        )
+        .collect();
+    for session_id in doomed_sessions {
+        let active_request = inner.session_active_requests.remove(&session_id);
+        inner.sessions.remove(&session_id);
+        inner.broker_session_runners.remove(&session_id);
+        inner.session_keys.remove(&session_id);
+        inner.azdo_sessions.remove(&session_id);
+        inner.inflight_messages.remove(&session_id);
+        // A job this session claimed but never finished goes back on the
+        // queue for another runner right away, instead of sitting for the
+        // lease reaper to fail tens of minutes later.
+        if let Some(request_id) = active_request {
+            let pending = inner
+                .job_requests
+                .get(&request_id)
+                .filter(|request| request.result.is_none())
+                .map(|request| (request.run_id, request.job_id.clone()));
+            if let Some((run_id, job_id)) = pending {
+                {
+                    let key = (run_id, job_id.clone());
+                    if let Some(job) = inner.claimed_jobs.remove(&key) {
+                        if let Some(run) = inner.runs.get_mut(&run_id) {
+                            run.jobs.insert(job_id.clone(), ExecutionStatus::Queued);
+                            run.status =
+                                runtime_scheduling::summarize_run(run.jobs.values().copied());
+                        }
+                        info!(
+                            runner_id,
+                            %run_id,
+                            job_id = %job_id.0,
+                            "requeuing job of purged runner"
+                        );
+                        runtime_scheduling::on_job_enqueued(&mut inner, &job);
+                        inner.queue.push_back(job);
+                    }
+                }
+            }
+        }
+    }
+    // Assignments it never claimed: release the jobs back to pool-pending so
+    // a replacement machine can be provisioned for them.
+    let orphaned: Vec<(RunId, JobId)> = inner
+        .job_assignments
+        .iter()
+        .filter(|(_, record)| record.runner_id == runner_id)
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in orphaned {
+        if crate::runtime_scheduling::clear_assignment(&mut inner, key.0, &key.1)
+            && inner.pool_assignments_enabled
+        {
+            // Keep the *first* mark: a pool that keeps provisioning and
+            // losing machines for the same job would otherwise refresh the
+            // hold on every purge and block healthy runners forever.
+            inner
+                .pool_pending
+                .entry(key)
+                .or_insert_with(std::time::SystemTime::now);
+        }
+    }
+    shared
+        .state
+        .queue_depth
+        .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
+    runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
+    drop(inner);
+    shared.state.message_notify.notify_waiters();
 }
 
 /// DELETE /runner/server/_apis/distributedtask/pools/:pool_id/sessions (no session_id)
@@ -307,6 +436,7 @@ pub(crate) async fn runner_pools() -> Json<serde_json::Value> {
 pub(crate) async fn register_runner_compat(
     State(shared): State<Arc<SharedState>>,
     Path((_pool_id, _agent_id)): Path<(i64, String)>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // The runner sends a TaskAgent-style body; extract what we need.
@@ -368,6 +498,25 @@ pub(crate) async fn register_runner_compat(
         inner
             .runner_client_ids
             .insert(client_id.clone(), result.0.id);
+        // Pair the fresh runner with the job its machine was provisioned
+        // for. Pairing is gated on the one-time provision token the pool
+        // generated host-side for exactly this machine — a rogue process on
+        // another machine cannot mint it, so it cannot steal pairings.
+        let provision_token = headers
+            .get("x-preloop-provision-token")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        if let Some(token) = provision_token {
+            let accepted = shared
+                .state
+                .pending_registrations
+                .write()
+                .map(|mut pending| pending.remove(&token).is_some())
+                .unwrap_or(false);
+            if accepted {
+                crate::runtime_scheduling::pair_registered_runner(&mut inner, result.0.id);
+            }
+        }
     }
     Ok(Json(json!({
         "id": result.0.id,
@@ -407,11 +556,13 @@ pub(crate) async fn register_runner_compat(
 pub(crate) async fn register_runner_compat_pool_only(
     State(shared): State<Arc<SharedState>>,
     Path(_pool_id): Path<i64>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     register_runner_compat(
         State(shared),
         Path((_pool_id, "0".to_owned())),
+        headers,
         Json(request),
     )
     .await
@@ -446,7 +597,42 @@ pub(crate) async fn create_session_compat(
 pub(crate) async fn next_message_compat(
     State(shared): State<Arc<SharedState>>,
     Path(_pool_id): Path<i64>,
+    identity: Option<axum::Extension<RunnerIdentity>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> (StatusCode, Json<Option<azdo::TaskAgentMessage>>) {
-    next_message(State(shared), Query(params)).await
+    next_message(State(shared), identity, Query(params)).await
+}
+/// POST /api/v1/runners/purge — orchestrator-facing runner deregistration:
+/// purges the identity AND requeues any claimed-but-unfinished job, so a
+/// machine torn down mid-job stops stalling the job until the lease reaper.
+pub(crate) async fn purge_runners_by_name(
+    State(shared): State<Arc<SharedState>>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let name = body
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "name is required" })),
+        );
+    }
+    let id_or_ids: Vec<i64> = {
+        let inner = shared.state.inner.lock().await;
+        inner
+            .runners
+            .iter()
+            .filter(|(_, runner)| runner.name == name)
+            .map(|(id, _)| *id)
+            .collect()
+    };
+    for id in &id_or_ids {
+        purge_runner_identity(&shared, *id).await;
+    }
+    (
+        StatusCode::OK,
+        Json(json!({ "purged": id_or_ids.len(), "ids": id_or_ids })),
+    )
 }

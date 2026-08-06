@@ -170,9 +170,14 @@ pub(crate) enum MintFailurePolicy {
 }
 
 impl MintFailurePolicy {
-    /// Read the policy from `AKSH_GITHUB_APP_MINT_FAILURE`.
-    fn from_env() -> anyhow::Result<Self> {
-        Self::parse(env_non_empty(MINT_FAILURE_ENV).as_deref())
+    /// Read the policy from `AKSH_GITHUB_APP_MINT_FAILURE`, falling back to
+    /// the config file's `github.mint_failure`.
+    fn from_env_or_config(config: &crate::config::GitHubConfig) -> anyhow::Result<Self> {
+        Self::parse(
+            env_non_empty(MINT_FAILURE_ENV)
+                .as_deref()
+                .or(config.mint_failure.as_deref()),
+        )
     }
 
     /// [`Self::from_env`] against an explicit value, so the mapping is testable
@@ -219,6 +224,9 @@ pub(crate) struct GitHubAppCredentials {
     pub private_key: rsa::RsaPrivateKey,
     /// What each job's token becomes if minting fails.
     pub mint_failure: MintFailurePolicy,
+    /// PAT consulted under [`MintFailurePolicy::Pat`] when minting fails.
+    /// Comes from `AKSH_GITHUB_TOKEN` or the config file's `github.pat`.
+    pub pat_fallback: Option<String>,
     /// Lowercased account login to installation id.
     ///
     /// Only the installation id is cached, never a token: token scope follows
@@ -241,12 +249,14 @@ impl GitHubAppCredentials {
             app_id: app_id.to_owned(),
             private_key,
             mint_failure,
+            pat_fallback: None,
             installation_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
 
-/// Read GitHub App credentials from the environment.
+/// Read GitHub App credentials from the config file, overlaid by the
+/// environment (`AKSH_GITHUB_*` wins over `~/.preloop/config.toml`).
 ///
 /// Returns `Ok(None)` when the App is not configured — including partial
 /// configuration, which is logged rather than fatal so a server with a stale
@@ -254,13 +264,35 @@ impl GitHubAppCredentials {
 /// unreadable or malformed *is* fatal: the operator plainly meant to configure
 /// an App, and starting without one would silently downgrade every job token.
 pub(crate) fn load_from_env() -> anyhow::Result<Option<GitHubAppCredentials>> {
+    load_from(&crate::config::load_config()?)
+}
+
+/// [`load_from_env`] against an already-loaded config file.
+///
+/// A caller that resolved the config path once (the engine does, at startup)
+/// uses this so the file is read exactly once and every consumer agrees on
+/// which file that was.
+pub(crate) fn load_from(
+    file_config: &crate::config::ConfigFile,
+) -> anyhow::Result<Option<GitHubAppCredentials>> {
     // Parsed before the not-configured early return so a typo is a startup
     // error rather than a surprise the first time a mint fails in production.
-    let mint_failure = MintFailurePolicy::from_env()?;
-    let app_id = env_non_empty("AKSH_GITHUB_APP_ID");
+    let mint_failure = MintFailurePolicy::from_env_or_config(&file_config.github)?;
+    let app_id = env_non_empty("AKSH_GITHUB_APP_ID").or_else(|| file_config.github.app_id.clone());
     let key_source = PRIVATE_KEY_ENV
         .iter()
-        .find_map(|&(name, is_path)| env_non_empty(name).map(|value| (name, is_path, value)));
+        .find_map(|&(name, is_path)| env_non_empty(name).map(|value| (name, is_path, value)))
+        .or_else(|| {
+            file_config
+                .github
+                .app_pem
+                .as_ref()
+                .map(|pem| ("config github.app_pem", false, pem.clone()))
+        });
+    let pat_fallback = std::env::var("AKSH_GITHUB_TOKEN")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| file_config.github.pat.clone());
 
     let (app_id, source, is_path, value) = match (app_id, key_source) {
         (Some(app_id), Some((source, is_path, value))) => (app_id, source, is_path, value),
@@ -299,6 +331,7 @@ pub(crate) fn load_from_env() -> anyhow::Result<Option<GitHubAppCredentials>> {
         app_id,
         private_key,
         mint_failure,
+        pat_fallback,
         installation_cache: Arc::new(RwLock::new(HashMap::new())),
     }))
 }
@@ -328,10 +361,11 @@ pub(crate) async fn get_or_mint_token(
 
 /// [`get_or_mint_token`], told whether the workflow declared `permissions:`.
 ///
-/// A declared set is minted verbatim and fails loudly when the installation
-/// cannot grant it. An undeclared set is this server's own default, so it is
-/// narrowed to the installation's grants rather than failing a job that never
-/// asked for the missing scope.
+/// Either way the request is narrowed to the installation's grants: GitHub's
+/// `GITHUB_TOKEN` is the intersection of the workflow's `permissions:` block
+/// and the installation's grant, and its App API rejects a mint naming scopes
+/// the installation lacks, so refusing the whole claim would cost the job its
+/// GitHub authority for a scope it could never have carried.
 ///
 /// The second element is the set the token *actually* carries, present only
 /// when narrowing occurred. Callers must restate it to the job: a token that
@@ -385,24 +419,27 @@ async fn mint_for_repository(
     let (token, expires_at) = if unprocessable {
         let granted = installation_grants(api_base, &app_jwt, installation_id).await?;
         let missing = ungranted_scopes(permissions, &granted);
-        if declared {
-            return Err(attempt.unwrap_err()).with_context(|| {
-                format!(
-                    "the GitHub App installation on {owner} does not grant [{}] required by this \
-                     workflow's `permissions:` block; grant them to the App installation",
-                    missing.join(", ")
-                )
-            });
-        }
         let clamped = clamp_to_grants(permissions, &granted);
-        warn!(
-            repository,
-            installation_id,
-            ungranted = %missing.join(", "),
-            "the GitHub App installation does not grant [{}]; this job's GITHUB_TOKEN will not \
-             carry them. Grant them to the installation if your workflows need them",
-            missing.join(", ")
-        );
+        if declared {
+            warn!(
+                repository,
+                installation_id,
+                ungranted = %missing.join(", "),
+                "the workflow declares permissions the GitHub App installation does not grant [{}]; \
+                 this job's GITHUB_TOKEN will not carry them. Grant them to the installation if \
+                 your workflows need them",
+                missing.join(", ")
+            );
+        } else {
+            warn!(
+                repository,
+                installation_id,
+                ungranted = %missing.join(", "),
+                "the GitHub App installation does not grant [{}]; this job's GITHUB_TOKEN will not \
+                 carry them. Grant them to the installation if your workflows need them",
+                missing.join(", ")
+            );
+        }
         let minted =
             mint_installation_token(api_base, &app_jwt, installation_id, repo, &clamped).await?;
         narrowed = Some(clamped);
@@ -721,6 +758,160 @@ fn base64_json(value: &serde_json::Value) -> anyhow::Result<String> {
     Ok(URL_SAFE_NO_PAD.encode(serde_json::to_vec(value)?))
 }
 
+/// Permissions [`verify_repo_access_with_token`] probes, and therefore the
+/// permissions a verification token has to request to be probed meaningfully.
+const PROBED_PERMISSIONS: [(&str, &str); 4] = [
+    ("contents", "read"),
+    ("pull-requests", "read"),
+    ("actions", "read"),
+    ("issues", "read"),
+];
+
+/// Probe what a credential can actually read on a repository, for
+/// `preloop setup` and `preloop doctor`.
+///
+/// Returns the permission pairs that WORK (e.g. `contents: read`,
+/// `pull-requests: read`). A credential that cannot read the repo at all is
+/// an error naming the status GitHub returned; individually missing
+/// permissions simply don't appear in the list.
+pub async fn verify_repo_access_with_token(
+    token: &str,
+    repo: &str,
+) -> anyhow::Result<Vec<(String, String)>> {
+    verify_repo_access_at(&api_base(), token, repo).await
+}
+
+/// [`verify_repo_access_with_token`] against an explicit API base.
+async fn verify_repo_access_at(
+    api_base: &str,
+    token: &str,
+    repo: &str,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let (owner, name) = split_repository(repo)?;
+    let client = reqwest::Client::builder()
+        .user_agent("preloop-doctor")
+        .build()
+        .context("building GitHub API client")?;
+    let base = format!("{api_base}/repos/{owner}/{name}");
+    // contents: read is the baseline — without it nothing else matters.
+    let resp = client
+        .get(&base)
+        .bearer_auth(token)
+        .send()
+        .await
+        .with_context(|| format!("probing {repo}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "credential cannot read {repo}: GitHub returned {}: {}",
+            status,
+            body.chars().take(240).collect::<String>()
+        );
+    }
+    let mut granted = vec![("contents".to_owned(), "read".to_owned())];
+    for (permission, path) in [
+        ("pull-requests", "pulls?state=open&per_page=1"),
+        ("actions", "actions/workflows?per_page=1"),
+        ("issues", "issues?state=open&per_page=1"),
+    ] {
+        let url = format!("{base}/{path}");
+        match client.get(&url).bearer_auth(token).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                granted.push((permission.to_owned(), "read".to_owned()));
+            }
+            // 401/403 are the credential's honest answer: the permission is
+            // not granted. Everything else (transport failure, 5xx, 404)
+            // says nothing about the permission and must not be reported as
+            // a denial — a transient GitHub hiccup would otherwise make the
+            // doctor claim the App/PAT is missing a scope it actually has.
+            Ok(resp)
+                if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                    || resp.status() == reqwest::StatusCode::FORBIDDEN => {}
+            Ok(resp) => {
+                bail!(
+                    "cannot verify {permission} read access on {repo}: GitHub returned {}",
+                    resp.status()
+                )
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("probing {permission} read access on {repo}"))
+            }
+        }
+    }
+    Ok(granted)
+}
+
+/// Verify a GitHub App configuration by minting a scoped installation token
+/// for `repo` and probing it.
+pub async fn verify_app_config(
+    app_id: &str,
+    pem: &str,
+    repo: &str,
+) -> anyhow::Result<Vec<(String, String)>> {
+    verify_app_config_at(&api_base(), app_id, pem, repo).await
+}
+
+/// [`verify_app_config`] against an explicit API base.
+async fn verify_app_config_at(
+    api_base: &str,
+    app_id: &str,
+    pem: &str,
+    repo: &str,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let creds = credentials_for(app_id, pem)?;
+    // The verification token must request every permission the probe reports
+    // on. GitHub narrows an installation token to the intersection of what is
+    // requested and what the installation was granted, so a contents-only
+    // token would fail the pull-requests, actions and issues probes no matter
+    // what the installation actually grants — the doctor would be reporting
+    // the scope of its own temporary token instead of the installation's.
+    let probed: BTreeMap<String, String> = PROBED_PERMISSIONS
+        .iter()
+        .map(|(scope, level)| ((*scope).to_owned(), (*level).to_owned()))
+        .collect();
+    let (token, degraded) = match get_or_mint_token_at(api_base, &creds, repo, &probed).await {
+        Ok(token) => (token, false),
+        Err(error) => {
+            // A correctly configured App must never hard-fail the doctor just
+            // because the wider mint was refused: fall back to the baseline
+            // token and mark the result so the report says so out loud.
+            debug!(
+                repository = repo,
+                error = format!("{error:#}"),
+                "minting a probe token with the full permission set failed; falling back to \
+                 contents-only"
+            );
+            let baseline = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
+            let token = get_or_mint_token_at(api_base, &creds, repo, &baseline)
+                .await
+                .with_context(|| format!("minting an installation token for {repo}"))?;
+            (token, true)
+        }
+    };
+    let mut granted = verify_repo_access_at(api_base, &token, repo).await?;
+    if degraded {
+        granted.push((
+            "probe".to_owned(),
+            "degraded (contents-only token; other permissions unverified)".to_owned(),
+        ));
+    }
+    Ok(granted)
+}
+
+/// Build credentials from raw config pieces (no environment involved).
+fn credentials_for(app_id: &str, pem: &str) -> anyhow::Result<GitHubAppCredentials> {
+    let private_key = parse_private_key(pem).context("parsing the GitHub App private key")?;
+    Ok(GitHubAppCredentials {
+        app_id: app_id.to_owned(),
+        private_key,
+        mint_failure: MintFailurePolicy::LocalJwt,
+        pat_fallback: None,
+        installation_cache: Arc::new(RwLock::new(HashMap::new())),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -992,6 +1183,7 @@ mod tests {
             app_id: "424".to_owned(),
             private_key: test_key(),
             mint_failure: MintFailurePolicy::LocalJwt,
+            pat_fallback: None,
             installation_cache: Arc::new(RwLock::new(HashMap::new())),
         };
         let permissions = BTreeMap::from([
@@ -1152,5 +1344,250 @@ mod tests {
         // An unrecognised level must never look weaker than a real grant, or
         // clamping would keep it instead of narrowing to what is held.
         assert!(permission_rank("something-new") > permission_rank("admin"));
+    }
+
+    /// Stub GitHub API for the doctor path: installation discovery, minting,
+    /// and the four repository probes. `reject_wide` models an installation
+    /// whose mint refuses anything past `contents`.
+    async fn doctor_stub(calls: Arc<std::sync::Mutex<StubCalls>>, reject_wide: bool) -> String {
+        use axum::http::StatusCode;
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+
+        let stub = Router::new()
+            .route(
+                "/app/installations",
+                get(|| async { Json(json!([{ "id": 77, "account": { "login": "preloop" } }])) }),
+            )
+            .route(
+                "/app/installations/:installation_id/access_tokens",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        let wide = body["permissions"]
+                            .as_object()
+                            .is_some_and(|permissions| permissions.len() > 1);
+                        calls.lock().expect("stub state").mint_bodies.push(body);
+                        if reject_wide && wide {
+                            return (
+                                StatusCode::FORBIDDEN,
+                                Json(json!({ "message": "not accessible by integration" })),
+                            );
+                        }
+                        (
+                            StatusCode::CREATED,
+                            Json(json!({
+                                "token": "ghs_stub_probe_token",
+                                "expires_at": "2999-01-01T00:00:00Z",
+                            })),
+                        )
+                    }
+                }),
+            )
+            .route("/repos/preloop/repo", get(|| async { Json(json!({})) }))
+            .route(
+                "/repos/preloop/repo/pulls",
+                get(|| async { Json(json!([])) }),
+            )
+            .route(
+                "/repos/preloop/repo/actions/workflows",
+                get(|| async { Json(json!({})) }),
+            )
+            .route(
+                "/repos/preloop/repo/issues",
+                get(|| async { Json(json!([])) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub API");
+        let api_base = format!("http://{}", listener.local_addr().expect("stub address"));
+        tokio::spawn(async move { axum::serve(listener, stub).await.expect("serve stub API") });
+        api_base
+    }
+
+    fn test_pem() -> String {
+        use rsa::pkcs1::EncodeRsaPrivateKey;
+        test_key()
+            .to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)
+            .expect("encode PKCS#1")
+            .to_string()
+    }
+
+    /// A contents-only probe token makes the pull-requests, actions and issues
+    /// probes fail regardless of the installation's real grant, so the doctor
+    /// would report its own token's scope rather than the installation's.
+    #[tokio::test]
+    async fn app_doctor_probe_token_requests_every_probed_permission() {
+        let calls = Arc::new(std::sync::Mutex::new(StubCalls::default()));
+        let api_base = doctor_stub(Arc::clone(&calls), false).await;
+
+        let granted = verify_app_config_at(&api_base, "424", &test_pem(), "preloop/repo")
+            .await
+            .expect("verify a healthy App installation");
+
+        let calls = calls.lock().expect("stub state");
+        assert_eq!(calls.mint_bodies.len(), 1, "one mint for a healthy App");
+        assert_eq!(
+            calls.mint_bodies[0]["permissions"],
+            json!({
+                "actions": "read",
+                "contents": "read",
+                "issues": "read",
+                "pull_requests": "read",
+            }),
+            "the probe token must request every permission the probe reports on"
+        );
+        assert_eq!(
+            granted,
+            vec![
+                ("contents".to_owned(), "read".to_owned()),
+                ("pull-requests".to_owned(), "read".to_owned()),
+                ("actions".to_owned(), "read".to_owned()),
+                ("issues".to_owned(), "read".to_owned()),
+            ],
+            "a healthy installation reports every probe as granted, undegraded"
+        );
+    }
+
+    #[tokio::test]
+    async fn app_doctor_degrades_rather_than_failing_when_the_wide_mint_is_refused() {
+        let calls = Arc::new(std::sync::Mutex::new(StubCalls::default()));
+        let api_base = doctor_stub(Arc::clone(&calls), true).await;
+
+        let granted = verify_app_config_at(&api_base, "424", &test_pem(), "preloop/repo")
+            .await
+            .expect("a refused wide mint must not hard-fail the doctor");
+
+        assert!(
+            granted
+                .iter()
+                .any(|(scope, note)| scope == "probe" && note.starts_with("degraded")),
+            "a fallback probe must say the result is narrowed: {granted:?}"
+        );
+        let calls = calls.lock().expect("stub state");
+        assert_eq!(
+            calls.mint_bodies.len(),
+            2,
+            "the wide mint is retried once at the contents-only baseline"
+        );
+        assert_eq!(
+            calls.mint_bodies[1]["permissions"],
+            json!({ "contents": "read" }),
+            "the fallback is the baseline token"
+        );
+    }
+
+    /// Minimal HTTP stub for probe tests. `handle` maps `(method, path)` to
+    /// `Some((status, body))` or `None` (drop the connection — a transport
+    /// error from the client's point of view).
+    async fn spawn_probe_stub(
+        handle: impl Fn(&str, &str) -> Option<(u16, String)> + Send + Sync + 'static,
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind probe stub");
+        let address = listener.local_addr().expect("probe stub address");
+        let handle = Arc::new(handle);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let handle = Arc::clone(&handle);
+                tokio::spawn(async move {
+                    let mut buf = [0_u8; 4096];
+                    let Ok(n) = socket.read(&mut buf).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let mut parts = request.split_whitespace();
+                    let method = parts.next().unwrap_or("").to_owned();
+                    let path = parts.next().unwrap_or("/").to_owned();
+                    let Some((status, body)) = handle(&method, &path) else {
+                        return; // drop the connection: transport error
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn probe_fails_on_unexpected_probe_status_instead_of_reporting_denial() {
+        let server = spawn_probe_stub(|method, path| match (method, path) {
+            ("GET", "/repos/preloop/repo") => Some((200, "{}".to_owned())),
+            ("GET", p) if p.starts_with("/repos/preloop/repo/pulls") => {
+                Some((500, "boom".to_owned()))
+            }
+            _ => Some((200, "{}".to_owned())),
+        })
+        .await;
+        let error = verify_repo_access_at(&server, "ghp_stub", "preloop/repo")
+            .await
+            .expect_err("a 5xx probe says nothing about permissions and must fail verification");
+        assert!(
+            error.to_string().contains("pull-requests"),
+            "the failure must name the probe that broke: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_distinguishes_authorization_denials_from_transport_failures() {
+        let server = spawn_probe_stub(|method, path| match (method, path) {
+            ("GET", "/repos/preloop/repo") => Some((200, "{}".to_owned())),
+            // 401 is the credential's honest answer: permission not granted.
+            ("GET", p) if p.starts_with("/repos/preloop/repo/pulls") => {
+                Some((401, "denied".to_owned()))
+            }
+            // Dropping the connection is a transport failure, not a denial.
+            ("GET", p) if p.starts_with("/repos/preloop/repo/actions/workflows") => None,
+            _ => Some((200, "{}".to_owned())),
+        })
+        .await;
+        let error = verify_repo_access_at(&server, "ghp_stub", "preloop/repo")
+            .await
+            .expect_err("a transport failure must fail verification, not read as 'not granted'");
+        assert!(
+            error.to_string().contains("actions"),
+            "the failure must name the probe that broke: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_treats_401_and_403_as_not_granted_without_failing() {
+        let server = spawn_probe_stub(|method, path| match (method, path) {
+            ("GET", "/repos/preloop/repo") => Some((200, "{}".to_owned())),
+            ("GET", p) if p.starts_with("/repos/preloop/repo/pulls") => {
+                Some((401, "denied".to_owned()))
+            }
+            ("GET", p) if p.starts_with("/repos/preloop/repo/actions/workflows") => {
+                Some((403, "denied".to_owned()))
+            }
+            ("GET", p) if p.starts_with("/repos/preloop/repo/issues") => {
+                Some((200, "[]".to_owned()))
+            }
+            _ => Some((200, "{}".to_owned())),
+        })
+        .await;
+        let granted = verify_repo_access_at(&server, "ghp_stub", "preloop/repo")
+            .await
+            .expect("401/403 are the credential's honest 'not granted' answers");
+        assert_eq!(
+            granted,
+            vec![
+                ("contents".to_owned(), "read".to_owned()),
+                ("issues".to_owned(), "read".to_owned()),
+            ],
+            "401/403 probes are skipped; successes are still reported"
+        );
     }
 }

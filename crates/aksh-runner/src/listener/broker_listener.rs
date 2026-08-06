@@ -10,8 +10,10 @@ use tracing::{debug, info, warn};
 
 use crate::client::broker::BrokerClient;
 use crate::client::http::{HttpClient, SessionBackoff};
+use crate::client::run_service::RunServiceClient;
 use crate::listener::job_dispatcher::{self, cancellation_timing, parse_timespan_secs, RunningJob};
 use crate::settings::RunnerConfig;
+use crate::worker::helpers::extract_service_endpoint;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BrokerMessageKind {
@@ -39,6 +41,117 @@ fn classify_message(message_type: &str) -> BrokerMessageKind {
         "RunnerRefresh" => BrokerMessageKind::RunnerRefresh,
         "RunnerRefreshConfig" => BrokerMessageKind::RunnerRefreshConfig,
         _ => BrokerMessageKind::Unknown,
+    }
+}
+
+/// Official `JobDispatcher.ForceFailJob` (run-server variant): a worker that
+/// exits abnormally never reports completion, so the listener completes the
+/// job request as Failed itself. Without this the broker session stays
+/// "active" server-side and no further job is ever delivered to the runner
+/// (the pool-stall signature: crashed worker, everything after it queued
+/// forever). The worker's own completion path covers normal exits — this only
+/// fires when the worker process died before reporting.
+async fn force_fail_job(http: &HttpClient, job: &RunningJob, conclusion: &str) {
+    let Some(message) = job.job_message.as_ref() else {
+        return;
+    };
+    let Some((service_url, token)) = extract_service_endpoint(message) else {
+        warn!(
+            "cannot force-fail job {} — no SystemVssConnection endpoint",
+            job.request_id
+        );
+        return;
+    };
+    let plan_id = message
+        .get("plan")
+        .and_then(|plan| plan.get("planId"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let job_id = message
+        .get("jobId")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if plan_id.is_empty() || job_id.is_empty() {
+        warn!(
+            "cannot force-fail job {} — message lacks planId/jobId",
+            job.request_id
+        );
+        return;
+    }
+    // The worker's completion posts to `{SystemVssConnection url}/completejob`
+    // — the server advertises that endpoint as the runner's broker base
+    // (`/broker/{runner_id}`), NOT the bare origin. Using the same base keeps
+    // the listener's force-fail on the exact route the worker uses.
+    // The listener's own transport (custom CA bundle, proxy, control-socket
+    // rewrite) is reused rather than a bare HttpClient, so force-fail works
+    // on custom-trust self-hosted servers too.
+    let client = RunServiceClient::new(http.clone(), service_url);
+    // Official `LogWorkerProcessUnhandledException` → `ForceFailJob`: the
+    // worker's captured output rides along as an error annotation so the
+    // crash isn't indistinguishable from an ordinary failure. Empty when the
+    // worker produced no output.
+    let annotations = {
+        let detail = job.worker_output_tail();
+        if detail.is_empty() {
+            Vec::new()
+        } else {
+            vec![serde_json::json!({
+                "level": "failure",
+                "message": detail,
+                "stepNumber": 0,
+                "startLine": 1,
+                "endLine": 1,
+            })]
+        }
+    };
+    let body = serde_json::json!({
+        "planId": plan_id,
+        "jobId": job_id,
+        "conclusion": conclusion,
+        "outputs": {},
+        "stepResults": [],
+        "annotations": annotations,
+        "telemetry": [],
+        "billingOwnerId": "",
+    });
+    match client.complete_job(&token, &body).await {
+        Ok(_) => info!("Listener force-failed crashed job {job_id}"),
+        Err(error) => warn!("Listener force-fail for job {job_id} failed (non-fatal): {error:#}"),
+    }
+}
+
+/// Ask the worker to cancel the running job and wrap up, waiting up to the
+/// official 60s grace; if the worker fails or ignores the message, force-fail
+/// the job request so the run concludes instead of dangling until the lease
+/// reaper. Shared by the OS-signal and RunnerShutdown-broker-message paths
+/// (CR-2 F-1); mirrors the official `RunnerShutdown`/`OperatingSystemShutdown`
+/// handling in `JobDispatcher`.
+async fn shutdown_job_gracefully(http: &HttpClient, job: &mut RunningJob) {
+    match job
+        .shutdown_gracefully(std::time::Duration::from_secs(60))
+        .await
+    {
+        Some(true) => {
+            info!(
+                "Worker completed job {} gracefully during shutdown",
+                job.request_id
+            );
+        }
+        Some(false) => {
+            warn!(
+                "Worker failed job {} during shutdown — force-failing",
+                job.request_id
+            );
+            force_fail_job(http, job, "failed").await;
+        }
+        None => {
+            warn!("Worker killed after shutdown grace expired");
+            // The worker never reported. The official completes the request
+            // even after the forced kill (`CompleteJobRequestAsync` with
+            // Canceled on the shutdown path); do the same so the job
+            // concludes instead of dangling to the reaper.
+            force_fail_job(http, job, "canceled").await;
+        }
     }
 }
 
@@ -89,7 +202,30 @@ pub async fn run_broker_loop(
     let mut session_key: Option<Vec<u8>> = None;
     let mut use_fips_encryption = false;
 
-    let shutdown = tokio::signal::ctrl_c();
+    // Runner shutdown signal: Ctrl-C (user) or SIGTERM (OS shutdown, e.g.
+    // systemd stop / VM teardown) — the official runner's
+    // `RunnerShutdown`/`OperatingSystemShutdown` triggers.
+    let shutdown = async {
+        #[cfg(unix)]
+        {
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("install SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Ctrl-C received — shutting down");
+                }
+                _ = sigterm.recv() => {
+                    info!("SIGTERM received — shutting down");
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            info!("Ctrl-C received — shutting down");
+        }
+    };
     tokio::pin!(shutdown);
 
     let mut processed_message_ids: std::collections::HashSet<i64> =
@@ -128,9 +264,15 @@ pub async fn run_broker_loop(
                 Ok(Some(success)) => {
                     let id = &job.request_id;
                     if success {
-                        info!("Worker completed job {id} successfully");
+                        if job.confirm_completion().await {
+                            info!("Worker completed job {id} successfully");
+                        } else {
+                            warn!("Worker exited job {id} but its completion was not acknowledged — force-failing");
+                            force_fail_job(http, job, "failed").await;
+                        }
                     } else {
                         warn!("Worker failed for job {id}");
+                        force_fail_job(http, job, "failed").await;
                     }
                     if once || config.settings.ephemeral {
                         if once {
@@ -253,8 +395,7 @@ pub async fn run_broker_loop(
             _ = &mut shutdown => {
                 info!("Shutdown signal received");
                 if let Some(mut job) = active_job.take() {
-                    info!("Killing active worker");
-                    job.kill().await;
+                    shutdown_job_gracefully(http, &mut job).await;
                 }
                 return Ok(());
             }
@@ -267,9 +408,15 @@ pub async fn run_broker_loop(
                     Ok(success) => {
                         let id = &active_job.as_ref().unwrap().request_id;
                         if success {
-                            info!("Worker completed job {id} successfully");
+                            if active_job.as_ref().unwrap().confirm_completion().await {
+                                info!("Worker completed job {id} successfully");
+                            } else {
+                                warn!("Worker exited job {id} but its completion was not acknowledged — force-failing");
+                                force_fail_job(http, active_job.as_ref().unwrap(), "failed").await;
+                            }
                         } else {
                             warn!("Worker failed for job {id}");
+                            force_fail_job(http, active_job.as_ref().unwrap(), "failed").await;
                         }
                     }
                     Err(e) => warn!("Worker wait error: {e:#}"),
@@ -361,6 +508,16 @@ pub async fn run_broker_loop(
 
                         match classify_message(&message_type) {
                             BrokerMessageKind::RunnerJobRequest => {
+                                // The runner is spoken for the moment the
+                                // request arrives: the orchestrator's
+                                // environment-adaptation reaper kills idle
+                                // machines to make room for a queued job of a
+                                // different image, and it watches stdout for
+                                // this sentinel. Announcing after the oauth
+                                // renewal and acquire round-trips left a
+                                // window where a freshly-paired machine was
+                                // still "idle" and got reaped mid-claim.
+                                announce_busy();
                                 if let Some(mut prev) = active_job.take() {
                                     // C-04: Official run-service dispatcher cancels
                                     // the previous worker immediately on overlap
@@ -393,7 +550,6 @@ pub async fn run_broker_loop(
                                 }
                                 let job = acquire_job_from_ref(&body, http, &token).await?;
                                 if let Some(job_msg) = job {
-                                    announce_busy();
                                     let running = job_dispatcher::spawn_job(
                                         job_msg,
                                         runner_root,
@@ -497,6 +653,15 @@ pub async fn run_broker_loop(
                                     .and_then(|value| value.as_str())
                                     .unwrap_or("unspecified");
                                 info!(%reason, "Service requested runner shutdown");
+                                // CR-2 F-1: this is the broker equivalent of
+                                // the OS shutdown path — ask the worker to
+                                // cancel the running job and wrap up so the
+                                // run concludes instead of dangling until the
+                                // lease reaper; force-fail if the worker
+                                // fails or ignores the grace period.
+                                if let Some(mut job) = active_job.take() {
+                                    shutdown_job_gracefully(http, &mut job).await;
+                                }
                                 return Ok(());
                             }
                             BrokerMessageKind::RunnerRefresh => {
@@ -749,6 +914,11 @@ fn parse_message_body(
 
 /// Tell a supervising orchestrator that this single-use runner is now spoken
 /// for, so it can build the replacement while the job runs instead of after.
+///
+/// Called as soon as the job request is received rather than once the claim
+/// completes: the orchestrator must never reap a machine that is taking a job,
+/// and the acquire handshake is exactly the window its environment-adaptation
+/// reaper was losing the race in.
 ///
 /// Written straight to stdout rather than through `tracing` so it survives any
 /// log filter and stays trivially greppable in the process output stream.

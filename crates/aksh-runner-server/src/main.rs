@@ -124,6 +124,16 @@ async fn main() -> anyhow::Result<()> {
                 test_api_token,
                 oidc_issuer,
                 enable_scheduler,
+                pending_registrations: None,
+                require_job_assignments: std::env::var("PRELOOP_REQUIRE_JOB_ASSIGNMENTS")
+                    .ok()
+                    .map(|value| {
+                        matches!(
+                            value.trim().to_ascii_lowercase().as_str(),
+                            "1" | "true" | "yes"
+                        )
+                    })
+                    .unwrap_or(false),
             })
             .await?;
         }

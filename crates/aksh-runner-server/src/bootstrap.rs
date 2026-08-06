@@ -33,6 +33,15 @@ pub struct ServerConfig {
     pub oidc_issuer: Option<String>,
     /// Enable the cron scheduler for schedule-triggered workflows.
     pub enable_scheduler: bool,
+    /// Shared one-time provision-token map written by a co-hosted runner
+    /// pool. Presence enables pool assignment enforcement: jobs queued while
+    /// it is set may only be claimed by the runner whose registration later
+    /// presents the matching provisioning token.
+    pub pending_registrations:
+        Option<Arc<std::sync::RwLock<std::collections::BTreeMap<String, std::time::SystemTime>>>>,
+    /// `PRELOOP_REQUIRE_JOB_ASSIGNMENTS`: refuse to dispatch any job without
+    /// a recorded assignment, including to external runners.
+    pub require_job_assignments: bool,
 }
 
 /// TLS configuration.
@@ -163,6 +172,7 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
                         job_id: job_id.clone(),
                         status: ExecutionStatus::Failure,
                         outputs: Default::default(),
+                        annotations: Vec::new(),
                     },
                 ));
             }
@@ -221,6 +231,15 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     }
     if let Some(next_job_runs_on) = config.next_job_runs_on.clone() {
         state.next_job_runs_on = next_job_runs_on;
+    }
+    {
+        let pool_managed = config.pending_registrations.is_some();
+        if let Some(pending_registrations) = config.pending_registrations.clone() {
+            state.pending_registrations = pending_registrations;
+        }
+        let mut inner = state.inner.lock().await;
+        inner.pool_assignments_enabled = pool_managed;
+        inner.require_job_assignments = config.require_job_assignments;
     }
     if !config.listen.ip().is_loopback() && state.system_token == DEFAULT_AKSH_SYSTEM_TOKEN {
         anyhow::bail!(
@@ -315,7 +334,12 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
                 let unix_listener = tokio::net::UnixListener::bind(unix_path)?;
                 std::fs::set_permissions(unix_path, std::fs::Permissions::from_mode(0o600))?;
                 info!(path = %unix_path.display(), "aksh runner server listening on unix socket");
-                let router_unix = router.clone();
+                // The control socket is mounted into every runner VM: guests
+                // get the runner/broker protocol only. Native management and
+                // test APIs stay off it — workflow code is untrusted.
+                let router_unix = router
+                    .clone()
+                    .layer(middleware::from_fn(auth::runner_surface_only));
                 let shutdown_unix = shutdown.clone();
                 tokio::spawn(async move {
                     use hyper_util::rt::{TokioExecutor, TokioIo};

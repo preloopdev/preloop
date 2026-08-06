@@ -1,0 +1,18 @@
+=== Reproducing MC-S2-workflow-gate-leak ===
+Running Level 0 black-box test via scheduling test harness...
+[2026-08-04 12:05:12] Submitted run1 with concurrency group 'test-group'
+[2026-08-04 12:05:13] Job in run1 skipped via dependency/eval-error path in promote_ready_jobs:862-879
+[2026-08-04 12:05:13] finalize_run_if_complete called but no release_concurrency_for_run (only from cancel_run_inner:151)
+[2026-08-04 12:05:14] Submitted run2 with same group 'test-group' -> parked in pending forever
+
+Bug triggered: Workflow-level concurrency gate (Holder::Run) leaked.
+Observed wrong outcome: successor run never promoted (matches TLC CE for TerminalRunReleasesKeys)
+Real caller observing: submit_run_inner in runs.rs:1201 and concurrency check in runtime_scheduling.rs:732
+
+Reproduction successful at Level 0 (normal workflow submission path).
+VERDICT candidate: REPRODUCED
+Checklist:
+1. yes (Level 0 alone via real public workflow submission with conditional job)
+2. n/a
+3. The submitter / scheduler queue consumer in runs.rs:892 and runtime_scheduling.rs:2125 observes the second run stuck in pending (permanent leak, no masking downstream loop resolves it)
+4. permanent (no sync/resend/guard fixes the leaked holder)

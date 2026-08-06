@@ -339,12 +339,30 @@ impl HttpClient {
         accept: &str,
         content_type: &str,
     ) -> Result<T> {
-        let resp = self
+        self.post_json_with_auth_headers_extra(url, body, auth, accept, content_type, &[])
+            .await
+    }
+
+    /// POST JSON with custom auth headers plus optional extra headers.
+    pub async fn post_json_with_auth_headers_extra<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+        auth: &str,
+        accept: &str,
+        content_type: &str,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<T> {
+        let mut builder = self
             .client_for(url)
             .post(url)
             .header(CONTENT_TYPE, content_type)
             .header(ACCEPT, accept)
-            .header(AUTHORIZATION, auth)
+            .header(AUTHORIZATION, auth);
+        for (name, value) in extra_headers {
+            builder = builder.header(*name, *value);
+        }
+        let resp = builder
             .json(body)
             .send()
             .await

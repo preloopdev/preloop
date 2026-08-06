@@ -35,9 +35,41 @@ where
     result
 }
 
+/// Resolve an entire [`crate::SecretMap`] to plaintext, keyed by secret name.
+///
+/// This function and [`expose_values`] are the only sanctioned boundary where a
+/// whole collection of secrets becomes plaintext. Callers must resolve once and
+/// then iterate the returned collection; re-exposing per element inside a loop
+/// or iterator closure scatters plaintext across the codebase and defeats the
+/// audit rule `rules/no-expose-in-loop.yml`.
+pub fn expose_all(secrets: &crate::SecretMap) -> std::collections::BTreeMap<String, String> {
+    secrets
+        .iter()
+        .map(|(name, secret)| (name.clone(), secret.expose().to_owned()))
+        .collect()
+}
+
+/// Resolve an iterator of secrets to their plaintext values, order preserved.
+///
+/// Duplicates are kept: the result mirrors the input one-for-one so that
+/// callers can hand it straight to [`mask_secrets`], which does its own
+/// filtering and longest-first ordering.
+///
+/// See [`expose_all`] for why callers must not re-expose per element instead.
+pub fn expose_values<'a, I>(secrets: I) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a crate::SecretString>,
+{
+    secrets
+        .into_iter()
+        .map(|secret| secret.expose().to_owned())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{SecretMap, SecretString};
 
     #[test]
     fn empty_secrets_are_skipped() {
@@ -84,5 +116,32 @@ mod tests {
     fn no_secrets_returns_input_unchanged() {
         let input = "nothing to mask here";
         assert_eq!(mask_secrets(input, std::iter::empty(), &[]), input);
+    }
+
+    #[test]
+    fn expose_all_round_trips_names_and_values() {
+        let mut secrets = SecretMap::new();
+        secrets.insert("TOKEN".to_owned(), SecretString::new("t0p"));
+        secrets.insert("EMPTY".to_owned(), SecretString::new(""));
+        let exposed = expose_all(&secrets);
+        assert_eq!(exposed.len(), 2);
+        assert_eq!(exposed["TOKEN"], "t0p");
+        assert_eq!(exposed["EMPTY"], "");
+    }
+
+    #[test]
+    fn expose_values_preserves_every_value_including_duplicates() {
+        let secrets = [
+            SecretString::new("dup"),
+            SecretString::new("other"),
+            SecretString::new("dup"),
+        ];
+        assert_eq!(expose_values(secrets.iter()), vec!["dup", "other", "dup"]);
+    }
+
+    #[test]
+    fn empty_input_yields_empty_collection() {
+        assert!(expose_all(&SecretMap::new()).is_empty());
+        assert!(expose_values(std::iter::empty()).is_empty());
     }
 }

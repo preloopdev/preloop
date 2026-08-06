@@ -218,10 +218,7 @@ pub(crate) fn build_app(
 
     let router = Router::new()
         .route("/healthz", get(healthz))
-        .route(
-            "/runs/:run_id",
-            get(get_public_run),
-        )
+        .route("/runs/:run_id", get(get_public_run))
         .route(
             "/openapi.json",
             get(|| async { axum::Json(crate::openapi::ApiDoc::openapi()) }),
@@ -355,6 +352,26 @@ pub(crate) fn build_app(
             "/api/v1/runs",
             post(submit_run)
                 .get(list_runs)
+                .route_layer(middleware::from_fn_with_state(
+                    shared.clone(),
+                    require_native_bearer,
+                ))
+                // The CLI inlines every local workflow file as a reusable
+                // workflow; monorepos with hundreds of workflow files push
+                // the submission past axum's default 2 MiB body limit.
+                .layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
+        .route(
+            "/api/v1/secrets",
+            get(list_secrets).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
+        .route(
+            "/api/v1/secrets/:name",
+            put(set_secret)
+                .delete(delete_secret)
                 .route_layer(middleware::from_fn_with_state(
                     shared.clone(),
                     require_native_bearer,
@@ -514,7 +531,14 @@ pub(crate) fn build_app(
         )
         .route(
             "/api/v1/runners",
-            post(register_runner).route_layer(middleware::from_fn_with_state(
+            post(register_runner_native).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
+        .route(
+            "/api/v1/runners/purge",
+            post(purge_runners_by_name).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
             )),
@@ -719,6 +743,10 @@ pub(crate) fn build_app(
         .with_state(shared.clone())
         .merge(results_metadata)
         .fallback(errors::protocol_not_found)
+        .layer(middleware::from_fn_with_state(
+            shared.clone(),
+            resolve_runner_identity,
+        ))
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn(errors::protocol_error_envelope))
         .layer(middleware::from_fn_with_state(

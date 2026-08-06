@@ -1,0 +1,998 @@
+[
+  {
+    "type": "cameraUpdate",
+    "width": 1600,
+    "height": 1150,
+    "x": 0,
+    "y": 0
+  },
+  {
+    "type": "text",
+    "id": "title",
+    "x": 550,
+    "y": 25,
+    "text": "Preloop \u2014 System Overview",
+    "fontSize": 28,
+    "strokeColor": "#1e1e1e"
+  },
+  {
+    "type": "text",
+    "id": "subtitle",
+    "x": 450,
+    "y": 60,
+    "text": "Self-hosted GitHub Actions control plane + runner (Rust workspace)",
+    "fontSize": 15,
+    "strokeColor": "#757575"
+  },
+  {
+    "type": "rectangle",
+    "id": "zone_ext",
+    "x": 50,
+    "y": 110,
+    "width": 240,
+    "height": 980,
+    "backgroundColor": "#dbe4ff",
+    "fillStyle": "solid",
+    "opacity": 25,
+    "strokeColor": "#1e40af",
+    "strokeWidth": 1.5,
+    "roundness": {
+      "type": 3
+    }
+  },
+  {
+    "type": "text",
+    "id": "zone_l_ext",
+    "x": 70,
+    "y": 125,
+    "text": "External Clients",
+    "fontSize": 18,
+    "strokeColor": "#1e40af"
+  },
+  {
+    "type": "rectangle",
+    "id": "ext_github",
+    "x": 70,
+    "y": 180,
+    "width": 200,
+    "height": 75,
+    "backgroundColor": "#ffd8a8",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "GitHub.com / GHES\nwebhooks, REST API",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "ext_runner",
+    "x": 70,
+    "y": 320,
+    "width": 200,
+    "height": 75,
+    "backgroundColor": "#ffd8a8",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Official Runner v2.336.0\nor 3rd-party runner",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "ext_user",
+    "x": 70,
+    "y": 460,
+    "width": 200,
+    "height": 75,
+    "backgroundColor": "#ffd8a8",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "User / CI Agent\npreloop CLI client",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "ext_actions",
+    "x": 70,
+    "y": 600,
+    "width": 200,
+    "height": 75,
+    "backgroundColor": "#ffd8a8",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "github.com/actions/*\naction tarball repos",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "zone_cp",
+    "x": 350,
+    "y": 110,
+    "width": 1200,
+    "height": 430,
+    "backgroundColor": "#dbe4ff",
+    "fillStyle": "solid",
+    "opacity": 25,
+    "strokeColor": "#1e40af",
+    "strokeWidth": 1.5,
+    "roundness": {
+      "type": 3
+    }
+  },
+  {
+    "type": "text",
+    "id": "zone_l_cp",
+    "x": 370,
+    "y": 125,
+    "text": "Control Plane (aksh-runner-server)",
+    "fontSize": 18,
+    "strokeColor": "#1e40af"
+  },
+  {
+    "type": "rectangle",
+    "id": "server",
+    "x": 370,
+    "y": 170,
+    "width": 260,
+    "height": 80,
+    "backgroundColor": "#a5d8ff",
+    "fillStyle": "solid",
+    "strokeColor": "#1e40af",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "HTTP Server (axum)\n_apis + /api/v1 + /broker",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "broker",
+    "x": 665,
+    "y": 170,
+    "width": 260,
+    "height": 80,
+    "backgroundColor": "#d0bfff",
+    "fillStyle": "solid",
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Broker Protocol\nsession / message / acquire",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "queue",
+    "x": 960,
+    "y": 170,
+    "width": 260,
+    "height": 80,
+    "backgroundColor": "#fff3bf",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Run Queue + State\nArc<Mutex> + Notify",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "scheduler",
+    "x": 370,
+    "y": 290,
+    "width": 260,
+    "height": 75,
+    "backgroundColor": "#ffd8a8",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Scheduler\ncron / workflow_dispatch",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "concurrency",
+    "x": 665,
+    "y": 290,
+    "width": 260,
+    "height": 75,
+    "backgroundColor": "#ffd8a8",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Concurrency Mgr\ngroups & matrix limits",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "oidc",
+    "x": 960,
+    "y": 290,
+    "width": 260,
+    "height": 75,
+    "backgroundColor": "#ffd8a8",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "OIDC Federation\nJWT mint + JWKS endpoint",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "events",
+    "x": 1255,
+    "y": 290,
+    "width": 270,
+    "height": 75,
+    "backgroundColor": "#ffd8a8",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Event Handlers (16+)\npush / dispatch / labels",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "runs",
+    "x": 370,
+    "y": 410,
+    "width": 260,
+    "height": 75,
+    "backgroundColor": "#b2f2bb",
+    "fillStyle": "solid",
+    "strokeColor": "#15803d",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "/api/v1/runs\nnative REST submission API",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "bootstrap",
+    "x": 665,
+    "y": 410,
+    "width": 260,
+    "height": 75,
+    "backgroundColor": "#b2f2bb",
+    "fillStyle": "solid",
+    "strokeColor": "#15803d",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Bootstrap + Auth\nTLS, GitHub App auth",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "twirp",
+    "x": 960,
+    "y": 410,
+    "width": 260,
+    "height": 75,
+    "backgroundColor": "#b2f2bb",
+    "fillStyle": "solid",
+    "strokeColor": "#15803d",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Twirp Services\nresults, artifacts, _blob",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "zone_runner",
+    "x": 350,
+    "y": 570,
+    "width": 1200,
+    "height": 180,
+    "backgroundColor": "#d3f9d8",
+    "fillStyle": "solid",
+    "opacity": 25,
+    "strokeColor": "#22c55e",
+    "strokeWidth": 1.5,
+    "roundness": {
+      "type": 3
+    }
+  },
+  {
+    "type": "text",
+    "id": "zone_l_runner",
+    "x": 370,
+    "y": 585,
+    "text": "Runner & Storage Tier",
+    "fontSize": 18,
+    "strokeColor": "#22c55e"
+  },
+  {
+    "type": "rectangle",
+    "id": "cache",
+    "x": 370,
+    "y": 630,
+    "width": 260,
+    "height": 75,
+    "backgroundColor": "#c3fae8",
+    "fillStyle": "solid",
+    "strokeColor": "#0d9488",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "aksh-cache\naction dependency cache",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "artifacts",
+    "x": 665,
+    "y": 630,
+    "width": 260,
+    "height": 75,
+    "backgroundColor": "#c3fae8",
+    "fillStyle": "solid",
+    "strokeColor": "#0d9488",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "aksh-artifacts\nbuild artifact storage",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "runner",
+    "x": 960,
+    "y": 630,
+    "width": 260,
+    "height": 75,
+    "backgroundColor": "#eebefa",
+    "fillStyle": "solid",
+    "strokeColor": "#a21caf",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "aksh-runner\nRust runner engine",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "vm",
+    "x": 1255,
+    "y": 630,
+    "width": 270,
+    "height": 75,
+    "backgroundColor": "#eebefa",
+    "fillStyle": "solid",
+    "strokeColor": "#a21caf",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "preloop-vm\nsmolvm / libkrun microVM",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "zone_libs",
+    "x": 350,
+    "y": 780,
+    "width": 1200,
+    "height": 140,
+    "backgroundColor": "#e5dbff",
+    "fillStyle": "solid",
+    "opacity": 25,
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 1.5,
+    "roundness": {
+      "type": 3
+    }
+  },
+  {
+    "type": "text",
+    "id": "zone_l_libs",
+    "x": 370,
+    "y": 795,
+    "text": "Shared Libraries & Protocol Workspace",
+    "fontSize": 18,
+    "strokeColor": "#7c3aed"
+  },
+  {
+    "type": "rectangle",
+    "id": "proto",
+    "x": 370,
+    "y": 830,
+    "width": 260,
+    "height": 70,
+    "backgroundColor": "#d0bfff",
+    "fillStyle": "solid",
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "aksh-gha-protocol\nwire DTOs, crypto, masking",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "parser",
+    "x": 665,
+    "y": 830,
+    "width": 260,
+    "height": 70,
+    "backgroundColor": "#d0bfff",
+    "fillStyle": "solid",
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "aksh-gha-parser\nworkflow YAML to DAG",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "expressions",
+    "x": 960,
+    "y": 830,
+    "width": 260,
+    "height": 70,
+    "backgroundColor": "#d0bfff",
+    "fillStyle": "solid",
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "aksh-gha-expressions\n${{ }} expression engine",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "orch",
+    "x": 1255,
+    "y": 830,
+    "width": 270,
+    "height": 70,
+    "backgroundColor": "#d0bfff",
+    "fillStyle": "solid",
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "preloop-orchestrator\npluggable backends",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "zone_tools",
+    "x": 350,
+    "y": 945,
+    "width": 1200,
+    "height": 140,
+    "backgroundColor": "#dbe4ff",
+    "fillStyle": "solid",
+    "opacity": 25,
+    "strokeColor": "#1e40af",
+    "strokeWidth": 1.5,
+    "roundness": {
+      "type": 3
+    }
+  },
+  {
+    "type": "text",
+    "id": "zone_l_tools",
+    "x": 370,
+    "y": 960,
+    "text": "Tooling & Conformance",
+    "fontSize": 18,
+    "strokeColor": "#1e40af"
+  },
+  {
+    "type": "rectangle",
+    "id": "cli",
+    "x": 370,
+    "y": 995,
+    "width": 260,
+    "height": 70,
+    "backgroundColor": "#a5d8ff",
+    "fillStyle": "solid",
+    "strokeColor": "#4a9eed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "preloop-cli\nlocal run submission",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "conf",
+    "x": 665,
+    "y": 995,
+    "width": 260,
+    "height": 70,
+    "backgroundColor": "#a5d8ff",
+    "fillStyle": "solid",
+    "strokeColor": "#4a9eed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "aksh-conformance\nprotocol diff vs reference",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "dap",
+    "x": 960,
+    "y": 995,
+    "width": 260,
+    "height": 70,
+    "backgroundColor": "#a5d8ff",
+    "fillStyle": "solid",
+    "strokeColor": "#4a9eed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "aksh-dap\nDebug Adapter bridge",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "sock",
+    "x": 1255,
+    "y": 995,
+    "width": 270,
+    "height": 70,
+    "backgroundColor": "#a5d8ff",
+    "fillStyle": "solid",
+    "strokeColor": "#4a9eed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "socket-activation\nsd_notify / hot reload",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_github_server",
+    "x": 270,
+    "y": 217,
+    "width": 100,
+    "height": -7,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        100,
+        -7
+      ]
+    ],
+    "strokeColor": "#1e1e1e",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "ext_github",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "server",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "webhook",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_runner_broker",
+    "x": 270,
+    "y": 357,
+    "width": 525,
+    "height": -187,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        45,
+        0
+      ],
+      [
+        45,
+        -217
+      ],
+      [
+        525,
+        -217
+      ],
+      [
+        525,
+        -187
+      ]
+    ],
+    "strokeColor": "#1e1e1e",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "ext_runner",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "broker",
+      "fixedPoint": [
+        0.5,
+        0
+      ]
+    },
+    "label": {
+      "text": "register / poll",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_user_runs",
+    "x": 270,
+    "y": 497,
+    "width": 100,
+    "height": -50,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        45,
+        0
+      ],
+      [
+        45,
+        -50
+      ],
+      [
+        100,
+        -50
+      ]
+    ],
+    "strokeColor": "#1e1e1e",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "ext_user",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "runs",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "submit",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_actions_runner",
+    "x": 270,
+    "y": 637,
+    "width": 820,
+    "height": 30,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        45,
+        0
+      ],
+      [
+        45,
+        -80
+      ],
+      [
+        820,
+        -80
+      ],
+      [
+        820,
+        -7
+      ]
+    ],
+    "strokeColor": "#1e1e1e",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "ext_actions",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "runner",
+      "fixedPoint": [
+        0.5,
+        0
+      ]
+    },
+    "label": {
+      "text": "download action tarballs",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_cli_runs",
+    "x": 370,
+    "y": 1030,
+    "width": 0,
+    "height": -583,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        -55,
+        0
+      ],
+      [
+        -55,
+        -583
+      ],
+      [
+        0,
+        -583
+      ]
+    ],
+    "strokeColor": "#4a9eed",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "cli",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "runs",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "submit run",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_server_broker",
+    "x": 630,
+    "y": 210,
+    "width": 35,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        35,
+        0
+      ]
+    ],
+    "strokeColor": "#1e1e1e",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "server",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "broker",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "auth",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_broker_queue",
+    "x": 925,
+    "y": 210,
+    "width": 35,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        35,
+        0
+      ]
+    ],
+    "strokeColor": "#1e1e1e",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "broker",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "queue",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "enqueue",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_runner_vm",
+    "x": 1220,
+    "y": 667,
+    "width": 35,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        35,
+        0
+      ]
+    ],
+    "strokeColor": "#a21caf",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "runner",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "vm",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "host",
+      "fontSize": 14
+    }
+  }
+]
