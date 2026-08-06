@@ -1,5 +1,28 @@
 use super::*;
 
+/// Deduplicate label strings case-insensitively, preserving first occurrence.
+///
+/// The official `actions/runner` builds labels as 3 system entries
+/// (`self-hosted`, OS, arch) plus any user-supplied labels via `--labels`. A
+/// user who adds a label that already exists as a system entry — most
+/// commonly `self-hosted`, which is the default `config.sh` suggestion — would
+/// otherwise produce a duplicate that violates the `(runner_id, label)`
+/// primary key on `runner_labels` and surface as a 500. Dispatch matching in
+/// `runtime_scheduling::job_matches_runner` is already case-insensitive, so
+/// collapsing here keeps the stored set consistent with the matcher without
+/// changing semantics.
+fn dedupe_labels_ci(labels: &[String]) -> Vec<String> {
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(labels.len());
+    let mut out: Vec<String> = Vec::with_capacity(labels.len());
+    for label in labels {
+        if seen.insert(label.to_lowercase()) {
+            out.push(label.clone());
+        }
+    }
+    out
+}
+
 pub(crate) async fn register_runner(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<RunnerRegistrationRequest>,
@@ -17,7 +40,7 @@ pub(crate) async fn register_runner(
     let runner = RegisteredRunner {
         id: runner_id,
         name: request.name,
-        labels: request.labels,
+        labels: dedupe_labels_ci(&request.labels),
         ephemeral: request.ephemeral,
         public_key,
         runner_group_id: request.runner_group_id,
@@ -32,6 +55,11 @@ pub(crate) async fn register_runner(
         inner.runner_rsa_public_keys.insert(runner_id, public_key);
     }
     inner.runners.insert(runner.id, runner.clone());
+    shared
+        .state
+        .store
+        .store_inner(&inner)
+        .map_err(|error| ApiError::internal(format!("failed to persist runner: {error}")))?;
     Ok(Json(runner))
 }
 
@@ -77,6 +105,21 @@ pub(crate) async fn create_session(
         inner
             .session_keys
             .insert(session_id.to_string(), session_enc);
+        inner.sessions.insert(
+            session_id.to_string(),
+            RunnerSession {
+                session_id: SessionId(session_id),
+                runner_id: request.runner_id,
+            },
+        );
+        inner
+            .broker_session_runners
+            .insert(session_id.to_string(), request.runner_id);
+        shared
+            .state
+            .store
+            .store_inner(&inner)
+            .map_err(|error| ApiError::internal(format!("failed to persist session: {error}")))?;
     }
 
     info!(%session_id, runner_id = request.runner_id, encrypted, "session created with AES key");
@@ -155,6 +198,13 @@ pub(crate) async fn create_session_disttask(
             inner
                 .broker_session_runners
                 .insert(session_id.to_string(), runner_id);
+            inner.sessions.insert(
+                session_id.to_string(),
+                RunnerSession {
+                    session_id: SessionId(session_id),
+                    runner_id,
+                },
+            );
         }
         // Only mark as AzDO if the client explicitly opts in.
         // This preserves backward compat: test and broker-hybrid sessions do NOT
@@ -166,6 +216,11 @@ pub(crate) async fn create_session_disttask(
         {
             inner.azdo_sessions.insert(session_id.to_string());
         }
+        shared
+            .state
+            .store
+            .store_inner(&inner)
+            .map_err(|error| ApiError::internal(format!("failed to persist session: {error}")))?;
     }
 
     let owner_name = body
@@ -201,6 +256,9 @@ pub(crate) async fn delete_session(
     let mut inner = shared.state.inner.lock().await;
     inner.sessions.remove(&session_id);
     inner.broker_session_runners.remove(&session_id);
+    if let Err(error) = shared.state.store.store_inner(&inner) {
+        tracing::warn!(?error, "failed to persist deleted runner session");
+    }
     StatusCode::NO_CONTENT
 }
 
@@ -449,13 +507,15 @@ pub(crate) async fn register_runner_compat(
         .get("labels")
         .and_then(|v| v.as_array())
         .map(|arr| {
-            arr.iter()
+            let raw: Vec<String> = arr
+                .iter()
                 .filter_map(|v| {
                     v.as_str()
                         .or_else(|| v.get("name").and_then(|name| name.as_str()))
                         .map(str::to_owned)
                 })
-                .collect()
+                .collect();
+            dedupe_labels_ci(&raw)
         })
         .unwrap_or_default();
     let ephemeral = request
