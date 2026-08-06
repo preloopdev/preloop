@@ -1,37 +1,231 @@
-//! Durable SQLite state for the control plane.
+//! Durable state backends for the control plane.
 //!
 //! The HTTP layer still uses the in-memory structures for fast protocol
 //! handling, but every correctness-bearing transition is written through to
-//! this database before the transition is announced to observers.  The
-//! database is also the restart source for runs, dispatch queues, runners,
+//! the selected backend before the transition is announced to observers. The
+//! backend is also the restart source for runs, dispatch queues, runners,
 //! sessions, and broker request identifiers.
 //!
-//! The store is **best-effort**: in-memory state is the source of truth, the
-//! database is a restart source. Store failures are logged and the
-//! affected event is still broadcast to subscribers. See `state.rs::emit`.
+
+//!
+//! Backends are selected at startup via [`open_store`] (env `AKSH_STORE_URL`:
+//! `sqlite://<path>` or `postgres://…`; the default is SQLite at
+//! `<state_dir>/aksh.db`). The [`Store`] trait is the only surface the rest
+//! of the server sees, so a new database plugs in without touching callers.
 
 use super::*;
 use aksh_gha_protocol::{SecretMap, SessionId};
+use async_trait::async_trait;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use sha2::Digest;
 use std::sync::Mutex as StdMutex;
 
 const DATABASE_FILE: &str = "aksh.db";
-const SNAPSHOT_FORMAT: u8 = 2;
+pub(crate) const SNAPSHOT_FORMAT: u8 = 2;
 const MIGRATION_DOMAIN: &[u8] = b"aksh-store-v2";
 const KEY_INFO_ENCRYPT: &[u8] = b"aks-store-aead/v1";
 const KEY_INFO_MAC: &[u8] = b"aks-store-mac/v1";
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Durable-state backend. See the module docs for the contract.
+#[async_trait]
+pub(crate) trait Store: Send + Sync {
+    /// Restore the persisted state into `inner` (startup path).
+    async fn load_into(&self, inner: &mut InnerState) -> anyhow::Result<()>;
+    /// Full snapshot: rewrite every table from `inner` in one transaction.
+    async fn store_inner(&self, inner: &InnerState) -> anyhow::Result<()>;
+    /// Persist only the runtime metadata snapshot (hot path).
+    async fn store_meta_only(&self, inner: &InnerState) -> anyhow::Result<()>;
+    /// Persist one run's mutable projection plus a control event.
+    async fn store_run_event(
+        &self,
+        inner: &InnerState,
+        run_id: RunId,
+        event: &NdjsonEvent,
+    ) -> anyhow::Result<()>;
+    /// Persist the run-number allocator for one workflow path.
+    async fn store_workflow_run_counter(
+        &self,
+        workflow_path: &str,
+        next_run_number: u64,
+    ) -> anyhow::Result<()>;
+    /// Append one log chunk (and upsert the parent log file aggregate).
+    async fn store_log_chunk(
+        &self,
+        key: &str,
+        chunk_index: i64,
+        payload: &[u8],
+        byte_count: i64,
+        line_count: i64,
+    ) -> anyhow::Result<()>;
+    /// Append a control event (`run_accepted` / `run_status` / `job_status`).
+    async fn append_event(&self, event: &NdjsonEvent) -> anyhow::Result<()>;
+}
+
+/// SQLite backend: `<state_dir>/aksh.db`, one connection behind a mutex.
 #[derive(Clone)]
-pub(crate) struct Store {
+pub(crate) struct SqliteStore {
     connection: Arc<StdMutex<Connection>>,
-    key: Vec<u8>,
+    cipher: Envelope,
+}
+
+/// Where the server should look for durable state. Parsed from `AKSH_STORE_URL`
+/// (or an explicit override); see [`parse_store_url`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StoreUrl {
+    /// `sqlite://<path>`, `sqlite:<path>`, or a bare filesystem path.
+    /// An empty path means the default `<state_dir>/aksh.db`.
+    Sqlite(std::path::PathBuf),
+    /// `postgres://<user>:<pass>@<host>:<port>/<db>`.
+    Postgres(String),
+}
+
+/// Environment variable selecting the store backend when no explicit URL is
+/// given. Values: `sqlite://<path>`, `postgres://…`, or a bare path.
+pub(crate) const STORE_URL_ENV: &str = "AKSH_STORE_URL";
+
+/// Parse a store URL. Bare paths and `sqlite:` forms map to the SQLite
+/// backend; `postgres://` / `postgresql://` map to the Postgres backend.
+pub(crate) fn parse_store_url(value: &str) -> anyhow::Result<StoreUrl> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(StoreUrl::Sqlite(std::path::PathBuf::new()));
+    }
+    if let Some(rest) = value
+        .strip_prefix("sqlite://")
+        .or_else(|| value.strip_prefix("sqlite:"))
+    {
+        return Ok(StoreUrl::Sqlite(std::path::PathBuf::from(rest)));
+    }
+    if value.starts_with("postgres://") || value.starts_with("postgresql://") {
+        return Ok(StoreUrl::Postgres(value.to_owned()));
+    }
+    if !value.contains("://") {
+        // Bare path: keep the SQLite default behaviour.
+        return Ok(StoreUrl::Sqlite(std::path::PathBuf::from(value)));
+    }
+    anyhow::bail!(
+        "unsupported store URL {value:?}: expected sqlite://<path>, \
+         postgres://<user>:<pass>@<host>/<db>, or a bare sqlite path"
+    )
+}
+
+/// Open the store selected by `url` (falling back to `AKSH_STORE_URL`, then
+/// to SQLite at `<state_dir>/aksh.db`). The AEAD envelope key is derived from
+/// the JWT HMAC key with domain separation, independent of the backend.
+pub(crate) async fn open_store(
+    url: Option<&str>,
+    state_dir: &std::path::Path,
+    key: &[u8],
+) -> anyhow::Result<Arc<dyn Store>> {
+    let raw = match url {
+        Some(value) if !value.trim().is_empty() => value.to_owned(),
+        _ => std::env::var(STORE_URL_ENV).unwrap_or_default(),
+    };
+    let cipher = Envelope::new(key);
+    let store: Arc<dyn Store> = match parse_store_url(&raw)? {
+        StoreUrl::Sqlite(path) => {
+            let path = if path.as_os_str().is_empty() {
+                state_dir.join(DATABASE_FILE)
+            } else {
+                path
+            };
+            Arc::new(SqliteStore::open(&path, cipher)?)
+        }
+        StoreUrl::Postgres(url) => Arc::new(crate::store_pg::PgStore::open(&url, cipher).await?),
+    };
+    Ok(store)
+}
+
+/// AEAD envelope used to seal persisted blobs (runs, requests, session keys,
+/// metadata snapshot). Backend-independent: SQLite and Postgres both store
+/// the sealed bytes as opaque blobs.
+#[derive(Clone)]
+pub(crate) struct Envelope {
+    aead: [u8; 32],
+    mac: [u8; 32],
+}
+
+impl Envelope {
+    /// Derive the AEAD + MAC sub-keys from the root HMAC key (HKDF-SHA256,
+    /// domain-separated per purpose).
+    pub(crate) fn new(root: &[u8]) -> Self {
+        let keys = derive_keys(root);
+        Self {
+            aead: keys.aead,
+            mac: keys.mac,
+        }
+    }
+
+    /// AES-256-CBC + HMAC-SHA256 over the migration domain, IV, and
+    /// ciphertext. Returns `(ciphertext, iv, tag)`.
+    pub(crate) fn encrypt_sealed(&self, plaintext: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let cipher = SessionEncryption::from_key(self.aead.to_vec());
+        let (ciphertext, iv) = cipher
+            .encrypt(plaintext)
+            .expect("AES-256-CBC encrypt is infallible for in-spec inputs");
+        let mut mac = HmacSha256::new_from_slice(&self.mac).expect("HMAC accepts any key length");
+        mac.update(MIGRATION_DOMAIN);
+        mac.update(&iv);
+        mac.update(&ciphertext);
+        (ciphertext, iv, mac.finalize().into_bytes().to_vec())
+    }
+
+    /// Verify the MAC and decrypt. Fails on tampering or a wrong key.
+    pub(crate) fn decrypt_sealed(
+        &self,
+        ciphertext: &[u8],
+        iv: &[u8],
+        tag: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut mac = HmacSha256::new_from_slice(&self.mac).expect("HMAC accepts any key length");
+        mac.update(MIGRATION_DOMAIN);
+        mac.update(iv);
+        mac.update(ciphertext);
+        mac.verify_slice(tag)
+            .map_err(|_| anyhow::anyhow!("store session-key envelope authentication failed"))?;
+        SessionEncryption::from_key(self.aead.to_vec())
+            .decrypt(ciphertext, iv)
+            .map_err(|error| anyhow::anyhow!("store session-key decryption failed: {error}"))
+    }
+
+    /// Seal a plaintext blob: `version || iv || ciphertext || tag`.
+    pub(crate) fn seal(&self, plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let (ciphertext, iv, tag) = self.encrypt_sealed(plaintext);
+        let mut sealed = Vec::with_capacity(1 + iv.len() + ciphertext.len() + tag.len());
+        sealed.push(SNAPSHOT_FORMAT);
+        sealed.extend_from_slice(&iv);
+        sealed.extend_from_slice(&ciphertext);
+        sealed.extend_from_slice(&tag);
+        Ok(sealed)
+    }
+
+    /// Unseal a blob written by [`Envelope::seal`]. Rejects foreign envelope
+    /// versions (v1 used a different, unauthenticated scheme).
+    pub(crate) fn unseal(&self, sealed: &[u8]) -> anyhow::Result<Vec<u8>> {
+        anyhow::ensure!(sealed.len() >= 1 + 16 + 32, "invalid store envelope");
+        let version = sealed[0];
+        if version != SNAPSHOT_FORMAT {
+            // Old envelopes (v1) used a different key derivation (raw key or
+            // SHA-256 of env input) and an unauthenticated AES-CBC layer.
+            // We don't try to decrypt them — the user must drop the state
+            // directory to start fresh. This is a hard cut-over; see the
+            // migration notes in the architecture doc.
+            anyhow::bail!(
+                "unsupported store envelope version {version}; current version is {SNAPSHOT_FORMAT}"
+            );
+        }
+        let iv = &sealed[1..17];
+        let tag_start = sealed.len() - 32;
+        let ciphertext = &sealed[17..tag_start];
+        let tag = &sealed[tag_start..];
+        self.decrypt_sealed(ciphertext, iv, tag)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct MetaSnapshot {
+pub(crate) struct MetaSnapshot {
     workflow_run_counters: BTreeMap<String, u64>,
     next_runner_id: i64,
     next_cache_id: i64,
@@ -85,7 +279,7 @@ struct MetaSnapshot {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct RequestSnapshot {
+pub(crate) struct RequestSnapshot {
     request_id: i64,
     run_id: RunId,
     job_id: JobId,
@@ -102,12 +296,12 @@ struct RequestSnapshot {
 }
 
 #[derive(Debug)]
-struct RowJob {
-    run_id: RunId,
-    job_id: JobId,
-    queue_kind: String,
-    queue_position: i64,
-    payload: Vec<u8>,
+pub(crate) struct RowJob {
+    pub(crate) run_id: RunId,
+    pub(crate) job_id: JobId,
+    pub(crate) queue_kind: String,
+    pub(crate) queue_position: i64,
+    pub(crate) payload: Vec<u8>,
 }
 
 struct DerivedKeys {
@@ -139,10 +333,262 @@ fn derive_keys(root: &[u8]) -> DerivedKeys {
     }
 }
 
-impl Store {
-    pub(crate) fn open(state_dir: &std::path::Path, key: &[u8]) -> anyhow::Result<Self> {
-        std::fs::create_dir_all(state_dir)?;
-        let path = state_dir.join(DATABASE_FILE);
+/// Serialize a run record for storage: `submission` and `job_needs` are
+/// injected as JSON so the persisted blob is self-contained.
+pub(crate) fn run_record_value(run: &RunRecord) -> anyhow::Result<serde_json::Value> {
+    let mut value = serde_json::to_value(run)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("submission".to_owned(), run.submission.to_request_json()?);
+        object.insert(
+            "job_needs".to_owned(),
+            serde_json::to_value(&run.job_needs)?,
+        );
+    }
+    Ok(value)
+}
+
+/// Unseal + parse a run blob written by [`run_record_value`].
+pub(crate) fn restore_run_record(cipher: &Envelope, blob: &[u8]) -> anyhow::Result<RunRecord> {
+    let value: serde_json::Value = serde_json::from_slice(&cipher.unseal(blob)?)?;
+    let mut run: RunRecord = serde_json::from_value(value.clone())?;
+    run.job_needs = value
+        .get("job_needs")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()?
+        .unwrap_or_default();
+    Ok(run)
+}
+
+/// Project a job-request record into its persisted snapshot shape.
+pub(crate) fn request_snapshot(record: &TaskAgentJobRequestRecord) -> RequestSnapshot {
+    RequestSnapshot {
+        request_id: record.request_id,
+        run_id: record.run_id,
+        job_id: record.job_id.clone(),
+        agent_job_id: record.agent_job_id,
+        plan_id: record.plan_id.clone(),
+        plan_type: record.plan_type.clone(),
+        timeline_id: record.timeline_id,
+        result: record.result,
+        locked_until: record.locked_until.clone(),
+        started_at_us: record.started_at.map(system_time_us),
+        last_renewed_at_us: record.last_renewed_at.map(system_time_us),
+        timeout_triggered: record.timeout_triggered,
+        debug_token_issued: record.debug_token_issued,
+    }
+}
+
+/// Unseal + parse a request blob written by [`request_snapshot`].
+pub(crate) fn restore_request_snapshot(
+    cipher: &Envelope,
+    blob: &[u8],
+) -> anyhow::Result<TaskAgentJobRequestRecord> {
+    let snapshot: RequestSnapshot = serde_json::from_slice(&cipher.unseal(blob)?)?;
+    Ok(TaskAgentJobRequestRecord {
+        request_id: snapshot.request_id,
+        run_id: snapshot.run_id,
+        job_id: snapshot.job_id.clone(),
+        agent_job_id: snapshot.agent_job_id,
+        plan_id: snapshot.plan_id.clone(),
+        plan_type: snapshot.plan_type,
+        timeline_id: snapshot.timeline_id,
+        result: snapshot.result,
+        locked_until: snapshot.locked_until,
+        started_at: snapshot.started_at_us.map(system_time_from_us),
+        last_renewed_at: snapshot.last_renewed_at_us.map(system_time_from_us),
+        timeout_triggered: snapshot.timeout_triggered,
+        debug_token_issued: snapshot.debug_token_issued,
+    })
+}
+
+/// Serialize the runtime metadata snapshot from in-memory state. Shared by
+/// every backend so one code path defines what survives a restart.
+pub(crate) fn build_meta_snapshot(inner: &InnerState) -> MetaSnapshot {
+    MetaSnapshot {
+        workflow_run_counters: inner.workflow_run_counters.clone(),
+        next_runner_id: inner.next_runner_id,
+        next_cache_id: inner.next_cache_id,
+        next_message_id: inner.next_message_id,
+        next_log_id: inner.next_log_id,
+        next_artifact_v2_id: inner.next_artifact_v2_id,
+        azdo_sessions: inner.azdo_sessions.clone(),
+        oidc_job_contexts: inner
+            .oidc_job_contexts
+            .iter()
+            .map(|((run_id, job_id), context)| (*run_id, job_id.clone(), context.clone()))
+            .collect(),
+        id_token_grants: inner
+            .id_token_grants
+            .iter()
+            .map(|((run_id, job_id), granted)| (*run_id, job_id.clone(), *granted))
+            .collect(),
+        concurrency_groups: inner
+            .concurrency_groups
+            .iter()
+            .map(|(key, group)| (key.clone(), group.clone()))
+            .collect(),
+        jobset_admissions: inner
+            .jobset_admissions
+            .iter()
+            .map(|(key, admission)| (key.clone(), admission.clone()))
+            .collect(),
+        run_concurrency: inner
+            .run_concurrency
+            .iter()
+            .map(|(run_id, config)| (*run_id, config.clone()))
+            .collect(),
+        holder_keys: inner
+            .holder_keys
+            .iter()
+            .map(|(run_id, keys)| (*run_id, keys.clone()))
+            .collect(),
+        pending_caches: inner
+            .pending_caches
+            .iter()
+            .map(|(id, cache)| (*id, cache.clone()))
+            .collect(),
+        artifacts: inner
+            .artifacts
+            .iter()
+            .map(|(id, artifact)| (id.clone(), artifact.clone()))
+            .collect(),
+        log_metadata: inner
+            .log_metadata
+            .iter()
+            .map(|(key, metadata)| (key.clone(), metadata.clone()))
+            .collect(),
+        timeline_events: inner
+            .timeline_events
+            .iter()
+            .map(|(run_id, events)| (*run_id, events.clone()))
+            .collect(),
+        timeline_change_ids: inner
+            .timeline_change_ids
+            .iter()
+            .map(|(key, change_id)| (key.clone(), *change_id))
+            .collect(),
+        timeline_records: inner
+            .timeline_records
+            .iter()
+            .map(|(key, records)| {
+                (
+                    key.clone(),
+                    records
+                        .iter()
+                        .map(|(id, record)| (*id, record.clone()))
+                        .collect(),
+                )
+            })
+            .collect(),
+        cache_v2_pending: inner
+            .cache_v2_pending
+            .iter()
+            .map(|(token, pending)| (token.clone(), pending.clone()))
+            .collect(),
+        cache_v2_dl_tokens: inner
+            .cache_v2_dl_tokens
+            .iter()
+            .map(|(token, value)| (token.clone(), value.clone()))
+            .collect(),
+        artifact_v2_pending: inner
+            .artifact_v2_pending
+            .iter()
+            .map(|(token, pending)| (token.clone(), pending.clone()))
+            .collect(),
+        artifact_v2_registry: inner
+            .artifact_v2_registry
+            .iter()
+            .map(|(key, entry)| (key.clone(), entry.clone()))
+            .collect(),
+        github_token_requests: inner
+            .github_token_requests
+            .iter()
+            .map(|(request_id, req)| (*request_id, req.clone()))
+            .collect(),
+        cancellation_queue: inner.cancellation_queue.clone(),
+        broker_messages: inner
+            .broker_messages
+            .iter()
+            .map(|(request_id, msg)| (*request_id, msg.clone()))
+            .collect(),
+        session_active_requests: inner
+            .session_active_requests
+            .iter()
+            .map(|(session_id, request_id)| (session_id.clone(), *request_id))
+            .collect(),
+    }
+}
+
+/// Apply a restored metadata snapshot onto in-memory state.
+pub(crate) fn apply_meta_snapshot(inner: &mut InnerState, meta: MetaSnapshot) {
+    inner.workflow_run_counters = meta.workflow_run_counters;
+    inner.next_runner_id = meta.next_runner_id;
+    inner.next_cache_id = meta.next_cache_id;
+    inner.next_message_id = meta.next_message_id;
+    inner.next_log_id = meta.next_log_id;
+    inner.next_artifact_v2_id = meta.next_artifact_v2_id;
+    inner.azdo_sessions = meta.azdo_sessions;
+    inner.oidc_job_contexts = meta
+        .oidc_job_contexts
+        .into_iter()
+        .map(|(run_id, job_id, context)| ((run_id, job_id), context))
+        .collect();
+    inner.id_token_grants = meta
+        .id_token_grants
+        .into_iter()
+        .map(|(run_id, job_id, granted)| ((run_id, job_id), granted))
+        .collect();
+    inner.concurrency_groups = meta.concurrency_groups.into_iter().collect();
+    inner.jobset_admissions = meta.jobset_admissions.into_iter().collect();
+    inner.run_concurrency = meta.run_concurrency.into_iter().collect();
+    inner.holder_keys = meta.holder_keys.into_iter().collect();
+    inner.pending_caches = meta.pending_caches.into_iter().collect();
+    inner.artifacts = meta.artifacts.into_iter().collect();
+    inner.log_metadata = meta.log_metadata.into_iter().collect();
+    inner.timeline_events = meta.timeline_events.into_iter().collect();
+    inner.timeline_change_ids = meta.timeline_change_ids.into_iter().collect();
+    inner.timeline_records = meta
+        .timeline_records
+        .into_iter()
+        .map(|(key, records)| (key, records.into_iter().collect()))
+        .collect();
+    inner.cache_v2_pending = meta.cache_v2_pending.into_iter().collect();
+    inner.cache_v2_dl_tokens = meta.cache_v2_dl_tokens.into_iter().collect();
+    inner.artifact_v2_pending = meta.artifact_v2_pending.into_iter().collect();
+    inner.artifact_v2_registry = meta.artifact_v2_registry.into_iter().collect();
+    inner.github_token_requests = meta.github_token_requests.into_iter().collect();
+    inner.cancellation_queue = meta.cancellation_queue;
+    inner.session_active_requests = meta.session_active_requests.into_iter().collect();
+}
+
+/// Seal a session AES key for storage. Returns `(ciphertext, iv, tag)`.
+pub(crate) fn seal_session_key(
+    cipher: &Envelope,
+    enc: &SessionEncryption,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let payload = serde_json::to_vec(&SessionKeyPayload(enc.key.clone()))
+        .expect("SessionKeyPayload is always serializable");
+    cipher.encrypt_sealed(&payload)
+}
+
+/// Unseal + parse a session AES key blob written by [`seal_session_key`].
+pub(crate) fn restore_session_key(
+    cipher: &Envelope,
+    key_blob: &[u8],
+    iv: &[u8],
+    tag: &[u8],
+) -> anyhow::Result<SessionEncryption> {
+    let plaintext = cipher.decrypt_sealed(key_blob, iv, tag)?;
+    let payload: SessionKeyPayload = serde_json::from_slice(&plaintext)?;
+    Ok(SessionEncryption::from_key(payload.0))
+}
+
+impl SqliteStore {
+    pub(crate) fn open(path: &std::path::Path, cipher: Envelope) -> anyhow::Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let connection = Connection::open(path)?;
         connection.execute_batch(
             r#"
@@ -158,7 +604,7 @@ impl Store {
         Self::migrate(&connection)?;
         Ok(Self {
             connection: Arc::new(StdMutex::new(connection)),
-            key: key.to_vec(),
+            cipher,
         })
     }
 
@@ -205,14 +651,7 @@ impl Store {
             .query_map([], |row| row.get::<_, Vec<u8>>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         for blob in runs {
-            let value: serde_json::Value = serde_json::from_slice(&self.unseal(&blob)?)?;
-            let mut run: RunRecord = serde_json::from_value(value.clone())?;
-            run.job_needs = value
-                .get("job_needs")
-                .cloned()
-                .map(serde_json::from_value)
-                .transpose()?
-                .unwrap_or_default();
+            let mut run = restore_run_record(&self.cipher, &blob)?;
             let run_id = run.run_id;
             if let Some(secret_blob) = connection
                 .query_row(
@@ -222,7 +661,8 @@ impl Store {
                 )
                 .optional()?
             {
-                let secrets: SecretMap = serde_json::from_slice(&self.unseal(&secret_blob)?)?;
+                let secrets: SecretMap =
+                    serde_json::from_slice(&self.cipher.unseal(&secret_blob)?)?;
                 Arc::make_mut(&mut run.submission).secrets = secrets;
             }
             inner.runs.insert(run_id, run);
@@ -250,7 +690,7 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         for row in jobs {
-            let job: QueuedJob = serde_json::from_slice(&self.unseal(&row.payload)?)?;
+            let job: QueuedJob = serde_json::from_slice(&self.cipher.unseal(&row.payload)?)?;
             match row.queue_kind.as_str() {
                 "ready" => inner.queue.push_back(job),
                 "pending" => inner.pending_jobs.push_back(job),
@@ -327,19 +767,12 @@ impl Store {
             ))
         })? {
             let (session_id, key_blob, iv, tag) = row?;
-            match self.decrypt_sealed(&key_blob, &iv, &tag) {
-                Ok(plaintext) => match serde_json::from_slice::<SessionKeyPayload>(&plaintext) {
-                    Ok(payload) => {
-                        inner
-                            .session_keys
-                            .insert(session_id.clone(), SessionEncryption::from_key(payload.0));
-                    }
-                    Err(error) => {
-                        tracing::warn!(%session_id, %error, "failed to parse session_key payload on load");
-                    }
-                },
+            match restore_session_key(&self.cipher, &key_blob, &iv, &tag) {
+                Ok(enc) => {
+                    inner.session_keys.insert(session_id.clone(), enc);
+                }
                 Err(error) => {
-                    tracing::warn!(%session_id, %error, "failed to decrypt session_key on load");
+                    tracing::warn!(%session_id, %error, "failed to restore session_key on load");
                 }
             }
         }
@@ -386,22 +819,7 @@ impl Store {
             Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
         })? {
             let (request_id, blob) = row?;
-            let snapshot: RequestSnapshot = serde_json::from_slice(&self.unseal(&blob)?)?;
-            let record = TaskAgentJobRequestRecord {
-                request_id,
-                run_id: snapshot.run_id,
-                job_id: snapshot.job_id.clone(),
-                agent_job_id: snapshot.agent_job_id,
-                plan_id: snapshot.plan_id.clone(),
-                plan_type: snapshot.plan_type,
-                timeline_id: snapshot.timeline_id,
-                result: snapshot.result,
-                locked_until: snapshot.locked_until,
-                started_at: snapshot.started_at_us.map(system_time_from_us),
-                last_renewed_at: snapshot.last_renewed_at_us.map(system_time_from_us),
-                timeout_triggered: snapshot.timeout_triggered,
-                debug_token_issued: snapshot.debug_token_issued,
-            };
+            let record = restore_request_snapshot(&self.cipher, &blob)?;
             inner
                 .inflight_requests
                 .insert(request_id, (record.run_id, record.job_id.clone()));
@@ -425,45 +843,8 @@ impl Store {
             )
             .optional()?
         {
-            let meta: MetaSnapshot = serde_json::from_slice(&self.unseal(&blob)?)?;
-            inner.workflow_run_counters = meta.workflow_run_counters;
-            inner.next_runner_id = meta.next_runner_id;
-            inner.next_cache_id = meta.next_cache_id;
-            inner.next_message_id = meta.next_message_id;
-            inner.next_log_id = meta.next_log_id;
-            inner.next_artifact_v2_id = meta.next_artifact_v2_id;
-            inner.azdo_sessions = meta.azdo_sessions;
-            inner.oidc_job_contexts = meta
-                .oidc_job_contexts
-                .into_iter()
-                .map(|(run_id, job_id, context)| ((run_id, job_id), context))
-                .collect();
-            inner.id_token_grants = meta
-                .id_token_grants
-                .into_iter()
-                .map(|(run_id, job_id, granted)| ((run_id, job_id), granted))
-                .collect();
-            inner.concurrency_groups = meta.concurrency_groups.into_iter().collect();
-            inner.jobset_admissions = meta.jobset_admissions.into_iter().collect();
-            inner.run_concurrency = meta.run_concurrency.into_iter().collect();
-            inner.holder_keys = meta.holder_keys.into_iter().collect();
-            inner.pending_caches = meta.pending_caches.into_iter().collect();
-            inner.artifacts = meta.artifacts.into_iter().collect();
-            inner.log_metadata = meta.log_metadata.into_iter().collect();
-            inner.timeline_events = meta.timeline_events.into_iter().collect();
-            inner.timeline_change_ids = meta.timeline_change_ids.into_iter().collect();
-            inner.timeline_records = meta
-                .timeline_records
-                .into_iter()
-                .map(|(key, records)| (key, records.into_iter().collect()))
-                .collect();
-            inner.cache_v2_pending = meta.cache_v2_pending.into_iter().collect();
-            inner.cache_v2_dl_tokens = meta.cache_v2_dl_tokens.into_iter().collect();
-            inner.artifact_v2_pending = meta.artifact_v2_pending.into_iter().collect();
-            inner.artifact_v2_registry = meta.artifact_v2_registry.into_iter().collect();
-            inner.github_token_requests = meta.github_token_requests.into_iter().collect();
-            inner.cancellation_queue = meta.cancellation_queue;
-            inner.session_active_requests = meta.session_active_requests.into_iter().collect();
+            let meta: MetaSnapshot = serde_json::from_slice(&self.cipher.unseal(&blob)?)?;
+            apply_meta_snapshot(inner, meta);
         }
         let mut counters = connection.prepare(
             "SELECT workflow_path, next_run_number
@@ -588,7 +969,7 @@ impl Store {
                 }
                 serde_json::to_vec(&value)?
             };
-            let sealed_run = self.seal(&run_json)?;
+            let sealed_run = self.cipher.seal(&run_json)?;
             tx.execute(
                 "INSERT INTO runs(run_id, repository, workflow_path, status, run_number,
                                   run_attempt, created_at_us, completed_at_us, record_blob)
@@ -608,7 +989,7 @@ impl Store {
             let secrets = serde_json::to_vec(&run.submission.secrets)?;
             tx.execute(
                 "INSERT INTO run_secrets(run_id, secret_blob) VALUES (?1, ?2)",
-                params![run.run_id.to_string(), self.seal(&secrets)?],
+                params![run.run_id.to_string(), self.cipher.seal(&secrets)?],
             )?;
         }
 
@@ -682,12 +1063,7 @@ impl Store {
             let key_blob = inner
                 .session_keys
                 .get(&session.session_id.0.to_string())
-                .map(|enc| {
-                    let payload = serde_json::to_vec(&SessionKeyPayload(enc.key.clone()))
-                        .expect("SessionKeyPayload is always serializable");
-                    let (ct, iv, tag) = self.encrypt_sealed(&payload);
-                    (ct, iv, tag)
-                });
+                .map(|enc| seal_session_key(&self.cipher, enc));
             match key_blob {
                 Some((ct, iv, tag)) => {
                     tx.execute(
@@ -735,7 +1111,7 @@ impl Store {
                 timeout_triggered: record.timeout_triggered,
                 debug_token_issued: record.debug_token_issued,
             };
-            let blob = self.seal(&serde_json::to_vec(&snapshot)?)?;
+            let blob = self.cipher.seal(&serde_json::to_vec(&snapshot)?)?;
             tx.execute(
                 "INSERT INTO job_requests(request_id, run_id, job_id, agent_job_id,
                                           plan_id, timeline_id, state, request_blob)
@@ -773,119 +1149,7 @@ impl Store {
             }
         }
 
-        let meta = MetaSnapshot {
-            workflow_run_counters: inner.workflow_run_counters.clone(),
-            next_runner_id: inner.next_runner_id,
-            next_cache_id: inner.next_cache_id,
-            next_message_id: inner.next_message_id,
-            next_log_id: inner.next_log_id,
-            next_artifact_v2_id: inner.next_artifact_v2_id,
-            azdo_sessions: inner.azdo_sessions.clone(),
-            oidc_job_contexts: inner
-                .oidc_job_contexts
-                .iter()
-                .map(|((run_id, job_id), context)| (*run_id, job_id.clone(), context.clone()))
-                .collect(),
-            id_token_grants: inner
-                .id_token_grants
-                .iter()
-                .map(|((run_id, job_id), granted)| (*run_id, job_id.clone(), *granted))
-                .collect(),
-            concurrency_groups: inner
-                .concurrency_groups
-                .iter()
-                .map(|(key, group)| (key.clone(), group.clone()))
-                .collect(),
-            jobset_admissions: inner
-                .jobset_admissions
-                .iter()
-                .map(|(key, admission)| (key.clone(), admission.clone()))
-                .collect(),
-            run_concurrency: inner
-                .run_concurrency
-                .iter()
-                .map(|(run_id, config)| (*run_id, config.clone()))
-                .collect(),
-            holder_keys: inner
-                .holder_keys
-                .iter()
-                .map(|(run_id, keys)| (*run_id, keys.clone()))
-                .collect(),
-            pending_caches: inner
-                .pending_caches
-                .iter()
-                .map(|(id, cache)| (*id, cache.clone()))
-                .collect(),
-            artifacts: inner
-                .artifacts
-                .iter()
-                .map(|(id, artifact)| (id.clone(), artifact.clone()))
-                .collect(),
-            log_metadata: inner
-                .log_metadata
-                .iter()
-                .map(|(key, metadata)| (key.clone(), metadata.clone()))
-                .collect(),
-            timeline_events: inner
-                .timeline_events
-                .iter()
-                .map(|(run_id, events)| (*run_id, events.clone()))
-                .collect(),
-            timeline_change_ids: inner
-                .timeline_change_ids
-                .iter()
-                .map(|(key, change_id)| (key.clone(), *change_id))
-                .collect(),
-            timeline_records: inner
-                .timeline_records
-                .iter()
-                .map(|(key, records)| {
-                    (
-                        key.clone(),
-                        records
-                            .iter()
-                            .map(|(id, record)| (*id, record.clone()))
-                            .collect(),
-                    )
-                })
-                .collect(),
-            cache_v2_pending: inner
-                .cache_v2_pending
-                .iter()
-                .map(|(token, pending)| (token.clone(), pending.clone()))
-                .collect(),
-            cache_v2_dl_tokens: inner
-                .cache_v2_dl_tokens
-                .iter()
-                .map(|(token, value)| (token.clone(), value.clone()))
-                .collect(),
-            artifact_v2_pending: inner
-                .artifact_v2_pending
-                .iter()
-                .map(|(token, pending)| (token.clone(), pending.clone()))
-                .collect(),
-            artifact_v2_registry: inner
-                .artifact_v2_registry
-                .iter()
-                .map(|(key, entry)| (key.clone(), entry.clone()))
-                .collect(),
-            github_token_requests: inner
-                .github_token_requests
-                .iter()
-                .map(|(request_id, req)| (*request_id, req.clone()))
-                .collect(),
-            cancellation_queue: inner.cancellation_queue.clone(),
-            broker_messages: inner
-                .broker_messages
-                .iter()
-                .map(|(request_id, msg)| (*request_id, msg.clone()))
-                .collect(),
-            session_active_requests: inner
-                .session_active_requests
-                .iter()
-                .map(|(session_id, request_id)| (session_id.clone(), *request_id))
-                .collect(),
-        };
+        let meta = build_meta_snapshot(inner);
         tx.execute(
             "INSERT INTO runtime_snapshots(snapshot_id, format_version, meta_blob, written_at_us)
              VALUES (1, ?1, ?2, ?3)
@@ -895,7 +1159,7 @@ impl Store {
                written_at_us = excluded.written_at_us",
             params![
                 SNAPSHOT_FORMAT as i64,
-                self.seal(&serde_json::to_vec(&meta)?)?,
+                self.cipher.seal(&serde_json::to_vec(&meta)?)?,
                 now_us()
             ],
         )?;
@@ -1007,14 +1271,7 @@ impl Store {
     }
 
     fn store_run_tx(&self, tx: &Transaction<'_>, run: &RunRecord) -> anyhow::Result<()> {
-        let mut value = serde_json::to_value(run)?;
-        if let Some(object) = value.as_object_mut() {
-            object.insert("submission".to_owned(), run.submission.to_request_json()?);
-            object.insert(
-                "job_needs".to_owned(),
-                serde_json::to_value(&run.job_needs)?,
-            );
-        }
+        let value = run_record_value(run)?;
         tx.execute(
             "INSERT INTO runs(run_id, repository, workflow_path, status, run_number,
                               run_attempt, created_at_us, completed_at_us, record_blob)
@@ -1037,7 +1294,7 @@ impl Store {
                 run.run_attempt as i64,
                 unix_us(run.created_at),
                 run.completed_at.map(unix_us),
-                self.seal(&serde_json::to_vec(&value)?)?,
+                self.cipher.seal(&serde_json::to_vec(&value)?)?,
             ],
         )?;
         tx.execute(
@@ -1045,7 +1302,8 @@ impl Store {
              ON CONFLICT(run_id) DO UPDATE SET secret_blob = excluded.secret_blob",
             params![
                 run.run_id.to_string(),
-                self.seal(&serde_json::to_vec(&run.submission.secrets)?)?
+                self.cipher
+                    .seal(&serde_json::to_vec(&run.submission.secrets)?)?
             ],
         )?;
         Ok(())
@@ -1056,21 +1314,7 @@ impl Store {
         tx: &Transaction<'_>,
         record: &TaskAgentJobRequestRecord,
     ) -> anyhow::Result<()> {
-        let snapshot = RequestSnapshot {
-            request_id: record.request_id,
-            run_id: record.run_id,
-            job_id: record.job_id.clone(),
-            agent_job_id: record.agent_job_id,
-            plan_id: record.plan_id.clone(),
-            plan_type: record.plan_type.clone(),
-            timeline_id: record.timeline_id,
-            result: record.result,
-            locked_until: record.locked_until.clone(),
-            started_at_us: record.started_at.map(system_time_us),
-            last_renewed_at_us: record.last_renewed_at.map(system_time_us),
-            timeout_triggered: record.timeout_triggered,
-            debug_token_issued: record.debug_token_issued,
-        };
+        let snapshot = request_snapshot(record);
         tx.execute(
             "INSERT INTO job_requests(request_id, run_id, job_id, agent_job_id,
                                       plan_id, timeline_id, state, request_blob)
@@ -1082,126 +1326,14 @@ impl Store {
                 record.agent_job_id.to_string(),
                 record.plan_id,
                 record.timeline_id.to_string(),
-                self.seal(&serde_json::to_vec(&snapshot)?)?,
+                self.cipher.seal(&serde_json::to_vec(&snapshot)?)?,
             ],
         )?;
         Ok(())
     }
 
     fn write_meta_tx(&self, tx: &Transaction<'_>, inner: &InnerState) -> anyhow::Result<()> {
-        let meta = MetaSnapshot {
-            workflow_run_counters: inner.workflow_run_counters.clone(),
-            next_runner_id: inner.next_runner_id,
-            next_cache_id: inner.next_cache_id,
-            next_message_id: inner.next_message_id,
-            next_log_id: inner.next_log_id,
-            next_artifact_v2_id: inner.next_artifact_v2_id,
-            azdo_sessions: inner.azdo_sessions.clone(),
-            oidc_job_contexts: inner
-                .oidc_job_contexts
-                .iter()
-                .map(|((run_id, job_id), context)| (*run_id, job_id.clone(), context.clone()))
-                .collect(),
-            id_token_grants: inner
-                .id_token_grants
-                .iter()
-                .map(|((run_id, job_id), granted)| (*run_id, job_id.clone(), *granted))
-                .collect(),
-            concurrency_groups: inner
-                .concurrency_groups
-                .iter()
-                .map(|(key, group)| (key.clone(), group.clone()))
-                .collect(),
-            jobset_admissions: inner
-                .jobset_admissions
-                .iter()
-                .map(|(key, admission)| (key.clone(), admission.clone()))
-                .collect(),
-            run_concurrency: inner
-                .run_concurrency
-                .iter()
-                .map(|(run_id, config)| (*run_id, config.clone()))
-                .collect(),
-            holder_keys: inner
-                .holder_keys
-                .iter()
-                .map(|(run_id, keys)| (*run_id, keys.clone()))
-                .collect(),
-            pending_caches: inner
-                .pending_caches
-                .iter()
-                .map(|(id, cache)| (*id, cache.clone()))
-                .collect(),
-            artifacts: inner
-                .artifacts
-                .iter()
-                .map(|(id, artifact)| (id.clone(), artifact.clone()))
-                .collect(),
-            log_metadata: inner
-                .log_metadata
-                .iter()
-                .map(|(key, metadata)| (key.clone(), metadata.clone()))
-                .collect(),
-            timeline_events: inner
-                .timeline_events
-                .iter()
-                .map(|(run_id, events)| (*run_id, events.clone()))
-                .collect(),
-            timeline_change_ids: inner
-                .timeline_change_ids
-                .iter()
-                .map(|(key, change_id)| (key.clone(), *change_id))
-                .collect(),
-            timeline_records: inner
-                .timeline_records
-                .iter()
-                .map(|(key, records)| {
-                    (
-                        key.clone(),
-                        records
-                            .iter()
-                            .map(|(id, record)| (*id, record.clone()))
-                            .collect(),
-                    )
-                })
-                .collect(),
-            cache_v2_pending: inner
-                .cache_v2_pending
-                .iter()
-                .map(|(token, pending)| (token.clone(), pending.clone()))
-                .collect(),
-            cache_v2_dl_tokens: inner
-                .cache_v2_dl_tokens
-                .iter()
-                .map(|(token, value)| (token.clone(), value.clone()))
-                .collect(),
-            artifact_v2_pending: inner
-                .artifact_v2_pending
-                .iter()
-                .map(|(token, pending)| (token.clone(), pending.clone()))
-                .collect(),
-            artifact_v2_registry: inner
-                .artifact_v2_registry
-                .iter()
-                .map(|(key, entry)| (key.clone(), entry.clone()))
-                .collect(),
-            github_token_requests: inner
-                .github_token_requests
-                .iter()
-                .map(|(request_id, req)| (*request_id, req.clone()))
-                .collect(),
-            cancellation_queue: inner.cancellation_queue.clone(),
-            broker_messages: inner
-                .broker_messages
-                .iter()
-                .map(|(request_id, msg)| (*request_id, msg.clone()))
-                .collect(),
-            session_active_requests: inner
-                .session_active_requests
-                .iter()
-                .map(|(session_id, request_id)| (session_id.clone(), *request_id))
-                .collect(),
-        };
+        let meta = build_meta_snapshot(inner);
         tx.execute(
             "INSERT INTO runtime_snapshots(snapshot_id, format_version, meta_blob, written_at_us)
              VALUES (1, ?1, ?2, ?3)
@@ -1211,7 +1343,7 @@ impl Store {
                written_at_us = excluded.written_at_us",
             params![
                 SNAPSHOT_FORMAT as i64,
-                self.seal(&serde_json::to_vec(&meta)?)?,
+                self.cipher.seal(&serde_json::to_vec(&meta)?)?,
                 now_us()
             ],
         )?;
@@ -1225,7 +1357,7 @@ impl Store {
         queue_kind: &str,
         position: i64,
     ) -> anyhow::Result<()> {
-        let payload = self.seal(&serde_json::to_vec(job)?)?;
+        let payload = self.cipher.seal(&serde_json::to_vec(job)?)?;
         tx.execute(
             "INSERT INTO jobs(run_id, job_id, status, queue_kind, queue_position, payload_blob)
              VALUES (?1, ?2, 'queued', ?3, ?4, ?5)",
@@ -1280,66 +1412,57 @@ impl Store {
         )?;
         Ok(())
     }
+}
 
-    fn encrypt_sealed(&self, plaintext: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-        let keys = derive_keys(&self.key);
-        let cipher = SessionEncryption::from_key(keys.aead.to_vec());
-        let (ciphertext, iv) = cipher
-            .encrypt(plaintext)
-            .expect("AES-256-CBC encrypt is infallible for in-spec inputs");
-        let mut mac = HmacSha256::new_from_slice(&keys.mac).expect("HMAC accepts any key length");
-        mac.update(MIGRATION_DOMAIN);
-        mac.update(&iv);
-        mac.update(&ciphertext);
-        (ciphertext, iv, mac.finalize().into_bytes().to_vec())
+#[async_trait]
+impl Store for SqliteStore {
+    async fn load_into(&self, inner: &mut InnerState) -> anyhow::Result<()> {
+        SqliteStore::load_into(self, inner)
     }
 
-    fn decrypt_sealed(&self, ciphertext: &[u8], iv: &[u8], tag: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let keys = derive_keys(&self.key);
-        let mut mac = HmacSha256::new_from_slice(&keys.mac).expect("HMAC accepts any key length");
-        mac.update(MIGRATION_DOMAIN);
-        mac.update(iv);
-        mac.update(ciphertext);
-        mac.verify_slice(tag)
-            .map_err(|_| anyhow::anyhow!("store session-key envelope authentication failed"))?;
-        SessionEncryption::from_key(keys.aead.to_vec())
-            .decrypt(ciphertext, iv)
-            .map_err(|error| anyhow::anyhow!("store session-key decryption failed: {error}"))
+    async fn store_inner(&self, inner: &InnerState) -> anyhow::Result<()> {
+        SqliteStore::store_inner(self, inner)
     }
 
-    fn seal(&self, plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let (ciphertext, iv, tag) = self.encrypt_sealed(plaintext);
-        let mut sealed = Vec::with_capacity(1 + iv.len() + ciphertext.len() + tag.len());
-        sealed.push(SNAPSHOT_FORMAT);
-        sealed.extend_from_slice(&iv);
-        sealed.extend_from_slice(&ciphertext);
-        sealed.extend_from_slice(&tag);
-        Ok(sealed)
+    async fn store_meta_only(&self, inner: &InnerState) -> anyhow::Result<()> {
+        SqliteStore::store_meta_only(self, inner)
     }
 
-    fn unseal(&self, sealed: &[u8]) -> anyhow::Result<Vec<u8>> {
-        anyhow::ensure!(sealed.len() >= 1 + 16 + 32, "invalid store envelope");
-        let version = sealed[0];
-        if version != SNAPSHOT_FORMAT {
-            // Old envelopes (v1) used a different key derivation (raw key or
-            // SHA-256 of env input) and an unauthenticated AES-CBC layer.
-            // We don't try to decrypt them — the user must drop the state
-            // directory to start fresh. This is a hard cut-over; see the
-            // migration notes in the architecture doc.
-            anyhow::bail!(
-                "unsupported store envelope version {version}; current version is {SNAPSHOT_FORMAT}"
-            );
-        }
-        let iv = &sealed[1..17];
-        let tag_start = sealed.len() - 32;
-        let ciphertext = &sealed[17..tag_start];
-        let tag = &sealed[tag_start..];
-        self.decrypt_sealed(ciphertext, iv, tag)
+    async fn store_run_event(
+        &self,
+        inner: &InnerState,
+        run_id: RunId,
+        event: &NdjsonEvent,
+    ) -> anyhow::Result<()> {
+        SqliteStore::store_run_event(self, inner, run_id, event)
+    }
+
+    async fn store_workflow_run_counter(
+        &self,
+        workflow_path: &str,
+        next_run_number: u64,
+    ) -> anyhow::Result<()> {
+        SqliteStore::store_workflow_run_counter(self, workflow_path, next_run_number)
+    }
+
+    async fn store_log_chunk(
+        &self,
+        key: &str,
+        chunk_index: i64,
+        payload: &[u8],
+        byte_count: i64,
+        line_count: i64,
+    ) -> anyhow::Result<()> {
+        SqliteStore::store_log_chunk(self, key, chunk_index, payload, byte_count, line_count)
+    }
+
+    async fn append_event(&self, event: &NdjsonEvent) -> anyhow::Result<()> {
+        SqliteStore::append_event(self, event)
     }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct SessionKeyPayload(Vec<u8>);
+pub(crate) struct SessionKeyPayload(Vec<u8>);
 
 const MIGRATIONS: &[(u32, &str, &str)] = &[(
     1,
@@ -1501,7 +1624,7 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[(
         "#,
 )];
 
-fn now_us() -> i64 {
+pub(crate) fn now_us() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1509,7 +1632,7 @@ fn now_us() -> i64 {
         .min(i64::MAX as u128) as i64
 }
 
-fn unix_us(value: chrono::DateTime<chrono::Utc>) -> i64 {
+pub(crate) fn unix_us(value: chrono::DateTime<chrono::Utc>) -> i64 {
     value.timestamp_micros()
 }
 
@@ -1542,4 +1665,66 @@ pub(crate) fn dedupe_labels_ci(labels: &[String]) -> Vec<String> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn store_url_parsing() {
+        // Empty → default sqlite in the state dir.
+        assert_eq!(
+            parse_store_url("").unwrap(),
+            StoreUrl::Sqlite(std::path::PathBuf::new())
+        );
+        assert_eq!(
+            parse_store_url("   ").unwrap(),
+            StoreUrl::Sqlite(std::path::PathBuf::new())
+        );
+        // sqlite forms.
+        assert_eq!(
+            parse_store_url("sqlite:///tmp/aksh.db").unwrap(),
+            StoreUrl::Sqlite(std::path::PathBuf::from("/tmp/aksh.db"))
+        );
+        assert_eq!(
+            parse_store_url("sqlite:relative.db").unwrap(),
+            StoreUrl::Sqlite(std::path::PathBuf::from("relative.db"))
+        );
+        // Bare path keeps the old behaviour.
+        assert_eq!(
+            parse_store_url("/var/lib/aksh.db").unwrap(),
+            StoreUrl::Sqlite(std::path::PathBuf::from("/var/lib/aksh.db"))
+        );
+        // Postgres forms.
+        assert_eq!(
+            parse_store_url("postgres://aksh:secret@localhost:5432/aksh").unwrap(),
+            StoreUrl::Postgres("postgres://aksh:secret@localhost:5432/aksh".to_owned())
+        );
+        assert_eq!(
+            parse_store_url("postgresql://aksh@db.example/aksh").unwrap(),
+            StoreUrl::Postgres("postgresql://aksh@db.example/aksh".to_owned())
+        );
+        // Unsupported schemes are rejected loudly.
+        assert!(parse_store_url("mysql://localhost/aksh").is_err());
+        assert!(parse_store_url("redis://localhost/0").is_err());
+        assert!(parse_store_url("mongodb://localhost/aksh").is_err());
+    }
+
+    #[test]
+    fn envelope_roundtrip_and_tamper_detection() {
+        let envelope = Envelope::new(b"test-root-key");
+        let sealed = envelope.seal(b"secret payload").unwrap();
+        assert_eq!(envelope.unseal(&sealed).unwrap(), b"secret payload");
+
+        // Any flipped byte (version, IV, ciphertext, tag) must fail auth.
+        for index in [0usize, 1, 7, sealed.len() / 2, sealed.len() - 1] {
+            let mut tampered = sealed.clone();
+            tampered[index] ^= 0x01;
+            assert!(
+                envelope.unseal(&tampered).is_err(),
+                "tampered envelope at byte {index} must not unseal"
+            );
+        }
+    }
 }

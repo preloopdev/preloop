@@ -693,6 +693,7 @@ pub(crate) async fn submit_run_inner(
             .state
             .store
             .store_workflow_run_counter(&workflow_path, value.saturating_add(1))
+            .await
         {
             return Err(ApiError::internal(format!(
                 "failed to persist workflow run counter: {error}"

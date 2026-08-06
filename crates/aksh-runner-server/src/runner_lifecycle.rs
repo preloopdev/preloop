@@ -59,6 +59,7 @@ pub(crate) async fn register_runner(
         .state
         .store
         .store_inner(&inner)
+        .await
         .map_err(|error| ApiError::internal(format!("failed to persist runner: {error}")))?;
     Ok(Json(runner))
 }
@@ -119,6 +120,7 @@ pub(crate) async fn create_session(
             .state
             .store
             .store_inner(&inner)
+            .await
             .map_err(|error| ApiError::internal(format!("failed to persist session: {error}")))?;
     }
 
@@ -220,6 +222,7 @@ pub(crate) async fn create_session_disttask(
             .state
             .store
             .store_inner(&inner)
+            .await
             .map_err(|error| ApiError::internal(format!("failed to persist session: {error}")))?;
     }
 
@@ -256,7 +259,7 @@ pub(crate) async fn delete_session(
     let mut inner = shared.state.inner.lock().await;
     inner.sessions.remove(&session_id);
     inner.broker_session_runners.remove(&session_id);
-    if let Err(error) = shared.state.store.store_inner(&inner) {
+    if let Err(error) = shared.state.store.store_inner(&inner).await {
         tracing::warn!(?error, "failed to persist deleted runner session");
     }
     StatusCode::NO_CONTENT
