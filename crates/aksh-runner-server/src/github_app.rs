@@ -820,7 +820,24 @@ async fn verify_repo_access_at(
             Ok(resp) if resp.status().is_success() => {
                 granted.push((permission.to_owned(), "read".to_owned()));
             }
-            _ => {}
+            // 401/403 are the credential's honest answer: the permission is
+            // not granted. Everything else (transport failure, 5xx, 404)
+            // says nothing about the permission and must not be reported as
+            // a denial — a transient GitHub hiccup would otherwise make the
+            // doctor claim the App/PAT is missing a scope it actually has.
+            Ok(resp)
+                if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                    || resp.status() == reqwest::StatusCode::FORBIDDEN => {}
+            Ok(resp) => {
+                bail!(
+                    "cannot verify {permission} read access on {repo}: GitHub returned {}",
+                    resp.status()
+                )
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("probing {permission} read access on {repo}"))
+            }
         }
     }
     Ok(granted)
@@ -1457,6 +1474,120 @@ mod tests {
             calls.mint_bodies[1]["permissions"],
             json!({ "contents": "read" }),
             "the fallback is the baseline token"
+        );
+    }
+
+    /// Minimal HTTP stub for probe tests. `handle` maps `(method, path)` to
+    /// `Some((status, body))` or `None` (drop the connection — a transport
+    /// error from the client's point of view).
+    async fn spawn_probe_stub(
+        handle: impl Fn(&str, &str) -> Option<(u16, String)> + Send + Sync + 'static,
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind probe stub");
+        let address = listener.local_addr().expect("probe stub address");
+        let handle = Arc::new(handle);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let handle = Arc::clone(&handle);
+                tokio::spawn(async move {
+                    let mut buf = [0_u8; 4096];
+                    let Ok(n) = socket.read(&mut buf).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let mut parts = request.split_whitespace();
+                    let method = parts.next().unwrap_or("").to_owned();
+                    let path = parts.next().unwrap_or("/").to_owned();
+                    let Some((status, body)) = handle(&method, &path) else {
+                        return; // drop the connection: transport error
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn probe_fails_on_unexpected_probe_status_instead_of_reporting_denial() {
+        let server = spawn_probe_stub(|method, path| match (method, path) {
+            ("GET", "/repos/preloop/repo") => Some((200, "{}".to_owned())),
+            ("GET", p) if p.starts_with("/repos/preloop/repo/pulls") => {
+                Some((500, "boom".to_owned()))
+            }
+            _ => Some((200, "{}".to_owned())),
+        })
+        .await;
+        let error = verify_repo_access_at(&server, "ghp_stub", "preloop/repo")
+            .await
+            .expect_err("a 5xx probe says nothing about permissions and must fail verification");
+        assert!(
+            error.to_string().contains("pull-requests"),
+            "the failure must name the probe that broke: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_distinguishes_authorization_denials_from_transport_failures() {
+        let server = spawn_probe_stub(|method, path| match (method, path) {
+            ("GET", "/repos/preloop/repo") => Some((200, "{}".to_owned())),
+            // 401 is the credential's honest answer: permission not granted.
+            ("GET", p) if p.starts_with("/repos/preloop/repo/pulls") => {
+                Some((401, "denied".to_owned()))
+            }
+            // Dropping the connection is a transport failure, not a denial.
+            ("GET", p) if p.starts_with("/repos/preloop/repo/actions/workflows") => None,
+            _ => Some((200, "{}".to_owned())),
+        })
+        .await;
+        let error = verify_repo_access_at(&server, "ghp_stub", "preloop/repo")
+            .await
+            .expect_err("a transport failure must fail verification, not read as 'not granted'");
+        assert!(
+            error.to_string().contains("actions"),
+            "the failure must name the probe that broke: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_treats_401_and_403_as_not_granted_without_failing() {
+        let server = spawn_probe_stub(|method, path| match (method, path) {
+            ("GET", "/repos/preloop/repo") => Some((200, "{}".to_owned())),
+            ("GET", p) if p.starts_with("/repos/preloop/repo/pulls") => {
+                Some((401, "denied".to_owned()))
+            }
+            ("GET", p) if p.starts_with("/repos/preloop/repo/actions/workflows") => {
+                Some((403, "denied".to_owned()))
+            }
+            ("GET", p) if p.starts_with("/repos/preloop/repo/issues") => {
+                Some((200, "[]".to_owned()))
+            }
+            _ => Some((200, "{}".to_owned())),
+        })
+        .await;
+        let granted = verify_repo_access_at(&server, "ghp_stub", "preloop/repo")
+            .await
+            .expect("401/403 are the credential's honest 'not granted' answers");
+        assert_eq!(
+            granted,
+            vec![
+                ("contents".to_owned(), "read".to_owned()),
+                ("issues".to_owned(), "read".to_owned()),
+            ],
+            "401/403 probes are skipped; successes are still reported"
         );
     }
 }
