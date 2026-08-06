@@ -51,7 +51,7 @@ fn classify_message(message_type: &str) -> BrokerMessageKind {
 /// (the pool-stall signature: crashed worker, everything after it queued
 /// forever). The worker's own completion path covers normal exits — this only
 /// fires when the worker process died before reporting.
-async fn force_fail_job(job: &RunningJob, conclusion: &str) {
+async fn force_fail_job(http: &HttpClient, job: &RunningJob, conclusion: &str) {
     let Some(message) = job.job_message.as_ref() else {
         return;
     };
@@ -78,14 +78,14 @@ async fn force_fail_job(job: &RunningJob, conclusion: &str) {
         );
         return;
     }
-    let Ok(http) = HttpClient::new(None) else {
-        return;
-    };
     // The worker's completion posts to `{SystemVssConnection url}/completejob`
     // — the server advertises that endpoint as the runner's broker base
     // (`/broker/{runner_id}`), NOT the bare origin. Using the same base keeps
     // the listener's force-fail on the exact route the worker uses.
-    let client = RunServiceClient::new(http, service_url);
+    // The listener's own transport (custom CA bundle, proxy, control-socket
+    // rewrite) is reused rather than a bare HttpClient, so force-fail works
+    // on custom-trust self-hosted servers too.
+    let client = RunServiceClient::new(http.clone(), service_url);
     // Official `LogWorkerProcessUnhandledException` → `ForceFailJob`: the
     // worker's captured output rides along as an error annotation so the
     // crash isn't indistinguishable from an ordinary failure. Empty when the
@@ -126,7 +126,7 @@ async fn force_fail_job(job: &RunningJob, conclusion: &str) {
 /// reaper. Shared by the OS-signal and RunnerShutdown-broker-message paths
 /// (CR-2 F-1); mirrors the official `RunnerShutdown`/`OperatingSystemShutdown`
 /// handling in `JobDispatcher`.
-async fn shutdown_job_gracefully(job: &mut RunningJob) {
+async fn shutdown_job_gracefully(http: &HttpClient, job: &mut RunningJob) {
     match job
         .shutdown_gracefully(std::time::Duration::from_secs(60))
         .await
@@ -142,7 +142,7 @@ async fn shutdown_job_gracefully(job: &mut RunningJob) {
                 "Worker failed job {} during shutdown — force-failing",
                 job.request_id
             );
-            force_fail_job(job, "failed").await;
+            force_fail_job(http, job, "failed").await;
         }
         None => {
             warn!("Worker killed after shutdown grace expired");
@@ -150,7 +150,7 @@ async fn shutdown_job_gracefully(job: &mut RunningJob) {
             // even after the forced kill (`CompleteJobRequestAsync` with
             // Canceled on the shutdown path); do the same so the job
             // concludes instead of dangling to the reaper.
-            force_fail_job(job, "canceled").await;
+            force_fail_job(http, job, "canceled").await;
         }
     }
 }
@@ -264,10 +264,15 @@ pub async fn run_broker_loop(
                 Ok(Some(success)) => {
                     let id = &job.request_id;
                     if success {
-                        info!("Worker completed job {id} successfully");
+                        if job.confirm_completion().await {
+                            info!("Worker completed job {id} successfully");
+                        } else {
+                            warn!("Worker exited job {id} but its completion was not acknowledged — force-failing");
+                            force_fail_job(http, job, "failed").await;
+                        }
                     } else {
                         warn!("Worker failed for job {id}");
-                        force_fail_job(job, "failed").await;
+                        force_fail_job(http, job, "failed").await;
                     }
                     if once || config.settings.ephemeral {
                         if once {
@@ -390,7 +395,7 @@ pub async fn run_broker_loop(
             _ = &mut shutdown => {
                 info!("Shutdown signal received");
                 if let Some(mut job) = active_job.take() {
-                    shutdown_job_gracefully(&mut job).await;
+                    shutdown_job_gracefully(http, &mut job).await;
                 }
                 return Ok(());
             }
@@ -403,10 +408,15 @@ pub async fn run_broker_loop(
                     Ok(success) => {
                         let id = &active_job.as_ref().unwrap().request_id;
                         if success {
-                            info!("Worker completed job {id} successfully");
+                            if active_job.as_ref().unwrap().confirm_completion().await {
+                                info!("Worker completed job {id} successfully");
+                            } else {
+                                warn!("Worker exited job {id} but its completion was not acknowledged — force-failing");
+                                force_fail_job(http, active_job.as_ref().unwrap(), "failed").await;
+                            }
                         } else {
                             warn!("Worker failed for job {id}");
-                            force_fail_job(active_job.as_ref().unwrap(), "failed").await;
+                            force_fail_job(http, active_job.as_ref().unwrap(), "failed").await;
                         }
                     }
                     Err(e) => warn!("Worker wait error: {e:#}"),
@@ -650,7 +660,7 @@ pub async fn run_broker_loop(
                                 // lease reaper; force-fail if the worker
                                 // fails or ignores the grace period.
                                 if let Some(mut job) = active_job.take() {
-                                    shutdown_job_gracefully(&mut job).await;
+                                    shutdown_job_gracefully(http, &mut job).await;
                                 }
                                 return Ok(());
                             }
