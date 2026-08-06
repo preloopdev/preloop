@@ -734,6 +734,16 @@ pub(crate) async fn handle_github_webhook(
             .push_back((delivery_id.clone(), WebhookDeliveryState::InFlight));
     }
 
+    // A delivery that dies mid-processing — the future is cancelled (client
+    // disconnect, server shutdown) or the processing panics — never reaches
+    // the Completed/release code below, so its InFlight reservation would
+    // stick forever and make GitHub's later redelivery look like a duplicate
+    // that gets skipped: a silently lost run. The guard releases the
+    // reservation on every exit path, including cancellation and panic.
+    let mut reservation_guard = delivery_id
+        .as_ref()
+        .map(|id| InFlightReservationGuard::arm(shared.clone(), id.clone()));
+
     // Everything past the reservation runs in a helper so that no `?` can
     // escape while still holding the in-flight marker.
     let result = process_github_webhook(&shared, &headers, &body).await;
@@ -750,6 +760,12 @@ pub(crate) async fn handle_github_webhook(
                 {
                     *state = WebhookDeliveryState::Completed(completed_at);
                 }
+                // The Completed entry is now the durable reservation; without
+                // disarming, the guard's drop would erase it and the dedup
+                // window would admit a duplicate run.
+                if let Some(guard) = &mut reservation_guard {
+                    guard.disarm();
+                }
             }
             // Release the reservation: GitHub retries this delivery and the
             // retry must be allowed to do the work this attempt did not.
@@ -760,6 +776,60 @@ pub(crate) async fn handle_github_webhook(
     }
 
     result
+}
+
+/// RAII release of a webhook delivery's in-flight reservation.
+///
+/// The reservation is normally released explicitly — `Completed` once
+/// processing succeeded, removed once it failed. If processing is cancelled or
+/// panics instead, neither path runs; this guard releases the reservation on
+/// drop so a redelivery is processed rather than skipped as a duplicate.
+struct InFlightReservationGuard {
+    shared: Arc<SharedState>,
+    delivery_id: String,
+    armed: bool,
+}
+
+impl InFlightReservationGuard {
+    fn arm(shared: Arc<SharedState>, delivery_id: String) -> Self {
+        Self {
+            shared,
+            delivery_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InFlightReservationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let shared = self.shared.clone();
+        let delivery_id = self.delivery_id.clone();
+        // Synchronous release when the state lock is free (the common case:
+        // the guard outlives the processing, so no one else is holding it).
+        if let Ok(mut inner) = shared.state.inner.try_lock() {
+            inner
+                .webhook_deliveries
+                .retain(|(seen, _)| seen != &delivery_id);
+            return;
+        }
+        // The state lock is contended; defer the release to the runtime so the
+        // reservation is still cleared promptly instead of leaking forever.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let mut inner = shared.state.inner.lock().await;
+                inner
+                    .webhook_deliveries
+                    .retain(|(seen, _)| seen != &delivery_id);
+            });
+        }
+    }
 }
 
 /// Processing half of [`handle_github_webhook`], after signature verification
@@ -866,13 +936,16 @@ async fn process_github_webhook(
         } else {
             &effective.git_ref
         };
-        let workflows = match fetch_workflows(shared, &repo_full_name, workflow_ref).await {
-            Ok(w) => w,
-            Err(e) => {
-                error!("Failed to fetch workflows for {}: {:?}", effective.event, e);
-                continue;
-            }
-        };
+        let workflows = fetch_workflows(shared, &repo_full_name, workflow_ref)
+            .await
+            .map_err(|error| {
+                error!(
+                    event = %effective.event,
+                    ?error,
+                    "Failed to fetch workflows — delivery failed, will be redelivered"
+                );
+                StatusCode::BAD_GATEWAY
+            })?;
         let resolved_sha = match &effective.sha {
             Some(sha) => sha.clone(),
             None => match resolve_ref_sha(
@@ -884,12 +957,18 @@ async fn process_github_webhook(
             {
                 Ok(Some(sha)) => sha,
                 Ok(None) => {
-                    error!(ref_name = %effective.git_ref, "webhook ref has no resolvable commit SHA");
-                    continue;
+                    error!(
+                        ref_name = %effective.git_ref,
+                        "webhook ref has no resolvable commit SHA — delivery failed, will be redelivered"
+                    );
+                    return Err(StatusCode::BAD_GATEWAY);
                 }
                 Err(error) => {
-                    error!(?error, "failed to resolve webhook ref SHA");
-                    continue;
+                    error!(
+                        ?error,
+                        "failed to resolve webhook ref SHA — delivery failed, will be redelivered"
+                    );
+                    return Err(StatusCode::BAD_GATEWAY);
                 }
             },
         };
@@ -1046,7 +1125,25 @@ async fn process_github_webhook(
                     triggered_runs.push(accepted);
                 }
                 Err(e) => {
-                    error!("Failed to submit run for {filename}: {e:?}");
+                    // A 4xx submission outcome means the workflow legitimately
+                    // does not run for this event — no trigger match, or a
+                    // permanent workflow problem a redelivery cannot fix — so
+                    // the delivery itself is complete. A 5xx means the
+                    // delivery's work did not finish: surface it as a failure
+                    // so the delivery is not marked Completed and GitHub's
+                    // redelivery gets a real chance to do the work.
+                    let detail = format!("{e:?}");
+                    let status = e.into_response().status();
+                    if status.is_client_error() {
+                        info!(
+                            "Workflow {filename} was not triggered by this event ({detail}) — not a delivery failure"
+                        );
+                        continue;
+                    }
+                    error!(
+                        "Failed to submit run for {filename}: {detail} — delivery failed, will be redelivered"
+                    );
+                    return Err(status);
                 }
             }
         }
@@ -1120,7 +1217,10 @@ pub(crate) struct CallbackQuery {
 
 /// Callback endpoint for GitHub App Manifest conversion.
 pub(crate) async fn github_callback(
-    State(shared): State<Arc<SharedState>>,
+    // The App credentials are handed to the operator through the one-time HTML
+    // response below; `AppState` is immutable behind an `Arc`, so nothing here
+    // can persist them into the running server.
+    State(_shared): State<Arc<SharedState>>,
     Query(params): Query<CallbackQuery>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let client = crate::shared_http::CLIENT.clone();
@@ -1153,12 +1253,14 @@ pub(crate) async fn github_callback(
 
     info!("Successfully registered GitHub App ID: {}", credentials.id);
 
-    // Save webhook secret to AppState
-    if let Some(secret) = &credentials.webhook_secret {
-        let mut inner = shared.state.inner.lock().await;
-        inner.next_runner_id += 0; // dummy access to keep compiler happy if needed
-        info!("Webhook secret registered: {}", secret);
-    }
+    // The webhook secret is deliberately never logged: it is the only thing
+    // standing between this server and a forged `push` event. It reaches the
+    // operator through the one-time HTML handoff below, the same way the
+    // private key does, and is configured from there.
+    info!(
+        has_webhook_secret = credentials.webhook_secret.is_some(),
+        "GitHub App credentials received"
+    );
 
     let credentials_html = format!(
         r#"<!DOCTYPE html>
@@ -1187,4 +1289,332 @@ export AKSH_GITHUB_APP_ID="{}"
     );
 
     Ok(axum::response::Html(credentials_html))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::AppState;
+    use axum::body::Body;
+    use axum::http::{HeaderValue, Method, Request};
+    use std::future::Future;
+    use tokio_util::sync::CancellationToken;
+    use tower::ServiceExt;
+
+    /// Sign `payload` the way GitHub does: HMAC-SHA256 over the raw body with
+    /// the webhook secret, hex-encoded and prefixed with `sha256=`.
+    fn sign(payload: &[u8], secret: &str) -> String {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(payload);
+        let sig = mac.finalize().into_bytes();
+        let hex = sig.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        format!("sha256={hex}")
+    }
+
+    /// The signed push payload GitHub would deliver for `owner/repo`.
+    fn signed_push_payload() -> (Vec<u8>, String) {
+        let payload = serde_json::json!({
+            "ref": "refs/heads/main",
+            "before": "0000000000000000000000000000000000000000",
+            "after": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            "repository": {"full_name": "owner/repo", "default_branch": "main"},
+            "commits": [{
+                "id": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                "added": ["src/main.rs"],
+                "modified": [],
+                "removed": []
+            }],
+        });
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        let signature = sign(&bytes, "super-secret");
+        (bytes, signature)
+    }
+
+    /// In-process server fixture mirroring the crate's `WebhookDedupFixture`:
+    /// a local workspace (with one push-triggered workflow by default), a
+    /// webhook secret, and the signed push payload.
+    struct WebhookFixture {
+        state: AppState,
+        app: axum::Router,
+        payload_bytes: Vec<u8>,
+        signature_header: String,
+    }
+
+    impl WebhookFixture {
+        /// Standard fixture: the workspace holds one push-triggered workflow.
+        async fn new(temp: &tempfile::TempDir) -> Self {
+            let ws_dir = temp.path().join("ws");
+            std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
+            std::fs::write(
+                ws_dir.join(".github/workflows/build.yml"),
+                "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
+            )
+            .unwrap();
+            Self::with_workspace(temp, ws_dir).await
+        }
+
+        async fn with_workspace(temp: &tempfile::TempDir, ws_dir: std::path::PathBuf) -> Self {
+            let mut state = AppState::new(temp.path().join("state").to_path_buf())
+                .await
+                .unwrap();
+            state.webhook_secret = Some("super-secret".to_owned());
+            state.local_workspace = Some(ws_dir);
+            let app =
+                crate::app_with_test_api(state.clone(), CancellationToken::new(), "test-token");
+            let (payload_bytes, signature_header) = signed_push_payload();
+            Self {
+                state,
+                app,
+                payload_bytes,
+                signature_header,
+            }
+        }
+
+        /// Deliver the signed standard payload under `delivery`.
+        async fn post(&self, delivery: &str, event: Option<&str>) -> StatusCode {
+            self.post_body(delivery, event, &self.payload_bytes).await
+        }
+
+        /// Deliver an arbitrary signed payload under `delivery`.
+        async fn post_body(
+            &self,
+            delivery: &str,
+            event: Option<&str>,
+            payload: &[u8],
+        ) -> StatusCode {
+            let app = self.app.clone();
+            let signature = sign(payload, "super-secret");
+            let mut request = Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/github/webhooks")
+                .header("x-github-delivery", delivery)
+                .header("x-hub-signature-256", signature)
+                .header("content-type", "application/json");
+            if let Some(event) = event {
+                request = request.header("x-github-event", event);
+            }
+            app.oneshot(request.body(Body::from(payload.to_vec())).unwrap())
+                .await
+                .unwrap()
+                .status()
+        }
+    }
+
+    /// Issue 1: a delivery whose workflow inventory cannot be fetched must not
+    /// be acknowledged as processed. GitHub only redelivers after an error
+    /// response, and a Completed (or lingering InFlight) marker would make the
+    /// retry look like a duplicate and skip it — a silently lost run.
+    #[tokio::test]
+    async fn webhook_workflow_fetch_failure_is_redelivered() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = temp.path().join("ws");
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        std::fs::create_dir_all(ws_dir.join(".github")).unwrap();
+        // `.github/workflows` exists but is a regular file: the inventory read
+        // fails deterministically (read_dir on a non-directory errors), so the
+        // delivery cannot be processed.
+        std::fs::write(ws_dir.join(".github/workflows"), "not a directory").unwrap();
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+
+        let status = fixture.post("delivery-fetch-fail", Some("push")).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "a delivery whose processing failed must not be acknowledged as processed"
+        );
+        {
+            let inner = fixture.state.inner.lock().await;
+            assert!(
+                !inner
+                    .webhook_deliveries
+                    .iter()
+                    .any(|(id, _)| id == "delivery-fetch-fail"),
+                "a failed delivery must not keep a Completed/InFlight marker"
+            );
+            assert!(
+                inner.runs.is_empty(),
+                "a failed delivery must not create a run"
+            );
+        }
+
+        // Repair the workspace: the redelivery GitHub sends after the error
+        // response must be processed instead of dropped as a duplicate.
+        std::fs::remove_file(ws_dir.join(".github/workflows")).unwrap();
+        std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
+        std::fs::write(
+            ws_dir.join(".github/workflows/build.yml"),
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            fixture.post("delivery-fetch-fail", Some("push")).await,
+            StatusCode::OK
+        );
+        let inner = fixture.state.inner.lock().await;
+        assert_eq!(
+            inner.runs.len(),
+            1,
+            "the redelivery of a failed delivery must create the run"
+        );
+    }
+
+    /// Issue 1: a delivery whose ref SHA cannot be resolved must not be
+    /// acknowledged as processed either — the run cannot be created and would
+    /// be silently lost if the delivery were marked Completed.
+    #[tokio::test]
+    async fn webhook_unresolvable_sha_is_redelivered() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = WebhookFixture::new(&temp).await;
+
+        // A push without `after` leaves the effective SHA unresolved, and the
+        // local workspace is not a Git repository, so no SHA can be resolved:
+        // the delivery's work cannot be done.
+        let payload = serde_json::json!({
+            "ref": "refs/heads/main",
+            "before": "0000000000000000000000000000000000000000",
+            "repository": {"full_name": "owner/repo", "default_branch": "main"},
+            "commits": [{
+                "id": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                "added": ["src/main.rs"],
+                "modified": [],
+                "removed": []
+            }],
+        });
+        let bytes = serde_json::to_vec(&payload).unwrap();
+
+        let status = fixture
+            .post_body("delivery-no-sha", Some("push"), &bytes)
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "a delivery whose ref SHA cannot be resolved must not be acknowledged as processed"
+        );
+        let inner = fixture.state.inner.lock().await;
+        assert!(
+            !inner
+                .webhook_deliveries
+                .iter()
+                .any(|(id, _)| id == "delivery-no-sha"),
+            "a failed delivery must not keep a Completed/InFlight marker"
+        );
+        assert!(
+            inner.runs.is_empty(),
+            "a failed delivery must not create a run"
+        );
+    }
+
+    /// Regression guard: a workflow that simply is not triggered by the event
+    /// is a *completed* delivery, not a failure. Pushing to a repository whose
+    /// workflows all gate on `pull_request` must stay a 200 or GitHub would
+    /// redeliver forever.
+    #[tokio::test]
+    async fn webhook_untriggered_workflow_still_completes_delivery() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = temp.path().join("ws");
+        std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
+        std::fs::write(
+            ws_dir.join(".github/workflows/build.yml"),
+            "on: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
+        )
+        .unwrap();
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+
+        assert_eq!(
+            fixture.post("delivery-no-match", Some("push")).await,
+            StatusCode::OK
+        );
+        let inner = fixture.state.inner.lock().await;
+        assert!(
+            inner
+                .webhook_deliveries
+                .iter()
+                .any(|(id, s)| id == "delivery-no-match"
+                    && matches!(s, WebhookDeliveryState::Completed(_))),
+            "a delivery that triggered no workflow is still processed"
+        );
+        assert!(inner.runs.is_empty());
+    }
+
+    /// Issue 2: a delivery whose processing future is cancelled (client
+    /// disconnect, server shutdown) or panics must not keep its InFlight
+    /// reservation. A stale reservation makes GitHub's redelivery look like an
+    /// in-flight duplicate, gets skipped with a 200, and the run is lost.
+    #[tokio::test]
+    async fn webhook_cancelled_processing_releases_reservation() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = WebhookFixture::new(&temp).await;
+
+        let shared = Arc::new(SharedState {
+            state: fixture.state.clone(),
+            shutdown: CancellationToken::new(),
+        });
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-github-delivery",
+            HeaderValue::from_static("delivery-cancel"),
+        );
+        headers.insert("x-github-event", HeaderValue::from_static("push"));
+        headers.insert(
+            "x-hub-signature-256",
+            HeaderValue::from_str(&fixture.signature_header).unwrap(),
+        );
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+
+        let future = handle_github_webhook(
+            State(shared.clone()),
+            headers,
+            bytes::Bytes::from(fixture.payload_bytes.clone()),
+        );
+        let mut future = Box::pin(future);
+
+        // Poll once with a waker that never fires. The handler reserves the
+        // delivery and parks inside processing (the workspace snapshot runs
+        // real git subprocesses it cannot pass within one poll), so the future
+        // cannot complete while parked — exactly a cancelled request.
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        assert!(
+            future.as_mut().poll(&mut context).is_pending(),
+            "processing must still be in flight after the first poll"
+        );
+        {
+            let inner = fixture.state.inner.lock().await;
+            assert!(
+                inner.webhook_deliveries.iter().any(|(id, s)| {
+                    id == "delivery-cancel" && matches!(s, WebhookDeliveryState::InFlight)
+                }),
+                "the delivery must be reserved InFlight while processing"
+            );
+        }
+
+        // Drop the future mid-processing: the reservation must not survive the
+        // processing that owned it.
+        drop(future);
+        {
+            let inner = fixture.state.inner.lock().await;
+            assert!(
+                !inner
+                    .webhook_deliveries
+                    .iter()
+                    .any(|(id, _)| id == "delivery-cancel"),
+                "a cancelled delivery must not keep an InFlight reservation"
+            );
+        }
+
+        // GitHub redelivers after the failed delivery; the retry must be
+        // processed, not skipped as an in-flight duplicate.
+        assert_eq!(
+            fixture.post("delivery-cancel", Some("push")).await,
+            StatusCode::OK
+        );
+        let inner = fixture.state.inner.lock().await;
+        assert_eq!(
+            inner.runs.len(),
+            1,
+            "a redelivery after cancellation must be processed"
+        );
+    }
 }
