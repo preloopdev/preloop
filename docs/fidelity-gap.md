@@ -378,9 +378,9 @@ workflow. All are fixed:
 ### 1b.5 Second campaign — CLI dogfood (2026-08-06): just, gin
 
 The dogfood campaign (see `docs/conformance/just.md`, `docs/conformance/gin.md`,
-`docs/conformance/black.md`) runs a second wave of unmodified third-party
-workflows: `casey/just`, `gin-gonic/gin`, `psf/black`, and `antfu/eslint-config`
-in progress. New gaps it surfaced:
+`docs/conformance/black.md`, `docs/conformance/eslint-config.md`) runs a second
+wave of unmodified third-party workflows: `casey/just`, `gin-gonic/gin`,
+`psf/black`, and `antfu/eslint-config`. New gaps it surfaced:
 
 | Gap | Symptom in a real workflow | Status |
 | --- | --- | --- |
@@ -389,6 +389,7 @@ in progress. New gaps it surfaced:
 | **The runner executes as root; GitHub runs steps as uid 1001** | gin's `TestSaveUploadedFileWithPermissionFailed` expects EACCES writing into a read-only dir; as root the write succeeds → "An error is expected but got nil" | ⚠️ documented, not fixed — see 1b.4 |
 | **The CLI could not submit workflows with path filters** | black's `test.yml` filters `on: push.paths`; the server must reject a submission without a complete changed-file list (it cannot know whether the filter should skip the run), and the CLI had no way to provide one → `400 workflow path filters require a complete changed-file list` before any job ran | ✅ fixed — the CLI computes the local push delta (`git diff --name-only HEAD^ HEAD`; every tracked file counts as new for an initial commit, mirroring GitHub's null-SHA initial-push base) and sends it as the changed-file list |
 | **amd64-only images can't run inside docker containers in the VM** | black's coveralls step docker-builds `thekevjames/coveralls:4.0.0` (amd64-only) on the arm64 VM: `rosetta-wrapper: unexpected initial stop: 32512` — the translator works (static x86_64 binaries run translated), but `/mnt/rosetta` is not mounted into container namespaces, so the wrapper's path lookup fails | ⚠️ documented, not fixed — the fix is a default-runtime shim injecting the mount, see 1b.6 |
+| **`lts/*`-pinned setup-node steps cannot run without a real GitHub token** | eslint-config's `ci.yml` pins `node-version: lts/*` in every job; setup-node resolves the alias via `api.github.com` using the job's `GITHUB_TOKEN`, and with no GitHub App configured the local JWT 401s → all 4 jobs fail at setup (`Attempt to resolve LTS alias from manifest...` / `##[error]Bad credentials`) | ⚠️ documented, not fixed — this is the standing token-scope contract (`docs/github-tokens.md` §3); the remedy is an installed GitHub App (`AKSH_GITHUB_APP_ID` + PEM, minting already implemented in `github_app.rs`) |
 
 ### 1b.6 Rosetta/amd64 container execution in the VM (2026-08-06)
 
