@@ -1,0 +1,19 @@
+name: battery
+
+on:
+  push:
+
+jobs:
+  hello:
+    runs-on: ubuntu-latest
+    steps:
+      - name: greet
+        run: echo "hello from battery $GITHUB_ACTIONS"
+      - name: matrix-echo
+        run: echo "step two"
+  world:
+    runs-on: ubuntu-latest
+    needs: hello
+    steps:
+      - name: after
+        run: echo "world done"
