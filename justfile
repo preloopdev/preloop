@@ -1,5 +1,5 @@
 server := "http://127.0.0.1:9090"
-repo := "preloopdev/aksh"
+repo := "preloopdev/preloop"
 
 build:
     cargo build --locked --release -p aksh-runner-server
