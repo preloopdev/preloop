@@ -1,0 +1,35 @@
+Running TLC for MC-S3-job-gate-bypass reproduction...
+TLC2 Version 2026.07.31.184830 (rev: 30cc360)
+Running breadth-first search Model-Checking with fp 49 and seed 6515773719864818436 with 1 worker on 16 cores with 27300MB heap and 64MB offheap memory [pid: 57543] (Mac OS X 26.4.1 aarch64, Homebrew 21.0.12 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /private/tmp/Specula/runs/20260804-120119-9811/preloop/.specula-output/spec/MC.tla
+Parsing file /private/tmp/Specula/runs/20260804-120119-9811/preloop/.specula-output/spec/base.tla
+Parsing file /private/var/folders/zp/vgmwhq6x7_n735svhbgsmj2m0000gp/T/tlc-17533375033028453424/_TLCTrace.tla (jar:file:/private/tmp/Specula/lib/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
+Parsing file /private/var/folders/zp/vgmwhq6x7_n735svhbgsmj2m0000gp/T/tlc-17533375033028453424/Integers.tla (jar:file:/private/tmp/Specula/lib/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Parsing file /private/var/folders/zp/vgmwhq6x7_n735svhbgsmj2m0000gp/T/tlc-17533375033028453424/Naturals.tla (jar:file:/private/tmp/Specula/lib/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /private/var/folders/zp/vgmwhq6x7_n735svhbgsmj2m0000gp/T/tlc-17533375033028453424/Sequences.tla (jar:file:/private/tmp/Specula/lib/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /private/var/folders/zp/vgmwhq6x7_n735svhbgsmj2m0000gp/T/tlc-17533375033028453424/FiniteSets.tla (jar:file:/private/tmp/Specula/lib/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /private/var/folders/zp/vgmwhq6x7_n735svhbgsmj2m0000gp/T/tlc-17533375033028453424/TLC.tla (jar:file:/private/tmp/Specula/lib/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /private/var/folders/zp/vgmwhq6x7_n735svhbgsmj2m0000gp/T/tlc-17533375033028453424/TLCExt.tla (jar:file:/private/tmp/Specula/lib/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
+Semantic processing of module Naturals
+Semantic processing of module Integers
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module base
+Semantic processing of module TLCExt
+Semantic processing of module _TLCTrace
+Semantic processing of module MC
+Linting of module base
+Linting of module TLCExt
+Linting of module _TLCTrace
+Linting of module MC
+Starting... (2026-08-04 21:17:29)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-08-04 21:17:29.
+Progress(3) at 2026-08-04 21:17:32: 29,479 states generated (29,479 s/min), 26,107 distinct states found (26,107 ds/min), 25,825 states left on queue.
+Warning: The variable jobAssign was changed while it is specified as UNCHANGED at
+line 1129, col 328 to line 1129, col 336 of module base
+(Use the -nowarning option to disable this warning.)
+Warning: The variable jobAssign was changed while it is specified as UNCHANGED at
+line 1129, col 328 to line 1129, col 336 of module base
+No violation found

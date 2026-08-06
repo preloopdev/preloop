@@ -380,6 +380,28 @@ impl<'a> StepContext<'a> {
         for (k, v) in &self.env {
             env.insert(k.clone(), v.clone());
         }
+        // Container-bound environments (docker actions, and every step of a
+        // job container) must NOT receive the host PATH fallback: it is
+        // passed to docker run/exec as `-e PATH=<host path>`, overriding the
+        // image/container PATH so commands available only through the image
+        // PATH fail. The container's own PATH (image ENV for `docker run`,
+        // inherited container env for `docker exec`) stands instead. The
+        // host fallback stays for host processes (node actions, plain
+        // script steps).
+        let for_container = self.translate_container_path;
+        if !for_container {
+            // The official runner guarantees a usable PATH in the job
+            // environment (the machine env). The worker can be launched with
+            // a sanitized environment — fork and packed-golden boot paths do
+            // not always carry the guest's PATH — in which case actions that
+            // spawn commands by name break: `bash` compensates with its
+            // compiled-in default PATH, but node actions inherit the raw
+            // environment, so checkout@v4's `git` spawn fails with ENOENT
+            // ("add Git 2.18 or higher to the PATH") and shell-outs inside
+            // git (submodule foreach → git-sh-setup → uname) fail the same
+            // way.
+            ensure_path(&mut env, std::env::var("PATH").ok().as_deref());
+        }
         // Post action steps receive state saved by their paired main step via
         // GITHUB_STATE. A post step is named `__post_<main-step-id>`.
         let state_step_id = self
@@ -395,12 +417,20 @@ impl<'a> StepContext<'a> {
         // Match official runner: use the job/step env PATH as base (which
         // includes workflow-level env.PATH), falling back to system PATH.
         if !self.job.extra_path.is_empty() {
-            let base_path = env
-                .get("PATH")
-                .cloned()
-                .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
+            let base_path = env.get("PATH").cloned().unwrap_or_else(|| {
+                if for_container {
+                    // No host fallback inside a container: GITHUB_PATH
+                    // additions stand alone so the image PATH is not
+                    // clobbered by the host machine's PATH.
+                    String::new()
+                } else {
+                    std::env::var("PATH").unwrap_or_default()
+                }
+            });
             let mut parts: Vec<&str> = self.job.extra_path.iter().map(|s| s.as_str()).collect();
-            parts.push(&base_path);
+            if !base_path.is_empty() {
+                parts.push(&base_path);
+            }
             env.insert("PATH".to_string(), parts.join(":"));
         }
         env
@@ -421,6 +451,23 @@ impl<'a> StepContext<'a> {
             String::new()
         }
     }
+}
+
+/// Platform-default PATH, matching the Ubuntu golden's `/etc/environment`.
+pub(crate) const DEFAULT_PATH: &str =
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// Guarantee a usable `PATH` in a step environment when neither the job nor
+/// the step env supplies one. Prefers the worker's own PATH (the machine
+/// env) and falls back to the platform default — never an empty value.
+pub(crate) fn ensure_path(env: &mut HashMap<String, String>, worker_path: Option<&str>) {
+    if env.contains_key("PATH") {
+        return;
+    }
+    let path = worker_path
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or(DEFAULT_PATH);
+    env.insert("PATH".to_string(), path.to_string());
 }
 
 #[cfg(test)]
@@ -503,6 +550,115 @@ mod tests {
             "expected workflow PATH base, got: {path}"
         );
         // Should NOT contain the test runner's system path as the base
+    }
+
+    #[test]
+    fn build_env_guarantees_path_when_none_supplied() {
+        let mut job = make_job();
+        let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+
+        let env = ctx.build_env();
+        let path = env.get("PATH").expect("PATH must always be present");
+        assert!(
+            !path.trim().is_empty(),
+            "PATH must never be empty, got: {path:?}"
+        );
+        // With no job/step override, the worker's own machine PATH is the base.
+        if let Ok(worker_path) = std::env::var("PATH") {
+            assert_eq!(path, &worker_path);
+        }
+    }
+
+    /// A container environment must NOT receive the host PATH fallback: the
+    /// `-e PATH=<host path>` flag would override the container image's own
+    /// PATH, so commands available only through the image PATH fail. When
+    /// neither the job nor the step env sets PATH, the container's own PATH
+    /// (image ENV for `docker run`, inherited container env for `docker
+    /// exec`) must stand.
+    #[test]
+    fn container_env_does_not_leak_host_path_fallback() {
+        let mut job = make_job();
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        // Set by the docker-action handlers, and for every step of a job
+        // container: the env is bound for docker run/exec.
+        ctx.translate_container_path = true;
+
+        let env = ctx.build_env();
+        assert!(
+            !env.contains_key("PATH"),
+            "container env must not carry the host PATH fallback, got {:?}",
+            env.get("PATH")
+        );
+    }
+
+    /// An explicit job/step PATH is user intent and must survive into the
+    /// container env; only the host fallback is suppressed.
+    #[test]
+    fn container_env_keeps_explicit_job_path() {
+        let mut job = make_job();
+        job.env.insert("PATH".into(), "/image/bin:/usr/bin".into());
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        ctx.translate_container_path = true;
+
+        let env = ctx.build_env();
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some("/image/bin:/usr/bin")
+        );
+    }
+
+    /// GITHUB_PATH additions in a container env must not be anchored on the
+    /// host machine's PATH either — that would leak the host PATH into the
+    /// container through the base.
+    #[test]
+    fn container_env_prepends_github_path_without_host_base() {
+        let mut job = make_job();
+        job.extra_path.push("/github/path/bin".into());
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        ctx.translate_container_path = true;
+
+        let env = ctx.build_env();
+        let path = env.get("PATH").expect("GITHUB_PATH additions need a PATH");
+        assert!(
+            path.starts_with("/github/path/bin"),
+            "GITHUB_PATH must be prepended, got: {path}"
+        );
+        if let Ok(host_path) = std::env::var("PATH") {
+            assert!(
+                !path.contains(host_path.as_str()),
+                "container PATH must not fall back to the host PATH, got: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_env_respects_explicit_job_path() {
+        let mut job = make_job();
+        job.env.insert("PATH".into(), "/custom/bin".into());
+        let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+
+        let env = ctx.build_env();
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/custom/bin"));
+    }
+
+    #[test]
+    fn ensure_path_falls_back_to_platform_default() {
+        let mut env = HashMap::new();
+        ensure_path(&mut env, None);
+        assert_eq!(env["PATH"], DEFAULT_PATH);
+
+        let mut env = HashMap::new();
+        ensure_path(&mut env, Some("   "));
+        assert_eq!(env["PATH"], DEFAULT_PATH);
+
+        let mut env = HashMap::new();
+        ensure_path(&mut env, Some("/opt/bin:/usr/bin"));
+        assert_eq!(env["PATH"], "/opt/bin:/usr/bin");
+
+        // An explicit PATH wins over the worker path.
+        let mut env = HashMap::from([("PATH".to_string(), "/custom".to_string())]);
+        ensure_path(&mut env, Some("/worker"));
+        assert_eq!(env["PATH"], "/custom");
     }
 
     #[test]

@@ -1,0 +1,832 @@
+[
+  {
+    "type": "cameraUpdate",
+    "width": 1400,
+    "height": 1050,
+    "x": 0,
+    "y": 0
+  },
+  {
+    "type": "text",
+    "id": "title",
+    "x": 480,
+    "y": 25,
+    "text": "aksh-gha-expressions \u2014 Engine Architecture",
+    "fontSize": 28,
+    "strokeColor": "#1e1e1e"
+  },
+  {
+    "type": "text",
+    "id": "subtitle",
+    "x": 380,
+    "y": 60,
+    "text": "${{ }} parser, recursive-descent AST, context resolution, and function dispatch",
+    "fontSize": 15,
+    "strokeColor": "#757575"
+  },
+  {
+    "type": "rectangle",
+    "id": "zone_inputs",
+    "x": 50,
+    "y": 110,
+    "width": 240,
+    "height": 880,
+    "backgroundColor": "#dbe4ff",
+    "fillStyle": "solid",
+    "opacity": 25,
+    "strokeColor": "#1e40af",
+    "strokeWidth": 1.5,
+    "roundness": {
+      "type": 3
+    }
+  },
+  {
+    "type": "text",
+    "id": "zone_l_inputs",
+    "x": 70,
+    "y": 125,
+    "text": "Expression Sources",
+    "fontSize": 18,
+    "strokeColor": "#1e40af"
+  },
+  {
+    "type": "rectangle",
+    "id": "s1",
+    "x": 70,
+    "y": 180,
+    "width": 200,
+    "height": 75,
+    "backgroundColor": "#a5d8ff",
+    "fillStyle": "solid",
+    "strokeColor": "#4a9eed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "step 'run' field\n${{ }} template interpolation",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "s2",
+    "x": 70,
+    "y": 320,
+    "width": 200,
+    "height": 75,
+    "backgroundColor": "#a5d8ff",
+    "fillStyle": "solid",
+    "strokeColor": "#4a9eed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "if: conditions\nboolean evaluation",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "s3",
+    "x": 70,
+    "y": 460,
+    "width": 200,
+    "height": 75,
+    "backgroundColor": "#a5d8ff",
+    "fillStyle": "solid",
+    "strokeColor": "#4a9eed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "matrix.fromJSON\nJSON matrix expansion",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "s4",
+    "x": 70,
+    "y": 600,
+    "width": 200,
+    "height": 75,
+    "backgroundColor": "#a5d8ff",
+    "fillStyle": "solid",
+    "strokeColor": "#4a9eed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "env, inputs, outputs\ncontext data lookups",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "limits",
+    "x": 70,
+    "y": 740,
+    "width": 200,
+    "height": 230,
+    "backgroundColor": "#ffc9c9",
+    "fillStyle": "solid",
+    "opacity": 30,
+    "strokeColor": "#ef4444",
+    "strokeWidth": 1.5,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Known Gaps\n\u2022 no [a.b] bracket access\n\u2022 no object filter '*'\n\u2022 no '{{' escaping",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "zone_pipe",
+    "x": 330,
+    "y": 110,
+    "width": 570,
+    "height": 570,
+    "backgroundColor": "#e5dbff",
+    "fillStyle": "solid",
+    "opacity": 25,
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 1.5,
+    "roundness": {
+      "type": 3
+    }
+  },
+  {
+    "type": "text",
+    "id": "zone_l_pipe",
+    "x": 350,
+    "y": 125,
+    "text": "Engine Parsing & Evaluation Pipeline",
+    "fontSize": 18,
+    "strokeColor": "#7c3aed"
+  },
+  {
+    "type": "rectangle",
+    "id": "lexer",
+    "x": 360,
+    "y": 180,
+    "width": 230,
+    "height": 80,
+    "backgroundColor": "#d0bfff",
+    "fillStyle": "solid",
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "lexer.rs\nIdent, Lit, Op, Brackets",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "parser",
+    "x": 640,
+    "y": 180,
+    "width": 230,
+    "height": 80,
+    "backgroundColor": "#d0bfff",
+    "fillStyle": "solid",
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "expr_parser.rs\nrecursive-descent -> Expr",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "ast",
+    "x": 500,
+    "y": 300,
+    "width": 230,
+    "height": 80,
+    "backgroundColor": "#d0bfff",
+    "fillStyle": "solid",
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "ast.rs\nExpr enum, BinaryOp, FnCall",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "ctx",
+    "x": 360,
+    "y": 420,
+    "width": 230,
+    "height": 80,
+    "backgroundColor": "#fff3bf",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "context.rs\nhierarchical scope resolution",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "cond",
+    "x": 640,
+    "y": 420,
+    "width": 230,
+    "height": 80,
+    "backgroundColor": "#fff3bf",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "conditions.rs\neffective_condition() rules",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "eval",
+    "x": 500,
+    "y": 550,
+    "width": 230,
+    "height": 90,
+    "backgroundColor": "#b2f2bb",
+    "fillStyle": "solid",
+    "strokeColor": "#15803d",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "evaluator.rs\neval(ast, ctx) -> Value",
+      "fontSize": 16
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "zone_fns",
+    "x": 940,
+    "y": 110,
+    "width": 410,
+    "height": 570,
+    "backgroundColor": "#fff3bf",
+    "fillStyle": "solid",
+    "opacity": 25,
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 1.5,
+    "roundness": {
+      "type": 3
+    }
+  },
+  {
+    "type": "text",
+    "id": "zone_l_fns",
+    "x": 960,
+    "y": 125,
+    "text": "Built-in Function Handlers",
+    "fontSize": 18,
+    "strokeColor": "#f59e0b"
+  },
+  {
+    "type": "rectangle",
+    "id": "fn_hash",
+    "x": 970,
+    "y": 180,
+    "width": 160,
+    "height": 75,
+    "backgroundColor": "#ffd8a8",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "hashFiles\nSHA-256 glob",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "fn_fmt",
+    "x": 1160,
+    "y": 180,
+    "width": 160,
+    "height": 75,
+    "backgroundColor": "#ffd8a8",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "format / join\nstring formatting",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "fn_toj",
+    "x": 970,
+    "y": 300,
+    "width": 160,
+    "height": 75,
+    "backgroundColor": "#ffd8a8",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "toJSON\nobject serialize",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "fn_fromj",
+    "x": 1160,
+    "y": 300,
+    "width": 160,
+    "height": 75,
+    "backgroundColor": "#ffd8a8",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "fromJSON\nJSON deserialize",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "fn_contains",
+    "x": 970,
+    "y": 420,
+    "width": 160,
+    "height": 75,
+    "backgroundColor": "#ffd8a8",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "contains\nsubstring match",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "fn_sew",
+    "x": 1160,
+    "y": 420,
+    "width": 160,
+    "height": 75,
+    "backgroundColor": "#ffd8a8",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "starts/endsWith\nprefix/suffix match",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "zone_out",
+    "x": 330,
+    "y": 720,
+    "width": 1020,
+    "height": 270,
+    "backgroundColor": "#d3f9d8",
+    "fillStyle": "solid",
+    "opacity": 25,
+    "strokeColor": "#22c55e",
+    "strokeWidth": 1.5,
+    "roundness": {
+      "type": 3
+    }
+  },
+  {
+    "type": "text",
+    "id": "zone_l_out",
+    "x": 350,
+    "y": 735,
+    "text": "Evaluated Output Values",
+    "fontSize": 18,
+    "strokeColor": "#22c55e"
+  },
+  {
+    "type": "rectangle",
+    "id": "o_str",
+    "x": 360,
+    "y": 780,
+    "width": 220,
+    "height": 80,
+    "backgroundColor": "#b2f2bb",
+    "fillStyle": "solid",
+    "strokeColor": "#15803d",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Resolved String\ninterpolated step text",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "o_bool",
+    "x": 610,
+    "y": 780,
+    "width": 220,
+    "height": 80,
+    "backgroundColor": "#b2f2bb",
+    "fillStyle": "solid",
+    "strokeColor": "#15803d",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Boolean Value\neffective if: condition",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "o_json",
+    "x": 860,
+    "y": 780,
+    "width": 220,
+    "height": 80,
+    "backgroundColor": "#b2f2bb",
+    "fillStyle": "solid",
+    "strokeColor": "#15803d",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "JSON Structure\nenv / inputs / matrix array",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "o_hash",
+    "x": 1110,
+    "y": 780,
+    "width": 220,
+    "height": 80,
+    "backgroundColor": "#b2f2bb",
+    "fillStyle": "solid",
+    "strokeColor": "#15803d",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Cache Key Hash\nhashFiles SHA-256 digest",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_s_lexer",
+    "x": 270,
+    "y": 215,
+    "width": 90,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        90,
+        0
+      ]
+    ],
+    "strokeColor": "#1e1e1e",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "s1",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "lexer",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "raw expression",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_lexer_parser",
+    "x": 590,
+    "y": 220,
+    "width": 50,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        50,
+        0
+      ]
+    ],
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "lexer",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "parser",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "tokens",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_parser_ast",
+    "x": 755,
+    "y": 260,
+    "width": -140,
+    "height": 40,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        20
+      ],
+      [
+        -140,
+        20
+      ],
+      [
+        -140,
+        40
+      ]
+    ],
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "parser",
+      "fixedPoint": [
+        0.5,
+        1
+      ]
+    },
+    "endBinding": {
+      "elementId": "ast",
+      "fixedPoint": [
+        0.5,
+        0
+      ]
+    },
+    "label": {
+      "text": "build AST",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_ctx_eval",
+    "x": 475,
+    "y": 500,
+    "width": 140,
+    "height": 50,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        25
+      ],
+      [
+        140,
+        25
+      ],
+      [
+        140,
+        50
+      ]
+    ],
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "ctx",
+      "fixedPoint": [
+        0.5,
+        1
+      ]
+    },
+    "endBinding": {
+      "elementId": "eval",
+      "fixedPoint": [
+        0.5,
+        0
+      ]
+    },
+    "label": {
+      "text": "scope data",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_ast_eval",
+    "x": 615,
+    "y": 380,
+    "width": 0,
+    "height": 170,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        170
+      ]
+    ],
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "ast",
+      "fixedPoint": [
+        0.5,
+        1
+      ]
+    },
+    "endBinding": {
+      "elementId": "eval",
+      "fixedPoint": [
+        0.5,
+        0
+      ]
+    },
+    "label": {
+      "text": "eval AST",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_eval_fns",
+    "x": 730,
+    "y": 595,
+    "width": 210,
+    "height": -200,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        175,
+        0
+      ],
+      [
+        175,
+        -200
+      ],
+      [
+        210,
+        -200
+      ]
+    ],
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "eval",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "zone_fns",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "function dispatch",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_eval_out",
+    "x": 615,
+    "y": 640,
+    "width": 225,
+    "height": 140,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        70
+      ],
+      [
+        225,
+        70
+      ],
+      [
+        225,
+        140
+      ]
+    ],
+    "strokeColor": "#15803d",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "eval",
+      "fixedPoint": [
+        0.5,
+        1
+      ]
+    },
+    "endBinding": {
+      "elementId": "o_bool",
+      "fixedPoint": [
+        0.5,
+        0
+      ]
+    },
+    "label": {
+      "text": "evaluate to Value",
+      "fontSize": 14
+    }
+  }
+]
