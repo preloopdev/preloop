@@ -509,6 +509,7 @@ fn arb_job() -> impl Strategy<Value = AgentJobRequestMessage> {
                 aksh_debug_transport: None,
                 preloop_preserve_on_failure: None,
                 aksh_snapshot_commit: None,
+                aksh_snapshot_origin_rewrite: None,
             },
         )
 }
@@ -751,6 +752,14 @@ fn task_result_serialization() {
     assert_eq!(
         serde_json::from_str::<TaskResult>("\"cancelled\"").unwrap(),
         TaskResult::Cancelled
+    );
+    assert_eq!(
+        serde_json::to_string(&TaskResult::Abandoned).unwrap(),
+        "\"abandoned\""
+    );
+    assert_eq!(
+        serde_json::from_str::<TaskResult>("\"abandoned\"").unwrap(),
+        TaskResult::Abandoned
     );
 }
 
@@ -1167,4 +1176,33 @@ fn context_data_from_json_empty_array_and_dict() {
     let ctx = PipelineContextData::from_json(&dict_json);
     assert!(matches!(&ctx, PipelineContextData::Dict(m) if m.is_empty()));
     assert_eq!(ctx.to_json(), dict_json);
+}
+
+#[test]
+fn template_string_token_escapes_literal_braces() {
+    // MC-S6: the protocol copy must escape literal { and } the same way the
+    // parser copy does (job_builder.rs append_format_literal). The official
+    // runner's format() throws InvalidFormatString on an unescaped brace, so
+    // a template mixing a literal brace with an expression must produce
+    // {{ }} around the literal.
+    let token = template_string_token("deploy {env} to ${{ inputs.region }} now");
+    assert_eq!(token["type"], 3);
+    let expr = token["expr"].as_str().unwrap();
+    assert!(
+        expr.contains("format('deploy {{env}} to {0} now', inputs.region)"),
+        "literal braces must be escaped, got: {expr}"
+    );
+
+    // Leading/trailing literal braces.
+    let token = template_string_token("${{ vars.a }}{");
+    let expr = token["expr"].as_str().unwrap();
+    assert!(
+        expr.contains("format('{0}{{', vars.a)"),
+        "trailing literal brace must be escaped, got: {expr}"
+    );
+
+    // A pure literal without expressions is not a format template.
+    let token = template_string_token("plain {not} an expression");
+    assert_eq!(token["type"], 0);
+    assert_eq!(token["lit"], "plain {not} an expression");
 }

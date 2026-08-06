@@ -1,0 +1,126 @@
+{
+  "generated_by": "consolidate",
+  "findings": [
+    {
+      "id": "MC-S2-workflow-gate-leak",
+      "title": "Workflow-level concurrency gate leak on terminal skip/error",
+      "source": "model-checking",
+      "scenario": "Scenario 2",
+      "severity": "high",
+      "invariant": "TerminalRunReleasesKeys",
+      "config": "MC_hunt_s2_concurrency.safety.cfg",
+      "counterexample": "spec/counterexamples/MC-S2-workflow-gate-leak.txt",
+      "affected_code": [
+        "crates/aksh-runner-server/src/runtime_scheduling.rs:862-879",
+        "crates/aksh-runner-server/src/runtime_scheduling.rs:151",
+        "crates/aksh-runner-server/src/runtime_scheduling.rs:2027-2041"
+      ],
+      "summary": "Workflow-level concurrency gate (Holder::Run) is never released when a run terminates through the dependency-skip/eval-error arm of promote_ready_jobs. A successor submission to the same group without cancel-in-progress parks in `pending` forever. TLC counterexample confirms the leak. Matches modeling-brief Scenario 2 F2.",
+      "dedup_note": "also covers code-review Scenario 2 (R1: single caller for release_concurrency_for_run; terminal-by-skip paths)",
+      "evidence": [
+        "promote_ready_jobs Skip|Error arm (runtime_scheduling.rs:862-879) sets terminal status + finalize_run_if_complete but never calls release_concurrency_for_run",
+        "release_concurrency_for_run has exactly one production caller: cancel_run_inner (runtime_scheduling.rs:151)",
+        "finalize_run_if_complete (runtime_scheduling.rs:2027-2041) only stamps completed_at/conclusion, no release"
+      ]
+    },
+    {
+      "id": "MC-S3-job-gate-bypass",
+      "title": "Job-level concurrency gate bypassed on promote path",
+      "source": "model-checking",
+      "scenario": "Scenario 3",
+      "severity": "high",
+      "invariant": "GateBeforeDispatch",
+      "config": "MC_hunt_s3_deferred_expansion.safety.cfg",
+      "counterexample": "spec/counterexamples/MC-S3-job-gate-bypass.txt",
+      "affected_code": [
+        "crates/aksh-runner-server/src/runtime_scheduling.rs:842-857",
+        "crates/aksh-runner-server/src/runs.rs:1075-1094"
+      ],
+      "summary": "Job-level concurrency gate (queued_job.concurrency) is evaluated only at submit time and only for needs-empty jobs; jobs with needs (or max-parallel violations) carry their gate through pending_jobs and are dispatched by promote_ready_jobs without ever acquiring it. TLC confirms dispatch without gate. Matches Scenario 2/3 F8/F-2.",
+      "dedup_note": "also covers code-review Scenario 3 (R2: on_job_enqueued missing on promote path; F-2 gate bypass for expanded jobs)",
+      "evidence": [
+        "try_enqueue_with_job_concurrency has exactly one production call site: runs.rs:1077, guarded by `needs_empty && under_mp`",
+        "promote_ready_jobs Run arm pushes directly to inner.queue without consulting queued_job.concurrency",
+        "TLC counterexample: SubmitRun2 -> DeclareGate -> EnqueuePending -> PromoteDispatchJob"
+      ]
+    },
+    {
+      "id": "MC-S5-step-transition-loss",
+      "title": "Step transition lost on failed POST to reporting queue",
+      "source": "model-checking",
+      "scenario": "Scenario 5",
+      "severity": "high",
+      "invariant": "StepTransitionDelivered",
+      "config": "MC_hunt_s5_reporting_queue.safety.cfg",
+      "counterexample": "spec/counterexamples/MC-S5-step-transition-loss.txt",
+      "affected_code": [
+        "crates/aksh-runner-server/src/server_queue.rs",
+        "crates/aksh-runner/src/worker/reporting.rs:19-77"
+      ],
+      "summary": "ServerQueue.take_steps_update_body clears dirty_keys while steps_generation stays ahead of published_generation; a failed POST (flush_step_updates publish=false) never re-dirties the steps, so the next take returns an empty body and the terminal step transition is lost forever. TLC counterexample confirms loss. Matches Scenario 5 F1.",
+      "dedup_note": "covers code-review Scenario 5 (F1 reporting queue loss on failed POST; P8 test-verifiable)",
+      "evidence": [
+        "take_steps_update_body clears dirty_keys at take time",
+        "mark_steps_published only on HTTP success; failure leaves gen mismatch with empty dirty",
+        "TLC: WorkerQueueUpdate -> WorkerTakeBody with gen != pubGen, dirty={}"
+      ]
+    },
+    {
+      "id": "MC-S6-format-brace-escape",
+      "title": "Format brace escaping divergence in protocol vs parser",
+      "source": "model-checking",
+      "scenario": "Scenario 6",
+      "severity": "medium",
+      "invariant": "FormatEscapeClosed",
+      "config": "MC_hunt_s6_masking_tokenizer.safety.cfg",
+      "counterexample": "spec/counterexamples/MC-S6-format-brace-escape.txt",
+      "affected_code": [
+        "crates/aksh-gha-protocol/src/azdo/job.rs:588-615",
+        "crates/aksh-gha-parser/src/job_builder.rs:126-135"
+      ],
+      "summary": "The aksh-gha-protocol copy of the template-string builder escapes only single quotes; the parser copy also escapes { and }. Official runner throws FormatException on unescaped braces. Any env/input with literal brace + ${{}} breaks on AzDO/broker path. TLC confirms formatError. Matches Scenario 6 F1 and R13.",
+      "dedup_note": "covers code-review Scenario 6 (R13 duplicated tokenizer; P1 test-verifiable brace escape)",
+      "evidence": [
+        "protocol copy escapes only `'`; parser escapes `{`->`{{`, `}`->`}}`",
+        "protocol copy is live in TaskStep::serialize path",
+        "TLC counterexample: SetEscapeBraces(FALSE) -> BuildFormat(TRUE,TRUE)"
+      ]
+    },
+    {
+      "id": "CR-1",
+      "title": "Job claim/lease lifecycle and cancel delivery scoping mismatch",
+      "source": "code-review",
+      "scenario": "Scenario 1",
+      "severity": "high",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "crates/aksh-runner-server/src/broker.rs:253-255",
+        "crates/aksh-runner-server/src/distributed_task.rs:28-39",
+        "crates/aksh-runner-server/src/broker.rs:661",
+        "crates/aksh-runner-server/src/bootstrap.rs:155-157"
+      ],
+      "summary": "Server and runner disagree on who holds job claim and release timing. Global cancellation_queue popped before session check (F1). Pool path re-delivers job ref every poll with messageId collision vs request_id (F2). Token mint outside lock allows reaper race (S1). AzDO claim misses lastRenewedAt so reaper never fires (F5). Many request maps have no removal (F4, R7, R10). No MC violation found after spec repairs (S1 counterexample was artifact).",
+      "dedup_note": null
+    },
+    {
+      "id": "CR-2",
+      "title": "Runner cancellation to process-tree kill sequencing gaps",
+      "source": "code-review",
+      "scenario": "Scenario 4",
+      "severity": "high",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "crates/aksh-runner/src/listener/broker_listener.rs:623-630",
+        "crates/aksh-runner/src/listener/job_dispatcher.rs:297-303",
+        "crates/aksh-runner/src/listener/broker_listener.rs:493-518",
+        "crates/aksh-runner/src/process.rs:104"
+      ],
+      "summary": "Cancel/timeout through three sources with mismatched treatments. RunnerShutdown returns Ok without graceful worker shutdown (F-1). Listener kill only targets worker PID; step groups in separate PG survive (F-2, R5). Overlap-kill omits force_fail_job (F-5, R3). Dedup before parse leaves unacked messages (F-4). Kill window and clocks differ between listener and worker. No MC violation within bounded states (S4 reachability gap noted). Matches multiple historical orphan bugs.",
+      "dedup_note": null
+    }
+  ]
+}

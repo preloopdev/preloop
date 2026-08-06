@@ -101,6 +101,7 @@ pub async fn run_job(
     job_message: serde_json::Value,
     via: ProtocolPath,
     cancel_rx: watch::Receiver<bool>,
+    timing: LeaseTiming,
 ) -> Result<()> {
     let job_id = job_message
         .get("jobId")
@@ -130,9 +131,6 @@ pub async fn run_job(
         variables,
         context_data,
     );
-    let workspace = super::job_extension::setup_workspace(&job_message)?;
-    job_ctx.workspace = Some(workspace.clone());
-    super::job_extension::inject_github_env(&mut job_ctx, &job_message);
     // v2.336.0 (#4546/#4550): Announce locked dependencies in Setup Job log
     if let Some(deps) = job_message
         .get("actionsDependencies")
@@ -172,6 +170,37 @@ pub async fn run_job(
         .unwrap_or("")
         .to_string();
     let reporting = create_reporting_context(&job_message, via, &plan_id, job_id)?;
+    // Official JobDispatcher first-renew gate: no job work (workspace setup,
+    // action preparation, steps) may happen until the first renewjob
+    // succeeds. A 404 or an exhausted retry budget completes the job as
+    // Abandoned with zero steps run; cancellation completes it as Canceled.
+    // `JobDispatcher.RunAsync` gates this way so a runner that cannot reach
+    // the server never executes a job it holds no valid lease for.
+    if let Some(rpt) = &reporting {
+        match first_renew_gate(rpt, cancel_rx.clone(), timing).await {
+            FirstRenewOutcome::Renewed => {}
+            FirstRenewOutcome::Abandoned => {
+                error!("Job {job_name} abandoned before first renewal — no steps run");
+                job_ctx.job_status = super::contexts::JobStatus::Failure;
+                report_completion(&job_message, "abandoned", &job_ctx, &[], via, Some(rpt)).await?;
+                return Ok(());
+            }
+            FirstRenewOutcome::Cancelled => {
+                info!("Job {job_name} cancelled during first-renew gate — no steps run");
+                job_ctx.job_status = super::contexts::JobStatus::Cancelled;
+                report_completion(&job_message, "canceled", &job_ctx, &[], via, Some(rpt)).await?;
+                return Ok(());
+            }
+        }
+    }
+    // Workspace setup happens only once the lease is valid: an invalid or
+    // cancelled lease must not wipe an existing checkout (`setup_workspace`
+    // `remove_dir_all`s the work directory). The gate above returns early on
+    // Abandoned/Cancelled, so a job that never held a valid lease never
+    // touches the workspace.
+    let workspace = super::job_extension::setup_workspace(&job_message)?;
+    job_ctx.workspace = Some(workspace.clone());
+    super::job_extension::inject_github_env(&mut job_ctx, &job_message);
     let main_steps = super::job_extension::build_step_list(&steps, &job_message);
     let action_paths =
         match prepare_remote_actions(&job_message, &workspace, &main_steps, &plan_id).await {
@@ -388,6 +417,7 @@ pub async fn run_job(
             cancel_rx.clone(),
             job_cancel_tx.clone(),
             lease_lost.clone(),
+            timing,
         )
     });
     let fwd_tx = job_cancel_tx.clone();
@@ -613,8 +643,15 @@ pub async fn run_job(
         });
     }
 
-    let (result_str, conclusion) = if was_timeout || was_lease_lost {
+    let (result_str, conclusion) = if was_timeout {
         ("Failed".to_string(), "Failed".to_string())
+    } else if was_lease_lost {
+        // Official JobDispatcher: a renew that dies mid-job (404 or the
+        // LockedUntil + 5 min retry window exhausted) cancels the worker and
+        // completes the request with `TaskResult.Abandoned` — not Failed.
+        // The job never finished on this runner; the server maps abandoned
+        // to a failure conclusion, matching GitHub's self-hosted disposition.
+        ("abandoned".to_string(), "abandoned".to_string())
     } else {
         match &job_result {
             Ok(conclusion) => {
@@ -725,6 +762,7 @@ fn spawn_renew_loop(
     cancel_rx: watch::Receiver<bool>,
     job_cancel_tx: watch::Sender<bool>,
     lease_lost: Arc<AtomicBool>,
+    timing: LeaseTiming,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut cancel_rx = cancel_rx;
@@ -751,7 +789,7 @@ fn spawn_renew_loop(
                         .or(lease_deadline);
                     failures = 0;
                     info!(locked_until = ?lease_deadline, "Job lock renewed");
-                    Duration::from_secs(60)
+                    timing.renew_interval
                 }
                 Err(error) if is_job_not_found(&error) => {
                     error!("Job lease lost (404); stopping renewal");
@@ -858,6 +896,126 @@ fn spawn_renew_loop(
     })
 }
 
+/// Renewal timing knobs mirroring the official `JobDispatcher`:
+/// - first-renew gate: retry up to 5 times (random 1–10 s backoff, matching
+///   the official band) before the worker is allowed to start; exhaustion
+///   abandons the job (no steps run);
+/// - steady-state renew: every 60 s.
+///
+/// Defaults match the official runner; tests shrink the windows.
+#[derive(Debug, Clone, Copy)]
+pub struct LeaseTiming {
+    pub first_renew_backoff: RenewBackoff,
+    pub renew_interval: Duration,
+}
+
+impl Default for LeaseTiming {
+    fn default() -> Self {
+        Self {
+            first_renew_backoff: RenewBackoff::Official,
+            renew_interval: Duration::from_secs(60),
+        }
+    }
+}
+
+/// Backoff between failed renew attempts, mirroring the official
+/// `JobDispatcher.RenewJobRequestAsync` bands. The official runner
+/// randomizes within each band so a fleet of runners that loses connectivity
+/// at once does not retry in synchronized lockstep.
+#[derive(Debug, Clone, Copy)]
+pub enum RenewBackoff {
+    /// Official randomized bands: 1–10 s before the first successful renew,
+    /// 5–15 s for the first five mid-job errors, 15–30 s afterwards.
+    Official,
+    /// Fixed delay between attempts (tests).
+    Fixed(Duration),
+}
+
+/// Outcome of the official first-renew gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstRenewOutcome {
+    /// The first renewjob succeeded — the job may start.
+    Renewed,
+    /// Renewal failed before the first success (404 or retry budget
+    /// exhausted) — the job is completed as Abandoned, no steps run.
+    Abandoned,
+    /// The job was cancelled while waiting for the first renewal.
+    Cancelled,
+}
+
+/// Official `JobDispatcher.RunAsync` first-renew gate.
+///
+/// The dispatcher refuses to spawn the worker until the first `renewjob`
+/// succeeds: `Task.WhenAny(firstJobRequestRenewed.Task, renewJobRequest, …)`
+/// with `renewJobRequest` completing when the renew task returns. That
+/// happens on a 404 (job no longer valid) or after `firstRenewRetryLimit`
+/// (5) retries of ~10 s each; either way the request is completed with
+/// `TaskResult.Abandoned` and no step ever executes. The gate also yields to
+/// job cancellation — the official completes such jobs as `Canceled`. The
+/// renew request itself is raced against the cancellation signal so a stalled
+/// HTTP call (server unreachable) cannot outlive the cancellation/kill
+/// window: the official `Task.WhenAny(firstJobRequestRenewed.Task,
+/// renewJobRequest)` cancels the in-flight renew task on the job run token.
+async fn first_renew_gate(
+    rpt: &ReportingContext,
+    mut cancel_rx: watch::Receiver<bool>,
+    timing: LeaseTiming,
+) -> FirstRenewOutcome {
+    const FIRST_RENEW_RETRY_LIMIT: u32 = 5;
+    let body = serde_json::json!({ "planId": rpt.plan_id, "jobId": rpt.job_id });
+    let mut failures = 0_u32;
+    loop {
+        if *cancel_rx.borrow() {
+            return FirstRenewOutcome::Cancelled;
+        }
+        let renew = rpt.run_service.renew_job(&rpt.access_token, &body);
+        tokio::pin!(renew);
+        let result = tokio::select! {
+            result = &mut renew => result,
+            changed = cancel_rx.changed() => {
+                if changed.is_err() || *cancel_rx.borrow() {
+                    return FirstRenewOutcome::Cancelled;
+                }
+                // The channel was notified without a real cancellation —
+                // restart the renew request (idempotent) rather than
+                // blocking on a stalled HTTP call.
+                continue;
+            }
+        };
+        match result {
+            Ok(_) => return FirstRenewOutcome::Renewed,
+            Err(error) if is_job_not_found(&error) => {
+                error!("First job renew failed (404) — abandoning job before start");
+                return FirstRenewOutcome::Abandoned;
+            }
+            Err(error) => {
+                failures += 1;
+                warn!(failures, "first renewjob failed: {error:#}");
+                if failures > FIRST_RENEW_RETRY_LIMIT {
+                    error!("First job renew retry budget exhausted — abandoning job");
+                    return FirstRenewOutcome::Abandoned;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(match timing.first_renew_backoff {
+                        RenewBackoff::Fixed(delay) => delay,
+                        RenewBackoff::Official => {
+                            Duration::from_secs(rand::Rng::gen_range(
+                                &mut rand::thread_rng(),
+                                1..=10,
+                            ))
+                        }
+                    }) => {}
+                    changed = cancel_rx.changed() => {
+                        if changed.is_err() || *cancel_rx.borrow() {
+                            return FirstRenewOutcome::Cancelled;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Build the pause-on-failure client, naming whichever prerequisite is absent.
 ///
 /// Each of these is a distinct operational fault — a server that did not send
@@ -908,10 +1066,16 @@ async fn build_debug_pause_client(
     ))
 }
 
-fn renew_backoff(attempt: u32) -> Duration {
-    const DELAYS: [u64; 4] = [5, 10, 20, 30];
-    let index = attempt.saturating_sub(1).min(DELAYS.len() as u32 - 1) as usize;
-    Duration::from_secs(DELAYS[index])
+/// Official mid-job renew backoff band: random 5–15 s for the first five
+/// consecutive errors, random 15–30 s afterwards
+/// (`JobDispatcher.RenewJobRequestAsync`).
+fn renew_backoff(encountering_error: u32) -> Duration {
+    let (min, max) = if encountering_error > 5 {
+        (15, 30)
+    } else {
+        (5, 15)
+    };
+    Duration::from_secs(rand::Rng::gen_range(&mut rand::thread_rng(), min..=max))
 }
 
 fn parse_lease_deadline(value: &str) -> Option<DateTime<Utc>> {

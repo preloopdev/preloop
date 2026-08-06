@@ -52,9 +52,27 @@ jobs:
       # malicious dependency, so any PR touching them fails immediately.
       - name: Reject gate-config tampering in PRs
         if: github.event_name == 'pull_request'
+        env:
+          # The engine now injects GITHUB_TOKEN into the job's secret set
+          # (GitHub's dispatcher substitutes it at dispatch time), so the
+          # canonical spelling works here and on hosted runners alike.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git fetch origin main --depth=1
-          changed=$(git diff --name-only origin/main...HEAD -- deny.toml .cargo/audit.toml supply-chain/ || true)
+          # The checkout above ran with `persist-credentials: false`, so the
+          # clone holds no credential and this repo is private. The runner
+          # masks secrets, so embedding the token in a URL or an env-var fetch
+          # gets rewritten before the process starts and git sees an invalid
+          # credential. Use the same mechanism actions/checkout itself uses:
+          # a per-invocation extraheader, so nothing is persisted into the
+          # clone for later steps to inherit.
+          encoded=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64)
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${encoded}" \
+            fetch --depth=1 origin main
+          # Two-dot, not three: `A...B` needs a merge base, and neither side of
+          # this comparison has one — the checkout and this fetch are both
+          # depth 1. Comparing the trees answers the gate's actual question,
+          # "do these files differ from main's tip".
+          changed=$(git diff --name-only FETCH_HEAD HEAD -- deny.toml .cargo/audit.toml supply-chain/ || true)
           if [ -n "$changed" ]; then
             echo "supply-chain policy files must not change in PRs: $changed" >&2
             exit 1

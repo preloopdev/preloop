@@ -22,17 +22,25 @@ pub(crate) async fn agent_lookup_by_id_org(
 pub(crate) async fn register_runner_compat_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, pool_id)): Path<(String, i64)>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    register_runner_compat_pool_only(State(shared), Path(pool_id), Json(request)).await
+    register_runner_compat_pool_only(State(shared), Path(pool_id), headers, Json(request)).await
 }
 
 pub(crate) async fn register_runner_compat_org_2(
     State(shared): State<Arc<SharedState>>,
     Path((_org, pool_id, agent_id)): Path<(String, i64, String)>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    register_runner_compat(State(shared), Path((pool_id, agent_id)), Json(request)).await
+    register_runner_compat(
+        State(shared),
+        Path((pool_id, agent_id)),
+        headers,
+        Json(request),
+    )
+    .await
 }
 
 pub(crate) async fn create_session_compat_org(
@@ -72,9 +80,10 @@ pub(crate) async fn delete_session_org(
 pub(crate) async fn next_message_compat_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, pool_id)): Path<(String, i64)>,
+    identity: Option<axum::Extension<RunnerIdentity>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> (StatusCode, Json<Option<azdo::TaskAgentMessage>>) {
-    next_message_compat(State(shared), Path(pool_id), Query(params)).await
+    next_message_compat(State(shared), Path(pool_id), identity, Query(params)).await
 }
 
 pub(crate) async fn delete_pool_message_org(
