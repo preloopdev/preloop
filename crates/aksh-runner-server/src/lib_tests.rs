@@ -3044,11 +3044,30 @@ async fn action_download_info_returns_remote_action_tickets() {
 
 #[tokio::test]
 async fn runnerresolve_actions_returns_runner_parseable_tar_urls() {
+    // Held for the whole test: `AKSH_GITHUB_API_URL` is process-global.
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    // Hermetic ref→SHA resolution: point AKSH_GITHUB_API_URL at a mock that
+    // answers `commits/{ref}` with a fixed SHA, so the test never touches the
+    // real GitHub API (and pins the new SHA-pinning behavior deterministically).
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", api_listener.local_addr().unwrap());
+    let mock = axum::Router::new().route(
+        "/repos/:owner/:repo/commits/:git_ref",
+        axum::routing::get(|| async {
+            axum::Json(serde_json::json!({"sha": "abc123def456abc123def456abc123def456abc1"}))
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(api_listener, mock).await.unwrap();
+    });
+    std::env::set_var("AKSH_GITHUB_API_URL", &api_base);
+
     let temp = tempfile::tempdir().unwrap();
     let app = app(
         AppState::new(temp.path().to_path_buf()).await.unwrap(),
         CancellationToken::new(),
     );
+    std::env::remove_var("AKSH_GITHUB_API_URL");
 
     let response = request_json(
         &app,
@@ -3069,19 +3088,23 @@ async fn runnerresolve_actions_returns_runner_parseable_tar_urls() {
         response["actions"]["actions/checkout@v4"]["tar_url"]
             .as_str()
             .unwrap()
-            .starts_with("http://127.0.0.1:9090/api/v1/actions/download/actions/checkout/v4?exp="),
+            .starts_with(
+                "http://127.0.0.1:9090/api/v1/actions/download/actions/checkout/abc123def456abc123def456abc123def456abc1?exp="
+            ),
         "{}",
         response["actions"]["actions/checkout@v4"]["tar_url"]
     );
     assert_eq!(
         response["actions"]["actions/checkout@v4"]["resolved_sha"],
-        "v4"
+        "abc123def456abc123def456abc123def456abc1"
     );
     assert!(
         response["actions"]["owner/repo/path@main"]["tar_url"]
             .as_str()
             .unwrap()
-            .starts_with("http://127.0.0.1:9090/api/v1/actions/download/owner/repo/main?exp="),
+            .starts_with(
+                "http://127.0.0.1:9090/api/v1/actions/download/owner/repo/abc123def456abc123def456abc123def456abc1?exp="
+            ),
         "{}",
         response["actions"]["owner/repo/path@main"]["tar_url"]
     );
@@ -6705,6 +6728,8 @@ async fn github_app_manifest_registration_flow() {
     });
 
     // 2. Configure mock API URL in environment
+    // Held for the whole test: `AKSH_GITHUB_API_URL` is process-global.
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
     std::env::set_var("AKSH_GITHUB_API_URL", format!("http://127.0.0.1:{}", port));
 
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -11191,6 +11216,21 @@ jobs:
             .cloned()
             .expect("submitted run should have one dispatchable job")
     };
+    // Synthetic push payloads carry a `head_commit` object (GitHub shape):
+    // workflows gate on `github.event.head_commit.message` and must not see a
+    // null that makes property access error out.
+    {
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&run_id).unwrap();
+        let head_commit = &run.github["event"]["head_commit"];
+        let id = head_commit["id"].as_str().unwrap();
+        assert_eq!(id.len(), 40, "head_commit.id must be the snapshot commit");
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(head_commit["distinct"], true);
+        assert_eq!(head_commit["message"], "");
+        assert_eq!(run.github["event"]["before"].as_str().unwrap().len(), 40);
+        assert_eq!(run.github["event"]["after"], json!(id));
+    }
     complete_via_api(&app, &run_id.to_string(), &job_id.to_string()).await;
 
     assert_eq!(
@@ -11205,6 +11245,42 @@ jobs:
         object_cache.is_dir(),
         "terminal completion must preserve the shared snapshot object cache"
     );
+}
+
+#[tokio::test]
+async fn submit_rejects_invalid_schedule_cron() {
+    // GitHub rejects an unparsable `on.schedule` cron at workflow save; aksh
+    // rejects it at submit instead of registering a cron job that never fires.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let response = request_json_status(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on:\n  push:\n  schedule:\n    - cron: 'not a cron'\njobs:\n  build:\n    runs-on: self-hosted\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo",
+        }),
+    )
+    .await;
+    assert_eq!(response.0, StatusCode::BAD_REQUEST);
+
+    // Valid cron still submits.
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on:\n  push:\n  schedule:\n    - cron: '0 0 * * *'\njobs:\n  build:\n    runs-on: self-hosted\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo",
+        }),
+    )
+    .await;
+    assert_eq!(accepted["queued_jobs"], 1);
 }
 
 #[tokio::test]
@@ -12047,6 +12123,71 @@ async fn pull_request_submission_uses_head_sha_not_zeros() {
         run_record.head_sha, "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3",
         "pull_request head sha must drive github.sha instead of the zero sha"
     );
+}
+
+#[tokio::test]
+async fn pull_request_submission_uses_short_ref_name_and_job_id() {
+    // GitHub presents PR events with `github.ref = refs/pull/<n>/merge` and
+    // `github.ref_name = <n>/merge` (short form), and supplies the job id via
+    // the `system.github.job` variable. Previously `ref_name` leaked the full
+    // `refs/pull/7/merge` and `github.job`/`GITHUB_JOB` were empty.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: pull_request\njobs:\n  build:\n    runs-on: self-hosted\n    strategy:\n      matrix:\n        os: [a, b]\n    steps:\n      - run: echo hi\n",
+            "event": "pull_request",
+            "repository": "owner/repo",
+            "payload": {
+                "action": "opened",
+                "number": 7,
+                "pull_request": {
+                    "head": { "ref": "feature", "sha": "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3" },
+                    "base": { "ref": "main", "sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3" }
+                }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(accepted["queued_jobs"], 2);
+
+    let inner = state.inner.lock().await;
+    let queued: Vec<_> = inner.queue.iter().collect();
+    assert_eq!(queued.len(), 2);
+    let github = &queued[0].message.context_data["github"].to_json();
+    assert_eq!(github["ref"], "refs/pull/7/merge");
+    assert_eq!(github["ref_name"], "7/merge");
+    assert_eq!(github["ref_type"], "branch");
+    assert_eq!(github["head_ref"], "feature");
+    assert_eq!(github["base_ref"], "main");
+    assert_eq!(
+        queued[0].message.variables["system.github.job"]
+            .value
+            .as_deref(),
+        Some("build")
+    );
+    // GitHub's context carries no `job` key — the runner reads the variable.
+    assert!(github.get("job").is_none());
+
+    // Both matrix cells carry the same job id; strategy indices are per-cell.
+    for request in &queued {
+        assert_eq!(
+            request.message.variables["system.github.job"]
+                .value
+                .as_deref(),
+            Some("build")
+        );
+    }
+    let strategy = queued[0].message.context_data["strategy"].to_json();
+    assert_eq!(strategy["job-index"], 0.0);
+    assert_eq!(strategy["job-total"], 2.0);
+    let strategy1 = queued[1].message.context_data["strategy"].to_json();
+    assert_eq!(strategy1["job-index"], 1.0);
 }
 
 async fn pool_managed_state(temp: &tempfile::TempDir) -> AppState {
