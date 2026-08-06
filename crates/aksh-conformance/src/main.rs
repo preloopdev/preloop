@@ -78,6 +78,17 @@ enum CommandKind {
         /// Optional path to write recorded HTTP flows to.
         #[arg(long)]
         record_flows: Option<PathBuf>,
+        /// Port for the embedded server and runner. Defaults to 9090; pick a
+        /// free one when a development server already owns 9090, or the
+        /// runner's registration will silently target the wrong instance.
+        #[arg(long, default_value_t = 9090)]
+        port: u16,
+        /// Comma-separated runner labels. Defaults to "self-hosted,linux":
+        /// real-world workflows overwhelmingly target `ubuntu-latest`, and the
+        /// runner would otherwise register the *host's* OS label (macOS on a
+        /// Mac), which the server's OS guard then refuses for linux jobs.
+        #[arg(long, default_value = "self-hosted,linux")]
+        labels: String,
     },
     /// H2: Generate a flow diff report against the golden scenario captures.
     #[command(name = "runner-diff")]
@@ -112,7 +123,9 @@ async fn main() -> anyhow::Result<()> {
             runner_bin,
             workflow,
             record_flows,
-        } => run_runner_e2e(runner_bin, workflow, record_flows).await,
+            port,
+            labels,
+        } => run_runner_e2e(runner_bin, workflow, record_flows, port, labels).await,
         CommandKind::RunnerDiff { scenario, target } => run_runner_diff(scenario, target).await,
     }
 }
@@ -510,8 +523,12 @@ async fn run_runner_e2e(
     runner_bin: PathBuf,
     workflow: PathBuf,
     record_flows: Option<PathBuf>,
+    port: u16,
+    labels: String,
 ) -> anyhow::Result<()> {
     use std::time::Duration;
+    let server_url = format!("http://127.0.0.1:{port}");
+    let listen = format!("127.0.0.1:{port}");
 
     // Check binaries
     if !runner_bin.exists() {
@@ -554,10 +571,10 @@ async fn run_runner_e2e(
     // Start server in background on port 9090
     let mut server_cmd = Command::new(server_bin);
     server_cmd
-        .env("AKSH_PUBLIC_URL", "http://127.0.0.1:9090")
+        .env("AKSH_PUBLIC_URL", &server_url)
         .arg("serve")
         .arg("--listen")
-        .arg("127.0.0.1:9090")
+        .arg(&listen)
         .arg("--state-dir")
         .arg(state_dir.to_str().unwrap());
 
@@ -575,7 +592,7 @@ async fn run_runner_e2e(
         .expect("HTTP client");
     let mut ready = false;
     for _ in 0..30 {
-        if client.get("http://127.0.0.1:9090/").send().await.is_ok() {
+        if client.get(&server_url).send().await.is_ok() {
             ready = true;
             break;
         }
@@ -583,7 +600,7 @@ async fn run_runner_e2e(
     }
     if !ready {
         let _ = server.kill().await;
-        anyhow::bail!("aksh-runner-server failed to start on port 9090");
+        anyhow::bail!("aksh-runner-server failed to start on port {port}");
     }
 
     // Configure the runner
@@ -593,7 +610,7 @@ async fn run_runner_e2e(
         .arg("configure")
         .args([
             "--url",
-            "http://127.0.0.1:9090",
+            &server_url,
             "--token",
             "dummy-token",
             "--name",
@@ -603,6 +620,8 @@ async fn run_runner_e2e(
             "--no-externals",
             "--unattended",
             "--replace",
+            "--labels",
+            &labels,
         ])
         .status()
         .await?;
@@ -628,7 +647,7 @@ async fn run_runner_e2e(
 
     // Submit workflow
     let submit_output = Command::new(client_bin)
-        .args(["--server", "http://127.0.0.1:9090", "submit", "-W"])
+        .args(["--server", &server_url, "submit", "-W"])
         .arg(&submit_workflow_path)
         .output()
         .await?;
@@ -647,7 +666,7 @@ async fn run_runner_e2e(
 
     // Loop runner until the run reaches a terminal status (handles multi-job workflows).
     let terminal = ["completed", "success", "failed", "cancelled"];
-    let run_status_url = format!("http://127.0.0.1:9090/api/v1/runs/{}", run_id);
+    let run_status_url = format!("{server_url}/api/v1/runs/{run_id}");
     let native_api_token =
         std::env::var("AKSH_SYSTEM_TOKEN").unwrap_or_else(|_| "aksh-system-token".to_owned());
     let mut run_status = "unknown".to_string();
