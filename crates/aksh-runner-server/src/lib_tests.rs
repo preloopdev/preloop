@@ -11532,6 +11532,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
         },
         "http://127.0.0.1:9090",
         "local-runtime-jwt",
+        Some("refs/heads/main"),
     );
 
     assert_eq!(redirected, 1);
@@ -11572,6 +11573,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
             },
             "http://127.0.0.1:9090",
             "local-runtime-jwt",
+            Some("refs/heads/main"),
         ),
         1,
         "a token-only primary checkout still targets the local snapshot"
@@ -11592,6 +11594,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
             },
             "http://127.0.0.1:9090",
             "local-runtime-jwt",
+            Some("refs/heads/main"),
         ),
         1,
         "an empty `ref` input is GitHub's default-branch semantics and must be redirected to the snapshot"
@@ -11612,6 +11615,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
             },
             "http://127.0.0.1:9090",
             "local-runtime-jwt",
+            Some("refs/heads/main"),
         ),
         0,
         "a template `ref` input selects the workflow's own target and must not be redirected to the snapshot"

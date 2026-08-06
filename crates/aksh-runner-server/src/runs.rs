@@ -1499,8 +1499,16 @@ pub(crate) fn build_job_artifacts(
         .mint_runtime_token(&agent_msg.plan.plan_id, &agent_msg.job_id);
 
     if let Some(snapshot) = workspace_snapshot {
-        let redirected =
-            redirect_primary_checkout(&mut agent_msg, snapshot, base_url, &runtime_token);
+        let github_ref = normalized_github
+            .get("ref")
+            .and_then(|value| value.as_str());
+        let redirected = redirect_primary_checkout(
+            &mut agent_msg,
+            snapshot,
+            base_url,
+            &runtime_token,
+            github_ref,
+        );
         if redirected > 0 {
             info!(
                 %run_id,

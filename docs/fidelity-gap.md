@@ -367,6 +367,26 @@ workflow. All are fixed:
   steps; GitHub exports only the step's own `env:` block. Harmless so far —
   `install-action`'s `BASH_FUNC_` guard does not trip on them — but it is a
   divergence a workflow could observe.
+- **The runner executes as root; GitHub runs steps as uid 1001.** gin's
+  `TestSaveUploadedFileWithPermissionFailed` (write into a read-only dir,
+  expect EACCES) fails under root. GitHub's hosted images run the `runner`
+  user (uid 1001, passwordless sudo); the official runner refuses root by
+  default (`config.sh`: "Must not run with sudo" without
+  `RUNNER_ALLOW_RUNASROOT`). Any permission-semantics workflow diverges.
+  Faithful fix: run the VM-pool runner as a non-root user. See 1b.5.
+
+### 1b.5 Second campaign — CLI dogfood (2026-08-06): just, gin
+
+The dogfood campaign (see `docs/conformance/just.md`, `docs/conformance/gin.md`)
+runs a second wave of unmodified third-party workflows: `casey/just`,
+`gin-gonic/gin`, plus `psf/black` and `antfu/eslint-config` in progress. New
+gaps it surfaced:
+
+| Gap | Symptom in a real workflow | Status |
+| --- | --- | --- |
+| Host steps lacked the user-session environment | just's `dirs::runtime_dir` / `env_var('USER')` tests failed: no `XDG_RUNTIME_DIR` (hosted images run under systemd with `/run/user/<uid>`) and no `USER`/`LOGNAME` (steps run as the runner account) | ✅ fixed — `job_extension.rs` provisions `/run/user/0`; `execution_context.rs` supplies the host-surface contract (`XDG_RUNTIME_DIR`, `USER=root`, `LOGNAME=root`); container surfaces stay clean |
+| `ref: ${{ github.ref }}` checkout bypassed the snapshot redirect | gin checks out with a template `ref`; the job fetched `master` from github.com with the engine's local token → 401 → git interactive credential prompt → checkout failed ("could not read Username … terminal prompts disabled") | ✅ fixed — the redirect also applies to `ref: ${{ github.ref }}` when the run's ref provably targets the snapshot (`refs/heads/<default branch>`); other template refs stay conservative |
+| **The runner executes as root; GitHub runs steps as uid 1001** | gin's `TestSaveUploadedFileWithPermissionFailed` expects EACCES writing into a read-only dir; as root the write succeeds → "An error is expected but got nil" | ⚠️ documented, not fixed — see 1b.4 |
 
 ---
 

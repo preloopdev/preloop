@@ -1412,8 +1412,20 @@ pub(crate) fn redirect_primary_checkout(
     snapshot: &WorkspaceSnapshot,
     github_server_url: &str,
     runtime_token: &str,
+    github_ref: Option<&str>,
 ) -> usize {
     let mut redirected = 0;
+    // `ref: ${{ github.ref }}` selects the workflow run's own target. When
+    // the run is on the repository's default branch, that target is
+    // provably `refs/heads/<default>` — the snapshot's content — so the
+    // redirect applies. On any other ref (a feature branch, a tag, a PR
+    // merge ref) the checkout is explicit and must not be hijacked.
+    let ref_targets_default = github_ref.is_some_and(|run_ref| {
+        snapshot
+            .default_branch
+            .as_deref()
+            .is_some_and(|branch| run_ref == format!("refs/heads/{branch}"))
+    });
     for step in &mut message.steps {
         let is_checkout = step
             .reference
@@ -1449,8 +1461,15 @@ pub(crate) fn redirect_primary_checkout(
                 if value.is_empty() {
                     return false;
                 }
-                !value.contains("${{")
-                    || declared_default(name).is_none_or(|default| value != default)
+                if value.contains("${{") {
+                    // `ref: ${{ github.ref }}` on the default branch is the
+                    // snapshot, not an explicit remote target.
+                    if name == "ref" && value == "${{ github.ref }}" && ref_targets_default {
+                        return false;
+                    }
+                    return declared_default(name).is_none_or(|default| value != default);
+                }
+                true
             })
         };
         if !is_checkout
@@ -1883,6 +1902,10 @@ mod deepen_and_redirect_tests {
     }
 
     fn redirect_count(inputs: serde_json::Value) -> usize {
+        redirect_count_for_ref(inputs, Some("refs/heads/main"))
+    }
+
+    fn redirect_count_for_ref(inputs: serde_json::Value, github_ref: Option<&str>) -> usize {
         let mut message = checkout_message(serde_json::json!([{
             "id": "00000000-0000-0000-0000-000000000010",
             "name": "checkout",
@@ -1896,7 +1919,53 @@ mod deepen_and_redirect_tests {
             &snapshot_fixture(),
             "http://127.0.0.1:9090",
             "local-runtime-jwt",
+            github_ref,
         )
+    }
+
+    /// A checkout whose `ref` is `${{ github.ref }}` selects the run's own
+    /// target. On the repository's default branch that target is the
+    /// snapshot's content, so it may be redirected; on any other ref the
+    /// checkout is explicit and must not be hijacked.
+    #[test]
+    fn redirect_primary_checkout_respects_github_ref_on_default_branch() {
+        // The run is on the default branch: `github.ref` is the snapshot.
+        assert_eq!(
+            redirect_count_for_ref(
+                serde_json::json!({"ref": "${{ github.ref }}", "fetch-depth": "0"}),
+                Some("refs/heads/main")
+            ),
+            1,
+            "github.ref on the default branch must be redirected"
+        );
+        // The run is on a feature branch: `github.ref` is explicit.
+        assert_eq!(
+            redirect_count_for_ref(
+                serde_json::json!({"ref": "${{ github.ref }}", "fetch-depth": "0"}),
+                Some("refs/heads/feature")
+            ),
+            0,
+            "github.ref on a feature branch must not be redirected"
+        );
+        // A tag run is explicit too.
+        assert_eq!(
+            redirect_count_for_ref(
+                serde_json::json!({"ref": "${{ github.ref }}", "fetch-depth": "0"}),
+                Some("refs/tags/v1.0.0")
+            ),
+            0,
+            "a tag github.ref must not be redirected"
+        );
+        // Without the run's ref the server cannot prove the target — the
+        // conservative answer is to not redirect.
+        assert_eq!(
+            redirect_count_for_ref(
+                serde_json::json!({"ref": "${{ github.ref }}", "fetch-depth": "0"}),
+                None
+            ),
+            0,
+            "an unknown run ref must not be redirected"
+        );
     }
 
     /// A checkout whose `ref`/`repository` input is a template expression
