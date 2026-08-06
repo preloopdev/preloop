@@ -1,0 +1,667 @@
+TLC counterexample for invariant FormatEscapeClosed
+(from tlc-hunt-s6-safety.out)
+
+State 1: <Initial predicate>
+/\ brokerMsg = <<0, 0, 0, 0, 0, 0, 0, 0>>
+/\ gateHeld = {}
+/\ listenerJob = ( s1 :>
+      [ run |-> norun,
+        job |-> nojob,
+        req |-> 0,
+        workerAlive |-> FALSE,
+        cancelSent |-> FALSE,
+        killAt |-> -1,
+        shutdownSrc |-> "NoShutdown" ] @@
+  s2 :>
+      [ run |-> norun,
+        job |-> nojob,
+        req |-> 0,
+        workerAlive |-> FALSE,
+        cancelSent |-> FALSE,
+        killAt |-> -1,
+        shutdownSrc |-> "NoShutdown" ] )
+/\ planReq = <<0, 0, 0, 0, 0, 0, 0, 0>>
+/\ scannerDiverged = FALSE
+/\ forceFailed = (s1 :> FALSE @@ s2 :> FALSE)
+/\ msgIdNext = 0
+/\ blockedJobs = <<>>
+/\ pendingJobs = <<>>
+/\ lines = <<>>
+/\ now = 0
+/\ pendingExp = <<>>
+/\ ghostJob = {}
+/\ stepGroupsAlive = {}
+/\ setupFailed = FALSE
+/\ sessionActive = (s1 :> 0 @@ s2 :> 0)
+/\ mintInFlight = {}
+/\ signalled = {}
+/\ scanState = "Normal"
+/\ maskSet = {}
+/\ completeReported = FALSE
+/\ agentJobReq = (job1 :> 0 @@ job2 :> 0 @@ job3 :> 0)
+/\ changeOrder = 0
+/\ timelineReq = <<0, 0, 0, 0, 0, 0, 0, 0>>
+/\ holderKeys = (run1 :> {} @@ run2 :> {})
+/\ workerReported = (s1 :> FALSE @@ s2 :> FALSE)
+/\ jobsetReady = {}
+/\ heldRuns = (run1 :> {} @@ run2 :> {})
+/\ inflightReq = {}
+/\ httpUp = TRUE
+/\ hasGate = ( run1 :> (job1 :> nokey @@ job2 :> nokey @@ job3 :> nokey) @@
+  run2 :> (job1 :> nokey @@ job2 :> nokey @@ job3 :> nokey) )
+/\ runStatus = (run1 :> "NoStatus" @@ run2 :> "NoStatus")
+/\ deliveredCancel = <<>>
+/\ runJobs = (run1 :> {} @@ run2 :> {})
+/\ cancelSentStep = {}
+/\ fanoutReqs = {}
+/\ cancelFlipped = {}
+/\ jobStatus = ( run1 :> (job1 :> "StQueued" @@ job2 :> "StQueued" @@ job3 :> "StQueued") @@
+  run2 :> (job1 :> "StQueued" @@ job2 :> "StQueued" @@ job3 :> "StQueued") )
+/\ gen = 0
+/\ faultCounters = [ submit |-> 0,
+  arrive |-> 0,
+  cancel |-> 0,
+  time |-> 0,
+  httpFail |-> 0,
+  shutdown |-> 0,
+  workerCrash |-> 0,
+  parseFail |-> 0,
+  postFail |-> 0,
+  escapeSwitch |-> 0,
+  maskFail |-> 0,
+  crash |-> 0,
+  output |-> 0,
+  input |-> 0 ]
+/\ escapeBraces = TRUE
+/\ renewAborted = FALSE
+/\ poolPending = {}
+/\ jobsetAdm = (js1 :> [gates |-> {}, acquired |-> {}])
+/\ sessionRunner = (s1 :> r1 @@ s2 :> r1)
+/\ jobAssign = ( run1 :> (job1 :> norunner @@ job2 :> norunner @@ job3 :> norunner) @@
+  run2 :> (job1 :> norunner @@ job2 :> norunner @@ job3 :> norunner) )
+/\ processed = (s1 :> {} @@ s2 :> {})
+/\ steps = ( st1 :>
+      [ status |-> "StPending",
+        conclusion |-> "RNone",
+        killCause |-> "NoKill" ] @@
+  st2 :>
+      [status |-> "StPending", conclusion |-> "RNone", killCause |-> "NoKill"] )
+/\ pubGen = 0
+/\ acked = (s1 :> {} @@ s2 :> {})
+/\ formatError = FALSE
+/\ dirty = {}
+/\ outputBytes = 0
+/\ msgIdHigh = 1000000
+/\ cancelQueue = <<>>
+/\ expanding = {}
+/\ reqInfo = << [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ],
+   [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ],
+   [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ],
+   [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ],
+   [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ],
+   [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ],
+   [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ],
+   [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ] >>
+/\ inflightMsgs = (s1 :> {} @@ s2 :> {})
+/\ discardedCompletion = {}
+/\ dispatchQueue = <<>>
+/\ groups = ( g1 :>
+      [ pending |-> <<>>,
+        running |->
+            [ run |-> norun,
+              jobs |-> {},
+              job |-> nojob,
+              kind |-> "NoHolder" ] ] @@
+  g2 :>
+      [ pending |-> <<>>,
+        running |->
+            [run |-> norun, jobs |-> {}, job |-> nojob, kind |-> "NoHolder"] ] )
+/\ parsed = (s1 :> {} @@ s2 :> {})
+
+State 2: <MCWorkerQueueUpdate(st2,"StQueued","RNone") line 368, col 5 to line 369, col 26 of module MC>
+/\ brokerMsg = <<0, 0, 0, 0, 0, 0, 0, 0>>
+/\ gateHeld = {}
+/\ listenerJob = ( s1 :>
+      [ run |-> norun,
+        job |-> nojob,
+        req |-> 0,
+        workerAlive |-> FALSE,
+        cancelSent |-> FALSE,
+        killAt |-> -1,
+        shutdownSrc |-> "NoShutdown" ] @@
+  s2 :>
+      [ run |-> norun,
+        job |-> nojob,
+        req |-> 0,
+        workerAlive |-> FALSE,
+        cancelSent |-> FALSE,
+        killAt |-> -1,
+        shutdownSrc |-> "NoShutdown" ] )
+/\ planReq = <<0, 0, 0, 0, 0, 0, 0, 0>>
+/\ scannerDiverged = FALSE
+/\ forceFailed = (s1 :> FALSE @@ s2 :> FALSE)
+/\ msgIdNext = 0
+/\ blockedJobs = <<>>
+/\ pendingJobs = <<>>
+/\ lines = <<>>
+/\ now = 0
+/\ pendingExp = <<>>
+/\ ghostJob = {}
+/\ stepGroupsAlive = {}
+/\ setupFailed = FALSE
+/\ sessionActive = (s1 :> 0 @@ s2 :> 0)
+/\ mintInFlight = {}
+/\ signalled = {}
+/\ scanState = "Normal"
+/\ maskSet = {}
+/\ completeReported = FALSE
+/\ agentJobReq = (job1 :> 0 @@ job2 :> 0 @@ job3 :> 0)
+/\ changeOrder = 0
+/\ timelineReq = <<0, 0, 0, 0, 0, 0, 0, 0>>
+/\ holderKeys = (run1 :> {} @@ run2 :> {})
+/\ workerReported = (s1 :> FALSE @@ s2 :> FALSE)
+/\ jobsetReady = {}
+/\ heldRuns = (run1 :> {} @@ run2 :> {})
+/\ inflightReq = {}
+/\ httpUp = TRUE
+/\ hasGate = ( run1 :> (job1 :> nokey @@ job2 :> nokey @@ job3 :> nokey) @@
+  run2 :> (job1 :> nokey @@ job2 :> nokey @@ job3 :> nokey) )
+/\ runStatus = (run1 :> "NoStatus" @@ run2 :> "NoStatus")
+/\ deliveredCancel = <<>>
+/\ runJobs = (run1 :> {} @@ run2 :> {})
+/\ cancelSentStep = {}
+/\ fanoutReqs = {}
+/\ cancelFlipped = {}
+/\ jobStatus = ( run1 :> (job1 :> "StQueued" @@ job2 :> "StQueued" @@ job3 :> "StQueued") @@
+  run2 :> (job1 :> "StQueued" @@ job2 :> "StQueued" @@ job3 :> "StQueued") )
+/\ gen = 1
+/\ faultCounters = [ submit |-> 0,
+  arrive |-> 0,
+  cancel |-> 0,
+  time |-> 0,
+  httpFail |-> 0,
+  shutdown |-> 0,
+  workerCrash |-> 0,
+  parseFail |-> 0,
+  postFail |-> 0,
+  escapeSwitch |-> 0,
+  maskFail |-> 0,
+  crash |-> 0,
+  output |-> 0,
+  input |-> 0 ]
+/\ escapeBraces = TRUE
+/\ renewAborted = FALSE
+/\ poolPending = {}
+/\ jobsetAdm = (js1 :> [gates |-> {}, acquired |-> {}])
+/\ sessionRunner = (s1 :> r1 @@ s2 :> r1)
+/\ jobAssign = ( run1 :> (job1 :> norunner @@ job2 :> norunner @@ job3 :> norunner) @@
+  run2 :> (job1 :> norunner @@ job2 :> norunner @@ job3 :> norunner) )
+/\ processed = (s1 :> {} @@ s2 :> {})
+/\ steps = ( st1 :>
+      [ status |-> "StPending",
+        conclusion |-> "RNone",
+        killCause |-> "NoKill" ] @@
+  st2 :>
+      [status |-> "StQueued", conclusion |-> "RNone", killCause |-> "NoKill"] )
+/\ pubGen = 0
+/\ acked = (s1 :> {} @@ s2 :> {})
+/\ formatError = FALSE
+/\ dirty = {st2}
+/\ outputBytes = 0
+/\ msgIdHigh = 1000000
+/\ cancelQueue = <<>>
+/\ expanding = {}
+/\ reqInfo = << [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ],
+   [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ],
+   [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ],
+   [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ],
+   [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ],
+   [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ],
+   [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ],
+   [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ] >>
+/\ inflightMsgs = (s1 :> {} @@ s2 :> {})
+/\ discardedCompletion = {}
+/\ dispatchQueue = <<>>
+/\ groups = ( g1 :>
+      [ pending |-> <<>>,
+        running |->
+            [ run |-> norun,
+              jobs |-> {},
+              job |-> nojob,
+              kind |-> "NoHolder" ] ] @@
+  g2 :>
+      [ pending |-> <<>>,
+        running |->
+            [run |-> norun, jobs |-> {}, job |-> nojob, kind |-> "NoHolder"] ] )
+/\ parsed = (s1 :> {} @@ s2 :> {})
+
+State 3: <MCSetEscapeBracesFalse line 148, col 5 to line 150, col 69 of module MC>
+/\ brokerMsg = <<0, 0, 0, 0, 0, 0, 0, 0>>
+/\ gateHeld = {}
+/\ listenerJob = ( s1 :>
+      [ run |-> norun,
+        job |-> nojob,
+        req |-> 0,
+        workerAlive |-> FALSE,
+        cancelSent |-> FALSE,
+        killAt |-> -1,
+        shutdownSrc |-> "NoShutdown" ] @@
+  s2 :>
+      [ run |-> norun,
+        job |-> nojob,
+        req |-> 0,
+        workerAlive |-> FALSE,
+        cancelSent |-> FALSE,
+        killAt |-> -1,
+        shutdownSrc |-> "NoShutdown" ] )
+/\ planReq = <<0, 0, 0, 0, 0, 0, 0, 0>>
+/\ scannerDiverged = FALSE
+/\ forceFailed = (s1 :> FALSE @@ s2 :> FALSE)
+/\ msgIdNext = 0
+/\ blockedJobs = <<>>
+/\ pendingJobs = <<>>
+/\ lines = <<>>
+/\ now = 0
+/\ pendingExp = <<>>
+/\ ghostJob = {}
+/\ stepGroupsAlive = {}
+/\ setupFailed = FALSE
+/\ sessionActive = (s1 :> 0 @@ s2 :> 0)
+/\ mintInFlight = {}
+/\ signalled = {}
+/\ scanState = "Normal"
+/\ maskSet = {}
+/\ completeReported = FALSE
+/\ agentJobReq = (job1 :> 0 @@ job2 :> 0 @@ job3 :> 0)
+/\ changeOrder = 0
+/\ timelineReq = <<0, 0, 0, 0, 0, 0, 0, 0>>
+/\ holderKeys = (run1 :> {} @@ run2 :> {})
+/\ workerReported = (s1 :> FALSE @@ s2 :> FALSE)
+/\ jobsetReady = {}
+/\ heldRuns = (run1 :> {} @@ run2 :> {})
+/\ inflightReq = {}
+/\ httpUp = TRUE
+/\ hasGate = ( run1 :> (job1 :> nokey @@ job2 :> nokey @@ job3 :> nokey) @@
+  run2 :> (job1 :> nokey @@ job2 :> nokey @@ job3 :> nokey) )
+/\ runStatus = (run1 :> "NoStatus" @@ run2 :> "NoStatus")
+/\ deliveredCancel = <<>>
+/\ runJobs = (run1 :> {} @@ run2 :> {})
+/\ cancelSentStep = {}
+/\ fanoutReqs = {}
+/\ cancelFlipped = {}
+/\ jobStatus = ( run1 :> (job1 :> "StQueued" @@ job2 :> "StQueued" @@ job3 :> "StQueued") @@
+  run2 :> (job1 :> "StQueued" @@ job2 :> "StQueued" @@ job3 :> "StQueued") )
+/\ gen = 1
+/\ faultCounters = [ submit |-> 0,
+  arrive |-> 0,
+  cancel |-> 0,
+  time |-> 0,
+  httpFail |-> 0,
+  shutdown |-> 0,
+  workerCrash |-> 0,
+  parseFail |-> 0,
+  postFail |-> 0,
+  escapeSwitch |-> 1,
+  maskFail |-> 0,
+  crash |-> 0,
+  output |-> 0,
+  input |-> 0 ]
+/\ escapeBraces = FALSE
+/\ renewAborted = FALSE
+/\ poolPending = {}
+/\ jobsetAdm = (js1 :> [gates |-> {}, acquired |-> {}])
+/\ sessionRunner = (s1 :> r1 @@ s2 :> r1)
+/\ jobAssign = ( run1 :> (job1 :> norunner @@ job2 :> norunner @@ job3 :> norunner) @@
+  run2 :> (job1 :> norunner @@ job2 :> norunner @@ job3 :> norunner) )
+/\ processed = (s1 :> {} @@ s2 :> {})
+/\ steps = ( st1 :>
+      [ status |-> "StPending",
+        conclusion |-> "RNone",
+        killCause |-> "NoKill" ] @@
+  st2 :>
+      [status |-> "StQueued", conclusion |-> "RNone", killCause |-> "NoKill"] )
+/\ pubGen = 0
+/\ acked = (s1 :> {} @@ s2 :> {})
+/\ formatError = FALSE
+/\ dirty = {st2}
+/\ outputBytes = 0
+/\ msgIdHigh = 1000000
+/\ cancelQueue = <<>>
+/\ expanding = {}
+/\ reqInfo = << [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ],
+   [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ],
+   [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ],
+   [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ],
+   [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ],
+   [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ],
+   [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ],
+   [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ] >>
+/\ inflightMsgs = (s1 :> {} @@ s2 :> {})
+/\ discardedCompletion = {}
+/\ dispatchQueue = <<>>
+/\ groups = ( g1 :>
+      [ pending |-> <<>>,
+        running |->
+            [ run |-> norun,
+              jobs |-> {},
+              job |-> nojob,
+              kind |-> "NoHolder" ] ] @@
+  g2 :>
+      [ pending |-> <<>>,
+        running |->
+            [run |-> norun, jobs |-> {}, job |-> nojob, kind |-> "NoHolder"] ] )
+/\ parsed = (s1 :> {} @@ s2 :> {})
+
+State 4: <MCBuildFormat(TRUE,TRUE) line 174, col 5 to line 176, col 62 of module MC>
+/\ brokerMsg = <<0, 0, 0, 0, 0, 0, 0, 0>>
+/\ gateHeld = {}
+/\ listenerJob = ( s1 :>
+      [ run |-> norun,
+        job |-> nojob,
+        req |-> 0,
+        workerAlive |-> FALSE,
+        cancelSent |-> FALSE,
+        killAt |-> -1,
+        shutdownSrc |-> "NoShutdown" ] @@
+  s2 :>
+      [ run |-> norun,
+        job |-> nojob,
+        req |-> 0,
+        workerAlive |-> FALSE,
+        cancelSent |-> FALSE,
+        killAt |-> -1,
+        shutdownSrc |-> "NoShutdown" ] )
+/\ planReq = <<0, 0, 0, 0, 0, 0, 0, 0>>
+/\ scannerDiverged = FALSE
+/\ forceFailed = (s1 :> FALSE @@ s2 :> FALSE)
+/\ msgIdNext = 0
+/\ blockedJobs = <<>>
+/\ pendingJobs = <<>>
+/\ lines = <<>>
+/\ now = 0
+/\ pendingExp = <<>>
+/\ ghostJob = {}
+/\ stepGroupsAlive = {}
+/\ setupFailed = FALSE
+/\ sessionActive = (s1 :> 0 @@ s2 :> 0)
+/\ mintInFlight = {}
+/\ signalled = {}
+/\ scanState = "Normal"
+/\ maskSet = {}
+/\ completeReported = FALSE
+/\ agentJobReq = (job1 :> 0 @@ job2 :> 0 @@ job3 :> 0)
+/\ changeOrder = 0
+/\ timelineReq = <<0, 0, 0, 0, 0, 0, 0, 0>>
+/\ holderKeys = (run1 :> {} @@ run2 :> {})
+/\ workerReported = (s1 :> FALSE @@ s2 :> FALSE)
+/\ jobsetReady = {}
+/\ heldRuns = (run1 :> {} @@ run2 :> {})
+/\ inflightReq = {}
+/\ httpUp = TRUE
+/\ hasGate = ( run1 :> (job1 :> nokey @@ job2 :> nokey @@ job3 :> nokey) @@
+  run2 :> (job1 :> nokey @@ job2 :> nokey @@ job3 :> nokey) )
+/\ runStatus = (run1 :> "NoStatus" @@ run2 :> "NoStatus")
+/\ deliveredCancel = <<>>
+/\ runJobs = (run1 :> {} @@ run2 :> {})
+/\ cancelSentStep = {}
+/\ fanoutReqs = {}
+/\ cancelFlipped = {}
+/\ jobStatus = ( run1 :> (job1 :> "StQueued" @@ job2 :> "StQueued" @@ job3 :> "StQueued") @@
+  run2 :> (job1 :> "StQueued" @@ job2 :> "StQueued" @@ job3 :> "StQueued") )
+/\ gen = 1
+/\ faultCounters = [ submit |-> 0,
+  arrive |-> 0,
+  cancel |-> 0,
+  time |-> 0,
+  httpFail |-> 0,
+  shutdown |-> 0,
+  workerCrash |-> 0,
+  parseFail |-> 0,
+  postFail |-> 0,
+  escapeSwitch |-> 1,
+  maskFail |-> 0,
+  crash |-> 0,
+  output |-> 0,
+  input |-> 1 ]
+/\ escapeBraces = FALSE
+/\ renewAborted = FALSE
+/\ poolPending = {}
+/\ jobsetAdm = (js1 :> [gates |-> {}, acquired |-> {}])
+/\ sessionRunner = (s1 :> r1 @@ s2 :> r1)
+/\ jobAssign = ( run1 :> (job1 :> norunner @@ job2 :> norunner @@ job3 :> norunner) @@
+  run2 :> (job1 :> norunner @@ job2 :> norunner @@ job3 :> norunner) )
+/\ processed = (s1 :> {} @@ s2 :> {})
+/\ steps = ( st1 :>
+      [ status |-> "StPending",
+        conclusion |-> "RNone",
+        killCause |-> "NoKill" ] @@
+  st2 :>
+      [status |-> "StQueued", conclusion |-> "RNone", killCause |-> "NoKill"] )
+/\ pubGen = 0
+/\ acked = (s1 :> {} @@ s2 :> {})
+/\ formatError = TRUE
+/\ dirty = {st2}
+/\ outputBytes = 0
+/\ msgIdHigh = 1000000
+/\ cancelQueue = <<>>
+/\ expanding = {}
+/\ reqInfo = << [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ],
+   [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ],
+   [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ],
+   [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ],
+   [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ],
+   [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ],
+   [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ],
+   [ run |-> norun,
+     job |-> nojob,
+     result |-> "RNone",
+     state |-> "SNone",
+     started |-> -1,
+     renew |-> -1,
+     deadline |-> -1 ] >>
+/\ inflightMsgs = (s1 :> {} @@ s2 :> {})
+/\ discardedCompletion = {}
+/\ dispatchQueue = <<>>
+/\ groups = ( g1 :>
+      [ pending |-> <<>>,
+        running |->
+            [ run |-> norun,
+              jobs |-> {},
+              job |-> nojob,
+              kind |-> "NoHolder" ] ] @@
+  g2 :>
+      [ pending |-> <<>>,
+        running |->
+            [run |-> norun, jobs |-> {}, job |-> nojob, kind |-> "NoHolder"] ] )
+/\ parsed = (s1 :> {} @@ s2 :> {})
+
+26914 states generated, 7821 distinct states found, 7556 states left on queue.
+The depth of the complete state graph search is 4.
+Finished in 05s at (2026-08-04 20:56:26)
+Trace exploration spec path: ./MC_TTrace_1785891381.tla
