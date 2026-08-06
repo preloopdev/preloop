@@ -7,6 +7,7 @@ pub fn parse_workflow(input: &str) -> Result<Workflow, ParserError> {
     let mut value: serde_yaml::Value = serde_yaml::from_str(input)?;
     normalize_yaml_keys(&mut value);
     let workflow: Workflow = serde_yaml::from_value(value)?;
+    workflow.on.validate_event_names()?;
     if workflow.jobs.is_empty() {
         return Err(ParserError::EmptyJobs);
     }
