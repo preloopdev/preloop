@@ -134,6 +134,14 @@ pub struct MachineSpec {
     pub volumes: Vec<VolumeMount>,
     /// Narrowly scoped host Unix sockets.
     pub sockets: Vec<SocketMount>,
+    /// Guest DNS resolver, passed through as smolvm's `--dns`.
+    ///
+    /// smolvm's registry client resolves through the guest, and defaults to
+    /// the public resolvers (8.8.8.8/1.1.1.1) — unreachable on networks that
+    /// filter them (many LANs). Override from the host when the guest must
+    /// pull images on such networks.
+    #[serde(default)]
+    pub dns: Option<String>,
     /// Enable Rosetta 2 x86_64 translation on Apple Silicon.
     #[serde(default)]
     pub rosetta: bool,
@@ -474,6 +482,9 @@ impl VmProvider for SmolVmProvider {
                     args.extend(["--allow-cidr".into(), cidr.clone()]);
                 }
             }
+        }
+        if let Some(dns) = &spec.dns {
+            args.extend(["--dns".into(), dns.clone()]);
         }
         for mount in &spec.volumes {
             let mut value = format!("{}:{}", mount.host.display(), mount.guest.display());

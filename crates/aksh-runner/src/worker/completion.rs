@@ -199,6 +199,10 @@ pub(crate) fn runner_conclusion(conclusion: &str) -> &'static str {
         "failure" | "failed" => "failed",
         "cancelled" | "canceled" => "canceled",
         "skipped" => "skipped",
+        // Official TaskResult.Abandoned: the job never finished on this runner
+        // (lease lost / first renew failed). Kept distinct on the wire so the
+        // server can tell "runner vanished" from "steps failed".
+        "abandoned" => "abandoned",
         _ => "failed",
     }
 }
@@ -365,6 +369,7 @@ pub(crate) async fn report_completion(
                     let azdo_result_str = match result.to_ascii_lowercase().as_str() {
                         "success" | "succeeded" => "succeeded",
                         "cancelled" | "canceled" => "canceled",
+                        "abandoned" => "abandoned",
                         _ => "failed",
                     };
                     let issues: Vec<serde_json::Value> = job_ctx

@@ -373,6 +373,12 @@ impl ProdState {
             job_outputs: BTreeMap::new(),
             job_base_ids,
             job_needs: BTreeMap::new(),
+            caller_plans: BTreeMap::new(),
+            job_names: BTreeMap::new(),
+            github: serde_json::Value::Null,
+            head_sha: String::new(),
+            workflow_ref: String::new(),
+            workspace_snapshot: None,
             job_fail_fast: BTreeMap::new(),
             job_continue_on_error: BTreeMap::new(),
             job_check_run_ids: BTreeMap::new(),
@@ -1566,5 +1572,130 @@ pub mod pure {
                 QUEUE_MAX_PENDING
             );
         }
+    }
+}
+
+/// Regression tests for the two concurrency-holder leaks found in review.
+///
+/// Both are release-path defects: a group slot stays occupied (or is handed
+/// away) after the code believes it settled the holder, so a later run in the
+/// same group parks forever. Each test fails on the unfixed code.
+mod holder_leak_regressions {
+    use super::*;
+    use crate::runtime_scheduling::{apply_matrix_fail_fast, try_acquire_concurrency};
+
+    fn key() -> (String, String) {
+        ("group-a".to_owned(), "owner/repo".to_owned())
+    }
+
+    /// MC-R1: fail-fast cancels a matrix sibling without releasing the
+    /// concurrency slot that sibling holds.
+    ///
+    /// `apply_matrix_fail_fast` flips siblings to `Cancelled` and drops them
+    /// from the queue, but a cancelled sibling never reaches the completion
+    /// path that calls `release_concurrency_for_job`. Without the release the
+    /// group stays occupied by a job that will never run again.
+    #[test]
+    fn fail_fast_releases_the_cancelled_sibling_concurrency_slot() {
+        let mut prod = ProdState::new();
+        prod.register_run(1, &[1, 2]);
+        // Both cells share one base job, and the base is fail-fast.
+        if let Some(run) = prod.inner.runs.get_mut(&rid(1)) {
+            run.job_base_ids.insert(jid(1), "build".to_owned());
+            run.job_base_ids.insert(jid(2), "build".to_owned());
+            run.job_fail_fast.insert("build".to_owned(), true);
+            run.jobs.insert(jid(2), ExecutionStatus::InProgress);
+        }
+        // Sibling job2 owns the group slot.
+        let acquired = try_acquire_concurrency(
+            &mut prod.inner,
+            key(),
+            "group-a".to_owned(),
+            Holder::Job {
+                run_id: rid(1),
+                job_id: jid(2),
+            },
+            false,
+            ConcurrencyQueue::Single,
+        )
+        .expect("acquisition is valid");
+        assert!(acquired, "sibling must own the slot before fail-fast");
+
+        // job1 fails; fail-fast cancels job2.
+        let cancelled = apply_matrix_fail_fast(&mut prod.inner, rid(1), &jid(1));
+        assert!(
+            cancelled.contains(&jid(2)),
+            "fail-fast must cancel the sibling, got {cancelled:?}"
+        );
+
+        let still_held = prod
+            .inner
+            .concurrency_groups
+            .get(&key())
+            .and_then(|group| group.running.clone());
+        assert!(
+            still_held.is_none(),
+            "the cancelled sibling's slot must be released, still held by {still_held:?}"
+        );
+    }
+
+    /// MC-R2: `cancel-in-progress` admission cancels a predecessor belonging
+    /// to the *arriving* run, which then releases the arriving holder.
+    ///
+    /// `release_concurrency_for_run` matches `group.running` by `run_id`
+    /// alone, so cancelling a same-run predecessor evicts the holder that was
+    /// installed microseconds earlier. The caller is told it holds the slot
+    /// while the group records no holder at all.
+    #[test]
+    fn same_run_cancel_in_progress_keeps_the_arriving_holder() {
+        let mut prod = ProdState::new();
+        prod.register_run(1, &[1]);
+
+        // The run holds the group at workflow level.
+        let acquired = try_acquire_concurrency(
+            &mut prod.inner,
+            key(),
+            "group-a".to_owned(),
+            Holder::Run(rid(1)),
+            false,
+            ConcurrencyQueue::Single,
+        )
+        .expect("acquisition is valid");
+        assert!(acquired, "the run must own the slot first");
+
+        // A job of the SAME run arrives at the same group with
+        // cancel-in-progress.
+        let arriving = Holder::Job {
+            run_id: rid(1),
+            job_id: jid(1),
+        };
+        let acquired = try_acquire_concurrency(
+            &mut prod.inner,
+            key(),
+            "group-a".to_owned(),
+            arriving.clone(),
+            true,
+            ConcurrencyQueue::Single,
+        )
+        .expect("acquisition is valid");
+        assert!(acquired, "the arriving holder is admitted");
+
+        let running = prod
+            .inner
+            .concurrency_groups
+            .get(&key())
+            .and_then(|group| group.running.clone());
+        assert_eq!(
+            running,
+            Some(arriving),
+            "admission returned true, so the group must record the arriving holder"
+        );
+        assert!(
+            prod.inner
+                .holder_keys
+                .get(&rid(1))
+                .is_some_and(|keys| keys.contains(&key())),
+            "the arriving holder's key tracking must survive its own admission"
+        );
     }
 }

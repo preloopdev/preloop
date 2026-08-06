@@ -133,6 +133,7 @@ esac
             network: NetworkPolicy::Disabled,
             volumes: Vec::new(),
             sockets: Vec::new(),
+            dns: None,
             rosetta: false,
         }
     }
@@ -157,6 +158,7 @@ esac
                 hosts: vec!["example.com".to_owned(), "api.example.com".to_owned()],
                 cidrs: vec!["10.0.0.0/8".to_owned(), "2001:db8::/32".to_owned()],
             },
+            dns: Some("192.168.1.1".into()),
             volumes: vec![
                 VolumeMount {
                     host: host_rw.clone(),
@@ -206,6 +208,8 @@ esac
                 "10.0.0.0/8".to_owned(),
                 "--allow-cidr".to_owned(),
                 "2001:db8::/32".to_owned(),
+                "--dns".to_owned(),
+                "192.168.1.1".to_owned(),
                 "--volume".to_owned(),
                 format!("{}:/workspace", host_rw.display()),
                 "--volume".to_owned(),

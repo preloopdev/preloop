@@ -1,0 +1,1032 @@
+[
+  {
+    "type": "cameraUpdate",
+    "width": 1400,
+    "height": 1000,
+    "x": 0,
+    "y": 0
+  },
+  {
+    "type": "text",
+    "id": "title",
+    "x": 420,
+    "y": 25,
+    "text": "aksh-runner-server \u2014 Control Plane",
+    "fontSize": 28,
+    "strokeColor": "#1e1e1e"
+  },
+  {
+    "type": "text",
+    "id": "subtitle",
+    "x": 420,
+    "y": 60,
+    "text": "axum HTTP routes + broker protocol + in-memory state",
+    "fontSize": 15,
+    "strokeColor": "#757575"
+  },
+  {
+    "type": "rectangle",
+    "id": "zone_ext",
+    "x": 50,
+    "y": 110,
+    "width": 220,
+    "height": 830,
+    "backgroundColor": "#dbe4ff",
+    "fillStyle": "solid",
+    "opacity": 25,
+    "strokeColor": "#1e40af",
+    "strokeWidth": 1.5,
+    "roundness": {
+      "type": 3
+    }
+  },
+  {
+    "type": "text",
+    "id": "zone_l_ext",
+    "x": 70,
+    "y": 125,
+    "text": "External Clients",
+    "fontSize": 18,
+    "strokeColor": "#1e40af"
+  },
+  {
+    "type": "rectangle",
+    "id": "c_runner",
+    "x": 70,
+    "y": 180,
+    "width": 180,
+    "height": 70,
+    "backgroundColor": "#a5d8ff",
+    "fillStyle": "solid",
+    "strokeColor": "#4a9eed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Runners (Listener)\nAzDO / broker poll",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "c_gh",
+    "x": 70,
+    "y": 300,
+    "width": 180,
+    "height": 70,
+    "backgroundColor": "#a5d8ff",
+    "fillStyle": "solid",
+    "strokeColor": "#4a9eed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "GitHub Webhook\nevents / push",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "c_cli",
+    "x": 70,
+    "y": 420,
+    "width": 180,
+    "height": 70,
+    "backgroundColor": "#a5d8ff",
+    "fillStyle": "solid",
+    "strokeColor": "#4a9eed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "preloop CLI\nworkflow submission",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "zone_routes",
+    "x": 310,
+    "y": 110,
+    "width": 1040,
+    "height": 250,
+    "backgroundColor": "#e5dbff",
+    "fillStyle": "solid",
+    "opacity": 25,
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 1.5,
+    "roundness": {
+      "type": 3
+    }
+  },
+  {
+    "type": "text",
+    "id": "zone_l_routes",
+    "x": 330,
+    "y": 125,
+    "text": "Route Surfaces (axum)",
+    "fontSize": 18,
+    "strokeColor": "#7c3aed"
+  },
+  {
+    "type": "rectangle",
+    "id": "r_apis",
+    "x": 330,
+    "y": 165,
+    "width": 230,
+    "height": 80,
+    "backgroundColor": "#d0bfff",
+    "fillStyle": "solid",
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "_apis/\u2026 (AzDO)\nAgent & Session APIs",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "r_v1",
+    "x": 585,
+    "y": 165,
+    "width": 230,
+    "height": 80,
+    "backgroundColor": "#d0bfff",
+    "fillStyle": "solid",
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "/api/v1/\u2026 (native)\nsubmit / get / cancel",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "r_broker",
+    "x": 840,
+    "y": 165,
+    "width": 230,
+    "height": 80,
+    "backgroundColor": "#d0bfff",
+    "fillStyle": "solid",
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "/broker/\u2026 (modern)\nacquire / renew / msg",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "r_twirp",
+    "x": 1095,
+    "y": 165,
+    "width": 230,
+    "height": 80,
+    "backgroundColor": "#d0bfff",
+    "fillStyle": "solid",
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Twirp + webhooks\nresults, artifacts, events",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "r_auth",
+    "x": 450,
+    "y": 275,
+    "width": 320,
+    "height": 60,
+    "backgroundColor": "#d0bfff",
+    "fillStyle": "solid",
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "auth.rs \u2014 Bearer / mTLS / OAuth",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "r_err",
+    "x": 850,
+    "y": 275,
+    "width": 320,
+    "height": 60,
+    "backgroundColor": "#d0bfff",
+    "fillStyle": "solid",
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "errors.rs \u2014 ApiError \u2192 HTTP 4xx/5xx",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "zone_state",
+    "x": 310,
+    "y": 390,
+    "width": 1040,
+    "height": 250,
+    "backgroundColor": "#fff3bf",
+    "fillStyle": "solid",
+    "opacity": 25,
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 1.5,
+    "roundness": {
+      "type": 3
+    }
+  },
+  {
+    "type": "text",
+    "id": "zone_l_state",
+    "x": 330,
+    "y": 405,
+    "text": "In-Memory State",
+    "fontSize": 18,
+    "strokeColor": "#f59e0b"
+  },
+  {
+    "type": "rectangle",
+    "id": "s_runs",
+    "x": 330,
+    "y": 445,
+    "width": 230,
+    "height": 80,
+    "backgroundColor": "#ffd8a8",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "RunStore (in-mem)\nRunId, JobId, status",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "s_dag",
+    "x": 585,
+    "y": 445,
+    "width": 230,
+    "height": 80,
+    "backgroundColor": "#ffd8a8",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "QueuedJob + DAG\nneeds-gated dispatch",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "s_session",
+    "x": 840,
+    "y": 445,
+    "width": 230,
+    "height": 80,
+    "backgroundColor": "#ffd8a8",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Runner Sessions\ncrypto + ack + renew",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "s_events",
+    "x": 1095,
+    "y": 445,
+    "width": 230,
+    "height": 80,
+    "backgroundColor": "#ffd8a8",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Events (NDJSON)\nlog lines, step updates",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "s_log",
+    "x": 420,
+    "y": 555,
+    "width": 330,
+    "height": 60,
+    "backgroundColor": "#ffd8a8",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "LiveLogFeedLinesWrapper\nSSE streaming tail",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "s_bcast",
+    "x": 840,
+    "y": 555,
+    "width": 330,
+    "height": 60,
+    "backgroundColor": "#ffd8a8",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "broadcast::Sender<RunEvent>\nin-memory event bus",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "zone_aux",
+    "x": 310,
+    "y": 670,
+    "width": 1040,
+    "height": 270,
+    "backgroundColor": "#c3fae8",
+    "fillStyle": "solid",
+    "opacity": 25,
+    "strokeColor": "#0d9488",
+    "strokeWidth": 1.5,
+    "roundness": {
+      "type": 3
+    }
+  },
+  {
+    "type": "text",
+    "id": "zone_l_aux",
+    "x": 330,
+    "y": 685,
+    "text": "Auxiliary Subsystems",
+    "fontSize": 18,
+    "strokeColor": "#0d9488"
+  },
+  {
+    "type": "rectangle",
+    "id": "a_sched",
+    "x": 330,
+    "y": 725,
+    "width": 230,
+    "height": 80,
+    "backgroundColor": "#a5d8ff",
+    "fillStyle": "solid",
+    "strokeColor": "#0d9488",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "scheduler.rs\ncron & trigger dispatch",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "a_conc",
+    "x": 585,
+    "y": 725,
+    "width": 230,
+    "height": 80,
+    "backgroundColor": "#a5d8ff",
+    "fillStyle": "solid",
+    "strokeColor": "#0d9488",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "concurrency.rs\ngroup limits & matrix",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "a_oidc",
+    "x": 840,
+    "y": 725,
+    "width": 230,
+    "height": 80,
+    "backgroundColor": "#a5d8ff",
+    "fillStyle": "solid",
+    "strokeColor": "#0d9488",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "oidc.rs\nJWT mint + JWKS endpoint",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "a_evt",
+    "x": 1095,
+    "y": 725,
+    "width": 230,
+    "height": 80,
+    "backgroundColor": "#a5d8ff",
+    "fillStyle": "solid",
+    "strokeColor": "#0d9488",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "events/ (16+ handlers)\npush / dispatch / label",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_runner_broker",
+    "x": 250,
+    "y": 215,
+    "width": 705,
+    "height": -50,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        40,
+        0
+      ],
+      [
+        40,
+        -75
+      ],
+      [
+        705,
+        -75
+      ],
+      [
+        705,
+        -50
+      ]
+    ],
+    "strokeColor": "#1e1e1e",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "c_runner",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "r_broker",
+      "fixedPoint": [
+        0.5,
+        0
+      ]
+    },
+    "label": {
+      "text": "poll / acquire",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_gh_twirp",
+    "x": 250,
+    "y": 335,
+    "width": 960,
+    "height": -170,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        40,
+        0
+      ],
+      [
+        40,
+        -195
+      ],
+      [
+        960,
+        -195
+      ],
+      [
+        960,
+        -170
+      ]
+    ],
+    "strokeColor": "#1e1e1e",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "c_gh",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "r_twirp",
+      "fixedPoint": [
+        0.5,
+        0
+      ]
+    },
+    "label": {
+      "text": "webhook events",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_cli_v1",
+    "x": 250,
+    "y": 455,
+    "width": 450,
+    "height": -290,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        40,
+        0
+      ],
+      [
+        40,
+        -315
+      ],
+      [
+        450,
+        -315
+      ],
+      [
+        450,
+        -290
+      ]
+    ],
+    "strokeColor": "#1e1e1e",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "c_cli",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "r_v1",
+      "fixedPoint": [
+        0.5,
+        0
+      ]
+    },
+    "label": {
+      "text": "workflow submit",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_v1_runs",
+    "x": 700,
+    "y": 245,
+    "width": -290,
+    "height": 200,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        15
+      ],
+      [
+        -290,
+        15
+      ],
+      [
+        -290,
+        200
+      ]
+    ],
+    "strokeColor": "#15803d",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "r_v1",
+      "fixedPoint": [
+        0.5,
+        1
+      ]
+    },
+    "endBinding": {
+      "elementId": "s_runs",
+      "fixedPoint": [
+        0.35,
+        0
+      ]
+    },
+    "label": {
+      "text": "submit run",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_broker_session",
+    "x": 840,
+    "y": 245,
+    "width": 115,
+    "height": 200,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        -15,
+        0
+      ],
+      [
+        -15,
+        200
+      ],
+      [
+        115,
+        200
+      ]
+    ],
+    "strokeColor": "#15803d",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "r_broker",
+      "fixedPoint": [
+        0,
+        1
+      ]
+    },
+    "endBinding": {
+      "elementId": "s_session",
+      "fixedPoint": [
+        0.5,
+        0
+      ]
+    },
+    "label": {
+      "text": "open session",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_twirp_events",
+    "x": 1210,
+    "y": 245,
+    "width": 0,
+    "height": 200,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        200
+      ]
+    ],
+    "strokeColor": "#15803d",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "r_twirp",
+      "fixedPoint": [
+        0.5,
+        1
+      ]
+    },
+    "endBinding": {
+      "elementId": "s_events",
+      "fixedPoint": [
+        0.5,
+        0
+      ]
+    },
+    "label": {
+      "text": "stream logs",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_runs_dag",
+    "x": 560,
+    "y": 485,
+    "width": 25,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        25,
+        0
+      ]
+    ],
+    "strokeColor": "#b45309",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "s_runs",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "s_dag",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "enqueue",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_dag_session",
+    "x": 815,
+    "y": 485,
+    "width": 25,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        25,
+        0
+      ]
+    ],
+    "strokeColor": "#b45309",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "s_dag",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "s_session",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "dispatch",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_session_events",
+    "x": 1070,
+    "y": 485,
+    "width": 25,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        25,
+        0
+      ]
+    ],
+    "strokeColor": "#b45309",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "s_session",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "s_events",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "log",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_sched_runs",
+    "x": 445,
+    "y": 725,
+    "width": 0,
+    "height": -200,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        -80,
+        0
+      ],
+      [
+        -80,
+        -200
+      ],
+      [
+        0,
+        -200
+      ]
+    ],
+    "strokeColor": "#0f766e",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "a_sched",
+      "fixedPoint": [
+        0.5,
+        0
+      ]
+    },
+    "endBinding": {
+      "elementId": "s_runs",
+      "fixedPoint": [
+        0.5,
+        1
+      ]
+    },
+    "label": {
+      "text": "trigger",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_conc_dag",
+    "x": 700,
+    "y": 725,
+    "width": 80,
+    "height": -200,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        80,
+        0
+      ],
+      [
+        80,
+        -200
+      ],
+      [
+        0,
+        -200
+      ]
+    ],
+    "strokeColor": "#0f766e",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "a_conc",
+      "fixedPoint": [
+        0.5,
+        0
+      ]
+    },
+    "endBinding": {
+      "elementId": "s_dag",
+      "fixedPoint": [
+        0.5,
+        1
+      ]
+    },
+    "label": {
+      "text": "concurrency gate",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_oidc_session",
+    "x": 955,
+    "y": 725,
+    "width": -135,
+    "height": -200,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        -135,
+        0
+      ],
+      [
+        -135,
+        -200
+      ],
+      [
+        -115,
+        -200
+      ]
+    ],
+    "strokeColor": "#0f766e",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "a_oidc",
+      "fixedPoint": [
+        0.5,
+        0
+      ]
+    },
+    "endBinding": {
+      "elementId": "s_session",
+      "fixedPoint": [
+        0.5,
+        1
+      ]
+    },
+    "label": {
+      "text": "mint tokens",
+      "fontSize": 14
+    }
+  }
+]
