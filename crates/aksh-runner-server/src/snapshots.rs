@@ -23,6 +23,13 @@ const MAX_GIT_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorkspaceSnapshot {
     pub(crate) commit_sha: String,
+    /// The workspace's real HEAD commit (the commit the submission is based
+    /// on), when the workspace has one. This is the identity a workflow sees
+    /// as `github.sha`: it is what a custom checkout that fetches from the
+    /// real remote can actually resolve. The synthetic [`Self::commit_sha`]
+    /// exists only in this engine's snapshot store and would be rejected as
+    /// `not our ref` by the upstream host.
+    pub(crate) head_sha: Option<String>,
     pub(crate) repository: String,
     /// Current branch of the source workspace (`master`, `main`, …), when
     /// resolvable. Mirrored into the event payload as
@@ -48,6 +55,7 @@ pub(crate) async fn create_workspace_snapshot(
     state_dir: &FsPath,
     workspace: &FsPath,
     run_id: RunId,
+    github_pat: Option<&str>,
 ) -> Result<WorkspaceSnapshot, ApiError> {
     let workspace = std::fs::canonicalize(workspace).map_err(|error| {
         ApiError::bad_request(format!(
@@ -97,6 +105,7 @@ pub(crate) async fn create_workspace_snapshot(
         &staging_index,
         &final_repository,
         run_id,
+        github_pat,
     )
     .await;
     if let Err(error) = tokio::fs::remove_dir_all(&staging_root).await {
@@ -111,6 +120,7 @@ pub(crate) async fn create_workspace_snapshot(
 
     let SnapshotResult {
         commit_sha,
+        head_sha,
         default_branch,
         before_sha,
     } = result?;
@@ -122,6 +132,7 @@ pub(crate) async fn create_workspace_snapshot(
     );
     Ok(WorkspaceSnapshot {
         commit_sha,
+        head_sha,
         repository,
         default_branch,
         before_sha,
@@ -135,6 +146,7 @@ async fn create_workspace_snapshot_inner(
     staging_index: &FsPath,
     final_repository: &FsPath,
     run_id: RunId,
+    github_pat: Option<&str>,
 ) -> Result<SnapshotResult, ApiError> {
     // Creating the staging repository does not depend on anything we learn
     // from the workspace, so pay for both spawns at once. Every millisecond
@@ -165,32 +177,204 @@ async fn create_workspace_snapshot_inner(
             source_objects.display()
         )));
     }
-    // A shallow workspace ends its history at the commits listed in its
-    // `shallow` file. The snapshot commit parents onto the workspace HEAD
-    // (below), so `git fsck --connectivity-only` on the staging repository
-    // would walk past that boundary into commits the workspace never fetched
-    // and report broken links. Mirror the boundary so fsck knows where the
-    // history legitimately ends and checkout clones carry the same shallow
-    // depth (e.g. `HEAD^` remains resolvable for changed-file diffing).
-    if source_head.is_some() {
-        let source_shallow = common_dir.join("shallow");
-        if source_shallow.is_file() {
-            if let Err(error) =
-                tokio::fs::copy(&source_shallow, staging_repository.join("shallow")).await
-            {
-                return Err(ApiError::internal(format!(
-                    "failed to mirror workspace shallow boundary: {error}"
-                )));
-            }
-        }
-    }
-    let cache =
-        ensure_object_cache(state_dir, workspace, &common_dir, source_head.as_deref()).await?;
+    let cache = ensure_object_cache(
+        state_dir,
+        workspace,
+        &common_dir,
+        source_head.as_deref(),
+        github_pat,
+    )
+    .await?;
     let ObjectCache {
         objects: cached_objects,
         index: cache_index,
         refreshed: cache_refreshed,
+        ancestry_complete,
     } = cache;
+
+    // A shallow workspace ends its history at the commits listed in its
+    // `shallow` file; commits behind those roots were never fetched, so
+    // their objects do not exist anywhere local. The staging repository must
+    // serve a *complete* graph: a shallow-mirrored repo advertises refs
+    // whose ancestry crosses the boundary, and a plain full fetch from it is
+    // rejected by git ("shallow roots are not allowed to be updated"),
+    // leaving the client with a broken object store and unusable
+    // merge-base/diff walks. Instead, graft every shallow root to a
+    // parentless copy (`git replace --graft`), which pack-objects honors
+    // when serving. Clients then receive the boundary commit with no parents
+    // and never see a shallow edge; `HEAD^` and the snapshot parent chain
+    // stay resolvable for changed-file diffing.
+    // A shallow workspace ends its history at the commits listed in its
+    // `shallow` file; commits behind those roots were never fetched, so
+    // their objects do not exist anywhere local. The staging repository must
+    // serve a *complete* graph: advertising refs whose ancestry crosses the
+    // boundary makes git reject the client's full fetch ("shallow roots are
+    // not allowed to be updated") and leaves the client's object store
+    // broken for merge-base/diff walks. `git replace` does not help — the
+    // server-side pack generation deliberately ignores replace refs. So
+    // rewrite the reachable history: every shallow root becomes a
+    // parentless copy and every descendant is re-created with rewritten
+    // parent links, producing a self-contained, fsck-clean repository.
+    // Clients receive the boundary commits with no parents and never see a
+    // shallow edge; `HEAD^` and the snapshot parent chain stay resolvable
+    // for changed-file diffing. Returns the original→rewritten mapping for
+    // the shas the submission exposes (snapshot parent, before/after base).
+    let mut history_rewrite: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    // Only when the real ancestry could not be recovered: rewriting is what
+    // makes the served SHAs diverge from the forge's, so it is the fallback,
+    // not the default.
+    if source_head.is_some() && !ancestry_complete {
+        let source_shallow = common_dir.join("shallow");
+        if source_shallow.is_file() {
+            let shallow_roots = std::fs::read_to_string(&source_shallow).map_err(|error| {
+                ApiError::internal(format!("failed to read workspace shallow file: {error}"))
+            })?;
+            let shallow_roots = shallow_roots
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>();
+            if !shallow_roots.is_empty() {
+                // The shallow file stops `rev-list` at the boundary; the
+                // walk fails on the missing objects without it.
+                let staging_shallow = staging_repository.join("shallow");
+                tokio::fs::copy(&source_shallow, &staging_shallow)
+                    .await
+                    .map_err(|error| {
+                        ApiError::internal(format!(
+                            "failed to stage workspace shallow file: {error}"
+                        ))
+                    })?;
+                let rev_list = run_snapshot_git(
+                    workspace,
+                    staging_repository,
+                    staging_index,
+                    &cached_objects,
+                    [
+                        "rev-list",
+                        "--reverse",
+                        source_head.as_deref().expect("checked above"),
+                    ],
+                    "list shallow history",
+                )
+                .await?;
+                for sha in output_text(&rev_list, "list shallow history")?.lines() {
+                    let sha = sha.trim();
+                    if sha.is_empty() {
+                        continue;
+                    }
+                    let raw = {
+                        let mut cat = snapshot_git_command(
+                            workspace,
+                            staging_repository,
+                            staging_index,
+                            &cached_objects,
+                        );
+                        cat.args(["cat-file", "commit", sha]);
+                        let output = cat.output().await.map_err(|error| {
+                            ApiError::internal(format!("read commit {sha}: {error}"))
+                        })?;
+                        if !output.status.success() {
+                            return Err(ApiError::internal(format!(
+                                "failed to read commit {sha}: {}",
+                                String::from_utf8_lossy(&output.stderr).trim()
+                            )));
+                        }
+                        String::from_utf8_lossy(&output.stdout).into_owned()
+                    };
+                    let (header, body) = raw.split_once("\n\n").unwrap_or((raw.as_str(), ""));
+                    let mut parents = Vec::new();
+                    let mut author: Option<(String, String, String)> = None;
+                    let mut committer: Option<(String, String, String)> = None;
+                    let mut tree: Option<String> = None;
+                    let mut header_lines = header.lines().peekable();
+                    while let Some(line) = header_lines.next() {
+                        if let Some(value) = line.strip_prefix("tree ") {
+                            tree = Some(value.trim().to_owned());
+                        } else if let Some(value) = line.strip_prefix("parent ") {
+                            let parent = value.trim();
+                            if let Some(rewritten) = history_rewrite.get(parent) {
+                                parents.push(rewritten.clone());
+                            }
+                            // An unmapped parent is behind the shallow
+                            // boundary: drop it (this commit is a shallow
+                            // root and becomes parentless).
+                        } else if let Some(value) = line.strip_prefix("author ") {
+                            author = Some(parse_ident(value));
+                        } else if let Some(value) = line.strip_prefix("committer ") {
+                            committer = Some(parse_ident(value));
+                        } else if line.starts_with("gpgsig") {
+                            // Skip the signature and its indented
+                            // continuation lines.
+                            while header_lines
+                                .peek()
+                                .is_some_and(|next| next.starts_with(' '))
+                            {
+                                header_lines.next();
+                            }
+                        }
+                        // Other headers (e.g. `encoding`) are kept implicitly
+                        // by regenerating the commit from the tree, parents,
+                        // and ident below; they are not re-emitted.
+                    }
+                    let tree = tree
+                        .ok_or_else(|| ApiError::internal(format!("commit {sha} has no tree")))?;
+                    let mut commit_tree = snapshot_git_command(
+                        workspace,
+                        staging_repository,
+                        staging_index,
+                        &cached_objects,
+                    );
+                    if let Some((name, email, date)) = author {
+                        commit_tree
+                            .env("GIT_AUTHOR_NAME", name)
+                            .env("GIT_AUTHOR_EMAIL", email)
+                            .env("GIT_AUTHOR_DATE", date);
+                    }
+                    if let Some((name, email, date)) = committer {
+                        commit_tree
+                            .env("GIT_COMMITTER_NAME", name)
+                            .env("GIT_COMMITTER_EMAIL", email)
+                            .env("GIT_COMMITTER_DATE", date);
+                    }
+                    let mut args = vec!["commit-tree".to_owned(), tree];
+                    for parent in &parents {
+                        args.push("-p".to_owned());
+                        args.push(parent.clone());
+                    }
+                    commit_tree.args(args);
+                    let mut child = commit_tree
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .spawn()
+                        .map_err(|error| {
+                            ApiError::internal(format!("spawn commit-tree: {error}"))
+                        })?;
+                    AsyncWriteExt::write_all(
+                        child.stdin.as_mut().expect("stdin is piped"),
+                        body.as_bytes(),
+                    )
+                    .await
+                    .map_err(|error| ApiError::internal(format!("write commit body: {error}")))?;
+                    let output = child
+                        .wait_with_output()
+                        .await
+                        .map_err(|error| ApiError::internal(format!("run commit-tree: {error}")))?;
+                    if !output.status.success() {
+                        return Err(ApiError::internal(format!(
+                            "failed to rewrite commit {sha}: {}",
+                            String::from_utf8_lossy(&output.stderr).trim()
+                        )));
+                    }
+                    let rewritten = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                    history_rewrite.insert(sha.to_owned(), rewritten);
+                }
+                let _ = tokio::fs::remove_file(&staging_shallow).await;
+            }
+        }
+    }
 
     // `git add --all` has to decide, for every path, whether the working tree
     // still matches the index. With a cold index it re-hashes the whole tree;
@@ -224,9 +408,26 @@ async fn create_workspace_snapshot_inner(
         staging_index,
         &cached_objects,
     );
-    add.args(["add", "--all", "--", ":/"]);
-    if let Some(excluded_state) = state_dir_exclusion(state_dir, workspace)? {
-        add.arg(format!(":(exclude,top){excluded_state}/**"));
+    add.args(["add", "--all"]);
+    // A positive pathspec that matches a gitignored path makes `git add` fail
+    // the whole invocation ("the following paths are ignored by one of your
+    // .gitignore files"), and an exclude pathspec does not suppress it. The
+    // normal setup gitignores the state directory (`/.aksh/`), so the old
+    // `-- :/ :(exclude,top){state}/**` form failed on every repository that
+    // followed the documented convention, and each snapshot silently degraded
+    // to a plain checkout.
+    //
+    // When git already ignores the state directory a bare `--all` excludes it
+    // for free. Only a *tracked or otherwise visible* state directory needs an
+    // explicit exclusion, and naming one cannot trip the ignore error.
+    match state_dir_exclusion(state_dir, workspace)? {
+        Some(excluded_state) if !path_is_ignored(workspace, &excluded_state).await => {
+            add.arg("--");
+            add.arg(":/");
+            add.arg(format!(":(exclude,top){excluded_state}"));
+            add.arg(format!(":(exclude,top){excluded_state}/**"));
+        }
+        _ => {}
     }
     run_git(&mut add, "stage local workspace state").await?;
 
@@ -251,10 +452,15 @@ async fn create_workspace_snapshot_inner(
     //     `HEAD..S` would be empty and changed-file actions would see nothing).
     // `None` (unborn HEAD, or an initial commit with a clean tree) falls
     // through to the null-SHA "initial push" base downstream.
+    let rewrite = |sha: &Option<String>| {
+        sha.as_deref()
+            .and_then(|value| history_rewrite.get(value).cloned())
+            .or_else(|| sha.clone())
+    };
     let before_sha = if Some(tree.as_str()) != source_tree.as_deref() {
-        source_head.clone()
+        rewrite(&source_head)
     } else {
-        parent_sha.clone()
+        rewrite(&parent_sha)
     };
 
     // Best effort: the index is a cache, so a failed hand-off only costs the
@@ -280,12 +486,12 @@ async fn create_workspace_snapshot_inner(
     // ref; an orphan root commit leaves them nothing to diff and they fail.
     // The parent object is always present: the object cache holds every
     // committed object from the workspace (see `ensure_object_cache`).
-    if let Some(head) = source_head.as_deref() {
+    if let Some(head) = rewrite(&source_head) {
         commit.args([
             "commit-tree",
             tree.as_str(),
             "-p",
-            head,
+            head.as_str(),
             "-m",
             "aksh workspace snapshot",
         ]);
@@ -389,6 +595,48 @@ async fn create_workspace_snapshot_inner(
         .map_err(|error| ApiError::internal(format!("failed to list workspace refs: {error}")))?;
     if workspace_refs.status.success() {
         let refs = String::from_utf8_lossy(&workspace_refs.stdout);
+        // `update-ref --stdin` is atomic: one ref whose target is missing
+        // aborts the whole transaction and fails the snapshot. Workspaces
+        // collect such refs routinely — a tag fetched without its object, a
+        // filtered clone, a `--unshallow` that dropped an old tag's target.
+        // Ask once which objects actually exist and publish only those.
+        // Resolve every ref to the sha we would publish first, so the
+        // existence check below covers rewritten objects too.
+        let mut planned: Vec<(String, String)> = Vec::new();
+        for line in refs.lines() {
+            let Some((name, object)) = line.split_once(' ') else {
+                continue;
+            };
+            if object.len() != 40 {
+                continue;
+            }
+            let is_default_branch =
+                default_branch.as_deref() == Some(name.strip_prefix("refs/heads/").unwrap_or(name));
+            let published = if is_default_branch {
+                commit_sha.clone()
+            } else {
+                history_rewrite
+                    .get(object)
+                    .cloned()
+                    .unwrap_or_else(|| object.to_owned())
+            };
+            planned.push((name.to_owned(), published));
+        }
+        // `update-ref --stdin` is atomic: one ref whose target object is
+        // missing aborts the whole transaction and fails the snapshot.
+        // Workspaces collect such refs routinely — a tag fetched without its
+        // target, a filtered clone, an `--unshallow` that left an old tag
+        // dangling. Ask once which objects exist and skip the rest.
+        let candidates: std::collections::BTreeSet<String> =
+            planned.iter().map(|(_, sha)| sha.clone()).collect();
+        let present = present_objects(
+            workspace,
+            staging_repository,
+            staging_index,
+            &cached_objects,
+            &candidates,
+        )
+        .await?;
         let mut publish = snapshot_git_command(
             workspace,
             staging_repository,
@@ -396,22 +644,21 @@ async fn create_workspace_snapshot_inner(
             &cached_objects,
         );
         publish.args(["update-ref", "--stdin"]);
-        let publish_input = refs
-            .lines()
-            .filter_map(|line| {
-                let (name, object) = line.split_once(' ')?;
-                if object.len() != 40 {
-                    return None;
-                }
-                let is_default_branch = default_branch.as_deref()
-                    == Some(name.strip_prefix("refs/heads/").unwrap_or(name));
-                if is_default_branch {
-                    Some(format!("update {name} {commit_sha}\n"))
-                } else {
-                    Some(format!("update {name} {object}\n"))
-                }
-            })
-            .collect::<String>();
+        let mut publish_input = String::new();
+        let mut skipped = 0usize;
+        for (name, published) in planned {
+            if !present.contains(&published) {
+                skipped += 1;
+                continue;
+            }
+            publish_input.push_str(&format!("update {name} {published}\n"));
+        }
+        if skipped > 0 {
+            warn!(
+                skipped,
+                "skipped workspace refs whose target objects are absent"
+            );
+        }
         if !publish_input.is_empty() {
             run_git_with_stdin(
                 &mut publish,
@@ -422,6 +669,33 @@ async fn create_workspace_snapshot_inner(
         }
     }
 
+    // Allow clients to fetch arbitrary commits that exist in the snapshot's
+    // object store, not just advertised ref tips: workflows that deep-fetch a
+    // concrete SHA (`git fetch origin <sha>`, `fetch-depth: 0` checkouts of a
+    // base ref) hit exactly this path, and the official host serves it via
+    // `uploadpack.allowReachableSHA1InWant`. Without it upload-pack answers
+    // "not our ref" for any want that is not a tip.
+    let mut uploadpack_reachable = Command::new("git");
+    uploadpack_reachable
+        .env("GIT_DIR", staging_repository)
+        .args(["config", "uploadpack.allowReachableSHA1InWant", "true"]);
+    run_git(
+        &mut uploadpack_reachable,
+        "allow reachable sha wants in snapshot upload-pack",
+    )
+    .await?;
+    let mut uploadpack_tip = Command::new("git");
+    uploadpack_tip.env("GIT_DIR", staging_repository).args([
+        "config",
+        "uploadpack.allowTipSHA1InWant",
+        "true",
+    ]);
+    run_git(
+        &mut uploadpack_tip,
+        "allow tip sha wants in snapshot upload-pack",
+    )
+    .await?;
+
     tokio::fs::rename(staging_repository, final_repository)
         .await
         .map_err(|error| {
@@ -431,6 +705,7 @@ async fn create_workspace_snapshot_inner(
         })?;
     Ok(SnapshotResult {
         commit_sha,
+        head_sha: source_head,
         default_branch,
         before_sha,
     })
@@ -440,6 +715,7 @@ async fn create_workspace_snapshot_inner(
 /// the submission as a coherent GitHub event to changed-file actions.
 struct SnapshotResult {
     commit_sha: String,
+    head_sha: Option<String>,
     default_branch: Option<String>,
     before_sha: Option<String>,
 }
@@ -571,6 +847,23 @@ fn snapshot_git_command(
     command
 }
 
+/// Whether the workspace's own `.gitignore` rules already exclude `relative`.
+///
+/// Uses the workspace repository rather than the staging one so the answer
+/// reflects the rules the user actually wrote. `check-ignore` exits 0 when the
+/// path is ignored, 1 when it is not, and >1 on error; anything other than a
+/// clean "ignored" answer is treated as not ignored, which keeps the explicit
+/// exclusion in place and is the safe direction.
+async fn path_is_ignored(workspace: &FsPath, relative: &str) -> bool {
+    Command::new("git")
+        .current_dir(workspace)
+        .args(["check-ignore", "--quiet", "--", relative])
+        .status()
+        .await
+        .map(|status| status.code() == Some(0))
+        .unwrap_or(false)
+}
+
 async fn run_snapshot_git<const N: usize>(
     workspace: &FsPath,
     repository: &FsPath,
@@ -670,6 +963,10 @@ struct ObjectCache {
     index: PathBuf,
     /// Whether this call added objects to the cache.
     refreshed: bool,
+    /// Whether the cache holds the full ancestry behind the workspace's
+    /// shallow boundary. False means the snapshot must rewrite history to
+    /// serve a complete graph, at the cost of changing every sha.
+    ancestry_complete: bool,
 }
 
 async fn ensure_object_cache(
@@ -677,6 +974,7 @@ async fn ensure_object_cache(
     workspace: &FsPath,
     common_dir: &FsPath,
     source_head: Option<&str>,
+    github_pat: Option<&str>,
 ) -> Result<ObjectCache, ApiError> {
     use sha2::Digest;
 
@@ -757,15 +1055,198 @@ async fn ensure_object_cache(
     let objects = std::fs::canonicalize(repository.join("objects")).map_err(|error| {
         ApiError::internal(format!("failed to resolve snapshot object cache: {error}"))
     })?;
+    // The cache is what the snapshot actually serves, so its boundary is the
+    // one that matters — a workspace that has since been deepened does not
+    // help if the cache was built while it was shallow. Deepen from the
+    // remote while the lock is held; once complete it stays complete and
+    // later runs skip the fetch entirely.
+    let mut ancestry_complete = !repository.join("shallow").is_file();
+    if !ancestry_complete {
+        ancestry_complete =
+            deepen_object_cache_from_remote(&repository, workspace, github_pat).await;
+        refreshed = refreshed || ancestry_complete;
+    }
     let mut index = repository.as_os_str().to_owned();
     index.push(".index");
     Ok(ObjectCache {
         objects,
         index: PathBuf::from(index),
         refreshed,
+        ancestry_complete,
     })
 }
 
+/// Which of `shas` exist in the snapshot's object view.
+///
+/// One `cat-file --batch-check` instead of a spawn per ref: a workspace can
+/// carry thousands of tags, and this runs inside `POST /api/v1/runs`.
+async fn present_objects(
+    workspace: &FsPath,
+    staging_repository: &FsPath,
+    staging_index: &FsPath,
+    cached_objects: &FsPath,
+    shas: &std::collections::BTreeSet<String>,
+) -> Result<std::collections::BTreeSet<String>, ApiError> {
+    if shas.is_empty() {
+        return Ok(std::collections::BTreeSet::new());
+    }
+    let mut query = String::with_capacity(shas.len() * 41);
+    for sha in shas {
+        query.push_str(sha);
+        query.push('\n');
+    }
+    let mut command =
+        snapshot_git_command(workspace, staging_repository, staging_index, cached_objects);
+    command.args(["cat-file", "--batch-check=%(objectname) %(objecttype)"]);
+    let output =
+        run_git_with_stdin(&mut command, query.as_bytes(), "check snapshot objects").await?;
+    let text = output_text(&output, "check snapshot objects")?;
+    let mut present = std::collections::BTreeSet::new();
+    for line in text.lines() {
+        // Present: "<sha> commit". Missing: "<sha> missing".
+        let mut parts = line.split_whitespace();
+        let (Some(sha), Some(kind)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if kind != "missing" {
+            present.insert(sha.to_owned());
+        }
+    }
+    Ok(present)
+}
+
+/// Restore the ancestry a shallow workspace never downloaded.
+///
+/// A shallow clone stops at the commits listed in its `shallow` file, and the
+/// object cache inherits that boundary. Serving a shallow graph is impossible,
+/// so the snapshot otherwise rewrites history: shallow roots become
+/// parentless and every descendant is re-created, which changes the tip's
+/// sha. Workflows that resolve a base commit from git (`rev-list --parents`,
+/// `HEAD^`, `merge-base`) and then fetch it from the forge then ask for a sha
+/// that exists nowhere upstream and fail with "not our ref".
+///
+/// Fetching the real ancestry from the workspace's own remote removes the
+/// boundary and keeps every sha identical to the forge's.
+///
+/// This fetches objects in full. `--filter=blob:none` would be enough for what
+/// diff-base resolution needs — the commit and tree graph — and far cheaper,
+/// but it leaves the cache a promisor whose missing blobs fail the snapshot's
+/// `fsck` and cannot be hydrated through the alternate. Making that work needs
+/// real partial-clone plumbing (`extensions.partialClone` on the staging repo
+/// plus a promisor remote it can reach); until then, correctness first.
+///
+/// Best effort by design. No remote, no network, or a private repository
+/// without credentials simply leaves the cache shallow and the caller falls
+/// back to rewriting.
+async fn deepen_object_cache_from_remote(
+    repository: &FsPath,
+    workspace: &FsPath,
+    github_pat: Option<&str>,
+) -> bool {
+    let remote = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["config", "--get", "remote.origin.url"])
+        .output()
+        .await;
+    let Ok(remote) = remote else {
+        return false;
+    };
+    if !remote.status.success() {
+        return false;
+    }
+    let url = String::from_utf8_lossy(&remote.stdout).trim().to_owned();
+    if url.is_empty() {
+        return false;
+    }
+    let shallow_marker = repository.join("shallow");
+    let mut fetch = Command::new("git");
+    fetch
+        .env("GIT_DIR", repository)
+        .args(["fetch", "--quiet", "--force", "--no-tags"]);
+    if shallow_marker.is_file() {
+        fetch.arg("--unshallow");
+    }
+    if let Some((key, value)) = github_pat.and_then(|pat| github_auth_header_for_remote(&url, pat))
+    {
+        // A private remote rejects the anonymous unshallow; the engine's own
+        // GitHub credential (already used for action downloads) closes it.
+        // Scoped by `github_auth_header_for_remote` so the PAT is never sent
+        // to a host the operator did not configure it for.
+        fetch
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", key)
+            .env("GIT_CONFIG_VALUE_0", value);
+    }
+    fetch
+        .arg(&url)
+        .arg("+refs/heads/*:refs/remotes/preloop-upstream/*");
+    match run_git(&mut fetch, "deepen snapshot object cache").await {
+        Ok(_) => !shallow_marker.is_file(),
+        Err(error) => {
+            // The remote URL can embed a credential in its userinfo, and
+            // git's stderr echoes the URL it failed on verbatim. Scrub both
+            // before anything reaches the log.
+            let sanitized_url = sanitize_remote_url(&url);
+            let sanitized_error = format!("{error:?}").replace(&url, &sanitized_url);
+            warn!(
+                error = %sanitized_error,
+                url = %sanitized_url,
+                "could not deepen snapshot object cache from remote; \
+                 snapshot will rewrite history and expose synthetic SHAs"
+            );
+            false
+        }
+    }
+}
+
+/// Strip userinfo credentials from a remote URL so a log never embeds them.
+///
+/// `https://user:token@github.com/owner/repo` becomes
+/// `https://github.com/owner/repo`. Schemeless (SSH) remotes carry no
+/// userinfo and are returned untouched.
+fn sanitize_remote_url(remote_url: &str) -> String {
+    let Some((scheme, rest)) = remote_url.split_once("://") else {
+        return remote_url.to_owned();
+    };
+    let (authority, suffix) = match rest.find('/') {
+        Some(index) => rest.split_at(index),
+        None => (rest, ""),
+    };
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    format!("{scheme}://{authority}{suffix}")
+}
+
+/// Extra-header config that authenticates a deepen fetch against the engine's
+/// GitHub credential, or `None` when the remote is not GitHub.
+///
+/// The static PAT is a GitHub credential; attaching it to any other host would
+/// leak it to a remote the operator never vouched for. Scope strictly: only
+/// `https://github.com/...` remotes get the header, matching what
+/// `actions/checkout` configures for its own auth.
+fn github_auth_header_for_remote(remote_url: &str, pat: &str) -> Option<(&'static str, String)> {
+    // The credential rides only over https to github.com: never over a
+    // plaintext remote, and never over an SSH remote (no scheme at all —
+    // SSH has its own key auth).
+    let (scheme, rest) = remote_url.split_once("://")?;
+    if scheme != "https" {
+        return None;
+    }
+    // Strip userinfo (`https://user:pass@github.com/...`) before extracting
+    // the host; the port separator `:` must not truncate a host either.
+    let authority = rest.rsplit('@').next().unwrap_or(rest);
+    let host = authority.split(['/', ':']).next().unwrap_or("");
+    if host != "github.com" {
+        return None;
+    }
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD
+        .encode(format!("x-access-token:{pat}").as_bytes());
+    Some((
+        "http.https://github.com/.extraheader",
+        format!("AUTHORIZATION: basic {encoded}"),
+    ))
+}
 /// Persist the workspace HEAD the cache was last synced to.
 ///
 /// An unborn HEAD has nothing to record; clearing the marker keeps the next
@@ -862,6 +1343,40 @@ async fn acquire_cache_lock(path: &FsPath) -> Result<CacheLock, ApiError> {
     }
 }
 
+/// Split a git ident header (`Name <email> 1234567890 +0000`) into the
+/// (name, email, date) parts `commit-tree` expects through its env vars.
+fn parse_ident(value: &str) -> (String, String, String) {
+    let value = value.trim();
+    let name;
+    let email;
+    let date;
+    match value.rfind('<') {
+        Some(angle) => {
+            name = value[..angle].trim().to_owned();
+            let tail = &value[angle + 1..];
+            match tail.find('>') {
+                Some(end) => {
+                    email = format!("<{}>", &tail[..end]);
+                    date = tail[end + 1..].trim().to_owned();
+                }
+                None => {
+                    email = String::new();
+                    date = tail.trim().to_owned();
+                }
+            }
+        }
+        None => {
+            // Unusual ident without angle brackets; take the last token as
+            // the date and everything before as the name.
+            let mut parts = value.rsplitn(2, ' ');
+            date = parts.next().unwrap_or("").to_owned();
+            name = parts.next().unwrap_or("").to_owned();
+            email = String::new();
+        }
+    }
+    (name, email, date)
+}
+
 fn state_dir_exclusion(state_dir: &FsPath, workspace: &FsPath) -> Result<Option<String>, ApiError> {
     let state_dir = std::fs::canonicalize(state_dir).map_err(|error| {
         ApiError::internal(format!(
@@ -905,17 +1420,53 @@ pub(crate) fn redirect_primary_checkout(
             .as_ref()
             .and_then(|reference| reference.name.as_deref())
             .is_some_and(|name| name.eq_ignore_ascii_case("actions/checkout"));
-        if !is_checkout
-            || step.inputs.keys().any(|key| {
-                ["repository", "ref", "github-server-url"]
-                    .iter()
-                    .any(|reserved| key.eq_ignore_ascii_case(reserved))
+        // A checkout whose `repository`/`ref`/`github-server-url` input is
+        // provably absent or provably the action's declared default
+        // (`${{ github.repository }}` / `${{ github.server_url }}`) selects
+        // GitHub's "default branch" semantics — the snapshot IS the local
+        // default — so the redirect applies. Everything else is explicitly
+        // set: a literal points at a specific remote target, and an
+        // unresolved template expression (e.g. `ref: ${{ inputs.head-sha }}`)
+        // selects a target the workflow controls at runtime, which the server
+        // cannot prove is the default. Redirecting those hijacks the
+        // workflow's intended checkout once the runner evaluates them.
+        let declared_default = |name: &str| -> Option<&str> {
+            match name {
+                // actions/checkout's own action.yml defaults. `ref` declares
+                // no default, so no expression can be provably the default
+                // for it.
+                "repository" => Some("${{ github.repository }}"),
+                "github-server-url" => Some("${{ github.server_url }}"),
+                _ => None,
+            }
+        };
+        let explicitly_set = |name: &str| {
+            step.inputs.iter().any(|(key, value)| {
+                if !key.eq_ignore_ascii_case(name) {
+                    return false;
+                }
+                let value = value.as_str().trim();
+                if value.is_empty() {
+                    return false;
+                }
+                !value.contains("${{")
+                    || declared_default(name).is_none_or(|default| value != default)
             })
+        };
+        if !is_checkout
+            || ["repository", "ref", "github-server-url"]
+                .iter()
+                .any(|reserved| explicitly_set(reserved))
         {
             continue;
         }
         step.inputs
             .insert("repository".to_owned(), snapshot.repository.clone());
+        // The snapshot commit SHA. `actions/checkout` treats a bare SHA as a
+        // commit ref (it derives `commit` from it, so the fetch lands on the
+        // snapshot). A branch ref instead leaves the action's `commit` empty,
+        // which skips the targeted refetch and breaks checkout entirely when
+        // the all-refs fetch is rejected (shallow-mirrored snapshots).
         step.inputs
             .insert("ref".to_owned(), snapshot.commit_sha.clone());
         step.inputs
@@ -1136,4 +1687,272 @@ fn snapshot_authorization_token(value: &str) -> Option<String> {
     let decoded = String::from_utf8(decoded).ok()?;
     let (_, token) = decoded.split_once(':')?;
     Some(token.to_owned())
+}
+
+#[cfg(test)]
+mod auth_scoping_tests {
+    use super::github_auth_header_for_remote;
+
+    #[test]
+    fn github_remote_gets_scoped_basic_header() {
+        let (key, value) = github_auth_header_for_remote(
+            "https://github.com/preloopdev/aksh-trigger-e2e-20260715.git",
+            "gho_secret",
+        )
+        .expect("github.com remote should get the header");
+        assert_eq!(key, "http.https://github.com/.extraheader");
+        // base64("x-access-token:gho_secret")
+        assert_eq!(
+            value,
+            "AUTHORIZATION: basic eC1hY2Nlc3MtdG9rZW46Z2hvX3NlY3JldA=="
+        );
+    }
+
+    #[test]
+    fn userinfo_in_remote_url_is_stripped_before_host_matching() {
+        let header = github_auth_header_for_remote(
+            "https://x-access-token:gho_secret@github.com/owner/repo.git",
+            "gho_secret",
+        );
+        assert!(header.is_some(), "userinfo must not defeat host matching");
+    }
+
+    #[test]
+    fn non_github_remote_never_receives_the_pat() {
+        for url in [
+            "https://git.example.com/owner/repo.git",
+            "https://github.example.net/owner/repo.git",
+            "git@github.com:owner/repo.git", // SSH remotes have no scheme
+            "http://github.com/owner/repo.git", // https-only credential
+        ] {
+            assert_eq!(
+                github_auth_header_for_remote(url, "gho_secret"),
+                None,
+                "PAT must not be attached to {url}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod deepen_and_redirect_tests {
+    use super::*;
+
+    /// A `Write` sink that records every byte, so a test can assert on what a
+    /// tracing subscriber actually emitted.
+    #[derive(Clone)]
+    struct RecordingWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn git_in(cwd: &FsPath, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .status()
+            .expect("git runs in tests");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// The deepen failure path must never write the remote's embedded
+    /// userinfo credential to the server log: the remote URL itself carries
+    /// it, and git's stderr echoes the URL verbatim.
+    #[tokio::test]
+    async fn deepen_failure_warning_never_logs_the_remote_credential() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || RecordingWriter(sink.clone()))
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        git_in(&workspace, &["init", "-q", "-b", "main"]);
+        git_in(
+            &workspace,
+            &[
+                "config",
+                "remote.origin.url",
+                "https://user:super-secret-token@127.0.0.1:1/owner/repo.git",
+            ],
+        );
+        // A valid bare repository so the fetch is actually attempted: the
+        // connect to 127.0.0.1:1 is refused instantly (loopback, nothing
+        // listening), so the failure carries git's stderr, which echoes the
+        // credential-bearing URL.
+        let repository = temp.path().join("snapshot.git");
+        let status = std::process::Command::new("git")
+            .args(["init", "-q", "--bare"])
+            .arg(&repository)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let deepened = deepen_object_cache_from_remote(&repository, &workspace, None).await;
+        assert!(
+            !deepened,
+            "the deepen must fail against a refused connection"
+        );
+
+        let logs = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(
+            !logs.contains("super-secret-token"),
+            "remote credential leaked into the server log: {logs}"
+        );
+        assert!(
+            !logs.contains("user:"),
+            "userinfo leaked into the server log: {logs}"
+        );
+    }
+
+    #[test]
+    fn sanitize_remote_url_strips_userinfo_credentials() {
+        assert_eq!(
+            sanitize_remote_url("https://user:token@github.com/owner/repo.git"),
+            "https://github.com/owner/repo.git"
+        );
+        assert_eq!(
+            sanitize_remote_url("https://user@github.com"),
+            "https://github.com"
+        );
+        // Ports and paths survive; only the userinfo goes.
+        assert_eq!(
+            sanitize_remote_url("https://user:token@github.example:8443/owner/repo"),
+            "https://github.example:8443/owner/repo"
+        );
+        // An `@` inside the path is not userinfo.
+        assert_eq!(
+            sanitize_remote_url("https://user:token@github.com/owner/@releases/repo"),
+            "https://github.com/owner/@releases/repo"
+        );
+        // Schemeless (SSH) remotes carry no userinfo and are untouched.
+        assert_eq!(
+            sanitize_remote_url("git@github.com:owner/repo.git"),
+            "git@github.com:owner/repo.git"
+        );
+    }
+
+    fn checkout_message(
+        steps: serde_json::Value,
+    ) -> aksh_gha_protocol::azdo::AgentJobRequestMessage {
+        serde_json::from_value(serde_json::json!({
+            "jobId": "00000000-0000-0000-0000-000000000001",
+            "requestId": 1,
+            "plan": {
+                "planId": "plan",
+                "planType": "build",
+                "version": 1,
+                "artifactUri": "",
+                "artifactLocation": ""
+            },
+            "timeline": {
+                "id": "00000000-0000-0000-0000-000000000002",
+                "changeId": 0,
+                "location": null
+            },
+            "jobName": "build",
+            "lockedUntil": "",
+            "resources": {"endpoints": []},
+            "steps": steps,
+            "snapshot": null
+        }))
+        .unwrap()
+    }
+
+    fn snapshot_fixture() -> WorkspaceSnapshot {
+        WorkspaceSnapshot {
+            head_sha: Some("f000000000000000000000000000000000000000".to_owned()),
+            commit_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            repository: "snapshots/11111111-1111-4111-8111-111111111111".to_owned(),
+            default_branch: Some("main".to_owned()),
+            before_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+        }
+    }
+
+    fn redirect_count(inputs: serde_json::Value) -> usize {
+        let mut message = checkout_message(serde_json::json!([{
+            "id": "00000000-0000-0000-0000-000000000010",
+            "name": "checkout",
+            "reference": {"name": "actions/checkout", "version": "v4", "type": "repository"},
+            "inputs": inputs,
+            "continueOnError": false,
+            "timeoutInMinutes": null
+        }]));
+        redirect_primary_checkout(
+            &mut message,
+            &snapshot_fixture(),
+            "http://127.0.0.1:9090",
+            "local-runtime-jwt",
+        )
+    }
+
+    /// A checkout whose `ref`/`repository` input is a template expression
+    /// selects a target the workflow controls at runtime; redirecting it to
+    /// the snapshot hijacks that target once the runner evaluates the
+    /// expression. Only inputs that are provably absent — or provably the
+    /// action's declared default — may be redirected.
+    #[test]
+    fn redirect_primary_checkout_respects_dynamic_expression_inputs() {
+        // A dynamic ref is an explicit target once evaluated.
+        assert_eq!(
+            redirect_count(
+                serde_json::json!({"ref": "${{ inputs.head-sha }}", "fetch-depth": "0"})
+            ),
+            0,
+            "an unresolved expression ref must count as explicitly set"
+        );
+        // A dynamic repository likewise.
+        assert_eq!(
+            redirect_count(serde_json::json!({
+                "repository": "${{ fromJSON(inputs.targets)[0].repo }}",
+            })),
+            0,
+            "an unresolved expression repository must count as explicitly set"
+        );
+        // A literal target is explicitly set.
+        assert_eq!(
+            redirect_count(
+                serde_json::json!({"repository": "octo/other", "ref": "refs/heads/release"})
+            ),
+            0,
+            "a literal remote target must not be redirected"
+        );
+        // The declared input default (`${{ github.repository }}`) is provably
+        // the default branch the snapshot represents — redirect applies.
+        assert_eq!(
+            redirect_count(serde_json::json!({"repository": "${{ github.repository }}"})),
+            1,
+            "the declared repository default must still be redirected"
+        );
+        // `github-server-url`'s declared default is provably the default too.
+        assert_eq!(
+            redirect_count(serde_json::json!({"github-server-url": "${{ github.server_url }}"})),
+            1,
+            "the declared server-url default must still be redirected"
+        );
+        // Absent and empty inputs keep the default-branch redirect.
+        assert_eq!(
+            redirect_count(serde_json::json!({"fetch-depth": "0"})),
+            1,
+            "an absent ref/repository is default-branch semantics"
+        );
+        assert_eq!(
+            redirect_count(serde_json::json!({"ref": "", "fetch-depth": "0"})),
+            1,
+            "an empty ref is default-branch semantics"
+        );
+    }
 }

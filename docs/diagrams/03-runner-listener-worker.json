@@ -1,0 +1,1237 @@
+[
+  {
+    "type": "cameraUpdate",
+    "width": 1600,
+    "height": 1200,
+    "x": 0,
+    "y": 0
+  },
+  {
+    "type": "text",
+    "id": "title",
+    "x": 520,
+    "y": 25,
+    "text": "aksh-runner \u2014 Listener + Worker Model",
+    "fontSize": 28,
+    "strokeColor": "#1e1e1e"
+  },
+  {
+    "type": "text",
+    "id": "subtitle",
+    "x": 420,
+    "y": 60,
+    "text": "Faithful to actions/runner v2.336.0 \u2014 two-process isolation over stdin NDJSON",
+    "fontSize": 15,
+    "strokeColor": "#757575"
+  },
+  {
+    "type": "rectangle",
+    "id": "zone_listener",
+    "x": 50,
+    "y": 110,
+    "width": 1500,
+    "height": 360,
+    "backgroundColor": "#dbe4ff",
+    "fillStyle": "solid",
+    "opacity": 25,
+    "strokeColor": "#1e40af",
+    "strokeWidth": 1.5,
+    "roundness": {
+      "type": 3
+    }
+  },
+  {
+    "type": "text",
+    "id": "zone_l_listener",
+    "x": 70,
+    "y": 125,
+    "text": "Listener Process (aks-runner run)",
+    "fontSize": 18,
+    "strokeColor": "#1e40af"
+  },
+  {
+    "type": "rectangle",
+    "id": "cp",
+    "x": 80,
+    "y": 165,
+    "width": 200,
+    "height": 75,
+    "backgroundColor": "#a5d8ff",
+    "fillStyle": "solid",
+    "strokeColor": "#4a9eed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Control Plane\naksh-runner-server",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "oauth",
+    "x": 330,
+    "y": 165,
+    "width": 220,
+    "height": 75,
+    "backgroundColor": "#d0bfff",
+    "fillStyle": "solid",
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "OAuth (RS256 JWT)\nclient_assertion flow",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "session",
+    "x": 600,
+    "y": 165,
+    "width": 220,
+    "height": 75,
+    "backgroundColor": "#d0bfff",
+    "fillStyle": "solid",
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Session Create\nbroker / azdo + AES key",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "choose",
+    "x": 870,
+    "y": 165,
+    "width": 200,
+    "height": 75,
+    "backgroundColor": "#fff3bf",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Protocol Select\nbroker  |  azdo",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "brokerPoll",
+    "x": 1120,
+    "y": 165,
+    "width": 200,
+    "height": 75,
+    "backgroundColor": "#a5d8ff",
+    "fillStyle": "solid",
+    "strokeColor": "#4a9eed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "broker_listener.rs\nlong-poll message loop",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "azdoPoll",
+    "x": 1340,
+    "y": 165,
+    "width": 190,
+    "height": 75,
+    "backgroundColor": "#a5d8ff",
+    "fillStyle": "solid",
+    "strokeColor": "#4a9eed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "message_listener.rs\nAzDO _apis poll",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "pollLoop",
+    "x": 600,
+    "y": 285,
+    "width": 470,
+    "height": 75,
+    "backgroundColor": "#b2f2bb",
+    "fillStyle": "solid",
+    "strokeColor": "#15803d",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Long-Poll Message Loop\n60s SLA, exponential backoff, AES decrypt",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "dispatcher",
+    "x": 1120,
+    "y": 285,
+    "width": 200,
+    "height": 75,
+    "backgroundColor": "#ffd8a8",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "job_dispatcher.rs\nspawn worker child",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "client",
+    "x": 1340,
+    "y": 285,
+    "width": 190,
+    "height": 75,
+    "backgroundColor": "#a5d8ff",
+    "fillStyle": "solid",
+    "strokeColor": "#4a9eed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "client/* http.rs\nreqwest HTTP client",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "ipc",
+    "x": 50,
+    "y": 500,
+    "width": 1500,
+    "height": 60,
+    "backgroundColor": "#c3fae8",
+    "fillStyle": "solid",
+    "opacity": 60,
+    "strokeColor": "#0d9488",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "IPC Bridge: Listener \u2192 Worker via STDIN (NDJSON) \u2014 job | cancel | shutdown",
+      "fontSize": 16
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "zone_worker",
+    "x": 50,
+    "y": 590,
+    "width": 1500,
+    "height": 580,
+    "backgroundColor": "#eebefa",
+    "fillStyle": "solid",
+    "opacity": 20,
+    "strokeColor": "#a21caf",
+    "strokeWidth": 1.5,
+    "roundness": {
+      "type": 3
+    }
+  },
+  {
+    "type": "text",
+    "id": "zone_l_worker",
+    "x": 70,
+    "y": 605,
+    "text": "Worker Process (aks-runner worker) \u2014 exit 0 = reported, exit 1 = infra failure",
+    "fontSize": 18,
+    "strokeColor": "#a21caf"
+  },
+  {
+    "type": "rectangle",
+    "id": "jr",
+    "x": 80,
+    "y": 650,
+    "width": 320,
+    "height": 80,
+    "backgroundColor": "#eebefa",
+    "fillStyle": "solid",
+    "strokeColor": "#a21caf",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "job_runner.rs\nrun_job() & session renew loop",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "je",
+    "x": 440,
+    "y": 650,
+    "width": 320,
+    "height": 80,
+    "backgroundColor": "#eebefa",
+    "fillStyle": "solid",
+    "strokeColor": "#a21caf",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "job_extension.rs\nworkspace setup & GITHUB_* env",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "ctx",
+    "x": 800,
+    "y": 650,
+    "width": 320,
+    "height": 80,
+    "backgroundColor": "#eebefa",
+    "fillStyle": "solid",
+    "strokeColor": "#a21caf",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "contexts.rs\ngithub / runner / job / steps contexts",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "execCtx",
+    "x": 1160,
+    "y": 650,
+    "width": 370,
+    "height": 80,
+    "backgroundColor": "#eebefa",
+    "fillStyle": "solid",
+    "strokeColor": "#a21caf",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "execution_context.rs\nper-step env, log sink & annotations",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "stepsRunner",
+    "x": 80,
+    "y": 780,
+    "width": 320,
+    "height": 80,
+    "backgroundColor": "#eebefa",
+    "fillStyle": "solid",
+    "strokeColor": "#a21caf",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "steps_runner.rs\nsequential execution & conditions",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "handlers",
+    "x": 440,
+    "y": 780,
+    "width": 320,
+    "height": 80,
+    "backgroundColor": "#eebefa",
+    "fillStyle": "solid",
+    "strokeColor": "#a21caf",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "handlers/\nnode, composite, container, script",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "commands",
+    "x": 800,
+    "y": 780,
+    "width": 320,
+    "height": 80,
+    "backgroundColor": "#eebefa",
+    "fillStyle": "solid",
+    "strokeColor": "#a21caf",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "commands & file_commands\n::name::data, GITHUB_ENV/OUTPUT",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "report",
+    "x": 1160,
+    "y": 780,
+    "width": 370,
+    "height": 80,
+    "backgroundColor": "#eebefa",
+    "fillStyle": "solid",
+    "strokeColor": "#a21caf",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "reporting & completion\nstep log upload, completejob (Twirp)",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "actionsMgr",
+    "x": 80,
+    "y": 910,
+    "width": 320,
+    "height": 80,
+    "backgroundColor": "#fff3bf",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "actions/manager.rs\ntarball download & extract",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "matchers",
+    "x": 440,
+    "y": 910,
+    "width": 320,
+    "height": 80,
+    "backgroundColor": "#fff3bf",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "matchers.rs\nproblem matchers parser",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "containerOps",
+    "x": 800,
+    "y": 910,
+    "width": 320,
+    "height": 80,
+    "backgroundColor": "#fff3bf",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "container_ops.rs\ndocker container management",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "template",
+    "x": 1160,
+    "y": 910,
+    "width": 370,
+    "height": 80,
+    "backgroundColor": "#fff3bf",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "template.rs\nexpression evaluation in step fields",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_cp_oauth",
+    "x": 280,
+    "y": 202,
+    "width": 50,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        50,
+        0
+      ]
+    ],
+    "strokeColor": "#1e1e1e",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "cp",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "oauth",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "poll",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_oauth_session",
+    "x": 550,
+    "y": 202,
+    "width": 50,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        50,
+        0
+      ]
+    ],
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "oauth",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "session",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "token",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_session_choose",
+    "x": 820,
+    "y": 202,
+    "width": 50,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        50,
+        0
+      ]
+    ],
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "session",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "choose",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "creds",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_choose_broker",
+    "x": 1070,
+    "y": 202,
+    "width": 50,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        50,
+        0
+      ]
+    ],
+    "strokeColor": "#b45309",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "choose",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "brokerPoll",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "broker",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_broker_disp",
+    "x": 1220,
+    "y": 240,
+    "width": 0,
+    "height": 45,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        45
+      ]
+    ],
+    "strokeColor": "#1e1e1e",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "brokerPoll",
+      "fixedPoint": [
+        0.5,
+        1
+      ]
+    },
+    "endBinding": {
+      "elementId": "dispatcher",
+      "fixedPoint": [
+        0.5,
+        0
+      ]
+    },
+    "label": {
+      "text": "message",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_disp_client",
+    "x": 1320,
+    "y": 322,
+    "width": 20,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        20,
+        0
+      ]
+    ],
+    "strokeColor": "#1e1e1e",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "dispatcher",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "client",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "uses",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_disp_ipc",
+    "x": 1220,
+    "y": 360,
+    "width": 0,
+    "height": 140,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        140
+      ]
+    ],
+    "strokeColor": "#0d9488",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "dispatcher",
+      "fixedPoint": [
+        0.5,
+        1
+      ]
+    },
+    "endBinding": {
+      "elementId": "ipc",
+      "fixedPoint": [
+        0.78,
+        0
+      ]
+    },
+    "label": {
+      "text": "spawn & write stdin",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_ipc_jr",
+    "x": 240,
+    "y": 560,
+    "width": 0,
+    "height": 90,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        90
+      ]
+    ],
+    "strokeColor": "#0d9488",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "ipc",
+      "fixedPoint": [
+        0.13,
+        1
+      ]
+    },
+    "endBinding": {
+      "elementId": "jr",
+      "fixedPoint": [
+        0.5,
+        0
+      ]
+    },
+    "label": {
+      "text": "parse job message",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_jr_je",
+    "x": 400,
+    "y": 690,
+    "width": 40,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        40,
+        0
+      ]
+    ],
+    "strokeColor": "#a21caf",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "jr",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "je",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "setup",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_je_ctx",
+    "x": 760,
+    "y": 690,
+    "width": 40,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        40,
+        0
+      ]
+    ],
+    "strokeColor": "#a21caf",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "je",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "ctx",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "build",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_ctx_exec",
+    "x": 1120,
+    "y": 690,
+    "width": 40,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        40,
+        0
+      ]
+    ],
+    "strokeColor": "#a21caf",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "ctx",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "execCtx",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "context",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_jr_steps",
+    "x": 240,
+    "y": 730,
+    "width": 0,
+    "height": 50,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        50
+      ]
+    ],
+    "strokeColor": "#a21caf",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "jr",
+      "fixedPoint": [
+        0.5,
+        1
+      ]
+    },
+    "endBinding": {
+      "elementId": "stepsRunner",
+      "fixedPoint": [
+        0.5,
+        0
+      ]
+    },
+    "label": {
+      "text": "execute",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_steps_handlers",
+    "x": 400,
+    "y": 820,
+    "width": 40,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        40,
+        0
+      ]
+    ],
+    "strokeColor": "#a21caf",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "stepsRunner",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "handlers",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "dispatch",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_handlers_commands",
+    "x": 760,
+    "y": 820,
+    "width": 40,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        40,
+        0
+      ]
+    ],
+    "strokeColor": "#a21caf",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "handlers",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "commands",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "parse commands",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_commands_report",
+    "x": 1120,
+    "y": 820,
+    "width": 40,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        40,
+        0
+      ]
+    ],
+    "strokeColor": "#a21caf",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "commands",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "report",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "emit status",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_handlers_actions",
+    "x": 240,
+    "y": 860,
+    "width": 0,
+    "height": 50,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        50
+      ]
+    ],
+    "strokeColor": "#b45309",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "stepsRunner",
+      "fixedPoint": [
+        0.5,
+        1
+      ]
+    },
+    "endBinding": {
+      "elementId": "actionsMgr",
+      "fixedPoint": [
+        0.5,
+        0
+      ]
+    },
+    "label": {
+      "text": "downloads",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_handlers_matchers",
+    "x": 600,
+    "y": 860,
+    "width": 0,
+    "height": 50,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        50
+      ]
+    ],
+    "strokeColor": "#b45309",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "handlers",
+      "fixedPoint": [
+        0.5,
+        1
+      ]
+    },
+    "endBinding": {
+      "elementId": "matchers",
+      "fixedPoint": [
+        0.5,
+        0
+      ]
+    },
+    "label": {
+      "text": "matchers",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_handlers_container",
+    "x": 960,
+    "y": 860,
+    "width": 0,
+    "height": 50,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        50
+      ]
+    ],
+    "strokeColor": "#b45309",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "commands",
+      "fixedPoint": [
+        0.5,
+        1
+      ]
+    },
+    "endBinding": {
+      "elementId": "containerOps",
+      "fixedPoint": [
+        0.5,
+        0
+      ]
+    },
+    "label": {
+      "text": "containers",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_commands_template",
+    "x": 1345,
+    "y": 860,
+    "width": 0,
+    "height": 50,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        50
+      ]
+    ],
+    "strokeColor": "#b45309",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "report",
+      "fixedPoint": [
+        0.5,
+        1
+      ]
+    },
+    "endBinding": {
+      "elementId": "template",
+      "fixedPoint": [
+        0.5,
+        0
+      ]
+    },
+    "label": {
+      "text": "eval",
+      "fontSize": 14
+    }
+  }
+]

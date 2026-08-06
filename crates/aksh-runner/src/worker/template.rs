@@ -123,7 +123,34 @@ fn value_to_string(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::Null => String::new(),
         serde_json::Value::Bool(b) => b.to_string(),
-        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Number(n) => {
+            // GitHub renders whole numbers as integers. Event payloads reach
+            // us through parsers that may hand back `f64(2.0)` for a JSON `2`,
+            // and `to_string` would print "2.0" — enough to fail a workflow
+            // that validates a count or an id against `^[0-9]+$`.
+            if let Some(value) = n.as_i64() {
+                return value.to_string();
+            }
+            if let Some(value) = n.as_u64() {
+                return value.to_string();
+            }
+            match n.as_f64() {
+                Some(value) if value.is_finite() && value.fract() == 0.0 => {
+                    // Whole-number f64s render as integers with no magnitude
+                    // cutoff: 1e15 and above are integral too, and
+                    // `Number::to_string` prints them as "...0.0". The i64
+                    // cast also normalizes -0.0 to 0; magnitudes at or beyond
+                    // i64's range fall back to fixed-point formatting (never
+                    // exponent notation).
+                    if value >= i64::MIN as f64 && value < i64::MAX as f64 {
+                        (value as i64).to_string()
+                    } else {
+                        format!("{value:.0}")
+                    }
+                }
+                _ => n.to_string(),
+            }
+        }
         serde_json::Value::String(s) => s.clone(),
         other => serde_json::to_string(other).unwrap_or_default(),
     }
@@ -132,6 +159,65 @@ fn value_to_string(value: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn whole_numbers_render_without_a_decimal_point() {
+        // A workflow validating `${{ github.event.pull_request.commits }}`
+        // against `^[0-9]+$` fails on "2.0". GitHub renders whole numbers as
+        // integers, and event payloads can reach us as f64.
+        let mut ctx = aksh_gha_expressions::Context::new();
+        ctx.insert(
+            "github",
+            serde_json::json!({
+                "event": {
+                    "pull_request": { "commits": 2.0, "number": 7 }
+                }
+            }),
+        );
+
+        assert_eq!(
+            evaluate_template("${{ github.event.pull_request.commits }}", &ctx).unwrap(),
+            "2"
+        );
+        assert_eq!(
+            evaluate_template("${{ github.event.pull_request.number }}", &ctx).unwrap(),
+            "7"
+        );
+    }
+
+    #[test]
+    fn integral_f64_values_beyond_1e15_render_as_integers() {
+        // The `abs() < 1e15` cutoff left whole-number f64s at or above 1e15
+        // rendering as "1e15"/"1.15…e18" — a workflow validating a count or
+        // an id against `^[0-9]+$` fails on those.
+        assert_eq!(
+            value_to_string(&serde_json::json!(1e15)),
+            "1000000000000000"
+        );
+        assert_eq!(
+            value_to_string(&serde_json::json!(1e16)),
+            "10000000000000000"
+        );
+        assert_eq!(
+            value_to_string(&serde_json::json!(1e20)),
+            "100000000000000000000"
+        );
+        assert_eq!(
+            value_to_string(&serde_json::json!(-1e15)),
+            "-1000000000000000"
+        );
+        assert_eq!(
+            value_to_string(&serde_json::json!(-1e20)),
+            "-100000000000000000000"
+        );
+        // 2^60 is exactly representable; it must not render as "1.15…e18".
+        assert_eq!(
+            value_to_string(&serde_json::json!((1u64 << 60) as f64)),
+            "1152921504606846976"
+        );
+        // -0.0 normalizes to "0", never "-0".
+        assert_eq!(value_to_string(&serde_json::json!(-0.0)), "0");
+    }
 
     fn make_ctx() -> aksh_gha_expressions::Context {
         let mut ctx = aksh_gha_expressions::Context::new();

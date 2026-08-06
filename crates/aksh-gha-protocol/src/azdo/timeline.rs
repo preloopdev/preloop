@@ -118,6 +118,9 @@ pub enum TaskResult {
     #[serde(rename = "canceled", alias = "cancelled")]
     Cancelled,
     Skipped,
+    /// The job never finished on this runner — lease lost before completion
+    /// (`TaskResult.Abandoned` in the official `TaskResult.cs`).
+    Abandoned,
 }
 
 /// An issue (annotation) attached to a timeline record.

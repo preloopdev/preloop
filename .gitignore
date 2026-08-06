@@ -8,6 +8,11 @@
 # run `runner-watch conform`, but drop the heavy raw captures and binary bodies.
 /.runner-watch/golden/**/*.mitm
 /.runner-watch/golden/**/*.bin
+# Real-world repo campaign captures: GitHub's own run logs for third-party
+# repos, fetched on demand (tens of MB). The findings live in
+# docs/fidelity-gap.md; the raw logs are regenerable with `gh run view --log`.
+/.runner-watch/goldens/
+/.runner-watch/repos-conformance-*.md
 *.db
 *.sqlite
 *.log
@@ -99,3 +104,18 @@ benchmarks/real-world/results/aksh-runs/
 benchmarks/compatibility/runner/behavior/*-new.jsonl
 # Scratch runner roots from local pool experiments
 /runners/
+
+# 4-repo conformance campaign captures (2nd wave and later).
+#
+# NOTE: `compare-goldens.py` reads these directories and the first-wave corpus
+# (bat/vite/uv/nextcloud) is already committed, so these rules only hide NEW
+# captures — they do not untrack committed files. A capture is regenerable by
+# re-running the campaign harness against GitHub's runs API.
+benchmarks/real-world/goldens/
+benchmarks/real-world/results/conformance-4repos/**/run.json*
+benchmarks/real-world/conformance-4repos/payloads/
+
+# Conformance campaign captures: multi-MB run records and logs, regenerated
+# by the harness and not reviewable in a diff.
+benchmarks/real-world/results/conformance-4repos/**/run*.json
+benchmarks/real-world/results/conformance-4repos/**/run*.log

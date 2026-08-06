@@ -6,6 +6,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 use tokio::fs;
 
+/// POSIX `NAME_MAX` for the filesystems we target (APFS, ext4, XFS, overlayfs):
+/// a single path component may not exceed 255 bytes.
+const MAX_NAME_BYTES: usize = 255;
+
 /// Cache storage error.
 #[derive(Debug, thiserror::Error)]
 pub enum CacheError {
@@ -125,11 +129,14 @@ impl CacheStore {
         }
 
         let exact = self.path_for(key, version);
-        let legacy = self.legacy_path_for(key, version);
         let exact_path = if fs::try_exists(&exact).await? {
             Some(exact)
-        } else if fs::try_exists(&legacy).await? {
-            Some(legacy)
+        } else if let Some(legacy) = self.legacy_path_for(key, version) {
+            if fs::try_exists(&legacy).await? {
+                Some(legacy)
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -162,7 +169,7 @@ impl CacheStore {
     fn path_for(&self, key: &str, version: &str) -> PathBuf {
         self.entry_dir(key, version).join("archive.tzst")
     }
-    fn legacy_path_for(&self, key: &str, version: &str) -> PathBuf {
+    fn legacy_path_for(&self, key: &str, version: &str) -> Option<PathBuf> {
         let key_component = hex(key.as_bytes());
         let mut version_hasher = Sha256::new();
         version_hasher.update(version.as_bytes());
@@ -172,12 +179,19 @@ impl CacheStore {
         identity.update(key.as_bytes());
         identity.update(b"\0");
         identity.update(version.as_bytes());
-        self.root
-            .join(format!(
-                "{key_component}-{version_hash}-{}",
-                hex(identity.finalize())
-            ))
-            .join("archive.tzst")
+        let component = format!(
+            "{key_component}-{version_hash}-{}",
+            hex(identity.finalize())
+        );
+        // The legacy layout used the raw hex-encoded key as part of a single
+        // directory component. A component longer than NAME_MAX can never have
+        // been written by that layout, and probing it fails with ENAMETOOLONG
+        // instead of a clean not-found miss — which surfaced as a 500 on cache
+        // restore. Skip the probe rather than let the syscall error escape.
+        if component.len() > MAX_NAME_BYTES {
+            return None;
+        }
+        Some(self.root.join(component).join("archive.tzst"))
     }
 
     async fn find_prefix(
@@ -335,6 +349,8 @@ mod tests {
                 assert_eq!(bytes, *payload2);
             });
         }
+
+
         #[test]
         fn test_cache_invalid_keys(ref key in invalid_key(), ref version in "[a-zA-Z0-9_-]{1,32}") {
             let temp = tempfile::tempdir().unwrap();
@@ -351,5 +367,71 @@ mod tests {
                 assert!(matches!(res_get_rk, Err(CacheError::InvalidKey(_))));
             });
         }
+    }
+
+    #[test]
+    fn long_keys_do_not_fail_lookup_with_name_too_long() {
+        let temp = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let store = CacheStore::new(temp.path()).await.unwrap();
+            // The legacy layout hex-encodes the key as a directory component;
+            // a key this long overflows NAME_MAX and the legacy probe used
+            // to surface ENAMETOOLONG as a 500 on restore.
+            let long_key = "v0-check-".to_owned() + &"a".repeat(400);
+            let version = "v-".to_owned() + &"b".repeat(64);
+            // Put + exact restore round-trip through the hashed layout.
+            store.put(&long_key, &version, b"payload").await.unwrap();
+            let (entry, bytes) = store
+                .get(&long_key, &version, &[])
+                .await
+                .expect("lookup must not fail on key length")
+                .expect("entry must be found");
+            assert_eq!(entry.key, long_key);
+            assert_eq!(bytes, b"payload");
+            // A restore-key probe for a missing entry must also succeed.
+            let missing = store
+                .get(&long_key, &version, std::slice::from_ref(&long_key))
+                .await
+                .expect("prefix probe must not fail on key length");
+            assert!(missing.is_some());
+            let unknown = store
+                .get(&"z".repeat(300), &version, &[])
+                .await
+                .expect("unknown long key must not fail the lookup");
+            assert!(unknown.is_none());
+        });
+    }
+
+    #[test]
+    fn legacy_probe_never_errors_across_name_max_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let store = CacheStore::new(temp.path()).await.unwrap();
+            let version = "v1";
+            // The legacy component is `{key_hex}-{version_hash_16}-{identity_hex_64}`,
+            // i.e. `2 * key.len() + 82` bytes. 86-byte keys are the largest that
+            // fit in NAME_MAX (254 bytes); 87 bytes is the first that does not
+            // (256 bytes) and used to raise ENAMETOOLONG from the probe.
+            for key_len in 84..=92 {
+                let stored = "s".repeat(key_len);
+                store.put(&stored, version, b"payload").await.unwrap();
+                let hit = store
+                    .get(&stored, version, &[])
+                    .await
+                    .unwrap_or_else(|error| panic!("get errored at len {key_len}: {error}"));
+                let (entry, bytes) = hit.expect("stored entry must be found");
+                assert_eq!(entry.key, stored);
+                assert_eq!(bytes, b"payload");
+
+                let unknown = "u".repeat(key_len);
+                let miss = store
+                    .get(&unknown, version, &[])
+                    .await
+                    .unwrap_or_else(|error| panic!("miss errored at len {key_len}: {error}"));
+                assert!(miss.is_none(), "unknown {key_len}-byte key must miss");
+            }
+        });
     }
 }
