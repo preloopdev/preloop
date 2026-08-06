@@ -406,14 +406,26 @@ pub fn compare_traces(expected: &DapTrace, actual: &DapTrace) -> Vec<TraceDiverg
     out
 }
 
-/// The capture path: wrap a TcpStream and log every framed DAP
-/// message in both directions to a [`DapTrace`].
+/// The capture path: record every framed DAP message seen in either
+/// direction, then hand back a [`DapTrace`] for comparison.
 ///
-/// ```ignore
-/// let mut rec = DapRecorder::new("test1", "job-1", true, vec![], vec![], vec![]);
-/// let stream = rec.wrap(stream);
-/// // drive the test; reader/writer goes through `stream`
-/// let trace = rec.finish();
+/// Direction is the caller's convention; the rest of this module uses `c2a`
+/// for client-to-adapter and `a2c` for adapter-to-client.
+///
+/// ```
+/// use aksh_dap::harness::DapRecorder;
+/// use serde_json::json;
+///
+/// let mut recorder = DapRecorder::new("test1", "job-1", true, vec![], vec![], vec![]);
+/// recorder.record("c2a", json!({"seq": 1, "type": "request", "command": "threads"}));
+/// recorder.record(
+///     "a2c",
+///     json!({"seq": 1, "type": "response", "command": "threads", "success": true}),
+/// );
+///
+/// let trace = recorder.finish();
+/// assert_eq!(trace.frames.len(), 2);
+/// assert_eq!(trace.frames[0].direction, "c2a");
 /// ```
 pub struct DapRecorder {
     name: String,

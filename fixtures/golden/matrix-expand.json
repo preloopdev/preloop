@@ -1,110 +1,146 @@
 [
   {
-    "base_id": "build",
-    "env": {},
-    "fail_fast": true,
     "id": "build (ubuntu-latest, 16)",
-    "if_condition": null,
-    "matrix": { "os": "ubuntu-latest", "node": 16 },
-    "max_parallel": null,
-    "name": "build",
+    "base_id": "build",
+    "name": "build (ubuntu-latest, 16)",
+    "runs_on": [
+      "self-hosted"
+    ],
     "needs": [],
-    "runs_on": ["self-hosted"],
-    "secrets_inherit": false,
+    "matrix": {
+      "os": "ubuntu-latest",
+      "node": 16
+    },
+    "matrix_index": 1,
+    "matrix_total": 4,
+    "env": {},
     "steps": [
       {
-        "continue_on_error": null,
-        "env": {},
         "id": null,
-        "if_condition": null,
         "name": null,
         "run": "echo ${{ matrix.os }} ${{ matrix.node }}",
-        "shell": null,
         "uses": null,
+        "env": {},
         "with": {},
-        "working_directory": null
+        "if_condition": null,
+        "working_directory": null,
+        "shell": null,
+        "continue_on_error": null
       }
-    ]
+    ],
+    "if_condition": null,
+    "fail_fast": true,
+    "continue_on_error": false,
+    "max_parallel": null,
+    "secrets_inherit": false,
+    "oidc_id_token_granted": false
   },
   {
-    "base_id": "build",
-    "env": {},
-    "fail_fast": true,
     "id": "build (ubuntu-latest, 18)",
-    "if_condition": null,
-    "matrix": { "os": "ubuntu-latest", "node": 18 },
-    "max_parallel": null,
-    "name": "build",
+    "base_id": "build",
+    "name": "build (ubuntu-latest, 18)",
+    "runs_on": [
+      "self-hosted"
+    ],
     "needs": [],
-    "runs_on": ["self-hosted"],
-    "secrets_inherit": false,
+    "matrix": {
+      "os": "ubuntu-latest",
+      "node": 18
+    },
+    "matrix_index": 2,
+    "matrix_total": 4,
+    "env": {},
     "steps": [
       {
-        "continue_on_error": null,
-        "env": {},
         "id": null,
-        "if_condition": null,
         "name": null,
         "run": "echo ${{ matrix.os }} ${{ matrix.node }}",
-        "shell": null,
         "uses": null,
+        "env": {},
         "with": {},
-        "working_directory": null
+        "if_condition": null,
+        "working_directory": null,
+        "shell": null,
+        "continue_on_error": null
       }
-    ]
+    ],
+    "if_condition": null,
+    "fail_fast": true,
+    "continue_on_error": false,
+    "max_parallel": null,
+    "secrets_inherit": false,
+    "oidc_id_token_granted": false
   },
   {
-    "base_id": "build",
-    "env": {},
-    "fail_fast": true,
     "id": "build (macos-latest, 16)",
-    "if_condition": null,
-    "matrix": { "os": "macos-latest", "node": 16 },
-    "max_parallel": null,
-    "name": "build",
+    "base_id": "build",
+    "name": "build (macos-latest, 16)",
+    "runs_on": [
+      "self-hosted"
+    ],
     "needs": [],
-    "runs_on": ["self-hosted"],
-    "secrets_inherit": false,
+    "matrix": {
+      "os": "macos-latest",
+      "node": 16
+    },
+    "matrix_index": 3,
+    "matrix_total": 4,
+    "env": {},
     "steps": [
       {
-        "continue_on_error": null,
-        "env": {},
         "id": null,
-        "if_condition": null,
         "name": null,
         "run": "echo ${{ matrix.os }} ${{ matrix.node }}",
-        "shell": null,
         "uses": null,
+        "env": {},
         "with": {},
-        "working_directory": null
+        "if_condition": null,
+        "working_directory": null,
+        "shell": null,
+        "continue_on_error": null
       }
-    ]
+    ],
+    "if_condition": null,
+    "fail_fast": true,
+    "continue_on_error": false,
+    "max_parallel": null,
+    "secrets_inherit": false,
+    "oidc_id_token_granted": false
   },
   {
-    "base_id": "build",
-    "env": {},
-    "fail_fast": true,
     "id": "build (macos-latest, 18)",
-    "if_condition": null,
-    "matrix": { "os": "macos-latest", "node": 18 },
-    "max_parallel": null,
-    "name": "build",
+    "base_id": "build",
+    "name": "build (macos-latest, 18)",
+    "runs_on": [
+      "self-hosted"
+    ],
     "needs": [],
-    "runs_on": ["self-hosted"],
-    "secrets_inherit": false,
+    "matrix": {
+      "os": "macos-latest",
+      "node": 18
+    },
+    "matrix_index": 4,
+    "matrix_total": 4,
+    "env": {},
     "steps": [
       {
-        "continue_on_error": null,
-        "env": {},
         "id": null,
-        "if_condition": null,
         "name": null,
         "run": "echo ${{ matrix.os }} ${{ matrix.node }}",
-        "shell": null,
         "uses": null,
+        "env": {},
         "with": {},
-        "working_directory": null
+        "if_condition": null,
+        "working_directory": null,
+        "shell": null,
+        "continue_on_error": null
       }
-    ]
+    ],
+    "if_condition": null,
+    "fail_fast": true,
+    "continue_on_error": false,
+    "max_parallel": null,
+    "secrets_inherit": false,
+    "oidc_id_token_granted": false
   }
 ]

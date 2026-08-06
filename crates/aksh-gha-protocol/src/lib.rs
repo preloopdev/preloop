@@ -257,15 +257,11 @@ impl WorkflowSubmission {
         if self.secrets.is_empty() {
             return Ok(value);
         }
-        let exposed = self
-            .secrets
-            .iter()
-            .map(|(name, secret)| {
-                (
-                    name.clone(),
-                    serde_json::Value::String(secret.expose().to_owned()),
-                )
-            })
+        // Resolve the whole map once through the sanctioned masking boundary,
+        // then wrap the already-plaintext values for JSON.
+        let exposed = masking::expose_all(&self.secrets)
+            .into_iter()
+            .map(|(name, value)| (name, serde_json::Value::String(value)))
             .collect();
         if let Some(object) = value.as_object_mut() {
             object.insert("secrets".to_owned(), serde_json::Value::Object(exposed));
@@ -353,6 +349,14 @@ pub struct JobPlan {
     /// User-Agent product token; `__default` is used when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matrix_index: Option<usize>,
+    /// Total number of matrix cells for the base job, when the job expanded
+    /// from a matrix with more than one combination. Feeds the
+    /// `strategy.job-total` context (1-based total, like GitHub).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matrix_total: Option<usize>,
+    /// Deferred expression for runtime dynamic matrix expansion, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_matrix: Option<String>,
     /// Job-level environment.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
@@ -425,6 +429,38 @@ pub struct JobPlan {
     /// Job-level concurrency queue mode: `"single"` or `"max"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency_queue: Option<String>,
+    /// Pending reusable-workflow invocation.
+    ///
+    /// Present on caller placeholder nodes: the callee subtree is not part of
+    /// the plan. The server expands it at runtime only when the caller's
+    /// `if:` gate passes, and otherwise records this single node as skipped —
+    /// matching GitHub, which never materializes a false-gated caller's subtree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reusable_call: Option<ReusableCallPlan>,
+}
+
+/// Everything needed to expand a reusable-workflow caller node into its
+/// callee job subtree once the caller's `if:` gate passes at runtime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReusableCallPlan {
+    /// The raw `uses:` reference (`owner/repo/path@ref` or `./path`).
+    pub uses: String,
+    /// Normalized path of the called workflow file.
+    pub workflow_file: String,
+    /// Resolved called-workflow commit SHA.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_sha: Option<String>,
+    /// Resolved called-workflow repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_repository: Option<String>,
+    /// Reusable-call nesting depth of this caller (1 = called from the root
+    /// workflow). GitHub caps nesting at 4.
+    #[serde(default = "default_reusable_depth")]
+    pub depth: usize,
+}
+
+fn default_reusable_depth() -> usize {
+    1
 }
 
 fn default_fail_fast() -> bool {
@@ -626,6 +662,57 @@ pub struct JobCompletion {
     /// Outputs captured by the runner.
     #[serde(default)]
     pub outputs: OutputMap,
+    /// Job-level annotations reported with the completion (e.g. the
+    /// official runner's worker-crash detail from `ForceFailJob`).
+    #[serde(default)]
+    pub annotations: Vec<serde_json::Value>,
+}
+
+/// Mask every string value in job-completion annotations with the run's
+/// canonical secret masker.
+///
+/// Crash annotations (e.g. the official runner's worker-crash detail from
+/// `ForceFailJob`) embed worker stdout/stderr, which can contain secret
+/// values. The server must run annotations through this before persisting or
+/// returning them — the raw `JobCompletion` is the protocol boundary and is
+/// not safe to store as-is. Object keys are preserved so the annotation
+/// schema survives masking; only string values are rewritten.
+///
+/// `secrets` matches [`masking::mask_secrets`]'s iterator shape, so server
+/// callers pass the same plaintext collection they use for log masking (e.g.
+/// `masking::expose_values(run.submission.secrets.values()).iter().map(String::as_str)`).
+pub fn mask_annotations<'a, I>(
+    annotations: Vec<serde_json::Value>,
+    secrets: I,
+) -> Vec<serde_json::Value>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let secrets: Vec<&'a str> = secrets.into_iter().collect();
+    annotations
+        .into_iter()
+        .map(|value| mask_annotation_strings(value, &secrets))
+        .collect()
+}
+
+fn mask_annotation_strings(value: serde_json::Value, secrets: &[&str]) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => {
+            serde_json::Value::String(masking::mask_secrets(&text, secrets.iter().copied(), &[]))
+        }
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .into_iter()
+                .map(|item| mask_annotation_strings(item, secrets))
+                .collect(),
+        ),
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(key, value)| (key, mask_annotation_strings(value, secrets)))
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 /// Machine-readable event emitted as NDJSON.
@@ -849,6 +936,39 @@ mod tests {
             submission.to_request_json().unwrap(),
             serde_json::to_value(&submission).unwrap()
         );
+    }
+
+    #[test]
+    fn mask_annotations_redacts_secrets_in_nested_strings() {
+        let annotations = vec![
+            serde_json::json!({
+                "level": "failure",
+                "message": "worker crashed: token ghp_secret123 in output",
+                "stack": ["stdout ghp_secret123", "stderr ghp_secret123"],
+            }),
+            serde_json::json!({ "message": "clean annotation" }),
+        ];
+
+        let masked = mask_annotations(annotations, ["ghp_secret123"].iter().copied());
+
+        let serialized = serde_json::to_string(&masked).unwrap();
+        assert!(
+            !serialized.contains("ghp_secret123"),
+            "annotation leaked a secret: {serialized}"
+        );
+        assert_eq!(masked[0]["message"], "worker crashed: token *** in output");
+        assert_eq!(masked[0]["stack"][0], "stdout ***");
+        assert_eq!(masked[0]["stack"][1], "stderr ***");
+        assert_eq!(
+            masked[0]["level"], "failure",
+            "annotation schema keys must survive masking"
+        );
+        assert_eq!(masked[1]["message"], "clean annotation");
+
+        // Masking is idempotent — re-masking the already-masked output is a
+        // no-op, so a secret can never surface on a second pass.
+        let twice = mask_annotations(masked.clone(), ["ghp_secret123"].iter().copied());
+        assert_eq!(twice, masked);
     }
 
     fn submission_with_secrets() -> WorkflowSubmission {

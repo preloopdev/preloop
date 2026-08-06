@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeSet;
 
 pub(crate) async fn healthz(State(shared): State<Arc<SharedState>>) -> Json<serde_json::Value> {
     Json(json!({
@@ -82,12 +83,48 @@ fn evaluate_run_name(
     result
 }
 
+/// Validate every `on.schedule[*].cron` expression in a submitted workflow.
+/// GitHub rejects invalid cron at workflow save; aksh rejects at submit so a
+/// bad schedule is a hard error instead of a cron job that never registers.
+fn validate_schedule_crons(workflow: &aksh_gha_parser::Workflow) -> Result<(), ApiError> {
+    let aksh_gha_parser::Trigger::Map(triggers) = &workflow.on else {
+        return Ok(());
+    };
+    let Some(schedule) = triggers.get("schedule").and_then(|v| v.as_array()) else {
+        return Ok(());
+    };
+    for entry in schedule {
+        let Some(cron) = entry.get("cron").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if let Err(error) = crate::scheduler::github_to_cron(cron) {
+            return Err(ApiError::bad_request(format!(
+                "invalid cron expression {cron:?} in on.schedule: {error}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn submit_run_inner(
     shared: &Arc<SharedState>,
     mut submission: WorkflowSubmission,
 ) -> Result<RunAccepted, ApiError> {
     let workflow = parse_workflow(&submission.workflow_yaml)?;
-    crate::remote_workflows::resolve_remote_workflows(&mut submission, &workflow).await?;
+    // GitHub rejects workflows whose `on.schedule` cron cannot parse (save
+    // time); aksh rejects them at submit so a bad schedule is a hard error
+    // instead of a cron job that never registers.
+    validate_schedule_crons(&workflow)?;
+    // The same static credential job tokens use (env `AKSH_GITHUB_TOKEN`,
+    // else the config file's `github.pat`) authenticates remote reusable
+    // workflow fetches: private `uses: owner/repo/...` references must
+    // resolve without a separately exported token.
+    crate::remote_workflows::resolve_remote_workflows(
+        &mut submission,
+        &workflow,
+        shared.state.static_github_pat().as_deref(),
+    )
+    .await?;
     if submission.event == "workflow_dispatch" {
         workflow.apply_workflow_dispatch_inputs(&mut submission.payload)?;
         if submission.dispatch_inputs.is_empty() {
@@ -116,11 +153,42 @@ pub(crate) async fn submit_run_inner(
             object.insert("inputs".to_owned(), inputs_value);
         }
     }
-    if let Some(tier) = submission.trust_tier.as_deref().and_then(|value| {
-        serde_json::from_value::<crate::events::trust_tier::TrustTier>(json!(value)).ok()
-    }) {
-        if !tier.allows_secrets() {
-            submission.secrets.clear();
+    // Native submissions carry no trust tier (the webhook path sets it) and
+    // pass secrets through unmodified — None is therefore trusted. Mirror
+    // GitHub repo secrets: stored secrets are available to every trusted
+    // job, with submission-provided values winning per name.
+    let allow_secrets = submission
+        .trust_tier
+        .as_deref()
+        .and_then(|value| {
+            serde_json::from_value::<crate::events::trust_tier::TrustTier>(json!(value)).ok()
+        })
+        .map(|tier| tier.allows_secrets())
+        .unwrap_or(true);
+    if !allow_secrets {
+        submission.secrets.clear();
+    } else {
+        // Global secrets first, then per-repository secrets for the
+        // submitting repository. Precedence: submission-provided secrets
+        // (already in the map) > per-repo tier > global tier — mirroring
+        // GitHub, where repo secrets override org secrets of the same name.
+        let secret_store = shared.state.secrets.read();
+        let submission_names: BTreeSet<String> = submission.secrets.keys().cloned().collect();
+        for (name, value) in &secret_store.global {
+            submission
+                .secrets
+                .entry(name.clone())
+                .or_insert_with(|| aksh_gha_protocol::SecretString::new(value.clone()));
+        }
+        if let Some(repo_secrets) = secret_store.repo.get(&submission.repository) {
+            for (name, value) in repo_secrets {
+                if !submission_names.contains(name) {
+                    submission.secrets.insert(
+                        name.clone(),
+                        aksh_gha_protocol::SecretString::new(value.clone()),
+                    );
+                }
+            }
         }
     }
     let (branch, tag) = {
@@ -219,27 +287,19 @@ pub(crate) async fn submit_run_inner(
         let mut known: std::collections::BTreeSet<&str> =
             pairs.iter().map(|(id, _)| id.as_str()).collect();
         for requested in &submission.selected_jobs {
-            let mut matched_reusable = false;
-            for caller in reusable_calls.keys().filter(|caller| {
+            // A reusable caller is selected by its own (possibly
+            // matrix-suffixed) node: its callee subtree is not part of the
+            // plan anymore — it materializes at runtime after the gate passes.
+            let matched_reusable = reusable_calls.keys().any(|caller| {
                 caller.as_str() == requested
                     || caller
                         .strip_prefix(requested)
                         .is_some_and(|suffix| suffix.starts_with(" ("))
-            }) {
-                matched_reusable = true;
-                selected.extend(
-                    pairs
-                        .iter()
-                        .map(|(id, _)| id)
-                        .filter(|id| id.starts_with(&format!("{caller}/")))
-                        .cloned(),
-                );
-            }
+            });
             if matched_reusable {
                 known.insert(requested);
-            } else {
-                selected.insert(requested.clone());
             }
+            selected.insert(requested.clone());
         }
         let unknown: Vec<&str> = submission
             .selected_jobs
@@ -286,6 +346,20 @@ pub(crate) async fn submit_run_inner(
                 .and_then(|value| value.as_str())
                 .map(str::to_owned)
         })
+        .or_else(|| {
+            // `pull_request` payloads carry no `after`; without consulting the
+            // head sha the chain falls through to all-zeros and every checkout
+            // asks the server for `0000…`, which fails as "not our ref" with
+            // nothing pointing at the real cause.
+            submission
+                .payload
+                .get("pull_request")
+                .and_then(|pull_request| pull_request.get("head"))
+                .and_then(|head| head.get("sha"))
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })
         .unwrap_or_else(|| {
             if submission.git_ref.len() == 40
                 && submission
@@ -308,20 +382,69 @@ pub(crate) async fn submit_run_inner(
         submission.repository, workflow_path, submission.git_ref
     );
 
-    let ref_name = submission
-        .git_ref
+    // A pull_request submission is a synthetic PR: GitHub presents the
+    // event with `github.ref = refs/pull/<number>/merge`, not the base
+    // branch ref. Workflows gate on this (e.g. uv's plan computes
+    // `on_main_branch` from `github.ref == refs/heads/main`); leaking the
+    // base branch ref makes them treat the PR as a main-branch push and
+    // enable every main-only gate.
+    let github_ref = if submission.event == "pull_request" {
+        let number = submission
+            .payload
+            .get("number")
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| {
+                submission
+                    .payload
+                    .get("pull_request")
+                    .and_then(|pr| pr.get("number"))
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .unwrap_or(1);
+        format!("refs/pull/{number}/merge")
+    } else {
+        submission.git_ref.clone()
+    };
+    // GitHub's `ref_name` is the short ref of `github.ref`: `feature-branch-1`
+    // for branch events, `<tag>` for tags, and `<pr_number>/merge` for pull
+    // requests (docs: "For pull requests that were not merged, the format is
+    // `<pr_number>/merge`"). Deriving it from `github_ref` keeps the pair
+    // consistent — previously PR events leaked the full `refs/pull/N/merge`
+    // into `github.ref_name`/`GITHUB_REF_NAME`, breaking string comparisons
+    // against the short form.
+    let ref_name = github_ref
         .strip_prefix("refs/heads/")
-        .or_else(|| submission.git_ref.strip_prefix("refs/tags/"))
-        .unwrap_or(&submission.git_ref)
+        .or_else(|| github_ref.strip_prefix("refs/tags/"))
+        .or_else(|| github_ref.strip_prefix("refs/pull/"))
+        .unwrap_or(&github_ref)
         .to_owned();
-    let ref_type = if submission.git_ref.starts_with("refs/tags/") {
+    let ref_type = if github_ref.starts_with("refs/tags/") {
         "tag"
     } else {
         "branch"
     };
+    let (pr_head_ref, pr_base_ref) = if submission.event == "pull_request" {
+        let pr = submission.payload.get("pull_request");
+        let head = pr
+            .and_then(|pr| pr.get("head"))
+            .and_then(|head| head.get("ref"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let base = pr
+            .and_then(|pr| pr.get("base"))
+            .and_then(|base| base.get("ref"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        (head.to_owned(), base.to_owned())
+    } else {
+        (
+            String::new(),
+            submission.base_ref.clone().unwrap_or_default(),
+        )
+    };
 
     let mut github = json!({
-        "ref": submission.git_ref,
+        "ref": github_ref,
         "sha": sha,
         "repository": submission.repository,
         "repository_owner": repository_owner,
@@ -336,12 +459,12 @@ pub(crate) async fn submit_run_inner(
         "actor_id": "0",
         "actor": "aksh-system",
         "workflow": workflow.name.clone().unwrap_or_default(),
-        "head_ref": "",
-        "base_ref": submission.base_ref.as_deref().unwrap_or(""),
+        "head_ref": pr_head_ref,
+        "base_ref": pr_base_ref,
         "event_name": submission.event,
-        "server_url": "https://github.com",
-        "api_url": "https://api.github.com",
-        "graphql_url": "https://api.github.com/graphql",
+        "server_url": shared.state.github_urls.server_url,
+        "api_url": shared.state.github_urls.api_url,
+        "graphql_url": shared.state.github_urls.graphql_url,
         "ref_name": ref_name,
         "ref_protected": false,
         "ref_type": ref_type,
@@ -397,7 +520,14 @@ pub(crate) async fn submit_run_inner(
         .map(std::path::Path::new)
         .or(shared.state.local_workspace.as_deref());
     let workspace_snapshot = if let Some(workspace) = local_workspace {
-        match create_workspace_snapshot(&shared.state.state_dir, workspace, run_id).await {
+        match create_workspace_snapshot(
+            &shared.state.state_dir,
+            workspace,
+            run_id,
+            shared.state.static_github_pat().as_deref(),
+        )
+        .await
+        {
             Ok(snapshot) => Some(snapshot),
             Err(error) => {
                 warn!(%run_id, error = ?error, "Failed to create workspace snapshot — falling back to normal checkout");
@@ -414,6 +544,13 @@ pub(crate) async fn submit_run_inner(
     // read `payload.repository.default_branch` and `payload.before` to pick
     // their diff base; without them they abort and gate the whole DAG closed.
     if let Some(snapshot) = &workspace_snapshot {
+        // Payload-less submissions (native local runs) carry `payload: null`;
+        // the synthetic push/PR shape below needs an object to mutate, and
+        // without it `before`/`after`/`ref`/`head_commit` were silently
+        // missing from `github.event` for local runs.
+        if !submission.payload.is_object() {
+            submission.payload = serde_json::json!({});
+        }
         if let Some(payload) = submission.payload.as_object_mut() {
             let (owner, name) = submission
                 .repository
@@ -457,13 +594,75 @@ pub(crate) async fn submit_run_inner(
                 );
                 payload.insert("after".to_owned(), serde_json::json!(snapshot.commit_sha));
                 payload.insert("ref".to_owned(), serde_json::json!(submission.git_ref));
+                // GitHub push payloads carry `head_commit`; workflows gate on
+                // `github.event.head_commit.message` (e.g. `[skip ci]`
+                // markers). The snapshot knows the commit identity but not its
+                // message, so the object is present with empty free-text
+                // fields — `null` would make `head_commit.message` accesses
+                // error out in expressions, an empty string stays falsey.
+                payload.insert(
+                    "head_commit".to_owned(),
+                    serde_json::json!({
+                        "id": snapshot.commit_sha,
+                        "tree_id": "",
+                        "distinct": true,
+                        "message": "",
+                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                        "url": "",
+                        "author": {"name": "", "email": "", "username": ""},
+                        "committer": {"name": "", "email": "", "username": ""},
+                        "added": [],
+                        "removed": [],
+                        "modified": [],
+                    }),
+                );
+            } else if submission.event == "pull_request" {
+                // Same synthetic-push shape for PR-family events: the head
+                // commit the runner checks out is the snapshot commit
+                // (`commit_sha` — the synthetic commit that carries the
+                // dirty tree), and `base.sha` is the base its changes are
+                // measured against (the workspace HEAD when the tree is
+                // dirty, HEAD^ when clean — see `WorkspaceSnapshot::before_sha`).
+                // Changed-file actions (`dorny/paths-filter`,
+                // `tj-actions/changed-files`) diff these two SHAs; without
+                // the refresh they would diff the caller-supplied head
+                // against itself and see nothing, and pointing `head.sha` at
+                // the real workspace HEAD diffed it against an identical
+                // tree (and a sha absent from the snapshot store).
+                let base_sha = snapshot
+                    .before_sha
+                    .clone()
+                    .unwrap_or_else(|| "0000000000000000000000000000000000000000".to_owned());
+                if let Some(pr) = payload
+                    .get_mut("pull_request")
+                    .and_then(|v| v.as_object_mut())
+                {
+                    if let Some(base) = pr.get_mut("base").and_then(|v| v.as_object_mut()) {
+                        base.insert("sha".to_owned(), serde_json::json!(base_sha));
+                    }
+                    if let Some(head) = pr.get_mut("head").and_then(|v| v.as_object_mut()) {
+                        head.insert("sha".to_owned(), serde_json::json!(snapshot.commit_sha));
+                    }
+                }
             }
         }
         // The github context was built before the snapshot existed; refresh
         // the pieces that now describe the local tree.
         if let Some(object) = github.as_object_mut() {
             object.insert("event".to_owned(), submission.payload.clone());
-            object.insert("sha".to_owned(), serde_json::json!(snapshot.commit_sha));
+            // `github.sha` is the workspace's real HEAD commit, not the
+            // synthetic snapshot commit: the snapshot commit exists only in
+            // this engine's store, so a workflow step that fetches
+            // `${{ github.sha }}` from the real remote (custom checkouts)
+            // would be answered "not our ref". The workspace HEAD is the
+            // identity the run is really based on.
+            object.insert(
+                "sha".to_owned(),
+                serde_json::json!(snapshot
+                    .head_sha
+                    .clone()
+                    .unwrap_or_else(|| snapshot.commit_sha.clone())),
+            );
         }
     }
 
@@ -473,7 +672,7 @@ pub(crate) async fn submit_run_inner(
     // expires.
     let mut github_tokens: BTreeMap<JobId, String> = BTreeMap::new();
     if shared.state.github_app.is_none() {
-        if let Ok(pat) = std::env::var("AKSH_GITHUB_TOKEN") {
+        if let Some(pat) = shared.state.static_github_pat() {
             info!(%run_id, "Using AKSH_GITHUB_TOKEN PAT for run jobs");
             github_tokens.extend(jobs.iter().map(|job| (job.id.clone(), pat.clone())));
         }
@@ -506,11 +705,8 @@ pub(crate) async fn submit_run_inner(
     // O(jobs × map_insert).
     let base_url = runner_base_url();
     let normalized_github = aksh_gha_parser::job_builder::normalize_github_context(&github);
-    let secrets_exposed: BTreeMap<String, String> = submission
-        .secrets
-        .iter()
-        .map(|(k, v)| (k.clone(), v.expose().to_owned()))
-        .collect();
+    let secrets_exposed: BTreeMap<String, String> =
+        aksh_gha_protocol::masking::expose_all(&submission.secrets);
 
     struct PrebuiltJob {
         job: aksh_gha_protocol::JobPlan,
@@ -518,6 +714,7 @@ pub(crate) async fn submit_run_inner(
         request_id: i64,
         condition_context: aksh_gha_expressions::Context,
         skipped: bool,
+        caller: bool,
         id_token_granted: bool,
         oidc_ctx: OidcJobContext,
         job_request: Option<TaskAgentJobRequestRecord>,
@@ -531,6 +728,8 @@ pub(crate) async fn submit_run_inner(
     let mut pre_job_fail_fast: BTreeMap<String, bool> = BTreeMap::new();
     let mut pre_job_continue_on_error: BTreeMap<String, bool> = BTreeMap::new();
     let mut pre_initially_skipped: Vec<(RunId, JobId)> = Vec::new();
+    let mut pre_caller_plans: BTreeMap<JobId, aksh_gha_protocol::JobPlan> = BTreeMap::new();
+    let mut pre_job_names: BTreeMap<JobId, String> = BTreeMap::new();
 
     for job in jobs {
         pre_job_base_ids.insert(job.id.clone(), job.base_id.clone());
@@ -538,6 +737,10 @@ pub(crate) async fn submit_run_inner(
         pre_job_fail_fast.insert(job.base_id.clone(), job.fail_fast);
         pre_job_continue_on_error.insert(job.id.to_string(), job.continue_on_error);
         pre_statuses.insert(job.id.clone(), ExecutionStatus::Queued);
+        pre_job_names.insert(job.id.clone(), job.name.clone());
+        if job.reusable_call.is_some() {
+            pre_caller_plans.insert(job.id.clone(), job.clone());
+        }
 
         let condition_context = build_context(
             &github,
@@ -576,6 +779,7 @@ pub(crate) async fn submit_run_inner(
                 request_id: 0,
                 condition_context,
                 skipped: true,
+                caller: false,
                 id_token_granted: false,
                 oidc_ctx: OidcJobContext {
                     environment: None,
@@ -588,178 +792,32 @@ pub(crate) async fn submit_run_inner(
             continue;
         }
 
-        // Heavy work: build the agent message outside the lock.
-        let mut agent_msg =
-            aksh_gha_parser::job_builder::build_agent_job_message_with_normalized_context(
-                &job,
-                &normalized_github,
-                &job.env,
-                &secrets_exposed,
-                &submission.vars,
-            )
-            .map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
-
-        agent_msg.preloop_preserve_on_failure = submission.preserve_on_failure.then_some(true);
-
-        // Pre-allocate request ID atomically (no lock needed).
-        let request_id = shared
-            .state
-            .next_request_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        agent_msg.request_id = request_id;
-
-        // Mint tokens outside the lock (HMAC computation).
-        let runtime_token = shared
-            .state
-            .mint_runtime_token(&agent_msg.plan.plan_id, &agent_msg.job_id);
-
-        if let Some(snapshot) = workspace_snapshot.as_ref() {
-            let redirected =
-                redirect_primary_checkout(&mut agent_msg, snapshot, &base_url, &runtime_token);
-            if redirected > 0 {
-                info!(
-                    %run_id,
-                    job = %job.id,
-                    %redirected,
-                    commit = %snapshot.commit_sha,
-                    "Redirected primary checkout to local workspace snapshot"
-                );
-                agent_msg.aksh_snapshot_commit = Some(snapshot.commit_sha.clone());
-            }
-        }
-
-        let id_token_granted = job.oidc_id_token_granted;
-        if id_token_granted {
-            let oidc_url = format!(
-                "{}/runner/server/_apis/distributedtask/hubs/actions/plans/{}/jobs/{}/oidctoken?api-version=2.0",
-                base_url,
-                agent_msg.plan.plan_id,
-                agent_msg.job_id,
-            );
-            for endpoint in &mut agent_msg.resources.endpoints {
-                if endpoint.name.eq_ignore_ascii_case("SystemVssConnection") {
-                    endpoint
-                        .data
-                        .insert("GenerateIdTokenUrl".to_owned(), oidc_url.clone());
-                }
-            }
-        }
-
-        let github_token = github_tokens
-            .remove(&job.id)
-            .unwrap_or_else(|| runtime_token.clone());
-        agent_msg.variables.insert(
-            "system.github.token".to_owned(),
-            aksh_gha_protocol::azdo::VariableValue::secret(github_token.clone()),
-        );
-        agent_msg.variables.insert(
-            "github_token".to_owned(),
-            aksh_gha_protocol::azdo::VariableValue::secret(github_token),
-        );
-        agent_msg.variables.insert(
-            "actions_runner_allow_artifacts_file".to_owned(),
-            aksh_gha_protocol::azdo::VariableValue::new("false"),
-        );
-        agent_msg.variables.insert(
-            "actions_self_repository".to_owned(),
-            aksh_gha_protocol::azdo::VariableValue::new("true"),
-        );
-        // The debug-worker token is deliberately not a job variable. An
-        // official runner copies every `isSecret` variable into the `secrets`
-        // context, so shipping it here would publish it to workflow YAML as
-        // `${{ secrets['system.preloop.debug_worker_token'] }}`. The worker
-        // acquires it instead over `POST /api/v1/debug/worker-token`, which
-        // authenticates against this job's runtime token.
-        agent_msg.variables.insert(
-            "system.github.launch_endpoint".to_owned(),
-            aksh_gha_protocol::azdo::VariableValue::new(base_url.clone()),
-        );
-        agent_msg.variables.insert(
-            "system.github.results_endpoint".to_owned(),
-            aksh_gha_protocol::azdo::VariableValue::new(base_url.clone()),
-        );
-        agent_msg.variables.insert(
-            "system.orchestrationId".to_owned(),
-            aksh_gha_protocol::azdo::VariableValue::new(orchestration_id(
-                &agent_msg.plan.plan_id,
-                &job.base_id,
-                job.matrix_index,
-            )),
-        );
-        agent_msg.file_table = vec![workflow_path.clone()];
-        if let Some(aksh_gha_protocol::azdo::PipelineContextData::Dict(job_dict)) =
-            agent_msg.context_data.get_mut("job")
-        {
-            job_dict.insert(
-                "check_run_id".to_owned(),
-                aksh_gha_protocol::azdo::PipelineContextData::Number(0.0),
-            );
-            job_dict.insert(
-                "workflow_ref".to_owned(),
-                aksh_gha_protocol::azdo::PipelineContextData::String(workflow_ref.clone()),
-            );
-            job_dict.insert(
-                "workflow_sha".to_owned(),
-                aksh_gha_protocol::azdo::PipelineContextData::String(sha.clone()),
-            );
-            job_dict.insert(
-                "workflow_repository".to_owned(),
-                aksh_gha_protocol::azdo::PipelineContextData::String(submission.repository.clone()),
-            );
-            job_dict.insert(
-                "workflow_file_path".to_owned(),
-                aksh_gha_protocol::azdo::PipelineContextData::String(workflow_path.clone()),
-            );
-        }
-        agent_msg.enable_debugger = submission.enable_debugger;
-        agent_msg.debugger_welcome_message = submission.debugger_welcome_message.clone();
-        if submission.enable_debugger || submission.preserve_on_failure {
-            agent_msg.aksh_debug_run_id = Some(run_id.to_string());
-            agent_msg.aksh_debug_transport = Some("local".to_string());
-        }
-
-        let oidc_ctx = OidcJobContext {
-            environment: job.oidc_environment.clone(),
-            job_workflow_ref: job.oidc_job_workflow_ref.clone(),
-            job_workflow_sha: job.workflow_sha.clone(),
-        };
-
-        let job_request = TaskAgentJobRequestRecord {
-            request_id,
+        let artifacts = build_job_artifacts(
+            shared,
+            &submission,
             run_id,
-            job_id: job.id.clone(),
-            agent_job_id: agent_msg.job_id,
-            plan_id: agent_msg.plan.plan_id.clone(),
-            plan_type: agent_msg.plan.plan_type.clone(),
-            timeline_id: agent_msg.timeline.id,
-            result: None,
-            locked_until: agent_request_locked_until(),
-            started_at: None,
-            last_renewed_at: None,
-            timeout_triggered: false,
-            debug_token_issued: false,
-        };
-        let github_token_request = shared
-            .state
-            .github_app
-            .as_ref()
-            .map(|_| GitHubTokenRequest {
-                repository: submission.repository.clone(),
-                permissions: aksh_gha_parser::effective_token_permissions(job.permissions.as_ref())
-                    .into_owned(),
-                declared: job.permissions.is_some(),
-            });
+            &workflow_path,
+            &workflow_ref,
+            &sha,
+            &normalized_github,
+            &secrets_exposed,
+            &base_url,
+            workspace_snapshot.as_ref(),
+            &job,
+            github_tokens.remove(&job.id),
+        )?;
 
         prebuilt.push(PrebuiltJob {
+            caller: job.reusable_call.is_some(),
             job,
-            agent_msg: Some(agent_msg),
-            request_id,
+            agent_msg: Some(artifacts.agent_msg),
+            request_id: artifacts.request_id,
             condition_context,
             skipped: false,
-            id_token_granted,
-            oidc_ctx,
-            job_request: Some(job_request),
-            github_token_request,
+            id_token_granted: artifacts.id_token_granted,
+            oidc_ctx: artifacts.oidc_ctx,
+            job_request: Some(artifacts.job_request),
+            github_token_request: artifacts.github_token_request,
         });
     }
 
@@ -769,6 +827,8 @@ pub(crate) async fn submit_run_inner(
         let event = submission.event.clone();
         let github = github;
         let mut statuses = pre_statuses;
+        let caller_plans = pre_caller_plans;
+        let job_names = pre_job_names;
         let mut ready_jobs = 0usize;
         let job_base_ids = pre_job_base_ids;
         let job_needs = pre_job_needs;
@@ -776,6 +836,9 @@ pub(crate) async fn submit_run_inner(
         let job_continue_on_error = pre_job_continue_on_error;
         let mut ready_by_base: BTreeMap<String, u64> = BTreeMap::new();
         let initially_skipped = pre_initially_skipped;
+        // Jobs concluded at submit because no runner can host their platform,
+        // paired with the explanation emitted to watchers below.
+        let mut unhostable_reasons: Vec<(JobId, String)> = Vec::new();
         let mut built_jobs: Vec<QueuedJob> = Vec::new();
         if empty_workflow_concurrency_group {
             let queued_jobs = 0;
@@ -789,6 +852,12 @@ pub(crate) async fn submit_run_inner(
                     job_outputs: BTreeMap::new(),
                     job_base_ids: BTreeMap::new(),
                     job_needs: BTreeMap::new(),
+                    caller_plans: BTreeMap::new(),
+                    job_names: BTreeMap::new(),
+                    github: serde_json::Value::Null,
+                    head_sha: String::new(),
+                    workflow_ref: String::new(),
+                    workspace_snapshot: None,
                     job_fail_fast: BTreeMap::new(),
                     job_continue_on_error: BTreeMap::new(),
                     status: ExecutionStatus::Failure,
@@ -834,32 +903,50 @@ pub(crate) async fn submit_run_inner(
             }
             let job = &pb.job;
             let agent_msg = pb.agent_msg.expect("non-skipped job must have agent_msg");
-            let job_request = pb
-                .job_request
-                .expect("non-skipped job must have job_request");
 
-            inner
-                .id_token_grants
-                .insert((run_id, job.id.clone()), pb.id_token_granted);
-            inner
-                .oidc_job_contexts
-                .insert((run_id, job.id.clone()), pb.oidc_ctx);
+            if !pb.caller {
+                // Caller placeholders are scheduling-only: no runner ever
+                // acquires them, so no request correlation records exist.
+                let job_request = pb
+                    .job_request
+                    .expect("non-skipped job must have job_request");
 
-            inner
-                .inflight_requests
-                .insert(job_request.request_id, (run_id, job.id.clone()));
-            inner
-                .plan_requests
-                .insert(job_request.plan_id.clone(), pb.request_id);
-            inner
-                .agent_job_requests
-                .insert(job_request.agent_job_id, pb.request_id);
-            inner
-                .timeline_requests
-                .insert(job_request.timeline_id, pb.request_id);
-            inner.job_requests.insert(pb.request_id, job_request);
-            if let Some(request) = pb.github_token_request {
-                inner.github_token_requests.insert(pb.request_id, request);
+                inner
+                    .id_token_grants
+                    .insert((run_id, job.id.clone()), pb.id_token_granted);
+                inner
+                    .oidc_job_contexts
+                    .insert((run_id, job.id.clone()), pb.oidc_ctx);
+
+                inner
+                    .inflight_requests
+                    .insert(job_request.request_id, (run_id, job.id.clone()));
+                inner
+                    .plan_requests
+                    .insert(job_request.plan_id.clone(), pb.request_id);
+                inner
+                    .agent_job_requests
+                    .insert(job_request.agent_job_id, pb.request_id);
+                inner
+                    .timeline_requests
+                    .insert(job_request.timeline_id, pb.request_id);
+                inner.job_requests.insert(pb.request_id, job_request);
+                if let Some(request) = pb.github_token_request {
+                    inner.github_token_requests.insert(pb.request_id, request);
+                    tracing::debug!(
+                        request_id = pb.request_id,
+                        job = %job.id,
+                        "prebuild: dispatch token request inserted"
+                    );
+                } else {
+                    // Normal whenever no GitHub App is configured; one line per
+                    // job would drown the log on a wide matrix.
+                    tracing::debug!(
+                        request_id = pb.request_id,
+                        job = %job.id,
+                        "prebuild: job has no dispatch token request"
+                    );
+                }
             }
 
             let queued_job = QueuedJob {
@@ -883,6 +970,8 @@ pub(crate) async fn submit_run_inner(
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
+                deferred_matrix: job.deferred_matrix.clone(),
+                reusable_call: job.reusable_call.clone(),
             };
             built_jobs.push(queued_job);
         }
@@ -922,6 +1011,12 @@ pub(crate) async fn submit_run_inner(
                             job_outputs: BTreeMap::new(),
                             job_base_ids,
                             job_needs,
+                            caller_plans: caller_plans.clone(),
+                            job_names: job_names.clone(),
+                            github: github.clone(),
+                            head_sha: sha.clone(),
+                            workflow_ref: workflow_ref.clone(),
+                            workspace_snapshot: workspace_snapshot.clone(),
                             job_fail_fast,
                             job_continue_on_error,
                             status: ExecutionStatus::Cancelled,
@@ -982,6 +1077,12 @@ pub(crate) async fn submit_run_inner(
                     job_outputs: BTreeMap::new(),
                     job_base_ids,
                     job_needs,
+                    caller_plans: caller_plans.clone(),
+                    job_names: job_names.clone(),
+                    github: github.clone(),
+                    head_sha: sha.clone(),
+                    workflow_ref: workflow_ref.clone(),
+                    workspace_snapshot: workspace_snapshot.clone(),
                     job_fail_fast,
                     job_continue_on_error,
                     status: ExecutionStatus::Pending,
@@ -1034,6 +1135,12 @@ pub(crate) async fn submit_run_inner(
                 job_outputs: BTreeMap::new(),
                 job_base_ids: job_base_ids.clone(),
                 job_needs: job_needs.clone(),
+                caller_plans: caller_plans.clone(),
+                job_names: job_names.clone(),
+                github: github.clone(),
+                head_sha: sha.clone(),
+                workflow_ref: workflow_ref.clone(),
+                workspace_snapshot: workspace_snapshot.clone(),
                 job_fail_fast: job_fail_fast.clone(),
                 job_continue_on_error: job_continue_on_error.clone(),
                 status: ExecutionStatus::Queued,
@@ -1051,120 +1158,52 @@ pub(crate) async fn submit_run_inner(
             },
         );
 
-        // Reusable workflow invocations must acquire caller and embedded
-        // concurrency gates as one ordered, deduplicated admission set. A
-        // partially admitted JobSet keeps its earlier keys while waiting on
-        // the next key, preventing it from bypassing either scope.
-        let mut jobset_blocked: std::collections::HashSet<JobId> = std::collections::HashSet::new();
-        for call in reusable_calls.values() {
-            let member_ids: BTreeSet<JobId> = call
-                .inner_job_ids
-                .iter()
-                .map(|id| JobId(id.clone()))
-                .collect();
-            let id = JobSetId {
-                run_id,
-                job_ids: member_ids.clone(),
-            };
-            let mut gates = Vec::new();
-            let mut evaluation_failed = false;
-
-            for (raw, scope, label, inputs) in [
-                (
-                    call.caller_concurrency.as_ref(),
-                    concurrency::ConcurrencyScope::Job,
-                    "caller concurrency (JobSet)",
-                    &submission.inputs,
-                ),
-                (
-                    call.embedded_concurrency.as_ref(),
-                    concurrency::ConcurrencyScope::Workflow,
-                    "embedded concurrency (JobSet)",
-                    &call.inputs,
-                ),
-            ] {
-                let Some(raw) = raw else { continue };
-                let eval_ctx = concurrency::ConcurrencyContext {
-                    scope,
-                    github: &github,
-                    vars: &submission.vars,
-                    inputs,
-                    matrix: Some(&call.matrix),
-                    strategy: None,
-                    needs: None,
-                };
-                match concurrency::evaluate_concurrency(raw, &eval_ctx) {
-                    Ok((group, cancel_in_progress, queue)) if !group.trim().is_empty() => {
-                        merge_jobset_gate(
-                            &mut gates,
-                            JobSetGate {
-                                key: concurrency::concurrency_key(&submission.repository, &group),
-                                display_name: group,
-                                cancel_in_progress,
-                                queue,
-                            },
-                        );
-                    }
-                    Ok((_, _, _)) => {
-                        evaluation_failed = true;
-                    }
-                    Err(error) => {
-                        concurrency::log_eval_error(label, &error);
-                        evaluation_failed = true;
-                    }
-                }
-            }
-
-            if evaluation_failed {
-                for member_id in &member_ids {
-                    statuses.insert(member_id.clone(), ExecutionStatus::Failure);
-                }
-                jobset_blocked.extend(member_ids);
-                continue;
-            }
-            if gates.is_empty() {
-                continue;
-            }
-
-            inner.jobset_admissions.insert(
-                id.clone(),
-                JobSetAdmission {
-                    gates,
-                    acquired_keys: BTreeSet::new(),
-                },
-            );
-            match advance_jobset_admission(&mut inner, &id, None) {
-                Ok(JobSetAdmissionResult::Ready) => {}
-                Ok(JobSetAdmissionResult::Blocked) => {
-                    jobset_blocked.extend(member_ids);
-                }
-                Err(error) => {
-                    let status = if error == "concurrency_queue_overflow" {
-                        ExecutionStatus::Cancelled
-                    } else {
-                        ExecutionStatus::Failure
-                    };
-                    for member_id in &member_ids {
-                        statuses.insert(member_id.clone(), status);
-                    }
-                    jobset_blocked.extend(member_ids);
-                }
-            }
-        }
-
         // Enqueue jobs (workflow concurrency free / acquired).
         for queued_job in built_jobs {
             let job_id = queued_job.job_id.clone();
             let base_id = queued_job.base_id.clone();
 
-            // A blocked JobSet member must remain durably parked until every
-            // required key is acquired. Terminal members are not parked.
-            if jobset_blocked.contains(&job_id) {
-                let status = statuses.get(&job_id).copied();
-                if status.is_some_and(concurrency::is_awaiting_execution) {
-                    statuses.insert(job_id, ExecutionStatus::Pending);
-                    inner.concurrency_blocked.push_back(queued_job);
-                }
+            // Deferred reusable-caller nodes are scheduling-only: they wait in
+            // pending_jobs until their `if:` gate passes, when the scheduler
+            // acquires caller/embedded JobSet concurrency gates and expands
+            // the callee subtree (mirroring GitHub, which evaluates caller
+            // concurrency when the caller job starts).
+            if queued_job.reusable_call.is_some() {
+                statuses.insert(job_id, ExecutionStatus::Pending);
+                inner.pending_jobs.push_back(queued_job);
+                continue;
+            }
+
+            // No runner host for this platform: conclude the job rather than
+            // queue one nothing can ever claim. Checked here, before the job
+            // reaches either the ready queue or `pending_jobs`, so a
+            // needs-gated job on an unhostable platform concludes too and its
+            // dependents see a terminal status.
+            //
+            // The conclusion is `Failure`, never `Skipped`. A skipped job folds
+            // into `summarize_run` as success, so a workflow whose macOS leg
+            // could not run anywhere would report green while its steps never
+            // executed — the worst outcome available, and worse than the
+            // indefinite queue GitHub would leave behind. Failing is loud,
+            // and the annotation below puts the reason where the user reads it
+            // rather than only in the server log.
+            let platforms = runtime_scheduling::registered_runner_platforms(&inner);
+            if let Some(platform) =
+                runtime_scheduling::unhostable_platform(&queued_job.runs_on, platforms)
+            {
+                let reason = format!(
+                    "no {platform} runner is registered with this server, so `runs-on: {}` \
+                     cannot be scheduled",
+                    queued_job.runs_on.join(", ")
+                );
+                tracing::warn!(
+                    job = %job_id.0,
+                    labels = ?queued_job.runs_on,
+                    platform,
+                    "no {platform} runner is registered; failing the job"
+                );
+                unhostable_reasons.push((job_id.clone(), reason));
+                statuses.insert(job_id, ExecutionStatus::Failure);
                 continue;
             }
 
@@ -1233,6 +1272,12 @@ pub(crate) async fn submit_run_inner(
                 job_outputs: BTreeMap::new(),
                 job_base_ids,
                 job_needs,
+                caller_plans,
+                job_names,
+                github,
+                head_sha: sha,
+                workflow_ref,
+                workspace_snapshot,
                 job_fail_fast,
                 job_continue_on_error,
                 status: initial_status,
@@ -1249,6 +1294,19 @@ pub(crate) async fn submit_run_inner(
                 conclusion: None,
             },
         );
+        // Deferred reusable-caller nodes whose needs are already satisfied
+        // (typically none) are reified by a first promote sweep: needs-free
+        // callers acquire their JobSet gates and materialize their callee
+        // subtree immediately.
+        promote_ready_jobs(&mut inner);
+        // A submission whose every job concluded before it reached the queue
+        // (all skipped by `if:`, or none hostable) never passes through the
+        // completion path, so nothing else would ever stamp `completed_at` and
+        // `conclusion`. Without this the run reports a terminal status while
+        // anything polling for completion waits forever.
+        if let Some(run) = inner.runs.get_mut(&run_id) {
+            runtime_scheduling::finalize_run_if_complete(run);
+        }
         // The on-demand runner supervisor uses this atomic as its wake-up
         // signal. Refresh it when submission makes work runnable; updating it
         // only after a runner claims a job leaves a size-zero pool asleep
@@ -1259,7 +1317,10 @@ pub(crate) async fn submit_run_inner(
             .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
         let cancel_count = inner.cancellation_queue.len();
         drop(inner);
-        if ready_jobs > 0 || cancel_count > 0 {
+        // The sweep above only recorded the intent to expand; the subtree build
+        // runs here with the lock released.
+        let expansion = drain_expansions(shared).await;
+        if ready_jobs > 0 || cancel_count > 0 || expansion.promoted > 0 {
             shared.state.message_notify.notify_waiters();
         }
         for (event_run_id, job_id) in initially_skipped {
@@ -1270,6 +1331,19 @@ pub(crate) async fn submit_run_inner(
                     job_id,
                     status: ExecutionStatus::Skipped,
                     reason: None,
+                })
+                .await;
+        }
+        // Surface why a job could never be scheduled. Without this the only
+        // record is a server-side log line the workflow author never sees.
+        for (job_id, reason) in unhostable_reasons {
+            shared
+                .state
+                .emit(NdjsonEvent::JobStatus {
+                    run_id,
+                    job_id,
+                    status: ExecutionStatus::Failure,
+                    reason: Some(reason),
                 })
                 .await;
         }
@@ -1369,6 +1443,254 @@ pub(crate) fn collect_string_array(values: &[serde_json::Value], out: &mut Vec<S
     );
 }
 
+/// Per-job runner artifacts: agent message plus the correlation records the
+/// broker and results/timeline services use to track the delivered request.
+pub(crate) struct BuiltJobArtifacts {
+    pub(crate) agent_msg: azdo::AgentJobRequestMessage,
+    pub(crate) request_id: i64,
+    pub(crate) job_request: TaskAgentJobRequestRecord,
+    pub(crate) id_token_granted: bool,
+    pub(crate) oidc_ctx: OidcJobContext,
+    pub(crate) github_token_request: Option<GitHubTokenRequest>,
+}
+
+/// Build one job's runner message and correlation records.
+///
+/// Pure computation shared by the submission prebuild and the scheduler's
+/// runtime expansion of reusable-workflow callee subtrees (which cannot be
+/// built at submission: they exist only after the caller's `if:` gate passes).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_job_artifacts(
+    shared: &SharedState,
+    submission: &WorkflowSubmission,
+    run_id: RunId,
+    workflow_path: &str,
+    workflow_ref: &str,
+    sha: &str,
+    normalized_github: &serde_json::Value,
+    secrets_exposed: &BTreeMap<String, String>,
+    base_url: &str,
+    workspace_snapshot: Option<&WorkspaceSnapshot>,
+    job: &aksh_gha_protocol::JobPlan,
+    github_token_override: Option<String>,
+) -> Result<BuiltJobArtifacts, ApiError> {
+    let mut agent_msg =
+        aksh_gha_parser::job_builder::build_agent_job_message_with_normalized_context(
+            job,
+            normalized_github,
+            &job.env,
+            secrets_exposed,
+            &submission.vars,
+        )
+        .map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
+
+    agent_msg.preloop_preserve_on_failure = submission.preserve_on_failure.then_some(true);
+
+    // Pre-allocate request ID atomically (no lock needed).
+    let request_id = shared
+        .state
+        .next_request_id
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    agent_msg.request_id = request_id;
+
+    // Mint tokens outside the lock (HMAC computation).
+    let runtime_token = shared
+        .state
+        .mint_runtime_token(&agent_msg.plan.plan_id, &agent_msg.job_id);
+
+    if let Some(snapshot) = workspace_snapshot {
+        let redirected =
+            redirect_primary_checkout(&mut agent_msg, snapshot, base_url, &runtime_token);
+        if redirected > 0 {
+            info!(
+                %run_id,
+                job = %job.id,
+                %redirected,
+                commit = %snapshot.commit_sha,
+                "Redirected primary checkout to local workspace snapshot"
+            );
+            agent_msg.aksh_snapshot_commit = Some(snapshot.commit_sha.clone());
+        }
+        // Cover the workflows the checkout redirect cannot reach: anything
+        // that hardcodes the forge URL. Without this a job running unpushed
+        // work fails the moment it fetches its own sha from github.com.
+        let repository = normalized_github
+            .get("repository")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned);
+        if let Some(repository) = repository {
+            use base64::Engine as _;
+            let credentials = base64::engine::general_purpose::STANDARD
+                .encode(format!("x-access-token:{runtime_token}"));
+            agent_msg.aksh_snapshot_origin_rewrite =
+                Some(aksh_gha_protocol::azdo::SnapshotOriginRewrite {
+                    snapshot_url: format!("{base_url}/{}", snapshot.repository),
+                    forge_url: format!("https://github.com/{repository}"),
+                    auth_header: format!("AUTHORIZATION: basic {credentials}"),
+                });
+        }
+    }
+
+    let id_token_granted = job.oidc_id_token_granted;
+    if id_token_granted {
+        let oidc_url = format!(
+            "{}/runner/server/_apis/distributedtask/hubs/actions/plans/{}/jobs/{}/oidctoken?api-version=2.0",
+            base_url,
+            agent_msg.plan.plan_id,
+            agent_msg.job_id,
+        );
+        for endpoint in &mut agent_msg.resources.endpoints {
+            if endpoint.name.eq_ignore_ascii_case("SystemVssConnection") {
+                endpoint
+                    .data
+                    .insert("GenerateIdTokenUrl".to_owned(), oidc_url.clone());
+            }
+        }
+    }
+
+    let github_token = github_token_override.unwrap_or_else(|| runtime_token.clone());
+    agent_msg.variables.insert(
+        "system.github.token".to_owned(),
+        aksh_gha_protocol::azdo::VariableValue::secret(github_token.clone()),
+    );
+    agent_msg.variables.insert(
+        "github_token".to_owned(),
+        aksh_gha_protocol::azdo::VariableValue::secret(github_token.clone()),
+    );
+    // GitHub's dispatcher injects the job token into the `secrets` context
+    // under the name `GITHUB_TOKEN` — that is what `${{ secrets.GITHUB_TOKEN }}`
+    // resolves to. The runner builds `secrets` from `isSecret` variables keyed
+    // by name, so without this exact key the single most common token
+    // reference in real workflows (cargo-dist's release.yml, supply-chain
+    // gates, action scaffolding) resolves empty on this control plane while
+    // working on GitHub.
+    agent_msg.variables.insert(
+        "GITHUB_TOKEN".to_owned(),
+        aksh_gha_protocol::azdo::VariableValue::secret(github_token.clone()),
+    );
+    agent_msg.variables.insert(
+        "actions_runner_allow_artifacts_file".to_owned(),
+        aksh_gha_protocol::azdo::VariableValue::new("false"),
+    );
+    agent_msg.variables.insert(
+        "actions_self_repository".to_owned(),
+        aksh_gha_protocol::azdo::VariableValue::new("true"),
+    );
+    // The debug-worker token is deliberately not a job variable. An
+    // official runner copies every `isSecret` variable into the `secrets`
+    // context, so shipping it here would publish it to workflow YAML as
+    // `${{ secrets['system.preloop.debug_worker_token'] }}`. The worker
+    // acquires it instead over `POST /api/v1/debug/worker-token`, which
+    // authenticates against this job's runtime token.
+    agent_msg.variables.insert(
+        "system.github.launch_endpoint".to_owned(),
+        aksh_gha_protocol::azdo::VariableValue::new(base_url),
+    );
+    agent_msg.variables.insert(
+        "system.github.results_endpoint".to_owned(),
+        aksh_gha_protocol::azdo::VariableValue::new(base_url),
+    );
+    agent_msg.variables.insert(
+        "system.orchestrationId".to_owned(),
+        aksh_gha_protocol::azdo::VariableValue::new(orchestration_id(
+            &agent_msg.plan.plan_id,
+            &job.base_id,
+            job.matrix_index,
+        )),
+    );
+    // GitHub's dispatcher sets `github.job` from the `system.github.job`
+    // variable (official runner `ExecutionContext.cs` reads exactly this key;
+    // the docs say the property is "set by the Actions runner"). Without it
+    // `${{ github.job }}` and `GITHUB_JOB` are empty on the official-runner
+    // path and every matrix cell reports the same blank job id.
+    agent_msg.variables.insert(
+        "system.github.job".to_owned(),
+        aksh_gha_protocol::azdo::VariableValue::new(job.base_id.clone()),
+    );
+    // Cache v2 switch. GitHub's server sends the `actions_uses_cache_service_v2`
+    // feature variable (golden capture: `true`); the official runner's node/
+    // container handlers turn it into the `ACTIONS_CACHE_SERVICE_V2` step env
+    // (`NodeScriptActionHandler.cs:76-78`). Without it, actions/cache@v4 falls
+    // back to the v1 endpoints — which aksh also serves, but v2 is the modern
+    // path and the one the golden exercises.
+    agent_msg.variables.insert(
+        "actions_uses_cache_service_v2".to_owned(),
+        aksh_gha_protocol::azdo::VariableValue::new("true"),
+    );
+    agent_msg.file_table = vec![workflow_path.to_owned()];
+    if let Some(aksh_gha_protocol::azdo::PipelineContextData::Dict(job_dict)) =
+        agent_msg.context_data.get_mut("job")
+    {
+        job_dict.insert(
+            "check_run_id".to_owned(),
+            aksh_gha_protocol::azdo::PipelineContextData::Number(0.0),
+        );
+        job_dict.insert(
+            "workflow_ref".to_owned(),
+            aksh_gha_protocol::azdo::PipelineContextData::String(workflow_ref.to_owned()),
+        );
+        job_dict.insert(
+            "workflow_sha".to_owned(),
+            aksh_gha_protocol::azdo::PipelineContextData::String(sha.to_owned()),
+        );
+        job_dict.insert(
+            "workflow_repository".to_owned(),
+            aksh_gha_protocol::azdo::PipelineContextData::String(submission.repository.clone()),
+        );
+        job_dict.insert(
+            "workflow_file_path".to_owned(),
+            aksh_gha_protocol::azdo::PipelineContextData::String(workflow_path.to_owned()),
+        );
+    }
+    agent_msg.enable_debugger = submission.enable_debugger;
+    agent_msg.debugger_welcome_message = submission.debugger_welcome_message.clone();
+    if submission.enable_debugger || submission.preserve_on_failure {
+        agent_msg.aksh_debug_run_id = Some(run_id.to_string());
+        agent_msg.aksh_debug_transport = Some("local".to_string());
+    }
+
+    let oidc_ctx = OidcJobContext {
+        environment: job.oidc_environment.clone(),
+        job_workflow_ref: job.oidc_job_workflow_ref.clone(),
+        job_workflow_sha: job.workflow_sha.clone(),
+    };
+
+    let job_request = TaskAgentJobRequestRecord {
+        request_id,
+        run_id,
+        job_id: job.id.clone(),
+        agent_job_id: agent_msg.job_id,
+        plan_id: agent_msg.plan.plan_id.clone(),
+        plan_type: agent_msg.plan.plan_type.clone(),
+        timeline_id: agent_msg.timeline.id,
+        result: None,
+        locked_until: agent_request_locked_until(),
+        started_at: None,
+        last_renewed_at: None,
+        timeout_triggered: false,
+        debug_token_issued: false,
+    };
+    let github_token_request = shared
+        .state
+        .github_app
+        .as_ref()
+        .map(|_| GitHubTokenRequest {
+            repository: submission.repository.clone(),
+            permissions: aksh_gha_parser::effective_token_permissions(job.permissions.as_ref())
+                .into_owned(),
+            declared: job.permissions.is_some(),
+        });
+
+    Ok(BuiltJobArtifacts {
+        agent_msg,
+        request_id,
+        job_request,
+        id_token_granted,
+        oidc_ctx,
+        github_token_request,
+    })
+}
+
 pub(crate) async fn get_run(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
@@ -1380,24 +1702,49 @@ pub(crate) async fn get_run(
         .cloned()
         .ok_or_else(|| ApiError::not_found("run not found"))?;
 
-    // Results/timeline updates only create details for dispatched jobs. Keep
-    // the native jobs_list a complete projection by adding jobs that were
-    // cancelled or failed before dispatch with an empty step list.
-    for (job_id, status) in &run.jobs {
-        if !run.jobs_list.iter().any(|detail| detail.name == job_id.0) {
-            run.jobs_list.push(JobDetail {
-                name: job_id.0.clone(),
-                conclusion: status_string(*status),
-                steps: Vec::new(),
-            });
-        }
-    }
+    // GitHub's run record shows a gate-passed reusable caller only as its
+    // callee jobs: once the subtree is materialized, the caller entry leaves
+    // the visible job set. Gate-failed callers never materialize and stay as
+    // exactly one (skipped) entry.
+    let expanded_callers: std::collections::BTreeSet<&str> = run
+        .reusable_calls
+        .iter()
+        .filter(|(_, call)| !call.inner_job_ids.is_empty())
+        .map(|(caller_id, _)| caller_id.as_str())
+        .collect();
+    run.jobs
+        .retain(|job_id, _| !expanded_callers.contains(job_id.0.as_str()));
 
-    for job_detail in &mut run.jobs_list {
-        if let Some(status) = run.jobs.get(&JobId(job_detail.name.clone())) {
-            job_detail.conclusion = status_string(*status);
-        }
-    }
+    // Project with GitHub display names (evaluated `name:`, `caller / callee`
+    // separator). Results/timeline updates only create details for dispatched
+    // jobs; jobs skipped or cancelled before dispatch get an empty step list.
+    let existing = std::mem::take(&mut run.jobs_list);
+    run.jobs_list = run
+        .jobs
+        .iter()
+        .map(|(job_id, status)| {
+            let name = run
+                .job_names
+                .get(job_id)
+                .cloned()
+                .unwrap_or_else(|| job_id.0.clone());
+            let mut detail = existing
+                .iter()
+                .find(|detail| detail.name == job_id.0 || detail.name == name)
+                .cloned()
+                .unwrap_or(JobDetail {
+                    name: name.clone(),
+                    conclusion: status_string(*status),
+                    steps: Vec::new(),
+                    annotations: Vec::new(),
+                });
+            detail.name = name;
+            if let Some(stored) = run.jobs.get(job_id) {
+                detail.conclusion = status_string(*stored);
+            }
+            detail
+        })
+        .collect();
 
     Ok(Json(run))
 }
@@ -1816,5 +2163,218 @@ mod tests {
             started.elapsed() < EVENT_STREAM_IDLE_TIMEOUT * 2,
             "stream outlived its idle deadline by more than a full bound"
         );
+    }
+
+    fn git_in(cwd: &std::path::Path, args: &[&str]) -> Vec<u8> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .expect("git runs in tests");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    /// A local PR run over a dirty tree must present the snapshot commit that
+    /// carries the dirty tree as `pull_request.head.sha`, with `base.sha`
+    /// pointing at the base its changes are measured against. Both SHAs live
+    /// in the snapshot store, so changed-file actions
+    /// (`dorny/paths-filter`, `tj-actions/changed-files`) can actually diff
+    /// them; the real workspace HEAD is neither in the store nor the tree
+    /// carrying the uncommitted changes.
+    #[tokio::test]
+    async fn local_pull_request_head_is_the_snapshot_commit_carrying_the_dirty_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        git_in(&workspace, &["init", "-q", "-b", "main"]);
+        git_in(&workspace, &["config", "user.email", "test@example.com"]);
+        git_in(&workspace, &["config", "user.name", "Test"]);
+        std::fs::write(workspace.join("file.txt"), "one\n").unwrap();
+        git_in(&workspace, &["add", "file.txt"]);
+        git_in(&workspace, &["commit", "-qm", "initial"]);
+        let workspace_head = String::from_utf8(git_in(&workspace, &["rev-parse", "HEAD"])).unwrap();
+        // Dirty the tree: the uncommitted change must show up in the
+        // head..base diff, which it cannot when head is the workspace HEAD.
+        std::fs::write(workspace.join("file.txt"), "two (uncommitted)\n").unwrap();
+
+        let mut state = AppState::new(state_dir.clone()).await.unwrap();
+        state.local_workspace = Some(workspace.clone());
+        let shared = std::sync::Arc::new(SharedState {
+            state: state.clone(),
+            shutdown: CancellationToken::new(),
+        });
+
+        let submission = aksh_gha_protocol::WorkflowSubmission {
+            workflow_yaml: "on: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n".to_owned(),
+            event: "pull_request".to_owned(),
+            payload: serde_json::json!({
+                "action": "opened",
+                "number": 7,
+                "pull_request": {
+                    "head": { "ref": "feature", "sha": "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3" },
+                    "base": { "ref": "main", "sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2" }
+                }
+            }),
+            repository: "owner/repo".to_owned(),
+            ..Default::default()
+        };
+        let accepted = submit_run_inner(&shared, submission).await.unwrap();
+
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&accepted.run_id).expect("run is recorded");
+        let snapshot = run
+            .workspace_snapshot
+            .as_ref()
+            .expect("local runs must create a workspace snapshot");
+        let pr = run.submission.payload["pull_request"].as_object().unwrap();
+        let head_sha = pr["head"]["sha"].as_str().unwrap().to_owned();
+        let base_sha = pr["base"]["sha"].as_str().unwrap().to_owned();
+
+        assert_eq!(
+            head_sha, snapshot.commit_sha,
+            "PR head must be the snapshot commit carrying the dirty tree"
+        );
+        assert_ne!(
+            head_sha,
+            snapshot.head_sha.as_deref().unwrap(),
+            "PR head must not be the real workspace HEAD"
+        );
+        assert_ne!(
+            head_sha,
+            workspace_head.trim(),
+            "head must not be the workspace HEAD"
+        );
+        assert_eq!(
+            base_sha,
+            snapshot.before_sha.as_deref().unwrap(),
+            "PR base must be the base the dirty tree is measured against"
+        );
+        assert_ne!(
+            base_sha, head_sha,
+            "a dirty tree must diff against its base"
+        );
+
+        // Both endpoints resolve inside the snapshot store, and the diff names
+        // exactly the uncommitted change.
+        let snapshot_repository = state_dir.join(&snapshot.repository);
+        let changed = git_in(
+            &snapshot_repository,
+            &["diff", "--name-only", &base_sha, &head_sha],
+        );
+        assert_eq!(
+            String::from_utf8(changed).unwrap().trim(),
+            "file.txt",
+            "changed-file actions must see the dirty tree's changes"
+        );
+    }
+
+    /// A PAT stored by `preloop setup github --via pat` must authenticate
+    /// remote reusable-workflow resolution, not just queued job tokens:
+    /// private `uses: owner/repo/...` references fetch through the same
+    /// credential the config file holds.
+    #[tokio::test]
+    async fn remote_reusable_workflow_resolution_uses_config_backed_pat() {
+        use axum::body::Body;
+        use axum::http::{header, HeaderMap, Method, Request, StatusCode};
+        use axum::routing::get;
+        use axum::Json;
+        use tower::ServiceExt;
+
+        // A mock GitHub API that REQUIRES the engine credential, exactly like
+        // a private repository: without a bearer token it answers 404.
+        let seen_auth = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let callee_yaml =
+            "on: workflow_call\njobs:\n  callee:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo callee\n";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(callee_yaml.as_bytes());
+        let mock = axum::Router::new()
+            .route(
+                "/repos/:owner/:repo/contents/*path",
+                get({
+                    let seen = seen_auth.clone();
+                    move |headers: HeaderMap| async move {
+                        let auth = headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned);
+                        *seen.lock().unwrap() = auth.clone();
+                        if auth.is_some() {
+                            Json(serde_json::json!({
+                                "content": encoded,
+                                "encoding": "base64",
+                            }))
+                            .into_response()
+                        } else {
+                            (
+                                StatusCode::NOT_FOUND,
+                                Json(serde_json::json!({"message": "Not Found"})),
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/repos/:owner/:repo/commits/:git_ref",
+                get(|| async move {
+                    Json(serde_json::json!({"sha": "c0ffee0000000000000000000000000000000000"}))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        // Held for the whole test: `AKSH_GITHUB_API_URL` is process-global.
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        std::env::set_var("AKSH_GITHUB_API_URL", api_base);
+
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(&config_path, "[github]\npat = \"ghp_config_pat_value\"\n").unwrap();
+        let state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
+            .await
+            .unwrap();
+        let app = crate::app(state, CancellationToken::new());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/runs")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {DEFAULT_AKSH_SYSTEM_TOKEN}"),
+                    )
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "workflow_yaml": "on: push\njobs:\n  call:\n    uses: acme/private/.github/workflows/callee.yml@main\n",
+                            "event": "push",
+                            "repository": "owner/repo",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "submission must succeed when the config PAT authenticates the remote reusable fetch"
+        );
+        let received = seen_auth.lock().unwrap().clone();
+        assert_eq!(
+            received.as_deref(),
+            Some("Bearer ghp_config_pat_value"),
+            "remote reusable-workflow resolution must send the config-backed PAT"
+        );
+
+        std::env::remove_var("AKSH_GITHUB_API_URL");
     }
 }

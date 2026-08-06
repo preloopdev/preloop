@@ -295,6 +295,81 @@ conformance scenario:
 
 ---
 
+## 1b. Real-world repo conformance (2026-08-05)
+
+The conformance replay proves the **wire** is faithful. It says nothing about the
+**machine** a job lands on, and that is where unmodified third-party workflows
+actually break. This campaign runs four medium-sized public repos against the
+engine with their workflows untouched, and diffs each job against GitHub's own
+run of the same commit.
+
+### 1b.1 Goldens
+
+GitHub's run logs for each repo are the baseline (fetched with `gh run view --log`;
+kept out of git, see `.gitignore`):
+
+| Repo | Golden run | Commit | Jobs / steps | Match |
+| --- | --- | --- | ---: | --- |
+| `tokio-rs/tokio` | [30662962001](https://github.com/tokio-rs/tokio/actions/runs/30662962001) | `108d6d3` | 77 / 706 | exact SHA |
+| `caddyserver/caddy` | [30679769787](https://github.com/caddyserver/caddy/actions/runs/30679769787) | `e096ca9` | 5 / 45 | exact SHA |
+| `nyblnet/bento` | [30837350817](https://github.com/nyblnet/bento/actions/runs/30837350817) | `cc03818` | 1 / 36 | exact SHA |
+| `astral-sh/uv` | [30641370430](https://github.com/astral-sh/uv/actions/runs/30641370430) | `d709d47` | 121 / 1682 | default-branch fallback (the clone's SHA was force-pushed away) |
+
+### 1b.2 Host/image gaps the campaign found
+
+Every one of these passed the wire conformance gate and still failed a real
+workflow. All are fixed:
+
+| Gap | Symptom in a real workflow | Fix |
+| --- | --- | --- |
+| `runs-on` was not evaluated per matrix combination | `runs-on: ${{ matrix.os }}` — the shape tokio, caddy and uv all use — expanded to a label no runner can advertise, so every cell queued forever. This is why the campaign's clones all carried a patched `runs-on`, which defeats the point of the exercise | `expand.rs` resolves each label against the cell's matrix (and reusable-workflow inputs), like every other per-cell field |
+| A self-hosted runner stood in for **any** hosted image label, across operating systems | a macOS host sharing the engine claimed `ubuntu-latest` jobs and failed them inside a step (tokio's Linux-only `taskdump`, uv's `/home/runner` layout) | `job_matches_runner` matches the OS the runner declares; a runner declaring none stays eligible |
+| A machine took a job it only loosely matched | a 24.04 machine claimed the `ubuntu-22.04` job while the pool was still baking the 22.04 golden that job asked for | `take_matching_job` prefers a job whose labels the runner carries verbatim, and stands in only when nothing exact is claimable |
+| Env goldens were rebaked on every engine restart | the in-memory registry forgot a golden that was still running and still correct, so the first `ubuntu-22.04` job after any deploy waited 5–11 minutes for apt and rustup | a host-side fingerprint record beside the packed artifact; a running golden whose record matches is adopted |
+| A custom `shell:` command line was collapsed into one argv entry | `taiki-e/install-action` declares `shell: /usr/bin/env -u ENV … /bin/sh -eu {0}`; `env` unset one absurdly named variable, found no command, printed the environment, exited 0 — the step "succeeded" installing nothing and the next step died with `no such command: hack` | `resolve_shell` splits every whitespace token; `{0}` substitution per token |
+| Toolchain bin directories were not on the runner's PATH | `dtolnay/rust-toolchain` only appends `$CARGO_HOME/bin` to `$GITHUB_PATH` when it installs rustup itself, so on an image that already has rustup (ours, and GitHub's) anything `cargo install`-ed was unreachable | the guest runner is launched with an explicit PATH covering `$HOME/.cargo/bin` and `/usr/local/go/bin` |
+| The baseline wiped `/var/lib/apt/lists` | uv's musl cell runs `sudo apt-get install musl-tools` with no `apt-get update`: `E: Unable to locate package` | keep the lists; a fork of a pack that shipped without them refreshes on provision |
+| A fork of the packed golden trusted the pack's bake | a published pack predating the workspace's toolchain pin boots without cargo, and cargo-dist dies on "you don't appear to have cargo installed" in 11s | probe each toolchain layer per fork and install only what the pack lacks; and `build-golden` now bakes the workspace's toolchains (`rust-toolchain.toml` etc.) into the artifact, so forks inherit them — the per-fork install is gone once the pack is rebuilt |
+| The guest hostname did not resolve | every `sudo` call printed `sudo: unable to resolve host <name>`, which appears in no hosted log | the baseline adds the hostname to `/etc/hosts` |
+| `apt-get install` prompted, and a step's stdin never reached EOF | the hosted images ship `/etc/apt/apt.conf.d/90assumeyes`, so uv's `sudo apt-get install musl-tools` (no `-y`) installs three packages without a prompt; here it asked `Do you want to continue? [Y/n]` and, because the runner is a child of a guest `exec` whose stdin never closes, blocked for 45 minutes | ship the same apt config, and give every step `Stdio::null()` for stdin |
+
+### 1b.3 Results
+
+| Repo | Workflow | Result |
+| --- | --- | --- |
+| `bento` | `ci.yml` | ✅ full gate (checkout, setup-node, `npm ci`, tsc builds, i18n checks, shell gate) |
+| `caddy` | `ci.yml` | ✅ full gate (go vet/build/test matrix) |
+| `tokio` | `ci.yml` | `clippy` ✅, `minrust` ✅ (every step, `cargo-hack` installed and run) after the shell/PATH fixes |
+| `uv` | `build-dev-binaries.yml` | `plan` ✅, `linux-libc` ✅, `linux-aarch64` ✅, `macos-aarch64` ✅; `linux-musl` now runs every step through `Setup musl`, `Install Rust toolchain` and the cache restore, and stops in `Build` — the cell targets `x86_64-unknown-linux-musl` on an `x86_64` fleet, and this host's guests are `aarch64`, so `musl-gcc -m64` cannot build `aws-lc-sys`. A host-architecture limit, not a fidelity gap: `build-binary-linux-aarch64` is the cell this host can run. |
+
+### 1b.4 Still open
+
+- **Non-Linux cells are skipped, not queued.** The microVM pool builds Linux
+  guests only; macOS needs a `preloop-runner` on a Mac registered against the
+  control plane, and Windows has no host at all. GitHub would leave such a job
+  queued until it times out; we mark it `skipped` at submit so the run
+  finishes, dependents skip, and the reason lands in the log. A deliberate
+  divergence — an unclaimable job that reports nothing is worse than a visible
+  skip. The skip is conditional on *no* runner declaring that OS being
+  registered, so a Mac host serving `macos-latest` still runs the job.
+- **macOS and Windows image versions are not disambiguated.** `macos-13`
+  (x86_64), `macos-14`/`macos-15` (arm64) and every `windows-*` image are
+  distinct on GitHub; here any `macos-*` label matches whatever Mac is
+  registered. A workflow pinning `macos-13` for x86_64 gets an arm64 host.
+- **Nested virtualization.** tokio's io_uring jobs build a kernel and boot it
+  under `qemu-system-x86_64`; uv's freebsd cell wants docker-in-docker plus
+  `/dev/kvm`. Neither works inside a guest without nested KVM.
+- **Third-party runner fleets.** uv targets `depot-ubuntu-24.04`,
+  `github-ubuntu-24.04-x86_64-8` and `namespace-profile-macos-15`; those labels
+  only match here because a self-hosted runner stands in for unknown labels.
+- **Job variables leak into the step environment.** `system.*`,
+  `DistributedTask.*` and `actions_*` job-message variables are exported to
+  steps; GitHub exports only the step's own `env:` block. Harmless so far —
+  `install-action`'s `BASH_FUNC_` guard does not trip on them — but it is a
+  divergence a workflow could observe.
+
+---
+
 ## 2. Upstream surface we must emulate
 
 The 23 controllers in `runner.server/src/Runner.Server/Controllers/` define the contract.
@@ -512,6 +587,36 @@ Comprehensive source review of official `actions/runner` v2.335.1 and
 | P3 | `EnsureDispatchFinished` zombie detection | Busy dispatches query `AgentRequest`; terminal requests cancel/drain the worker, active overlap is fatal, and status failures cancel/drain before rethrowing | ✅ `8d275862` |
 | P3 | Session reconnection backoff | Session conflicts are bounded to four minutes; poll/session failures use cancellable `[15,30)`/`[30,60)` jitter and reset after success | ✅ `67ad4447` |
 | P3 | FIPS encryption mode | Session responses select RSA-OAEP-SHA256 when `useFipsEncryption` is true; legacy/default sessions remain OAEP-SHA1, and FIPS paths reject plaintext fallback | ✅ `0673a741`, `c44a570`, `e2e1a8e` |
+
+#### Resolved (2026-08-02): deferred reusable-caller materialization + job display names
+
+The parser used to inline every reusable-workflow callee subtree into the run
+record at expand time, so a false-gated caller appeared as its full matrix
+expansion instead of GitHub's single skipped entry (uv `ci.yml` pull_request:
+145 jobs vs the golden's 33, conclusions 20/38/81/6 vs 16/17). Reusable
+callers are now deferred, mirroring the runtime deferred-matrix design:
+
+- The parser emits one placeholder node per caller (`JobPlan.reusable_call`);
+  the callee subtree materializes via `aksh_gha_parser::expand_reusable_call`
+  only when the caller's `needs` complete and its `if:` evaluates true. A
+  false gate leaves exactly one skipped entry, as GitHub does.
+- Caller/embedded concurrency JobSet gates move from submission time to
+  gate-pass time (GitHub evaluates caller concurrency when the caller starts);
+  the JobSet member set is the caller node, which aggregates its subtree's
+  result and outputs on completion (`propagate_reusable_outputs`).
+- The visible run record (`GET /api/v1/runs/:id`) drops gate-passed caller
+  entries, showing callee jobs instead — uv's run record is now 33 jobs,
+  matching golden run 30680325919.
+- Job display names match GitHub: `name:` is evaluated per matrix cell against
+  matrix/inputs contexts (`test-ecosystem / prefecthq/prefect`, not the raw
+  key with parenthesized values), and callee jobs display as
+  `caller / callee` with spaces (was `caller/callee`).
+
+Known remaining gap: runtime *deferred-matrix* expansion never registered
+runner-correlation maps (`job_requests`, `inflight_requests`, …) the way
+runtime reusable expansion now does — jobs fanned out from
+`needs`-dependent matrices lack RenewJob/timeline correlation until that path
+adopts the shared `build_job_artifacts` helper.
 
 ---
 ## 4. Pluggable backends & deployment modes

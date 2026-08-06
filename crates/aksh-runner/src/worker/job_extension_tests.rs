@@ -1,6 +1,283 @@
 use super::*;
 use proptest::prelude::*;
 
+/// A workflow that sets its own `GIT_CONFIG_COUNT` used to disable the
+/// snapshot redirect entirely: the injector bailed when the key was already
+/// present, git then reached the real forge, and the job failed on commits
+/// that exist only in the local workspace. The rewrite now appends after the
+/// workflow's own entries instead of standing down.
+#[test]
+fn snapshot_rewrite_appends_to_workflow_supplied_git_config() {
+    let mut job = JobContext::new(
+        "j1".into(),
+        "Test".into(),
+        serde_json::json!({}),
+        serde_json::json!({ "github": { "repository": "openclaw/openclaw" } }),
+    );
+    job.env
+        .insert("GIT_CONFIG_COUNT".to_owned(), "1".to_owned());
+    job.env
+        .insert("GIT_CONFIG_KEY_0".to_owned(), "user.name".to_owned());
+    job.env
+        .insert("GIT_CONFIG_VALUE_0".to_owned(), "workflow".to_owned());
+    let msg = serde_json::json!({
+        "contextData": { "github": { "repository": "openclaw/openclaw" } },
+        "akshSnapshotOriginRewrite": {
+            "snapshotUrl": "http://127.0.0.1:9091/snapshots/run-1",
+            "forgeUrl": "https://github.com/openclaw/openclaw",
+            "authHeader": "AUTHORIZATION: basic dG9rZW4="
+        }
+    });
+
+    inject_github_env(&mut job, &msg);
+
+    // Workflow entry survives, snapshot entries land after it.
+    assert_eq!(
+        job.env.get("GIT_CONFIG_COUNT").map(String::as_str),
+        Some("4")
+    );
+    assert_eq!(
+        job.env.get("GIT_CONFIG_KEY_0").map(String::as_str),
+        Some("user.name")
+    );
+    assert_eq!(
+        job.env.get("GIT_CONFIG_VALUE_1").map(String::as_str),
+        Some("https://github.com/openclaw/openclaw.git")
+    );
+    assert_eq!(
+        job.env.get("GIT_CONFIG_KEY_3").map(String::as_str),
+        Some("http.http://127.0.0.1:9091/snapshots/run-1.extraheader")
+    );
+}
+
+#[test]
+fn snapshot_origin_rewrite_routes_hardcoded_forge_urls_to_the_snapshot() {
+    // Redirecting `actions/checkout` misses any step that wires its own
+    // remote (`git remote add origin https://github.com/owner/repo`). Those
+    // reach the real forge and fail on commits that exist only in the local
+    // workspace, so git config has to redirect them job-wide.
+    let mut job = JobContext::new(
+        "j1".into(),
+        "Test".into(),
+        serde_json::json!({}),
+        serde_json::json!({ "github": { "repository": "openclaw/openclaw" } }),
+    );
+    let msg = serde_json::json!({
+        "contextData": { "github": { "repository": "openclaw/openclaw" } },
+        "akshSnapshotOriginRewrite": {
+            "snapshotUrl": "http://127.0.0.1:9091/snapshots/run-1",
+            "forgeUrl": "https://github.com/openclaw/openclaw",
+            "authHeader": "AUTHORIZATION: basic dG9rZW4="
+        }
+    });
+
+    inject_github_env(&mut job, &msg);
+
+    assert_eq!(
+        job.env.get("GIT_CONFIG_COUNT").map(String::as_str),
+        Some("3")
+    );
+    let key = "url.http://127.0.0.1:9091/snapshots/run-1.insteadOf";
+    assert_eq!(
+        job.env.get("GIT_CONFIG_KEY_0").map(String::as_str),
+        Some(key)
+    );
+    assert_eq!(
+        job.env.get("GIT_CONFIG_VALUE_0").map(String::as_str),
+        Some("https://github.com/openclaw/openclaw.git"),
+        "the .git form must be registered too — insteadOf matches on prefix"
+    );
+    assert_eq!(
+        job.env.get("GIT_CONFIG_KEY_1").map(String::as_str),
+        Some(key)
+    );
+    assert_eq!(
+        job.env.get("GIT_CONFIG_VALUE_1").map(String::as_str),
+        Some("https://github.com/openclaw/openclaw/"),
+        "the bare form is anchored with a trailing slash so a sibling \
+         repository sharing the prefix (openclaw/openclaw-tools) is not \
+         redirected into this run's snapshot"
+    );
+    // The snapshot demands a token even for reads; without credentials a
+    // redirected fetch prompts for a username and fails.
+    assert_eq!(
+        job.env.get("GIT_CONFIG_KEY_2").map(String::as_str),
+        Some("http.http://127.0.0.1:9091/snapshots/run-1.extraheader")
+    );
+    assert_eq!(
+        job.env.get("GIT_CONFIG_VALUE_2").map(String::as_str),
+        Some("AUTHORIZATION: basic dG9rZW4=")
+    );
+}
+
+#[test]
+fn snapshot_rewrite_installs_its_own_extraheader_only() {
+    let mut job = JobContext::new(
+        "j1".into(),
+        "Test".into(),
+        serde_json::json!({}),
+        serde_json::json!({ "github": { "repository": "openclaw/openclaw" } }),
+    );
+    let msg = serde_json::json!({
+        "contextData": { "github": { "token": "gho_t", "repository": "openclaw/openclaw" } },
+        "akshSnapshotOriginRewrite": {
+            "snapshotUrl": "http://127.0.0.1:9091/snapshots/run-1",
+            "forgeUrl": "https://github.com/openclaw/openclaw",
+            "authHeader": "AUTHORIZATION: basic dG9rZW4="
+        }
+    });
+
+    inject_github_env(&mut job, &msg);
+
+    // The rewrite installs only its own snapshot header. github.com auth is
+    // the checkout's own job (the broker patches the minted token into the
+    // github context at claim); a runner-side env header would duplicate the
+    // one checkout persists — GitHub rejects duplicate Authorization headers
+    // with HTTP 400.
+    assert_eq!(
+        job.env.get("GIT_CONFIG_COUNT").map(String::as_str),
+        Some("3")
+    );
+    assert_eq!(job.env.get("GIT_CONFIG_KEY_3").map(String::as_str), None);
+}
+
+#[test]
+fn snapshot_auth_header_is_registered_as_a_mask() {
+    // cubic P1 (job_extension.rs:370): the Basic-encoded snapshot credential
+    // reaches the job environment as GIT_CONFIG_VALUE_2. If it is not
+    // registered with the job's mask list, ACTIONS_STEP_DEBUG (or any step
+    // debug that prints the job env) leaks it.
+    let mut job = JobContext::new(
+        "j1".into(),
+        "Test".into(),
+        serde_json::json!({}),
+        serde_json::json!({ "github": { "repository": "openclaw/openclaw" } }),
+    );
+    let msg = serde_json::json!({
+        "contextData": { "github": { "repository": "openclaw/openclaw" } },
+        "akshSnapshotOriginRewrite": {
+            "snapshotUrl": "http://127.0.0.1:9091/snapshots/run-1",
+            "forgeUrl": "https://github.com/openclaw/openclaw",
+            "authHeader": "AUTHORIZATION: basic dG9rZW4="
+        }
+    });
+
+    inject_github_env(&mut job, &msg);
+
+    assert_eq!(
+        job.env.get("GIT_CONFIG_VALUE_2").map(String::as_str),
+        Some("AUTHORIZATION: basic dG9rZW4="),
+        "precondition: the header is installed as git config"
+    );
+    assert!(
+        job.masks.contains("AUTHORIZATION: basic dG9rZW4="),
+        "the snapshot credential must be registered with the job's mask list \
+         so step-debug env dumps redact it"
+    );
+}
+
+#[test]
+fn setup_workspace_clears_stale_repository() {
+    // A previous job left a checked-out repo in the workspace (the failure
+    // mode behind "remote origin already exists" on long-lived runners).
+    // GitHub-hosted semantics: every job starts with a fresh workspace.
+    // The workspace is relative to the runner root (the process cwd) — an
+    // absolute payload path outside that root is rejected by design.
+    let runner_root = std::env::current_dir().unwrap();
+    let unique = format!("__aksh_test_work_{}", std::process::id());
+    let root_dir = runner_root.join(&unique);
+    let _ = std::fs::remove_dir_all(&root_dir);
+    let workspace = root_dir.join("work").join("openclaw").join("openclaw");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let stale = workspace.join(".git");
+    std::fs::create_dir_all(stale.join("objects")).unwrap();
+    std::fs::write(
+        stale.join("config"),
+        b"[remote \"origin\"]\nurl = https://github.com/openclaw/openclaw.git\n",
+    )
+    .unwrap();
+    std::fs::write(workspace.join("README.md"), b"stale").unwrap();
+
+    let rel_workspace = format!("{unique}/work/openclaw/openclaw");
+    let message = serde_json::json!({
+        "fileTable": { "workDirectory": rel_workspace }
+    });
+    let resolved = setup_workspace(&message).unwrap();
+
+    let entries: Vec<_> = std::fs::read_dir(&workspace).unwrap().collect();
+    assert!(
+        entries.is_empty(),
+        "workspace must be empty after setup, got: {:?}",
+        entries
+    );
+    assert_eq!(resolved, workspace.to_string_lossy());
+    let _ = std::fs::remove_dir_all(&root_dir);
+}
+
+#[test]
+fn setup_workspace_rejects_workspace_outside_runner_root() {
+    // Reproduction for cubic P0 (job_extension.rs:42): a crafted payload can
+    // name any absolute path as the workspace. On the unfixed code the path
+    // is used verbatim — an existing path is remove_dir_all'd, a missing one
+    // is created outside the runner root. The fixed contract: the workspace
+    // must be strictly inside the runner root; anything else is rejected
+    // before any filesystem mutation.
+    let outside = std::env::temp_dir().join(format!(
+        "aksh_workspace_escape_probe_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&outside);
+
+    let message = serde_json::json!({
+        "fileTable": { "workDirectory": outside.to_str().unwrap() }
+    });
+    let result = setup_workspace(&message);
+    let _ = std::fs::remove_dir_all(&outside);
+
+    match result {
+        Err(_) => {}
+        Ok(resolved) => panic!(
+            "workspace outside the runner root was accepted as {resolved}; \
+             remove_dir_all would target that path the moment it exists"
+        ),
+    }
+}
+
+#[test]
+fn setup_workspace_refuses_to_delete_outside_root() {
+    // Data-loss sandbox: a directory outside the runner root holding a
+    // sentinel file is named as the workspace. The unfixed code recursively
+    // deletes it; the fixed code must reject the payload with the sentinel
+    // untouched.
+    let outside = std::env::temp_dir().join(format!(
+        "aksh_workspace_delete_probe_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&outside);
+    std::fs::create_dir_all(&outside).unwrap();
+    let sentinel = outside.join("sentinel.txt");
+    std::fs::write(&sentinel, b"data").unwrap();
+
+    let message = serde_json::json!({
+        "fileTable": { "workDirectory": outside.to_str().unwrap() }
+    });
+    let result = setup_workspace(&message);
+
+    let sentinel_survived = sentinel.exists();
+    let _ = std::fs::remove_dir_all(&outside);
+
+    match result {
+        Err(_) => assert!(
+            sentinel_survived,
+            "outside-root workspace was rejected, but remove_dir_all still reached it"
+        ),
+        Ok(resolved) => panic!(
+            "workspace outside the runner root was accepted (resolved to {resolved}); \
+             remove_dir_all fired on it, sentinel survived: {sentinel_survived}"
+        ),
+    }
+}
+
 #[test]
 fn inject_github_env_sets_core_vars() {
     let mut job = JobContext::new(
@@ -292,6 +569,69 @@ fn injects_job_environment_variables_from_acquire_payload() {
     assert_eq!(
         job.env.get("MEGA_GLOBAL_ENV").map(String::as_str),
         Some("global-env-ok")
+    );
+}
+
+#[test]
+fn job_message_variables_do_not_leak_into_step_env() {
+    // GitHub exports only the step's own env + GITHUB_*/RUNNER_*/ACTIONS_*
+    // plumbing; system.*/DistributedTask.*/actions_* job-message variables
+    // must stay out of the step environment (previously every non-secret
+    // variable was injected wholesale).
+    let mut job = JobContext::new(
+        "j1".into(),
+        "Job".into(),
+        serde_json::json!({}),
+        serde_json::json!({}),
+    );
+    job.workspace = Some("_work/repo/repo".into());
+    let msg = serde_json::json!({
+        "variables": {
+            "system.github.token": {"value": "tok", "isSecret": true},
+            "system.orchestrationId": {"value": "plan.build.__default"},
+            "DistributedTask.EnableCompositeActions": {"value": "true"},
+            "actions_runner_allow_artifacts_file": {"value": "false"},
+            "system.github.job": {"value": "build"},
+        },
+        "environmentVariables": []
+    });
+    inject_github_env(&mut job, &msg);
+
+    for leaked in [
+        "system.orchestrationId",
+        "DistributedTask.EnableCompositeActions",
+        "actions_runner_allow_artifacts_file",
+        "system.github.token",
+    ] {
+        assert!(
+            !job.env.contains_key(leaked),
+            "job-message variable {leaked} leaked into the step environment"
+        );
+    }
+    // The job id flows through system.github.job (GitHub's mechanism), not a
+    // raw variable export.
+    assert_eq!(job.env.get("GITHUB_JOB").map(String::as_str), Some("build"));
+}
+
+#[test]
+fn github_job_falls_back_to_context_when_variable_absent() {
+    let mut job = JobContext::new(
+        "j1".into(),
+        "Job".into(),
+        serde_json::json!({}),
+        serde_json::json!({}),
+    );
+    job.workspace = Some("_work/repo/repo".into());
+    inject_github_env(
+        &mut job,
+        &serde_json::json!({
+            "contextData": {"github": {"job": "legacy-build"}},
+            "environmentVariables": []
+        }),
+    );
+    assert_eq!(
+        job.env.get("GITHUB_JOB").map(String::as_str),
+        Some("legacy-build")
     );
 }
 #[test]

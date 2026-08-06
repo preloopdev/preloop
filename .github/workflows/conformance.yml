@@ -36,33 +36,7 @@ jobs:
             .runner-watch/conformance-report.md
           if-no-files-found: error
 
-  # The deep profile uses the official runner and pre-packed smolVM machines
-  # on the dedicated macOS host. The host-only variable is also the explicit
-  # opt-in: webhook CI runs inside disposable Linux guests and must not try to
-  # launch nested host smolVMs. Once enabled, missing infrastructure or any
-  # captured response difference fails closed.
-  server-deep:
-    name: Server deep conformance
-    if: (github.event_name == 'pull_request' || github.event_name == 'schedule') && vars.SERVER_CONFORMANCE_TEMPLATE != ''
-    runs-on: [self-hosted, macOS, ARM64, smolvm-host]
-    timeout-minutes: 180
-    env:
-      GH_REPO: ${{ vars.SERVER_CONFORMANCE_REPO || 'preloopdev/aksh-conformance' }}
-      AKSH_GITHUB_TOKEN: ${{ secrets.SERVER_CONFORMANCE_TOKEN }}
-      TEMPLATE: ${{ vars.SERVER_CONFORMANCE_TEMPLATE || '/private/tmp/bench-runner.smolmachine' }}
-      OFFICIAL_RUNNER_HOST: ${{ vars.SERVER_CONFORMANCE_RUNNER_HOST || '/Users/bnjoroge/cachingv4' }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build current PR server for smolVM
-        run: cargo zigbuild -p aksh-runner-server --release --target aarch64-unknown-linux-musl
-      - name: Run deep server conformance
-        run: bash ./scripts/conform-server-deep.sh
-      - name: Upload deep captures
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: server-deep-conformance
-          path: |
-            benchmarks/compatibility/server/behavior/**
-            benchmarks/compatibility/server/protocol/captures/**
-          if-no-files-found: error
+# The deep profile (official runner + pre-packed smolVM machines on the
+# dedicated macOS host) is temporarily removed: no macOS executor is deployed
+# right now, so the job would queue forever on every PR. Restore from git
+# history once a `[self-hosted, macOS, ARM64, smolvm-host]` host exists.

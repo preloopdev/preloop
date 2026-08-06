@@ -104,14 +104,26 @@ pub(crate) async fn patch_timeline_records(
                     } else {
                         run.jobs_list.push(JobDetail {
                             name: job_name,
-                            conclusion: "success".to_owned(),
+                            // A timeline update means the job started; the run
+                            // record's final conclusion comes from the job
+                            // status map (projected in the runs GET). Default
+                            // to the truthful in-flight state, never "success".
+                            conclusion: "in_progress".to_owned(),
                             steps: Vec::new(),
+                            annotations: Vec::new(),
                         });
                         run.jobs_list.last_mut().unwrap()
                     };
 
                 if let Some(status) = run.jobs.get(job_id) {
-                    job_detail.conclusion = format!("{:?}", status).to_lowercase();
+                    // The status map is authoritative for terminal states
+                    // only. Its in-flight projection ("inprogress" from the
+                    // raw Debug spelling, or "success" from the run-level
+                    // status_string) lies about a job that is still running —
+                    // keep the truthful "in_progress" default set above.
+                    if *status != ExecutionStatus::InProgress {
+                        job_detail.conclusion = format!("{:?}", status).to_lowercase();
+                    }
                 }
 
                 for record in &records {
@@ -135,6 +147,7 @@ pub(crate) async fn patch_timeline_records(
                         }
                         Some(azdo::TaskResult::Cancelled) => "cancelled",
                         Some(azdo::TaskResult::Skipped) => "skipped",
+                        Some(azdo::TaskResult::Abandoned) => "failed",
                         None if record.state == Some(azdo::TimelineRecordState::InProgress) => {
                             "in_progress"
                         }
@@ -185,6 +198,7 @@ pub(crate) fn timeline_status(record: &azdo::TimelineRecord) -> Option<Execution
         Some(azdo::TaskResult::Failed) => Some(ExecutionStatus::Failure),
         Some(azdo::TaskResult::Cancelled) => Some(ExecutionStatus::Cancelled),
         Some(azdo::TaskResult::Skipped) => Some(ExecutionStatus::Skipped),
+        Some(azdo::TaskResult::Abandoned) => Some(ExecutionStatus::Failure),
         None if record.state == Some(azdo::TimelineRecordState::InProgress) => {
             Some(ExecutionStatus::InProgress)
         }
@@ -249,20 +263,14 @@ pub(crate) fn mask_log_bytes(inner: &InnerState, plan_id: &str, body: &[u8]) -> 
         .or_else(|| plan_id.parse::<RunId>().ok());
     let run_secrets: Vec<String> = resolved_run_id
         .and_then(|run_id| inner.runs.get(&run_id))
-        .map(|run| {
-            run.submission
-                .secrets
-                .values()
-                .map(|s| s.expose().to_owned())
-                .collect()
-        })
+        .map(|run| aksh_gha_protocol::masking::expose_values(run.submission.secrets.values()))
         .unwrap_or_else(|| {
-            inner
-                .runs
-                .values()
-                .flat_map(|run| run.submission.secrets.values())
-                .map(|s| s.expose().to_owned())
-                .collect()
+            aksh_gha_protocol::masking::expose_values(
+                inner
+                    .runs
+                    .values()
+                    .flat_map(|run| run.submission.secrets.values()),
+            )
         });
 
     aksh_gha_protocol::masking::mask_secrets(&text, run_secrets.iter().map(String::as_str), &[])
@@ -332,6 +340,7 @@ pub(crate) async fn finish_job(
                 job_id,
                 status,
                 outputs,
+                annotations: Vec::new(),
             })
         } else {
             None
@@ -497,6 +506,7 @@ pub(crate) async fn finish_job_plan(
                 job_id,
                 status,
                 outputs,
+                annotations: Vec::new(),
             })
         } else {
             warn!(plan_id, "finish_job_plan: could not resolve run/job");
@@ -507,4 +517,121 @@ pub(crate) async fn finish_job_plan(
         let _ = complete_job_inner(shared, c).await;
     }
     Json(serde_json::Value::Null)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{RunRecord, TaskAgentJobRequestRecord};
+    use aksh_gha_protocol::{ExecutionStatus, WorkflowSubmission};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    /// A timeline PATCH for an in-flight job must keep the truthful
+    /// "in_progress" conclusion. The raw Debug spelling ("inprogress") and
+    /// the run-level status_string projection ("success") both lie about a
+    /// job that is still running.
+    #[tokio::test]
+    async fn timeline_patch_keeps_in_progress_conclusion_for_in_flight_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = crate::AppState::new(temp.path().to_path_buf())
+            .await
+            .expect("app state");
+        let shared = Arc::new(SharedState {
+            state: state.clone(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        });
+        let run_id = RunId::new();
+        let job_id = JobId("build".to_owned());
+        let plan_id = run_id.to_string();
+        let timeline_id = uuid::Uuid::new_v4();
+        let request_id = 7_i64;
+        {
+            let mut inner = state.inner.lock().await;
+            inner.runs.insert(
+                run_id,
+                RunRecord {
+                    run_id,
+                    run_name: Some("timeline-conclusion-test".to_owned()),
+                    submission: Arc::new(WorkflowSubmission {
+                        workflow_yaml: "on: push\njobs: {}\n".to_owned(),
+                        event: "push".to_owned(),
+                        repository: "test/repo".to_owned(),
+                        git_ref: "refs/heads/main".to_owned(),
+                        ..Default::default()
+                    }),
+                    jobs: BTreeMap::from([(job_id.clone(), ExecutionStatus::InProgress)]),
+                    status: ExecutionStatus::InProgress,
+                    job_outputs: BTreeMap::new(),
+                    job_base_ids: BTreeMap::new(),
+                    job_needs: BTreeMap::new(),
+                    caller_plans: BTreeMap::new(),
+                    job_names: BTreeMap::from([(job_id.clone(), "build".to_owned())]),
+                    github: serde_json::json!({}),
+                    head_sha: String::new(),
+                    workflow_ref: String::new(),
+                    workspace_snapshot: None,
+                    job_fail_fast: BTreeMap::new(),
+                    job_continue_on_error: BTreeMap::new(),
+                    job_check_run_ids: BTreeMap::new(),
+                    reusable_calls: BTreeMap::new(),
+                    jobs_list: Vec::new(),
+                    created_at: chrono::Utc::now(),
+                    started_at: None,
+                    completed_at: None,
+                    run_number: 1,
+                    run_attempt: 1,
+                    workflow_path_str: ".github/workflows/ci.yml".to_owned(),
+                    event: "push".to_owned(),
+                    conclusion: None,
+                },
+            );
+            inner.plan_requests.insert(plan_id.clone(), request_id);
+            inner.job_requests.insert(
+                request_id,
+                TaskAgentJobRequestRecord {
+                    request_id,
+                    run_id,
+                    job_id: job_id.clone(),
+                    agent_job_id: uuid::Uuid::new_v4(),
+                    plan_id: plan_id.clone(),
+                    plan_type: "Build".to_owned(),
+                    timeline_id,
+                    result: None,
+                    locked_until: String::new(),
+                    started_at: None,
+                    last_renewed_at: None,
+                    timeout_triggered: false,
+                    debug_token_issued: false,
+                },
+            );
+        }
+
+        let _ = patch_timeline_records(
+            State(shared),
+            Path((
+                "scope".to_owned(),
+                "hub".to_owned(),
+                plan_id,
+                timeline_id.to_string(),
+            )),
+            Json(azdo::VssJsonCollectionWrapper {
+                count: 0,
+                value: Vec::new(),
+            }),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&run_id).expect("run still present");
+        let detail = run
+            .jobs_list
+            .iter()
+            .find(|detail| detail.name == "build")
+            .expect("timeline PATCH created the job detail");
+        assert_eq!(
+            detail.conclusion, "in_progress",
+            "an in-flight job must not read as 'success' or 'inprogress'"
+        );
+    }
 }

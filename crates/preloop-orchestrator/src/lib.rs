@@ -3,6 +3,8 @@
 pub mod environment;
 mod keys;
 
+include!(concat!(env!("OUT_DIR"), "/pins.rs"));
+
 use crate::environment::{EnvironmentResolver, EnvironmentSpec, ToolchainLayer};
 use crate::keys::{KeyPool, StagedKey};
 use aksh_gha_protocol::RUNNER_BUSY_SENTINEL;
@@ -60,13 +62,46 @@ fn control_bridge_dir(config: &RunnerPoolConfig) -> Option<PathBuf> {
         .map(|parent| parent.join("control-bridge"))
 }
 
-fn runner_volumes(config: &RunnerPoolConfig) -> Vec<VolumeMount> {
+fn runner_volumes(
+    config: &RunnerPoolConfig,
+    machine: &MachineName,
+    mount_externals: bool,
+) -> Vec<VolumeMount> {
     let mut volumes = vec![VolumeMount {
         host: config.runner_bundle.clone(),
         guest: PathBuf::from("/opt/preloop/bin"),
         read_only: true,
     }];
+    // The Node externals are shared host-side, mounted read-only into machines
+    // built from a registry base image — never baked into a machine image nor
+    // downloaded per runner (that is what the `--no-externals` configure flag
+    // enforces). Artifact-based machines (packed golden and create-per-runner)
+    // skip the mount: the packed artifact already carries the externals baked
+    // into its rootfs, and every virtio device consumes one of libkrun's 11
+    // x86_64 IRQ lines — the packed launcher is already the device-heaviest
+    // config (root + layers virtiofs + 2 disks + mounts + vsock + net +
+    // console), so a third mount pushes it past the budget and the golden
+    // fails to start (`RegisterNetDevice(IrqsExhausted)`). When the pack is
+    // rebuilt without the baked externals, fold the mount back in (e.g. a
+    // guest symlink `<root>/externals -> /opt/preloop/bin/externals` pointing
+    // at an `externals/` dir shipped inside the runner bundle).
+    if mount_externals {
+        volumes.push(VolumeMount {
+            host: config.externals_dir.join("externals"),
+            guest: PathBuf::from(RUNNER_ROOT).join("externals"),
+            read_only: true,
+        });
+    }
     if let Some(host) = control_bridge_dir(config) {
+        // Per-machine target: the guest agent's mounted-socket bridge binds
+        // its listener INTO the mounted directory through virtiofs, and the
+        // node outlives the machine. A shared directory let every machine see
+        // every dead machine's socket node — connects then resolve to a dead
+        // listener and return ECONNREFUSED forever (the hung-runner class).
+        let host = host.join(machine.as_str());
+        if let Err(error) = std::fs::create_dir_all(&host) {
+            warn!(machine = machine.as_str(), %error, "control-bridge directory creation failed");
+        }
         volumes.push(VolumeMount {
             host,
             guest: PathBuf::from(GUEST_CONTROL_DIR),
@@ -74,6 +109,87 @@ fn runner_volumes(config: &RunnerPoolConfig) -> Vec<VolumeMount> {
         });
     }
     volumes
+}
+
+/// Populate the host-side externals directory once, so every VM can mount
+/// `node20`/`node24` instead of baking or downloading them per machine.
+///
+/// Reuses the same shell routine the golden bake used — it is pure
+/// `curl | tar` plus an atomic temp-dir publish, so it runs identically on
+/// the host. Skips when the external is already present, so a concurrent
+/// engine start or an operator-provided directory is left untouched.
+fn ensure_host_externals(config: &RunnerPoolConfig) -> Result<(), OrchestratorError> {
+    let externals = config.externals_dir.join("externals");
+    if externals.join("node24").join("bin").join("node").is_file() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&externals).map_err(|error| {
+        OrchestratorError::Config(format!(
+            "failed to create externals directory {}: {error}",
+            externals.display()
+        ))
+    })?;
+    for command in node_externals_at(config.externals_dir.to_string_lossy().as_ref()) {
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command[2])
+            .status()
+            .map_err(|error| {
+                OrchestratorError::Config(format!(
+                    "failed to spawn host externals install: {error}"
+                ))
+            })?;
+        if !status.success() {
+            return Err(OrchestratorError::Config(
+                "host node externals install failed; \
+                 check network egress to nodejs.org"
+                    .to_owned(),
+            ));
+        }
+    }
+    info!(
+        path = %externals.display(),
+        "Node externals installed on host; mounting into runners"
+    );
+    // Artifact-based machines reach node through the baked symlink
+    // `<root>/externals -> /opt/preloop/bin/externals` (the packed launcher
+    // has no IRQ headroom for a third virtiofs mount), so the runner bundle
+    // must expose the same externals. This must be a REAL directory, not a
+    // host symlink: virtiofs exports a symlink node verbatim and the guest
+    // kernel then resolves its target in the GUEST namespace, where
+    // `/var/lib/preloop/externals` does not exist — node would be missing.
+    // Best-effort copy: the bundle lives in a root-owned release dir when
+    // the engine runs unprivileged, and the deploy step materializes the
+    // externals in that case.
+    let bundle_externals = config.runner_bundle.join("externals");
+    if !bundle_externals
+        .join("node24")
+        .join("bin")
+        .join("node")
+        .is_file()
+    {
+        let copy = std::process::Command::new("cp")
+            .args(["-a", externals.to_str().unwrap_or_default()])
+            .arg(format!("{}/.", bundle_externals.display()))
+            .output();
+        match copy {
+            Ok(output) if output.status.success() => info!(
+                bundle = %bundle_externals.display(),
+                "Materialized node externals into runner bundle"
+            ),
+            Ok(output) => warn!(
+                status = %output.status,
+                bundle = %bundle_externals.display(),
+                "Could not materialize bundle externals (deploy step should copy them)"
+            ),
+            Err(error) => warn!(
+                %error,
+                bundle = %bundle_externals.display(),
+                "Could not materialize bundle externals (deploy step should copy them)"
+            ),
+        }
+    }
+    Ok(())
 }
 async fn download_prebaked_golden(payload: &Path) -> bool {
     let default_url = format!(
@@ -164,17 +280,29 @@ const BASE_PACKAGES: &str = "\
      build-essential pkg-config libssl-dev make autoconf automake libtool m4 \
      bison flex texinfo patchelf swig dpkg-dev fakeroot binutils \
      libicu-dev libsqlite3-dev libyaml-dev \
-     nodejs npm python3 python3-pip python-is-python3 \
+     python3 python3-pip python-is-python3 \
      unzip zip xz-utils zstd bzip2 brotli lz4 pigz p7zip-full tar \
      jq file tree shellcheck parallel time acl locales tzdata \
      rsync dnsutils iputils-ping net-tools iproute2 netcat-openbsd \
      sqlite3 rpm aria2 mercurial";
 
+/// Node.js baked into the base image, pinned (via `versions.toml`) to the
+/// GitHub-hosted ubuntu-24.04 system Node. Ubuntu's apt `nodejs` (18.19) is
+/// deliberately *not* installed: workflows written against hosted runners
+/// assume a modern Node on PATH, and the apt series floats with the archive.
+pub const BASE_NODE_VERSION: &str = crate::NODE_VERSION;
+
 /// Container engine, installed separately from [`BASE_PACKAGES`].
+///
+/// Installed from Docker's official apt repository (not Ubuntu's `docker.io`
+/// package): the runner needs parity with the `ubuntu-latest` container
+/// stack, and the official packages ship `dockerd`, the CLI, and the
+/// buildx/compose plugins as first-class artifacts.
 ///
 /// Kept apart because it needs storage configuration the other packages do not
 /// — see [`DOCKER_DATA_ROOT`].
-const DOCKER_PACKAGES: &str = "docker.io";
+const DOCKER_PACKAGES: &str =
+    "docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin";
 
 /// Where the container engine stores images and layers.
 ///
@@ -220,6 +348,12 @@ pub fn base_packages() -> &'static str {
     BASE_PACKAGES
 }
 
+/// The golden image's container engine baseline. Exposed for the fidelity
+/// tests.
+pub fn docker_packages() -> &'static str {
+    DOCKER_PACKAGES
+}
+
 /// Where the container engine stores layers. Exposed for the fidelity tests.
 pub fn docker_data_root() -> &'static str {
     DOCKER_DATA_ROOT
@@ -230,6 +364,11 @@ pub fn loopback_hosts() -> &'static str {
     LOOPBACK_HOSTS
 }
 
+/// PATH exported to the guest runner. Exposed for the lifecycle tests.
+pub fn guest_runner_path() -> &'static str {
+    GUEST_RUNNER_PATH
+}
+
 fn node_externals_at(runner_root: &str) -> Vec<Vec<String>> {
     [vec![
         "sh".to_owned(),
@@ -237,7 +376,7 @@ fn node_externals_at(runner_root: &str) -> Vec<Vec<String>> {
         format!(
             "RUNNER_EXTERNALS={runner_root}/externals && \
              mkdir -p \"$RUNNER_EXTERNALS\" && \
-             for entry in 'node20 v20.19.0' 'node24 v24.3.0'; do \
+             for entry in 'node20 v{NODE20_EXTERNALS_VERSION}' 'node24 v{NODE24_EXTERNALS_VERSION}'; do \
                set -- $entry; \
                NAME=$1; VERSION=$2; \
                DEST=$RUNNER_EXTERNALS/$NAME; \
@@ -265,29 +404,41 @@ fn node_externals_at(runner_root: &str) -> Vec<Vec<String>> {
     .collect()
 }
 
-fn node_externals() -> Vec<Vec<String>> {
-    node_externals_at(RUNNER_ROOT)
+/// The guest bootstrap script, one shell round trip.
+///
+/// Every `exec` is a host process spawn plus a vsock round trip, and this runs
+/// on the engine's start-up critical path. Exposed for the fidelity tests.
+pub fn base_install_script() -> String {
+    format!(
+        "apt-get update -qq && \
+         DEBIAN_FRONTEND=noninteractive \
+         apt-get install -y -qq --no-install-recommends {BASE_PACKAGES} \
+         && printf '{LOOPBACK_HOSTS}' > /etc/hosts && \
+         printf '127.0.0.1 %s\\n' \"$(hostname)\" >> /etc/hosts && \
+         printf 'APT::Get::Assume-Yes \"true\";\\n' > /etc/apt/apt.conf.d/90assumeyes && \
+         (arch=$(uname -m); \
+          case \"$arch\" in x86_64) NODE_ARCH=x64 ;; aarch64|arm64) NODE_ARCH=arm64 ;; *) NODE_ARCH=x64 ;; esac; \
+          curl -fsSL \"https://nodejs.org/dist/v{BASE_NODE_VERSION}/node-v{BASE_NODE_VERSION}-linux-$NODE_ARCH.tar.gz\" \
+            | tar -xz --strip-components=1 -C /usr/local) && \
+         (install -m 0755 -d /etc/apt/keyrings && \
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc && \
+          echo \"deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable\" > /etc/apt/sources.list.d/docker.list && \
+          apt-get update -qq && \
+          DEBIAN_FRONTEND=noninteractive \
+          apt-get install -y -qq {DOCKER_PACKAGES} && \
+          mkdir -p {DOCKER_DATA_ROOT} /etc/docker && \
+          printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\"}}\\n' > /etc/docker/daemon.json \
+          || true) && \
+       (curl -sSL https://github.com/Boshen/cargo-shear/releases/download/v{CARGO_SHEAR_VERSION}/cargo-shear-$(uname -m)-unknown-linux-musl.tar.gz 2>/dev/null | tar -xz -C /usr/local/bin 2>/dev/null || true) && \
+         apt-get clean"
+    )
 }
 
 fn base_install_commands() -> Vec<Vec<String>> {
-    // One shell round trip instead of several: every `exec` is a host process
-    // spawn plus a vsock round trip, and this runs on the engine's start-up
-    // critical path.
     [vec![
         "sh".to_owned(),
         "-c".to_owned(),
-        format!(
-            "apt-get update -qq && \
-             DEBIAN_FRONTEND=noninteractive \
-             apt-get install -y -qq --no-install-recommends {BASE_PACKAGES} \
-             && printf '{LOOPBACK_HOSTS}' > /etc/hosts && \
-             (DEBIAN_FRONTEND=noninteractive \
-              apt-get install -y -qq {DOCKER_PACKAGES} && \
-              mkdir -p {DOCKER_DATA_ROOT} /etc/docker && \
-              printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\"}}\\n' > /etc/docker/daemon.json \
-              || true) && \
-             apt-get clean && rm -rf /var/lib/apt/lists/*"
-        ),
+        base_install_script(),
     ]]
     .into_iter()
     .collect()
@@ -354,6 +505,29 @@ async fn await_guest_ready<P: VmProvider>(
     }
 }
 
+/// Restore apt's package indices when the image shipped without them.
+///
+/// Hosted images keep populated lists, so real workflows run
+/// `sudo apt-get install <pkg>` with no `apt-get update` first (uv's musl cell
+/// installs `musl-tools` that way). Every pack published while the baseline
+/// script ended in `rm -rf /var/lib/apt/lists/*` boots without them, and each
+/// of those steps fails with `E: Unable to locate package`. Cheap to check,
+/// and a no-op on an image that has them.
+///
+/// Hard-bounded: a fork of a packed golden can inherit a held apt lock from the
+/// frozen image, and `apt-get update` then waits forever — which would block
+/// provisioning, not just the refresh. A missed refresh costs a workflow one
+/// `apt-get update`; a hung one costs the whole pool.
+fn apt_lists_refresh_command() -> Vec<String> {
+    vec![
+        "sh".to_owned(),
+        "-c".to_owned(),
+        "[ -n \"$(find /var/lib/apt/lists -name '*_Packages*' -print -quit 2>/dev/null)\" ] \
+         || timeout 120 apt-get -o DPkg::Lock::Timeout=10 update -qq || true"
+            .to_owned(),
+    ]
+}
+
 async fn install_base_dependencies<P: VmProvider>(
     provider: &P,
     name: &MachineName,
@@ -369,19 +543,90 @@ async fn install_base_dependencies<P: VmProvider>(
             )));
         }
     }
-    for command in node_externals() {
-        let output = provider.exec(name, &command).await?;
-        if output.exit_code != 0 {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(OrchestratorError::Config(format!(
-                "node externals install failed (exit {}): {}",
-                output.exit_code,
-                stderr.lines().last().unwrap_or("unknown error")
-            )));
-        }
-    }
+    // Node externals are no longer baked: they arrive via the read-only
+    // host mount (`ensure_host_externals` + `runner_volumes`), which keeps
+    // the golden pack and every machine image lean.
     Ok(())
 }
+
+/// Record what a golden actually baked, so provenance is inspectable
+/// instead of reconstructed.
+///
+/// The resolved versions are the point: channels (`stable`, `22`, `lts/*`,
+/// `go 1.24` minimums) resolve at bake time, and the manifest captures what
+/// they resolved to. `/etc/preloop-bake.json` in any fork answers "what is
+/// in this environment?" without re-deriving it.
+async fn write_bake_manifest<P: VmProvider>(
+    provider: &P,
+    name: &MachineName,
+    env_spec: &EnvironmentSpec,
+) -> Result<(), OrchestratorError> {
+    let probe = [
+        "sh".to_owned(),
+        "-c".to_owned(),
+        "for cmd in node npm python3 docker git rustc cargo go cargo-shear; do \
+           printf '%s=%s\\n' \"$cmd\" \"$($cmd --version 2>/dev/null | head -n1 || echo missing)\"; \
+         done; \
+         printf 'packages=%s\\n' \"$(dpkg-query -W -f={{Package}} | wc -l)\"; \
+         printf 'built_at=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+            .to_owned(),
+    ];
+    let output = provider.exec(name, &probe).await?;
+    let mut versions = serde_json::Map::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Some((key, value)) = line.split_once('=') {
+            versions.insert(key.to_owned(), serde_json::Value::String(value.to_owned()));
+        }
+    }
+    let manifest = serde_json::json!({
+        "base": env_spec.base,
+        "toolchains": env_spec.toolchains,
+        "versions": versions,
+        "base_node": BASE_NODE_VERSION,
+        "cargo_shear": CARGO_SHEAR_VERSION,
+        // Derived from the same generated pins the install path uses, so a
+        // version bump can never install one version and record another.
+        "node_externals": [
+            format!("node20 {NODE20_EXTERNALS_VERSION}"),
+            format!("node24 {NODE24_EXTERNALS_VERSION}"),
+        ],
+        "preloop": env!("CARGO_PKG_VERSION"),
+    });
+    let json =
+        serde_json::to_string(&manifest).expect("bake manifest is a fixed string-only structure");
+    provider
+        .exec(
+            name,
+            &[
+                "sh".to_owned(),
+                "-c".to_owned(),
+                format!(
+                    "printf '%s' '{}' > /etc/preloop-bake.json",
+                    json.replace('\'', "'\\''")
+                ),
+            ],
+        )
+        .await?;
+    info!(
+        machine = name.as_str(),
+        "bake manifest written to /etc/preloop-bake.json"
+    );
+    Ok(())
+}
+
+/// PATH the guest runner process exports to every step.
+///
+/// Hosted images carry the toolchain bin directories on the runner's own PATH,
+/// which is what makes `cargo install`-style actions work: `taiki-e/install-action`
+/// drops `cargo-hack` in `$CARGO_HOME/bin` and the next step runs `cargo hack`.
+/// dtolnay/rust-toolchain only appends that directory to `$GITHUB_PATH` when it
+/// has to install rustup itself, so on an image that already has rustup — ours,
+/// and GitHub's — the directory is on PATH or the tool is simply unreachable.
+/// Guests run as root, so `$HOME/.cargo` is `/root/.cargo`; the Go layer
+/// untars into `/usr/local/go`. Absent directories cost nothing.
+const GUEST_RUNNER_PATH: &str = "/root/.cargo/bin:/usr/local/go/bin:\
+                                 /usr/local/sbin:/usr/local/bin:\
+                                 /usr/sbin:/usr/bin:/sbin:/bin";
 
 /// `env` prefix for guest runner invocations, empty when nothing needs setting.
 ///
@@ -390,6 +635,7 @@ async fn install_base_dependencies<P: VmProvider>(
 /// vice versa, so neither may gate the other.
 fn guest_env_prefix(config: &RunnerPoolConfig, name: &MachineName) -> Vec<String> {
     let mut env = Vec::new();
+    env.push(format!("PATH={GUEST_RUNNER_PATH}"));
     // The guest needs its own VM name so a debug session can tell a controller
     // which machine to open a shell into. Nothing else in the guest knows it.
     env.push(format!("PRELOOP_MACHINE_NAME={}", name.as_str()));
@@ -446,6 +692,13 @@ pub struct RunnerPoolConfig {
     pub artifact_stem: PathBuf,
     /// Host directory containing the Linux `preloop-runner` executable.
     pub runner_bundle: PathBuf,
+    /// Host directory holding the Node externals shared with every VM.
+    ///
+    /// Populated once on the host (`node20`/`node24` downloaded from
+    /// nodejs.org), then mounted read-only into every machine at the runner
+    /// root's `externals`. Keeps the golden pack small: externals are never
+    /// baked into a machine image or downloaded per runner.
+    pub externals_dir: PathBuf,
     /// Runner executable filename within `runner_bundle`.
     pub runner_binary_name: String,
     /// Guest-visible control-plane URL.
@@ -459,6 +712,9 @@ pub struct RunnerPoolConfig {
     /// unavailable. The bridge binds `control_origin` inside the VM and
     /// proxies accepted connections to this address over virtio-net TCP.
     pub control_upstream: Option<String>,
+    /// Guest DNS resolver override (smolvm `--dns`), for networks that
+    /// filter smolvm's default public resolvers.
+    pub dns: Option<String>,
     /// Host environment variable containing the registration credential.
     pub registration_token_env: String,
     /// Runner labels advertised to the scheduler.
@@ -496,6 +752,13 @@ pub struct RunnerPoolConfig {
     /// [`crate::environment::scan_workflow_images`].
     pub preload_images: Vec<String>,
     pub next_job_runs_on: Option<Arc<std::sync::RwLock<Vec<String>>>>,
+    /// One-time provision-token map shared with the control plane. When set,
+    /// every provisioning event registers a token here and injects it into
+    /// the guest's `configure` call; the control plane trusts only
+    /// registrations presenting a match, which is what authorizes it to bind
+    /// a queued job to a specific machine's runner identity.
+    pub pending_registrations:
+        Option<Arc<std::sync::RwLock<std::collections::BTreeMap<String, std::time::SystemTime>>>>,
 }
 
 /// Cache of environment-specific golden VMs.
@@ -725,6 +988,65 @@ async fn preload_images<P: VmProvider>(
 /// Prepare a running forkable golden VM with the requested environment.
 ///
 /// SmolVM takes the forkable RAM/disk snapshot when `start --forkable` runs.
+/// Host-side record of the environment a golden was baked for.
+///
+/// Lives beside the packed artifact, which is already the pool's writable home
+/// for VM assets. The fingerprint covers the base-image digest and every
+/// toolchain layer, so bumping any of them leaves the record unmatched and the
+/// golden is rebuilt rather than wrongly adopted.
+fn golden_record_path(config: &RunnerPoolConfig, golden: &MachineName) -> Option<PathBuf> {
+    let directory = config.artifact_stem.parent()?.join("goldens");
+    Some(directory.join(format!("{}.fingerprint", golden.as_str())))
+}
+
+/// Record what this golden was baked for, replacing any earlier record.
+fn write_golden_record(config: &RunnerPoolConfig, golden: &MachineName, fingerprint: &str) {
+    let Some(path) = golden_record_path(config, golden) else {
+        return;
+    };
+    let written = path
+        .parent()
+        .map(std::fs::create_dir_all)
+        .transpose()
+        .and_then(|_| std::fs::write(&path, fingerprint));
+    if let Err(error) = written {
+        // A missing record costs one rebake on the next start, nothing more.
+        warn!(path = %path.display(), %error, "golden bake record not written");
+    }
+}
+
+/// Drop the record, so an interrupted rebake cannot be adopted.
+fn remove_golden_record(config: &RunnerPoolConfig, golden: &MachineName) {
+    if let Some(path) = golden_record_path(config, golden) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Whether `golden` is already booted as a fork base for `fingerprint`.
+///
+/// Deliberately host-side: the golden is frozen as SmolVM's fork base, and
+/// probing it through the guest would touch the very snapshot every clone is
+/// taken from.
+async fn golden_is_reusable<P: VmProvider>(
+    provider: &Arc<P>,
+    config: &RunnerPoolConfig,
+    golden: &MachineName,
+    fingerprint: &str,
+) -> bool {
+    if !matches!(provider.status(golden).await, Ok(MachineState::Running)) {
+        return false;
+    }
+    let Some(path) = golden_record_path(config, golden) else {
+        return false;
+    };
+    std::fs::read_to_string(path)
+        .map(|recorded| recorded.trim() == fingerprint)
+        .unwrap_or(false)
+}
+
+/// Prepare a running forkable golden VM with the requested environment.
+///
+/// SmolVM takes the forkable RAM/disk snapshot when `start --forkable` runs.
 /// Provision the guest while it is a normal machine, then restart it as the
 /// fork base so package and external-runtime writes are inherited by clones.
 async fn prepare_golden_for_env<P: VmProvider + 'static>(
@@ -733,6 +1055,22 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
     golden: &MachineName,
     env_spec: &EnvironmentSpec,
 ) -> Result<(), OrchestratorError> {
+    // The golden registry is in-memory, so without this every engine restart
+    // rebakes a golden that is still sitting there fully baked and forkable —
+    // apt plus rustup, five to eleven minutes, before the first job of that
+    // environment can run, paid again on every deploy.
+    if golden_is_reusable(provider, config, golden, &env_spec.fingerprint).await {
+        info!(
+            machine = golden.as_str(),
+            fingerprint = %env_spec.fingerprint,
+            "adopted the existing golden fork base"
+        );
+        return Ok(());
+    }
+    // Any record must die before the machine does: a rebake interrupted
+    // halfway would otherwise leave a fingerprint claiming a golden that no
+    // longer carries it.
+    remove_golden_record(config, golden);
     if provider.status(golden).await? != MachineState::Missing {
         provider.delete(golden).await?;
     }
@@ -744,7 +1082,7 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
         storage_gib: config.storage_gib,
         overlay_gib: config.overlay_gib,
         network: NetworkPolicy::PublicOnly,
-        volumes: runner_volumes(config),
+        volumes: runner_volumes(config, golden, true),
         sockets: config
             .control_socket
             .iter()
@@ -753,6 +1091,7 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
                 guest: PathBuf::from(GUEST_CONTROL_SOCKET),
             })
             .collect(),
+        dns: config.dns.clone(),
         rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
     };
     provider.create(&spec).await?;
@@ -773,6 +1112,10 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
             }
         }
     }
+    if let Err(error) = write_bake_manifest(provider.as_ref(), golden, env_spec).await {
+        // Provenance is an audit aid, not a build gate.
+        warn!(machine = golden.as_str(), %error, "bake manifest not written");
+    }
     if let Err(error) = preload_images(provider.as_ref(), golden, &config.preload_images).await {
         // A preload miss costs a run-time pull, not a broken job.
         warn!(
@@ -788,6 +1131,7 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
         let _ = provider.delete(golden).await;
         return Err(error.into());
     }
+    write_golden_record(config, golden, &env_spec.fingerprint);
     info!(machine = golden.as_str(), "golden fork base ready");
     Ok(())
 }
@@ -813,7 +1157,7 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
         storage_gib: config.storage_gib,
         overlay_gib: config.overlay_gib,
         network: NetworkPolicy::PublicOnly,
-        volumes: runner_volumes(config),
+        volumes: runner_volumes(config, golden, false),
         sockets: config
             .control_socket
             .iter()
@@ -822,6 +1166,7 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
                 guest: PathBuf::from(GUEST_CONTROL_SOCKET),
             })
             .collect(),
+        dns: config.dns.clone(),
         rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
     };
     provider.create(&spec).await?;
@@ -855,6 +1200,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
 
     /// Prepare the immutable runner image once, then supervise all slots until cancellation.
     pub async fn run(&self, shutdown: CancellationToken) -> Result<(), OrchestratorError> {
+        ensure_host_externals(&self.config)?;
         if self.config.use_packed_artifact || self.config.control_socket.is_none() {
             self.prepare_artifact(true).await?;
         }
@@ -1092,6 +1438,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             network: NetworkPolicy::PublicOnly,
             volumes: Vec::new(),
             sockets: Vec::new(),
+            dns: self.config.dns.clone(),
             rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
         };
         self.provider.create(&spec).await?;
@@ -1113,6 +1460,39 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     return Err(error.into());
                 }
             }
+        }
+        // Bake the externals *pointer*, not the externals: the packed rootfs
+        // gets `<root>/externals -> /opt/preloop/bin/externals` so node rides
+        // the runner-bundle mount instead of being baked into the image or
+        // downloaded per machine. The symlink must live in the pack itself —
+        // forkable snapshots do not capture exec writes made after create —
+        // and it must be baked here, in the builder, where the rootfs layer
+        // is flattened into the artifact. The bundle's host side carries the
+        // real `externals/` (see `ensure_host_externals`).
+        let link_command = format!(
+            "mkdir -p {root} && rm -rf {root}/externals && \
+             ln -s /opt/preloop/bin/externals {root}/externals",
+            root = RUNNER_ROOT
+        );
+        let output = self
+            .provider
+            .exec(&name, &["sh".to_owned(), "-c".to_owned(), link_command])
+            .await?;
+        if output.exit_code != 0 {
+            let _ = self.provider.delete(&name).await;
+            return Err(OrchestratorError::Config(format!(
+                "baking externals symlink failed (exit {}): {}",
+                output.exit_code,
+                String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .last()
+                    .unwrap_or("unknown")
+            )));
+        }
+        let env_spec = EnvironmentSpec::new(self.config.base_image.clone(), toolchains);
+        if let Err(error) = write_bake_manifest(self.provider.as_ref(), &name, &env_spec).await {
+            // Provenance is an audit aid, not a build gate.
+            warn!(machine = name.as_str(), %error, "bake manifest not written");
         }
         self.provider.stop(&name).await?;
         let temporary = payload
@@ -1154,6 +1534,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                 .as_str()
                 .starts_with(&format!("{}-", self.config.name_prefix))
             {
+                notify_runner_gone(&self.config, &name).await;
                 if let Err(error) = self.provider.delete(&name).await {
                     warn!(machine = name.as_str(), %error, "failed to delete stale Preloop runner");
                 }
@@ -1169,6 +1550,42 @@ struct ReadyRunner {
     name: MachineName,
     run: Vec<String>,
     environment: RunnerEnvironment,
+}
+
+/// Tell the control plane a machine's runner is gone, BEFORE the VM goes
+/// away: the server purges the identity AND requeues any job the runner
+/// claimed but never finished. Without this, a machine torn down mid-job
+/// hangs that job until the 45-minute lease reaper marks it failed.
+///
+/// Fire-and-forget: machine deletion must not stall on control-plane
+/// availability, and a missed purge only reverts to the old reaper path.
+async fn notify_runner_gone(config: &RunnerPoolConfig, name: &MachineName) {
+    let Some(token) = std::env::var(&config.registration_token_env)
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let url = format!(
+        "{}/api/v1/runners/purge",
+        config.server_url.trim_end_matches('/')
+    );
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(1500))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return,
+    };
+    if let Err(error) = client
+        .post(url)
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "name": name.as_str() }))
+        .send()
+        .await
+    {
+        warn!(machine = name.as_str(), %error, "runner purge notification failed");
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1350,6 +1767,7 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     // runners around).
     match result {
         Ok(Some(successor)) => {
+            notify_runner_gone(&config, &successor.name).await;
             let _ = provider.delete(&successor.name).await;
             Ok(())
         }
@@ -1526,6 +1944,7 @@ async fn run_slot<P: VmProvider + 'static>(
     }
 
     if let Some(spare) = spare {
+        notify_runner_gone(&config, &spare.name).await;
         let _ = provider.delete(&spare.name).await;
     }
     Ok(())
@@ -1594,6 +2013,14 @@ async fn wait_for_environment_change(
         std::future::pending::<()>().await;
         return;
     };
+    // Grace before reaping: a freshly-paired machine is not idle — the broker
+    // assigns jobs before the guest runner has even received the request, and
+    // the guest announces its claim on stdout moments later. Reaping on the
+    // first observed mismatch killed machines mid-claim and requeued jobs
+    // forever under mixed environments. Require the mismatch to persist across
+    // a few checks so only genuinely idle runners are recycled.
+    const REAP_GRACE_CHECKS: u32 = 25; // ~2.5 s at the 100 ms cadence below.
+    let mut mismatch_checks = 0u32;
     loop {
         if claimed.load(Ordering::Acquire) {
             std::future::pending::<()>().await;
@@ -1604,7 +2031,12 @@ async fn wait_for_environment_change(
             .map(|labels| labels.clone())
             .unwrap_or_default();
         if !labels.is_empty() && EnvironmentSpec::default_base(&labels) != current_base {
-            return;
+            mismatch_checks += 1;
+            if mismatch_checks >= REAP_GRACE_CHECKS {
+                return;
+            }
+        } else {
+            mismatch_checks = 0;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -1746,15 +2178,17 @@ async fn run_one_runner<P: VmProvider + 'static>(
 
     if let Some(debug_dir) = preserved {
         hold_for_debugging(name, &debug_dir, &shutdown).await;
+        notify_runner_gone(config, name).await;
         if let Err(error) = provider.delete(name).await {
             warn!(machine = name.as_str(), %error, "failed to delete preserved machine");
         }
-        return finish(&provider, result, successor).await;
+        return finish(&provider, config, result, successor).await;
     }
 
     // Report the runner's own failure in preference to a teardown failure.
+    notify_runner_gone(config, name).await;
     let delete_result = provider.delete(name).await.map_err(OrchestratorError::from);
-    finish(&provider, result.and(delete_result), successor).await
+    finish(&provider, config, result.and(delete_result), successor).await
 }
 
 /// Hand the replacement back, or discard it if this runner is failing.
@@ -1764,6 +2198,7 @@ async fn run_one_runner<P: VmProvider + 'static>(
 /// swept stale names, so failure paths delete it explicitly.
 async fn finish<P: VmProvider + 'static>(
     provider: &Arc<P>,
+    config: &RunnerPoolConfig,
     result: Result<(), OrchestratorError>,
     successor: Option<ReadyRunner>,
 ) -> Result<Option<ReadyRunner>, OrchestratorError> {
@@ -1771,6 +2206,7 @@ async fn finish<P: VmProvider + 'static>(
         Ok(()) => Ok(successor),
         Err(error) => {
             if let Some(successor) = successor {
+                notify_runner_gone(config, &successor.name).await;
                 if let Err(cleanup) = provider.delete(&successor.name).await {
                     warn!(
                         machine = successor.name.as_str(),
@@ -1878,7 +2314,64 @@ async fn provision_runner<P: VmProvider + 'static>(
     if let Some(golden) = golden {
         // Fork from the already-booted golden VM instant CoW clone.
         provider.fork(golden, name).await?;
-        // The golden carries the toolchains pre-installed; nothing to do.
+        // The PACKED golden carries its bake inside the artifact's flattened
+        // rootfs, which forks inherit through the storage chain — so the apt
+        // baseline is already there. Environment goldens are different:
+        // `prepare_golden_for_env`
+        // bakes via guest `exec`, and SmolVM's forkable snapshot does NOT
+        // carry post-create exec writes into clones (verified empirically),
+        // so an env-golden fork boots the bare stock base image. Install the
+        // apt baseline and toolchains into the fork itself — it is the job's
+        // single-use machine, so the writes persist for its lifetime.
+        let golden_is_packed = config.use_packed_artifact
+            && golden.as_str() == format!("{}-golden", config.name_prefix);
+        if golden_is_packed {
+            // The pack carries the apt baseline, but not necessarily apt's
+            // indices — restore them before any workflow apt-installs.
+            if let Err(error) = provider.exec(name, &apt_lists_refresh_command()).await {
+                warn!(
+                    machine = name.as_str(),
+                    %error, "apt list refresh failed; workflow apt installs may not resolve"
+                );
+            }
+            // A pack is only as baked as whoever produced it: `prepare_artifact`
+            // bakes the workspace toolchains, but `download_prebaked_golden`
+            // short-circuits that path, and a published pack can predate (or
+            // simply omit) the toolchain the workspace now asks for. Probing
+            // beats assuming — a fork missing cargo runs the job anyway and
+            // cargo-dist dies with "you don't appear to have cargo installed",
+            // blaming the workflow for a broken machine. A fully baked pack
+            // pays one `command -v` per layer.
+            for layer in toolchains {
+                if verify_toolchain_installed(provider.as_ref(), name, layer)
+                    .await
+                    .is_ok()
+                {
+                    continue;
+                }
+                warn!(
+                    machine = name.as_str(),
+                    toolchain = %layer,
+                    "packed golden lacks toolchain; installing into the fork"
+                );
+                for command in layer.install_commands() {
+                    if let Err(error) = provider.exec(name, &command).await {
+                        return Err(error.into());
+                    }
+                }
+                verify_toolchain_installed(provider.as_ref(), name, layer).await?;
+            }
+        } else {
+            install_base_dependencies(provider.as_ref(), name).await?;
+            for layer in toolchains {
+                for command in layer.install_commands() {
+                    if let Err(error) = provider.exec(name, &command).await {
+                        return Err(error.into());
+                    }
+                }
+                verify_toolchain_installed(provider.as_ref(), name, layer).await?;
+            }
+        }
     } else {
         let uses_packed_artifact = config.use_packed_artifact;
         let spec = MachineSpec {
@@ -1893,7 +2386,7 @@ async fn provision_runner<P: VmProvider + 'static>(
             storage_gib: config.storage_gib,
             overlay_gib: config.overlay_gib,
             network: NetworkPolicy::PublicOnly,
-            volumes: runner_volumes(config),
+            volumes: runner_volumes(config, name, !uses_packed_artifact),
             sockets: config
                 .control_socket
                 .iter()
@@ -1902,19 +2395,26 @@ async fn provision_runner<P: VmProvider + 'static>(
                     guest: PathBuf::from(GUEST_CONTROL_SOCKET),
                 })
                 .collect(),
+            dns: config.dns.clone(),
             rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
         };
         provider.create(&spec).await?;
         provider.start(name).await?;
-        if !uses_packed_artifact {
-            install_base_dependencies(provider.as_ref(), name).await?;
-            for layer in toolchains {
-                for command in layer.install_commands() {
-                    if let Err(error) = provider.exec(name, &command).await {
-                        return Err(error.into());
-                    }
+        // The packed artifact is the golden's frozen image; the live golden
+        // receives the apt baseline and toolchain bake *after* boot, so a
+        // machine created from the artifact is bare and must install the
+        // baseline itself — otherwise node actions die with "curl: command
+        // not found" and rust jobs with "cargo: command not found". The
+        // installs are idempotent, so a fully baked artifact only pays the
+        // presence checks.
+        install_base_dependencies(provider.as_ref(), name).await?;
+        for layer in toolchains {
+            for command in layer.install_commands() {
+                if let Err(error) = provider.exec(name, &command).await {
+                    return Err(error.into());
                 }
             }
+            verify_toolchain_installed(provider.as_ref(), name, layer).await?;
         }
     }
 
@@ -1958,6 +2458,40 @@ async fn provision_runner<P: VmProvider + 'static>(
         "PRELOOP_RUNNER_TOKEN".to_owned(),
         SecretSource::HostEnv(config.registration_token_env.clone()),
     )];
+    // One-time provision token: the control plane pairs this machine's
+    // registration with the queued job the machine was provisioned for. The
+    // guest cannot fabricate a pairing because only this exact configure
+    // invocation ever sees the token value.
+    let mut provision_token_file: Option<PathBuf> = None;
+    if let Some(pending) = &config.pending_registrations {
+        let token = uuid::Uuid::new_v4().to_string();
+        let dir = config
+            .runner_key_dir
+            .clone()
+            .unwrap_or_else(std::env::temp_dir);
+        match std::fs::create_dir_all(&dir).and_then(|()| {
+            let path = dir.join(format!(".provision-token-{}", uuid::Uuid::new_v4()));
+            std::fs::write(&path, &token).map(|()| path)
+        }) {
+            Ok(path) => {
+                if let Ok(mut guard) = pending.write() {
+                    guard.insert(token, std::time::SystemTime::now());
+                    let now = std::time::SystemTime::now();
+                    guard.retain(|_, at| {
+                        now.duration_since(*at)
+                            .map(|age| age < std::time::Duration::from_secs(600))
+                            .unwrap_or(false)
+                    });
+                }
+                secrets.push((
+                    "PRELOOP_PROVISION_TOKEN".to_owned(),
+                    SecretSource::HostFile(path.clone()),
+                ));
+                provision_token_file = Some(path);
+            }
+            Err(error) => warn!(%error, "could not stage provision token"),
+        }
+    }
     // Held until `configure` returns; dropping it wipes the key from disk.
     let staged = stage_runner_key(config, name, keys).await;
     if let Some(staged) = &staged {
@@ -1975,6 +2509,9 @@ async fn provision_runner<P: VmProvider + 'static>(
         .exec_with_secret_env(name, &configure, &secrets)
         .await?;
     drop(staged);
+    if let Some(path) = provision_token_file {
+        let _ = std::fs::remove_file(path);
+    }
 
     // Bring the container engine up before the runner accepts work, so a job
     // declaring `container:` or `services:` does not race the daemon. Failure
@@ -1997,6 +2534,26 @@ async fn provision_runner<P: VmProvider + 'static>(
         "/var/lib/preloop-runner".into(),
     ]);
     Ok(run)
+}
+
+/// Fail the provision if a toolchain layer's binary is not on the default
+/// PATH after install. A provision interrupted between install commands (or
+/// an install that silently succeeded without producing the binary) would
+/// otherwise leave the job running without its toolchain — e.g. cargo-dist
+/// failing on "you don't appear to have cargo installed" with no hint that
+/// the machine itself was broken.
+async fn verify_toolchain_installed<P: VmProvider>(
+    provider: &P,
+    name: &MachineName,
+    layer: &ToolchainLayer,
+) -> Result<(), OrchestratorError> {
+    let binary = layer.verify_binary();
+    let mut command = vec!["sh".to_owned(), "-c".to_owned()];
+    command.push(format!("command -v {binary}"));
+    if let Err(error) = provider.exec(name, &command).await {
+        return Err(OrchestratorError::Vm(error));
+    }
+    Ok(())
 }
 
 /// Stage a pre-generated keypair for one `configure` call, if one is ready.
@@ -2105,6 +2662,8 @@ mod lifecycle_tests {
         fail_configure: bool,
         fail_run: bool,
         fail_delete: bool,
+        /// Binary that `command -v` cannot find until its toolchain installs.
+        absent_binary: Mutex<Option<&'static str>>,
     }
 
     impl TestProvider {
@@ -2123,6 +2682,16 @@ mod lifecycle_tests {
                 fail_configure,
                 fail_run,
                 fail_delete,
+                absent_binary: Mutex::new(None),
+            }
+        }
+
+        /// A provider whose guests lack `binary` until an install command for
+        /// it runs — a pack baked without the workspace's toolchain.
+        fn without_binary(binary: &'static str) -> Self {
+            Self {
+                absent_binary: Mutex::new(Some(binary)),
+                ..Self::new(false, false, false, false, false)
             }
         }
 
@@ -2216,6 +2785,37 @@ chmod +x "$destination/bin/node"
         assert!(!env.contains(&"PRELOOP_CONTROL_ORIGIN=http://192.168.1.20:9090".to_owned()));
     }
 
+    /// A workflow that installs a cargo subcommand and runs it in the next
+    /// step (`taiki-e/install-action` + `cargo hack`) only works when the
+    /// toolchain's bin directory is on the runner's PATH, as it is on hosted
+    /// images. Without it the install "succeeds" and the next step reports
+    /// `no such command: hack`.
+    #[test]
+    fn runner_path_carries_toolchain_bin_directories() {
+        let config = test_config(false);
+        let name = MachineName::new("runner").unwrap();
+
+        let env = guest_env_prefix(&config, &name);
+
+        let path = env
+            .iter()
+            .find_map(|entry| entry.strip_prefix("PATH="))
+            .expect("the runner is launched with an explicit PATH");
+        let entries: Vec<&str> = path.split(':').collect();
+        assert!(
+            entries.contains(&"/root/.cargo/bin"),
+            "cargo-installed binaries must be reachable: {path}"
+        );
+        assert!(
+            entries.contains(&"/usr/local/go/bin"),
+            "the go layer untars into /usr/local/go: {path}"
+        );
+        assert!(
+            entries.contains(&"/usr/local/bin") && entries.contains(&"/usr/bin"),
+            "the system PATH must survive: {path}"
+        );
+    }
+
     #[test]
     fn tcp_upstream_sets_origin_and_upstream_without_socket() {
         let mut config = test_config(false);
@@ -2253,11 +2853,13 @@ chmod +x "$destination/bin/node"
             workspace: None,
             artifact_stem: PathBuf::from("/tmp/lifecycle-artifact"),
             runner_bundle: PathBuf::from("/tmp"),
+            externals_dir: PathBuf::from("/tmp/lifecycle-externals"),
             runner_binary_name: "runner".to_owned(),
             server_url: "https://runner.test".to_owned(),
             control_origin: None,
             control_socket: control_socket.then(|| PathBuf::from("/tmp/engine.sock")),
             control_upstream: None,
+            dns: None,
             registration_token_env: "LIFECYCLE_TEST_TOKEN".to_owned(),
             labels: vec!["test".to_owned()],
             cpus: 1,
@@ -2269,6 +2871,7 @@ chmod +x "$destination/bin/node"
             pending_jobs: None,
             preload_images: Vec::new(),
             next_job_runs_on: None,
+            pending_registrations: None,
         }
     }
 
@@ -2356,6 +2959,18 @@ chmod +x "$destination/bin/node"
                 .lock()
                 .await
                 .push(format!("exec:{}:{:?}", name.as_str(), argv));
+            let mut absent = self.absent_binary.lock().await;
+            if let Some(binary) = *absent {
+                let probe = format!("command -v {binary}");
+                if argv.contains(&probe) {
+                    return Err(test_error("binary-not-found"));
+                }
+                // An install command that names the binary lands it on PATH.
+                if argv.iter().any(|arg| arg.contains(binary)) {
+                    *absent = None;
+                }
+            }
+            drop(absent);
             if self.fail_install && argv.iter().any(|arg| arg.contains("apt-get")) {
                 return Err(test_error("install-failure"));
             }
@@ -2476,6 +3091,162 @@ chmod +x "$destination/bin/node"
         let config = test_config(false);
         let golden = MachineName::new("lifecycle-test-golden").unwrap();
         provisioning_failure(provider, &config, Some(&golden), "configure-failure").await;
+    }
+
+    fn packed_fork_config() -> RunnerPoolConfig {
+        let mut config = test_config(false);
+        config.use_fork = true;
+        config.use_packed_artifact = true;
+        config
+    }
+
+    /// A published pack can be older than the workspace's toolchain pin, so a
+    /// fork of the packed golden must not be trusted to already have cargo:
+    /// cargo-dist's plan job installs no toolchain of its own and fails with
+    /// "you don't appear to have cargo installed" on a bare machine.
+    #[tokio::test]
+    async fn packed_golden_fork_installs_a_toolchain_the_pack_lacks() {
+        let provider = Arc::new(TestProvider::without_binary("cargo"));
+        let config = packed_fork_config();
+        let golden = MachineName::new("lifecycle-test-golden").unwrap();
+        let name = MachineName::new("lifecycle-test-0-1").unwrap();
+
+        provision_runner(
+            &provider,
+            &config,
+            &name,
+            Some(&golden),
+            &Arc::new(KeyPool::new()),
+            &config.base_image.clone(),
+            &[ToolchainLayer::Rust("1.97".to_owned())],
+        )
+        .await
+        .expect("the fork installs the toolchain its pack lacks");
+
+        let events = provider.events().await;
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("command -v cargo")),
+            "the fork must probe for the toolchain: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| event.contains("rustup-init")),
+            "a probe miss must install the toolchain: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.contains("--no-install-recommends")),
+            "the pack already carries the apt baseline: {events:?}"
+        );
+    }
+
+    /// A pack published before the baseline stopped wiping `/var/lib/apt/lists`
+    /// boots without apt indices, and `sudo apt-get install <pkg>` — how real
+    /// workflows install system packages — then resolves nothing.
+    #[tokio::test]
+    async fn packed_golden_fork_restores_apt_indices() {
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let config = packed_fork_config();
+        let golden = MachineName::new("lifecycle-test-golden").unwrap();
+        let name = MachineName::new("lifecycle-test-0-3").unwrap();
+
+        provision_runner(
+            &provider,
+            &config,
+            &name,
+            Some(&golden),
+            &Arc::new(KeyPool::new()),
+            &config.base_image.clone(),
+            &[],
+        )
+        .await
+        .expect("provisioning succeeds");
+
+        let events = provider.events().await;
+        assert!(
+            events.iter().any(|event| event.contains("_Packages")
+                && event.contains("apt-get")
+                && event.contains("update")
+                && event.contains("timeout 120")),
+            "the fork must restore apt indices when the pack has none: {events:?}"
+        );
+    }
+
+    /// The probe is the whole cost on a pack that is already baked: no reinstall.
+    #[tokio::test]
+    async fn packed_golden_fork_keeps_a_baked_toolchain() {
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let config = packed_fork_config();
+        let golden = MachineName::new("lifecycle-test-golden").unwrap();
+        let name = MachineName::new("lifecycle-test-0-2").unwrap();
+
+        provision_runner(
+            &provider,
+            &config,
+            &name,
+            Some(&golden),
+            &Arc::new(KeyPool::new()),
+            &config.base_image.clone(),
+            &[ToolchainLayer::Rust("1.97".to_owned())],
+        )
+        .await
+        .expect("provisioning succeeds");
+
+        let events = provider.events().await;
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("command -v cargo")),
+            "the fork must probe for the toolchain: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| event.contains("rustup-init")),
+            "a baked toolchain must not be reinstalled: {events:?}"
+        );
+    }
+
+    /// The golden registry dies with the process, so a restart would rebake a
+    /// golden that is still running and still correct. The host-side record is
+    /// what makes adoption safe: it must match the requested fingerprint, and
+    /// the machine must actually be up to serve as a fork base.
+    #[tokio::test]
+    async fn golden_is_adopted_only_when_running_and_recorded() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = test_config(false);
+        config.artifact_stem = temp.path().join("runner-image");
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let golden = MachineName::new("lifecycle-test-golden-abc123").unwrap();
+
+        // Recorded, but the machine was never started.
+        write_golden_record(&config, &golden, "fp-1");
+        assert!(!golden_is_reusable(&provider, &config, &golden, "fp-1").await);
+
+        provider
+            .create(&MachineSpec {
+                name: golden.clone(),
+                image: config.base_image.clone(),
+                cpus: config.cpus,
+                memory_mib: config.memory_mib,
+                storage_gib: config.storage_gib,
+                overlay_gib: None,
+                network: NetworkPolicy::PublicOnly,
+                volumes: Vec::new(),
+                sockets: Vec::new(),
+                dns: None,
+                rosetta: false,
+            })
+            .await
+            .unwrap();
+        provider.start(&golden).await.unwrap();
+
+        assert!(golden_is_reusable(&provider, &config, &golden, "fp-1").await);
+        // A base-image or toolchain bump changes the fingerprint: rebake.
+        assert!(!golden_is_reusable(&provider, &config, &golden, "fp-2").await);
+
+        remove_golden_record(&config, &golden);
+        assert!(!golden_is_reusable(&provider, &config, &golden, "fp-1").await);
     }
 
     #[tokio::test]
