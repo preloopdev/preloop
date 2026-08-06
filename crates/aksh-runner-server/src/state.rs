@@ -75,6 +75,55 @@ impl AppState {
         Some(payload)
     }
 
+    /// Sign an action-archive download ticket.
+    ///
+    /// The download route is deliberately bearerless — the official runner
+    /// treats archive URLs as tickets — and it is reachable from inside every
+    /// runner VM, where workflow code runs. Unsigned, it let a guest ask the
+    /// engine to fetch *any* `owner/repo` tarball using the engine's own
+    /// GitHub credential, which reads repositories the workflow was never
+    /// granted. Signing binds each URL to the one action it was minted for.
+    pub(crate) fn sign_action_ticket(
+        &self,
+        owner: &str,
+        repo: &str,
+        git_ref: &str,
+        expires_at: u64,
+    ) -> String {
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.local_jwt_key)
+            .expect("HMAC accepts keys of any length");
+        mac.update(action_ticket_payload(owner, repo, git_ref, expires_at).as_bytes());
+        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    }
+
+    /// Whether `signature` authorises this exact action at this expiry.
+    pub(crate) fn verify_action_ticket(
+        &self,
+        owner: &str,
+        repo: &str,
+        git_ref: &str,
+        expires_at: u64,
+        signature: &str,
+    ) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_secs())
+            .unwrap_or(u64::MAX);
+        if expires_at <= now {
+            return false;
+        }
+        let Ok(provided) = URL_SAFE_NO_PAD.decode(signature) else {
+            return false;
+        };
+        let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(&self.local_jwt_key) else {
+            return false;
+        };
+        mac.update(action_ticket_payload(owner, repo, git_ref, expires_at).as_bytes());
+        // Constant-time comparison: `verify_slice` rejects length mismatches
+        // and never short-circuits on the first differing byte.
+        mac.verify_slice(&provided).is_ok()
+    }
+
     pub(crate) fn verify_local_jwt_scope(&self, token: &str, expected_scope: &str) -> bool {
         self.verify_local_jwt_claims(token)
             .and_then(|payload| {
@@ -195,6 +244,40 @@ pub struct SharedState {
 }
 
 /// Application state.
+/// Server-visible GitHub endpoints for `github.server_url` / `api_url` /
+/// `graphql_url` and their `GITHUB_*` env counterparts. GitHub's server
+/// supplies these to every job; aksh exposes the real forge it fronts (env >
+/// config file > github.com defaults) so actions that read the host don't
+/// silently point at github.com from a GHES-style deployment.
+#[derive(Debug, Clone)]
+pub struct GitHubUrls {
+    pub server_url: String,
+    pub api_url: String,
+    pub graphql_url: String,
+}
+
+/// (owner, repo, ref) → resolution outcome with the instant it was recorded.
+///
+/// See [`GITHUB_ENV_LOCK`] for why the tests around this are serialized.
+///
+/// `None` is a cached *failure*. Without it an offline or rate-limited server
+/// re-attempts every unresolvable ref on every job dispatch and pays the full
+/// connect timeout each time, which is the common local-CI case.
+pub(crate) type ActionShaCache = std::sync::Mutex<
+    std::collections::HashMap<(String, String, String), (Option<String>, std::time::Instant)>,
+>;
+
+/// Serializes tests that mutate the process-global GitHub URL environment
+/// variables.
+///
+/// `std::env` is process-wide while `cargo test` runs the suite on a thread
+/// pool, so two tests that point `AKSH_GITHUB_API_URL` at their own mock
+/// server observe each other's value. Each such test passes in isolation and
+/// they fail reliably whenever they are co-scheduled, which is what happens
+/// when a developer filters the suite down to a handful of names.
+#[cfg(test)]
+pub(crate) static GITHUB_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[derive(Clone)]
 pub struct AppState {
     pub(crate) inner: Arc<Mutex<InnerState>>,
@@ -234,6 +317,81 @@ pub struct AppState {
     /// `None` when no App is configured, in which case job tokens fall back to
     /// `AKSH_GITHUB_TOKEN` and then to the local HMAC JWT.
     pub(crate) github_app: Option<crate::github_app::GitHubAppCredentials>,
+    /// Static PAT used for job tokens when no GitHub App is configured.
+    ///
+    /// Sourced from `AKSH_GITHUB_TOKEN` (which wins) or, failing that, the
+    /// config file's `github.pat` — the credential `preloop setup github
+    /// --via pat` writes. Without this, a PAT-only setup would report success
+    /// while every job silently received the local runtime token instead.
+    pub(crate) github_pat: Option<aksh_gha_protocol::SecretString>,
+    /// GitHub endpoints surfaced to workflows (server/api/graphql URLs).
+    pub(crate) github_urls: GitHubUrls,
+    /// Short-TTL cache of resolved action refs (`owner`, `repo`, `ref`) → SHA.
+    /// Keeps a matrix fan-out from re-resolving the same `uses:` ref per cell
+    /// and bounds GitHub API pressure; entries expire after
+    /// [`ACTION_SHA_CACHE_TTL`].
+    pub(crate) action_sha_cache: Arc<ActionShaCache>,
+    /// Stored job secrets from the config file (`[secrets]` + per-repo
+    /// tables), injected into every job whose trust tier allows secrets
+    /// (mirroring GitHub org/repo secrets). Submission-provided secrets
+    /// take precedence per name. Writable at runtime by the live secrets
+    /// API, which also persists the config file.
+    pub(crate) secrets: Arc<parking_lot::RwLock<SecretStore>>,
+    /// Serializes the live secrets API's load → mutate → persist → publish
+    /// sequence. `set_secret`/`delete_secret` read the whole config file,
+    /// change one entry and write the file back; without mutual exclusion
+    /// two concurrent requests read the same base config and the second
+    /// rename drops the first request's secret, leaving the in-memory store
+    /// holding both mutations while the file holds only one.
+    ///
+    /// Lock ordering, to keep this deadlock-free: acquire this mutex
+    /// FIRST, then (briefly, and only after the file write succeeded) the
+    /// `secrets` `RwLock`. Never acquire it while holding `secrets` or the
+    /// global `inner` mutex, and never acquire `inner` while holding it —
+    /// the secrets handlers touch neither ordering partner.
+    pub(crate) secret_mutation: Arc<Mutex<()>>,
+    /// The config file this engine is pinned to, resolved once at startup.
+    ///
+    /// Every engine-side read and write of configuration goes through this
+    /// rather than re-resolving `PRELOOP_CONFIG`, so one engine stays bound
+    /// to one file for its whole life and cannot be retargeted underneath
+    /// itself by a later environment change.
+    pub(crate) config_path: PathBuf,
+    /// One-time provision tokens issued by the embedded runner pool, one per
+    /// machine provisioning event, forwarded by the runner's `configure`
+    /// call inside the fresh VM. Registration presenting a matching token is
+    /// trusted to be pool-originated, which is what authorizes stamping a
+    /// job → runner assignment a rogue machine-side process cannot mint.
+    pub pending_registrations: Arc<std::sync::RwLock<BTreeMap<String, std::time::SystemTime>>>,
+}
+
+/// The runtime secret store: a global tier injected everywhere plus
+/// per-repository tiers that override the global tier by name.
+#[derive(Clone, Default)]
+pub(crate) struct SecretStore {
+    /// Global secrets, injected into every trusted job.
+    pub global: BTreeMap<String, String>,
+    /// Per-repository secrets, keyed by `owner/repo`. A name here wins over
+    /// the same name in `global` for jobs of that repository.
+    pub repo: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+/// Redacting `Debug`: the store holds plaintext secret values, so a single
+/// `debug!(?store)` on the derived impl would disclose every stored secret.
+/// Only counts and names are rendered.
+impl std::fmt::Debug for SecretStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let repo_names: BTreeMap<&String, Vec<&String>> = self
+            .repo
+            .iter()
+            .map(|(scope, names)| (scope, names.keys().collect()))
+            .collect();
+        f.debug_struct("SecretStore")
+            .field("global_count", &self.global.len())
+            .field("global_names", &self.global.keys().collect::<Vec<_>>())
+            .field("repo_names", &repo_names)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -281,6 +439,18 @@ pub(crate) enum JobSetAdmissionResult {
 
 impl AppState {
     pub async fn new(state_dir: PathBuf) -> anyhow::Result<Self> {
+        let config_path = crate::config::config_path();
+        Self::new_with_config(state_dir, config_path).await
+    }
+
+    /// [`AppState::new`] against an explicit config file.
+    ///
+    /// The path is resolved once, here, and then stored: every later read and
+    /// write goes through the stored value rather than re-reading
+    /// `PRELOOP_CONFIG`. That keeps one engine pinned to one file for its
+    /// whole life, and lets tests point at a temp file without mutating
+    /// process-wide environment state that other tests race against.
+    pub async fn new_with_config(state_dir: PathBuf, config_path: PathBuf) -> anyhow::Result<Self> {
         let cache = CacheStore::new(state_dir.join("cache")).await?;
         let artifacts = ArtifactStore::new(state_dir.join("artifacts")).await?;
         let (events, _) = broadcast::channel(1024);
@@ -342,7 +512,56 @@ impl AppState {
                 )
             })
             .unwrap_or(false);
-        let github_app = crate::github_app::load_from_env()?;
+        let config = crate::config::load_config_from(&config_path)?;
+        let github_app = crate::github_app::load_from(&config)?;
+        // Env wins over the config file, matching every other `AKSH_GITHUB_*`
+        // override. An empty value in either source counts as unset.
+        let github_pat = env::var("AKSH_GITHUB_TOKEN")
+            .ok()
+            .filter(|pat| !pat.is_empty())
+            .or_else(|| config.github.pat.clone().filter(|pat| !pat.is_empty()))
+            .map(aksh_gha_protocol::SecretString::new);
+        // Env wins over the config file, matching every other `AKSH_GITHUB_*`
+        // override; an empty value in either source counts as unset.
+        let github_urls = GitHubUrls {
+            server_url: env::var("AKSH_GITHUB_SERVER_URL")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    config
+                        .github
+                        .server_url
+                        .clone()
+                        .filter(|value| !value.is_empty())
+                })
+                .unwrap_or_else(|| "https://github.com".to_owned()),
+            api_url: env::var("AKSH_GITHUB_API_URL")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    config
+                        .github
+                        .api_url
+                        .clone()
+                        .filter(|value| !value.is_empty())
+                })
+                .unwrap_or_else(|| "https://api.github.com".to_owned()),
+            graphql_url: env::var("AKSH_GITHUB_GRAPHQL_URL")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    config
+                        .github
+                        .graphql_url
+                        .clone()
+                        .filter(|value| !value.is_empty())
+                })
+                .unwrap_or_else(|| "https://api.github.com/graphql".to_owned()),
+        };
+        let secrets = Arc::new(parking_lot::RwLock::new(SecretStore {
+            global: config.secrets,
+            repo: config.repo_secrets,
+        }));
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
             events,
@@ -359,14 +578,49 @@ impl AppState {
             local_jwt_key,
             runner_version_deprecated,
             scheduler: None,
+            secrets,
+            secret_mutation: Arc::new(Mutex::new(())),
             github_app,
+            github_pat,
+            github_urls,
+            action_sha_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            config_path,
+            pending_registrations: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
         })
     }
 
     pub(crate) async fn emit(&self, event: NdjsonEvent) {
         let _ = self.events.send(event);
     }
+
+    /// Plaintext static PAT for job tokens, when one is configured.
+    ///
+    /// A job message carries the credential in the clear, so this is a genuine
+    /// protocol boundary; the single `expose` below is the whole reason the
+    /// field is wrapped everywhere else.
+    pub(crate) fn static_github_pat(&self) -> Option<String> {
+        // Deliberately `let ... else` rather than `Option::map`: the audit rule
+        // `no-expose-in-loop` flags any `.expose()` inside a closure, and a
+        // `match` here trips clippy::manual_map. This form satisfies both.
+        let Some(pat) = &self.github_pat else {
+            return None;
+        };
+        Some(pat.expose().to_owned())
+    }
 }
+/// Canonical bytes covered by an action ticket signature.
+///
+/// Serialized as a JSON array so the encoding is injective: the download
+/// route rejects `.`, `/`, and `\` in owner/repo and `..` in `git_ref`, but
+/// NOT control characters, so a newline inside any accepted component could
+/// splice the `\n`-joined format into a different action's payload. Two
+/// distinct actions always sign distinct bytes, so a ticket minted for one
+/// action can never validate for another.
+fn action_ticket_payload(owner: &str, repo: &str, git_ref: &str, expires_at: u64) -> String {
+    serde_json::to_string(&("action-archive", owner, repo, git_ref, expires_at))
+        .expect("a tuple of strings and an integer always serializes")
+}
+
 #[cfg(test)]
 pub(crate) fn mint_runtime_token(plan_id: &str, job_id: &uuid::Uuid) -> String {
     let now = SystemTime::now()
@@ -545,6 +799,22 @@ pub(crate) struct InnerState {
     pub(crate) workflow_run_counters: BTreeMap<String, u64>,
     pub(crate) queue: VecDeque<QueuedJob>,
     pub(crate) pending_jobs: VecDeque<QueuedJob>,
+    /// Reusable-caller and dynamic-matrix nodes whose gates are already held
+    /// and whose callee subtree still has to be built.
+    ///
+    /// Building a subtree parses workflow YAML, constructs one runner message
+    /// per inner job and mints a runtime token for each, so it scales with the
+    /// width of the callee matrix. Doing that while holding the global state
+    /// mutex stalls every other request, so promotion only records the intent
+    /// here; `drain_expansions` performs the work with the lock released and
+    /// applies the result under a fresh one.
+    pub(crate) pending_expansions: VecDeque<QueuedJob>,
+    /// Nodes currently being expanded with the lock released.
+    ///
+    /// The entry is the reservation: it stops a second sweep from expanding
+    /// the same node, and cancellation drops it so a build that finishes after
+    /// the run was cancelled is discarded instead of resurrecting jobs.
+    pub(crate) expanding: BTreeSet<(RunId, JobId)>,
     pub(crate) runners: BTreeMap<i64, RegisteredRunner>,
     pub(crate) sessions: BTreeMap<String, RunnerSession>,
     pub(crate) session_keys: BTreeMap<String, SessionEncryption>,
@@ -559,6 +829,47 @@ pub(crate) struct InnerState {
     pub(crate) github_token_requests: BTreeMap<i64, GitHubTokenRequest>,
     pub(crate) runner_client_ids: BTreeMap<String, i64>,
     pub(crate) cancellation_queue: VecDeque<QueuedCancellation>,
+    /// Job → runner pairings. While an entry is fresh, the job may only be
+    /// claimed by sessions presenting a verified listen-token identity for
+    /// that runner. Entries are consumed on successful claim and dropped on
+    /// runner deregistration, requeue, or run teardown.
+    pub(crate) job_assignments: BTreeMap<(RunId, JobId), AssignmentRecord>,
+    /// Pool-managed jobs that are queued but not yet paired with a registered
+    /// runner (a machine is being provisioned for them). While fresh, these
+    /// cannot be claimed at all — the wait protects against a rogue session
+    /// claiming the job before its machine registers.
+    pub(crate) pool_pending: BTreeMap<(RunId, JobId), std::time::SystemTime>,
+    /// Runners that proved themselves with a provision token at registration,
+    /// keyed by runner id. Pool-managed jobs must pair with one of these
+    /// (or a machine the pool itself provisioned) rather than an external
+    /// runner that registered before the job was queued.
+    pub(crate) pool_proven_runners: BTreeSet<i64>,
+    /// Set when the embedded runner pool provisions machines for queued jobs
+    /// (the `preloop serve` flow). Enables assignment enforcement for newly
+    /// queued jobs.
+    pub(crate) pool_assignments_enabled: bool,
+    /// `PRELOOP_REQUIRE_JOB_ASSIGNMENTS`: when true, jobs may only be claimed
+    /// through an assignment; unassigned jobs are never delivered, even to
+    /// external runners. Default false keeps bring-your-own-runner installs
+    /// working unchanged.
+    pub(crate) require_job_assignments: bool,
+    /// Jobs popped from the queue by a dispatch claim, keyed for requeueing:
+    /// if the runner that claimed a job dies mid-execution (machine torn down,
+    /// identity purged), the stashed copy is what gets the same job back into
+    /// the queue intact instead of waiting for the lease reaper to fail it.
+    /// Entries drop on normal completion.
+    pub(crate) claimed_jobs: BTreeMap<(RunId, JobId), QueuedJob>,
+    /// Recently seen GitHub webhook delivery IDs, so a redelivered (or
+    /// double-fired) webhook does not create duplicate runs. An entry is
+    /// `InFlight` while the handler is still processing that delivery, so a
+    /// concurrent second copy of the same delivery is skipped, and
+    /// `Completed` once processing succeeded, so a later redelivery inside
+    /// the dedup window is skipped. A failed delivery has its entry removed
+    /// entirely: GitHub redelivers after an error response and that retry is
+    /// the only remaining chance to process the event, so keeping the
+    /// reservation would swallow it permanently. Completed entries are pruned
+    /// by the dedup window on every insert.
+    pub(crate) webhook_deliveries: VecDeque<(String, WebhookDeliveryState)>,
     pub(crate) pending_caches: BTreeMap<i64, PendingCache>,
     pub(crate) artifacts: BTreeMap<String, ArtifactRecord>,
     pub(crate) logs: BTreeMap<String, Vec<u8>>,
@@ -616,10 +927,65 @@ pub(crate) struct InnerState {
     pub(crate) concurrency_blocked: VecDeque<QueuedJob>,
     /// Multi-key admission state for reusable workflow invocations.
     pub(crate) jobset_admissions: BTreeMap<JobSetId, JobSetAdmission>,
+    /// JobSets whose gates were acquired and whose caller placeholder nodes
+    /// still await callee-subtree expansion by the scheduler.
+    pub(crate) jobset_ready: BTreeSet<JobSetId>,
     /// Evaluated workflow-level concurrency raw config per run (for release/debug).
     pub(crate) run_concurrency: BTreeMap<RunId, aksh_gha_parser::Concurrency>,
     /// Which concurrency key a holder currently occupies (for release).
     pub(crate) holder_keys: BTreeMap<RunId, Vec<(String, String)>>,
     /// Live debug sessions holding paused jobs open.
     pub(crate) debug_sessions: crate::debug_sessions::DebugSessionRegistry,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The ticket payload must be injective even when an accepted identifier
+    /// contains a newline: the download route rejects `.`, `/`, and `\` in
+    /// owner/repo and `..` in `git_ref`, but never control characters, so a
+    /// crafted ref could previously splice the `\n`-joined payload into a
+    /// different action's bytes. Distinct actions must sign distinct bytes.
+    #[test]
+    fn action_ticket_payload_is_injective_across_newline_splits() {
+        let expires_at = 1_800_000_000u64;
+        let first = action_ticket_payload("acme", "repo", "v1\nx", expires_at);
+        let second = action_ticket_payload("acme", "repo\nv1", "x", expires_at);
+        assert_ne!(
+            first, second,
+            "two actions must never produce the same ticket payload"
+        );
+        // Sanity: the encoding still covers every component.
+        let baseline = action_ticket_payload("acme", "repo", "v1", expires_at);
+        assert_ne!(baseline, first);
+        assert_ne!(baseline, second);
+        assert_ne!(
+            baseline,
+            action_ticket_payload("acme", "repo", "v1", expires_at + 1)
+        );
+    }
+
+    /// End to end: a ticket minted for one action must not authorise a
+    /// different action whose identifier only differs by a newline split.
+    #[tokio::test]
+    async fn action_ticket_does_not_cross_validate_across_newline_splits() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let expires_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+
+        let signature = state.sign_action_ticket("acme", "repo", "v1\nx", expires_at);
+        assert!(
+            state.verify_action_ticket("acme", "repo", "v1\nx", expires_at, &signature),
+            "the minted action must verify"
+        );
+        assert!(
+            !state.verify_action_ticket("acme", "repo\nv1", "x", expires_at, &signature),
+            "a ticket for one action must not validate for a newline-split twin"
+        );
+    }
 }

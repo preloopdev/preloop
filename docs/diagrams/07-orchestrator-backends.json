@@ -1,0 +1,693 @@
+[
+  {
+    "type": "cameraUpdate",
+    "width": 1500,
+    "height": 1100,
+    "x": 0,
+    "y": 0
+  },
+  {
+    "type": "text",
+    "id": "title",
+    "x": 480,
+    "y": 25,
+    "text": "preloop-orchestrator \u2014 Pluggable Backends",
+    "fontSize": 28,
+    "strokeColor": "#1e1e1e"
+  },
+  {
+    "type": "text",
+    "id": "subtitle",
+    "x": 380,
+    "y": 60,
+    "text": "Three core Rust traits decouple state storage, authentication, and runner execution",
+    "fontSize": 15,
+    "strokeColor": "#757575"
+  },
+  {
+    "type": "rectangle",
+    "id": "zone_rs",
+    "x": 50,
+    "y": 110,
+    "width": 430,
+    "height": 940,
+    "backgroundColor": "#dbe4ff",
+    "fillStyle": "solid",
+    "opacity": 25,
+    "strokeColor": "#1e40af",
+    "strokeWidth": 1.5,
+    "roundness": {
+      "type": 3
+    }
+  },
+  {
+    "type": "text",
+    "id": "zone_l_rs",
+    "x": 70,
+    "y": 125,
+    "text": "RunStore implementations",
+    "fontSize": 18,
+    "strokeColor": "#1e40af"
+  },
+  {
+    "type": "rectangle",
+    "id": "rs",
+    "x": 70,
+    "y": 165,
+    "width": 390,
+    "height": 90,
+    "backgroundColor": "#d0bfff",
+    "fillStyle": "solid",
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2.5,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "trait RunStore\npersist RunId, JobId, status & queue state",
+      "fontSize": 17
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "rs_mem",
+    "x": 70,
+    "y": 290,
+    "width": 390,
+    "height": 75,
+    "backgroundColor": "#a5d8ff",
+    "fillStyle": "solid",
+    "strokeColor": "#4a9eed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "InMemory (local dev / tests)\nArc<Mutex<HashMap>>, no disk persistence",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "rs_file",
+    "x": 70,
+    "y": 405,
+    "width": 390,
+    "height": 75,
+    "backgroundColor": "#a5d8ff",
+    "fillStyle": "solid",
+    "strokeColor": "#4a9eed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "File (current default)\n.aksh/ disk cache & artifact files",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "rs_sqlx",
+    "x": 70,
+    "y": 520,
+    "width": 390,
+    "height": 75,
+    "backgroundColor": "#a5d8ff",
+    "fillStyle": "solid",
+    "strokeColor": "#4a9eed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Sqlx (production cluster)\nPostgreSQL / SQLite via repo trait",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "rs_none",
+    "x": 70,
+    "y": 635,
+    "width": 390,
+    "height": 75,
+    "backgroundColor": "#a5d8ff",
+    "fillStyle": "solid",
+    "strokeColor": "#4a9eed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "None (stateless proxy)\nfire-and-forget, BYO external runner",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "zone_ap",
+    "x": 520,
+    "y": 110,
+    "width": 430,
+    "height": 940,
+    "backgroundColor": "#fff3bf",
+    "fillStyle": "solid",
+    "opacity": 25,
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 1.5,
+    "roundness": {
+      "type": 3
+    }
+  },
+  {
+    "type": "text",
+    "id": "zone_l_ap",
+    "x": 540,
+    "y": 125,
+    "text": "AuthProvider implementations",
+    "fontSize": 18,
+    "strokeColor": "#f59e0b"
+  },
+  {
+    "type": "rectangle",
+    "id": "ap",
+    "x": 540,
+    "y": 165,
+    "width": 390,
+    "height": 90,
+    "backgroundColor": "#d0bfff",
+    "fillStyle": "solid",
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2.5,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "trait AuthProvider\ninbound verification & OIDC token minting",
+      "fontSize": 17
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "ap_loop",
+    "x": 540,
+    "y": 290,
+    "width": 390,
+    "height": 75,
+    "backgroundColor": "#ffd8a8",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "LoopbackTrust (local single-user)\n127.0.0.1 trusted as admin",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "ap_tok",
+    "x": 540,
+    "y": 405,
+    "width": 390,
+    "height": 75,
+    "backgroundColor": "#ffd8a8",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Preloop Token (bearer CLI)\nissued bearer tokens for CLI agents",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "ap_oauth",
+    "x": 540,
+    "y": 520,
+    "width": 390,
+    "height": 75,
+    "backgroundColor": "#ffd8a8",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "OAuth + mTLS (server / runner)\nGitHub App JWT & mTLS polling",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "ap_oidc",
+    "x": 540,
+    "y": 635,
+    "width": 390,
+    "height": 75,
+    "backgroundColor": "#ffd8a8",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "OIDC Federation (cloud WIF)\nOIDC workload identity tokens",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "zone_rp",
+    "x": 990,
+    "y": 110,
+    "width": 460,
+    "height": 940,
+    "backgroundColor": "#eebefa",
+    "fillStyle": "solid",
+    "opacity": 20,
+    "strokeColor": "#a21caf",
+    "strokeWidth": 1.5,
+    "roundness": {
+      "type": 3
+    }
+  },
+  {
+    "type": "text",
+    "id": "zone_l_rp",
+    "x": 1010,
+    "y": 125,
+    "text": "RunnerProvider implementations",
+    "fontSize": 18,
+    "strokeColor": "#a21caf"
+  },
+  {
+    "type": "rectangle",
+    "id": "rp",
+    "x": 1010,
+    "y": 165,
+    "width": 420,
+    "height": 90,
+    "backgroundColor": "#d0bfff",
+    "fillStyle": "solid",
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2.5,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "trait RunnerProvider\nephemeral runner lifecycle & log streams",
+      "fontSize": 17
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "rp_proc",
+    "x": 1010,
+    "y": 290,
+    "width": 420,
+    "height": 75,
+    "backgroundColor": "#eebefa",
+    "fillStyle": "solid",
+    "strokeColor": "#a21caf",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Process (subprocess runner)\nspawn aks-runner run child process",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "rp_docker",
+    "x": 1010,
+    "y": 405,
+    "width": 420,
+    "height": 75,
+    "backgroundColor": "#eebefa",
+    "fillStyle": "solid",
+    "strokeColor": "#a21caf",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Container (docker engine)\nper-job container with mounted workspace",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "rp_vm",
+    "x": 1010,
+    "y": 520,
+    "width": 420,
+    "height": 75,
+    "backgroundColor": "#eebefa",
+    "fillStyle": "solid",
+    "strokeColor": "#a21caf",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "preloop-vm (smolvm / libkrun)\nephemeral microVM with packed kernel",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "rp_k8s",
+    "x": 1010,
+    "y": 635,
+    "width": 420,
+    "height": 75,
+    "backgroundColor": "#eebefa",
+    "fillStyle": "solid",
+    "strokeColor": "#a21caf",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Kubernetes (k8s pod)\nkube-rs ephemeral runner pod",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "rp_cloud",
+    "x": 1010,
+    "y": 750,
+    "width": 420,
+    "height": 75,
+    "backgroundColor": "#eebefa",
+    "fillStyle": "solid",
+    "strokeColor": "#a21caf",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Cloud VM (EC2 / GCE)\nprovision cloud VM instance per job",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "rp_byo",
+    "x": 1010,
+    "y": 865,
+    "width": 420,
+    "height": 75,
+    "backgroundColor": "#eebefa",
+    "fillStyle": "solid",
+    "strokeColor": "#a21caf",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "BYO External Runner\nexternal runner registers & polls directly",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_rs_impl",
+    "x": 265,
+    "y": 255,
+    "width": 0,
+    "height": 35,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        35
+      ]
+    ],
+    "strokeColor": "#1e40af",
+    "strokeWidth": 2,
+    "strokeStyle": "dashed",
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "rs",
+      "fixedPoint": [
+        0.5,
+        1
+      ]
+    },
+    "endBinding": {
+      "elementId": "rs_mem",
+      "fixedPoint": [
+        0.5,
+        0
+      ]
+    },
+    "label": {
+      "text": "implements",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_ap_impl",
+    "x": 735,
+    "y": 255,
+    "width": 0,
+    "height": 35,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        35
+      ]
+    ],
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "strokeStyle": "dashed",
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "ap",
+      "fixedPoint": [
+        0.5,
+        1
+      ]
+    },
+    "endBinding": {
+      "elementId": "ap_loop",
+      "fixedPoint": [
+        0.5,
+        0
+      ]
+    },
+    "label": {
+      "text": "implements",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_rp_impl",
+    "x": 1220,
+    "y": 255,
+    "width": 0,
+    "height": 35,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        35
+      ]
+    ],
+    "strokeColor": "#a21caf",
+    "strokeWidth": 2,
+    "strokeStyle": "dashed",
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "rp",
+      "fixedPoint": [
+        0.5,
+        1
+      ]
+    },
+    "endBinding": {
+      "elementId": "rp_proc",
+      "fixedPoint": [
+        0.5,
+        0
+      ]
+    },
+    "label": {
+      "text": "implements",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "pair_local_1",
+    "x": 460,
+    "y": 327,
+    "width": 80,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        80,
+        0
+      ]
+    ],
+    "strokeColor": "#15803d",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "rs_mem",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "ap_loop",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "Local Dev Stack",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "pair_local_2",
+    "x": 930,
+    "y": 327,
+    "width": 80,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        80,
+        0
+      ]
+    ],
+    "strokeColor": "#15803d",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "ap_loop",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "rp_proc",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "pair_prod_1",
+    "x": 460,
+    "y": 557,
+    "width": 80,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        80,
+        0
+      ]
+    ],
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "rs_sqlx",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "ap_oauth",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "Production Cluster Stack",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "pair_prod_2",
+    "x": 930,
+    "y": 557,
+    "width": 80,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        80,
+        0
+      ]
+    ],
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "ap_oauth",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "rp_vm",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    }
+  }
+]

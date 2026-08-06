@@ -1,0 +1,98 @@
+{
+  "findings": [
+    {
+      "id": "MC-S2-workflow-gate-leak",
+      "source": "model-checking",
+      "invariant": "TerminalRunReleasesKeys",
+      "config": "MC_hunt_s2_concurrency.safety.cfg",
+      "counterexample": "spec/counterexamples/MC-S2-workflow-gate-leak.txt",
+      "summary": "Workflow-level concurrency gate (Holder::Run) is never released when a run terminates through the dependency-skip/eval-error arm of promote_ready_jobs. A successor submission to the same group without cancel-in-progress parks in `pending` forever.",
+      "evidence": [
+        "promote_ready_jobs Skip|Error arm (runtime_scheduling.rs:862-879) sets terminal status + finalize_run_if_complete but never calls release_concurrency_for_run",
+        "release_concurrency_for_run has exactly one production caller: cancel_run_inner (runtime_scheduling.rs:151)",
+        "finalize_run_if_complete (runtime_scheduling.rs:2027-2041) only stamps completed_at/conclusion, no release",
+        "try_acquire_concurrency (runtime_scheduling.rs:595): a dead Holder::Run blocks the group; only the cancel_in_progress arm evicts it (cancel_holder -> cancel_run_inner -> release)",
+        "TLC counterexample: SubmitRun2(run1,{job1}) -> EnqueuePending -> ArriveRunFree(run1,g2) -> SkipJob; run terminal StSuccess with holderKeys[run1] = {g2}"
+      ],
+      "status": "fixed \u2014 release_concurrency_for_job now called in the promote Skip|Error arm (runtime_scheduling.rs, `MC-S2:` comment)"
+    },
+    {
+      "id": "MC-S3-job-gate-bypass",
+      "source": "model-checking",
+      "invariant": "GateBeforeDispatch",
+      "config": "MC_hunt_s3_deferred_expansion.safety.cfg",
+      "counterexample": "spec/counterexamples/MC-S3-job-gate-bypass.txt",
+      "summary": "Job-level concurrency gate (queued_job.concurrency) is evaluated only at submit time and only for needs-empty jobs; jobs with needs (or max-parallel violations) carry their gate through pending_jobs and are dispatched by promote_ready_jobs without ever acquiring it.",
+      "evidence": [
+        "try_enqueue_with_job_concurrency has exactly one production call site: runs.rs:1077, guarded by `needs_empty && under_mp` (runs.rs:1099-1121)",
+        "needs-gated jobs go to inner.pending_jobs (runs.rs:1118) with concurrency field set",
+        "promote_ready_jobs Run arm (runtime_scheduling.rs:850-857) pushes directly to inner.queue without consulting queued_job.concurrency",
+        "take_matching_job (runtime_scheduling.rs:1032-1060) has zero concurrency checks",
+        "TLC counterexample: SubmitRun2(run1,{job1}) -> DeclareGate(run1,job1,g1) -> EnqueuePending -> PromoteDispatchJob; job dispatched while gateHeld = {}"
+      ],
+      "status": "fixed \u2014 promote-time gate acquisition; see spec/base.tla promotion-time acquisition path"
+    },
+    {
+      "id": "MC-S5-step-transition-loss",
+      "source": "model-checking",
+      "invariant": "StepTransitionDelivered",
+      "config": "MC_hunt_s5_reporting_queue.safety.cfg",
+      "counterexample": "spec/counterexamples/MC-S5-step-transition-loss.txt",
+      "summary": "ServerQueue.take_steps_update_body clears dirty_keys while steps_generation stays ahead of published_generation; a failed POST (flush_step_updates publish=false) never re-dirties the steps, so the next take returns an empty body and the terminal step transition is lost forever.",
+      "evidence": [
+        "take_steps_update_body (server_queue.rs) returns None only when generations match, otherwise collects dirty_keys and clears them",
+        "flush_step_updates (reporting.rs:19-77) calls mark_steps_published only when the POST/PATCH succeeded; on failure neither re-dirties nor restores",
+        "a step in terminal state receives no further queue_update, so nothing re-registers it as dirty",
+        "TLC counterexample: WorkerQueueUpdate(st1,StCancelled,RNone) -> WorkerTakeBody; gen != pubGen with dirty = {}"
+      ],
+      "status": "withdrawn \u2014 invariant modelled the `dirty` set implementation detail, not deliverability; take_steps_update_body republishes via generation max"
+    },
+    {
+      "id": "MC-S6-format-brace-escape",
+      "source": "model-checking",
+      "invariant": "FormatEscapeClosed",
+      "config": "MC_hunt_s6_masking_tokenizer.safety.cfg",
+      "counterexample": "spec/counterexamples/MC-S6-format-brace-escape.txt",
+      "summary": "The aksh-gha-protocol copy of the template-string builder (azdo/job.rs template_string_token) escapes only single quotes; the parser copy (job_builder.rs append_format_literal) also escapes { and }. The official runner's format() throws FormatException on unescaped braces, so any env/input mixing a literal brace with a ${{ }} expression breaks on dispatch through the protocol (AzDO/broker) serialization path.",
+      "evidence": [
+        "protocol copy: azdo/job.rs:588-615 template_string_token escapes only `'` (literal.replace('\\'', \"''\"))",
+        "parser copy: job_builder.rs:126-135 append_format_literal escapes `'` -> `''`, `{` -> `{{`, `}` -> `}}`",
+        "protocol copy is live: TaskStep::serialize -> TemplateStringMap -> TemplateStringMapPair::serialize -> template_string_token (azdo/job.rs:312-319, 555-585)",
+        "official runner Format.EvaluateCore throws ExpressionResources.InvalidFormatString for lone { or } (runner v2.336.0 src/Sdk/DTExpressions2/Expressions2/Sdk/Functions/Format.cs:20-85)",
+        "TLC counterexample: SetEscapeBraces(FALSE) -> BuildFormat(TRUE,TRUE); formatError set"
+      ],
+      "status": "fixed \u2014 protocol and parser now share one escape helper, `azdo::append_format_literal`"
+    },
+    {
+      "id": "MC-R1-failfast-holder-leak",
+      "source": "code-review",
+      "invariant": "TerminalRunReleasesKeys",
+      "config": null,
+      "counterexample": null,
+      "status": "fixed (2026-08-06)",
+      "summary": "Matrix fail-fast cancelled sibling jobs without releasing the concurrency slot each sibling held. A cancelled sibling never reaches the completion path, so the group stayed occupied by a job that would never run again and later runs in the same group parked forever.",
+      "evidence": [
+        "apply_matrix_fail_fast set siblings to Cancelled and pruned queue/pending_jobs but never called release_concurrency_for_job",
+        "release_concurrency_for_job is the only per-job slot/key cleanup path",
+        "fix: apply_matrix_fail_fast now releases every id it returns in cancelled_jobs",
+        "regression test: concurrency_properties.rs fail_fast_releases_the_cancelled_sibling_concurrency_slot; reverting the fix fails it with 'still held by Some(Job { .. job_id: \"j2\" })'"
+      ]
+    },
+    {
+      "id": "MC-R2-same-run-cancel-in-progress",
+      "source": "code-review",
+      "invariant": "GateBeforeDispatch",
+      "config": null,
+      "counterexample": null,
+      "status": "fixed (2026-08-06)",
+      "summary": "The cancel-in-progress admission arm cancelled a predecessor holder belonging to the arriving run. release_concurrency_for_run matches group.running by run_id alone, so it evicted the holder installed microseconds earlier: the caller was told it held the slot while the group recorded no holder and the run's holder_keys were dropped.",
+      "evidence": [
+        "try_acquire_concurrency cancel_in_progress arm installed the new holder, then called cancel_holder(prev) unconditionally",
+        "release_concurrency_for_run matches group.running via h.run_id() == run_id, which also matches the arriving same-run holder",
+        "the contended path already skipped same-run holders, making the omission an asymmetry rather than intent",
+        "fix: both cancel_holder calls in the arm now skip holders whose run_id() equals the arriving holder's",
+        "regression test: concurrency_properties.rs same_run_cancel_in_progress_keeps_the_arriving_holder; reverting the fix fails it with 'admission returned true, so the group must record the arriving holder'"
+      ]
+    }
+  ]
+}

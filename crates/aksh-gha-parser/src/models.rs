@@ -68,6 +68,9 @@ pub enum ParserError {
     /// Invalid workflow_call trigger definition.
     #[error("invalid workflow_call trigger: {0}")]
     InvalidWorkflowCallTrigger(String),
+    /// `on:` names an event GitHub does not recognize.
+    #[error("invalid workflow trigger event `{0}`")]
+    InvalidTriggerEvent(String),
     /// Maximum nesting depth for reusable workflows exceeded.
     #[error("maximum nested reusable workflows depth (4) exceeded")]
     MaxNestingDepthExceeded,
@@ -409,7 +412,9 @@ pub struct ReusableCallMetadata {
     pub caller_job_id: String,
     /// Output definitions (name -> value expression).
     pub output_definitions: BTreeMap<String, String>,
-    /// List of expanded inner job IDs that must complete.
+    /// Expanded inner job IDs that must complete. Empty at parse time: the
+    /// callee subtree is deferred; the server populates this when the caller's
+    /// `if:` gate passes and the subtree is materialized at runtime.
     pub inner_job_ids: Vec<String>,
     /// Evaluated inputs.
     #[serde(default)]
@@ -423,6 +428,14 @@ pub struct ReusableCallMetadata {
     /// Caller strategy matrix values.
     #[serde(default)]
     pub matrix: BTreeMap<String, Value>,
+    /// Caller job-level `if:` condition, verbatim.
+    ///
+    /// GitHub evaluates it once the caller's `needs` complete and skips the
+    /// whole invocation when it is false. The inlined inner jobs carry the
+    /// merged condition (`caller && inner`), and this field preserves the
+    /// caller's own expression for scheduling and observability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_condition: Option<String>,
     /// Resolved called-workflow commit SHA.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_sha: Option<String>,
@@ -446,6 +459,67 @@ pub enum Trigger {
 impl Default for Trigger {
     fn default() -> Self {
         Self::Many(Vec::new())
+    }
+}
+
+/// Every event GitHub accepts in an `on:` block. GitHub rejects workflows
+/// whose `on:` names an event outside this set at save time; aksh mirrors that
+/// at parse time so a typo'd trigger is a hard error, not a workflow that
+/// silently never fires.
+pub const KNOWN_TRIGGER_EVENTS: &[&str] = &[
+    "branch_protection_rule",
+    "check_run",
+    "check_suite",
+    "create",
+    "delete",
+    "deployment",
+    "deployment_status",
+    "discussion",
+    "discussion_comment",
+    "fork",
+    "gollum",
+    "issue_comment",
+    "issues",
+    "label",
+    "merge_group",
+    "milestone",
+    "page_build",
+    "public",
+    "pull_request",
+    "pull_request_review",
+    "pull_request_review_comment",
+    "pull_request_target",
+    "push",
+    "registry_package",
+    "release",
+    "repository_dispatch",
+    "schedule",
+    "secret_scanning_alert",
+    "status",
+    "watch",
+    "workflow_call",
+    "workflow_dispatch",
+    "workflow_run",
+];
+
+impl Trigger {
+    /// Reject `on:` blocks that name an event GitHub does not know.
+    pub fn validate_event_names(&self) -> Result<(), ParserError> {
+        let mut names = Vec::new();
+        match self {
+            Trigger::Single(name) => names.push(name.as_str()),
+            Trigger::Many(list) => names.extend(list.iter().map(String::as_str)),
+            Trigger::Map(map) => names.extend(map.keys().map(String::as_str)),
+        }
+        for name in names {
+            if !KNOWN_TRIGGER_EVENTS
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(name))
+            {
+                return Err(ParserError::InvalidTriggerEvent(name.to_owned()));
+            }
+        }
+        Ok(())
     }
 }
 /// Environment map with scalar values normalized to strings.

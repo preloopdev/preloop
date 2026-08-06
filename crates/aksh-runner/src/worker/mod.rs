@@ -129,5 +129,11 @@ pub async fn run_worker(args: WorkerArgs) -> Result<()> {
     });
 
     // Run the job with cancellation support.
-    job_runner::run_job(job_body, args.via, cancel_rx).await
+    job_runner::run_job(
+        job_body,
+        args.via,
+        cancel_rx,
+        job_runner::LeaseTiming::default(),
+    )
+    .await
 }
