@@ -408,9 +408,26 @@ async fn create_workspace_snapshot_inner(
         staging_index,
         &cached_objects,
     );
-    add.args(["add", "--all", "--", ":/"]);
-    if let Some(excluded_state) = state_dir_exclusion(state_dir, workspace)? {
-        add.arg(format!(":(exclude,top){excluded_state}/**"));
+    add.args(["add", "--all"]);
+    // A positive pathspec that matches a gitignored path makes `git add` fail
+    // the whole invocation ("the following paths are ignored by one of your
+    // .gitignore files"), and an exclude pathspec does not suppress it. The
+    // normal setup gitignores the state directory (`/.aksh/`), so the old
+    // `-- :/ :(exclude,top){state}/**` form failed on every repository that
+    // followed the documented convention, and each snapshot silently degraded
+    // to a plain checkout.
+    //
+    // When git already ignores the state directory a bare `--all` excludes it
+    // for free. Only a *tracked or otherwise visible* state directory needs an
+    // explicit exclusion, and naming one cannot trip the ignore error.
+    match state_dir_exclusion(state_dir, workspace)? {
+        Some(excluded_state) if !path_is_ignored(workspace, &excluded_state).await => {
+            add.arg("--");
+            add.arg(":/");
+            add.arg(format!(":(exclude,top){excluded_state}"));
+            add.arg(format!(":(exclude,top){excluded_state}/**"));
+        }
+        _ => {}
     }
     run_git(&mut add, "stage local workspace state").await?;
 
@@ -828,6 +845,23 @@ fn snapshot_git_command(
         .env("GIT_INDEX_FILE", index)
         .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", source_objects);
     command
+}
+
+/// Whether the workspace's own `.gitignore` rules already exclude `relative`.
+///
+/// Uses the workspace repository rather than the staging one so the answer
+/// reflects the rules the user actually wrote. `check-ignore` exits 0 when the
+/// path is ignored, 1 when it is not, and >1 on error; anything other than a
+/// clean "ignored" answer is treated as not ignored, which keeps the explicit
+/// exclusion in place and is the safe direction.
+async fn path_is_ignored(workspace: &FsPath, relative: &str) -> bool {
+    Command::new("git")
+        .current_dir(workspace)
+        .args(["check-ignore", "--quiet", "--", relative])
+        .status()
+        .await
+        .map(|status| status.code() == Some(0))
+        .unwrap_or(false)
 }
 
 async fn run_snapshot_git<const N: usize>(

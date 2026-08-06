@@ -244,6 +244,23 @@ pub struct SharedState {
 }
 
 /// Application state.
+/// Server-visible GitHub endpoints for `github.server_url` / `api_url` /
+/// `graphql_url` and their `GITHUB_*` env counterparts. GitHub's server
+/// supplies these to every job; aksh exposes the real forge it fronts (env >
+/// config file > github.com defaults) so actions that read the host don't
+/// silently point at github.com from a GHES-style deployment.
+#[derive(Debug, Clone)]
+pub struct GitHubUrls {
+    pub server_url: String,
+    pub api_url: String,
+    pub graphql_url: String,
+}
+
+/// (owner, repo, ref) → resolved SHA with the instant it was resolved.
+pub(crate) type ActionShaCache = std::sync::Mutex<
+    std::collections::HashMap<(String, String, String), (String, std::time::Instant)>,
+>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub(crate) inner: Arc<Mutex<InnerState>>,
@@ -290,6 +307,13 @@ pub struct AppState {
     /// --via pat` writes. Without this, a PAT-only setup would report success
     /// while every job silently received the local runtime token instead.
     pub(crate) github_pat: Option<aksh_gha_protocol::SecretString>,
+    /// GitHub endpoints surfaced to workflows (server/api/graphql URLs).
+    pub(crate) github_urls: GitHubUrls,
+    /// Short-TTL cache of resolved action refs (`owner`, `repo`, `ref`) → SHA.
+    /// Keeps a matrix fan-out from re-resolving the same `uses:` ref per cell
+    /// and bounds GitHub API pressure; entries expire after
+    /// [`ACTION_SHA_CACHE_TTL`].
+    pub(crate) action_sha_cache: Arc<ActionShaCache>,
     /// Stored job secrets from the config file (`[secrets]` + per-repo
     /// tables), injected into every job whose trust tier allows secrets
     /// (mirroring GitHub org/repo secrets). Submission-provided secrets
@@ -480,6 +504,43 @@ impl AppState {
             .filter(|pat| !pat.is_empty())
             .or_else(|| config.github.pat.clone().filter(|pat| !pat.is_empty()))
             .map(aksh_gha_protocol::SecretString::new);
+        // Env wins over the config file, matching every other `AKSH_GITHUB_*`
+        // override; an empty value in either source counts as unset.
+        let github_urls = GitHubUrls {
+            server_url: env::var("AKSH_GITHUB_SERVER_URL")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    config
+                        .github
+                        .server_url
+                        .clone()
+                        .filter(|value| !value.is_empty())
+                })
+                .unwrap_or_else(|| "https://github.com".to_owned()),
+            api_url: env::var("AKSH_GITHUB_API_URL")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    config
+                        .github
+                        .api_url
+                        .clone()
+                        .filter(|value| !value.is_empty())
+                })
+                .unwrap_or_else(|| "https://api.github.com".to_owned()),
+            graphql_url: env::var("AKSH_GITHUB_GRAPHQL_URL")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    config
+                        .github
+                        .graphql_url
+                        .clone()
+                        .filter(|value| !value.is_empty())
+                })
+                .unwrap_or_else(|| "https://api.github.com/graphql".to_owned()),
+        };
         let secrets = Arc::new(parking_lot::RwLock::new(SecretStore {
             global: config.secrets,
             repo: config.repo_secrets,
@@ -504,6 +565,8 @@ impl AppState {
             secret_mutation: Arc::new(Mutex::new(())),
             github_app,
             github_pat,
+            github_urls,
+            action_sha_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             config_path,
             pending_registrations: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
         })
@@ -530,10 +593,15 @@ impl AppState {
 }
 /// Canonical bytes covered by an action ticket signature.
 ///
-/// The separator cannot appear in a sanitised owner/repo (both reject `/` and
-/// `.`), so no two distinct actions can produce the same payload.
+/// Serialized as a JSON array so the encoding is injective: the download
+/// route rejects `.`, `/`, and `\` in owner/repo and `..` in `git_ref`, but
+/// NOT control characters, so a newline inside any accepted component could
+/// splice the `\n`-joined format into a different action's payload. Two
+/// distinct actions always sign distinct bytes, so a ticket minted for one
+/// action can never validate for another.
 fn action_ticket_payload(owner: &str, repo: &str, git_ref: &str, expires_at: u64) -> String {
-    format!("action-archive\n{owner}\n{repo}\n{git_ref}\n{expires_at}")
+    serde_json::to_string(&("action-archive", owner, repo, git_ref, expires_at))
+        .expect("a tuple of strings and an integer always serializes")
 }
 
 #[cfg(test)]
@@ -754,6 +822,11 @@ pub(crate) struct InnerState {
     /// cannot be claimed at all — the wait protects against a rogue session
     /// claiming the job before its machine registers.
     pub(crate) pool_pending: BTreeMap<(RunId, JobId), std::time::SystemTime>,
+    /// Runners that proved themselves with a provision token at registration,
+    /// keyed by runner id. Pool-managed jobs must pair with one of these
+    /// (or a machine the pool itself provisioned) rather than an external
+    /// runner that registered before the job was queued.
+    pub(crate) pool_proven_runners: BTreeSet<i64>,
     /// Set when the embedded runner pool provisions machines for queued jobs
     /// (the `preloop serve` flow). Enables assignment enforcement for newly
     /// queued jobs.
@@ -846,4 +919,56 @@ pub(crate) struct InnerState {
     pub(crate) holder_keys: BTreeMap<RunId, Vec<(String, String)>>,
     /// Live debug sessions holding paused jobs open.
     pub(crate) debug_sessions: crate::debug_sessions::DebugSessionRegistry,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The ticket payload must be injective even when an accepted identifier
+    /// contains a newline: the download route rejects `.`, `/`, and `\` in
+    /// owner/repo and `..` in `git_ref`, but never control characters, so a
+    /// crafted ref could previously splice the `\n`-joined payload into a
+    /// different action's bytes. Distinct actions must sign distinct bytes.
+    #[test]
+    fn action_ticket_payload_is_injective_across_newline_splits() {
+        let expires_at = 1_800_000_000u64;
+        let first = action_ticket_payload("acme", "repo", "v1\nx", expires_at);
+        let second = action_ticket_payload("acme", "repo\nv1", "x", expires_at);
+        assert_ne!(
+            first, second,
+            "two actions must never produce the same ticket payload"
+        );
+        // Sanity: the encoding still covers every component.
+        let baseline = action_ticket_payload("acme", "repo", "v1", expires_at);
+        assert_ne!(baseline, first);
+        assert_ne!(baseline, second);
+        assert_ne!(
+            baseline,
+            action_ticket_payload("acme", "repo", "v1", expires_at + 1)
+        );
+    }
+
+    /// End to end: a ticket minted for one action must not authorise a
+    /// different action whose identifier only differs by a newline split.
+    #[tokio::test]
+    async fn action_ticket_does_not_cross_validate_across_newline_splits() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let expires_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+
+        let signature = state.sign_action_ticket("acme", "repo", "v1\nx", expires_at);
+        assert!(
+            state.verify_action_ticket("acme", "repo", "v1\nx", expires_at, &signature),
+            "the minted action must verify"
+        );
+        assert!(
+            !state.verify_action_ticket("acme", "repo\nv1", "x", expires_at, &signature),
+            "a ticket for one action must not validate for a newline-split twin"
+        );
+    }
 }

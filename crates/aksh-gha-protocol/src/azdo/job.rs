@@ -1,6 +1,7 @@
 use super::{MaskHint, PipelineContextData, TaskResources, TimelineReference, VariableValue};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
+use std::fmt;
 
 // ─── Job message DTOs ─────────────────────────────────────────────────────
 
@@ -202,7 +203,13 @@ pub struct AgentJobRequestMessage {
 
 /// Where to send git traffic a workflow aimed at the forge, and how to
 /// authenticate to it.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+///
+/// `Debug` is implemented manually: `auth_header` carries the snapshot
+/// credential, and `AgentJobRequestMessage` is a `Debug`-derived DTO that
+/// embeds this struct — a derived `Debug` would print the credential in any
+/// diagnostic log/error that formats the job message. Serde still emits the
+/// raw value; the runner needs it to authenticate git traffic.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotOriginRewrite {
     /// The run's snapshot, e.g. `http://host/snapshots/<run>`.
@@ -214,6 +221,16 @@ pub struct SnapshotOriginRewrite {
     /// redirected fetch that carried no credentials would prompt for a
     /// username and fail with terminal prompts disabled.
     pub auth_header: String,
+}
+
+impl fmt::Debug for SnapshotOriginRewrite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SnapshotOriginRewrite")
+            .field("snapshot_url", &self.snapshot_url)
+            .field("forge_url", &self.forge_url)
+            .field("auth_header", &"<redacted>")
+            .finish()
+    }
 }
 
 fn is_false(b: &bool) -> bool {
@@ -693,4 +710,59 @@ pub struct ActionsDownloadInfo {
     pub url: Option<String>,
     #[serde(rename = "auth", skip_serializing_if = "Option::is_none")]
     pub auth: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The snapshot credential must never appear in Debug output of the job
+    /// message DTO — `AgentJobRequestMessage` derives Debug and embeds
+    /// `SnapshotOriginRewrite`, so any diagnostic log/error that formats the
+    /// message would otherwise print the credential.
+    #[test]
+    fn job_message_debug_redacts_snapshot_auth_header() {
+        let message: AgentJobRequestMessage = serde_json::from_value(serde_json::json!({
+            "jobId": "00000000-0000-0000-0000-000000000001",
+            "requestId": 1,
+            "plan": {
+                "planId": "p1",
+                "planType": "t",
+                "version": 0,
+                "artifactUri": "",
+                "artifactLocation": ""
+            },
+            "timeline": {
+                "id": "00000000-0000-0000-0000-000000000002",
+                "changeId": 0
+            },
+            "jobName": "test-job",
+            "lockedUntil": "0001-01-01T00:00:00",
+            "resources": {},
+            "akshSnapshotOriginRewrite": {
+                "snapshotUrl": "http://127.0.0.1:9091/snapshots/run-1",
+                "forgeUrl": "https://github.com/owner/repo",
+                "authHeader": "AUTHORIZATION: basic dG9rZW4="
+            }
+        }))
+        .unwrap();
+
+        let debug = format!("{message:?}");
+        assert!(
+            !debug.contains("dG9rZW4="),
+            "Debug output leaked the snapshot credential: {debug}"
+        );
+        assert!(
+            debug.contains("<redacted>"),
+            "expected a redaction marker: {debug}"
+        );
+
+        // The protocol boundary still needs the raw value on the wire — the
+        // runner uses it to authenticate git traffic against the snapshot.
+        let wire = serde_json::to_value(&message).unwrap();
+        assert_eq!(
+            wire["akshSnapshotOriginRewrite"]["authHeader"],
+            "AUTHORIZATION: basic dG9rZW4="
+        );
+    }
 }
