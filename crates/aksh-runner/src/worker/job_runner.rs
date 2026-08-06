@@ -131,9 +131,6 @@ pub async fn run_job(
         variables,
         context_data,
     );
-    let workspace = super::job_extension::setup_workspace(&job_message)?;
-    job_ctx.workspace = Some(workspace.clone());
-    super::job_extension::inject_github_env(&mut job_ctx, &job_message);
     // v2.336.0 (#4546/#4550): Announce locked dependencies in Setup Job log
     if let Some(deps) = job_message
         .get("actionsDependencies")
@@ -196,6 +193,14 @@ pub async fn run_job(
             }
         }
     }
+    // Workspace setup happens only once the lease is valid: an invalid or
+    // cancelled lease must not wipe an existing checkout (`setup_workspace`
+    // `remove_dir_all`s the work directory). The gate above returns early on
+    // Abandoned/Cancelled, so a job that never held a valid lease never
+    // touches the workspace.
+    let workspace = super::job_extension::setup_workspace(&job_message)?;
+    job_ctx.workspace = Some(workspace.clone());
+    super::job_extension::inject_github_env(&mut job_ctx, &job_message);
     let main_steps = super::job_extension::build_step_list(&steps, &job_message);
     let action_paths =
         match prepare_remote_actions(&job_message, &workspace, &main_steps, &plan_id).await {
@@ -946,7 +951,11 @@ enum FirstRenewOutcome {
 /// happens on a 404 (job no longer valid) or after `firstRenewRetryLimit`
 /// (5) retries of ~10 s each; either way the request is completed with
 /// `TaskResult.Abandoned` and no step ever executes. The gate also yields to
-/// job cancellation — the official completes such jobs as `Canceled`.
+/// job cancellation — the official completes such jobs as `Canceled`. The
+/// renew request itself is raced against the cancellation signal so a stalled
+/// HTTP call (server unreachable) cannot outlive the cancellation/kill
+/// window: the official `Task.WhenAny(firstJobRequestRenewed.Task,
+/// renewJobRequest)` cancels the in-flight renew task on the job run token.
 async fn first_renew_gate(
     rpt: &ReportingContext,
     mut cancel_rx: watch::Receiver<bool>,
@@ -959,7 +968,21 @@ async fn first_renew_gate(
         if *cancel_rx.borrow() {
             return FirstRenewOutcome::Cancelled;
         }
-        match rpt.run_service.renew_job(&rpt.access_token, &body).await {
+        let renew = rpt.run_service.renew_job(&rpt.access_token, &body);
+        tokio::pin!(renew);
+        let result = tokio::select! {
+            result = &mut renew => result,
+            changed = cancel_rx.changed() => {
+                if changed.is_err() || *cancel_rx.borrow() {
+                    return FirstRenewOutcome::Cancelled;
+                }
+                // The channel was notified without a real cancellation —
+                // restart the renew request (idempotent) rather than
+                // blocking on a stalled HTTP call.
+                continue;
+            }
+        };
+        match result {
             Ok(_) => return FirstRenewOutcome::Renewed,
             Err(error) if is_job_not_found(&error) => {
                 error!("First job renew failed (404) — abandoning job before start");

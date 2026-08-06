@@ -25,12 +25,26 @@ pub fn setup_workspace(job_message: &serde_json::Value) -> anyhow::Result<String
         })
         .unwrap_or("_work/default/default");
 
+    // The runner owns everything below its working directory — its root,
+    // where `_work` and `.runner` live (the worker is spawned with
+    // `current_dir(runner_root)`). A crafted job payload must never make the
+    // runner delete arbitrary paths: workspace="/" or "/home/user" would
+    // otherwise reach `remove_dir_all` below verbatim. Resolve the payload
+    // path and require it to stay strictly inside the runner root, rejecting
+    // absolute paths and `..` traversal that escape it.
+    let runner_root = std::env::current_dir()?;
     let work_path = Path::new(work_dir);
     let work_path = if work_path.is_absolute() {
         work_path.to_path_buf()
     } else {
-        std::env::current_dir()?.join(work_path)
+        runner_root.join(work_path)
     };
+    let work_path = resolve_workspace_contained(&work_path, &runner_root).with_context(|| {
+        format!(
+            "workspace {} is outside the runner root",
+            work_path.display()
+        )
+    })?;
 
     // GitHub-hosted parity: every job starts with a fresh workspace. Hosted
     // runners get a new VM per job, so workflows that assume an empty
@@ -65,6 +79,88 @@ pub fn setup_workspace(job_message: &serde_json::Value) -> anyhow::Result<String
     }
 
     Ok(work_path.to_string_lossy().into_owned())
+}
+
+/// Resolve `path` to a canonical form and verify it is strictly contained
+/// within `root`.
+///
+/// Two independent checks, because the workspace may not exist yet (it is
+/// created after this check):
+/// 1. Lexical: `.`/`..` components are collapsed; a `..` that would pop
+///    above the filesystem root is rejected outright — pure string math.
+/// 2. Symlink: the deepest existing ancestor is canonicalized and the
+///    not-yet-created suffix is re-appended, so a symlink anywhere in the
+///    payload path (or between `/var` and `/private/var` on macOS) cannot
+///    smuggle the workspace outside `root`. Containment is then verified
+///    against the canonicalized `root`, so both sides share the same
+///    symlink resolution.
+fn resolve_workspace_contained(path: &Path, root: &Path) -> std::io::Result<std::path::PathBuf> {
+    use std::path::Component;
+
+    // Resolve the runner root first: `current_dir()` already returns a
+    // resolved path, but canonicalizing keeps both sides of the comparison
+    // on the same footing regardless of how `root` was obtained.
+    let root = std::fs::canonicalize(root)?;
+
+    // 1. Lexical normalization.
+    let mut normalized = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "workspace {} escapes the runner root {} via '..'",
+                            path.display(),
+                            root.display()
+                        ),
+                    ));
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                normalized.push(component.as_os_str());
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+
+    // 2. Symlink resolution on the deepest existing ancestor.
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    let mut probe: &Path = &normalized;
+    let canonical = loop {
+        match std::fs::canonicalize(probe) {
+            Ok(canonical) => {
+                break missing
+                    .iter()
+                    .rev()
+                    .fold(canonical, |acc, part| acc.join(part));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = probe.file_name() else {
+                    return Err(error);
+                };
+                missing.push(name.to_os_string());
+                let Some(parent) = probe.parent() else {
+                    return Err(error);
+                };
+                probe = parent;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    if canonical == root || !canonical.starts_with(&root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "workspace {} is outside the runner root {}",
+                path.display(),
+                root.display()
+            ),
+        ));
+    }
+    Ok(canonical)
 }
 
 /// Inject GITHUB_* and RUNNER_* environment variables into the job context.
@@ -104,7 +200,19 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
         ("GITHUB_RUN_ATTEMPT", str_from_json(&github, "run_attempt")),
         ("GITHUB_ACTOR", str_from_json(&github, "actor")),
         ("GITHUB_WORKFLOW", str_from_json(&github, "workflow")),
-        ("GITHUB_JOB", str_from_json(&github, "job")),
+        // GitHub supplies the job id via the `system.github.job` variable
+        // (the official runner's `ExecutionContext` reads exactly that key to
+        // populate `github.job`); the github-context fallback covers older
+        // messages that carried it in the context dict.
+        (
+            "GITHUB_JOB",
+            msg.get("variables")
+                .and_then(|v| v.get("system.github.job"))
+                .and_then(|v| v.get("value"))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+                .unwrap_or_else(|| str_from_json(&github, "job")),
+        ),
         (
             "GITHUB_SERVER_URL",
             str_from_json_or(&github, "server_url", "https://github.com"),
@@ -233,24 +341,6 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
         }
     }
 
-    // Inject variables from the job message (non-secret ones)
-    if let Some(vars) = msg.get("variables").and_then(|v| v.as_object()) {
-        for (key, val) in vars {
-            let is_secret = val
-                .get("isSecret")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if !is_secret {
-                if let Some(value) = val.get("value").and_then(|v| v.as_str()) {
-                    // Only inject if not already set (step env > job vars)
-                    if !job.env.contains_key(key) {
-                        job.env.insert(key.clone(), value.to_string());
-                    }
-                }
-            }
-        }
-    }
-
     // Official runner evaluates job/workflow-level env from
     // AgentJobRequestMessage.EnvironmentVariables into the global environment
     // before any step starts. GitHub sends this as a list of typed template maps.
@@ -357,7 +447,9 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
     // `GIT_CONFIG_COUNT` applies config to every git invocation in the job
     // without writing a config file. Both the bare and `.git` forms are
     // registered because `insteadOf` matches on prefix and git prefers the
-    // longest match.
+    // longest match. Each is anchored — `{forge}.git` and `{forge}/` — so a
+    // sibling repository sharing the prefix (`owner/repo-tools` beside
+    // `owner/repo`) is not silently redirected into this run's snapshot.
     if let Some(rewrite) = msg.get("akshSnapshotOriginRewrite") {
         let snapshot_url = rewrite.get("snapshotUrl").and_then(|value| value.as_str());
         let forge_url = rewrite.get("forgeUrl").and_then(|value| value.as_str());
@@ -365,28 +457,48 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
         if let (Some(snapshot_url), Some(forge_url), Some(auth_header)) =
             (snapshot_url, forge_url, auth_header)
         {
-            if !job.env.contains_key("GIT_CONFIG_COUNT") {
-                let key = format!("url.{snapshot_url}.insteadOf");
-                job.env
-                    .insert("GIT_CONFIG_COUNT".to_owned(), "3".to_owned());
-                job.env.insert("GIT_CONFIG_KEY_0".to_owned(), key.clone());
-                job.env
-                    .insert("GIT_CONFIG_VALUE_0".to_owned(), format!("{forge_url}.git"));
-                job.env.insert("GIT_CONFIG_KEY_1".to_owned(), key);
-                job.env
-                    .insert("GIT_CONFIG_VALUE_1".to_owned(), forge_url.to_owned());
+            // Append to any count the workflow already set instead of bailing.
+            // Bailing let a workflow that legitimately uses `GIT_CONFIG_COUNT`
+            // silently opt out of the redirect and hit the real forge, which
+            // then fails on commits that exist only in the local workspace.
+            let base: usize = job
+                .env
+                .get("GIT_CONFIG_COUNT")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            let insteadof = format!("url.{snapshot_url}.insteadOf");
+            let entries = [
+                (insteadof.clone(), format!("{forge_url}.git")),
+                (insteadof, format!("{forge_url}/")),
                 // The snapshot authenticates every read; the forge does not
                 // for public repos. A redirected fetch with no credentials
                 // prompts for a username and dies with prompts disabled.
-                job.env.insert(
-                    "GIT_CONFIG_KEY_2".to_owned(),
+                (
                     format!("http.{snapshot_url}.extraheader"),
-                );
-                job.env
-                    .insert("GIT_CONFIG_VALUE_2".to_owned(), auth_header.to_owned());
+                    auth_header.to_owned(),
+                ),
+            ];
+            for (offset, (key, value)) in entries.into_iter().enumerate() {
+                let index = base + offset;
+                job.env.insert(format!("GIT_CONFIG_KEY_{index}"), key);
+                job.env.insert(format!("GIT_CONFIG_VALUE_{index}"), value);
             }
+            job.env.insert(
+                "GIT_CONFIG_COUNT".to_owned(),
+                (base + entries_len()).to_string(),
+            );
+            // The Basic-encoded snapshot credential rides in the job
+            // environment; register it with the mask list like the runtime
+            // token above, or ACTIONS_STEP_DEBUG env dumps leak it.
+            job.add_mask(auth_header);
         }
     }
+}
+
+/// Number of git config entries [`inject_github_env`] appends for a snapshot
+/// origin rewrite.
+const fn entries_len() -> usize {
+    3
 }
 
 /// Decode an Azure DevOps typed-dictionary value.
