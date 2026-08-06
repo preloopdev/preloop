@@ -1,0 +1,967 @@
+[
+  {
+    "type": "cameraUpdate",
+    "width": 1500,
+    "height": 1100,
+    "x": 0,
+    "y": 0
+  },
+  {
+    "type": "text",
+    "id": "title",
+    "x": 520,
+    "y": 25,
+    "text": "aksh-gha-parser \u2014 Pipeline Architecture",
+    "fontSize": 28,
+    "strokeColor": "#1e1e1e"
+  },
+  {
+    "type": "text",
+    "id": "subtitle",
+    "x": 420,
+    "y": 60,
+    "text": "YAML -> typed model -> trigger matching -> DAG validation -> matrix expansion -> DTOs",
+    "fontSize": 15,
+    "strokeColor": "#757575"
+  },
+  {
+    "type": "rectangle",
+    "id": "zone_inputs",
+    "x": 50,
+    "y": 110,
+    "width": 240,
+    "height": 930,
+    "backgroundColor": "#dbe4ff",
+    "fillStyle": "solid",
+    "opacity": 25,
+    "strokeColor": "#1e40af",
+    "strokeWidth": 1.5,
+    "roundness": {
+      "type": 3
+    }
+  },
+  {
+    "type": "text",
+    "id": "zone_l_inputs",
+    "x": 70,
+    "y": 125,
+    "text": "Input Sources",
+    "fontSize": 18,
+    "strokeColor": "#1e40af"
+  },
+  {
+    "type": "rectangle",
+    "id": "in_wf",
+    "x": 70,
+    "y": 180,
+    "width": 200,
+    "height": 75,
+    "backgroundColor": "#a5d8ff",
+    "fillStyle": "solid",
+    "strokeColor": "#4a9eed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "workflow.yml\non: / jobs: definitions",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "in_act",
+    "x": 70,
+    "y": 320,
+    "width": 200,
+    "height": 75,
+    "backgroundColor": "#a5d8ff",
+    "fillStyle": "solid",
+    "strokeColor": "#4a9eed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "action.yml\nuses: foo/bar@v1 metadata",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "in_evt",
+    "x": 70,
+    "y": 460,
+    "width": 200,
+    "height": 75,
+    "backgroundColor": "#a5d8ff",
+    "fillStyle": "solid",
+    "strokeColor": "#4a9eed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Event Payload\npush / issue / pull_request",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "in_rw",
+    "x": 70,
+    "y": 600,
+    "width": 200,
+    "height": 75,
+    "backgroundColor": "#a5d8ff",
+    "fillStyle": "solid",
+    "strokeColor": "#4a9eed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Reusable Workflow\nworkflow_call parameters",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "zone_s1",
+    "x": 330,
+    "y": 110,
+    "width": 1120,
+    "height": 200,
+    "backgroundColor": "#e5dbff",
+    "fillStyle": "solid",
+    "opacity": 25,
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 1.5,
+    "roundness": {
+      "type": 3
+    }
+  },
+  {
+    "type": "text",
+    "id": "zone_l_s1",
+    "x": 350,
+    "y": 125,
+    "text": "Stage 1: Parsing & Trigger Evaluation",
+    "fontSize": 18,
+    "strokeColor": "#7c3aed"
+  },
+  {
+    "type": "rectangle",
+    "id": "yaml",
+    "x": 350,
+    "y": 165,
+    "width": 250,
+    "height": 80,
+    "backgroundColor": "#d0bfff",
+    "fillStyle": "solid",
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "yaml.rs\nparse_workflow() & key norm",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "models",
+    "x": 640,
+    "y": 165,
+    "width": 250,
+    "height": 80,
+    "backgroundColor": "#d0bfff",
+    "fillStyle": "solid",
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "models.rs\nWorkflow, Job, Step, Trigger",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "trigger",
+    "x": 930,
+    "y": 165,
+    "width": 250,
+    "height": 80,
+    "backgroundColor": "#fff3bf",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "trigger.rs\nglob match branches/tags/paths",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "match",
+    "x": 1220,
+    "y": 165,
+    "width": 200,
+    "height": 80,
+    "backgroundColor": "#b2f2bb",
+    "fillStyle": "solid",
+    "strokeColor": "#15803d",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Trigger Match?\nevaluate filter rules",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "zone_s2",
+    "x": 330,
+    "y": 340,
+    "width": 1120,
+    "height": 200,
+    "backgroundColor": "#fff3bf",
+    "fillStyle": "solid",
+    "opacity": 25,
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 1.5,
+    "roundness": {
+      "type": 3
+    }
+  },
+  {
+    "type": "text",
+    "id": "zone_l_s2",
+    "x": 350,
+    "y": 355,
+    "text": "Stage 2: Expression Resolution & DAG Expansion",
+    "fontSize": 18,
+    "strokeColor": "#f59e0b"
+  },
+  {
+    "type": "rectangle",
+    "id": "exprs",
+    "x": 350,
+    "y": 395,
+    "width": 340,
+    "height": 80,
+    "backgroundColor": "#d0bfff",
+    "fillStyle": "solid",
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "expressions engine\neval.rs: build github/needs/matrix context",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "expand",
+    "x": 720,
+    "y": 395,
+    "width": 340,
+    "height": 80,
+    "backgroundColor": "#d0bfff",
+    "fillStyle": "solid",
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "expand.rs & matrix_expand.rs\nexpand_jobs() & matrix Cartesian products",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "dag",
+    "x": 1090,
+    "y": 395,
+    "width": 330,
+    "height": 80,
+    "backgroundColor": "#fff3bf",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "dag.rs\nDAG graph validation & cycle checks",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "zone_s3",
+    "x": 330,
+    "y": 570,
+    "width": 1120,
+    "height": 200,
+    "backgroundColor": "#c3fae8",
+    "fillStyle": "solid",
+    "opacity": 25,
+    "strokeColor": "#0d9488",
+    "strokeWidth": 1.5,
+    "roundness": {
+      "type": 3
+    }
+  },
+  {
+    "type": "text",
+    "id": "zone_l_s3",
+    "x": 350,
+    "y": 585,
+    "text": "Stage 3: Matrix Strategy & Job DTO Construction",
+    "fontSize": 18,
+    "strokeColor": "#0d9488"
+  },
+  {
+    "type": "rectangle",
+    "id": "matrix",
+    "x": 350,
+    "y": 625,
+    "width": 340,
+    "height": 80,
+    "backgroundColor": "#c3fae8",
+    "fillStyle": "solid",
+    "strokeColor": "#0d9488",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Matrix Strategies\nshard, fail-fast, max-parallel",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "jobBuilder",
+    "x": 720,
+    "y": 625,
+    "width": 340,
+    "height": 80,
+    "backgroundColor": "#d0bfff",
+    "fillStyle": "solid",
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "job_builder.rs\nbuild AgentJobRequestMessage",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "conditions",
+    "x": 1090,
+    "y": 625,
+    "width": 330,
+    "height": 80,
+    "backgroundColor": "#fff3bf",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "conditions.rs\neffective_condition() & status checks",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "zone_out",
+    "x": 330,
+    "y": 800,
+    "width": 1120,
+    "height": 240,
+    "backgroundColor": "#d3f9d8",
+    "fillStyle": "solid",
+    "opacity": 25,
+    "strokeColor": "#22c55e",
+    "strokeWidth": 1.5,
+    "roundness": {
+      "type": 3
+    }
+  },
+  {
+    "type": "text",
+    "id": "zone_l_out",
+    "x": 350,
+    "y": 815,
+    "text": "Pipeline Outputs & Verification",
+    "fontSize": 18,
+    "strokeColor": "#22c55e"
+  },
+  {
+    "type": "rectangle",
+    "id": "out_dto",
+    "x": 350,
+    "y": 855,
+    "width": 340,
+    "height": 80,
+    "backgroundColor": "#b2f2bb",
+    "fillStyle": "solid",
+    "strokeColor": "#15803d",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "AgentJobRequestMessage[]\nready to enqueue (one per matrix cell)",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "out_runs",
+    "x": 720,
+    "y": 855,
+    "width": 340,
+    "height": 80,
+    "backgroundColor": "#b2f2bb",
+    "fillStyle": "solid",
+    "strokeColor": "#15803d",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "RunId, JobId & Outputs\npropagated via needs-gating",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "rectangle",
+    "id": "props",
+    "x": 1090,
+    "y": 855,
+    "width": 330,
+    "height": 80,
+    "backgroundColor": "#fff3bf",
+    "fillStyle": "solid",
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "roundness": {
+      "type": 3
+    },
+    "label": {
+      "text": "Proptests Suite\nmatrix order, globs, expr roundtrips",
+      "fontSize": 15
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_in_yaml",
+    "x": 270,
+    "y": 215,
+    "width": 80,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        80,
+        0
+      ]
+    ],
+    "strokeColor": "#1e1e1e",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "in_wf",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "yaml",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "parse",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_yaml_models",
+    "x": 600,
+    "y": 205,
+    "width": 40,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        40,
+        0
+      ]
+    ],
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "yaml",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "models",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "serde",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_models_trigger",
+    "x": 890,
+    "y": 205,
+    "width": 40,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        40,
+        0
+      ]
+    ],
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "models",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "trigger",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "triggers",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_trigger_match",
+    "x": 1180,
+    "y": 205,
+    "width": 40,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        40,
+        0
+      ]
+    ],
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "trigger",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "match",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "check",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_match_s2",
+    "x": 1320,
+    "y": 245,
+    "width": -800,
+    "height": 150,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        75
+      ],
+      [
+        -800,
+        75
+      ],
+      [
+        -800,
+        150
+      ]
+    ],
+    "strokeColor": "#15803d",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "match",
+      "fixedPoint": [
+        0.5,
+        1
+      ]
+    },
+    "endBinding": {
+      "elementId": "exprs",
+      "fixedPoint": [
+        0.5,
+        0
+      ]
+    },
+    "label": {
+      "text": "matched -> resolve expressions",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_exprs_expand",
+    "x": 690,
+    "y": 435,
+    "width": 30,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        30,
+        0
+      ]
+    ],
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "exprs",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "expand",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "context",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_expand_dag",
+    "x": 1060,
+    "y": 435,
+    "width": 30,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        30,
+        0
+      ]
+    ],
+    "strokeColor": "#7c3aed",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "expand",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "dag",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "jobs DAG",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_dag_s3",
+    "x": 1255,
+    "y": 475,
+    "width": -735,
+    "height": 150,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        75
+      ],
+      [
+        -735,
+        75
+      ],
+      [
+        -735,
+        150
+      ]
+    ],
+    "strokeColor": "#f59e0b",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "dag",
+      "fixedPoint": [
+        0.5,
+        1
+      ]
+    },
+    "endBinding": {
+      "elementId": "matrix",
+      "fixedPoint": [
+        0.5,
+        0
+      ]
+    },
+    "label": {
+      "text": "valid DAG -> matrix expand",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_matrix_builder",
+    "x": 690,
+    "y": 665,
+    "width": 30,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        30,
+        0
+      ]
+    ],
+    "strokeColor": "#0d9488",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "matrix",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "jobBuilder",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "matrix cells",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_builder_cond",
+    "x": 1060,
+    "y": 665,
+    "width": 30,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        30,
+        0
+      ]
+    ],
+    "strokeColor": "#0d9488",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "jobBuilder",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "conditions",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "if: conditions",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_builder_out",
+    "x": 890,
+    "y": 705,
+    "width": -370,
+    "height": 150,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        75
+      ],
+      [
+        -370,
+        75
+      ],
+      [
+        -370,
+        150
+      ]
+    ],
+    "strokeColor": "#15803d",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "jobBuilder",
+      "fixedPoint": [
+        0.5,
+        1
+      ]
+    },
+    "endBinding": {
+      "elementId": "out_dto",
+      "fixedPoint": [
+        0.5,
+        0
+      ]
+    },
+    "label": {
+      "text": "emit DTOs",
+      "fontSize": 14
+    }
+  },
+  {
+    "type": "arrow",
+    "id": "a_dto_runs",
+    "x": 690,
+    "y": 895,
+    "width": 30,
+    "height": 0,
+    "points": [
+      [
+        0,
+        0
+      ],
+      [
+        30,
+        0
+      ]
+    ],
+    "strokeColor": "#15803d",
+    "strokeWidth": 2,
+    "endArrowhead": "arrow",
+    "startBinding": {
+      "elementId": "out_dto",
+      "fixedPoint": [
+        1,
+        0.5
+      ]
+    },
+    "endBinding": {
+      "elementId": "out_runs",
+      "fixedPoint": [
+        0,
+        0.5
+      ]
+    },
+    "label": {
+      "text": "enqueue",
+      "fontSize": 14
+    }
+  }
+]

@@ -323,6 +323,11 @@ impl JobContext {
         // github context from contextData (may be typed-dict encoded)
         if let Some(github) = self.context_data.get("github") {
             let mut gh = super::job_extension::decode_typed_value(github);
+            let context_token_len = gh
+                .get("token")
+                .and_then(|v| v.as_str())
+                .map(|t| t.len())
+                .unwrap_or(0);
             // Token is often in variables, not contextData; inject it if missing
             if gh
                 .get("token")
@@ -336,6 +341,11 @@ impl JobContext {
                     }
                 }
             }
+            tracing::info!(
+                context_token_len,
+                env_token = self.env.get("GITHUB_TOKEN").map(|t| t.len()).unwrap_or(0),
+                "github context token resolution"
+            );
             // `github.workspace` is supplied by the runner at execution time,
             // not by the server's job message. Actions use it in input
             // defaults such as `working-directory: ${{ github.workspace }}`.

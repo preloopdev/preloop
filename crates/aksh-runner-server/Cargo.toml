@@ -52,6 +52,8 @@ chrono-tz.workspace = true
 serde_yaml.workspace = true
 utoipa.workspace = true
 
+toml = { workspace = true }
+parking_lot.workspace = true
 [[bin]]
 name = "preloop-server"
 path = "src/main.rs"

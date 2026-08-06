@@ -34,7 +34,14 @@ python3 benchmarks/conformance/check_corpus.py
 # The CI recipe already runs the workspace tests. Standalone conformance builds
 # only the server it executes; runner-watch is told not to repeat the suite.
 cargo build --quiet -p aksh-runner-server
+# Pin the engine config into the throwaway state dir. Without this the replay
+# server reads the developer's ~/.preloop/config.toml, so conformance would
+# depend on host credentials — and a stale or malformed App key there aborts
+# startup, failing the run for reasons that have nothing to do with protocol
+# fidelity. The path intentionally does not exist: a missing file loads the
+# default (unconfigured) engine config.
 AKSH_PUBLIC_URL="$REPLAY_URL" \
+  PRELOOP_CONFIG="$STATE_DIR/config.toml" \
   ./target/debug/preloop-server serve --listen "127.0.0.1:$REPLAY_PORT" \
   --state-dir "$STATE_DIR/server-state" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
