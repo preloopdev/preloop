@@ -117,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
                 listen,
                 systemd_socket_activation: false,
                 unix_socket,
+                host_socket: None,
                 state_dir,
                 record_flows,
                 tls,

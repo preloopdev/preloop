@@ -48,6 +48,35 @@ pub(crate) async fn register_runner_native(
     Ok(result)
 }
 
+/// GET /api/v1/runners — engine-authorized snapshot of registered runners.
+///
+/// The native API exists so an operator can see *why* a job sits queued:
+/// zero registered runners matching its labels means provisioning never
+/// happened, and `pool_proven` tells whether a runner was paired with a
+/// pool-assigned job rather than self-registered.
+pub(crate) async fn list_runners_native(
+    State(shared): State<Arc<SharedState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let inner = shared.state.inner.lock().await;
+    let runners: Vec<serde_json::Value> = inner
+        .runners
+        .values()
+        .map(|runner| {
+            let active_sessions = inner
+                .broker_session_runners
+                .values()
+                .filter(|id| **id == runner.id)
+                .count();
+            json!({
+                "runner": runner,
+                "pool_proven": inner.pool_proven_runners.contains(&runner.id),
+                "active_sessions": active_sessions,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "count": runners.len(), "runners": runners })))
+}
+
 pub(crate) async fn create_session(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<RunnerSessionRequest>,

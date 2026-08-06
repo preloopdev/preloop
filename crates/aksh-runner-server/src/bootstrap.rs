@@ -9,6 +9,12 @@ pub struct ServerConfig {
     pub systemd_socket_activation: bool,
     /// Optional Unix domain socket path to bind.
     pub unix_socket: Option<PathBuf>,
+    /// Optional Unix domain socket for the host CLI: the full native surface,
+    /// without the runner-only guard applied to [`ServerConfig::unix_socket`].
+    /// The CLI uses this as its default transport when `AKSH_URL` is unset —
+    /// the runner surface refuses every native `/api/v1/*` route, so a CLI
+    /// talking to the runner socket could never reach its own engine.
+    pub host_socket: Option<PathBuf>,
     /// State directory for cache/artifacts and future durable state.
     pub state_dir: PathBuf,
     /// Optional file path to write recorded flows to (NDJSON format).
@@ -320,53 +326,26 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     match config.tls {
         TlsMode::None => {
             #[cfg(unix)]
-            if let Some(unix_path) = &config.unix_socket {
-                use std::os::unix::fs::PermissionsExt;
-
-                if let Some(parent) = unix_path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                match std::fs::remove_file(unix_path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
-                }
-                let unix_listener = tokio::net::UnixListener::bind(unix_path)?;
-                std::fs::set_permissions(unix_path, std::fs::Permissions::from_mode(0o600))?;
-                info!(path = %unix_path.display(), "aksh runner server listening on unix socket");
+            {
                 // The control socket is mounted into every runner VM: guests
                 // get the runner/broker protocol only. Native management and
                 // test APIs stay off it — workflow code is untrusted.
-                let router_unix = router
-                    .clone()
-                    .layer(middleware::from_fn(auth::runner_surface_only));
-                let shutdown_unix = shutdown.clone();
-                tokio::spawn(async move {
-                    use hyper_util::rt::{TokioExecutor, TokioIo};
-                    use hyper_util::server::conn::auto::Builder as AutoBuilder;
-                    use hyper_util::service::TowerToHyperService;
-
-                    loop {
-                        tokio::select! {
-                            _ = shutdown_unix.cancelled() => break,
-                            accept_result = unix_listener.accept() => {
-                                let Ok((stream, _)) = accept_result else {
-                                    continue;
-                                };
-                                let io = TokioIo::new(stream);
-                                let service = TowerToHyperService::new(router_unix.clone());
-                                tokio::spawn(async move {
-                                    if let Err(error) = AutoBuilder::new(TokioExecutor::new())
-                                        .serve_connection_with_upgrades(io, service)
-                                        .await
-                                    {
-                                        warn!(%error, "Unix socket HTTP connection failed");
-                                    }
-                                });
-                            }
-                        }
-                    }
-                });
+                if let Some(unix_path) = &config.unix_socket {
+                    spawn_unix_listener(router.clone(), unix_path.clone(), true, shutdown.clone())?;
+                }
+                // The host CLI talks to the engine over its own socket with
+                // the full native surface: it is never mounted into a VM, so
+                // the runner-only guard would cut off `preloop status`, `run`,
+                // `logs` — the engine's own client. The runner surface above
+                // keeps the guest untrusted regardless.
+                if let Some(host_path) = &config.host_socket {
+                    spawn_unix_listener(
+                        router.clone(),
+                        host_path.clone(),
+                        false,
+                        shutdown.clone(),
+                    )?;
+                }
             }
             let listener = if config.systemd_socket_activation {
                 preloop_socket_activation::take_tcp_listener()?.ok_or_else(|| {
@@ -422,6 +401,65 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             handle.graceful_shutdown(Some(Duration::from_secs(5)));
         }
     }
+    Ok(())
+}
+
+/// Bind a Unix-domain listener and serve the router on it until shutdown.
+///
+/// `guarded` wraps the router with the runner-only surface guard, for sockets
+/// that are mounted into runner VMs. The host CLI's socket passes `false` and
+/// gets the full native surface.
+#[cfg(unix)]
+fn spawn_unix_listener(
+    router: axum::Router,
+    path: std::path::PathBuf,
+    guarded: bool,
+    shutdown: CancellationToken,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let listener = tokio::net::UnixListener::bind(&path)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    info!(path = %path.display(), guarded, "aksh runner server listening on unix socket");
+    let router = if guarded {
+        router.layer(middleware::from_fn(auth::runner_surface_only))
+    } else {
+        router
+    };
+    tokio::spawn(async move {
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+        use hyper_util::server::conn::auto::Builder as AutoBuilder;
+        use hyper_util::service::TowerToHyperService;
+
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                accept_result = listener.accept() => {
+                    let Ok((stream, _)) = accept_result else {
+                        continue;
+                    };
+                    let io = TokioIo::new(stream);
+                    let service = TowerToHyperService::new(router.clone());
+                    tokio::spawn(async move {
+                        if let Err(error) = AutoBuilder::new(TokioExecutor::new())
+                            .serve_connection_with_upgrades(io, service)
+                            .await
+                        {
+                            warn!(%error, "Unix socket HTTP connection failed");
+                        }
+                    });
+                }
+            }
+        }
+    });
     Ok(())
 }
 

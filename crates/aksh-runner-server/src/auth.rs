@@ -327,6 +327,7 @@ pub(crate) async fn runner_surface_only(
 ) -> Result<Response, ApiError> {
     const DENIED_PREFIXES: &[&str] = &["/internal/", "/runs/"];
     let path = request.uri().path();
+    let method = request.method().clone();
     let denied = DENIED_PREFIXES
         .iter()
         .any(|prefix| path.starts_with(prefix))
@@ -346,7 +347,9 @@ pub(crate) async fn runner_surface_only(
         // system credential, which workflow code never holds — so the carve
         // out cannot be used to mint anything.
         || (path.starts_with("/api/v3/") && path != "/api/v3/actions/runner-registration")
-        || (path.starts_with("/api/v1/") && !path.starts_with("/api/v1/actions/"));
+        || (path.starts_with("/api/v1/")
+            && !path.starts_with("/api/v1/actions/")
+            && !worker_debug_path(&method, path));
     if denied {
         return Err(ApiError::not_found(format!(
             "{path} not available on this endpoint"
@@ -354,6 +357,94 @@ pub(crate) async fn runner_surface_only(
     }
     request.extensions_mut().insert(SocketSurface);
     Ok(next.run(request).await)
+}
+
+/// The worker-facing debug routes a guest runner legitimately reaches through
+/// the mounted control socket: token exchange, session open, verdict poll,
+/// and close. Each carries its own job-scoped authentication — the exchange
+/// takes the job runtime token (one-shot per job request, job-bound) and the
+/// session routes take the debug-worker token that is delivered only to the
+/// trusted runner process and never appears in the guest environment — so the
+/// socket guard is not their security boundary. The controller routes on the
+/// same prefix (`GET /api/v1/debug/sessions`, `POST …/verdict`, the
+/// `/api/v1/agent/debug/…` surface) use native authentication and stay denied
+/// on the guest surface.
+fn worker_debug_path(method: &axum::http::Method, path: &str) -> bool {
+    let mut segments = path.split('/').filter(|segment| !segment.is_empty());
+    if segments.next() != Some("api")
+        || segments.next() != Some("v1")
+        || segments.next() != Some("debug")
+    {
+        return false;
+    }
+    match segments.next() {
+        Some("worker-token") => segments.next().is_none() && method == axum::http::Method::POST,
+        Some("sessions") => match segments.next() {
+            // POST /api/v1/debug/sessions — open a session for the job.
+            None => method == axum::http::Method::POST,
+            Some(id) if !id.is_empty() => match segments.next() {
+                // GET /api/v1/debug/sessions/{id}/verdict — worker verdict poll.
+                Some("verdict") => segments.next().is_none() && method == axum::http::Method::GET,
+                // POST /api/v1/debug/sessions/{id}/close — worker closes the
+                // session after a verdict.
+                Some("close") => segments.next().is_none() && method == axum::http::Method::POST,
+                _ => false,
+            },
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn call(method: axum::http::Method, path: &str) -> bool {
+        worker_debug_path(&method, path)
+    }
+
+    #[test]
+    fn worker_token_exchange() {
+        assert!(call(axum::http::Method::POST, "/api/v1/debug/worker-token"));
+        assert!(!call(axum::http::Method::GET, "/api/v1/debug/worker-token"));
+    }
+
+    #[test]
+    fn session_open_verdict_close() {
+        assert!(call(axum::http::Method::POST, "/api/v1/debug/sessions"));
+        assert!(!call(axum::http::Method::GET, "/api/v1/debug/sessions"));
+        assert!(call(
+            axum::http::Method::GET,
+            "/api/v1/debug/sessions/dbg-1/verdict"
+        ));
+        assert!(call(
+            axum::http::Method::POST,
+            "/api/v1/debug/sessions/dbg-1/close"
+        ));
+    }
+
+    #[test]
+    fn controller_routes_stay_denied() {
+        assert!(!call(
+            axum::http::Method::GET,
+            "/api/v1/debug/sessions/dbg-1"
+        ));
+        assert!(!call(
+            axum::http::Method::POST,
+            "/api/v1/debug/sessions/dbg-1/verdict"
+        ));
+        assert!(!call(
+            axum::http::Method::GET,
+            "/api/v1/debug/sessions/dbg-1/close"
+        ));
+        assert!(!call(
+            axum::http::Method::GET,
+            "/api/v1/agent/debug/sessions/dbg-1"
+        ));
+        assert!(!call(axum::http::Method::POST, "/api/v1/runs"));
+        assert!(!call(axum::http::Method::GET, "/api/v1/debug/sessions"));
+    }
 }
 
 /// The job a worker request speaks for, proven by its debug-worker token.
