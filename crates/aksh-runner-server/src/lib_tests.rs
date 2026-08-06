@@ -360,6 +360,8 @@ async fn sqlite_recovery_restores_post_restart_state() {
 /// the translated SQL (dialect, upserts, sealed blobs) round-trips the same
 /// state a restart must restore. Skipped unless `AKSH_TEST_PG_URL` points at
 /// a disposable Postgres (the repo gate does not assume one is running).
+/// TLS URLs (`?sslmode=require|verify-full`) additionally need
+/// `AKSH_TEST_PG_CA` set to a PEM trust anchor for the test database.
 #[tokio::test]
 async fn postgres_recovery_restores_post_restart_state() {
     let pg_url = match std::env::var("AKSH_TEST_PG_URL") {
@@ -377,7 +379,60 @@ async fn postgres_recovery_restores_post_restart_state() {
         "on: push\njobs:\n  build:\n    runs-on: self-hosted\n    steps:\n      - run: echo hi\n";
     let config_path = crate::config::config_path();
 
-    let (run_id_str, runner_id, session_id, public_xml) = {
+    // For TLS URLs, trust the operator-supplied CA (PEM) — the store's
+    // connector loads it via SSL_CERT_FILE. Nothing else in the crate reads
+    // this variable, so setting it process-wide cannot affect other tests.
+    if let Ok(ca) = std::env::var("AKSH_TEST_PG_CA") {
+        if !ca.is_empty() {
+            std::env::set_var("SSL_CERT_FILE", ca);
+        }
+    }
+
+    // The URL may point at a reused database; clear the store tables so the
+    // round-trip starts from a known state (migrations stay behind).
+    let connect_url = crate::store_pg::connect_url(&pg_url);
+    let client = match crate::store_pg::tls_connector(&pg_url).unwrap() {
+        Some(tls) => {
+            let (client, connection) = tokio_postgres::connect(&connect_url, tls).await.unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            client
+        }
+        None => {
+            let (client, connection) = tokio_postgres::connect(&connect_url, tokio_postgres::NoTls)
+                .await
+                .unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            client
+        }
+    };
+    // A brand-new database has no tables yet (the store's migration creates
+    // them on first open); only clean a schema that already exists.
+    let has_schema: bool = client
+        .query_one(
+            "SELECT to_regclass('public.workflow_run_counters') IS NOT NULL",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    if has_schema {
+        client
+            .batch_execute(
+                "TRUNCATE workflow_run_counters, runs, run_secrets, runners, runner_labels,
+                         runner_sessions, jobs, job_dependencies, job_requests, control_events,
+                         session_active_requests, broker_messages, log_files, log_chunks,
+                         runtime_snapshots RESTART IDENTITY CASCADE",
+            )
+            .await
+            .unwrap();
+    }
+    drop(client);
+
+    let (run_id_str, runner_id, session_id, public_xml, first_number) = {
         let state = AppState::new_with_store(
             temp.path().to_path_buf(),
             config_path.clone(),
@@ -398,7 +453,7 @@ async fn postgres_recovery_restores_post_restart_state() {
             }),
         )
         .await;
-        assert_eq!(accepted["run_number"], 1);
+        let first_number = accepted["run_number"].as_u64().unwrap();
         let run_id = accepted["run_id"].as_str().unwrap().to_owned();
 
         // Register a runner with an RSA public key.
@@ -477,7 +532,7 @@ async fn postgres_recovery_restores_post_restart_state() {
             state.store.store_inner(&inner).await.unwrap();
         }
 
-        (run_id, runner_id, session_id, public_xml)
+        (run_id, runner_id, session_id, public_xml, first_number)
     };
 
     // Restart against the same database.
@@ -497,7 +552,7 @@ async fn postgres_recovery_restores_post_restart_state() {
             .get(&run_id_str.parse::<RunId>().unwrap())
             .cloned()
             .expect("run must survive restart");
-        assert_eq!(recovered_run.run_number, 1);
+        assert_eq!(recovered_run.run_number, first_number);
 
         // The claimed job is gone from the ready queue but its agent job
         // request is restored for re-delivery.
@@ -541,7 +596,7 @@ async fn postgres_recovery_restores_post_restart_state() {
         );
     }
 
-    // The run-number allocator survives: the next submission is #2.
+    // The run-number allocator survives: the next submission continues.
     let recovered_app = app(recovered, CancellationToken::new());
     let accepted = request_json(
         &recovered_app,
@@ -554,7 +609,7 @@ async fn postgres_recovery_restores_post_restart_state() {
         }),
     )
     .await;
-    assert_eq!(accepted["run_number"], 2);
+    assert_eq!(accepted["run_number"], first_number + 1);
 }
 
 #[tokio::test]

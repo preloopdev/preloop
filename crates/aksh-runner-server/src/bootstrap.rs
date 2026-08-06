@@ -11,6 +11,10 @@ pub struct ServerConfig {
     pub unix_socket: Option<PathBuf>,
     /// State directory for cache/artifacts and future durable state.
     pub state_dir: PathBuf,
+    /// Durable-state backend URL (`sqlite://<path>`, a bare path, or
+    /// `postgres://…`). `None` falls back to `AKSH_STORE_URL`, then to
+    /// SQLite at `<state_dir>/aksh.db`.
+    pub store_url: Option<String>,
     /// Optional file path to write recorded flows to (NDJSON format).
     pub record_flows: Option<PathBuf>,
     /// TLS mode (default: no TLS).
@@ -225,7 +229,12 @@ async fn run_background_reaper(shared: Arc<SharedState>) {
 
 /// Start the server and block until shutdown.
 pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
-    let mut state = AppState::new(config.state_dir.clone()).await?;
+    let mut state = AppState::new_with_store(
+        config.state_dir.clone(),
+        crate::config::config_path(),
+        config.store_url.as_deref(),
+    )
+    .await?;
     if let Some(queue_depth) = config.queue_depth.clone() {
         state.queue_depth = queue_depth;
     }

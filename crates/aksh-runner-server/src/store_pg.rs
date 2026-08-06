@@ -7,12 +7,17 @@
 //!
 //! Concurrency model: one `tokio-postgres` client behind a tokio mutex, the
 //! same single-writer shape as SQLite. The in-memory state remains the source
-//! of truth; this is a restart store, not a shared bus. TLS is not negotiated
-//! (`NoTls`) — terminate TLS at a proxy/tunnel for remote databases.
+//! of truth; this is a restart store, not a shared bus.
+//!
+//! TLS: append `?sslmode=require` (or `verify-ca` / `verify-full`) to the URL
+//! to connect with rustls over the system root store; the default and
+//! `sslmode=disable` stay plaintext for loopback databases.
 
 use super::*;
 use aksh_gha_protocol::{SecretMap, SessionId};
 use async_trait::async_trait;
+use postgres_rustls::MakeTlsConnector;
+use std::future::Future;
 use tokio_postgres::{connect, Client, NoTls};
 
 /// Postgres backend: one client behind a mutex.
@@ -21,15 +26,94 @@ pub(crate) struct PgStore {
     cipher: Envelope,
 }
 
+/// Build a rustls connector when the URL asks for TLS (`sslmode=require`,
+/// `verify-ca`, or `verify-full`); `None` for `sslmode=disable` or when no
+/// `sslmode` is present. Chain + hostname verification always use the system
+/// root store, so `verify-full` semantics apply to every TLS mode.
+pub(crate) fn tls_connector(url: &str) -> anyhow::Result<Option<MakeTlsConnector>> {
+    let query = url.split('?').nth(1).unwrap_or("");
+    let sslmode = query
+        .split('&')
+        .find_map(|part| part.strip_prefix("sslmode="));
+    match sslmode {
+        Some("require" | "verify-ca" | "verify-full") => {
+            // rustls 0.23 needs a process-level crypto provider. The server
+            // binaries install one at startup; installing here makes the
+            // library self-sufficient (tests, embedded use) without breaking
+            // an already-installed provider.
+            rustls::crypto::ring::default_provider()
+                .install_default()
+                .ok();
+            let mut roots = rustls::RootCertStore::empty();
+            for cert in rustls_native_certs::load_native_certs().certs {
+                roots
+                    .add(cert)
+                    .map_err(|error| anyhow::anyhow!("adding native root cert: {error}"))?;
+            }
+            let mut config = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            postgres_rustls::set_postgresql_alpn(&mut config);
+            Ok(Some(MakeTlsConnector::new(
+                tokio_rustls::TlsConnector::from(Arc::new(config)),
+            )))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// URL to hand to `tokio-postgres::connect`. `sslmode` values `verify-ca` /
+/// `verify-full` are libpq extensions that tokio-postgres rejects; the
+/// rustls connector always performs full chain + hostname verification, so
+/// mapping them onto `require` (TLS stays mandatory) loses nothing.
+pub(crate) fn connect_url(url: &str) -> String {
+    let (before, after) = match url.split_once("sslmode=verify-") {
+        Some((before, after)) => (before, after),
+        None => return url.to_owned(),
+    };
+    let (mode, rest) = match after.split_once('&') {
+        Some((mode, rest)) => (mode, rest),
+        None => (after, ""),
+    };
+    if !matches!(mode, "ca" | "full") {
+        return url.to_owned();
+    }
+    let rest = if rest.is_empty() {
+        ""
+    } else {
+        &format!("&{rest}")
+    };
+    format!("{before}sslmode=require{rest}")
+}
+
+/// Drive the tokio-postgres connection task until it ends (normally only on
+/// shutdown or a fatal protocol error), logging any failure.
+fn spawn_connection_task(
+    connection: impl Future<Output = Result<(), tokio_postgres::Error>> + Send + 'static,
+) {
+    tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            tracing::error!(%error, "postgres connection task failed");
+        }
+    });
+}
+
 impl PgStore {
     /// Connect, apply pending migrations, and return the store.
     pub(crate) async fn open(url: &str, cipher: Envelope) -> anyhow::Result<Self> {
-        let (mut client, connection) = connect(url, NoTls).await?;
-        tokio::spawn(async move {
-            if let Err(error) = connection.await {
-                tracing::error!(%error, "postgres connection task failed");
+        let connect_url = connect_url(url);
+        let mut client = match tls_connector(url)? {
+            Some(tls) => {
+                let (client, connection) = connect(&connect_url, tls).await?;
+                spawn_connection_task(connection);
+                client
             }
-        });
+            None => {
+                let (client, connection) = connect(&connect_url, NoTls).await?;
+                spawn_connection_task(connection);
+                client
+            }
+        };
         Self::migrate(&mut client).await?;
         Ok(Self {
             connection: Arc::new(tokio::sync::Mutex::new(client)),
@@ -529,6 +613,19 @@ impl Store for PgStore {
             // reject the insert whenever the in-memory map had two runners
             // that share a name — which the official `actions/runner` does
             // on every re-register / replace flow.
+            //
+            // SQLite's `INSERT OR REPLACE` resolves *any* unique conflict
+            // (delete + insert), so two in-memory runners sharing a name
+            // converge to the last one written. Postgres `ON CONFLICT` only
+            // covers one constraint, so mirror the delete side explicitly:
+            // drop any same-named row with a different id first (the
+            // `runner_labels` cascade cleans up its labels, as SQLite's
+            // replace does).
+            tx.execute(
+                "DELETE FROM runners WHERE name = $1 AND runner_id <> $2",
+                &[&runner.name, &runner.id],
+            )
+            .await?;
             // Typed RSA public key is stored alongside the XML form so a
             // post-restart session can be FIPS-encrypted without re-parsing
             // and without an extra table.
