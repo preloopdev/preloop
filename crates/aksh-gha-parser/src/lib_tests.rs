@@ -197,6 +197,47 @@ jobs:
 }
 
 #[test]
+fn unknown_trigger_event_is_rejected() {
+    // GitHub rejects `on: extremely-invalid` at workflow save; aksh must not
+    // silently accept a trigger that can never fire.
+    let err = parse_workflow(
+        r#"
+on:
+  extremely-invalid:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("extremely-invalid"),
+        "unexpected error: {err}"
+    );
+
+    // Single and list forms are validated too.
+    assert!(parse_workflow(
+        "on: not-an-event\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo\n",
+    )
+    .is_err());
+
+    // Known events still parse.
+    parse_workflow(
+        r#"
+on: [push, pull_request, workflow_dispatch, merge_group]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#,
+    )
+    .unwrap();
+}
+
+#[test]
 fn parses_and_expands_matrix() {
     let workflow = parse_workflow(
         r#"
@@ -1848,4 +1889,392 @@ jobs:
     assert_eq!(expanded.len(), 2);
     let build_deferred = expanded.iter().find(|j| j.base_id == "build").unwrap();
     assert!(build_deferred.deferred_matrix.is_some());
+}
+
+/// A reusable-workflow caller whose matrix reads `needs.*` is deferred at
+/// parse time like any other needs-driven matrix, but at runtime the matrix
+/// must be resolved *before* the callee subtree materializes — one leg per
+/// combination, each inheriting the caller's matrix cell. Before the fix the
+/// caller was expanded as a single call with an empty matrix, so the callee
+/// never fanned out.
+#[test]
+fn deferred_matrix_reusable_caller_fans_out_per_cell() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  generator:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo gen
+  build:
+    needs: generator
+    uses: octo/demo/.github/workflows/build.yml@v1
+    strategy:
+      matrix: ${{ fromJson(needs.generator.outputs.matrix) }}
+"#,
+    )
+    .unwrap();
+    let called = r#"
+on:
+  workflow_call:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test
+"#;
+    let mut reusable = BTreeMap::new();
+    reusable.insert(
+        "octo/demo/.github/workflows/build.yml@v1".to_owned(),
+        called.to_owned(),
+    );
+
+    // Parse time: one un-suffixed deferred caller node; no callee jobs yet.
+    let expanded = expand_jobs_with_reusables(&caller, &reusable).unwrap();
+    let node = expanded.jobs.iter().find(|j| j.base_id == "build").unwrap();
+    assert!(node.deferred_matrix.is_some());
+    assert!(node.reusable_call.is_some());
+    assert!(node.matrix.is_empty());
+    let called_parsed = parse_workflow(called).unwrap();
+
+    // The caller cannot be materialized from the empty placeholder matrix:
+    // the deferred matrix must be resolved first, then one callee leg per
+    // combination.
+    assert!(
+        crate::expand_reusable_call(&called_parsed, node, &reusable, &BTreeMap::new()).is_err(),
+        "expanding a needs-deferred caller against the empty matrix must be refused"
+    );
+
+    // Runtime (needs complete): resolve the matrix, then materialize the
+    // callee once per combination.
+    let mut needs_outputs = BTreeMap::new();
+    let mut gen_outputs = BTreeMap::new();
+    gen_outputs.insert(
+        "matrix".to_string(),
+        json!("{\"include\": [{\"os\": \"ubuntu-latest\"}, {\"os\": \"macos-latest\"}]}"),
+    );
+    needs_outputs.insert("generator".to_string(), gen_outputs);
+
+    let jobs = crate::expand_deferred_reusable_call(
+        &called_parsed,
+        &caller,
+        node,
+        &needs_outputs,
+        &reusable,
+        &BTreeMap::new(),
+    )
+    .unwrap()
+    .jobs;
+    assert_eq!(
+        jobs.len(),
+        2,
+        "one callee leg per matrix combination, got: {:?}",
+        jobs.iter().map(|j| &j.id.0).collect::<Vec<_>>()
+    );
+    let ids: Vec<&str> = jobs.iter().map(|j| j.id.0.as_str()).collect();
+    assert!(ids.contains(&"build (ubuntu-latest)/test"));
+    assert!(ids.contains(&"build (macos-latest)/test"));
+    for job in &jobs {
+        assert!(
+            job.matrix.get("os").is_some(),
+            "each leg must inherit its caller's matrix cell: {:?}",
+            job.matrix
+        );
+        assert!(job.needs.contains(&JobId("generator".to_string())));
+    }
+}
+
+/// A deferred matrix job inside a reusable workflow is promoted at runtime
+/// with a caller-prefixed base id (`call/build`). Re-expansion must resolve
+/// that node against the *called* workflow — where the callee-local job id
+/// (`build`) is the key — not the root workflow. The prefixed run id stays,
+/// but the job lookup and the `needs.*` context use the callee-local keys.
+#[test]
+fn deferred_matrix_inside_reusable_resolves_via_callee() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  call:
+    uses: octo/demo/.github/workflows/build.yml@v1
+"#,
+    )
+    .unwrap();
+    let called = r#"
+on:
+  workflow_call:
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo gen
+  build:
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+    steps:
+      - run: echo ${{ matrix.os }}
+"#;
+    let mut reusable = BTreeMap::new();
+    reusable.insert(
+        "octo/demo/.github/workflows/build.yml@v1".to_owned(),
+        called.to_owned(),
+    );
+
+    let caller_node = &expand_jobs_with_reusables(&caller, &reusable).unwrap().jobs[0];
+    let called_parsed = parse_workflow(called).unwrap();
+    let subtree =
+        crate::expand_reusable_call(&called_parsed, caller_node, &reusable, &BTreeMap::new())
+            .unwrap()
+            .jobs;
+
+    let build_node = subtree.iter().find(|j| j.base_id == "call/build").unwrap();
+    assert_eq!(build_node.id.0, "call/build");
+    assert!(build_node.deferred_matrix.is_some());
+    assert!(build_node.needs.contains(&JobId("call/setup".to_string())));
+
+    // Runtime promotion: needs outputs arrive keyed by the base id the run
+    // recorded (`call/setup`), while the callee's expression references the
+    // callee-local job id (`setup`).
+    let mut needs_outputs = BTreeMap::new();
+    let mut setup_outputs = BTreeMap::new();
+    setup_outputs.insert(
+        "matrix".to_string(),
+        json!("{\"include\": [{\"os\": \"ubuntu-latest\"}, {\"os\": \"macos-latest\"}]}"),
+    );
+    needs_outputs.insert("call/setup".to_string(), setup_outputs);
+
+    let plans = crate::expand_deferred_matrix_job(
+        &called_parsed,
+        &build_node.base_id,
+        build_node.deferred_matrix.as_ref().unwrap(),
+        &needs_outputs,
+        None,
+    )
+    .unwrap();
+    assert_eq!(plans.len(), 2);
+    assert_eq!(plans[0].id.0, "call/build (ubuntu-latest)");
+    assert_eq!(plans[1].id.0, "call/build (macos-latest)");
+    for plan in &plans {
+        assert!(plan.needs.contains(&JobId("call/setup".to_string())));
+    }
+}
+
+/// A needs-deferred matrix leaves a single un-suffixed placeholder node whose
+/// matrix is intentionally empty. Matrix-dependent `fail-fast`, `max-parallel`
+/// and `continue-on-error` expressions cannot be evaluated against that empty
+/// placeholder — they resolve to null and are rejected at parse time — so the
+/// placeholder defers them: defaults apply until the runtime fan-out builds
+/// the concrete combinations and re-resolves them per cell.
+#[test]
+fn deferred_matrix_placeholder_defers_strategy_scalars() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo gen
+  build:
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+      fail-fast: ${{ matrix.experimental }}
+      max-parallel: ${{ matrix.parallelism }}
+    continue-on-error: ${{ matrix.experimental }}
+    steps:
+      - run: echo ${{ matrix.os }}
+"#,
+    )
+    .unwrap();
+    let jobs = expand_jobs(&workflow).unwrap();
+    let build = jobs.iter().find(|j| j.base_id == "build").unwrap();
+    assert!(build.deferred_matrix.is_some());
+    assert!(
+        build.fail_fast,
+        "placeholder keeps the default until fan-out"
+    );
+    assert_eq!(build.max_parallel, None);
+    assert!(!build.continue_on_error);
+
+    // The runtime fan-out resolves the scalars per concrete combination.
+    let mut needs_outputs = BTreeMap::new();
+    let mut setup_outputs = BTreeMap::new();
+    setup_outputs.insert(
+        "matrix".to_string(),
+        json!("{\"include\": [{\"os\": \"ubuntu-latest\", \"experimental\": true, \"parallelism\": 3}]}"),
+    );
+    needs_outputs.insert("setup".to_string(), setup_outputs);
+    let plans = crate::expand_deferred_matrix_job(
+        &workflow,
+        "build",
+        build.deferred_matrix.as_ref().unwrap(),
+        &needs_outputs,
+        None,
+    )
+    .unwrap();
+    assert_eq!(plans.len(), 1);
+    assert!(plans[0].fail_fast);
+    assert_eq!(plans[0].max_parallel, Some(3));
+}
+
+/// A needs-deferred matrix reusable caller nested inside another reusable
+/// keeps its caller-prefixed ids (`call/call2 (os)/test`). The composed
+/// expansion resolves the matrix from the *containing* called workflow, which
+/// keys jobs and needs callee-locally.
+#[test]
+fn nested_deferred_matrix_reusable_caller_keeps_prefixed_ids() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  call:
+    uses: octo/demo/.github/workflows/a.yml@v1
+"#,
+    )
+    .unwrap();
+    let a_yml = r#"
+on:
+  workflow_call:
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo gen
+  call2:
+    needs: setup
+    uses: octo/demo/.github/workflows/b.yml@v1
+    strategy:
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+"#;
+    let b_yml = r#"
+on:
+  workflow_call:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test
+"#;
+    let mut reusable = BTreeMap::new();
+    reusable.insert(
+        "octo/demo/.github/workflows/a.yml@v1".to_owned(),
+        a_yml.to_owned(),
+    );
+    reusable.insert(
+        "octo/demo/.github/workflows/b.yml@v1".to_owned(),
+        b_yml.to_owned(),
+    );
+
+    // Materialize A under the root caller, exactly as the runtime does.
+    let caller_node = &expand_jobs_with_reusables(&caller, &reusable).unwrap().jobs[0];
+    let a_parsed = parse_workflow(a_yml).unwrap();
+    let subtree = crate::expand_reusable_call(&a_parsed, caller_node, &reusable, &BTreeMap::new())
+        .unwrap()
+        .jobs;
+    let nested = subtree.iter().find(|j| j.id.0 == "call/call2").unwrap();
+    assert!(nested.deferred_matrix.is_some());
+    assert!(nested.reusable_call.is_some());
+    assert!(nested.needs.contains(&JobId("call/setup".to_string())));
+
+    // Runtime promotion of the nested caller: needs outputs are keyed by the
+    // prefixed run id, and the caller lives in workflow A under `call2`.
+    let mut needs_outputs = BTreeMap::new();
+    let mut setup_outputs = BTreeMap::new();
+    setup_outputs.insert(
+        "matrix".to_string(),
+        json!("{\"include\": [{\"os\": \"ubuntu-latest\"}, {\"os\": \"macos-latest\"}]}"),
+    );
+    needs_outputs.insert("call/setup".to_string(), setup_outputs);
+
+    let b_parsed = parse_workflow(b_yml).unwrap();
+    let composed = crate::expand_deferred_reusable_call(
+        &b_parsed,
+        &a_parsed,
+        nested,
+        &needs_outputs,
+        &reusable,
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    let jobs = composed.jobs;
+    assert_eq!(jobs.len(), 2);
+    let ids: Vec<&str> = jobs.iter().map(|j| j.id.0.as_str()).collect();
+    assert!(ids.contains(&"call/call2 (ubuntu-latest)/test"));
+    assert!(ids.contains(&"call/call2 (macos-latest)/test"));
+    for job in &jobs {
+        assert!(job.matrix.get("os").is_some());
+        assert!(job.needs.contains(&JobId("call/setup".to_string())));
+    }
+}
+
+/// A caller `name:` template that references the matrix renders per cell once
+/// the deferred matrix is resolved — `Build ubuntu-latest / test`, not the
+/// empty-matrix placeholder rendering.
+#[test]
+fn deferred_matrix_reusable_caller_renders_per_cell_names() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  generator:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo gen
+  build:
+    needs: generator
+    name: Build ${{ matrix.os }}
+    uses: octo/demo/.github/workflows/build.yml@v1
+    strategy:
+      matrix: ${{ fromJson(needs.generator.outputs.matrix) }}
+"#,
+    )
+    .unwrap();
+    let called = r#"
+on:
+  workflow_call:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test
+"#;
+    let mut reusable = BTreeMap::new();
+    reusable.insert(
+        "octo/demo/.github/workflows/build.yml@v1".to_owned(),
+        called.to_owned(),
+    );
+    let node = expand_jobs_with_reusables(&caller, &reusable)
+        .unwrap()
+        .jobs
+        .into_iter()
+        .find(|job| job.base_id == "build")
+        .unwrap();
+
+    let mut needs_outputs = BTreeMap::new();
+    let mut gen_outputs = BTreeMap::new();
+    gen_outputs.insert(
+        "matrix".to_string(),
+        json!("{\"include\": [{\"os\": \"ubuntu-latest\"}, {\"os\": \"macos-latest\"}]}"),
+    );
+    needs_outputs.insert("generator".to_string(), gen_outputs);
+
+    let called_parsed = parse_workflow(called).unwrap();
+    let jobs = crate::expand_deferred_reusable_call(
+        &called_parsed,
+        &caller,
+        &node,
+        &needs_outputs,
+        &reusable,
+        &BTreeMap::new(),
+    )
+    .unwrap()
+    .jobs;
+    assert_eq!(jobs.len(), 2);
+    assert!(jobs.iter().any(|j| j.name == "Build ubuntu-latest / test"));
+    assert!(jobs.iter().any(|j| j.name == "Build macos-latest / test"));
 }
