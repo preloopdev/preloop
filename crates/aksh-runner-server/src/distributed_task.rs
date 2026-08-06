@@ -501,6 +501,23 @@ pub(crate) fn job_request_tuple(
     Some((request_id, request.run_id, request.job_id.clone()))
 }
 
+/// Mask job-completion annotations with the run's canonical secret masker
+/// before persisting them. Crash annotations (the official runner's
+/// worker-crash detail from `ForceFailJob`) embed worker stdout/stderr, which
+/// can contain secret values; the raw `JobCompletion` is the protocol boundary
+/// and is not safe to store or return as-is.
+fn mask_completion_annotations(
+    run: &RunRecord,
+    completion: &JobCompletion,
+) -> Vec<serde_json::Value> {
+    aksh_gha_protocol::mask_annotations(
+        completion.annotations.clone(),
+        aksh_gha_protocol::masking::expose_values(run.submission.secrets.values())
+            .iter()
+            .map(String::as_str),
+    )
+}
+
 pub(crate) async fn complete_job_inner(
     shared: Arc<SharedState>,
     completion: JobCompletion,
@@ -548,14 +565,14 @@ pub(crate) async fn complete_job_inner(
         if let Some(pos) = run.jobs_list.iter().position(|j| j.name == job_name) {
             run.jobs_list[pos].conclusion = format!("{:?}", effective).to_lowercase();
             if !completion.annotations.is_empty() {
-                run.jobs_list[pos].annotations = completion.annotations.clone();
+                run.jobs_list[pos].annotations = mask_completion_annotations(run, &completion);
             }
         } else {
             run.jobs_list.push(JobDetail {
                 name: job_name,
                 conclusion: format!("{:?}", effective).to_lowercase(),
                 steps: Vec::new(),
-                annotations: completion.annotations.clone(),
+                annotations: mask_completion_annotations(run, &completion),
             });
         }
         run.job_outputs.insert(
@@ -630,11 +647,6 @@ pub(crate) async fn complete_job_inner(
         .state
         .queue_depth
         .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
-    let record = inner
-        .runs
-        .get(&completion.run_id)
-        .cloned()
-        .ok_or_else(|| ApiError::not_found("run not found"))?;
     // Mark agent request finished and free the broker session slot so the
     // runner can immediately poll the next job (including concurrency successors).
     let finished_request_ids: Vec<i64> = inner
@@ -674,6 +686,22 @@ pub(crate) async fn complete_job_inner(
     // that the guard is released, and fold the result into the outcome the
     // notify and event fan-out below reports on.
     scheduling.merge(drain_expansions(&shared).await);
+
+    // Deferred expansion runs after the snapshot point above and can mutate
+    // the run record: an empty dynamic matrix concludes its node as Skipped, a
+    // failed build as Failure, and a successful one materializes the subtree.
+    // Re-read so the emitted RunStatus, the terminal workspace cleanup, and
+    // the returned record reflect the post-expansion state — publishing the
+    // pre-expansion snapshot would report a failed/empty expansion as still
+    // in progress and skip terminal workspace cleanup.
+    let record = {
+        let inner = shared.state.inner.lock().await;
+        inner
+            .runs
+            .get(&completion.run_id)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("run not found"))?
+    };
 
     github::report_check_run_completed(
         &shared,
@@ -765,4 +793,368 @@ pub(crate) async fn complete_job_inner(
         tokio::spawn(async move { prune_replay_results(&state_dir, &active_plans).await });
     }
     Ok(Json(record))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{Method, Request};
+    use serde_json::Value;
+    use tower::ServiceExt;
+
+    const TEST_API_TOKEN: &str = "cluster-g-test-token";
+
+    fn test_app(state: AppState, shutdown: CancellationToken) -> Router {
+        app_with_test_api(state, shutdown, TEST_API_TOKEN)
+    }
+
+    async fn test_request(app: &Router, method: Method, uri: &str, body: Value) -> Value {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if uri.starts_with("/api/v1/") {
+            builder = builder.header(header::AUTHORIZATION, "Bearer aksh-system-token");
+        } else if uri.starts_with("/internal/test/") {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {TEST_API_TOKEN}"));
+        }
+        let request = if body.is_null() {
+            builder.body(Body::empty()).unwrap()
+        } else {
+            builder
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let response = app.clone().oneshot(request).await.unwrap();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    }
+
+    /// Completing the last real job of a run with a deferred dynamic matrix
+    /// runs the expansion inside the SAME completion call (`drain_expansions`).
+    /// When the expansion fails, the completion response used to carry the
+    /// pre-expansion snapshot: the run was still reported in progress and the
+    /// terminal workspace cleanup was skipped.
+    #[tokio::test]
+    async fn completion_response_reflects_post_expansion_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = test_app(state.clone(), CancellationToken::new());
+
+        let accepted = test_request(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  generator:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo gen
+  downstream:
+    needs: [generator]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.generator.outputs.matrix) }}
+    steps:
+      - run: echo dynamic
+"#,
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+
+        // `42` parses as JSON but is not a matrix: the deferred expansion
+        // fails, concluding the downstream node (and the run) as Failure.
+        let response = test_request(
+            &app,
+            Method::POST,
+            "/internal/test/jobs/complete",
+            json!({
+                "run_id": run_id,
+                "job_id": "generator",
+                "status": "success",
+                "outputs": {"matrix": "42"}
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            response["status"], "failure",
+            "completion must publish the post-expansion run status, got {}",
+            response["status"]
+        );
+        assert_eq!(
+            response["jobs"]["downstream"], "failure",
+            "completion must publish the failed expansion node"
+        );
+    }
+
+    /// Crash annotations embed worker stdout/stderr, which can contain secret
+    /// values. Both the persisted run and the completion response must carry
+    /// the masked form, never the raw completion payload.
+    #[tokio::test]
+    async fn completion_annotations_are_masked_before_storage_and_response() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        state
+            .secrets
+            .write()
+            .global
+            .insert("CRASH_SECRET".to_owned(), "super-secret-value".to_owned());
+        let app = test_app(state.clone(), CancellationToken::new());
+
+        let accepted = test_request(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: self-hosted\n    steps:\n      - run: echo hi\n",
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+        let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+
+        let response = test_request(
+            &app,
+            Method::POST,
+            "/internal/test/jobs/complete",
+            json!({
+                "run_id": run_id,
+                "job_id": "build",
+                "status": "failure",
+                "outputs": {},
+                "annotations": [
+                    {"message": "worker crashed: super-secret-value leaked", "level": "failure"}
+                ]
+            }),
+        )
+        .await;
+
+        let response_message = response["jobs_list"][0]["annotations"][0]["message"]
+            .as_str()
+            .unwrap();
+        assert!(
+            !response_message.contains("super-secret-value"),
+            "completion response must not carry the raw secret: {response_message}"
+        );
+
+        let stored = test_request(
+            &app,
+            Method::GET,
+            &format!("/api/v1/runs/{run_id}"),
+            Value::Null,
+        )
+        .await;
+        let stored_message = stored["jobs_list"][0]["annotations"][0]["message"]
+            .as_str()
+            .unwrap();
+        assert!(
+            !stored_message.contains("super-secret-value"),
+            "persisted run must not carry the raw secret: {stored_message}"
+        );
+    }
+
+    /// A reusable caller whose strategy matrix reads `needs` is deferred at
+    /// parse time (its matrix cannot be resolved until the needs outputs
+    /// exist). At runtime the matrix must be resolved against the completed
+    /// outputs and the callee materialized once per cell, exactly like a
+    /// static-matrix caller.
+    #[tokio::test]
+    async fn deferred_reusable_caller_with_needs_matrix_fans_out_per_cell() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = test_app(state.clone(), CancellationToken::new());
+
+        let accepted = test_request(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  gen:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo gen
+  call:
+    needs: [gen]
+    uses: ./.github/workflows/callee.yml
+    strategy:
+      matrix: ${{ fromJson(needs.gen.outputs.matrix) }}
+"#,
+                "event": "push",
+                "repository": "owner/repo",
+                "reusable_workflows": {
+                    ".github/workflows/callee.yml": r#"
+on: workflow_call
+jobs:
+  inner:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo inner
+"#
+                }
+            }),
+        )
+        .await;
+        let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+
+        test_request(
+            &app,
+            Method::POST,
+            "/internal/test/jobs/complete",
+            json!({
+                "run_id": run_id,
+                "job_id": "gen",
+                "status": "success",
+                "outputs": {"matrix": "{\"include\": [{\"os\": \"linux\"}, {\"os\": \"macos\"}]}"}
+            }),
+        )
+        .await;
+
+        let legs: Vec<JobId> = {
+            let inner = state.inner.lock().await;
+            let run = inner.runs.get(&RunId(run_id.parse().unwrap())).unwrap();
+            run.jobs
+                .keys()
+                .filter(|id| id.0.starts_with("call ("))
+                .cloned()
+                .collect()
+        };
+        assert_eq!(
+            legs.len(),
+            2,
+            "one materialized callee leg per resolved matrix cell"
+        );
+        for leg in &legs {
+            assert!(
+                leg.0.ends_with("/inner"),
+                "leg id must be the caller-cell-prefixed inner job: {leg}"
+            );
+        }
+
+        // Completing every leg concludes the caller (and the run).
+        for leg in &legs {
+            test_request(
+                &app,
+                Method::POST,
+                "/internal/test/jobs/complete",
+                json!({
+                    "run_id": run_id,
+                    "job_id": leg.0,
+                    "status": "success",
+                    "outputs": {}
+                }),
+            )
+            .await;
+        }
+        let run = state.inner.lock().await;
+        assert_eq!(
+            run.runs[&RunId(run_id.parse().unwrap())].status,
+            ExecutionStatus::Success,
+            "run must conclude once every deferred-matrix leg completes"
+        );
+    }
+
+    /// A deferred matrix that lives inside a reusable workflow is promoted
+    /// with a caller-prefixed runtime id that does not exist in the root
+    /// workflow; the runtime must expand it against the callee workflow that
+    /// actually contains the job.
+    #[tokio::test]
+    async fn deferred_matrix_inside_reusable_expands_against_the_callee() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = test_app(state.clone(), CancellationToken::new());
+
+        let accepted = test_request(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": r#"
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/callee.yml
+"#,
+                "event": "push",
+                "repository": "owner/repo",
+                "reusable_workflows": {
+                    ".github/workflows/callee.yml": r#"
+on: workflow_call
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo setup
+  build:
+    needs: [setup]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+    steps:
+      - run: echo build
+"#
+                }
+            }),
+        )
+        .await;
+        let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+
+        test_request(
+            &app,
+            Method::POST,
+            "/internal/test/jobs/complete",
+            json!({
+                "run_id": run_id,
+                "job_id": "call/setup",
+                "status": "success",
+                "outputs": {"matrix": "{\"include\": [{\"node\": \"1\"}, {\"node\": \"2\"}]}"}
+            }),
+        )
+        .await;
+
+        let legs: Vec<JobId> = {
+            let inner = state.inner.lock().await;
+            let run = inner.runs.get(&RunId(run_id.parse().unwrap())).unwrap();
+            run.jobs
+                .keys()
+                .filter(|id| id.0.starts_with("call/build ("))
+                .cloned()
+                .collect()
+        };
+        assert_eq!(
+            legs.len(),
+            2,
+            "callee-local deferred matrix must fan out: {:?}",
+            legs
+        );
+
+        for leg in &legs {
+            test_request(
+                &app,
+                Method::POST,
+                "/internal/test/jobs/complete",
+                json!({
+                    "run_id": run_id,
+                    "job_id": leg.0,
+                    "status": "success",
+                    "outputs": {}
+                }),
+            )
+            .await;
+        }
+        let run = state.inner.lock().await;
+        assert_eq!(
+            run.runs[&RunId(run_id.parse().unwrap())].status,
+            ExecutionStatus::Success,
+            "run must conclude once the callee-local matrix legs complete"
+        );
+    }
 }
