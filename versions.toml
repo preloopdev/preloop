@@ -15,9 +15,10 @@ ubuntu_22_04_base = "ubuntu:22.04@sha256:0e0a0fc6d18feda9db1590da249ac93e8d5abfe
 # at build time; see docs/vm-images.md for the tier rationale.
 git_version = "2.54.0"
 git_lfs_version = "3.7.1"
-docker_version = "28.0.4"
-docker_buildx_version = "0.35.0"
-docker_compose_version = "2.38.2"
+# Docker is deliberately NOT pinned: download.docker.com prunes old
+# versions, so the official image's exact stack (28.0.4 / buildx 0.35.0 /
+# compose 2.38.2) is unavailable from the apt repo (verified 2026-08). The
+# golden installs the repo's latest stable instead — documented drift.
 nvm_version = "0.40.6"
 yarn_version = "1.22.22"
 node_toolcache_versions = "22.23.1 24.18.0"

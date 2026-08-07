@@ -301,14 +301,14 @@ pub const BASE_NODE_VERSION: &str = crate::NODE_VERSION;
 ///
 /// Kept apart because it needs storage configuration the other packages do not
 /// — see [`DOCKER_DATA_ROOT`].
-/// Pinned to the official runner image's docker stack (versions.toml). Apt
-/// version globs (`pkg=version*`) keep the exact upstream versions while
-/// tolerating the distro-suffix in the deb name.
+/// The official image's docker stack (28.0.4 / buildx 0.35.0 / compose
+/// 2.38.2) cannot be apt-pinned: download.docker.com prunes old versions and
+/// currently retains only the 29.x line (verified 2026-08). The official
+/// image builds docker from its own mirror. So the stack stays latest-stable
+/// from Docker's repo — a documented drift — while every other parity pin is
+/// exact.
 fn docker_apt_packages() -> String {
-    format!(
-        "docker-ce={DOCKER_VERSION}* docker-ce-cli={DOCKER_VERSION}* containerd.io \
-         docker-buildx-plugin={DOCKER_BUILDX_VERSION}* docker-compose-plugin={DOCKER_COMPOSE_VERSION}*"
-    )
+    "docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin".to_owned()
 }
 
 /// Where the container engine stores images and layers.
@@ -335,7 +335,7 @@ const RUNNER_ROOT: &str = "/var/lib/preloop-runner";
 /// Standard loopback entries for `/etc/hosts`.
 ///
 /// The base image ships an **empty** `/etc/hosts`, and `nsswitch.conf` is
-/// `hosts: files dns` — so `localhost` falls through to the upstream resolver
+/// `hosts: files dns` so `localhost` falls through to the upstream resolver
 /// and fails to resolve at all. Everything still works over `127.0.0.1`, which
 /// is why this hides so well.
 ///
@@ -423,11 +423,14 @@ pub fn base_install_script() -> String {
          && printf '{LOOPBACK_HOSTS}' > /etc/hosts && \
          printf '127.0.0.1 %s\\n' \"$(hostname)\" >> /etc/hosts && \
          printf 'APT::Get::Assume-Yes \"true\";\\n' > /etc/apt/apt.conf.d/90assumeyes && \
-         (arch=$(uname -m); \
-          case \"$arch\" in x86_64) NODE_ARCH=x64 ;; aarch64|arm64) NODE_ARCH=arm64 ;; *) NODE_ARCH=x64 ;; esac; \
+         arch=$(uname -m); \
+         case \"$arch\" in x86_64) NODE_ARCH=x64 ;; aarch64|arm64) NODE_ARCH=arm64 ;; *) NODE_ARCH=x64 ;; esac; \
+         case \"$NODE_ARCH\" in x64) LFS_ARCH=amd64 ;; *) LFS_ARCH=arm64 ;; esac; \
+         (echo \"### fetch system node v{BASE_NODE_VERSION}\" >&2 && \
           curl -fsSL \"https://nodejs.org/dist/v{BASE_NODE_VERSION}/node-v{BASE_NODE_VERSION}-linux-$NODE_ARCH.tar.gz\" \
             | tar -xz --strip-components=1 -C /usr/local) && \
          (install -m 0755 -d /etc/apt/keyrings && \
+          echo \"### fetch docker gpg\" >&2 && \
           curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc && \
           echo \"deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable\" > /etc/apt/sources.list.d/docker.list && \
           apt-get update -qq && \
@@ -436,35 +439,40 @@ pub fn base_install_script() -> String {
           mkdir -p {DOCKER_DATA_ROOT} /etc/docker && \
           printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\"}}\\n' > /etc/docker/daemon.json \
           || true) && \
-       (curl -sSL https://github.com/Boshen/cargo-shear/releases/download/v{CARGO_SHEAR_VERSION}/cargo-shear-$(uname -m)-unknown-linux-musl.tar.gz 2>/dev/null | tar -xz -C /usr/local/bin 2>/dev/null || true) && \
-         (arch=$(uname -m); \
-          case \"$arch\" in x86_64) NODE_ARCH=x64 ;; aarch64|arm64) NODE_ARCH=arm64 ;; *) NODE_ARCH=x64 ;; esac; \
-          case \"$NODE_ARCH\" in x64) LFS_ARCH=amd64 ;; *) LFS_ARCH=arm64 ;; esac; \
+         (echo \"### fetch cargo-shear\" >&2 && \
+          curl -sSL https://github.com/Boshen/cargo-shear/releases/download/v{CARGO_SHEAR_VERSION}/cargo-shear-$(uname -m)-unknown-linux-musl.tar.gz 2>/dev/null | tar -xz -C /usr/local/bin 2>/dev/null || true) && \
+         (echo \"### bake git v{GIT_VERSION}\" >&2 && \
           apt-get install -y -qq --no-install-recommends libcurl4-openssl-dev zlib1g-dev gettext libexpat-dev && \
           curl -fsSL https://github.com/git/git/archive/refs/tags/v{GIT_VERSION}.tar.gz | tar -xz -C /tmp && \
           (cd /tmp/git-{GIT_VERSION} && make -s prefix=/usr all && make -s prefix=/usr install) && \
           rm -rf /tmp/git-{GIT_VERSION} && \
+          echo \"### bake git-lfs v{GIT_LFS_VERSION}\" >&2 && \
           curl -fsSL https://github.com/git-lfs/git-lfs/releases/download/v{GIT_LFS_VERSION}/git-lfs-linux-$LFS_ARCH-v{GIT_LFS_VERSION}.tar.gz | tar -xz -C /tmp && \
           /tmp/git-lfs-{GIT_LFS_VERSION}/install.sh && rm -rf /tmp/git-lfs-{GIT_LFS_VERSION}) && \
          (mkdir -p /opt/hostedtoolcache/node && \
           for NODE_TOOLCACHE_VERSION in {NODE_TOOLCACHE_VERSIONS}; do \
+            echo \"### bake node toolcache $NODE_TOOLCACHE_VERSION\" >&2 && \
             mkdir -p /opt/hostedtoolcache/node/$NODE_TOOLCACHE_VERSION/x64 && \
             curl -fsSL https://nodejs.org/dist/v$NODE_TOOLCACHE_VERSION/node-v$NODE_TOOLCACHE_VERSION-linux-$NODE_ARCH.tar.gz \
               | tar -xz --strip-components=1 -C /opt/hostedtoolcache/node/$NODE_TOOLCACHE_VERSION/x64; \
           done) && \
          (mkdir -p /usr/local/share && \
+          echo \"### bake nvm v{NVM_VERSION}\" >&2 && \
           curl -fsSL https://github.com/nvm-sh/nvm/archive/refs/tags/v{NVM_VERSION}.tar.gz | tar -xz -C /usr/local/share && \
           mv /usr/local/share/nvm-{NVM_VERSION} /usr/local/share/nvm && \
           printf 'export NVM_DIR=/usr/local/share/nvm\\n[ -s \"$NVM_DIR/nvm.sh\" ] && \\. \"$NVM_DIR/nvm.sh\"\\n' > /etc/profile.d/nvm.sh) && \
+         echo \"### bake yarn v{YARN_VERSION}\" >&2 && \
          npm install -g yarn@{YARN_VERSION} && \
          (mkdir -p /opt/hostedtoolcache/python /opt/hostedtoolcache/go && \
           for PY_VERSION in {PYTHON_TOOLCACHE_VERSIONS}; do \
+            echo \"### bake python $PY_VERSION\" >&2 && \
             PY_TAG=$(git ls-remote --tags https://github.com/actions/python-versions.git \"refs/tags/$PY_VERSION-*\" 2>/dev/null | awk -F/ '{{print $3}}' | sort -V | tail -1) && \
             mkdir -p /opt/hostedtoolcache/python/$PY_VERSION/x64 && \
             curl -fsSL https://github.com/actions/python-versions/releases/download/$PY_TAG/python-$PY_VERSION-linux-24.04-$NODE_ARCH.tar.gz \
               | tar -xz --strip-components=1 -C /opt/hostedtoolcache/python/$PY_VERSION/x64; \
           done && \
           for GO_VERSION in {GO_TOOLCACHE_VERSIONS}; do \
+            echo \"### bake go $GO_VERSION\" >&2 && \
             mkdir -p /opt/hostedtoolcache/go/$GO_VERSION/x64 && \
             curl -fsSL https://go.dev/dl/go$GO_VERSION.linux-$LFS_ARCH.tar.gz \
               | tar -xz --strip-components=1 -C /opt/hostedtoolcache/go/$GO_VERSION/x64; \
