@@ -33,17 +33,13 @@ type HmacSha256 = Hmac<Sha256>;
 pub(crate) trait Store: Send + Sync {
     /// Restore the persisted state into `inner` (startup path).
     async fn load_into(&self, inner: &mut InnerState) -> anyhow::Result<()>;
-    /// Full snapshot: rewrite every table from `inner` in one transaction.
-    async fn store_inner(&self, inner: &InnerState) -> anyhow::Result<()>;
+    /// Full snapshot: rewrite every table from a captured [`StoreSnapshot`]
+    /// in one transaction.
+    async fn store_inner(&self, snapshot: &StoreSnapshot) -> anyhow::Result<()>;
     /// Persist only the runtime metadata snapshot (hot path).
-    async fn store_meta_only(&self, inner: &InnerState) -> anyhow::Result<()>;
+    async fn store_meta_only(&self, meta: &MetaSnapshot) -> anyhow::Result<()>;
     /// Persist one run's mutable projection plus a control event.
-    async fn store_run_event(
-        &self,
-        inner: &InnerState,
-        run_id: RunId,
-        event: &NdjsonEvent,
-    ) -> anyhow::Result<()>;
+    async fn store_run_event(&self, projection: RunProjection) -> anyhow::Result<()>;
     /// Persist the run-number allocator for one workflow path.
     async fn store_workflow_run_counter(
         &self,
@@ -61,6 +57,135 @@ pub(crate) trait Store: Send + Sync {
     ) -> anyhow::Result<()>;
     /// Append a control event (`run_accepted` / `run_status` / `job_status`).
     async fn append_event(&self, event: &NdjsonEvent) -> anyhow::Result<()>;
+}
+
+/// Owned projection of the in-memory state that a full snapshot persists.
+/// Captured under the state lock; the database write happens after the lock
+/// is released, so a slow backend never stalls the control plane.
+#[derive(Clone)]
+pub(crate) struct StoreSnapshot {
+    pub(crate) runs: Vec<RunRecord>,
+    /// (queue_kind, job, global queue position within the kind).
+    pub(crate) jobs: Vec<(&'static str, QueuedJob, i64)>,
+    pub(crate) runners: Vec<RegisteredRunner>,
+    pub(crate) rsa_public_keys: Vec<(i64, AgentRsaPublicKey)>,
+    pub(crate) sessions: Vec<RunnerSession>,
+    pub(crate) session_keys: Vec<(String, SessionEncryption)>,
+    pub(crate) requests: Vec<TaskAgentJobRequestRecord>,
+    /// (session_id, message_id, undelivered message).
+    pub(crate) inflight: Vec<(String, i64, azdo::TaskAgentMessage)>,
+    /// session_id → currently claimed request id.
+    pub(crate) session_active_requests: Vec<(String, i64)>,
+    /// request_id → undelivered job message.
+    pub(crate) broker_request_messages: Vec<(i64, azdo::AgentJobRequestMessage)>,
+    pub(crate) meta: MetaSnapshot,
+}
+
+impl StoreSnapshot {
+    pub(crate) fn from_inner(inner: &InnerState) -> Self {
+        StoreSnapshot {
+            runs: inner.runs.values().cloned().collect(),
+            jobs: queue_rows(inner)
+                .into_iter()
+                .map(|(kind, job, position)| (kind, job.clone(), position))
+                .collect(),
+            runners: inner.runners.values().cloned().collect(),
+            rsa_public_keys: inner
+                .runner_rsa_public_keys
+                .iter()
+                .map(|(id, key)| (*id, key.clone()))
+                .collect(),
+            sessions: inner.sessions.values().cloned().collect(),
+            session_keys: inner
+                .session_keys
+                .iter()
+                .map(|(id, enc)| (id.clone(), enc.clone()))
+                .collect(),
+            requests: inner.job_requests.values().cloned().collect(),
+            inflight: inner
+                .inflight_messages
+                .iter()
+                .flat_map(|(session, messages)| {
+                    messages
+                        .iter()
+                        .map(move |(id, message)| (session.clone(), *id, message.clone()))
+                })
+                .collect(),
+            session_active_requests: inner
+                .session_active_requests
+                .iter()
+                .map(|(session, request)| (session.clone(), *request))
+                .collect(),
+            broker_request_messages: inner
+                .broker_messages
+                .iter()
+                .map(|(id, message)| (*id, message.clone()))
+                .collect(),
+            meta: build_meta_snapshot(inner),
+        }
+    }
+}
+
+/// The per-run projection persisted on control events. Captured under the
+/// state lock, written after it is released. Includes the claim/message state
+/// so a job that was claimed (dequeued, message handed to a session) but not
+/// yet acked survives a restart in the same transaction that rewrites its
+/// run's queue rows.
+#[derive(Clone)]
+pub(crate) struct RunProjection {
+    pub(crate) run: RunRecord,
+    /// (queue_kind, job, global queue position within the kind).
+    pub(crate) jobs: Vec<(&'static str, QueuedJob, i64)>,
+    pub(crate) requests: Vec<TaskAgentJobRequestRecord>,
+    pub(crate) session_active_requests: Vec<(String, i64)>,
+    pub(crate) inflight: Vec<(String, i64, azdo::TaskAgentMessage)>,
+    pub(crate) broker_request_messages: Vec<(i64, azdo::AgentJobRequestMessage)>,
+    pub(crate) event: NdjsonEvent,
+}
+
+impl RunProjection {
+    /// Returns `None` when the run is no longer present; the caller then skips
+    /// persistence but still broadcasts.
+    pub(crate) fn from_inner(
+        inner: &InnerState,
+        run_id: RunId,
+        event: NdjsonEvent,
+    ) -> Option<Self> {
+        let run = inner.runs.get(&run_id)?.clone();
+        Some(RunProjection {
+            run,
+            jobs: queue_rows_for_run(inner, run_id)
+                .into_iter()
+                .map(|(kind, job, position)| (kind, job.clone(), position))
+                .collect(),
+            requests: inner
+                .job_requests
+                .values()
+                .filter(|record| record.run_id == run_id)
+                .cloned()
+                .collect(),
+            session_active_requests: inner
+                .session_active_requests
+                .iter()
+                .map(|(session, request)| (session.clone(), *request))
+                .collect(),
+            inflight: inner
+                .inflight_messages
+                .iter()
+                .flat_map(|(session, messages)| {
+                    messages
+                        .iter()
+                        .map(move |(id, message)| (session.clone(), *id, message.clone()))
+                })
+                .collect(),
+            broker_request_messages: inner
+                .broker_messages
+                .iter()
+                .map(|(id, message)| (*id, message.clone()))
+                .collect(),
+            event,
+        })
+    }
 }
 
 /// SQLite backend: `<state_dir>/aksh.db`, one connection behind a mutex.
@@ -224,7 +349,7 @@ impl Envelope {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct MetaSnapshot {
     workflow_run_counters: BTreeMap<String, u64>,
     next_runner_id: i64,
@@ -274,14 +399,25 @@ pub(crate) struct MetaSnapshot {
     /// runner. Persisted so a restart mid-cancel still delivers the cancel.
     #[serde(default)]
     cancellation_queue: std::collections::VecDeque<QueuedCancellation>,
-    /// Per-session broker message queue (dequeued but not yet delivered to
-    /// the runner). Persisted so a restart re-delivers instead of dropping
-    /// the assignment.
+    /// Per-request job messages: request_id → job message, the counterpart of
+    /// `inflight_messages` (which is per-session and lives in the
+    /// `broker_messages` table). Moved to the `job_request_messages` table by
+    /// `store_inner` / `store_run_event` so a claimed-but-unacked job survives
+    /// a restart; kept out of this blob so a full snapshot is not needed to
+    /// persist one claim.
     #[serde(default)]
-    broker_messages: Vec<(i64, azdo::AgentJobRequestMessage)>,
-    /// `session_active_requests`: per-session currently-claimed request id.
+    runner_client_ids: Vec<(String, i64)>,
+    /// Runners that presented a valid one-time provision token. Persisted so a
+    /// restart between registration and job claim keeps the pairing proof.
     #[serde(default)]
-    session_active_requests: Vec<(String, i64)>,
+    pool_proven_runners: Vec<i64>,
+    /// Job → runner assignments (strict-assignment mode), as
+    /// (run_id, job_id, runner_id, at_us, first_at_us).
+    #[serde(default)]
+    job_assignments: Vec<(String, String, i64, u64, u64)>,
+    /// Jobs waiting for a provisioned runner: (run_id, job_id, marked_at_us).
+    #[serde(default)]
+    pool_pending: Vec<(String, String, i64)>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -339,8 +475,13 @@ fn derive_keys(root: &[u8]) -> DerivedKeys {
     }
 }
 
-/// Serialize a run record for storage: `submission` and `job_needs` are
-/// injected as JSON so the persisted blob is self-contained.
+/// Serialize a run record for storage. The fields `#[serde(skip)]`-ped off
+/// the wire shape are injected as JSON so the persisted blob is
+/// self-contained: `submission` (through the sanctioned expose boundary),
+/// `job_needs`, and the expansion-only fields (`caller_plans`, `github`,
+/// `head_sha`, `workflow_ref`, `workspace_snapshot`) that the scheduler needs
+/// to materialize a deferred reusable-caller or matrix subtree after a
+/// restart.
 pub(crate) fn run_record_value(run: &RunRecord) -> anyhow::Result<serde_json::Value> {
     let mut value = serde_json::to_value(run)?;
     if let Some(object) = value.as_object_mut() {
@@ -348,6 +489,20 @@ pub(crate) fn run_record_value(run: &RunRecord) -> anyhow::Result<serde_json::Va
         object.insert(
             "job_needs".to_owned(),
             serde_json::to_value(&run.job_needs)?,
+        );
+        object.insert(
+            "caller_plans".to_owned(),
+            serde_json::to_value(&run.caller_plans)?,
+        );
+        object.insert("github".to_owned(), run.github.clone());
+        object.insert("head_sha".to_owned(), serde_json::to_value(&run.head_sha)?);
+        object.insert(
+            "workflow_ref".to_owned(),
+            serde_json::to_value(&run.workflow_ref)?,
+        );
+        object.insert(
+            "workspace_snapshot".to_owned(),
+            serde_json::to_value(&run.workspace_snapshot)?,
         );
     }
     Ok(value)
@@ -357,12 +512,40 @@ pub(crate) fn run_record_value(run: &RunRecord) -> anyhow::Result<serde_json::Va
 pub(crate) fn restore_run_record(cipher: &Envelope, blob: &[u8]) -> anyhow::Result<RunRecord> {
     let value: serde_json::Value = serde_json::from_slice(&cipher.unseal(blob)?)?;
     let mut run: RunRecord = serde_json::from_value(value.clone())?;
-    run.job_needs = value
-        .get("job_needs")
-        .cloned()
-        .map(serde_json::from_value)
-        .transpose()?
-        .unwrap_or_default();
+    if let Some(object) = value.as_object() {
+        run.job_needs = object
+            .get("job_needs")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?
+            .unwrap_or_default();
+        run.caller_plans = object
+            .get("caller_plans")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?
+            .unwrap_or_default();
+        run.github = object
+            .get("github")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        run.head_sha = object
+            .get("head_sha")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        run.workflow_ref = object
+            .get("workflow_ref")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        // `run_record_value` always writes the key (null when absent), so a
+        // JSON null must restore as `None` rather than fail to parse.
+        run.workspace_snapshot = match object.get("workspace_snapshot") {
+            Some(value) if !value.is_null() => Some(serde_json::from_value(value.clone())?),
+            _ => None,
+        };
+    }
     Ok(run)
 }
 
@@ -508,15 +691,31 @@ pub(crate) fn build_meta_snapshot(inner: &InnerState) -> MetaSnapshot {
             .map(|(request_id, req)| (*request_id, req.clone()))
             .collect(),
         cancellation_queue: inner.cancellation_queue.clone(),
-        broker_messages: inner
-            .broker_messages
+        runner_client_ids: inner
+            .runner_client_ids
             .iter()
-            .map(|(request_id, msg)| (*request_id, msg.clone()))
+            .map(|(client_id, runner_id)| (client_id.clone(), *runner_id))
             .collect(),
-        session_active_requests: inner
-            .session_active_requests
+        pool_proven_runners: inner.pool_proven_runners.iter().copied().collect(),
+        job_assignments: inner
+            .job_assignments
             .iter()
-            .map(|(session_id, request_id)| (session_id.clone(), *request_id))
+            .map(|((run_id, job_id), record)| {
+                (
+                    run_id.to_string(),
+                    job_id.0.clone(),
+                    record.runner_id,
+                    system_time_us(record.at) as u64,
+                    system_time_us(record.first_at) as u64,
+                )
+            })
+            .collect(),
+        pool_pending: inner
+            .pool_pending
+            .iter()
+            .map(|((run_id, job_id), at)| {
+                (run_id.to_string(), job_id.0.clone(), system_time_us(*at))
+            })
             .collect(),
     }
 }
@@ -559,8 +758,34 @@ pub(crate) fn apply_meta_snapshot(inner: &mut InnerState, meta: MetaSnapshot) {
     inner.artifact_v2_registry = meta.artifact_v2_registry.into_iter().collect();
     inner.github_token_requests = meta.github_token_requests.into_iter().collect();
     inner.cancellation_queue = meta.cancellation_queue;
-    inner.broker_messages = meta.broker_messages.into_iter().collect();
-    inner.session_active_requests = meta.session_active_requests.into_iter().collect();
+    inner.runner_client_ids = meta.runner_client_ids.into_iter().collect();
+    inner.pool_proven_runners = meta.pool_proven_runners.into_iter().collect();
+    inner.job_assignments = meta
+        .job_assignments
+        .into_iter()
+        .filter_map(|(run_id, job_id, runner_id, at_us, first_at_us)| {
+            run_id.parse().ok().map(|run_id| {
+                (
+                    (run_id, JobId(job_id)),
+                    AssignmentRecord {
+                        runner_id,
+                        at: system_time_from_us(at_us as i64),
+                        first_at: system_time_from_us(first_at_us as i64),
+                    },
+                )
+            })
+        })
+        .collect();
+    inner.pool_pending = meta
+        .pool_pending
+        .into_iter()
+        .filter_map(|(run_id, job_id, at_us)| {
+            run_id
+                .parse()
+                .ok()
+                .map(|run_id| ((run_id, JobId(job_id)), system_time_from_us(at_us)))
+        })
+        .collect();
 }
 
 /// Seal a session AES key for storage. Returns `(ciphertext, iv, tag)`.
@@ -827,6 +1052,25 @@ impl SqliteStore {
                 }
             }
         }
+        // Restore per-request job messages (request_id → message) from their
+        // own table; `inner.broker_messages` is keyed by request_id and the
+        // broker re-delivers from it after a restart.
+        let mut jrm_stmt = connection.prepare(
+            "SELECT request_id, payload_json FROM job_request_messages ORDER BY request_id",
+        )?;
+        for row in jrm_stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (request_id, payload_json) = row?;
+            match serde_json::from_str::<azdo::AgentJobRequestMessage>(&payload_json) {
+                Ok(message) => {
+                    inner.broker_messages.insert(request_id, message);
+                }
+                Err(error) => {
+                    tracing::warn!(request_id, %error, "dropping undecodable job request message");
+                }
+            }
+        }
         let mut request_stmt =
             connection.prepare("SELECT request_id, request_blob FROM job_requests")?;
         for row in request_stmt.query_map([], |row| {
@@ -953,11 +1197,12 @@ impl SqliteStore {
         Ok(())
     }
 
-    pub(crate) fn store_inner(&self, inner: &InnerState) -> anyhow::Result<()> {
+    pub(crate) fn store_inner(&self, snapshot: &StoreSnapshot) -> anyhow::Result<()> {
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let tx = connection.transaction()?;
         for table in [
             "broker_messages",
+            "job_request_messages",
             "session_active_requests",
             "job_requests",
             "job_dependencies",
@@ -970,19 +1215,10 @@ impl SqliteStore {
             tx.execute(&format!("DELETE FROM {table}"), [])
                 .map_err(|error| anyhow::anyhow!("deleting {table}: {error}"))?;
         }
-        for run in inner.runs.values() {
-            let run_json = {
-                let mut value = serde_json::to_value(run)?;
-                if let Some(object) = value.as_object_mut() {
-                    object.insert("submission".to_owned(), run.submission.to_request_json()?);
-                    object.insert(
-                        "job_needs".to_owned(),
-                        serde_json::to_value(&run.job_needs)?,
-                    );
-                }
-                serde_json::to_vec(&value)?
-            };
-            let sealed_run = self.cipher.seal(&run_json)?;
+        for run in &snapshot.runs {
+            let sealed_run = self
+                .cipher
+                .seal(&serde_json::to_vec(&run_record_value(run)?)?)?;
             tx.execute(
                 "INSERT INTO runs(run_id, repository, workflow_path, status, run_number,
                                   run_attempt, created_at_us, completed_at_us, record_blob)
@@ -1001,11 +1237,21 @@ impl SqliteStore {
             )?;
         }
 
-        for (kind, job, position) in queue_rows(inner) {
-            self.insert_job(&tx, job, kind, position)?;
+        for (kind, job, position) in &snapshot.jobs {
+            self.insert_job(&tx, job, kind, *position)?;
         }
 
-        for runner in inner.runners.values() {
+        let rsa_keys: std::collections::BTreeMap<i64, &AgentRsaPublicKey> = snapshot
+            .rsa_public_keys
+            .iter()
+            .map(|(id, key)| (*id, key))
+            .collect();
+        let session_keys: std::collections::BTreeMap<String, &SessionEncryption> = snapshot
+            .session_keys
+            .iter()
+            .map(|(id, key)| (id.clone(), key))
+            .collect();
+        for runner in &snapshot.runners {
             // `OR REPLACE` so re-registration (same `runner_id`, new name)
             // overwrites the row in place. Without it, `UNIQUE(name)` would
             // reject the insert whenever the in-memory map had two runners
@@ -1014,10 +1260,7 @@ impl SqliteStore {
             // Typed RSA public key is stored alongside the XML form so a
             // post-restart session can be FIPS-encrypted without re-parsing
             // and without an extra table.
-            let rsa_xml = inner
-                .runner_rsa_public_keys
-                .get(&runner.id)
-                .map(|key| key.to_xml_string());
+            let rsa_xml = rsa_keys.get(&runner.id).map(|key| key.to_xml_string());
             tx.execute(
                 "INSERT OR REPLACE INTO runners(runner_id, name, ephemeral,
                                                 runner_group_id, runner_group_name,
@@ -1047,11 +1290,10 @@ impl SqliteStore {
                 )?;
             }
         }
-        for session in inner.sessions.values() {
+        for session in &snapshot.sessions {
             // `session_id` is the natural primary key; a re-persist
             // overwrites the same row.
-            let key_blob = inner
-                .session_keys
+            let key_blob = session_keys
                 .get(&session.session_id.0.to_string())
                 .map(|enc| seal_session_key(&self.cipher, enc));
             match key_blob {
@@ -1085,74 +1327,16 @@ impl SqliteStore {
                 }
             }
         }
-        for record in inner.job_requests.values() {
-            let snapshot = RequestSnapshot {
-                request_id: record.request_id,
-                run_id: record.run_id,
-                job_id: record.job_id.clone(),
-                agent_job_id: record.agent_job_id,
-                plan_id: record.plan_id.clone(),
-                plan_type: record.plan_type.clone(),
-                timeline_id: record.timeline_id,
-                result: record.result,
-                locked_until: record.locked_until.clone(),
-                started_at_us: record.started_at.map(system_time_us),
-                last_renewed_at_us: record.last_renewed_at.map(system_time_us),
-                timeout_triggered: record.timeout_triggered,
-                debug_token_issued: record.debug_token_issued,
-            };
-            let blob = self.cipher.seal(&serde_json::to_vec(&snapshot)?)?;
-            tx.execute(
-                "INSERT INTO job_requests(request_id, run_id, job_id, agent_job_id,
-                                          plan_id, timeline_id, state, request_blob)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7)",
-                params![
-                    record.request_id,
-                    record.run_id.to_string(),
-                    record.job_id.0,
-                    record.agent_job_id.to_string(),
-                    record.plan_id,
-                    record.timeline_id.to_string(),
-                    blob,
-                ],
-            )?;
+        for record in &snapshot.requests {
+            self.insert_request_tx(&tx, record)?;
         }
-        // Persist per-session active-request assignments. A restart
-        // re-derives the assignment so a dequeued-but-unacked request is
-        // re-delivered to the runner when it polls again.
-        tx.execute("DELETE FROM session_active_requests", [])?;
-        for (session_id, request_id) in &inner.session_active_requests {
-            tx.execute(
-                "INSERT INTO session_active_requests(session_id, active_request_id) VALUES (?1, ?2)",
-                params![session_id, *request_id],
-            )?;
-        }
-        // Persist per-session broker message queues.
-        tx.execute("DELETE FROM broker_messages", [])?;
-        for (session_id, messages) in &inner.inflight_messages {
-            for (message_id, payload) in messages {
-                let payload_json = serde_json::to_string(payload)?;
-                tx.execute(
-                    "INSERT INTO broker_messages(session_id, message_id, payload_json, written_at_us) VALUES (?1, ?2, ?3, ?4)",
-                    params![session_id, *message_id, payload_json, now_us()],
-                )?;
-            }
-        }
-
-        let meta = build_meta_snapshot(inner);
-        tx.execute(
-            "INSERT INTO runtime_snapshots(snapshot_id, format_version, meta_blob, written_at_us)
-             VALUES (1, ?1, ?2, ?3)
-             ON CONFLICT(snapshot_id) DO UPDATE SET
-               format_version = excluded.format_version,
-               meta_blob = excluded.meta_blob,
-               written_at_us = excluded.written_at_us",
-            params![
-                SNAPSHOT_FORMAT as i64,
-                self.cipher.seal(&serde_json::to_vec(&meta)?)?,
-                now_us()
-            ],
+        self.write_claim_state_tx(
+            &tx,
+            &snapshot.session_active_requests,
+            &snapshot.inflight,
+            &snapshot.broker_request_messages,
         )?;
+        self.write_meta_tx(&tx, &snapshot.meta)?;
         tx.commit()
             .map_err(|error| anyhow::anyhow!("committing store snapshot: {error}"))?;
         Ok(())
@@ -1161,34 +1345,33 @@ impl SqliteStore {
     /// Persist only one run's mutable projection. This is the hot path used
     /// after runner events; rebuilding every run on every status transition
     /// turns a burst of independent submissions into quadratic work.
-    pub(crate) fn store_run_event(
-        &self,
-        inner: &InnerState,
-        run_id: RunId,
-        event: &NdjsonEvent,
-    ) -> anyhow::Result<()> {
+    pub(crate) fn store_run_event(&self, projection: &RunProjection) -> anyhow::Result<()> {
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let tx = connection.transaction()?;
-        let Some(run) = inner.runs.get(&run_id) else {
-            return Ok(());
-        };
-        self.store_run_tx(&tx, run)?;
+        let run_id = projection.run.run_id;
+        self.store_run_tx(&tx, &projection.run)?;
         tx.execute("DELETE FROM jobs WHERE run_id = ?1", [run_id.to_string()])?;
-        for (kind, job, position) in queue_rows_for_run(inner, run_id) {
-            self.insert_job(&tx, job, kind, position)?;
+        for (kind, job, position) in &projection.jobs {
+            self.insert_job(&tx, job, kind, *position)?;
         }
         tx.execute(
             "DELETE FROM job_requests WHERE run_id = ?1",
             [run_id.to_string()],
         )?;
-        for record in inner
-            .job_requests
-            .values()
-            .filter(|record| record.run_id == run_id)
-        {
+        for record in &projection.requests {
             self.insert_request_tx(&tx, record)?;
         }
-        self.insert_event_tx(&tx, event)?;
+        // The claim state must land in the same transaction as the queue
+        // rewrite above: a job that was claimed (dequeued, message handed to a
+        // session) but not yet acked would otherwise have neither its queue
+        // row nor its claim after a restart.
+        self.write_claim_state_tx(
+            &tx,
+            &projection.session_active_requests,
+            &projection.inflight,
+            &projection.broker_request_messages,
+        )?;
+        self.insert_event_tx(&tx, &projection.event)?;
         tx.commit()
             .map_err(|error| anyhow::anyhow!("committing run event: {error}"))?;
         Ok(())
@@ -1216,10 +1399,10 @@ impl SqliteStore {
         Ok(())
     }
 
-    pub(crate) fn store_meta_only(&self, inner: &InnerState) -> anyhow::Result<()> {
+    pub(crate) fn store_meta_only(&self, meta: &MetaSnapshot) -> anyhow::Result<()> {
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let tx = connection.transaction()?;
-        self.write_meta_tx(&tx, inner)?;
+        self.write_meta_tx(&tx, meta)?;
         tx.commit()
             .map_err(|error| anyhow::anyhow!("committing metadata: {error}"))?;
         Ok(())
@@ -1278,8 +1461,7 @@ impl SqliteStore {
         Ok(())
     }
 
-    fn write_meta_tx(&self, tx: &Transaction<'_>, inner: &InnerState) -> anyhow::Result<()> {
-        let meta = build_meta_snapshot(inner);
+    fn write_meta_tx(&self, tx: &Transaction<'_>, meta: &MetaSnapshot) -> anyhow::Result<()> {
         tx.execute(
             "INSERT INTO runtime_snapshots(snapshot_id, format_version, meta_blob, written_at_us)
              VALUES (1, ?1, ?2, ?3)
@@ -1293,6 +1475,43 @@ impl SqliteStore {
                 now_us()
             ],
         )?;
+        Ok(())
+    }
+
+    /// Persist the claim/message state: per-session active requests, per-session
+    /// undelivered broker messages, and per-request job messages. Rewrites all
+    /// rows from the captured projections; the maps are bounded by the number
+    /// of live claims.
+    fn write_claim_state_tx(
+        &self,
+        tx: &Transaction<'_>,
+        session_active_requests: &[(String, i64)],
+        inflight: &[(String, i64, azdo::TaskAgentMessage)],
+        broker_request_messages: &[(i64, azdo::AgentJobRequestMessage)],
+    ) -> anyhow::Result<()> {
+        tx.execute("DELETE FROM session_active_requests", [])?;
+        for (session_id, request_id) in session_active_requests {
+            tx.execute(
+                "INSERT INTO session_active_requests(session_id, active_request_id) VALUES (?1, ?2)",
+                params![session_id, *request_id],
+            )?;
+        }
+        tx.execute("DELETE FROM broker_messages", [])?;
+        for (session_id, message_id, payload) in inflight {
+            let payload_json = serde_json::to_string(payload)?;
+            tx.execute(
+                "INSERT INTO broker_messages(session_id, message_id, payload_json, written_at_us) VALUES (?1, ?2, ?3, ?4)",
+                params![session_id, *message_id, payload_json, now_us()],
+            )?;
+        }
+        tx.execute("DELETE FROM job_request_messages", [])?;
+        for (request_id, payload) in broker_request_messages {
+            let payload_json = serde_json::to_string(payload)?;
+            tx.execute(
+                "INSERT INTO job_request_messages(request_id, payload_json, written_at_us) VALUES (?1, ?2, ?3)",
+                params![*request_id, payload_json, now_us()],
+            )?;
+        }
         Ok(())
     }
 
@@ -1366,21 +1585,27 @@ impl Store for SqliteStore {
         SqliteStore::load_into(self, inner)
     }
 
-    async fn store_inner(&self, inner: &InnerState) -> anyhow::Result<()> {
-        SqliteStore::store_inner(self, inner)
+    async fn store_inner(&self, snapshot: &StoreSnapshot) -> anyhow::Result<()> {
+        let store = self.clone();
+        let snapshot = snapshot.clone();
+        tokio::task::spawn_blocking(move || store.store_inner(&snapshot))
+            .await
+            .map_err(|error| anyhow::anyhow!("store snapshot task panicked: {error}"))?
     }
 
-    async fn store_meta_only(&self, inner: &InnerState) -> anyhow::Result<()> {
-        SqliteStore::store_meta_only(self, inner)
+    async fn store_meta_only(&self, meta: &MetaSnapshot) -> anyhow::Result<()> {
+        let store = self.clone();
+        let meta = meta.clone();
+        tokio::task::spawn_blocking(move || store.store_meta_only(&meta))
+            .await
+            .map_err(|error| anyhow::anyhow!("store metadata task panicked: {error}"))?
     }
 
-    async fn store_run_event(
-        &self,
-        inner: &InnerState,
-        run_id: RunId,
-        event: &NdjsonEvent,
-    ) -> anyhow::Result<()> {
-        SqliteStore::store_run_event(self, inner, run_id, event)
+    async fn store_run_event(&self, projection: RunProjection) -> anyhow::Result<()> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.store_run_event(&projection))
+            .await
+            .map_err(|error| anyhow::anyhow!("store run-event task panicked: {error}"))?
     }
 
     async fn store_workflow_run_counter(
@@ -1388,7 +1613,13 @@ impl Store for SqliteStore {
         workflow_path: &str,
         next_run_number: u64,
     ) -> anyhow::Result<()> {
-        SqliteStore::store_workflow_run_counter(self, workflow_path, next_run_number)
+        let store = self.clone();
+        let workflow_path = workflow_path.to_owned();
+        tokio::task::spawn_blocking(move || {
+            store.store_workflow_run_counter(&workflow_path, next_run_number)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("store counter task panicked: {error}"))?
     }
 
     async fn store_log_chunk(
@@ -1399,11 +1630,22 @@ impl Store for SqliteStore {
         byte_count: i64,
         line_count: i64,
     ) -> anyhow::Result<()> {
-        SqliteStore::store_log_chunk(self, key, chunk_index, payload, byte_count, line_count)
+        let store = self.clone();
+        let key = key.to_owned();
+        let payload = payload.to_vec();
+        tokio::task::spawn_blocking(move || {
+            store.store_log_chunk(&key, chunk_index, &payload, byte_count, line_count)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("store log-chunk task panicked: {error}"))?
     }
 
     async fn append_event(&self, event: &NdjsonEvent) -> anyhow::Result<()> {
-        SqliteStore::append_event(self, event)
+        let store = self.clone();
+        let event = event.clone();
+        tokio::task::spawn_blocking(move || store.append_event(&event))
+            .await
+            .map_err(|error| anyhow::anyhow!("store event task panicked: {error}"))?
     }
 }
 
@@ -1580,6 +1822,22 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         // `load_into` clobbered the good copy with it.
         r#"
         DROP TABLE IF EXISTS run_secrets;
+        "#,
+    ),
+    (
+        3,
+        "job-request-messages-table",
+        // `inner.broker_messages` (request_id → job message) used to live only
+        // in the runtime meta blob, which `store_run_event` never rewrites —
+        // a job claimed right before a restart had neither its queue row nor
+        // its broker payload. Its own table lets the hot path persist the
+        // claim in the same transaction as the queue rewrite.
+        r#"
+        CREATE TABLE IF NOT EXISTS job_request_messages (
+          request_id INTEGER PRIMARY KEY,
+          payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+          written_at_us INTEGER NOT NULL
+        ) STRICT;
         "#,
     ),
 ];

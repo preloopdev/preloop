@@ -688,19 +688,24 @@ pub(crate) async fn submit_run_inner(
             .entry(workflow_path.clone())
             .or_insert(0);
         *counter += 1;
-        let value = *counter;
-        if let Err(error) = shared
-            .state
-            .store
-            .store_workflow_run_counter(&workflow_path, value.saturating_add(1))
-            .await
-        {
-            return Err(ApiError::internal(format!(
-                "failed to persist workflow run counter: {error}"
-            )));
-        }
-        value
+        *counter
     };
+    // Best-effort, outside the lock: the in-memory counter is authoritative
+    // and the run has already been accepted. A failed write only means the
+    // next run number may repeat after a restart, which the store is allowed
+    // to lose (AGENTS.md: the DB is a restart source, not a shared bus).
+    if let Err(error) = shared
+        .state
+        .store
+        .store_workflow_run_counter(&workflow_path, run_number.saturating_add(1))
+        .await
+    {
+        tracing::warn!(
+            %error,
+            %workflow_path,
+            "failed to persist workflow run counter; next run number may repeat after restart"
+        );
+    }
     if let Some(object) = github.as_object_mut() {
         object.insert(
             "run_number".to_owned(),

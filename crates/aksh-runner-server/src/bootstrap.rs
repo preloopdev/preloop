@@ -1,7 +1,7 @@
 use super::*;
 
 /// Server configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ServerConfig {
     /// Address to bind.
     pub listen: SocketAddr,
@@ -46,6 +46,50 @@ pub struct ServerConfig {
     /// `PRELOOP_REQUIRE_JOB_ASSIGNMENTS`: refuse to dispatch any job without
     /// a recorded assignment, including to external runners.
     pub require_job_assignments: bool,
+}
+
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print a Postgres URL verbatim: it carries the password.
+        f.debug_struct("ServerConfig")
+            .field("listen", &self.listen)
+            .field("systemd_socket_activation", &self.systemd_socket_activation)
+            .field("unix_socket", &self.unix_socket)
+            .field("state_dir", &self.state_dir)
+            .field(
+                "store_url",
+                &self.store_url.as_deref().map(redact_store_url),
+            )
+            .field("record_flows", &self.record_flows)
+            .field("tls", &self.tls)
+            .field("queue_depth", &self.queue_depth)
+            .field("next_job_runs_on", &self.next_job_runs_on)
+            .field("enable_test_api", &self.enable_test_api)
+            .field(
+                "test_api_token",
+                &self.test_api_token.as_deref().map(|_| "<redacted>"),
+            )
+            .field("oidc_issuer", &self.oidc_issuer)
+            .field("enable_scheduler", &self.enable_scheduler)
+            .field("pending_registrations", &self.pending_registrations)
+            .field("require_job_assignments", &self.require_job_assignments)
+            .finish()
+    }
+}
+
+/// Mask the password portion of a `postgres://user:pass@host/db` URL. Non-URL
+/// values (bare sqlite paths, sqlite:// URLs) pass through untouched.
+fn redact_store_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    let Some((userinfo, hostport)) = rest.rsplit_once('@') else {
+        return url.to_owned();
+    };
+    match userinfo.split_once(':') {
+        Some((user, _)) => format!("{scheme}://{user}:***@{hostport}"),
+        None => url.to_owned(),
+    }
 }
 
 /// TLS configuration.

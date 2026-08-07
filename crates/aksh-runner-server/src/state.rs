@@ -621,7 +621,6 @@ impl AppState {
     }
 
     pub(crate) async fn emit(&self, event: NdjsonEvent) {
-        let inner = self.inner.lock().await;
         let run_id = match &event {
             NdjsonEvent::RunAccepted { run_id, .. }
             | NdjsonEvent::JobStatus { run_id, .. }
@@ -630,12 +629,20 @@ impl AppState {
             _ => None,
         };
         let has_run_projection = run_id.is_some();
+        // Capture the projection under the lock, then persist after releasing
+        // it: a slow or unavailable backend must not stall the control plane
+        // (runner polling, heartbeats, other state mutations).
         if let Some(run_id) = run_id {
-            if let Err(error) = self.store.store_run_event(&inner, run_id, &event).await {
-                error!(?error, %run_id, "failed to persist control-plane run event");
+            let projection = {
+                let inner = self.inner.lock().await;
+                crate::store::RunProjection::from_inner(&inner, run_id, event.clone())
+            };
+            if let Some(projection) = projection {
+                if let Err(error) = self.store.store_run_event(projection).await {
+                    error!(?error, %run_id, "failed to persist control-plane run event");
+                }
             }
         }
-        drop(inner);
         if !has_run_projection {
             if let Err(error) = self.store.append_event(&event).await {
                 error!(?error, "failed to append durable control-plane event");

@@ -139,7 +139,11 @@ async fn sqlite_recovery_restores_queued_runs_and_next_run_number() {
                     version: "cache-version".to_owned(),
                 },
             );
-            state.store.store_meta_only(&inner).await.unwrap();
+            state
+                .store
+                .store_meta_only(&crate::store::build_meta_snapshot(&inner))
+                .await
+                .unwrap();
         }
         (
             accepted["run_id"].as_str().unwrap().to_owned(),
@@ -423,8 +427,8 @@ async fn postgres_recovery_restores_post_restart_state() {
             .batch_execute(
                 "TRUNCATE workflow_run_counters, runs, runners, runner_labels,
                          runner_sessions, jobs, job_dependencies, job_requests, control_events,
-                         session_active_requests, broker_messages, log_files, log_chunks,
-                         runtime_snapshots RESTART IDENTITY CASCADE",
+                         session_active_requests, broker_messages, job_request_messages,
+                         log_files, log_chunks, runtime_snapshots RESTART IDENTITY CASCADE",
             )
             .await
             .unwrap();
@@ -528,7 +532,11 @@ async fn postgres_recovery_restores_post_restart_state() {
             .unwrap();
         {
             let inner = state.inner.lock().await;
-            state.store.store_inner(&inner).await.unwrap();
+            state
+                .store
+                .store_inner(&crate::store::StoreSnapshot::from_inner(&inner))
+                .await
+                .unwrap();
         }
 
         (run_id, runner_id, session_id, public_xml, first_number)
@@ -14231,7 +14239,11 @@ async fn store_recovery_preserves_broker_and_inflight_messages() {
                     iv: None,
                 },
             );
-        state.store.store_inner(&inner).await.unwrap();
+        state
+            .store
+            .store_inner(&crate::store::StoreSnapshot::from_inner(&inner))
+            .await
+            .unwrap();
     }
 
     let recovered = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -14287,7 +14299,11 @@ async fn cache_upload_payload_stays_out_of_the_runtime_snapshot() {
             Some(payload.len()),
             "the upload is buffered in memory"
         );
-        state.store.store_meta_only(&inner).await.unwrap();
+        state
+            .store
+            .store_meta_only(&crate::store::build_meta_snapshot(&inner))
+            .await
+            .unwrap();
     }
 
     let db = temp.path().join("aksh.db");
@@ -14362,6 +14378,37 @@ async fn postgres_recovery_preserves_run_secrets() {
     }
     let temp = tempfile::tempdir().unwrap();
     let config_path = crate::config::config_path();
+    // Start from a known state: the shared test database may hold rows left by
+    // earlier Postgres tests (they restore into the queue on load). A
+    // brand-new database has no tables yet; only clean a schema that exists.
+    {
+        let connect_url = crate::store_pg::connect_url(&pg_url);
+        let (client, connection) = tokio_postgres::connect(&connect_url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let has_schema: bool = client
+            .query_one(
+                "SELECT to_regclass('public.workflow_run_counters') IS NOT NULL",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if has_schema {
+            client
+                .batch_execute(
+                    "TRUNCATE workflow_run_counters, runs, runners, runner_labels,
+                             runner_sessions, jobs, job_dependencies, job_requests, control_events,
+                             session_active_requests, broker_messages, job_request_messages,
+                             log_files, log_chunks, runtime_snapshots RESTART IDENTITY CASCADE",
+                )
+                .await
+                .unwrap();
+        }
+    }
     let workflow =
         "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
     let run_id = {
@@ -14406,5 +14453,448 @@ async fn postgres_recovery_preserves_run_secrets() {
             .get("MY_TOKEN")
             .map(|s| s.expose()),
         Some("s3cr3t-value")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for the cubic.dev review blockers on PR #27.
+// ---------------------------------------------------------------------------
+
+/// Restart while a reusable-caller node is parked (its concurrency gate is
+/// held by an earlier run) must keep the caller plan and the expansion-only
+/// fields (`github`, `head_sha`, `workflow_ref`) that the scheduler needs to
+/// materialize the callee subtree later. They were `#[serde(skip)]` on
+/// `RunRecord`, so a restart reset them to defaults and the deferred
+/// expansion failed or misbuilt.
+#[tokio::test]
+async fn store_recovery_preserves_deferred_caller_plan_and_expansion_fields() {
+    let temp = tempfile::tempdir().unwrap();
+    let caller_yaml = r#"
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/callee.yml
+    concurrency:
+      group: reusable-serial
+"#;
+    let callee_yaml = r#"
+on: workflow_call
+jobs:
+  inner:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo callee
+"#;
+    let submission = || {
+        json!({
+            "workflow_yaml": caller_yaml,
+            "event": "push",
+            "repository": "owner/repo",
+            "reusable_workflows": { ".github/workflows/callee.yml": callee_yaml },
+        })
+    };
+
+    let (parked_run, github, head_sha, workflow_ref) = {
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+        let first = request_json(&app, Method::POST, "/api/v1/runs", submission()).await;
+        let second = request_json(&app, Method::POST, "/api/v1/runs", submission()).await;
+        let first_run: RunId = first["run_id"].as_str().unwrap().parse().unwrap();
+        let parked: RunId = second["run_id"].as_str().unwrap().parse().unwrap();
+        let inner = state.inner.lock().await;
+        // First caller's gate is free: subtree materialized immediately.
+        assert_eq!(
+            inner.runs[&first_run].jobs[&JobId("call/inner".to_owned())],
+            ExecutionStatus::Queued
+        );
+        // Second caller is parked behind the gate with its plan in the run.
+        let run = &inner.runs[&parked];
+        assert_eq!(
+            run.jobs[&JobId("call".to_owned())],
+            ExecutionStatus::Pending
+        );
+        assert!(
+            run.caller_plans.contains_key(&JobId("call".to_owned())),
+            "parked caller must keep its plan pre-restart"
+        );
+        assert!(
+            !run.github.is_null() && !run.head_sha.is_empty() && !run.workflow_ref.is_empty(),
+            "expansion fields must be populated pre-restart"
+        );
+        (
+            parked,
+            run.github.clone(),
+            run.head_sha.clone(),
+            run.workflow_ref.clone(),
+        )
+    };
+
+    let recovered = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let inner = recovered.inner.lock().await;
+    let run = inner
+        .runs
+        .get(&parked_run)
+        .expect("parked run survives restart");
+    assert!(
+        run.caller_plans.contains_key(&JobId("call".to_owned())),
+        "deferred caller plan must survive restart"
+    );
+    assert_eq!(run.github, github, "github context must survive restart");
+    assert_eq!(run.head_sha, head_sha, "head_sha must survive restart");
+    assert_eq!(
+        run.workflow_ref, workflow_ref,
+        "workflow_ref must survive restart"
+    );
+}
+
+/// A job claimed (dequeued, broker message handed to a session) but not yet
+/// acked is re-delivered after a restart, even when the only write between
+/// the claim and the crash was a `store_run_event` for another status change.
+#[tokio::test]
+async fn store_recovery_preserves_claim_state_across_run_events() {
+    let temp = tempfile::tempdir().unwrap();
+    let workflow =
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 1\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 2\n";
+    let (claimed_job, other_job, request_id) = {
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({"workflow_yaml": workflow, "event": "push", "repository": "owner/repo"}),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        // Simulate the broker claiming `build`: dequeued, message parked in
+        // the per-session and per-request maps, session claim recorded.
+        let (claimed_job, other_job, request_id) = {
+            let mut inner = state.inner.lock().await;
+            let claimed = inner
+                .queue
+                .iter()
+                .find(|job| job.job_id.0 == "build")
+                .cloned()
+                .expect("build job queued");
+            inner.queue.retain(|job| job.job_id.0 != "build");
+            let request = inner
+                .job_requests
+                .values()
+                .find(|record| record.job_id.0 == "build")
+                .cloned()
+                .expect("build request");
+            inner
+                .session_active_requests
+                .insert("sess-1".to_owned(), request.request_id);
+            inner
+                .inflight_messages
+                .entry("sess-1".to_owned())
+                .or_default()
+                .insert(
+                    99,
+                    azdo::TaskAgentMessage {
+                        message_id: 99,
+                        message_type: "PipelineAgentJobRequest".to_owned(),
+                        body: "e30=".to_owned(),
+                        iv: None,
+                    },
+                );
+            inner
+                .broker_messages
+                .insert(request.request_id, claimed.message.clone());
+            (
+                claimed.job_id.clone(),
+                JobId("test".to_owned()),
+                request.request_id,
+            )
+        };
+
+        // The only store write after the claim: a status event for the OTHER
+        // job of the same run (store_run_event).
+        state
+            .emit(NdjsonEvent::JobStatus {
+                run_id,
+                job_id: other_job.clone(),
+                status: ExecutionStatus::InProgress,
+                reason: None,
+            })
+            .await;
+        (claimed_job, other_job, request_id)
+    };
+
+    let recovered = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let inner = recovered.inner.lock().await;
+    assert!(
+        inner
+            .inflight_messages
+            .get("sess-1")
+            .and_then(|messages| messages.get(&99))
+            .is_some(),
+        "undelivered broker message must survive a store_run_event restart"
+    );
+    assert!(
+        inner.broker_messages.contains_key(&request_id),
+        "per-request job message must survive a store_run_event restart"
+    );
+    assert_eq!(
+        inner.session_active_requests.get("sess-1"),
+        Some(&request_id),
+        "session claim must survive a store_run_event restart"
+    );
+    assert!(
+        inner.queue.iter().any(|job| job.job_id == other_job)
+            && !inner.queue.iter().any(|job| job.job_id == claimed_job),
+        "claimed job stays dequeued; the unclaimed job stays queued"
+    );
+}
+
+/// Pool pairing state — one-time provision proof, strict job assignments and
+/// pending pairings — plus the OAuth `client_id` map must survive a restart.
+#[tokio::test]
+async fn store_recovery_preserves_pool_pairing_and_oauth_client_ids() {
+    let temp = tempfile::tempdir().unwrap();
+    let workflow =
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+    let (run_id, now) = {
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({"workflow_yaml": workflow, "event": "push", "repository": "owner/repo"}),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+        let now = std::time::SystemTime::now();
+        {
+            let mut inner = state.inner.lock().await;
+            inner.runner_client_ids.insert("client-abc".to_owned(), 42);
+            inner.pool_proven_runners.insert(7);
+            inner.job_assignments.insert(
+                (run_id, JobId("build".to_owned())),
+                AssignmentRecord {
+                    runner_id: 7,
+                    at: now,
+                    first_at: now,
+                },
+            );
+            inner
+                .pool_pending
+                .insert((run_id, JobId("build".to_owned())), now);
+            state
+                .store
+                .store_inner(&crate::store::StoreSnapshot::from_inner(&inner))
+                .await
+                .unwrap();
+        }
+        (run_id, now)
+    };
+
+    let recovered = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let inner = recovered.inner.lock().await;
+    assert_eq!(
+        inner.runner_client_ids.get("client-abc"),
+        Some(&42),
+        "OAuth client id must survive restart"
+    );
+    assert!(
+        inner.pool_proven_runners.contains(&7),
+        "provision-token proof must survive restart"
+    );
+    let assignment = inner
+        .job_assignments
+        .get(&(run_id, JobId("build".to_owned())))
+        .expect("job assignment must survive restart");
+    assert_eq!(assignment.runner_id, 7);
+    assert_eq!(assignment.at, now);
+    assert_eq!(assignment.first_at, now);
+    assert!(
+        inner
+            .pool_pending
+            .contains_key(&(run_id, JobId("build".to_owned()))),
+        "pending pairing must survive restart"
+    );
+}
+
+/// `ServerConfig`'s Debug output must never print a Postgres password.
+#[test]
+fn server_config_debug_redacts_store_url_password() {
+    let config = ServerConfig {
+        listen: "127.0.0.1:9090".parse().unwrap(),
+        systemd_socket_activation: false,
+        unix_socket: None,
+        state_dir: std::path::PathBuf::from(".aksh"),
+        store_url: Some(
+            "postgres://aksh:hunter2-secret@db.example:5432/aksh?sslmode=verify-full".to_owned(),
+        ),
+        record_flows: None,
+        tls: TlsMode::None,
+        queue_depth: None,
+        next_job_runs_on: None,
+        enable_test_api: false,
+        test_api_token: Some("super-secret-token".to_owned()),
+        oidc_issuer: None,
+        enable_scheduler: false,
+        pending_registrations: None,
+        require_job_assignments: false,
+    };
+    let debug = format!("{config:?}");
+    assert!(
+        !debug.contains("hunter2-secret"),
+        "Debug must not expose the Postgres password: {debug}"
+    );
+    assert!(
+        !debug.contains("super-secret-token"),
+        "Debug must not expose the test API token: {debug}"
+    );
+    assert!(
+        debug.contains("aksh:***@db.example"),
+        "Debug should keep the masked URL shape"
+    );
+}
+
+/// Postgres twin of `store_recovery_preserves_claim_state_across_run_events`:
+/// the `job_request_messages` table and the claim rewrite inside
+/// `store_run_event` are backend-specific SQL, so the round-trip has to be
+/// proven against a live database too.
+#[tokio::test]
+async fn postgres_recovery_preserves_claim_state_across_run_events() {
+    let Ok(pg_url) = std::env::var("AKSH_TEST_PG_URL") else {
+        eprintln!("skipping: set AKSH_TEST_PG_URL to a disposable Postgres URL");
+        return;
+    };
+    if pg_url.trim().is_empty() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = crate::config::config_path();
+    // Isolate from earlier Postgres tests sharing this database: their rows
+    // restore into the queue on load. Only clean a schema that already exists.
+    {
+        let connect_url = crate::store_pg::connect_url(&pg_url);
+        let (client, connection) = tokio_postgres::connect(&connect_url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let has_schema: bool = client
+            .query_one(
+                "SELECT to_regclass('public.workflow_run_counters') IS NOT NULL",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if has_schema {
+            client
+                .batch_execute(
+                    "TRUNCATE workflow_run_counters, runs, runners, runner_labels,
+                             runner_sessions, jobs, job_dependencies, job_requests, control_events,
+                             session_active_requests, broker_messages, job_request_messages,
+                             log_files, log_chunks, runtime_snapshots RESTART IDENTITY CASCADE",
+                )
+                .await
+                .unwrap();
+        }
+    }
+    let workflow =
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 1\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 2\n";
+    let (claimed_job, other_job, request_id) = {
+        let state = AppState::new_with_store(
+            temp.path().to_path_buf(),
+            config_path.clone(),
+            Some(&pg_url),
+        )
+        .await
+        .unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({"workflow_yaml": workflow, "event": "push", "repository": "owner/repo"}),
+        )
+        .await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+        let (claimed_job, other_job, request_id) = {
+            let mut inner = state.inner.lock().await;
+            let claimed = inner
+                .queue
+                .iter()
+                .find(|job| job.job_id.0 == "build")
+                .cloned()
+                .expect("build job queued");
+            inner.queue.retain(|job| job.job_id.0 != "build");
+            let request = inner
+                .job_requests
+                .values()
+                .find(|record| record.job_id.0 == "build")
+                .cloned()
+                .expect("build request");
+            inner
+                .session_active_requests
+                .insert("sess-pg".to_owned(), request.request_id);
+            inner
+                .inflight_messages
+                .entry("sess-pg".to_owned())
+                .or_default()
+                .insert(
+                    99,
+                    azdo::TaskAgentMessage {
+                        message_id: 99,
+                        message_type: "PipelineAgentJobRequest".to_owned(),
+                        body: "e30=".to_owned(),
+                        iv: None,
+                    },
+                );
+            inner
+                .broker_messages
+                .insert(request.request_id, claimed.message.clone());
+            (
+                claimed.job_id.clone(),
+                JobId("test".to_owned()),
+                request.request_id,
+            )
+        };
+        state
+            .emit(NdjsonEvent::JobStatus {
+                run_id,
+                job_id: other_job.clone(),
+                status: ExecutionStatus::InProgress,
+                reason: None,
+            })
+            .await;
+        (claimed_job, other_job, request_id)
+    };
+
+    let recovered = AppState::new_with_store(temp.path().to_path_buf(), config_path, Some(&pg_url))
+        .await
+        .unwrap();
+    let inner = recovered.inner.lock().await;
+    assert!(
+        inner
+            .inflight_messages
+            .get("sess-pg")
+            .and_then(|messages| messages.get(&99))
+            .is_some(),
+        "undelivered broker message must survive a store_run_event restart (PG)"
+    );
+    assert!(
+        inner.broker_messages.contains_key(&request_id),
+        "per-request job message must survive a store_run_event restart (PG)"
+    );
+    assert_eq!(
+        inner.session_active_requests.get("sess-pg"),
+        Some(&request_id),
+        "session claim must survive a store_run_event restart (PG)"
+    );
+    assert!(
+        inner.queue.iter().any(|job| job.job_id == other_job)
+            && !inner.queue.iter().any(|job| job.job_id == claimed_job),
+        "claimed job stays dequeued; the unclaimed job stays queued (PG)"
     );
 }
