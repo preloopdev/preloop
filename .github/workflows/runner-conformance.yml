@@ -19,6 +19,13 @@ jobs:
     runs-on: self-hosted
     timeout-minutes: 10
     steps:
+      - name: Ensure git-lfs for LFS-tracked goldens
+        run: |
+          if ! command -v git-lfs >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq git-lfs
+          fi
+          git lfs install --skip-repo >/dev/null 2>&1 || true
       - uses: actions/checkout@v4
         with:
           lfs: true
@@ -51,6 +58,13 @@ jobs:
       HOST_WORKSPACE: ${{ vars.RUNNER_CONFORMANCE_HOST_WORKSPACE || '' }}
       AKSH_RUNNER_HOST: ${{ github.workspace }}/target/aarch64-unknown-linux-musl/release/preloop-runner
     steps:
+      - name: Ensure git-lfs for LFS-tracked goldens
+        run: |
+          if ! command -v git-lfs >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq git-lfs
+          fi
+          git lfs install --skip-repo >/dev/null 2>&1 || true
       - uses: actions/checkout@v4
         with:
           lfs: true
