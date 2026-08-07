@@ -46,6 +46,13 @@ jobs:
       
       CARGO_BUILD_JOBS: "2"
     steps:
+      - name: Ensure git-lfs for LFS-tracked goldens
+        run: |
+          if ! command -v git-lfs >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq git-lfs
+          fi
+          git lfs install --skip-repo >/dev/null 2>&1 || true
       - uses: actions/checkout@v4
         with:
           lfs: true
@@ -74,6 +81,13 @@ jobs:
     timeout-minutes: 30
     if: github.event_name != 'schedule'
     steps:
+      - name: Ensure git-lfs for LFS-tracked goldens
+        run: |
+          if ! command -v git-lfs >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq git-lfs
+          fi
+          git lfs install --skip-repo >/dev/null 2>&1 || true
       - uses: actions/checkout@v4
         with:
           lfs: true
@@ -181,6 +195,13 @@ jobs:
     timeout-minutes: 120
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.profile == 'intensive')
     steps:
+      - name: Ensure git-lfs for LFS-tracked goldens
+        run: |
+          if ! command -v git-lfs >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq git-lfs
+          fi
+          git lfs install --skip-repo >/dev/null 2>&1 || true
       - uses: actions/checkout@v4
         with:
           lfs: true
@@ -288,6 +309,13 @@ jobs:
     # still caught at merge time via the push-triggered run.
     if: github.event_name != 'pull_request'
     steps:
+      - name: Ensure git-lfs for LFS-tracked goldens
+        run: |
+          if ! command -v git-lfs >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq git-lfs
+          fi
+          git lfs install --skip-repo >/dev/null 2>&1 || true
       - uses: actions/checkout@v4
         with:
           lfs: true
