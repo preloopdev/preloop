@@ -142,6 +142,21 @@ impl<'de> Deserialize<'de> for SecretString {
 /// Redaction-safe map of secret names to values.
 pub type SecretMap = BTreeMap<String, SecretString>;
 
+/// Push-back requested for a run: after the run reaches a terminal state the
+/// tested commit is pushed to GitHub and the server creates or updates the
+/// pull request and reports check runs. The push itself is performed by the
+/// submitting client (its own git credentials); this record only carries the
+/// user's intent so the server can gate check reporting and the sync
+/// endpoint on it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncRequest {
+    /// Create a pull request when the branch has no open PR yet.
+    pub create_pr: bool,
+    /// Create newly-created pull requests as drafts so reviewers are not
+    /// notified until the author marks them ready.
+    pub draft_pr: bool,
+}
+
 /// Complete workflow request submitted to the control plane.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WorkflowSubmission {
@@ -243,6 +258,16 @@ pub struct WorkflowSubmission {
     /// Keep the failed job VM alive for interactive debugging.
     #[serde(default)]
     pub preserve_on_failure: bool,
+    /// Push-back requested after the run completes. Absent means the run is
+    /// a plain local submission with no GitHub interaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<SyncRequest>,
+    /// `git rev-parse HEAD^{tree}` of the tree the workspace snapshot was
+    /// taken from. The sync endpoint refuses to report checks unless the
+    /// pushed commit's tree matches this, so a run can never vouch for a
+    /// commit it did not test.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_tree: Option<String>,
 }
 
 impl WorkflowSubmission {

@@ -14,6 +14,7 @@ mod errors;
 pub mod events;
 pub mod github;
 pub mod github_app;
+mod github_sync;
 pub mod scheduler;
 mod shared_http;
 pub use errors::ApiError;

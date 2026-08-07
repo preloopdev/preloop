@@ -123,7 +123,18 @@ fn decode_hex(hex: &str) -> Result<Vec<u8>, &'static str> {
     Ok(bytes)
 }
 
-async fn resolve_check_run_token(shared: &Arc<SharedState>, repo: &str) -> Option<String> {
+pub(crate) fn github_api_base() -> String {
+    std::env::var("AKSH_GITHUB_API_URL")
+        .ok()
+        .map(|base| base.trim_end_matches('/').to_owned())
+        .filter(|base| !base.is_empty())
+        .unwrap_or_else(|| "https://api.github.com".to_owned())
+}
+
+pub(crate) async fn resolve_check_run_token(
+    shared: &Arc<SharedState>,
+    repo: &str,
+) -> Option<String> {
     if let Some(app_creds) = &shared.state.github_app {
         let mut permissions = std::collections::BTreeMap::new();
         permissions.insert("checks".to_owned(), "write".to_owned());
@@ -143,7 +154,7 @@ async fn send_github_check_request(
     body: Value,
 ) -> anyhow::Result<Value> {
     let client = crate::shared_http::CLIENT.clone();
-    let url = format!("https://api.github.com/repos/{}/{}", repo, path);
+    let url = format!("{}/repos/{}/{}", github_api_base(), repo, path);
     let res = client
         .request(method, &url)
         .header("User-Agent", "aksh")
@@ -167,7 +178,7 @@ async fn send_github_check_request(
     Ok(val)
 }
 
-fn run_details_url(run_id: RunId) -> Option<String> {
+pub(crate) fn run_details_url(run_id: RunId) -> Option<String> {
     std::env::var("AKSH_PUBLIC_URL")
         .ok()
         .map(|base| format!("{}/runs/{run_id}", base.trim_end_matches('/')))
@@ -991,6 +1002,8 @@ async fn process_github_webhook(
                 selected_jobs: vec![],
                 base_ref: None,
                 preserve_on_failure: false,
+                sync: None,
+                sync_tree: None,
             };
 
             // Call submit_run_inner — it performs the authoritative trigger match.
@@ -1065,7 +1078,7 @@ pub(crate) async fn github_register(headers: HeaderMap) -> impl IntoResponse {
             "checks": "write",
             "contents": "read",
             "metadata": "read",
-            "pull_requests": "read"
+            "pull_requests": "write"
     }
     });
 
