@@ -10,9 +10,9 @@
 //! environment. The toolkit's `OidcClient.getIDToken()` hits this endpoint
 //! and reads `{"value":"<jwt>"}`.
 
-use preloop_gha_protocol::crypto::{sign_jwt_rs256_with_key, AgentRsaKeypair, RsaParametersExport};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use preloop_gha_protocol::crypto::{sign_jwt_rs256_with_key, AgentRsaKeypair, RsaParametersExport};
 use rcgen::{CertificateParams, DnType, KeyPair, KeyUsagePurpose};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};

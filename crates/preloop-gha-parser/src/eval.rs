@@ -11,8 +11,8 @@
 use std::collections::BTreeMap;
 
 use crate::models::{EnvValue, JobContinueOnError, ParserError, RunsOn, Workflow};
-use preloop_gha_expressions::{eval_expression, Context};
 use indexmap::IndexMap;
+use preloop_gha_expressions::{eval_expression, Context};
 use serde_json::{Map, Value};
 
 /// Resolve all `${{ }}` expressions in a string using the given context.

@@ -782,7 +782,8 @@ pub(crate) async fn submit_run_inner(
         // Evaluate condition for root jobs (no needs) outside the lock.
         let mut skipped = false;
         if job.needs.is_empty() {
-            let condition = preloop_gha_expressions::effective_condition(job.if_condition.as_deref());
+            let condition =
+                preloop_gha_expressions::effective_condition(job.if_condition.as_deref());
             let should_run = preloop_gha_expressions::eval_bool(&condition, &condition_context)
                 .map_err(|error| {
                     ApiError::bad_request(format!(

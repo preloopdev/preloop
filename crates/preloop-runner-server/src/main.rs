@@ -3,8 +3,8 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use preloop_runner_server::{serve, ServerConfig, TlsMode};
 use clap::{Parser, Subcommand};
+use preloop_runner_server::{serve, ServerConfig, TlsMode};
 
 #[derive(Debug, Parser)]
 #[command(name = "preloop-server")]

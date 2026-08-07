@@ -22,7 +22,9 @@ async fn main() -> Result<()> {
         .init();
 
     match cli.command {
-        Commands::Configure(args) => preloop_runner::configure::run_configure(args, &cli.global).await,
+        Commands::Configure(args) => {
+            preloop_runner::configure::run_configure(args, &cli.global).await
+        }
         Commands::Remove(args) => preloop_runner::configure::run_remove(args, &cli.global).await,
         Commands::Run(args) => preloop_runner::listener::run_listener(args, &cli.global).await,
         Commands::Worker(args) => preloop_runner::worker::run_worker(args).await,
@@ -37,9 +39,10 @@ async fn main() -> Result<()> {
             let reusable_workflows =
                 resolve_remote_workflows(reusable_workflows, &workflow_yaml).await?;
             let expanded =
-                preloop_gha_parser::expand_jobs_with_reusables(&parsed, &reusable_workflows).map_err(
-                    |e| anyhow::anyhow!("expand workflow {}: {e}", args.workflow.display()),
-                )?;
+                preloop_gha_parser::expand_jobs_with_reusables(&parsed, &reusable_workflows)
+                    .map_err(|e| {
+                        anyhow::anyhow!("expand workflow {}: {e}", args.workflow.display())
+                    })?;
 
             let step_count: usize = expanded.jobs.iter().map(|j| j.steps.len()).sum();
             println!(

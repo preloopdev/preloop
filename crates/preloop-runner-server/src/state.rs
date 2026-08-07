@@ -504,8 +504,8 @@ impl AppState {
         let (keypair_result, oidc_result) = tokio::join!(keypair_handle, oidc_handle);
         let keypair = keypair_result??;
         let oidc_keypair = oidc_result??;
-        let system_token =
-            env::var("PRELOOP_SYSTEM_TOKEN").unwrap_or_else(|_| DEFAULT_PRELOOP_SYSTEM_TOKEN.to_owned());
+        let system_token = env::var("PRELOOP_SYSTEM_TOKEN")
+            .unwrap_or_else(|_| DEFAULT_PRELOOP_SYSTEM_TOKEN.to_owned());
         #[cfg(test)]
         let local_jwt_key = TEST_LOCAL_JWT_KEY.to_vec();
         #[cfg(not(test))]

@@ -4,9 +4,9 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use indexmap::IndexMap;
 use preloop_gha_expressions::{eval_expression, Context};
 use preloop_gha_protocol::{JobId, JobPlan, ReusableCallPlan, StepPlan};
-use indexmap::IndexMap;
 use serde_json::Value;
 
 use crate::{

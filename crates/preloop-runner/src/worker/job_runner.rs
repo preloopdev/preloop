@@ -478,7 +478,10 @@ pub async fn run_job(
             ));
         } else {
             // Register the bound local port with the server
-            if let Some(run_id_str) = job_message.get("preloopDebugRunId").and_then(|v| v.as_str()) {
+            if let Some(run_id_str) = job_message
+                .get("preloopDebugRunId")
+                .and_then(|v| v.as_str())
+            {
                 if let Some((svc_url, token)) = extract_service_endpoint(&job_message) {
                     let port = dbg.local_port().unwrap_or(preloop_dap::DAP_TUNNEL_PORT);
                     let url = format!("{svc_url}/api/v1/runs/{run_id_str}/debug");

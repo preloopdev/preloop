@@ -178,7 +178,8 @@ fn dependency_decision(state: &SchedulerState, job: &SchedJob) -> DependencyDeci
     let failure = aggregate == ExecutionStatus::Failure;
     let cancelled = aggregate == ExecutionStatus::Cancelled;
     let condition = preloop_gha_expressions::effective_condition(job.if_condition.as_deref());
-    let context = preloop_gha_expressions::Context::default().with_status(success, failure, cancelled);
+    let context =
+        preloop_gha_expressions::Context::default().with_status(success, failure, cancelled);
     match preloop_gha_expressions::eval_bool(&condition, &context) {
         Ok(true) => DependencyDecision::Run,
         Ok(false) => DependencyDecision::Skip,

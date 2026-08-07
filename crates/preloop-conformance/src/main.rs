@@ -3,9 +3,9 @@
 use std::path::PathBuf;
 use std::process::Stdio;
 
-use preloop_gha_parser::{expand_jobs, parse_workflow};
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
+use preloop_gha_parser::{expand_jobs, parse_workflow};
 use tokio::process::Command;
 use walkdir::WalkDir;
 
@@ -188,7 +188,11 @@ fn looks_like_workflow(text: &str) -> bool {
     })
 }
 
-async fn compare_command(upstream: String, preloop: String, args: Vec<String>) -> anyhow::Result<()> {
+async fn compare_command(
+    upstream: String,
+    preloop: String,
+    args: Vec<String>,
+) -> anyhow::Result<()> {
     let upstream_output = Command::new(&upstream)
         .args(&args)
         .stdout(Stdio::piped())

@@ -14,8 +14,8 @@
 //! of the server sees, so a new database plugs in without touching callers.
 
 use super::*;
-use preloop_gha_protocol::SessionId;
 use async_trait::async_trait;
+use preloop_gha_protocol::SessionId;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use sha2::Digest;
 use std::sync::Mutex as StdMutex;

@@ -2831,7 +2831,8 @@ fn write_conformance_summary(
     lines.push("## Replay methodology and known gaps".to_string());
     lines.push(String::new());
     lines.push(
-        "The conformance gate replays official golden flows through preloop and compares".to_string(),
+        "The conformance gate replays official golden flows through preloop and compares"
+            .to_string(),
     );
     lines.push(
         "HTTP status codes. Several categories of flow are intentionally excluded or".to_string(),
@@ -2927,7 +2928,8 @@ fn write_conformance_summary(
     lines.push("### How Wire Compliance is Checked".to_string());
     lines.push(String::new());
     lines.push(
-        "The conformance checker compares the local `preloop` server against the official".to_string(),
+        "The conformance checker compares the local `preloop` server against the official"
+            .to_string(),
     );
     lines.push("recorded golden baseline. For each non-skipped flow, it compares:".to_string());
     lines.push(String::new());

@@ -6,9 +6,9 @@
 //! store the server injects into trusted jobs.
 
 use crate::preloop_home;
-use preloop_runner_server::config::{load_config, store_memory, write_config};
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use preloop_runner_server::config::{load_config, store_memory, write_config};
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -195,6 +195,7 @@ async fn cmd_setup_github(args: GithubSetupArgs) -> anyhow::Result<()> {
                  \x20 1. github.com/settings/apps/new — name it (e.g. `dummy-preloop-app`),\n\
                  \x20    disable webhook, permissions: Contents: Read-only and\n\
                  \x20    Pull requests: Read-only (if your workflows read PRs).\n\
+                 \x20    Upload the repo-root logo.png as the App avatar.\n\
                  \x20 2. Generate a private key — save the PEM.\n\
                  \x20 3. Install the App on your repositories:\n\
                  \x20    https://github.com/apps/<slug>/installations/new\n\

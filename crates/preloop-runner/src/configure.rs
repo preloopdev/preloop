@@ -554,7 +554,9 @@ async fn create_agent(
 }
 
 /// Export keypair to RsaParameters + XML public key.
-fn export_keypair(keypair: &preloop_gha_protocol::crypto::AgentRsaKeypair) -> (RsaParameters, String) {
+fn export_keypair(
+    keypair: &preloop_gha_protocol::crypto::AgentRsaKeypair,
+) -> (RsaParameters, String) {
     let export = keypair.to_rsaparams();
     let xml = keypair.public_key_xml();
     let rsa_params = RsaParameters {

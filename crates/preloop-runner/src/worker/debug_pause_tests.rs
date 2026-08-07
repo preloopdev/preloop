@@ -8,11 +8,11 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
-use preloop_gha_protocol::debug_session::{FailedStep, Verdict};
-use preloop_gha_protocol::{JobId, RunId};
 use axum::extract::State;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use preloop_gha_protocol::debug_session::{FailedStep, Verdict};
+use preloop_gha_protocol::{JobId, RunId};
 use serde_json::{json, Value};
 
 use super::debug_pause::DebugPauseClient;

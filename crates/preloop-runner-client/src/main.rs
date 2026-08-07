@@ -4,10 +4,10 @@ use std::collections::BTreeMap;
 use std::env;
 use std::path::PathBuf;
 
-use preloop_gha_protocol::RunId;
 use anyhow::Context;
 use base64::Engine;
 use clap::{Parser, Subcommand};
+use preloop_gha_protocol::RunId;
 use reqwest::Url;
 use serde_json::Value;
 

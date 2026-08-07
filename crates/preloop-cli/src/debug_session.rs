@@ -17,10 +17,10 @@
 
 use std::io::{IsTerminal, Write};
 
+use anyhow::{Context, Result};
 use preloop_gha_protocol::debug_session::{
     ChangeCategory, DebugSession, RevertPolicy, Verdict, VerdictRequest, WorkspaceChange,
 };
-use anyhow::{Context, Result};
 
 /// `preloop debug [session]`.
 #[derive(clap::Args, Debug)]

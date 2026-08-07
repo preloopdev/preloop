@@ -295,9 +295,11 @@ fn build_expression_context_exposes_runner_workspace_on_github_context() {
     );
     ctx.workspace = Some("/runner/_work/repo/repo".into());
 
-    let value =
-        preloop_gha_expressions::eval_expression("github.workspace", &ctx.build_expression_context())
-            .unwrap();
+    let value = preloop_gha_expressions::eval_expression(
+        "github.workspace",
+        &ctx.build_expression_context(),
+    )
+    .unwrap();
     assert_eq!(value.as_str(), Some("/runner/_work/repo/repo"));
 }
 

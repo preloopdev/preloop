@@ -853,7 +853,8 @@ async fn bench_snapshots(cfg: BenchConfig) -> Result<()> {
             let mut state_with_ws = state.clone();
             state_with_ws.local_workspace = Some(ws_path.clone());
             let shutdown = CancellationToken::new();
-            let app = preloop_runner_server::app_with_test_api(state_with_ws, shutdown, "test-token");
+            let app =
+                preloop_runner_server::app_with_test_api(state_with_ws, shutdown, "test-token");
 
             for iteration in 0..(1 + SNAPSHOT_WARM_REPEATS) {
                 let start = Instant::now();

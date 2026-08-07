@@ -201,7 +201,8 @@ mod tests {
 
     #[test]
     fn parse_run_azdo() {
-        let cli = Cli::try_parse_from(["preloop-runner", "run", "--via", "azdo", "--once"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["preloop-runner", "run", "--via", "azdo", "--once"]).unwrap();
         match &cli.command {
             Commands::Run(args) => {
                 assert!(args.once);

@@ -278,7 +278,8 @@ pub(crate) fn load_from(
     // Parsed before the not-configured early return so a typo is a startup
     // error rather than a surprise the first time a mint fails in production.
     let mint_failure = MintFailurePolicy::from_env_or_config(&file_config.github)?;
-    let app_id = env_non_empty("PRELOOP_GITHUB_APP_ID").or_else(|| file_config.github.app_id.clone());
+    let app_id =
+        env_non_empty("PRELOOP_GITHUB_APP_ID").or_else(|| file_config.github.app_id.clone());
     let key_source = PRIVATE_KEY_ENV
         .iter()
         .find_map(|&(name, is_path)| env_non_empty(name).map(|value| (name, is_path, value)))

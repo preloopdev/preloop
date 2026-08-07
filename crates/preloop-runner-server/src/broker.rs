@@ -660,7 +660,9 @@ pub(crate) async fn broker_acquire_job(
             .context_data
             .get("github")
             .and_then(|github| match github {
-                preloop_gha_protocol::azdo::PipelineContextData::Dict(dict) => dict.get("repository"),
+                preloop_gha_protocol::azdo::PipelineContextData::Dict(dict) => {
+                    dict.get("repository")
+                }
                 _ => None,
             })
             .and_then(|repository| match repository {

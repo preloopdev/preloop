@@ -1,6 +1,6 @@
-use preloop_gha_protocol::azdo::AgentJobRequestMessage;
 use axum::body::{to_bytes, Body};
 use axum::http::{Method, Request, StatusCode};
+use preloop_gha_protocol::azdo::AgentJobRequestMessage;
 use serde_json::Value;
 use sha1::{Digest, Sha1};
 use std::collections::{BTreeMap, BTreeSet};
@@ -5842,7 +5842,10 @@ async fn try_req(app: &Router, method: Method, uri: &str, body: Value) -> (Statu
     } else if uri.starts_with("/internal/test/") {
         builder = builder.header(header::AUTHORIZATION, format!("Bearer {TEST_API_TOKEN}"));
     } else if uri.starts_with("/api/v3/actions/runner-registration") {
-        builder = builder.header(header::AUTHORIZATION, "RemoteAuth preloop-registration-token");
+        builder = builder.header(
+            header::AUTHORIZATION,
+            "RemoteAuth preloop-registration-token",
+        );
     }
     let request = if body.is_null() {
         builder.body(Body::empty()).unwrap()
@@ -5885,7 +5888,10 @@ async fn request_json(app: &Router, method: Method, uri: &str, body: Value) -> V
     } else if uri.starts_with("/internal/test/") {
         builder = builder.header(header::AUTHORIZATION, format!("Bearer {TEST_API_TOKEN}"));
     } else if uri.starts_with("/api/v3/actions/runner-registration") {
-        builder = builder.header(header::AUTHORIZATION, "RemoteAuth preloop-registration-token");
+        builder = builder.header(
+            header::AUTHORIZATION,
+            "RemoteAuth preloop-registration-token",
+        );
     }
     let request = if body.is_null() {
         builder.body(Body::empty()).unwrap()
@@ -7562,7 +7568,10 @@ async fn github_app_manifest_registration_flow() {
     // 2. Configure mock API URL in environment
     // Held for the whole test: `PRELOOP_GITHUB_API_URL` is process-global.
     let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    std::env::set_var("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{}", port));
+    std::env::set_var(
+        "PRELOOP_GITHUB_API_URL",
+        format!("http://127.0.0.1:{}", port),
+    );
 
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
@@ -13713,7 +13722,10 @@ async fn control_socket_surface_denies_native_and_test_apis() {
                 Request::builder()
                     .method(Method::POST)
                     .uri(v3)
-                    .header(header::AUTHORIZATION, "RemoteAuth preloop-registration-token")
+                    .header(
+                        header::AUTHORIZATION,
+                        "RemoteAuth preloop-registration-token",
+                    )
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(r#"{"url":"https://github.com/acme/repo"}"#))
                     .unwrap(),
@@ -13732,7 +13744,10 @@ async fn control_socket_surface_denies_native_and_test_apis() {
             Request::builder()
                 .method(Method::POST)
                 .uri("/api/v3/actions/runner-registration")
-                .header(header::AUTHORIZATION, "RemoteAuth preloop-registration-token")
+                .header(
+                    header::AUTHORIZATION,
+                    "RemoteAuth preloop-registration-token",
+                )
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"url":"https://github.com/acme/repo"}"#))
                 .unwrap(),
@@ -15128,7 +15143,8 @@ fn server_config_debug_redacts_store_url_password() {
         unix_socket: None,
         state_dir: std::path::PathBuf::from(".preloop"),
         store_url: Some(
-            "postgres://preloop:hunter2-secret@db.example:5432/preloop?sslmode=verify-full".to_owned(),
+            "postgres://preloop:hunter2-secret@db.example:5432/preloop?sslmode=verify-full"
+                .to_owned(),
         ),
         record_flows: None,
         tls: TlsMode::None,

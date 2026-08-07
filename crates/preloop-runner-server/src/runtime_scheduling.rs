@@ -1840,7 +1840,10 @@ fn build_jobs<F>(
     condition_context: F,
 ) -> Result<Vec<BuiltJob>, ExecutionStatus>
 where
-    F: Fn(&preloop_gha_protocol::JobPlan, &BTreeMap<String, String>) -> preloop_gha_expressions::Context,
+    F: Fn(
+        &preloop_gha_protocol::JobPlan,
+        &BTreeMap<String, String>,
+    ) -> preloop_gha_expressions::Context,
 {
     let base_url = runner_base_url();
     let normalized_github =

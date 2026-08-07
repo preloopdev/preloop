@@ -1,10 +1,10 @@
 //! Preloop CI command-line interface.
 
-use preloop_gha_protocol::{ExecutionStatus, NdjsonEvent, RunAccepted, WorkflowSubmission};
 use anyhow::Context;
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
+use preloop_gha_protocol::{ExecutionStatus, NdjsonEvent, RunAccepted, WorkflowSubmission};
 use preloop_orchestrator::environment::DEFAULT_BASE_IMAGE;
 use preloop_orchestrator::{RunnerPool, RunnerPoolConfig};
 use preloop_vm::SmolVmProvider;

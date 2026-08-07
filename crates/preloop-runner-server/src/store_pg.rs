@@ -14,9 +14,9 @@
 //! `sslmode=disable` stay plaintext for loopback databases.
 
 use super::*;
-use preloop_gha_protocol::SessionId;
 use async_trait::async_trait;
 use postgres_rustls::MakeTlsConnector;
+use preloop_gha_protocol::SessionId;
 use std::future::Future;
 use tokio_postgres::{connect, Client, NoTls};
 

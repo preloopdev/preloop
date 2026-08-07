@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 
 use crate::expand::coerce_value;
-use preloop_gha_protocol::{JobId, JobPlan};
 use indexmap::IndexMap;
+use preloop_gha_protocol::{JobId, JobPlan};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

@@ -852,7 +852,8 @@ fn extract_session_key_if_present(
         .unwrap_or(false);
     if encrypted {
         let keypair =
-            preloop_gha_protocol::crypto::AgentRsaKeypair::from_rsaparams(&config.rsa_params).ok()?;
+            preloop_gha_protocol::crypto::AgentRsaKeypair::from_rsaparams(&config.rsa_params)
+                .ok()?;
         let hash = if use_fips_encryption {
             preloop_gha_protocol::crypto::RsaOaepHash::Sha256
         } else {
