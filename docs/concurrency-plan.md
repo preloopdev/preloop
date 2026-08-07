@@ -331,7 +331,7 @@ Everything here is **additive on aksh-native surfaces only** (invariant 4): CLI 
 Single control-plane node; scale = many runners (Mac fleet / smolvm VMs). No multi-node
 control plane — runners are the horizontal axis.
 
-1. **Persistence** — new `crates/aksh-runner-server/src/persist.rs`, `rusqlite` (WAL) at
+1. **Persistence** — new `crates/aksh-runner-server/src/store.rs`, `rusqlite` (WAL) at
    `<state-dir>/aksh.sqlite`, enabled by `serve --persist` (default off; local mode stays
    pure in-memory). Write-through on state transitions only (submit, status change, group
    acquire/release, pending queue mutation); tables: `runs`, `jobs`,

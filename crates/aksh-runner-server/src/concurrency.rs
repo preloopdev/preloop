@@ -9,6 +9,7 @@ use aksh_gha_expressions::{eval_bool, Context};
 use aksh_gha_parser::eval::{build_context, resolve_string};
 use aksh_gha_parser::{Concurrency, ConcurrencyQueue};
 use aksh_gha_protocol::{azdo, ExecutionStatus, JobId, RunId};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::warn;
 
@@ -16,7 +17,7 @@ use tracing::warn;
 pub const CANCEL_TIMEOUT: &str = "00:05:00";
 
 /// A concurrency-group holder (workflow run, single job, or reusable JobSet).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Holder {
     /// Workflow-level concurrency covers an entire run.
     Run(RunId),
@@ -65,7 +66,7 @@ impl Holder {
 }
 
 /// One concurrency group (repo + group name, case-insensitive key).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ConcurrencyGroup {
     /// Display-case group name as first evaluated.
     pub display_name: String,
