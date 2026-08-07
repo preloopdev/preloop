@@ -1,0 +1,5 @@
+# cargo-audit configuration. Mirrors the accepts in deny.toml — keep the two
+# in sync. See RUSTSEC-2023-0071 for the rationale (no fixed release; signing
+# is local-only and timing is not observable).
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]
