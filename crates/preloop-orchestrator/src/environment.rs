@@ -81,6 +81,17 @@ pub enum ToolchainLayer {
     Go(String),
 }
 
+impl std::fmt::Display for ToolchainLayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Node(version) => write!(f, "node {version}"),
+            Self::Rust(channel) => write!(f, "rust {channel}"),
+            Self::Python(version) => write!(f, "python {version}"),
+            Self::Go(version) => write!(f, "go {version}"),
+        }
+    }
+}
+
 impl ToolchainLayer {
     /// Return shell commands to install this toolchain in a SmolVM.
     ///
@@ -96,7 +107,12 @@ impl ToolchainLayer {
                 // index at bake time (GitHub's setup-node resolves the same
                 // way, so this matches hosted behavior instead of floating
                 // with the apt archive).
-                let version = version.trim().trim_start_matches('v');
+                // The version is interpolated into a `sh -c` script, so it
+                // must be allowlisted (same `safe_component` the Rust and Go
+                // layers use): a workflow-controlled value carrying shell
+                // metacharacters would execute arbitrary commands in the
+                // provisioning VM.
+                let version = safe_component(version.trim().trim_start_matches('v'));
                 vec![
                     vec![
                         "sh".into(),
@@ -171,31 +187,56 @@ impl ToolchainLayer {
                     "python3-pip".into(),
                 ]]
             }
-            Self::Go(version) => vec![vec![
-                "sh".into(),
-                "-c".into(),
-                format!(
-                    // `go.mod` carries a minimum (`go 1.24`), not a tarball
-                    // version — resolve it against the go.dev release index
-                    // so `go1.24` becomes the newest 1.24.x and the install
-                    // is exact and reproducible.
-                    "set -e\n\
-                     WANT='{}'\n\
-                     VERSION=$(curl -fsSL 'https://go.dev/dl/?mode=json&include=all' | python3 -c '\n\
-                     import json, sys\n\
-                     want = sys.argv[1]\n\
-                     if not want.startswith(\"go\"):\n\
-                         want = \"go\" + want\n\
-                     idx = json.load(sys.stdin)\n\
-                     print(next((e[\"version\"] for e in idx if e[\"version\"] == want or e[\"version\"].startswith(want + \".\")), \"\"))\n\
-                     ' \"$WANT\")\n\
-                     [ -n \"$VERSION\" ] || {{ echo \"no go release matching $WANT\" >&2; exit 1; }}\n\
-                     arch=$(uname -m)\n\
-                     case \"$arch\" in aarch64) arch=arm64 ;; x86_64) arch=amd64 ;; esac\n\
-                     curl -fsSL \"https://go.dev/dl/$VERSION.linux-$arch.tar.gz\" | tar -C /usr/local -xzf -",
-                    safe_component(version)
-                ),
-            ]],
+            Self::Go(version) => vec![
+                vec![
+                    "sh".into(),
+                    "-c".into(),
+                    format!(
+                        // `go.mod` carries a minimum (`go 1.24`), not a tarball
+                        // version — resolve it against the go.dev release index
+                        // so `go1.24` becomes the newest 1.24.x and the install
+                        // is exact and reproducible.
+                        "set -e\n\
+                         WANT='{}'\n\
+                         VERSION=$(curl -fsSL 'https://go.dev/dl/?mode=json&include=all' | python3 -c '\n\
+                         import json, sys\n\
+                         want = sys.argv[1]\n\
+                         if not want.startswith(\"go\"):\n\
+                             want = \"go\" + want\n\
+                         idx = json.load(sys.stdin)\n\
+                         print(next((e[\"version\"] for e in idx if e[\"version\"] == want or e[\"version\"].startswith(want + \".\")), \"\"))\n\
+                         ' \"$WANT\")\n\
+                         [ -n \"$VERSION\" ] || {{ echo \"no go release matching $WANT\" >&2; exit 1; }}\n\
+                         arch=$(uname -m)\n\
+                         case \"$arch\" in aarch64) arch=arm64 ;; x86_64) arch=amd64 ;; esac\n\
+                         curl -fsSL \"https://go.dev/dl/$VERSION.linux-$arch.tar.gz\" | tar -C /usr/local -xzf -",
+                        safe_component(version)
+                    ),
+                ],
+                vec![
+                    "sh".into(),
+                    "-c".into(),
+                    // The Go tarball extracts to /usr/local/go/bin, which is
+                    // not on the default system PATH. Run steps execute with
+                    // `bash --noprofile --norc`, so profile.d PATH exports
+                    // are never sourced; symlink the binaries into
+                    // /usr/local/bin like the Rust layer does for cargo.
+                    "ln -sf /usr/local/go/bin/go /usr/local/bin/go; ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt".into(),
+                ],
+            ],
+        }
+    }
+
+    /// Binary that must exist on the default PATH once this layer is
+    /// installed. Verified after install so a provision interrupted mid-way
+    /// (or a toolchain that silently failed) fails the machine instead of
+    /// running the job without the tool it asked for.
+    pub fn verify_binary(&self) -> &'static str {
+        match self {
+            Self::Node(_) => "node",
+            Self::Rust(_) => "cargo",
+            Self::Python(_) => "python3",
+            Self::Go(_) => "go",
         }
     }
 }
@@ -529,6 +570,7 @@ mod tests {
             needs: Vec::new(),
             matrix: Default::default(),
             matrix_index: None,
+            matrix_total: None,
             deferred_matrix: None,
             env: BTreeMap::new(),
             steps,
@@ -665,6 +707,26 @@ mod tests {
     }
 
     #[test]
+    fn node_layer_version_rejects_shell_metacharacters() {
+        // A workflow-controlled `node-version` is interpolated into the
+        // `sh -c` provisioning script (`WANT=v{version}`, the case pattern,
+        // and the error message), so shell metacharacters would execute
+        // arbitrary commands inside the bake VM. The version must be
+        // allowlisted through the same `safe_component` used by the Rust and
+        // Go layers.
+        let payload = "22; touch /tmp/pwned; #";
+        let commands = ToolchainLayer::Node(payload.into()).install_commands();
+        let script = commands[0].join(" ");
+        // The raw payload must not survive into the script...
+        assert!(!script.contains("touch /tmp/pwned"));
+        assert!(!script.contains("22;"));
+        // ...and the sanitized version is still interpolated everywhere the
+        // original was (WANT, case, error message), never silently dropped.
+        assert!(script.contains("WANT=v22touch/tmp/pwned"));
+        assert!(script.contains("no node release matching 22touch/tmp/pwned"));
+    }
+
+    #[test]
     fn rust_layer_install_uses_pinned_rustup() {
         let commands = ToolchainLayer::Rust("stable".into()).install_commands();
         let script = commands[0].join(" ");
@@ -683,6 +745,20 @@ mod tests {
         assert!(script.contains("go.dev/dl/?mode=json"));
         assert!(script.contains("$VERSION.linux"));
         assert!(!script.contains("go1.24.linux")); // never a raw minimum
+    }
+
+    #[test]
+    fn go_layer_puts_binary_on_default_path() {
+        // The Go tarball extracts to /usr/local/go/bin, which is not on the
+        // default PATH of `bash --noprofile --norc` step shells (the same
+        // problem the Rust layer's symlinks solve), so `go`/`gofmt` would be
+        // unresolvable in job steps. The layer must link them into
+        // /usr/local/bin.
+        let commands = ToolchainLayer::Go("1.24".into()).install_commands();
+        assert_eq!(commands.len(), 2);
+        let script = commands[1].join(" ");
+        assert!(script.contains("ln -sf /usr/local/go/bin/go /usr/local/bin/go"));
+        assert!(script.contains("ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt"));
     }
 
     #[test]

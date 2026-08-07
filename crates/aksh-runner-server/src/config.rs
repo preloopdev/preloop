@@ -37,6 +37,21 @@ pub struct GitHubConfig {
     /// policy. Also the credential for the `--via pat` setup path.
     #[serde(default)]
     pub pat: Option<String>,
+    /// GitHub server URL exposed to workflows as `github.server_url` /
+    /// `GITHUB_SERVER_URL`. Defaults to `https://github.com`; point it at a
+    /// GHES-style host when the engine fronts one. Env: `AKSH_GITHUB_SERVER_URL`.
+    #[serde(default)]
+    pub server_url: Option<String>,
+    /// GitHub REST API base URL exposed as `github.api_url` /
+    /// `GITHUB_API_URL`. Defaults to `https://api.github.com`. Also used for
+    /// remote workflow/action fetches. Env: `AKSH_GITHUB_API_URL`.
+    #[serde(default)]
+    pub api_url: Option<String>,
+    /// GitHub GraphQL endpoint exposed as `github.graphql_url` /
+    /// `GITHUB_GRAPHQL_URL`. Defaults to `https://api.github.com/graphql`.
+    /// Env: `AKSH_GITHUB_GRAPHQL_URL`.
+    #[serde(default)]
+    pub graphql_url: Option<String>,
 }
 
 /// Renders as `<redacted>` / `None` without quoting, for credential fields.
@@ -227,6 +242,9 @@ mod tests {
                 ),
                 mint_failure: Some("pat".into()),
                 pat: Some("ghp_secret".into()),
+                server_url: None,
+                api_url: None,
+                graphql_url: None,
             },
             secrets: BTreeMap::from([("DOCKERHUB_TOKEN".into(), "abc123".into())]),
             repo_secrets: BTreeMap::from([(

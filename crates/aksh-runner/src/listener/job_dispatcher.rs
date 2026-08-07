@@ -12,7 +12,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Child;
 use tracing::{error, info, warn};
@@ -70,7 +70,23 @@ pub struct RunningJob {
 pub struct WorkerOutputCapture {
     lines: VecDeque<String>,
     bytes: usize,
+    /// Number of the worker's output streams that have reached EOF or a
+    /// read error (0–2). When both are done, `tail()` is final — no more
+    /// bytes can arrive.
+    streams_done: u8,
 }
+
+/// Marker the worker logs when its completejob POST is acknowledged. The
+/// listener relies on the worker's own report because completejob failures
+/// are non-fatal inside the worker (completion.rs logs and swallows them):
+/// the process exits 0 either way, so the exit status alone cannot
+/// distinguish an acknowledged completion from a failed one.
+const COMPLETION_ACKNOWLEDGED_MARKER: &str = "Job completion reported successfully";
+
+/// Marker the worker logs when the job message carries no reporting endpoint
+/// at all. The listener has the same endpoint, so there is nothing to
+/// force-complete either — the worker's exit is the best available signal.
+const NO_REPORTING_CHANNEL_MARKER: &str = "cannot report completion";
 
 impl WorkerOutputCapture {
     const MAX_BYTES: usize = 64 * 1024;
@@ -97,6 +113,33 @@ impl WorkerOutputCapture {
         }
         out
     }
+
+    /// Record that one of the worker's output streams ended (EOF or read
+    /// error), so the capture can be recognized as final.
+    fn mark_eof(&mut self) {
+        self.streams_done = self.streams_done.saturating_add(1);
+    }
+
+    /// Whether the worker's own output confirms its completejob POST was
+    /// acknowledged by the server.
+    pub fn completion_acknowledged(&self) -> bool {
+        self.tail().contains(COMPLETION_ACKNOWLEDGED_MARKER)
+    }
+
+    /// Whether the worker's own output records that its completion report
+    /// POST failed. The two strings are the broker and AzDO failure lines
+    /// from completion.rs.
+    pub fn completion_rejected(&self) -> bool {
+        let tail = self.tail();
+        tail.contains("completejob POST failed") || tail.contains("FinishJob POST failed")
+    }
+
+    /// Whether the worker had no reporting channel at all (no
+    /// SystemVssConnection endpoint), so neither the worker nor the listener
+    /// can complete the job request.
+    pub fn completion_impossible(&self) -> bool {
+        self.tail().contains(NO_REPORTING_CHANNEL_MARKER)
+    }
 }
 
 /// Read a worker output stream, forwarding every line to the listener's own
@@ -114,36 +157,77 @@ fn forward_worker_stream(
 ) {
     tokio::spawn(async move {
         let mut reader = tokio::io::BufReader::new(stream);
-        let mut buf = Vec::new();
+        // Bounded accumulation of the current partial line for the crash
+        // capture. A worker that never emits a newline must not grow the
+        // listener's memory without limit — the previous read_until(b'\n')
+        // into a growing Vec held the whole unterminated line (arbitrarily
+        // large allocation → runner OOM). Only the trailing MAX_BYTES of
+        // any line are retained, matching the WorkerOutputCapture contract;
+        // the full line is still forwarded verbatim, chunk by chunk, as it
+        // is read.
+        let mut pending: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
         loop {
-            buf.clear();
-            match reader.read_until(b'\n', &mut buf).await {
+            match reader.read(&mut chunk).await {
                 Ok(0) => break,
-                Ok(_) => {}
+                Ok(n) => {
+                    // Forward the raw bytes exactly as read (the
+                    // inherited-descriptor behavior this pipe replaces).
+                    let _ = if to_stderr {
+                        tokio::io::stderr().write_all(&chunk[..n]).await
+                    } else {
+                        tokio::io::stdout().write_all(&chunk[..n]).await
+                    };
+                    // Split the chunk into logical lines, retaining only the
+                    // bounded tail of any line for the capture.
+                    let mut start = 0;
+                    for (i, &byte) in chunk[..n].iter().enumerate() {
+                        if byte == b'\n' {
+                            pending.extend_from_slice(&chunk[start..i]);
+                            start = i + 1;
+                            let mut line = std::mem::take(&mut pending);
+                            // Strip the line terminator and a single trailing
+                            // CR, matching the previous read_until behavior.
+                            if line.last() == Some(&b'\r') {
+                                line.pop();
+                            }
+                            capture
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push(String::from_utf8_lossy(&line).into_owned());
+                        }
+                    }
+                    pending.extend_from_slice(&chunk[start..n]);
+                    // Keep only the final ~64 KiB of the unterminated line —
+                    // the capture is the crash detail, not a transcript.
+                    // The budget is MAX_BYTES with a +1 per-line accounting
+                    // overhead in `push`, so a line of exactly MAX_BYTES
+                    // would be evicted again; cap one byte under it.
+                    let line_cap = WorkerOutputCapture::MAX_BYTES - 1;
+                    if pending.len() > line_cap {
+                        let excess = pending.len() - line_cap;
+                        pending.drain(..excess);
+                    }
+                }
                 Err(e) => {
                     warn!("worker output read failed: {e}");
                     break;
                 }
             }
-            // Capture the logical line without its terminator; the official
-            // `workerOutput` list holds lines, and `tail()` re-joins them.
-            let mut line = buf.as_slice();
-            if let [rest @ .., b'\n'] = line {
-                line = rest;
-            }
-            if let [rest @ .., b'\r'] = line {
-                line = rest;
+        }
+        // EOF: flush any trailing unterminated line, matching read_until's
+        // delivery of the final partial line.
+        if !pending.is_empty() {
+            let mut line = std::mem::take(&mut pending);
+            if line.last() == Some(&b'\r') {
+                line.pop();
             }
             capture
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .push(String::from_utf8_lossy(line).into_owned());
-            let _ = if to_stderr {
-                tokio::io::stderr().write_all(&buf).await
-            } else {
-                tokio::io::stdout().write_all(&buf).await
-            };
+                .push(String::from_utf8_lossy(&line).into_owned());
         }
+        capture.lock().unwrap_or_else(|e| e.into_inner()).mark_eof();
     });
 }
 
@@ -263,9 +347,10 @@ impl RunningJob {
     /// only hard-kill if the worker ignores the message.
     ///
     /// Returns `Some(success)` when the worker exited on its own (success =
-    /// the worker reported a normal completion, so the job concluded
-    /// cleanly), or `None` when the grace expired and the worker had to be
-    /// killed.
+    /// the worker's completejob POST was acknowledged, so the job concluded
+    /// cleanly), `Some(false)` when the worker reported a failure or exited
+    /// without a confirmed completion, or `None` when the grace expired and
+    /// the worker had to be killed.
     pub async fn shutdown_gracefully(&mut self, grace: Duration) -> Option<bool> {
         if !self.cancel_sent {
             self.cancel_sent = true;
@@ -281,7 +366,28 @@ impl RunningJob {
         // A cancel was already delivered, or just now — the worker cancels
         // the job and exits. Wait for it within the grace before killing.
         match tokio::time::timeout(grace, self.wait()).await {
-            Ok(result) => result.ok(),
+            Ok(result) => match result {
+                Ok(success) => {
+                    // A successful process exit is only a clean completion
+                    // when the worker's completejob POST was acknowledged:
+                    // the worker treats a failed report as non-fatal and
+                    // still exits 0, so a bare exit would leave the job
+                    // active server-side forever.
+                    if success && !self.confirm_completion().await {
+                        warn!(
+                            "Worker {} exited successfully but its completion was not acknowledged — treating as failed",
+                            self.request_id
+                        );
+                        Some(false)
+                    } else {
+                        Some(success)
+                    }
+                }
+                Err(error) => {
+                    warn!("Worker {} shutdown wait failed: {error:#}", self.request_id);
+                    None
+                }
+            },
             Err(_) => {
                 warn!(
                     "Worker {} did not exit within the shutdown grace — killing",
@@ -293,13 +399,134 @@ impl RunningJob {
         }
     }
 
-    /// Hard-kill the worker process group (after cancel timeout expires).
+    /// After the worker process has exited, determine whether the job was
+    /// actually completed server-side.
+    ///
+    /// The worker's completejob POST can fail while the process still exits
+    /// 0 (completion.rs logs the failure and carries on), which would leave
+    /// the job active server-side forever. The only confirmation available
+    /// to the listener is the worker's own report in its captured output:
+    /// it logs a distinct marker on acknowledgment and a distinct failure
+    /// line when the POST was rejected. The capture pipe is settled (bounded)
+    /// so a marker written just before exit cannot be missed.
+    pub async fn confirm_completion(&self) -> bool {
+        const SETTLE: Duration = Duration::from_millis(500);
+        let deadline = tokio::time::Instant::now() + SETTLE;
+        loop {
+            {
+                let capture = self.worker_output.lock().unwrap_or_else(|e| e.into_inner());
+                if capture.completion_acknowledged() {
+                    return true;
+                }
+                if capture.completion_rejected() {
+                    return false;
+                }
+                if capture.completion_impossible() {
+                    // No reporting channel at all — there is nothing to recover
+                    // (the listener has no endpoint either), so the worker's
+                    // exit is the best available signal.
+                    return true;
+                }
+                if capture.streams_done == 2 {
+                    // Both streams drained without any completion report.
+                    return false;
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Hard-kill the worker and its whole process tree (after cancel timeout
+    /// expires). Steps run in their own process groups (`process.rs`
+    /// `group_spawn`), so killing only the worker PID would orphan them
+    /// (CR-2 F-2); the official runner's JobDispatcher kills the worker with
+    /// `Process.Kill(entireProcessTree: true)`, and this mirrors that.
     pub async fn kill(&mut self) {
         // Drop stdin first to unblock the worker's reader
         self.stdin.take();
+        #[cfg(unix)]
+        if let Some(pid) = self.child.id() {
+            kill_process_tree(pid);
+        }
         if let Err(e) = self.child.kill().await {
             warn!("Failed to kill worker: {e}");
         }
+    }
+}
+
+/// Best-effort SIGKILL of `root` and every descendant in its process tree.
+///
+/// Walks a (pid, ppid) snapshot taken once, then kills each PID with
+/// `kill -9`. Errors are ignored: cleanup must never fail the listener.
+#[cfg(unix)]
+fn kill_process_tree(root: u32) {
+    use std::collections::BTreeMap;
+
+    let mut children: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(proc_dir) = std::fs::read_dir("/proc") {
+            for entry in proc_dir.flatten() {
+                let name = entry.file_name();
+                let Ok(pid) = name.to_string_lossy().parse::<u32>() else {
+                    continue;
+                };
+                let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                    continue;
+                };
+                // /proc/<pid>/stat: pid (comm) state ppid ...
+                let Some(open) = stat.find('(') else { continue };
+                let Some(close) = stat.rfind(')') else {
+                    continue;
+                };
+                let mut fields = stat[close + 1..].split_whitespace();
+                fields.next(); // state
+                let Some(ppid) = fields.next().and_then(|s| s.parse::<u32>().ok()) else {
+                    continue;
+                };
+                children.entry(ppid).or_default().push(pid);
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(out) = std::process::Command::new("ps")
+            .args(["-axo", "pid=,ppid="])
+            .output()
+        {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let mut fields = line.split_whitespace();
+                if let (Some(pid), Some(ppid)) = (fields.next(), fields.next()) {
+                    if let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>()) {
+                        children.entry(ppid).or_default().push(pid);
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = root;
+        return;
+    }
+
+    // DFS from the worker; kill descendants first so no child outlives its
+    // reaped parent.
+    let mut stack = vec![root];
+    let mut order = Vec::new();
+    while let Some(pid) = stack.pop() {
+        order.push(pid);
+        if let Some(kids) = children.get(&pid) {
+            stack.extend(kids.iter().copied());
+        }
+    }
+    for pid in order {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
     }
 }
 
@@ -619,12 +846,15 @@ pub async fn dispatch_job(
 mod tests {
     use super::*;
     use futures::future::BoxFuture;
+    use parking_lot::Mutex as ParkingLotMutex;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
     use std::time::Instant;
     use tempfile::TempDir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     /// Fake status provider for testing ensure_dispatch_finished.
     struct FakeStatusProvider {
@@ -694,10 +924,15 @@ mod tests {
             }
         });
 
-        let start = Instant::now();
         let mut running = spawn_job(payload, dir.path(), ProtocolPath::Broker)
             .await
             .unwrap();
+
+        // Measure the cancellation behavior only, not `spawn_job`'s one-time
+        // `cargo build` of the test worker binary (the WORKER_BIN OnceLock),
+        // which is dominated by unrelated shared-machine build contention and
+        // routinely exceeds the grace budget on its own.
+        let start = Instant::now();
 
         // Let it start up
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -860,6 +1095,46 @@ mod tests {
         assert!(tail.contains("bad\u{fffd}"), "tail: {tail:?}");
     }
 
+    /// A worker that never emits a newline must not grow the listener's
+    /// memory without bound: `read_until(b'\n')` into a growing Vec held the
+    /// whole unterminated line (arbitrarily large allocation → runner OOM).
+    /// The capture may retain at most the trailing 64 KiB of such a line,
+    /// matching the `WorkerOutputCapture` contract.
+    #[tokio::test]
+    async fn forward_worker_stream_bounds_unterminated_line() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"seed\n");
+        // 1 MiB with no newline until EOF — far past the 64 KiB contract.
+        bytes.extend_from_slice(&[b'x'; 1024 * 1024]);
+
+        let capture = Arc::new(Mutex::new(WorkerOutputCapture::default()));
+        forward_worker_stream(std::io::Cursor::new(bytes), capture.clone(), false);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let tail = loop {
+            let tail = capture.lock().unwrap_or_else(|e| e.into_inner()).tail();
+            // The final chunk of the unterminated line must eventually be
+            // captured; its absence means the forward task is still draining.
+            if tail.ends_with('x') || Instant::now() >= deadline {
+                break tail;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        assert!(
+            tail.len() <= WorkerOutputCapture::MAX_BYTES,
+            "capture exceeded the 64 KiB contract: {}",
+            tail.len()
+        );
+        // The trailing portion of the unterminated line survives (that is the
+        // crash detail); the prefix is discarded rather than accumulated.
+        assert!(
+            tail.ends_with('x'),
+            "the tail of the unterminated line must be retained, got {} bytes",
+            tail.len()
+        );
+    }
+
     #[tokio::test]
     async fn spawn_job_captures_worker_stdout() {
         let dir = TempDir::new().unwrap();
@@ -931,6 +1206,104 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(30),
             "graceful shutdown must finish within the grace, took {elapsed:?}"
+        );
+    }
+
+    /// A worker whose completejob POST failed still exits 0 — the worker
+    /// treats the failed report as non-fatal — so the listener must not
+    /// treat a bare successful process exit as a confirmed completion: the
+    /// job would stay active server-side forever. `shutdown_gracefully`
+    /// reports `Some(false)` for that case so the listener force-completes.
+    #[tokio::test]
+    async fn shutdown_gracefully_reports_unacknowledged_completion_as_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(ParkingLotMutex::new(Vec::<String>::new()));
+        let requests_w = requests.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let requests = requests_w.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0_u8; 16384];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    let raw = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = raw
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("")
+                        .to_string();
+                    requests.lock().push(path.clone());
+                    // Everything succeeds except completejob, which the
+                    // server rejects — the worker's completion report fails.
+                    let (status, reason, body) = if path.ends_with("/completejob") {
+                        (500, "Internal Server Error", "{}")
+                    } else {
+                        (200, "OK", "{}")
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status} {reason}\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        let dir = TempDir::new().unwrap();
+        let workspace_dir = dir.path().join("work");
+        let payload = serde_json::json!({
+            "jobId": "job-unacked",
+            "jobDisplayName": "Unacknowledged Job",
+            "plan": {"planId": "plan-unacked"},
+            "resources": {
+                "endpoints": [{
+                    "name": "SystemVssConnection",
+                    "url": format!("http://{addr}"),
+                    "authorization": {"parameters": {"AccessToken": "test-token"}}
+                }]
+            },
+            "steps": [{
+                "id": "step-1",
+                "contextName": "step1",
+                "displayName": "Step One",
+                "run": "echo hi",
+                "shell": "bash"
+            }],
+            "fileTable": {
+                "workDirectory": workspace_dir.to_str().unwrap()
+            }
+        });
+
+        let mut running = spawn_job(payload, dir.path(), ProtocolPath::Broker)
+            .await
+            .unwrap();
+        // Let the worker run the job to completion. The completejob POST is
+        // rejected, but the worker still exits 0 (non-fatal report).
+        assert!(
+            running.wait().await.unwrap(),
+            "worker exits 0 even when the completejob POST failed"
+        );
+
+        let outcome = running.shutdown_gracefully(Duration::from_secs(10)).await;
+        assert_eq!(
+            outcome,
+            Some(false),
+            "an exit without a confirmed completion must not look like success"
+        );
+
+        let reqs = requests.lock().clone();
+        assert!(
+            reqs.iter().any(|path| path.ends_with("/completejob")),
+            "the worker must have attempted the completejob POST"
         );
     }
 
