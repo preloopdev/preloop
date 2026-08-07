@@ -54,6 +54,46 @@ The replay gate compares status codes, request-body schemas, and
 `acquirejob` response schemas byte-for-byte; anything volatile (timing,
 tokens) is normalized before comparison.
 
+## Tracking new official runner versions
+
+The pinned target is `versions.toml` (`runner_version = "2.336.0"`), and
+`runner-watch` keeps the repo from silently desyncing when upstream ships a
+new release. The pipeline is watch → diff → triage → implement → review →
+record → conform → PR:
+
+```sh
+runner-watch watch      # poll https://github.com/actions/runner/releases.atom
+                        # for new tags; records last_known_tag in
+                        # .runner-watch/state.json when one appears
+
+runner-watch diff --from v2.322.0 --to v2.335.1
+                        # clone both tags and emit .runner-watch/delta.json —
+                        # every source change between the two releases
+
+runner-watch triage     # convert delta.json into per-change TOML specs
+                        # (.runner-watch/specs/<version>/), AI-triaged
+                        # against the surface map (docs/aksh-surface.toml)
+
+runner-watch implement  # Codex implements the specs (dry-run: prompts only)
+runner-watch review     # Claude reviews the diffs
+
+runner-watch record-golden --runner /path/to/actions-runner --scenario <name>
+runner-watch conform --runner 2.336.0 --aksh-url http://127.0.0.1:9090
+                        # record official bytes for the new version and replay
+                        # them against the built server
+
+runner-watch pr         # create tiered draft PRs from the artifacts
+runner-watch run        # the whole watch→diff→triage→implement→conform loop
+```
+
+The watch scope is configured in `.runner-watch/config.toml`: which upstream
+directories are tracked (`src/Runner.Listener`, `src/Runner.Worker`,
+`src/Runner.Common`, `src/Runner.Sdk`), which paths are skipped
+(`src/Test/**`, `*.md`, `*.yml`, …), and which agents drive triage,
+implementation, and review. Every new release therefore lands as: a version
+bump in `versions.toml`, a fresh golden capture set, a conformance run, and
+specs/PRs for anything the delta changed.
+
 ## Layer 2: replayed wire using the goldens
 
 `.runner-watch/golden/v2.335.1/` holds **23 scenario captures** from the
@@ -195,8 +235,9 @@ changes against the official runner (golden replay), per the PR template.
 
 ## Compatibility targets
 
-- Protocol: official `actions/runner` v2.336.0 (`versions.toml`), tracked
-by `runner-watch` against upstream releases.
+- Protocol: official `actions/runner` v2.336.0, pinned in `versions.toml` and
+tracked through the watch→diff→triage→conform pipeline in
+[Tracking new official runner versions](#tracking-new-official-runner-versions).
 - Upstream reference: `ChristopherHX/runner.server` at the pinned commit
 (`AKSH_UPSTREAM_RUNNER_SERVER_REF`), per `docs/fidelity-gap.md`.
 - Current status (2026-07): the official runner completes the full broker
