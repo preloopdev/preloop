@@ -754,7 +754,16 @@ pub async fn run_job(
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            if let Err(error) = std::fs::write(&path, &conclusion) {
+            // The marker names the preservation reason, not the job's final
+            // conclusion: a job preserved only because a `continue-on-error`
+            // step failed concludes "Success", and a tool reading
+            // `.preloop-job-failed` must see why the VM was held.
+            let marker = if conclusion.eq_ignore_ascii_case("failed") || steps_had_failure {
+                "Failed"
+            } else {
+                &conclusion
+            };
+            if let Err(error) = std::fs::write(&path, marker) {
                 warn!(path = %path.display(), %error, "failed to write Preloop failure marker");
             }
         }

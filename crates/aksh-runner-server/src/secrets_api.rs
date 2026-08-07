@@ -199,7 +199,12 @@ pub(crate) async fn set_secret(
     // reverting.
     let credential = crate::config::load_credential_secrets()
         .map_err(|error| ApiError::internal(format!("{error:#}")))?;
-    if credential_scope_conflict(&credential, body.repo.as_deref(), body.env.as_deref(), &name) {
+    if credential_scope_conflict(
+        &credential,
+        body.repo.as_deref(),
+        body.env.as_deref(),
+        &name,
+    ) {
         return Err(ApiError::conflict(format!(
             "secret `{name}` is managed by the systemd credential; edit the credential file \
              (re-encrypt with `systemd-creds encrypt --name=preloop-secrets ...`) instead"
@@ -302,7 +307,12 @@ pub(crate) async fn delete_secret(
     // silently reappear. The credential file is the only supported edit path.
     let credential = crate::config::load_credential_secrets()
         .map_err(|error| ApiError::internal(format!("{error:#}")))?;
-    if credential_scope_conflict(&credential, query.repo.as_deref(), query.env.as_deref(), &name) {
+    if credential_scope_conflict(
+        &credential,
+        query.repo.as_deref(),
+        query.env.as_deref(),
+        &name,
+    ) {
         return Err(ApiError::conflict(format!(
             "secret `{name}` is managed by the systemd credential; edit the credential file \
              (re-encrypt with `systemd-creds encrypt --name=preloop-secrets ...`) instead"

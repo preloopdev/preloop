@@ -82,7 +82,7 @@ pub(crate) struct InstallArgs {
     no_update_timer: bool,
 
     /// Encrypted systemd credential to mount into the service as
-    /// `LoadCredential=preloop-secrets:PATH`. The engine reads
+    /// `LoadCredentialEncrypted=preloop-secrets:PATH`. The engine reads
     /// `[secrets]`/`[repo_secrets]` from it at startup — encrypted at rest,
     /// host-key bound, decrypted into a memfd by systemd. Create it with
     /// `systemd-creds encrypt --name=preloop-secrets secrets.toml PATH`.
@@ -224,12 +224,21 @@ fn install_systemd(
     let dir = systemd_unit_dir(args.user);
     let service = render_systemd_service(exe, home, args.user, args.systemd_credential.as_deref())?;
     let socket = render_systemd_socket(args.listen);
-    let update_service = render_systemd_update_service(exe, home)?;
+    let update_service = render_systemd_update_service(exe, home, args.user)?;
     let timer = render_systemd_update_timer();
 
     prepare_home(home, dry)?;
     write_env_file(home, env_lines, dry)?;
 
+    // A rootless install cannot assume `~/.config/systemd/user` exists on a
+    // fresh machine — create the unit directory before the first write.
+    if !dir.exists() {
+        if dry {
+            eprintln!("[preloop] would create unit directory {}", dir.display());
+        } else {
+            std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        }
+    }
     write_unit(&dir.join("preloop.service"), &service, dry)?;
     write_unit(&dir.join("preloop.socket"), &socket, dry)?;
     if !args.no_update_timer {
@@ -253,7 +262,7 @@ fn install_systemd(
     }
     if let Some(path) = &args.systemd_credential {
         eprintln!(
-            "[preloop] credential: {} mounted as LoadCredential=preloop-secrets \
+            "[preloop] credential: {} mounted as LoadCredentialEncrypted=preloop-secrets \
              (secrets from it override config.toml)",
             path.display()
         );
@@ -303,21 +312,38 @@ fn install_systemd(
 fn uninstall_systemd(args: &UninstallArgs, home: &Path) -> Result<()> {
     let _ = home;
     let dry = args.dry_run;
-    run_ok(
-        "systemctl",
+    // Stop first and treat failure as fatal: deleting the unit files while a
+    // service is still active would report success with the engine running
+    // from a now-orphaned unit. The service and socket are always installed;
+    // the update timer may never have been, so its disable stays tolerant.
+    run_systemctl(
         &systemctl_args(
             args.user,
-            &[
-                "disable",
-                "--now",
-                "preloop-update.timer",
-                "preloop.service",
-                "preloop.socket",
-            ],
+            &["disable", "--now", "preloop.socket", "preloop.service"],
         ),
         dry,
-        "disable Preloop units",
+    )?;
+    run_ok(
+        "systemctl",
+        &systemctl_args(args.user, &["disable", "--now", "preloop-update.timer"]),
+        dry,
+        "disable the update timer",
     );
+    // Belt and braces: verify nothing is left running before removing units.
+    if !dry {
+        let status = Command::new("systemctl")
+            .args(systemctl_args(args.user, &["is-active", "preloop.service"]))
+            .status()
+            .context("check preloop.service state")?;
+        if status.success() {
+            bail!("preloop.service is still active after disable --now — aborting uninstall");
+        }
+    } else {
+        eprintln!(
+            "[preloop] would run: systemctl {} is-active preloop.service",
+            if args.user { "--user" } else { "" }
+        );
+    }
     let dir = systemd_unit_dir(args.user);
     for unit in [
         "preloop.service",
@@ -347,7 +373,7 @@ fn render_systemd_service(
     user: bool,
     credential: Option<&Path>,
 ) -> Result<String> {
-    let exe_display = exec_display(exe);
+    let exe_display = systemd_path(exe);
     Ok(format!(
         r#"[Unit]
 Description=Preloop self-hosted GitHub Actions control plane
@@ -375,11 +401,14 @@ WantedBy={wanted_by}
             "multi-user.target"
         },
         credential = credential
-            .map(|path| format!("LoadCredential=preloop-secrets:{}\n", path.display()))
+            .map(|path| {
+                format!(
+                    "LoadCredentialEncrypted=preloop-secrets:{}\n",
+                    path.display()
+                )
+            })
             .unwrap_or_default(),
-        readwrite = readwrite_dir(exe)
-            .map(|dir| format!("ReadWritePaths={}\n", dir.display()))
-            .unwrap_or_default(),
+        readwrite = readwrite_paths(exe, home, user),
     ))
 }
 
@@ -409,8 +438,8 @@ fn systemctl_args(user: bool, args: &[&str]) -> Vec<String> {
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn render_systemd_update_service(exe: &Path, home: &Path) -> Result<String> {
-    let exe_display = exec_display(exe);
+fn render_systemd_update_service(exe: &Path, home: &Path, user: bool) -> Result<String> {
+    let exe_display = systemd_path(exe);
     Ok(format!(
         r#"[Unit]
 Description=Update the Preloop binary from GitHub Releases
@@ -427,10 +456,31 @@ ProtectSystem=full
 ProtectHome=read-only
 {readwrite}"#,
         home = home.display(),
-        readwrite = readwrite_dir(exe)
-            .map(|dir| format!("ReadWritePaths={}\n", dir.display()))
-            .unwrap_or_default(),
+        readwrite = readwrite_paths(exe, home, user),
     ))
+}
+
+/// `ReadWritePaths=` line: the executable's directory (so the self-update
+/// timer can replace the binary under `ProtectSystem=full`) and, for
+/// user-scoped units, `PRELOOP_HOME` (which `ProtectHome=read-only` would
+/// otherwise make unwritable — the service cannot initialize its state).
+/// Paths are quoted per systemd's path-list syntax when they contain
+/// whitespace; an unquoted path with a space would split the list and the
+/// whitelist would silently miss the real directory.
+#[cfg(any(target_os = "linux", test))]
+fn readwrite_paths(exe: &Path, home: &Path, user: bool) -> String {
+    let mut paths = Vec::new();
+    if let Some(dir) = readwrite_dir(exe) {
+        paths.push(systemd_path(&dir));
+    }
+    if user {
+        paths.push(systemd_path(home));
+    }
+    if paths.is_empty() {
+        String::new()
+    } else {
+        format!("ReadWritePaths={}\n", paths.join(" "))
+    }
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -708,7 +758,14 @@ fn env_line(key: &str, value: &str) -> Result<String> {
     if value.contains(['\n', '\0']) {
         bail!("{key} must not contain newlines or NUL bytes");
     }
-    Ok(format!("{key}={value}"))
+    // systemd parses EnvironmentFile values with POSIX-shell backslash-escape
+    // rules, so a literal `\`, `"` or `'` in a secret must be escaped or the
+    // service receives a different value (and rejects every webhook).
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\'', "\\'");
+    Ok(format!("{key}={escaped}"))
 }
 
 fn resolve_home(home: Option<&Path>, user: bool) -> Result<PathBuf> {
@@ -814,10 +871,12 @@ fn run_ok(program: &str, args: &[String], dry_run: bool, what: &str) {
     }
 }
 
-/// Quote an ExecStart path when it contains whitespace (systemd requirement).
+/// Render a path for systemd directives (`ExecStart=`, `ReadWritePaths=`):
+/// quoted when it contains whitespace, since both are parsed as
+/// whitespace-separated lists.
 #[cfg(any(target_os = "linux", test))]
-fn exec_display(exe: &Path) -> String {
-    let display = exe.display().to_string();
+fn systemd_path(path: &Path) -> String {
+    let display = path.display().to_string();
     if display.contains(char::is_whitespace) {
         format!("\"{display}\"")
     } else {
@@ -883,7 +942,7 @@ mod tests {
             Some(Path::new("/etc/preloop-secrets.enc")),
         )
         .unwrap();
-        assert!(unit.contains("LoadCredential=preloop-secrets:/etc/preloop-secrets.enc"));
+        assert!(unit.contains("LoadCredentialEncrypted=preloop-secrets:/etc/preloop-secrets.enc"));
         let plain = render_systemd_service(
             Path::new("/usr/local/bin/preloop"),
             Path::new(DEFAULT_HOME),
@@ -892,6 +951,7 @@ mod tests {
         )
         .unwrap();
         assert!(!plain.contains("LoadCredential="));
+        assert!(!plain.contains("LoadCredentialEncrypted="));
         // Exactly one Restart line: the credential slot must not emit an
         // empty duplicate line.
         assert_eq!(unit.matches("Restart=on-failure").count(), 1);
@@ -908,7 +968,46 @@ mod tests {
         )
         .unwrap();
         assert!(unit.contains("ExecStart=\"/opt/pre loop/preloop\" serve"));
-        assert!(unit.contains("ReadWritePaths=/opt/pre loop"));
+        assert!(unit.contains("ReadWritePaths=\"/opt/pre loop\""));
+    }
+
+    #[test]
+    fn user_service_grants_write_to_preloop_home() {
+        let unit = render_systemd_service(
+            Path::new("/usr/local/bin/preloop"),
+            Path::new("/Users/me/.preloop"),
+            true,
+            None,
+        )
+        .unwrap();
+        // ProtectHome=read-only would block ~/.preloop state; the unit must
+        // carve out a writable exception.
+        assert!(unit.contains("ProtectHome=read-only"));
+        assert!(unit.contains("ReadWritePaths=/usr/local/bin /Users/me/.preloop"));
+        let system = render_systemd_service(
+            Path::new("/usr/local/bin/preloop"),
+            Path::new(DEFAULT_HOME),
+            false,
+            None,
+        )
+        .unwrap();
+        // System scope grants only the executable's directory, never home.
+        assert!(system.contains("ReadWritePaths=/usr/local/bin\n"));
+        assert!(!system.contains("/var/lib/preloop\""));
+    }
+
+    #[test]
+    fn readwrite_paths_quote_whitespace_dirs() {
+        let line = readwrite_paths(Path::new("/opt/pre loop/preloop"), Path::new("/h/p"), true);
+        assert_eq!(line, "ReadWritePaths=\"/opt/pre loop\" /h/p\n",);
+    }
+
+    #[test]
+    fn env_line_escapes_shell_specials() {
+        assert_eq!(env_line("A", "a\\b\"c'd").unwrap(), "A=a\\\\b\\\"c\\'d");
+        assert_eq!(env_line("A", "plain").unwrap(), "A=plain");
+        assert!(env_line("A", "x\ny").is_err());
+        assert!(env_line("A", "x\0y").is_err());
     }
 
     #[test]
@@ -923,6 +1022,7 @@ mod tests {
         let update = render_systemd_update_service(
             Path::new("/usr/local/bin/preloop"),
             Path::new(DEFAULT_HOME),
+            false,
         )
         .unwrap();
         for secret in ["hunter2", "12345"] {

@@ -141,7 +141,7 @@ By default stored secrets persist in the config file (`[secrets]`, mode
   re-seed. Combine with the systemd credential below for a durable base set.
 - **systemd credential** — install the service with
   `--systemd-credential /etc/preloop-secrets.enc` to mount an encrypted
-  credential (`LoadCredential=preloop-secrets`); the engine reads
+  credential (`LoadCredentialEncrypted=preloop-secrets`); the engine reads
   `[secrets]`/`[repo_secrets]` from it at startup, overriding the config
   file per name. Create the blob with:
 
@@ -152,7 +152,10 @@ By default stored secrets persist in the config file (`[secrets]`, mode
   At rest the blob is encrypted and bound to the host (TPM or machine key);
   systemd decrypts it into an in-memory file (memfd) the service never
   writes back. Secrets already in the config file still load and apply —
-  the credential wins per name.
+  the credential wins per name. Note: secrets backed by the credential are
+  re-applied on every engine restart — `preloop secret rm` removes them from
+  the running store, but to make the removal permanent, edit the credential
+  file (or the config file) itself.
 
 ## Config file
 
@@ -237,7 +240,7 @@ What it does:
 - **macOS (launchd)** — writes a LaunchDaemon plist to
   `/Library/LaunchDaemons/dev.preloop.server.plist` (mode 0600).
 - `--systemd-credential PATH` (Linux) — mounts an encrypted systemd
-  credential (`LoadCredential=preloop-secrets:PATH`) so stored secrets come
+  credential (`LoadCredentialEncrypted=preloop-secrets:PATH`) so stored secrets come
   from an encrypted, host-bound blob instead of the config file; see
   "Where secrets live" in the Secrets section.
 - Configuration is written to a mode-0600 environment file
