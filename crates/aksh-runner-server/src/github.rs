@@ -10,7 +10,7 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -1055,6 +1055,7 @@ async fn process_github_webhook(
                 local_workspace: None,
                 vars: BTreeMap::new(),
                 secrets: BTreeMap::new(),
+                submission_names: BTreeSet::new(),
                 reusable_workflows: BTreeMap::new(),
                 reusable_workflow_shas: BTreeMap::new(),
                 enable_debugger: false,

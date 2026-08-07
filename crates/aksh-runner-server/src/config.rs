@@ -93,6 +93,86 @@ pub struct ConfigFile {
     /// secret of the same name for that repository.
     #[serde(default)]
     pub repo_secrets: BTreeMap<String, BTreeMap<String, String>>,
+    /// Per-repository, per-environment job secrets
+    /// (`[env_secrets."owner/repo".prod]`), mirroring GitHub's
+    /// environment-level secrets. A name here overrides the repo-level and
+    /// global secret of the same name for jobs in that environment.
+    #[serde(default)]
+    pub env_secrets: BTreeMap<String, BTreeMap<String, BTreeMap<String, String>>>,
+    /// Secrets-store mode: `file` (default; values persist in this file,
+    /// mode 0600) or `memory` (values exist only in engine memory for the
+    /// current process lifetime — nothing is ever written to the config
+    /// file; re-seed after restart, e.g. via a systemd credential).
+    /// `PRELOOP_SECRETS_STORE` overrides this key.
+    #[serde(default)]
+    pub secrets_store: Option<String>,
+}
+
+/// Env override for the secrets-store mode; see [`ConfigFile::secrets_store`].
+pub const SECRETS_STORE_ENV: &str = "PRELOOP_SECRETS_STORE";
+
+/// Systemd sets this when the unit mounts any `LoadCredential=`.
+pub const CREDENTIALS_ENV: &str = "CREDENTIALS_DIRECTORY";
+
+/// Credential name `preloop server install --systemd-credential` mounts.
+pub const CREDENTIAL_NAME: &str = "preloop-secrets";
+
+/// True when stored secrets must stay out of the config file: values live in
+/// engine memory only, mutated live through the secrets API and lost on
+/// restart. `PRELOOP_SECRETS_STORE=memory` wins over the config file key.
+pub fn store_memory(config: &ConfigFile) -> bool {
+    store_memory_from(std::env::var(SECRETS_STORE_ENV).ok(), config)
+}
+
+fn store_memory_from(env_value: Option<String>, config: &ConfigFile) -> bool {
+    let memory = |value: &str| value.trim().eq_ignore_ascii_case("memory");
+    env_value
+        .as_deref()
+        .map(memory)
+        .unwrap_or_else(|| config.secrets_store.as_deref().map(memory).unwrap_or(false))
+}
+
+/// Load the systemd credential mounted at
+/// `$CREDENTIALS_DIRECTORY/preloop-secrets`, if any: a TOML fragment with
+/// the same `[secrets]` / `[repo_secrets."owner/repo"]` schema as the config
+/// file. Missing directory or file yields an empty config; a malformed
+/// credential is an error — the operator mounted it explicitly, so a typo
+/// must not be silently ignored at startup.
+pub fn load_credential_secrets() -> anyhow::Result<ConfigFile> {
+    let Some(dir) = std::env::var_os(CREDENTIALS_ENV) else {
+        return Ok(ConfigFile::default());
+    };
+    load_credential_from(&PathBuf::from(dir).join(CREDENTIAL_NAME))
+}
+
+fn load_credential_from(path: &Path) -> anyhow::Result<ConfigFile> {
+    if !path.exists() {
+        return Ok(ConfigFile::default());
+    }
+    load_config_from(path)
+}
+
+/// Overlay one config's stored secrets onto another, per name; the overlay
+/// wins. Used for systemd credentials, which take precedence over the config
+/// file's `[secrets]`.
+pub fn merge_secret_stores(config: &mut ConfigFile, overlay: ConfigFile) {
+    for (name, value) in overlay.secrets {
+        config.secrets.insert(name, value);
+    }
+    for (repo, names) in overlay.repo_secrets {
+        config.repo_secrets.entry(repo).or_default().extend(names);
+    }
+    for (repo, envs) in overlay.env_secrets {
+        for (env, names) in envs {
+            config
+                .env_secrets
+                .entry(repo.clone())
+                .or_default()
+                .entry(env)
+                .or_default()
+                .extend(names);
+        }
+    }
 }
 
 /// Manual `Debug`: secret values are never printed, only how many exist.
@@ -100,10 +180,11 @@ impl std::fmt::Debug for ConfigFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ConfigFile {{ github: {:?}, secrets: {} names, repo_secrets: {} repos }}",
+            "ConfigFile {{ github: {:?}, secrets: {} names, repo_secrets: {} repos, env_secrets: {} repos }}",
             self.github,
             self.secrets.len(),
-            self.repo_secrets.len()
+            self.repo_secrets.len(),
+            self.env_secrets.len()
         )
     }
 }
@@ -251,6 +332,14 @@ mod tests {
                 "owner/repo".into(),
                 BTreeMap::from([("REPO_ONLY".into(), "xyz789".into())]),
             )]),
+            env_secrets: BTreeMap::from([(
+                "owner/repo".into(),
+                BTreeMap::from([(
+                    "prod".into(),
+                    BTreeMap::from([("DEPLOY_KEY".into(), "env-secret".into())]),
+                )]),
+            )]),
+            secrets_store: None,
         }
     }
 
@@ -318,5 +407,86 @@ mod tests {
         assert!(!whole.contains("xyz789"), "repo secret leaked: {whole}");
         assert!(whole.contains("secrets: 1 names"), "{whole}");
         assert!(whole.contains("repo_secrets: 1 repos"), "{whole}");
+    }
+
+    /// Pure form of the store-mode check: no process env is touched, so the
+    /// test cannot race other tests that read `PRELOOP_SECRETS_STORE`.
+    #[test]
+    fn store_memory_combines_env_and_config() {
+        let file_mode = ConfigFile {
+            secrets_store: Some("file".into()),
+            ..ConfigFile::default()
+        };
+        let memory_mode = ConfigFile {
+            secrets_store: Some("memory".into()),
+            ..ConfigFile::default()
+        };
+        // Config field alone decides when no env value is supplied.
+        assert!(!store_memory_from(None, &file_mode));
+        assert!(store_memory_from(None, &memory_mode));
+        assert!(!store_memory_from(None, &ConfigFile::default()));
+        // Env wins over the config field, either direction.
+        assert!(store_memory_from(Some("memory".into()), &file_mode));
+        assert!(store_memory_from(Some(" MEMORY ".into()), &file_mode));
+        assert!(!store_memory_from(Some("file".into()), &memory_mode));
+    }
+
+    #[test]
+    fn credential_load_merges_per_name_and_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let cred_path = dir.path().join(CREDENTIAL_NAME);
+        std::fs::write(
+            &cred_path,
+            r#"
+[secrets]
+OVERLAY = "from-credential"
+SHARED = "credential-wins"
+
+[repo_secrets."owner/repo"]
+REPO_OVERLAY = "repo-from-credential"
+"#,
+        )
+        .unwrap();
+        let overlay = load_credential_from(&cred_path).unwrap();
+        let mut config = ConfigFile {
+            secrets: BTreeMap::from([
+                ("SHARED".into(), "file-value".into()),
+                ("FILE_ONLY".into(), "stays".into()),
+            ]),
+            repo_secrets: BTreeMap::from([(
+                "owner/repo".into(),
+                BTreeMap::from([("REPO_SHARED".into(), "file-repo".into())]),
+            )]),
+            ..ConfigFile::default()
+        };
+        merge_secret_stores(&mut config, overlay);
+
+        assert_eq!(config.secrets.get("OVERLAY").unwrap(), "from-credential");
+        assert_eq!(config.secrets.get("SHARED").unwrap(), "credential-wins");
+        assert_eq!(config.secrets.get("FILE_ONLY").unwrap(), "stays");
+        assert_eq!(
+            config.repo_secrets["owner/repo"]
+                .get("REPO_OVERLAY")
+                .unwrap(),
+            "repo-from-credential"
+        );
+        assert_eq!(
+            config.repo_secrets["owner/repo"]
+                .get("REPO_SHARED")
+                .unwrap(),
+            "file-repo"
+        );
+    }
+
+    #[test]
+    fn credential_load_treats_missing_file_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = load_credential_from(&dir.path().join(CREDENTIAL_NAME)).unwrap();
+        assert!(overlay.secrets.is_empty());
+        assert!(overlay.repo_secrets.is_empty());
+        // A malformed credential must fail loudly, not silently no-op.
+        let bad = dir.path().join("bad");
+        std::fs::write(&bad, "[secrets\nnot-valid").unwrap();
+        assert!(load_credential_from(&bad).is_err());
     }
 }

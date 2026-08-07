@@ -18,6 +18,7 @@ use std::time::Duration;
 mod debug_session;
 mod github_auth;
 mod github_setup;
+mod server_install;
 mod update;
 
 pub(crate) fn server_url() -> String {
@@ -76,7 +77,7 @@ pub(crate) fn build_client() -> reqwest::Client {
     builder.build().expect("valid HTTP client configuration")
 }
 
-fn preloop_home() -> PathBuf {
+pub(crate) fn preloop_home() -> PathBuf {
     std::env::var_os("PRELOOP_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".preloop")))
@@ -113,6 +114,15 @@ enum Command {
 
     /// Verify the GitHub credential configuration.
     Doctor(github_setup::DoctorArgs),
+
+    /// Install or remove the control plane as a supervised service.
+    ///
+    /// `install` scaffolds hardened systemd units (Linux) or a LaunchDaemon
+    /// (macOS), a private environment file, and an optional self-update
+    /// timer. `--user` installs rootless per-user services (systemd user
+    /// units / a LaunchAgent) with state in ~/.preloop. `uninstall` removes
+    /// them without touching PRELOOP_HOME data unless asked.
+    Server(server_install::ServerArgs),
 
     /// Open a shell in a preserved VM.
     Shell(ShellArgs),
@@ -323,6 +333,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Setup(args) => return github_setup::cmd_setup(args).await,
         Command::Doctor(args) => return github_setup::cmd_doctor(args).await,
         Command::Secret(args) => return github_setup::cmd_secret(args).await,
+        Command::Server(args) => return server_install::run(args),
         _ => {}
     }
     ensure_engine_running().await?;
@@ -343,7 +354,8 @@ async fn main() -> anyhow::Result<()> {
         | Command::BuildGolden(_)
         | Command::Setup(_)
         | Command::Doctor(_)
-        | Command::Secret(_) => {
+        | Command::Secret(_)
+        | Command::Server(_) => {
             unreachable!("daemon commands handled before client startup")
         }
     }
@@ -505,30 +517,30 @@ async fn ensure_engine_running() -> anyhow::Result<()> {
 }
 
 #[cfg(unix)]
-fn set_private_directory_permissions(path: &std::path::Path) -> anyhow::Result<()> {
+pub(crate) fn set_private_directory_permissions(path: &std::path::Path) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn set_private_directory_permissions(_path: &std::path::Path) -> anyhow::Result<()> {
+pub(crate) fn set_private_directory_permissions(_path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
 #[cfg(unix)]
-fn set_private_file_permissions(path: &std::path::Path) -> anyhow::Result<()> {
+pub(crate) fn set_private_file_permissions(path: &std::path::Path) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn set_private_file_permissions(_path: &std::path::Path) -> anyhow::Result<()> {
+pub(crate) fn set_private_file_permissions(_path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn write_private_file(path: &std::path::Path, contents: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn write_private_file(path: &std::path::Path, contents: &[u8]) -> anyhow::Result<()> {
     use std::io::Write as _;
 
     let mut options = std::fs::OpenOptions::new();
@@ -2044,7 +2056,7 @@ mod tests {
         let Command::Secret(args) = cli.command else {
             panic!("expected Secret");
         };
-        let github_setup::SecretCommand::List { repo } = args.command else {
+        let github_setup::SecretCommand::List { repo, .. } = args.command else {
             panic!("expected List");
         };
         assert!(repo.is_none());
@@ -2056,10 +2068,51 @@ mod tests {
         let Command::Secret(args) = cli.command else {
             panic!("expected Secret");
         };
-        let github_setup::SecretCommand::List { repo } = args.command else {
+        let github_setup::SecretCommand::List { repo, .. } = args.command else {
             panic!("expected List");
         };
         assert_eq!(repo.as_deref(), Some("owner/repo"));
+    }
+
+    #[test]
+    fn secret_set_with_env_scope() {
+        let cli = parse(&[
+            "secret",
+            "set",
+            "DEPLOY_KEY",
+            "--repo",
+            "owner/repo",
+            "--env",
+            "prod",
+            "--value",
+            "x",
+        ])
+        .unwrap();
+        let Command::Secret(args) = cli.command else {
+            panic!("expected Secret");
+        };
+        let github_setup::SecretCommand::Set {
+            name, repo, env, ..
+        } = args.command
+        else {
+            panic!("expected Set");
+        };
+        assert_eq!(name, "DEPLOY_KEY");
+        assert_eq!(repo.as_deref(), Some("owner/repo"));
+        assert_eq!(env.as_deref(), Some("prod"));
+    }
+
+    #[test]
+    fn secret_list_with_env_scope() {
+        let cli = parse(&["secret", "list", "--repo", "owner/repo", "--env", "prod"]).unwrap();
+        let Command::Secret(args) = cli.command else {
+            panic!("expected Secret");
+        };
+        let github_setup::SecretCommand::List { repo, env } = args.command else {
+            panic!("expected List");
+        };
+        assert_eq!(repo.as_deref(), Some("owner/repo"));
+        assert_eq!(env.as_deref(), Some("prod"));
     }
 
     #[test]
