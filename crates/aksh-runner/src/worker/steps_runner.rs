@@ -763,13 +763,18 @@ pub async fn run_steps(
             // inside it — available to whoever attaches.
             //
             // Only genuine failures pause. A cancelled step means someone already
-            // decided the job is over, and `continue-on-error` means the author
-            // already declared this failure acceptable.
-            if conclusion_str == "Failure"
-                && !cancelled
-                && !step.is_background
-                && !debugging_declined
-            {
+            // decided the job is over, and background steps have no interactive
+            // surface. `continue-on-error` steps pause too: the author tolerated
+            // the failure, but the VM state at the moment it died is exactly
+            // what debugging wants — the `continue` verdict preserves the
+            // official outcome=Failure / conclusion=Success semantics with a
+            // checkpoint in the middle.
+            if should_pause_on_failure(
+                &outcome_str,
+                cancelled,
+                step.is_background,
+                debugging_declined,
+            ) {
                 if let Some(client) = debug_client.as_ref() {
                     let elapsed_ms = attempt_started.elapsed().as_millis() as u64;
                     // Use only this attempt's log/annotation slice so a retry
@@ -985,6 +990,20 @@ pub async fn run_steps(
                                  cleanup steps still run.",
                             );
                             debugging_declined = true;
+                            // An aborted `continue-on-error` step keeps its
+                            // failure: the verdict promises "the job fails
+                            // from here", and the tolerated conclusion would
+                            // leave `any_failed` false and the job green.
+                            // Flip the recorded conclusion so the aggregation
+                            // and the step report agree.
+                            if outcome_str == "Failure" {
+                                if let Some(step_result) =
+                                    step_ctx.job.steps.get_mut(&step.context_name)
+                                {
+                                    step_result.conclusion = "Failure".to_string();
+                                }
+                                break ("Failure".to_string(), file_command_paths);
+                            }
                             break (conclusion_str, file_command_paths);
                         }
                         // No session, or the session vanished. Neither is a
@@ -1299,6 +1318,23 @@ fn should_run_step(step: &Step, job: &JobContext) -> Result<bool> {
             }
         }
     }
+}
+
+/// Whether a failed step merits a debug pause.
+///
+/// Genuine execution failures pause; cancelled steps and background steps
+/// never do, and one declined verdict silences later failures so a trailing
+/// `always()` step cannot re-trap a user who walked away. `continue-on-error`
+/// steps pause despite the tolerated conclusion — see the gate's comment:
+/// the pause is a checkpoint, and the `continue` verdict keeps the official
+/// outcome/conclusion pair intact.
+fn should_pause_on_failure(
+    outcome: &str,
+    cancelled: bool,
+    is_background: bool,
+    declined: bool,
+) -> bool {
+    outcome == "Failure" && !cancelled && !is_background && !declined
 }
 
 /// Execute a single step, threading cancel_rx to the process invoker.

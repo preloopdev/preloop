@@ -284,7 +284,7 @@ const BASE_PACKAGES: &str = "\
      unzip zip xz-utils zstd bzip2 brotli lz4 pigz p7zip-full tar \
      jq file tree shellcheck parallel time acl locales tzdata \
      rsync dnsutils iputils-ping net-tools iproute2 netcat-openbsd \
-     sqlite3 rpm aria2 mercurial sshpass git-lfs cmake";
+     sqlite3 rpm aria2 mercurial";
 
 /// Node.js baked into the base image, pinned (via `versions.toml`) to the
 /// GitHub-hosted ubuntu-24.04 system Node. Ubuntu's apt `nodejs` (18.19) is
@@ -342,18 +342,6 @@ const LOOPBACK_HOSTS: &str = "127.0.0.1 localhost\\n\
                               ff00::0 ip6-mcastprefix\\n\
                               ff02::1 ip6-allnodes\\n\
                               ff02::2 ip6-allrouters\\n";
-
-/// Static resolvers baked into the golden's `/etc/resolv.conf`.
-///
-/// The base image ships a dangling symlink to systemd-resolved's stub
-/// (`/run/systemd/resolve/stub-resolv.conf`), which nothing creates in our
-/// VMs — the guest then has no DNS at all, and every outbound name lookup
-/// fails. This bit the golden bake itself: `smolvm pack` boots an export VM
-/// from the machine disk, and the in-VM registry client could not resolve
-/// `index.docker.io`. A plain file survives reboots (verified on a live
-/// VM). `PRELOOP_RUNNER_DNS` still overrides at machine start for operators
-/// on networks that filter the public resolvers.
-const GUEST_RESOLVERS: &str = "nameserver 1.1.1.1\nnameserver 8.8.8.8\n";
 
 /// The golden image's package baseline. Exposed for the fidelity tests.
 pub fn base_packages() -> &'static str {
@@ -426,7 +414,6 @@ pub fn base_install_script() -> String {
          DEBIAN_FRONTEND=noninteractive \
          apt-get install -y -qq --no-install-recommends {BASE_PACKAGES} \
          && printf '{LOOPBACK_HOSTS}' > /etc/hosts && \
-         printf '{GUEST_RESOLVERS}' > /etc/resolv.conf && \
          printf '127.0.0.1 %s\\n' \"$(hostname)\" >> /etc/hosts && \
          printf 'APT::Get::Assume-Yes \"true\";\\n' > /etc/apt/apt.conf.d/90assumeyes && \
          (arch=$(uname -m); \
@@ -443,49 +430,6 @@ pub fn base_install_script() -> String {
           printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\"}}\\n' > /etc/docker/daemon.json \
           || true) && \
        (curl -sSL https://github.com/Boshen/cargo-shear/releases/download/v{CARGO_SHEAR_VERSION}/cargo-shear-$(uname -m)-unknown-linux-musl.tar.gz 2>/dev/null | tar -xz -C /usr/local/bin 2>/dev/null || true) && \
-       (npm install -g --no-fund --no-audit pnpm@{PNPM_VERSION} yarn@{YARN_VERSION}) && \
-       (mkdir -p /usr/local/nvm && \
-        curl -fsSL \"https://github.com/nvm-sh/nvm/archive/refs/tags/v{NVM_VERSION}.tar.gz\" | \
-          tar -xz -C /usr/local/nvm --strip-components=1 && \
-        mkdir -p /usr/local/nvm/versions/node && \
-        ln -sfn /usr/local /usr/local/nvm/versions/node/v{BASE_NODE_VERSION} && \
-        mkdir -p /usr/local/nvm/alias && \
-        printf '{BASE_NODE_VERSION}\\n' > /usr/local/nvm/alias/22 && \
-        ln -sfn /usr/local/nvm /root/.nvm; \
-        [ -d /home/runner ] && ln -sfn /usr/local/nvm /home/runner/.nvm; \
-        printf 'export NVM_DIR=/usr/local/nvm\\n[ -s \\\"$NVM_DIR/nvm.sh\\\" ] && . \\\"$NVM_DIR/nvm.sh\\\"\\n' > /etc/profile.d/nvm.sh) && \
-       (case \"$(uname -m)\" in \
-          aarch64|arm64) PY_ARCH=aarch64-unknown-linux-gnu ;; \
-          x86_64) PY_ARCH=x86_64-unknown-linux-gnu ;; \
-          *) echo \"unsupported arch for python\" >&2; exit 1 ;; \
-        esac && \
-        mkdir -p /opt/python/{PYTHON_3_10_VERSION} && \
-        curl -fsSL \"https://github.com/astral-sh/python-build-standalone/releases/download/{PYTHON_STANDALONE_RELEASE}/cpython-{PYTHON_3_10_VERSION}+{PYTHON_STANDALONE_RELEASE}-$PY_ARCH-install_only.tar.gz\" | \
-          tar -xz -C /opt/python/{PYTHON_3_10_VERSION} --strip-components=1 && \
-        ln -sfn /opt/python/{PYTHON_3_10_VERSION}/bin/python3.10 /usr/local/bin/python3.10 && \
-        ln -sfn /opt/python/{PYTHON_3_10_VERSION}/bin/pip3.10 /usr/local/bin/pip3.10) && \
-       (case \"$(uname -m)\" in \
-          aarch64|arm64) GO_ARCH=arm64 ;; \
-          x86_64) GO_ARCH=amd64 ;; \
-          *) echo \"unsupported arch for go\" >&2; exit 1 ;; \
-        esac && \
-        mkdir -p /opt/go/{GO_1_24_VERSION} && \
-        curl -fsSL \"https://go.dev/dl/go{GO_1_24_VERSION}.linux-$GO_ARCH.tar.gz\" | \
-          tar -xz -C /opt/go/{GO_1_24_VERSION} --strip-components=1 && \
-        ln -sfn /opt/go/{GO_1_24_VERSION}/bin/go /usr/local/bin/go && \
-        ln -sfn /opt/go/{GO_1_24_VERSION}/bin/gofmt /usr/local/bin/gofmt) && \
-       (case \"$(uname -m)\" in \
-          aarch64|arm64) GH_ARCH=arm64 ;; \
-          x86_64) GH_ARCH=amd64 ;; \
-          *) echo \"unsupported arch for gh\" >&2; exit 1 ;; \
-        esac && \
-        curl -fsSL \"https://github.com/cli/cli/releases/download/v{GH_VERSION}/gh_{GH_VERSION}_linux_$GH_ARCH.tar.gz\" | \
-          tar -xz -C /usr/local --strip-components=1 && \
-        curl -fsSL \"https://github.com/mikefarah/yq/releases/download/v{YQ_VERSION}/yq_linux_$GH_ARCH\" -o /usr/local/bin/yq && \
-        chmod +x /usr/local/bin/yq) && \
-       (for t in node npm pnpm yarn python3.10 go gh yq git-lfs cmake sshpass; do \
-          command -v \"$t\" >/dev/null 2>&1 || {{ echo \"bake verification failed: $t missing from PATH\" >&2; exit 1; }}; \
-        done) && \
          apt-get clean"
     )
 }
@@ -620,10 +564,9 @@ async fn write_bake_manifest<P: VmProvider>(
     let probe = [
         "sh".to_owned(),
         "-c".to_owned(),
-        "for cmd in node npm python3 python3.10 docker git git-lfs rustc cargo cargo-shear pnpm yarn gh yq cmake; do \
+        "for cmd in node npm python3 docker git rustc cargo go cargo-shear; do \
            printf '%s=%s\\n' \"$cmd\" \"$($cmd --version 2>/dev/null | head -n1 || echo missing)\"; \
          done; \
-         printf 'go=%s\\n' \"$(go version 2>/dev/null || echo missing)\"; \
          printf 'packages=%s\\n' \"$(dpkg-query -W -f={{Package}} | wc -l)\"; \
          printf 'built_at=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
             .to_owned(),
@@ -693,11 +636,6 @@ const GUEST_RUNNER_PATH: &str = "/root/.cargo/bin:/usr/local/go/bin:\
 fn guest_env_prefix(config: &RunnerPoolConfig, name: &MachineName) -> Vec<String> {
     let mut env = Vec::new();
     env.push(format!("PATH={GUEST_RUNNER_PATH}"));
-    // nvm is a shell function, not a binary: steps source `$NVM_DIR/nvm.sh`
-    // explicitly (steps run `bash --noprofile --norc`, so profile.d never
-    // applies). Exporting the directory is what makes the documented hosted
-    // pattern (`source "$NVM_DIR/nvm.sh"`) work unmodified.
-    env.push("NVM_DIR=/usr/local/nvm".to_owned());
     // The guest needs its own VM name so a debug session can tell a controller
     // which machine to open a shell into. Nothing else in the guest knows it.
     env.push(format!("PRELOOP_MACHINE_NAME={}", name.as_str()));

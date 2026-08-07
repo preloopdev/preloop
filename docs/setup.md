@@ -129,6 +129,34 @@ steps:
 Trust: submissions from untrusted events (fork PRs via the webhook path) do
 not receive stored secrets; native `preloop run` submissions always do.
 
+### Where secrets live
+
+By default stored secrets persist in the config file (`[secrets]`, mode
+0600). For deployments that must not hold plaintext at rest, two options:
+
+- **Memory-only store** — set `secrets_store = "memory"` in the config file
+  (or `PRELOOP_SECRETS_STORE=memory`): the live secrets API keeps values in
+  engine memory for the process lifetime and never writes them to the file.
+  `preloop secret set` then requires a running engine; after a restart you
+  re-seed. Combine with the systemd credential below for a durable base set.
+- **systemd credential** — install the service with
+  `--systemd-credential /etc/preloop-secrets.enc` to mount an encrypted
+  credential (`LoadCredentialEncrypted=preloop-secrets`); the engine reads
+  `[secrets]`/`[repo_secrets]` from it at startup, overriding the config
+  file per name. Create the blob with:
+
+  ```sh
+  systemd-creds encrypt --name=preloop-secrets secrets.toml /etc/preloop-secrets.enc
+  ```
+
+  At rest the blob is encrypted and bound to the host (TPM or machine key);
+  systemd decrypts it into an in-memory file (memfd) the service never
+  writes back. Secrets already in the config file still load and apply —
+  the credential wins per name. Note: secrets backed by the credential are
+  re-applied on every engine restart — `preloop secret rm` removes them from
+  the running store, but to make the removal permanent, edit the credential
+  file (or the config file) itself.
+
 ## Config file
 
 Everything lives in `~/.preloop/config.toml` (mode 0600; `PRELOOP_CONFIG`
@@ -190,151 +218,114 @@ Run Postgres however you like — a managed service, a `postgres` container on
 the same host, or an OS package. The engine does not bundle or spawn a
 database server; SQLite is the embedded option, Postgres is an external
 dependency you point at.
+## Running as a service
+
+For a team server that must survive reboots and restarts, install the engine
+as a supervised service instead of running `preloop serve` by hand:
+
+```sh
+sudo preloop server install \
+    --public-url https://ci.example.com \
+    --github-app-id 123456 \
+    --github-app-key /etc/preloop/app.pem \
+    --webhook-secret '…'
+```
+
+What it does:
+
+- **Linux (systemd)** — writes hardened units to
+  `/etc/systemd/system/preloop.{service,socket}` plus a self-update timer
+  (`preloop-update.{service,timer}`, hourly, polls GitHub Releases). The
+  control plane is socket-activated on the port of `--listen` (default 9090).
+- **macOS (launchd)** — writes a LaunchDaemon plist to
+  `/Library/LaunchDaemons/dev.preloop.server.plist` (mode 0600).
+- `--systemd-credential PATH` (Linux) — mounts an encrypted systemd
+  credential (`LoadCredentialEncrypted=preloop-secrets:PATH`) so stored secrets come
+  from an encrypted, host-bound blob instead of the config file; see
+  "Where secrets live" in the Secrets section.
+- Configuration is written to a mode-0600 environment file
+  (`/var/lib/preloop/environment` on Linux) — the webhook secret never lands
+  in a world-readable unit.
+- State lives in `/var/lib/preloop` (mode 0700; `--home` overrides).
+
+The `--github-app-*` / `--webhook-secret` flags are optional at install time,
+but **you must define these secrets** for the service to be useful: without a
+webhook secret the engine rejects every GitHub webhook delivery, and without
+an App key it cannot mint `GITHUB_TOKEN`. They land in the mode-0600
+environment file (never in the world-readable units); alternatively install
+first, then configure credentials with
+`PRELOOP_HOME=/var/lib/preloop preloop setup github --save` (writes the
+mode-0600 `config.toml` — see above). `preloop server install --dry-run`
+prints the full plan without touching the system, and
+`sudo preloop server uninstall` removes the units while keeping
+`/var/lib/preloop` data; pass `--purge-data` to delete it. Manual copies of
+the units live in `contrib/systemd/`.
+
+### Rootless option: `--user`
+
+Don't have (or don't want) root on the box? Install a per-user service
+instead — **no sudo required**, and state defaults to `~/.preloop` instead of
+`/var/lib/preloop`:
+
+```sh
+preloop server install --user --public-url https://ci.example.com
+```
+
+- **Linux** — systemd *user* units in `~/.config/systemd/user/`, managed with
+  `systemctl --user` (the self-update timer works the same). They stop when
+  you log out; `sudo loginctl enable-linger $USER` keeps them running.
+- **macOS** — a LaunchAgent at `~/Library/LaunchAgents/`, loaded into your
+  GUI session. LaunchAgents only run while you're logged in.
+- Everything else is identical: same flags, same 0600 config file, same
+  `--dry-run`, and `preloop server uninstall --user` to remove it.
+
+System scope is still the right default for a team server (runs before login,
+accepts webhooks unattended); `--user` fits personal machines and dev boxes.
+
+### Exposing the engine to GitHub
+
+`--public-url` is the address GitHub uses to deliver webhooks and link check
+runs. Without it (or with a loopback default), GitHub can't reach the engine —
+the service runs, but nothing ever triggers. Two ways to make it reachable:
+
+**Production — a domain.** You should definitely point a DNS record at the host and terminate TLS
+in front of the engine: a Caddy/nginx reverse proxy to `127.0.0.1:9090 and do a bunch of other security hardening stuff on your server. (or
+bind `0.0.0.0:9090` behind your own TLS). Register the App's webhook as
+`https://ci.example.com/api/v1/github/webhooks` (gated by the webhook secret)
+and install with:
+
+```sh
+sudo preloop server install \
+    --public-url https://ci.example.com \
+    --github-app-id 123456 --github-app-key /etc/preloop/app.pem \
+    --webhook-secret '…'
+```
+
+**Trying it out — a tunnel.** No DNS record or inbound port needed:
+
+```sh
+cloudflared tunnel --url http://127.0.0.1:9090   # quick tunnel → https://xxx.trycloudflare.com
+ngrok http 9090
+tailscale funnel 9090
+```
+
+Re-run `preloop server install` with the tunnel URL as `--public-url` (or set
+`PRELOOP_PUBLIC_URL` in the service environment file and restart). Note that a
+quick tunnel's URL changes on every restart — for anything long-lived, use a
+named Cloudflare tunnel or the domain path above.
 
 ## Troubleshooting
-
-First stop for any failure: the engine log (`~/.preloop/engine.log`), and
-`preloop doctor --repo owner/repo` for credential problems.
-
-### Engine won't start
-
-- **`preloop run` / `preloop serve` exits with "engine exited before
-  becoming ready: exit status: 1"** — read `~/.preloop/engine.log` for the
-  real error. The two common causes below produce exactly this symptom.
-- **`Error: Address already in use (os error 48)` on the unix socket
-  (`~/.preloop/preloop.sock`)** — a stale socket file or an orphaned engine
-  from a crashed session. Find and kill the holder, then remove the file:
-  `lsof ~/.preloop/preloop.sock`; kill it; `rm -f ~/.preloop/preloop.sock`.
-- **`Address already in use` on TCP :9090** — another `preloop serve`/`engine`
-  is already listening (or a leftover process from a previous session).
-  `lsof -nP -iTCP:9090 -sTCP:LISTEN` to see who, kill the stale one, or run
-  the new engine on another port with `PRELOOP_LISTEN=127.0.0.1:9091`.
-- **`server returned 404: /api/v1/runs not available on this endpoint`** —
-  the CLI is talking to the wrong server: `AKSH_URL` unset defaults to
-  `http://127.0.0.1:9090`, and an older/different engine may be squatting
-  there. Point `AKSH_URL` at your engine, or clear the stale engine.
-- **`missing or invalid native API token`** — the client's token
-  (`~/.preloop/engine.token`) does not match the engine's
-  `AKSH_SYSTEM_TOKEN`. Restart the engine and client together, or set
-  `AKSH_SYSTEM_TOKEN` to the value in `~/.preloop/engine.token`.
-- **`Error: connection refused` when submitting** — no engine is listening on
-  `AKSH_URL`; start one (`preloop serve`) or fix the URL.
-- **`local runner provisioning unavailable … Linux runner bundle
-  unavailable; run just build-preloop`** — the Linux guest runner binary is
-  missing; build it with `just build-preloop` (the control plane stays up,
-  but no VM jobs can start).
-
-### Runner / VM issues
-
-- **Job queued forever, nothing claims it** — no runner is registered for the
-  job's `runs-on` labels, or the pool can't provision a VM (see the engine
-  log for the slot error). Check `preloop runner list` and the label set.
-- **`smolvm exec failed with exit code 1: setpriv: mutually exclusive
-  arguments`** — an old engine binary with the pre-fix `as_runner_user`
-  wrapper. Rebuild the engine (`cargo build -p preloop-cli`) and restart it.
-- **`crane manifest failed … lookup index.docker.io on 100.96.0.1:53: i/o
-  timeout` (or any in-guest DNS timeout)** — the VM's gateway forwards DNS to
-  a broken host resolver (Tailscale is a common culprit). Run the engine with
-  `PRELOOP_RUNNER_DNS=8.8.8.8` so the gateway uses a public resolver
-  directly.
-- **`TOOMANYREQUESTS: unauthenticated pull rate limit` from
-  index.docker.io** — Docker Hub's anonymous rate limit on the egress IP.
-  Authenticate: `docker login` on the host (the guest's `crane` reads the
-  host's `~/.docker`), or use a packed golden / preloaded image so no pull is
-  needed.
-- **`530 / Argo Tunnel error 1033` from inside VMs, or
-  `actions/upload-artifact` timeouts** — the guests reach the engine through
-  the tunnel; a tunnel outage breaks local CI too. Restore `cloudflared`, or
-  give guests a host-reachable URL (see
-  [github-app-webhook.md](github-app-webhook.md) §8.2).
-- **A workflow pins `macos-13`/`windows-*` and gets the wrong host** — image
-  versions are not disambiguated yet: any `macos-*` label matches whatever
-  Mac is registered. Track [issue #44] for platform-specific routing.
-
-### Credentials & tokens
 
 - **`doctor` says the App has no installation for a repo** — install the app
   on that account/repo, or check the installation's repository selection.
 - **`GITHUB_TOKEN` 403s in a job** — the installation may not grant the
   workflow's requested permissions. The engine logs which permissions are
-  ungranted; grant them on the installation page. Requesting a scope the App
-  was never granted fails the mint outright (a `422`), by design — narrow
-  the workflow's `permissions:` or grant the scope.
-- **A job's `GITHUB_TOKEN` is the local JWT instead of a GitHub token** —
-  App minting failed and `mint_failure` defaulted to `local`. Check the
-  engine log for why (App not installed on that owner, expired key, PAT-only
-  configuration). Set `AKSH_GITHUB_APP_MINT_FAILURE=error` to make
-  misconfiguration loud (`502` at submit), or `pat` to fall back to the
-  static PAT deliberately. See [github-tokens.md](github-tokens.md).
-- **PAT-authenticated jobs fail with `401`/`403` at api.github.com** — the
-  PAT expired or lacks a permission. Rotate it:
-  `preloop setup github --via pat --token github_pat_… --repo owner/repo`.
-- **`parsed PEM …` hard startup error** — a configured App PEM was invalid,
-  or `AKSH_GITHUB_APP_MINT_FAILURE` had an unrecognised value; both are fatal
-  at startup on purpose. Fix the config, restart.
-
-### Workflow & event issues
-
-- **Submit fails with `workflow does not match event pull_request`** —
-  pull_request events need an activity type: the simulated payload must
-  include `"action": "opened"` (or `synchronize`/`reopened`), e.g.
-  `preloop run --event pull_request --payload pr.json`. The same applies to
-  webhook deliveries missing the action.
-- **`${{ steps.*.outputs.* }}` is empty on local runs** — the parser
-  pre-evaluates expressions at submit time, before step outputs exist. Known
-  gap on aksh (works on GitHub). See [issue #88].
-- **A job that should run is `skipped` at submit** — non-Linux cells
-  (macOS/Windows) are skipped when no runner declares the OS, a deliberate
-  divergence from GitHub's queue-and-wait.
-- **`system.*` / `DistributedTask.*` variables visible in steps** — a known
-  divergence (GitHub exports only the step's own `env:`); harmless so far.
-
-### Webhooks
-
-- **`401 Unauthorized` on webhook deliveries** — `X-Hub-Signature-256`
-  verification failed: the secret in GitHub's hook does not match
-  `AKSH_WEBHOOK_SECRET` on the server.
-- **Runs never created for push/PR events** — check the hook is pointed at
-  the tunnel/`public_url` (not a LAN IP — the egress floor blackholes them),
-  the tunnel is up (see Error 1033 above), and the event has the
-  `action`/`ref` fields the workflow filters on.
-- **No check runs on commits/PRs** — check runs require a GitHub App; a
-  repository-level webhook delivers runs but cannot create check marks (see
-  [github-webhooks.md](github-webhooks.md)).
-
-### Secrets
-
+  ungranted; grant them on the installation page.
 - **A secret reads empty in a run** — check `preloop secret list` (was it
   scoped to another repo?) and whether the event was trusted (fork PRs get
-  no stored secrets). Values are masked as `***` in logs by design.
-- **`preloop secret set` says the name is invalid** — names must be
-  `UPPER_SNAKE`.
-
-### Store / database
-
-- **Engine log warns about store failures but keeps running** — the store is
-  best-effort on some surfaces (`delete_session` warns) and fatal on others
-  (`register_runner`/`create_session` return 500). Check the SQLite file
-  permissions/disk space, or the Postgres connection.
-- **Postgres: credentials travel in plaintext** — any `postgres://` URL
-  without explicit `sslmode` connects unencrypted with no warning. Add
-  `?sslmode=require` (or `verify-ca`/`verify-full`) for remote databases.
-- **Two engines sharing one Postgres database** — unsupported: the engine
-  keeps a single writer connection; point each engine at its own database.
-- **`conform: FAIL` when running `just test-ci`** — protocol drift against
-  the official-runner goldens. See [conformance.md](conformance.md) — it is
-  the compatibility contract and the index for what must not drift.
-
-### Still stuck?
-
-- Check `~/.preloop/engine.log` first — it carries the actual error behind
-  most one-line CLI failures.
-- `preloop doctor --repo owner/repo` re-verifies every credential.
-- For official-runner E2E quirks (port stripping), see
-  [CONTRIBUTING.md](../CONTRIBUTING.md) — `USE_DEV_ACTIONS_SERVICE_URL`
-  keeps non-default ports instead of the old port-80 redirect.
-
-[issue #44]: https://github.com/preloopdev/preloop/issues/44
-[issue #88]: https://github.com/preloopdev/preloop/issues/88
+  no stored secrets).
+- **Mint failure policy** — `mint_failure` decides what happens when App
+  minting fails: `local` (fall back to the local JWT), `error` (fail the
+  job), `pat` (fall back to the PAT).
 
 [smolvm]: https://github.com/preloopdev/smolvm

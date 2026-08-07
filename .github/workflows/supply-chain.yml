@@ -24,25 +24,7 @@ jobs:
     runs-on: self-hosted
     timeout-minutes: 30
     steps:
-      - name: Ensure git-lfs for LFS-tracked goldens
-        run: |
-          if ! command -v git-lfs >/dev/null 2>&1; then
-            case $(uname -m) in
-              aarch64|arm64) LFS_ARCH=arm64 ;;
-              x86_64) LFS_ARCH=amd64 ;;
-              *) echo "unsupported arch" >&2; exit 1 ;;
-            esac
-            curl -fsSL "https://github.com/git-lfs/git-lfs/releases/download/v3.7.1/git-lfs-linux-$LFS_ARCH-v3.7.1.tar.gz" -o /tmp/git-lfs.tgz
-            tar -xzf /tmp/git-lfs.tgz -C /tmp
-            mkdir -p "$HOME/bin"
-            cp /tmp/git-lfs-3.7.1/git-lfs "$HOME/bin/git-lfs"
-            chmod +x "$HOME/bin/git-lfs"
-            echo "$HOME/bin" >> "$GITHUB_PATH"
-          fi
-          git lfs install --skip-repo >/dev/null 2>&1 || true
       - uses: actions/checkout@v4
-        with:
-          lfs: true
         with:
           persist-credentials: false
 

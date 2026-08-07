@@ -107,8 +107,6 @@ allow = [
     "curl",
     # webpki-roots (Mozilla CA bundle data).
     "CDLA-Permissive-2.0",
-    # The project's own license (LICENSE files ship FSL-1.1-MIT).
-    "FSL-1.1-MIT",
 ]
 # The confidence threshold for detecting a license from license text.
 # The higher the value, the more closely the license text must be to the

@@ -737,18 +737,33 @@ pub async fn run_job(
     // Gated on the per-run opt-in carried in the job message, so preservation
     // is a property of the run rather than of the engine that happens to be up.
     // Cancellation is not a failure — preserving it would pin a pool slot on
-    // every Ctrl-C.
+    // every Ctrl-C. A job that stayed green only through continue-on-error
+    // still preserves: the tolerated failure is exactly the state an operator
+    // wants to inspect.
+    let steps_had_failure = any_step_failed(&job_ctx.steps);
     let preserve_requested = job_message
         .get("preloopPreserveOnFailure")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    if preserve_requested && conclusion.eq_ignore_ascii_case("failed") && !debug_was_active {
+    if preserve_requested
+        && (conclusion.eq_ignore_ascii_case("failed") || steps_had_failure)
+        && !debug_was_active
+    {
         if let Some(path) = std::env::var_os("PRELOOP_FAILURE_MARKER") {
             let path = std::path::PathBuf::from(path);
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            if let Err(error) = std::fs::write(&path, &conclusion) {
+            // The marker names the preservation reason, not the job's final
+            // conclusion: a job preserved only because a `continue-on-error`
+            // step failed concludes "Success", and a tool reading
+            // `.preloop-job-failed` must see why the VM was held.
+            let marker = if conclusion.eq_ignore_ascii_case("failed") || steps_had_failure {
+                "Failed"
+            } else {
+                &conclusion
+            };
+            if let Err(error) = std::fs::write(&path, marker) {
                 warn!(path = %path.display(), %error, "failed to write Preloop failure marker");
             }
         }
@@ -756,6 +771,15 @@ pub async fn run_job(
 
     info!("Job {job_name} finished with result: {conclusion}");
     Ok(())
+}
+
+/// Whether any step ended in a genuine execution failure.
+///
+/// `continue-on-error` steps count: their `outcome` stays `Failure` even when
+/// the job conclusion is tolerated to `Success`, and a tolerated failure is
+/// precisely the state worth preserving for inspection.
+fn any_step_failed(steps: &indexmap::IndexMap<String, super::contexts::StepResult>) -> bool {
+    steps.values().any(|result| result.outcome == "Failure")
 }
 fn spawn_renew_loop(
     rpt: Arc<ReportingContext>,

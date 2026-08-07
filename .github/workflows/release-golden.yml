@@ -11,10 +11,6 @@ jobs:
   build-and-publish-linux-binaries:
     name: Build Linux ${{ matrix.arch }} release
     runs-on: self-hosted
-    # 4 GB pool VMs: parallel crate builds with LTO peak past the limit and
-    # the linker gets OOM-killed mid-link (seen on the aarch64 musl build).
-    env:
-      CARGO_BUILD_JOBS: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -26,34 +22,13 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Ensure git-lfs for LFS-tracked goldens
-        run: |
-          if ! command -v git-lfs >/dev/null 2>&1; then
-            case $(uname -m) in
-              aarch64|arm64) LFS_ARCH=arm64 ;;
-              x86_64) LFS_ARCH=amd64 ;;
-              *) echo "unsupported arch" >&2; exit 1 ;;
-            esac
-            curl -fsSL "https://github.com/git-lfs/git-lfs/releases/download/v3.7.1/git-lfs-linux-$LFS_ARCH-v3.7.1.tar.gz" -o /tmp/git-lfs.tgz
-            tar -xzf /tmp/git-lfs.tgz -C /tmp
-            mkdir -p "$HOME/bin"
-            cp /tmp/git-lfs-3.7.1/git-lfs "$HOME/bin/git-lfs"
-            chmod +x "$HOME/bin/git-lfs"
-            echo "$HOME/bin" >> "$GITHUB_PATH"
-          fi
-          git lfs install --skip-repo >/dev/null 2>&1 || true
       - name: Check out repository
         uses: actions/checkout@v4
-        with:
-          lfs: true
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      - name: Ensure cross target (dtolnay may skip it on self-hosted)
-        run: rustup target add ${{ matrix.target }}
 
       - name: Set up Zig cross toolchain
         uses: goto-bus-stop/setup-zig@v2
@@ -107,26 +82,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Ensure git-lfs for LFS-tracked goldens
-        run: |
-          if ! command -v git-lfs >/dev/null 2>&1; then
-            case $(uname -m) in
-              aarch64|arm64) LFS_ARCH=arm64 ;;
-              x86_64) LFS_ARCH=amd64 ;;
-              *) echo "unsupported arch" >&2; exit 1 ;;
-            esac
-            curl -fsSL "https://github.com/git-lfs/git-lfs/releases/download/v3.7.1/git-lfs-linux-$LFS_ARCH-v3.7.1.tar.gz" -o /tmp/git-lfs.tgz
-            tar -xzf /tmp/git-lfs.tgz -C /tmp
-            mkdir -p "$HOME/bin"
-            cp /tmp/git-lfs-3.7.1/git-lfs "$HOME/bin/git-lfs"
-            chmod +x "$HOME/bin/git-lfs"
-            echo "$HOME/bin" >> "$GITHUB_PATH"
-          fi
-          git lfs install --skip-repo >/dev/null 2>&1 || true
       - name: Check out repository
         uses: actions/checkout@v4
-        with:
-          lfs: true
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
