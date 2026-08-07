@@ -1,0 +1,7 @@
+name: e2e-push
+on: push
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "push demo ok"
