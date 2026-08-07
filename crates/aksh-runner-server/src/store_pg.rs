@@ -248,9 +248,8 @@ impl PgStore {
     async fn write_meta_tx(
         &self,
         tx: &tokio_postgres::Transaction<'_>,
-        inner: &InnerState,
+        meta: &MetaSnapshot,
     ) -> anyhow::Result<()> {
-        let meta = build_meta_snapshot(inner);
         let blob = self.cipher.seal(&serde_json::to_vec(&meta)?)?;
         tx.execute(
             "INSERT INTO runtime_snapshots(snapshot_id, format_version, meta_blob, written_at_us)
@@ -262,6 +261,47 @@ impl PgStore {
             &[&(SNAPSHOT_FORMAT as i64), &blob, &now_us()],
         )
         .await?;
+        Ok(())
+    }
+
+    /// Rewrite the claim/message tables from the captured projections (see the
+    /// SQLite twin for the rationale).
+    async fn write_claim_state_tx(
+        &self,
+        tx: &tokio_postgres::Transaction<'_>,
+        session_active_requests: &[(String, i64)],
+        inflight: &[(String, i64, azdo::TaskAgentMessage)],
+        broker_request_messages: &[(i64, azdo::AgentJobRequestMessage)],
+    ) -> anyhow::Result<()> {
+        tx.execute("DELETE FROM session_active_requests", &[])
+            .await?;
+        for (session_id, request_id) in session_active_requests {
+            tx.execute(
+                "INSERT INTO session_active_requests(session_id, active_request_id) VALUES ($1, $2)",
+                &[&session_id, request_id],
+            )
+            .await?;
+        }
+        tx.execute("DELETE FROM broker_messages", &[]).await?;
+        for (session_id, message_id, payload) in inflight {
+            let payload_json = serde_json::to_string(payload)?;
+            tx.execute(
+                "INSERT INTO broker_messages(session_id, message_id, payload_json, written_at_us)
+                 VALUES ($1, $2, $3, $4)",
+                &[&session_id, message_id, &payload_json, &now_us()],
+            )
+            .await?;
+        }
+        tx.execute("DELETE FROM job_request_messages", &[]).await?;
+        for (request_id, payload) in broker_request_messages {
+            let payload_json = serde_json::to_string(payload)?;
+            tx.execute(
+                "INSERT INTO job_request_messages(request_id, payload_json, written_at_us)
+                 VALUES ($1, $2, $3)",
+                &[request_id, &payload_json, &now_us()],
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -479,8 +519,9 @@ impl Store for PgStore {
         }
         // Restore per-session broker message queues (dequeued but not yet
         // delivered to the runner) from the `broker_messages` table that
-        // `store_inner` writes. `inner.broker_messages` (keyed by request_id)
-        // is a separate map and comes back with the meta snapshot below.
+        // `store_inner` / `store_run_event` write. `inner.broker_messages`
+        // (keyed by request_id) is a separate map restored from its own table
+        // below.
         let rows = client
             .query(
                 "SELECT session_id, message_id, payload_json FROM broker_messages
@@ -502,6 +543,27 @@ impl Store for PgStore {
                 }
                 Err(error) => {
                     tracing::warn!(%session_id, message_id, %error, "dropping undecodable broker message");
+                }
+            }
+        }
+        // Restore per-request job messages (request_id → message); the broker
+        // re-delivers from `inner.broker_messages` after a restart.
+        let rows = client
+            .query(
+                "SELECT request_id, payload_json FROM job_request_messages
+                 ORDER BY request_id",
+                &[],
+            )
+            .await?;
+        for row in rows {
+            let request_id: i64 = row.get(0);
+            let payload_json: String = row.get(1);
+            match serde_json::from_str::<azdo::AgentJobRequestMessage>(&payload_json) {
+                Ok(message) => {
+                    inner.broker_messages.insert(request_id, message);
+                }
+                Err(error) => {
+                    tracing::warn!(request_id, %error, "dropping undecodable job request message");
                 }
             }
         }
@@ -594,11 +656,12 @@ impl Store for PgStore {
         Ok(())
     }
 
-    async fn store_inner(&self, inner: &InnerState) -> anyhow::Result<()> {
+    async fn store_inner(&self, snapshot: &StoreSnapshot) -> anyhow::Result<()> {
         let mut client = self.connection.lock().await;
         let tx = client.transaction().await?;
         for table in [
             "broker_messages",
+            "job_request_messages",
             "session_active_requests",
             "job_requests",
             "job_dependencies",
@@ -610,15 +673,25 @@ impl Store for PgStore {
         ] {
             tx.execute(&format!("DELETE FROM {table}"), &[]).await?;
         }
-        for run in inner.runs.values() {
+        for run in &snapshot.runs {
             self.store_run_tx(&tx, run).await?;
         }
 
-        for (kind, job, position) in queue_rows(inner) {
-            self.insert_job(&tx, job, kind, position).await?;
+        let rsa_keys: std::collections::BTreeMap<i64, &AgentRsaPublicKey> = snapshot
+            .rsa_public_keys
+            .iter()
+            .map(|(id, key)| (*id, key))
+            .collect();
+        let session_keys: std::collections::BTreeMap<String, &SessionEncryption> = snapshot
+            .session_keys
+            .iter()
+            .map(|(id, key)| (id.clone(), key))
+            .collect();
+        for (kind, job, position) in &snapshot.jobs {
+            self.insert_job(&tx, job, kind, *position).await?;
         }
 
-        for runner in inner.runners.values() {
+        for runner in &snapshot.runners {
             // `ON CONFLICT` so re-registration (same `runner_id`, new name)
             // overwrites the row in place. Without it, `UNIQUE(name)` would
             // reject the insert whenever the in-memory map had two runners
@@ -640,10 +713,7 @@ impl Store for PgStore {
             // Typed RSA public key is stored alongside the XML form so a
             // post-restart session can be FIPS-encrypted without re-parsing
             // and without an extra table.
-            let rsa_xml = inner
-                .runner_rsa_public_keys
-                .get(&runner.id)
-                .map(|key| key.to_xml_string());
+            let rsa_xml = rsa_keys.get(&runner.id).map(|key| key.to_xml_string());
             tx.execute(
                 "INSERT INTO runners(runner_id, name, ephemeral,
                                      runner_group_id, runner_group_name,
@@ -684,11 +754,10 @@ impl Store for PgStore {
                 .await?;
             }
         }
-        for session in inner.sessions.values() {
+        for session in &snapshot.sessions {
             // `session_id` is the natural primary key; a re-persist
             // overwrites the same row.
-            let key_blob = inner
-                .session_keys
+            let key_blob = session_keys
                 .get(&session.session_id.0.to_string())
                 .map(|enc| seal_session_key(&self.cipher, enc));
             match key_blob {
@@ -738,81 +807,61 @@ impl Store for PgStore {
                 }
             }
         }
-        for record in inner.job_requests.values() {
+        for record in &snapshot.requests {
             self.insert_request_tx(&tx, record).await?;
         }
-        // Persist per-session active-request assignments. A restart
-        // re-derives the assignment so a dequeued-but-unacked request is
-        // re-delivered to the runner when it polls again.
-        tx.execute("DELETE FROM session_active_requests", &[])
-            .await?;
-        for (session_id, request_id) in &inner.session_active_requests {
-            tx.execute(
-                "INSERT INTO session_active_requests(session_id, active_request_id) VALUES ($1, $2)",
-                &[&session_id, &request_id],
-            )
-            .await?;
-        }
-        // Persist per-session broker message queues.
-        tx.execute("DELETE FROM broker_messages", &[]).await?;
-        for (session_id, messages) in &inner.inflight_messages {
-            for (message_id, payload) in messages {
-                let payload_json = serde_json::to_string(payload)?;
-                tx.execute(
-                    "INSERT INTO broker_messages(session_id, message_id, payload_json, written_at_us)
-                     VALUES ($1, $2, $3, $4)",
-                    &[&session_id, &message_id, &payload_json, &now_us()],
-                )
-                .await?;
-            }
-        }
-        self.write_meta_tx(&tx, inner).await?;
+        self.write_claim_state_tx(
+            &tx,
+            &snapshot.session_active_requests,
+            &snapshot.inflight,
+            &snapshot.broker_request_messages,
+        )
+        .await?;
+        self.write_meta_tx(&tx, &snapshot.meta).await?;
         tx.commit()
             .await
             .map_err(|error| anyhow::anyhow!("committing store snapshot: {error}"))?;
         Ok(())
     }
 
-    async fn store_meta_only(&self, inner: &InnerState) -> anyhow::Result<()> {
+    async fn store_meta_only(&self, meta: &MetaSnapshot) -> anyhow::Result<()> {
         let mut client = self.connection.lock().await;
         let tx = client.transaction().await?;
-        self.write_meta_tx(&tx, inner).await?;
+        self.write_meta_tx(&tx, meta).await?;
         tx.commit()
             .await
             .map_err(|error| anyhow::anyhow!("committing metadata: {error}"))?;
         Ok(())
     }
 
-    async fn store_run_event(
-        &self,
-        inner: &InnerState,
-        run_id: RunId,
-        event: &NdjsonEvent,
-    ) -> anyhow::Result<()> {
+    async fn store_run_event(&self, projection: RunProjection) -> anyhow::Result<()> {
         let mut client = self.connection.lock().await;
         let tx = client.transaction().await?;
-        let Some(run) = inner.runs.get(&run_id) else {
-            return Ok(());
-        };
-        self.store_run_tx(&tx, run).await?;
+        let run_id = projection.run.run_id;
+        self.store_run_tx(&tx, &projection.run).await?;
         tx.execute("DELETE FROM jobs WHERE run_id = $1", &[&run_id.to_string()])
             .await?;
-        for (kind, job, position) in queue_rows_for_run(inner, run_id) {
-            self.insert_job(&tx, job, kind, position).await?;
+        for (kind, job, position) in &projection.jobs {
+            self.insert_job(&tx, job, kind, *position).await?;
         }
         tx.execute(
             "DELETE FROM job_requests WHERE run_id = $1",
             &[&run_id.to_string()],
         )
         .await?;
-        for record in inner
-            .job_requests
-            .values()
-            .filter(|record| record.run_id == run_id)
-        {
+        for record in &projection.requests {
             self.insert_request_tx(&tx, record).await?;
         }
-        self.insert_event_tx(&tx, event).await?;
+        // Claim state must land in the same transaction as the queue rewrite
+        // (see the SQLite twin).
+        self.write_claim_state_tx(
+            &tx,
+            &projection.session_active_requests,
+            &projection.inflight,
+            &projection.broker_request_messages,
+        )
+        .await?;
+        self.insert_event_tx(&tx, &projection.event).await?;
         tx.commit()
             .await
             .map_err(|error| anyhow::anyhow!("committing run event: {error}"))?;
@@ -1046,6 +1095,19 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         // See the SQLite twin: this table stored `"<redacted>"`, not secrets.
         r#"
         DROP TABLE IF EXISTS run_secrets;
+        "#,
+    ),
+    (
+        3,
+        "job-request-messages-table",
+        // See the SQLite twin: claim state must land in the same transaction
+        // as the queue rewrite.
+        r#"
+        CREATE TABLE IF NOT EXISTS job_request_messages (
+          request_id BIGINT PRIMARY KEY,
+          payload_json TEXT NOT NULL,
+          written_at_us BIGINT NOT NULL
+        );
         "#,
     ),
 ];

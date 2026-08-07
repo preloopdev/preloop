@@ -517,6 +517,7 @@ pub fn sign_jwt_rs256_with_key(
 
 /// A session encryption context — holds the AES key for encrypting/decrypting
 /// message bodies within a session.
+#[derive(Clone)]
 pub struct SessionEncryption {
     /// The raw AES-256 key.
     pub key: Vec<u8>,
