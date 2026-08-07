@@ -471,7 +471,27 @@ async fn artifact_preparation_runs_once_and_reuses_payload_on_next_run() {
         vec![RunAction::Wait, RunAction::Wait],
     ));
     let pool = RunnerPool::new(provider.clone(), fixture.config.clone()).unwrap();
-    run_until_cancelled(pool, &provider, CancellationToken::new(), 1).await;
+    // The builder machine's install steps count as `exec` calls, so a
+    // `run_calls` wait can cancel the pool between the builder's install and
+    // its pack on a loaded host — the pack never runs and the assertion
+    // below fails with `pack_calls == 0`. Wait on the pack itself, which
+    // only happens after the artifact is fully built, then cancel.
+    let task_shutdown = CancellationToken::new();
+    let task = tokio::spawn({
+        let pool = pool;
+        let task_shutdown = task_shutdown.clone();
+        async move { pool.run(task_shutdown).await }
+    });
+    provider
+        .wait_until(|state| {
+            state
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Pack(_)))
+        })
+        .await;
+    task_shutdown.cancel();
+    task.await.unwrap().unwrap();
 
     assert!(artifact_payload(&fixture.config.artifact_stem).is_file());
     let first = provider.snapshot().await;
