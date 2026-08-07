@@ -21,26 +21,26 @@ not the required source of triggers.
 
 ```
 1. work locally on branch feat/x          (tree must be CLEAN)
-2. preloop run --sync [--create-pr]
+2. preloop run --push [--create-pr]
 3. server runs CI on the workspace snapshot
 4. run reaches a terminal state
 5. CLI pins the push to the tested SHA (never the branch tip)
 6. if no open PR for the branch: server creates one (draft by default)
 7. server reports check runs for the tested SHA (queued/in_progress/completed)
-8. GitHub unreachable? CLI retries with backoff; `preloop sync <run_id>` replays
+8. GitHub unreachable? CLI retries with backoff; `preloop push <run_id>` replays
 ```
 
 ## Invariants
 
 1. **The SHA that lands on GitHub is the SHA that was tested.** Enforced by
-   the clean-tree gate (refuse to submit with a dirty tree when `--sync` is
+   the clean-tree gate (refuse to submit with a dirty tree when `--push` is
    set), by pinning the push to the recorded `HEAD` SHA, and by the server's
    tree verification: the pushed commit's tree must equal the tree the
    snapshot was taken from (`submit_tree`).
 2. **No clobbering.** The push is a fast-forward or a branch creation only.
    If the remote branch diverged from the tested commit, the sync refuses
    with instructions; a force-push never happens automatically.
-3. **Idempotent sync.** `preloop sync <run_id>` may be re-run freely: the
+3. **Idempotent sync.** `preloop push <run_id>` may be re-run freely: the
    push becomes a no-op when the remote already points at the tested SHA,
    PR creation checks for an existing open PR first, and check runs are only
    created for jobs that lack one.
@@ -49,24 +49,24 @@ not the required source of triggers.
 
 `WorkflowSubmission` (aksh-gha-protocol) gains two optional fields:
 
-- `sync: Option<SyncRequest>` — present when the user asked for push-back.
-  `SyncRequest { create_pr: bool, draft_pr: bool }`.
-- `sync_tree: Option<String>` — `git rev-parse HEAD^{tree}` of the tested
+- `sync: Option<PushRequest>` — present when the user asked for push-back.
+  `PushRequest { create_pr: bool, draft_pr: bool }`.
+- `push_tree: Option<String>` — `git rev-parse HEAD^{tree}` of the tested
   tree, used for verification.
 
-The run record gains `sync_state: Option<SyncState>`
-(`pending | synced | blocked` + error + PR number), surfaced by
+The run record gains `push_state: Option<PushState>`
+(`pending | pushed | blocked` + error + PR number), surfaced by
 `preloop status`.
 
 ## Components
 
 | Piece | Location | Notes |
 |---|---|---|
-| Clean-tree gate, SHA/tree capture | `preloop-cli` `cmd_run` | `--sync` requires `git status --porcelain` empty; captures `HEAD` + `HEAD^{tree}` |
+| Clean-tree gate, SHA/tree capture | `preloop-cli` `cmd_run` | `--push` requires `git status --porcelain` empty; captures `HEAD` + `HEAD^{tree}` |
 | Pinned push + divergence check + backoff | `preloop-cli/src/sync.rs` | `git push <sha>:refs/heads/<branch>`; remote missing / equal / ancestor → push or skip; diverged → refuse |
 | Retry loop | `preloop-cli/src/sync.rs` | transient push/sync failures retried at 1m/5m/15m; permanent failures surface immediately |
 | Check reporting for native runs | `aksh-runner-server` `submit_run` | same queued/completed loop the webhook adapter uses, gated on `sync` being set |
-| PR create/update + tree verify | `aksh-runner-server/src/github_sync.rs` | `POST /api/v1/runs/:run_id/sync` |
+| PR create/update + tree verify | `aksh-runner-server/src/github_push.rs` | `POST /api/v1/runs/:run_id/push` |
 | Manifest | `github.rs` | default stays `pull_requests: read`; PR creation is opt-in — grant `pull_requests: write` only if you want `--create-pr`. `checks: write` is the only permission check reporting needs |
 
 ## Opt-in permission
@@ -84,11 +84,11 @@ hint.
 
 | Failure | Behavior |
 |---|---|
-| GitHub unreachable at completion | CLI retries (1m/5m/15m); then instructs `preloop sync <run_id>` |
+| GitHub unreachable at completion | CLI retries (1m/5m/15m); then instructs `preloop push <run_id>` |
 | Remote branch diverged | Sync blocked with error; user rebases and re-submits |
 | Tree mismatch (pushed ≠ tested) | Sync blocked; never reports checks against an untested SHA |
 | Commit not on GitHub yet | Sync blocked with "push the branch first" (commit lookup 404s) |
-| Interrupted CLI during sync | Run keeps its state; `preloop sync <run_id>` replays idempotently |
+| Interrupted CLI during sync | Run keeps its state; `preloop push <run_id>` replays idempotently |
 | Run failed | Sync still proceeds (draft PR + red checks — reviewable state); `--pr-draft=false` to create ready PRs |
 
 ## Scope boundaries
@@ -109,5 +109,5 @@ hint.
   tree verification, existing-PR reuse, and blocked states.
 - CLI: git-level tests against a local bare remote (create / equal /
   fast-forward / diverged).
-- E2E: `preloop run --sync` against a real repository with the App
+- E2E: `preloop run --push` against a real repository with the App
   installation, then cleanup (close PR, delete branch).

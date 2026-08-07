@@ -12349,11 +12349,11 @@ async fn purge_of_finished_runner_does_not_requeue() {
 }
 
 // ---------------------------------------------------------------------------
-// Submit-driven CI push-back (`--sync`): the server verifies the tested tree,
+// Submit-driven CI push-back (`--push`): the server verifies the tested tree,
 // creates the draft PR, and stays idempotent across replays.
 // ---------------------------------------------------------------------------
 
-async fn submit_sync_run(app: &Router, sha: &str, sync_tree: &str) -> Value {
+async fn submit_push_run(app: &Router, sha: &str, push_tree: &str) -> Value {
     request_json(
         app,
         Method::POST,
@@ -12364,15 +12364,15 @@ async fn submit_sync_run(app: &Router, sha: &str, sync_tree: &str) -> Value {
             "repository": "owner/repo",
             "git_ref": "refs/heads/feat/x",
             "sha": sha,
-            "sync_tree": sync_tree,
-            "sync": {"create_pr": true, "draft_pr": true}
+            "push_tree": push_tree,
+            "push": {"create_pr": true, "draft_pr": true}
         }),
     )
     .await
 }
 
 #[tokio::test]
-async fn submit_driven_sync_publishes_pr_and_checks_idempotently() {
+async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -12441,9 +12441,9 @@ async fn submit_driven_sync_publishes_pr_and_checks_idempotently() {
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
-    // 1. A --sync submission reports queued check runs at accept time and
+    // 1. A --push submission reports queued check runs at accept time and
     //    starts in `pending`.
-    let accepted = submit_sync_run(&app, SHA, TREE).await;
+    let accepted = submit_push_run(&app, SHA, TREE).await;
     let run_id = accepted["run_id"].as_str().unwrap().to_owned();
     {
         let inner = state.inner.lock().await;
@@ -12454,7 +12454,7 @@ async fn submit_driven_sync_publishes_pr_and_checks_idempotently() {
             7,
             "check run id comes from the (mock) GitHub API"
         );
-        assert_eq!(run.sync_state.as_ref().unwrap().status, SyncStatus::Pending);
+        assert_eq!(run.push_state.as_ref().unwrap().status, PushStatus::Pending);
     }
 
     // 2. Sync before the run is terminal is refused.
@@ -12463,7 +12463,7 @@ async fn submit_driven_sync_publishes_pr_and_checks_idempotently() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri(format!("/api/v1/runs/{run_id}/sync"))
+                .uri(format!("/api/v1/runs/{run_id}/push"))
                 .header(header::AUTHORIZATION, "Bearer aksh-system-token")
                 .body(Body::empty())
                 .unwrap(),
@@ -12473,7 +12473,7 @@ async fn submit_driven_sync_publishes_pr_and_checks_idempotently() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
     // 3. Terminal run: the sync verifies the tree, creates the draft PR,
-    //    and marks the run synced.
+    //    and marks the run pushed.
     {
         let mut inner = state.inner.lock().await;
         let run = inner
@@ -12482,22 +12482,22 @@ async fn submit_driven_sync_publishes_pr_and_checks_idempotently() {
             .unwrap();
         run.conclusion = Some("success".to_owned());
     }
-    let synced = request_json(
+    let pushed = request_json(
         &app,
         Method::POST,
-        &format!("/api/v1/runs/{run_id}/sync"),
+        &format!("/api/v1/runs/{run_id}/push"),
         Value::Null,
     )
     .await;
-    assert_eq!(synced["status"], "synced");
-    assert_eq!(synced["pr_number"], 42);
-    assert!(synced["pr_url"].as_str().unwrap().ends_with("/pull/42"));
+    assert_eq!(pushed["status"], "pushed");
+    assert_eq!(pushed["pr_number"], 42);
+    assert!(pushed["pr_url"].as_str().unwrap().ends_with("/pull/42"));
 
     {
         let inner = state.inner.lock().await;
         let run = inner.runs.get(&run_id.parse::<RunId>().unwrap()).unwrap();
-        assert_eq!(run.sync_state.as_ref().unwrap().status, SyncStatus::Synced);
-        assert_eq!(run.sync_state.as_ref().unwrap().pr_number, Some(42));
+        assert_eq!(run.push_state.as_ref().unwrap().status, PushStatus::Synced);
+        assert_eq!(run.push_state.as_ref().unwrap().pr_number, Some(42));
     }
     let pr_body = pr_bodies.lock().unwrap().first().unwrap().clone();
     assert_eq!(pr_body["head"], "feat/x");
@@ -12514,7 +12514,7 @@ async fn submit_driven_sync_publishes_pr_and_checks_idempotently() {
     let again = request_json(
         &app,
         Method::POST,
-        &format!("/api/v1/runs/{run_id}/sync"),
+        &format!("/api/v1/runs/{run_id}/push"),
         Value::Null,
     )
     .await;
@@ -12522,7 +12522,7 @@ async fn submit_driven_sync_publishes_pr_and_checks_idempotently() {
     assert_eq!(pr_creates.load(Ordering::SeqCst), 1, "idempotent replay");
 
     // 5. A pushed tree that differs from the tested tree blocks the sync.
-    let accepted = submit_sync_run(&app, SHA, "cccccccccccccccccccccccccccccccccccccccc").await;
+    let accepted = submit_push_run(&app, SHA, "cccccccccccccccccccccccccccccccccccccccc").await;
     let run_id = accepted["run_id"].as_str().unwrap().to_owned();
     {
         let mut inner = state.inner.lock().await;
@@ -12537,7 +12537,7 @@ async fn submit_driven_sync_publishes_pr_and_checks_idempotently() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri(format!("/api/v1/runs/{run_id}/sync"))
+                .uri(format!("/api/v1/runs/{run_id}/push"))
                 .header(header::AUTHORIZATION, "Bearer aksh-system-token")
                 .body(Body::empty())
                 .unwrap(),
@@ -12548,9 +12548,9 @@ async fn submit_driven_sync_publishes_pr_and_checks_idempotently() {
     {
         let inner = state.inner.lock().await;
         let run = inner.runs.get(&run_id.parse::<RunId>().unwrap()).unwrap();
-        assert_eq!(run.sync_state.as_ref().unwrap().status, SyncStatus::Blocked);
+        assert_eq!(run.push_state.as_ref().unwrap().status, PushStatus::Blocked);
         assert!(run
-            .sync_state
+            .push_state
             .as_ref()
             .unwrap()
             .error
@@ -12559,7 +12559,7 @@ async fn submit_driven_sync_publishes_pr_and_checks_idempotently() {
             .contains("does not match"));
     }
 
-    // 6. A run submitted without --sync can never be synced.
+    // 6. A run submitted without --push can never be pushed.
     let accepted = request_json(
         &app,
         Method::POST,
@@ -12577,7 +12577,7 @@ async fn submit_driven_sync_publishes_pr_and_checks_idempotently() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri(format!("/api/v1/runs/{run_id}/sync"))
+                .uri(format!("/api/v1/runs/{run_id}/push"))
                 .header(header::AUTHORIZATION, "Bearer aksh-system-token")
                 .body(Body::empty())
                 .unwrap(),

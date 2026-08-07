@@ -799,7 +799,7 @@ pub(crate) async fn submit_run_inner(
                     workflow_path_str: workflow_path.clone(),
                     event: event.clone(),
                     conclusion: Some("failure".to_owned()),
-                    sync_state: None,
+                    push_state: None,
                 },
             );
             drop(inner);
@@ -946,7 +946,7 @@ pub(crate) async fn submit_run_inner(
                             workflow_path_str: workflow_path.clone(),
                             event: event.clone(),
                             conclusion: Some("cancelled".to_owned()),
-                            sync_state: None,
+                            push_state: None,
                         },
                     );
                     drop(inner);
@@ -1013,7 +1013,7 @@ pub(crate) async fn submit_run_inner(
                     workflow_path_str: workflow_path.clone(),
                     event: event.clone(),
                     conclusion: None,
-                    sync_state: None,
+                    push_state: None,
                 },
             );
             drop(inner);
@@ -1072,7 +1072,7 @@ pub(crate) async fn submit_run_inner(
                 workflow_path_str: workflow_path.clone(),
                 event: event.clone(),
                 conclusion: None,
-                sync_state: None,
+                push_state: None,
             },
         );
 
@@ -1177,7 +1177,7 @@ pub(crate) async fn submit_run_inner(
                 workflow_path_str: workflow_path.clone(),
                 event: event.clone(),
                 conclusion: None,
-                sync_state: None,
+                push_state: None,
             },
         );
         // Deferred reusable-caller nodes whose needs are already satisfied
@@ -1248,18 +1248,18 @@ pub(crate) async fn submit_run(
     // A run that asks for push-back must be a real GitHub branch at a real
     // commit; anything else can never produce a PR or honest checks. Refuse
     // before queueing a single job so the failure is loud and immediate.
-    let sync_requested = submission.sync.is_some();
-    if sync_requested {
-        crate::github_sync::validate_sync_target(
+    let push_requested = submission.push.is_some();
+    if push_requested {
+        crate::github_push::validate_push_target(
             &submission.repository,
             &submission.sha,
             &submission.git_ref,
-            submission.sync_tree.as_deref().unwrap_or_default(),
+            submission.push_tree.as_deref().unwrap_or_default(),
         )?;
     }
 
     let accepted = submit_run_inner(&shared, submission).await?;
-    if sync_requested {
+    if push_requested {
         // Report queued check runs for every job, exactly like the webhook
         // adapter does for delivered events, so GitHub shows the run from
         // the moment it is accepted. Jobs resolved terminal at submission
@@ -1293,8 +1293,8 @@ pub(crate) async fn submit_run(
         }
         let mut inner = shared.state.inner.lock().await;
         if let Some(run) = inner.runs.get_mut(&run_id) {
-            run.sync_state = Some(SyncState {
-                status: SyncStatus::Pending,
+            run.push_state = Some(PushState {
+                status: PushStatus::Pending,
                 error: None,
                 pr_number: None,
             });

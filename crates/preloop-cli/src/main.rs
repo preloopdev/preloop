@@ -18,7 +18,7 @@ use std::time::Duration;
 mod debug_session;
 mod github_auth;
 mod github_setup;
-mod sync;
+mod push;
 mod update;
 
 pub(crate) fn server_url() -> String {
@@ -126,7 +126,7 @@ enum Command {
     ///
     /// Defaults to the most recent run. Re-running is safe — every step is
     /// idempotent.
-    Sync(SyncArgs),
+    Push(PushArgs),
 
     /// Poll GitHub Releases and atomically install the matching binary.
     Update(update::UpdateArgs),
@@ -249,10 +249,10 @@ struct RunArgs {
     /// (the pushed commit must be exactly what was tested) and a GitHub
     /// origin.
     #[arg(long)]
-    sync: bool,
+    push: bool,
 
     /// Create a pull request for the branch when none is open. Implies
-    /// `--sync`.
+    /// `--push`.
     #[arg(long)]
     create_pr: bool,
 
@@ -299,7 +299,7 @@ struct ShellArgs {
 }
 
 #[derive(Debug, Parser)]
-struct SyncArgs {
+struct PushArgs {
     /// Run ID. Defaults to the most recent run.
     run_id: Option<String>,
 }
@@ -355,7 +355,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Debug(args) => {
             debug_session::run(args, build_client(), server_url(), api_token()).await
         }
-        Command::Sync(args) => cmd_sync(args).await,
+        Command::Push(args) => cmd_push(args).await,
         Command::Update(_)
         | Command::Serve(_)
         | Command::Engine
@@ -1138,13 +1138,13 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     // Push-back requires the tested commit to be exactly what lands on
     // GitHub: a dirty tree would run CI on commit + local edits, then push
     // the commit alone — untested code. Refuse loudly instead of lying.
-    let sync_requested = args.sync || args.create_pr;
-    let (head_sha, head_tree) = if sync_requested {
+    let push_requested = args.push || args.create_pr;
+    let (head_sha, head_tree) = if push_requested {
         let dirty = git_porcelain()
-            .with_context(|| "failed to check the working tree for --sync".to_string())?;
+            .with_context(|| "failed to check the working tree for --push".to_string())?;
         if !dirty.is_empty() {
             anyhow::bail!(
-                "--sync requires a clean working tree so the pushed commit is exactly what \
+                "--push requires a clean working tree so the pushed commit is exactly what \
                  was tested. Uncommitted changes:\n  {}\n\nCommit or stash them first.",
                 dirty.join("\n  ")
             );
@@ -1165,11 +1165,11 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         git_ref: detect_git_ref(),
         actor: git_config_user_name().unwrap_or_else(|| "aksh-system".to_owned()),
         sha: head_sha.clone().unwrap_or_default(),
-        sync: sync_requested.then_some(aksh_gha_protocol::SyncRequest {
+        push: push_requested.then_some(aksh_gha_protocol::PushRequest {
             create_pr: args.create_pr,
             draft_pr: args.pr_draft,
         }),
-        sync_tree: head_tree,
+        push_tree: head_tree,
         workflow_path: Some(workflow_path.display().to_string()),
         local_workspace: None,
         secrets,
@@ -1319,8 +1319,8 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         // Push-back runs on any conclusion: a draft PR with red checks is
         // the reviewable state. Sync progress goes to stderr so piped
         // stdout stays clean.
-        let sync_error = if sync_requested {
-            sync::sync_run(&client, &url, api_token(), &accepted.run_id.to_string())
+        let sync_error = if push_requested {
+            push::push_run(&client, &url, api_token(), &accepted.run_id.to_string())
                 .await
                 .err()
         } else {
@@ -1328,8 +1328,8 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         };
         if let Some(error) = &sync_error {
             eprintln!(
-                "sync failed: {error:#}\n\
-                 fix the problem and rerun: `preloop sync {}`",
+                "push failed: {error:#}\n\
+                 fix the problem and rerun: `preloop push {}`",
                 accepted.run_id
             );
         }
@@ -1525,7 +1525,7 @@ fn git_config_user_name() -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
-async fn cmd_sync(args: SyncArgs) -> anyhow::Result<()> {
+async fn cmd_push(args: PushArgs) -> anyhow::Result<()> {
     let client = build_client();
     let url = server_url();
     let run_id = match args.run_id {
@@ -1544,7 +1544,7 @@ async fn cmd_sync(args: SyncArgs) -> anyhow::Result<()> {
             }
             let runs: Vec<serde_json::Value> = response.json().await?;
             let Some(run) = runs.first() else {
-                anyhow::bail!("no runs found; pass a run id: `preloop sync <run_id>`");
+                anyhow::bail!("no runs found; pass a run id: `preloop push <run_id>`");
             };
             run.get("run_id")
                 .and_then(serde_json::Value::as_str)
@@ -1552,7 +1552,7 @@ async fn cmd_sync(args: SyncArgs) -> anyhow::Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("run record has no run_id"))?
         }
     };
-    sync::sync_run(&client, &url, api_token(), &run_id).await
+    push::push_run(&client, &url, api_token(), &run_id).await
 }
 
 async fn cmd_plan(args: PlanArgs) -> anyhow::Result<()> {
@@ -1621,10 +1621,10 @@ async fn cmd_status() -> anyhow::Result<()> {
                     .and_then(serde_json::Value::as_str)
             })
             .unwrap_or("?");
-        let sync = match run.get("sync_state").and_then(|s| s.get("status")) {
+        let push = match run.get("push_state").and_then(|s| s.get("status")) {
             Some(status) => {
                 let status = status.as_str().unwrap_or("?");
-                match run["sync_state"]["pr_number"].as_u64() {
+                match run["push_state"]["pr_number"].as_u64() {
                     Some(number) => format!("{status} #{number}"),
                     None => status.to_owned(),
                 }
@@ -1633,7 +1633,7 @@ async fn cmd_status() -> anyhow::Result<()> {
         };
         println!(
             "{:<38}  {:<6}  {:<12}  {:<12}  {:<10}  {}",
-            run_id, run_number, status, event, sync, workflow
+            run_id, run_number, status, event, push, workflow
         );
     }
     Ok(())

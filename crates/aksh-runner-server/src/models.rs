@@ -2,21 +2,21 @@ use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum SyncStatus {
+pub(crate) enum PushStatus {
     /// The run requested push-back and it has not been performed yet.
     Pending,
     /// The tested commit is on GitHub and the PR/check runs are in place.
     Synced,
     /// The sync could not be performed (diverged branch, tree mismatch,
     /// GitHub unreachable, …). `error` carries the reason; a later
-    /// `preloop sync` retry may clear it.
+    /// `preloop push` retry may clear it.
     Blocked,
 }
 
-/// Push-back state for a run that requested `submission.sync`.
+/// Push-back state for a run that requested `submission.push`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct SyncState {
-    pub(crate) status: SyncStatus,
+pub(crate) struct PushState {
+    pub(crate) status: PushStatus,
     pub(crate) error: Option<String>,
     /// Pull request number, when the branch has an open PR (created or
     /// pre-existing).
@@ -109,7 +109,7 @@ pub(crate) struct RunRecord {
     pub(crate) event: String,
     pub(crate) conclusion: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) sync_state: Option<SyncState>,
+    pub(crate) push_state: Option<PushState>,
 }
 
 #[derive(Debug, Clone)]

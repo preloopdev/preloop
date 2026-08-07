@@ -174,7 +174,7 @@ async fn cmd_setup_github(args: GithubSetupArgs) -> anyhow::Result<()> {
                  \x20    disable webhook, permissions: Contents: Read-only and\n\
                  \x20    Pull requests: Read-only (if your workflows read PRs).\n\
                  \x20    If you want to run CI before creating a pull request\n\
-                 \x20    (`preloop run --sync --create-pr`), grant Pull requests:\n\
+                 \x20    (`preloop run --push --create-pr`), grant Pull requests:\n\
                  \x20    Write instead — it creates the PR after CI passes.\n\
                  \x20 2. Generate a private key — save the PEM.\n\
                  \x20 3. Install the App on your repositories:\n\

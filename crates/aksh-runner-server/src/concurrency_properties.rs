@@ -392,7 +392,7 @@ impl ProdState {
             workflow_path_str: ".github/workflows/workflow.yml".to_owned(),
             event: "push".to_owned(),
             conclusion: None,
-            sync_state: None,
+            push_state: None,
         };
         self.inner.runs.insert(run_id, record);
     }

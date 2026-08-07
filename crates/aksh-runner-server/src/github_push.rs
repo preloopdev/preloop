@@ -1,11 +1,11 @@
-//! Push-back for submit-driven CI (`preloop run --sync`).
+//! Push-back for submit-driven CI (`preloop run --push`).
 //!
-//! After a run that requested `submission.sync` reaches a terminal state,
+//! After a run that requested `submission.push` reaches a terminal state,
 //! the submitting client pushes the tested commit to GitHub itself; this
 //! module then (1) verifies the pushed commit's tree matches the tree the
 //! run actually tested, (2) creates or reuses the branch's pull request, and
 //! (3) reports check runs for any job that lacks one. Every step is
-//! idempotent so `preloop sync <run_id>` can replay a failed or interrupted
+//! idempotent so `preloop push <run_id>` can replay a failed or interrupted
 //! sync freely.
 //!
 //! The server never pushes: it holds no `contents: write` power. The client
@@ -21,34 +21,34 @@ pub(crate) struct SyncResponse {
     pub(crate) pr_url: Option<String>,
 }
 
-/// `POST /api/v1/runs/:run_id/sync` — publish a terminal run's result to
+/// `POST /api/v1/runs/:run_id/push` — publish a terminal run's result to
 /// GitHub. Idempotent: re-running after success is a no-op, and every
 /// external effect is guarded by a check-before-create.
-pub(crate) async fn sync_run(
+pub(crate) async fn push_run(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
 ) -> Result<Json<SyncResponse>, ApiError> {
-    Ok(Json(sync_run_to_github(&shared, run_id).await?))
+    Ok(Json(push_run_to_github(&shared, run_id).await?))
 }
 
-pub(crate) async fn sync_run_to_github(
+pub(crate) async fn push_run_to_github(
     shared: &Arc<SharedState>,
     run_id: RunId,
 ) -> Result<SyncResponse, ApiError> {
     // Snapshot everything the sync needs under one lock, then work outside
     // it: the GitHub calls are slow and must not hold the state mutex.
-    let (repository, git_ref, sha, sync_tree, create_pr, draft_pr, actor, conclusion, jobs) = {
+    let (repository, git_ref, sha, push_tree, create_pr, draft_pr, actor, conclusion, jobs) = {
         let inner = shared.state.inner.lock().await;
         let run = inner
             .runs
             .get(&run_id)
             .ok_or_else(|| ApiError::not_found("run not found"))?;
 
-        if let Some(state) = &run.sync_state {
-            if state.status == SyncStatus::Synced {
+        if let Some(state) = &run.push_state {
+            if state.status == PushStatus::Synced {
                 // Already published; replay is a no-op.
                 return Ok(SyncResponse {
-                    status: "synced",
+                    status: "pushed",
                     pr_number: state.pr_number,
                     pr_url: state.pr_number.map(|number| {
                         pr_web_url(
@@ -61,24 +61,24 @@ pub(crate) async fn sync_run_to_github(
             }
         }
 
-        let Some(sync) = &run.submission.sync else {
+        let Some(push) = &run.submission.push else {
             return Err(ApiError::bad_request(
-                "run was not submitted with --sync; submit with `preloop run --sync`",
+                "run was not submitted with --push; submit with `preloop run --push`",
             ));
         };
         let Some(conclusion) = &run.conclusion else {
             return Err(ApiError::bad_request(
-                "run is not terminal yet; sync runs after completion",
+                "run is not terminal yet; push runs after completion",
             ));
         };
-        let Some(tree) = &run.submission.sync_tree else {
+        let Some(tree) = &run.submission.push_tree else {
             return Err(ApiError::bad_request(
-                "run has no recorded tested tree; it was not submitted with --sync",
+                "run has no recorded tested tree; it was not submitted with --push",
             ));
         };
 
         let repository = run.submission.repository.clone();
-        validate_sync_target(
+        validate_push_target(
             &repository,
             &run.submission.sha,
             &run.submission.git_ref,
@@ -90,8 +90,8 @@ pub(crate) async fn sync_run_to_github(
             run.submission.git_ref.clone(),
             run.submission.sha.clone(),
             tree.clone(),
-            sync.create_pr,
-            sync.draft_pr,
+            push.create_pr,
+            push.draft_pr,
             run.submission.actor.clone(),
             conclusion.clone(),
             run.jobs.clone(),
@@ -101,8 +101,8 @@ pub(crate) async fn sync_run_to_github(
     async fn mark_blocked(shared: &Arc<SharedState>, run_id: RunId, error: String) {
         let mut inner = shared.state.inner.lock().await;
         if let Some(run) = inner.runs.get_mut(&run_id) {
-            run.sync_state = Some(SyncState {
-                status: SyncStatus::Blocked,
+            run.push_state = Some(PushState {
+                status: PushStatus::Blocked,
                 error: Some(error),
                 pr_number: None,
             });
@@ -116,7 +116,7 @@ pub(crate) async fn sync_run_to_github(
         .strip_prefix("refs/heads/")
         .expect("validated above to be a branch ref");
 
-    let token = match sync_token(shared, &repository).await {
+    let token = match push_token(shared, &repository).await {
         Some(token) => token,
         None => {
             let message =
@@ -143,9 +143,9 @@ pub(crate) async fn sync_run_to_github(
         .and_then(|t| t.get("sha"))
         .and_then(|s| s.as_str())
         .unwrap_or_default();
-    if pushed_tree != sync_tree {
+    if pushed_tree != push_tree {
         let message = format!(
-            "tested tree {sync_tree} does not match pushed commit tree {pushed_tree}; \
+            "tested tree {push_tree} does not match pushed commit tree {pushed_tree}; \
              the branch was not pushed from the tested commit — re-submit after pushing"
         );
         mark_blocked(shared, run_id, message.clone()).await;
@@ -185,6 +185,18 @@ pub(crate) async fn sync_run_to_github(
         }
     };
 
+    // Authoritative backstop: push-back is for feature branches. The CLI
+    // refuses the default branch before pushing; this catches direct API
+    // callers and repos whose default differs from what the client knew.
+    if branch == base {
+        let message = format!(
+            "branch {branch} is the repository's default branch; push-back is for \
+             feature branches (main stays webhook-driven)"
+        );
+        mark_blocked(shared, run_id, message.clone()).await;
+        return Err(classify(&message));
+    }
+
     // 3. Reuse an open PR for the branch; create one only when asked.
     let head = format!("{owner}:{branch}");
     let pr_number = match github_json(
@@ -213,7 +225,7 @@ pub(crate) async fn sync_run_to_github(
         let body = format!(
             "CI run `{run_id}` completed with `{conclusion}`.\n\n\
              - Head: `{sha}`\n\
-             - Tested tree: `{sync_tree}`\n\
+             - Tested tree: `{push_tree}`\n\
              - Actor: `{actor}`\n\
              - Details: {}",
             crate::github::run_details_url(run_id)
@@ -274,8 +286,8 @@ pub(crate) async fn sync_run_to_github(
 
     let mut inner = shared.state.inner.lock().await;
     if let Some(run) = inner.runs.get_mut(&run_id) {
-        run.sync_state = Some(SyncState {
-            status: SyncStatus::Synced,
+        run.push_state = Some(PushState {
+            status: PushStatus::Synced,
             error: None,
             pr_number,
         });
@@ -283,7 +295,7 @@ pub(crate) async fn sync_run_to_github(
     drop(inner);
 
     Ok(SyncResponse {
-        status: "synced",
+        status: "pushed",
         pr_number,
         pr_url: pr_number
             .map(|number| pr_web_url(&crate::github::github_api_base(), &repository, number)),
@@ -292,34 +304,34 @@ pub(crate) async fn sync_run_to_github(
 
 /// A sync target must be a real GitHub branch at a real commit: a local-only
 /// repository or an unpushed SHA can never produce a PR or honest checks.
-pub(crate) fn validate_sync_target(
+pub(crate) fn validate_push_target(
     repository: &str,
     sha: &str,
     git_ref: &str,
-    sync_tree: &str,
+    push_tree: &str,
 ) -> Result<(), ApiError> {
     let (owner, repo) = repository.split_once('/').ok_or_else(|| {
         ApiError::bad_request(format!(
-            "--sync requires a GitHub repository in git origin (got `{repository}`)"
+            "--push requires a GitHub repository in git origin (got `{repository}`)"
         ))
     })?;
     if owner.is_empty() || repo.is_empty() || repo.contains('/') {
         return Err(ApiError::bad_request(format!(
-            "--sync requires a GitHub repository in git origin (got `{repository}`)"
+            "--push requires a GitHub repository in git origin (got `{repository}`)"
         )));
     }
     if !git_ref.starts_with("refs/heads/") {
         return Err(ApiError::bad_request(format!(
-            "--sync supports branch refs only (got `{git_ref}`)"
+            "--push supports branch refs only (got `{git_ref}`)"
         )));
     }
     if !(sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()) && sha != default_zero_sha())
     {
         return Err(ApiError::bad_request(
-            "--sync requires a committed HEAD (submit from a git checkout)",
+            "--push requires a committed HEAD (submit from a git checkout)",
         ));
     }
-    if sync_tree.len() != 40 || !sync_tree.chars().all(|c| c.is_ascii_hexdigit()) {
+    if push_tree.len() != 40 || !push_tree.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(ApiError::bad_request("invalid tested tree recorded"));
     }
     Ok(())
@@ -331,7 +343,7 @@ const fn default_zero_sha() -> &'static str {
 
 /// Installation token covering everything the sync touches, or the ambient
 /// `AKSH_GITHUB_TOKEN` when no App is configured.
-async fn sync_token(shared: &Arc<SharedState>, repository: &str) -> Option<String> {
+async fn push_token(shared: &Arc<SharedState>, repository: &str) -> Option<String> {
     if let Some(app_creds) = &shared.state.github_app {
         let permissions = std::collections::BTreeMap::from([
             ("checks".to_owned(), "write".to_owned()),
@@ -340,7 +352,7 @@ async fn sync_token(shared: &Arc<SharedState>, repository: &str) -> Option<Strin
         ]);
         match crate::github_app::get_or_mint_token(app_creds, repository, &permissions).await {
             Ok(token) => return Some(token),
-            Err(error) => tracing::warn!(%repository, %error, "sync token mint failed"),
+            Err(error) => tracing::warn!(%repository, %error, "push token mint failed"),
         }
     }
     std::env::var("AKSH_GITHUB_TOKEN").ok()

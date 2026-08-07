@@ -149,7 +149,7 @@ pub type SecretMap = BTreeMap<String, SecretString>;
 /// user's intent so the server can gate check reporting and the sync
 /// endpoint on it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SyncRequest {
+pub struct PushRequest {
     /// Create a pull request when the branch has no open PR yet.
     pub create_pr: bool,
     /// Create newly-created pull requests as drafts so reviewers are not
@@ -261,13 +261,13 @@ pub struct WorkflowSubmission {
     /// Push-back requested after the run completes. Absent means the run is
     /// a plain local submission with no GitHub interaction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sync: Option<SyncRequest>,
+    pub push: Option<PushRequest>,
     /// `git rev-parse HEAD^{tree}` of the tree the workspace snapshot was
     /// taken from. The sync endpoint refuses to report checks unless the
     /// pushed commit's tree matches this, so a run can never vouch for a
     /// commit it did not test.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sync_tree: Option<String>,
+    pub push_tree: Option<String>,
 }
 
 impl WorkflowSubmission {

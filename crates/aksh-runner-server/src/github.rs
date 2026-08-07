@@ -1002,8 +1002,8 @@ async fn process_github_webhook(
                 selected_jobs: vec![],
                 base_ref: None,
                 preserve_on_failure: false,
-                sync: None,
-                sync_tree: None,
+                push: None,
+                push_tree: None,
             };
 
             // Call submit_run_inner — it performs the authoritative trigger match.
@@ -1104,7 +1104,7 @@ pub(crate) async fn github_register(headers: HeaderMap) -> impl IntoResponse {
     </form>
     <p style="color: #57606a; font-size: 14px;">
         If you want to run CI before creating a pull request
-        (<code>preloop run --sync --create-pr</code>), grant the App
+        (<code>preloop run --push --create-pr</code>), grant the App
         <code>pull_requests: write</code>: GitHub App settings &rarr;
         Permissions &rarr; Pull requests &rarr; Read and write. Check-run
         reporting works with just <code>checks: write</code>.

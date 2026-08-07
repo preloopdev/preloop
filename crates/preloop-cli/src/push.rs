@@ -1,11 +1,11 @@
-//! Push-back for submit-driven CI: after a run requested with `--sync`
+//! Push-back for submit-driven CI: after a run requested with `--push`
 //! reaches a terminal state, push the tested commit to GitHub (fast-forward
 //! or branch creation only — never a force), then ask the server to create
 //! or update the pull request and report check runs.
 //!
 //! The git operations run against the current directory's `origin`, so this
 //! module must be invoked from the checkout the run was submitted from. All
-//! steps are idempotent: `preloop sync <run_id>` may be re-run freely.
+//! steps are idempotent: `preloop push <run_id>` may be re-run freely.
 
 use aksh_gha_protocol::WorkflowSubmission;
 use anyhow::Context as _;
@@ -45,22 +45,43 @@ fn push_tested_commit_in(
     sha: &str,
     branch: &str,
 ) -> anyhow::Result<PushOutcome> {
-    // The tested commit must exist in this checkout (it does when the sync
+    // The tested commit must exist in this checkout (it does when the push
     // runs where the run was submitted). Without it the push would fail with
     // a confusing "src refspec does not match any" error.
     if git_output(cwd, ["cat-file", "-e", &format!("{sha}^{{commit}}")]).is_err() {
         anyhow::bail!(
-            "commit {sha} is not present in this checkout — run `preloop sync` from the \
+            "commit {sha} is not present in this checkout — run `preloop push` from the \
              checkout the run was submitted from"
         );
     }
-    let remote_sha = git_output(
+    // One round trip tells us both the remote HEAD's default branch (via
+    // `--symref`) and the branch's current position. Push-back is scoped to
+    // feature branches: the default branch stays webhook/reconciliation
+    // driven, and pushing it here would publish untested main.
+    let remote = git_output(
         cwd,
-        ["ls-remote", "origin", &format!("refs/heads/{branch}")],
+        [
+            "ls-remote",
+            "--symref",
+            "origin",
+            "HEAD",
+            &format!("refs/heads/{branch}"),
+        ],
     )?;
-    let remote_sha = remote_sha
-        .split_whitespace()
-        .next()
+    let default_branch = remote.lines().find_map(|line| {
+        line.strip_prefix("ref: refs/heads/")
+            .and_then(|rest| rest.strip_suffix("\tHEAD"))
+    });
+    if default_branch == Some(branch) {
+        anyhow::bail!(
+            "refusing to push branch {branch}: it is the repository's default branch. \
+             Push-back is for feature branches; main stays webhook-driven."
+        );
+    }
+    let remote_sha = remote
+        .lines()
+        .find(|line| line.ends_with(&format!("\trefs/heads/{branch}")))
+        .and_then(|line| line.split_whitespace().next())
         .map(str::to_owned)
         .filter(|sha| !sha.is_empty());
 
@@ -84,7 +105,7 @@ fn push_tested_commit_in(
             if !is_ancestor {
                 anyhow::bail!(
                     "branch {branch} on GitHub has commits that are not ancestors of the tested \
-                     commit {sha} (remote {remote}). The sync never force-pushes: rebase your \
+                     commit {sha} (remote {remote}). The push never force-pushes: rebase your \
                      branch onto the remote (or reset to the tested commit) and re-submit."
                 );
             }
@@ -151,7 +172,7 @@ fn is_transient(error: &anyhow::Error) -> bool {
 /// Run the full push-back for a run: fetch it, pin the push, and ask the
 /// server to publish PR + checks. Retries transient failures on a backoff
 /// schedule; permanent failures surface immediately with instructions.
-pub(crate) async fn sync_run(
+pub(crate) async fn push_run(
     client: &reqwest::Client,
     url: &str,
     token: Option<String>,
@@ -159,15 +180,15 @@ pub(crate) async fn sync_run(
 ) -> anyhow::Result<()> {
     let mut attempt = 0;
     loop {
-        match sync_run_once(client, url, token.as_deref(), run_id).await {
+        match push_run_once(client, url, token.as_deref(), run_id).await {
             Ok(()) => return Ok(()),
             Err(error) if is_transient(&error) && attempt < RETRY_DELAYS_SECS.len() => {
                 let delay = RETRY_DELAYS_SECS[attempt];
                 attempt += 1;
                 eprintln!(
-                    "sync failed transiently: {error:#}\n\
+                    "push failed transiently: {error:#}\n\
                      retrying in {delay}s (attempt {attempt}/{}) — Ctrl-C stops, \
-                     `preloop sync {run_id}` resumes later",
+                     `preloop push {run_id}` resumes later",
                     RETRY_DELAYS_SECS.len()
                 );
                 tokio::time::sleep(Duration::from_secs(delay)).await;
@@ -177,7 +198,7 @@ pub(crate) async fn sync_run(
     }
 }
 
-async fn sync_run_once(
+async fn push_run_once(
     client: &reqwest::Client,
     url: &str,
     token: Option<&str>,
@@ -206,11 +227,11 @@ async fn sync_run_once(
     .context("parsing run submission")?;
 
     submission
-        .sync
+        .push
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("run {run_id} was not submitted with --sync"))?;
-    let _sync_tree = submission
-        .sync_tree
+        .ok_or_else(|| anyhow::anyhow!("run {run_id} was not submitted with --push"))?;
+    let _push_tree = submission
+        .push_tree
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("run {run_id} has no recorded tested tree"))?;
     let sha = &submission.sha;
@@ -219,7 +240,7 @@ async fn sync_run_once(
         .strip_prefix("refs/heads/")
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "run {run_id} targets {} — sync supports branch refs only",
+                "run {run_id} targets {} — push supports branch refs only",
                 submission.git_ref
             )
         })?;
@@ -234,29 +255,29 @@ async fn sync_run_once(
 
     // 2. The server verifies the pushed tree, reuses or creates the PR, and
     //    reports check runs — all idempotently.
-    let mut request = client.post(format!("{url}/api/v1/runs/{run_id}/sync"));
+    let mut request = client.post(format!("{url}/api/v1/runs/{run_id}/push"));
     if let Some(token) = token {
         request = request.bearer_auth(token);
     }
     let response = request
         .send()
         .await
-        .with_context(|| format!("requesting server sync for run {run_id}"))?;
+        .with_context(|| format!("requesting server push for run {run_id}"))?;
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("server sync for run {run_id} failed with {status}: {body}");
+        anyhow::bail!("server push for run {run_id} failed with {status}: {body}");
     }
     let result: serde_json::Value = response.json().await?;
 
     match result.get("pr_number").and_then(serde_json::Value::as_u64) {
         Some(number) => {
             let repository = submission.repository;
-            eprintln!("synced: PR https://github.com/{repository}/pull/{number}");
+            eprintln!("pushed: PR https://github.com/{repository}/pull/{number}");
         }
         None => eprintln!(
-            "synced: branch pushed, {}",
-            if submission.sync.as_ref().is_some_and(|s| s.create_pr) {
+            "pushed: branch pushed, {}",
+            if submission.push.as_ref().is_some_and(|s| s.create_pr) {
                 "no open pull request for the branch"
             } else {
                 "no pull request created (--create-pr not requested)"
@@ -412,7 +433,7 @@ mod tests {
         let transient = [
             "git push failed: fatal: unable to access 'https://github.com/x/y.git/': Could not resolve host: github.com",
             "git push failed: fatal: The remote end hung up unexpectedly",
-            "server sync for run x failed with 502 Bad Gateway",
+            "server push for run x failed with 502 Bad Gateway",
         ];
         for message in transient {
             assert!(is_transient(&anyhow::anyhow!("{message}")), "{message}");
@@ -426,5 +447,15 @@ mod tests {
         for message in permanent {
             assert!(!is_transient(&anyhow::anyhow!("{message}")), "{message}");
         }
+    }
+
+    #[test]
+    fn push_refuses_default_branch() {
+        let (work, _remote, head) = repo_with_remote();
+        let error = push_tested_commit_in(work.path(), &head, "main").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("default branch"),
+            "default-branch push refused: {error:#}"
+        );
     }
 }
