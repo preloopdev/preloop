@@ -19,12 +19,12 @@ jobs:
     runs-on: self-hosted
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Validate runner status responses
         run: python3 benchmarks/real-world/runner-conformance.py --mode light
       - name: Upload light report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: runner-light-conformance
           path: benchmarks/compatibility/runner/behavior/RUNNER-CONFORMANCE-REPORT.md
@@ -49,7 +49,7 @@ jobs:
       HOST_WORKSPACE: ${{ vars.RUNNER_CONFORMANCE_HOST_WORKSPACE || '' }}
       PRELOOP_RUNNER_HOST: ${{ github.workspace }}/target/aarch64-unknown-linux-musl/release/preloop-runner
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Build current PR runner for smolVM
         run: cargo zigbuild -p preloop-runner --release --target aarch64-unknown-linux-musl
       - name: Run deep runner conformance
@@ -59,7 +59,7 @@ jobs:
           python3 benchmarks/real-world/runner-conformance.py --mode deep
       - name: Upload deep report and captures
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: runner-deep-conformance
           path: |

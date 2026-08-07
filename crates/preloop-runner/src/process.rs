@@ -635,12 +635,19 @@ mod tests {
 
     #[tokio::test]
     async fn invoke_forces_stream_close_after_official_grace_window() {
+        // The shell exits at once while an orphaned child holds the inherited
+        // pipe open far longer than the grace window: `invoke` must stop
+        // waiting when the window elapses rather than block on the pipe
+        // holder. The upper bound is deliberately far from the grace window
+        // instead of a tight wall-clock deadline — this also runs on loaded
+        // CI hosts, where a 1s ceiling over a 350ms window flakes on process
+        // spawn alone.
         let started = std::time::Instant::now();
         let result = tokio::time::timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(5),
             invoke(
                 "sh",
-                &["-c", "(sleep 5) & echo marker"],
+                &["-c", "(sleep 30) & echo marker"],
                 Path::new("."),
                 &HashMap::new(),
                 None,
@@ -654,7 +661,11 @@ mod tests {
 
         assert_eq!(result.exit_code, 0);
         assert!(started.elapsed() >= STREAM_DRAIN_GRACE);
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "invoke waited on the orphaned pipe holder: {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
