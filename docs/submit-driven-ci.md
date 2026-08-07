@@ -67,7 +67,17 @@ The run record gains `sync_state: Option<SyncState>`
 | Retry loop | `preloop-cli/src/sync.rs` | transient push/sync failures retried at 1m/5m/15m; permanent failures surface immediately |
 | Check reporting for native runs | `aksh-runner-server` `submit_run` | same queued/completed loop the webhook adapter uses, gated on `sync` being set |
 | PR create/update + tree verify | `aksh-runner-server/src/github_sync.rs` | `POST /api/v1/runs/:run_id/sync` |
-| Manifest | `github.rs` | `pull_requests: write` (was `read`); `checks: write` already granted |
+| Manifest | `github.rs` | default stays `pull_requests: read`; PR creation is opt-in — grant `pull_requests: write` only if you want `--create-pr`. `checks: write` is the only permission check reporting needs |
+
+## Opt-in permission
+
+The registration manifest requests `checks: write`, `contents: read`, and
+`metadata: read` only — enough for check-run reporting and commit lookups.
+PR creation (`--create-pr`) additionally needs `pull_requests: write`, which
+is deliberately **not** a default: a workflow that never creates PRs should
+not carry PR-write authority. Grant it in the App settings (Permissions →
+Pull requests → Read and write) when you want the feature; the sync endpoint
+then fails PR creation with a 403 that carries the hint.
 
 ## Failure modes
 

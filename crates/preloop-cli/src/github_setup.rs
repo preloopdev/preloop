@@ -173,6 +173,9 @@ async fn cmd_setup_github(args: GithubSetupArgs) -> anyhow::Result<()> {
                  \x20 1. github.com/settings/apps/new — name it (e.g. `dummy-aksh-app`),\n\
                  \x20    disable webhook, permissions: Contents: Read-only and\n\
                  \x20    Pull requests: Read-only (if your workflows read PRs).\n\
+                 \x20    Pull requests: Write is only needed for the optional\n\
+                 \x20    submit-driven CI feature (`preloop run --sync --create-pr`),\n\
+                 \x20    which creates pull requests for tested branches.\n\
                  \x20 2. Generate a private key — save the PEM.\n\
                  \x20 3. Install the App on your repositories:\n\
                  \x20    https://github.com/apps/<slug>/installations/new\n\
