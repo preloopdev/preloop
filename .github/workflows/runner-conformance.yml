@@ -35,14 +35,14 @@ jobs:
             echo "$HOME/bin" >> "$GITHUB_PATH"
           fi
           git lfs install --skip-repo >/dev/null 2>&1 || true
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           lfs: true
       - name: Validate runner status responses
         run: python3 benchmarks/real-world/runner-conformance.py --mode light
       - name: Upload light report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: runner-light-conformance
           path: benchmarks/compatibility/runner/behavior/RUNNER-CONFORMANCE-REPORT.md
@@ -83,7 +83,7 @@ jobs:
             echo "$HOME/bin" >> "$GITHUB_PATH"
           fi
           git lfs install --skip-repo >/dev/null 2>&1 || true
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           lfs: true
       - name: Build current PR runner for smolVM
@@ -95,7 +95,7 @@ jobs:
           python3 benchmarks/real-world/runner-conformance.py --mode deep
       - name: Upload deep report and captures
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: runner-deep-conformance
           path: |

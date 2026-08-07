@@ -62,12 +62,12 @@ jobs:
           fi
           git lfs install --skip-repo >/dev/null 2>&1 || true
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           lfs: true
 
       - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@1.86
+        uses: dtolnay/rust-toolchain@52699249a776424c51ebc9ee197baf0f9dbf0d8a
 
       - name: Run targeted Tier 2 Rust property filters
         shell: bash
