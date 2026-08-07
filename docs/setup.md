@@ -160,6 +160,37 @@ it mints an App token (or uses the PAT) and probes the repository for
 contents/pull-requests/actions/issues read. Run it after setup and any time a
 job's `GITHUB_TOKEN` misbehaves.
 
+## Durable state (SQLite by default, Postgres optional)
+
+Run history, queued jobs, runners, sessions, and logs survive restarts. The
+default backend is **SQLite** at `<state dir>/aksh.db` — zero configuration,
+correct for a single machine, and the right choice unless you have a reason
+to move off it.
+
+To use **Postgres**, point the engine at a database with `--store` or
+`AKSH_STORE_URL`:
+
+```sh
+preloop serve --store 'postgres://user:password@host:5432/aksh?sslmode=require'
+# or, for systemd deployments:
+# Environment=AKSH_STORE_URL=postgres://…?sslmode=require
+```
+
+- **`sqlite://<path>`**, a bare path, or nothing = SQLite (default).
+- **`postgres://…`** = the Postgres backend. The schema (tables, sealed-blob
+  payloads, migrations) mirrors SQLite exactly; the engine keeps a single
+  writer connection, so the database must not be shared with a second engine
+  process.
+- **TLS**: add `?sslmode=require` (or `verify-ca` / `verify-full`) for remote
+  databases — managed Postgres (Neon, RDS, Supabase, …) typically requires
+  it. Verification always uses the system root store. Plaintext is the
+  default for loopback databases.
+
+Run Postgres however you like — a managed service, a `postgres` container on
+the same host, or an OS package. The engine does not bundle or spawn a
+database server; SQLite is the embedded option, Postgres is an external
+dependency you point at.
+
 ## Troubleshooting
 
 - **`doctor` says the App has no installation for a repo** — install the app
