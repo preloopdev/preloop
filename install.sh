@@ -94,18 +94,34 @@ install_from_release() {
     trap 'rm -rf "$tmp"' EXIT
 
     local archive="$tmp/$(basename "$asset")"
+    local asset_name="$(basename "$asset")"
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$asset" -o "$archive" || return 1
+        curl -fsSL "$asset" -o "$archive" 2>/dev/null || archive=""
     elif command -v wget >/dev/null 2>&1; then
-        wget -q "$asset" -O "$archive" || return 1
-    else
-        return 1
+        wget -q "$asset" -O "$archive" 2>/dev/null || archive=""
     fi
+    if [ -z "${archive:-}" ] || [ ! -s "$archive" ]; then
+        # Private repositories 404 unauthenticated downloads; the authenticated
+        # gh client covers them, and works just the same once public.
+        if command -v gh >/dev/null 2>&1; then
+            archive="$tmp/$asset_name"
+            rm -f "$archive"
+            (cd "$tmp" && gh release download "$tag" --repo "$REPO" --pattern "$asset_name" --clobber >/dev/null 2>&1) \
+                || archive=""
+        fi
+    fi
+    [ -n "${archive:-}" ] && [ -s "$archive" ] || return 1
 
     # cargo-dist checksum files bake the build machine's absolute path, so
     # compare hashes by value instead of `sha256sum -c`.
     local sha_url="${asset}.sha256" expected actual
-    if expected="$(curl -fsSL "$sha_url" 2>/dev/null | awk '{print $1}')" && [ -n "$expected" ]; then
+    local sha_name="$(basename "$sha_url")"
+    expected="$(curl -fsSL "$sha_url" 2>/dev/null | awk '{print $1}')"
+    if [ -z "$expected" ] && command -v gh >/dev/null 2>&1; then
+        (cd "$tmp" && gh release download "$tag" --repo "$REPO" --pattern "$sha_name" --clobber >/dev/null 2>&1) \
+            && expected="$(awk '{print $1}' "$tmp/$sha_name" 2>/dev/null)"
+    fi
+    if [ -n "$expected" ]; then
         if command -v sha256sum >/dev/null 2>&1; then
             actual="$(sha256sum "$archive" | awk '{print $1}')"
         else
@@ -116,7 +132,7 @@ install_from_release() {
     fi
 
     mkdir -p "$tmp/extract"
-    tar -xzf "$archive" -C "$tmp/extract"
+    tar -xzf "$archive" -C "$tmp/extract" --strip-components=1
     mkdir -p "$BIN_DIR"
     for bin in preloop preloop-server preloop-runner; do
         if [ -f "$tmp/extract/$bin" ]; then
