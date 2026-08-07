@@ -91,3 +91,11 @@ aksh exposes two protocol surfaces simultaneously:
 
 Both read from and write to the same state; the native surface is strictly additive.
 See [docs/architecture.md](docs/architecture.md) for the design.
+
+## License
+
+MIT for all crates except `aksh-runner-server` (the control plane), which is
+licensed under **FSL-1.1-MIT** (`crates/aksh-runner-server/LICENSE`):
+source-available — you may use, modify, and redistribute it for any
+non-competing purpose — and it converts to MIT on the second anniversary of
+each release.
