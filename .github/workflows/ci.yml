@@ -47,6 +47,8 @@ jobs:
       CARGO_BUILD_JOBS: "2"
     steps:
       - uses: actions/checkout@v4
+        with:
+          lfs: true
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -73,6 +75,8 @@ jobs:
     if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@v4
+        with:
+          lfs: true
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.86"
@@ -178,6 +182,8 @@ jobs:
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.profile == 'intensive')
     steps:
       - uses: actions/checkout@v4
+        with:
+          lfs: true
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.86"
@@ -283,6 +289,8 @@ jobs:
     if: github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v4
+        with:
+          lfs: true
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.86"

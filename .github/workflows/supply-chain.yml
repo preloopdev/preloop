@@ -26,6 +26,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          lfs: true
+        with:
           persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable

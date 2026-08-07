@@ -20,6 +20,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          lfs: true
       - name: Validate runner status responses
         run: python3 benchmarks/real-world/runner-conformance.py --mode light
       - name: Upload light report
@@ -50,6 +52,8 @@ jobs:
       AKSH_RUNNER_HOST: ${{ github.workspace }}/target/aarch64-unknown-linux-musl/release/preloop-runner
     steps:
       - uses: actions/checkout@v4
+        with:
+          lfs: true
       - name: Build current PR runner for smolVM
         run: cargo zigbuild -p aksh-runner --release --target aarch64-unknown-linux-musl
       - name: Run deep runner conformance

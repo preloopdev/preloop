@@ -22,6 +22,8 @@ jobs:
       CARGO_BUILD_JOBS: "1"
     steps:
       - uses: actions/checkout@v4
+        with:
+          lfs: true
       - uses: dtolnay/rust-toolchain@1.86
       - uses: Swatinem/rust-cache@v2
       - name: Replay official runner flows
