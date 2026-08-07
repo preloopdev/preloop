@@ -150,4 +150,18 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload ${{ github.event.release.tag_name }} dist/preloop-ubuntu-24.04-aarch64 --clobber
+          gh release upload ${{ github.event.release.tag_name }} "dist/$GOLDEN_NAME" --clobber
+
+      # A dispatched build has no release to upload to; without this the
+      # golden would sit only on the runner's workspace and be lost. Keep it
+      # as a downloadable workflow artifact so the pool can be updated from
+      # the run page.
+      - name: Retain Golden Artifact for non-release builds
+        if: github.event_name != 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-${{ env.GOLDEN_ARCH }}
+          path: dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
+          retention-days: 90
+          if-no-files-found: error
+
