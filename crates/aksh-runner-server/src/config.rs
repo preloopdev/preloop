@@ -117,19 +117,36 @@ pub const CREDENTIALS_ENV: &str = "CREDENTIALS_DIRECTORY";
 /// Credential name `preloop server install --systemd-credential` mounts.
 pub const CREDENTIAL_NAME: &str = "preloop-secrets";
 
+/// Secrets-store mode: `file` (default) or `memory`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretsStoreMode {
+    File,
+    Memory,
+}
+
+/// Resolve the secrets-store mode: `PRELOOP_SECRETS_STORE` wins over the
+/// config file key. Unknown values are an error — a typo must fail closed
+/// (never silently fall back to writing plaintext secrets to the file).
+pub fn secrets_store_mode(config: &ConfigFile) -> anyhow::Result<SecretsStoreMode> {
+    let raw = std::env::var(SECRETS_STORE_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| config.secrets_store.clone());
+    match raw.as_deref().map(str::trim) {
+        None | Some("file") => Ok(SecretsStoreMode::File),
+        Some("memory") => Ok(SecretsStoreMode::Memory),
+        Some(other) => anyhow::bail!(
+            "invalid secrets store mode `{other}` (expected `file` or `memory`, \
+             from {SECRETS_STORE_ENV} or `secrets_store` in the config file)"
+        ),
+    }
+}
+
 /// True when stored secrets must stay out of the config file: values live in
 /// engine memory only, mutated live through the secrets API and lost on
 /// restart. `PRELOOP_SECRETS_STORE=memory` wins over the config file key.
-pub fn store_memory(config: &ConfigFile) -> bool {
-    store_memory_from(std::env::var(SECRETS_STORE_ENV).ok(), config)
-}
-
-fn store_memory_from(env_value: Option<String>, config: &ConfigFile) -> bool {
-    let memory = |value: &str| value.trim().eq_ignore_ascii_case("memory");
-    env_value
-        .as_deref()
-        .map(memory)
-        .unwrap_or_else(|| config.secrets_store.as_deref().map(memory).unwrap_or(false))
+pub fn store_memory(config: &ConfigFile) -> anyhow::Result<bool> {
+    Ok(secrets_store_mode(config)? == SecretsStoreMode::Memory)
 }
 
 /// Load the systemd credential mounted at
@@ -146,7 +163,14 @@ pub fn load_credential_secrets() -> anyhow::Result<ConfigFile> {
 }
 
 fn load_credential_from(path: &Path) -> anyhow::Result<ConfigFile> {
-    if !path.exists() {
+    // `exists()` swallows permission errors as "absent", which would let a
+    // credential the service cannot read silently no-op — startup would
+    // proceed with stale or plaintext secrets. Fail closed: only a
+    // genuinely missing credential is treated as empty.
+    if !path
+        .try_exists()
+        .with_context(|| format!("checking credential {}", path.display()))?
+    {
         return Ok(ConfigFile::default());
     }
     load_config_from(path)
@@ -409,10 +433,11 @@ mod tests {
         assert!(whole.contains("repo_secrets: 1 repos"), "{whole}");
     }
 
-    /// Pure form of the store-mode check: no process env is touched, so the
-    /// test cannot race other tests that read `PRELOOP_SECRETS_STORE`.
+    /// Config-driven form of the store-mode check: no process env is
+    /// touched, so the test cannot race other tests that read
+    /// `PRELOOP_SECRETS_STORE`.
     #[test]
-    fn store_memory_combines_env_and_config() {
+    fn secrets_store_mode_resolves_config_field_and_rejects_unknowns() {
         let file_mode = ConfigFile {
             secrets_store: Some("file".into()),
             ..ConfigFile::default()
@@ -421,14 +446,28 @@ mod tests {
             secrets_store: Some("memory".into()),
             ..ConfigFile::default()
         };
-        // Config field alone decides when no env value is supplied.
-        assert!(!store_memory_from(None, &file_mode));
-        assert!(store_memory_from(None, &memory_mode));
-        assert!(!store_memory_from(None, &ConfigFile::default()));
-        // Env wins over the config field, either direction.
-        assert!(store_memory_from(Some("memory".into()), &file_mode));
-        assert!(store_memory_from(Some(" MEMORY ".into()), &file_mode));
-        assert!(!store_memory_from(Some("file".into()), &memory_mode));
+        assert_eq!(
+            secrets_store_mode(&file_mode).unwrap(),
+            SecretsStoreMode::File
+        );
+        assert_eq!(
+            secrets_store_mode(&memory_mode).unwrap(),
+            SecretsStoreMode::Memory
+        );
+        assert_eq!(
+            secrets_store_mode(&ConfigFile::default()).unwrap(),
+            SecretsStoreMode::File
+        );
+        // Fail closed: a typo in either source must error, never silently
+        // fall back to writing plaintext secrets to the file.
+        let typo = ConfigFile {
+            secrets_store: Some("memroy".into()),
+            ..ConfigFile::default()
+        };
+        assert!(secrets_store_mode(&typo).is_err());
+        assert!(store_memory(&typo).is_err());
+        assert!(store_memory(&memory_mode).unwrap());
+        assert!(!store_memory(&file_mode).unwrap());
     }
 
     #[test]
