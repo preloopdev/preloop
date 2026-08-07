@@ -4,6 +4,12 @@
 /.runner-watch/repos/
 /.runner-watch/**/*.pid
 /.runner-watch/conformance/
+# Runtime state and raw protocol captures: regenerable artifacts. The
+# captures can carry signed OAuth JWTs and internal addresses, so they must
+# never be tracked (the redacted flows.jsonl goldens are committed by design).
+/.runner-watch/state.json
+/.runner-watch/goldens/
+/.runner-watch/dap-captures/
 # Conformance goldens: keep the replayable flows.jsonl fixtures in git so CI can
 # run `runner-watch conform`, but drop the heavy raw captures and binary bodies.
 /.runner-watch/golden/**/*.mitm
@@ -114,6 +120,7 @@ benchmarks/compatibility/runner/behavior/*-new.jsonl
 benchmarks/real-world/goldens/
 benchmarks/real-world/results/conformance-4repos/**/run.json*
 benchmarks/real-world/conformance-4repos/payloads/
+/goal
 
 # Conformance campaign captures: multi-MB run records and logs, regenerated
 # by the harness and not reviewable in a diff.
