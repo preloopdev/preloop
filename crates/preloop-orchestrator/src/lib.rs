@@ -449,6 +449,8 @@ pub fn base_install_script() -> String {
           tar -xz -C /usr/local/nvm --strip-components=1 && \
         mkdir -p /usr/local/nvm/versions/node && \
         ln -sfn /usr/local /usr/local/nvm/versions/node/v{BASE_NODE_VERSION} && \
+        mkdir -p /usr/local/nvm/alias && \
+        printf '22 v{BASE_NODE_VERSION}\\n' > /usr/local/nvm/alias/22 && \
         ln -sfn /usr/local/nvm /root/.nvm; \
         [ -d /home/runner ] && ln -sfn /usr/local/nvm /home/runner/.nvm; \
         printf 'export NVM_DIR=/usr/local/nvm\\n[ -s \\\"$NVM_DIR/nvm.sh\\\" ] && . \\\"$NVM_DIR/nvm.sh\\\"\\n' > /etc/profile.d/nvm.sh) && \
