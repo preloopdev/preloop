@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PRELOOP // ACT_VS_PRELOOP</title>
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700;800&display=swap');
+
+    :root {
+        --bg-color: #242526;
+        --text-main: #e2e4dc;
+        --text-muted: #8a8d87;
+        --accent-live: #ff4500;
+        --accent-success: #a8ff53;
+        --accent-warn: #e2c044;
+        --border-color: rgba(226, 228, 220, 0.15);
+        --font-mono: 'JetBrains Mono', monospace;
+        --grid-gap: 2rem;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+        background-color: var(--bg-color);
+        color: var(--text-main);
+        font-family: var(--font-mono);
+        font-size: 12px;
+        line-height: 1.55;
+        -webkit-font-smoothing: antialiased;
+    }
+
+    body::before {
+        content: "";
+        position: fixed;
+        top: 0; left: 0; width: 100%; height: 100%;
+        background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 400 400' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)'/%3E%3C/svg%3E");
+        opacity: 0.04;
+        pointer-events: none;
+        z-index: 9999;
+    }
+
+    ::selection { background: var(--text-main); color: var(--bg-color); }
+    a { color: inherit; text-decoration: underline; }
+    a:hover { background-color: var(--text-main); color: var(--bg-color); }
+
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 3rem 2rem 4rem; }
+
+    .hud { display: flex; justify-content: space-between; color: var(--text-muted); letter-spacing: 0.1em; margin-bottom: 3rem; font-size: 10px; }
+    .hud .on { color: var(--accent-success); }
+
+    h1 {
+        font-size: clamp(1.6rem, 3.5vw, 2.6rem);
+        font-weight: 800;
+        line-height: 1.15;
+        letter-spacing: -0.01em;
+        text-transform: uppercase;
+        margin-bottom: 0.75rem;
+    }
+    .subtitle { color: var(--text-main); font-size: 13px; margin-bottom: 3rem; }
+
+    h2 {
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.15em;
+        color: var(--text-muted);
+        text-transform: uppercase;
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+        padding: 2.5rem 0 1.5rem;
+        border-top: 1px solid var(--border-color);
+        margin-top: 2.5rem;
+    }
+    h2::before { content: "■"; font-size: 8px; color: var(--text-main); }
+    h3 { font-size: 12px; font-weight: 700; margin: 1.5rem 0 0.75rem; color: var(--text-main); }
+
+    p { color: var(--text-muted); margin-bottom: 1rem; max-width: 75ch; }
+    p strong, li strong { color: var(--text-main); }
+    ul { list-style: none; margin-bottom: 1.5rem; }
+    li { color: var(--text-muted); padding-left: 1.25rem; position: relative; margin-bottom: 0.4rem; }
+    li::before { content: ">"; position: absolute; left: 0; color: var(--accent-live); }
+
+    pre {
+        background: rgba(0,0,0,0.25);
+        border: 1px solid var(--border-color);
+        padding: 1rem;
+        overflow-x: auto;
+        color: var(--text-main);
+        font-size: 11px;
+        line-height: 1.5;
+        margin: 1rem 0 1.5rem;
+    }
+
+    table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 1rem 0 1.5rem;
+        font-size: 11px;
+    }
+    th, td {
+        text-align: left;
+        vertical-align: top;
+        padding: 0.6rem 0.8rem;
+        border-bottom: 1px solid var(--border-color);
+    }
+    th { color: var(--text-main); letter-spacing: 0.1em; text-transform: uppercase; font-size: 10px; border-bottom: 1px solid var(--text-main); }
+    td { color: var(--text-muted); }
+    tr:hover td { background-color: rgba(255,255,255,0.02); }
+    td:first-child, th:first-child { color: var(--text-main); }
+    .ok { color: var(--accent-success); }
+    .no { color: var(--accent-live); }
+    .warn { color: var(--accent-warn); }
+    .na { color: var(--text-muted); }
+
+    .verdict { border: 1px solid var(--border-color); padding: 1.5rem; margin-top: 2rem; }
+    .verdict p:last-child { margin-bottom: 0; }
+
+    @media (max-width: 700px) {
+        .wrap { padding: 2rem 1rem 3rem; }
+        table { font-size: 10px; }
+        th, td { padding: 0.5rem 0.4rem; }
+    }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+    <div class="hud">
+        <span>SYS.PRELOOP // ACT_VS_PRELOOP</span>
+        <span>STATUS: <span class="on">[ONLINE]</span></span>
+    </div>
+
+    <h1>Three ways to run GitHub Actions locally</h1>
+    <div class="subtitle">nektos/act · agent-ci · preloop — and Gitea Actions (act_runner). Both let you run GitHub Actions workflows locally. They take fundamentally different approaches to the problem.</div>
+
+    <h2>01 // PHILOSOPHY</h2>
+    <table>
+        <thead><tr><th></th><th>act</th><th>agent-ci</th><th>preloop</th><th>Gitea Actions</th></tr></thead>
+        <tbody>
+        <tr><td>One-liner</td><td>Reimplement the runner in Go (CLI)</td><td>Reimplement the server in TypeScript</td><td>Reimplement <strong>both</strong> the control plane and the runner in Rust, with the full AzDO wire protocol between them</td><td>Reimplement the runner in Go (act fork), <strong>with a server</strong>: Gitea schedules, the runner executes</td></tr>
+        <tr><td>Strategy</td><td>Replace the runner with a Go reimplementation executing steps in Docker containers</td><td>Emulate the GitHub API (DTU) locally, drive the unmodified official runner in Docker</td><td>Replace the server and the runner; speak the official AzDO protocol between them</td><td>Replace the runner; Gitea supplies scheduling over a proprietary Connect-RPC protocol</td></tr>
+        <tr><td>Compatibility target</td><td>Behavioral: "workflows should mostly work"</td><td>Protocol: the official runner v2.336.0 cannot tell the difference</td><td>Protocol: the official runner v2.336.0 cannot tell the difference</td><td>Workflow-level: GitHub YAML syntax + the action ecosystem on Gitea's own wire protocol</td></tr>
+        <tr><td>Verification method</td><td>Manual testing + community bug reports</td><td>Differential conformance vs the official runner</td><td>Golden wire-capture scenarios replayed against the server; differential conformance</td><td>Unit tests + community reports; no official-runner wire conformance (by design)</td></tr>
+        </tbody>
+    </table>
+
+    <h2>02 // ARCHITECTURE</h2>
+    <h3>act — a monolithic Go binary</h3>
+    <pre>┌──────────────────────────────────────┐
+│            act (Go binary)          │
+│  YAML parser → Planner → Executor   │
+│  Expression evaluator · DAG sort    │
+└──────────────────┬──────────────────┘
+                   │ Docker API
+        ┌──────────▼──────────┐
+        │ Job container        │ ← tail -f /dev/null keeps it alive
+        │ (ubuntu image)       │ ← steps run via `docker exec`
+        │ + service containers │ ← same Docker network
+        └──────────────────────┘</pre>
+    <ul>
+        <li><strong>Language:</strong> Go 1.24+ · single static binary (~8 MB)</li>
+        <li><strong>Execution:</strong> monolithic — parses, plans, and executes in one process</li>
+        <li><strong>Container model:</strong> one long-lived Docker container per job, entrypoint `tail -f /dev/null`, steps via `docker exec`</li>
+        <li><strong>Host mode:</strong> `-self-hosted` runs steps directly on the host</li>
+    </ul>
+    <h3>preloop — a Rust control plane + runner</h3>
+    <pre>┌──────────────────────────────────────┐
+│    preloop-runner-server (Rust, Axum)   │
+│  YAML parser → Scheduler → AzDO wire │
+│  expressions · concurrency groups    │
+│  cache/artifacts · OIDC · DAP debug  │
+└──────────────┬───────────────────────┘
+               │ AzDO protocol (HTTP/WS)
+     ┌─────────┼──────────────┐
+┌────▼───┐ ┌────▼───┐  ┌─────▼────┐
+│Official│ │ preloop-  │  │ SmolVM   │
+│actions/│ │ runner │  │ (libkrun │
+│runner  │ │ (Rust) │  │  microVM)│
+└────────┘ └────────┘  └──────────┘</pre>
+    <ul>
+        <li><strong>Language:</strong> Rust — server (axum) and runner (Listener + Worker)</li>
+        <li><strong>Execution:</strong> client–server over the official AzDO wire protocol, verified against golden captures of runner v2.336.0</li>
+        <li><strong>Container model:</strong> one isolated microVM per job (smolvm/libkrun); the unmodified official runner also works against preloop</li>
+    </ul>
+
+    <h2>03 // FEATURE MATRIX</h2>
+    <h3>Core workflow features</h3>
+    <table>
+        <thead><tr><th>Feature</th><th>act</th><th>preloop</th><th>Gitea</th></tr></thead>
+        <tbody>
+        <tr><td>Workflow YAML parsing</td><td class="ok">✓</td><td class="ok">✓</td><td class="ok">✓</td></tr>
+        <tr><td>`run:` steps · remote/local actions · Docker actions</td><td class="ok">✓</td><td class="ok">✓</td><td class="ok">✓</td></tr>
+        <tr><td>`uses: $/` self-repo syntax (v2.336.0)</td><td class="no">✗</td><td class="ok">✓</td><td class="no">✗</td></tr>
+        <tr><td>Composite actions · reusable workflows · matrix · `needs` DAG · job outputs</td><td class="ok">✓</td><td class="ok">✓</td><td class="ok">✓</td></tr>
+        <tr><td>`if` conditionals · `continue-on-error` · `timeout-minutes`</td><td class="ok">✓</td><td class="ok">✓</td><td class="ok">✓</td></tr>
+        <tr><td>`run-name` expression</td><td class="no">✗</td><td class="ok">✓</td><td class="warn">⚠</td></tr>
+        </tbody>
+    </table>
+    <h3>Environment &amp; contexts</h3>
+    <table>
+        <thead><tr><th>Feature</th><th>act</th><th>preloop</th><th>Gitea</th></tr></thead>
+        <tbody>
+        <tr><td>$GITHUB_ENV / OUTPUT / PATH / STEP_SUMMARY / STATE</td><td class="ok">✓</td><td class="ok">✓</td><td class="ok">✓</td></tr>
+        <tr><td>$GITHUB_ARTIFACTS / $GITHUB_ARTIFACTS_LIST (v2.336.0)</td><td class="no">✗</td><td class="ok">✓</td><td class="no">✗</td></tr>
+        <tr><td>ACTIONS_CACHE_MODE</td><td class="no">✗</td><td class="ok">✓</td><td class="no">✗</td></tr>
+        <tr><td>github.* / env.* / secrets.* / vars.* / steps.* / needs.* / matrix.* / runner.* / inputs.*</td><td class="ok">✓</td><td class="ok">✓</td><td class="ok">✓</td></tr>
+        <tr><td>Comprehensive GITHUB_* env vars</td><td class="warn">⚠ partial</td><td class="ok">✓</td><td class="warn">⚠</td></tr>
+        </tbody>
+    </table>
+    <h3>Expression engine</h3>
+    <table>
+        <thead><tr><th>Feature</th><th>act</th><th>preloop</th><th>Gitea</th></tr></thead>
+        <tbody>
+        <tr><td>contains() · startsWith() · endsWith() · format() · join() · toJSON() · fromJSON() · hashFiles() · status functions</td><td class="ok">✓</td><td class="ok">✓</td><td class="ok">✓</td></tr>
+        <tr><td>`*` filter syntax</td><td class="no">✗</td><td class="ok">✓</td><td class="ok">✓</td></tr>
+        <tr><td>Bracket access ['key']</td><td class="warn">⚠</td><td class="ok">✓</td><td class="ok">✓</td></tr>
+        <tr><td>`{{` / `}}` escape sequences</td><td class="no">✗</td><td class="ok">✓</td><td class="ok">✓</td></tr>
+        <tr><td>Case-insensitive `==`</td><td class="warn">⚠</td><td class="ok">✓</td><td class="ok">✓</td></tr>
+        <tr><td>Parser</td><td>rhysd/actionlint AST</td><td>Custom Pratt parser</td><td>actionlint AST (fork evaluator)</td></tr>
+        </tbody>
+    </table>
+    <h3>Protocol &amp; runner features</h3>
+    <table>
+        <thead><tr><th>Feature</th><th>act</th><th>preloop</th><th>Gitea</th></tr></thead>
+        <tbody>
+        <tr><td>AzDO wire protocol</td><td class="no">✗</td><td class="ok">✓</td><td class="no">✗ (Connect RPC)</td></tr>
+        <tr><td>Runner registration handshake (RSA/AES session crypto)</td><td class="no">✗</td><td class="ok">✓</td><td class="warn">⚠ own token flow</td></tr>
+        <tr><td>Broker acquire/renew/complete lifecycle</td><td class="no">✗</td><td class="ok">✓</td><td class="warn">⚠ FetchTask/UpdateTask</td></tr>
+        <tr><td>OIDC id-token provider</td><td class="no">✗</td><td class="ok">✓</td><td class="no">✗</td></tr>
+        <tr><td>Concurrency groups (cancel-in-progress)</td><td class="no">✗</td><td class="ok">✓</td><td class="ok">✓</td></tr>
+        <tr><td>Job permissions / GITHUB_TOKEN scoping</td><td class="no">✗</td><td class="ok">✓ per-installation tokens</td><td class="warn">⚠ repo-scoped task token</td></tr>
+        <tr><td>Job cancellation (wire protocol)</td><td class="no">✗</td><td class="ok">✓</td><td class="warn">⚠ heartbeat result</td></tr>
+        <tr><td>Timeline / live logs / annotations</td><td class="no">✗</td><td class="ok">✓</td><td class="warn">⚠ log rows, no WS timeline</td></tr>
+        <tr><td>Results-service (Twirp)</td><td class="no">✗</td><td class="ok">✓</td><td class="no">✗</td></tr>
+        <tr><td>Ephemeral runners · runner groups</td><td class="na">N/A</td><td class="ok">✓</td><td class="ok">✓</td></tr>
+        <tr><td>Background steps · locked dependencies (v2.336.0)</td><td class="no">✗</td><td class="warn">⚠ partial / ✓</td><td class="no">✗</td></tr>
+        </tbody>
+    </table>
+    <h3>Container &amp; isolation</h3>
+    <table>
+        <thead><tr><th>Feature</th><th>act</th><th>preloop</th><th>Gitea</th></tr></thead>
+        <tbody>
+        <tr><td>Docker job containers · service containers · Docker-in-Docker</td><td class="ok">✓</td><td class="ok">✓</td><td class="ok">✓</td></tr>
+        <tr><td>MicroVM isolation (smolvm/libkrun)</td><td class="no">✗</td><td class="ok">✓</td><td class="no">✗</td></tr>
+        <tr><td>macOS / Windows native runner</td><td class="warn">⚠ `-self-hosted` workaround</td><td class="ok">✓</td><td class="ok">✓ host labels</td></tr>
+        <tr><td>Podman support</td><td class="ok">✓</td><td class="ok">✓</td><td class="ok">✓</td></tr>
+        </tbody>
+    </table>
+    <h3>Cache, artifacts &amp; developer experience</h3>
+    <table>
+        <thead><tr><th>Feature</th><th>act</th><th>preloop</th><th>Gitea</th></tr></thead>
+        <tbody>
+        <tr><td>Cache v2 (Twirp)</td><td class="no">✗</td><td class="ok">✓</td><td class="warn">⚠ runner-side, no Twirp</td></tr>
+        <tr><td>Artifacts v2+ (Twirp + blob)</td><td class="ok">✓ v3/v4</td><td class="ok">✓</td><td class="warn">⚠ v4 via patching</td></tr>
+        <tr><td>File-backed storage</td><td class="ok">✓</td><td class="ok">✓</td><td class="ok">✓</td></tr>
+        <tr><td>DAP debugger (breakpoints, stepping, REPL)</td><td class="no">✗</td><td class="ok">✓</td><td class="no">✗</td></tr>
+        <tr><td>Event simulation · dry run · .actrc / .secrets</td><td class="ok">✓</td><td class="warn">⚠ event sim only</td><td class="warn">⚠ web UI</td></tr>
+        </tbody>
+    </table>
+
+    <h2>04 // EXECUTION MODEL</h2>
+    <ul>
+        <li><strong>act</strong> keeps one idle Docker container alive per job and runs every step through `docker exec` on your host kernel — fast, but a step can see the host's kernel and any shared Docker daemon state.</li>
+        <li><strong>preloop</strong> builds the job on the server, ships it to a runner over the AzDO wire protocol, and executes it inside a dedicated smolvm microVM — separate kernel, network off by default, per-job lifecycle.</li>
+        <li><strong>Gitea Actions</strong> reuses act's execution engine but the Gitea monolith does scheduling (needs/matrix/concurrency) and ships the workflow YAML to the runner over proprietary Connect RPC.</li>
+    </ul>
+
+    <h2>05 // PROTOCOL FIDELITY</h2>
+    <h3>act — no protocol</h3>
+    <p>act parses the YAML itself and executes steps. Nothing speaks the runner protocol, so nothing can be verified against GitHub's actual behavior — discrepancies surface when your workflow fails.</p>
+    <h3>preloop — full AzDO wire protocol</h3>
+    <ul>
+        <li><strong>Registration:</strong> RSA key exchange, runner capabilities, labels</li>
+        <li><strong>Session:</strong> AES-encrypted message queue, session renewal, conflict resolution</li>
+        <li><strong>Broker:</strong> acquirejob → renewjob → completejob lifecycle</li>
+        <li><strong>Results service:</strong> 5 Twirp routes (step logs, job logs, step summaries, workflow steps, signed blob URLs)</li>
+        <li><strong>Timeline:</strong> PATCH updates with lastModified stamps, GET for full history</li>
+        <li><strong>OIDC:</strong> RS256-signed JWTs, X.509 chain, JWKS endpoint, OpenID discovery</li>
+        <li><strong>Cancellation:</strong> JobCancelMessage with GUID jobId, graceful + hard-kill phases</li>
+        <li><strong>Location services:</strong> 28 service definitions matching the hosted topology</li>
+    </ul>
+    <p>Verified by 24 golden conformance scenarios replayed from official runner v2.336.0 wire captures — all pass on status codes, request body schemas, and acquirejob response schemas.</p>
+
+    <h2>06 // PERFORMANCE — 39 SCENARIO BENCHMARK</h2>
+    <p>All tools measured on the same Apple M4 Max host against the 39 scenario workflow YAMLs. Each preloop job ran in its own smolvm microVM forked from the warm runner base image. (Scenarios 07, 09, 103, 107, 14 contain intentional failing steps — reporting Failure is correct.)</p>
+    <table>
+        <thead><tr><th></th><th>Behavioral fidelity</th><th>Typical run</th></tr></thead>
+        <tbody>
+        <tr><td>Preloop (preloop)</td><td class="ok">31 / 39 (79.5%)</td><td class="ok">366–824 ms</td></tr>
+        <tr><td>act</td><td class="warn">29 / 39 (74.4%)</td><td class="warn">~0.4–0.8 s warm</td></tr>
+        <tr><td>agent-ci</td><td class="warn">29 / 39 (74.4%)</td><td class="warn">~10–20 s</td></tr>
+        </tbody>
+    </table>
+    <h3>Selected scenarios</h3>
+    <table>
+        <thead><tr><th>Scenario</th><th>act</th><th>act time</th><th>agent-ci</th><th>agent-ci time</th><th>preloop</th><th>preloop time</th></tr></thead>
+        <tbody>
+        <tr><td>02-trivial-job</td><td class="ok">✓</td><td>0.45s</td><td class="ok">✓</td><td>10.34s</td><td class="ok">✓</td><td class="ok">366ms</td></tr>
+        <tr><td>05-multi-job</td><td class="ok">✓</td><td>0.45s</td><td class="ok">✓</td><td>10.14s</td><td class="ok">✓</td><td class="ok">431ms</td></tr>
+        <tr><td>08-job-outputs-needs</td><td class="ok">✓</td><td>0.79s</td><td class="ok">✓</td><td>20.24s</td><td class="ok">✓</td><td class="ok">824ms</td></tr>
+        <tr><td>10-uses-checkout</td><td class="ok">✓</td><td>0.49s</td><td class="ok">✓</td><td>10.15s</td><td class="ok">✓</td><td class="ok">730ms</td></tr>
+        <tr><td>15-oidc-id-token</td><td class="no">✗</td><td>0.34s</td><td class="no">✗</td><td>10.89s</td><td class="ok">✓</td><td class="ok">358ms</td></tr>
+        <tr><td>11-cache-roundtrip</td><td class="no">✗</td><td>30.01s</td><td class="ok">✓</td><td>11.47s</td><td class="ok">✓</td><td class="ok">679ms</td></tr>
+        <tr><td>113-artifact-v4-multi-pattern</td><td class="no">✗</td><td>1.45s</td><td class="ok">✓</td><td>22.27s</td><td class="ok">✓</td><td class="ok">755ms</td></tr>
+        <tr><td>112-service-container-health-ports</td><td class="no">✗</td><td>3.78s</td><td class="no">✗</td><td>47.81s</td><td class="no">✗</td><td>12.28s</td></tr>
+        <tr><td>105-concurrency-cancellation-group</td><td class="ok">✓</td><td>60.48s</td><td class="ok">✓</td><td>69.69s</td><td class="ok">✓</td><td>60.55s</td></tr>
+        </tbody>
+    </table>
+    <p>Full 39-row table with per-scenario status and timing: <a href="https://github.com/preloopdev/preloop/blob/main/docs/internal/act-vs-preloop.md">docs/internal/act-vs-preloop.md</a>.</p>
+
+    <h2>07 // ISOLATION &amp; SECURITY</h2>
+    <table>
+        <thead><tr><th></th><th>act</th><th>preloop</th></tr></thead>
+        <tbody>
+        <tr><td>Default isolation</td><td>Docker container (shared kernel)</td><td class="ok">SmolVM microVM (separate kernel, ~131 MB idle RSS)</td></tr>
+        <tr><td>Secret handling</td><td>Env vars passed to the container</td><td class="ok">SecretString type, mask hints on the wire, expose() only at protocol boundaries</td></tr>
+        <tr><td>Network isolation</td><td>Docker network modes (host/bridge)</td><td class="ok">SmolVM strict egress (off by default, allowlist opt-in)</td></tr>
+        <tr><td>Filesystem isolation</td><td>Volumes + bind mounts</td><td class="ok">VM filesystem, APFS clones for workspace</td></tr>
+        <tr><td>Multi-tenancy</td><td>Not designed for it</td><td class="ok">Ephemeral runners, per-job VM, runner groups</td></tr>
+        </tbody>
+    </table>
+
+    <h2>08 // CONFORMANCE &amp; TESTING</h2>
+    <h3>act</h3>
+    <ul>
+        <li>Community-driven testing via bug reports and PRs</li>
+        <li>No formal conformance suite against the official runner</li>
+        <li>No wire-capture comparison methodology — discrepancies are discovered when users' workflows fail</li>
+    </ul>
+    <h3>preloop</h3>
+    <ul>
+        <li><strong>runner-watch:</strong> automated pipeline that watches actions/runner releases, diffs source, emits TOML specs, replays golden captures</li>
+        <li><strong>24 golden scenarios</strong> captured from official runner v2.336.0: registration, job lifecycle, cancellation, matrix, cache, artifacts, OIDC, containers, services, composites, Docker actions</li>
+        <li><strong>Conformance gate:</strong> status codes, request body schemas, acquirejob response schemas must match exactly</li>
+        <li><strong>Differential testing:</strong> same workflow on GitHub Actions and preloop — 11/12 job-level match (92%), 6/12 full match including step details (50%)</li>
+        <li><strong>Property tests:</strong> 87 tests for concurrency groups alone</li>
+    </ul>
+
+    <h2>09 // KNOWN GAPS</h2>
+    <h3>act</h3>
+    <table>
+        <thead><tr><th>Feature</th><th>Status</th></tr></thead>
+        <tbody>
+        <tr><td>OIDC tokens</td><td class="no">✗ not implemented</td></tr>
+        <tr><td>Concurrency groups</td><td class="no">✗ not implemented</td></tr>
+        <tr><td>Job permissions / GITHUB_TOKEN scoping</td><td class="no">✗ not implemented</td></tr>
+        <tr><td>run-name · $GITHUB_ARTIFACTS · problem matchers</td><td class="no">✗ not implemented</td></tr>
+        <tr><td>`*` filter · `{{`/`}}` escapes</td><td class="no">✗ not implemented</td></tr>
+        <tr><td>Native macOS/Windows runners</td><td class="warn">⚠ `-self-hosted` workaround only</td></tr>
+        <tr><td>Wire protocol for external integrations</td><td class="no">✗ fundamental: act IS the runner</td></tr>
+        <tr><td>DAP debugger</td><td class="no">✗ not implemented</td></tr>
+        </tbody>
+    </table>
+    <h3>preloop</h3>
+    <table>
+        <thead><tr><th>Feature</th><th>Status</th></tr></thead>
+        <tbody>
+        <tr><td>BackgroundStepCoordinator + cancel-control</td><td class="warn">⚠ partial</td></tr>
+        <tr><td>Runner self-update</td><td class="no">✗ intentional</td></tr>
+        <tr><td>Runner config refresh</td><td class="no">✗ missing</td></tr>
+        <tr><td>Action download telemetry</td><td class="warn">⚠ info logs only</td></tr>
+        <tr><td>Full hosted-service location parity</td><td class="warn">⚠ 28 of the topology</td></tr>
+        <tr><td>Workflow graph visualization · dry run mode</td><td class="no">✗ not implemented</td></tr>
+        </tbody>
+    </table>
+
+    <h2>10 // COMMUNITY &amp; ECOSYSTEM</h2>
+    <table>
+        <thead><tr><th></th><th>act</th><th>preloop</th></tr></thead>
+        <tbody>
+        <tr><td>Stars</td><td>~71,000</td><td>Private</td></tr>
+        <tr><td>Language</td><td>Go</td><td>Rust</td></tr>
+        <tr><td>Contributors</td><td>300+</td><td>Small team</td></tr>
+        <tr><td>Latest release</td><td>v0.2.89 (2026-06-01)</td><td>Continuous</td></tr>
+        <tr><td>Release cadence</td><td>Monthly</td><td>Continuous</td></tr>
+        <tr><td>Ecosystem</td><td>gh-act extension, VS Code extension</td><td>Preloop product, smolvm integration</td></tr>
+        <tr><td>License</td><td>MIT</td><td>Proprietary</td></tr>
+        </tbody>
+    </table>
+
+    <h2>11 // WHEN TO USE WHICH</h2>
+    <table>
+        <thead><tr><th>Scenario</th><th>act</th><th>preloop</th></tr></thead>
+        <tbody>
+        <tr><td>Quick local smoke test of a simple workflow</td><td class="ok">best choice</td><td class="na">overkill</td></tr>
+        <tr><td>Full-fidelity local CI matching GitHub behavior</td><td class="warn">gaps will bite</td><td class="ok">designed for this</td></tr>
+        <tr><td>Step-by-step workflow debugging</td><td class="no">no debugger</td><td class="ok">DAP debugger</td></tr>
+        <tr><td>OIDC token testing</td><td class="no">not supported</td><td class="ok">full provider</td></tr>
+        <tr><td>Concurrency group testing</td><td class="no">not supported</td><td class="ok">full implementation</td></tr>
+        <tr><td>Full wire-protocol fidelity (server + runner)</td><td class="no">no protocol</td><td class="ok">both sides reimplemented</td></tr>
+        <tr><td>Windows/macOS container workflows</td><td class="no">Linux Docker only</td><td class="ok">macOS, Linux, Windows</td></tr>
+        <tr><td>Zero-setup, zero-dependency quick start</td><td class="ok">brew install act</td><td class="na">installer script</td></tr>
+        <tr><td>CI infrastructure (self-hosted replacement)</td><td class="no">not designed for it</td><td class="ok">ephemeral runners, runner groups, multi-tenancy</td></tr>
+        </tbody>
+    </table>
+
+    <h2>12 // SUMMARY</h2>
+    <div class="verdict">
+        <p><strong>act</strong> is a pragmatic tool for quickly testing workflows locally. It reimplements the runner in Go and runs steps in Docker. Easy to install, huge community, fine for simple workflows — but it breaks down on advanced features (OIDC, concurrency, permissions) and cannot guarantee behavioral parity because it is a clean-room reimplementation.</p>
+        <p><strong>preloop</strong> reimplements the entire stack — both the server-side control plane and the runner — in Rust. `preloop-runner` is a faithful port of `actions/runner` v2.336.0 handling the full step lifecycle. Both sides in Rust means the full wire protocol is exercised end-to-end and conformance is verified against golden captures: rigorous conformance testing, sub-host-speed performance, a DAP debugger, and full OIDC/concurrency support. More to set up, but much higher fidelity.</p>
+        <p style="color: var(--text-main);">The fundamental difference is scope: <strong>act reimplements only the runner; preloop implements both the server and the runner</strong> with the real wire protocol between them. This single decision cascades through every other difference in the comparison.</p>
+    </div>
+
+    <div class="hud" style="margin-top: 3rem; margin-bottom: 0;">
+        <span>PRELOOP_SYS // 2026</span>
+        <span><a href="https://preloop.dev">PRELOOP.DEV</a></span>
+    </div>
+
+</div>
+</body>
+</html>
