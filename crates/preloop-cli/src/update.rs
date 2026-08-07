@@ -54,11 +54,38 @@ struct SelectedAsset<'a> {
     checksum: Option<&'a ReleaseAsset>,
 }
 
-pub(crate) async fn run(args: UpdateArgs) -> anyhow::Result<()> {
-    let client = Client::builder()
+/// A shared HTTP client for GitHub release API + asset downloads.
+pub(crate) fn release_client() -> Client {
+    Client::builder()
         .user_agent(USER_AGENT)
         .build()
-        .context("build release API client")?;
+        .expect("valid release API client configuration")
+}
+
+/// Download the named asset of the latest stable release into
+/// `destination`. Returns `false` when the release exists but ships no such
+/// asset (e.g. a platform the release does not cover) — that is a normal
+/// "nothing to fetch", not an error.
+pub(crate) async fn fetch_latest_asset(
+    client: &Client,
+    repository: &str,
+    asset_name: &str,
+    destination: &Path,
+) -> anyhow::Result<bool> {
+    let api_url = format!("https://api.github.com/repos/{repository}/releases");
+    let release = fetch_release(client, &api_url, None).await?;
+    if release.draft || release.prerelease {
+        anyhow::bail!("release {} is not a stable release", release.tag_name);
+    }
+    let Some(asset) = release.assets.iter().find(|asset| asset.name == asset_name) else {
+        return Ok(false);
+    };
+    download(client, &asset.browser_download_url, destination).await?;
+    Ok(true)
+}
+
+pub(crate) async fn run(args: UpdateArgs) -> anyhow::Result<()> {
+    let client = release_client();
     let repository = args
         .repository
         .as_deref()

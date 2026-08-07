@@ -663,6 +663,47 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
             std::time::SystemTime,
         >::new()));
     let pool_enabled = env_flag("PRELOOP_RUNNER_POOL_ENABLED", false);
+    // First-run warm start: prefer the packed golden (prebuilt microVM
+    // image) over a cold OCI boot that downloads the base image and installs
+    // toolchains per job. When PRELOOP_USE_PACKED_GOLDEN is unset, use the
+    // packed artifact if it exists locally, otherwise fetch it from the
+    // latest release; only fall back to the cold path when neither is
+    // possible. An explicit PRELOOP_USE_PACKED_GOLDEN=false forces cold.
+    if pool_enabled && std::env::var("PRELOOP_USE_PACKED_GOLDEN").is_err() {
+        let golden_name = format!("preloop-ubuntu-24.04-{}", std::env::consts::ARCH);
+        let golden_path = home.join("vms").join(&golden_name);
+        let packed = if golden_path.is_file() {
+            true
+        } else {
+            match ensure_release_golden(&golden_path, &golden_name).await {
+                Ok(true) => true,
+                Ok(false) => {
+                    tracing::warn!(
+                        "the latest release ships no packed golden for this platform \
+                         ({golden_name}); the first run will cold-boot the base image \
+                         (rebuild locally with `preloop build-golden` for a warm start)"
+                    );
+                    false
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "could not fetch the packed golden; the first run will cold-boot \
+                         the base image (or place one at {})",
+                        golden_path.display()
+                    );
+                    false
+                }
+            }
+        };
+        if packed {
+            tracing::info!(
+                "using packed golden at {} (set PRELOOP_USE_PACKED_GOLDEN=false to force a cold boot)",
+                golden_path.display()
+            );
+            std::env::set_var("PRELOOP_USE_PACKED_GOLDEN", "true");
+        }
+    }
     let pool_config = local_runner_pool_config(
         &home,
         runner_url.clone(),
@@ -977,6 +1018,27 @@ const WARM_POOL_CAP: usize = 8;
 /// Capped at `WARM_POOL_CAP` so a very large machine does not sit on dozens of
 /// idle VMs. Set
 /// `PRELOOP_RUNNER_POOL_SIZE` to override.
+async fn ensure_release_golden(
+    golden_path: &std::path::Path,
+    golden_name: &str,
+) -> anyhow::Result<bool> {
+    let client = update::release_client();
+    match update::fetch_latest_asset(&client, "preloopdev/preloop", golden_name, golden_path).await
+    {
+        Ok(true) => {
+            eprintln!("downloaded packed golden {golden_name} (first run: warm start)");
+            Ok(true)
+        }
+        Ok(false) => Ok(false),
+        Err(error) => {
+            // A failed fetch may leave a partial file; a truncated pack would
+            // fail confusingly at boot time.
+            let _ = std::fs::remove_file(golden_path);
+            Err(error)
+        }
+    }
+}
+
 fn host_runner_pool_size(cpus_per_runner: u16) -> usize {
     let parallelism = std::thread::available_parallelism().map_or(2, |value| value.get());
     let by_cpu = (parallelism / usize::from(cpus_per_runner.max(1))).max(1);
