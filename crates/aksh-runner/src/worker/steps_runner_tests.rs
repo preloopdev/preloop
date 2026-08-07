@@ -41,6 +41,21 @@ fn condition_error_is_not_treated_as_skip() {
 }
 
 #[test]
+fn pause_is_offered_for_continue_on_error_failures_too() {
+    // A continue-on-error step failure has outcome=Failure with a tolerated
+    // conclusion=Success; the pause must still fire so the VM state at the
+    // moment of death is inspectable. The `continue` verdict keeps the
+    // official outcome/conclusion pair intact.
+    assert!(should_pause_on_failure("Failure", false, false, false));
+    // Skipped steps, cancellation, background steps, and one declined
+    // verdict never pause.
+    assert!(!should_pause_on_failure("Skipped", false, false, false));
+    assert!(!should_pause_on_failure("Failure", true, false, false));
+    assert!(!should_pause_on_failure("Failure", false, true, false));
+    assert!(!should_pause_on_failure("Failure", false, false, true));
+}
+
+#[test]
 fn status_check_function_detection_ignores_string_literals() {
     assert!(contains_status_check_function(
         "failure() && steps.build.outcome == 'failure'"

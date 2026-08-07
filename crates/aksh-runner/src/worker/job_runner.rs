@@ -737,12 +737,18 @@ pub async fn run_job(
     // Gated on the per-run opt-in carried in the job message, so preservation
     // is a property of the run rather than of the engine that happens to be up.
     // Cancellation is not a failure — preserving it would pin a pool slot on
-    // every Ctrl-C.
+    // every Ctrl-C. A job that stayed green only through continue-on-error
+    // still preserves: the tolerated failure is exactly the state an operator
+    // wants to inspect.
+    let steps_had_failure = any_step_failed(&job_ctx.steps);
     let preserve_requested = job_message
         .get("preloopPreserveOnFailure")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    if preserve_requested && conclusion.eq_ignore_ascii_case("failed") && !debug_was_active {
+    if preserve_requested
+        && (conclusion.eq_ignore_ascii_case("failed") || steps_had_failure)
+        && !debug_was_active
+    {
         if let Some(path) = std::env::var_os("PRELOOP_FAILURE_MARKER") {
             let path = std::path::PathBuf::from(path);
             if let Some(parent) = path.parent() {
@@ -756,6 +762,15 @@ pub async fn run_job(
 
     info!("Job {job_name} finished with result: {conclusion}");
     Ok(())
+}
+
+/// Whether any step ended in a genuine execution failure.
+///
+/// `continue-on-error` steps count: their `outcome` stays `Failure` even when
+/// the job conclusion is tolerated to `Success`, and a tolerated failure is
+/// precisely the state worth preserving for inspection.
+fn any_step_failed(steps: &indexmap::IndexMap<String, super::contexts::StepResult>) -> bool {
+    steps.values().any(|result| result.outcome == "Failure")
 }
 fn spawn_renew_loop(
     rpt: Arc<ReportingContext>,
