@@ -28,6 +28,10 @@ __pycache__/
 /_work/
 /_runner_work/
 /externals/
+
+# Internal planning docs, experiment reports, and campaign logs: they are
+# part of the development record, not the public documentation surface.
+/docs/internal/
 /.runner
 /.credentials
 /.credentials_rsaparams

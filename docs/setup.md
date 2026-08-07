@@ -1,15 +1,14 @@
 # Setup guide
 
-This page is the "what to tell users" companion to the `preloop setup github`
-wizard. It covers installing the engine, connecting it to GitHub, and storing
+This page covers installing the engine, connecting it to GitHub, and storing
 secrets.
 
 ## What preloop is
 
-`preloop` is a local GitHub Actions control plane. The engine (`preloop
+`preloop` is ana agent-native, local and self-hosted, Github-Actions compatible control plane. The engine (`preloop
 serve`) accepts workflows the same way GitHub does — `${{ }}` expressions,
 matrix builds, reusable workflows, concurrency groups, OIDC — and executes
-them on local machines (smolvm microVMs by default). Your `.github/workflows`
+them on local machines (microVMs by default). Your `.github/workflows`
 run unmodified.
 
 ## Requirements
