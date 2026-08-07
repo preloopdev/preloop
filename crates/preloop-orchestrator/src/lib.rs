@@ -870,6 +870,15 @@ pub struct RunnerPoolConfig {
     /// Deliberately not part of the environment fingerprint -- see
     /// [`crate::environment::scan_workflow_images`].
     pub preload_images: Vec<String>,
+    /// Run the guest runner under this account instead of root, matching the
+    /// GitHub-hosted runner user-session contract (steps see USER/LOGNAME/
+    /// XDG_RUNTIME_DIR of a dedicated user, not root). The control plane and
+    /// provisioning stay root; only the runner process drops privileges.
+    /// `Some("root")` restores the old behavior; None disables switching.
+    pub runner_user: Option<String>,
+    /// UID for [`RunnerPoolConfig::runner_user`] (default 1001, matching the
+    /// hosted `runner` account).
+    pub runner_uid: Option<u32>,
     pub next_job_runs_on: Option<Arc<std::sync::RwLock<Vec<String>>>>,
     /// One-time provision-token map shared with the control plane. When set,
     /// every provisioning event registers a token here and injects it into
@@ -2637,7 +2646,7 @@ async fn provision_runner<P: VmProvider + 'static>(
         }
     }
     provider
-        .exec_with_secret_env(name, &configure, &secrets)
+        .exec_with_secret_env(name, &as_runner_user(config, &configure), &secrets)
         .await?;
     drop(staged);
     if let Some(path) = provision_token_file {
@@ -2664,7 +2673,44 @@ async fn provision_runner<P: VmProvider + 'static>(
         "--runner-root".into(),
         "/var/lib/preloop-runner".into(),
     ]);
-    Ok(run)
+    Ok(as_runner_user(config, &run))
+}
+
+/// Wrap a guest argv so the runner executes under `runner_user` instead of
+/// root: create the account, provision its runtime directory, open the
+/// control bridge, grant the docker group, then drop privileges with
+/// `setpriv` and export the account identity for the step-environment
+/// contract (USER/LOGNAME/XDG_RUNTIME_DIR are derived from it by the
+/// worker). Purely a guest-side concern — never applied on the host.
+fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
+    let Some(user) = &config.runner_user else {
+        return argv.to_vec();
+    };
+    if user == "root" {
+        return argv.to_vec();
+    }
+    let uid = config.runner_uid.unwrap_or(1001);
+    let home = format!("/home/{user}");
+    let program = shell_quote(&argv[0]);
+    let args = argv[1..]
+        .iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let script = format!(
+        "getent passwd {user} >/dev/null 2>&1 || useradd -m -u {uid} {user} 2>/dev/null; \
+         mkdir -p /run/user/{uid}; chown {uid}:{uid} /run/user/{uid} /var/lib/preloop-runner 2>/dev/null; \
+         chmod 777 /run/preloop-control 2>/dev/null; \
+         getent group docker >/dev/null 2>&1 && usermod -aG docker {user} 2>/dev/null; \
+         exec setpriv --reuid {uid} --regid {uid} --init-groups env \
+           PRELOOP_RUNNER_USER={user} PRELOOP_RUNNER_UID={uid} HOME={home} {program} {args}"
+    );
+    vec!["sh".to_owned(), "-c".to_owned(), script]
+}
+
+/// Single-quote an argv element for the guest bootstrap shell.
+fn shell_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
 /// Fail the provision if a toolchain layer's binary is not on the default
@@ -2963,6 +3009,60 @@ chmod +x "$destination/bin/node"
     }
 
     #[test]
+    fn runner_user_wrapper_drops_privileges_and_creates_the_account() {
+        let mut config = test_config(false);
+        config.runner_user = Some("runner".to_owned());
+        config.runner_uid = Some(1001);
+        let argv = vec![
+            "/opt/preloop/bin/preloop-runner".to_owned(),
+            "run".to_owned(),
+            "--once".to_owned(),
+        ];
+
+        let wrapped = as_runner_user(&config, &argv);
+        assert_eq!(wrapped[0], "sh");
+        assert_eq!(wrapped[1], "-c");
+        let script = &wrapped[2];
+        assert!(script.contains("useradd -m -u 1001 runner"), "{script}");
+        assert!(
+            script.contains("chmod 777 /run/preloop-control"),
+            "{script}"
+        );
+        assert!(
+            script.contains("setpriv --reuid 1001 --regid 1001 --init-groups"),
+            "{script}"
+        );
+        assert!(
+            script.contains("PRELOOP_RUNNER_USER=runner PRELOOP_RUNNER_UID=1001"),
+            "{script}"
+        );
+        assert!(
+            script.ends_with("'/opt/preloop/bin/preloop-runner' 'run' '--once'"),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn runner_user_wrapper_passes_root_and_unset_through() {
+        let mut config = test_config(false);
+        let argv = vec![
+            "/opt/preloop/bin/preloop-runner".to_owned(),
+            "run".to_owned(),
+        ];
+        // Unset: no switching.
+        assert_eq!(as_runner_user(&config, &argv), argv);
+        // Explicit root: no switching.
+        config.runner_user = Some("root".to_owned());
+        assert_eq!(as_runner_user(&config, &argv), argv);
+    }
+
+    #[test]
+    fn shell_quote_escapes_single_quotes() {
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
     fn runner_labels_bind_to_selected_ubuntu_environment() {
         assert_eq!(
             runner_environment_labels("ubuntu:22.04"),
@@ -3001,6 +3101,8 @@ chmod +x "$destination/bin/node"
             runner_key_dir: None,
             pending_jobs: None,
             preload_images: Vec::new(),
+            runner_user: None,
+            runner_uid: None,
             next_job_runs_on: None,
             pending_registrations: None,
         }

@@ -413,6 +413,8 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         runner_key_dir: None,
         pending_jobs: None,
         preload_images: Vec::new(),
+        runner_user: None,
+        runner_uid: None,
         next_job_runs_on: None,
         pending_registrations: None,
     };
@@ -917,6 +919,19 @@ fn local_runner_pool_config(
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "preloop-runner".into()),
         base_image: base_image.clone(),
+        // GitHub-hosted parity: guest runners run as a dedicated account
+        // instead of root, so steps see the hosted user-session contract.
+        // PRELOOP_RUNNER_USER=root restores root; an empty value disables
+        // switching (runner keeps the guest's root identity).
+        runner_user: match std::env::var("PRELOOP_RUNNER_USER") {
+            Ok(value) if value.is_empty() => None,
+            Ok(value) => Some(value),
+            Err(_) => Some("runner".to_owned()),
+        },
+        runner_uid: std::env::var("PRELOOP_RUNNER_UID")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .or(Some(1001)),
         workspace: Some(workspace),
         // The packed artifact cache key includes the resolved base image
         // (tag AND digest): the digest-pinned defaults are a golden's

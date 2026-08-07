@@ -349,6 +349,8 @@ impl Fixture {
             runner_key_dir: None,
             pending_jobs: None,
             preload_images: Vec::new(),
+            runner_user: None,
+            runner_uid: None,
             next_job_runs_on: None,
             pending_registrations: None,
         };
