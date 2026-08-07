@@ -176,6 +176,13 @@ pub fn matrix_to_spec(
 }
 
 /// Convert any JSON matrix value (object or array) into a validated expansion specification.
+///
+/// GitHub's workflow schema requires `strategy.matrix` to be a mapping, and a
+/// dynamic `fromJSON(...)` matrix is held to the same schema: a bare array is a
+/// workflow error there, not an implicit `include:` list. Axis order is the
+/// object's declaration order — `JobNameBuilder` renders the name by walking
+/// the mapping as written — which is why `serde_json` is built with
+/// `preserve_order` and the axes land in an `IndexMap`.
 pub fn value_to_matrix_spec(job_id: &str, value: &Value) -> Result<MatrixSpec, crate::ParserError> {
     match value {
         Value::Object(map) => {
@@ -184,16 +191,24 @@ pub fn value_to_matrix_spec(job_id: &str, value: &Value) -> Result<MatrixSpec, c
             let mut exclude = Vec::new();
             for (key, val) in map {
                 if key == "include" {
-                    if let Value::Array(arr) = val {
-                        for item in arr {
-                            include.push(matrix_entry(job_id, "include", item)?);
-                        }
+                    let arr =
+                        val.as_array()
+                            .ok_or_else(|| crate::ParserError::InvalidMatrixEntry {
+                                job_id: job_id.to_owned(),
+                                field: "include",
+                            })?;
+                    for item in arr {
+                        include.push(matrix_entry(job_id, "include", item)?);
                     }
                 } else if key == "exclude" {
-                    if let Value::Array(arr) = val {
-                        for item in arr {
-                            exclude.push(matrix_entry(job_id, "exclude", item)?);
-                        }
+                    let arr =
+                        val.as_array()
+                            .ok_or_else(|| crate::ParserError::InvalidMatrixEntry {
+                                job_id: job_id.to_owned(),
+                                field: "exclude",
+                            })?;
+                    for item in arr {
+                        exclude.push(matrix_entry(job_id, "exclude", item)?);
                     }
                 } else {
                     let axis_values = match val {
@@ -209,19 +224,8 @@ pub fn value_to_matrix_spec(job_id: &str, value: &Value) -> Result<MatrixSpec, c
                 include,
             })
         }
-        Value::Array(arr) => {
-            let mut include = Vec::new();
-            for item in arr {
-                include.push(matrix_entry(job_id, "include", item)?);
-            }
-            Ok(MatrixSpec {
-                axes: IndexMap::new(),
-                exclude: Vec::new(),
-                include,
-            })
-        }
         _ => Err(crate::ParserError::InvalidExpression(format!(
-            "job `{job_id}` matrix expression did not return an object or array"
+            "job `{job_id}` matrix expression did not return a mapping"
         ))),
     }
 }
@@ -685,6 +689,27 @@ jobs:
         }
     }
 
+    /// A dynamic matrix (`fromJson` result) with a non-array reserved field
+    /// must be rejected like the static path rejects malformed include/exclude,
+    /// not silently dropped — dropping `exclude` would run jobs the workflow
+    /// asked to exclude.
+    #[test]
+    fn value_to_matrix_spec_rejects_non_array_include_and_exclude() {
+        for (field, value) in [
+            ("include", json!({"include": {"os": "ubuntu-latest"}})),
+            ("exclude", json!({"exclude": {"os": "ubuntu-latest"}})),
+        ] {
+            let error = value_to_matrix_spec("build", &value).unwrap_err();
+            assert!(matches!(
+                error,
+                crate::ParserError::InvalidMatrixEntry {
+                    ref job_id,
+                    field: actual_field,
+                } if job_id == "build" && actual_field == field
+            ));
+        }
+    }
+
     /// Golden fixture fixtures/golden/matrix-expand.yml expansion ids.
     #[test]
     fn golden_matrix_expand_fixture_ids() {
@@ -767,7 +792,7 @@ jobs:
     }
 
     #[test]
-    fn value_to_matrix_spec_handles_objects_and_arrays() {
+    fn value_to_matrix_spec_accepts_mappings_and_rejects_bare_arrays() {
         let json_obj = serde_json::json!({
             "include": [
                 {"os": "ubuntu-latest", "node": "20"},
@@ -778,13 +803,32 @@ jobs:
         let combos = expand_matrix_spec(&spec);
         assert_eq!(combos.len(), 2);
 
+        // GitHub's schema requires `strategy.matrix` to be a mapping. A bare
+        // array is a workflow error, not an implicit `include:` list.
         let json_arr = serde_json::json!([
             {"os": "ubuntu-latest"},
             {"os": "windows-latest"}
         ]);
-        let spec_arr = value_to_matrix_spec("test", &json_arr).unwrap();
-        let combos_arr = expand_matrix_spec(&spec_arr);
-        assert_eq!(combos_arr.len(), 2);
+        assert!(matches!(
+            value_to_matrix_spec("test", &json_arr),
+            Err(crate::ParserError::InvalidExpression(_))
+        ));
+    }
+
+    /// A dynamic matrix names its jobs in the order the mapping declares its
+    /// axes, matching `JobNameBuilder`. Sorted keys would render
+    /// `build (x64, ubuntu-latest)` for a spec that declares `os` first.
+    #[test]
+    fn value_to_matrix_spec_preserves_axis_declaration_order() {
+        let spec = value_to_matrix_spec(
+            "build",
+            &serde_json::json!({"os": ["ubuntu-latest"], "arch": ["x64"]}),
+        )
+        .unwrap();
+        assert_eq!(
+            spec.axes.keys().cloned().collect::<Vec<_>>(),
+            vec!["os".to_owned(), "arch".to_owned()]
+        );
     }
     /// Production-path: generated matrix → YAML → parse → expand → job count matches model.
     /// Oracle: docs/property-tests.md §2 production-path requirements.

@@ -131,15 +131,36 @@ pub(crate) async fn twirp_workflow_steps_update(
 }
 
 pub(crate) async fn twirp_get_job_logs_signed_blob_url(
+    State(shared): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<JobLogsSignedBlobUrlRequest>,
-) -> Json<serde_json::Value> {
-    Json(json!({
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // The signed URL is the upload credential for `/replay/results/*` — a
+    // bearerless route reachable from inside every runner VM. Only mint for
+    // the plan/job the caller's token actually names, or workflow code could
+    // ask for another job's URL and overwrite its logs.
+    if !crate::auth::results_token_binds_job(
+        &shared.state,
+        crate::auth::bearer_from_headers(&headers),
+        &request.workflow_run_backend_id,
+        &request.workflow_job_run_backend_id,
+    ) {
+        return Err(ApiError::forbidden(
+            "replay blob URL minting requires a token for that job",
+        ));
+    }
+    let path = format!(
+        "/replay/results/{}/{}/job-logs.txt",
+        request.workflow_run_backend_id, request.workflow_job_run_backend_id
+    );
+    let sig = crate::auth::sign_replay_upload_ticket(&shared.state, &path);
+    Ok(Json(json!({
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
         "logs_url": format!(
-            "{}/replay/results/{}/{}/job-logs.txt?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig=dummy",
-            runner_base_url(), request.workflow_run_backend_id, request.workflow_job_run_backend_id
+            "{}{}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig={sig}",
+            runner_base_url(), path
         )
-    }))
+    })))
 }
 
 pub(crate) async fn twirp_get_job_diag_logs_signed_blob_url(
@@ -153,16 +174,35 @@ pub(crate) async fn twirp_get_job_diag_logs_signed_blob_url(
 }
 
 pub(crate) async fn twirp_get_step_logs_signed_blob_url(
+    State(shared): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<StepLogsSignedBlobUrlRequest>,
-) -> Json<serde_json::Value> {
-    Json(json!({
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !crate::auth::results_token_binds_job(
+        &shared.state,
+        crate::auth::bearer_from_headers(&headers),
+        &request.workflow_run_backend_id,
+        &request.workflow_job_run_backend_id,
+    ) {
+        return Err(ApiError::forbidden(
+            "replay blob URL minting requires a token for that job",
+        ));
+    }
+    let path = format!(
+        "/replay/results/{}/{}/step-{}.txt",
+        request.workflow_run_backend_id,
+        request.workflow_job_run_backend_id,
+        request.step_backend_id
+    );
+    let sig = crate::auth::sign_replay_upload_ticket(&shared.state, &path);
+    Ok(Json(json!({
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
         "logs_url": format!(
-            "{}/replay/results/{}/{}/step-{}.txt?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig=dummy",
-            runner_base_url(), request.workflow_run_backend_id, request.workflow_job_run_backend_id, request.step_backend_id
+            "{}{}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig={sig}",
+            runner_base_url(), path
         ),
         "soft_size_limit": "1048576"
-    }))
+    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,16 +213,35 @@ pub(crate) struct StepSummarySignedBlobUrlRequest {
 }
 
 pub(crate) async fn twirp_get_step_summary_signed_blob_url(
+    State(shared): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<StepSummarySignedBlobUrlRequest>,
-) -> Json<serde_json::Value> {
-    Json(json!({
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !crate::auth::results_token_binds_job(
+        &shared.state,
+        crate::auth::bearer_from_headers(&headers),
+        &request.workflow_run_backend_id,
+        &request.workflow_job_run_backend_id,
+    ) {
+        return Err(ApiError::forbidden(
+            "replay blob URL minting requires a token for that job",
+        ));
+    }
+    let path = format!(
+        "/replay/results/{}/{}/step-{}-summary.md",
+        request.workflow_run_backend_id,
+        request.workflow_job_run_backend_id,
+        request.step_backend_id
+    );
+    let sig = crate::auth::sign_replay_upload_ticket(&shared.state, &path);
+    Ok(Json(json!({
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
         "summary_url": format!(
-            "{}/replay/results/{}/{}/step-{}-summary.md?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig=dummy",
-            runner_base_url(), request.workflow_run_backend_id, request.workflow_job_run_backend_id, request.step_backend_id
+            "{}{}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig={sig}",
+            runner_base_url(), path
         ),
         "soft_size_limit": "1048576"
-    }))
+    })))
 }
 
 #[derive(Debug, Deserialize)]

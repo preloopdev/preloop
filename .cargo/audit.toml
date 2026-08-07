@@ -1,5 +1,9 @@
-# cargo-audit configuration. Mirrors the accepts in deny.toml — keep the two
-# in sync. See RUSTSEC-2023-0071 for the rationale (no fixed release; signing
-# is local-only and timing is not observable).
+# cargo-audit configuration.
 [advisories]
+# RUSTSEC-2023-0071 (Marvin Attack, crate `rsa`): the advisory has
+# `patched = []` — no fixed version exists upstream; the constant-time
+# rewrite (rsa 0.10) is still pre-release. `rsa` is used here for RS256 JWT
+# *signing* in the local control plane (GitHub App tokens), not a
+# network-facing RSA decryption oracle, which is the exposure the Marvin
+# workaround targets. Revisit when rsa 0.10 stabilizes.
 ignore = ["RUSTSEC-2023-0071"]

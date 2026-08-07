@@ -34,6 +34,7 @@ mod routes;
 use routes::build_app;
 pub use routes::{app, app_with_test_api};
 mod live_logs;
+mod openapi;
 use live_logs::*;
 mod debug;
 use debug::*;
