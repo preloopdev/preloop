@@ -343,6 +343,18 @@ const LOOPBACK_HOSTS: &str = "127.0.0.1 localhost\\n\
                               ff02::1 ip6-allnodes\\n\
                               ff02::2 ip6-allrouters\\n";
 
+/// Static resolvers baked into the golden's `/etc/resolv.conf`.
+///
+/// The base image ships a dangling symlink to systemd-resolved's stub
+/// (`/run/systemd/resolve/stub-resolv.conf`), which nothing creates in our
+/// VMs — the guest then has no DNS at all, and every outbound name lookup
+/// fails. This bit the golden bake itself: `smolvm pack` boots an export VM
+/// from the machine disk, and the in-VM registry client could not resolve
+/// `index.docker.io`. A plain file survives reboots (verified on a live
+/// VM). `PRELOOP_RUNNER_DNS` still overrides at machine start for operators
+/// on networks that filter the public resolvers.
+const GUEST_RESOLVERS: &str = "nameserver 1.1.1.1\nnameserver 8.8.8.8\n";
+
 /// The golden image's package baseline. Exposed for the fidelity tests.
 pub fn base_packages() -> &'static str {
     BASE_PACKAGES
@@ -414,6 +426,7 @@ pub fn base_install_script() -> String {
          DEBIAN_FRONTEND=noninteractive \
          apt-get install -y -qq --no-install-recommends {BASE_PACKAGES} \
          && printf '{LOOPBACK_HOSTS}' > /etc/hosts && \
+         printf '{GUEST_RESOLVERS}' > /etc/resolv.conf && \
          printf '127.0.0.1 %s\\n' \"$(hostname)\" >> /etc/hosts && \
          printf 'APT::Get::Assume-Yes \"true\";\\n' > /etc/apt/apt.conf.d/90assumeyes && \
          (arch=$(uname -m); \
@@ -603,9 +616,10 @@ async fn write_bake_manifest<P: VmProvider>(
     let probe = [
         "sh".to_owned(),
         "-c".to_owned(),
-        "for cmd in node npm python3 python3.10 docker git git-lfs rustc cargo go cargo-shear pnpm yarn gh yq cmake; do \
+        "for cmd in node npm python3 python3.10 docker git git-lfs rustc cargo cargo-shear pnpm yarn gh yq cmake; do \
            printf '%s=%s\\n' \"$cmd\" \"$($cmd --version 2>/dev/null | head -n1 || echo missing)\"; \
          done; \
+         printf 'go=%s\\n' \"$(go version 2>/dev/null || echo missing)\"; \
          printf 'packages=%s\\n' \"$(dpkg-query -W -f={{Package}} | wc -l)\"; \
          printf 'built_at=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
             .to_owned(),
