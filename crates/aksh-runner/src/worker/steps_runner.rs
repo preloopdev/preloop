@@ -990,6 +990,20 @@ pub async fn run_steps(
                                  cleanup steps still run.",
                             );
                             debugging_declined = true;
+                            // An aborted `continue-on-error` step keeps its
+                            // failure: the verdict promises "the job fails
+                            // from here", and the tolerated conclusion would
+                            // leave `any_failed` false and the job green.
+                            // Flip the recorded conclusion so the aggregation
+                            // and the step report agree.
+                            if outcome_str == "Failure" {
+                                if let Some(step_result) =
+                                    step_ctx.job.steps.get_mut(&step.context_name)
+                                {
+                                    step_result.conclusion = "Failure".to_string();
+                                }
+                                break ("Failure".to_string(), file_command_paths);
+                            }
                             break (conclusion_str, file_command_paths);
                         }
                         // No session, or the session vanished. Neither is a

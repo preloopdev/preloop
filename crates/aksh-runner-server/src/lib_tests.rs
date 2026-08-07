@@ -3340,6 +3340,29 @@ async fn environment_secrets_override_repo_and_global_per_job() {
         json!({ "value": "repo-v", "repo": "owner/repo" }),
     )
     .await;
+    // A name present in every tier and NOT overridden by the submission: the
+    // environment tier must win for the prod job, the repo tier for plain.
+    request_json(
+        &app,
+        Method::PUT,
+        "/api/v1/secrets/TIERED",
+        json!({ "value": "tier-global" }),
+    )
+    .await;
+    request_json(
+        &app,
+        Method::PUT,
+        "/api/v1/secrets/TIERED",
+        json!({ "value": "tier-repo", "repo": "owner/repo" }),
+    )
+    .await;
+    request_json(
+        &app,
+        Method::PUT,
+        "/api/v1/secrets/TIERED",
+        json!({ "value": "tier-env", "repo": "owner/repo", "env": "prod" }),
+    )
+    .await;
 
     // Two jobs: one in environment prod, one with no environment. The caller
     // also supplies SHARED, which must beat the environment tier.
@@ -3435,6 +3458,11 @@ async fn environment_secrets_override_repo_and_global_per_job() {
         "environment secrets reach jobs in that environment"
     );
     assert_eq!(prod["ENV_ONLY"]["isSecret"], true);
+    assert_eq!(
+        prod["TIERED"]["value"], "tier-env",
+        "environment tier beats repo and global tiers for jobs in the environment"
+    );
+    assert_eq!(prod["TIERED"]["isSecret"], true);
 
     let plain = &variables_by_job["plain"];
     assert_eq!(
@@ -3443,6 +3471,10 @@ async fn environment_secrets_override_repo_and_global_per_job() {
     );
     assert_eq!(
         plain["REPO_GLOBAL"]["value"], "repo-v",
+        "without an environment the repo tier wins over the global tier"
+    );
+    assert_eq!(
+        plain["TIERED"]["value"], "tier-repo",
         "without an environment the repo tier wins over the global tier"
     );
     assert!(
@@ -8682,12 +8714,14 @@ async fn live_secrets_api_env_scope_round_trips() {
             let store = state.secrets.read();
             assert_eq!(store.env["owner/repo"]["prod"]["DEPLOY_KEY"], "k1");
         }
-        let text = std::fs::read_to_string(&config_path).unwrap();
-        assert!(
-            text.contains("DEPLOY_KEY"),
+        // Reload, don't grep: the assertion must prove the value round-trips
+        // through the serializer, not merely that the literal appears in the
+        // file (which a malformed or misplaced table could satisfy).
+        let persisted = crate::config::load_config_from(&config_path).unwrap();
+        assert_eq!(
+            persisted.env_secrets["owner/repo"]["prod"]["DEPLOY_KEY"], "k1",
             "config persists the env secret"
         );
-        assert!(text.contains("env_secrets"), "config persists the env tier");
 
         // Validation: env without repo and malformed env names are rejected.
         let (status, _) = request_json_status(
@@ -8774,15 +8808,35 @@ async fn memory_secrets_store_never_writes_the_config_file() {
             names.contains(&"GLOBAL_ONLY"),
             "live store serves the secret"
         );
-        let store = state.secrets.read();
-        assert!(store.global.contains_key("GLOBAL_ONLY"));
-        drop(store);
+        {
+            let store = state.secrets.read();
+            assert!(store.global.contains_key("GLOBAL_ONLY"));
+        }
 
         // Never persisted: the file holds the store-mode key and nothing else.
         let persisted = crate::config::load_config_from(&config_path).unwrap();
         assert!(persisted.secrets.is_empty(), "memory mode must not persist");
         assert!(persisted.repo_secrets.is_empty());
         assert_eq!(persisted.secrets_store.as_deref(), Some("memory"));
+
+        // Deletion must use the runtime store as the source of truth: the
+        // config-driven lookup would 404 on a secret that never reached the
+        // file, leaving it live in memory.
+        let (status, _) = request_json_status(
+            &app,
+            Method::DELETE,
+            "/api/v1/secrets/GLOBAL_ONLY",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        {
+            let store = state.secrets.read();
+            assert!(
+                !store.global.contains_key("GLOBAL_ONLY"),
+                "memory-mode delete must remove from the runtime store"
+            );
+        }
     }
     .await;
 }

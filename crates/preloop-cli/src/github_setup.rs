@@ -727,7 +727,7 @@ pub(crate) async fn cmd_secret(args: SecretArgs) -> anyhow::Result<()> {
                 }
                 ApiOutcome::Unavailable => {
                     let mut config = load_config()?;
-                    if store_memory(&config) {
+                    if store_memory(&config)? {
                         anyhow::bail!(
                             "secrets store is memory-only (secrets_store = \"memory\" or \
                              PRELOOP_SECRETS_STORE=memory): nothing is written to the config \
@@ -873,7 +873,7 @@ pub(crate) async fn cmd_secret(args: SecretArgs) -> anyhow::Result<()> {
                 }
                 ApiOutcome::Unavailable => {
                     let mut config = load_config()?;
-                    if store_memory(&config) {
+                    if store_memory(&config)? {
                         anyhow::bail!(
                             "secrets store is memory-only (secrets_store = \"memory\" or \
                              PRELOOP_SECRETS_STORE=memory): nothing is written to the config \

@@ -1506,30 +1506,39 @@ pub(crate) fn build_job_artifacts(
     // Precedence per name: submission-provided > environment > repo > global,
     // mirroring GitHub's env-over-repo-over-org rule with the local
     // `--secret` escape hatch kept on top.
-    let mut merged_secrets = secrets_exposed.clone();
+    // Overlay lazily: most jobs have no `environment:` tier, and the base
+    // map can be large — copying it per job would be pure allocation cost.
+    // The original map is borrowed directly in that case.
+    let mut env_overlay: Option<BTreeMap<String, String>> = None;
     if submission_allows_secrets(submission) {
         if let Some(env_name) = job.oidc_environment.as_deref() {
-            let secret_store = shared.state.secrets.read();
-            if let Some(env_secrets) = secret_store
+            let env_secrets = shared
+                .state
+                .secrets
+                .read()
                 .env
                 .get(&submission.repository)
                 .and_then(|envs| envs.get(env_name))
-            {
+                .cloned();
+            if let Some(env_secrets) = env_secrets {
+                let mut merged = secrets_exposed.clone();
                 for (name, value) in env_secrets {
-                    if !submission.submission_names.contains(name) {
-                        merged_secrets.insert(name.clone(), value.clone());
+                    if !submission.submission_names.contains(&name) {
+                        merged.insert(name, value);
                     }
                 }
+                env_overlay = Some(merged);
             }
         }
     }
+    let merged_secrets = env_overlay.as_ref().unwrap_or(secrets_exposed);
 
     let mut agent_msg =
         aksh_gha_parser::job_builder::build_agent_job_message_with_normalized_context(
             job,
             normalized_github,
             &job.env,
-            &merged_secrets,
+            merged_secrets,
             &submission.vars,
         )
         .map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
