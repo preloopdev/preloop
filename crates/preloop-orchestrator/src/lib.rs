@@ -2245,7 +2245,7 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
          mkdir -p /run/user/{uid}; chown {uid}:{uid} /run/user/{uid} /var/lib/preloop-runner 2>/dev/null; \
          chmod 777 /run/preloop-control 2>/dev/null; \
          getent group docker >/dev/null 2>&1 && usermod -aG docker {user} 2>/dev/null; \
-         exec setpriv --reuid {uid} --regid {uid} --init-groups --clear-groups env \
+         exec setpriv --reuid {uid} --regid {uid} --init-groups env \
            PRELOOP_RUNNER_USER={user} PRELOOP_RUNNER_UID={uid} HOME={home} {program} {args}"
     );
     vec!["sh".to_owned(), "-c".to_owned(), script]
@@ -2509,7 +2509,7 @@ chmod +x "$destination/bin/node"
             "{script}"
         );
         assert!(
-            script.contains("setpriv --reuid 1001 --regid 1001 --init-groups --clear-groups"),
+            script.contains("setpriv --reuid 1001 --regid 1001 --init-groups"),
             "{script}"
         );
         assert!(
