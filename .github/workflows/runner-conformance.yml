@@ -38,7 +38,7 @@ jobs:
     env:
       GH_REPO: ${{ vars.RUNNER_CONFORMANCE_REPO || 'preloopdev/aksh-conformance' }}
       GH_TOKEN: ${{ secrets.RUNNER_CONFORMANCE_TOKEN }}
-      HOST_WORKSPACE: ${{ vars.RUNNER_CONFORMANCE_HOST_WORKSPACE || '/Users/bnjoroge/macos-runners' }}
+      HOST_WORKSPACE: ${{ vars.RUNNER_CONFORMANCE_HOST_WORKSPACE || '' }}
       AKSH_RUNNER_HOST: ${{ github.workspace }}/target/aarch64-unknown-linux-musl/release/preloop-runner
     steps:
       - uses: actions/checkout@v4

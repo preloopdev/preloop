@@ -1,0 +1,55 @@
+# Cargo-deny policy for the aksh workspace.
+#
+# Run locally with `cargo deny check`; CI runs the `audit-vet-deny` job.
+# Every advisory ignore below is a deliberate, documented acceptance — a new
+# advisory must never be silenced without a reason in this file.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071: Marvin Attack (timing side channel) in `rsa`. No
+    # fixed release exists. The crate signs GitHub App JWTs and OAuth
+    # assertions server-side; the attack requires an attacker able to
+    # observe signing timing over the network, which is not reachable here
+    # (signing is local, results never expose timing). `actions/runner`
+    # itself uses the equivalent .NET RSA stack. Revisit on every release.
+    "RUSTSEC-2023-0071",
+    # RUSTSEC-2025-0134: `rustls-pemfile` is unmaintained (archived). It is
+    # a thin wrapper over rustls-pki-types' PEM parsing; the dependency is
+    # transitive (rustls ecosystem) and its parsing code lives on in
+    # rustls-pki-types. Tracked for migration when a dependent crate drops
+    # the wrapper.
+    "RUSTSEC-2025-0134",
+]
+
+[bans]
+multiple-versions = "warn"
+# Workspace-internal path dependencies are declared without a version
+# (`{ path = "../aksh-runner-server" }`), which cargo reports as `*`. These
+# can never resolve from crates.io (cargo honors the path), so the wildcard
+# supply-chain risk does not apply; release versions come from the workspace.
+wildcards = "allow"
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "0BSD",
+    "Unlicense",
+    "Zlib",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+    "OpenSSL",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "curl",
+]
+confidence-threshold = 0.8
+
+# Workspace crates carry our own MIT license (see LICENSE) and need no
+# third-party review.
+[licenses.private]
+ignore = true
