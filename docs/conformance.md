@@ -1,11 +1,11 @@
 # Conformance
 
-aksh treats compatibility as a test artifact, not an assertion in prose.
-The evidence lives in four layers, from raw wire bytes to whole-repo
+aksh treats compatibility as a test artifact,The evidence lives in four layers, from raw wire bytes to whole-repo  
 behavior; the index below maps each layer to its artifacts and commands.
 
 ```
-Layer 4  whole-repo behavior   real-world repos, 39-scenario benchmark
+Layer 5  whole-repo behavior   ~28 real-world repos, 39-scenario benchmark
+Layer 4  formal verification   TLA+ model checking (Specula, SANY + TLC)
 Layer 3  invariants            property tests (concurrency, scheduling)
 Layer 2  replayed wire         goldens: official bytes replayed at aksh
 Layer 1  captured wire         MITM proxy between runner and control plane
@@ -18,7 +18,7 @@ and the machine-readable captures in `.runner-watch/`.
 
 ---
 
-## Layer 1: captured wire — the MITM proxy
+## Layer 1: captured wire using the MITM proxy
 
 The bottom layer records the **exact HTTP traffic** between the official
 `actions/runner` binary and a control plane, using a mitmproxy addon
@@ -54,7 +54,7 @@ The replay gate compares status codes, request-body schemas, and
 `acquirejob` response schemas byte-for-byte; anything volatile (timing,
 tokens) is normalized before comparison.
 
-## Layer 2: replayed wire — the goldens
+## Layer 2: replayed wire using the goldens
 
 `.runner-watch/golden/v2.335.1/` holds **23 scenario captures** from the
 official runner: `01-register-and-idle`, `06-multi-step`, `07-step-failure`,
@@ -64,22 +64,21 @@ run reports live in `.runner-watch/conformance/v2.336.0/` (one markdown
 report per scenario, 79 files).
 
 The `runner-watch` pipeline keeps the goldens honest across upstream
-releases: it watches `actions/runner` tags, clones and diffs the upstream
-source, turns each delta into TOML specs, and re-runs the replay gate —
-so a new runner release cannot silently desync aksh.
+releases: it watches `actions/runner` tags, clones and diffs the upstream  
+source, turns each delta into TOML specs, and re-runs the replay gate  so a new runner release cannot silently desync aksh.
 
 ```sh
 just conform            # replay all goldens against the built server
 runner-watch run        # watch → diff → triage → implement → conform loop
 ```
 
-## Layer 3: invariants — property tests
+## Layer 3: invariants property tests
 
 Beyond recorded bytes, the server's scheduling and concurrency behavior is
 pinned by **91 property tests** in `aksh-runner-server` (proptest): queue
-modes, `cancel-in-progress`, lease expiry, stale-runner reaping, assignment
-binding, and matrix/concurrency interactions. These are randomized tests
-with explicit invariants, not golden replay — they catch the states a single
+modes, `cancel-in-progress`, lease expiry, stale-runner reaping, assignment  
+binding, and matrix/concurrency interactions. These are randomized tests  
+with explicit invariants, not golden replay so  they catch the states a single  
 recording never hits.
 
 ```sh
@@ -94,7 +93,49 @@ PROPTEST_CASES=10000 cargo test -p aksh-runner-server
 # test may contain `sleep(` (flaky-time guards).
 ```
 
-## Layer 4: whole-repo behavior — differential runs
+## Layer 4: formal verification — TLA+ model checking (Specula)
+
+Beyond randomized invariants, the concurrency model is *model-checked*:
+the [Specula](https://github.com/SpeculaIO/Specula) pipeline (code analysis
+→ TLA+ spec generation → validation → bug confirmation) built a TLA+
+specification of the server's scheduling/gate logic from the Rust source,
+repaired it against TLC's strict typing during validation, and hunted bugs
+with real SANY + TLC runs (`experiments/specula-20260804/`).
+
+**Six findings, all fixed and reconciled into the current tree** (2026-08-06):
+
+| Finding | Bug (model semantics) | Disposition |
+|---|---|---|
+| MC-S2 | Workflow concurrency-gate leak | Fixed; synchronized in `base.tla` |
+| MC-S3 | Job-level gate bypass | Fixed; confirmed as a code bug, not a model bug |
+| MC-S5 | Step-transition loss | Fixed |
+| MC-S6 | `format` brace-escape handling | Fixed |
+| MC-R1 | `apply_matrix_fail_fast` never released the concurrency slot of the siblings it cancelled | Fixed (2026-08-06); regression test `fail_fast_releases_the_cancelled_sibling_concurrency_slot` |
+| MC-R2 | `cancel_in_progress` could cancel a predecessor of the *arriving* run, letting `release_concurrency_for_run` evict the holder it had just admitted | Fixed; regression test `same_run_cancel_in_progress_keeps_the_arriving_holder` |
+
+MC-R1 and MC-R2 were each confirmed by reverting the fix and watching the
+regression test fail on the predicted symptom, then pass again with the fix
+restored. CR-1 (broker messageId collision) was dropped during confirmation
+— already fixed by review commit `193986ce`.
+
+Artifacts: `spec/base.tla` (single SANY-valid module), TLC configs per
+scenario, four counterexample traces, `spec/bug-report.md` (per-bug Rust
+source evidence), `spec/findings.json` (current status per finding), and
+per-finding confirmation verdicts in `confirmation/`.
+
+Re-running (Java 21 + `tla2tools.jar`):
+
+```sh
+cd experiments/specula-20260804/spec
+java -cp /path/to/tla2tools.jar tla2sany.SANY base.tla
+java -cp /path/to/tla2tools.jar tlc2.TLC -config MC_hunt_s2_concurrency.safety.cfg -workers auto -deadlock MC
+```
+
+Known TLC pitfalls from the run are documented in the experiment README
+(sequential runs or separate `-metadir`s, single-name `CONSTRAINT` entries,
+strict runtime typing, `\*` comments, parenthesized primed disjunctions).
+
+## Layer 5: whole-repo behavior — differential runs
 
 The top layer runs real workflows end to end and compares *behavior*: job
 and step names, order, and conclusions.
@@ -103,12 +144,11 @@ and step names, order, and conclusions.
 jobs, cancellation, matrix fan-out, OIDC, container jobs, service health,
 artifacts, annotations, reusable callers) is executed on act, agent-ci, and
 Preloop on the same host; results are recorded per scenario in
-`benchmarks/{act,agent_ci,preloop}_scenarios_results.json`. Latest run:
-Preloop 31/39 correct behavior, act 29/39, agent-ci 29/39 (details and
-per-scenario timings in `docs/act-vs-others.md`).
+`benchmarks/{act,agent_ci,preloop}_scenarios_results.json`. 
 
-**Real-world repos.** Unmodified workflows from medium-sized public repos
-run against the aksh stack, with GitHub's own run as the oracle:
+**Real-world repos.** Unmodified workflows from ~28 distinct public repos
+run against the aksh stack across five campaigns, with GitHub's own run as
+the oracle:
 
 ```sh
 gh run view --log <run-id>        # oracle: GitHub's step names/order/conclusions
@@ -116,11 +156,23 @@ gh run view --log <run-id>        # oracle: GitHub's step names/order/conclusion
 # step names, step order, job conclusions, job count.
 ```
 
-Eight repos covered so far (go-github, cli/cli, psf/requests, prettier,
-just, gin, black, eslint-config); per-repo reports are in
-`docs/internal/conformance/`, and the methodology — including known
-environment divergences (host OS vs `runs-on` labels, container jobs) — is
-documented alongside.
+1. **2026-07-28 runner campaign** (`benchmarks/real-world/results/aksh-campaign-report.md`):
+   Apache ECharts, VS Code, Angular, n8n, Apache RocketMQ, Apache Pulsar,
+   Cilium — official-runner-oracle runs of the aksh runner.
+2. **2026-08-05 stack campaign** (`.runner-watch/repos-conformance-20260805.md`):
+   bento, caddy, tokio, uv — unmodified workflows on the engine + smolvm
+   pool; the environmental findings (host-OS vs `runs-on` mismatch, pool
+   labels, smolvm state pileup) are documented there.
+3. **Replay campaigns** (`docs/internal/conformance/`, per-repo reports):
+   go-github, cli/cli, psf/requests, prettier, just, gin, black,
+   eslint-config.
+4. **Earlier openclaw / aksh-trigger era** (`benchmarks/real-world/results/`):
+   axum, bat, serde, buzz, nextcloud, qm, vite, agent-ci, openclaw — with
+   e2e flow captures (`e2e-*.jsonl`) and comparison reports
+   (`UNIFIED-COMPARISON.md`, `FLOW-DIFF-REPORT.md`).
+
+The methodology — including known environment divergences (host OS vs
+`runs-on` labels, container jobs) — is documented alongside each campaign.
 
 **Differential probes.** The concurrency-property harness runs the same
 scenario against GitHub and aksh and compares conclusions:
@@ -144,10 +196,11 @@ changes against the official runner (golden replay), per the PR template.
 ## Compatibility targets
 
 - Protocol: official `actions/runner` v2.336.0 (`versions.toml`), tracked
-  by `runner-watch` against upstream releases.
+by `runner-watch` against upstream releases.
 - Upstream reference: `ChristopherHX/runner.server` at the pinned commit
-  (`AKSH_UPSTREAM_RUNNER_SERVER_REF`), per `docs/fidelity-gap.md`.
+(`AKSH_UPSTREAM_RUNNER_SERVER_REF`), per `docs/fidelity-gap.md`.
 - Current status (2026-07): the official runner completes the full broker
-  lifecycle against aksh — configure → session → message → acquire →
-  execute → report. Verified live against real GitHub services (scenario 61:
-  three ephemeral runners, cache v2 save/restore through Azure Blob).
+lifecycle against aksh — configure → session → message → acquire →
+execute → report. Verified live against real GitHub services (scenario 61:
+three ephemeral runners, cache v2 save/restore through Azure Blob).
+
