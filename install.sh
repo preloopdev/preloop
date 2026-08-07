@@ -1,7 +1,7 @@
 #!/bin/sh
 # Preloop installer — builds from source and installs the CLI.
 #
-#   curl -fsSL https://raw.githubusercontent.com/preloopdev/preloop/main/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/preloopdev/preloop/main/install.sh | sh
 #
 # What it does:
 #   1. Checks prerequisites (git, cargo/rustup; zig for the microVM runner).
