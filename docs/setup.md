@@ -44,6 +44,10 @@ preloop run -f .github/workflows/ci.yml --event push
 `preloop run` snapshots the local workspace (dirty changes included) so a run
 never depends on what is pushed to GitHub.
 
+Running it as an always-on server for a team — service install, every runtime
+knob, and how to expose it (tunnel, funnel, or your own domain) — is covered in
+[self-hosting.md](self-hosting.md).
+
 ## Connecting GitHub credentials
 
 Workflows reference GitHub — `${{ github.repository }}`, `GITHUB_TOKEN`,

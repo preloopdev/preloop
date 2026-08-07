@@ -37,6 +37,7 @@ Setup, GitHub App and PAT credentials, secrets, config file, and the troubleshoo
 | Topic | Doc |
 |---|---|
 | Setup, credentials, secrets, config | [docs/setup.md](docs/setup.md) |
+| Hosting it yourself: service install, knobs, exposure | [docs/self-hosting.md](docs/self-hosting.md) |
 | GitHub App webhooks and check runs | [docs/github-app-webhook.md](docs/github-app-webhook.md) |
 | Job tokens, minting, OIDC | [docs/github-tokens.md](docs/github-tokens.md) |
 | Debug sessions (pause, inspect, retry) | [docs/debug-sessions.md](docs/debug-sessions.md) |
