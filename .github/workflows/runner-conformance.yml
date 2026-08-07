@@ -20,6 +20,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          # Conformance goldens are LFS-tracked; without this they arrive
+          # as pointer stubs and every test that reads them fails.
+          lfs: true
       - name: Validate runner status responses
         run: python3 benchmarks/real-world/runner-conformance.py --mode light
       - name: Upload light report
@@ -50,6 +54,10 @@ jobs:
       PRELOOP_RUNNER_HOST: ${{ github.workspace }}/target/aarch64-unknown-linux-musl/release/preloop-runner
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          # Conformance goldens are LFS-tracked; without this they arrive
+          # as pointer stubs and every test that reads them fails.
+          lfs: true
       - name: Build current PR runner for smolVM
         run: cargo zigbuild -p preloop-runner --release --target aarch64-unknown-linux-musl
       - name: Run deep runner conformance
