@@ -2,7 +2,11 @@
 name = "aksh-runner-server"
 version = "0.2.0"
 edition.workspace = true
-license.workspace = true
+# FSL-1.1-MIT: source-available, converts to MIT on the second anniversary
+# of each release (see LICENSE in this crate). The rest of the workspace is
+# MIT. `license-file` (not SPDX `license`) because FSL-1.1-MIT has no SPDX id.
+license-file = "LICENSE"
+publish = false
 repository.workspace = true
 rust-version.workspace = true
 
