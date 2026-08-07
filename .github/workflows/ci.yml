@@ -1,4 +1,6 @@
 name: ci
+permissions:
+  contents: read
 
 on:
   push:
@@ -36,8 +38,10 @@ on:
 
 jobs:
   rust:
+    # Runs on the preloop self-hosted pool: the product's own runner is the
+    # CI executor (dogfood).
     runs-on: self-hosted
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       
       CARGO_BUILD_JOBS: "2"
@@ -49,13 +53,16 @@ jobs:
           toolchain: "1.86"
           components: rustfmt,clippy
 
+      # inline run steps work against aksh
+      - uses: Swatinem/rust-cache@v2
+
       - run: cargo fmt --all --check
       - run: |
           # Run clippy on warning-free crates with strict -D warnings
-          cargo clippy -p aksh-gha-protocol -p aksh-gha-parser -p aksh-gha-expressions -p aksh-cache -p aksh-artifacts -p runner-watch -p aksh-conformance --all-targets -- -D warnings
+          cargo clippy --locked -p aksh-gha-protocol -p aksh-gha-parser -p aksh-gha-expressions -p aksh-cache -p aksh-artifacts -p runner-watch -p aksh-conformance --all-targets -- -D warnings
           # Run clippy on crates with pre-existing warnings without -D warnings
-          cargo clippy -p aksh-runner -p aksh-runner-server -p aksh-runner-client -p aksh-dap --all-targets
-      - run: cargo test --workspace
+          cargo clippy --locked -p aksh-runner -p aksh-runner-server -p aksh-runner-client -p aksh-dap --all-targets
+      - run: cargo test --locked --workspace
         env:
           RUSTFLAGS: "-A warnings"
 

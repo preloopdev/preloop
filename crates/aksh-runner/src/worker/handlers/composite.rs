@@ -247,10 +247,25 @@ fn run_composite_action_inner<'a>(
 
                 let evaluated = crate::worker::template::evaluate_template(script, &expr_ctx)
                     .unwrap_or_else(|_| script.to_string());
+                // Composite inner `run` steps honor their own `working-directory`
+                // (GitHub applies it relative to the composite's workspace; the
+                // official runner threads it through ScriptHandler inputs).
+                let step_working_dir = step
+                    .get("working-directory")
+                    .and_then(|v| v.as_str())
+                    .map(|relative| {
+                        let base = std::path::Path::new(workspace);
+                        if std::path::Path::new(relative).is_absolute() {
+                            relative.to_owned()
+                        } else {
+                            base.join(relative).to_string_lossy().into_owned()
+                        }
+                    })
+                    .unwrap_or_else(|| workspace.to_owned());
                 let result = super::script::run_script(
                     &evaluated,
                     step_shell,
-                    workspace,
+                    &step_working_dir,
                     ctx,
                     Some(cancel_rx.clone()),
                 )

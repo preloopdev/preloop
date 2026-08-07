@@ -5,6 +5,27 @@ use super::*;
 /// aggregate status. Returns the caller ids that became terminal in this pass
 /// so `complete_job_inner` can release their JobSet concurrency gates.
 pub(crate) fn propagate_reusable_outputs(run: &mut RunRecord) -> Vec<JobId> {
+    let mut finalized = Vec::new();
+    // A single pass can only fold one nesting level: an ancestor caller's
+    // `all_complete` check reads the *recorded* status of its callee, and a
+    // callee that is itself a caller only becomes terminal in the same pass it
+    // is folded (the status writes land at the end of the pass). Nested
+    // reusable workflows (outer -> mid -> leaf) therefore need repeated passes:
+    // without them the ancestor stays InProgress forever after the deepest job
+    // finishes, because no further job completion ever re-triggers the fold,
+    // and its JobSet gate never releases. Repeat until a pass changes nothing —
+    // each pass terminalizes at least one caller, so this terminates.
+    loop {
+        let pass = propagate_reusable_outputs_once(run);
+        let changed = !pass.is_empty();
+        finalized.extend(pass);
+        if !changed {
+            return finalized;
+        }
+    }
+}
+
+fn propagate_reusable_outputs_once(run: &mut RunRecord) -> Vec<JobId> {
     let mut outputs_to_add = Vec::new();
     let mut statuses_to_set = Vec::new();
     for (caller_job_id, call) in &run.reusable_calls {
@@ -105,4 +126,108 @@ pub(crate) fn propagate_reusable_outputs(run: &mut RunRecord) -> Vec<JobId> {
         finalized.push(job_id);
     }
     finalized
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn caller_meta(
+        caller: &str,
+        inner_job_ids: Vec<&str>,
+    ) -> aksh_gha_parser::ReusableCallMetadata {
+        aksh_gha_parser::ReusableCallMetadata {
+            caller_job_id: caller.to_owned(),
+            output_definitions: BTreeMap::new(),
+            inner_job_ids: inner_job_ids.into_iter().map(str::to_owned).collect(),
+            inputs: BTreeMap::new(),
+            caller_concurrency: None,
+            embedded_concurrency: None,
+            matrix: BTreeMap::new(),
+            if_condition: None,
+            workflow_sha: None,
+            workflow_repository: None,
+        }
+    }
+
+    fn nested_run() -> RunRecord {
+        let mut jobs = BTreeMap::new();
+        jobs.insert(
+            JobId("outer/call/inner/leaf".to_owned()),
+            ExecutionStatus::Success,
+        );
+        jobs.insert(
+            JobId("outer/call/inner".to_owned()),
+            ExecutionStatus::InProgress,
+        );
+        jobs.insert(JobId("outer/call".to_owned()), ExecutionStatus::InProgress);
+        RunRecord {
+            run_id: RunId::new(),
+            run_name: None,
+            submission: Arc::new(WorkflowSubmission::default()),
+            jobs,
+            status: ExecutionStatus::InProgress,
+            job_outputs: BTreeMap::new(),
+            job_base_ids: BTreeMap::new(),
+            job_needs: BTreeMap::new(),
+            caller_plans: BTreeMap::new(),
+            job_names: BTreeMap::new(),
+            github: serde_json::Value::Null,
+            head_sha: String::new(),
+            workflow_ref: String::new(),
+            workspace_snapshot: None,
+            job_fail_fast: BTreeMap::new(),
+            job_continue_on_error: BTreeMap::new(),
+            job_check_run_ids: BTreeMap::new(),
+            reusable_calls: BTreeMap::from([
+                (
+                    "outer/call".to_owned(),
+                    caller_meta("outer/call", vec!["outer/call/inner"]),
+                ),
+                (
+                    "outer/call/inner".to_owned(),
+                    caller_meta("outer/call/inner", vec!["outer/call/inner/leaf"]),
+                ),
+            ]),
+            jobs_list: Vec::new(),
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            run_number: 1,
+            run_attempt: 1,
+            workflow_path_str: ".github/workflows/workflow.yml".to_owned(),
+            event: "push".to_owned(),
+            conclusion: None,
+        }
+    }
+
+    #[test]
+    fn nested_reusable_callers_all_terminalize_in_one_fold() {
+        // outer -> mid -> leaf: the leaf is the only real job, and it completes
+        // while both callers are still InProgress. GitHub's fold must terminalize
+        // BOTH callers from that single completion — the mid caller only becomes
+        // terminal during the same pass, so the outer caller's all_complete check
+        // cannot see it without a second pass. A one-pass fold leaves the outer
+        // caller (and therefore the whole run) InProgress forever.
+        let mut run = nested_run();
+        let finalized = propagate_reusable_outputs(&mut run);
+
+        assert!(
+            finalized.contains(&JobId("outer/call/inner".to_owned())),
+            "mid caller must terminalize: {finalized:?}"
+        );
+        assert!(
+            finalized.contains(&JobId("outer/call".to_owned())),
+            "ancestor caller must terminalize in the same fold: {finalized:?}"
+        );
+        assert_eq!(
+            run.jobs[&JobId("outer/call".to_owned())],
+            ExecutionStatus::Success
+        );
+        assert!(
+            run.job_outputs
+                .contains_key(&JobId("outer/call".to_owned())),
+            "ancestor outputs must be recorded"
+        );
+    }
 }

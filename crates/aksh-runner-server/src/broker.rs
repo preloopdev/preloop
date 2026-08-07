@@ -650,7 +650,42 @@ pub(crate) async fn broker_acquire_job(
             inner.github_token_requests.get(&request_id).cloned(),
         )
     };
-    if let Some(token_request) = github_token_request {
+    // The token request is registered at build time and removed after the
+    // first claim's mint. A re-claim after a runner disconnect finds it
+    // consumed; without a re-mint the job keeps the build-time local runtime
+    // token, which cannot authenticate git against github.com (401, prompts
+    // disabled). Rebuild the request from the message in that case.
+    let token_request = github_token_request.or_else(|| {
+        let repository = message
+            .context_data
+            .get("github")
+            .and_then(|github| match github {
+                aksh_gha_protocol::azdo::PipelineContextData::Dict(dict) => dict.get("repository"),
+                _ => None,
+            })
+            .and_then(|repository| match repository {
+                aksh_gha_protocol::azdo::PipelineContextData::String(repo) => Some(repo.clone()),
+                _ => None,
+            });
+        repository.map(|repository| {
+            tracing::info!(
+                request_id,
+                %repository,
+                "broker acquire: token request consumed; re-minting from message"
+            );
+            crate::models::GitHubTokenRequest {
+                repository,
+                permissions: aksh_gha_parser::effective_token_permissions(None).into_owned(),
+                declared: false,
+            }
+        })
+    });
+    if let Some(token_request) = token_request {
+        tracing::info!(
+            request_id,
+            repository = %token_request.repository,
+            "broker acquire: dispatch token request present"
+        );
         // The polling path has already dequeued this job, marked the run
         // `InProgress` and pinned the request to this session, so bubbling the
         // mint refusal out as a 502 would leave nothing holding the claim: the
@@ -666,13 +701,18 @@ pub(crate) async fn broker_acquire_job(
             }
         };
         if let Some(minted) = minted {
+            let token = minted.token;
+            tracing::info!(
+                token_len = token.len(),
+                "minted dispatch GitHub token at claim"
+            );
             message.variables.insert(
                 "system.github.token".to_owned(),
-                aksh_gha_protocol::azdo::VariableValue::secret(minted.token.clone()),
+                aksh_gha_protocol::azdo::VariableValue::secret(token.clone()),
             );
             message.variables.insert(
                 "github_token".to_owned(),
-                aksh_gha_protocol::azdo::VariableValue::secret(minted.token),
+                aksh_gha_protocol::azdo::VariableValue::secret(token.clone()),
             );
             // Restate what the token carries when the installation could not
             // grant everything. The message was built with the requested set,
@@ -687,10 +727,38 @@ pub(crate) async fn broker_acquire_job(
                     ),
                 );
             }
+            // The workflow's `github` context is built at submission time,
+            // before the App token can exist, so `${{ github.token }}`
+            // inputs (actions/checkout's token, the persist-credentials
+            // config, the non-persist temp-config include) resolve empty
+            // and every git fetch prompts for a username. Patch the minted
+            // token into the context at claim so checkout authenticates
+            // exactly like it does on GitHub-hosted runners — no runner-side
+            // env header needed (an env `extraheader` would duplicate the
+            // one checkout persists itself: "Duplicate header: Authorization",
+            // HTTP 400).
+            match message.context_data.get_mut("github") {
+                Some(aksh_gha_protocol::azdo::PipelineContextData::Dict(github)) => {
+                    github.insert(
+                        "token".to_owned(),
+                        aksh_gha_protocol::azdo::PipelineContextData::String(token),
+                    );
+                    tracing::info!("patched minted token into github context");
+                }
+                other => tracing::warn!(
+                    github_context = %match other { Some(_) => "non-dict", None => "missing" },
+                    "could not patch github context token"
+                ),
+            }
         }
         let mut inner = shared.state.inner.lock().await;
         inner.github_token_requests.remove(&request_id);
         inner.broker_messages.insert(request_id, message.clone());
+    } else {
+        tracing::warn!(
+            request_id,
+            "broker acquire: no dispatch token request for job"
+        );
     }
     message.message_type = Some(azdo::message_type::RUNNER_JOB_REQUEST.to_owned());
     let run_service_url = broker_run_service_url(runner_id);

@@ -97,6 +97,15 @@ pub async fn invoke<'a>(
     cmd.args(args)
         .current_dir(cwd)
         .envs(env)
+        // A step never gets interactive input. The official runner leaves
+        // stdin unredirected, so on a hosted runner a step inherits the
+        // service's `/dev/null` and a prompting command fails fast. Here the
+        // runner itself is a child of a guest `exec` whose stdin is a live
+        // pipe that never delivers a byte and never reaches EOF, so
+        // `sudo apt-get install musl-tools` (uv's musl cell, no `-y`) blocks
+        // on its confirmation prompt until the job times out. Hand every step
+        // an empty stdin instead.
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
@@ -420,6 +429,42 @@ async fn wait_for_exit(child: &mut AsyncGroupChild, timeout: Duration) -> bool {
 mod tests {
     use super::*;
     use std::sync::mpsc as std_mpsc;
+
+    /// A step that reads stdin must see EOF, not block. The runner runs as a
+    /// child of a guest `exec` whose stdin never closes, so an inherited stdin
+    /// hangs any command that prompts — `sudo apt-get install <pkg>` without
+    /// `-y` waits on its confirmation prompt until the job times out.
+    #[tokio::test]
+    async fn steps_read_eof_from_stdin() {
+        let (line_tx, line_rx) = std_mpsc::channel();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            invoke(
+                "sh",
+                &["-c", "cat; echo eof-reached"],
+                Path::new("."),
+                &HashMap::new(),
+                Some(Box::new(move |chunk: &[u8]| {
+                    if let Ok(text) = std::str::from_utf8(chunk) {
+                        let _ = line_tx.send(text.to_owned());
+                    }
+                })),
+                None,
+                true,
+            ),
+        )
+        .await
+        .expect("a step reading stdin must not block")
+        .expect("the step runs");
+
+        assert_eq!(result.exit_code, 0);
+        let output: String = line_rx.try_iter().collect();
+        assert!(
+            output.contains("eof-reached"),
+            "`cat` must reach EOF, got {output:?}"
+        );
+    }
 
     #[tokio::test]
     async fn cancel_sends_sigint_before_hard_kill() {
