@@ -1,0 +1,2792 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>act vs agent-ci vs aksh — GitHub Actions Local Runners Compared</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;600&family=Manrope:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --hue: 35;
+    --bg-deep: oklch(0.12 0.008 var(--hue));
+    --bg-base: oklch(0.15 0.008 var(--hue));
+    --bg-raised: oklch(0.19 0.01 var(--hue));
+    --bg-elevated: oklch(0.23 0.012 var(--hue));
+    --border-subtle: oklch(0.28 0.012 var(--hue));
+    --border-medium: oklch(0.35 0.015 var(--hue));
+    --text-muted: oklch(0.55 0.01 var(--hue));
+    --text-secondary: oklch(0.68 0.01 var(--hue));
+    --text-primary: oklch(0.88 0.01 var(--hue));
+    --text-bright: oklch(0.95 0.005 var(--hue));
+    --accent: oklch(0.72 0.14 45);
+    --accent-dim: oklch(0.52 0.1 45);
+    --accent-bg: oklch(0.22 0.03 45);
+    --green: oklch(0.7 0.16 145);
+    --green-dim: oklch(0.35 0.06 145);
+    --green-bg: oklch(0.2 0.03 145);
+    --red: oklch(0.65 0.18 25);
+    --red-dim: oklch(0.35 0.08 25);
+    --red-bg: oklch(0.18 0.03 25);
+    --yellow: oklch(0.75 0.14 85);
+    --yellow-dim: oklch(0.4 0.06 85);
+    --yellow-bg: oklch(0.2 0.03 85);
+    --blue: oklch(0.68 0.12 250);
+    --blue-dim: oklch(0.35 0.06 250);
+    --na: oklch(0.45 0.01 var(--hue));
+
+    --space-xs: 4px;
+    --space-sm: 8px;
+    --space-md: 16px;
+    --space-lg: 24px;
+    --space-xl: 32px;
+    --space-2xl: 48px;
+    --space-3xl: 64px;
+    --space-4xl: 96px;
+
+    --radius-sm: 4px;
+    --radius-md: 6px;
+    --radius-lg: 10px;
+
+    --font-body: 'Manrope', system-ui, sans-serif;
+    --font-mono: 'Geist Mono', 'SF Mono', 'Cascadia Code', monospace;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html {
+    font-size: 15px;
+    scroll-behavior: smooth;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    font-family: var(--font-body);
+    background: var(--bg-deep);
+    color: var(--text-primary);
+    line-height: 1.65;
+    min-height: 100vh;
+  }
+
+  /* ---------- NAVIGATION ---------- */
+  .nav {
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    background: oklch(0.12 0.008 var(--hue) / 0.92);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border-subtle);
+    padding: var(--space-sm) var(--space-lg);
+  }
+  .nav-inner {
+    max-width: 1280px;
+    margin: 0 auto;
+    display: flex;
+    align-items: center;
+    gap: var(--space-lg);
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .nav-inner::-webkit-scrollbar { display: none; }
+  .nav-brand {
+    font-weight: 700;
+    font-size: 0.85rem;
+    color: var(--accent);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .nav a {
+    color: var(--text-muted);
+    text-decoration: none;
+    font-size: 0.78rem;
+    font-weight: 500;
+    white-space: nowrap;
+    transition: color 0.15s;
+  }
+  .nav a:hover { color: var(--text-primary); }
+
+  /* ---------- LAYOUT ---------- */
+  .container {
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 0 var(--space-lg);
+  }
+
+  /* ---------- HERO ---------- */
+  .hero {
+    padding: var(--space-4xl) 0 var(--space-3xl);
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .hero-subtitle {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    color: var(--accent);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    margin-bottom: var(--space-md);
+  }
+  .hero h1 {
+    font-size: clamp(2rem, 4vw, 3.2rem);
+    font-weight: 800;
+    color: var(--text-bright);
+    line-height: 1.15;
+    max-width: 720px;
+    letter-spacing: -0.03em;
+  }
+  .hero h1 em {
+    font-style: normal;
+    color: var(--accent);
+  }
+  .hero-desc {
+    margin-top: var(--space-lg);
+    font-size: 1.05rem;
+    color: var(--text-secondary);
+    max-width: 640px;
+    line-height: 1.7;
+  }
+
+  /* ---------- STATS ROW ---------- */
+  .stats-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: var(--space-md);
+    margin-top: var(--space-2xl);
+  }
+  .stat-card {
+    background: var(--bg-raised);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg);
+    padding: var(--space-lg);
+  }
+  .stat-card .label {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: var(--space-xs);
+  }
+  .stat-card .value {
+    font-size: 1.6rem;
+    font-weight: 700;
+    color: var(--text-bright);
+    line-height: 1.2;
+  }
+  .stat-card .note {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    margin-top: var(--space-xs);
+  }
+
+  /* ---------- SECTIONS ---------- */
+  section {
+    padding: var(--space-3xl) 0;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  section:last-child { border-bottom: none; }
+
+  .section-label {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--accent-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: var(--space-sm);
+  }
+  .section-title {
+    font-size: clamp(1.4rem, 2.5vw, 1.8rem);
+    font-weight: 700;
+    color: var(--text-bright);
+    letter-spacing: -0.02em;
+    margin-bottom: var(--space-md);
+  }
+  .section-desc {
+    color: var(--text-secondary);
+    max-width: 640px;
+    margin-bottom: var(--space-2xl);
+    line-height: 1.7;
+  }
+
+  /* ---------- ARCH COMPARISON ---------- */
+  .arch-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+    gap: var(--space-lg);
+  }
+  @media (max-width: 800px) {
+    .arch-grid { grid-template-columns: 1fr; }
+  }
+  .arch-card {
+    background: var(--bg-raised);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg);
+    padding: var(--space-xl);
+    display: flex;
+    flex-direction: column;
+  }
+  .arch-card-header {
+    display: flex;
+    align-items: center;
+    gap: var(--space-md);
+    margin-bottom: var(--space-lg);
+  }
+  .arch-card-header .icon {
+    width: 40px;
+    height: 40px;
+    border-radius: var(--radius-md);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 700;
+    font-size: 0.85rem;
+    flex-shrink: 0;
+  }
+  .arch-card.act .icon {
+    background: oklch(0.22 0.04 250);
+    color: var(--blue);
+  }
+  .arch-card.agentci .icon {
+    background: oklch(0.22 0.04 145);
+    color: var(--green);
+  }
+  .arch-card.agentci .tag {
+    background: oklch(0.22 0.04 145);
+    color: var(--green);
+  }
+  .arch-card.aksh .icon {
+    background: var(--accent-bg);
+    color: var(--accent);
+  }
+  .arch-card-header h3 {
+    font-size: 1.1rem;
+    font-weight: 700;
+    color: var(--text-bright);
+  }
+  .arch-card-header .tag {
+    font-family: var(--font-mono);
+    font-size: 0.65rem;
+    padding: 2px 8px;
+    border-radius: 99px;
+    font-weight: 500;
+  }
+  .arch-card.act .tag {
+    background: oklch(0.22 0.04 250);
+    color: var(--blue);
+  }
+  .arch-card.aksh .tag {
+    background: var(--accent-bg);
+    color: var(--accent);
+  }
+  .arch-card .strategy {
+    font-size: 0.92rem;
+    color: var(--text-secondary);
+    margin-bottom: var(--space-lg);
+    line-height: 1.6;
+  }
+  .arch-card .strategy strong { color: var(--text-primary); }
+  .arch-meta {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--space-sm) var(--space-md);
+    margin-top: auto;
+    padding-top: var(--space-lg);
+    border-top: 1px solid var(--border-subtle);
+  }
+  .arch-meta dt {
+    font-family: var(--font-mono);
+    font-size: 0.65rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .arch-meta dd {
+    font-size: 0.82rem;
+    color: var(--text-primary);
+    margin-bottom: var(--space-sm);
+  }
+
+  /* ---------- DIAGRAM ---------- */
+  .diagram-wrap {
+    background: var(--bg-base);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg);
+    padding: var(--space-xl) var(--space-lg);
+    overflow-x: auto;
+  }
+  .diagram-wrap pre {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    line-height: 1.55;
+    color: var(--text-secondary);
+    white-space: pre;
+  }
+  .diagram-label {
+    font-family: var(--font-mono);
+    font-size: 0.65rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: var(--space-sm);
+  }
+
+  /* ---------- FEATURE MATRIX ---------- */
+  .matrix-controls {
+    display: flex;
+    gap: var(--space-sm);
+    margin-bottom: var(--space-lg);
+    flex-wrap: wrap;
+  }
+  .matrix-controls button {
+    font-family: var(--font-body);
+    font-size: 0.78rem;
+    font-weight: 500;
+    padding: 6px 14px;
+    border-radius: 99px;
+    border: 1px solid var(--border-subtle);
+    background: var(--bg-raised);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .matrix-controls button:hover {
+    border-color: var(--border-medium);
+    color: var(--text-primary);
+  }
+  .matrix-controls button.active {
+    background: var(--accent-bg);
+    border-color: var(--accent-dim);
+    color: var(--accent);
+  }
+
+  .matrix-table-wrap {
+    overflow-x: auto;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg);
+  }
+  .matrix-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.82rem;
+  }
+  .matrix-table thead th {
+    position: sticky;
+    top: 0;
+    background: var(--bg-elevated);
+    font-weight: 600;
+    text-align: left;
+    padding: var(--space-md) var(--space-md);
+    border-bottom: 1px solid var(--border-medium);
+    white-space: nowrap;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-secondary);
+  }
+  .matrix-table thead th:first-child { padding-left: var(--space-lg); }
+  .matrix-table thead th.col-act,
+  .matrix-table thead th.col-aksh,
+  .matrix-table thead th.col-gitea {
+    text-align: center;
+    width: 90px;
+  }
+  .matrix-table thead th.col-gitea {
+    background: var(--yellow-bg);
+    color: var(--yellow);
+  }
+  .matrix-table tbody tr {
+    border-bottom: 1px solid var(--border-subtle);
+    transition: background 0.1s;
+  }
+  .matrix-table tbody tr:last-child { border-bottom: none; }
+  .matrix-table tbody tr:hover { background: oklch(0.17 0.008 var(--hue)); }
+  .matrix-table td {
+    padding: 10px var(--space-md);
+    vertical-align: top;
+  }
+  .matrix-table td:first-child {
+    padding-left: var(--space-lg);
+    font-weight: 500;
+    color: var(--text-primary);
+    min-width: 200px;
+  }
+  .matrix-table td.col-status {
+    text-align: center;
+    vertical-align: middle;
+    width: 90px;
+  }
+  .matrix-table td.col-notes {
+    color: var(--text-muted);
+    font-size: 0.78rem;
+    max-width: 360px;
+    line-height: 1.5;
+  }
+
+  .matrix-table .group-row td {
+    background: var(--bg-deep);
+    padding: var(--space-sm) var(--space-lg);
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    font-weight: 600;
+    color: var(--accent-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  /* Status badges */
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border-radius: var(--radius-sm);
+    font-size: 0.75rem;
+    font-weight: 600;
+    line-height: 1;
+  }
+  .badge-yes {
+    background: var(--green-bg);
+    color: var(--green);
+  }
+  .badge-no {
+    background: var(--red-bg);
+    color: var(--red);
+  }
+  .badge-partial {
+    background: var(--yellow-bg);
+    color: var(--yellow);
+  }
+  .badge-na {
+    background: oklch(0.18 0.005 var(--hue));
+    color: var(--na);
+    font-size: 0.6rem;
+  }
+
+  /* ---------- LEGEND ---------- */
+  .legend {
+    display: flex;
+    gap: var(--space-lg);
+    margin-bottom: var(--space-lg);
+    flex-wrap: wrap;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    font-size: 0.78rem;
+    color: var(--text-muted);
+  }
+
+  /* ---------- PERF SECTION ---------- */
+  .perf-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--space-lg);
+    margin-top: var(--space-xl);
+  }
+  @media (max-width: 700px) { .perf-grid { grid-template-columns: 1fr; } }
+
+  .perf-card {
+    background: var(--bg-raised);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg);
+    padding: var(--space-xl);
+  }
+  .perf-card h4 {
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: var(--space-lg);
+  }
+  .bar-group {
+    margin-bottom: var(--space-md);
+  }
+  .bar-label {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.75rem;
+    margin-bottom: var(--space-xs);
+  }
+  .bar-label .name { color: var(--text-secondary); }
+  .bar-label .val { font-family: var(--font-mono); color: var(--text-primary); font-weight: 500; }
+  .bar-track {
+    height: 8px;
+    background: var(--bg-deep);
+    border-radius: 99px;
+    overflow: hidden;
+  }
+  .bar-fill {
+    height: 100%;
+    border-radius: 99px;
+    transition: width 0.6s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  .bar-fill.aksh-bar { background: var(--accent); }
+  .bar-fill.host-bar { background: var(--text-muted); }
+  .bar-fill.act-bar { background: var(--blue); }
+  .perf-note {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    margin-top: var(--space-md);
+    line-height: 1.5;
+    padding-top: var(--space-md);
+    border-top: 1px solid var(--border-subtle);
+  }
+
+  /* ---------- PROTOCOL SECTION ---------- */
+  .protocol-comparison {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: var(--space-lg);
+  }
+  @media (max-width: 800px) { .protocol-comparison { grid-template-columns: 1fr; } }
+  .protocol-card {
+    background: var(--bg-raised);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg);
+    padding: var(--space-xl);
+  }
+  .protocol-card h4 {
+    font-size: 0.92rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: var(--space-md);
+  }
+  .proto-list {
+    list-style: none;
+  }
+  .proto-list li {
+    padding: var(--space-sm) 0;
+    border-bottom: 1px solid var(--border-subtle);
+    font-size: 0.82rem;
+    color: var(--text-secondary);
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-sm);
+  }
+  .proto-list li:last-child { border-bottom: none; }
+  .proto-list .dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    margin-top: 5px;
+  }
+  .proto-list .dot.on { background: var(--green); }
+  .proto-list .dot.off { background: var(--red-dim); }
+
+  /* ---------- CONFORMANCE ---------- */
+  .conformance-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: var(--space-sm);
+  }
+  .scenario-chip {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    background: var(--bg-raised);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    padding: var(--space-sm) var(--space-md);
+    font-size: 0.78rem;
+  }
+  .scenario-chip .num {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    color: var(--text-muted);
+    min-width: 20px;
+  }
+  .scenario-chip .name {
+    color: var(--text-primary);
+    flex: 1;
+  }
+  .scenario-chip .status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--green);
+    flex-shrink: 0;
+  }
+
+  /* ---------- GAPS ---------- */
+  .gaps-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: var(--space-lg);
+  }
+  @media (max-width: 800px) { .gaps-grid { grid-template-columns: 1fr; } }
+  .gap-card {
+    background: var(--bg-raised);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg);
+    padding: var(--space-xl);
+  }
+  .gap-card h4 {
+    font-size: 0.92rem;
+    font-weight: 600;
+    margin-bottom: var(--space-md);
+  }
+  .gap-list { list-style: none; }
+  .gap-list li {
+    padding: var(--space-sm) 0;
+    border-bottom: 1px solid var(--border-subtle);
+    font-size: 0.82rem;
+    display: flex;
+    gap: var(--space-sm);
+    align-items: baseline;
+  }
+  .gap-list li:last-child { border-bottom: none; }
+  .gap-tag {
+    font-family: var(--font-mono);
+    font-size: 0.62rem;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 3px;
+    flex-shrink: 0;
+    text-transform: uppercase;
+  }
+  .gap-tag.missing { background: var(--red-bg); color: var(--red); }
+  .gap-tag.partial { background: var(--yellow-bg); color: var(--yellow); }
+  .gap-tag.intentional { background: oklch(0.2 0.01 var(--hue)); color: var(--text-muted); }
+
+  /* ---------- SUMMARY ---------- */
+  .summary-card {
+    background: var(--bg-raised);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg);
+    padding: var(--space-2xl);
+    margin-top: var(--space-xl);
+  }
+  .summary-card blockquote {
+    font-size: 1.1rem;
+    color: var(--accent);
+    font-weight: 500;
+    line-height: 1.6;
+    max-width: 640px;
+  }
+
+  /* ---------- FOOTER ---------- */
+  .footer {
+    padding: var(--space-2xl) 0;
+    text-align: center;
+    font-size: 0.72rem;
+    color: var(--text-muted);
+  }
+
+  /* scroll gutter fix */
+  .matrix-table-wrap { -webkit-overflow-scrolling: touch; }
+</style>
+</head>
+<body>
+
+<!-- NAV -->
+<nav class="nav">
+  <div class="nav-inner">
+    <span class="nav-brand">act vs agent-ci vs aksh</span>
+    <a href="#architecture">Architecture</a>
+    <a href="#matrix">Feature Matrix</a>
+    <a href="#performance">Performance</a>
+    <a href="#protocol">Protocol</a>
+    <a href="#gitea">Gitea</a>
+    <a href="#conformance">Conformance</a>
+    <a href="#gaps">Known Gaps</a>
+  </div>
+</nav>
+
+<!-- HERO -->
+<header class="hero">
+  <div class="container">
+    <p class="hero-subtitle">Architectural Comparison</p>
+    <h1>Four ways to run GitHub Actions locally. <em>Two reimplement the runner. Two reimplement the server. Only one reimplements everything.</em></h1>
+    <p class="hero-desc">
+      nektos/act reimplements the runner in Go and executes steps in Docker.
+      agent-ci (RedwoodJS) reimplements the server in TypeScript, launching the official runner binary in Docker containers — with pause-on-failure for AI agents.
+      aksh reimplements both the server and runner in Rust with full wire-protocol fidelity, running on SmolVM microVMs, <code>somac</code> (macOS), and <code>vowin</code> (Windows).
+    </p>
+
+    <div class="stats-row">
+      <div class="stat-card">
+        <div class="label">act</div>
+        <div class="value">Go</div>
+        <div class="note">Single binary, ~8 MB. Replaces the runner.</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">aksh</div>
+        <div class="value">Rust</div>
+        <div class="note">15 crates, ~130K LOC. Server + runner + SmolVM/somac/vowin.</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">act community</div>
+        <div class="value">71K ★</div>
+        <div class="note">300+ contributors, monthly releases</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">agent-ci</div>
+        <div class="value">TypeScript</div>
+        <div class="note">725 ★. Server reimpl + official runner in Docker.</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">aksh conformance</div>
+        <div class="value">24/24</div>
+        <div class="note">Golden scenarios pass vs v2.336.0</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">aksh single-job</div>
+        <div class="value">318 ms</div>
+        <div class="note">0.97× host speed on M4 Max</div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<!-- ARCHITECTURE -->
+<section id="architecture">
+  <div class="container">
+    <p class="section-label">01 — Architecture</p>
+    <h2 class="section-title">Fundamentally different approaches</h2>
+    <p class="section-desc">
+      The single architectural decision — replace the runner vs replace the server — cascades through every feature,
+      limitation, and tradeoff in both projects.
+    </p>
+
+    <div class="arch-grid">
+      <!-- act -->
+      <div class="arch-card act">
+        <div class="arch-card-header">
+          <div class="icon">act</div>
+          <div>
+            <h3>nektos/act</h3>
+            <span class="tag">Replaces the runner</span>
+          </div>
+        </div>
+        <p class="strategy">
+          <strong>Monolithic Go reimplementation.</strong> Parses workflow YAML, builds a topological plan from the
+          <code>needs</code> DAG, and executes steps inside Docker containers. Each job gets a long-lived container
+          with <code>tail -f /dev/null</code> as entrypoint — steps run via <code>docker exec</code>.
+          The official <code>actions/runner</code> binary is never used.
+        </p>
+        <div class="diagram-wrap" style="margin-bottom: var(--space-lg);">
+          <pre>
+  ┌─────────────────────────────┐
+  │       act  (Go binary)      │
+  │                             │
+  │  YAML ─► Plan ─► Executor   │
+  │   │         │         │     │
+  │  Expr    Stages    Docker   │
+  │  eval   (serial)    exec    │
+  └──────────────┬──────────────┘
+                 │ Docker API
+  ┌──────────────▼──────────────┐
+  │   Job container (ubuntu)    │
+  │   ┌──────────────────────┐  │
+  │   │  step: docker exec   │  │
+  │   │  step: docker exec   │  │
+  │   └──────────────────────┘  │
+  │   Service containers ◄──────┤
+  └─────────────────────────────┘</pre>
+        </div>
+        <dl class="arch-meta">
+          <dt>Language</dt><dd>Go 1.24+</dd>
+          <dt>Binary size</dt><dd>~8 MB</dd>
+          <dt>Expression parser</dt><dd>rhysd/actionlint AST</dd>
+          <dt>Container</dt><dd>Docker required</dd>
+          <dt>Host mode</dt><dd>-self-hosted flag</dd>
+          <dt>Runner binary</dt><dd>Not used</dd>
+        </dl>
+      </div>
+
+      <!-- act_runner (Gitea Actions) -->
+      <div class="arch-card act">
+        <div class="arch-card-header">
+          <div class="icon">gta</div>
+          <div>
+            <h3>Gitea Actions (act_runner)</h3>
+            <span class="tag">Replaces the runner — with a server</span>
+          </div>
+        </div>
+        <p class="strategy">
+          <strong>Act with a control plane.</strong> The Gitea monolith detects workflows, resolves the
+          job DAG (needs / if / matrix / concurrency / max-parallel) and picks a runner by label. Each
+          task carries the <strong>raw workflow YAML</strong> plus the <code>github</code> context,
+          secrets, vars and <code>needs</code> outputs; the runner parses and executes it with an
+          in-tree fork of act (<code>act/</code>). Server ↔ runner link is a proprietary
+          <strong>Connect RPC</strong> protocol (<code>/api/actions</code>) — the official runner
+          binary is never used. The fork fixed most of act's expression gaps; OIDC id-tokens,
+          problem matchers and server-side cache are still missing.
+        </p>
+        <div class="diagram-wrap" style="margin-bottom: var(--space-lg);">
+          <pre>
+  ┌──────────────────────────────────┐
+  │    Gitea server (Go monolith)    │
+  │                                  │
+  │  detect ─► job DAG ─► concurrency│
+  │  needs/matrix/max-parallel ─►    │
+  │  label match                     │
+  └───────────────┬──────────────────┘
+                  │ Connect RPC (protobuf)
+                  │ Ping, Register/Declare,
+                  │ FetchTask/UpdateTask/
+                  │ UpdateLog
+  ┌───────────────▼──────────────────┐
+  │  act_runner (Go, act fork)       │
+  │  parses YAML, plans stages,      │
+  │  executes steps                  │
+  │                                  │
+  │  Docker job container + exec     │
+  │  or host mode (labels)           │
+  └──────────────────────────────────┘</pre>
+        </div>
+        <dl class="arch-meta">
+          <dt>Language</dt><dd>Go 1.26 (act fork in-tree)</dd>
+          <dt>Server</dt><dd>Gitea monolith (scheduling only)</dd>
+          <dt>Expression parser</dt><dd>act/exprparser + actionlint AST</dd>
+          <dt>Container</dt><dd>Docker per-job container + exec</dd>
+          <dt>Host mode</dt><dd>host schema labels (macos/windows)</dd>
+          <dt>Protocol</dt><dd>Gitea Connect RPC (not GitHub)</dd>
+        </dl>
+      </div>
+
+      <!-- agent-ci -->
+      <div class="arch-card agentci">
+        <div class="arch-card-header">
+          <div class="icon">aci</div>
+          <div>
+            <h3>agent-ci</h3>
+            <span class="tag">Replaces the server</span>
+          </div>
+        </div>
+        <p class="strategy">
+          <strong>TypeScript server + official runner in Docker.</strong> Emulates the GitHub API surface
+          (DTU) as a local HTTP server. Launches the unmodified <code>actions/runner</code> binary inside
+          Docker containers per job. Flagship feature: <strong>pause-on-failure</strong> — container
+          stays alive, host edits sync in, retry just the failed step. Built for AI coding agents.
+          Rust rewrite in progress (opt-in).
+        </p>
+        <div class="diagram-wrap" style="margin-bottom: var(--space-lg);">
+          <pre>
+  ┌──────────────────────────────────┐
+  │  agent-ci CLI  (TypeScript/Rust) │
+  │                                  │
+  │  YAML ─► Plan ─► DTU HTTP server │
+  │   │        │          │          │
+  │  Expr   Waves    AzDO + GitHub   │
+  │  eval  (serial)  REST emulation  │
+  │                                  │
+  │  Cache (bind-mount)  Artifacts   │
+  └───────────────┬──────────────────┘
+                  │ DTU HTTP (local)
+  ┌───────────────▼──────────────────┐
+  │   Docker container per job       │
+  │   Official actions/runner binary │
+  │   (ghcr.io/actions/actions-      │
+  │    runner image)                 │
+  │   Workspace: rsynced bind-mount  │
+  └──────────────────────────────────┘</pre>
+        </div>
+        <dl class="arch-meta">
+          <dt>Language</dt><dd>TypeScript (Rust rewrite WIP)</dd>
+          <dt>Distribution</dt><dd>npm @redwoodjs/agent-ci</dd>
+          <dt>Expression parser</dt><dd>Custom TS + Rust</dd>
+          <dt>Execution</dt><dd>Docker (official runner image)</dd>
+          <dt>Headline</dt><dd>Pause-on-failure for AI agents</dd>
+          <dt>Runner</dt><dd>Official binary (unmodified)</dd>
+        </dl>
+      </div>
+
+      <!-- aksh -->
+      <div class="arch-card aksh">
+        <div class="arch-card-header">
+          <div class="icon">ash</div>
+          <div>
+            <h3>aksh</h3>
+            <span class="tag">Replaces the server</span>
+          </div>
+        </div>
+        <p class="strategy">
+          <strong>Full-stack Rust reimplementation — server and runner.</strong> The server implements the
+          complete AzDO/GitHub Actions control plane (100+ API routes, broker lifecycle, OIDC, concurrency,
+          Twirp results service). <code>aksh-runner</code> is a faithful Rust port of the official
+          <code>actions/runner</code> v2.336.0 (Listener + Worker), handling the full step lifecycle.
+          The primary execution backend is <strong>SmolVM microVMs</strong> (Linux &amp; macOS via libkrun),
+          which support running Docker actions inside the VM. Additional backends:
+          <code>somac</code> (ephemeral macOS VMs via Virtualization.framework) and
+          <code>vowin</code> (ephemeral Windows VMs via QEMU). Process and Docker backends
+          also available.
+        </p>
+        <div class="diagram-wrap" style="margin-bottom: var(--space-lg);">
+          <pre>
+  ┌──────────────────────────────────┐
+  │   aksh-runner-server  (Rust)     │
+  │                                  │
+  │  YAML ─► Scheduler ─► AzDO wire │
+  │   │          │            │      │
+  │  Expr    Concurrency    100+     │
+  │  eval     groups       routes    │
+  │                                  │
+  │  Cache  Artifacts  OIDC    DAP   │
+  └───────────────┬──────────────────┘
+                  │ AzDO protocol
+     ┌────────────┼─────────────┐
+     │            │             │
+  ┌─────────────────────────────────┐
+  │   aksh-runner (Rust)            │
+  │   Listener + Worker             │
+  │   faithful port of v2.336.0     │
+  │                                 │
+  │   Backends:                     │
+  │   SmolVM (primary, Linux+macOS) │
+  │   somac  (ephemeral macOS VMs)  │
+  │   vowin  (ephemeral Windows VMs)│
+  │   Process │ Docker              │
+  └─────────────────────────────────┘</pre>
+        </div>
+        <dl class="arch-meta">
+          <dt>Language</dt><dd>Rust 1.97, 15 crates</dd>
+          <dt>Codebase</dt><dd>~130,000 LOC</dd>
+          <dt>Expression parser</dt><dd>Custom Pratt parser</dd>
+          <dt>Backends</dt><dd>SmolVM (primary) / somac (macOS) / vowin (Windows) / Docker / Process</dd>
+          <dt>Protocol</dt><dd>Full AzDO wire compat (server ↔ runner)</dd>
+          <dt>Runner</dt><dd>aksh-runner (Rust port of v2.336.0)</dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- FEATURE MATRIX -->
+<section id="matrix">
+  <div class="container">
+    <p class="section-label">02 — Feature Matrix</p>
+    <h2 class="section-title">Detailed compatibility breakdown</h2>
+    <p class="section-desc">
+      Every feature compared across both implementations. Status reflects current mainline of each project.
+    </p>
+
+    <div class="legend">
+      <div class="legend-item"><span class="badge badge-yes">✓</span> Fully supported</div>
+      <div class="legend-item"><span class="badge badge-partial">◐</span> Partial</div>
+      <div class="legend-item"><span class="badge badge-no">✗</span> Not supported</div>
+      <div class="legend-item"><span class="badge badge-na">—</span> N/A</div>
+    </div>
+
+    <div class="matrix-controls">
+      <button class="active" data-filter="all">All Features</button>
+      <button data-filter="workflow">Workflow</button>
+      <button data-filter="env">Environment</button>
+      <button data-filter="expr">Expressions</button>
+      <button data-filter="commands">Commands</button>
+      <button data-filter="protocol">Protocol</button>
+      <button data-filter="container">Container</button>
+      <button data-filter="cache">Cache &amp; Artifacts</button>
+      <button data-filter="dx">Dev Experience</button>
+    </div>
+
+    <div class="matrix-table-wrap">
+      <table class="matrix-table">
+        <thead>
+          <tr>
+            <th>Feature</th>
+            <th class="col-act">act</th>
+            <th class="col-aksh" style="background: oklch(0.24 0.03 145);">agent-ci</th>
+            <th class="col-aksh">aksh</th>
+            <th class="col-gitea">Gitea</th>
+            <th>Notes</th>
+          </tr>
+        </thead>
+        <tbody>
+
+          <!-- WORKFLOW -->
+          <tr class="group-row" data-group="workflow"><td colspan="5">Core Workflow Features</td></tr>
+          <tr data-group="workflow">
+            <td>Workflow YAML parsing</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">Both parse the full schema. aksh uses typed model with IndexMap ordering.</td>
+          </tr>
+          <tr data-group="workflow">
+            <td><code>run:</code> steps</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
+          </tr>
+          <tr data-group="workflow">
+            <td><code>uses:</code> actions (remote)</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">aksh: batch <code>runnerresolve/actions</code> + tarball cache with ticket auth</td>
+          </tr>
+          <tr data-group="workflow">
+            <td><code>uses:</code> actions (local)</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
+          </tr>
+          <tr data-group="workflow">
+            <td><code>uses:</code> Docker actions</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">act builds/pulls separate container sharing job network</td>
+          </tr>
+          <tr data-group="workflow">
+            <td><code>uses: $/</code> self-repo syntax</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">v2.336.0 feature. Feature-gated + composite parent root resolution.</td>
+          </tr>
+          <tr data-group="workflow">
+            <td>Composite actions</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">agent-ci + aksh: official runner handles composites. aksh: 10-deep nesting, pre/post steps, output evaluation.</td>
+          </tr>
+          <tr data-group="workflow">
+            <td>Reusable workflows (<code>workflow_call</code>)</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">aksh: <code>secrets: inherit</code>, input type validation, OIDC propagation, depth=4 Gitea: depth 5; github.event_name overridden to workflow_call in callees</td>
+          </tr>
+          <tr data-group="workflow">
+            <td>Matrix strategy</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">aksh preserves IndexMap insertion order (matches GitHub)</td>
+          </tr>
+          <tr data-group="workflow">
+            <td><code>include</code> / <code>exclude</code> in matrix</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
+          </tr>
+          <tr data-group="workflow">
+            <td><code>needs</code> DAG scheduling</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">act: stages (serial) × runs (parallel). aksh: dependency-gated scheduler with output propagation. Gitea: resolved server-side (jobEmitterQueue)</td>
+          </tr>
+          <tr data-group="workflow">
+            <td>Job outputs</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
+          </tr>
+          <tr data-group="workflow">
+            <td><code>if</code> conditionals (job/step)</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
+          </tr>
+          <tr data-group="workflow">
+            <td><code>continue-on-error</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
+          </tr>
+          <tr data-group="workflow">
+            <td><code>timeout-minutes</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"> Gitea: runner.timeout default 3h + server StopEndlessTasks</td>
+          </tr>
+          <tr data-group="workflow">
+            <td><code>defaults.run</code> (shell, working-directory)</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
+          </tr>
+          <tr data-group="workflow">
+            <td><code>workflow_dispatch</code> inputs</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
+          </tr>
+          <tr data-group="workflow">
+            <td><code>run-name</code> expression</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+<td class="col-notes">aksh parses and evaluates with <code>github</code>/<code>inputs</code>/<code>vars</code> contexts at submit Gitea: displayed; expression evaluation unverified</td>
+          </tr>
+          <tr data-group="workflow">
+            <td>Concurrency groups</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">aksh: queue modes (single/max), cancel-in-progress, FIFO, 87 property tests Gitea: server-side, cancel-in-progress</td>
+          </tr>
+          <tr data-group="workflow">
+            <td>Trigger matching (branches/tags/paths)</td>
+            <td class="col-status"><span class="badge badge-partial">◐</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">act supports basic triggers; aksh: branches/tags/paths/types/schedule/dispatch Gitea: server-side notifier filters</td>
+          </tr>
+
+          <!-- ENVIRONMENT -->
+          <tr class="group-row" data-group="env"><td colspan="5">Environment &amp; Contexts</td></tr>
+          <tr data-group="env">
+            <td><code>$GITHUB_ENV</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
+          </tr>
+          <tr data-group="env">
+            <td><code>$GITHUB_OUTPUT</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
+          </tr>
+          <tr data-group="env">
+            <td><code>$GITHUB_PATH</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
+          </tr>
+          <tr data-group="env">
+            <td><code>$GITHUB_STEP_SUMMARY</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
+          </tr>
+          <tr data-group="env">
+            <td><code>$GITHUB_STATE</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
+          </tr>
+          <tr data-group="env">
+            <td><code>$GITHUB_ARTIFACTS</code></td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">v2.336.0. SHA-256 digest, OCI parsing, conflict detection, 500-cap.</td>
+          </tr>
+          <tr data-group="env">
+            <td><code>$GITHUB_ARTIFACTS_LIST</code></td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">v2.336.0. Versioned JSON list, sorted.</td>
+          </tr>
+          <tr data-group="env">
+            <td><code>ACTIONS_CACHE_MODE</code></td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">v2.336.0. Variable → env mapping, logged at job start. Gitea: uses CACHE_SERVICE_V2=true instead</td>
+          </tr>
+          <tr data-group="env">
+            <td><code>github.*</code> context</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"> Gitea: gitea alias; event_name divergence under workflow_call</td>
+          </tr>
+          <tr data-group="env">
+            <td><code>secrets.*</code> context</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">act: <code>.secrets</code> file or <code>--secret</code> flag. aksh: <code>SecretString</code> + wire masking. Gitea: server-scoped, encrypted</td>
+          </tr>
+          <tr data-group="env">
+            <td><code>vars.*</code> context</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"> Gitea: Repo > Org > Global precedence</td>
+          </tr>
+          <tr data-group="env">
+            <td><code>env.*</code> / <code>steps.*</code> / <code>needs.*</code> / <code>matrix.*</code> / <code>runner.*</code> / <code>inputs.*</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">Both implement the full context set.</td>
+          </tr>
+          <tr data-group="env">
+            <td>Comprehensive <code>GITHUB_*</code> env vars (40+)</td>
+            <td class="col-status"><span class="badge badge-partial">◐</span></td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+<td class="col-notes">aksh injects CI, GITHUB_ACTIONS, WORKSPACE, REPOSITORY, SHA, REF, REF_NAME, REF_TYPE, HEAD_REF, BASE_REF, EVENT_NAME, RUN_ID, RUN_NUMBER, RUN_ATTEMPT, ACTOR, WORKFLOW, JOB, SERVER_URL, API_URL, GRAPHQL_URL, ACTION, TOKEN, ACTION_PATH, ACTION_REPOSITORY, ACTION_REF, REF_PROTECTED, REPOSITORY_ID, REPOSITORY_OWNER_ID, TRIGGERING_ACTOR, WORKFLOW_REF, WORKFLOW_SHA, RETENTION_DAYS, RUNNER_* Gitea: GITEA_* extras; not the full official set</td>
+          </tr>
+
+          <!-- EXPRESSIONS -->
+          <tr class="group-row" data-group="expr"><td colspan="5">Expression Engine</td></tr>
+          <tr data-group="expr">
+            <td><code>contains()</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
+          </tr>
+          <tr data-group="expr">
+            <td><code>startsWith()</code> / <code>endsWith()</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
+          </tr>
+          <tr data-group="expr">
+            <td><code>format()</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
+          </tr>
+          <tr data-group="expr">
+            <td><code>join()</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
+          </tr>
+          <tr data-group="expr">
+            <td><code>toJSON()</code> / <code>fromJSON()</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
+          </tr>
+          <tr data-group="expr">
+            <td><code>hashFiles()</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">act has two implementations: local filesystem walk + container-based Node.js</td>
+          </tr>
+          <tr data-group="expr">
+            <td><code>success()</code> / <code>failure()</code> / <code>cancelled()</code> / <code>always()</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
+          </tr>
+          <tr data-group="expr">
+            <td>Type coercion (string/number/bool/null)</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">Both implement GitHub's full coercion rules</td>
+          </tr>
+          <tr data-group="expr">
+            <td><code>*</code> filter syntax (<code>steps.*.outputs</code>)</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">Used for filtering arrays of objects in expressions</td>
+          </tr>
+          <tr data-group="expr">
+            <td>Bracket access <code>['key']</code></td>
+            <td class="col-status"><span class="badge badge-partial">◐</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">Required for keys with special characters</td>
+          </tr>
+          <tr data-group="expr">
+            <td><code>{{</code> / <code>}}</code> escape sequences</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">Literal brace output in expressions</td>
+          </tr>
+          <tr data-group="expr">
+            <td>Case-insensitive <code>==</code></td>
+            <td class="col-status"><span class="badge badge-partial">◐</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">GitHub compares strings case-insensitively</td>
+          </tr>
+          <tr data-group="expr">
+            <td>Parser ownership</td>
+            <td class="col-status"><span class="badge badge-na">dep</span></td>
+                        <td class="col-status"><span class="badge badge-na">—</span></td>
+            <td class="col-status"><span class="badge badge-yes">own</span></td>
+                        <td class="col-status"><span class="badge badge-na">—</span></td>
+<td class="col-notes">act depends on <code>rhysd/actionlint</code> AST. aksh owns a custom Pratt parser. Gitea: act/exprparser on actionlint AST (fork-owned)</td>
+          </tr>
+
+          <!-- COMMANDS -->
+          <tr class="group-row" data-group="commands"><td colspan="5">Workflow Commands</td></tr>
+          <tr data-group="commands">
+            <td><code>::set-output::</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">Deprecated but still supported by both</td>
+          </tr>
+          <tr data-group="commands">
+            <td><code>::set-env::</code> / <code>::add-path::</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
+          </tr>
+          <tr data-group="commands">
+            <td><code>::add-mask::</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
+          </tr>
+          <tr data-group="commands">
+            <td><code>::debug::</code> / <code>::warning::</code> / <code>::error::</code> / <code>::notice::</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"> Gitea: folded into log with source location</td>
+          </tr>
+          <tr data-group="commands">
+            <td><code>::group::</code> / <code>::endgroup::</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"> Gitea: web UI folds on these</td>
+          </tr>
+          <tr data-group="commands">
+            <td><code>::stop-commands::</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
+          </tr>
+          <tr data-group="commands">
+            <td>Problem matchers (<code>::add-matcher::</code>)</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes"><code>::add-matcher::</code> / <code>::remove-matcher::</code></td>
+          </tr>
+
+          <!-- PROTOCOL -->
+          <tr class="group-row" data-group="protocol"><td colspan="5">Protocol &amp; Runner Infrastructure</td></tr>
+          <tr data-group="protocol">
+            <td>Faithful runner reimplementation</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">act reimplements in Go. aksh reimplements in Rust (faithful port of v2.336.0 with Listener + Worker architecture). Gitea: in-tree act fork</td>
+          </tr>
+          <tr data-group="protocol">
+            <td>AzDO wire protocol</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">act has no wire protocol at all. aksh implements 100+ routes. Gitea: proprietary Connect RPC (/api/actions)</td>
+          </tr>
+          <tr data-group="protocol">
+            <td>Runner registration (RSA key exchange)</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+<td class="col-notes">RSA-wrapped session key, runner capabilities, labels Gitea: own token → uuid/agent-token flow; no RSA/AES</td>
+          </tr>
+          <tr data-group="protocol">
+            <td>Session crypto (AES-CBC encrypted messages)</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">Encrypted message queue with session renewal</td>
+          </tr>
+          <tr data-group="protocol">
+            <td>Broker lifecycle (acquire → renew → complete)</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+<td class="col-notes">9 broker message types handled Gitea: FetchTask / UpdateTask heartbeat instead</td>
+          </tr>
+          <tr data-group="protocol">
+            <td>OIDC id-token provider</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">RS256-signed JWTs, X.509 certificate chain, JWKS endpoint, OpenID discovery Gitea: not wired on main</td>
+          </tr>
+          <tr data-group="protocol">
+            <td>Job permissions / <code>GITHUB_TOKEN</code> scoping</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+<td class="col-notes">aksh: GitHub App installation tokens per job, scoped to repo + effective <code>permissions:</code> (declared verbatim, implicit clamped; PAT fallback opt-in). Gitea: single repo-scoped task token</td>
+          </tr>
+          <tr data-group="protocol">
+            <td>Job cancellation (wire protocol)</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+<td class="col-notes"><code>JobCancelMessage</code> with GUID + TimeSpan, graceful → hard-kill phases Gitea: RESULT_CANCELLED via UpdateTask heartbeat</td>
+          </tr>
+          <tr data-group="protocol">
+            <td>Results-service (Twirp)</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">5 Twirp routes: step/job logs metadata, step summary, workflow steps update, signed blob URLs</td>
+          </tr>
+          <tr data-group="protocol">
+            <td>Timeline / live logs (WebSocket)</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+<td class="col-notes">PATCH timeline with lastModified, GET for history, WebSocket live-feed Gitea: UpdateLog → DBFS; web UI polls</td>
+          </tr>
+          <tr data-group="protocol">
+            <td>Job annotations</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">Feature-gated aggregation via <code>actions_send_job_level_annotations</code> Gitea: folded into log text</td>
+          </tr>
+          <tr data-group="protocol">
+            <td>Runner groups (server-side routing)</td>
+            <td class="col-status"><span class="badge badge-na">—</span></td>
+                        <td class="col-status"><span class="badge badge-na">—</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">Name, ID, default group matching in scheduler Gitea: repo / org / global scoping</td>
+          </tr>
+          <tr data-group="protocol">
+            <td>Ephemeral runners</td>
+            <td class="col-status"><span class="badge badge-na">—</span></td>
+                        <td class="col-status"><span class="badge badge-na">—</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">Exit-on-ack, session invalidation, RunnerSessionInvalid handling</td>
+          </tr>
+          <tr data-group="protocol">
+            <td>Location services (<code>connectionData</code>)</td>
+            <td class="col-status"><span class="badge badge-na">—</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">28 service definitions, query-aware fresh-cache responses</td>
+          </tr>
+          <tr data-group="protocol">
+            <td>Background steps (v2.336.0)</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-partial">◐</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">DTO + <code>is_background</code> flag; full <code>BackgroundStepCoordinator</code> missing</td>
+          </tr>
+          <tr data-group="protocol">
+            <td>Locked dependencies announcement (v2.336.0)</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">Log message when <code>actionsDependencies</code> non-empty</td>
+          </tr>
+          <tr data-group="protocol">
+            <td>Version deprecation warnings</td>
+            <td class="col-status"><span class="badge badge-na">—</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-na">—</span></td>
+<td class="col-notes">Server returns 403 + <code>AccessDeniedException</code> for deprecated runners</td>
+          </tr>
+          <tr data-group="protocol">
+            <td>Node 20→24 migration warnings</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-na">—</span></td>
+<td class="col-notes">Flag source precedence, conflict warning, ARM32 fallback Gitea: runner ships its own Node runtime</td>
+          </tr>
+
+          <!-- CONTAINER -->
+          <tr class="group-row" data-group="container"><td colspan="5">Container &amp; Isolation</td></tr>
+          <tr data-group="container">
+            <td>Docker job containers</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">Different models: act uses idle container + <code>docker exec</code>; aksh delegates to runner Gitea: same idle-container + docker exec model</td>
+          </tr>
+          <tr data-group="container">
+            <td>Service containers</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">Both support health checks and network configuration Gitea: not in host mode</td>
+          </tr>
+          <tr data-group="container">
+            <td>Docker-in-Docker</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">act mounts host Docker socket. aksh supports it natively inside SmolVM guest microVMs (bundled kernel with cgroups + overlayfs2). Gitea: dind / dind-rootless image flavours</td>
+          </tr>
+          <tr data-group="container">
+            <td>MicroVM isolation (SmolVM/libkrun)</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">Primary backend. Fork-based warm pool, 131 MB idle RSS per VM (measured). Runs on Linux + macOS. Docker actions run inside the VM (cgroups + overlayfs2).</td>
+          </tr>
+          <tr data-group="container">
+            <td>Process execution (no container)</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">act: <code>-self-hosted</code> flag. aksh: process backend. Gitea: host labels</td>
+          </tr>
+          <tr data-group="container">
+            <td>macOS native runner</td>
+            <td class="col-status"><span class="badge badge-partial">◐</span></td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">act: workaround only (<code>-self-hosted</code>). aksh: <code>somac</code> — fast ephemeral macOS VMs via Apple Virtualization.framework with copy-on-write golden snapshots. Gitea: macos:host label</td>
+          </tr>
+          <tr data-group="container">
+            <td>Windows native runner</td>
+            <td class="col-status"><span class="badge badge-partial">◐</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">act: workaround only (<code>-self-hosted</code>). aksh: <code>vowin</code> — ephemeral Windows 11 VMs via QEMU (ARM64 on macOS/HVF, x86_64 on Linux/KVM). Warm memory snapshot restore, qcow2 overlay per job. Gitea: windows:host label</td>
+          </tr>
+          <tr data-group="container">
+            <td>Custom platform images (<code>-P</code>)</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-na">—</span></td>
+            <td class="col-status"><span class="badge badge-na">—</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">act-specific concept: map <code>runs-on</code> labels to Docker images Gitea: label schema name:docker://image</td>
+          </tr>
+          <tr data-group="container">
+            <td>Podman support</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">act: via <code>DOCKER_HOST</code>. aksh: via runner backend. Gitea: via DOCKER_HOST</td>
+          </tr>
+          <tr data-group="container">
+            <td>Ephemeral macOS VMs (<code>somac</code>)</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">Fast ephemeral macOS VMs via Apple Virtualization.framework. Copy-on-write clones from golden snapshots. OCI image push/pull for distribution.</td>
+          </tr>
+          <tr data-group="container">
+            <td>Ephemeral Windows VMs (<code>vowin</code>)</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">Ephemeral Windows 11 VMs via QEMU. ARM64 on macOS (HVF), x86_64 on Linux (KVM). Warm memory snapshot restore. qcow2 overlay per job, destroyed after.</td>
+          </tr>
+          <tr data-group="container">
+            <td>Docker inside VM</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">SmolVM bundles a kernel with cgroups + overlayfs2 support. Docker actions run natively inside the guest — no Docker-in-Docker socket mount.</td>
+          </tr>
+          <tr data-group="container">
+            <td>Network isolation (egress control)</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">SmolVM strict egress (<code>SMOLVM_EGRESS_FLOOR=strict</code>)</td>
+          </tr>
+          <tr data-group="container">
+            <td>Secret masking on wire</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+<td class="col-notes">aksh: <code>SecretString</code> type, mask hints in wire messages, <code>expose()</code> at boundaries Gitea: log-row masking; no wire mask hints</td>
+          </tr>
+
+          <!-- CACHE & ARTIFACTS -->
+          <tr class="group-row" data-group="cache"><td colspan="5">Cache &amp; Artifacts</td></tr>
+          <tr data-group="cache">
+            <td>Cache v1 (reserve/upload/commit/lookup)</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">File-backed storage in both Gitea: runner-side embedded cache server</td>
+          </tr>
+          <tr data-group="cache">
+            <td>Cache v2 (Twirp protocol)</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+<td class="col-notes">Twirp endpoints backed by file storage Gitea: runner-side v2; bundles patched; no Twirp</td>
+          </tr>
+          <tr data-group="cache">
+            <td>Cache prefix matching</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">aksh: key/version immutability with prefix restore-key matching</td>
+          </tr>
+          <tr data-group="cache">
+            <td>Artifact v1 (create/put/get/list)</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">aksh: name validation per official toolkit Gitea: server-side v3 REST (AzDO-style)</td>
+          </tr>
+          <tr data-group="cache">
+            <td>Artifact v2 / v3 / v4 (Twirp + blob)</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+<td class="col-notes">Both support modern artifact protocols Gitea: v4 Connect + signed URLs; upload-artifact@v4 via patching</td>
+          </tr>
+
+          <!-- DEV EXPERIENCE -->
+          <tr class="group-row" data-group="dx"><td colspan="5">Developer Experience</td></tr>
+          <tr data-group="dx">
+            <td>Pause-on-failure (interactive retry)</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">Supported by both agent-ci and aksh (preloop). <code>preloop debug &lt;session&gt;</code> provides host&lt;&ndash;&gt;VM source sync (<code>--sync</code> / <code>--export</code>), step rewind (<code>--from &lt;step&gt;</code> / <code>--from-start</code>), workspace debris revert (<code>--revert &lt;none|untracked|all&gt;</code>), DAP debugger, and interactive guest shell. Server suspends job timeouts while paused.</td>
+          </tr>
+          <tr data-group="dx">
+            <td>NDJSON event stream (AI agent output)</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">agent-ci: <code>--json</code> emits structured events for AI agent consumption</td>
+          </tr>
+          <tr data-group="dx">
+            <td>Commit status posting</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">agent-ci: <code>--commit-status</code>. aksh: GitHub App integration. Gitea: server-side commit statuses</td>
+          </tr>
+          <tr data-group="dx">
+            <td>DAP debugger</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">4,527 LOC, 67 tests. WebSocket/TCP transport. Breakpoints, stepping, variable inspection, REPL DSL.</td>
+          </tr>
+          <tr data-group="dx">
+            <td>Workflow graph visualization</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes"><code>act --graph</code> outputs Graphviz DOT</td>
+          </tr>
+          <tr data-group="dx">
+            <td>Event simulation</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+<td class="col-notes">act: <code>-e event.json</code> Gitea: manual run via web UI; no event-file injection</td>
+          </tr>
+          <tr data-group="dx">
+            <td>Dry run / list workflows</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">act: <code>-l</code> (list), <code>-n</code> (dry run)</td>
+          </tr>
+          <tr data-group="dx">
+            <td>Config file (<code>.actrc</code>)</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-na">—</span></td>
+            <td class="col-status"><span class="badge badge-na">—</span></td>
+                        <td class="col-status"><span class="badge badge-na">—</span></td>
+<td class="col-notes">act-specific configuration Gitea: YAML config (config.yaml)</td>
+          </tr>
+          <tr data-group="dx">
+            <td>Zero-dependency install</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes"><code>brew install act</code> — single static binary. aksh requires Rust build. Gitea: needs a Gitea server + Docker</td>
+          </tr>
+          <tr data-group="dx">
+            <td>Conformance testing harness</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">runner-watch: 24 golden scenarios, automated diffing, TOML specs, conformance gate Gitea: no wire-level conformance</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+  </div>
+</section>
+
+<!-- PERFORMANCE -->
+<section id="performance">
+  <div class="container">
+    <p class="section-label">03 — Performance</p>
+    <h2 class="section-title">Measured, not claimed</h2>
+    <p class="section-desc">
+      All three measured on the same host: Apple M4 Max, 16 cores, 128 GB RAM.
+      act: OrbStack Docker + <code>catthehacker/ubuntu:act-latest</code>.
+      agent-ci v0.17.1: OrbStack Docker + official <code>actions/runner</code> image.
+      aksh: SmolVM microVMs.
+      Workflows: 3 echo steps (single-job) and 4×3 echo steps (matrix). Trimmed mean of 9 warm runs.
+    </p>
+
+    <div class="perf-grid">
+      <div class="perf-card">
+        <h4>Single Job Latency (warm)</h4>
+        <div class="bar-group">
+          <div class="bar-label"><span class="name">aksh (SmolVM)</span><span class="val">318 ms</span></div>
+          <div class="bar-track"><div class="bar-fill aksh-bar" style="width: 57.9%"></div></div>
+        </div>
+        <div class="bar-group">
+          <div class="bar-label"><span class="name">Host baseline</span><span class="val">327 ms</span></div>
+          <div class="bar-track"><div class="bar-fill host-bar" style="width: 59.6%"></div></div>
+        </div>
+        <div class="bar-group">
+          <div class="bar-label"><span class="name">act (Docker)</span><span class="val">549 ms</span></div>
+          <div class="bar-track"><div class="bar-fill act-bar" style="width: 12.8%"></div></div>
+        </div>
+        <div class="bar-group">
+          <div class="bar-label"><span class="name">agent-ci (Docker + official runner)</span><span class="val">4,294 ms</span></div>
+          <div class="bar-track"><div class="bar-fill" style="width: 100%; background: var(--green);"></div></div>
+        </div>
+        <p class="perf-note">
+          aksh: <strong>318 ms</strong>. act: <strong>549 ms</strong>. agent-ci: <strong>4,294 ms</strong>.<br>
+          agent-ci overhead from launching official runner binary per job + DTU HTTP server startup.
+          Cold start: aksh 318 ms, act 584 ms, agent-ci 4,139 ms.
+        </p>
+      </div>
+      <div class="perf-card">
+        <h4>4-Shard Matrix (warm)</h4>
+        <div class="bar-group">
+          <div class="bar-label"><span class="name">aksh (SmolVM)</span><span class="val">401 ms</span></div>
+          <div class="bar-track"><div class="bar-fill aksh-bar" style="width: 48.0%"></div></div>
+        </div>
+        <div class="bar-group">
+          <div class="bar-label"><span class="name">Host baseline</span><span class="val">550–630 ms</span></div>
+          <div class="bar-track"><div class="bar-fill host-bar" style="width: 70.7%"></div></div>
+        </div>
+        <div class="bar-group">
+          <div class="bar-label"><span class="name">act (Docker)</span><span class="val">834 ms</span></div>
+          <div class="bar-track"><div class="bar-fill act-bar" style="width: 10.3%"></div></div>
+        </div>
+        <div class="bar-group">
+          <div class="bar-label"><span class="name">agent-ci (Docker + official runner)</span><span class="val">8,134 ms</span></div>
+          <div class="bar-track"><div class="bar-fill" style="width: 100%; background: var(--green);"></div></div>
+        </div>
+        <p class="perf-note">
+          aksh: <strong>401 ms</strong>. act: <strong>834 ms</strong>. agent-ci: <strong>8,134 ms</strong>.<br>
+          agent-ci runs 4 shards sequentially (each spawns a Docker container with official runner).
+          Cold start: aksh 401 ms, act 1,358 ms, agent-ci 8,133 ms.
+        </p>
+      </div>
+    </div>
+
+    <div class="perf-grid" style="margin-top: var(--space-lg);">
+      <div class="perf-card">
+        <h4>Resource Usage</h4>
+        <div class="bar-group">
+          <div class="bar-label"><span class="name">act process RSS</span><span class="val">31 MB</span></div>
+          <div class="bar-track"><div class="bar-fill act-bar" style="width: 23.7%"></div></div>
+        </div>
+        <div class="bar-group">
+          <div class="bar-label"><span class="name">act container memory</span><span class="val">2.3 MB</span></div>
+          <div class="bar-track"><div class="bar-fill act-bar" style="width: 1.8%"></div></div>
+        </div>
+        <div class="bar-group">
+          <div class="bar-label"><span class="name">agent-ci process RSS</span><span class="val">123 MB</span></div>
+          <div class="bar-track"><div class="bar-fill" style="width: 93.9%; background: var(--green);"></div></div>
+        </div>
+        <div class="bar-group">
+          <div class="bar-label"><span class="name">aksh VM RSS (idle)</span><span class="val">131 MB</span></div>
+          <div class="bar-track"><div class="bar-fill aksh-bar" style="width: 100%"></div></div>
+        </div>
+        <div class="bar-group">
+          <div class="bar-label"><span class="name">aksh engine RSS</span><span class="val">27 MB</span></div>
+          <div class="bar-track"><div class="bar-fill aksh-bar" style="width: 20.6%"></div></div>
+        </div>
+        <p class="perf-note">
+          act: 31 MB process + 2.3 MB per container. Total ~33 MB per job.<br>
+          agent-ci: 123 MB Node.js process + official runner inside container.<br>
+          aksh: 27 MB engine + 131 MB per VM (idle), ~390 MB after running a job. More memory for stronger isolation.
+        </p>
+      </div>
+      <div class="perf-card">
+        <h4>Binary &amp; Image Size</h4>
+        <div class="bar-group">
+          <div class="bar-label"><span class="name">act binary</span><span class="val">29 MB</span></div>
+          <div class="bar-track"><div class="bar-fill act-bar" style="width: 100%"></div></div>
+        </div>
+        <div class="bar-group">
+          <div class="bar-label"><span class="name">act Docker image</span><span class="val">2.29 GB</span></div>
+          <div class="bar-track"><div class="bar-fill act-bar" style="width: 100%"></div></div>
+        </div>
+        <div class="bar-group">
+          <div class="bar-label"><span class="name">agent-ci npm package</span><span class="val">32 MB</span></div>
+          <div class="bar-track"><div class="bar-fill" style="width: 100%; background: var(--green);"></div></div>
+        </div>
+        <p class="perf-note">
+          act v0.2.89 (Go, 29 MB binary). agent-ci v0.17.1 (TypeScript, 32 MB node_modules).<br>
+          agent-ci also downloads the official runner image on first run.<br>
+          All measurements on OrbStack Docker, Apple M4 Max, macOS.
+        </p>
+      </div>
+    </div>
+
+  </div>
+                                    <div class="summary-card" style="margin-top: var(--space-2xl);">
+      <h3 style="font-size: 1.1rem; font-weight: 700; margin-bottom: var(--space-md); color: var(--text-bright);">
+        3-Way Golden Scenario Benchmark &amp; Behavioral Fidelity (39 Workflows)
+      </h3>
+      <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: var(--space-lg);">
+        Measured on Apple M4 Max against the 39 golden scenario workflow YAML files (<code>experiments/mitm/scenarios/</code>).<br>
+        <strong>Behavioral Fidelity</strong> (Correct local outcome matching GitHub Actions intent):<br>
+        • <strong>Preloop</strong> (Rust + SmolVM microVMs): <strong>31 / 39 (79.5%)</strong> correct behavior (26/39 passed, single-job avg ~366&ndash;480ms).<br>
+        • <strong>act</strong> (Go + Docker): <strong>29 / 39 (74.4%)</strong> correct behavior (24/39 passed, single-job avg ~0.48s).<br>
+        • <strong>agent-ci</strong> (TS + Docker + official runner): <strong>29 / 39 (74.4%)</strong> correct behavior (24/39 passed, single-job avg ~10.4s).<br>
+        <em>Note: Scenarios 07, 09, 103, 107, and 14 contain intentional <code>exit 1</code> steps. Reporting <code>Failure</code> is the correct local behavior.</em>
+      </p>
+
+      <div class="matrix-table-wrap">
+        <table class="matrix-table">
+          <thead>
+            <tr>
+              <th style="width: 40px;">#</th>
+              <th>Scenario</th>
+              <th>File</th>
+              <th class="col-status">act</th>
+              <th>act Time</th>
+              <th class="col-status">agent-ci</th>
+              <th>agent-ci Time</th>
+              <th class="col-status">Preloop</th>
+              <th>Preloop Time</th>
+              <th>Workflow Classification</th>
+            </tr>
+          </thead>
+          <tbody>
+          <tr>
+            <td>1</td>
+            <td><code>02-trivial-job</code></td>
+            <td><code>02-trivial-job.yml</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.45s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.34s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">366ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
+          </tr>
+          <tr>
+            <td>2</td>
+            <td><code>03-cancellation</code></td>
+            <td><code>03-cancellation.yml</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">60.57s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">69.59s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">60.46s</td>
+            <td class="col-notes"><span style='color: var(--blue);'>⏳ Sleep / Timeout Test</span></td>
+          </tr>
+          <tr>
+            <td>3</td>
+            <td><code>04-request-ack</code></td>
+            <td><code>04-request-ack.yml</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.45s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.36s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">519ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
+          </tr>
+          <tr>
+            <td>4</td>
+            <td><code>05-multi-job</code></td>
+            <td><code>05-multi-job-a.yml</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.45s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.14s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">431ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
+          </tr>
+          <tr>
+            <td>5</td>
+            <td><code>05-multi-job</code></td>
+            <td><code>05-multi-job-b.yml</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.39s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.13s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">485ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
+          </tr>
+          <tr>
+            <td>6</td>
+            <td><code>06-multi-step</code></td>
+            <td><code>06-multi-step.yml</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.51s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.60s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">447ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
+          </tr>
+          <tr>
+            <td>7</td>
+            <td><code>07-step-failure</code></td>
+            <td><code>07-step-failure.yml</code></td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.46s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">9.85s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">447ms</td>
+            <td class="col-notes"><span style='color: var(--yellow);'>⚠️ Intentional Failure</span></td>
+          </tr>
+          <tr>
+            <td>8</td>
+            <td><code>08-job-outputs-needs</code></td>
+            <td><code>08-job-outputs-needs.yml</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.79s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">20.24s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">824ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
+          </tr>
+          <tr>
+            <td>9</td>
+            <td><code>09-matrix-fan-out</code></td>
+            <td><code>09-matrix-fan-out.yml</code></td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">20.70s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">42.05s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">458ms</td>
+            <td class="col-notes"><span style='color: var(--yellow);'>⚠️ Intentional Failure</span></td>
+          </tr>
+          <tr>
+            <td>10</td>
+            <td><code>10-uses-checkout</code></td>
+            <td><code>10-uses-checkout.yml</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.49s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.15s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">730ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
+          </tr>
+          <tr>
+            <td>11</td>
+            <td><code>101-dynamic-matrix-dataflow</code></td>
+            <td><code>101-dynamic-matrix-dataflow.yml</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.95s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">19.82s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">480ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
+          </tr>
+          <tr>
+            <td>12</td>
+            <td><code>102-mask-and-secret-propagation</code></td>
+            <td><code>102-mask-and-secret-propagation.yml</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.45s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.36s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">400ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
+          </tr>
+          <tr>
+            <td>13</td>
+            <td><code>103-composite-nested-post</code></td>
+            <td><code>103-composite-nested-post.yml</code></td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.45s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.21s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">693ms</td>
+            <td class="col-notes"><span style='color: var(--yellow);'>⚠️ Intentional Failure</span></td>
+          </tr>
+          <tr>
+            <td>14</td>
+            <td><code>104-job-defaults-env-cascade</code></td>
+            <td><code>104-job-defaults-env-cascade.yml</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.38s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.33s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">433ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
+          </tr>
+          <tr>
+            <td>15</td>
+            <td><code>105-concurrency-cancellation-group</code></td>
+            <td><code>105-concurrency-cancellation-group.yml</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">60.48s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">69.69s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">60.55s</td>
+            <td class="col-notes"><span style='color: var(--blue);'>⏳ Sleep / Timeout Test</span></td>
+          </tr>
+          <tr>
+            <td>16</td>
+            <td><code>107-continue-on-error-status-funcs</code></td>
+            <td><code>107-continue-on-error-status-funcs.yml</code></td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.61s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">9.96s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">466ms</td>
+            <td class="col-notes"><span style='color: var(--yellow);'>⚠️ Intentional Failure</span></td>
+          </tr>
+          <tr>
+            <td>17</td>
+            <td><code>108-workflow-dispatch-inputs</code></td>
+            <td><code>108-workflow-dispatch-inputs.yml</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.40s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.47s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">380ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
+          </tr>
+          <tr>
+            <td>18</td>
+            <td><code>109-log-streaming-backpressure</code></td>
+            <td><code>109-log-streaming-backpressure.yml</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.48s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.83s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">606ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
+          </tr>
+          <tr>
+            <td>19</td>
+            <td><code>11-cache-roundtrip</code></td>
+            <td><code>11-cache-roundtrip.yml</code></td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">30.01s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">11.47s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">679ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
+          </tr>
+          <tr>
+            <td>20</td>
+            <td><code>110-environment-deployment-url</code></td>
+            <td><code>110-environment-deployment-url.yml</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.45s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.36s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">378ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
+          </tr>
+          <tr>
+            <td>21</td>
+            <td><code>111-github-state-post-execution</code></td>
+            <td><code>111-github-state-post-execution.yml</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.43s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">28.13s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">376ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
+          </tr>
+          <tr>
+            <td>22</td>
+            <td><code>112-service-container-health-ports</code></td>
+            <td><code>112-service-container-health-ports.yml</code></td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">3.78s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">47.81s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">12.28s</td>
+            <td class="col-notes">Normal (Success expected)</td>
+          </tr>
+          <tr>
+            <td>23</td>
+            <td><code>113-artifact-v4-multi-pattern</code></td>
+            <td><code>113-artifact-v4-multi-pattern.yml</code></td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">1.45s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">22.27s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">755ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
+          </tr>
+          <tr>
+            <td>24</td>
+            <td><code>114-step-timeout-graceful-kill</code></td>
+            <td><code>114-step-timeout-graceful-kill.yml</code></td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">30.01s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">130.18s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">120.45s</td>
+            <td class="col-notes"><span style='color: var(--blue);'>⏳ Sleep / Timeout Test</span></td>
+          </tr>
+          <tr>
+            <td>25</td>
+            <td><code>115-cache-v2-restore-fallback</code></td>
+            <td><code>115-cache-v2-restore-fallback.yml</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">23.30s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">44.77s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">784ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
+          </tr>
+          <tr>
+            <td>26</td>
+            <td><code>12-artifact</code></td>
+            <td><code>12-artifact.yml</code></td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">1.57s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">40.45s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">799ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
+          </tr>
+          <tr>
+            <td>27</td>
+            <td><code>13-composite-action</code></td>
+            <td><code>13-composite-action.yml</code></td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.39s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.37s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">742ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
+          </tr>
+          <tr>
+            <td>28</td>
+            <td><code>14-annotations</code></td>
+            <td><code>14-annotations.yml</code></td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.34s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.47s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">454ms</td>
+            <td class="col-notes"><span style='color: var(--yellow);'>⚠️ Intentional Failure</span></td>
+          </tr>
+          <tr>
+            <td>29</td>
+            <td><code>15-oidc-id-token</code></td>
+            <td><code>15-oidc-id-token.yml</code></td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.34s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">10.89s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">358ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
+          </tr>
+          <tr>
+            <td>30</td>
+            <td><code>16-container-job</code></td>
+            <td><code>16-container-job.yml</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.44s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">21.42s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">12.80s</td>
+            <td class="col-notes">Normal (Success expected)</td>
+          </tr>
+          <tr>
+            <td>31</td>
+            <td><code>163-reusable-caller</code></td>
+            <td><code>163-reusable-caller.yml</code></td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.03s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.65s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">18ms</td>
+            <td class="col-notes">Normal (Success expected)</td>
+          </tr>
+          <tr>
+            <td>32</td>
+            <td><code>17-service-container</code></td>
+            <td><code>17-service-container.yml</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">16.18s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">2.79s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">20.42s</td>
+            <td class="col-notes">Normal (Success expected)</td>
+          </tr>
+          <tr>
+            <td>33</td>
+            <td><code>30-container-job-basic</code></td>
+            <td><code>30-container-job-basic.yml</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.62s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">11.95s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">11.96s</td>
+            <td class="col-notes">Normal (Success expected)</td>
+          </tr>
+          <tr>
+            <td>34</td>
+            <td><code>31-container-with-services</code></td>
+            <td><code>31-container-with-services.yml</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">11.16s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">16.61s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">30.00s</td>
+            <td class="col-notes">Normal (Success expected)</td>
+          </tr>
+          <tr>
+            <td>35</td>
+            <td><code>32-services-no-container</code></td>
+            <td><code>32-services-no-container.yml</code></td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.45s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">3.11s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">30.00s</td>
+            <td class="col-notes">Normal (Success expected)</td>
+          </tr>
+          <tr>
+            <td>36</td>
+            <td><code>33-container-env-options</code></td>
+            <td><code>33-container-env-options.yml</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">0.83s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">9.94s</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">2.12s</td>
+            <td class="col-notes">Normal (Success expected)</td>
+          </tr>
+          <tr>
+            <td>37</td>
+            <td><code>34-container-with-checkout</code></td>
+            <td><code>34-container-with-checkout.yml</code></td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">7.93s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">38.68s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">30.00s</td>
+            <td class="col-notes">Normal (Success expected)</td>
+          </tr>
+          <tr>
+            <td>38</td>
+            <td><code>35-container-lifecycle</code></td>
+            <td><code>35-container-lifecycle.yml</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">2.40s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">12.60s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">30.00s</td>
+            <td class="col-notes">Normal (Success expected)</td>
+          </tr>
+          <tr>
+            <td>39</td>
+            <td><code>36-docker-action</code></td>
+            <td><code>36-docker-action.yml</code></td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">2.36s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">13.78s</td>
+            <td class="col-status"><span class="badge badge-no">✗</span></td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">3.12s</td>
+            <td class="col-notes">Normal (Success expected)</td>
+          </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+</section>
+
+<!-- PROTOCOL -->
+<section id="protocol">
+  <div class="container">
+    <p class="section-label">04 — Wire Protocol</p>
+    <h2 class="section-title">act skips the protocol entirely. aksh reimplements the full stack.</h2>
+    <p class="section-desc">
+      This is the deepest architectural divide. act is a monolith that reads YAML and runs Docker commands.
+      aksh speaks the same protocol that GitHub's hosted infrastructure uses.
+    </p>
+
+    <div class="protocol-comparison">
+      <div class="protocol-card">
+        <h4>act — No wire protocol</h4>
+        <ul class="proto-list">
+          <li><span class="dot off"></span>No runner registration</li>
+          <li><span class="dot off"></span>No session management</li>
+          <li><span class="dot off"></span>No broker lifecycle</li>
+          <li><span class="dot off"></span>No timeline updates</li>
+          <li><span class="dot off"></span>No results service</li>
+          <li><span class="dot off"></span>No OIDC provider</li>
+          <li><span class="dot off"></span>No encrypted message queue</li>
+          <li><span class="dot off"></span>No location services</li>
+          <li><span class="dot off"></span>No cancellation protocol</li>
+          <li><span class="dot off"></span>Actions using <code>ACTIONS_RUNTIME_URL</code> must be intercepted</li>
+        </ul>
+      </div>
+      <div class="protocol-card">
+        <h4>agent-ci — DTU emulation layer</h4>
+        <ul class="proto-list">
+          <li><span class="dot on"></span>AzDO DistributedTask REST (pool/agent/session/message)</li>
+          <li><span class="dot on"></span>Timeline/record PATCH updates</li>
+          <li><span class="dot on"></span>Log streaming (POST/PATCH)</li>
+          <li><span class="dot on"></span>Action download info</li>
+          <li><span class="dot on"></span>Cache REST API (reserve/upload/commit/download)</li>
+          <li><span class="dot on"></span>Artifact Twirp v4 + Azure Block Blob</li>
+          <li><span class="dot on"></span>GitHub REST mirror (registration tokens, compare, tarball)</li>
+          <li><span class="dot off"></span>No session encryption</li>
+          <li><span class="dot off"></span>No broker lifecycle (acquirejob/renewjob)</li>
+          <li><span class="dot off"></span>No OIDC provider</li>
+          <li><span class="dot off"></span>No results-service Twirp</li>
+          <li><span class="dot off"></span>No concurrency groups</li>
+        </ul>
+      </div>
+      <div class="protocol-card">
+        <h4>aksh — Full AzDO wire protocol</h4>
+        <ul class="proto-list">
+          <li><span class="dot on"></span>Registration: RSA key exchange, capabilities, labels</li>
+          <li><span class="dot on"></span>Session: AES-CBC encrypted queue, renewal, conflict resolution</li>
+          <li><span class="dot on"></span>Broker: acquirejob → renewjob → completejob (9 message types)</li>
+          <li><span class="dot on"></span>Timeline: PATCH updates with lastModified, GET for history</li>
+          <li><span class="dot on"></span>Results: 5 Twirp routes, signed blob URLs</li>
+          <li><span class="dot on"></span>OIDC: RS256 JWTs, X.509 chain, JWKS, OpenID discovery</li>
+          <li><span class="dot on"></span>Cancellation: GUID + TimeSpan, graceful → hard-kill</li>
+          <li><span class="dot on"></span>Location: 28 service definitions, fresh-cache responses</li>
+          <li><span class="dot on"></span>Live logs: WebSocket feed + console log API</li>
+          <li><span class="dot on"></span>100+ API routes under <code>/_apis/*</code> and <code>/broker/*</code></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- GITEA ACTIONS -->
+<section id="gitea">
+  <div class="container">
+    <p class="section-label">05 — Gitea Actions (act_runner)</p>
+    <h2 class="section-title">The act fork with a control plane</h2>
+    <p class="section-desc">
+      Gitea Actions pairs Gitea's server with <code>act_runner</code> — the act fork running as a
+      daemon against Gitea's own Connect RPC protocol. GitHub-compatible at the <em>workflow</em>
+      level, wire-incompatible by design. The server does the scheduling; the runner interprets the
+      raw YAML and executes with the same Docker model as act.
+    </p>
+
+    <div class="protocol-comparison">
+      <div class="protocol-card">
+        <h4>Connect RPC — <code>/api/actions</code></h4>
+        <ul class="proto-list">
+          <li><span class="dot on"></span><code>ping.v1.PingService/Ping</code> — pre-registration check</li>
+          <li><span class="dot on"></span><code>runner.v1.RunnerService/Register</code> — token → uuid + agent token</li>
+          <li><span class="dot on"></span><code>/Declare</code> — version, labels, capabilities</li>
+          <li><span class="dot on"></span><code>/FetchTask</code> — long-poll, version counter, backoff</li>
+          <li><span class="dot on"></span><code>/UpdateTask</code> — heartbeat + state; server can reply <code>RESULT_CANCELLED</code></li>
+          <li><span class="dot on"></span><code>/UpdateLog</code> — batched rows with ack index</li>
+          <li><span class="dot on"></span>Auth: <code>x-runner-uuid</code> + <code>x-runner-token</code> headers</li>
+          <li><span class="dot on"></span>Artifacts: server-side v3 REST (AzDO-style chunks) + v4 Connect, signed URLs</li>
+        </ul>
+      </div>
+      <div class="protocol-card">
+        <h4>Division of labor — opposite of aksh</h4>
+        <ul class="proto-list">
+          <li><span class="dot on"></span>Server: detect workflows, needs/if/matrix/concurrency/max-parallel, label match, fork-PR approval</li>
+          <li><span class="dot on"></span>Task = raw workflow YAML + <code>github</code> context + secrets + vars + needs outputs</li>
+          <li><span class="dot on"></span>Runner: parses YAML (<code>generateWorkflow</code>), plans stages, executes via act engine</li>
+          <li><span class="dot on"></span>Same Docker model as act: per-job container, <code>docker exec</code> per step, service containers</li>
+          <li><span class="dot on"></span><code>host</code> labels run steps natively (macOS / Windows first-class)</li>
+          <li><span class="dot off"></span>No microVM isolation — shared-kernel Docker only</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="matrix-table-wrap" style="margin-top: var(--space-xl);">
+      <table class="matrix-table">
+        <thead>
+          <tr>
+            <th>act CLI limitation</th>
+            <th class="col-aksh">Status in act_runner</th>
+            <th class="col-notes">Evidence</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>Concurrency groups</td><td class="col-status"><span class="gap-tag partial">fixed — server-side</span></td><td class="col-notes"><code>services/actions/concurrency.go</code>; prior group members cancelled on arrival</td></tr>
+          <tr><td><code>*</code> filter (<code>steps.*.outputs</code>)</td><td class="col-status"><span class="gap-tag partial">fixed in fork</span></td><td class="col-notes"><code>act/exprparser/interpreter.go</code> — <code>ArrayDerefNode</code> + slice property walk</td></tr>
+          <tr><td><code>{{</code> / <code>}}</code> escapes</td><td class="col-status"><span class="gap-tag partial">fixed in fork</span></td><td class="col-notes"><code>format()</code> brace state machine in <code>functions.go</code></td></tr>
+          <tr><td>Bracket access / case-insensitive <code>==</code></td><td class="col-status"><span class="gap-tag partial">fixed</span></td><td class="col-notes"><code>IndexAccessNode</code>; <code>compareString</code> lowercases</td></tr>
+          <tr><td>macOS / Windows native</td><td class="col-status"><span class="gap-tag partial">fixed</span></td><td class="col-notes">first-class <code>host</code> labels (<code>macos:host</code>, <code>windows:host</code>)</td></tr>
+          <tr><td>OIDC id tokens</td><td class="col-status"><span class="gap-tag missing">missing</span></td><td class="col-notes">server never sets <code>actions_id_token_request_url</code>; runner only forwards what the server provides</td></tr>
+          <tr><td>GITHUB_TOKEN permission scoping</td><td class="col-status"><span class="gap-tag missing">partial</span></td><td class="col-notes">one repo-scoped task token (<code>GITEA_TOKEN</code> / <code>GITHUB_TOKEN</code>); no per-permission JWT</td></tr>
+          <tr><td>Problem matchers (<code>::add-matcher::</code>)</td><td class="col-status"><span class="gap-tag missing">missing</span></td><td class="col-notes">reporter handles add-mask/debug/notice/warning/error/group/stop-commands only</td></tr>
+          <tr><td>Wire compatibility with GitHub</td><td class="col-status"><span class="gap-tag missing">missing</span></td><td class="col-notes">by design — Gitea-proprietary Connect RPC; official runner cannot connect</td></tr>
+          <tr><td>Server-side <code>@actions/cache</code></td><td class="col-status"><span class="gap-tag missing">missing</span></td><td class="col-notes">runner-local cache server; action bundles are patched to redirect URLs</td></tr>
+          <tr><td>Annotation store</td><td class="col-status"><span class="gap-tag missing">missing</span></td><td class="col-notes">annotations folded into log text (<code>formatAnnotation</code>)</td></tr>
+          <tr><td>Service containers in host mode</td><td class="col-status"><span class="gap-tag missing">missing</span></td><td class="col-notes">README: host-label jobs start no service containers</td></tr>
+          <tr><td>DAP debugger / microVM isolation</td><td class="col-status"><span class="gap-tag missing">missing</span></td><td class="col-notes">neither exists in the runner</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="section-desc" style="margin-top: var(--space-lg);">
+      No wire-level conformance methodology: behavior is enforced by unit tests and real-world
+      deployment. The mirror image of aksh's golden-capture pipeline — Gitea optimizes for
+      <em>workflow</em> compatibility on its own protocol, aksh for <em>protocol</em> compatibility
+      with the official runner.
+    </p>
+  </div>
+</section>
+
+<!-- CONFORMANCE -->
+<section id="conformance">
+  <div class="container">
+    <p class="section-label">06 — Conformance</p>
+    <h2 class="section-title">24 golden scenarios — all passing</h2>
+    <p class="section-desc">
+      aksh's runner-watch pipeline captures wire traffic from the official runner v2.336.0, then replays
+      those captures against aksh. Status codes, request body schemas, and acquirejob response schemas
+      must match exactly. act has no equivalent testing methodology.
+    </p>
+
+    <div class="conformance-grid">
+      <div class="scenario-chip"><span class="num">01</span><span class="name">Register &amp; idle</span><span class="status-dot"></span></div>
+      <div class="scenario-chip"><span class="num">02</span><span class="name">Trivial job</span><span class="status-dot"></span></div>
+      <div class="scenario-chip"><span class="num">03</span><span class="name">Cancellation</span><span class="status-dot"></span></div>
+      <div class="scenario-chip"><span class="num">04</span><span class="name">Request ack</span><span class="status-dot"></span></div>
+      <div class="scenario-chip"><span class="num">05</span><span class="name">Multi-job</span><span class="status-dot"></span></div>
+      <div class="scenario-chip"><span class="num">06</span><span class="name">Multi-step</span><span class="status-dot"></span></div>
+      <div class="scenario-chip"><span class="num">07</span><span class="name">Step failure</span><span class="status-dot"></span></div>
+      <div class="scenario-chip"><span class="num">08</span><span class="name">Job outputs + needs</span><span class="status-dot"></span></div>
+      <div class="scenario-chip"><span class="num">09</span><span class="name">Matrix fan-out</span><span class="status-dot"></span></div>
+      <div class="scenario-chip"><span class="num">10</span><span class="name">Uses checkout</span><span class="status-dot"></span></div>
+      <div class="scenario-chip"><span class="num">11</span><span class="name">Cache roundtrip</span><span class="status-dot"></span></div>
+      <div class="scenario-chip"><span class="num">12</span><span class="name">Artifact upload/download</span><span class="status-dot"></span></div>
+      <div class="scenario-chip"><span class="num">13</span><span class="name">Composite action</span><span class="status-dot"></span></div>
+      <div class="scenario-chip"><span class="num">14</span><span class="name">Annotations</span><span class="status-dot"></span></div>
+      <div class="scenario-chip"><span class="num">15</span><span class="name">OIDC id-token</span><span class="status-dot"></span></div>
+      <div class="scenario-chip"><span class="num">16</span><span class="name">Container job</span><span class="status-dot"></span></div>
+      <div class="scenario-chip"><span class="num">17</span><span class="name">Service container</span><span class="status-dot"></span></div>
+      <div class="scenario-chip"><span class="num">30</span><span class="name">Container job basic</span><span class="status-dot"></span></div>
+      <div class="scenario-chip"><span class="num">31</span><span class="name">Container + services</span><span class="status-dot"></span></div>
+      <div class="scenario-chip"><span class="num">32</span><span class="name">Services, no container</span><span class="status-dot"></span></div>
+      <div class="scenario-chip"><span class="num">33</span><span class="name">Container env/options</span><span class="status-dot"></span></div>
+      <div class="scenario-chip"><span class="num">34</span><span class="name">Container + checkout</span><span class="status-dot"></span></div>
+      <div class="scenario-chip"><span class="num">35</span><span class="name">Container lifecycle</span><span class="status-dot"></span></div>
+      <div class="scenario-chip"><span class="num">36</span><span class="name">Docker action</span><span class="status-dot"></span></div>
+    </div>
+  </div>
+</section>
+
+<!-- GAPS -->
+<section id="gaps">
+  <div class="container">
+    <p class="section-label">07 — Known Gaps</p>
+    <h2 class="section-title">What each project doesn't do</h2>
+
+    <div class="gaps-grid">
+      <div class="gap-card">
+        <h4 style="color: var(--blue);">act — Missing features</h4>
+        <ul class="gap-list">
+          <li><span class="gap-tag missing">missing</span> OIDC token support</li>
+          <li><span class="gap-tag missing">missing</span> Concurrency groups / cancel-in-progress</li>
+          <li><span class="gap-tag missing">missing</span> Job permissions / GITHUB_TOKEN scoping</li>
+          <li><span class="gap-tag missing">missing</span> <code>run-name:</code> expression evaluation</li>
+          <li><span class="gap-tag missing">missing</span> <code>$GITHUB_ARTIFACTS</code> / <code>$GITHUB_ARTIFACTS_LIST</code></li>
+          <li><span class="gap-tag missing">missing</span> Problem matchers</li>
+          <li><span class="gap-tag missing">missing</span> <code>*</code> filter syntax in expressions</li>
+          <li><span class="gap-tag missing">missing</span> <code>{{</code> / <code>}}</code> escape sequences</li>
+          <li><span class="gap-tag missing">missing</span> Wire protocol — act has no server/runner split, so no protocol at all</li>
+          <li><span class="gap-tag missing">missing</span> DAP debugger</li>
+          <li><span class="gap-tag missing">missing</span> MicroVM isolation</li>
+          <li><span class="gap-tag missing">missing</span> Cache v2 (Twirp)</li>
+          <li><span class="gap-tag missing">missing</span> Node 20→24 migration warnings</li>
+          <li><span class="gap-tag missing">missing</span> Background steps</li>
+          <li><span class="gap-tag partial">partial</span> macOS / Windows — workaround via <code>-self-hosted</code> only</li>
+          <li><span class="gap-tag partial">partial</span> Comprehensive GITHUB_* env vars</li>
+        </ul>
+      </div>
+      <div class="gap-card">
+        <h4 style="color: var(--green);">agent-ci — Missing features</h4>
+        <ul class="gap-list">
+          <li><span class="gap-tag missing">missing</span> OIDC token support</li>
+          <li><span class="gap-tag missing">missing</span> Concurrency groups (no persistent server)</li>
+          <li><span class="gap-tag missing">missing</span> <code>timeout-minutes</code> (conflicts with pause model)</li>
+          <li><span class="gap-tag missing">missing</span> <code>continue-on-error</code> (conflicts with pause model)</li>
+          <li><span class="gap-tag missing">missing</span> Matrix <code>include</code> / <code>exclude</code></li>
+          <li><span class="gap-tag missing">missing</span> <code>docker://</code> action references</li>
+          <li><span class="gap-tag missing">missing</span> <code>*</code> filter syntax in expressions</li>
+          <li><span class="gap-tag missing">missing</span> <code>steps.*.conclusion</code> / <code>.outcome</code></li>
+          <li><span class="gap-tag missing">missing</span> <code>job.*</code> context</li>
+          <li><span class="gap-tag missing">missing</span> Windows runners</li>
+          <li><span class="gap-tag missing">missing</span> Session encryption</li>
+          <li><span class="gap-tag missing">missing</span> Background steps / v2.336.0 features</li>
+          <li><span class="gap-tag partial">partial</span> macOS — Tart VMs, Apple Silicon only</li>
+                    <li><span class="gap-tag partial">partial</span> <code>github.*</code> context — most fields empty</li>
+          <li><span class="gap-tag partial">partial</span> Rust rewrite incomplete (opt-in only)</li>
+        </ul>
+      </div>
+      <div class="gap-card">
+        <h4 style="color: var(--accent);">aksh — Missing features</h4>
+        <ul class="gap-list">
+          <li><span class="gap-tag partial">partial</span> BackgroundStepCoordinator — DTO + flag done, async coordinator missing</li>
+                    <li><span class="gap-tag partial">partial</span> Action download telemetry (info logs only)</li>
+          <li><span class="gap-tag intentional">intentional</span> Runner self-update — acknowledged but not implemented</li>
+          <li><span class="gap-tag missing">missing</span> Runner config refresh (dynamic)</li>
+          <li><span class="gap-tag missing">missing</span> Workflow graph visualization</li>
+          <li><span class="gap-tag missing">missing</span> Dry run / list mode</li>
+          
+          <li><span class="gap-tag missing">missing</span> Zero-dependency install (requires Rust build)</li>
+        </ul>
+      </div>
+      <div class="gap-card">
+        <h4 style="color: var(--yellow);">act_runner — Missing features</h4>
+        <ul class="gap-list">
+          <li><span class="gap-tag missing">missing</span> OIDC id tokens — server never sets <code>actions_id_token_request_url</code></li>
+          <li><span class="gap-tag missing">missing</span> Problem matchers (<code>::add-matcher::</code>)</li>
+          <li><span class="gap-tag missing">missing</span> <code>$GITHUB_ARTIFACTS</code> / <code>$GITHUB_ARTIFACTS_LIST</code></li>
+          <li><span class="gap-tag partial">partial</span> GITHUB_TOKEN scoping — one repo-scoped task token</li>
+          <li><span class="gap-tag missing">missing</span> Server-side <code>@actions/cache</code> — runner-local; bundles patched</li>
+          <li><span class="gap-tag missing">missing</span> Annotation store — folded into log text</li>
+          <li><span class="gap-tag missing">missing</span> Service containers in host mode</li>
+          <li><span class="gap-tag missing">missing</span> <code>github.event_name</code> in <code>workflow_call</code> callees (overridden)</li>
+          <li><span class="gap-tag missing">missing</span> Wire compatibility with the official runner — by design</li>
+          <li><span class="gap-tag missing">missing</span> DAP debugger / microVM isolation</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- SUMMARY -->
+<section>
+  <div class="container">
+    <p class="section-label">08 — The Bottom Line</p>
+    <h2 class="section-title">Different tools for different problems</h2>
+
+    <div class="summary-card">
+      <blockquote>act reimplements the runner. act_runner reimplements the runner behind Gitea's own protocol. agent-ci reimplements the server and uses the official runner. aksh reimplements both — and that's why the fidelity gap between them is what it is.</blockquote>
+    </div>
+
+    <div class="arch-grid" style="margin-top: var(--space-xl);">
+      <div class="arch-card act">
+        <div class="arch-card-header">
+          <div class="icon">gta</div>
+          <h3>act_runner — Best for</h3>
+        </div>
+        <ul class="proto-list">
+          <li><span class="dot on"></span>Self-hosted CI platform for a team (Gitea)</li>
+          <li><span class="dot on"></span>GitHub-syntax workflows on a non-GitHub forge</li>
+          <li><span class="dot on"></span>Fork-PR approvals, org runners, reruns, retention</li>
+          <li><span class="dot on"></span>Open source (MIT), Docker/K8s images, deployed fleets</li>
+          <li><span class="dot on"></span>Native host-mode steps (macOS / Windows labels)</li>
+        </ul>
+      </div>
+      <div class="arch-card act">
+        <div class="arch-card-header">
+          <div class="icon">act</div>
+          <h3>Best for</h3>
+        </div>
+        <ul class="proto-list">
+          <li><span class="dot on"></span>Quick local smoke tests of simple workflows</li>
+          <li><span class="dot on"></span>Zero-setup, zero-dependency quick start</li>
+          <li><span class="dot on"></span>Visualizing workflow graphs</li>
+          <li><span class="dot on"></span>Dry-run / list mode before running</li>
+          <li><span class="dot on"></span>Teams already using Docker for development</li>
+        </ul>
+      </div>
+      <div class="arch-card aksh">
+        <div class="arch-card-header">
+          <div class="icon">ash</div>
+          <h3>Best for</h3>
+        </div>
+        <ul class="proto-list">
+          <li><span class="dot on"></span>Full-fidelity local CI matching GitHub's behavior exactly</li>
+          <li><span class="dot on"></span>Debugging workflow logic step by step (DAP + pause-on-failure)</li>
+          <li><span class="dot on"></span>OIDC token testing</li>
+          <li><span class="dot on"></span>Concurrency group testing</li>
+          <li><span class="dot on"></span>Full wire-protocol fidelity (server + runner)</li>
+          <li><span class="dot on"></span>CI infrastructure (ephemeral runners, runner groups)</li>
+          <li><span class="dot on"></span>Performance-critical CI pipelines</li>
+          <li><span class="dot on"></span>macOS runners locally (<code>somac</code>)</li>
+          <li><span class="dot on"></span>Windows runners locally (<code>vowin</code>)</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer class="footer">
+  <div class="container">
+    Generated from aksh fidelity-gap.md, nektos/act source, redwoodjs/agent-ci source, and gitea.com/gitea/runner + gitea.dev/actions-proto-go source — August 2026. All benchmarks measured on Apple M4 Max, 16 cores, 128 GB RAM.
+  </div>
+</footer>
+
+<script>
+  // Filter buttons
+  document.querySelectorAll('.matrix-controls button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.matrix-controls button').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      const filter = btn.dataset.filter;
+      document.querySelectorAll('.matrix-table tbody tr').forEach(row => {
+        if (filter === 'all') {
+          row.style.display = '';
+        } else {
+          row.style.display = row.dataset.group === filter ? '' : 'none';
+        }
+      });
+    });
+  });
+</script>
+</body>
+</html>

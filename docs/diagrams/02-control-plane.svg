@@ -1,0 +1,147 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 1000" width="1400" height="1000" style="background:#fff">
+<defs>
+  <marker id="ah-dark" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M 0 1.5 L 10 5 L 0 8.5 z" fill="#1e1e1e" />
+  </marker>
+  <marker id="ah-green" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M 0 1.5 L 10 5 L 0 8.5 z" fill="#15803d" />
+  </marker>
+  <marker id="ah-purple" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M 0 1.5 L 10 5 L 0 8.5 z" fill="#7c3aed" />
+  </marker>
+  <marker id="ah-amber" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M 0 1.5 L 10 5 L 0 8.5 z" fill="#f59e0b" />
+  </marker>
+  <marker id="ah-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M 0 1.5 L 10 5 L 0 8.5 z" fill="#4a9eed" />
+  </marker>
+  <marker id="ah-magenta" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M 0 1.5 L 10 5 L 0 8.5 z" fill="#a21caf" />
+  </marker>
+  <marker id="ah-teal" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M 0 1.5 L 10 5 L 0 8.5 z" fill="#0d9488" />
+  </marker>
+  <marker id="ah-red" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M 0 1.5 L 10 5 L 0 8.5 z" fill="#ef4444" />
+  </marker>
+  <marker id="ah-orange" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M 0 1.5 L 10 5 L 0 8.5 z" fill="#b45309" />
+  </marker>
+  <marker id="ah-navy" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M 0 1.5 L 10 5 L 0 8.5 z" fill="#1e40af" />
+  </marker>
+  <marker id="ah-darkred" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M 0 1.5 L 10 5 L 0 8.5 z" fill="#7f1d1d" />
+  </marker>
+  <marker id="ah-deepviolet" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M 0 1.5 L 10 5 L 0 8.5 z" fill="#5b21b6" />
+  </marker>
+  <marker id="ah-darkteal" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M 0 1.5 L 10 5 L 0 8.5 z" fill="#0f766e" />
+  </marker>
+  <marker id="arrowhead" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M 0 1.5 L 10 5 L 0 8.5 z" fill="#1e1e1e" />
+  </marker>
+</defs>
+<text x="420" y="53.0" font-size="28" font-family="system-ui, sans-serif" fill="#1e1e1e" font-weight="700">aksh-runner-server — Control Plane</text>
+<text x="420" y="75.0" font-size="15" font-family="system-ui, sans-serif" fill="#757575" font-weight="500">axum HTTP routes + broker protocol + in-memory state</text>
+<rect x="50" y="110" width="220" height="830" rx="10" fill="#dbe4ff" fill-opacity="0.25" stroke="#1e40af" stroke-width="1.5"/>
+<text x="70" y="143.0" font-size="18" font-family="system-ui, sans-serif" fill="#1e40af" font-weight="500">External Clients</text>
+<rect x="70" y="180" width="180" height="70" rx="10" fill="#a5d8ff" stroke="#4a9eed" stroke-width="2"/>
+<text x="160.0" y="208.7" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#4a9eed" font-weight="600">Runners (Listener)</text>
+<text x="160.0" y="226.2" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#4a9eed" font-weight="600">AzDO / broker poll</text>
+<rect x="70" y="300" width="180" height="70" rx="10" fill="#a5d8ff" stroke="#4a9eed" stroke-width="2"/>
+<text x="160.0" y="328.7" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#4a9eed" font-weight="600">GitHub Webhook</text>
+<text x="160.0" y="346.2" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#4a9eed" font-weight="600">events / push</text>
+<rect x="70" y="420" width="180" height="70" rx="10" fill="#a5d8ff" stroke="#4a9eed" stroke-width="2"/>
+<text x="160.0" y="448.7" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#4a9eed" font-weight="600">preloop CLI</text>
+<text x="160.0" y="466.2" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#4a9eed" font-weight="600">workflow submission</text>
+<rect x="310" y="110" width="1040" height="250" rx="10" fill="#e5dbff" fill-opacity="0.25" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="330" y="143.0" font-size="18" font-family="system-ui, sans-serif" fill="#7c3aed" font-weight="500">Route Surfaces (axum)</text>
+<rect x="330" y="165" width="230" height="80" rx="10" fill="#d0bfff" stroke="#7c3aed" stroke-width="2"/>
+<text x="445.0" y="198.2" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#7c3aed" font-weight="600">_apis/… (AzDO)</text>
+<text x="445.0" y="217.0" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#7c3aed" font-weight="600">Agent &amp; Session APIs</text>
+<rect x="585" y="165" width="230" height="80" rx="10" fill="#d0bfff" stroke="#7c3aed" stroke-width="2"/>
+<text x="700.0" y="198.2" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#7c3aed" font-weight="600">/api/v1/… (native)</text>
+<text x="700.0" y="217.0" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#7c3aed" font-weight="600">submit / get / cancel</text>
+<rect x="840" y="165" width="230" height="80" rx="10" fill="#d0bfff" stroke="#7c3aed" stroke-width="2"/>
+<text x="955.0" y="198.2" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#7c3aed" font-weight="600">/broker/… (modern)</text>
+<text x="955.0" y="217.0" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#7c3aed" font-weight="600">acquire / renew / msg</text>
+<rect x="1095" y="165" width="230" height="80" rx="10" fill="#d0bfff" stroke="#7c3aed" stroke-width="2"/>
+<text x="1210.0" y="198.2" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#7c3aed" font-weight="600">Twirp + webhooks</text>
+<text x="1210.0" y="217.0" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#7c3aed" font-weight="600">results, artifacts, events</text>
+<rect x="450" y="275" width="320" height="60" rx="10" fill="#d0bfff" stroke="#7c3aed" stroke-width="2"/>
+<text x="610.0" y="307.4" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#7c3aed" font-weight="600">auth.rs — Bearer / mTLS / OAuth</text>
+<rect x="850" y="275" width="320" height="60" rx="10" fill="#d0bfff" stroke="#7c3aed" stroke-width="2"/>
+<text x="1010.0" y="307.4" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#7c3aed" font-weight="600">errors.rs — ApiError → HTTP 4xx/5xx</text>
+<rect x="310" y="390" width="1040" height="250" rx="10" fill="#fff3bf" fill-opacity="0.25" stroke="#f59e0b" stroke-width="1.5"/>
+<text x="330" y="423.0" font-size="18" font-family="system-ui, sans-serif" fill="#f59e0b" font-weight="500">In-Memory State</text>
+<rect x="330" y="445" width="230" height="80" rx="10" fill="#ffd8a8" stroke="#f59e0b" stroke-width="2"/>
+<text x="445.0" y="478.2" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#f59e0b" font-weight="600">RunStore (in-mem)</text>
+<text x="445.0" y="497.0" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#f59e0b" font-weight="600">RunId, JobId, status</text>
+<rect x="585" y="445" width="230" height="80" rx="10" fill="#ffd8a8" stroke="#f59e0b" stroke-width="2"/>
+<text x="700.0" y="478.2" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#f59e0b" font-weight="600">QueuedJob + DAG</text>
+<text x="700.0" y="497.0" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#f59e0b" font-weight="600">needs-gated dispatch</text>
+<rect x="840" y="445" width="230" height="80" rx="10" fill="#ffd8a8" stroke="#f59e0b" stroke-width="2"/>
+<text x="955.0" y="478.2" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#f59e0b" font-weight="600">Runner Sessions</text>
+<text x="955.0" y="497.0" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#f59e0b" font-weight="600">crypto + ack + renew</text>
+<rect x="1095" y="445" width="230" height="80" rx="10" fill="#ffd8a8" stroke="#f59e0b" stroke-width="2"/>
+<text x="1210.0" y="478.2" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#f59e0b" font-weight="600">Events (NDJSON)</text>
+<text x="1210.0" y="497.0" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#f59e0b" font-weight="600">log lines, step updates</text>
+<rect x="420" y="555" width="330" height="60" rx="10" fill="#ffd8a8" stroke="#f59e0b" stroke-width="2"/>
+<text x="585.0" y="578.7" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#f59e0b" font-weight="600">LiveLogFeedLinesWrapper</text>
+<text x="585.0" y="596.2" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#f59e0b" font-weight="600">SSE streaming tail</text>
+<rect x="840" y="555" width="330" height="60" rx="10" fill="#ffd8a8" stroke="#f59e0b" stroke-width="2"/>
+<text x="1005.0" y="578.7" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#f59e0b" font-weight="600">broadcast::Sender&lt;RunEvent&gt;</text>
+<text x="1005.0" y="596.2" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#f59e0b" font-weight="600">in-memory event bus</text>
+<rect x="310" y="670" width="1040" height="270" rx="10" fill="#c3fae8" fill-opacity="0.25" stroke="#0d9488" stroke-width="1.5"/>
+<text x="330" y="703.0" font-size="18" font-family="system-ui, sans-serif" fill="#0d9488" font-weight="500">Auxiliary Subsystems</text>
+<rect x="330" y="725" width="230" height="80" rx="10" fill="#a5d8ff" stroke="#0d9488" stroke-width="2"/>
+<text x="445.0" y="758.2" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#0d9488" font-weight="600">scheduler.rs</text>
+<text x="445.0" y="777.0" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#0d9488" font-weight="600">cron &amp; trigger dispatch</text>
+<rect x="585" y="725" width="230" height="80" rx="10" fill="#a5d8ff" stroke="#0d9488" stroke-width="2"/>
+<text x="700.0" y="758.2" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#0d9488" font-weight="600">concurrency.rs</text>
+<text x="700.0" y="777.0" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#0d9488" font-weight="600">group limits &amp; matrix</text>
+<rect x="840" y="725" width="230" height="80" rx="10" fill="#a5d8ff" stroke="#0d9488" stroke-width="2"/>
+<text x="955.0" y="758.2" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#0d9488" font-weight="600">oidc.rs</text>
+<text x="955.0" y="777.0" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#0d9488" font-weight="600">JWT mint + JWKS endpoint</text>
+<rect x="1095" y="725" width="230" height="80" rx="10" fill="#a5d8ff" stroke="#0d9488" stroke-width="2"/>
+<text x="1210.0" y="758.2" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#0d9488" font-weight="600">events/ (16+ handlers)</text>
+<text x="1210.0" y="777.0" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#0d9488" font-weight="600">push / dispatch / label</text>
+<path d="M 250.0,215.0 L 290.0,215.0 L 290.0,140.0 L 955.0,140.0 L 955.0,165.0" stroke="#1e1e1e" stroke-width="2" marker-end="url(#ah-dark)" fill="none"/>
+<rect x="225.2" y="166.5" width="129.6" height="20.0" rx="4" fill="#ffffff" fill-opacity="0.9" stroke="#e0e0e0" stroke-width="0.5"/>
+<text x="290.0" y="182.4" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#1e1e1e" font-weight="600">poll / acquire</text>
+<path d="M 250.0,335.0 L 290.0,335.0 L 290.0,140.0 L 1210.0,140.0 L 1210.0,165.0" stroke="#1e1e1e" stroke-width="2" marker-end="url(#ah-dark)" fill="none"/>
+<rect x="225.2" y="226.5" width="129.6" height="20.0" rx="4" fill="#ffffff" fill-opacity="0.9" stroke="#e0e0e0" stroke-width="0.5"/>
+<text x="290.0" y="242.4" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#1e1e1e" font-weight="600">webhook events</text>
+<path d="M 250.0,455.0 L 290.0,455.0 L 290.0,140.0 L 700.0,140.0 L 700.0,165.0" stroke="#1e1e1e" stroke-width="2" marker-end="url(#ah-dark)" fill="none"/>
+<rect x="221.0" y="286.5" width="138.0" height="20.0" rx="4" fill="#ffffff" fill-opacity="0.9" stroke="#e0e0e0" stroke-width="0.5"/>
+<text x="290.0" y="302.4" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#1e1e1e" font-weight="600">workflow submit</text>
+<path d="M 700.0,245.0 L 700.0,260.0 L 410.0,260.0 L 410.0,445.0" stroke="#15803d" stroke-width="2" marker-end="url(#ah-green)" fill="none"/>
+<rect x="507.0" y="249.0" width="96.0" height="20.0" rx="4" fill="#ffffff" fill-opacity="0.9" stroke="#e0e0e0" stroke-width="0.5"/>
+<text x="555.0" y="264.9" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#15803d" font-weight="600">submit run</text>
+<path d="M 840.0,245.0 L 825.0,245.0 L 825.0,445.0 L 955.0,445.0" stroke="#15803d" stroke-width="2" marker-end="url(#ah-green)" fill="none"/>
+<rect x="768.6" y="334.0" width="112.8" height="20.0" rx="4" fill="#ffffff" fill-opacity="0.9" stroke="#e0e0e0" stroke-width="0.5"/>
+<text x="825.0" y="349.9" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#15803d" font-weight="600">open session</text>
+<path d="M 1210.0,245.0 L 1210.0,445.0" stroke="#15803d" stroke-width="2" marker-end="url(#ah-green)" fill="none"/>
+<rect x="1157.8" y="334.0" width="104.4" height="20.0" rx="4" fill="#ffffff" fill-opacity="0.9" stroke="#e0e0e0" stroke-width="0.5"/>
+<text x="1210.0" y="349.9" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#15803d" font-weight="600">stream logs</text>
+<path d="M 560.0,485.0 L 585.0,485.0" stroke="#b45309" stroke-width="2" marker-end="url(#ah-orange)" fill="none"/>
+<rect x="537.1" y="474.0" width="70.8" height="20.0" rx="4" fill="#ffffff" fill-opacity="0.9" stroke="#e0e0e0" stroke-width="0.5"/>
+<text x="572.5" y="489.9" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#b45309" font-weight="600">enqueue</text>
+<path d="M 815.0,485.0 L 840.0,485.0" stroke="#b45309" stroke-width="2" marker-end="url(#ah-orange)" fill="none"/>
+<rect x="787.9" y="474.0" width="79.2" height="20.0" rx="4" fill="#ffffff" fill-opacity="0.9" stroke="#e0e0e0" stroke-width="0.5"/>
+<text x="827.5" y="489.9" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#b45309" font-weight="600">dispatch</text>
+<path d="M 1070.0,485.0 L 1095.0,485.0" stroke="#b45309" stroke-width="2" marker-end="url(#ah-orange)" fill="none"/>
+<rect x="1063.9" y="474.0" width="37.2" height="20.0" rx="4" fill="#ffffff" fill-opacity="0.9" stroke="#e0e0e0" stroke-width="0.5"/>
+<text x="1082.5" y="489.9" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#b45309" font-weight="600">log</text>
+<path d="M 445.0,725.0 L 365.0,725.0 L 365.0,525.0 L 445.0,525.0" stroke="#0f766e" stroke-width="2" marker-end="url(#ah-darkteal)" fill="none"/>
+<rect x="329.6" y="614.0" width="70.8" height="20.0" rx="4" fill="#ffffff" fill-opacity="0.9" stroke="#e0e0e0" stroke-width="0.5"/>
+<text x="365.0" y="629.9" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#0f766e" font-weight="600">trigger</text>
+<path d="M 700.0,725.0 L 780.0,725.0 L 780.0,525.0 L 700.0,525.0" stroke="#0f766e" stroke-width="2" marker-end="url(#ah-darkteal)" fill="none"/>
+<rect x="706.8" y="614.0" width="146.4" height="20.0" rx="4" fill="#ffffff" fill-opacity="0.9" stroke="#e0e0e0" stroke-width="0.5"/>
+<text x="780.0" y="629.9" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#0f766e" font-weight="600">concurrency gate</text>
+<path d="M 955.0,725.0 L 820.0,725.0 L 820.0,525.0 L 840.0,525.0" stroke="#0f766e" stroke-width="2" marker-end="url(#ah-darkteal)" fill="none"/>
+<rect x="767.8" y="614.0" width="104.4" height="20.0" rx="4" fill="#ffffff" fill-opacity="0.9" stroke="#e0e0e0" stroke-width="0.5"/>
+<text x="820.0" y="629.9" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#0f766e" font-weight="600">mint tokens</text>
+</svg>

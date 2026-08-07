@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Aksh WebSocket Live Log Flow</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #0f172a;
+            color: #e2e8f0;
+        }
+        pre, code {
+            font-family: 'Fira Code', monospace;
+        }
+        .flow-card {
+            background-color: #1e293b;
+            border: 1px solid #334155;
+            transition: all 0.2s ease-in-out;
+        }
+        .flow-card:hover {
+            border-color: #3b82f6;
+            transform: translateY(-2px);
+            box-shadow: 0 10px 15px -3px rgba(59, 130, 246, 0.1), 0 4px 6px -4px rgba(59, 130, 246, 0.1);
+        }
+        .arrow-line {
+            stroke: #475569;
+            stroke-dasharray: 5;
+            animation: dash 2s linear infinite;
+        }
+        @keyframes dash {
+            to {
+                stroke-dashoffset: -20;
+            }
+        }
+    </style>
+</head>
+<body class="p-6 md:p-12 max-w-6xl mx-auto">
+    <header class="mb-12 border-b border-slate-800 pb-8">
+        <div class="flex items-center space-x-3 mb-2">
+            <span class="px-3 py-1 text-xs font-semibold bg-blue-500/10 text-blue-400 rounded-full border border-blue-500/20">System Architecture</span>
+            <span class="text-slate-500">•</span>
+            <span class="text-slate-400 text-sm">Sophomore CS/EE Guide</span>
+        </div>
+        <h1 class="text-4xl font-extrabold text-white tracking-tight mb-4">
+            WebSocket Live Log Pipeline
+        </h1>
+        <p class="text-slate-400 text-lg max-w-3xl">
+            A walkthrough of how <code class="text-blue-400 font-semibold bg-slate-900 px-1.5 py-0.5 rounded">aksh-runner</code> pipes live execution output through the control plane to native subscribers using the Database WAL Replication analogy.
+        </p>
+    </header>
+
+    <main class="space-y-16">
+        <!-- Interactive Analogy Toggle -->
+        <section class="bg-slate-900/50 border border-slate-800 rounded-xl p-6">
+            <h2 class="text-xl font-bold text-white mb-4 flex items-center">
+                <span class="mr-2">💡</span> The Core Mental Model: DB WAL Replication
+            </h2>
+            <p class="text-slate-400 mb-6">
+                Think of the live log pipeline as a <strong>database replication system</strong>. Below is the mapping from classic DB concepts to our real code components:
+            </p>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+                <div class="p-4 rounded-lg bg-slate-800/40 border border-slate-700/50">
+                    <h3 class="font-bold text-blue-400 mb-2">1. The WAL Producer</h3>
+                    <p class="text-sm text-slate-400 mb-3">In a database, transactions generate mutation logs which are written to a local memory buffer before syncing to disk.</p>
+                    <div class="text-xs bg-slate-950 p-2 rounded text-slate-300">
+                        <span class="text-emerald-400">Real Code:</span> <code class="text-blue-300">process::invoke</code> capturing output -> enqueuing into <code class="text-blue-300">LiveLogQueue</code>.
+                    </div>
+                </div>
+                <div class="p-4 rounded-lg bg-slate-800/40 border border-slate-700/50">
+                    <h3 class="font-bold text-blue-400 mb-2">2. The Replication Primary</h3>
+                    <p class="text-sm text-slate-400 mb-3">The primary server receives transaction streams, appends them to its local log book, and broadcasts them to replicas.</p>
+                    <div class="text-xs bg-slate-950 p-2 rounded text-slate-300">
+                        <span class="text-emerald-400">Real Code:</span> <code class="text-blue-300">ws_live_logs</code> endpoint storing lines in per-job Arc-Mutex <code class="text-blue-300">live_log_lines</code> and broadcasting via <code class="text-blue-300">live_log_tx</code>.
+                    </div>
+                </div>
+                <div class="p-4 rounded-lg bg-slate-800/40 border border-slate-700/50">
+                    <h3 class="font-bold text-blue-400 mb-2">3. The Read Replicas</h3>
+                    <p class="text-sm text-slate-400 mb-3">Replicas connect, fetch the historical log snapshot to catch up, then subscribe to the live update feed.</p>
+                    <div class="text-xs bg-slate-950 p-2 rounded text-slate-300">
+                        <span class="text-emerald-400">Real Code:</span> UI connecting to <code class="text-blue-300">live_logs_sse</code>, playing the cached snapshot, then forwarding the broadcast stream.
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Pipeline Diagram -->
+        <section>
+            <h2 class="text-2xl font-bold text-white mb-6">Visual Pipeline Flow</h2>
+            <div class="p-6 bg-slate-900 border border-slate-800 rounded-xl flex flex-col items-center">
+                <svg viewBox="0 0 1000 300" class="w-full h-auto max-w-4xl">
+                    <!-- Runner Box -->
+                    <rect x="20" y="30" width="260" height="240" rx="8" fill="#1e293b" stroke="#475569" stroke-width="2"/>
+                    <text x="150" y="55" fill="#f8fafc" font-size="14" font-weight="bold" text-anchor="middle">aksh-runner (Producer)</text>
+                    
+                    <!-- Process Output -->
+                    <rect x="40" y="80" width="220" height="40" rx="4" fill="#0f172a" stroke="#334155"/>
+                    <text x="150" y="105" fill="#94a3b8" font-size="12" text-anchor="middle">Process stdout/stderr</text>
+                    
+                    <!-- Queue -->
+                    <rect x="40" y="140" width="220" height="40" rx="4" fill="#0f172a" stroke="#334155"/>
+                    <text x="150" y="165" fill="#94a3b8" font-size="12" text-anchor="middle">LiveLogQueue & Masking</text>
+
+                    <!-- Connection -->
+                    <rect x="40" y="200" width="220" height="40" rx="4" fill="#1e3a8a" stroke="#2563eb"/>
+                    <text x="150" y="225" fill="#3b82f6" font-size="12" font-weight="bold" text-anchor="middle">WebSocket Sender</text>
+
+                    <!-- WebSocket arrow -->
+                    <path d="M 280 220 L 440 220" fill="none" stroke="#3b82f6" stroke-width="3" class="arrow-line"/>
+                    <text x="360" y="210" fill="#3b82f6" font-size="11" text-anchor="middle">ws:// / wss://</text>
+                    <text x="360" y="238" fill="#64748b" font-size="10" text-anchor="middle">FeedStreamUrl</text>
+
+                    <!-- Server Box -->
+                    <rect x="460" y="30" width="260" height="240" rx="8" fill="#1e293b" stroke="#475569" stroke-width="2"/>
+                    <text x="590" y="55" fill="#f8fafc" font-size="14" font-weight="bold" text-anchor="middle">aksh-runner-server (Primary)</text>
+
+                    <!-- Ingest WS Endpoint -->
+                    <rect x="480" y="200" width="220" height="40" rx="4" fill="#1e3b8a" stroke="#2563eb"/>
+                    <text x="590" y="225" fill="#3b82f6" font-size="12" font-weight="bold" text-anchor="middle">ws_live_logs Endpoint</text>
+
+                    <!-- In-memory WAL -->
+                    <rect x="480" y="80" width="220" height="40" rx="4" fill="#0f172a" stroke="#334155"/>
+                    <text x="590" y="105" fill="#e2e8f0" font-size="12" text-anchor="middle">live_log_lines (Snapshot)</text>
+
+                    <!-- Broadcast Sender -->
+                    <rect x="480" y="140" width="220" height="40" rx="4" fill="#312e81" stroke="#4f46e5"/>
+                    <text x="590" y="165" fill="#818cf8" font-size="12" text-anchor="middle">live_log_tx (Broadcast)</text>
+
+                    <!-- SSE Arrow -->
+                    <path d="M 720 120 L 860 120" fill="none" stroke="#818cf8" stroke-width="3" class="arrow-line"/>
+                    <text x="790" y="110" fill="#818cf8" font-size="11" text-anchor="middle">SSE Stream</text>
+                    <text x="790" y="138" fill="#64748b" font-size="10" text-anchor="middle">Snapshot + Live</text>
+
+                    <!-- Subscriber Box -->
+                    <rect x="880" y="80" width="100" height="80" rx="8" fill="#312e81" stroke="#4f46e5" stroke-width="2"/>
+                    <text x="930" y="115" fill="#f8fafc" font-size="13" font-weight="bold" text-anchor="middle">Native UI</text>
+                    <text x="930" y="135" fill="#a5b4fc" font-size="11" text-anchor="middle">(Client)</text>
+                </svg>
+            </div>
+        </section>
+
+        <!-- The Code Walkthrough -->
+        <section class="grid grid-cols-1 md:grid-cols-2 gap-12">
+            <!-- Left Side: Runner Logic -->
+            <div>
+                <h2 class="text-2xl font-bold text-white mb-6 flex items-center">
+                    <span class="mr-2">🚀</span> Runner Pipeline
+                </h2>
+                <div class="space-y-6">
+                    <div class="flow-card p-6 rounded-xl">
+                        <div class="flex items-center justify-between mb-3">
+                            <h3 class="font-bold text-white text-lg">1. Intercepting Output</h3>
+                            <span class="text-xs bg-slate-900 px-2 py-1 rounded text-slate-400">process.rs</span>
+                        </div>
+                        <p class="text-slate-400 text-sm mb-3">
+                            Process invocations yield stdout/stderr lines asynchronously. Instead of storing them locally first, we attach a callback constructed via <code class="text-blue-400 font-semibold bg-slate-950 px-1 py-0.5 rounded text-xs">live_logs::process_line_callback</code>.
+                        </p>
+                    </div>
+
+                    <div class="flow-card p-6 rounded-xl">
+                        <div class="flex items-center justify-between mb-3">
+                            <h3 class="font-bold text-white text-lg">2. Bounded Local Buffer</h3>
+                            <span class="text-xs bg-slate-900 px-2 py-1 rounded text-slate-400">live_logs.rs</span>
+                        </div>
+                        <p class="text-slate-400 text-sm mb-3">
+                            Lines pass through secret masking and are enqueued into <code class="text-blue-400 font-semibold bg-slate-950 px-1 py-0.5 rounded text-xs">LiveLogQueue</code>. 
+                            To prevent memory allocation runaway, the queue acts as a <strong>bounded ring buffer</strong>. If it exceeds <code class="text-slate-300">1024</code> queued lines, new lines are dropped to prevent memory exhaustion.
+                        </p>
+                    </div>
+
+                    <div class="flow-card p-6 rounded-xl">
+                        <div class="flex items-center justify-between mb-3">
+                            <h3 class="font-bold text-white text-lg">3. Ephemeral WS Sender</h3>
+                            <span class="text-xs bg-slate-900 px-2 py-1 rounded text-slate-400">live_logs.rs</span>
+                        </div>
+                        <p class="text-slate-400 text-sm mb-3">
+                            A background loop polls the queue and aggregates lines into batches (max <code class="text-slate-300">100</code> lines or <code class="text-slate-300">250ms</code> timeout). 
+                            If the server endpoint falls over, the WS sender retries up to <code class="text-slate-300">3</code> times, dropping the connection permanently if failure rate exceeds 50%. This guarantees live logs never block the core execution.
+                        </p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Side: Server Logic -->
+            <div>
+                <h2 class="text-2xl font-bold text-white mb-6 flex items-center">
+                    <span class="mr-2">🖥️</span> Server Pipeline
+                </h2>
+                <div class="space-y-6">
+                    <div class="flow-card p-6 rounded-xl">
+                        <div class="flex items-center justify-between mb-3">
+                            <h3 class="font-bold text-white text-lg">1. Authenticated Ingest</h3>
+                            <span class="text-xs bg-slate-900 px-2 py-1 rounded text-slate-400">lib.rs</span>
+                        </div>
+                        <p class="text-slate-400 text-sm mb-3">
+                            The runner performs a WebSocket upgrade handshake at <code class="text-blue-400 font-semibold bg-slate-950 px-1 py-0.5 rounded text-xs">/ws/live-logs/:job_id</code>. Axum's middleware validates the bearer token <code class="text-slate-300">aksh-system-token</code> before upgrading the connection.
+                        </p>
+                    </div>
+
+                    <div class="flow-card p-6 rounded-xl">
+                        <div class="flex items-center justify-between mb-3">
+                            <h3 class="font-bold text-white text-lg">2. Thread-Safe WAL & Dispatcher</h3>
+                            <span class="text-xs bg-slate-900 px-2 py-1 rounded text-slate-400">lib.rs</span>
+                        </div>
+                        <p class="text-slate-400 text-sm mb-3">
+                            Incoming WS text frames are parsed as <code class="text-blue-400 font-semibold bg-slate-950 px-1 py-0.5 rounded text-xs">LiveLogFeedLinesWrapper</code>.
+                            The server locks a job-specific <code class="text-slate-300">Arc&lt;Mutex&lt;Vec&lt;...&gt;&gt;&gt;</code>, appends the lines (the WAL snapshot), and sends them to a tokio broadcast sender.
+                        </p>
+                    </div>
+
+                    <div class="flow-card p-6 rounded-xl">
+                        <div class="flex items-center justify-between mb-3">
+                            <h3 class="font-bold text-white text-lg">3. Replaying to Replicas (SSE)</h3>
+                            <span class="text-xs bg-slate-900 px-2 py-1 rounded text-slate-400">lib.rs</span>
+                        </div>
+                        <p class="text-slate-400 text-sm mb-3">
+                            When a client hits the Server-Sent Events endpoint, we clone the historical log snapshot from the per-job Mutex, stream it immediately, and then chain the receiver stream. This ensures the client catches up seamlessly without races or duplicate lines.
+                        </p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Divergence Section -->
+        <section class="bg-red-950/20 border border-red-900/30 rounded-xl p-8">
+            <h2 class="text-2xl font-bold text-red-400 mb-4">Where the Database WAL Analogy Diverges</h2>
+            <ul class="space-y-4 text-slate-400 text-sm list-disc pl-5">
+                <li>
+                    <strong class="text-slate-200">Best-Effort vs Strong Durability:</strong> In a real database, transaction logs must survive crashes. Live streaming logs are intentionally ephemeral: if a runner loses connection, it will drop live frames rather than backing up local memory or blocking execution. The durable source of truth is still the full step-log blob uploaded to the store at the end of each step.
+                </li>
+                <li>
+                    <strong class="text-slate-200">Replication Lag Drops:</strong> In database replication, replicas wait or apply backpressure if they lag. If our SSE client lags behind the <code class="text-slate-300">1024</code> channel buffer capacity, the stream is closed or drops events. This keeps server memory footprint strictly bound.
+                </li>
+                <li>
+                    <strong class="text-slate-200">Short-Lived WAL:</strong> A database retains WAL logs for recovery or backup. The server evicts all memory-buffered live log lines as soon as `completejob` runs, keeping heap memory free.
+                </li>
+            </ul>
+        </section>
+    </main>
+
+    <footer class="mt-16 pt-8 border-t border-slate-800 text-center text-slate-500 text-xs">
+        Aksh Runner System Architecture Docs • preloopdev/aksh
+    </footer>
+</body>
+</html>
