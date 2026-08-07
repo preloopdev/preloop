@@ -12,6 +12,23 @@ It speaks the official `actions/runner` protocol, so you can use the official ru
 
 Runs on macOS, Linux, and Windows.
 
+## License
+
+Two licenses, one project:
+
+- **Everything except the control plane is MIT** — the CLI, the Rust runner,
+  the parser/expression/protocol crates, the VM orchestrator, and the docs.
+- **The control plane (`preloop serve` / `preloop-runner-server`) is
+  FSL-1.1-MIT** — source-available. You may use, modify, and redistribute it
+  for any non-competing purpose (internal CI, commercial products, forks),
+  and it converts to MIT on the second anniversary of each release. What
+  "non-competing" means: you can't offer it as a hosted CI *service* that
+  competes with preloop's own offering.
+
+Full terms: `crates/preloop-runner-server/LICENSE` (FSL-1.1-MIT) and MIT for
+the rest. If that split doesn't work for you, the FSL clause is time-boxed —
+the server becomes MIT two years after its release date.
+
 ## Quick start
 
 ```sh
@@ -48,13 +65,6 @@ Setup, GitHub App and PAT credentials, secrets, config file, and the troubleshoo
 ## Requirements
 
 macOS (Apple Silicon) or Linux, 64-bit, Rust 1.97+, and [smolvm] for the default VM runner pool. `preloop runner` works without smolvm. Postgres is optional.
-
-## License
-
-MIT for all crates except the control plane (`preloop-runner-server`), which is
-licensed under FSL-1.1-MIT (`crates/preloop-runner-server/LICENSE`):
-source-available (you may use, modify, and redistribute it for any
-non-competing purpose), converting to MIT on the second anniversary of each release.
 
 ## Credits
 
