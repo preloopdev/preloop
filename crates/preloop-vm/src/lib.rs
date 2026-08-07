@@ -808,13 +808,9 @@ impl VmProvider for SmolVmProvider {
                 args.push(proxy.into());
             }
         }
-        self.exclusive_with_staging(
-            "pack",
-            &args,
-            staging_dir,
-        )
-        .await
-        .map(|_| ())
+        self.exclusive_with_staging("pack", &args, staging_dir)
+            .await
+            .map(|_| ())
     }
 }
 
