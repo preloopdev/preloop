@@ -612,7 +612,7 @@ pub struct RunnerPoolConfig {
     /// provisioning stay root; only the runner process drops privileges.
     /// `Some("root")` restores the old behavior; None disables switching.
     pub runner_user: Option<String>,
-    /// UID for [`RunnerPoolConfig::runner_user`] (default 1000, matching the
+    /// UID for [`RunnerPoolConfig::runner_user`] (default 1001, matching the
     /// hosted `runner` account).
     pub runner_uid: Option<u32>,
     pub next_job_runs_on: Option<Arc<std::sync::RwLock<Vec<String>>>>,
@@ -2232,7 +2232,7 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
     if user == "root" {
         return argv.to_vec();
     }
-    let uid = config.runner_uid.unwrap_or(1000);
+    let uid = config.runner_uid.unwrap_or(1001);
     let home = format!("/home/{user}");
     let program = shell_quote(&argv[0]);
     let args = argv[1..]
@@ -2492,7 +2492,7 @@ chmod +x "$destination/bin/node"
     fn runner_user_wrapper_drops_privileges_and_creates_the_account() {
         let mut config = test_config(false);
         config.runner_user = Some("runner".to_owned());
-        config.runner_uid = Some(1000);
+        config.runner_uid = Some(1001);
         let argv = vec![
             "/opt/preloop/bin/preloop-runner".to_owned(),
             "run".to_owned(),
@@ -2503,17 +2503,17 @@ chmod +x "$destination/bin/node"
         assert_eq!(wrapped[0], "sh");
         assert_eq!(wrapped[1], "-c");
         let script = &wrapped[2];
-        assert!(script.contains("useradd -m -u 1000 runner"), "{script}");
+        assert!(script.contains("useradd -m -u 1001 runner"), "{script}");
         assert!(
             script.contains("chmod 777 /run/preloop-control"),
             "{script}"
         );
         assert!(
-            script.contains("setpriv --reuid 1000 --regid 1000 --init-groups --clear-groups"),
+            script.contains("setpriv --reuid 1001 --regid 1001 --init-groups --clear-groups"),
             "{script}"
         );
         assert!(
-            script.contains("PRELOOP_RUNNER_USER=runner PRELOOP_RUNNER_UID=1000"),
+            script.contains("PRELOOP_RUNNER_USER=runner PRELOOP_RUNNER_UID=1001"),
             "{script}"
         );
         assert!(

@@ -932,7 +932,7 @@ fn local_runner_pool_config(
         base_image: std::env::var("PRELOOP_RUNNER_BASE_IMAGE")
             .unwrap_or_else(|_| preloop_orchestrator::environment::DEFAULT_BASE_IMAGE.into()),
         // GitHub-hosted parity: guest runners run as a dedicated account
-        // (uid 1000) instead of root, so steps see the hosted user-session
+        // (uid 1001) instead of root, so steps see the hosted user-session
         // contract. PRELOOP_RUNNER_USER=root restores root; an empty value
         // disables switching (runner keeps the guest's root identity).
         runner_user: match std::env::var("PRELOOP_RUNNER_USER") {
@@ -943,7 +943,7 @@ fn local_runner_pool_config(
         runner_uid: std::env::var("PRELOOP_RUNNER_UID")
             .ok()
             .and_then(|value| value.parse().ok())
-            .or(Some(1000)),
+            .or(Some(1001)),
         workspace: Some(workspace),
         artifact_stem: home
             .join("vms")
