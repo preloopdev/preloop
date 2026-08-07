@@ -29,7 +29,7 @@ is how a runner instance is created and destroyed. This is modeled as the
 `RunnerProvider` trait in the orchestrator layer:
 
 - `**Store**` — durable control-plane state: SQLite (default) or Postgres.
-  See [State Model](#state-model).
+See [State Model](#state-model).
 - `**AuthProvider**` — loopback-trust (local) or OAuth + mTLS (server).
 - `**RunnerProvider**` — creates/destroys runners (process, container, libkrun,
 cloud VM, k8s pod, bare BYO). Optional — preloop works with external runners.
@@ -44,8 +44,8 @@ a shared bus. Two servers pointed at one SQLite file or one Postgres database
 still diverge in memory.
 
 - `preloop-runner-server/src/store.rs` — the `Store` trait (async, object-safe:
-  the only surface the rest of the server sees), the SQLite backend, the
-  AEAD envelope, and the snapshot serialization shared by every backend.
+the only surface the rest of the server sees), the SQLite backend, the
+AEAD envelope, and the snapshot serialization shared by every backend.
 - `preloop-runner-server/src/store_pg.rs` — the Postgres backend.
 
 Backends are selected by `--store` / `PRELOOP_STORE_URL` (`sqlite://<path>`, a
@@ -60,8 +60,7 @@ still broadcast (`state.rs::emit`). Cache and artifact payloads stay in
 file-backed stores under `.preloop/`; only control-plane state goes to the
 database.
 
-Known gaps and their tradeoffs are tracked in
-[store-known-issues.md](store-known-issues.md).
+
 
 ## Secrets
 
@@ -69,35 +68,7 @@ Secrets use `SecretString` in `preloop-gha-protocol`. It redacts `Debug`,
 `Display`, and serialized output. Code that needs the raw payload must call
 `expose()` explicitly at a protocol boundary.
 
-## Compatibility Position
-
-As of 2026-06-26, preloop is a proven working control plane for the official `actions/runner`.
-The runner completes the full lifecycle: configure → session → message → execute → complete.
-
-Implemented and verified with the real `Runner.Listener` v2.322.0:
-
-- Full AzDO lifecycle routes (connectionData, AgentPools, Agent, AgentSession, Message,
-AgentRequest, Timeline, Logfiles, FinishJob, ActionDownloadInfo)
-- GitHub-compatible registration (`/api/v3/actions/runner-registration` with `RemoteAuth`)
-- GHES org-prefix routing (`/:org/_apis/...` for all lifecycle endpoints)
-- AES session key exchange (unencrypted mode — RSA wrapping planned)
-- Encrypted `TaskAgentMessage` delivery with message ack
-- Full `AgentJobRequestMessage` with plan, requestId, system context, steps
-- `needs` DAG scheduling with dependency-gated dispatch and outputs propagation
-- Trigger matching (branches/tags/paths/types/schedule/workflow_dispatch)
-- Matrix expansion with IndexMap order preservation and GitHub name format
-- Expression evaluation wired into job builder
-- `fail-fast` / `max-parallel` matrix strategy support
-
-Known limitations:
-
-- Worker reports job as "Failed" (timeline/log endpoint fidelity gap)
-- Session AES key sent unencrypted (RSA-OAEP wrapping of runner's public key TODO)
-- Cache/artifact endpoints are in-memory stubs; v2 blob protocols not implemented
-- Conformance harness needs golden tests, fuzz targets, wire capture/replay
-- Expression engine lacks bracket access, object-filter, format escaping
-
-## Module Map (post-Plans 012–017)
+## Module Map 
 
 ### `preloop-gha-protocol/src/`
 
