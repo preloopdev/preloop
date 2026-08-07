@@ -14,7 +14,7 @@
 //! of the server sees, so a new database plugs in without touching callers.
 
 use super::*;
-use aksh_gha_protocol::{SecretMap, SessionId};
+use aksh_gha_protocol::SessionId;
 use async_trait::async_trait;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use sha2::Digest;
@@ -239,8 +239,14 @@ pub(crate) struct MetaSnapshot {
     jobset_admissions: Vec<(JobSetId, JobSetAdmission)>,
     run_concurrency: Vec<(RunId, aksh_gha_parser::Concurrency)>,
     holder_keys: Vec<(RunId, Vec<(String, String)>)>,
-    #[serde(default)]
-    pending_caches: Vec<(i64, PendingCache)>,
+    // `pending_caches` is deliberately absent. `PendingCache` owns the whole
+    // in-flight upload payload (`bytes: Vec<u8>`), and every field in this
+    // struct is cloned, JSON-serialized and AES-sealed on *every*
+    // `store_meta_only` call. Persisting it made `cache_upload` quadratic in
+    // total cache size — measured 75 ms per accumulated MiB per chunk, with
+    // the global state lock held throughout. An interrupted upload now 404s
+    // on commit and the runner re-uploads next run, which is what
+    // `actions/cache` already expects.
     #[serde(default)]
     artifacts: Vec<(String, ArtifactRecord)>,
     #[serde(default)]
@@ -443,11 +449,6 @@ pub(crate) fn build_meta_snapshot(inner: &InnerState) -> MetaSnapshot {
             .iter()
             .map(|(run_id, keys)| (*run_id, keys.clone()))
             .collect(),
-        pending_caches: inner
-            .pending_caches
-            .iter()
-            .map(|(id, cache)| (*id, cache.clone()))
-            .collect(),
         artifacts: inner
             .artifacts
             .iter()
@@ -543,7 +544,6 @@ pub(crate) fn apply_meta_snapshot(inner: &mut InnerState, meta: MetaSnapshot) {
     inner.jobset_admissions = meta.jobset_admissions.into_iter().collect();
     inner.run_concurrency = meta.run_concurrency.into_iter().collect();
     inner.holder_keys = meta.holder_keys.into_iter().collect();
-    inner.pending_caches = meta.pending_caches.into_iter().collect();
     inner.artifacts = meta.artifacts.into_iter().collect();
     inner.log_metadata = meta.log_metadata.into_iter().collect();
     inner.timeline_events = meta.timeline_events.into_iter().collect();
@@ -559,6 +559,7 @@ pub(crate) fn apply_meta_snapshot(inner: &mut InnerState, meta: MetaSnapshot) {
     inner.artifact_v2_registry = meta.artifact_v2_registry.into_iter().collect();
     inner.github_token_requests = meta.github_token_requests.into_iter().collect();
     inner.cancellation_queue = meta.cancellation_queue;
+    inner.broker_messages = meta.broker_messages.into_iter().collect();
     inner.session_active_requests = meta.session_active_requests.into_iter().collect();
 }
 
@@ -651,20 +652,8 @@ impl SqliteStore {
             .query_map([], |row| row.get::<_, Vec<u8>>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         for blob in runs {
-            let mut run = restore_run_record(&self.cipher, &blob)?;
+            let run = restore_run_record(&self.cipher, &blob)?;
             let run_id = run.run_id;
-            if let Some(secret_blob) = connection
-                .query_row(
-                    "SELECT secret_blob FROM run_secrets WHERE run_id = ?1",
-                    [run_id.to_string()],
-                    |row| row.get::<_, Vec<u8>>(0),
-                )
-                .optional()?
-            {
-                let secrets: SecretMap =
-                    serde_json::from_slice(&self.cipher.unseal(&secret_blob)?)?;
-                Arc::make_mut(&mut run.submission).secrets = secrets;
-            }
             inner.runs.insert(run_id, run);
         }
 
@@ -809,10 +798,35 @@ impl SqliteStore {
             let (session_id, request_id) = row?;
             inner.session_active_requests.insert(session_id, request_id);
         }
-        // Restore per-session broker message queues (dequeued but not delivered).
-        // `broker_messages` in the in-memory state is keyed by request_id and
-        // lives in the meta snapshot; `inflight_messages` (per-session) is
-        // also restored from the same snapshot below.
+        // Restore per-session broker message queues (dequeued but not yet
+        // delivered to the runner) from the `broker_messages` table that
+        // `store_inner` writes. `inner.broker_messages` (keyed by request_id)
+        // is a separate map and comes back with the meta snapshot below.
+        let mut inflight_stmt = connection.prepare(
+            "SELECT session_id, message_id, payload_json FROM broker_messages
+             ORDER BY session_id, message_id",
+        )?;
+        for row in inflight_stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })? {
+            let (session_id, message_id, payload_json) = row?;
+            match serde_json::from_str::<azdo::TaskAgentMessage>(&payload_json) {
+                Ok(message) => {
+                    inner
+                        .inflight_messages
+                        .entry(session_id)
+                        .or_default()
+                        .insert(message_id, message);
+                }
+                Err(error) => {
+                    tracing::warn!(%session_id, message_id, %error, "dropping undecodable broker message");
+                }
+            }
+        }
         let mut request_stmt =
             connection.prepare("SELECT request_id, request_blob FROM job_requests")?;
         for row in request_stmt.query_map([], |row| {
@@ -945,7 +959,6 @@ impl SqliteStore {
         for table in [
             "broker_messages",
             "session_active_requests",
-            "run_secrets",
             "job_requests",
             "job_dependencies",
             "jobs",
@@ -986,33 +999,10 @@ impl SqliteStore {
                     sealed_run,
                 ],
             )?;
-            let secrets = serde_json::to_vec(&run.submission.secrets)?;
-            tx.execute(
-                "INSERT INTO run_secrets(run_id, secret_blob) VALUES (?1, ?2)",
-                params![run.run_id.to_string(), self.cipher.seal(&secrets)?],
-            )?;
         }
 
-        let mut position = 0i64;
-        for (kind, jobs) in [
-            ("ready", inner.queue.iter().collect::<Vec<_>>()),
-            ("pending", inner.pending_jobs.iter().collect::<Vec<_>>()),
-            (
-                "blocked",
-                inner.concurrency_blocked.iter().collect::<Vec<_>>(),
-            ),
-        ] {
-            for job in jobs {
-                self.insert_job(&tx, job, kind, position)?;
-                position += 1;
-            }
-        }
-        for (run_id, jobs) in &inner.held_runs {
-            for job in jobs {
-                self.insert_job(&tx, job, "held", position)?;
-                position += 1;
-            }
-            let _ = run_id;
+        for (kind, job, position) in queue_rows(inner) {
+            self.insert_job(&tx, job, kind, position)?;
         }
 
         for runner in inner.runners.values() {
@@ -1184,43 +1174,8 @@ impl SqliteStore {
         };
         self.store_run_tx(&tx, run)?;
         tx.execute("DELETE FROM jobs WHERE run_id = ?1", [run_id.to_string()])?;
-        let mut position = 0i64;
-        for (kind, jobs) in [
-            (
-                "ready",
-                inner
-                    .queue
-                    .iter()
-                    .filter(|job| job.run_id == run_id)
-                    .collect::<Vec<_>>(),
-            ),
-            (
-                "pending",
-                inner
-                    .pending_jobs
-                    .iter()
-                    .filter(|job| job.run_id == run_id)
-                    .collect::<Vec<_>>(),
-            ),
-            (
-                "blocked",
-                inner
-                    .concurrency_blocked
-                    .iter()
-                    .filter(|job| job.run_id == run_id)
-                    .collect::<Vec<_>>(),
-            ),
-        ] {
-            for job in jobs {
-                self.insert_job(&tx, job, kind, position)?;
-                position += 1;
-            }
-        }
-        if let Some(jobs) = inner.held_runs.get(&run_id) {
-            for job in jobs {
-                self.insert_job(&tx, job, "held", position)?;
-                position += 1;
-            }
+        for (kind, job, position) in queue_rows_for_run(inner, run_id) {
+            self.insert_job(&tx, job, kind, position)?;
         }
         tx.execute(
             "DELETE FROM job_requests WHERE run_id = ?1",
@@ -1295,15 +1250,6 @@ impl SqliteStore {
                 unix_us(run.created_at),
                 run.completed_at.map(unix_us),
                 self.cipher.seal(&serde_json::to_vec(&value)?)?,
-            ],
-        )?;
-        tx.execute(
-            "INSERT INTO run_secrets(run_id, secret_blob) VALUES (?1, ?2)
-             ON CONFLICT(run_id) DO UPDATE SET secret_blob = excluded.secret_blob",
-            params![
-                run.run_id.to_string(),
-                self.cipher
-                    .seal(&serde_json::to_vec(&run.submission.secrets)?)?
             ],
         )?;
         Ok(())
@@ -1464,10 +1410,11 @@ impl Store for SqliteStore {
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct SessionKeyPayload(Vec<u8>);
 
-const MIGRATIONS: &[(u32, &str, &str)] = &[(
-    1,
-    "initial-control-plane-schema",
-    r#"
+const MIGRATIONS: &[(u32, &str, &str)] = &[
+    (
+        1,
+        "initial-control-plane-schema",
+        r#"
         CREATE TABLE IF NOT EXISTS workflow_run_counters (
           repository_key TEXT NOT NULL,
           workflow_path TEXT NOT NULL,
@@ -1622,7 +1569,20 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[(
           written_at_us INTEGER NOT NULL
         ) STRICT;
         "#,
-)];
+    ),
+    (
+        2,
+        "drop-redundant-run-secrets",
+        // `runs.record_blob` already carries the submission through
+        // `WorkflowSubmission::to_request_json`, which is the sanctioned
+        // expose boundary. This table held a second copy written with the
+        // plain `Serialize` impl, i.e. the literal `"<redacted>"`, and
+        // `load_into` clobbered the good copy with it.
+        r#"
+        DROP TABLE IF EXISTS run_secrets;
+        "#,
+    ),
+];
 
 pub(crate) fn now_us() -> i64 {
     SystemTime::now()
@@ -1646,6 +1606,55 @@ fn system_time_us(value: SystemTime) -> i64 {
 
 fn system_time_from_us(value: i64) -> SystemTime {
     UNIX_EPOCH + Duration::from_micros(value.max(0) as u64)
+}
+
+/// Every queued job paired with its `queue_kind` and a **globally** assigned
+/// `queue_position` within that kind.
+///
+/// Restore reads `ORDER BY queue_kind, queue_position` and pushes into the
+/// matching container, so positions only have to be consistent *within* a
+/// kind — but they must be consistent across writers. `store_inner` rewrites
+/// every row while `store_run_event` rewrites one run's rows, so both derive
+/// the position from the same global index instead of numbering from zero
+/// per run. Numbering per run made every run's first job `position = 0`,
+/// which collapsed cross-run FIFO order on the next restart.
+///
+/// The queues are FIFO (push-back / pop-front), so a stale absolute index
+/// left behind by another run's write still orders correctly relative to
+/// later writes: popping the front shifts everyone down uniformly and
+/// pushing to the back always yields a larger index than anything present.
+pub(crate) fn queue_rows(inner: &InnerState) -> Vec<(&'static str, &QueuedJob, i64)> {
+    let mut rows = Vec::new();
+    for (kind, jobs) in [
+        ("ready", &inner.queue),
+        ("pending", &inner.pending_jobs),
+        ("blocked", &inner.concurrency_blocked),
+    ] {
+        rows.extend(
+            jobs.iter()
+                .enumerate()
+                .map(|(index, job)| (kind, job, index as i64)),
+        );
+    }
+    rows.extend(
+        inner
+            .held_runs
+            .values()
+            .flatten()
+            .enumerate()
+            .map(|(index, job)| ("held", job, index as i64)),
+    );
+    rows
+}
+
+/// [`queue_rows`] restricted to one run, keeping the global positions.
+pub(crate) fn queue_rows_for_run(
+    inner: &InnerState,
+    run_id: RunId,
+) -> Vec<(&'static str, &QueuedJob, i64)> {
+    let mut rows = queue_rows(inner);
+    rows.retain(|(_, job, _)| job.run_id == run_id);
+    rows
 }
 
 /// Deduplicate label strings case-insensitively, preserving first occurrence.
