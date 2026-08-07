@@ -75,9 +75,10 @@ The registration manifest requests `checks: write`, `contents: read`, and
 `metadata: read` only — enough for check-run reporting and commit lookups.
 PR creation (`--create-pr`) additionally needs `pull_requests: write`, which
 is deliberately **not** a default: a workflow that never creates PRs should
-not carry PR-write authority. Grant it in the App settings (Permissions →
-Pull requests → Read and write) when you want the feature; the sync endpoint
-then fails PR creation with a 403 that carries the hint.
+not carry PR-write authority. If you want to run CI before creating a pull
+request, grant it in the App settings (Permissions → Pull requests → Read and
+write); the sync endpoint then fails PR creation with a 403 that carries the
+hint.
 
 ## Failure modes
 

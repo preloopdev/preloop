@@ -239,9 +239,9 @@ pub(crate) async fn sync_run_to_github(
                 let mut message = format!("could not create pull request: {error}");
                 if format!("{error}").contains("status 403") {
                     message.push_str(
-                        ". Grant the GitHub App `pull_requests: write` (App settings → \
-                         Permissions → Pull requests → Read and write) to enable PR \
-                         creation; check-run reporting needs only `checks: write`",
+                        ". To run CI before creating a pull request, grant the App \
+                         `pull_requests: write` (App settings → Permissions → \
+                         Pull requests → Read and write)",
                     );
                 }
                 mark_blocked(shared, run_id, message.clone()).await;

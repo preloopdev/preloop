@@ -1103,12 +1103,11 @@ pub(crate) async fn github_register(headers: HeaderMap) -> impl IntoResponse {
         <button type="submit" style="font-size: 16px; padding: 10px 20px; cursor: pointer; background: #2da44e; color: white; border: none; border-radius: 6px; font-weight: bold;">Register App on GitHub</button>
     </form>
     <p style="color: #57606a; font-size: 14px;">
-        The manifest requests <code>checks: write</code> (check-run reporting),
-        <code>contents: read</code>, and <code>metadata: read</code>. If you want
-        submit-driven CI to create pull requests (<code>preloop run --sync
-        --create-pr</code>), also grant the App <code>pull_requests: write</code>
-        after registration: GitHub App settings &rarr; Permissions &rarr;
-        Pull requests &rarr; Read and write.
+        If you want to run CI before creating a pull request
+        (<code>preloop run --sync --create-pr</code>), grant the App
+        <code>pull_requests: write</code>: GitHub App settings &rarr;
+        Permissions &rarr; Pull requests &rarr; Read and write. Check-run
+        reporting works with just <code>checks: write</code>.
     </p>
 </body>
 </html>"#,
