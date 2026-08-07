@@ -6,9 +6,10 @@
 //! store the server injects into trusted jobs.
 
 use crate::preloop_home;
-use aksh_runner_server::config::{load_config, write_config};
+use aksh_runner_server::config::{load_config, store_memory, write_config};
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
@@ -114,12 +115,19 @@ pub enum SecretCommand {
         /// Scope to one repository (owner/repo) instead of global.
         #[arg(long)]
         repo: Option<String>,
+        /// Scope to one environment of `--repo` (requires --repo).
+        /// Mirrors GitHub environment secrets.
+        #[arg(long)]
+        env: Option<String>,
     },
     /// List secret names (never values).
     List {
         /// Only list secrets scoped to this repository (owner/repo).
         #[arg(long)]
         repo: Option<String>,
+        /// Only list secrets scoped to this environment (requires --repo).
+        #[arg(long)]
+        env: Option<String>,
     },
     /// Remove a secret.
     Rm {
@@ -128,6 +136,9 @@ pub enum SecretCommand {
         /// Remove from this repository scope (owner/repo) instead of global.
         #[arg(long)]
         repo: Option<String>,
+        /// Remove from this environment scope (requires --repo).
+        #[arg(long)]
+        env: Option<String>,
     },
 }
 
@@ -136,17 +147,28 @@ pub enum SecretCommand {
 impl std::fmt::Debug for SecretCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Set { name, value, repo } => f
+            Self::Set {
+                name,
+                value,
+                repo,
+                env,
+            } => f
                 .debug_struct("Set")
                 .field("name", name)
                 .field("value", &redacted(value.is_some()))
                 .field("repo", repo)
+                .field("env", env)
                 .finish(),
-            Self::List { repo } => f.debug_struct("List").field("repo", repo).finish(),
-            Self::Rm { name, repo } => f
+            Self::List { repo, env } => f
+                .debug_struct("List")
+                .field("repo", repo)
+                .field("env", env)
+                .finish(),
+            Self::Rm { name, repo, env } => f
                 .debug_struct("Rm")
                 .field("name", name)
                 .field("repo", repo)
+                .field("env", env)
                 .finish(),
         }
     }
@@ -525,9 +547,22 @@ fn valid_repo_scope(repo: &str) -> bool {
         .is_some_and(|(owner, name)| !owner.is_empty() && !name.is_empty())
 }
 
-fn scope_suffix(repo: Option<&str>) -> String {
-    repo.map(|repo| format!(" (for {repo})"))
-        .unwrap_or_default()
+fn valid_env_scope(env: &str) -> bool {
+    !env.is_empty()
+        && env.len() <= 255
+        && !env.starts_with(['-', '_'])
+        && env
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+fn scope_suffix(repo: Option<&str>, env: Option<&str>) -> String {
+    match (repo, env) {
+        (Some(repo), Some(env)) => format!(" (for {repo}, environment {env})"),
+        (Some(repo), None) => format!(" (for {repo})"),
+        (None, None) => String::new(),
+        (None, Some(_)) => unreachable!("env requires repo, validated by callers"),
+    }
 }
 
 /// Map a request to the engine into `Unavailable` when the engine is down
@@ -561,12 +596,14 @@ async fn api_set_secret(
     name: &str,
     value: &str,
     repo: Option<&str>,
+    env: Option<&str>,
 ) -> Result<ApiOutcome<()>, anyhow::Error> {
     let client = crate::build_client();
     let url = format!("{}/api/v1/secrets/{name}", crate::server_url());
     let request = client.put(&url).json(&serde_json::json!({
         "value": value,
         "repo": repo,
+        "env": env,
     }));
     match api_request(request).await? {
         ApiOutcome::Applied(_) => Ok(ApiOutcome::Applied(())),
@@ -577,12 +614,16 @@ async fn api_set_secret(
 async fn api_delete_secret(
     name: &str,
     repo: Option<&str>,
+    env: Option<&str>,
 ) -> Result<ApiOutcome<()>, anyhow::Error> {
     let client = crate::build_client();
     let url = format!("{}/api/v1/secrets/{name}", crate::server_url());
     let mut request = client.delete(&url);
     if let Some(repo) = repo {
         request = request.query(&[("repo", repo)]);
+    }
+    if let Some(env) = env {
+        request = request.query(&[("env", env)]);
     }
     match api_request(request).await? {
         ApiOutcome::Applied(_) => Ok(ApiOutcome::Applied(())),
@@ -594,12 +635,16 @@ async fn api_delete_secret(
 /// unavailable; the caller falls back to reading the config file.
 async fn api_list_secrets(
     repo: Option<&str>,
-) -> Result<ApiOutcome<Vec<(String, Option<String>)>>, anyhow::Error> {
+    env: Option<&str>,
+) -> Result<ApiOutcome<Vec<(String, Option<String>, Option<String>)>>, anyhow::Error> {
     let client = crate::build_client();
     let url = format!("{}/api/v1/secrets", crate::server_url());
     let mut request = client.get(&url);
     if let Some(repo) = repo {
         request = request.query(&[("repo", repo)]);
+    }
+    if let Some(env) = env {
+        request = request.query(&[("env", env)]);
     }
     match api_request(request).await? {
         ApiOutcome::Unavailable => Ok(ApiOutcome::Unavailable),
@@ -618,7 +663,11 @@ async fn api_list_secrets(
                                 .get("repo")
                                 .and_then(serde_json::Value::as_str)
                                 .map(str::to_owned);
-                            Some((name, repo))
+                            let env = entry
+                                .get("env")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned);
+                            Some((name, repo, env))
                         })
                         .collect()
                 })
@@ -630,13 +679,28 @@ async fn api_list_secrets(
 
 pub(crate) async fn cmd_secret(args: SecretArgs) -> anyhow::Result<()> {
     match args.command {
-        SecretCommand::Set { name, value, repo } => {
+        SecretCommand::Set {
+            name,
+            value,
+            repo,
+            env,
+        } => {
             if !valid_secret_name(&name) {
                 anyhow::bail!("secret name must be UPPER_SNAKE (letters, digits, underscore)");
             }
             if let Some(repo) = &repo {
                 if !valid_repo_scope(repo) {
                     anyhow::bail!("--repo must look like owner/repo");
+                }
+            }
+            if let Some(env) = &env {
+                if !valid_env_scope(env) {
+                    anyhow::bail!(
+                        "--env must be letters, digits, hyphens, underscores (max 255, not starting with `-` or `_`)"
+                    );
+                }
+                if repo.is_none() {
+                    anyhow::bail!("--env requires --repo (owner/repo)");
                 }
             }
             let value = match value {
@@ -654,51 +718,85 @@ pub(crate) async fn cmd_secret(args: SecretArgs) -> anyhow::Result<()> {
             if value.is_empty() {
                 anyhow::bail!("empty secret value");
             }
-            match api_set_secret(&name, &value, repo.as_deref()).await? {
+            match api_set_secret(&name, &value, repo.as_deref(), env.as_deref()).await? {
                 ApiOutcome::Applied(()) => {
                     println!(
                         "secret {name}{} stored (live)",
-                        scope_suffix(repo.as_deref())
+                        scope_suffix(repo.as_deref(), env.as_deref())
                     );
                 }
                 ApiOutcome::Unavailable => {
                     let mut config = load_config()?;
-                    match &repo {
-                        Some(repo) => {
+                    if store_memory(&config) {
+                        anyhow::bail!(
+                            "secrets store is memory-only (secrets_store = \"memory\" or \
+                             PRELOOP_SECRETS_STORE=memory): nothing is written to the config \
+                             file — start the engine (`preloop serve`) to set secrets live"
+                        );
+                    }
+                    match (&repo, &env) {
+                        (Some(repo), Some(env)) => {
+                            config
+                                .env_secrets
+                                .entry(repo.clone())
+                                .or_default()
+                                .entry(env.clone())
+                                .or_default()
+                                .insert(name.clone(), value);
+                        }
+                        (Some(repo), None) => {
                             config
                                 .repo_secrets
                                 .entry(repo.clone())
                                 .or_default()
                                 .insert(name.clone(), value);
                         }
-                        None => {
+                        (None, None) => {
                             config.secrets.insert(name.clone(), value);
                         }
+                        (None, Some(_)) => unreachable!("env requires repo, validated above"),
                     }
                     let path = write_config(&config)?;
                     println!(
                         "secret {name}{} stored in {} (engine not running or predates live secrets — applies on next start)",
-                        scope_suffix(repo.as_deref()),
+                        scope_suffix(repo.as_deref(), env.as_deref()),
                         path.display()
                     );
                 }
             }
         }
-        SecretCommand::List { repo } => {
+        SecretCommand::List { repo, env } => {
             if let Some(repo) = &repo {
                 if !valid_repo_scope(repo) {
                     anyhow::bail!("--repo must look like owner/repo");
                 }
             }
-            match api_list_secrets(repo.as_deref()).await? {
+            if env.is_some() && repo.is_none() {
+                anyhow::bail!("--env requires --repo (owner/repo)");
+            }
+            if let Some(env) = &env {
+                if !valid_env_scope(env) {
+                    anyhow::bail!(
+                        "--env must be letters, digits, hyphens, underscores (max 255, not starting with `-` or `_`)"
+                    );
+                }
+            }
+            match api_list_secrets(repo.as_deref(), env.as_deref()).await? {
                 ApiOutcome::Applied(secrets) => {
                     if secrets.is_empty() {
-                        println!("no secrets stored{}", scope_suffix(repo.as_deref()));
+                        println!(
+                            "no secrets stored{}",
+                            scope_suffix(repo.as_deref(), env.as_deref())
+                        );
                     } else {
-                        for (name, scope) in secrets {
-                            match scope {
-                                Some(repo) => println!("{name} ({repo})"),
-                                None => println!("{name}"),
+                        for (name, scope, env) in secrets {
+                            match (scope, env) {
+                                (Some(repo), Some(env)) => {
+                                    println!("{name} ({repo}, environment {env})")
+                                }
+                                (Some(repo), None) => println!("{name} ({repo})"),
+                                (None, None) => println!("{name}"),
+                                (None, Some(_)) => unreachable!("env requires repo on the server"),
                             }
                         }
                     }
@@ -706,22 +804,42 @@ pub(crate) async fn cmd_secret(args: SecretArgs) -> anyhow::Result<()> {
                 ApiOutcome::Unavailable => {
                     let config = load_config()?;
                     let mut secrets: Vec<String> = config.secrets.keys().cloned().collect();
-                    match &repo {
-                        Some(repo) => {
+                    match (&repo, &env) {
+                        (Some(repo), Some(env)) => {
+                            if let Some(map) =
+                                config.env_secrets.get(repo).and_then(|envs| envs.get(env))
+                            {
+                                secrets = map.keys().cloned().collect();
+                            } else {
+                                secrets.clear();
+                            }
+                        }
+                        (Some(repo), None) => {
                             if let Some(map) = config.repo_secrets.get(repo) {
                                 secrets = map.keys().cloned().collect();
                             } else {
                                 secrets.clear();
                             }
                         }
-                        None => {
+                        (None, None) => {
                             for (scope, map) in &config.repo_secrets {
                                 secrets.extend(map.keys().map(|name| format!("{name} ({scope})")));
                             }
+                            for (scope, envs) in &config.env_secrets {
+                                for (env, map) in envs {
+                                    secrets.extend(map.keys().map(|name| {
+                                        format!("{name} ({scope}, environment {env})")
+                                    }));
+                                }
+                            }
                         }
+                        (None, Some(_)) => unreachable!("env requires repo, validated above"),
                     }
                     if secrets.is_empty() {
-                        println!("no secrets stored{}", scope_suffix(repo.as_deref()));
+                        println!(
+                            "no secrets stored{}",
+                            scope_suffix(repo.as_deref(), env.as_deref())
+                        );
                     } else {
                         for entry in secrets {
                             println!("{entry}");
@@ -730,20 +848,61 @@ pub(crate) async fn cmd_secret(args: SecretArgs) -> anyhow::Result<()> {
                 }
             }
         }
-        SecretCommand::Rm { name, repo } => {
+        SecretCommand::Rm { name, repo, env } => {
             if let Some(repo) = &repo {
                 if !valid_repo_scope(repo) {
                     anyhow::bail!("--repo must look like owner/repo");
                 }
             }
-            match api_delete_secret(&name, repo.as_deref()).await? {
+            if let Some(env) = &env {
+                if !valid_env_scope(env) {
+                    anyhow::bail!(
+                        "--env must be letters, digits, hyphens, underscores (max 255, not starting with `-` or `_`)"
+                    );
+                }
+                if repo.is_none() {
+                    anyhow::bail!("--env requires --repo (owner/repo)");
+                }
+            }
+            match api_delete_secret(&name, repo.as_deref(), env.as_deref()).await? {
                 ApiOutcome::Applied(()) => {
-                    println!("secret {name}{} removed", scope_suffix(repo.as_deref()));
+                    println!(
+                        "secret {name}{} removed",
+                        scope_suffix(repo.as_deref(), env.as_deref())
+                    );
                 }
                 ApiOutcome::Unavailable => {
                     let mut config = load_config()?;
-                    let removed = match &repo {
-                        Some(repo) => {
+                    if store_memory(&config) {
+                        anyhow::bail!(
+                            "secrets store is memory-only (secrets_store = \"memory\" or \
+                             PRELOOP_SECRETS_STORE=memory): nothing is written to the config \
+                             file — start the engine (`preloop serve`) to remove secrets live"
+                        );
+                    }
+                    let removed = match (&repo, &env) {
+                        (Some(repo), Some(env)) => {
+                            let removed = config.env_secrets.get_mut(repo).is_some_and(|envs| {
+                                envs.get_mut(env)
+                                    .is_some_and(|map| map.remove(&name).is_some())
+                            });
+                            if removed {
+                                if config.env_secrets.get(repo).is_some_and(|envs| {
+                                    envs.get(env).is_some_and(BTreeMap::is_empty)
+                                }) {
+                                    config
+                                        .env_secrets
+                                        .get_mut(repo)
+                                        .expect("envs exist when env map exists")
+                                        .remove(env);
+                                }
+                                if config.env_secrets.get(repo).is_some_and(BTreeMap::is_empty) {
+                                    config.env_secrets.remove(repo);
+                                }
+                            }
+                            removed
+                        }
+                        (Some(repo), None) => {
                             let removed = config
                                 .repo_secrets
                                 .get_mut(repo)
@@ -758,15 +917,19 @@ pub(crate) async fn cmd_secret(args: SecretArgs) -> anyhow::Result<()> {
                             }
                             removed
                         }
-                        None => config.secrets.remove(&name).is_some(),
+                        (None, None) => config.secrets.remove(&name).is_some(),
+                        (None, Some(_)) => unreachable!("env requires repo, validated above"),
                     };
                     if !removed {
-                        anyhow::bail!("no secret named {name}{}", scope_suffix(repo.as_deref()));
+                        anyhow::bail!(
+                            "no secret named {name}{}",
+                            scope_suffix(repo.as_deref(), env.as_deref())
+                        );
                     }
                     let path = write_config(&config)?;
                     println!(
                         "secret {name}{} removed from {} (engine not running or predates live secrets)",
-                        scope_suffix(repo.as_deref()),
+                        scope_suffix(repo.as_deref(), env.as_deref()),
                         path.display()
                     );
                 }

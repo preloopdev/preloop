@@ -3280,6 +3280,181 @@ async fn job_message_carries_github_token_as_a_secret() {
     );
 }
 
+/// GitHub's environment-secret tier: a job whose `environment:` resolves to
+/// a stored environment sees that tier, with environment > repo > global
+/// precedence per name — and only that job does. Submission-provided values
+/// still win per name over every stored tier.
+#[tokio::test]
+async fn environment_secrets_override_repo_and_global_per_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let runner_token = state
+        .local_jwt(json!({
+            "sub": "aksh-runner-listen-1",
+            "scp": "ActionsRuntime.RunnerListen",
+        }))
+        .unwrap();
+
+    // Seed the three stored tiers with the same name so precedence is
+    // observable, plus a name that exists only in the environment tier.
+    request_json(
+        &app,
+        Method::PUT,
+        "/api/v1/secrets/SHARED",
+        json!({ "value": "global-shared" }),
+    )
+    .await;
+    request_json(
+        &app,
+        Method::PUT,
+        "/api/v1/secrets/SHARED",
+        json!({ "value": "repo-shared", "repo": "owner/repo" }),
+    )
+    .await;
+    request_json(
+        &app,
+        Method::PUT,
+        "/api/v1/secrets/SHARED",
+        json!({ "value": "env-shared", "repo": "owner/repo", "env": "prod" }),
+    )
+    .await;
+    request_json(
+        &app,
+        Method::PUT,
+        "/api/v1/secrets/ENV_ONLY",
+        json!({ "value": "env-only", "repo": "owner/repo", "env": "prod" }),
+    )
+    .await;
+    request_json(
+        &app,
+        Method::PUT,
+        "/api/v1/secrets/REPO_GLOBAL",
+        json!({ "value": "global-v" }),
+    )
+    .await;
+    request_json(
+        &app,
+        Method::PUT,
+        "/api/v1/secrets/REPO_GLOBAL",
+        json!({ "value": "repo-v", "repo": "owner/repo" }),
+    )
+    .await;
+
+    // Two jobs: one in environment prod, one with no environment. The caller
+    // also supplies SHARED, which must beat the environment tier.
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  prod:\n    runs-on: ubuntu-latest\n    environment: prod\n    steps:\n      - run: echo hi\n  plain:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "payload": {"ref": "refs/heads/main", "commits": []},
+            "repository": "owner/repo",
+            "git_ref": "refs/heads/main",
+            "secrets": {"SHARED": "sub-shared"},
+            "vars": {},
+            "reusable_workflows": {}
+        }),
+    )
+    .await;
+    assert_eq!(accepted["queued_jobs"], 2);
+    let run_id = accepted["run_id"].as_str().unwrap();
+
+    let session = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/distributedtask/pools/1/sessions",
+        json!({
+            "agent": {"id": 1, "name": "runner-1"},
+            "ownerName": "owner",
+            "sessionId": "00000000-0000-0000-0000-000000000000",
+            "useFipsEncryption": false
+        }),
+    )
+    .await;
+    let session_id = session["sessionId"].as_str().unwrap();
+
+    let mut variables_by_job = BTreeMap::new();
+    for _ in 0..2 {
+        let message = poll_message(&app, "aksh-system-token", session_id).await;
+        let message_id = message["messageId"]
+            .as_i64()
+            .expect("polled message has an id");
+        let body: Value = serde_json::from_str(message["body"].as_str().unwrap()).unwrap();
+        let runner_request_id = body["runner_request_id"].as_str().unwrap();
+        let acquired = request_json_with_bearer(
+            &app,
+            Method::POST,
+            "/broker/1/acquirejob",
+            json!({"jobMessageId": runner_request_id, "billingOwnerId": "local", "runnerOS": "Linux"}),
+            &runner_token,
+        )
+        .await;
+        assert_eq!(
+            acquired["messageType"],
+            azdo::message_type::RUNNER_JOB_REQUEST
+        );
+        // Ack the delivered message so the next poll does not redeliver it.
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!(
+                        "/runner/server/_apis/distributedtask/pools/1/messages/{message_id}?sessionId={session_id}"
+                    ))
+                    .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let job_name = acquired["jobName"].as_str().unwrap().to_owned();
+        variables_by_job.insert(job_name.clone(), acquired["variables"].clone());
+        // One session holds one active job until it completes; free the slot
+        // so the next poll delivers the other job's message.
+        request_json(
+            &app,
+            Method::POST,
+            "/internal/test/jobs/complete",
+            json!({"run_id": run_id, "job_id": job_name, "status": "success"}),
+        )
+        .await;
+    }
+
+    let prod = &variables_by_job["prod"];
+    assert_eq!(
+        prod["SHARED"]["value"], "sub-shared",
+        "submission-provided secrets win per name over every stored tier"
+    );
+    assert_eq!(prod["SHARED"]["isSecret"], true);
+    assert_eq!(
+        prod["ENV_ONLY"]["value"], "env-only",
+        "environment secrets reach jobs in that environment"
+    );
+    assert_eq!(prod["ENV_ONLY"]["isSecret"], true);
+
+    let plain = &variables_by_job["plain"];
+    assert_eq!(
+        plain["SHARED"]["value"], "sub-shared",
+        "submission-provided secrets win per name even without an environment"
+    );
+    assert_eq!(
+        plain["REPO_GLOBAL"]["value"], "repo-v",
+        "without an environment the repo tier wins over the global tier"
+    );
+    assert!(
+        plain.get("ENV_ONLY").is_none(),
+        "environment secrets never reach jobs outside the environment"
+    );
+    assert_eq!(
+        prod["REPO_GLOBAL"]["value"], "repo-v",
+        "repo tier still applies to jobs in an environment that has no env-tier override"
+    );
+}
+
 #[tokio::test]
 async fn current_service_broker_flow_uses_queued_job() {
     let temp = tempfile::tempdir().unwrap();
@@ -8436,6 +8611,178 @@ async fn live_secrets_api_round_trips_and_persists() {
         let text = std::fs::read_to_string(&config_path).unwrap();
         assert!(text.contains("GLOBAL_ONLY"), "config persists the secret");
         assert!(text.contains("other/repo"), "config persists the scope");
+    }
+    .await;
+}
+
+#[tokio::test]
+async fn live_secrets_api_env_scope_round_trips() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    async {
+        let state = AppState::new_with_config(temp.path().to_path_buf(), config_path.clone())
+            .await
+            .unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        request_json(
+            &app,
+            Method::PUT,
+            "/api/v1/secrets/DEPLOY_KEY",
+            json!({ "value": "k1", "repo": "owner/repo", "env": "prod" }),
+        )
+        .await;
+        request_json(
+            &app,
+            Method::PUT,
+            "/api/v1/secrets/SHARED",
+            json!({ "value": "repo-only", "repo": "owner/repo" }),
+        )
+        .await;
+
+        // Full listing carries the environment scope on the env entry.
+        let listed = request_json(&app, Method::GET, "/api/v1/secrets", Value::Null).await;
+        let entries: Vec<(String, Option<String>, Option<String>)> = listed["secrets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                (
+                    entry["name"].as_str().unwrap().to_owned(),
+                    entry["repo"].as_str().map(str::to_owned),
+                    entry["env"].as_str().map(str::to_owned),
+                )
+            })
+            .collect();
+        assert!(entries.contains(&(
+            "DEPLOY_KEY".to_owned(),
+            Some("owner/repo".to_owned()),
+            Some("prod".to_owned())
+        )));
+        assert!(entries.contains(&("SHARED".to_owned(), Some("owner/repo".to_owned()), None)));
+
+        // Env-scoped listing returns only that environment's names.
+        let scoped = request_json(
+            &app,
+            Method::GET,
+            "/api/v1/secrets?repo=owner/repo&env=prod",
+            Value::Null,
+        )
+        .await;
+        let scoped_names: Vec<&str> = scoped["secrets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(scoped_names, vec!["DEPLOY_KEY"]);
+
+        // The in-memory store and the persisted file both reflect the env tier.
+        {
+            let store = state.secrets.read();
+            assert_eq!(store.env["owner/repo"]["prod"]["DEPLOY_KEY"], "k1");
+        }
+        let text = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            text.contains("DEPLOY_KEY"),
+            "config persists the env secret"
+        );
+        assert!(text.contains("env_secrets"), "config persists the env tier");
+
+        // Validation: env without repo and malformed env names are rejected.
+        let (status, _) = request_json_status(
+            &app,
+            Method::PUT,
+            "/api/v1/secrets/NO_REPO",
+            json!({ "value": "x", "env": "prod" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = request_json_status(
+            &app,
+            Method::PUT,
+            "/api/v1/secrets/BAD_ENV",
+            json!({ "value": "x", "repo": "owner/repo", "env": "-dash" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) =
+            request_json_status(&app, Method::GET, "/api/v1/secrets?env=prod", Value::Null).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Deletion, then 404 on a second attempt.
+        request_json(
+            &app,
+            Method::DELETE,
+            "/api/v1/secrets/DEPLOY_KEY?repo=owner/repo&env=prod",
+            Value::Null,
+        )
+        .await;
+        let (status, _) = request_json_status(
+            &app,
+            Method::DELETE,
+            "/api/v1/secrets/DEPLOY_KEY?repo=owner/repo&env=prod",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // The env map is pruned when its last name goes.
+        {
+            let store = state.secrets.read();
+            assert!(
+                !store.env.contains_key("owner/repo"),
+                "empty environment maps are pruned"
+            );
+        }
+    }
+    .await;
+}
+
+/// `secrets_store = "memory"` keeps values out of the config file entirely:
+/// the live API mutates the in-memory store only, so a restart loses the
+/// secret and the file never carries it. The in-memory store must still
+/// serve it for the current process lifetime.
+#[tokio::test]
+async fn memory_secrets_store_never_writes_the_config_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    std::fs::write(&config_path, "secrets_store = \"memory\"\n").unwrap();
+    async {
+        let state = AppState::new_with_config(temp.path().to_path_buf(), config_path.clone())
+            .await
+            .unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+
+        request_json(
+            &app,
+            Method::PUT,
+            "/api/v1/secrets/GLOBAL_ONLY",
+            json!({ "value": "g1" }),
+        )
+        .await;
+
+        // Live and visible in the store.
+        let listed = request_json(&app, Method::GET, "/api/v1/secrets", Value::Null).await;
+        let names: Vec<&str> = listed["secrets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"GLOBAL_ONLY"),
+            "live store serves the secret"
+        );
+        let store = state.secrets.read();
+        assert!(store.global.contains_key("GLOBAL_ONLY"));
+        drop(store);
+
+        // Never persisted: the file holds the store-mode key and nothing else.
+        let persisted = crate::config::load_config_from(&config_path).unwrap();
+        assert!(persisted.secrets.is_empty(), "memory mode must not persist");
+        assert!(persisted.repo_secrets.is_empty());
+        assert_eq!(persisted.secrets_store.as_deref(), Some("memory"));
     }
     .await;
 }

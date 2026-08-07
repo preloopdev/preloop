@@ -106,6 +106,20 @@ fn validate_schedule_crons(workflow: &aksh_gha_parser::Workflow) -> Result<(), A
     Ok(())
 }
 
+/// Whether a submission's trust tier permits injecting stored secrets
+/// (repo/global/environment tiers). Native submissions carry no trust tier —
+/// `None` is therefore trusted.
+fn submission_allows_secrets(submission: &WorkflowSubmission) -> bool {
+    submission
+        .trust_tier
+        .as_deref()
+        .and_then(|value| {
+            serde_json::from_value::<crate::events::trust_tier::TrustTier>(json!(value)).ok()
+        })
+        .map(|tier| tier.allows_secrets())
+        .unwrap_or(true)
+}
+
 pub(crate) async fn submit_run_inner(
     shared: &Arc<SharedState>,
     mut submission: WorkflowSubmission,
@@ -155,16 +169,9 @@ pub(crate) async fn submit_run_inner(
     }
     // Native submissions carry no trust tier (the webhook path sets it) and
     // pass secrets through unmodified — None is therefore trusted. Mirror
-    // GitHub repo secrets: stored secrets are available to every trusted
-    // job, with submission-provided values winning per name.
-    let allow_secrets = submission
-        .trust_tier
-        .as_deref()
-        .and_then(|value| {
-            serde_json::from_value::<crate::events::trust_tier::TrustTier>(json!(value)).ok()
-        })
-        .map(|tier| tier.allows_secrets())
-        .unwrap_or(true);
+    // GitHub org/repo/environment secrets: stored secrets are available to
+    // every trusted job, with submission-provided values winning per name.
+    let allow_secrets = submission_allows_secrets(&submission);
     if !allow_secrets {
         submission.secrets.clear();
     } else {
@@ -174,6 +181,10 @@ pub(crate) async fn submit_run_inner(
         // GitHub, where repo secrets override org secrets of the same name.
         let secret_store = shared.state.secrets.read();
         let submission_names: BTreeSet<String> = submission.secrets.keys().cloned().collect();
+        // Remember the caller-provided names so per-job environment overlays
+        // (applied later, in `build_job_artifacts`) keep these values
+        // winning per name over the stored environment tier.
+        submission.submission_names = submission_names.clone();
         for (name, value) in &secret_store.global {
             submission
                 .secrets
@@ -1490,12 +1501,35 @@ pub(crate) fn build_job_artifacts(
     job: &aksh_gha_protocol::JobPlan,
     github_token_override: Option<String>,
 ) -> Result<BuiltJobArtifacts, ApiError> {
+    // Environment secrets are per-job: a job's `environment:` selects the
+    // tier, so the overlay happens here, not in the submission-level merge.
+    // Precedence per name: submission-provided > environment > repo > global,
+    // mirroring GitHub's env-over-repo-over-org rule with the local
+    // `--secret` escape hatch kept on top.
+    let mut merged_secrets = secrets_exposed.clone();
+    if submission_allows_secrets(submission) {
+        if let Some(env_name) = job.oidc_environment.as_deref() {
+            let secret_store = shared.state.secrets.read();
+            if let Some(env_secrets) = secret_store
+                .env
+                .get(&submission.repository)
+                .and_then(|envs| envs.get(env_name))
+            {
+                for (name, value) in env_secrets {
+                    if !submission.submission_names.contains(name) {
+                        merged_secrets.insert(name.clone(), value.clone());
+                    }
+                }
+            }
+        }
+    }
+
     let mut agent_msg =
         aksh_gha_parser::job_builder::build_agent_job_message_with_normalized_context(
             job,
             normalized_github,
             &job.env,
-            secrets_exposed,
+            &merged_secrets,
             &submission.vars,
         )
         .map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
