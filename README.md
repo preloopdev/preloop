@@ -1,6 +1,9 @@
 # preloop
 
-<video src="docs/demo/debug.mp4" autoplay loop muted playsinline width="100%"></video>
+[![Watch the demo](docs/demo/poster.png)](docs/demo/debug.mp4)
+
+> Watch: [debug.mp4](docs/demo/debug.mp4) — a failed step, a fix in another
+> pane, and a re-run. All local, no push required.
 
 > A failed step, a fix in another pane, and a re-run — all local, no push required.
 
