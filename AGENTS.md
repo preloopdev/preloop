@@ -43,6 +43,7 @@ just dogfood    # E2E with real runner
 ## Important Files
 
 - `docs/architecture.md` — crate map + module map
+- `docs/store-known-issues.md` — durable-store follow-ups (perf, retention, layering)
 - `docs/fidelity-gap.md` — protocol gaps and conformance status
 - `docs/preloop-performance-engineering.md` — perf campaign record: harness, measurements, rejected ideas, and the cold-start blocker
 - `docs/smolvm-packed-socket-handoff.md` — fork implementation brief and upstream issue for packed-machine socket publication
