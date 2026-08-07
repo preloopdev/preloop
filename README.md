@@ -15,12 +15,19 @@ Runs on macOS, Linux, and Windows.
 ## Quick start
 
 ```sh
+# Install (macOS/Linux): downloads the release binary and verifies its sha256
+curl -fsSL https://raw.githubusercontent.com/preloopdev/preloop/main/install.sh | sh
+
 preloop serve            # engine on 127.0.0.1:9090
 cd my-repo
 preloop run -f .github/workflows/ci.yml --event push
 ```
 
 Setup, GitHub App and PAT credentials, secrets, config file, and the troubleshooting guide: [docs/setup.md](docs/setup.md)
+
+Run it as a team server — service install, every runtime knob, and how to
+expose it (tailnet only, Tailscale Funnel, Cloudflare Tunnel, or your own
+domain): [docs/self-hosting.md](docs/self-hosting.md)
 
 ## What makes it different
 
@@ -70,6 +77,9 @@ the server becomes MIT two years after its release date.
 ## Credits
 
 This project wouldn't be possible without:
+
+- [smolvm] — the microVM runtime every job executes in
+- [runner.server] — the protocol reverse-engineering this project builds on
 
 [smolvm]: https://github.com/preloopdev/smolvm
 [runner.server]: https://github.com/ChristopherHX/runner.server
