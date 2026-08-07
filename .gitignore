@@ -136,3 +136,7 @@ skills-lock.json
 
 # Release build output — 863 MB golden artifact, never tracked
 /dist/
+
+# Internal planning notes — kept local, like docs/internal/
+/goals/
+/plans/
