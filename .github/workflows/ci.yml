@@ -269,3 +269,29 @@ jobs:
           path: |
             crates/**/proptest-regressions/
           if-no-files-found: ignore
+
+  # Supply-chain gate: known-vulnerable or unlicensed dependencies, and
+  # unvetted new dependency versions, must not merge. `cargo vet --locked`
+  # fails when the lockfile gains a crate/version without an entry in
+  # supply-chain/ (see `cargo vet` docs for certifying new deps).
+  audit-vet-deny:
+    runs-on: self-hosted
+    timeout-minutes: 30
+    # Supply-chain checks are expensive (installs audit/deny/vet) and run
+    # nightly + on main pushes; PRs skip them — new dependency versions are
+    # still caught at merge time via the push-triggered run.
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.86"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny,cargo-vet
+      - name: cargo audit (known vulnerabilities)
+        run: cargo audit
+      - name: cargo deny (licenses, bans, advisories)
+        run: cargo deny check
+      - name: cargo vet --locked (unvetted dependency changes)
+        run: cargo vet --locked
