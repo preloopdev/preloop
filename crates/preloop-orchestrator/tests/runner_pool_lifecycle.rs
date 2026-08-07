@@ -347,6 +347,8 @@ impl Fixture {
             runner_key_dir: None,
             pending_jobs: None,
             preload_images: Vec::new(),
+            runner_user: None,
+            runner_uid: None,
             next_job_runs_on: None,
             pending_registrations: None,
         };
@@ -868,20 +870,31 @@ async fn removing_debug_marker_releases_preserved_runner_on_next_poll() {
         .machines
         .contains_key(&runner));
 
-    tokio::time::advance(std::time::Duration::from_secs(1)).await;
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
+    // The release must happen after the marker removal — bounded fake-time
+    // wait instead of a single advance, so scheduling pressure cannot make
+    // the poll arrive late (the machine's provisioning may still be
+    // mid-flight when the marker disappears).
+    let mut removed = false;
+    for _ in 0..120 {
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        if task_provider
+            .snapshot()
+            .await
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Delete(name) if name == &runner))
+        {
+            removed = true;
+            break;
+        }
     }
-    println!(
-        "events at removal poll: {:?}",
-        task_provider.snapshot().await.events
+    assert!(
+        removed,
+        "runner was not released after the debug marker was removed"
     );
-    assert!(task_provider
-        .snapshot()
-        .await
-        .events
-        .iter()
-        .any(|event| matches!(event, Event::Delete(name) if name == &runner)));
     shutdown.cancel();
     task.await.unwrap().unwrap();
     assert!(!provider.snapshot().await.machines.contains_key(&runner));

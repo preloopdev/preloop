@@ -390,6 +390,31 @@ impl<'a> StepContext<'a> {
         // PATH") and shell-outs inside git (submodule foreach →
         // git-sh-setup → uname) fail the same way.
         ensure_path(&mut env, std::env::var("PATH").ok().as_deref());
+        // GitHub-hosted parity: hosted runners run steps as a dedicated user
+        // in a systemd session, so USER/LOGNAME (the runner account) and
+        // XDG_RUNTIME_DIR (to /run/user/<uid>, existing) are present in the
+        // step environment. Our VMs run without a session manager, so the
+        // account identity is supplied by the orchestrator when it drops the
+        // runner to a non-root user (PRELOOP_RUNNER_USER/UID set by the
+        // provisioning wrapper). Outside a managed VM the runner keeps the
+        // process's own identity — a host-run runner sees the real user, not
+        // a fabricated one. Explicit job/step values win. Containers have
+        // neither the runtime dir nor the host user on hosted images either.
+        if !self.translate_container_path {
+            let runner_user = std::env::var("PRELOOP_RUNNER_USER")
+                .ok()
+                .filter(|user| !user.is_empty())
+                .or_else(|| std::env::var("USER").ok())
+                .unwrap_or_else(|| "root".to_owned());
+            let runner_uid = std::env::var("PRELOOP_RUNNER_UID")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(0);
+            env.insert("USER".to_owned(), runner_user.clone());
+            env.insert("LOGNAME".to_owned(), runner_user);
+            env.entry("XDG_RUNTIME_DIR".to_owned())
+                .or_insert_with(|| format!("/run/user/{runner_uid}"));
+        }
         // Post action steps receive state saved by their paired main step via
         // GITHUB_STATE. A post step is named `__post_<main-step-id>`.
         let state_step_id = self
@@ -457,7 +482,37 @@ mod tests {
 
     static STDOUT_ENV_LOCK: std::sync::LazyLock<Mutex<()>> =
         std::sync::LazyLock::new(|| Mutex::new(()));
+    static RUNNER_USER_ENV_LOCK: std::sync::LazyLock<Mutex<()>> =
+        std::sync::LazyLock::new(|| Mutex::new(()));
 
+    /// Set process env vars for the duration of a test and restore them on
+    /// drop. Serialize with `RUNNER_USER_ENV_LOCK` (env is process-wide).
+    struct EnvGuard(Vec<(&'static str, Option<String>)>);
+
+    impl EnvGuard {
+        fn set(vars: &[(&'static str, Option<String>)]) -> Self {
+            let mut previous = Vec::new();
+            for (name, value) in vars {
+                previous.push((*name, std::env::var(name).ok()));
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+            EnvGuard(previous)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
     fn with_stdout_toggle<T>(value: Option<&str>, test: impl FnOnce() -> T) -> T {
         let _guard = STDOUT_ENV_LOCK.lock();
         let previous = std::env::var(DISABLE_STDOUT_MULTILINE_LOG_PREFIXING).ok();
@@ -495,6 +550,63 @@ mod tests {
         let env = ctx.build_env();
         assert_eq!(env.get("STEP_VAR").unwrap(), "from_step");
         assert_eq!(env.get("JOB_VAR").unwrap(), "overridden");
+    }
+
+    /// A managed runner (orchestrator set PRELOOP_RUNNER_USER/UID) gets the
+    /// hosted-runner account contract: USER/LOGNAME name the runner account
+    /// and XDG_RUNTIME_DIR points at its runtime dir.
+    #[test]
+    fn host_env_uses_configured_runner_user() {
+        let _lock = RUNNER_USER_ENV_LOCK.lock();
+        let _guard = EnvGuard::set(&[
+            ("PRELOOP_RUNNER_USER", Some("runner".to_owned())),
+            ("PRELOOP_RUNNER_UID", Some("1000".to_owned())),
+        ]);
+        let mut job = make_job();
+        let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+
+        let env = ctx.build_env();
+        assert_eq!(env.get("USER").map(String::as_str), Some("runner"));
+        assert_eq!(env.get("LOGNAME").map(String::as_str), Some("runner"));
+        assert_eq!(
+            env.get("XDG_RUNTIME_DIR").map(String::as_str),
+            Some("/run/user/1000")
+        );
+    }
+
+    /// An unmanaged runner (host-run, fork, no orchestrator override) keeps
+    /// the process's real identity — never a fabricated root.
+    #[test]
+    fn host_env_keeps_process_user_when_unmanaged() {
+        let _lock = RUNNER_USER_ENV_LOCK.lock();
+        let _guard = EnvGuard::set(&[("PRELOOP_RUNNER_USER", None), ("PRELOOP_RUNNER_UID", None)]);
+        let mut job = make_job();
+        let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+
+        let env = ctx.build_env();
+        let expected = std::env::var("USER").unwrap_or_else(|_| "root".to_owned());
+        assert_eq!(env.get("USER").map(String::as_str), Some(expected.as_str()));
+    }
+
+    /// An explicit job/step XDG_RUNTIME_DIR is user intent and must win over
+    /// the contract default.
+    #[test]
+    fn host_env_keeps_explicit_runtime_dir() {
+        let _lock = RUNNER_USER_ENV_LOCK.lock();
+        let _guard = EnvGuard::set(&[
+            ("PRELOOP_RUNNER_USER", Some("runner".to_owned())),
+            ("PRELOOP_RUNNER_UID", Some("1000".to_owned())),
+        ]);
+        let mut job = make_job();
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        ctx.env
+            .insert("XDG_RUNTIME_DIR".into(), "/custom/run".into());
+
+        let env = ctx.build_env();
+        assert_eq!(
+            env.get("XDG_RUNTIME_DIR").map(String::as_str),
+            Some("/custom/run")
+        );
     }
 
     #[test]
