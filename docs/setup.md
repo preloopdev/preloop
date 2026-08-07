@@ -129,6 +129,31 @@ steps:
 Trust: submissions from untrusted events (fork PRs via the webhook path) do
 not receive stored secrets; native `preloop run` submissions always do.
 
+### Where secrets live
+
+By default stored secrets persist in the config file (`[secrets]`, mode
+0600). For deployments that must not hold plaintext at rest, two options:
+
+- **Memory-only store** — set `secrets_store = "memory"` in the config file
+  (or `PRELOOP_SECRETS_STORE=memory`): the live secrets API keeps values in
+  engine memory for the process lifetime and never writes them to the file.
+  `preloop secret set` then requires a running engine; after a restart you
+  re-seed. Combine with the systemd credential below for a durable base set.
+- **systemd credential** — install the service with
+  `--systemd-credential /etc/preloop-secrets.enc` to mount an encrypted
+  credential (`LoadCredential=preloop-secrets`); the engine reads
+  `[secrets]`/`[repo_secrets]` from it at startup, overriding the config
+  file per name. Create the blob with:
+
+  ```sh
+  systemd-creds encrypt --name=preloop-secrets secrets.toml /etc/preloop-secrets.enc
+  ```
+
+  At rest the blob is encrypted and bound to the host (TPM or machine key);
+  systemd decrypts it into an in-memory file (memfd) the service never
+  writes back. Secrets already in the config file still load and apply —
+  the credential wins per name.
+
 ## Config file
 
 Everything lives in `~/.preloop/config.toml` (mode 0600; `PRELOOP_CONFIG`
@@ -190,6 +215,101 @@ Run Postgres however you like — a managed service, a `postgres` container on
 the same host, or an OS package. The engine does not bundle or spawn a
 database server; SQLite is the embedded option, Postgres is an external
 dependency you point at.
+## Running as a service
+
+For a team server that must survive reboots and restarts, install the engine
+as a supervised service instead of running `preloop serve` by hand:
+
+```sh
+sudo preloop server install \
+    --public-url https://ci.example.com \
+    --github-app-id 123456 \
+    --github-app-key /etc/preloop/app.pem \
+    --webhook-secret '…'
+```
+
+What it does:
+
+- **Linux (systemd)** — writes hardened units to
+  `/etc/systemd/system/preloop.{service,socket}` plus a self-update timer
+  (`preloop-update.{service,timer}`, hourly, polls GitHub Releases). The
+  control plane is socket-activated on the port of `--listen` (default 9090).
+- **macOS (launchd)** — writes a LaunchDaemon plist to
+  `/Library/LaunchDaemons/dev.preloop.server.plist` (mode 0600).
+- `--systemd-credential PATH` (Linux) — mounts an encrypted systemd
+  credential (`LoadCredential=preloop-secrets:PATH`) so stored secrets come
+  from an encrypted, host-bound blob instead of the config file; see
+  "Where secrets live" in the Secrets section.
+- Configuration is written to a mode-0600 environment file
+  (`/var/lib/preloop/environment` on Linux) — the webhook secret never lands
+  in a world-readable unit.
+- State lives in `/var/lib/preloop` (mode 0700; `--home` overrides).
+
+The `--github-app-*` / `--webhook-secret` flags are optional at install time,
+but **you must define these secrets** for the service to be useful: without a
+webhook secret the engine rejects every GitHub webhook delivery, and without
+an App key it cannot mint `GITHUB_TOKEN`. They land in the mode-0600
+environment file (never in the world-readable units); alternatively install
+first, then configure credentials with
+`PRELOOP_HOME=/var/lib/preloop preloop setup github --save` (writes the
+mode-0600 `config.toml` — see above). `preloop server install --dry-run`
+prints the full plan without touching the system, and
+`sudo preloop server uninstall` removes the units while keeping
+`/var/lib/preloop` data; pass `--purge-data` to delete it. Manual copies of
+the units live in `contrib/systemd/`.
+
+### Rootless option: `--user`
+
+Don't have (or don't want) root on the box? Install a per-user service
+instead — **no sudo required**, and state defaults to `~/.preloop` instead of
+`/var/lib/preloop`:
+
+```sh
+preloop server install --user --public-url https://ci.example.com
+```
+
+- **Linux** — systemd *user* units in `~/.config/systemd/user/`, managed with
+  `systemctl --user` (the self-update timer works the same). They stop when
+  you log out; `sudo loginctl enable-linger $USER` keeps them running.
+- **macOS** — a LaunchAgent at `~/Library/LaunchAgents/`, loaded into your
+  GUI session. LaunchAgents only run while you're logged in.
+- Everything else is identical: same flags, same 0600 config file, same
+  `--dry-run`, and `preloop server uninstall --user` to remove it.
+
+System scope is still the right default for a team server (runs before login,
+accepts webhooks unattended); `--user` fits personal machines and dev boxes.
+
+### Exposing the engine to GitHub
+
+`--public-url` is the address GitHub uses to deliver webhooks and link check
+runs. Without it (or with a loopback default), GitHub can't reach the engine —
+the service runs, but nothing ever triggers. Two ways to make it reachable:
+
+**Production — a domain.** You should definitely point a DNS record at the host and terminate TLS
+in front of the engine: a Caddy/nginx reverse proxy to `127.0.0.1:9090 and do a bunch of other security hardening stuff on your server. (or
+bind `0.0.0.0:9090` behind your own TLS). Register the App's webhook as
+`https://ci.example.com/api/v1/github/webhooks` (gated by the webhook secret)
+and install with:
+
+```sh
+sudo preloop server install \
+    --public-url https://ci.example.com \
+    --github-app-id 123456 --github-app-key /etc/preloop/app.pem \
+    --webhook-secret '…'
+```
+
+**Trying it out — a tunnel.** No DNS record or inbound port needed:
+
+```sh
+cloudflared tunnel --url http://127.0.0.1:9090   # quick tunnel → https://xxx.trycloudflare.com
+ngrok http 9090
+tailscale funnel 9090
+```
+
+Re-run `preloop server install` with the tunnel URL as `--public-url` (or set
+`PRELOOP_PUBLIC_URL` in the service environment file and restart). Note that a
+quick tunnel's URL changes on every restart — for anything long-lived, use a
+named Cloudflare tunnel or the domain path above.
 
 ## Troubleshooting
 

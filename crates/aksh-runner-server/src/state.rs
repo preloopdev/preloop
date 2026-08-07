@@ -367,7 +367,9 @@ pub struct AppState {
 }
 
 /// The runtime secret store: a global tier injected everywhere plus
-/// per-repository tiers that override the global tier by name.
+/// per-repository tiers and per-repository, per-environment tiers that
+/// override the coarser tiers by name — mirroring GitHub's org, repo, and
+/// environment secrets.
 #[derive(Clone, Default)]
 pub(crate) struct SecretStore {
     /// Global secrets, injected into every trusted job.
@@ -375,6 +377,11 @@ pub(crate) struct SecretStore {
     /// Per-repository secrets, keyed by `owner/repo`. A name here wins over
     /// the same name in `global` for jobs of that repository.
     pub repo: BTreeMap<String, BTreeMap<String, String>>,
+    /// Per-repository, per-environment secrets, keyed by `owner/repo` then
+    /// environment name. A name here wins over the same name in `repo` and
+    /// `global` for jobs of that repository whose `environment:` resolves to
+    /// that environment.
+    pub env: BTreeMap<String, BTreeMap<String, BTreeMap<String, String>>>,
 }
 
 /// Redacting `Debug`: the store holds plaintext secret values, so a single
@@ -387,10 +394,23 @@ impl std::fmt::Debug for SecretStore {
             .iter()
             .map(|(scope, names)| (scope, names.keys().collect()))
             .collect();
+        let env_names: BTreeMap<&String, BTreeMap<&String, Vec<&String>>> = self
+            .env
+            .iter()
+            .map(|(scope, envs)| {
+                (
+                    scope,
+                    envs.iter()
+                        .map(|(env, names)| (env, names.keys().collect()))
+                        .collect(),
+                )
+            })
+            .collect();
         f.debug_struct("SecretStore")
             .field("global_count", &self.global.len())
             .field("global_names", &self.global.keys().collect::<Vec<_>>())
             .field("repo_names", &repo_names)
+            .field("env_names", &env_names)
             .finish()
     }
 }
@@ -540,7 +560,14 @@ impl AppState {
                 )
             })
             .unwrap_or(false);
-        let config = crate::config::load_config_from(&config_path)?;
+        let mut config = crate::config::load_config_from(&config_path)?;
+        // systemd credentials (`LoadCredential=preloop-secrets:…`, encrypted
+        // at rest, decrypted into a memfd by systemd) override the config
+        // file's stored secrets per name. The file may hold nothing at all
+        // in `secrets_store = "memory"` mode; the credential is then the
+        // durable base set.
+        let credential = crate::config::load_credential_secrets()?;
+        crate::config::merge_secret_stores(&mut config, credential);
         let github_app = crate::github_app::load_from(&config)?;
         // Env wins over the config file, matching every other `AKSH_GITHUB_*`
         // override. An empty value in either source counts as unset.
@@ -589,6 +616,7 @@ impl AppState {
         let secrets = Arc::new(parking_lot::RwLock::new(SecretStore {
             global: config.secrets,
             repo: config.repo_secrets,
+            env: config.env_secrets,
         }));
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),

@@ -1,4 +1,6 @@
 [Unit]
+# Managed copy: `preloop server install` renders equivalent units (see
+# crates/preloop-cli/src/server_install.rs). Keep in sync.
 Description=Preloop HTTP control-plane socket
 
 [Socket]
