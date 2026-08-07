@@ -129,4 +129,5 @@ benchmarks/real-world/results/conformance-4repos/**/run*.log
 
 # Internal documentation
 docs/internal/
-.
+.agents/
+skills-lock.json

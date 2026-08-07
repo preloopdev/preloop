@@ -1,4 +1,8 @@
-# Contributing to aksh
+# Contributing to preloop
+
+Hey, appreciate you looking to contribute. All kinds of feedback is welcome, and especially encouraged. 
+
+
 
 ## Quick start
 
@@ -13,13 +17,13 @@ just test-ci       # fmt-check + clippy + test (the full CI gate)
 
 ## Before submitting
 
-1. **`just test-ci`** must pass locally.
+1. `**just test-ci**` must pass locally.
 2. **Protocol changes** (anything under `/_apis/`, `/broker/`, `/twirp/`, or runner-facing
-   JSON shapes) must be validated against the **official `actions/runner`**, not only unit
-   tests. Use `just dogfood` for live validation and `just conform` for the
-   committed official-runner flow replay.
+ JSON shapes) must be validated against the **official `actions/runner`**, not only unit
+ tests. Use `just dogfood` for live validation and `just conform` for the
+ committed official-runner flow replay.
 3. **Wire-shape changes** to DTOs in `aksh-gha-protocol/src/azdo/` must preserve serde
-   round-trip fidelity. Check golden captures in `.runner-watch/golden/v2.335.1/`.
+ round-trip fidelity. Check golden captures in `.runner-watch/golden/v2.335.1/`.
 
 ## Compatibility checklist
 
@@ -48,3 +52,4 @@ just serve         # start aksh on :9090
 just e2e-status    # check redirect is active
 just e2e-teardown  # remove redirect
 ```
+
