@@ -43,6 +43,34 @@ pub(crate) fn valid_env(env: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// True when `name` in the given scope is managed by the systemd credential
+/// (the operator-owned durable base set). The live API rejects mutations on
+/// these: a `set` would be reverted at the next startup when the credential
+/// re-applies over config.toml, and a `rm` would 404 or silently reappear.
+/// Editing the credential file (and re-encrypting with `systemd-creds`) is
+/// the supported path.
+fn credential_scope_conflict(
+    credential: &crate::config::ConfigFile,
+    repo: Option<&str>,
+    env: Option<&str>,
+    name: &str,
+) -> bool {
+    match (repo, env) {
+        (Some(repo), Some(env)) => credential
+            .env_secrets
+            .get(repo)
+            .and_then(|envs| envs.get(env))
+            .is_some_and(|names| names.contains_key(name)),
+        (Some(repo), None) => credential
+            .repo_secrets
+            .get(repo)
+            .is_some_and(|names| names.contains_key(name)),
+        (None, None) => credential.secrets.contains_key(name),
+        // Rejected earlier by validation; treat as no conflict.
+        (None, Some(_)) => false,
+    }
+}
+
 #[derive(Deserialize)]
 pub(crate) struct SetSecretBody {
     #[serde(default)]
@@ -72,6 +100,18 @@ pub(crate) async fn list_secrets(
         return Err(ApiError::bad_request(
             "env scope requires repo (owner/repo)",
         ));
+    }
+    if let Some(repo) = &query.repo {
+        if !valid_repo(repo) {
+            return Err(ApiError::bad_request("repo must look like owner/repo"));
+        }
+    }
+    if let Some(env) = &query.env {
+        if !valid_env(env) {
+            return Err(ApiError::bad_request(
+                "env must be an alphanumeric name (letters, digits, - and _)",
+            ));
+        }
     }
     let store = shared.state.secrets.read();
     let mut secrets = Vec::new();
@@ -153,6 +193,19 @@ pub(crate) async fn set_secret(
         }
     }
 
+    // The systemd credential is an operator-owned immutable scope: a live
+    // `set` here would be overridden at the next startup when the credential
+    // re-applies over config.toml — reject with guidance instead of silently
+    // reverting.
+    let credential = crate::config::load_credential_secrets()
+        .map_err(|error| ApiError::internal(format!("{error:#}")))?;
+    if credential_scope_conflict(&credential, body.repo.as_deref(), body.env.as_deref(), &name) {
+        return Err(ApiError::conflict(format!(
+            "secret `{name}` is managed by the systemd credential; edit the credential file \
+             (re-encrypt with `systemd-creds encrypt --name=preloop-secrets ...`) instead"
+        )));
+    }
+
     // Persist first (unless the secrets store is memory-only): if the write
     // fails, the store stays untouched and the error surfaces instead of
     // silently diverging. In `secrets_store = "memory"` mode the write is
@@ -188,7 +241,9 @@ pub(crate) async fn set_secret(
         }
         (None, Some(_)) => unreachable!("env without repo rejected above"),
     }
-    if !crate::config::store_memory(&config) {
+    if !crate::config::store_memory(&config)
+        .map_err(|error| ApiError::internal(format!("{error:#}")))?
+    {
         crate::config::write_config_to(&shared.state.config_path, &config)
             .map_err(|error| ApiError::internal(format!("{error:#}")))?;
     }
@@ -230,12 +285,52 @@ pub(crate) async fn delete_secret(
             "env scope requires repo (owner/repo)",
         ));
     }
+    if let Some(repo) = &query.repo {
+        if !valid_repo(repo) {
+            return Err(ApiError::bad_request("repo must look like owner/repo"));
+        }
+    }
+    if let Some(env) = &query.env {
+        if !valid_env(env) {
+            return Err(ApiError::bad_request(
+                "env must be an alphanumeric name (letters, digits, - and _)",
+            ));
+        }
+    }
+    // Same immutable-scope rule as `set_secret`: credential-backed entries
+    // re-apply at startup, so a config-file removal would either 404 or
+    // silently reappear. The credential file is the only supported edit path.
+    let credential = crate::config::load_credential_secrets()
+        .map_err(|error| ApiError::internal(format!("{error:#}")))?;
+    if credential_scope_conflict(&credential, query.repo.as_deref(), query.env.as_deref(), &name) {
+        return Err(ApiError::conflict(format!(
+            "secret `{name}` is managed by the systemd credential; edit the credential file \
+             (re-encrypt with `systemd-creds encrypt --name=preloop-secrets ...`) instead"
+        )));
+    }
     // Same serialization as `set_secret`: load → mutate → persist → publish
     // is one critical section, so a concurrent set cannot resurrect the
     // deleted name in the file. Lock order: `secret_mutation` → `secrets`.
     let _mutation = shared.state.secret_mutation.lock().await;
-    let mut config = crate::config::load_config_from(&shared.state.config_path)
+    let config = crate::config::load_config_from(&shared.state.config_path)
         .map_err(|error| ApiError::internal(format!("{error:#}")))?;
+    let memory = crate::config::store_memory(&config)
+        .map_err(|error| ApiError::internal(format!("{error:#}")))?;
+
+    if memory {
+        // The runtime store is the source of truth: values set through the
+        // live API never reached the file, so a config-driven lookup would
+        // 404 on exactly the secrets this mode exists to hold. Credential-
+        // backed entries re-apply at restart — remove them from the
+        // credential file to make the deletion permanent.
+        let mut store = shared.state.secrets.write();
+        if !remove_from_store(&mut store, &query, &name) {
+            return Err(not_found_error(&name, &query));
+        }
+        return Ok(Json(serde_json::json!({ "ok": true })));
+    }
+
+    let mut config = config;
     let (removed, scope_key) = match (&query.repo, &query.env) {
         (Some(repo), Some(env)) => {
             let removed = config.env_secrets.get_mut(repo).is_some_and(|envs| {
@@ -279,26 +374,28 @@ pub(crate) async fn delete_secret(
         (None, Some(_)) => unreachable!("env without repo rejected above"),
     };
     if !removed {
-        return Err(ApiError::not_found(match &scope_key {
-            Some((repo, None)) => format!("no secret named {name} for {repo}"),
-            Some((repo, Some(env))) => {
-                format!("no secret named {name} for {repo} in environment {env}")
-            }
-            None => format!("no secret named {name}"),
-        }));
+        return Err(not_found_error(&name, &query));
     }
-    // Memory-only stores deliberately skip the file write, same as set.
-    if !crate::config::store_memory(&config) {
-        crate::config::write_config_to(&shared.state.config_path, &config)
-            .map_err(|error| ApiError::internal(format!("{error:#}")))?;
-    }
+    crate::config::write_config_to(&shared.state.config_path, &config)
+        .map_err(|error| ApiError::internal(format!("{error:#}")))?;
 
     let mut store = shared.state.secrets.write();
-    match &scope_key {
-        Some((repo, Some(env))) => {
+    let _ = scope_key;
+    let _ = remove_from_store(&mut store, &query, &name);
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// Remove a secret from the runtime store by scope, pruning empty maps.
+fn remove_from_store(
+    store: &mut crate::state::SecretStore,
+    query: &SecretQuery,
+    name: &str,
+) -> bool {
+    match (&query.repo, &query.env) {
+        (Some(repo), Some(env)) => {
             let removed = store.env.get_mut(repo).is_some_and(|envs| {
                 envs.get_mut(env)
-                    .is_some_and(|map| map.remove(&name).is_some())
+                    .is_some_and(|map| map.remove(name).is_some())
             });
             if removed {
                 if store
@@ -312,18 +409,81 @@ pub(crate) async fn delete_secret(
                     store.env.remove(repo);
                 }
             }
+            removed
         }
-        Some((repo, None)) => {
-            if let Some(map) = store.repo.get_mut(repo) {
-                map.remove(&name);
-                if map.is_empty() {
-                    store.repo.remove(repo);
-                }
+        (Some(repo), None) => {
+            let removed = store
+                .repo
+                .get_mut(repo)
+                .is_some_and(|map| map.remove(name).is_some());
+            if removed && store.repo.get(repo).is_some_and(BTreeMap::is_empty) {
+                store.repo.remove(repo);
             }
+            removed
         }
-        None => {
-            store.global.remove(&name);
-        }
+        (None, None) => store.global.remove(name).is_some(),
+        (None, Some(_)) => unreachable!("env without repo rejected above"),
     }
-    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+fn not_found_error(name: &str, query: &SecretQuery) -> ApiError {
+    match (&query.repo, &query.env) {
+        (Some(repo), Some(env)) => ApiError::not_found(format!(
+            "no secret named {name} for {repo} in environment {env}"
+        )),
+        (Some(repo), None) => ApiError::not_found(format!("no secret named {name} for {repo}")),
+        (None, None) => ApiError::not_found(format!("no secret named {name}")),
+        (None, Some(_)) => unreachable!("env without repo rejected above"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credential_scope_conflict_matches_all_three_tiers() {
+        let mut credential = crate::config::ConfigFile::default();
+        credential.secrets.insert("GLOBAL".into(), "v".into());
+        credential
+            .repo_secrets
+            .entry("owner/repo".into())
+            .or_default()
+            .insert("REPO".into(), "v".into());
+        credential
+            .env_secrets
+            .entry("owner/repo".into())
+            .or_default()
+            .entry("prod".into())
+            .or_default()
+            .insert("ENV".into(), "v".into());
+
+        assert!(credential_scope_conflict(&credential, None, None, "GLOBAL"));
+        assert!(credential_scope_conflict(
+            &credential,
+            Some("owner/repo"),
+            None,
+            "REPO"
+        ));
+        assert!(credential_scope_conflict(
+            &credential,
+            Some("owner/repo"),
+            Some("prod"),
+            "ENV"
+        ));
+        // Wrong tier, wrong repo, or unknown name: no conflict.
+        assert!(!credential_scope_conflict(
+            &credential,
+            Some("owner/repo"),
+            Some("prod"),
+            "REPO"
+        ));
+        assert!(!credential_scope_conflict(
+            &credential,
+            Some("other/repo"),
+            None,
+            "REPO"
+        ));
+        assert!(!credential_scope_conflict(&credential, None, None, "NOPE"));
+    }
 }
