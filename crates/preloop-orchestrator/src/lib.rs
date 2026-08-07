@@ -350,6 +350,75 @@ const LOOPBACK_HOSTS: &str = "127.0.0.1 localhost\\n\
                               ff02::1 ip6-allnodes\\n\
                               ff02::2 ip6-allrouters\\n";
 
+/// The golden's apt baseline, every package version-pinned (versions.toml).
+/// Versions marked EXACT there match the official ubuntu-24.04 runner image.
+fn base_packages_pinned() -> String {
+    format!(
+        "git={APT_GIT} \
+        curl={APT_CURL} \
+        wget={APT_WGET} \
+        ca-certificates={APT_CA_CERTIFICATES} \
+        gnupg2={APT_GNUPG2} \
+        sudo={APT_SUDO} \
+        openssh-client={APT_OPENSSH_CLIENT} \
+        build-essential={APT_BUILD_ESSENTIAL} \
+        pkg-config={APT_PKG_CONFIG} \
+        libssl-dev={APT_LIBSSL_DEV} \
+        make={APT_MAKE} \
+        autoconf={APT_AUTOCONF} \
+        automake={APT_AUTOMAKE} \
+        libtool={APT_LIBTOOL} \
+        m4={APT_M4} \
+        bison={APT_BISON} \
+        flex={APT_FLEX} \
+        texinfo={APT_TEXINFO} \
+        patchelf={APT_PATCHELF} \
+        swig={APT_SWIG} \
+        dpkg-dev={APT_DPKG_DEV} \
+        fakeroot={APT_FAKEROOT} \
+        binutils={APT_BINUTILS} \
+        libicu-dev={APT_LIBICU_DEV} \
+        libsqlite3-dev={APT_LIBSQLITE3_DEV} \
+        libyaml-dev={APT_LIBYAML_DEV} \
+        python3={APT_PYTHON3} \
+        python3-pip={APT_PYTHON3_PIP} \
+        python-is-python3={APT_PYTHON_IS_PYTHON3} \
+        unzip={APT_UNZIP} \
+        zip={APT_ZIP} \
+        xz-utils={APT_XZ_UTILS} \
+        zstd={APT_ZSTD} \
+        bzip2={APT_BZIP2} \
+        brotli={APT_BROTLI} \
+        lz4={APT_LZ4} \
+        pigz={APT_PIGZ} \
+        p7zip-full={APT_P7ZIP_FULL} \
+        tar={APT_TAR} \
+        jq={APT_JQ} \
+        file={APT_FILE} \
+        tree={APT_TREE} \
+        shellcheck={APT_SHELLCHECK} \
+        parallel={APT_PARALLEL} \
+        time={APT_TIME} \
+        acl={APT_ACL} \
+        locales={APT_LOCALES} \
+        tzdata={APT_TZDATA} \
+        rsync={APT_RSYNC} \
+        dnsutils={APT_DNSUTILS} \
+        iputils-ping={APT_IPUTILS_PING} \
+        net-tools={APT_NET_TOOLS} \
+        iproute2={APT_IPROUTE2} \
+        netcat-openbsd={APT_NETCAT_OPENBSD} \
+        sqlite3={APT_SQLITE3} \
+        rpm={APT_RPM} \
+        aria2={APT_ARIA2} \
+        mercurial={APT_MERCURIAL} \
+        libcurl4-openssl-dev={APT_LIBCURL4_OPENSSL_DEV} \
+        zlib1g-dev={APT_ZLIB1G_DEV} \
+        gettext={APT_GETTEXT} \
+        libexpat1-dev={APT_LIBEXPAT1_DEV}"
+    )
+}
+
 /// The golden image's package baseline. Exposed for the fidelity tests.
 pub fn base_packages() -> &'static str {
     BASE_PACKAGES
@@ -419,7 +488,7 @@ pub fn base_install_script() -> String {
     format!(
         "apt-get update -qq && \
          DEBIAN_FRONTEND=noninteractive \
-         apt-get install -y -qq --no-install-recommends {BASE_PACKAGES} \
+         apt-get install -y -qq --no-install-recommends {base_packages_pinned} \
          && printf '{LOOPBACK_HOSTS}' > /etc/hosts && \
          printf '127.0.0.1 %s\\n' \"$(hostname)\" >> /etc/hosts && \
          printf 'APT::Get::Assume-Yes \"true\";\\n' > /etc/apt/apt.conf.d/90assumeyes && \
@@ -479,7 +548,8 @@ pub fn base_install_script() -> String {
           done) && \
          (useradd -m -u 1000 -s /bin/bash ubuntu 2>/dev/null || true) && \
          apt-get clean",
-        docker_packages = docker_apt_packages()
+        docker_packages = docker_apt_packages(),
+        base_packages_pinned = base_packages_pinned()
     )
 }
 
