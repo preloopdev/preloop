@@ -30,11 +30,11 @@ jobs:
           echo "::stop-commands::$token"
           echo '::warning::this must remain plain text'
           echo "::$token::"
-          echo "AKSH_ORACLE: masked_and_resumed=true secret_len=${#SECRET_VALUE}"
+          echo "PRELOOP_ORACLE: masked_and_resumed=true secret_len=${#SECRET_VALUE}"
       - name: Large and Unicode output
         shell: bash
         run: |
           python3 - <<'PY'
           print('é東京🙂' * 4096)
           PY
-          printf 'AKSH_ORACLE: unicode=ok large=16384\n'
+          printf 'PRELOOP_ORACLE: unicode=ok large=16384\n'

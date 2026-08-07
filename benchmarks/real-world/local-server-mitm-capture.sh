@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
-# Capture official/aksh runner wire traffic against a local aksh-server.
-# Usage: local-server-mitm-capture.sh <workflow.yml> <official|aksh|both> [job-count]
+# Capture official/preloop runner wire traffic against a local preloop-server.
+# Usage: local-server-mitm-capture.sh <workflow.yml> <official|preloop|both> [job-count]
 set -euo pipefail
 
 SCENARIO="${1:?workflow filename required}"
 RUNNER_KIND="${2:-both}"
 JOB_COUNT="${3:-1}"
 ROOT="$PWD"
-VM_PREFIX="${VM_PREFIX:-bench-aksh}"
+VM_PREFIX="${VM_PREFIX:-bench-preloop}"
 HOST_IP="${HOST_IP:-$(ipconfig getifaddr en1 2>/dev/null || echo 127.0.0.1)}"
 SERVER_PORT="${SERVER_PORT:-9191}"
 SERVER_URL="http://${HOST_IP}:${SERVER_PORT}"
 SERVER_BIN="${SERVER_BIN:-$ROOT/target/release/preloop-server}"
-CLIENT_BIN="${CLIENT_BIN:-$ROOT/target/release/aksh-runner-client}"
+CLIENT_BIN="${CLIENT_BIN:-$ROOT/target/release/preloop-runner-client}"
 OFFICIAL_SRC="${OFFICIAL_SRC:-/opt/runners/actions-runner}"
-AKSH_RUNNER="${AKSH_RUNNER:-/workspace/target/aarch64-unknown-linux-musl/release/preloop-runner}"
+PRELOOP_RUNNER="${PRELOOP_RUNNER:-/workspace/target/aarch64-unknown-linux-musl/release/preloop-runner}"
 MITM_PORT="${MITM_PORT:-18081}"
 OUT_ROOT="${RESULTS_ROOT:-$ROOT/benchmarks/compatibility/runner/protocol-local}"
 WORKFLOW="$ROOT/benchmarks/real-world/overnight-workflows/$SCENARIO"
-SYSTEM_TOKEN="${AKSH_SYSTEM_TOKEN:-local-mitm-token}"
+SYSTEM_TOKEN="${PRELOOP_SYSTEM_TOKEN:-local-mitm-token}"
 
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 ensure_vms() {
@@ -34,14 +34,14 @@ ensure_vms() {
 start_server() {
   pkill -x preloop-server >/dev/null 2>&1 || true
   sleep .3
-  STATE_DIR="$(mktemp -d /tmp/aksh-local-state.XXXXXX)"
-  RUST_LOG=info AKSH_SYSTEM_TOKEN="$SYSTEM_TOKEN" AKSH_PUBLIC_URL="$SERVER_URL" "$SERVER_BIN" serve --listen "0.0.0.0:$SERVER_PORT" --state-dir "$STATE_DIR" >/tmp/aksh-local-server.log 2>&1 &
+  STATE_DIR="$(mktemp -d /tmp/preloop-local-state.XXXXXX)"
+  RUST_LOG=info PRELOOP_SYSTEM_TOKEN="$SYSTEM_TOKEN" PRELOOP_PUBLIC_URL="$SERVER_URL" "$SERVER_BIN" serve --listen "0.0.0.0:$SERVER_PORT" --state-dir "$STATE_DIR" >/tmp/preloop-local-server.log 2>&1 &
   SERVER_PID=$!
   for _ in $(seq 1 50); do curl -sf "http://127.0.0.1:$SERVER_PORT/healthz" >/dev/null && return; sleep .2; done
-  cat /tmp/aksh-local-server.log; exit 1
+  cat /tmp/preloop-local-server.log; exit 1
 }
 start_proxy() {
-  python3 - "$SERVER_PORT" "$SERVER_PORT" >/tmp/aksh-local-proxy.log 2>&1 <<'PY' &
+  python3 - "$SERVER_PORT" "$SERVER_PORT" >/tmp/preloop-local-proxy.log 2>&1 <<'PY' &
 import socket,sys,threading
 port=int(sys.argv[1]); target=int(sys.argv[2])
 s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(("0.0.0.0",port+1)); s.listen(128)
@@ -58,7 +58,7 @@ PY
   PROXY_PID=$!
 }
 run_one() {
-  kind="$1"; ts=$(date -u +%Y-%m-%dT%H-%M-%SZ); out="$OUT_ROOT/${SCENARIO%.yml}/aksh-server-$kind/$ts"; mkdir -p "$out"
+  kind="$1"; ts=$(date -u +%Y-%m-%dT%H-%M-%SZ); out="$OUT_ROOT/${SCENARIO%.yml}/preloop-server-$kind/$ts"; mkdir -p "$out"
   start_server; start_proxy; trap 'kill "$SERVER_PID" "$PROXY_PID" 2>/dev/null || true' RETURN
   pids=()
   for i in $(seq 1 "$JOB_COUNT"); do
@@ -67,15 +67,15 @@ run_one() {
     smolvm machine exec --name "$vm" -- bash -lc "command -v mitmdump >/dev/null || (apt-get update -qq && apt-get install -y -qq python3-pip >/dev/null && python3 -m pip install --break-system-packages -q mitmproxy==12.2.3); mkdir -p '$vout/vm-mitm' '$vout/vm-mitm-conf'; pkill -x mitmdump 2>/dev/null || true; nohup env MITM_CAPTURE_DIR='$vout/vm-mitm' mitmdump --listen-host 127.0.0.1 --listen-port $MITM_PORT --set confdir='$vout/vm-mitm-conf' -s /workspace/experiments/mitm/addons/capture.py >/dev/null 2>&1 &"
     sleep 2
     name="local-$kind-${SCENARIO%.yml}-$i-$(date +%s)"; name="${name:0:60}"; root="/tmp/local-$kind-$i"; ca="$vout/vm-mitm-conf/mitmproxy-ca-cert.pem"; proxy="http://127.0.0.1:$MITM_PORT"
-    if [ "$kind" = aksh ]; then
-      cmd="RUST_LOG=info '$AKSH_RUNNER' --ca-bundle '$ca' --runner-root '$root' configure --url '$SERVER_URL' --token '$SYSTEM_TOKEN' --name '$name' --unattended --replace --ephemeral --labels self-hosted,linux,x64,overnight --no-externals && RUST_LOG=info '$AKSH_RUNNER' --ca-bundle '$ca' --runner-root '$root' run --once"
+    if [ "$kind" = preloop ]; then
+      cmd="RUST_LOG=info '$PRELOOP_RUNNER' --ca-bundle '$ca' --runner-root '$root' configure --url '$SERVER_URL' --token '$SYSTEM_TOKEN' --name '$name' --unattended --replace --ephemeral --labels self-hosted,linux,x64,overnight --no-externals && RUST_LOG=info '$PRELOOP_RUNNER' --ca-bundle '$ca' --runner-root '$root' run --once"
     else
       cmd="rm -rf '$root'; mkdir -p '$root/bin'; cp -a '$OFFICIAL_SRC/' '$root/bin/actions-runner'; cd '$root/bin/actions-runner'; export RUNNER_ALLOW_RUNASROOT=1 GITHUB_ACTIONS_RUNNER_TLS_NO_VERIFY=1 NODE_EXTRA_CA_CERTS='$ca' SSL_CERT_FILE='$ca'; ./config.sh --unattended --url '$SERVER_URL' --token '$SYSTEM_TOKEN' --name '$name' --labels self-hosted,linux,x64,overnight --work '$root/_work' --replace --ephemeral && timeout 900 ./run.sh --once"
     fi
     smolvm machine exec --name "$vm" -- bash -lc "export HTTP_PROXY='$proxy' HTTPS_PROXY='$proxy' http_proxy='$proxy' https_proxy='$proxy' NO_PROXY='' no_proxy=''; $cmd" >"$out/vm-$i.log" 2>&1 & pids+=("$!")
   done
   sleep 12
-  submit=$(AKSH_SYSTEM_TOKEN="$SYSTEM_TOKEN" "$CLIENT_BIN" --server "http://127.0.0.1:$SERVER_PORT" submit -W "$WORKFLOW" --event workflow_dispatch --repository local/overnight --git-ref refs/heads/main 2>&1)
+  submit=$(PRELOOP_SYSTEM_TOKEN="$SYSTEM_TOKEN" "$CLIENT_BIN" --server "http://127.0.0.1:$SERVER_PORT" submit -W "$WORKFLOW" --event workflow_dispatch --repository local/overnight --git-ref refs/heads/main 2>&1)
   echo "$submit" >"$out/submit.txt"; run_id=$(printf '%s' "$submit" | python3 -c 'import json,sys; print(json.load(sys.stdin)["run_id"])')
   for _ in $(seq 1 360); do status=$(curl -sf -H "Authorization: Bearer $SYSTEM_TOKEN" "$SERVER_URL/api/v1/runs/$run_id" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status", ""))' || true); case "$status" in completed|success|failed|cancelled) break;; esac; sleep 2; done
   for p in "${pids[@]}"; do wait "$p" 2>/dev/null || true; done
@@ -89,12 +89,12 @@ for p in r.glob('vm-*/vm-mitm/flows.jsonl'):
   if l.strip(): flows.append(json.loads(l))
 flows.sort(key=lambda x:(x.get('ts_request') or 0,x.get('flow_index') or 0)); (r/'flows.jsonl').write_text('\n'.join(json.dumps(x) for x in flows)+'\n')
 status='unknown'
-try: status=json.loads(__import__('subprocess').check_output(['curl','-sf','-H','Authorization: Bearer aksh-system-token',f'http://127.0.0.1:{sys.argv[1]}']))
+try: status=json.loads(__import__('subprocess').check_output(['curl','-sf','-H','Authorization: Bearer preloop-system-token',f'http://127.0.0.1:{sys.argv[1]}']))
 except: pass
 (r/'summary.json').write_text(json.dumps({'runner':sys.argv[2],'scenario':sys.argv[3],'run_id':sys.argv[4],'flows_count':len(flows)},indent=2))
 PY
-  latest="$OUT_ROOT/${SCENARIO%.yml}/aksh-server-$kind/latest"; rm -f "$latest"; ln -s "$out" "$latest"; log "$kind local capture: $out flows=$(wc -l <"$out/flows.jsonl")"
+  latest="$OUT_ROOT/${SCENARIO%.yml}/preloop-server-$kind/latest"; rm -f "$latest"; ln -s "$out" "$latest"; log "$kind local capture: $out flows=$(wc -l <"$out/flows.jsonl")"
   kill "$SERVER_PID" "$PROXY_PID" 2>/dev/null || true
 }
 ensure_vms
-case "$RUNNER_KIND" in official|aksh) run_one "$RUNNER_KIND";; both) run_one official; run_one aksh;; *) exit 2;; esac
+case "$RUNNER_KIND" in official|preloop) run_one "$RUNNER_KIND";; both) run_one official; run_one preloop;; *) exit 2;; esac

@@ -176,8 +176,8 @@ DOCKERHUB_TOKEN = "…"
 AWS_CREDS = "…"
 ```
 
-Environment variables override the file per field (`AKSH_GITHUB_APP_ID`,
-`AKSH_GITHUB_APP_PEM`, `AKSH_GITHUB_PAT`, …) — the file is the durable store,
+Environment variables override the file per field (`PRELOOP_GITHUB_APP_ID`,
+`PRELOOP_GITHUB_APP_PEM`, `PRELOOP_GITHUB_PAT`, …) — the file is the durable store,
 env vars are the escape hatch for containers. GitHub credential changes are
 picked up on engine restart; secrets changes apply live.
 
@@ -191,17 +191,17 @@ job's `GITHUB_TOKEN` misbehaves.
 ## Durable state (SQLite by default, Postgres optional)
 
 Run history, queued jobs, runners, sessions, and logs survive restarts. The
-default backend is **SQLite** at `<state dir>/aksh.db` — zero configuration,
+default backend is **SQLite** at `<state dir>/preloop.db` — zero configuration,
 correct for a single machine, and the right choice unless you have a reason
 to move off it.
 
 To use **Postgres**, point the engine at a database with `--store` or
-`AKSH_STORE_URL`:
+`PRELOOP_STORE_URL`:
 
 ```sh
-preloop serve --store 'postgres://user:password@host:5432/aksh?sslmode=require'
+preloop serve --store 'postgres://user:password@host:5432/preloop?sslmode=require'
 # or, for systemd deployments:
-# Environment=AKSH_STORE_URL=postgres://…?sslmode=require
+# Environment=PRELOOP_STORE_URL=postgres://…?sslmode=require
 ```
 
 - **`sqlite://<path>`**, a bare path, or nothing = SQLite (default).

@@ -30,13 +30,13 @@ At execution time, verify each repository still exposes a public, runnable workf
 
 3. **Instrument the Preloop control-plane path.**
    - Add structured benchmark events around CLI submission and result polling in `crates/preloop-cli/src/main.rs`.
-   - Add correlated timestamps around workflow loading/parsing, matrix expansion, concurrency admission, queue insertion, job dispatch, and completion in `crates/aksh-runner-server/src/runs.rs` and scheduler/bootstrap paths.
+   - Add correlated timestamps around workflow loading/parsing, matrix expansion, concurrency admission, queue insertion, job dispatch, and completion in `crates/preloop-runner-server/src/runs.rs` and scheduler/bootstrap paths.
    - Reuse the run ID/job ID as correlation keys; do not alter official runner wire DTOs for benchmark-only fields.
    - Verification: a no-op or tiny local run emits a complete ordered submission-to-completion trace with monotonic timestamps.
 
 4. **Instrument VM, runner, and action lifecycle.**
    - Add lifecycle events around golden preparation, image/container preload, VM create/fork, VM start/resume, guest readiness, runner registration, job acquisition, successor pre-provisioning, guest exit, debug preservation, and deletion in `crates/preloop-orchestrator/src/lib.rs`.
-   - Capture checkout and remote-action preparation boundaries in `crates/aksh-runner/src/worker/action_preparation.rs`, the worker job/step runners, and local snapshot creation/serve paths in `crates/aksh-runner-server/src/snapshots.rs`.
+   - Capture checkout and remote-action preparation boundaries in `crates/preloop-runner/src/worker/action_preparation.rs`, the worker job/step runners, and local snapshot creation/serve paths in `crates/preloop-runner-server/src/snapshots.rs`.
    - Include VM name, generation, cold/warm class, image fingerprint, queue wait, and action/checkout result without logging source or secrets.
    - Verification: a synthetic runner-provider test covers every lifecycle event and guarantees terminal events occur once even on boot, job, and teardown failures.
 
@@ -67,7 +67,7 @@ At execution time, verify each repository still exposes a public, runnable workf
 
 - `just test-ci`
 - `cargo test -p preloop-orchestrator`
-- `cargo test -p aksh-runner-server`
+- `cargo test -p preloop-runner-server`
 - Benchmark manifest validation and dry-run commands from the new harness.
 - A one-repository end-to-end smoke run on each adapter before the full 80-run matrix.
 

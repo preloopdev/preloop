@@ -17,25 +17,25 @@ on:
     paths:
       - .github/actions/tier2-property-oracle/**
       - .github/workflows/tier2-property-live.yml
-      - crates/aksh-gha-protocol/Cargo.toml
-      - crates/aksh-gha-protocol/src/azdo.rs
-      - crates/aksh-runner/Cargo.toml
-      - crates/aksh-runner-server/Cargo.toml
-      - crates/aksh-gha-parser/src/dag.rs
-      - crates/aksh-gha-parser/src/lib.rs
-      - crates/aksh-gha-parser/src/matrix_expand.rs
-      - crates/aksh-gha-expressions/src/lib.rs
-      - crates/aksh-runner/src/worker/commands.rs
-      - crates/aksh-runner/src/worker/contexts.rs
-      - crates/aksh-runner/src/worker/file_commands.rs
-      - crates/aksh-runner/src/worker/job_extension.rs
-      - crates/aksh-runner/src/worker/official_oracles.rs
-      - crates/aksh-runner/src/worker/step_conditions.rs
-      - crates/aksh-runner/src/worker/step_records.rs
-      - crates/aksh-runner/src/worker/steps_runner.rs
-      - crates/aksh-runner-server/src/lib.rs
-      - crates/aksh-runner-server/src/scheduling.rs
-      - crates/aksh-runner-server/proptest-regressions/**
+      - crates/preloop-gha-protocol/Cargo.toml
+      - crates/preloop-gha-protocol/src/azdo.rs
+      - crates/preloop-runner/Cargo.toml
+      - crates/preloop-runner-server/Cargo.toml
+      - crates/preloop-gha-parser/src/dag.rs
+      - crates/preloop-gha-parser/src/lib.rs
+      - crates/preloop-gha-parser/src/matrix_expand.rs
+      - crates/preloop-gha-expressions/src/lib.rs
+      - crates/preloop-runner/src/worker/commands.rs
+      - crates/preloop-runner/src/worker/contexts.rs
+      - crates/preloop-runner/src/worker/file_commands.rs
+      - crates/preloop-runner/src/worker/job_extension.rs
+      - crates/preloop-runner/src/worker/official_oracles.rs
+      - crates/preloop-runner/src/worker/step_conditions.rs
+      - crates/preloop-runner/src/worker/step_records.rs
+      - crates/preloop-runner/src/worker/steps_runner.rs
+      - crates/preloop-runner-server/src/lib.rs
+      - crates/preloop-runner-server/src/scheduling.rs
+      - crates/preloop-runner-server/proptest-regressions/**
   workflow_dispatch:
 
 permissions:
@@ -74,24 +74,24 @@ jobs:
             fi
           }
 
-          run_filter aksh-gha-protocol tier2_codec_
-          run_filter aksh-runner worker::commands::tests
-          run_filter aksh-runner worker::contexts::tests::masking_
-          run_filter aksh-runner worker::file_commands::tests
-          run_filter aksh-runner lifecycle
-          run_filter aksh-runner-server workflow_steps_update_
+          run_filter preloop-gha-protocol tier2_codec_
+          run_filter preloop-runner worker::commands::tests
+          run_filter preloop-runner worker::contexts::tests::masking_
+          run_filter preloop-runner worker::file_commands::tests
+          run_filter preloop-runner lifecycle
+          run_filter preloop-runner-server workflow_steps_update_
 
       # The official runner does not support local pre actions, so this fixture
       # is pinned to an immutable, isolated action-only commit in this repository.
       - name: Run remote JavaScript oracle (declaration 1)
         id: oracle_first
-        uses: preloopdev/aksh/.github/actions/tier2-property-oracle@88e5328dd1ee742206bc5e4f12823613744aa311
+        uses: preloopdev/preloop/.github/actions/tier2-property-oracle@88e5328dd1ee742206bc5e4f12823613744aa311
         with:
           id: first
 
       - name: Run remote JavaScript oracle (declaration 2)
         id: oracle_second
-        uses: preloopdev/aksh/.github/actions/tier2-property-oracle@88e5328dd1ee742206bc5e4f12823613744aa311
+        uses: preloopdev/preloop/.github/actions/tier2-property-oracle@88e5328dd1ee742206bc5e4f12823613744aa311
         with:
           id: second
 

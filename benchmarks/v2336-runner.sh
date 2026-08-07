@@ -1,15 +1,15 @@
 #!/bin/bash
 set -euo pipefail
-CLIENT=/workspace/target/aarch64-unknown-linux-musl/release/aksh-runner-client
+CLIENT=/workspace/target/aarch64-unknown-linux-musl/release/preloop-runner-client
 RUNNER_SRC=/opt/runners/actions-runner
-OUTDIR=/workspace/benchmarks/v2336-official-vs-aksh
+OUTDIR=/workspace/benchmarks/v2336-official-vs-preloop
 
 RUNNER_DIR=$(mktemp -d)
 cp -r $RUNNER_SRC/* "$RUNNER_DIR/"
 cd "$RUNNER_DIR"
 ./config.sh --url http://127.0.0.1 --token dummy-token --name v2336-test --work _work --unattended --replace 2>&1 | tail -3
 
-SUBMIT=$($CLIENT --server http://127.0.0.1 submit -W /workspace/crates/aksh-conformance/fixtures/v2336-combined.yml 2>&1)
+SUBMIT=$($CLIENT --server http://127.0.0.1 submit -W /workspace/crates/preloop-conformance/fixtures/v2336-combined.yml 2>&1)
 echo "Submit: $SUBMIT"
 RUN_ID=$(echo "$SUBMIT" | python3 -c "import json,sys; print(json.load(sys.stdin)['run_id'])")
 echo "RUN_ID=$RUN_ID"

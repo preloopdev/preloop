@@ -495,8 +495,8 @@ def run_one(engine: str, workload: Workload, source: Path, workflow: Path, outpu
         port = 19000 + int.from_bytes(hashlib.sha256(port_key).digest()[:2], "big") % 500
         env["PRELOOP_LISTEN"] = f"127.0.0.1:{port}"
         env["PRELOOP_RUNNER_BASE_IMAGE"] = "ubuntu:24.04"
-        env["AKSH_SYSTEM_TOKEN"] = hashlib.sha256(str(home).encode()).hexdigest()
-        env.pop("AKSH_URL", None)
+        env["PRELOOP_SYSTEM_TOKEN"] = hashlib.sha256(str(home).encode()).hexdigest()
+        env.pop("PRELOOP_URL", None)
         env["PRELOOP_RUNNER_POOL_SIZE"] = "1"
         env["RUST_LOG"] = "info"
         try:

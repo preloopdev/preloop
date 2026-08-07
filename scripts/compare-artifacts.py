@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Compare GitHub and aksh official-runner artifacts.
+"""Compare GitHub and preloop official-runner artifacts.
 
 Both sides run the OFFICIAL runner — we're comparing the SERVER behavior.
 - GitHub side: `jobs.json` from GH API (step names, conclusions), `steps.log` (output)
-- aksh side: `run.json` from aksh API (job_steps with step records), or fallback to
+- preloop side: `run.json` from preloop API (job_steps with step records), or fallback to
   `status.json` + Worker diag logs.  Step log blobs from replay dir.
 
 Compares:
@@ -44,8 +44,8 @@ def strip_log_line(line: str) -> str:
 
 # ── Load data ───────────────────────────────────────────────────
 gh_jobs_data = load_json(root / "github/jobs.json") or {}
-aksh_status = load_json(root / "aksh-server/status.json") or {}
-aksh_run = load_json(root / "aksh-server/run.json")
+preloop_status = load_json(root / "preloop-server/status.json") or {}
+preloop_run = load_json(root / "preloop-server/run.json")
 gh = gh_jobs_data.get("jobs", [])
 
 print(f"{'='*60}")
@@ -55,19 +55,19 @@ print(f"{'='*60}")
 # ── 1. Job-level comparison ─────────────────────────────────────
 print("\n── Job Conclusions ──")
 gh_job_map = {j["name"]: j.get("conclusion", "") for j in gh}
-aksh_job_map = aksh_status.get("jobs", {})
+preloop_job_map = preloop_status.get("jobs", {})
 
-all_jobs = sorted(set(list(gh_job_map.keys()) + list(aksh_job_map.keys())))
+all_jobs = sorted(set(list(gh_job_map.keys()) + list(preloop_job_map.keys())))
 job_match = True
 for job_name in all_jobs:
     gh_c = gh_job_map.get(job_name, "MISSING")
-    ak_c = aksh_job_map.get(job_name, "MISSING")
+    ak_c = preloop_job_map.get(job_name, "MISSING")
     gh_norm = NORM.get(gh_c, gh_c)
     ak_norm = NORM.get(ak_c, ak_c)
     match = "✅" if gh_norm == ak_norm else "❌"
     if gh_norm != ak_norm:
         job_match = False
-    print(f"  {match} {job_name}: github={gh_c} aksh={ak_c}")
+    print(f"  {match} {job_name}: github={gh_c} preloop={ak_c}")
 
 # ── 2. Step-level comparison ────────────────────────────────────
 print("\n── Step Results (per job) ──")
@@ -88,15 +88,15 @@ for job in gh:
             })
     gh_steps_by_job[jname] = steps
 
-# aksh steps — prefer run.json (API response), fallback to Worker diag logs.
-aksh_steps_by_job: dict[str, list[dict]] = {}
-aksh_step_source = "none"
+# preloop steps — prefer run.json (API response), fallback to Worker diag logs.
+preloop_steps_by_job: dict[str, list[dict]] = {}
+preloop_step_source = "none"
 
-if aksh_run and aksh_run.get("job_steps"):
-    aksh_step_source = "api"
-    job_steps = aksh_run["job_steps"]
-    # job_steps uses aksh job display IDs. Never align unrelated jobs by
-    # iteration order: aksh BTreeMaps and GitHub API ordering differ.
+if preloop_run and preloop_run.get("job_steps"):
+    preloop_step_source = "api"
+    job_steps = preloop_run["job_steps"]
+    # job_steps uses preloop job display IDs. Never align unrelated jobs by
+    # iteration order: preloop BTreeMaps and GitHub API ordering differ.
     for job_key, steps_list in job_steps.items():
         job_name = job_key
         steps = []
@@ -114,11 +114,11 @@ if aksh_run and aksh_run.get("job_steps"):
                 "status": STATUS_CODES.get(step.get("status", 0), "unknown"),
                 "external_id": step.get("external_id", ""),
             })
-        aksh_steps_by_job[job_name] = steps
+        preloop_steps_by_job[job_name] = steps
 else:
     # Fallback: parse Worker diagnostic logs (legacy path).
-    aksh_step_source = "diag"
-    diag_dir = root / "aksh-server/diag"
+    preloop_step_source = "diag"
+    diag_dir = root / "preloop-server/diag"
     if diag_dir.exists():
         worker_logs = sorted(diag_dir.glob("Worker_*.log"))
         all_steps: list[dict] = []
@@ -143,16 +143,16 @@ else:
         # Single-job fallback: assign all steps to first GitHub job name.
         gh_job_names = list(gh_steps_by_job.keys())
         job_name = gh_job_names[0] if gh_job_names else "default"
-        aksh_steps_by_job[job_name] = all_steps
+        preloop_steps_by_job[job_name] = all_steps
 
-print(f"  (aksh step source: {aksh_step_source})")
+print(f"  (preloop step source: {preloop_step_source})")
 
 step_order_match = True
 step_results_match = True
 
-for job_name in sorted(set(list(gh_steps_by_job.keys()) + list(aksh_steps_by_job.keys()))):
+for job_name in sorted(set(list(gh_steps_by_job.keys()) + list(preloop_steps_by_job.keys()))):
     gh_steps = gh_steps_by_job.get(job_name, [])
-    ak_steps = aksh_steps_by_job.get(job_name, [])
+    ak_steps = preloop_steps_by_job.get(job_name, [])
     print(f"\n  Job: {job_name}")
 
     if not gh_steps and not ak_steps:
@@ -161,10 +161,10 @@ for job_name in sorted(set(list(gh_steps_by_job.keys()) + list(aksh_steps_by_job
     elif not gh_steps:
         print("    (no GitHub step data)")
         for s in ak_steps:
-            print(f"      aksh: \"{s['name']}\" → {s['conclusion']}")
+            print(f"      preloop: \"{s['name']}\" → {s['conclusion']}")
         continue
     elif not ak_steps:
-        print("    (no aksh step data)")
+        print("    (no preloop step data)")
         for s in gh_steps:
             print(f"      github: \"{s['name']}\" → {s['conclusion']}")
         continue
@@ -176,7 +176,7 @@ for job_name in sorted(set(list(gh_steps_by_job.keys()) + list(aksh_steps_by_job
         step_order_match = False
         print(f"    ⚠️  Step order/names differ")
         print(f"      GitHub ({len(gh_names)} steps): {gh_names}")
-        print(f"      aksh   ({len(ak_names)} steps): {ak_names}")
+        print(f"      preloop   ({len(ak_names)} steps): {ak_names}")
 
     max_len = max(len(gh_steps), len(ak_steps))
     for i in range(max_len):
@@ -187,20 +187,20 @@ for job_name in sorted(set(list(gh_steps_by_job.keys()) + list(aksh_steps_by_job
             names_ok = gs["name"] == aks["name"]
             results_ok = gc == ac
             if names_ok and results_ok:
-                print(f"    ✅ \"{gs['name']}\": github={gs['conclusion']} aksh={aks['conclusion']}")
+                print(f"    ✅ \"{gs['name']}\": github={gs['conclusion']} preloop={aks['conclusion']}")
             elif names_ok:
                 step_results_match = False
-                print(f"    ❌ \"{gs['name']}\": github={gs['conclusion']} aksh={aks['conclusion']}")
+                print(f"    ❌ \"{gs['name']}\": github={gs['conclusion']} preloop={aks['conclusion']}")
             else:
                 step_results_match = False
                 step_order_match = False
-                print(f"    ❌ \"{gs['name']}\" vs \"{aks['name']}\": github={gs['conclusion']} aksh={aks['conclusion']}")
+                print(f"    ❌ \"{gs['name']}\" vs \"{aks['name']}\": github={gs['conclusion']} preloop={aks['conclusion']}")
         elif i < len(gh_steps):
             step_results_match = False
-            print(f"    ❌ [{i+1}] github=\"{gh_steps[i]['name']}\"({gh_steps[i]['conclusion']}) aksh=MISSING")
+            print(f"    ❌ [{i+1}] github=\"{gh_steps[i]['name']}\"({gh_steps[i]['conclusion']}) preloop=MISSING")
         else:
             step_results_match = False
-            print(f"    ❌ [{i+1}] github=MISSING aksh=\"{ak_steps[i]['name']}\"({ak_steps[i]['conclusion']})")
+            print(f"    ❌ [{i+1}] github=MISSING preloop=\"{ak_steps[i]['name']}\"({ak_steps[i]['conclusion']})")
 
 # ── 3. Log content comparison ───────────────────────────────────
 print("\n── Log Content ──")
@@ -226,17 +226,17 @@ if gh_steps_log_path.exists():
             gh_logs_by_step.setdefault((job_name, step_name), []).append(stripped)
     gh_step_log_count = len(gh_logs_by_step)
 
-# aksh step logs from replay dir, mapped through the Twirp external step UUID.
+# preloop step logs from replay dir, mapped through the Twirp external step UUID.
 ak_logs_by_step: dict[tuple[str, str], list[str]] = {}
 step_identity = {
     step.get("external_id", ""): (job_name, step.get("name", ""))
-    for job_name, steps in aksh_steps_by_job.items()
+    for job_name, steps in preloop_steps_by_job.items()
     for step in steps
     if step.get("external_id")
 }
-replay_dir = root / "aksh-server/replay/results"
+replay_dir = root / "preloop-server/replay/results"
 if not replay_dir.exists():
-    replay_dir = root / "aksh-server/.aksh/replay/results"
+    replay_dir = root / "preloop-server/.preloop/replay/results"
 
 if replay_dir.exists() and step_identity:
     for run_dir in replay_dir.iterdir():
@@ -271,10 +271,10 @@ if all_log_steps:
         ak_lines = ak_logs_by_step.get(identity, [])
         label = f'{job_name} / {step_name}'
         if not gh_lines:
-            print(f"  Step \"{label}\": aksh={len(ak_lines)} lines, github=none")
+            print(f"  Step \"{label}\": preloop={len(ak_lines)} lines, github=none")
             continue
         if not ak_lines:
-            print(f"  Step \"{label}\": github={len(gh_lines)} lines, aksh=none")
+            print(f"  Step \"{label}\": github={len(gh_lines)} lines, preloop=none")
             continue
 
         max_len = max(len(gh_lines), len(ak_lines))
@@ -291,7 +291,7 @@ if all_log_steps:
                 step_diffs.extend([
                     f"        line {i+1}:",
                     f"          github: {gl[:120]}",
-                    f"          aksh:   {al[:120]}",
+                    f"          preloop:   {al[:120]}",
                 ])
 
         if step_matching == max_len:
@@ -314,7 +314,7 @@ else:
     elif not gh_logs_by_step:
         print("  (no GitHub log data)")
     else:
-        print("  (no aksh log data)")
+        print("  (no preloop log data)")
 
 # ── Summary ─────────────────────────────────────────────────────
 print(f"\n── Summary ──")
@@ -325,12 +325,12 @@ print(f"  log_content_match={log_content_match}")
 if log_match_pct is not None:
     print(f"  log_match_pct={log_match_pct:.1f}")
 print(f"  github_jobs={len(gh)}")
-print(f"  aksh_jobs={len(aksh_job_map)}")
+print(f"  preloop_jobs={len(preloop_job_map)}")
 print(f"  github_steps={sum(len(s) for s in gh_steps_by_job.values())}")
-print(f"  aksh_steps={sum(len(s) for s in aksh_steps_by_job.values())}")
-print(f"  aksh_step_source={aksh_step_source}")
+print(f"  preloop_steps={sum(len(s) for s in preloop_steps_by_job.values())}")
+print(f"  preloop_step_source={preloop_step_source}")
 print(f"  github_step_logs={gh_step_log_count}")
-print(f"  aksh_step_logs={ak_step_log_count}")
+print(f"  preloop_step_logs={ak_step_log_count}")
 
 if job_match and step_order_match and step_results_match and log_content_match:
     print(f"  overall=✅ FULL MATCH")

@@ -9,7 +9,7 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
-          echo 'AKSH_ORACLE: tolerated outcome=failure conclusion=success'
+          echo 'PRELOOP_ORACLE: tolerated outcome=failure conclusion=success'
           exit 7
       - name: Assert outcome and conclusion
         shell: bash
@@ -20,7 +20,7 @@ jobs:
     runs-on: [self-hosted, overnight]
     steps:
       - name: Before failure
-        run: "echo 'AKSH_ORACLE: before=ran'"
+        run: "echo 'PRELOOP_ORACLE: before=ran'"
       - name: Hard failure
         run: exit 9
       - name: Success-only step
@@ -28,10 +28,10 @@ jobs:
         run: echo MUST_NOT_RUN
       - name: Failure step
         if: failure()
-        run: "echo 'AKSH_ORACLE: failure=ran'"
+        run: "echo 'PRELOOP_ORACLE: failure=ran'"
       - name: Always step
         if: always()
-        run: "echo 'AKSH_ORACLE: always=ran'"
+        run: "echo 'PRELOOP_ORACLE: always=ran'"
   skipped:
     if: github.ref == 'refs/heads/never-run-this-job'
     runs-on: [self-hosted, overnight]
@@ -54,4 +54,4 @@ jobs:
           test "$HARD" = failure
           test "$SKIPPED" = skipped
           echo "::warning title=dependency::soft=$SOFT hard=$HARD skipped=$SKIPPED"
-          echo "AKSH_ORACLE: results soft=$SOFT hard=$HARD skipped=$SKIPPED"
+          echo "PRELOOP_ORACLE: results soft=$SOFT hard=$HARD skipped=$SKIPPED"

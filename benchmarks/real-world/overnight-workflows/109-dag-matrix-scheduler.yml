@@ -33,10 +33,10 @@ jobs:
           set -euo pipefail
           echo "cell=${{ matrix.name }}" >> "$GITHUB_OUTPUT"
           if test '${{ matrix.expected }}' = failure; then
-            echo 'AKSH_ORACLE: expected-cell-failure=${{ matrix.name }}'
+            echo 'PRELOOP_ORACLE: expected-cell-failure=${{ matrix.name }}'
             exit 4
           fi
-          echo 'AKSH_ORACLE: cell=${{ matrix.name }} success'
+          echo 'PRELOOP_ORACLE: cell=${{ matrix.name }} success'
   test:
     if: always()
     needs: [root, build]
@@ -51,18 +51,18 @@ jobs:
           set -euo pipefail
           test "$ROOT" = success
           test "$BUILD" = success
-          echo "AKSH_ORACLE: root=$ROOT build=$BUILD"
+          echo "PRELOOP_ORACLE: root=$ROOT build=$BUILD"
   package:
     needs: test
     runs-on: [self-hosted, overnight]
     steps:
-      - run: "echo 'AKSH_ORACLE: package=ran'"
+      - run: "echo 'PRELOOP_ORACLE: package=ran'"
   final:
     if: always()
     needs: [root, build, test, package]
     runs-on: [self-hosted, overnight]
     steps:
       - run: >-
-          echo "AKSH_ORACLE: final root=${{ needs.root.result }}
+          echo "PRELOOP_ORACLE: final root=${{ needs.root.result }}
           build=${{ needs.build.result }} test=${{ needs.test.result }}
           package=${{ needs.package.result }}"

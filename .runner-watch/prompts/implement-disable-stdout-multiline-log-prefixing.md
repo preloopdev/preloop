@@ -1,4 +1,4 @@
-You are implementing an aksh protocol-sync spec. Follow existing Rust patterns exactly. Run cargo check and relevant tests, but do not run formatters or project-wide lint.
+You are implementing an preloop protocol-sync spec. Follow existing Rust patterns exactly. Run cargo check and relevant tests, but do not run formatters or project-wide lint.
 
 Spec:
 ```toml
@@ -19,7 +19,7 @@ runner_behavior = '''
 Worker reads DisableStdoutMultilineLogPrefixing from environment/configuration.
 '''
 failure_mode = '''
-Runner-side cosmetic behavior; aksh control plane usually need not act.
+Runner-side cosmetic behavior; preloop control plane usually need not act.
 '''
 
 [feature_flag]
@@ -33,13 +33,13 @@ N/A
 '''
 expected_response = "N/A"
 
-[aksh_targets]
+[preloop_targets]
 files = [
 ]
 
 [implementation]
 approach = '''
-No control-plane change unless aksh injects runner environment.
+No control-plane change unless preloop injects runner environment.
 '''
 test = "No server test required; document skip."
 

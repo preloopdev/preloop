@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Compare concurrency scenario outcomes + step log content: GitHub vs aksh.
+"""Compare concurrency scenario outcomes + step log content: GitHub vs preloop.
 
-Captures aksh runs (status/jobs/events + step log blobs from state dir), then
+Captures preloop runs (status/jobs/events + step log blobs from state dir), then
 diffs against live GitHub captures under concurrency-live/.
 
 Usage:
   python3 benchmarks/real-world/concurrency-log-compare.py \
     --github-root benchmarks/real-world/results/concurrency-live/2026-07-13T13-19-42Z \
-    --aksh-root benchmarks/real-world/results/concurrency-live/aksh-compare-<ts>
+    --preloop-root benchmarks/real-world/results/concurrency-live/preloop-compare-<ts>
 """
 from __future__ import annotations
 
@@ -139,10 +139,10 @@ def load_github_capture(dir_path: Path) -> SideCapture:
     )
 
 
-def load_aksh_capture(dir_path: Path) -> SideCapture:
+def load_preloop_capture(dir_path: Path) -> SideCapture:
     summary = json.loads((dir_path / "summary.json").read_text())
     log = (dir_path / "run.log").read_text(errors="replace") if (dir_path / "run.log").exists() else ""
-    # aksh run.log may be synthetic: step\tline or plain lines
+    # preloop run.log may be synthetic: step\tline or plain lines
     steps: dict[str, list[str]] = defaultdict(list)
     for raw in log.splitlines():
         parts = raw.split("\t", 2)
@@ -188,7 +188,7 @@ def load_aksh_capture(dir_path: Path) -> SideCapture:
     )
 
 
-def compare(gh: SideCapture, aksh: SideCapture) -> dict:
+def compare(gh: SideCapture, preloop: SideCapture) -> dict:
     issues: list[str] = []
     notes: list[str] = []
 
@@ -205,35 +205,35 @@ def compare(gh: SideCapture, aksh: SideCapture) -> dict:
             return "failure"
         return c
 
-    if norm(gh.conclusion) != norm(aksh.conclusion):
-        issues.append(f"run conclusion: gh={gh.conclusion} aksh={aksh.conclusion}")
+    if norm(gh.conclusion) != norm(preloop.conclusion):
+        issues.append(f"run conclusion: gh={gh.conclusion} preloop={preloop.conclusion}")
     else:
         notes.append(f"run conclusion match: {norm(gh.conclusion)}")
 
-    # Cross-run contamination: aksh capture must not contain SCENARIO= or DONE= markers
+    # Cross-run contamination: preloop capture must not contain SCENARIO= or DONE= markers
     # from runs other than the one being compared. Extra markers indicate the run.log
     # accumulated output from previous scenarios, making the capture untrustworthy.
     gh_scenarios = {m for m in gh.markers if m.startswith("SCENARIO=")}
-    ak_scenarios = {m for m in aksh.markers if m.startswith("SCENARIO=")}
+    ak_scenarios = {m for m in preloop.markers if m.startswith("SCENARIO=")}
     extra_scenarios = ak_scenarios - gh_scenarios
     if extra_scenarios:
         issues.append(
-            f"cross-run log contamination: aksh has SCENARIO markers {sorted(extra_scenarios)} "
+            f"cross-run log contamination: preloop has SCENARIO markers {sorted(extra_scenarios)} "
             f"not present in GH capture {sorted(gh_scenarios)}; "
             "capture run.log was not isolated to this run"
         )
     for sm in sorted(gh_scenarios):
         if sm not in ak_scenarios:
-            issues.append(f"scenario marker missing in aksh: {sm}")
+            issues.append(f"scenario marker missing in preloop: {sm}")
         else:
             notes.append(f"scenario marker present: {sm}")
 
     gh_dones = {m for m in gh.markers if m.startswith("DONE=")}
-    ak_dones = {m for m in aksh.markers if m.startswith("DONE=")}
+    ak_dones = {m for m in preloop.markers if m.startswith("DONE=")}
     extra_dones = ak_dones - gh_dones
     if extra_dones:
         issues.append(
-            f"cross-run log contamination: aksh has DONE markers {sorted(extra_dones)} "
+            f"cross-run log contamination: preloop has DONE markers {sorted(extra_dones)} "
             f"not present in GH capture {sorted(gh_dones)}; "
             "capture run.log was not isolated to this run"
         )
@@ -241,29 +241,29 @@ def compare(gh: SideCapture, aksh: SideCapture) -> dict:
         if dm not in ak_dones:
             # cancelled runs often lack DONE=
             if norm(gh.conclusion) != "cancelled":
-                issues.append(f"DONE marker missing in aksh: {dm}")
+                issues.append(f"DONE marker missing in preloop: {dm}")
         else:
             notes.append(f"DONE marker present: {dm}")
 
     # Cancellation annotations are part of step-log fidelity. Presence must
     # match in both directions; conclusions do not substitute for log parity.
     gh_cancel_error = "CANCEL_ERROR" in gh.markers
-    aksh_cancel_error = "CANCEL_ERROR" in aksh.markers
-    if gh_cancel_error != aksh_cancel_error:
+    preloop_cancel_error = "CANCEL_ERROR" in preloop.markers
+    if gh_cancel_error != preloop_cancel_error:
         issues.append(
             "cancel error annotation presence differs: "
-            f"gh={gh_cancel_error} aksh={aksh_cancel_error}"
+            f"gh={gh_cancel_error} preloop={preloop_cancel_error}"
         )
     elif gh_cancel_error:
         notes.append("cancel error annotation present on both")
 
-    # SHOULD_NOT_REACH executed in aksh capture is always a hard failure when GH did not
+    # SHOULD_NOT_REACH executed in preloop capture is always a hard failure when GH did not
     # execute it. This marker appears in steps that must not run (e.g., a sleep after
     # cancel-in-progress). Its presence either means a real concurrency bug (the step was
     # not cancelled) or cross-run log contamination. Both conditions make the capture invalid.
-    if "SHOULD_NOT_REACH_EXECUTED" in aksh.markers and "SHOULD_NOT_REACH_EXECUTED" not in gh.markers:
+    if "SHOULD_NOT_REACH_EXECUTED" in preloop.markers and "SHOULD_NOT_REACH_EXECUTED" not in gh.markers:
         issues.append(
-            "SHOULD_NOT_REACH was executed in aksh capture but not in GH capture — "
+            "SHOULD_NOT_REACH was executed in preloop capture but not in GH capture — "
             "real concurrency bug or cross-run log contamination; capture is invalid"
         )
 
@@ -276,61 +276,61 @@ def compare(gh: SideCapture, aksh: SideCapture) -> dict:
     }
     ak_user = {
         key: value
-        for key, value in aksh.step_conclusions.items()
+        for key, value in preloop.step_conclusions.items()
         if key not in ("Set up job", "Complete job", "Set up runner", "Complete runner")
     }
     if len(gh_user) != len(ak_user):
-        issues.append(f"user step count: gh={len(gh_user)} aksh={len(ak_user)}")
+        issues.append(f"user step count: gh={len(gh_user)} preloop={len(ak_user)}")
 
-    unmatched_aksh = set(ak_user)
+    unmatched_preloop = set(ak_user)
     for gh_name, gh_conclusion in gh_user.items():
-        candidates = [name for name in unmatched_aksh if name == gh_name]
+        candidates = [name for name in unmatched_preloop if name == gh_name]
         if not candidates:
             candidates = [
                 name
-                for name in unmatched_aksh
+                for name in unmatched_preloop
                 if gh_name in name or name in gh_name
             ]
-        if not candidates and len(gh_user) == 1 and len(unmatched_aksh) == 1:
-            candidates = list(unmatched_aksh)
+        if not candidates and len(gh_user) == 1 and len(unmatched_preloop) == 1:
+            candidates = list(unmatched_preloop)
         if not candidates:
             issues.append(
-                f"missing aksh step matching GH step '{gh_name}' ({gh_conclusion})"
+                f"missing preloop step matching GH step '{gh_name}' ({gh_conclusion})"
             )
             continue
-        aksh_name = sorted(candidates)[0]
-        unmatched_aksh.remove(aksh_name)
-        aksh_conclusion = ak_user[aksh_name]
-        if norm(gh_conclusion) != norm(aksh_conclusion):
+        preloop_name = sorted(candidates)[0]
+        unmatched_preloop.remove(preloop_name)
+        preloop_conclusion = ak_user[preloop_name]
+        if norm(gh_conclusion) != norm(preloop_conclusion):
             issues.append(
                 f"step '{gh_name}' conclusion: "
-                f"gh={gh_conclusion} aksh={aksh_name}/{aksh_conclusion}"
+                f"gh={gh_conclusion} preloop={preloop_name}/{preloop_conclusion}"
             )
         else:
             notes.append(
-                f"step '{gh_name}'≈'{aksh_name}' conclusion={norm(gh_conclusion)}"
+                f"step '{gh_name}'≈'{preloop_name}' conclusion={norm(gh_conclusion)}"
             )
-    for aksh_name in sorted(unmatched_aksh):
+    for preloop_name in sorted(unmatched_preloop):
         issues.append(
-            f"unexpected aksh step '{aksh_name}' ({ak_user[aksh_name]})"
+            f"unexpected preloop step '{preloop_name}' ({ak_user[preloop_name]})"
         )
 
     # Job conclusions are always compared, including zero-job captures.
     gh_values = sorted(norm(value) for value in gh.jobs.values())
-    aksh_values = sorted(norm(value) for value in aksh.jobs.values())
-    if len(gh.jobs) != len(aksh.jobs):
-        issues.append(f"job count: gh={len(gh.jobs)} aksh={len(aksh.jobs)}")
-    if norm(aksh.conclusion) == "cancelled" and aksh_values and all(
-        value == "success" for value in aksh_values
+    preloop_values = sorted(norm(value) for value in preloop.jobs.values())
+    if len(gh.jobs) != len(preloop.jobs):
+        issues.append(f"job count: gh={len(gh.jobs)} preloop={len(preloop.jobs)}")
+    if norm(preloop.conclusion) == "cancelled" and preloop_values and all(
+        value == "success" for value in preloop_values
     ):
         issues.append(
-            f"contradictory aksh capture: job conclusions={aksh_values} "
+            f"contradictory preloop capture: job conclusions={preloop_values} "
             "but run conclusion=cancelled; job conclusion must come from run API, "
             "not from heuristic runner log"
         )
-    elif gh_values != aksh_values:
+    elif gh_values != preloop_values:
         issues.append(
-            f"job conclusions multiset: gh={gh_values} aksh={aksh_values}"
+            f"job conclusions multiset: gh={gh_values} preloop={preloop_values}"
         )
     else:
         notes.append(f"job conclusions match: {gh_values}")
@@ -340,7 +340,7 @@ def compare(gh: SideCapture, aksh: SideCapture) -> dict:
         "issues": issues,
         "notes": notes,
         "gh": {"name": gh.name, "conclusion": gh.conclusion, "markers": sorted(gh.markers)},
-        "aksh": {"name": aksh.name, "conclusion": aksh.conclusion, "markers": sorted(aksh.markers)},
+        "preloop": {"name": preloop.name, "conclusion": preloop.conclusion, "markers": sorted(preloop.markers)},
     }
 
 
@@ -374,16 +374,16 @@ CAPTURE_PAIRS = [
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--github-root", type=Path, required=True)
-    ap.add_argument("--aksh-root", type=Path, required=True)
+    ap.add_argument("--preloop-root", type=Path, required=True)
     ap.add_argument("--out", type=Path, default=None)
     args = ap.parse_args()
-    out = args.out or (args.aksh_root / "LOG-CONTENT-COMPARE.md")
+    out = args.out or (args.preloop_root / "LOG-CONTENT-COMPARE.md")
 
     comparisons = []
 
     pairs = [
-        (name, args.github_root / github_dir, args.aksh_root / aksh_dir)
-        for name, github_dir, aksh_dir in CAPTURE_PAIRS
+        (name, args.github_root / github_dir, args.preloop_root / preloop_dir)
+        for name, github_dir, preloop_dir in CAPTURE_PAIRS
     ]
 
     for name, gh_path, ak_path in pairs:
@@ -391,24 +391,24 @@ def main() -> int:
             comparisons.append({"name": name, "ok": False, "issues": ["missing github capture"], "notes": []})
             continue
         if not ak_path.exists():
-            comparisons.append({"name": name, "ok": False, "issues": [f"missing aksh capture {ak_path}"], "notes": []})
+            comparisons.append({"name": name, "ok": False, "issues": [f"missing preloop capture {ak_path}"], "notes": []})
             continue
         gh = load_github_capture(Path(gh_path))
-        ak = load_aksh_capture(ak_path)
+        ak = load_preloop_capture(ak_path)
         result = compare(gh, ak)
         result["name"] = name
         result["gh_path"] = str(gh_path)
-        result["aksh_path"] = str(ak_path)
+        result["preloop_path"] = str(ak_path)
         comparisons.append(result)
 
     passed = sum(1 for c in comparisons if c.get("ok"))
     total = len(comparisons)
 
     lines = [
-        "# Concurrency Log/Step Content Compare: GitHub vs aksh",
+        "# Concurrency Log/Step Content Compare: GitHub vs preloop",
         "",
         f"**GitHub root:** `{args.github_root}`",
-        f"**aksh root:** `{args.aksh_root}`",
+        f"**preloop root:** `{args.preloop_root}`",
         f"**Score:** **{passed}/{total}** scenarios with matching conclusions + content markers + step outcomes",
         "",
         "## What is compared",
@@ -437,22 +437,22 @@ def main() -> int:
         lines.append(f"- ok: `{c.get('ok')}`")
         if c.get("gh_path"):
             lines.append(f"- github: `{c['gh_path']}`")
-        if c.get("aksh_path"):
-            lines.append(f"- aksh: `{c['aksh_path']}`")
+        if c.get("preloop_path"):
+            lines.append(f"- preloop: `{c['preloop_path']}`")
         for i in c.get("issues") or []:
             lines.append(f"- **issue:** {i}")
         for n in c.get("notes") or []:
             lines.append(f"- note: {n}")
         if c.get("gh"):
             lines.append(f"- gh markers: `{c['gh'].get('markers')}`")
-        if c.get("aksh"):
-            lines.append(f"- aksh markers: `{c['aksh'].get('markers')}`")
+        if c.get("preloop"):
+            lines.append(f"- preloop markers: `{c['preloop'].get('markers')}`")
         lines.append("")
 
     out.write_text("\n".join(lines))
     comparison_json = json.dumps(comparisons, indent=2)
     out.with_suffix(".json").write_text(comparison_json)
-    default_json = args.aksh_root / "LOG-CONTENT-COMPARE.json"
+    default_json = args.preloop_root / "LOG-CONTENT-COMPARE.json"
     if default_json != out.with_suffix(".json"):
         default_json.write_text(comparison_json)
     print(f"{passed}/{total} passed")

@@ -58,7 +58,7 @@
       "type": 3
     },
     "label": {
-      "text": "Parser\naksh-gha-parser",
+      "text": "Parser\npreloop-gha-parser",
       "fontSize": 15
     }
   },
@@ -77,7 +77,7 @@
       "type": 3
     },
     "label": {
-      "text": "Server / Queue\naksh-runner-server",
+      "text": "Server / Queue\npreloop-runner-server",
       "fontSize": 15
     }
   },

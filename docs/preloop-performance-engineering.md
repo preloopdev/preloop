@@ -126,7 +126,7 @@ Cause: only the runner's own HTTP client knew about `PRELOOP_CONTROL_SOCKET`.
 Job subprocesses dial the advertised TCP origin, which `SMOLVM_EGRESS_FLOOR=
 strict` refuses with `EACCES`.
 
-Fix: `crates/aksh-runner/src/control_bridge.rs` binds the advertised loopback
+Fix: `crates/preloop-runner/src/control_bridge.rs` binds the advertised loopback
 address *inside* the guest and splices each connection onto the mounted socket.
 Blast radius is exactly one host endpoint; the egress floor stays strict.
 

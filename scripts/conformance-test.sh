@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# conformance-test.sh — Run local webhook conformance against aksh server.
+# conformance-test.sh — Run local webhook conformance against preloop server.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -7,7 +7,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEMP_DIR=$(mktemp -d)
 trap "rm -rf $TEMP_DIR; kill %1 2>/dev/null || true" EXIT
 
-echo "=== aksh Webhook Conformance Test ==="
+echo "=== preloop Webhook Conformance Test ==="
 echo "Temp dir: $TEMP_DIR"
 echo ""
 
@@ -15,20 +15,20 @@ echo ""
 mkdir -p "$TEMP_DIR/workspace/.github/workflows"
 cp "$PROJECT_ROOT/fixtures/webhook-conformance/"*.yml "$TEMP_DIR/workspace/.github/workflows/"
 git -C "$TEMP_DIR/workspace" init --initial-branch=main --quiet
-git -C "$TEMP_DIR/workspace" config user.email conformance@aksh.local
-git -C "$TEMP_DIR/workspace" config user.name aksh-conformance
+git -C "$TEMP_DIR/workspace" config user.email conformance@preloop.local
+git -C "$TEMP_DIR/workspace" config user.name preloop-conformance
 git -C "$TEMP_DIR/workspace" add .
 git -C "$TEMP_DIR/workspace" commit --quiet -m "webhook conformance fixtures"
 git -C "$TEMP_DIR/workspace" tag v1.0.0
 echo "Copied $(ls "$TEMP_DIR/workspace/.github/workflows/" | wc -l) workflow fixtures"
 echo ""
 
-# 2. Start aksh server with the same signed-webhook configuration used below.
-echo "Starting aksh server..."
+# 2. Start preloop server with the same signed-webhook configuration used below.
+echo "Starting preloop server..."
 WEBHOOK_SECRET="conformance-test-secret"
 TEST_API_TOKEN="conformance-test-api-token"
-AKSH_LOCAL_WORKSPACE="$TEMP_DIR/workspace" \
-AKSH_WEBHOOK_SECRET="$WEBHOOK_SECRET" \
+PRELOOP_LOCAL_WORKSPACE="$TEMP_DIR/workspace" \
+PRELOOP_WEBHOOK_SECRET="$WEBHOOK_SECRET" \
 "$PROJECT_ROOT/target/debug/preloop-server" serve \
   --listen 127.0.0.1:9199 \
   --state-dir "$TEMP_DIR/server-state" \

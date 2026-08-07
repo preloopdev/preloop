@@ -2,7 +2,7 @@
 # run-official-parallel.sh — Run conformance workflows with official C# runner, 4 at a time
 set -euo pipefail
 
-GH_REPO="preloopdev/aksh-conformance-sample"
+GH_REPO="preloopdev/preloop-conformance-sample"
 RESULTS_DIR="$HOME/macos-runners/benchmarks/compatibility/runner/behavior"
 mkdir -p "$RESULTS_DIR"
 
@@ -67,7 +67,7 @@ start_official_runner() {
 run_batch() {
   local wfs=("$@")
   local count=${#wfs[@]}
-  local vms=(bench-aksh-1 bench-aksh-2 bench-aksh-3 bench-aksh-4)
+  local vms=(bench-preloop-1 bench-preloop-2 bench-preloop-3 bench-preloop-4)
 
   log "── Batch: ${wfs[*]} ──"
 
@@ -175,18 +175,18 @@ for entry in "${MULTI_JOB_WFS[@]}"; do
   
   # Restart VMs
   for j in $(seq 1 "$job_count"); do
-    smolvm machine stop --name "bench-aksh-$j" 2>/dev/null || true
+    smolvm machine stop --name "bench-preloop-$j" 2>/dev/null || true
   done
   sleep 1
   for j in $(seq 1 "$job_count"); do
-    smolvm machine start --name "bench-aksh-$j" > /dev/null 2>&1
+    smolvm machine start --name "bench-preloop-$j" > /dev/null 2>&1
   done
 
   # Start one runner per job
   local_pids=()
   for j in $(seq 1 "$job_count"); do
     rname="off-multi-$(date +%s)-$j"
-    start_official_runner "bench-aksh-$j" "$rname" "$reg_token" > "/tmp/off-multi-$j.log" 2>&1 &
+    start_official_runner "bench-preloop-$j" "$rname" "$reg_token" > "/tmp/off-multi-$j.log" 2>&1 &
     local_pids+=($!)
     sleep 1
   done

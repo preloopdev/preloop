@@ -1,10 +1,10 @@
 # Contributing to preloop
 
-Appreciate you looking to contribute. All kinds of feedback are welcome — bug reports, feature requests, reproductions of official-runner divergence, docs, and code.
+Appreciate you looking to contribute. All kinds of feedback are welcome whether bug reports, feature requests, reproductions of official-runner divergence, docs, and code.
 
 ## Before you open an issue
 
-Use the right template — each one collects exactly the evidence a maintainer needs:
+Use the right template. Each one collects exactly the evidence a maintainer needs:
 
 | Template | When | Where |
 |---|---|---|
@@ -18,7 +18,7 @@ Use the right template — each one collects exactly the evidence a maintainer n
 
   ```sh
   runner-watch record-golden --runner /path/to/actions-runner --scenario <name>
-  runner-watch conform --runner 2.336.0 --aksh-url http://127.0.0.1:9090
+  runner-watch conform --runner 2.336.0 --preloop-url http://127.0.0.1:9090
   ```
 
   Attach the generated `.runner-watch/golden/v2.336.0/<scenario>/flows.jsonl` and the `conform` output.
@@ -31,7 +31,7 @@ Use the right template — each one collects exactly the evidence a maintainer n
    - `just conform-server-light` / `just conform-server-deep` — server fidelity gates
    - `just conform-runner-light` / `just conform-runner-deep` — Rust runner fidelity gates
    - `just dogfood` — live E2E with the real runner
-3. **Wire-shape changes** to DTOs in `aksh-gha-protocol/src/azdo/` must preserve serde round-trip fidelity. Check golden captures in `.runner-watch/golden/`.
+3. **Wire-shape changes** to DTOs in `preloop-gha-protocol/src/azdo/` must preserve serde round-trip fidelity. Check golden captures in `.runner-watch/golden/`.
 4. Read the PR template ([`.github/pull_request_template.md`](.github/pull_request_template.md)) and fill in every gate that applies — protocol changes **require** the official-runner validation gate.
 
 ## Compatibility checklist
@@ -78,7 +78,7 @@ redirect:
 
 ```sh
 just e2e-setup     # sudo: redirects :80 → :9090
-just serve         # start aksh on :9090
+just serve         # start preloop on :9090
 # In another terminal: configure + run the official runner against http://127.0.0.1
 just e2e-status    # check redirect is active
 just e2e-teardown  # remove redirect

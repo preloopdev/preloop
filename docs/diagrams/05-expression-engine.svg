@@ -43,7 +43,7 @@
     <path d="M 0 1.5 L 10 5 L 0 8.5 z" fill="#1e1e1e" />
   </marker>
 </defs>
-<text x="480" y="53.0" font-size="28" font-family="system-ui, sans-serif" fill="#1e1e1e" font-weight="700">aksh-gha-expressions — Engine Architecture</text>
+<text x="480" y="53.0" font-size="28" font-family="system-ui, sans-serif" fill="#1e1e1e" font-weight="700">preloop-gha-expressions — Engine Architecture</text>
 <text x="380" y="75.0" font-size="15" font-family="system-ui, sans-serif" fill="#757575" font-weight="500">${{ }} parser, recursive-descent AST, context resolution, and function dispatch</text>
 <rect x="50" y="110" width="240" height="880" rx="10" fill="#dbe4ff" fill-opacity="0.25" stroke="#1e40af" stroke-width="1.5"/>
 <text x="70" y="143.0" font-size="18" font-family="system-ui, sans-serif" fill="#1e40af" font-weight="500">Expression Sources</text>

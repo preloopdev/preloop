@@ -50,10 +50,10 @@
 <text x="170.0" y="157.0" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#4a9eed" font-weight="600">local execution client</text>
 <rect x="350" y="110" width="220" height="70" rx="10" fill="#d0bfff" stroke="#7c3aed" stroke-width="2"/>
 <text x="460.0" y="138.2" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#7c3aed" font-weight="600">Parser</text>
-<text x="460.0" y="157.0" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#7c3aed" font-weight="600">aksh-gha-parser</text>
+<text x="460.0" y="157.0" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#7c3aed" font-weight="600">preloop-gha-parser</text>
 <rect x="640" y="110" width="220" height="70" rx="10" fill="#fff3bf" stroke="#f59e0b" stroke-width="2"/>
 <text x="750.0" y="138.2" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#f59e0b" font-weight="600">Server / Queue</text>
-<text x="750.0" y="157.0" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#f59e0b" font-weight="600">aksh-runner-server</text>
+<text x="750.0" y="157.0" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#f59e0b" font-weight="600">preloop-runner-server</text>
 <rect x="930" y="110" width="220" height="70" rx="10" fill="#ffd8a8" stroke="#f59e0b" stroke-width="2"/>
 <text x="1040.0" y="138.2" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#f59e0b" font-weight="600">Listener</text>
 <text x="1040.0" y="157.0" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#f59e0b" font-weight="600">aks-runner run</text>

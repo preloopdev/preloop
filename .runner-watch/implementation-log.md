@@ -4,7 +4,7 @@
 
 Run end-to-end conformance testing for all 10 scenarios (06-multi-step through
 15-oidc-id-token) against the latest official runner golden captures (v2.335.1)
-and bring aksh to a passing gate.
+and bring preloop to a passing gate.
 
 ## Starting state
 
@@ -21,19 +21,19 @@ failure categories:
 
 | # | Symptom | Root cause |
 |---|---|---|
-| 1 | `DELETE agent` → 404 | Route missing entirely from aksh |
+| 1 | `DELETE agent` → 404 | Route missing entirely from preloop |
 | 2 | `DELETE session (no session_id)` → 405 | DELETE method not wired to sessions-pool route |
-| 3 | `POST oauth2/token` — all 200 vs some 400 | Official validates PSA256 client assertions; job-scoped credentials are rejected by the real PKI; aksh has no PKI |
+| 3 | `POST oauth2/token` — all 200 vs some 400 | Official validates PSA256 client assertions; job-scoped credentials are rejected by the real PKI; preloop has no PKI |
 | 4 | `GET messages` → 200 instead of 202 when queue empty | Handler returned `{}` with HTTP 200; correct is 202 ACCEPTED |
 | 5 | `GET messages` 202/404 lifecycle mismatch (scenarios 07-09) | Broker proactively invalidates sessions via concurrent two-session pattern with timing-based state; not reproducible in replay |
 | 6 | None-status flows counted as mismatches | Capture artifacts (requests in-flight when runner killed) appear in baseline |
-| 7 | `codeload.github.com` and `launch.actions.githubusercontent.com` → 404 | External GitHub CDN/resolution services replayed to aksh; should be skipped |
+| 7 | `codeload.github.com` and `launch.actions.githubusercontent.com` → 404 | External GitHub CDN/resolution services replayed to preloop; should be skipped |
 | 8 | `GET /{n}//idtoken/...` → 404 | OIDC token path not handled by normalize_request_path |
 | 9 | `CacheService`/`ArtifactService` twirp v4 → 404 | actions/cache@v4 and actions/upload-artifact@v4 twirp services not implemented |
 
 ## Changes
 
-### `crates/aksh-runner-server/src/lib.rs`
+### `crates/preloop-runner-server/src/lib.rs`
 
 **1. DELETE agent route (idempotent 204)**
 
@@ -43,7 +43,7 @@ DELETE /runner/server/_apis/distributedtask/pools/:pool_id/agents/:agent_id
 → delete_agent() → 204 NO_CONTENT (always, idempotent)
 ```
 
-The runner calls this on clean exit to deregister. aksh has no persistent agent
+The runner calls this on clean exit to deregister. preloop has no persistent agent
 registry, so the response is unconditionally 204.
 
 **2. DELETE sessions route (no session_id, 204)**
@@ -98,7 +98,7 @@ They cannot be meaningfully replayed because there is no recorded response to co
 Rewrote `status_mismatch_in_report` to track the current `### endpoint` section
 header and skip status comparison for:
 - `…/oauth2/token` — GitHub validates PSA256 JWTs and rejects job-scoped credentials
-  that the official JIT broker issued; aksh is its own CA and accepts all credentials.
+  that the official JIT broker issued; preloop is its own CA and accepts all credentials.
 - `…/messages?` — Broker session lifecycle (proactive invalidation, concurrent
   sessions) is timing-based state that cannot be reproduced in golden replay.
 
@@ -108,7 +108,7 @@ Added to `should_skip_replay_path`:
 - `codeload.github.com` — source tarballs for action downloads
 - `launch.actions.githubusercontent.com` — batch action-resolution service
 
-These hosts are captured by MITM but are never routed through aksh; replaying them
+These hosts are captured by MITM but are never routed through preloop; replaying them
 produces 404 noise with no protocol-fidelity information.
 
 **9. Normalize OIDC idtoken path**
@@ -126,7 +126,7 @@ any existing normalization rule, causing 404 on replay.
 
 ```
 cargo test --workspace       # 93 passed, 0 failed
-cargo run -p runner-watch -- conform --runner v2.335.1 --aksh-url http://127.0.0.1:80 --skip-cargo-test
+cargo run -p runner-watch -- conform --runner v2.335.1 --preloop-url http://127.0.0.1:80 --skip-cargo-test
 ```
 
 Final result:

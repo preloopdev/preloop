@@ -64,7 +64,7 @@ jobs:
 
       - name: Reset fidelity markers
         shell: bash
-        run: rm -rf .aksh-fidelity && mkdir -p .aksh-fidelity
+        run: rm -rf .preloop-fidelity && mkdir -p .preloop-fidelity
 
       - id: composite-status
         name: F045 composite action_status context
@@ -89,9 +89,9 @@ jobs:
         shell: bash
         run: |
           echo "Docker lifecycle log:"
-          cat .aksh-fidelity/docker-lifecycle.log
-          grep -Fx 'pre|env=beta|arg=alpha' .aksh-fidelity/docker-lifecycle.log
-          grep -Fx 'main|env=beta|arg=alpha' .aksh-fidelity/docker-lifecycle.log
-          grep -Fx 'post|env=beta|arg=alpha' .aksh-fidelity/docker-lifecycle.log
+          cat .preloop-fidelity/docker-lifecycle.log
+          grep -Fx 'pre|env=beta|arg=alpha' .preloop-fidelity/docker-lifecycle.log
+          grep -Fx 'main|env=beta|arg=alpha' .preloop-fidelity/docker-lifecycle.log
+          grep -Fx 'post|env=beta|arg=alpha' .preloop-fidelity/docker-lifecycle.log
           echo "F046: Docker pre-entrypoint/post-entrypoint lifecycle executed"
           echo "F047: Docker manifest entrypoint/args/env evaluated correctly"

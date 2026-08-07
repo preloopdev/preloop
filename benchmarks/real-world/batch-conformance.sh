@@ -2,25 +2,25 @@
 # batch-conformance.sh — Run conformance workflows in batches of 4
 # Each workflow dispatched on GitHub, picked up by a pre-packed smolvm runner
 #
-# Usage: ./batch-conformance.sh <aksh|official|both> [workflow-glob ...]
+# Usage: ./batch-conformance.sh <preloop|official|both> [workflow-glob ...]
 # Examples:
-#   ./batch-conformance.sh aksh "8*"          # run 80-89 with aksh-runner
+#   ./batch-conformance.sh preloop "8*"          # run 80-89 with preloop-runner
 #   ./batch-conformance.sh both               # run all new scenarios with both runners
 #   ./batch-conformance.sh official "98-*"    # run specific workflow
 set -euo pipefail
 
-RUNNER_TYPE="${1:?Usage: $0 <aksh|official|both> [workflow-glob ...]}"
+RUNNER_TYPE="${1:?Usage: $0 <preloop|official|both> [workflow-glob ...]}"
 shift
 WF_PATTERNS=("$@")
 
-GH_REPO="${GH_REPO:-preloopdev/aksh-conformance}"
+GH_REPO="${GH_REPO:-preloopdev/preloop-conformance}"
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 HOST_WORKSPACE="${HOST_WORKSPACE:-/Users/bnjoroge/macos-runners}"
 RESULTS_DIR="${RESULTS_DIR:-$REPO_ROOT/benchmarks/compatibility/runner/behavior}"
 TMP_DIR="/tmp/batch-conformance-$$"
 BATCH_SIZE=4
-VM_PREFIX="bench-aksh"
-AKSH_RUNNER_HOST="${AKSH_RUNNER_HOST:-}"
+VM_PREFIX="bench-preloop"
+PRELOOP_RUNNER_HOST="${PRELOOP_RUNNER_HOST:-}"
 
 mkdir -p "$RESULTS_DIR" "$TMP_DIR"
 
@@ -86,7 +86,7 @@ sleep 2
 
 # ── Run one batch of up to 4 workflows ─────────────────────────────
 run_batch() {
-  local runner_mode="$1"  # "aksh" or "official"
+  local runner_mode="$1"  # "preloop" or "official"
   shift
   local wfs=("$@")
   local batch_count=${#wfs[@]}
@@ -107,10 +107,10 @@ run_batch() {
     local vm="${VM_PREFIX}-${i}"
     smolvm machine start --name "$vm" > /dev/null 2>&1
     log "  VM $vm started"
-    if [ "$runner_mode" = "aksh" ] && [ -n "$AKSH_RUNNER_HOST" ]; then
-      smolvm machine cp "$AKSH_RUNNER_HOST" "$vm:/opt/runners/aksh-runner"
-      smolvm machine exec --name "$vm" -- chmod +x /opt/runners/aksh-runner
-      log "  Current aksh runner copied to $vm"
+    if [ "$runner_mode" = "preloop" ] && [ -n "$PRELOOP_RUNNER_HOST" ]; then
+      smolvm machine cp "$PRELOOP_RUNNER_HOST" "$vm:/opt/runners/preloop-runner"
+      smolvm machine exec --name "$vm" -- chmod +x /opt/runners/preloop-runner
+      log "  Current preloop runner copied to $vm"
     fi
   done
 
@@ -121,7 +121,7 @@ run_batch() {
   if [ "$runner_mode" = "official" ]; then
     runner_script="vm-run-official.sh"
   else
-    runner_script="vm-run-aksh.sh"
+    runner_script="vm-run-preloop.sh"
   fi
 
   for i in $(seq 1 "$batch_count"); do
@@ -139,7 +139,7 @@ run_batch() {
       smolvm machine exec --name "$vm" -- bash -c "
         export GH_REG_TOKEN='$reg_token'
         export RUNNER_TIMING_LOG='/tmp/runner-j${i}.log'
-        bash /workspace/benchmarks/real-world/vm-run-aksh.sh $i 'https://github.com/$GH_REPO' 'self-hosted,linux,x64'
+        bash /workspace/benchmarks/real-world/vm-run-preloop.sh $i 'https://github.com/$GH_REPO' 'self-hosted,linux,x64'
       " > "$vm_log" 2>&1 &
     fi
     vm_pids+=($!)
@@ -263,21 +263,21 @@ run_all() {
 
 # ── Execute ─────────────────────────────────────────────────────────
 case "$RUNNER_TYPE" in
-  aksh)
-    run_all "aksh"
+  preloop)
+    run_all "preloop"
     ;;
   official)
     run_all "official"
     ;;
   both)
-    run_all "aksh"
+    run_all "preloop"
     log ""
     log "Switching to official runner..."
     sleep 5
     run_all "official"
     ;;
   *)
-    echo "Unknown runner type: $RUNNER_TYPE (expected: aksh|official|both)"
+    echo "Unknown runner type: $RUNNER_TYPE (expected: preloop|official|both)"
     exit 1
     ;;
 esac

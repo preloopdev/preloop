@@ -1,6 +1,6 @@
 //! Preloop CI command-line interface.
 
-use aksh_gha_protocol::{ExecutionStatus, NdjsonEvent, RunAccepted, WorkflowSubmission};
+use preloop_gha_protocol::{ExecutionStatus, NdjsonEvent, RunAccepted, WorkflowSubmission};
 use anyhow::Context;
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
@@ -22,7 +22,7 @@ mod server_install;
 mod update;
 
 pub(crate) fn server_url() -> String {
-    std::env::var("AKSH_URL").unwrap_or_else(|_| "http://127.0.0.1:9090".to_owned())
+    std::env::var("PRELOOP_URL").unwrap_or_else(|_| "http://127.0.0.1:9090".to_owned())
 }
 
 fn should_send_local_workspace_header(url: &str, uses_default_transport: bool) -> bool {
@@ -55,8 +55,8 @@ fn mounted_control_origin(public_url: &str) -> Option<String> {
 }
 
 pub(crate) fn api_token() -> Option<String> {
-    std::env::var("AKSH_TOKEN")
-        .or_else(|_| std::env::var("AKSH_SYSTEM_TOKEN"))
+    std::env::var("PRELOOP_TOKEN")
+        .or_else(|_| std::env::var("PRELOOP_SYSTEM_TOKEN"))
         .ok()
         .or_else(|| {
             std::fs::read_to_string(preloop_home().join("engine.token"))
@@ -69,7 +69,7 @@ pub(crate) fn api_token() -> Option<String> {
 pub(crate) fn build_client() -> reqwest::Client {
     let builder = reqwest::Client::builder();
     #[cfg(unix)]
-    let builder = if std::env::var("AKSH_URL").is_err() {
+    let builder = if std::env::var("PRELOOP_URL").is_err() {
         builder.unix_socket(preloop_home().join("preloop.sock"))
     } else {
         builder
@@ -208,7 +208,7 @@ struct ServeArgs {
 
     /// Durable-state backend: `sqlite://<path>`, a bare path, or
     /// `postgres://…` (with optional `?sslmode=require|verify-full`).
-    /// Defaults to `AKSH_STORE_URL`, then to SQLite in the state dir.
+    /// Defaults to `PRELOOP_STORE_URL`, then to SQLite in the state dir.
     #[arg(long, value_name = "URL")]
     store: Option<String>,
 }
@@ -316,9 +316,9 @@ async fn main() -> anyhow::Result<()> {
     // custom PRELOOP_HOME split the CLI's writes ($HOME/.preloop/config.toml)
     // from the engine's reads ($PRELOOP_HOME/config.toml) — setup silently had
     // no effect. An explicit operator override still wins.
-    if std::env::var_os(aksh_runner_server::config::CONFIG_PATH_ENV).is_none() {
+    if std::env::var_os(preloop_runner_server::config::CONFIG_PATH_ENV).is_none() {
         std::env::set_var(
-            aksh_runner_server::config::CONFIG_PATH_ENV,
+            preloop_runner_server::config::CONFIG_PATH_ENV,
             github_setup::config_path_for_home(),
         );
     }
@@ -429,7 +429,7 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
 }
 
 async fn ensure_engine_running() -> anyhow::Result<()> {
-    if std::env::var("AKSH_URL").is_ok() {
+    if std::env::var("PRELOOP_URL").is_ok() {
         return Ok(());
     }
 
@@ -474,10 +474,10 @@ async fn ensure_engine_running() -> anyhow::Result<()> {
 
     let mut cmd = std::process::Command::new(&engine_bin);
     cmd.arg("engine");
-    cmd.env("AKSH_SYSTEM_TOKEN", token);
+    cmd.env("PRELOOP_SYSTEM_TOKEN", token);
     cmd.env("PRELOOP_HOME", &preloop_dir);
     if std::env::var_os("RUST_LOG").is_none() {
-        cmd.env("RUST_LOG", "info,preloop=debug,aksh=debug");
+        cmd.env("RUST_LOG", "info,preloop=debug");
     }
 
     let log_file = std::fs::OpenOptions::new()
@@ -569,7 +569,7 @@ fn prepare_engine_token(
 
     let token_path = home.join("engine.token");
     if let Some(token) = configured {
-        anyhow::ensure!(!token.trim().is_empty(), "AKSH_SYSTEM_TOKEN is empty");
+        anyhow::ensure!(!token.trim().is_empty(), "PRELOOP_SYSTEM_TOKEN is empty");
         write_private_file(&token_path, token.as_bytes())?;
         return Ok(token);
     }
@@ -635,9 +635,9 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
     let state_dir = home.join("state");
     let socket = home.join("preloop.sock");
 
-    // Ensure AKSH_SYSTEM_TOKEN and engine.token stay synchronized.
-    let token = prepare_engine_token(&home, std::env::var("AKSH_SYSTEM_TOKEN").ok())?;
-    std::env::set_var("AKSH_SYSTEM_TOKEN", &token);
+    // Ensure PRELOOP_SYSTEM_TOKEN and engine.token stay synchronized.
+    let token = prepare_engine_token(&home, std::env::var("PRELOOP_SYSTEM_TOKEN").ok())?;
+    std::env::set_var("PRELOOP_SYSTEM_TOKEN", &token);
     let listen: std::net::SocketAddr = args
         .listen
         .clone()
@@ -650,26 +650,26 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
         .clone()
         .or_else(|| std::env::var("PRELOOP_PUBLIC_URL").ok())
         .unwrap_or_else(|| format!("http://127.0.0.1:{}", listen.port()));
-    std::env::set_var("AKSH_PUBLIC_URL", &public_url);
+    std::env::set_var("PRELOOP_PUBLIC_URL", &public_url);
 
     // Runner-facing origin is always the loopback listen address: in-VM
     // runners reach it over the mounted control socket, and their job-side
     // programs through the in-guest loopback bridge — never over the public
     // network. The public URL stays strictly GitHub-facing (check-run
-    // details links). Runners on other machines need AKSH_RUNNER_URL to
+    // details links). Runners on other machines need PRELOOP_RUNNER_URL to
     // point at a host-reachable address instead.
     // When the control upstream is set, the VM reaches the server over
-    // virtio-net TCP at that address. `AKSH_RUNNER_URL` stays loopback so
+    // virtio-net TCP at that address. `PRELOOP_RUNNER_URL` stays loopback so
     // the server advertises loopback URLs in job messages — the in-guest
     // bridge makes them work.
     let control_upstream = std::env::var("PRELOOP_CONTROL_UPSTREAM").ok();
-    if std::env::var("AKSH_RUNNER_URL").is_err() {
+    if std::env::var("PRELOOP_RUNNER_URL").is_err() {
         std::env::set_var(
-            "AKSH_RUNNER_URL",
+            "PRELOOP_RUNNER_URL",
             format!("http://127.0.0.1:{}", listen.port()),
         );
     }
-    let runner_url = std::env::var("AKSH_RUNNER_URL").unwrap();
+    let runner_url = std::env::var("PRELOOP_RUNNER_URL").unwrap();
     let control_origin = mounted_control_origin(&runner_url);
 
     // Resolve GitHub credentials before `AppState::new` reads the environment.
@@ -709,8 +709,8 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
             false
         }
     };
-    let mut server = tokio::spawn(aksh_runner_server::serve(
-        aksh_runner_server::ServerConfig {
+    let mut server = tokio::spawn(preloop_runner_server::serve(
+        preloop_runner_server::ServerConfig {
             listen,
             systemd_socket_activation: systemd_socket_activation_requested(),
             unix_socket: Some(socket.clone()),
@@ -721,7 +721,7 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
             state_dir,
             store_url: args.store.clone(),
             record_flows: None,
-            tls: aksh_runner_server::TlsMode::None,
+            tls: preloop_runner_server::TlsMode::None,
             enable_test_api: false,
             test_api_token: None,
             oidc_issuer: None,
@@ -866,7 +866,7 @@ fn local_runner_pool_config(
         .unwrap_or_else(|| PathBuf::from("."));
     // The mounted control socket only makes sense when the runner URL is
     // loopback (the VM reaches the host through the socket relay). With
-    // `AKSH_RUNNER_URL` pointing at a host-reachable LAN address — the
+    // `PRELOOP_RUNNER_URL` pointing at a host-reachable LAN address — the
     // "runners on other machines" mode — there is no relay, and the runner
     // talks to the control plane over plain TCP instead. The orchestrator
     // gates both the socket mount and the guest env on this field, so leaving
@@ -941,7 +941,7 @@ fn local_runner_pool_config(
         control_socket,
         control_upstream,
         dns: std::env::var("PRELOOP_RUNNER_DNS").ok(),
-        registration_token_env: "AKSH_SYSTEM_TOKEN".into(),
+        registration_token_env: "PRELOOP_SYSTEM_TOKEN".into(),
         labels: runner_pool_labels(),
         cpus: RUNNER_CPUS,
         memory_mib: RUNNER_MEMORY_MIB,
@@ -1132,12 +1132,12 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         None => serde_json::json!({}),
     };
 
-    let mut secrets = aksh_gha_protocol::SecretMap::default();
+    let mut secrets = preloop_gha_protocol::SecretMap::default();
     for secret in &args.secrets {
         if let Some((name, value)) = secret.split_once('=') {
             secrets.insert(
                 name.to_owned(),
-                aksh_gha_protocol::SecretString::new(value.to_owned()),
+                preloop_gha_protocol::SecretString::new(value.to_owned()),
             );
         } else {
             anyhow::bail!("invalid --secret format `{secret}`: expected NAME=VALUE");
@@ -1173,7 +1173,7 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     let mut request = client
         .post(format!("{url}/api/v1/runs"))
         .json(&submission.to_request_json()?);
-    if should_send_local_workspace_header(&url, std::env::var("AKSH_URL").is_err()) {
+    if should_send_local_workspace_header(&url, std::env::var("PRELOOP_URL").is_err()) {
         let workspace = std::fs::canonicalize(".")?;
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(workspace.as_os_str().to_string_lossy().as_bytes());
@@ -1221,7 +1221,7 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
 
         let mut stream = events_response.bytes_stream();
         let mut pending = String::new();
-        let mut paused: Option<aksh_gha_protocol::debug_session::DebugSession> = None;
+        let mut paused: Option<preloop_gha_protocol::debug_session::DebugSession> = None;
         loop {
             // The server holds this stream open until the run is terminal, and
             // a job paused at a failed step never gets there. Watching only the
@@ -2213,6 +2213,6 @@ mod tests {
             mounted_control_origin("http://localhost:9090").as_deref(),
             Some("http://localhost:9090")
         );
-        assert_eq!(mounted_control_origin("https://aksh.preloop.dev"), None);
+        assert_eq!(mounted_control_origin("https://preloop.preloop.dev"), None);
     }
 }

@@ -5,7 +5,7 @@ set -euo pipefail
 
 WF="${1:?Usage: $0 <workflow-file> [num-runners]}"
 NUM_RUNNERS="${2:-2}"
-GH_REPO="preloopdev/aksh-conformance-sample"
+GH_REPO="preloopdev/preloop-conformance-sample"
 RESULTS_DIR="$(cd "$(dirname "$0")/results" && pwd)"
 WFBASE=$(basename "$WF" .yml)
 
@@ -29,8 +29,8 @@ sleep 2
 
 # ── Kill stale runner processes inside VMs ─────────────────────────
 for i in $(seq 1 "$NUM_RUNNERS"); do
-  vm="bench-aksh-$i"
-  smolvm machine exec --name "$vm" -- bash -c 'pkill -f aksh-runner 2>/dev/null; true' 2>/dev/null || true
+  vm="bench-preloop-$i"
+  smolvm machine exec --name "$vm" -- bash -c 'pkill -f preloop-runner 2>/dev/null; true' 2>/dev/null || true
 done
 sleep 2
 
@@ -41,9 +41,9 @@ log "Token: ${REG_TOKEN:0:10}..."
 # ── Start runners in all VMs ────────────────────────────────────────
 JOB_TS=$(date +%s)
 for i in $(seq 1 "$NUM_RUNNERS"); do
-  vm="bench-aksh-$i"
-  name="aksh-${WFBASE}-${JOB_TS}-${i}"
-  root="/tmp/aksh-${JOB_TS}-${i}"
+  vm="bench-preloop-$i"
+  name="preloop-${WFBASE}-${JOB_TS}-${i}"
+  root="/tmp/preloop-${JOB_TS}-${i}"
   log "Starting runner $i/$NUM_RUNNERS: $name on $vm"
 
   smolvm machine exec --name "$vm" -- bash -c "
@@ -94,8 +94,8 @@ RESULT=$(gh run view "$RUN_ID" -R "$GH_REPO" --json conclusion,jobs --jq '{
 }' 2>/dev/null || echo '{"conclusion":"unknown","jobs":[]}')
 
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ")
-echo "{\"runner\":\"aksh\",\"workflow\":\"$WF\",\"run_id\":\"$RUN_ID\",\"conclusion\":\"$CONCLUSION\",\"result\":$RESULT,\"timestamp\":\"$TIMESTAMP\"}" \
-  >> "$RESULTS_DIR/conformance/conformance-aksh.jsonl"
+echo "{\"runner\":\"preloop\",\"workflow\":\"$WF\",\"run_id\":\"$RUN_ID\",\"conclusion\":\"$CONCLUSION\",\"result\":$RESULT,\"timestamp\":\"$TIMESTAMP\"}" \
+  >> "$RESULTS_DIR/conformance/conformance-preloop.jsonl"
 
 log "Done: $WF => $CONCLUSION"
 
@@ -104,7 +104,7 @@ timeout 30 wait 2>/dev/null || true
 # Delete our ephemeral runners from GitHub
 log "Cleaning up runners..."
 for i in $(seq 1 "$NUM_RUNNERS"); do
-  gh api "repos/$GH_REPO/actions/runners" --jq ".runners[] | select(.name | startswith(\"aksh-${WFBASE}-\")) | .id" 2>/dev/null | \
+  gh api "repos/$GH_REPO/actions/runners" --jq ".runners[] | select(.name | startswith(\"preloop-${WFBASE}-\")) | .id" 2>/dev/null | \
     while read -r rid; do
       gh api -X DELETE "repos/$GH_REPO/actions/runners/$rid" 2>/dev/null || true
     done

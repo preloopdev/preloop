@@ -10,10 +10,10 @@ name = "preloop-loadtest"
 path = "src/main.rs"
 
 [dependencies]
-aksh-runner-server = { path = "../../crates/aksh-runner-server" }
-aksh-gha-parser = { path = "../../crates/aksh-gha-parser" }
-aksh-gha-expressions = { path = "../../crates/aksh-gha-expressions" }
-aksh-gha-protocol = { path = "../../crates/aksh-gha-protocol" }
+preloop-runner-server = { path = "../../crates/preloop-runner-server" }
+preloop-gha-parser = { path = "../../crates/preloop-gha-parser" }
+preloop-gha-expressions = { path = "../../crates/preloop-gha-expressions" }
+preloop-gha-protocol = { path = "../../crates/preloop-gha-protocol" }
 tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs"] }
 tokio-util = "0.7"
 axum = { version = "0.7", features = ["ws"] }

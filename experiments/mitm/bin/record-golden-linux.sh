@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MITM_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 GH_TOKEN_FILE="${GH_TOKEN_FILE:-$MITM_DIR/.cache/gh-token}"
 GITHUB_OWNER="${GITHUB_OWNER:-preloopdev}"
-GITHUB_REPO="${GITHUB_REPO:-aksh-conformance-sample}"
+GITHUB_REPO="${GITHUB_REPO:-preloop-conformance-sample}"
 GITHUB_REF="${GITHUB_REF:-main}"
 
 [[ $(uname -s) == Linux ]] || { echo "record-golden-linux.sh must run on Linux" >&2; exit 1; }

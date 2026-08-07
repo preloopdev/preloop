@@ -1,6 +1,6 @@
 --------------------------- MODULE Trace ---------------------------
 (*
- * Trace validation specification for aksh / preloop.
+ * Trace validation specification for preloop / preloop.
  *
  * Replays implementation traces against the base spec to verify that the
  * base spec can reproduce every observed state transition.

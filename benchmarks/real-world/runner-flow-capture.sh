@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
-# Capture official-runner vs aksh-runner HTTP flows against GitHub.
+# Capture official-runner vs preloop-runner HTTP flows against GitHub.
 # Invariant: every workflow job runs in its own smolvm. Each VM runs its own
 # local mitmproxy on 127.0.0.1, so runner traffic is captured without relying on
 # host<->guest proxy reachability.
 set -euo pipefail
 
-SCENARIO="${1:?Usage: $0 <workflow-yml> [official|aksh|both] [job-count]}"
+SCENARIO="${1:?Usage: $0 <workflow-yml> [official|preloop|both] [job-count]}"
 RUNNER_KIND="${2:-both}"
 JOB_COUNT="${3:-1}"
 
-GH_REPO="${GH_REPO:-preloopdev/aksh-conformance-sample}"
+GH_REPO="${GH_REPO:-preloopdev/preloop-conformance-sample}"
 GH_REF="${GH_REF:-main}"
-VM_PREFIX="${VM_PREFIX:-bench-aksh}"
+VM_PREFIX="${VM_PREFIX:-bench-preloop}"
 VM_CPUS="${VM_CPUS:-4}"
 VM_MEM="${VM_MEM:-8192}"
 MITM_PORT="${MITM_PORT:-18081}"
 HOST_WORKSPACE="$PWD"
 VM_WORKSPACE="/workspace"
 RESULTS_ROOT="${RESULTS_ROOT:-$PWD/benchmarks/compatibility/runner/protocol}"
-AKSH_RUNNER="${AKSH_RUNNER:-/workspace/target/aarch64-unknown-linux-musl/release/preloop-runner}"
+PRELOOP_RUNNER="${PRELOOP_RUNNER:-/workspace/target/aarch64-unknown-linux-musl/release/preloop-runner}"
 OFFICIAL_SRC="${OFFICIAL_SRC:-/opt/runners/actions-runner}"
 OFFICIAL_RUNNER_HOST="${OFFICIAL_RUNNER_HOST:-$HOME/cachingv4}"
 MITM_ADDON="/workspace/experiments/mitm/addons/capture.py"
@@ -88,7 +88,7 @@ prepare_vm() {
   # stale runner children explicitly before recycling the VM, otherwise an
   # old --once runner can retain a busy GitHub registration and steal the next
   # workflow job from the fresh capture process.
-  smolvm machine exec --name "$vm" -- sh -c 'pkill -x aksh-runner >/dev/null 2>&1 || true; pkill -x Runner.Listener >/dev/null 2>&1 || true' >/dev/null 2>&1 || true
+  smolvm machine exec --name "$vm" -- sh -c 'pkill -x preloop-runner >/dev/null 2>&1 || true; pkill -x Runner.Listener >/dev/null 2>&1 || true' >/dev/null 2>&1 || true
   smolvm machine stop --name "$vm" >/dev/null 2>&1 || true
   sleep 0.3
   smolvm machine start --name "$vm" >/dev/null 2>&1
@@ -96,7 +96,7 @@ prepare_vm() {
     set -euo pipefail
     # Wait up to 30s for mounts to appear
     for i in \$(seq 1 30); do
-      if [ -x '$AKSH_RUNNER' ] && [ -d '$OFFICIAL_SRC' ]; then
+      if [ -x '$PRELOOP_RUNNER' ] && [ -d '$OFFICIAL_SRC' ]; then
         break
       fi
       sleep 1
@@ -171,17 +171,17 @@ start_vm_runner() {
   start_vm_mitm "$vm" "$vm_capture_dir"
   log "Starting $runner_kind runner $i/$JOB_COUNT on $vm"
 
-  if [ "$runner_kind" = "aksh" ]; then
+  if [ "$runner_kind" = "preloop" ]; then
     smolvm machine exec --name "$vm" -- bash -lc "
       set -euo pipefail
       export PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       export HTTP_PROXY='$proxy' HTTPS_PROXY='$proxy' http_proxy='$proxy' https_proxy='$proxy' NO_PROXY='' no_proxy=''
       export NODE_EXTRA_CA_CERTS='$ca_bundle' SSL_CERT_FILE='$ca_bundle'
       mkdir -p '$root'
-      RUST_LOG=info '$AKSH_RUNNER' --ca-bundle '$ca_bundle' --runner-root '$root' configure \
+      RUST_LOG=info '$PRELOOP_RUNNER' --ca-bundle '$ca_bundle' --runner-root '$root' configure \
         --url 'https://github.com/$GH_REPO' --token '$token' --name '$runner_name' \
         --unattended --replace $ephemeral_arg --labels self-hosted,linux,x64,mitm,overnight
-      $runner_prefix RUST_LOG=info '$AKSH_RUNNER' --ca-bundle '$ca_bundle' --runner-root '$root' run $once_arg $runner_suffix
+      $runner_prefix RUST_LOG=info '$PRELOOP_RUNNER' --ca-bundle '$ca_bundle' --runner-root '$root' run $once_arg $runner_suffix
     " > "$vm_log" 2>&1 &
   else
     smolvm machine exec --name "$vm" -- bash -lc "
@@ -266,11 +266,11 @@ capture_one() {
   if [[ "$SCENARIO" == "103-cancellation-background-post.yml" ]]; then
     for i in $(seq 1 "$JOB_COUNT"); do
       smolvm machine exec --name "${VM_PREFIX}-${i}" -- sh -c \
-        'pkill -x aksh-runner >/dev/null 2>&1 || true; pkill -x Runner.Listener >/dev/null 2>&1 || true' \
+        'pkill -x preloop-runner >/dev/null 2>&1 || true; pkill -x Runner.Listener >/dev/null 2>&1 || true' \
         >/dev/null 2>&1 || true
       vm_log="$capture_dir/vm-${i}.log"
       smolvm machine exec --name "${VM_PREFIX}-${i}" -- sh -c \
-        "cat /root/flow-aksh-${i}/runner.log 2>/dev/null || true" > "$vm_log" 2>/dev/null || true
+        "cat /root/flow-preloop-${i}/runner.log 2>/dev/null || true" > "$vm_log" 2>/dev/null || true
     done
   fi
   for pid in "${pids[@]}"; do wait "$pid" >/dev/null 2>&1 || true; done
@@ -357,8 +357,8 @@ main() {
   ensure_vms
   case "$RUNNER_KIND" in
     official) capture_one official ;;
-    aksh) capture_one aksh ;;
-    both) capture_one official; sleep 10; capture_one aksh ;;
+    preloop) capture_one preloop ;;
+    both) capture_one official; sleep 10; capture_one preloop ;;
     *) echo "unknown runner kind: $RUNNER_KIND" >&2; exit 1 ;;
   esac
 }

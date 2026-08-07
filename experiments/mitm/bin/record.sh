@@ -11,7 +11,7 @@ MITM_LISTEN_HOST="${MITM_LISTEN_HOST:-$MITM_HOST}"
 MITM_URL="http://$MITM_HOST:$MITM_PORT"
 
 usage() {
-    echo "Usage: $0 --backend {official|runner-server|aksh} --scenario <name> [--non-interactive]" >&2
+    echo "Usage: $0 --backend  {official|runner-server|preloop} --scenario <name> [--non-interactive]" >&2
     exit 1
 }
 
@@ -48,14 +48,14 @@ if curl -fsS --connect-timeout 1 --max-time 2 --proxy "http://127.0.0.1:$MITM_PO
     echo "port $MITM_PORT (mitmproxy) is already in use — stop it first or choose another MITM_PORT" >&2
     exit 2
 fi
-if [ "$BACKEND" = "aksh" ]; then
-    AKSH_BASE_URL="${AKSH_URL:-http://127.0.0.1:9090}"
-    if ! curl -fsS "$AKSH_BASE_URL/healthz" >/dev/null 2>&1; then
-        echo "aksh backend requires a running aksh on $AKSH_BASE_URL — run bin/up-aksh.sh first or set AKSH_URL" >&2
+if [ "$BACKEND" = "preloop" ]; then
+    PRELOOP_BASE_URL="${PRELOOP_URL:-http://127.0.0.1:9090}"
+    if ! curl -fsS "$PRELOOP_BASE_URL/healthz" >/dev/null 2>&1; then
+        echo "preloop backend requires a running preloop on $PRELOOP_BASE_URL — run bin/up-preloop.sh first or set PRELOOP_URL" >&2
         exit 2
     fi
-    echo "http://aksh.local:9090/runner/server" > "$CACHE/aksh.url"
-    echo "ThisIsIgnored" > "$CACHE/aksh.token"
+    echo "http://preloop.local:9090/runner/server" > "$CACHE/preloop.url"
+    echo "ThisIsIgnored" > "$CACHE/preloop.token"
 fi
 STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 RUNNER_NAME="m-$BACKEND-$SCENARIO-$SHORT_TS"
@@ -63,7 +63,7 @@ RUNNER_NAME="m-$BACKEND-$SCENARIO-$SHORT_TS"
 # Determine backend port for mitm proxy port-80 forwarding.
 if [ "$BACKEND" = "runner-server" ]; then
     export BACKEND_PORT=5000
-elif [ "$BACKEND" = "aksh" ]; then
+elif [ "$BACKEND" = "preloop" ]; then
     export BACKEND_PORT=9090
 fi
 
@@ -193,14 +193,14 @@ elif [ "$BACKEND" = "runner-server" ]; then
     if ! setup_runner "$RS_URL" "$RS_TOKEN" "$RUNNER_NAME"; then
         STATUS="config_failed"
     fi
-elif [ "$BACKEND" = "aksh" ]; then
-    AKSH_URL=$(cat "$CACHE/aksh.url")
-    AKSH_TOKEN=$(cat "$CACHE/aksh.token")
-    if ! setup_runner "$AKSH_URL" "$AKSH_TOKEN" "$RUNNER_NAME"; then
+elif [ "$BACKEND" = "preloop" ]; then
+    PRELOOP_URL=$(cat "$CACHE/preloop.url")
+    PRELOOP_TOKEN=$(cat "$CACHE/preloop.token")
+    if ! setup_runner "$PRELOOP_URL" "$PRELOOP_TOKEN" "$RUNNER_NAME"; then
         STATUS="config_failed"
     fi
 else
-    echo "unknown backend: $BACKEND (expected: official, runner-server, aksh)" >&2
+    echo "unknown backend: $BACKEND (expected: official, runner-server, preloop)" >&2
     exit 1
 fi
 

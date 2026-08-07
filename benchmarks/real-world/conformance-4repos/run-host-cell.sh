@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run-host-cell.sh — Cell C with the aksh runner on the HOST (no VM pool).
+# run-host-cell.sh — Cell C with the preloop runner on the HOST (no VM pool).
 # Same runner binary the VMs use; the completion path avoids the VM teardown
 # race that currently kills in-VM runners at job end.
 #
@@ -17,13 +17,13 @@ RUNNER=/Users/bnjoroge/preloop/target/debug/preloop-runner
 ENGINE_PORT=127.0.0.1:9091
 RESULT_DIR=benchmarks/real-world/results/conformance-4repos/$OUT/c
 RUNNER_ROOT=/tmp/conformance-host-runner
-export AKSH_URL="http://$ENGINE_PORT"
+export PRELOOP_URL="http://$ENGINE_PORT"
 
 TOKEN=$(cat ~/.preloop/engine.token)
 
 # Configure the host runner once (labels match the rewritten runs-on).
 if [ ! -f "$RUNNER_ROOT/.runner" ]; then
-  AKSH_SYSTEM_TOKEN="$TOKEN" "$RUNNER" --runner-root "$RUNNER_ROOT" configure \
+  PRELOOP_SYSTEM_TOKEN="$TOKEN" "$RUNNER" --runner-root "$RUNNER_ROOT" configure \
     --url "http://$ENGINE_PORT" --token "$TOKEN" --name host-cf --unattended --replace \
     --labels self-hosted,Linux,X64 >/dev/null 2>&1
 fi
@@ -33,10 +33,10 @@ if [ -n "$PAYLOAD" ]; then
   PAYLOAD_ARGS=(--payload "$PAYLOAD")
 fi
 if [ ${#PAYLOAD_ARGS[@]} -gt 0 ]; then
-  RUN_LINE=$(cd "$REPO_DIR" && AKSH_GITHUB_TOKEN=$(gh auth token) \
+  RUN_LINE=$(cd "$REPO_DIR" && PRELOOP_GITHUB_TOKEN=$(gh auth token) \
     "$PRELOOP" run -f "$REPO_DIR/$WORKFLOW" --event "$EVENT" --payload "$PAYLOAD" --detach | head -1)
 else
-  RUN_LINE=$(cd "$REPO_DIR" && AKSH_GITHUB_TOKEN=$(gh auth token) \
+  RUN_LINE=$(cd "$REPO_DIR" && PRELOOP_GITHUB_TOKEN=$(gh auth token) \
     "$PRELOOP" run -f "$REPO_DIR/$WORKFLOW" --event "$EVENT" --detach | head -1)
 fi
 RUN_ID=$(echo "$RUN_LINE" | grep -oE '[0-9a-f]{8}-[0-9a-f-]{27}' | head -1)
@@ -52,7 +52,7 @@ for _ in $(seq 1 400); do
   esac
   # Claim one queued job with the host runner (--once per job).
   if [ "$STATUS" = "queued" ] || [ "$STATUS" = "in_progress" ]; then
-    AKSH_SYSTEM_TOKEN="$TOKEN" "$RUNNER" --runner-root "$RUNNER_ROOT" run --once \
+    PRELOOP_SYSTEM_TOKEN="$TOKEN" "$RUNNER" --runner-root "$RUNNER_ROOT" run --once \
       >/tmp/host-cell-$OUT.log 2>&1 || true
   else
     sleep 10
@@ -64,4 +64,4 @@ mkdir -p "$RESULT_DIR"
 curl -sf -H "Authorization: Bearer $TOKEN" \
   "http://$ENGINE_PORT/api/v1/runs/$RUN_ID" > "$RESULT_DIR/run.json"
 python3 benchmarks/real-world/conformance-4repos/compare-goldens.py --repo "$OUT" 2>/dev/null \
-  | grep -A100 "== $OUT/aksh" | head -60 || true
+  | grep -A100 "== $OUT/preloop" | head -60 || true

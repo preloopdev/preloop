@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Parse aksh-runner log and extract step timings."""
+"""Parse preloop-runner log and extract step timings."""
 import sys, re, json
 from datetime import datetime
 

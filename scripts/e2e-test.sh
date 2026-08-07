@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# e2e-test.sh — run a workflow YAML against aksh server + runner
+# e2e-test.sh — run a workflow YAML against preloop server + runner
 # Usage: ./scripts/e2e-test.sh <workflow.yml> [--verbose]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-SERVER_PORT="${AKSH_PORT:-9191}"
+SERVER_PORT="${PRELOOP_PORT:-9191}"
 SERVER_URL="http://127.0.0.1:${SERVER_PORT}"
-RUNNER_DIR="/tmp/aksh-e2e-runner"
+RUNNER_DIR="/tmp/preloop-e2e-runner"
 RUNNER_BIN="$REPO_ROOT/target/release/preloop-runner"
 SERVER_BIN="$REPO_ROOT/target/release/preloop-server"
 VERBOSE="${2:-}"
@@ -33,7 +33,7 @@ WORKFLOW_YAML=$(cat "$WORKFLOW_FILE")
 info "Starting server on port $SERVER_PORT..."
 pkill -f "preloop-server.*${SERVER_PORT}" 2>/dev/null || true
 sleep 1
-RUST_LOG=info AKSH_PUBLIC_URL="$SERVER_URL" "$SERVER_BIN" serve --listen "0.0.0.0:${SERVER_PORT}" > /tmp/aksh-e2e-server.log 2>&1 &
+RUST_LOG=info PRELOOP_PUBLIC_URL="$SERVER_URL" "$SERVER_BIN" serve --listen "0.0.0.0:${SERVER_PORT}" > /tmp/preloop-e2e-server.log 2>&1 &
 SERVER_PID=$!
 sleep 2
 
@@ -51,7 +51,7 @@ cd "$RUNNER_DIR"
 info "Configuring runner..."
 "$RUNNER_BIN" configure \
   --url "$SERVER_URL" \
-  --token aksh-system-token \
+  --token preloop-system-token \
   --name e2e-runner \
   --labels self-hosted,macOS,ARM64 \
   --work _work \
@@ -67,13 +67,13 @@ print(json.dumps({
     'event': 'push',
     'repository': 'test/repo',
     'git_ref': 'refs/heads/main',
-    'vars': {'AKSH_REPO_ROOT': '$REPO_ROOT'}
+    'vars': {'PRELOOP_REPO_ROOT': '$REPO_ROOT'}
 }))
 ")
 
 RESULT=$(curl -s -X POST "$SERVER_URL/api/v1/runs" \
   -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer aksh-system-token' \
+  -H 'Authorization: Bearer preloop-system-token' \
   -d "$PAYLOAD")
 RUN_ID=$(echo "$RESULT" | python3 -c 'import sys,json; print(json.load(sys.stdin)["run_id"])')
 info "Run submitted: $RUN_ID"
@@ -88,7 +88,7 @@ RUST_LOG=$LOG_LEVEL perl -e 'alarm 120; exec @ARGV' -- "$RUNNER_BIN" run --once 
 
 # Check result
 FINAL=$(curl -s "$SERVER_URL/api/v1/runs/$RUN_ID" \
-  -H 'Authorization: Bearer aksh-system-token')
+  -H 'Authorization: Bearer preloop-system-token')
 STATUS=$(echo "$FINAL" | python3 -c 'import sys,json; print(json.load(sys.stdin)["status"])')
 
 echo ""

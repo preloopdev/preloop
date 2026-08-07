@@ -43,8 +43,8 @@ jobs:
           cargo zigbuild --release \
             --target ${{ matrix.target }} \
             -p preloop-cli \
-            -p aksh-runner-server \
-            -p aksh-runner
+            -p preloop-runner-server \
+            -p preloop-runner
           mkdir -p dist/preloop-${{ matrix.arch }}
           cp target/${{ matrix.target }}/release/preloop \
             target/${{ matrix.target }}/release/preloop-server \
@@ -90,21 +90,31 @@ jobs:
 
       - name: Build Preloop binaries
         run: |
-          cargo build --release -p preloop-cli -p aksh-runner-server
-          cargo zigbuild --release -p aksh-runner --target aarch64-unknown-linux-gnu
+          cargo build --release -p preloop-cli -p preloop-runner-server
+          case $(uname -m) in
+            x86_64) RUNNER_TARGET=x86_64-unknown-linux-gnu; GOLDEN_ARCH=x86_64 ;;
+            aarch64|arm64) RUNNER_TARGET=aarch64-unknown-linux-gnu; GOLDEN_ARCH=aarch64 ;;
+            *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;;
+          esac
+          cargo build --release -p preloop-runner --target "$RUNNER_TARGET"
+          echo "GOLDEN_ARCH=$GOLDEN_ARCH" >> "$GITHUB_ENV"
+          echo "RUNNER_TARGET=$RUNNER_TARGET" >> "$GITHUB_ENV"
 
       - name: Pack Golden MicroVM Artifact
+        env:
+          GOLDEN_NAME: preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
         run: |
           mkdir -p dist
-          rm -f dist/preloop-ubuntu-24.04-aarch64
+          rm -f "dist/$GOLDEN_NAME"
           ./target/release/preloop build-golden \
-            --runner-bundle target/aarch64-unknown-linux-gnu/release \
-            --output dist/preloop-ubuntu-24.04-aarch64
-          test -s dist/preloop-ubuntu-24.04-aarch64
+            --runner-bundle "target/$RUNNER_TARGET/release" \
+            --output "dist/$GOLDEN_NAME"
+          test -s "dist/$GOLDEN_NAME"
 
       - name: Upload Golden Artifact to Release
         if: github.event_name == 'release'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GOLDEN_NAME: preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
         run: |
-          gh release upload ${{ github.event.release.tag_name }} dist/preloop-ubuntu-24.04-aarch64 --clobber
+          gh release upload ${{ github.event.release.tag_name }} "dist/$GOLDEN_NAME" --clobber

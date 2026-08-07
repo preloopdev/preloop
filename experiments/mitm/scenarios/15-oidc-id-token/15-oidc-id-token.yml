@@ -9,4 +9,4 @@ jobs:
     steps:
       - run: |
           curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://aksh"
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://preloop"

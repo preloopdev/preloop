@@ -2,10 +2,10 @@
 
 ## Step 1: Code audit
 Cited locations:
-- crates/aksh-runner/src/listener/broker_listener.rs:623-630 (spawn_job on RunnerJobRequest overlap)
-- crates/aksh-runner/src/listener/job_dispatcher.rs:297-303 (kill() only does child.kill(), no PG in some paths)
-- crates/aksh-runner/src/listener/broker_listener.rs:493-518 (dedup/parse/ack ordering)
-- crates/aksh-runner/src/process.rs:104 (group_spawn)
+- crates/preloop-runner/src/listener/broker_listener.rs:623-630 (spawn_job on RunnerJobRequest overlap)
+- crates/preloop-runner/src/listener/job_dispatcher.rs:297-303 (kill() only does child.kill(), no PG in some paths)
+- crates/preloop-runner/src/listener/broker_listener.rs:493-518 (dedup/parse/ack ordering)
+- crates/preloop-runner/src/process.rs:104 (group_spawn)
 
 Call chain: public broker listener loop -> classify_message -> RunnerJobRequest overlap cancel (broker_listener:586) or RunnerShutdown (737: return Ok(()) bypassing active_job.shutdown_gracefully) -> job_dispatcher::cancel/shutdown_gracefully/kill -> process::invoke group_spawn or direct kill.
 

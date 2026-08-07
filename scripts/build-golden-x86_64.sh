@@ -11,7 +11,7 @@ cargo build --release -p preloop-cli
 
 echo "==> Cross-building x86_64 runner bundle"
 rustup target add x86_64-unknown-linux-gnu 2>/dev/null || true
-cargo zigbuild --release -p aksh-runner --target x86_64-unknown-linux-gnu
+cargo zigbuild --release -p preloop-runner --target x86_64-unknown-linux-gnu
 
 echo "==> Building x86_64 golden (bakes tier 1-4: git-lfs/cmake/sshpass, pnpm/yarn/nvm, python 3.10, go 1.24, gh, yq)"
 mkdir -p dist

@@ -12,7 +12,7 @@
 > **Revised at**: commit `d7f495d5`, 2026-08-02 — scope widened from local-only to
 > local + self-hosted production grade; ecosystem download payload cache added as the
 > primary toolchain acceleration mechanism (replacing resolver-gated golden baking).
-> **Drift check before implementation**: `git diff --stat d7f495d5..HEAD -- crates/aksh-cache crates/aksh-runner-server crates/aksh-runner crates/preloop-orchestrator crates/preloop-vm docs`
+> **Drift check before implementation**: `git diff --stat d7f495d5..HEAD -- crates/preloop-cache crates/preloop-runner-server crates/preloop-runner crates/preloop-orchestrator crates/preloop-vm docs`
 
 ## Executive decision
 
@@ -87,7 +87,7 @@ Revised priority order:
 
 ### Actions cache store
 
-`crates/aksh-cache/src/lib.rs` implements a local file-backed `CacheStore`:
+`crates/preloop-cache/src/lib.rs` implements a local file-backed `CacheStore`:
 
 - cache identity is a SHA-256-derived directory;
 - original key, version, and creation time are stored as metadata;
@@ -97,15 +97,15 @@ Revised priority order:
 - complete archives are read into `Vec<u8>` on restore;
 - there is no quota, expiration, eviction policy, or indexed lookup.
 
-`crates/aksh-runner-server/src/models.rs` stores v1 uploads in `PendingCache.bytes`.
+`crates/preloop-runner-server/src/models.rs` stores v1 uploads in `PendingCache.bytes`.
 
-`crates/aksh-runner-server/src/blob_store.rs` stages v2 blocks on disk, then:
+`crates/preloop-runner-server/src/blob_store.rs` stages v2 blocks on disk, then:
 
 - assembles all blocks in a single `Vec<u8>`;
 - writes a second complete copy;
 - reads complete blobs to return downloads.
 
-`crates/aksh-runner-server/src/results_twirp.rs` reads the complete staged blob during finalize and passes complete bytes to `CacheStore::put`. This is acceptable for small local caches but cannot be the self-hosted data path under multi-gigabyte transfers.
+`crates/preloop-runner-server/src/results_twirp.rs` reads the complete staged blob during finalize and passes complete bytes to `CacheStore::put`. This is acceptable for small local caches but cannot be the self-hosted data path under multi-gigabyte transfers.
 
 ### Cache scoping and authorization
 
@@ -150,8 +150,8 @@ Toolchain baking status (2026-08-02): `prepare_artifact` installs workspace-reso
 
 ### Other useful caches
 
-- `crates/aksh-runner-server/src/actions.rs` streams action tarballs into an atomic on-disk cache keyed by owner/repository/ref. Mutable tags are cached indefinitely; resolve tags to commit SHA and store immutable content by digest.
-- `crates/aksh-runner-server/src/snapshots.rs` maintains a lock-protected Git object cache per local Git common-directory identity and persists stat data. Its documented `git add` result improves from `156 ms` to `16 ms` for a 6,000-file workspace. This is the right pattern: immutable objects, narrow identity, atomic refresh, and no workspace reuse.
+- `crates/preloop-runner-server/src/actions.rs` streams action tarballs into an atomic on-disk cache keyed by owner/repository/ref. Mutable tags are cached indefinitely; resolve tags to commit SHA and store immutable content by digest.
+- `crates/preloop-runner-server/src/snapshots.rs` maintains a lock-protected Git object cache per local Git common-directory identity and persists stat data. Its documented `git add` result improves from `156 ms` to `16 ms` for a 6,000-file workspace. This is the right pattern: immutable objects, narrow identity, atomic refresh, and no workspace reuse.
 - `crates/preloop-orchestrator/src/keys.rs` deliberately gives every runner a unique RSA key. Runner private keys, credentials, and secret-bearing state must never enter a shared cache or golden image.
 
 ### No payload cache today
@@ -773,7 +773,7 @@ Success criteria for the first campaign:
 
 Target areas:
 
-- cache handlers in `aksh-runner-server`;
+- cache handlers in `preloop-runner-server`;
 - `CacheStore` operations;
 - orchestrator golden/tool/image phases;
 - runner setup/post action timing.

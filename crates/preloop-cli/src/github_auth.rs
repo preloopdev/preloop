@@ -9,7 +9,7 @@
 //! re-export step; [`StoredAuth::report`] removes the silence.
 //!
 //! The environment always wins. A container or CI runner that injects
-//! `AKSH_GITHUB_APP_ID` must not be overridden by a file that some earlier
+//! `PRELOOP_GITHUB_APP_ID` must not be overridden by a file that some earlier
 //! `--save` left behind.
 
 use anyhow::{Context, Result};
@@ -24,20 +24,20 @@ const FILE: &str = "github-app.json";
 
 /// Every environment variable [`load_from_env`] accepts for the private key.
 ///
-/// Must stay in sync with `aksh_runner_server::github_app::PRIVATE_KEY_ENV`.
-/// `AKSH_GITHUB_APP_PEM` has the highest precedence there, so writing it would
+/// Must stay in sync with `preloop_runner_server::github_app::PRIVATE_KEY_ENV`.
+/// `PRELOOP_GITHUB_APP_PEM` has the highest precedence there, so writing it would
 /// shadow an operator who deliberately set one of the other three — hence
 /// [`StoredAuth::apply`] checks all four before setting any.
 const PRIVATE_KEY_ENV: [&str; 4] = [
-    "AKSH_GITHUB_APP_PEM",
-    "AKSH_GITHUB_APP_PEM_FILE",
-    "AKSH_GITHUB_APP_PRIVATE_KEY",
-    "AKSH_GITHUB_APP_PRIVATE_KEY_PATH",
+    "PRELOOP_GITHUB_APP_PEM",
+    "PRELOOP_GITHUB_APP_PEM_FILE",
+    "PRELOOP_GITHUB_APP_PRIVATE_KEY",
+    "PRELOOP_GITHUB_APP_PRIVATE_KEY_PATH",
 ];
 
-const APP_ID_ENV: &str = "AKSH_GITHUB_APP_ID";
-const INSTALLATION_ID_ENV: &str = "AKSH_GITHUB_APP_INSTALLATION_ID";
-const WEBHOOK_SECRET_ENV: &str = "AKSH_WEBHOOK_SECRET";
+const APP_ID_ENV: &str = "PRELOOP_GITHUB_APP_ID";
+const INSTALLATION_ID_ENV: &str = "PRELOOP_GITHUB_APP_INSTALLATION_ID";
+const WEBHOOK_SECRET_ENV: &str = "PRELOOP_WEBHOOK_SECRET";
 
 /// GitHub credentials a self-hosted deployment reuses across restarts.
 ///
@@ -381,7 +381,7 @@ mod tests {
 
     #[test]
     fn an_explicit_key_path_is_not_shadowed_by_the_stored_pem() {
-        // AKSH_GITHUB_APP_PEM outranks _PATH in the server, so applying a
+        // PRELOOP_GITHUB_APP_PEM outranks _PATH in the server, so applying a
         // stored inline PEM over an operator's explicit path would silently
         // swap which key signs the App JWT.
         let _env = clear_all(&[(PRIVATE_KEY_ENV[3], Some("/secure/key.pem"))]);
@@ -406,7 +406,7 @@ mod tests {
 
     #[test]
     fn a_blank_export_does_not_mask_a_stored_value() {
-        // `export AKSH_GITHUB_APP_ID=` is a common way to "unset" a variable
+        // `export PRELOOP_GITHUB_APP_ID=` is a common way to "unset" a variable
         // in a shell profile; treating it as set would disable minting.
         let _env = clear_all(&[(APP_ID_ENV, Some("   "))]);
         sample().apply();

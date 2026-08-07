@@ -5,7 +5,7 @@
 // Real consumer: backend steps updater never sees terminal status (reporting.rs:57).
 // Runs with: cargo test --test test_bugMC-S5-step-transition-loss_queue --lib
 
-#[path = "../worktree/crates/aksh-runner/src/worker/server_queue.rs"]
+#[path = "../worktree/crates/preloop-runner/src/worker/server_queue.rs"]
 mod server_queue;
 use server_queue::{ServerQueue, StepUpdate, step_status, step_conclusion};
 

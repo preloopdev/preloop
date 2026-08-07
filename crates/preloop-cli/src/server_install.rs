@@ -722,7 +722,7 @@ fn render_launchd_plist(exe: &Path, home: &Path, env_lines: &[String]) -> Result
 
 /// Environment-file lines for the config the operator supplied. Keys are the
 /// names `preloop serve` / the server already read (`PRELOOP_LISTEN`,
-/// `PRELOOP_PUBLIC_URL`, `AKSH_GITHUB_APP_*`, `AKSH_WEBHOOK_SECRET`).
+/// `PRELOOP_PUBLIC_URL`, `PRELOOP_GITHUB_APP_*`, `PRELOOP_WEBHOOK_SECRET`).
 fn config_env_lines(args: &InstallArgs) -> Result<Vec<String>> {
     let mut lines = Vec::new();
     if let Some(listen) = args.listen {
@@ -732,24 +732,24 @@ fn config_env_lines(args: &InstallArgs) -> Result<Vec<String>> {
         lines.push(env_line("PRELOOP_PUBLIC_URL", url)?);
     }
     if let Some(id) = &args.github_app_id {
-        lines.push(env_line("AKSH_GITHUB_APP_ID", id)?);
+        lines.push(env_line("PRELOOP_GITHUB_APP_ID", id)?);
     }
     if let Some(key) = &args.github_app_key {
         let key = std::fs::canonicalize(key)
             .with_context(|| format!("resolve --github-app-key {}", key.display()))?;
         lines.push(env_line(
-            "AKSH_GITHUB_APP_PEM_FILE",
+            "PRELOOP_GITHUB_APP_PEM_FILE",
             &key.display().to_string(),
         )?);
     }
     if let Some(id) = args.github_app_installation_id {
         lines.push(env_line(
-            "AKSH_GITHUB_APP_INSTALLATION_ID",
+            "PRELOOP_GITHUB_APP_INSTALLATION_ID",
             &id.to_string(),
         )?);
     }
     if let Some(secret) = &args.webhook_secret {
-        lines.push(env_line("AKSH_WEBHOOK_SECRET", secret)?);
+        lines.push(env_line("PRELOOP_WEBHOOK_SECRET", secret)?);
     }
     Ok(lines)
 }
@@ -909,8 +909,8 @@ mod tests {
 
     fn env_lines() -> Vec<String> {
         vec![
-            "AKSH_GITHUB_APP_ID=12345".to_owned(),
-            "AKSH_WEBHOOK_SECRET=hunter2&<secret>".to_owned(),
+            "PRELOOP_GITHUB_APP_ID=12345".to_owned(),
+            "PRELOOP_WEBHOOK_SECRET=hunter2&<secret>".to_owned(),
         ]
     }
 
@@ -1116,7 +1116,7 @@ mod tests {
         assert!(plist.contains("<string>serve</string>"));
         assert!(plist.contains("<key>PRELOOP_HOME</key>"));
         assert!(plist.contains("<string>/var/lib/preloop</string>"));
-        assert!(plist.contains("<key>AKSH_WEBHOOK_SECRET</key>"));
+        assert!(plist.contains("<key>PRELOOP_WEBHOOK_SECRET</key>"));
         // XML-escaped: & → &amp;, < → &lt;
         assert!(plist.contains("hunter2&amp;&lt;secret&gt;"));
         assert!(!plist.contains("hunter2&<secret>"));
@@ -1145,7 +1145,7 @@ mod tests {
             vec![
                 "PRELOOP_LISTEN=127.0.0.1:9090".to_owned(),
                 "PRELOOP_PUBLIC_URL=https://ci.example.com".to_owned(),
-                "AKSH_GITHUB_APP_INSTALLATION_ID=7".to_owned(),
+                "PRELOOP_GITHUB_APP_INSTALLATION_ID=7".to_owned(),
             ]
         );
     }

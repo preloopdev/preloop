@@ -8,12 +8,12 @@ REPORT="$OUT/REPORT.md"
 
 {
 cat <<'EOF'
-# Real-World Conformance Campaign — Official Runner vs aksh Server
+# Real-World Conformance Campaign — Official Runner vs preloop Server
 
 Cells:
 - **A** (golden): official runner vs GitHub — recent successful runs, captured via the GitHub API
-- **B**: official runner v2.336.0 vs local aksh server
-- **C**: aksh runner vs local aksh server
+- **B**: official runner v2.336.0 vs local preloop server
+- **C**: preloop runner vs local preloop server
 
 Repos: sharkdp/bat, vitejs/vite, astral-sh/uv, nextcloud/server.
 Workflows are the exact upstream files; only `runs-on:` labels were rewritten
@@ -22,7 +22,7 @@ to `[self-hosted, Linux, X64]`.
 EOF
 
 for repo in bat vite uv nextcloud; do
-  for cell in official aksh; do
+  for cell in official preloop; do
     echo "## $repo / $cell"
     echo ""
     if [ -f "$OUT/$repo/$cell/run.json" ]; then

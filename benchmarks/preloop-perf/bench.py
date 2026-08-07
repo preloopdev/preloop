@@ -196,7 +196,7 @@ def ensure_build() -> None:
     log("building release binaries")
     steps = [
         (
-            ["cargo", "zigbuild", "--release", "-p", "aksh-runner", "--target", RUNNER_TARGET],
+            ["cargo", "zigbuild", "--release", "-p", "preloop-runner", "--target", RUNNER_TARGET],
             "guest runner",
         ),
         (["cargo", "build", "--release", "-p", "preloop-cli"], "host CLI/engine"),
@@ -539,10 +539,10 @@ def start_engine() -> subprocess.Popen:
         "PRELOOP_LISTEN": LISTEN,
         "PRELOOP_RUNNER_BUNDLE": str(RUNNER_BUNDLE),
         "PRELOOP_RUNNER_BASE_IMAGE": BASE_IMAGE,
-        "AKSH_SYSTEM_TOKEN": TOKEN,
+        "PRELOOP_SYSTEM_TOKEN": TOKEN,
         "RUST_LOG": "info",
     }
-    env.pop("AKSH_URL", None)
+    env.pop("PRELOOP_URL", None)
     ENGINE_LOG.parent.mkdir(parents=True, exist_ok=True)
     handle = ENGINE_LOG.open("w")
     log(f"starting engine on {LISTEN}")
@@ -559,7 +559,7 @@ def start_engine() -> subprocess.Popen:
 
 def seed_action_cache() -> None:
     """Pre-populate the server action cache so no run reaches api.github.com."""
-    source = REPO / ".aksh/actions"
+    source = REPO / ".preloop/actions"
     if not source.is_dir():
         return
     destination = HOME / "state/actions"
@@ -652,9 +652,9 @@ def cli_env() -> dict:
     env = {
         **os.environ,
         "PRELOOP_HOME": str(HOME),
-        "AKSH_TOKEN": TOKEN,
+        "PRELOOP_TOKEN": TOKEN,
     }
-    env.pop("AKSH_URL", None)
+    env.pop("PRELOOP_URL", None)
     env.pop("RUST_LOG", None)
     return env
 

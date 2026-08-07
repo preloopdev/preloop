@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# vm-run-aksh.sh — configure + run aksh Rust runner inside per-job smolvm
-# Usage: vm-run-aksh.sh <job_index> <server_url> <runner_labels>
+# vm-run-preloop.sh — configure + run preloop Rust runner inside per-job smolvm
+# Usage: vm-run-preloop.sh <job_index> <server_url> <runner_labels>
 # server_url: https://github.com/<repo> or http://<host>:<port>
 set -euo pipefail
 
@@ -8,25 +8,25 @@ JOB_INDEX="${1:?Usage: $0 <job_index> <server_url> <runner_labels>}"
 SERVER_URL="${2:?}"
 LABELS="${3:-self-hosted,linux,x64}"
 
-RUNNER_ROOT="/tmp/aksh-j${JOB_INDEX}"
-RUNNER_NAME="e2e-aksh-${JOB_INDEX}-$(date +%s)"
+RUNNER_ROOT="/tmp/preloop-j${JOB_INDEX}"
+RUNNER_NAME="e2e-preloop-${JOB_INDEX}-$(date +%s)"
 TIMING_LOG="${RUNNER_TIMING_LOG:-/tmp/runner-j${JOB_INDEX}.log}"
-# Find aksh-runner: prefer mounted /opt/runners, then workspace build
-if [ -x /opt/runners/aksh-runner ]; then
-  AKSH_RUNNER="/opt/runners/aksh-runner"
-elif [ -x /opt/aksh/aksh-runner ]; then
-  AKSH_RUNNER="/opt/aksh/aksh-runner"
+# Find preloop-runner: prefer mounted /opt/runners, then workspace build
+if [ -x /opt/runners/preloop-runner ]; then
+  PRELOOP_RUNNER="/opt/runners/preloop-runner"
+elif [ -x /opt/preloop/preloop-runner ]; then
+  PRELOOP_RUNNER="/opt/preloop/preloop-runner"
 else
-  AKSH_RUNNER="/workspace/target/aarch64-unknown-linux-musl/release/preloop-runner"
+  PRELOOP_RUNNER="/workspace/target/aarch64-unknown-linux-musl/release/preloop-runner"
 fi
 
-log() { echo "[aksh-runner-j${JOB_INDEX} $(date +%T.%3N)] $*"; }
+log() { echo "[preloop-runner-j${JOB_INDEX} $(date +%T.%3N)] $*"; }
 
 # Setup — ensure cargo is in PATH
 export PATH="/root/.cargo/bin:$PATH"
 bash /workspace/benchmarks/real-world/vm-setup-common.sh
 
-log "Configuring aksh-runner at $RUNNER_ROOT..."
+log "Configuring preloop-runner at $RUNNER_ROOT..."
 rm -rf "$RUNNER_ROOT"
 mkdir -p "$RUNNER_ROOT"
 
@@ -40,7 +40,7 @@ if [[ "$SERVER_URL" == https://github.com/* ]]; then
   fi
 fi
 
-RUST_LOG=info "$AKSH_RUNNER" --runner-root "$RUNNER_ROOT" configure \
+RUST_LOG=info "$PRELOOP_RUNNER" --runner-root "$RUNNER_ROOT" configure \
   --url "$SERVER_URL" \
   --token "$REG_TOKEN" \
   --name "$RUNNER_NAME" \
@@ -54,7 +54,7 @@ log "Configuration complete. Running --once..."
 # Record start time
 echo "RUNNER_START_MS=$(date +%s%3N)" >> "$TIMING_LOG"
 
-RUST_LOG=info "$AKSH_RUNNER" --runner-root "$RUNNER_ROOT" run --once 2>&1 | while IFS= read -r line; do
+RUST_LOG=info "$PRELOOP_RUNNER" --runner-root "$RUNNER_ROOT" run --once 2>&1 | while IFS= read -r line; do
   echo "[$(date +%T.%3N)] $line"
 done
 

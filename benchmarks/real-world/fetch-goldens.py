@@ -3,7 +3,7 @@
 
 Cell A of the conformance matrix: official runner against GitHub.
 For each repo we capture a recent successful run's job/step structure
-(normalized) and the per-step log content, so aksh server + runner runs
+(normalized) and the per-step log content, so preloop server + runner runs
 (cells B/C) can be compared against it.
 
 Usage:

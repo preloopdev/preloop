@@ -1,11 +1,11 @@
-# Bug Report — preloop (aksh GitHub Actions control plane)
+# Bug Report — preloop (preloop GitHub Actions control plane)
 
 > **Status as of 2026-08-06: all findings resolved.** Bugs 1, 3 and 4 below are
 > fixed in the tree; Bug 2's invariant was withdrawn as a spec artifact. Two
 > further defects found by code review after this run — MC-R1 (fail-fast
 > holder leak) and MC-R2 (same-run cancel-in-progress evicting the arriving
 > holder) — are also fixed and carry regression tests in
-> `crates/aksh-runner-server/src/concurrency_properties.rs`. See
+> `crates/preloop-runner-server/src/concurrency_properties.rs`. See
 > `findings.json` for the per-finding `status` field. The bug descriptions
 > below are preserved as the original as-found record.
 
@@ -35,12 +35,12 @@
 
 ### Root Cause
 
-`promote_ready_jobs`' `Skip | Error` arm (crates/aksh-runner-server/src/runtime_scheduling.rs:858-875) inserts the terminal job status, re-summarizes the run, and calls `finalize_run_if_complete` — but never calls `release_concurrency_for_job`. That function (runtime_scheduling.rs:259-315) is the only path that releases group slots and prunes `holder_keys`, and it is called from exactly four sites: `cancel_job_inner` (:226), the expansion-failure path (:1851), and completion handling (distributed_task.rs:618-620). `finalize_run_if_complete` only stamps `completed_at`/`conclusion`. So any run whose last job settles through the promote Skip/Error arm terminates with its concurrency group permanently occupied. Later submissions to the same group wait on a dead holder.
+`promote_ready_jobs`' `Skip | Error` arm (crates/preloop-runner-server/src/runtime_scheduling.rs:858-875) inserts the terminal job status, re-summarizes the run, and calls `finalize_run_if_complete` — but never calls `release_concurrency_for_job`. That function (runtime_scheduling.rs:259-315) is the only path that releases group slots and prunes `holder_keys`, and it is called from exactly four sites: `cancel_job_inner` (:226), the expansion-failure path (:1851), and completion handling (distributed_task.rs:618-620). `finalize_run_if_complete` only stamps `completed_at`/`conclusion`. So any run whose last job settles through the promote Skip/Error arm terminates with its concurrency group permanently occupied. Later submissions to the same group wait on a dead holder.
 
 ### Affected Code
 
-- `crates/aksh-runner-server/src/runtime_scheduling.rs:858-875`: promote Skip/Error arm missing the release call
-- `crates/aksh-runner-server/src/runtime_scheduling.rs:259-315`: `release_concurrency_for_job` — the only slot/key cleanup path
+- `crates/preloop-runner-server/src/runtime_scheduling.rs:858-875`: promote Skip/Error arm missing the release call
+- `crates/preloop-runner-server/src/runtime_scheduling.rs:259-315`: `release_concurrency_for_job` — the only slot/key cleanup path
 
 ### Recommendation
 
@@ -70,7 +70,7 @@ Call `release_concurrency_for_job(inner, run_id, &job_id)` in the promote `Skip 
 
 ### Affected Code
 
-- `crates/aksh-runner-server/src/runtime_scheduling.rs:1888-1895`: placeholder removal without request settlement
+- `crates/preloop-runner-server/src/runtime_scheduling.rs:1888-1895`: placeholder removal without request settlement
 
 ### Recommendation
 
@@ -94,13 +94,13 @@ When `apply_expansion` replaces a placeholder, settle its correlation record (e.
 
 ### Root Cause
 
-The protocol crate escapes only single quotes (`crates/aksh-gha-protocol/src/azdo/job.rs:612`: `literal.replace('\'', "''")`) before emitting `format('<literal>', <args>)`. The parser-side builder escapes quotes AND braces (`crates/aksh-gha-parser/src/job_builder.rs:126-137`: `'{'` → `{{`, `'}'` → `}}`), and the expression evaluator's `format()` (crates/aksh-gha-expressions/src/evaluator.rs:347) enforces that convention: a lone `{` must start a `{N}` placeholder and a lone `}` is rejected. A step literal containing `{` mixed with `${{ }}` (JSON snippets, curl bodies) therefore produces a format string that fails with `InvalidFormat` — diverging from GitHub, where the escaping makes the same workflow run. This breaks the repo's drop-in-workflow guarantee.
+The protocol crate escapes only single quotes (`crates/preloop-gha-protocol/src/azdo/job.rs:612`: `literal.replace('\'', "''")`) before emitting `format('<literal>', <args>)`. The parser-side builder escapes quotes AND braces (`crates/preloop-gha-parser/src/job_builder.rs:126-137`: `'{'` → `{{`, `'}'` → `}}`), and the expression evaluator's `format()` (crates/preloop-gha-expressions/src/evaluator.rs:347) enforces that convention: a lone `{` must start a `{N}` placeholder and a lone `}` is rejected. A step literal containing `{` mixed with `${{ }}` (JSON snippets, curl bodies) therefore produces a format string that fails with `InvalidFormat` — diverging from GitHub, where the escaping makes the same workflow run. This breaks the repo's drop-in-workflow guarantee.
 
 ### Affected Code
 
-- `crates/aksh-gha-protocol/src/azdo/job.rs:612-613`: quote-only escaping in the format builder
-- `crates/aksh-gha-parser/src/job_builder.rs:126-137`: the parser's quote+brace escaping (the convention the evaluator expects)
-- `crates/aksh-gha-expressions/src/evaluator.rs:347-390`: `format()` placeholder/brace validation
+- `crates/preloop-gha-protocol/src/azdo/job.rs:612-613`: quote-only escaping in the format builder
+- `crates/preloop-gha-parser/src/job_builder.rs:126-137`: the parser's quote+brace escaping (the convention the evaluator expects)
+- `crates/preloop-gha-expressions/src/evaluator.rs:347-390`: `format()` placeholder/brace validation
 
 ### Recommendation
 
@@ -130,9 +130,9 @@ Job-level concurrency gates are evaluated exactly once — at submit time, insid
 
 ### Affected Code
 
-- `crates/aksh-runner-server/src/runtime_scheduling.rs:842-857`: promote Run arm dispatches without gate evaluation
-- `crates/aksh-runner-server/src/runtime_scheduling.rs:5-90`: `try_enqueue_with_job_concurrency` — the only gate-acquisition path
-- `crates/aksh-runner-server/src/runs.rs:1098-1100`: the sole call site, submit-time only
+- `crates/preloop-runner-server/src/runtime_scheduling.rs:842-857`: promote Run arm dispatches without gate evaluation
+- `crates/preloop-runner-server/src/runtime_scheduling.rs:5-90`: `try_enqueue_with_job_concurrency` — the only gate-acquisition path
+- `crates/preloop-runner-server/src/runs.rs:1098-1100`: the sole call site, submit-time only
 
 ### Recommendation
 

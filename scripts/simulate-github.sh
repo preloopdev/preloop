@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# simulate-github.sh — Simulate GitHub webhook events against a local aksh server.
+# simulate-github.sh — Simulate GitHub webhook events against a local preloop server.
 #
 # Usage:
 #   ./scripts/simulate-github.sh <event> [workflow-file] [payload-json]
@@ -10,12 +10,12 @@
 #   ./scripts/simulate-github.sh issues
 #
 # The script creates a minimal valid payload for each event and POSTs it
-# to the local aksh server webhook endpoint.
+# to the local preloop server webhook endpoint.
 
 set -euo pipefail
 
-AKSH_URL="${AKSH_URL:-http://127.0.0.1:8080}"
-WEBHOOK_SECRET="${AKSH_WEBHOOK_SECRET:-dev-secret}"
+PRELOOP_URL="${PRELOOP_URL:-http://127.0.0.1:8080}"
+WEBHOOK_SECRET="${PRELOOP_WEBHOOK_SECRET:-dev-secret}"
 PAYLOADS_DIR="${PAYLOADS_DIR:-experiments/mitm/scenarios}"
 
 event="${1:-}"
@@ -35,8 +35,8 @@ if [ -z "$event" ]; then
     echo "  gollum page_build schedule"
     echo ""
     echo "Environment:"
-    echo "  AKSH_URL           server URL (default: http://127.0.0.1:8080)"
-    echo "  AKSH_WEBHOOK_SECRET  webhook secret (default: dev-secret)"
+    echo "  PRELOOP_URL           server URL (default: http://127.0.0.1:8080)"
+    echo "  PRELOOP_WEBHOOK_SECRET  webhook secret (default: dev-secret)"
     echo "  PAYLOADS_DIR       captured payloads dir (default: experiments/mitm/scenarios)"
     exit 1
 fi
@@ -157,15 +157,15 @@ sig = hmac.new(secret, body, hashlib.sha256).hexdigest()
 print(f'sha256={sig}')
 " "$WEBHOOK_SECRET")
 
-# --- POST to aksh webhook endpoint ---
-echo "POSTing $event to $AKSH_URL/api/v1/github/webhooks ..."
+# --- POST to preloop webhook endpoint ---
+echo "POSTing $event to $PRELOOP_URL/api/v1/github/webhooks ..."
 response=$(curl -s -w "\n%{http_code}" \
     -X POST \
     -H "Content-Type: application/json" \
     -H "X-GitHub-Event: $event" \
     -H "X-Hub-Signature-256: $sig_hex" \
     -d "$body" \
-    "$AKSH_URL/api/v1/github/webhooks")
+    "$PRELOOP_URL/api/v1/github/webhooks")
 
 # Split response body and status code
 http_code=$(echo "$response" | tail -1)

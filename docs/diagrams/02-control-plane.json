@@ -11,7 +11,7 @@
     "id": "title",
     "x": 420,
     "y": 25,
-    "text": "aksh-runner-server \u2014 Control Plane",
+    "text": "preloop-runner-server \u2014 Control Plane",
     "fontSize": 28,
     "strokeColor": "#1e1e1e"
   },

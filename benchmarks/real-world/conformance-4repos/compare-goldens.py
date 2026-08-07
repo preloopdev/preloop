@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Compare golden GitHub runs (cell A) against aksh-server captures (cells B/C).
+"""Compare golden GitHub runs (cell A) against preloop-server captures (cells B/C).
 
 Cell A: official runner vs GitHub — captured from GitHub's runs API.
-Cell B: official runner vs aksh server — captured by the campaign harness.
-Cell C: aksh runner vs aksh server — captured by the campaign harness.
+Cell B: official runner vs preloop server — captured by the campaign harness.
+Cell C: preloop runner vs preloop server — captured by the campaign harness.
 
 The comparison is semantic: job names, step names, step order and conclusions.
 Diffs are categorized:
@@ -11,7 +11,7 @@ Diffs are categorized:
   environment  — the local host cannot do what the workflow asks (Windows
                  matrix cells on macOS, `apt-get`, missing cross toolchains,
                  broken local libraries). Not a conformance defect.
-  semantic     — the aksh stack produced a different job/step outcome than
+  semantic     — the preloop stack produced a different job/step outcome than
                  GitHub would. A conformance defect to investigate.
   naming       — job/step display-name differences (raw YAML keys vs
                  GitHub's `name:` rendering, un-evaluated matrix names).
@@ -64,7 +64,7 @@ def load_capture(repo, cell):
 
 def golden_job_index(golden):
     """Key golden jobs by their YAML key where possible, else display name."""
-    # GitHub's jobs API returns the evaluated display name; aksh's record uses
+    # GitHub's jobs API returns the evaluated display name; preloop's record uses
     # the YAML key. Build both indexes for fuzzy matching.
     by_display = {}
     by_key = {}
@@ -91,7 +91,7 @@ def compare_repo(repo, cell):
     }
 
     captured_names = list(capture["jobs"].keys())
-    # aksh records jobs by YAML key; match golden display names to keys by
+    # preloop records jobs by YAML key; match golden display names to keys by
     # trying the name and, failing that, the first golden job whose display
     # name starts with the key or vice versa.
     matched_golden = set()
@@ -153,7 +153,7 @@ def compare_job(gjob, cjob, run_has_env_failure=False):
 
     g_steps = {s["name"]: s.get("conclusion") for s in gjob.get("steps", [])}
     c_steps = {s["name"]: s.get("conclusion") for s in cjob.get("steps", [])}
-    # aksh run records drop unnamed steps (known projection gap); the runner
+    # preloop run records drop unnamed steps (known projection gap); the runner
     # logs carry them. Normalize: compare only steps present in both, and
     # report naming gaps for empty names.
     g_step_names = [s["name"] for s in gjob.get("steps", [])]
@@ -228,11 +228,11 @@ def main():
     args = ap.parse_args()
 
     report = []
-    # `c` is the preloop production path: aksh runner in per-job smolVMs
-    # against the local engine. `official`/`aksh` are the older host-runner
+    # `c` is the preloop production path: preloop runner in per-job smolVMs
+    # against the local engine. `official`/`preloop` are the older host-runner
     # cells from conformance-4repos.sh.
-    for repo, cells in (("bat", ["official", "aksh", "c"]), ("vite", ["official", "aksh", "c"]),
-                        ("uv", ["official", "aksh", "c"]), ("nextcloud", ["official", "aksh", "c"]),
+    for repo, cells in (("bat", ["official", "preloop", "c"]), ("vite", ["official", "preloop", "c"]),
+                        ("uv", ["official", "preloop", "c"]), ("nextcloud", ["official", "preloop", "c"]),
                         ("runner", ["c"]), ("qm", ["c"]), ("buzz", ["c"]),
                         ("openclaw", ["c"]), ("agent-ci", ["c"]),
                         ("bento", ["c"]), ("caddy", ["c"]), ("tokio", ["c"])):

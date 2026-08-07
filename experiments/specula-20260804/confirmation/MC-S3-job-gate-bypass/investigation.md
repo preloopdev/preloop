@@ -9,7 +9,7 @@
 - No downstream guard observed in promote path; dispatch to queue is permanent.
 
 ## Developer-knowledge search
-- git log -S concurrency -- crates/aksh-runner-server/src/runtime_scheduling.rs shows deferred-expansion commit (aafe5b77) introduced pending_jobs path; no commit message or blame cites gate bypass on promote.
+- git log -S concurrency -- crates/preloop-runner-server/src/runtime_scheduling.rs shows deferred-expansion commit (aafe5b77) introduced pending_jobs path; no commit message or blame cites gate bypass on promote.
 - REVIEW.md discusses concurrency correctness but no mention of this specific on_job_enqueued omission or GateBeforeDispatch.
 - No TODO/FIXME, no test asserting concurrency with needs+promote path. Code comment in try_enqueue_with_job_concurrency notes model refinement for EnqueuePending+PromoteReadyJob path divergence.
 

@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 # Direct capture on an already-running VM. Bypasses ensure_vms/prepare_vm.
-# Usage: ./direct-capture.sh <workflow-yml> <vm-name> [official|aksh|both]
+# Usage: ./direct-capture.sh <workflow-yml> <vm-name> [official|preloop|both]
 set -euo pipefail
 
 SCENARIO="${1:?Usage: $0 <workflow> <vm> [kind]}"
 VM="${2:?Need VM name}"
 RUNNER_KIND="${3:-both}"
 
-GH_REPO="${GH_REPO:-preloopdev/aksh-conformance-sample}"
+GH_REPO="${GH_REPO:-preloopdev/preloop-conformance-sample}"
 GH_REF="${GH_REF:-main}"
 MITM_PORT="${MITM_PORT:-18081}"
 HOST_WORKSPACE="$PWD"
 VM_WORKSPACE="/workspace"
 RESULTS_ROOT="${RESULTS_ROOT:-$PWD/benchmarks/compatibility/runner/protocol}"
-AKSH_RUNNER="/usr/local/bin/aksh-runner"
+PRELOOP_RUNNER="/usr/local/bin/preloop-runner"
 OFFICIAL_SRC="/opt/runners/actions-runner"
 MITM_ADDON="/workspace/experiments/mitm/addons/capture.py"
 
@@ -89,16 +89,16 @@ capture_one() {
   local proxy="http://127.0.0.1:${MITM_PORT}"
   local ca_bundle="$vm_capture_dir/vm-mitm-conf/mitmproxy-ca-cert.pem"
 
-  if [ "$kind" = "aksh" ]; then
+  if [ "$kind" = "preloop" ]; then
     smolvm machine exec --name "$VM" -- bash -lc "
       set -euo pipefail
       export HTTP_PROXY='$proxy' HTTPS_PROXY='$proxy' http_proxy='$proxy' https_proxy='$proxy' NO_PROXY='' no_proxy=''
       export NODE_EXTRA_CA_CERTS='$ca_bundle' SSL_CERT_FILE='$ca_bundle'
       rm -rf '$root'; mkdir -p '$root'
-      RUST_LOG=info '$AKSH_RUNNER' --ca-bundle '$ca_bundle' --runner-root '$root' configure \
+      RUST_LOG=info '$PRELOOP_RUNNER' --ca-bundle '$ca_bundle' --runner-root '$root' configure \
         --url 'https://github.com/$GH_REPO' --token '$token' --name '$runner_name' \
         --unattended --replace --ephemeral --labels "self-hosted,linux,x64,$wf_label" 2>&1
-      RUST_LOG=info '$AKSH_RUNNER' --ca-bundle '$ca_bundle' --runner-root '$root' run 2>&1
+      RUST_LOG=info '$PRELOOP_RUNNER' --ca-bundle '$ca_bundle' --runner-root '$root' run 2>&1
     " > "$capture_dir/vm-runner.log" 2>&1 &
   else
     smolvm machine exec --name "$VM" -- bash -lc "
@@ -156,7 +156,7 @@ JSON
 
 case "$RUNNER_KIND" in
   official) capture_one official ;;
-  aksh) capture_one aksh ;;
-  both) capture_one official || log "WARN: official failed, continuing with aksh"; sleep 10; capture_one aksh ;;
+  preloop) capture_one preloop ;;
+  both) capture_one official || log "WARN: official failed, continuing with preloop"; sleep 10; capture_one preloop ;;
   *) echo "unknown: $RUNNER_KIND" >&2; exit 1 ;;
 esac

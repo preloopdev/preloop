@@ -9,17 +9,17 @@
 #
 # Modes:
 #   github-official  — Official C# runner → GitHub control plane
-#   github-aksh      — aksh Rust runner → GitHub control plane
-#   aksh-server      — aksh Rust runner → local aksh-server control plane
+#   github-preloop      — preloop Rust runner → GitHub control plane
+#   preloop-server      — preloop Rust runner → local preloop-server control plane
 #
 # Workflows: serde | axum | bat | all
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────
-MODE="${1:?Usage: $0 <github-official|github-aksh|aksh-server> <serde|axum|bat|all>}"
+MODE="${1:?Usage: $0 <github-official|github-preloop|preloop-server> <serde|axum|bat|all>}"
 WF_SELECTOR="${2:?}"
 
-GH_REPO="preloopdev/aksh-conformance-sample"
+GH_REPO="preloopdev/preloop-conformance-sample"
 HOST_WORKSPACE="/Users/bnjoroge/macos-runners"
 WARM_CACHE="/Users/bnjoroge/cachingv4"
 WARM_RUSTUP="$WARM_CACHE/.rustup"
@@ -32,7 +32,7 @@ VM_CPUS=4
 VM_MEM=8192
 VM_STORAGE=20
 VM_IMAGE="ubuntu:24.04"  # fallback for ephemeral mode
-BENCH_VM_PREFIX="bench-aksh"  # persistent pre-packed VMs: bench-aksh-{1..4}
+BENCH_VM_PREFIX="bench-preloop"  # persistent pre-packed VMs: bench-preloop-{1..4}
 
 mkdir -p "$RESULTS_DIR" "$TMP_DIR"
 
@@ -59,7 +59,7 @@ count_jobs() {
 
 # ── GitHub modes ────────────────────────────────────────────────────
 run_github_mode() {
-  local runner_type="$1"  # "official" or "aksh"
+  local runner_type="$1"  # "official" or "preloop"
   local wf="$2"
   local label="${wf%.yml}"
   local run_label="${label}-github-${runner_type}"
@@ -84,7 +84,7 @@ run_github_mode() {
   if [ "$runner_type" = "official" ]; then
     runner_script="/workspace/benchmarks/real-world/vm-run-official.sh"
   else
-    runner_script="/workspace/benchmarks/real-world/vm-run-aksh.sh"
+    runner_script="/workspace/benchmarks/real-world/vm-run-preloop.sh"
   fi
 
   # Start VM runners using pre-packed persistent VMs
@@ -107,7 +107,7 @@ run_github_mode() {
     smolvm machine exec --name "$vm_name" -- bash -c "
       export GH_REG_TOKEN='$reg_token'
       export RUNNER_TIMING_LOG='/tmp/runner-j${i}.log'
-      bash /workspace/benchmarks/real-world/$( [ \"$runner_type\" = \"official\" ] && echo vm-run-official.sh || echo vm-run-aksh.sh ) \
+      bash /workspace/benchmarks/real-world/$( [ \"$runner_type\" = \"official\" ] && echo vm-run-official.sh || echo vm-run-preloop.sh ) \
         $i \
         $( [ \"$runner_type\" = \"official\" ] && echo \"$GH_REPO\" || echo \"https://github.com/$GH_REPO\" ) \
         'self-hosted,linux,x64'
@@ -178,14 +178,14 @@ run_github_mode() {
   log "Result: $result_json"
 }
 
-# ── aksh-server mode ────────────────────────────────────────────────
-run_aksh_server_mode() {
+# ── preloop-server mode ────────────────────────────────────────────────
+run_preloop_server_mode() {
   local wf="$1"
   local label="${wf%.yml}"
-  local run_label="${label}-aksh-server"
+  local run_label="${label}-preloop-server"
 
   log "════════════════════════════════════════════════════════════"
-  log "  MODE: aksh-server + aksh-runner | WF: $wf"
+  log "  MODE: preloop-server + preloop-runner | WF: $wf"
   log "════════════════════════════════════════════════════════════"
 
   local wf_path="$HOST_WORKSPACE/benchmarks/real-world/$wf"
@@ -193,7 +193,7 @@ run_aksh_server_mode() {
   job_count=$(count_jobs "$wf_path")
   log "Workflow has $job_count jobs → need $job_count VMs"
 
-  # Start aksh-server on localhost, with Python proxy for VM access
+  # Start preloop-server on localhost, with Python proxy for VM access
   # (macOS blocks Rust binary on external interfaces, but Python works)
   local server_internal_port=9192
   local server_external_port=9191
@@ -207,19 +207,19 @@ run_aksh_server_mode() {
 
   # Use host-native binaries (macOS), not the linux-musl cross-compiled ones
   local server_bin="$HOST_WORKSPACE/target/release/preloop-server"
-  local client_bin="$HOST_WORKSPACE/target/release/aksh-runner-client"
+  local client_bin="$HOST_WORKSPACE/target/release/preloop-runner-client"
 
   # Kill stale processes
   pkill -f preloop-server 2>/dev/null || true
   pkill -f "python3.*tcp-proxy" 2>/dev/null || true
   sleep 0.5
 
-  # Start aksh-server on localhost only
-  log "Starting aksh-server on 127.0.0.1:${server_internal_port}..."
-  AKSH_PUBLIC_URL="$server_url" RUST_LOG=info "$server_bin" serve \
+  # Start preloop-server on localhost only
+  log "Starting preloop-server on 127.0.0.1:${server_internal_port}..."
+  PRELOOP_PUBLIC_URL="$server_url" RUST_LOG=info "$server_bin" serve \
     --listen "127.0.0.1:${server_internal_port}" \
-    --state-dir "$TMP_DIR/aksh-state" \
-    > "$TMP_DIR/aksh-server.log" 2>&1 &
+    --state-dir "$TMP_DIR/preloop-state" \
+    > "$TMP_DIR/preloop-server.log" 2>&1 &
   local server_pid=$!
 
   # Wait for server
@@ -227,13 +227,13 @@ run_aksh_server_mode() {
   local server_ok=0
   for i in $(seq 1 30); do
     if curl -sf "http://127.0.0.1:${server_internal_port}/healthz" >/dev/null 2>&1; then
-      log "aksh-server ready (pid=$server_pid)"
+      log "preloop-server ready (pid=$server_pid)"
       server_ok=1
       break
     fi
     if ! kill -0 "$server_pid" 2>/dev/null; then
       log "Server died!"
-      cat "$TMP_DIR/aksh-server.log"
+      cat "$TMP_DIR/preloop-server.log"
       return 1
     fi
     sleep 0.2
@@ -276,11 +276,11 @@ main()
   log "Starting $job_count VMs (runners will register and poll)..."
   local vm_pids=()
   local vm_logs=()
-  local runner_script="/workspace/benchmarks/real-world/vm-run-aksh.sh"
+  local runner_script="/workspace/benchmarks/real-world/vm-run-preloop.sh"
   local t_overall_start=$(ms)
 
   for i in $(seq 1 "$job_count"); do
-    local vm_log="$TMP_DIR/vm-${label}-aksh-server-j${i}.log"
+    local vm_log="$TMP_DIR/vm-${label}-preloop-server-j${i}.log"
     vm_logs+=("$vm_log")
 
     log "Starting VM for job $i/$job_count..."
@@ -309,7 +309,7 @@ main()
   submit_out=$("$client_bin" --server "http://127.0.0.1:${server_internal_port}" submit \
     -W "$wf_path" \
     --event workflow_dispatch \
-    --workspace-root /tmp/aksh-conformance-push \
+    --workspace-root /tmp/preloop-conformance-push \
     --git-ref refs/heads/main 2>&1) || true
   log "Submit: $submit_out"
 
@@ -334,7 +334,7 @@ main()
   log "────────────────────────────────────────────────────────────"
   log "  Per-VM step timings:"
   for i in $(seq 1 "$job_count"); do
-    local vm_log="$TMP_DIR/vm-${label}-aksh-server-j${i}.log"
+    local vm_log="$TMP_DIR/vm-${label}-preloop-server-j${i}.log"
     log "  --- VM job $i ---"
     grep -E "Running step:|Job .* completed:" "$vm_log" 2>/dev/null | head -20 || log "  (no step data)"
   done
@@ -345,7 +345,7 @@ main()
   # Record result
   local result_json
   result_json=$(jq -n \
-    --arg mode "aksh-server" \
+    --arg mode "preloop-server" \
     --arg workflow "$wf" \
     --arg total_ms "$total_ms" \
     --arg vm_failures "$vm_failures" \
@@ -358,7 +358,7 @@ main()
   # Stop proxy and server
   log "Stopping TCP proxy (pid=$proxy_pid)..."
   kill "$proxy_pid" 2>/dev/null || true
-  log "Stopping aksh-server (pid=$server_pid)..."
+  log "Stopping preloop-server (pid=$server_pid)..."
   kill "$server_pid" 2>/dev/null || true
   wait "$server_pid" 2>/dev/null || true
 }
@@ -385,8 +385,8 @@ fi
 for wf in "${WORKFLOWS[@]}"; do
   case "$MODE" in
     github-official) run_github_mode "official" "$wf" ;;
-    github-aksh)     run_github_mode "aksh" "$wf" ;;
-    aksh-server)     run_aksh_server_mode "$wf" ;;
+    github-preloop)     run_github_mode "preloop" "$wf" ;;
+    preloop-server)     run_preloop_server_mode "$wf" ;;
     *) log "Unknown mode: $MODE"; exit 1 ;;
   esac
 

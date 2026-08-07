@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Comprehensive conformance comparison: step-level + log content + flow diffing.
 
-Reads conformance JSONL results from both official and aksh runners, matches
+Reads conformance JSONL results from both official and preloop runners, matches
 scenarios by workflow number, and produces a detailed comparison report covering:
 
 1. Job-level: conclusion match, job count match
@@ -10,7 +10,7 @@ scenarios by workflow number, and produces a detailed comparison report covering
 4. Flow-level: integrates with runner-flow-diff.py captures when available
 
 Usage:
-  python3 conformance-diff.py [--official FILE] [--aksh FILE] [--flows-dir DIR] [--output FILE]
+  python3 conformance-diff.py [--official FILE] [--preloop FILE] [--flows-dir DIR] [--output FILE]
 """
 from __future__ import annotations
 
@@ -146,7 +146,7 @@ def normalize_step_name(name: str) -> str:
     """Normalize step names for comparison.
 
     Official runner uses displayNameToken.lit (e.g. 'Set empty string output').
-    Aksh may use the script content prefix (e.g. 'Run echo ...' ) or the
+    Preloop may use the script content prefix (e.g. 'Run echo ...' ) or the
     displayNameToken depending on version.
     """
     # Strip leading 'Run ' for comparison — these are auto-generated names
@@ -156,12 +156,12 @@ def normalize_step_name(name: str) -> str:
 
 
 def compare_steps(
-    off_steps: list[dict], aksh_steps: list[dict], job_name: str
+    off_steps: list[dict], preloop_steps: list[dict], job_name: str
 ) -> StepDiff:
-    """Compare step lists between official and aksh for one job."""
+    """Compare step lists between official and preloop for one job."""
     diff = StepDiff(job_name)
 
-    # Filter out duplicate entries (aksh sometimes has duplicate Set up job / Complete job)
+    # Filter out duplicate entries (preloop sometimes has duplicate Set up job / Complete job)
     def dedup_steps(steps: list[dict]) -> list[dict]:
         seen = set()
         result = []
@@ -173,24 +173,24 @@ def compare_steps(
         return result
 
     off_dedup = dedup_steps(off_steps)
-    aksh_dedup = dedup_steps(aksh_steps)
+    preloop_dedup = dedup_steps(preloop_steps)
 
     # Step count
-    if len(off_dedup) != len(aksh_dedup):
+    if len(off_dedup) != len(preloop_dedup):
         diff.issues.append("step-count")
         diff.details.append(
-            f"Step count: official={len(off_dedup)}, aksh={len(aksh_dedup)} "
-            f"(raw: official={len(off_steps)}, aksh={len(aksh_steps)})"
+            f"Step count: official={len(off_dedup)}, preloop={len(preloop_dedup)} "
+            f"(raw: official={len(off_steps)}, preloop={len(preloop_steps)})"
         )
 
     # Duplicate detection
-    if len(aksh_steps) != len(aksh_dedup):
-        dupes = len(aksh_steps) - len(aksh_dedup)
+    if len(preloop_steps) != len(preloop_dedup):
+        dupes = len(preloop_steps) - len(preloop_dedup)
         diff.issues.append("duplicate-steps")
-        diff.details.append(f"Aksh has {dupes} duplicate step entries")
+        diff.details.append(f"Preloop has {dupes} duplicate step entries")
 
     # Step conclusion comparison (by position after dedup)
-    for i, (o, a) in enumerate(zip(off_dedup, aksh_dedup)):
+    for i, (o, a) in enumerate(zip(off_dedup, preloop_dedup)):
         oname = o.get("name", f"step-{i}")
         aname = a.get("name", f"step-{i}")
         oconc = o.get("conclusion", "")
@@ -204,39 +204,39 @@ def compare_steps(
             elif aname.startswith("Run ") and oname not in ("Set up job", "Complete job"):
                 diff.issues.append("step-display-name")
                 diff.details.append(
-                    f"Step {i+1} name: official='{oname}' vs aksh='{aname}'"
+                    f"Step {i+1} name: official='{oname}' vs preloop='{aname}'"
                 )
             elif aname.startswith("Post ") or "/" in aname or "@" in aname:
                 # Action refs or post-step names — still a display name issue
                 diff.issues.append("step-display-name")
                 diff.details.append(
-                    f"Step {i+1} name: official='{oname}' vs aksh='{aname}'"
+                    f"Step {i+1} name: official='{oname}' vs preloop='{aname}'"
                 )
             else:
                 diff.issues.append("step-name-mismatch")
                 diff.details.append(
-                    f"Step {i+1} name: official='{oname}' vs aksh='{aname}'"
+                    f"Step {i+1} name: official='{oname}' vs preloop='{aname}'"
                 )
 
         # Conclusion comparison
         if oconc != aconc:
             diff.issues.append("step-conclusion")
             diff.details.append(
-                f"Step {i+1} '{oname}': official={oconc}, aksh={aconc}"
+                f"Step {i+1} '{oname}': official={oconc}, preloop={aconc}"
             )
 
     # Steps only in one side (after exhausting zip)
-    if len(off_dedup) > len(aksh_dedup):
-        for s in off_dedup[len(aksh_dedup):]:
-            diff.issues.append("step-missing-in-aksh")
+    if len(off_dedup) > len(preloop_dedup):
+        for s in off_dedup[len(preloop_dedup):]:
+            diff.issues.append("step-missing-in-preloop")
             diff.details.append(
-                f"Missing in aksh: '{s.get('name','')}' ({s.get('conclusion','')})"
+                f"Missing in preloop: '{s.get('name','')}' ({s.get('conclusion','')})"
             )
-    elif len(aksh_dedup) > len(off_dedup):
-        for s in aksh_dedup[len(off_dedup):]:
-            diff.issues.append("step-extra-in-aksh")
+    elif len(preloop_dedup) > len(off_dedup):
+        for s in preloop_dedup[len(off_dedup):]:
+            diff.issues.append("step-extra-in-preloop")
             diff.details.append(
-                f"Extra in aksh: '{s.get('name','')}' ({s.get('conclusion','')})"
+                f"Extra in preloop: '{s.get('name','')}' ({s.get('conclusion','')})"
             )
 
     return diff
@@ -302,61 +302,61 @@ class LogAnalysis:
 
 
 def compare_logs(
-    off_log: Path | None, aksh_log: Path | None
+    off_log: Path | None, preloop_log: Path | None
 ) -> list[str]:
     """Compare log files and return diff lines."""
     issues: list[str] = []
 
     if off_log and not off_log.exists():
         off_log = None
-    if aksh_log and not aksh_log.exists():
-        aksh_log = None
+    if preloop_log and not preloop_log.exists():
+        preloop_log = None
 
-    if not off_log and not aksh_log:
+    if not off_log and not preloop_log:
         return ["No log files available for comparison"]
 
     off = LogAnalysis.from_file(off_log) if off_log else LogAnalysis()
-    aksh = LogAnalysis.from_file(aksh_log) if aksh_log else LogAnalysis()
+    preloop = LogAnalysis.from_file(preloop_log) if preloop_log else LogAnalysis()
 
     if off_log:
         issues.append(f"Official: {off.line_count} lines, "
                        f"timestamps={'✓' if off.has_timestamps else '✗'}, "
                        f"groups={'✓' if off.has_groups else '✗'}, "
                        f"annotations={'✓' if off.has_annotations else '✗'}")
-    if aksh_log:
-        issues.append(f"Aksh:     {aksh.line_count} lines, "
-                       f"timestamps={'✓' if aksh.has_timestamps else '✗'}, "
-                       f"groups={'✓' if aksh.has_groups else '✗'}, "
-                       f"annotations={'✓' if aksh.has_annotations else '✗'}")
+    if preloop_log:
+        issues.append(f"Preloop:     {preloop.line_count} lines, "
+                       f"timestamps={'✓' if preloop.has_timestamps else '✗'}, "
+                       f"groups={'✓' if preloop.has_groups else '✗'}, "
+                       f"annotations={'✓' if preloop.has_annotations else '✗'}")
 
     # Compare formatting features
-    if off_log and aksh_log:
-        if off.has_timestamps and not aksh.has_timestamps:
-            issues.append("⚠ Aksh logs missing timestamps")
-        if off.has_groups and not aksh.has_groups:
-            issues.append("⚠ Aksh logs missing ##[group] markers")
-        if off.has_endgroups and not aksh.has_endgroups:
-            issues.append("⚠ Aksh logs missing ##[endgroup] markers")
-        if off.has_annotations and not aksh.has_annotations:
-            issues.append("⚠ Aksh logs missing annotations (##[error]/##[warning])")
+    if off_log and preloop_log:
+        if off.has_timestamps and not preloop.has_timestamps:
+            issues.append("⚠ Preloop logs missing timestamps")
+        if off.has_groups and not preloop.has_groups:
+            issues.append("⚠ Preloop logs missing ##[group] markers")
+        if off.has_endgroups and not preloop.has_endgroups:
+            issues.append("⚠ Preloop logs missing ##[endgroup] markers")
+        if off.has_annotations and not preloop.has_annotations:
+            issues.append("⚠ Preloop logs missing annotations (##[error]/##[warning])")
 
         # Line count comparison
-        ratio = aksh.line_count / off.line_count if off.line_count else 0
+        ratio = preloop.line_count / off.line_count if off.line_count else 0
         if ratio < 0.7 or ratio > 1.5:
             issues.append(
                 f"⚠ Log size mismatch: official={off.line_count} lines, "
-                f"aksh={aksh.line_count} lines (ratio={ratio:.2f})"
+                f"preloop={preloop.line_count} lines (ratio={ratio:.2f})"
             )
 
         # Step-level log comparison
         off_steps = set(off.step_logs.keys())
-        aksh_steps = set(aksh.step_logs.keys())
-        missing = off_steps - aksh_steps
-        extra = aksh_steps - off_steps
+        preloop_steps = set(preloop.step_logs.keys())
+        missing = off_steps - preloop_steps
+        extra = preloop_steps - off_steps
         if missing:
-            issues.append(f"Steps with logs in official but not aksh: {sorted(missing)}")
+            issues.append(f"Steps with logs in official but not preloop: {sorted(missing)}")
         if extra:
-            issues.append(f"Steps with logs in aksh but not official: {sorted(extra)}")
+            issues.append(f"Steps with logs in preloop but not official: {sorted(extra)}")
 
     return issues
 
@@ -366,10 +366,10 @@ def compare_logs(
 def compare_scenario(
     num: str,
     off_data: dict | None,
-    aksh_data: dict | None,
+    preloop_data: dict | None,
     flows_dir: Path | None,
 ) -> dict:
-    """Compare a single scenario between official and aksh."""
+    """Compare a single scenario between official and preloop."""
     result: dict[str, Any] = {
         "number": num,
         "description": WORKFLOW_DESCRIPTIONS.get(num, f"Scenario {num}"),
@@ -378,7 +378,7 @@ def compare_scenario(
     }
 
     off_conclusion = ""
-    aksh_conclusion = ""
+    preloop_conclusion = ""
 
     if off_data:
         off_conclusion = off_data.get("conclusion", "") or ""
@@ -387,55 +387,55 @@ def compare_scenario(
     else:
         result["official_conclusion"] = "N/A"
 
-    if aksh_data:
-        aksh_conclusion = aksh_data.get("conclusion", "") or ""
-        result["aksh_conclusion"] = aksh_conclusion or "(empty)"
-        result["aksh_run_id"] = aksh_data.get("run_id", "")
+    if preloop_data:
+        preloop_conclusion = preloop_data.get("conclusion", "") or ""
+        result["preloop_conclusion"] = preloop_conclusion or "(empty)"
+        result["preloop_run_id"] = preloop_data.get("run_id", "")
     else:
-        result["aksh_conclusion"] = "N/A"
+        result["preloop_conclusion"] = "N/A"
 
     # Job-level conclusion match
-    if off_data and aksh_data:
-        if off_conclusion == aksh_conclusion:
+    if off_data and preloop_data:
+        if off_conclusion == preloop_conclusion:
             result["conclusion_match"] = True
-        elif not off_conclusion or not aksh_conclusion:
+        elif not off_conclusion or not preloop_conclusion:
             result["conclusion_match"] = None  # one didn't complete
             result["issues"].append("incomplete-run")
             if not off_conclusion:
                 result["details"].append("Official runner did not complete")
-            if not aksh_conclusion:
-                result["details"].append("Aksh runner did not complete")
+            if not preloop_conclusion:
+                result["details"].append("Preloop runner did not complete")
         else:
             result["conclusion_match"] = False
             result["issues"].append("conclusion-mismatch")
             result["details"].append(
-                f"Conclusion: official={off_conclusion}, aksh={aksh_conclusion}"
+                f"Conclusion: official={off_conclusion}, preloop={preloop_conclusion}"
             )
 
         # Job-level comparison
         off_jobs = off_data.get("result", {}).get("jobs", [])
-        aksh_jobs = aksh_data.get("result", {}).get("jobs", [])
+        preloop_jobs = preloop_data.get("result", {}).get("jobs", [])
 
-        if len(off_jobs) != len(aksh_jobs):
+        if len(off_jobs) != len(preloop_jobs):
             result["issues"].append("job-count-mismatch")
             result["details"].append(
-                f"Job count: official={len(off_jobs)}, aksh={len(aksh_jobs)}"
+                f"Job count: official={len(off_jobs)}, preloop={len(preloop_jobs)}"
             )
 
         # Match jobs by name
         off_by_name = {j["name"]: j for j in off_jobs}
-        aksh_by_name = {j["name"]: j for j in aksh_jobs}
+        preloop_by_name = {j["name"]: j for j in preloop_jobs}
 
-        for jname in sorted(set(off_by_name) | set(aksh_by_name)):
+        for jname in sorted(set(off_by_name) | set(preloop_by_name)):
             oj = off_by_name.get(jname)
-            aj = aksh_by_name.get(jname)
+            aj = preloop_by_name.get(jname)
 
             if not oj:
                 result["issues"].append("job-missing-in-official")
-                result["details"].append(f"Job '{jname}' only in aksh")
+                result["details"].append(f"Job '{jname}' only in preloop")
                 continue
             if not aj:
-                result["issues"].append("job-missing-in-aksh")
+                result["issues"].append("job-missing-in-preloop")
                 result["details"].append(f"Job '{jname}' only in official")
                 continue
 
@@ -445,27 +445,27 @@ def compare_scenario(
             if ojc != ajc and ojc and ajc:
                 result["issues"].append("job-conclusion-mismatch")
                 result["details"].append(
-                    f"Job '{jname}': official={ojc}, aksh={ajc}"
+                    f"Job '{jname}': official={ojc}, preloop={ajc}"
                 )
 
             # Step-level comparison
             off_steps = oj.get("steps", [])
-            aksh_steps = aj.get("steps", [])
+            preloop_steps = aj.get("steps", [])
 
-            if off_steps and aksh_steps:
-                step_diff = compare_steps(off_steps, aksh_steps, jname)
+            if off_steps and preloop_steps:
+                step_diff = compare_steps(off_steps, preloop_steps, jname)
                 if step_diff.has_issues:
                     result["issues"].extend(step_diff.issues)
                     result["details"].extend(step_diff.details)
-            elif off_steps and not aksh_steps:
-                result["issues"].append("no-aksh-steps")
+            elif off_steps and not preloop_steps:
+                result["issues"].append("no-preloop-steps")
                 result["details"].append(
-                    f"Job '{jname}': official has {len(off_steps)} steps, aksh has none (did not run?)"
+                    f"Job '{jname}': official has {len(off_steps)} steps, preloop has none (did not run?)"
                 )
 
-    elif off_data and not aksh_data:
-        result["issues"].append("no-aksh-data")
-    elif aksh_data and not off_data:
+    elif off_data and not preloop_data:
+        result["issues"].append("no-preloop-data")
+    elif preloop_data and not off_data:
         result["issues"].append("no-official-data")
 
     # Check for available flow captures
@@ -482,13 +482,13 @@ def compare_scenario(
 
 def generate_report(
     official: dict[str, dict],
-    aksh: dict[str, dict],
+    preloop: dict[str, dict],
     flows_dir: Path | None,
     output: Path,
 ) -> None:
     """Generate the full comparison report."""
     all_nums = sorted(
-        set(list(official.keys()) + list(aksh.keys())),
+        set(list(official.keys()) + list(preloop.keys())),
         key=lambda x: int(x),
     )
 
@@ -496,13 +496,13 @@ def generate_report(
     lines.append("# Runner Conformance Comparison Report")
     lines.append("")
     lines.append(f"Generated from conformance JSONL data.")
-    lines.append(f"Official scenarios: {len(official)}, Aksh scenarios: {len(aksh)}")
+    lines.append(f"Official scenarios: {len(official)}, Preloop scenarios: {len(preloop)}")
     lines.append("")
 
     # ── Summary table ───────────────────────────────────────────────
     lines.append("## Summary Matrix")
     lines.append("")
-    lines.append("| # | Scenario | Official | Aksh | Match | Issues |")
+    lines.append("| # | Scenario | Official | Preloop | Match | Issues |")
     lines.append("|---|---|---|---|---|---|")
 
     scenarios: list[dict] = []
@@ -510,8 +510,8 @@ def generate_report(
 
     for num in all_nums:
         off_data = official.get(num)
-        aksh_data = aksh.get(num)
-        result = compare_scenario(num, off_data, aksh_data, flows_dir)
+        preloop_data = preloop.get(num)
+        result = compare_scenario(num, off_data, preloop_data, flows_dir)
         scenarios.append(result)
 
         match_icon = ""
@@ -531,7 +531,7 @@ def generate_report(
         issue_summary = ", ".join(sorted(set(result["issues"])))[:60]
         lines.append(
             f"| {num} | {result['description']} | "
-            f"{result['official_conclusion']} | {result['aksh_conclusion']} | "
+            f"{result['official_conclusion']} | {result['preloop_conclusion']} | "
             f"{match_icon} | {issue_summary} |"
         )
 
@@ -555,11 +555,11 @@ def generate_report(
 
         if result.get("official_run_id"):
             lines.append(f"- Official run: {result['official_run_id']}")
-        if result.get("aksh_run_id"):
-            lines.append(f"- Aksh run: {result['aksh_run_id']}")
+        if result.get("preloop_run_id"):
+            lines.append(f"- Preloop run: {result['preloop_run_id']}")
         lines.append(
             f"- Conclusions: official={result['official_conclusion']}, "
-            f"aksh={result['aksh_conclusion']}"
+            f"preloop={result['preloop_conclusion']}"
         )
         lines.append("")
 
@@ -598,10 +598,10 @@ def generate_report(
     lines.append("| step-count | 🟡 Medium | Different number of steps executed |")
     lines.append("| step-display-name | 🔵 Low | Step name shown differently (display only) |")
     lines.append("| step-name-mismatch | 🟡 Medium | Step name differs in a meaningful way |")
-    lines.append("| duplicate-steps | 🟡 Medium | Aksh reports duplicate step entries |")
+    lines.append("| duplicate-steps | 🟡 Medium | Preloop reports duplicate step entries |")
     lines.append("| incomplete-run | ⚪ Info | One runner did not complete the workflow |")
-    lines.append("| no-aksh-data | ⚪ Info | Aksh has no data for this scenario |")
-    lines.append("| no-aksh-steps | 🟠 High | Aksh job has no step data (runner didn't execute) |")
+    lines.append("| no-preloop-data | ⚪ Info | Preloop has no data for this scenario |")
+    lines.append("| no-preloop-steps | 🟠 High | Preloop job has no step data (runner didn't execute) |")
     lines.append("")
 
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -619,10 +619,10 @@ def main() -> int:
         help="Official runner conformance JSONL",
     )
     p.add_argument(
-        "--aksh",
+        "--preloop",
         type=Path,
-        default=Path("benchmarks/compatibility/runner/behavior/conformance-aksh.jsonl"),
-        help="Aksh runner conformance JSONL",
+        default=Path("benchmarks/compatibility/runner/behavior/conformance-preloop.jsonl"),
+        help="Preloop runner conformance JSONL",
     )
     p.add_argument(
         "--flows-dir",
@@ -640,10 +640,10 @@ def main() -> int:
     args = p.parse_args()
 
     official = load_conformance(args.official)
-    aksh = load_conformance(args.aksh)
+    preloop = load_conformance(args.preloop)
 
-    print(f"Loaded {len(official)} official scenarios, {len(aksh)} aksh scenarios")
-    generate_report(official, aksh, args.flows_dir, args.output)
+    print(f"Loaded {len(official)} official scenarios, {len(preloop)} preloop scenarios")
+    generate_report(official, preloop, args.flows_dir, args.output)
     return 0
 
 

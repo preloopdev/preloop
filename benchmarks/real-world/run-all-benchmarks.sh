@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run-all-benchmarks.sh — runs baseline + aksh for a given repo
+# run-all-benchmarks.sh — runs baseline + preloop for a given repo
 set -euo pipefail
 
 REPO="${1:?Usage: $0 <serde|axum|bat>}"
@@ -30,39 +30,39 @@ echo ""
 echo "--- BASELINE ---"
 "$BENCH_DIR/baseline.sh" "$REPO"
 
-# 2. aksh-runner
+# 2. preloop-runner
 echo ""
 echo "--- AKSH-RUNNER ---"
-sudo kill $(pgrep -f aksh-runner-server) 2>/dev/null || true; sleep 0.3
-sudo AKSH_PUBLIC_URL=http://127.0.0.1 RUST_LOG=info \
-  $HOME/aksh-runner/aksh-runner-server serve --listen 127.0.0.1:80 --state-dir /tmp/bs-$REPO \
+sudo kill $(pgrep -f preloop-runner-server) 2>/dev/null || true; sleep 0.3
+sudo PRELOOP_PUBLIC_URL=http://127.0.0.1 RUST_LOG=info \
+  $HOME/preloop-runner/preloop-runner-server serve --listen 127.0.0.1:80 --state-dir /tmp/bs-$REPO \
   > /tmp/bs-$REPO.log 2>&1 &
 SPID=$!; sleep 1
 curl -sf http://127.0.0.1/healthz >/dev/null || { echo "Server failed"; cat /tmp/bs-$REPO.log; exit 1; }
 
 rm -rf /tmp/br-$REPO; mkdir -p /tmp/br-$REPO
-$HOME/aksh-runner/aksh-runner --runner-root /tmp/br-$REPO configure \
+$HOME/preloop-runner/preloop-runner --runner-root /tmp/br-$REPO configure \
   --url http://127.0.0.1 --token t --name $REPO-bench \
   --unattended --replace --ephemeral --labels "self-hosted,Linux,X64" --no-externals 2>&1 | tail -1
 
-$HOME/aksh-runner/aksh-runner-client --server http://127.0.0.1 \
+$HOME/preloop-runner/preloop-runner-client --server http://127.0.0.1 \
   submit -W ".github/workflows/${REPO}-bench.yml" --workspace-root . --git-ref refs/heads/main 2>&1
 
 T_START=$(date +%s%3N)
-RUST_LOG=info $HOME/aksh-runner/aksh-runner --runner-root /tmp/br-$REPO run --once > /tmp/${REPO}-aksh.log 2>&1
+RUST_LOG=info $HOME/preloop-runner/preloop-runner --runner-root /tmp/br-$REPO run --once > /tmp/${REPO}-preloop.log 2>&1
 T_END=$(date +%s%3N)
-echo "  aksh runner wall time: $((T_END - T_START))ms (includes ~50s broker timeout)"
+echo "  preloop runner wall time: $((T_END - T_START))ms (includes ~50s broker timeout)"
 
 echo ""
 echo "  Step timings:"
-grep -E "Running step|completed:" /tmp/${REPO}-aksh.log
+grep -E "Running step|completed:" /tmp/${REPO}-preloop.log
 
 # 3. Official runner
 echo ""
 echo "--- OFFICIAL RUNNER ---"
 sudo kill $SPID 2>/dev/null; sleep 0.3
-sudo AKSH_PUBLIC_URL=http://127.0.0.1 RUST_LOG=info \
-  $HOME/aksh-runner/aksh-runner-server serve --listen 127.0.0.1:80 --state-dir /tmp/bs-${REPO}-off \
+sudo PRELOOP_PUBLIC_URL=http://127.0.0.1 RUST_LOG=info \
+  $HOME/preloop-runner/preloop-runner-server serve --listen 127.0.0.1:80 --state-dir /tmp/bs-${REPO}-off \
   > /tmp/bs-${REPO}-off.log 2>&1 &
 SPID=$!; sleep 1
 curl -sf http://127.0.0.1/healthz >/dev/null || { echo "Server failed"; exit 1; }
@@ -74,7 +74,7 @@ cd $HOME/actions-runner
   --labels "self-hosted,Linux,X64" 2>&1 | tail -2
 
 cd /tmp/bench-repos/$REPO
-$HOME/aksh-runner/aksh-runner-client --server http://127.0.0.1 \
+$HOME/preloop-runner/preloop-runner-client --server http://127.0.0.1 \
   submit -W ".github/workflows/${REPO}-bench.yml" --workspace-root . --git-ref refs/heads/main 2>&1
 
 cd $HOME/actions-runner

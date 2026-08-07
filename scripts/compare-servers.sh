@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
-# compare-servers.sh — Official runner against GitHub vs official runner against aksh
-# Usage: ./scripts/compare-servers.sh <scenario.yml> [--github-only|--aksh-only]
+# compare-servers.sh — Official runner against GitHub vs official runner against preloop
+# Usage: ./scripts/compare-servers.sh <scenario.yml> [--github-only|--preloop-only]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SCENARIO="${1:?Usage: $0 <scenario.yml>}"
 MODE="${2:-both}"
-GH_REPO="${GH_REPO:-preloopdev/aksh-conformance}"
+GH_REPO="${GH_REPO:-preloopdev/preloop-conformance}"
 TEMPLATE="${TEMPLATE:-/private/tmp/bench-runner.smolmachine}"
 OFFICIAL_RUNNER_HOST="${OFFICIAL_RUNNER_HOST:-$HOME/cachingv4}"
-AKSH_SERVER_BIN="${AKSH_SERVER_BIN:-$REPO_ROOT/target/aarch64-unknown-linux-musl/release/preloop-server}"
+PRELOOP_SERVER_BIN="${PRELOOP_SERVER_BIN:-$REPO_ROOT/target/aarch64-unknown-linux-musl/release/preloop-server}"
 RESULTS_DIR="$REPO_ROOT/benchmarks/compatibility/server/behavior/${SCENARIO%.yml}"
 PROTOCOL_DIR="$REPO_ROOT/benchmarks/compatibility/server/protocol/captures/${SCENARIO%.yml}"
 MITM_PORT=18081
-GITHUB_ACTIONS_TOKEN="${AKSH_GITHUB_TOKEN:-}"
+GITHUB_ACTIONS_TOKEN="${PRELOOP_GITHUB_TOKEN:-}"
 
 red()   { printf '\033[1;31m%s\033[0m\n' "$*"; }
 green() { printf '\033[1;32m%s\033[0m\n' "$*"; }
@@ -184,14 +184,14 @@ run_github() {
     smolvm machine delete --name "$vm" -f 2>/dev/null || true
 }
 
-# ─── aksh server side ────────────────────────────────────────
-run_aksh() {
-    log "═══ Official runner → aksh server ═══"
-    local cap_dir="$RESULTS_DIR/aksh-server"
+# ─── preloop server side ────────────────────────────────────────
+run_preloop() {
+    log "═══ Official runner → preloop server ═══"
+    local cap_dir="$RESULTS_DIR/preloop-server"
     rm -rf "$cap_dir"
     mkdir -p "$cap_dir"
 
-    local vm="cmp-aksh-$$"
+    local vm="cmp-preloop-$$"
     local template_arg="--from $TEMPLATE"
     if [ ! -f "$TEMPLATE" ]; then
         template_arg="--image ubuntu:24.04"
@@ -203,7 +203,7 @@ run_aksh() {
     enable_rosetta "$vm"
     log "VM $vm started"
 
-    smolvm machine cp "$AKSH_SERVER_BIN" "$vm:/usr/local/bin/preloop-server" 2>&1 | tail -1
+    smolvm machine cp "$PRELOOP_SERVER_BIN" "$vm:/usr/local/bin/preloop-server" 2>&1 | tail -1
 
     # Prepare modified workflow YAML (change runs-on to just self-hosted)
     local modified_yaml
@@ -222,10 +222,10 @@ print(json.dumps({
     'git_ref': 'refs/heads/main'
 }))
 " > "$payload_file"
-    local vm_result_dir="$REPO_ROOT/benchmarks/compatibility/server/behavior/${SCENARIO%.yml}/aksh-server"
+    local vm_result_dir="$REPO_ROOT/benchmarks/compatibility/server/behavior/${SCENARIO%.yml}/preloop-server"
     mkdir -p "$vm_result_dir"
 
-    local result_base="/workspace/benchmarks/compatibility/server/behavior/${SCENARIO%.yml}/aksh-server"
+    local result_base="/workspace/benchmarks/compatibility/server/behavior/${SCENARIO%.yml}/preloop-server"
 
     smolvm machine exec --name "$vm" -- bash -lc "
         set -u
@@ -248,7 +248,7 @@ print(json.dumps({
             bash -c '</dev/tcp/127.0.0.1/$MITM_PORT' 2>/dev/null && break; sleep .25
         done
         chmod +x /usr/local/bin/preloop-server
-        RUST_LOG=info AKSH_PUBLIC_URL=http://127.0.0.1 AKSH_GITHUB_TOKEN='$GITHUB_ACTIONS_TOKEN' preloop-server serve --listen 127.0.0.1:80 --state-dir /tmp/aksh-state > /tmp/server.log 2>&1 &
+        RUST_LOG=info PRELOOP_PUBLIC_URL=http://127.0.0.1 PRELOOP_GITHUB_TOKEN='$GITHUB_ACTIONS_TOKEN' preloop-server serve --listen 127.0.0.1:80 --state-dir /tmp/preloop-state > /tmp/server.log 2>&1 &
         server_pid=\$!
         sleep 2
         wget -qO- http://127.0.0.1/healthz >/dev/null || { echo 'healthz failed'; cat /tmp/server.log; cp /tmp/server.log $result_base/server.log || true; exit 1; }
@@ -265,7 +265,7 @@ print(json.dumps({
         esac
         RESULT=\$(wget -qO- --post-file=/workspace/benchmarks/compatibility/server/behavior/payload-${SCENARIO%.yml}.json \\
             --header='Content-Type: application/json' \\
-            --header='Authorization: Bearer aksh-system-token' \\
+            --header='Authorization: Bearer preloop-system-token' \\
             http://127.0.0.1/api/v1/runs 2>/dev/null)
         echo \"SUBMISSION: \$RESULT\"
         RUN_ID=\$(echo \"\$RESULT\" | python3 -c 'import sys,json; print(next(iter(json.load(sys.stdin).values())))')
@@ -286,8 +286,8 @@ print(json.dumps({
             rm -f \$RUNNER_DIR/.runner \$RUNNER_DIR/.credentials \$RUNNER_DIR/.credentials_rsaparams
             rm -rf \$RUNNER_DIR/_work \$RUNNER_DIR/_diag; mkdir -p \$RUNNER_DIR/_work
             cd \$RUNNER_DIR
-            ./config.sh --unattended --url 'http://127.0.0.1' --token 'aksh-system-token' \\
-                --name \"cmp-aksh-\$i-$$\" --labels 'self-hosted,linux,x64' --work _work --replace --ephemeral > /tmp/config-\$i.log 2>&1
+            ./config.sh --unattended --url 'http://127.0.0.1' --token 'preloop-system-token' \\
+                --name \"cmp-preloop-\$i-$$\" --labels 'self-hosted,linux,x64' --work _work --replace --ephemeral > /tmp/config-\$i.log 2>&1
             rm -rf _work; mkdir -p _work
         done
 
@@ -300,12 +300,12 @@ print(json.dumps({
         done
 
         # GitHub's cancellation scenario cancels the in-flight workflow through
-        # GitHub's control plane. Mirror that control-plane event for aksh.
+        # GitHub's control plane. Mirror that control-plane event for preloop.
         if [ "$SCENARIO" = "22-cancel-semantics.yml" ]; then
             (
                 sleep 5
                 wget -qO /dev/null --post-data='' \
-                    --header='Authorization: Bearer aksh-system-token' \
+                    --header='Authorization: Bearer preloop-system-token' \
                     "http://127.0.0.1/api/v1/runs/\$RUN_ID/cancel"
             ) &
         fi
@@ -319,7 +319,7 @@ print(json.dumps({
 
         echo \"RUN_ID=\$RUN_ID\"
         sleep 2
-        wget -qO /tmp/status.json --header='Authorization: Bearer aksh-system-token' \\
+        wget -qO /tmp/status.json --header='Authorization: Bearer preloop-system-token' \\
             \"http://127.0.0.1/api/v1/runs/\$RUN_ID\" 2>/dev/null || true
 
         # Collect artifacts from all runners
@@ -336,13 +336,13 @@ print(json.dumps({
         cp /tmp/status.json $result_base/status.json || true
         cp /tmp/status.json $result_base/run.json || true
         mkdir -p $result_base/replay
-        cp -a /tmp/aksh-state/replay/results $result_base/replay/ 2>/dev/null || true
+        cp -a /tmp/preloop-state/replay/results $result_base/replay/ 2>/dev/null || true
         echo '---STATUS---'
         cat /tmp/status.json 2>/dev/null || true
         echo '---ENDSTATUS---'
         exit \$last_rc
     " > "$cap_dir/runner.log" 2>&1 || true
-    local protocol_cap_dir="$PROTOCOL_DIR/aksh-server"
+    local protocol_cap_dir="$PROTOCOL_DIR/preloop-server"
     mkdir -p "$protocol_cap_dir"
     smolvm machine exec --name "$vm" -- cat /tmp/cap/vm-mitm/flows.jsonl > "$protocol_cap_dir/flows.jsonl" 2>/dev/null || true
     smolvm machine exec --name "$vm" -- cat /tmp/cap/vm-mitm.log > "$protocol_cap_dir/mitm.log" 2>/dev/null || true
@@ -352,13 +352,13 @@ print(json.dumps({
 
     # Extract results from the persisted API response, not human runner output.
     local status_file="$vm_result_dir/status.json"
-    local aksh_status
-    aksh_status=$(python3 -c "import json; print(json.load(open('$status_file'))['status'])" 2>/dev/null || echo unknown)
+    local preloop_status
+    preloop_status=$(python3 -c "import json; print(json.load(open('$status_file'))['status'])" 2>/dev/null || echo unknown)
     local job_details
     job_details=$(python3 -c "import json; d=json.load(open('$status_file')); print('\\n'.join(f'{k}: {v}' for k,v in d.get('jobs',{}).items()))" 2>/dev/null || true)
-    echo "{\"server\":\"aksh\",\"conclusion\":\"$aksh_status\"}" > "$cap_dir/summary.json"
+    echo "{\"server\":\"preloop\",\"conclusion\":\"$preloop_status\"}" > "$cap_dir/summary.json"
     printf '%s\n' "$job_details" > "$cap_dir/jobs.txt"
-    log "aksh done: status=$aksh_status"
+    log "preloop done: status=$preloop_status"
     echo "$job_details"
 
     smolvm machine stop --name "$vm" >/dev/null 2>&1 || true
@@ -367,36 +367,36 @@ print(json.dumps({
 
 # ─── Main ─────────────────────────────────────────────────────
 info "Server comparison: $SCENARIO ($JOB_COUNT jobs)"
-info "  Official runner → GitHub  vs  Official runner → aksh server"
+info "  Official runner → GitHub  vs  Official runner → preloop server"
 
-if [ "$MODE" != "--aksh-only" ]; then
+if [ "$MODE" != "--preloop-only" ]; then
     run_github
 fi
 if [ "$MODE" != "--github-only" ]; then
-    run_aksh
+    run_preloop
 fi
 
 rm -f "$WF_YAML_FILE"
 
 # Compare
-if [ -f "$RESULTS_DIR/github/summary.json" ] && [ -f "$RESULTS_DIR/aksh-server/summary.json" ]; then
+if [ -f "$RESULTS_DIR/github/summary.json" ] && [ -f "$RESULTS_DIR/preloop-server/summary.json" ]; then
     gh_c=$(python3 -c "import json; print(json.load(open('$RESULTS_DIR/github/summary.json'))['conclusion'])")
-    aksh_c=$(python3 -c "import json; print(json.load(open('$RESULTS_DIR/aksh-server/summary.json'))['conclusion'])")
+    preloop_c=$(python3 -c "import json; print(json.load(open('$RESULTS_DIR/preloop-server/summary.json'))['conclusion'])")
 
     echo ""
     echo "══════════════════════════════════════════════════"
     printf "  %-30s %s\n" "Scenario:" "$SCENARIO"
     printf "  %-30s %s\n" "GitHub conclusion:" "$gh_c"
-    printf "  %-30s %s\n" "aksh server conclusion:" "$aksh_c"
-    if [ "$gh_c" = "$aksh_c" ]; then
-        green "  ✅ MATCH — aksh server matches GitHub"
+    printf "  %-30s %s\n" "preloop server conclusion:" "$preloop_c"
+    if [ "$gh_c" = "$preloop_c" ]; then
+        green "  ✅ MATCH — preloop server matches GitHub"
     else
-        red "  ❌ MISMATCH — aksh=$aksh_c github=$gh_c"
+        red "  ❌ MISMATCH — preloop=$preloop_c github=$gh_c"
     fi
     echo "══════════════════════════════════════════════════"
     echo ""
     echo "  GitHub jobs:"
     sed 's/^/    /' "$RESULTS_DIR/github/jobs.txt" 2>/dev/null || true
-    echo "  aksh jobs:"
-    sed 's/^/    /' "$RESULTS_DIR/aksh-server/jobs.txt" 2>/dev/null || true
+    echo "  preloop jobs:"
+    sed 's/^/    /' "$RESULTS_DIR/preloop-server/jobs.txt" 2>/dev/null || true
 fi

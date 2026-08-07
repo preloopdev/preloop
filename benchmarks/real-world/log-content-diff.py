@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Compare log content between official and aksh runner captures.
+"""Compare log content between official and preloop runner captures.
 
 Reads run.log files or step log uploads from MITM captures and produces a
 detailed comparison of formatting, content, and structure.
 
 Usage:
   # Compare two run.log files directly
-  python3 log-content-diff.py --official path/to/official/run.log --aksh path/to/aksh/run.log
+  python3 log-content-diff.py --official path/to/official/run.log --preloop path/to/preloop/run.log
 
   # Compare from MITM flow captures (extracts log uploads from flows.jsonl)
-  python3 log-content-diff.py --official-flows path/to/official/latest --aksh-flows path/to/aksh/latest
+  python3 log-content-diff.py --official-flows path/to/official/latest --preloop-flows path/to/preloop/latest
 
   # Batch compare all scenarios with flow captures
   python3 log-content-diff.py --batch --flows-root benchmarks/compatibility/runner/protocol
@@ -194,9 +194,9 @@ class RunLog:
 class LogDiff:
     """Result of comparing two run logs."""
 
-    def __init__(self, official: RunLog, aksh: RunLog, scenario: str = ""):
+    def __init__(self, official: RunLog, preloop: RunLog, scenario: str = ""):
         self.official = official
-        self.aksh = aksh
+        self.preloop = preloop
         self.scenario = scenario
         self.issues: list[tuple[str, str]] = []  # (severity, message)
 
@@ -210,47 +210,47 @@ class LogDiff:
 
     def _compare_structure(self) -> None:
         """Compare overall structure."""
-        o, a = self.official, self.aksh
+        o, a = self.official, self.preloop
 
         # Line counts
         if o.line_count and a.line_count:
             ratio = a.line_count / o.line_count
             if ratio < 0.6:
                 self.issues.append(("high",
-                    f"Aksh log significantly smaller: {a.line_count} vs {o.line_count} lines "
+                    f"Preloop log significantly smaller: {a.line_count} vs {o.line_count} lines "
                     f"(ratio={ratio:.2f})"))
             elif ratio > 1.8:
                 self.issues.append(("medium",
-                    f"Aksh log significantly larger: {a.line_count} vs {o.line_count} lines "
+                    f"Preloop log significantly larger: {a.line_count} vs {o.line_count} lines "
                     f"(ratio={ratio:.2f})"))
 
         # Step count
         if len(o.step_names) != len(a.step_names):
             self.issues.append(("medium",
-                f"Step count: official={len(o.step_names)}, aksh={len(a.step_names)}"))
+                f"Step count: official={len(o.step_names)}, preloop={len(a.step_names)}"))
 
         # Steps only in one side
         off_steps = set(o.step_names)
-        aksh_steps = set(a.step_names)
-        for s in sorted(off_steps - aksh_steps):
+        preloop_steps = set(a.step_names)
+        for s in sorted(off_steps - preloop_steps):
             self.issues.append(("medium", f"Step only in official: '{s}'"))
-        for s in sorted(aksh_steps - off_steps):
-            self.issues.append(("low", f"Step only in aksh: '{s}'"))
+        for s in sorted(preloop_steps - off_steps):
+            self.issues.append(("low", f"Step only in preloop: '{s}'"))
 
     def _compare_formatting(self) -> None:
         """Compare log formatting features."""
-        o, a = self.official, self.aksh
+        o, a = self.official, self.preloop
 
         if o.has_timestamps and not a.has_timestamps:
-            self.issues.append(("high", "Aksh logs missing timestamps"))
+            self.issues.append(("high", "Preloop logs missing timestamps"))
         if o.has_groups and not a.has_groups:
-            self.issues.append(("high", "Aksh logs missing ##[group] markers"))
+            self.issues.append(("high", "Preloop logs missing ##[group] markers"))
         if o.has_endgroups and not a.has_endgroups:
-            self.issues.append(("high", "Aksh logs missing ##[endgroup] markers"))
+            self.issues.append(("high", "Preloop logs missing ##[endgroup] markers"))
         if o.has_secret_masking and not a.has_secret_masking:
-            self.issues.append(("high", "Aksh logs missing secret masking (***) "))
+            self.issues.append(("high", "Preloop logs missing secret masking (***) "))
         if o.has_annotations and not a.has_annotations:
-            self.issues.append(("medium", "Aksh logs missing annotations"))
+            self.issues.append(("medium", "Preloop logs missing annotations"))
 
         # Compare command usage
         o_cmds = o.all_commands
@@ -260,11 +260,11 @@ class LogDiff:
             ac = a_cmds.get(cmd, 0)
             if oc > 0 and ac == 0:
                 self.issues.append(("medium",
-                    f"Command ##[{cmd}] used {oc}x in official, 0x in aksh"))
+                    f"Command ##[{cmd}] used {oc}x in official, 0x in preloop"))
 
     def _compare_step_content(self) -> None:
         """Compare per-step log content."""
-        o, a = self.official, self.aksh
+        o, a = self.official, self.preloop
 
         for step_name in o.step_names:
             if step_name not in a.steps:
@@ -288,7 +288,7 @@ class LogDiff:
                 ]:
                     if marker in o_content and marker not in a_content:
                         self.issues.append(("low",
-                            f"'Set up job' missing '{marker}' line in aksh"))
+                            f"'Set up job' missing '{marker}' line in preloop"))
 
             # Check if "Complete job" content matches
             if step_name == "Complete job":
@@ -296,20 +296,20 @@ class LogDiff:
                 a_content = "\n".join(az.content_lines)
                 if "Cleaning up orphan processes" in o_content and "Cleaning up" not in a_content:
                     self.issues.append(("low",
-                        "'Complete job' missing cleanup message in aksh"))
+                        "'Complete job' missing cleanup message in preloop"))
 
             # Per-step line count comparison
             if os.line_count > 0 and az.line_count > 0:
                 ratio = az.line_count / os.line_count
                 if ratio < 0.3 and os.line_count > 3:
                     self.issues.append(("medium",
-                        f"Step '{step_name}': aksh has {az.line_count} lines vs "
+                        f"Step '{step_name}': preloop has {az.line_count} lines vs "
                         f"official {os.line_count} (ratio={ratio:.2f})"))
 
     def _compare_annotations(self) -> None:
         """Compare error/warning/notice annotations."""
         o_ann = self.official.all_annotations
-        a_ann = self.aksh.all_annotations
+        a_ann = self.preloop.all_annotations
 
         o_types = Counter(a.annotation_type for a in o_ann)
         a_types = Counter(a.annotation_type for a in a_ann)
@@ -319,21 +319,21 @@ class LogDiff:
             ac = a_types.get(atype, 0)
             if oc != ac:
                 self.issues.append(("medium",
-                    f"##[{atype}] count: official={oc}, aksh={ac}"))
+                    f"##[{atype}] count: official={oc}, preloop={ac}"))
 
     def to_markdown(self) -> str:
         """Generate markdown report."""
         lines = []
         lines.append(f"### Log Content Comparison{f': {self.scenario}' if self.scenario else ''}")
         lines.append("")
-        lines.append(f"| Metric | Official | Aksh |")
+        lines.append(f"| Metric | Official | Preloop |")
         lines.append(f"|---|---|---|")
-        lines.append(f"| Lines | {self.official.line_count} | {self.aksh.line_count} |")
-        lines.append(f"| Steps | {len(self.official.step_names)} | {len(self.aksh.step_names)} |")
-        lines.append(f"| Timestamps | {'✓' if self.official.has_timestamps else '✗'} | {'✓' if self.aksh.has_timestamps else '✗'} |")
-        lines.append(f"| Groups | {'✓' if self.official.has_groups else '✗'} | {'✓' if self.aksh.has_groups else '✗'} |")
-        lines.append(f"| Annotations | {'✓' if self.official.has_annotations else '✗'} | {'✓' if self.aksh.has_annotations else '✗'} |")
-        lines.append(f"| Secret masking | {'✓' if self.official.has_secret_masking else '✗'} | {'✓' if self.aksh.has_secret_masking else '✗'} |")
+        lines.append(f"| Lines | {self.official.line_count} | {self.preloop.line_count} |")
+        lines.append(f"| Steps | {len(self.official.step_names)} | {len(self.preloop.step_names)} |")
+        lines.append(f"| Timestamps | {'✓' if self.official.has_timestamps else '✗'} | {'✓' if self.preloop.has_timestamps else '✗'} |")
+        lines.append(f"| Groups | {'✓' if self.official.has_groups else '✗'} | {'✓' if self.preloop.has_groups else '✗'} |")
+        lines.append(f"| Annotations | {'✓' if self.official.has_annotations else '✗'} | {'✓' if self.preloop.has_annotations else '✗'} |")
+        lines.append(f"| Secret masking | {'✓' if self.official.has_secret_masking else '✗'} | {'✓' if self.preloop.has_secret_masking else '✗'} |")
         lines.append("")
 
         if self.issues:
@@ -422,21 +422,21 @@ def batch_compare(flows_root: Path, output: Path) -> None:
 
     for scenario_dir in scenarios:
         off_dir = scenario_dir / "official" / "latest"
-        aksh_dir = scenario_dir / "aksh" / "latest"
+        preloop_dir = scenario_dir / "preloop" / "latest"
 
-        if not off_dir.exists() and not aksh_dir.exists():
+        if not off_dir.exists() and not preloop_dir.exists():
             continue
 
         scenario_count += 1
 
         # Try run.log files first
         off_log = off_dir / "run.log" if off_dir.exists() else None
-        aksh_log = aksh_dir / "run.log" if aksh_dir.exists() else None
+        preloop_log = preloop_dir / "run.log" if preloop_dir.exists() else None
 
-        if off_log and off_log.exists() and aksh_log and aksh_log.exists():
+        if off_log and off_log.exists() and preloop_log and preloop_log.exists():
             off_run = RunLog(off_log)
-            aksh_run = RunLog(aksh_log)
-            diff = LogDiff(off_run, aksh_run, scenario_dir.name).run()
+            preloop_run = RunLog(preloop_log)
+            diff = LogDiff(off_run, preloop_run, scenario_dir.name).run()
             total_issues += len(diff.issues)
             lines.append(diff.to_markdown())
 
@@ -455,9 +455,9 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--official", type=Path, help="Official run.log file")
-    p.add_argument("--aksh", type=Path, help="Aksh run.log file")
+    p.add_argument("--preloop", type=Path, help="Preloop run.log file")
     p.add_argument("--official-flows", type=Path, help="Official MITM capture directory")
-    p.add_argument("--aksh-flows", type=Path, help="Aksh MITM capture directory")
+    p.add_argument("--preloop-flows", type=Path, help="Preloop MITM capture directory")
     p.add_argument("--batch", action="store_true", help="Batch compare all scenarios")
     p.add_argument("--flows-root", type=Path,
                    default=Path("benchmarks/compatibility/runner/protocol"),
@@ -471,25 +471,25 @@ def main() -> int:
         return 0
 
     # Single comparison mode
-    if args.official and args.aksh:
+    if args.official and args.preloop:
         off_run = RunLog(args.official)
-        aksh_run = RunLog(args.aksh)
-    elif args.official_flows and args.aksh_flows:
+        preloop_run = RunLog(args.preloop)
+    elif args.official_flows and args.preloop_flows:
         off_text = extract_logs_from_flows(args.official_flows)
-        aksh_text = extract_logs_from_flows(args.aksh_flows)
+        preloop_text = extract_logs_from_flows(args.preloop_flows)
         if not off_text:
             print(f"No log content found in {args.official_flows}", file=sys.stderr)
             return 1
-        if not aksh_text:
-            print(f"No log content found in {args.aksh_flows}", file=sys.stderr)
+        if not preloop_text:
+            print(f"No log content found in {args.preloop_flows}", file=sys.stderr)
             return 1
         off_run = RunLog(text=off_text)
-        aksh_run = RunLog(text=aksh_text)
+        preloop_run = RunLog(text=preloop_text)
     else:
-        p.error("Provide --official/--aksh or --official-flows/--aksh-flows or --batch")
+        p.error("Provide --official/--preloop or --official-flows/--preloop-flows or --batch")
         return 1
 
-    diff = LogDiff(off_run, aksh_run).run()
+    diff = LogDiff(off_run, preloop_run).run()
     print(diff.to_markdown())
     return 0
 

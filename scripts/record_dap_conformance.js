@@ -8,13 +8,13 @@ const MITM_DIR = path.resolve(REPO_ROOT, "../mitm-proxy/experiments/mitm");
 const MITMDUMP_BIN = path.resolve(MITM_DIR, ".venv/bin/mitmdump");
 const CAPTURES_DIR = path.resolve(REPO_ROOT, ".runner-watch/dap-captures");
 const OFFICIAL_RUNNER_DIR = path.resolve(MITM_DIR, ".cache/runner-official");
-const AKSH_RUNNER_DIR = path.resolve(REPO_ROOT, "target/release");
-const SYSTEM_TOKEN = process.env.AKSH_SYSTEM_TOKEN || "aksh-system-token";
+const PRELOOP_RUNNER_DIR = path.resolve(REPO_ROOT, "target/release");
+const SYSTEM_TOKEN = process.env.PRELOOP_SYSTEM_TOKEN || "preloop-system-token";
 
 // Ensure capture directories exist
 fs.mkdirSync(CAPTURES_DIR, { recursive: true });
 fs.mkdirSync(path.join(CAPTURES_DIR, "official"), { recursive: true });
-fs.mkdirSync(path.join(CAPTURES_DIR, "aksh"), { recursive: true });
+fs.mkdirSync(path.join(CAPTURES_DIR, "preloop"), { recursive: true });
 
 async function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -32,25 +32,25 @@ async function runScenario(backend) {
     console.log(`Starting DAP E2E Conformance Recording for: ${backend}`);
     console.log(`==================================================`);
 
-    const tempStateDir = fs.mkdtempSync(path.join("/tmp", `aksh-state-${backend}-`));
-    const tempCaptureDir = fs.mkdtempSync(path.join("/tmp", `aksh-capture-${backend}-`));
+    const tempStateDir = fs.mkdtempSync(path.join("/tmp", `preloop-state-${backend}-`));
+    const tempCaptureDir = fs.mkdtempSync(path.join("/tmp", `preloop-capture-${backend}-`));
     console.log(`Temp state dir: ${tempStateDir}`);
     console.log(`Temp capture dir: ${tempCaptureDir}`);
 
-    // 1. Start aksh-runner-server
-    console.log("Starting aksh-runner-server...");
+    // 1. Start preloop-runner-server
+    console.log("Starting preloop-runner-server...");
     const serverProc = spawn(
-        path.join(AKSH_RUNNER_DIR, "preloop-server"),
+        path.join(PRELOOP_RUNNER_DIR, "preloop-server"),
         ["serve", "--listen", "0.0.0.0:9090", "--state-dir", tempStateDir],
         {
             stdio: "pipe",
             env: {
                 ...process.env,
                 RUST_LOG: "info",
-                AKSH_SYSTEM_TOKEN: SYSTEM_TOKEN,
+                PRELOOP_SYSTEM_TOKEN: SYSTEM_TOKEN,
                 // Official runner needs LAN IP (port 80 redirect via mitm).
-                // Aksh runner connects directly to localhost.
-                AKSH_PUBLIC_URL: backend === "official"
+                // Preloop runner connects directly to localhost.
+                PRELOOP_PUBLIC_URL: backend === "official"
                     ? "http://192.168.1.221:9090"
                     : "http://127.0.0.1:9090",
             }
@@ -115,7 +115,7 @@ async function runScenario(backend) {
 
     // Set proxy environment variables for the runner.
     // Official runner needs the proxy for port 80 → 9090 redirect.
-    // Aksh runner connects directly — proxy breaks its WebSocket live-log connection.
+    // Preloop runner connects directly — proxy breaks its WebSocket live-log connection.
     const baseEnv = {
         ...process.env,
         GITHUB_ACTIONS_RUNNER_TLS_NO_VERIFY: "1",
@@ -173,7 +173,7 @@ async function runScenario(backend) {
             { stdio: "pipe", env: runnerEnv, cwd: OFFICIAL_RUNNER_DIR }
         );
     } else {
-        console.log("Configuring aksh runner...");
+        console.log("Configuring preloop runner...");
         // Remove prior configuration
         fs.rmSync(path.join(REPO_ROOT, ".runner"), { force: true });
         fs.rmSync(path.join(REPO_ROOT, ".credentials"), { force: true });
@@ -181,13 +181,13 @@ async function runScenario(backend) {
 
         // Configure
         const configRes = spawnSync(
-            path.join(AKSH_RUNNER_DIR, "aksh-runner"),
+            path.join(PRELOOP_RUNNER_DIR, "preloop-runner"),
             [
                 "configure",
                 "--unattended",
                 "--url", "http://127.0.0.1:9090",
                 "--token", token,
-                "--name", `mitm-aksh-${backend}`,
+                "--name", `mitm-preloop-${backend}`,
                 "--labels", "self-hosted,mitm,ubuntu-latest",
                 "--work", "_work",
                 "--replace"
@@ -195,16 +195,16 @@ async function runScenario(backend) {
             { stdio: "pipe", env: runnerEnv, cwd: REPO_ROOT }
         );
         if (!fs.existsSync(path.join(REPO_ROOT, ".runner"))) {
-            console.error("aksh runner config failed!");
+            console.error("preloop runner config failed!");
             console.error(configRes.stdout.toString());
             console.error(configRes.stderr.toString());
             throw new Error("Configuration failed");
         }
-        console.log("aksh runner configured");
+        console.log("preloop runner configured");
 
-        console.log("Starting aksh runner...");
+        console.log("Starting preloop runner...");
         runnerProc = spawn(
-            path.join(AKSH_RUNNER_DIR, "aksh-runner"),
+            path.join(PRELOOP_RUNNER_DIR, "preloop-runner"),
             ["run", "--once"],
             { stdio: "pipe", env: runnerEnv, cwd: REPO_ROOT }
         );
@@ -293,7 +293,7 @@ jobs:
         seq: dapSeq++,
         type: "request",
         command: "initialize",
-        arguments: { clientID: "mitm-tester", adapterID: "aksh" }
+        arguments: { clientID: "mitm-tester", adapterID: "preloop" }
     };
 
     await new Promise((resolve, reject) => {
@@ -423,7 +423,7 @@ jobs:
 async function main() {
     try {
         await runScenario("official");
-        await runScenario("aksh");
+        await runScenario("preloop");
         console.log("\n==================================================");
         console.log("DAP E2E Conformance Recording Complete!");
         console.log("Captures saved in .runner-watch/dap-captures/");

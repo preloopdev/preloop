@@ -1,4 +1,4 @@
-//! Automated protocol sync orchestration for aksh.
+//! Automated protocol sync orchestration for preloop.
 //!
 //! `runner-watch` owns the deterministic parts of the protocol-sync pipeline:
 //! release watching, source diff extraction, deterministic triage/spec emission,
@@ -30,7 +30,7 @@ const RELEASES_ATOM: &str = "https://github.com/actions/runner/releases.atom";
 
 #[derive(Debug, Parser)]
 #[command(name = "runner-watch")]
-#[command(about = "Automated actions/runner protocol sync for aksh")]
+#[command(about = "Automated actions/runner protocol sync for preloop")]
 struct Cli {
     /// Path to runner-watch config.
     #[arg(long, global = true, default_value = DEFAULT_CONFIG)]
@@ -53,7 +53,7 @@ enum Commands {
     Review(ReviewArgs),
     /// Record a golden capture through the mitm worktree.
     RecordGolden(RecordGoldenArgs),
-    /// Replay flows.jsonl requests against aksh and compare responses.
+    /// Replay flows.jsonl requests against preloop and compare responses.
     Conform(ConformArgs),
     /// Create tiered draft PRs from artifacts.
     Pr(PrArgs),
@@ -121,9 +121,9 @@ struct ConformArgs {
     /// Runner version whose .runner-watch/golden/v{N} directory should be used.
     #[arg(long)]
     runner: String,
-    /// Base URL for a running aksh server, e.g. http://127.0.0.1:9090.
+    /// Base URL for a running preloop server, e.g. http://127.0.0.1:9090.
     #[arg(long)]
-    aksh_url: String,
+    preloop_url: String,
     /// Only run a single scenario directory under the golden version.
     #[arg(long)]
     scenario: Option<String>,
@@ -149,9 +149,9 @@ struct RunArgs {
     from: String,
     #[arg(long)]
     to: String,
-    /// Running aksh base URL for conformance. If omitted, conformance is reported skipped.
+    /// Running preloop base URL for conformance. If omitted, conformance is reported skipped.
     #[arg(long)]
-    aksh_url: Option<String>,
+    preloop_url: Option<String>,
     #[arg(long)]
     no_agents: bool,
     #[arg(long)]
@@ -187,8 +187,8 @@ struct Config {
 struct GeneralConfig {
     #[serde(default = "default_runner_repo")]
     runner_repo: String,
-    #[serde(default = "default_aksh_worktree")]
-    aksh_worktree: PathBuf,
+    #[serde(default = "default_preloop_worktree")]
+    preloop_worktree: PathBuf,
     #[serde(default = "default_golden_dir")]
     golden_dir: PathBuf,
     #[serde(default = "default_mitm_dir")]
@@ -233,7 +233,7 @@ impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
             runner_repo: default_runner_repo(),
-            aksh_worktree: default_aksh_worktree(),
+            preloop_worktree: default_preloop_worktree(),
             golden_dir: default_golden_dir(),
             mitm_dir: default_mitm_dir(),
             max_review_rounds: default_max_review_rounds(),
@@ -276,7 +276,7 @@ impl Default for SkipPaths {
 fn default_runner_repo() -> String {
     "actions/runner".to_string()
 }
-fn default_aksh_worktree() -> PathBuf {
+fn default_preloop_worktree() -> PathBuf {
     PathBuf::from(".")
 }
 fn default_golden_dir() -> PathBuf {
@@ -301,7 +301,7 @@ fn default_codex() -> String {
     "codex".to_string()
 }
 fn default_surface_map() -> PathBuf {
-    PathBuf::from("docs/aksh-surface.toml")
+    PathBuf::from("docs/preloop-surface.toml")
 }
 fn default_tracked_dirs() -> Vec<String> {
     [
@@ -991,38 +991,38 @@ fn default_surface_entries() -> SurfaceMap {
         mappings: vec![
             map(
                 "TimelineRecord",
-                "aksh-gha-protocol",
-                "crates/aksh-gha-protocol/src/azdo.rs",
+                "preloop-gha-protocol",
+                "crates/preloop-gha-protocol/src/azdo.rs",
                 "TimelineRecord DTO",
             ),
             map(
                 "AgentRequest",
-                "aksh-runner-server",
-                "crates/aksh-runner-server/src/lib.rs",
+                "preloop-runner-server",
+                "crates/preloop-runner-server/src/lib.rs",
                 "AgentRequest routes",
             ),
             map(
                 "ConnectionData",
-                "aksh-runner-server",
-                "crates/aksh-runner-server/src/lib.rs",
+                "preloop-runner-server",
+                "crates/preloop-runner-server/src/lib.rs",
                 "connectionData payload",
             ),
             map(
                 "ActionDownloadInfo",
-                "aksh-runner-server",
-                "crates/aksh-runner-server/src/lib.rs",
+                "preloop-runner-server",
+                "crates/preloop-runner-server/src/lib.rs",
                 "action download handler",
             ),
             map(
                 "Timeline",
-                "aksh-runner-server",
-                "crates/aksh-runner-server/src/lib.rs",
+                "preloop-runner-server",
+                "crates/preloop-runner-server/src/lib.rs",
                 "timeline handlers",
             ),
             map(
                 "Broker",
-                "aksh-runner-server",
-                "crates/aksh-runner-server/src/lib.rs",
+                "preloop-runner-server",
+                "crates/preloop-runner-server/src/lib.rs",
                 "broker/admin flow",
             ),
         ],
@@ -1129,9 +1129,9 @@ fn targets_for(surface: &SurfaceMap, needles: &[&str]) -> Vec<SurfaceMapping> {
     }
     if targets.is_empty() {
         targets.push(map(
-            "aksh",
-            "aksh-runner-server",
-            "crates/aksh-runner-server/src/lib.rs",
+            "preloop",
+            "preloop-runner-server",
+            "crates/preloop-runner-server/src/lib.rs",
             "protocol surface",
         ));
     }
@@ -1145,17 +1145,17 @@ fn spec_for_id(
     _version: &str,
 ) -> Spec {
     match id {
-        "background-step-timeline-fields" => Spec { id: id.into(), category: "blocker".into(), tags: vec!["protocol".into(), "timeline".into()], what: "Runner can send background-step metadata in timeline records.".into(), why: "v2.335.0 records concurrent background steps and control-flow waits/cancels in timeline PATCH payloads.".into(), runner_behavior: "PATCH timeline records may include isBackground, backgroundControlType, backgroundControlStepIds, and parallelGroupId.".into(), failure_mode: "Aksh must accept and preserve unknown timeline metadata; strict DTOs or storage projections can silently lose fidelity.".into(), feature_flag_name: None, feature_flag_where: None, feature_flag_default: None, request: "PATCH /_apis/v1/Timeline/{scope}/{hub}/{planId}/{timelineId}\n{\"value\":[{\"isBackground\":true,\"backgroundControlType\":\"waitAll\",\"backgroundControlStepIds\":[\"...\"],\"parallelGroupId\":\"...\"}]}".into(), response: "200 JSON timeline record collection".into(), targets: targets_for(surface, &["TimelineRecord", "timeline"]), approach: "Add optional serde fields to TimelineRecord and ensure timeline PATCH handlers round-trip/store them.".into(), test: "Serde test for camelCase optional background fields and handler test for timeline PATCH accepting them.".into(), source_entries, ai_status: "deterministic-known-fidelity-gap".into() },
+        "background-step-timeline-fields" => Spec { id: id.into(), category: "blocker".into(), tags: vec!["protocol".into(), "timeline".into()], what: "Runner can send background-step metadata in timeline records.".into(), why: "v2.335.0 records concurrent background steps and control-flow waits/cancels in timeline PATCH payloads.".into(), runner_behavior: "PATCH timeline records may include isBackground, backgroundControlType, backgroundControlStepIds, and parallelGroupId.".into(), failure_mode: "Preloop must accept and preserve unknown timeline metadata; strict DTOs or storage projections can silently lose fidelity.".into(), feature_flag_name: None, feature_flag_where: None, feature_flag_default: None, request: "PATCH /_apis/v1/Timeline/{scope}/{hub}/{planId}/{timelineId}\n{\"value\":[{\"isBackground\":true,\"backgroundControlType\":\"waitAll\",\"backgroundControlStepIds\":[\"...\"],\"parallelGroupId\":\"...\"}]}".into(), response: "200 JSON timeline record collection".into(), targets: targets_for(surface, &["TimelineRecord", "timeline"]), approach: "Add optional serde fields to TimelineRecord and ensure timeline PATCH handlers round-trip/store them.".into(), test: "Serde test for camelCase optional background fields and handler test for timeline PATCH accepting them.".into(), source_entries, ai_status: "deterministic-known-fidelity-gap".into() },
         "request-ack" => Spec { id: id.into(), category: "concern".into(), tags: vec!["protocol".into(), "endpoint".into()], what: "Runner sends an explicit acknowledgement after receiving a job request.".into(), why: "Broker flow uses acknowledgements to confirm the runner accepted a leased request.".into(), runner_behavior: "POST /_apis/v1/AgentRequest/{poolId}/{requestId} after decrypting a RunnerJobRequest.".into(), failure_mode: "warning-only in current captures; missing endpoint causes 404 noise and may affect broker leases.".into(), feature_flag_name: Some("UseBrokerFlow".into()), feature_flag_where: Some("connectionData or broker capability response".into()), feature_flag_default: Some(false), request: "POST /_apis/v1/AgentRequest/{poolId}/{requestId}?api-version=6.0\n{}".into(), response: "204 No Content".into(), targets: targets_for(surface, &["AgentRequest"]), approach: "Add POST handler for all AgentRequest route prefixes; accept empty/JSON body and return 204.".into(), test: "POST to AgentRequest endpoint returns 204.".into(), source_entries, ai_status: "deterministic-known-fidelity-gap".into() },
         "v2-admin-broker-connection" | "use-runner-admin-flow" => Spec { id: id.into(), category: "concern".into(), tags: vec!["protocol".into(), "broker".into()], what: "Runner v2 admin flow discovers auth_url_v2 and BrokerUrl values.".into(), why: "v2.329.0 introduced broker/admin paths used by newer hosted runner flows.".into(), runner_behavior: "connectionData/location data and admin responses can advertise auth_url_v2, BrokerUrl, and UseRunnerAdminFlow.".into(), failure_mode: "Runner can fall back today, but newer flows warn or skip broker features when absent.".into(), feature_flag_name: Some("UseRunnerAdminFlow".into()), feature_flag_where: Some("admin/connection response".into()), feature_flag_default: Some(false), request: "GET /_apis/connectionData and runner admin capability requests".into(), response: "JSON containing auth_url_v2/BrokerUrl when enabled".into(), targets: targets_for(surface, &["ConnectionData", "Broker"]), approach: "Extend connection/admin DTOs and route responses without changing legacy defaults.".into(), test: "connectionData/admin response includes optional v2 fields only when configured.".into(), source_entries, ai_status: "deterministic-known-fidelity-gap".into() },
-        "runner-version-deprecated" => Spec { id: id.into(), category: "concern".into(), tags: vec!["protocol".into(), "feature-flag".into()], what: "Server can tell the runner its version is deprecated.".into(), why: "GitHub enforces minimum runner versions and reports deprecation through feature/capability responses.".into(), runner_behavior: "Runner reads RunnerVersionDeprecated and emits upgrade/deprecation behavior.".into(), failure_mode: "Ignoring it hides an upstream control-plane signal; not needed for local aksh execution.".into(), feature_flag_name: Some("RunnerVersionDeprecated".into()), feature_flag_where: Some("feature flag response".into()), feature_flag_default: Some(false), request: "GET feature/connection capability endpoints".into(), response: "JSON flag value".into(), targets: targets_for(surface, &["ConnectionData"]), approach: "Model the flag in capability responses with a safe false default.".into(), test: "Capability serialization uses RunnerVersionDeprecated wire name.".into(), source_entries, ai_status: "deterministic-known-fidelity-gap".into() },
+        "runner-version-deprecated" => Spec { id: id.into(), category: "concern".into(), tags: vec!["protocol".into(), "feature-flag".into()], what: "Server can tell the runner its version is deprecated.".into(), why: "GitHub enforces minimum runner versions and reports deprecation through feature/capability responses.".into(), runner_behavior: "Runner reads RunnerVersionDeprecated and emits upgrade/deprecation behavior.".into(), failure_mode: "Ignoring it hides an upstream control-plane signal; not needed for local preloop execution.".into(), feature_flag_name: Some("RunnerVersionDeprecated".into()), feature_flag_where: Some("feature flag response".into()), feature_flag_default: Some(false), request: "GET feature/connection capability endpoints".into(), response: "JSON flag value".into(), targets: targets_for(surface, &["ConnectionData"]), approach: "Model the flag in capability responses with a safe false default.".into(), test: "Capability serialization uses RunnerVersionDeprecated wire name.".into(), source_entries, ai_status: "deterministic-known-fidelity-gap".into() },
         "dap-debugger-endpoint" => Spec { id: id.into(), category: "feature".into(), tags: vec!["debugger".into(), "websocket".into()], what: "Runner can expose a DAP debugger integration.".into(), why: "v2.335.0 added debugger hooks around worker step execution.".into(), runner_behavior: "Debugger-enabled runs use websocket/control endpoints for DAP traffic.".into(), failure_mode: "Non-blocking unless debugging is requested.".into(), feature_flag_name: None, feature_flag_where: None, feature_flag_default: None, request: "WebSocket debugger endpoint when debug feature is active".into(), response: "DAP frames proxied/stubbed according to runner expectation".into(), targets: targets_for(surface, &["Broker"]), approach: "Add explicit unsupported/stub behavior first; implement full proxy when debug scenarios are captured.".into(), test: "Debugger route returns expected upgrade/error semantics.".into(), source_entries, ai_status: "deterministic-known-fidelity-gap".into() },
         "send-job-level-annotations" => Spec { id: id.into(), category: "feature".into(), tags: vec!["timeline".into(), "annotations".into()], what: "Runner can send job-level annotations in timeline updates.".into(), why: "Newer runners aggregate annotations beyond individual step records.".into(), runner_behavior: "Timeline PATCH includes issue/annotation payloads that apply at job level.".into(), failure_mode: "Annotations may be missing from UI; job execution continues.".into(), feature_flag_name: Some("SendJobLevelAnnotations".into()), feature_flag_where: Some("timeline/feature flag response".into()), feature_flag_default: Some(false), request: "PATCH /_apis/v1/Timeline/... with issues[]".into(), response: "200 JSON timeline collection".into(), targets: targets_for(surface, &["TimelineRecord", "timeline"]), approach: "Preserve issues[] on job records and project them to annotations.".into(), test: "Timeline PATCH with job issues stores annotations.".into(), source_entries, ai_status: "deterministic-known-fidelity-gap".into() },
         "batch-action-resolution" | "use-bearer-token-for-codeload" => Spec { id: id.into(), category: "feature".into(), tags: vec!["actions".into(), "download".into()], what: "Runner can resolve action downloads in batches and optionally use bearer tokens for codeload.".into(), why: "v2.328.0 optimized action download resolution and codeload authentication.".into(), runner_behavior: "Calls ActionDownloadInfo with batch requests and may attach bearer token semantics to tarball URLs.".into(), failure_mode: "Existing action download stubs work for simple cases but miss newer auth/download behavior.".into(), feature_flag_name: Some(if id == "batch-action-resolution" { "BatchActionResolution" } else { "UseBearerTokenForCodeload" }.into()), feature_flag_where: Some("action download feature flags".into()), feature_flag_default: Some(false), request: "POST /_apis/v1/ActionDownloadInfo/{scope}/{hub}/{planId}".into(), response: "JSON action download info".into(), targets: targets_for(surface, &["ActionDownloadInfo"]), approach: "Extend action download handler to accept batch wire shape and token mode.".into(), test: "Batch ActionDownloadInfo request returns per-action entries.".into(), source_entries, ai_status: "deterministic-known-fidelity-gap".into() },
-        "node20-deprecation-warning" => Spec { id: id.into(), category: "nit".into(), tags: vec!["node".into(), "annotations".into()], what: "Runner emits Node 20 deprecation warning annotations for affected JavaScript actions.".into(), why: "v2.328.0+ introduced Node 20 migration warnings and feature flags for Node 24 rollout.".into(), runner_behavior: "Worker records DeprecatedNode20Actions and emits a job annotation warning listing affected actions.".into(), failure_mode: "Cosmetic warning fidelity only; job execution continues.".into(), feature_flag_name: Some("WarnOnNode20".into()), feature_flag_where: Some("runner feature flags / worker constants".into()), feature_flag_default: Some(false), request: "Timeline/job annotation payload generated by the worker when deprecated Node 20 actions are detected.".into(), response: "Server should preserve the annotation in timeline/issues data.".into(), targets: targets_for(surface, &["TimelineRecord", "timeline"]), approach: "Ensure job-level annotations from the runner are accepted and surfaced; do not synthesize warnings server-side unless aksh starts selecting action runtimes.".into(), test: "Timeline PATCH with Node 20 warning issue is preserved.".into(), source_entries, ai_status: "deterministic-known-fidelity-gap".into() },
-        "disable-stdout-multiline-log-prefixing" => Spec { id: id.into(), category: "nit".into(), tags: vec!["env".into(), "logs".into()], what: "Runner reads an env var controlling multiline stdout log prefixing.".into(), why: "v2.335.0 added a logging behavior switch.".into(), runner_behavior: "Worker reads DisableStdoutMultilineLogPrefixing from environment/configuration.".into(), failure_mode: "Runner-side cosmetic behavior; aksh control plane usually need not act.".into(), feature_flag_name: Some("DisableStdoutMultilineLogPrefixing".into()), feature_flag_where: Some("environment".into()), feature_flag_default: Some(false), request: "N/A".into(), response: "N/A".into(), targets: vec![], approach: "No control-plane change unless aksh injects runner environment.".into(), test: "No server test required; document skip.".into(), source_entries, ai_status: "deterministic-known-fidelity-gap".into() },
+        "node20-deprecation-warning" => Spec { id: id.into(), category: "nit".into(), tags: vec!["node".into(), "annotations".into()], what: "Runner emits Node 20 deprecation warning annotations for affected JavaScript actions.".into(), why: "v2.328.0+ introduced Node 20 migration warnings and feature flags for Node 24 rollout.".into(), runner_behavior: "Worker records DeprecatedNode20Actions and emits a job annotation warning listing affected actions.".into(), failure_mode: "Cosmetic warning fidelity only; job execution continues.".into(), feature_flag_name: Some("WarnOnNode20".into()), feature_flag_where: Some("runner feature flags / worker constants".into()), feature_flag_default: Some(false), request: "Timeline/job annotation payload generated by the worker when deprecated Node 20 actions are detected.".into(), response: "Server should preserve the annotation in timeline/issues data.".into(), targets: targets_for(surface, &["TimelineRecord", "timeline"]), approach: "Ensure job-level annotations from the runner are accepted and surfaced; do not synthesize warnings server-side unless preloop starts selecting action runtimes.".into(), test: "Timeline PATCH with Node 20 warning issue is preserved.".into(), source_entries, ai_status: "deterministic-known-fidelity-gap".into() },
+        "disable-stdout-multiline-log-prefixing" => Spec { id: id.into(), category: "nit".into(), tags: vec!["env".into(), "logs".into()], what: "Runner reads an env var controlling multiline stdout log prefixing.".into(), why: "v2.335.0 added a logging behavior switch.".into(), runner_behavior: "Worker reads DisableStdoutMultilineLogPrefixing from environment/configuration.".into(), failure_mode: "Runner-side cosmetic behavior; preloop control plane usually need not act.".into(), feature_flag_name: Some("DisableStdoutMultilineLogPrefixing".into()), feature_flag_where: Some("environment".into()), feature_flag_default: Some(false), request: "N/A".into(), response: "N/A".into(), targets: vec![], approach: "No control-plane change unless preloop injects runner environment.".into(), test: "No server test required; document skip.".into(), source_entries, ai_status: "deterministic-known-fidelity-gap".into() },
         "server-enforced-runner-settings" => Spec { id: id.into(), category: "nit".into(), tags: vec!["settings".into()], what: "Server can enforce selected runner settings.".into(), why: "v2.323.0 added server-provided settings hooks.".into(), runner_behavior: "Runner reads settings from server responses and applies them locally.".into(), failure_mode: "Defaults continue to work for local control plane usage.".into(), feature_flag_name: None, feature_flag_where: None, feature_flag_default: None, request: "GET settings/capability endpoint".into(), response: "JSON settings".into(), targets: targets_for(surface, &["ConnectionData"]), approach: "Return explicit defaults for any setting endpoint discovered in captures.".into(), test: "Settings response serializes default values.".into(), source_entries, ai_status: "deterministic-known-fidelity-gap".into() },
-        _ => Spec { id: id.into(), category: "concern".into(), tags: vec!["mapped-surface".into()], what: "Mapped upstream protocol surface changed and needs human/AI review.".into(), why: "The changed upstream file maps to an aksh control-plane surface.".into(), runner_behavior: "See source_entries snippets in this spec.".into(), failure_mode: "Unknown until semantic triage reviews the source context.".into(), feature_flag_name: None, feature_flag_where: None, feature_flag_default: None, request: "See upstream snippet.".into(), response: "TBD".into(), targets: targets_for(surface, &["aksh"]), approach: "Run Claude semantic triage with upstream and aksh context, then replace this catch-all spec.".into(), test: "TBD".into(), source_entries, ai_status: "deterministic-mapped-needs-ai".into() },
+        _ => Spec { id: id.into(), category: "concern".into(), tags: vec!["mapped-surface".into()], what: "Mapped upstream protocol surface changed and needs human/AI review.".into(), why: "The changed upstream file maps to an preloop control-plane surface.".into(), runner_behavior: "See source_entries snippets in this spec.".into(), failure_mode: "Unknown until semantic triage reviews the source context.".into(), feature_flag_name: None, feature_flag_where: None, feature_flag_default: None, request: "See upstream snippet.".into(), response: "TBD".into(), targets: targets_for(surface, &["preloop"]), approach: "Run Claude semantic triage with upstream and preloop context, then replace this catch-all spec.".into(), test: "TBD".into(), source_entries, ai_status: "deterministic-mapped-needs-ai".into() },
     }
 }
 
@@ -1195,7 +1195,7 @@ fn spec_to_toml(spec: &Spec, version: &str) -> String {
         "expected_response = \"{}\"\n\n",
         toml_escape(&spec.response)
     ));
-    s.push_str("[aksh_targets]\nfiles = [\n");
+    s.push_str("[preloop_targets]\nfiles = [\n");
     for target in &spec.targets {
         s.push_str(&format!(
             "  {{ crate = \"{}\", path = \"{}\", area = \"{}\" }},\n",
@@ -1264,7 +1264,7 @@ async fn write_unknown_triage_prompt(
         .join("prompts")
         .join(format!("triage-{version}.md"));
     ensure_parent(&prompt_path)?;
-    fs::write(&prompt_path, format!("Review these actions/runner delta entries for aksh protocol relevance. Return TOML specs matching docs/runner-watch-plan.md.\n\n```json\n{}\n```\n", serde_json::to_string_pretty(&unknown)?))?;
+    fs::write(&prompt_path, format!("Review these actions/runner delta entries for preloop protocol relevance. Return TOML specs matching docs/runner-watch-plan.md.\n\n```json\n{}\n```\n", serde_json::to_string_pretty(&unknown)?))?;
     let output_path = PathBuf::from(DEFAULT_ROOT).join("triage-ai-output.json");
     let status = Command::new(&config.agents.triage)
         .args([
@@ -1466,7 +1466,7 @@ fn existing_stage_paths() -> Vec<PathBuf> {
 
 fn implementation_prompt(spec: &Path) -> anyhow::Result<String> {
     let spec_text = fs::read_to_string(spec)?;
-    Ok(format!("You are implementing an aksh protocol-sync spec. Follow existing Rust patterns exactly. Run cargo check and relevant tests, but do not run formatters or project-wide lint.\n\nSpec:\n```toml\n{spec_text}\n```\n"))
+    Ok(format!("You are implementing an preloop protocol-sync spec. Follow existing Rust patterns exactly. Run cargo check and relevant tests, but do not run formatters or project-wide lint.\n\nSpec:\n```toml\n{spec_text}\n```\n"))
 }
 
 async fn review(config: &Config, args: &ReviewArgs) -> anyhow::Result<()> {
@@ -1482,7 +1482,7 @@ async fn review(config: &Config, args: &ReviewArgs) -> anyhow::Result<()> {
     let mut summary = Vec::new();
     for spec in sorted_files(&spec_dir, "toml")? {
         let spec_text = fs::read_to_string(&spec)?;
-        let prompt = format!("Adversarially review this aksh implementation against the spec. Return review.toml exactly as in docs/runner-watch-plan.md. You have independent cargo-test evidence from the orchestrator below; do not run formatters or project-wide lint.\n\nCargo test evidence:\n```text\n{test_evidence}\n```\n\nSpec:\n```toml\n{spec_text}\n```\n\nDiff:\n```diff\n{diff_text}\n```\n");
+        let prompt = format!("Adversarially review this preloop implementation against the spec. Return review.toml exactly as in docs/runner-watch-plan.md. You have independent cargo-test evidence from the orchestrator below; do not run formatters or project-wide lint.\n\nCargo test evidence:\n```text\n{test_evidence}\n```\n\nSpec:\n```toml\n{spec_text}\n```\n\nDiff:\n```diff\n{diff_text}\n```\n");
         let name = spec.file_stem().and_then(OsStr::to_str).unwrap_or("review");
         let out_path = review_dir.join(format!("{name}.toml"));
         if args.dry_run {
@@ -1645,12 +1645,12 @@ async fn conform(config: &Config, args: &ConformArgs) -> anyhow::Result<()> {
             .and_then(OsStr::to_str)
             .unwrap_or("scenario")
             .to_string();
-        let replay_dir = report_root.join(&scenario).join("aksh");
+        let replay_dir = report_root.join(&scenario).join("preloop");
         fs::create_dir_all(&replay_dir)?;
-        let baseline_dir = replay_flows_to_aksh(
+        let baseline_dir = replay_flows_to_preloop(
             &golden,
             &replay_dir,
-            &args.aksh_url,
+            &args.preloop_url,
             &config.general.mitm_dir.join("scenarios"),
         )
         .await
@@ -1662,7 +1662,7 @@ async fn conform(config: &Config, args: &ConformArgs) -> anyhow::Result<()> {
             && !text.contains("_No endpoints present only in official._")
             || text.contains("Status codes:")
                 && text.contains("official:")
-                && text.contains("aksh:")
+                && text.contains("preloop:")
                 && status_mismatch_in_report(&text)
             || schema_mismatch_in_report(&text)
         {
@@ -1718,10 +1718,10 @@ fn scenario_dirs(root: &Path, only: Option<&str>) -> anyhow::Result<Vec<PathBuf>
     Ok(dirs)
 }
 
-async fn replay_flows_to_aksh(
+async fn replay_flows_to_preloop(
     golden_dir: &Path,
     out_dir: &Path,
-    aksh_url: &str,
+    preloop_url: &str,
     scenario_root: &Path,
 ) -> anyhow::Result<PathBuf> {
     let client = reqwest::Client::builder()
@@ -1732,25 +1732,25 @@ async fn replay_flows_to_aksh(
         .unwrap_or(out_dir)
         .join("official-filtered");
     let native_token =
-        std::env::var("AKSH_SYSTEM_TOKEN").unwrap_or_else(|_| "aksh-system-token".to_owned());
+        std::env::var("PRELOOP_SYSTEM_TOKEN").unwrap_or_else(|_| "preloop-system-token".to_owned());
     // Runs are submitted by materialize before the replay starts; they must
     // be cancelled on EVERY exit from here on — including a materialization
     // or replay error — or the next scenario's acquire picks up this
     // scenario's leftovers. The out-param keeps partially-materialized run
     // ids cancellable even when materialize itself fails midway.
     let mut run_ids = Vec::new();
-    let replay_result = replay_flows_to_aksh_inner(
+    let replay_result = replay_flows_to_preloop_inner(
         golden_dir,
         out_dir,
         &baseline_dir,
-        aksh_url,
+        preloop_url,
         scenario_root,
         &client,
         &native_token,
         &mut run_ids,
     )
     .await;
-    let cancel_result = cancel_scenario_runs(&client, aksh_url, &native_token, &run_ids).await;
+    let cancel_result = cancel_scenario_runs(&client, preloop_url, &native_token, &run_ids).await;
     match (replay_result, cancel_result) {
         (Ok(dir), Ok(())) => Ok(dir),
         (Ok(_), Err(cancel_error)) => Err(cancel_error),
@@ -1766,11 +1766,11 @@ async fn replay_flows_to_aksh(
 /// every exit path, so a post-submission failure cannot leave the scenario's
 /// runs queued for the next replay to acquire.
 #[allow(clippy::too_many_arguments)]
-async fn replay_flows_to_aksh_inner(
+async fn replay_flows_to_preloop_inner(
     golden_dir: &Path,
     out_dir: &Path,
     baseline_dir: &Path,
-    aksh_url: &str,
+    preloop_url: &str,
     scenario_root: &Path,
     client: &reqwest::Client,
     native_token: &str,
@@ -1779,13 +1779,13 @@ async fn replay_flows_to_aksh_inner(
     let flows_path = golden_dir.join("flows.jsonl");
     let flows = fs::read_to_string(&flows_path)?;
     fs::create_dir_all(baseline_dir)?;
-    materialize_replay_state(golden_dir, scenario_root, aksh_url, client, run_ids).await?;
+    materialize_replay_state(golden_dir, scenario_root, preloop_url, client, run_ids).await?;
     // Pre-flight: register a replay runner with an RSA keypair, then exchange a
     // signed client_assertion for a runner-listen token.  Broker endpoints require
-    // a JWT whose sub is "aksh-runner-listen-{numeric_id}" — the system token
+    // a JWT whose sub is "preloop-runner-listen-{numeric_id}" — the system token
     // alone does not satisfy authenticated_runner_id().
     let (broker_token, replay_runner_id) = {
-        use aksh_gha_protocol::crypto::{sign_jwt_ps256, AgentRsaKeypair};
+        use preloop_gha_protocol::crypto::{sign_jwt_ps256, AgentRsaKeypair};
         // Step 1: generate an ephemeral RSA keypair
         let keypair = match AgentRsaKeypair::generate() {
             Ok(kp) => kp,
@@ -1801,7 +1801,7 @@ async fn replay_flows_to_aksh_inner(
         let register_resp = client
             .post(format!(
                 "{}/_apis/v1/Agent/1",
-                aksh_url.trim_end_matches('/')
+                preloop_url.trim_end_matches('/')
             ))
             .header("Content-Type", "application/json")
             .header("Authorization", format!("Bearer {native_token}"))
@@ -1875,7 +1875,7 @@ async fn replay_flows_to_aksh_inner(
             let token_resp = client
                 .post(format!(
                     "{}/_apis/v1/oauth2/token",
-                    aksh_url.trim_end_matches('/')
+                    preloop_url.trim_end_matches('/')
                 ))
                 .header("Content-Type", "application/x-www-form-urlencoded")
                 .header("Authorization", format!("Bearer {native_token}"))
@@ -1921,7 +1921,7 @@ async fn replay_flows_to_aksh_inner(
     let mut plan_job_ids: HashMap<(String, String), (String, String)> = HashMap::new();
     let mut session_ids: HashMap<String, String> = HashMap::new();
     let mut official_broker_job_ids = Vec::new();
-    let mut aksh_broker_job_ids = Vec::new();
+    let mut preloop_broker_job_ids = Vec::new();
     let mut blob_upload_urls: VecDeque<String> = VecDeque::new();
     for line in flows.lines().filter(|l| !l.trim().is_empty()) {
         let flow: Value = serde_json::from_str(line)?;
@@ -1984,7 +1984,7 @@ async fn replay_flows_to_aksh_inner(
             .write_all(serde_json::to_string(&baseline_flow)?.as_bytes())
             .await?;
         baseline.write_all(b"\n").await?;
-        let url = format!("{}{}", aksh_url.trim_end_matches('/'), path);
+        let url = format!("{}{}", preloop_url.trim_end_matches('/'), path);
         let mut req = client.request(Method::from_bytes(method.as_bytes())?, &url);
         let mut saw_auth = false;
         if let Some(headers) = flow.get("request_headers").and_then(Value::as_array) {
@@ -2067,12 +2067,12 @@ async fn replay_flows_to_aksh_inner(
                     if let Some(official_id) = official_runner_request_id {
                         official_broker_job_ids.push(official_id);
                     }
-                    if let Some(aksh_id) = extract_runner_request_id_from_message(&body_json) {
-                        aksh_broker_job_ids.push(aksh_id);
+                    if let Some(preloop_id) = extract_runner_request_id_from_message(&body_json) {
+                        preloop_broker_job_ids.push(preloop_id);
                     }
                     sync_broker_job_id_map(
                         &official_broker_job_ids,
-                        &aksh_broker_job_ids,
+                        &preloop_broker_job_ids,
                         &mut broker_job_ids,
                     );
                     // Extract plan/job IDs from acquirejob responses for OIDC path mapping
@@ -2148,19 +2148,19 @@ async fn replay_flows_to_aksh_inner(
 /// a silently-uncancelled run is exactly the leak this guard exists to stop.
 async fn cancel_scenario_runs(
     client: &reqwest::Client,
-    aksh_url: &str,
+    preloop_url: &str,
     native_token: &str,
     run_ids: &[String],
 ) -> anyhow::Result<()> {
     let mut failures: Vec<(String, String)> = Vec::new();
     for run_id in run_ids {
-        if let Some(message) = cancel_run(client, aksh_url, native_token, run_id).await {
+        if let Some(message) = cancel_run(client, preloop_url, native_token, run_id).await {
             failures.push((run_id.clone(), message));
         }
     }
     let mut still_failing: Vec<String> = Vec::new();
     for (run_id, _) in &failures {
-        if let Some(message) = cancel_run(client, aksh_url, native_token, run_id).await {
+        if let Some(message) = cancel_run(client, preloop_url, native_token, run_id).await {
             still_failing.push(message);
         }
     }
@@ -2178,14 +2178,14 @@ async fn cancel_scenario_runs(
 /// Attempt one cancellation; `Some(message)` describes the failure.
 async fn cancel_run(
     client: &reqwest::Client,
-    aksh_url: &str,
+    preloop_url: &str,
     native_token: &str,
     run_id: &str,
 ) -> Option<String> {
     let response = client
         .post(format!(
             "{}/api/v1/runs/{run_id}/cancel",
-            aksh_url.trim_end_matches('/')
+            preloop_url.trim_end_matches('/')
         ))
         .bearer_auth(native_token)
         .send()
@@ -2270,13 +2270,13 @@ fn extract_runner_request_id_from_message(message: &Value) -> Option<String> {
 
 fn sync_broker_job_id_map(
     official_broker_job_ids: &[String],
-    aksh_broker_job_ids: &[String],
+    preloop_broker_job_ids: &[String],
     broker_job_ids: &mut HashMap<String, String>,
 ) {
-    for (official_id, aksh_id) in official_broker_job_ids.iter().zip(aksh_broker_job_ids) {
+    for (official_id, preloop_id) in official_broker_job_ids.iter().zip(preloop_broker_job_ids) {
         broker_job_ids
             .entry(official_id.clone())
-            .or_insert_with(|| aksh_id.clone());
+            .or_insert_with(|| preloop_id.clone());
     }
 }
 
@@ -2421,7 +2421,7 @@ fn replay_workflow_submissions(
             "workflow_yaml": workflow_yaml,
             "event": "workflow_dispatch",
             "payload": payload.clone(),
-            "repository": "preloopdev/aksh-conformance-sample",
+            "repository": "preloopdev/preloop-conformance-sample",
             "git_ref": "refs/heads/main",
             "workflow_path": format!(".github/workflows/{workflow_path}"),
             "inputs": {},
@@ -2438,7 +2438,7 @@ fn replay_workflow_submissions(
 async fn materialize_replay_state(
     golden_dir: &Path,
     scenario_root: &Path,
-    aksh_url: &str,
+    preloop_url: &str,
     client: &reqwest::Client,
     run_ids: &mut Vec<String>,
 ) -> anyhow::Result<()> {
@@ -2466,7 +2466,7 @@ async fn materialize_replay_state(
     }
 
     let native_api_token =
-        std::env::var("AKSH_SYSTEM_TOKEN").unwrap_or_else(|_| "aksh-system-token".to_owned());
+        std::env::var("PRELOOP_SYSTEM_TOKEN").unwrap_or_else(|_| "preloop-system-token".to_owned());
     let submissions = replay_workflow_submissions(golden_dir, scenario_root)?;
     // Idle scenarios have no submit_workflow steps — skip job creation.
     // The replay will use the golden capture's message responses directly.
@@ -2476,7 +2476,7 @@ async fn materialize_replay_state(
     let mut queued_jobs = 0_u64;
     for submit_body in submissions {
         let accepted = client
-            .post(format!("{}/api/v1/runs", aksh_url.trim_end_matches('/')))
+            .post(format!("{}/api/v1/runs", preloop_url.trim_end_matches('/')))
             .bearer_auth(&native_api_token)
             .json(&submit_body)
             .send()
@@ -2497,8 +2497,8 @@ async fn materialize_replay_state(
     // only after the upstream job completes, and the capture ended before
     // that dispatch). The `replay.lenient-job-count` marker (a
     // `replay-lenient-job-count` file in the golden scenario directory)
-    // downgrades the strict equality to a subset check: aksh must queue at
-    // least everything the golden delivered — queueing MORE is aksh being
+    // downgrades the strict equality to a subset check: preloop must queue at
+    // least everything the golden delivered — queueing MORE is preloop being
     // more complete, not a regression.
     let lenient = golden_dir.join("replay-lenient-job-count").is_file();
     ensure!(
@@ -2665,7 +2665,7 @@ fn should_skip_replay_path(host: &str, path: &str) -> bool {
         || path == "/_ws/ingest.sock"
         || host.contains("token.actions.githubusercontent.com")
         || host.contains("objects.githubusercontent.com")
-        // codeload.github.com serves action source tarballs; aksh never intercepts these.
+        // codeload.github.com serves action source tarballs; preloop never intercepts these.
         || host.contains("codeload.github.com")
         // launch.actions.githubusercontent.com is the GitHub batch action-resolution service.
         || host.contains("launch.actions.githubusercontent.com")
@@ -2676,8 +2676,8 @@ fn should_skip_replay_flow(host: &str, path: &str, flow: &Value) -> bool {
         return true;
     }
     // Skip OAuth token requests: the golden contains GitHub's client_assertion JWTs
-    // with GitHub-specific client IDs that aksh cannot validate. The pre-flight token
-    // exchange in replay_flows_to_aksh already obtains a valid runner-listen token.
+    // with GitHub-specific client IDs that preloop cannot validate. The pre-flight token
+    // exchange in replay_flows_to_preloop already obtains a valid runner-listen token.
     if path.starts_with("/_apis/v1/oauth2/token")
         || path.starts_with("/runner/server/_apis/v1/oauth2/token")
     {
@@ -2703,22 +2703,22 @@ async fn run_compare(
     _config: &Config,
     scenario: &str,
     official: &Path,
-    aksh: &Path,
+    preloop: &Path,
     report: &Path,
 ) -> anyhow::Result<()> {
     compare::render_report(&compare::Args {
         scenario,
         left_dir: official,
-        right_dir: aksh,
+        right_dir: preloop,
         output: report,
         left_label: "official",
-        right_label: "aksh",
+        right_label: "preloop",
     })
 }
 
 fn status_mismatch_in_report(text: &str) -> bool {
     // Track the current endpoint section so we can skip known un-replayable paths.
-    // oauth2/token: official validates PSA256 client assertions; aksh cannot replay
+    // oauth2/token: official validates PSA256 client assertions; preloop cannot replay
     //   job-scoped credentials that were issued by the official JIT broker.
     // messages endpoint: broker session lifecycle (session invalidation timing) is
     //   driven by out-of-band state that isn't reproducible in golden replay.
@@ -2831,7 +2831,7 @@ fn write_conformance_summary(
     lines.push("## Replay methodology and known gaps".to_string());
     lines.push(String::new());
     lines.push(
-        "The conformance gate replays official golden flows through aksh and compares".to_string(),
+        "The conformance gate replays official golden flows through preloop and compares".to_string(),
     );
     lines.push(
         "HTTP status codes. Several categories of flow are intentionally excluded or".to_string(),
@@ -2842,10 +2842,10 @@ fn write_conformance_summary(
     lines.push(String::new());
     lines.push("### Flows skipped from replay".to_string());
     lines.push(String::new());
-    lines.push("Two skip layers are applied before any request is sent to aksh:".to_string());
+    lines.push("Two skip layers are applied before any request is sent to preloop:".to_string());
     lines.push(String::new());
     lines.push("**Host/path skip list** (`should_skip_replay_path`) — flows to these".to_string());
-    lines.push("destinations are dropped entirely; aksh is never involved:".to_string());
+    lines.push("destinations are dropped entirely; preloop is never involved:".to_string());
     lines.push(String::new());
     lines.push("| Host / path | Why skipped |".to_string());
     lines.push("|---|---|".to_string());
@@ -2884,7 +2884,7 @@ fn write_conformance_summary(
     lines.push(String::new());
     lines.push("| Endpoint pattern | Why excluded |".to_string());
     lines.push("|---|---|".to_string());
-    lines.push("| `…/oauth2/token` | Official validates PSA256 client assertions and rejects job-scoped credentials; aksh is its own CA and accepts all. Unverifiable in replay. |".to_string());
+    lines.push("| `…/oauth2/token` | Official validates PSA256 client assertions and rejects job-scoped credentials; preloop is its own CA and accepts all. Unverifiable in replay. |".to_string());
     lines.push("| `…/messages?…` | Broker proactively invalidates sessions via concurrent two-session pattern; timing-based and not reproducible from a static golden. |".to_string());
     lines.push(String::new());
     lines.push("### Cache and artifact replay".to_string());
@@ -2927,7 +2927,7 @@ fn write_conformance_summary(
     lines.push("### How Wire Compliance is Checked".to_string());
     lines.push(String::new());
     lines.push(
-        "The conformance checker compares the local `aksh` server against the official".to_string(),
+        "The conformance checker compares the local `preloop` server against the official".to_string(),
     );
     lines.push("recorded golden baseline. For each non-skipped flow, it compares:".to_string());
     lines.push(String::new());
@@ -3062,7 +3062,7 @@ fn update_readme_runner_version(version: &str) -> anyhow::Result<()> {
     }
     let text = fs::read_to_string(&path)?;
     let replacement = format!(
-        "## Current Status\n\n**As of 2026-06-29, aksh is tracked by runner-watch against the official `actions/runner` {version} protocol surface.**\n\naksh currently supports the core runner lifecycle:\n\n1. Registers against aksh (GHES-style org URL)\n2. Creates encrypted sessions (AES key exchange)\n3. Receives and decrypts job messages\n4. Executes jobs and reports completion\n5. Supports `needs` DAG, matrix strategies, trigger matching, expression evaluation\n\nWorkspace tests pass via `cargo test --workspace`. runner-watch records protocol-sync artifacts under `.runner-watch/`; remaining fidelity work is tracked in [docs/fidelity-gap.md](docs/fidelity-gap.md).\n\n"
+        "## Current Status\n\n**As of 2026-06-29, preloop is tracked by runner-watch against the official `actions/runner` {version} protocol surface.**\n\npreloop currently supports the core runner lifecycle:\n\n1. Registers against preloop (GHES-style org URL)\n2. Creates encrypted sessions (AES key exchange)\n3. Receives and decrypts job messages\n4. Executes jobs and reports completion\n5. Supports `needs` DAG, matrix strategies, trigger matching, expression evaluation\n\nWorkspace tests pass via `cargo test --workspace`. runner-watch records protocol-sync artifacts under `.runner-watch/`; remaining fidelity work is tracked in [docs/fidelity-gap.md](docs/fidelity-gap.md).\n\n"
     );
     if let (Some(start), Some(end)) = (
         text.find("## Current Status\n"),
@@ -3249,19 +3249,19 @@ async fn run_all(config: &Config, args: &RunArgs) -> anyhow::Result<()> {
         )
         .await?;
     }
-    if let Some(aksh_url) = &args.aksh_url {
+    if let Some(preloop_url) = &args.preloop_url {
         conform(
             config,
             &ConformArgs {
                 runner: args.to.clone(),
-                aksh_url: aksh_url.clone(),
+                preloop_url: preloop_url.clone(),
                 scenario: None,
                 skip_cargo_test: args.skip_cargo_test,
             },
         )
         .await?;
     } else {
-        fs::write(PathBuf::from(DEFAULT_ROOT).join("conformance-report.md"), "# runner-watch conformance report\n\nConformance skipped: --aksh-url was not provided.\n")?;
+        fs::write(PathBuf::from(DEFAULT_ROOT).join("conformance-report.md"), "# runner-watch conformance report\n\nConformance skipped: --preloop-url was not provided.\n")?;
     }
     pr(
         config,
@@ -3281,7 +3281,7 @@ async fn init_files(_config: &Config, args: &InitArgs) -> anyhow::Result<()> {
         ensure_parent(&cfg)?;
         fs::write(&cfg, DEFAULT_CONFIG_TEXT)?;
     }
-    let surface = PathBuf::from("docs/aksh-surface.toml");
+    let surface = PathBuf::from("docs/preloop-surface.toml");
     if args.force || !surface.exists() {
         ensure_parent(&surface)?;
         fs::write(&surface, DEFAULT_SURFACE_TEXT)?;
@@ -3310,7 +3310,7 @@ fn copy_dir_all(src: &Path, dst: &Path) -> anyhow::Result<()> {
 
 const DEFAULT_CONFIG_TEXT: &str = r#"[general]
 runner_repo = "actions/runner"
-aksh_worktree = "."
+preloop_worktree = "."
 golden_dir = ".runner-watch/golden"
 mitm_dir = "experiments/mitm"
 max_review_rounds = 3
@@ -3323,7 +3323,7 @@ implement = "codex"
 review = "claude"
 
 [surface_map]
-path = "docs/aksh-surface.toml"
+path = "docs/preloop-surface.toml"
 
 [tracked_dirs]
 dirs = [
@@ -3347,38 +3347,38 @@ patterns = [
 
 const DEFAULT_SURFACE_TEXT: &str = r#"[[mappings]]
 upstream = "TimelineRecord"
-crate_name = "aksh-gha-protocol"
-path = "crates/aksh-gha-protocol/src/azdo.rs"
+crate_name = "preloop-gha-protocol"
+path = "crates/preloop-gha-protocol/src/azdo.rs"
 area = "TimelineRecord DTO"
 
 [[mappings]]
 upstream = "AgentRequest"
-crate_name = "aksh-runner-server"
-path = "crates/aksh-runner-server/src/lib.rs"
+crate_name = "preloop-runner-server"
+path = "crates/preloop-runner-server/src/lib.rs"
 area = "AgentRequest routes"
 
 [[mappings]]
 upstream = "ConnectionData"
-crate_name = "aksh-runner-server"
-path = "crates/aksh-runner-server/src/lib.rs"
+crate_name = "preloop-runner-server"
+path = "crates/preloop-runner-server/src/lib.rs"
 area = "connectionData payload"
 
 [[mappings]]
 upstream = "ActionDownloadInfo"
-crate_name = "aksh-runner-server"
-path = "crates/aksh-runner-server/src/lib.rs"
+crate_name = "preloop-runner-server"
+path = "crates/preloop-runner-server/src/lib.rs"
 area = "action download handler"
 
 [[mappings]]
 upstream = "Timeline"
-crate_name = "aksh-runner-server"
-path = "crates/aksh-runner-server/src/lib.rs"
+crate_name = "preloop-runner-server"
+path = "crates/preloop-runner-server/src/lib.rs"
 area = "timeline handlers"
 
 [[mappings]]
 upstream = "Broker"
-crate_name = "aksh-runner-server"
-path = "crates/aksh-runner-server/src/lib.rs"
+crate_name = "preloop-runner-server"
+path = "crates/preloop-runner-server/src/lib.rs"
 area = "broker/admin flow"
 "#;
 
@@ -3458,15 +3458,15 @@ mod tests {
     #[test]
     fn broker_replay_body_rewrites_captured_job_ids() {
         let mut ids = HashMap::new();
-        ids.insert("official-job".to_string(), "aksh-job".to_string());
+        ids.insert("official-job".to_string(), "preloop-job".to_string());
         let mut body = br#"{"jobMessageId":"official-job","jobId":"official-job","runnerRequestId":"official-job","other":"kept"}"#.to_vec();
 
         rewrite_replay_body(&mut body, &ids, 1);
 
         let body: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["jobMessageId"], "aksh-job");
-        assert_eq!(body["jobId"], "aksh-job");
-        assert_eq!(body["runnerRequestId"], "aksh-job");
+        assert_eq!(body["jobMessageId"], "preloop-job");
+        assert_eq!(body["jobId"], "preloop-job");
+        assert_eq!(body["runnerRequestId"], "preloop-job");
         assert_eq!(body["other"], "kept");
     }
 
@@ -3487,35 +3487,35 @@ mod tests {
     #[test]
     fn broker_job_ids_are_correlated_by_delivery_order() {
         let official_ids = vec!["official-first".to_string()];
-        let mut aksh_ids = vec!["aksh-first".to_string(), "aksh-second".to_string()];
+        let mut preloop_ids = vec!["preloop-first".to_string(), "preloop-second".to_string()];
         let mut ids = HashMap::new();
 
-        sync_broker_job_id_map(&official_ids, &aksh_ids, &mut ids);
+        sync_broker_job_id_map(&official_ids, &preloop_ids, &mut ids);
 
         assert_eq!(
             ids.get("official-first").map(String::as_str),
-            Some("aksh-first")
+            Some("preloop-first")
         );
-        assert!(!ids.values().any(|id| id == "aksh-second"));
+        assert!(!ids.values().any(|id| id == "preloop-second"));
 
         let official_ids = vec!["official-first".to_string(), "official-second".to_string()];
-        sync_broker_job_id_map(&official_ids, &aksh_ids, &mut ids);
+        sync_broker_job_id_map(&official_ids, &preloop_ids, &mut ids);
 
         assert_eq!(
             ids.get("official-first").map(String::as_str),
-            Some("aksh-first")
+            Some("preloop-first")
         );
         assert_eq!(
             ids.get("official-second").map(String::as_str),
-            Some("aksh-second")
+            Some("preloop-second")
         );
 
-        aksh_ids[0] = "changed".to_string();
-        sync_broker_job_id_map(&official_ids, &aksh_ids, &mut ids);
+        preloop_ids[0] = "changed".to_string();
+        sync_broker_job_id_map(&official_ids, &preloop_ids, &mut ids);
 
         assert_eq!(
             ids.get("official-first").map(String::as_str),
-            Some("aksh-first")
+            Some("preloop-first")
         );
     }
 
@@ -3610,7 +3610,7 @@ mod tests {
         assert_eq!(submission["event"], "workflow_dispatch");
         assert_eq!(
             submission["repository"],
-            "preloopdev/aksh-conformance-sample"
+            "preloopdev/preloop-conformance-sample"
         );
         assert_eq!(submission["git_ref"], "refs/heads/main");
         assert_eq!(submission["payload"]["ref"], "refs/heads/main");
@@ -3669,7 +3669,7 @@ mod tests {
             "**Response body schema diff:**\n\n",
             "```diff\n",
             "--- official\n",
-            "+++ aksh\n",
+            "+++ preloop\n",
             "@@\n",
             " {\n",
             "   \"jobId\": \"string\",\n",
@@ -3864,7 +3864,7 @@ mod tests {
         })
         .await;
 
-        let result = replay_flows_to_aksh(&golden, &out, &server_url, &scenario_root).await;
+        let result = replay_flows_to_preloop(&golden, &out, &server_url, &scenario_root).await;
 
         assert!(
             result.is_err(),
@@ -3896,7 +3896,7 @@ mod tests {
         })
         .await;
 
-        let result = replay_flows_to_aksh(&golden, &out, &server_url, &scenario_root).await;
+        let result = replay_flows_to_preloop(&golden, &out, &server_url, &scenario_root).await;
 
         assert!(
             result.is_err(),

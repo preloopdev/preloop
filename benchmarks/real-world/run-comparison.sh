@@ -3,7 +3,7 @@
 #
 # Usage:
 #   ./run-comparison.sh                    # Compare existing data
-#   ./run-comparison.sh --capture aksh     # Re-run all scenarios with aksh, then compare
+#   ./run-comparison.sh --capture preloop     # Re-run all scenarios with preloop, then compare
 #   ./run-comparison.sh --capture both     # Re-run with both runners, then compare
 set -euo pipefail
 
@@ -16,7 +16,7 @@ log() { echo "[$(date +%T.%3N)] $*"; }
 
 # ── Step 1: Optionally re-run conformance scenarios ─────────────────
 if [ "$CAPTURE_MODE" = "--capture" ]; then
-    RUNNER="${CAPTURE_RUNNER:?Usage: $0 --capture <aksh|official|both>}"
+    RUNNER="${CAPTURE_RUNNER:?Usage: $0 --capture <preloop|official|both>}"
     log "Running batch conformance with runner=$RUNNER..."
     bash "$BENCH_DIR/batch-conformance.sh" "$RUNNER"
     log "Batch conformance complete."
@@ -26,7 +26,7 @@ fi
 log "Running step-level conformance diff..."
 python3 "$BENCH_DIR/conformance-diff.py" \
     --official "$RESULTS_DIR/conformance-official.jsonl" \
-    --aksh "$RESULTS_DIR/conformance-aksh.jsonl" \
+    --preloop "$RESULTS_DIR/conformance-preloop.jsonl" \
     --output "$RESULTS_DIR/CONFORMANCE-REPORT.md"
 
 # ── Step 3: Log content comparison ──────────────────────────────────
@@ -46,22 +46,22 @@ flow_count=0
 for scenario_dir in "$BENCH_DIR/../compatibility/runner/protocol"/*/; do
     scenario=$(basename "$scenario_dir")
     off_latest="$scenario_dir/official/latest"
-    aksh_latest="$scenario_dir/aksh/latest"
+    preloop_latest="$scenario_dir/preloop/latest"
 
-    if [ -d "$off_latest" ] && [ -d "$aksh_latest" ]; then
+    if [ -d "$off_latest" ] && [ -d "$preloop_latest" ]; then
         # Check if both have flows.jsonl
         off_flows="$off_latest/flows.jsonl"
-        aksh_flows="$aksh_latest/flows.jsonl"
+        preloop_flows="$preloop_latest/flows.jsonl"
         [ -f "$off_flows" ] || off_flows="$off_latest/vm-mitm/flows.jsonl"
-        [ -f "$aksh_flows" ] || aksh_flows="$aksh_latest/vm-mitm/flows.jsonl"
+        [ -f "$preloop_flows" ] || preloop_flows="$preloop_latest/vm-mitm/flows.jsonl"
 
-        if [ -f "$off_flows" ] && [ -f "$aksh_flows" ]; then
+        if [ -f "$off_flows" ] && [ -f "$preloop_flows" ]; then
             log "  Flow diff: $scenario"
             diff_out="$scenario_dir/diff.md"
             python3 "$BENCH_DIR/runner-flow-diff.py" \
                 --scenario "$scenario" \
                 --official-dir "$off_latest" \
-                --aksh-dir "$aksh_latest" \
+                --preloop-dir "$preloop_latest" \
                 --output "$diff_out" 2>/dev/null || true
 
             if [ -f "$diff_out" ]; then

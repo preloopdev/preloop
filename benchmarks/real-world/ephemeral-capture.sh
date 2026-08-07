@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
 # Capture a multi-job workflow with one VM per runner (GitHub-faithful isolation).
-# Usage: ./ephemeral-capture.sh <workflow-yml> <vm-template.smolmachine> <official|aksh> [runner-count]
+# Usage: ./ephemeral-capture.sh <workflow-yml> <vm-template.smolmachine> <official|preloop> [runner-count]
 #
 # Each runner gets its own isolated VM created from the packed template.
-# The template VM must have mitmdump and (for aksh) aksh-runner pre-installed.
+# The template VM must have mitmdump and (for preloop) preloop-runner pre-installed.
 # The official runner source is mounted read-only and copied locally in each VM.
 set -euo pipefail
 
 SCENARIO="${1:?workflow yaml required}"
 TEMPLATE="${2:?path to .smolmachine template required}"
-RUNNER_KIND="${3:?official or aksh required}"
+RUNNER_KIND="${3:?official or preloop required}"
 RUNNER_COUNT="${4:-3}"
-GH_REPO="${GH_REPO:-preloopdev/aksh-conformance-sample}"
+GH_REPO="${GH_REPO:-preloopdev/preloop-conformance-sample}"
 GH_REF="${GH_REF:-main}"
 MITM_PORT="${MITM_PORT:-18081}"
 HOST_WORKSPACE="$PWD"
 RESULTS_ROOT="${RESULTS_ROOT:-$PWD/benchmarks/compatibility/runner/protocol}"
-AKSH_RUNNER="/usr/local/bin/aksh-runner"
+PRELOOP_RUNNER="/usr/local/bin/preloop-runner"
 # Host path to the official runner install (mounted read-only into each VM)
 OFFICIAL_RUNNER_HOST="${OFFICIAL_RUNNER_HOST:-/Users/bnjoroge/cachingv4}"
 OFFICIAL_SRC="/opt/runners/actions-runner"   # guest mount point
@@ -113,17 +113,17 @@ for i in $(seq 1 "$RUNNER_COUNT"); do
   CA_BUNDLE="$VM_CAPTURE_DIR/vm-mitm-conf/mitmproxy-ca-cert.pem"
 
   # Start runner (backgrounded smolvm exec)
-  if [ "$RUNNER_KIND" = aksh ]; then
+  if [ "$RUNNER_KIND" = preloop ]; then
     smolvm machine exec --name "$VM_NAME" -- bash -lc "
       set -euo pipefail
       export HTTP_PROXY='$PROXY' HTTPS_PROXY='$PROXY' http_proxy='$PROXY' https_proxy='$PROXY' NO_PROXY='' no_proxy=''
       export NODE_EXTRA_CA_CERTS='$CA_BUNDLE' SSL_CERT_FILE='$CA_BUNDLE'
       ROOT='/tmp/runner-root'
       rm -rf \$ROOT; mkdir -p \$ROOT
-      RUST_LOG=info '$AKSH_RUNNER' --ca-bundle '$CA_BUNDLE' --runner-root \$ROOT configure \
+      RUST_LOG=info '$PRELOOP_RUNNER' --ca-bundle '$CA_BUNDLE' --runner-root \$ROOT configure \
         --url 'https://github.com/$GH_REPO' --token '$TOKEN' --name '$NAME' \
         --unattended --replace --ephemeral --labels 'self-hosted,linux,x64,$WF_LABEL' 2>&1
-      RUST_LOG=info '$AKSH_RUNNER' --ca-bundle '$CA_BUNDLE' --runner-root \$ROOT run 2>&1
+      RUST_LOG=info '$PRELOOP_RUNNER' --ca-bundle '$CA_BUNDLE' --runner-root \$ROOT run 2>&1
     " >> "$CAPTURE_DIR/vm-runner-${i}.log" 2>&1 &
   else
     smolvm machine exec --name "$VM_NAME" -- bash -lc "
@@ -159,7 +159,7 @@ for i in $(seq 1 "$RUNNER_COUNT"); do
   VM_NAME="${VM_NAMES[$((i-1))]}"
   smolvm machine exec --name "$VM_NAME" -- bash -lc "
     pkill -x Runner.Listener >/dev/null 2>&1 || true
-    pkill -x aksh-runner >/dev/null 2>&1 || true
+    pkill -x preloop-runner >/dev/null 2>&1 || true
   " >/dev/null 2>&1 &
 done
 wait 2>/dev/null || true
@@ -173,7 +173,7 @@ for i in $(seq 1 "$RUNNER_COUNT"); do
   # Stop remaining processes
   smolvm machine exec --name "$VM_NAME" -- bash -lc "
     pkill -x Runner.Listener >/dev/null 2>&1 || true
-    pkill -x aksh-runner >/dev/null 2>&1 || true
+    pkill -x preloop-runner >/dev/null 2>&1 || true
     if [ -f '$VM_RUNNER_CAPTURE/vm-mitm.pid' ]; then kill -INT \$(cat '$VM_RUNNER_CAPTURE/vm-mitm.pid') >/dev/null 2>&1 || true; fi
     sleep 1
     pkill -x mitmdump >/dev/null 2>&1 || true

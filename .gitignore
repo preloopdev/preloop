@@ -1,6 +1,7 @@
 /target/
 /target-arm/
 /.preloop/
+/.aksh/
 /.runner-watch/repos/
 /.runner-watch/**/*.pid
 /.runner-watch/conformance/
@@ -42,7 +43,7 @@ __pycache__/
 /.runner
 /.credentials
 /.credentials_rsaparams
-/.aksh/
+/\.preloop/
 /.omp/
 /.mcp/
 
@@ -58,8 +59,8 @@ official-runner.tar.gz
 # Large binary artifacts — never track
 bin-linux/
 libs/*.so*
-benchmarks/real-world/aksh-runner
-benchmarks/real-world/aksh-runner-new
+benchmarks/real-world/preloop-runner
+benchmarks/real-world/preloop-runner-new
 benchmarks/real-world/official-runner.tar.gz
 /benchmarks/compatibility/runner/protocol/
 /benchmarks/compatibility/runner/protocol-local/
@@ -98,15 +99,15 @@ rust_out
 /benchmarks/compatibility/conformance/
 benchmarks/real-world/externals
 # Real-world benchmark raw run data (keep reports, drop logs/zips)
-benchmarks/real-world/results/aksh-runs/**/logs/
-benchmarks/real-world/results/aksh-runs/**/logs.zip
+benchmarks/real-world/results/preloop-runs/**/logs/
+benchmarks/real-world/results/preloop-runs/**/logs.zip
 
 # Scratch bench scripts at root
 /bench-cache.* 
 .connectionData
 .commandcode/
 experiments/mitm/golden-fresh/
-benchmarks/real-world/results/aksh-runs/
+benchmarks/real-world/results/preloop-runs/
 benchmarks/compatibility/runner/behavior/*-new.jsonl
 # Scratch runner roots from local pool experiments
 /runners/
@@ -120,7 +121,8 @@ benchmarks/compatibility/runner/behavior/*-new.jsonl
 benchmarks/real-world/goldens/
 benchmarks/real-world/results/conformance-4repos/**/run.json*
 benchmarks/real-world/conformance-4repos/payloads/
-/goal
+/goals
+/plans
 
 # Conformance campaign captures: multi-MB run records and logs, regenerated
 # by the harness and not reviewable in a diff.

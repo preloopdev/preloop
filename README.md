@@ -51,8 +51,8 @@ macOS (Apple Silicon) or Linux, 64-bit, Rust 1.97+, and [smolvm] for the default
 
 ## License
 
-MIT for all crates except the control plane (`aksh-runner-server`), which is
-licensed under FSL-1.1-MIT (`crates/aksh-runner-server/LICENSE`):
+MIT for all crates except the control plane (`preloop-runner-server`), which is
+licensed under FSL-1.1-MIT (`crates/preloop-runner-server/LICENSE`):
 source-available (you may use, modify, and redistribute it for any
 non-competing purpose), converting to MIT on the second anniversary of each release.
 

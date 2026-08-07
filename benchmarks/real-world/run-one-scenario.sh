@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# run-one-scenario.sh — Dispatch one workflow and run a single aksh-runner in a VM for it
+# run-one-scenario.sh — Dispatch one workflow and run a single preloop-runner in a VM for it
 # Usage: ./run-one-scenario.sh <workflow-file> [vm-name]
 set -euo pipefail
 
 WF="${1:?Usage: $0 <workflow-file> [vm-name]}"
 VM="${2:-bench-golden}"
-GH_REPO="preloopdev/aksh-conformance-sample"
+GH_REPO="preloopdev/preloop-conformance-sample"
 RESULTS_DIR="$(cd "$(dirname "$0")/results" && pwd)"
 WORKSPACE="/Users/bnjoroge/macos-runners"
 
@@ -31,27 +31,27 @@ gh api "repos/$GH_REPO/actions/runners" --jq '.runners[] | select(.status == "of
   done
 # ── Kill stale runner processes in VM ───────────────────────────────
 log "Killing stale runners in $VM..."
-smolvm machine exec --name "$VM" -- bash -c 'pkill -f aksh-runner 2>/dev/null; true' 2>/dev/null || true
+smolvm machine exec --name "$VM" -- bash -c 'pkill -f preloop-runner 2>/dev/null; true' 2>/dev/null || true
 sleep 2
 # ── Get registration token ──────────────────────────────────────────
 log "Getting registration token..."
 REG_TOKEN=$(gh api "repos/$GH_REPO/actions/runners/registration-token" --method POST --jq .token)
 log "Token: ${REG_TOKEN:0:10}..."
 
-# ── Configure and run aksh-runner in VM ─────────────────────────────
+# ── Configure and run preloop-runner in VM ─────────────────────────────
 JOB=$(date +%s)
-RUNNER_NAME="aksh-${WFBASE}-${JOB}"
-RUNNER_ROOT="/tmp/aksh-${JOB}"
+RUNNER_NAME="preloop-${WFBASE}-${JOB}"
+RUNNER_ROOT="/tmp/preloop-${JOB}"
 
 log "Starting runner: $RUNNER_NAME in $VM..."
 smolvm machine exec --name "$VM" -- bash -c "
 set -euo pipefail
-export AKSH_RUNNER=/workspace/target/aarch64-unknown-linux-musl/release/preloop-runner
+export PRELOOP_RUNNER=/workspace/target/aarch64-unknown-linux-musl/release/preloop-runner
 
 # Configure
 rm -rf '$RUNNER_ROOT'
 mkdir -p '$RUNNER_ROOT'
-\$AKSH_RUNNER --runner-root '$RUNNER_ROOT' configure \
+\$PRELOOP_RUNNER --runner-root '$RUNNER_ROOT' configure \
   --url 'https://github.com/$GH_REPO' \
   --token '$REG_TOKEN' \
   --name '$RUNNER_NAME' \
@@ -59,7 +59,7 @@ mkdir -p '$RUNNER_ROOT'
   --labels 'self-hosted,linux,x64,mitm' 2>&1 | tail -3
 
 # Run once
-RUST_LOG=info \$AKSH_RUNNER --runner-root '$RUNNER_ROOT' run --once 2>&1
+RUST_LOG=info \$PRELOOP_RUNNER --runner-root '$RUNNER_ROOT' run --once 2>&1
 echo 'RUNNER_EXIT='\$?
 " > "/tmp/runner-${WFBASE}.log" 2>&1 &
 RUNNER_PID=$!
@@ -103,8 +103,8 @@ RESULT=$(gh run view "$RUN_ID" -R "$GH_REPO" --json conclusion,jobs --jq '{
 
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ")
 
-echo "{\"runner\":\"aksh\",\"workflow\":\"$WF\",\"run_id\":\"$RUN_ID\",\"conclusion\":\"$CONCLUSION\",\"result\":$RESULT,\"timestamp\":\"$TIMESTAMP\"}" \
-  >> "$RESULTS_DIR/conformance/conformance-aksh.jsonl"
+echo "{\"runner\":\"preloop\",\"workflow\":\"$WF\",\"run_id\":\"$RUN_ID\",\"conclusion\":\"$CONCLUSION\",\"result\":$RESULT,\"timestamp\":\"$TIMESTAMP\"}" \
+  >> "$RESULTS_DIR/conformance/conformance-preloop.jsonl"
 
 log "Done: $WF => $CONCLUSION"
 

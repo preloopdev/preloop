@@ -1,5 +1,5 @@
 name: Feature request
-description: Something aksh should do that it doesn't yet
+description: Something preloop should do that it doesn't yet
 labels: [enhancement]
 body:
   - type: textarea

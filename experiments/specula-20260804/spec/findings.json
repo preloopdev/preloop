@@ -53,7 +53,7 @@
       "invariant": "FormatEscapeClosed",
       "config": "MC_hunt_s6_masking_tokenizer.safety.cfg",
       "counterexample": "spec/counterexamples/MC-S6-format-brace-escape.txt",
-      "summary": "The aksh-gha-protocol copy of the template-string builder (azdo/job.rs template_string_token) escapes only single quotes; the parser copy (job_builder.rs append_format_literal) also escapes { and }. The official runner's format() throws FormatException on unescaped braces, so any env/input mixing a literal brace with a ${{ }} expression breaks on dispatch through the protocol (AzDO/broker) serialization path.",
+      "summary": "The preloop-gha-protocol copy of the template-string builder (azdo/job.rs template_string_token) escapes only single quotes; the parser copy (job_builder.rs append_format_literal) also escapes { and }. The official runner's format() throws FormatException on unescaped braces, so any env/input mixing a literal brace with a ${{ }} expression breaks on dispatch through the protocol (AzDO/broker) serialization path.",
       "evidence": [
         "protocol copy: azdo/job.rs:588-615 template_string_token escapes only `'` (literal.replace('\\'', \"''\"))",
         "parser copy: job_builder.rs:126-135 append_format_literal escapes `'` -> `''`, `{` -> `{{`, `}` -> `}}`",

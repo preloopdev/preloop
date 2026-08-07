@@ -1,0 +1,2280 @@
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
+
+use super::*;
+use crate::expand::coerce_value;
+use crate::trigger::glob_match;
+use preloop_gha_protocol::JobId;
+
+#[test]
+fn glob_match_handles_multiple_wildcards() {
+    assert!(glob_match("feature/*/*", "feature/auth/login"));
+    assert!(glob_match("release-*-rc*", "release-2026-rc1"));
+    assert!(!glob_match("feature/*", "feature/auth/login"));
+    assert!(glob_match("src/**", "src/bin/main.rs"));
+}
+
+#[test]
+fn parses_workflow_run_name() {
+    let workflow = parse_workflow(
+        r#"
+name: deploy
+run-name: Deploy production
+on: push
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo deploy
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(workflow.run_name.as_deref(), Some("Deploy production"));
+}
+
+#[test]
+fn workflow_run_name_defaults_to_none() {
+    let workflow = parse_workflow(
+        r#"
+name: ci
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(workflow.run_name, None);
+}
+
+#[test]
+fn preserves_run_name_expression_source() {
+    let workflow = parse_workflow(
+        r#"
+run-name: "Deploy ${{ github.ref }}"
+on: push
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo deploy
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        workflow.run_name.as_deref(),
+        Some("Deploy ${{ github.ref }}")
+    );
+}
+
+#[test]
+fn trigger_context_matches_activity_types() {
+    let workflow = parse_workflow(
+        r#"
+on:
+  pull_request:
+    types: [opened, synchronize]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#,
+    )
+    .unwrap();
+
+    assert!(workflow
+        .on
+        .matches_with_context("pull_request", None, None, &[], Some("opened"), &[]));
+    assert!(!workflow.on.matches_with_context(
+        "pull_request",
+        None,
+        None,
+        &[],
+        Some("closed"),
+        &[]
+    ));
+}
+
+#[test]
+fn push_branches_and_tags_are_or_filter_axes() {
+    // Real-world shape (sharkdp/bat CICD): a branch push must match even
+    // though the `tags` axis is present and inapplicable.
+    let workflow = parse_workflow(
+        r#"
+on:
+  push:
+    branches: [master]
+    tags: ['*']
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#,
+    )
+    .unwrap();
+
+    // Branch push to master: branch axis matches, tag axis inapplicable.
+    assert!(workflow
+        .on
+        .matches_with_context("push", Some("master"), None, &[], None, &[]));
+    // Tag push v1.2: tag axis matches, branch axis inapplicable.
+    assert!(workflow
+        .on
+        .matches_with_context("push", None, Some("v1.2"), &[], None, &[]));
+    // Branch push to a non-matching branch: neither axis matches.
+    assert!(!workflow
+        .on
+        .matches_with_context("push", Some("dev"), None, &[], None, &[]));
+}
+
+#[test]
+fn push_with_only_branches_skips_tag_pushes() {
+    let workflow = parse_workflow(
+        r#"
+on:
+  push:
+    branches: [master]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#,
+    )
+    .unwrap();
+
+    assert!(workflow
+        .on
+        .matches_with_context("push", Some("master"), None, &[], None, &[]));
+    // Tag pushes do not match a branches-only workflow.
+    assert!(!workflow
+        .on
+        .matches_with_context("push", None, Some("v1.2"), &[], None, &[]));
+}
+
+#[test]
+fn parses_and_expands_opencode_test_workflow_fixture() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let fixture_path = root
+        .join("fixtures")
+        .join("workflows")
+        .join("opencode-test.yml");
+    let yaml = std::fs::read_to_string(&fixture_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", fixture_path.display()));
+    let parsed = parse_workflow(&yaml).expect("parse_workflow failed for opencode-test.yml");
+    let expanded = expand_jobs(&parsed).expect("expand_jobs failed for opencode-test.yml");
+    assert_eq!(expanded.len(), 4);
+}
+#[test]
+fn schedule_trigger_matches_event_name() {
+    let workflow = parse_workflow(
+        r#"
+on:
+  schedule:
+    - cron: '0 0 * * *'
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#,
+    )
+    .unwrap();
+
+    assert!(workflow.on.matches("schedule"));
+    assert!(!workflow.on.matches("push"));
+}
+
+#[test]
+fn unknown_trigger_event_is_rejected() {
+    // GitHub rejects `on: extremely-invalid` at workflow save; aksh must not
+    // silently accept a trigger that can never fire.
+    let err = parse_workflow(
+        r#"
+on:
+  extremely-invalid:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("extremely-invalid"),
+        "unexpected error: {err}"
+    );
+
+    // Single and list forms are validated too.
+    assert!(parse_workflow(
+        "on: not-an-event\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo\n",
+    )
+    .is_err());
+
+    // Known events still parse.
+    parse_workflow(
+        r#"
+on: [push, pull_request, workflow_dispatch, merge_group]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn parses_and_expands_matrix() {
+    let workflow = parse_workflow(
+        r#"
+name: ci
+on: [push]
+env:
+  GLOBAL: true
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: [20, 22]
+        exclude:
+          - os: macos-latest
+            node: 20
+        include:
+          - os: ubuntu-latest
+            node: 24
+            experimental: true
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+
+    assert!(workflow.on.matches("push"));
+    let jobs = expand_jobs(&workflow).unwrap();
+    assert_eq!(jobs.len(), 4);
+    assert!(jobs.iter().any(|job| {
+        job.matrix.get("node") == Some(&json!(24))
+            && job.matrix.get("experimental") == Some(&json!(true))
+    }));
+    assert_eq!(jobs[0].env.get("GLOBAL"), Some(&"true".to_owned()));
+}
+/// Run-record parity for the real uv CI workflow (astral-sh/uv, ci.yml,
+/// pull_request, golden run 30680325919: GitHub shows 33 jobs — 16 success +
+/// 17 skipped).
+///
+/// Deferred materialization keeps the plan at the caller level: 22 expanded
+/// nodes (20 callers + required-checks-passed + the schema guard job). For a
+/// docs-only PR, the six gated-on checks callers + the three ungated callers
+/// materialize exactly the callee jobs GitHub lists; the thirteen false-gated
+/// callers each stay one skipped entry. (Current uv main dropped the
+/// `test-publish` caller the golden's ci.yml still had; the golden's 17th
+/// skip entry and this test's 22nd node are the same shape story.)
+#[test]
+fn uv_ci_run_record_matches_github_shape() {
+    let root = match std::env::var("UV_CONFORMANCE_WORKSPACE") {
+        Ok(root) => std::path::PathBuf::from(root),
+        Err(_) => {
+            let default = std::path::PathBuf::from("/tmp/conformance-workspaces/uv");
+            if !default.join(".github/workflows/ci.yml").exists() {
+                eprintln!("uv conformance workspace not present; skipping");
+                return;
+            }
+            default
+        }
+    };
+    let workflow_dir = root.join(".github/workflows");
+    let read = |name: &str| std::fs::read_to_string(workflow_dir.join(name)).unwrap();
+    let caller_yaml = read("ci.yml");
+    let workflow = parse_workflow(&caller_yaml).unwrap();
+    let mut reusables = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(&workflow_dir).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_str().unwrap().to_owned();
+        let yaml = std::fs::read_to_string(&path).unwrap();
+        // Both lookup keys the normalizer may produce.
+        reusables.insert(format!(".github/workflows/{name}"), yaml);
+    }
+
+    let expanded = expand_jobs_with_reusables(&workflow, &reusables).unwrap();
+    assert_eq!(
+        expanded.jobs.len(),
+        22,
+        "plan-level record holds callers, not expanded callee trees"
+    );
+    let callers: Vec<_> = expanded
+        .jobs
+        .iter()
+        .filter(|job| job.reusable_call.is_some())
+        .collect();
+    assert_eq!(callers.len(), 20);
+
+    // Docs-PR gate outcomes from the golden: six callers pass on
+    // `run-checks == 'true'`; three callers are ungated. Everything else
+    // stays a single skipped entry.
+    const PASSING: [&str; 7] = [
+        "check-fmt",
+        "check-lint",
+        "check-docs",
+        "check-release",
+        "check-zizmor",
+        "check-lock",
+        "plan",
+    ];
+    let mut visible = 0usize;
+    let mut per_caller: BTreeMap<&str, usize> = BTreeMap::new();
+    for job in &expanded.jobs {
+        let Some(call) = &job.reusable_call else {
+            visible += 1; // regular job, counted as itself
+            continue;
+        };
+        if !PASSING.contains(&job.base_id.as_str()) {
+            per_caller.insert(&job.base_id, 1);
+            visible += 1; // one skipped entry for the false-gated caller
+            continue;
+        }
+        let called = parse_workflow(&reusables[&call.workflow_file]).unwrap();
+        let subtree = expand_reusable_call(&called, job, &reusables, &BTreeMap::new()).unwrap();
+        assert!(
+            subtree
+                .jobs
+                .iter()
+                .all(|inner| inner.name.starts_with(&format!("{} / ", job.name))),
+            "callee display names are `caller / inner`: {:?}",
+            subtree.jobs.iter().map(|j| &j.name).collect::<Vec<_>>()
+        );
+        per_caller.insert(&job.base_id, subtree.jobs.len());
+        visible += subtree.jobs.len();
+    }
+    assert_eq!(
+        per_caller
+            .iter()
+            .map(|(caller, count)| format!("{caller}:{count}"))
+            .collect::<Vec<_>>(),
+        vec![
+            "bench:1",
+            "build-dev-binaries:1",
+            "build-docker:1",
+            "build-release-binaries:1",
+            "check-docs:1",
+            "check-fmt:3",
+            "check-generated-files:1",
+            "check-lint:10",
+            "check-lock:1",
+            "check-publish:1",
+            "check-release:1",
+            "check-zizmor:1",
+            "plan:1",
+            "review:1",
+            "test:1",
+            "test-ecosystem:1",
+            "test-integration:1",
+            "test-smoke:1",
+            "test-system:1",
+            "test-windows-trampolines:1",
+        ],
+        "each false-gated caller is one entry; passing callers materialize \
+         exactly the callee jobs of golden run 30680325919"
+    );
+    assert_eq!(visible, 33, "GitHub golden run 30680325919 lists 33 jobs");
+}
+
+#[test]
+fn parses_and_expands_deferred_dynamic_matrix() {
+    let yaml = r#"
+name: dynamic
+on: push
+jobs:
+  generator:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo gen
+  downstream:
+    needs: generator
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.generator.outputs.matrix) }}
+    steps:
+      - run: echo dynamic
+"#;
+    let workflow = parse_workflow(yaml).unwrap();
+    let jobs = expand_jobs(&workflow).unwrap();
+    assert_eq!(jobs.len(), 2);
+
+    let downstream_plan = jobs.iter().find(|j| j.base_id == "downstream").unwrap();
+    assert_eq!(
+        downstream_plan.deferred_matrix.as_deref(),
+        Some("${{ fromJson(needs.generator.outputs.matrix) }}")
+    );
+
+    // GitHub keeps one un-suffixed node until the runtime fan-out replaces it
+    // with the real combinations, so the deferred expression must not leak
+    // into the node's identity the way a matrix value would.
+    assert_eq!(downstream_plan.id.0, "downstream");
+    assert_eq!(downstream_plan.name, "downstream");
+    assert!(
+        downstream_plan.matrix.is_empty(),
+        "a deferred node carries no matrix values: {:?}",
+        downstream_plan.matrix
+    );
+    assert!(
+        downstream_plan.matrix_index.is_none(),
+        "a single deferred node is not one cell of a fan-out"
+    );
+
+    // Dynamic runtime expansion test
+    let mut needs_outputs = BTreeMap::new();
+    let mut gen_outputs = BTreeMap::new();
+    gen_outputs.insert(
+        "matrix".to_string(),
+        json!("{\"include\": [{\"os\": \"ubuntu-latest\"}, {\"os\": \"macos-latest\"}]}"),
+    );
+    needs_outputs.insert("generator".to_string(), gen_outputs);
+
+    let dynamic_plans = expand_deferred_matrix_job(
+        &workflow,
+        "downstream",
+        downstream_plan.deferred_matrix.as_ref().unwrap(),
+        &needs_outputs,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(dynamic_plans.len(), 2);
+    assert_eq!(dynamic_plans[0].id.0, "downstream (ubuntu-latest)");
+    assert_eq!(dynamic_plans[1].id.0, "downstream (macos-latest)");
+}
+#[test]
+fn evaluates_job_continue_on_error_for_each_matrix_cell() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.expected == 'failure' }}
+    strategy:
+      matrix:
+        expected: [success, failure]
+    steps:
+      - run: echo test
+"#,
+    )
+    .unwrap();
+
+    let jobs = expand_jobs(&workflow).unwrap();
+    assert_eq!(jobs.len(), 2);
+    for job in jobs {
+        let expected = job.matrix.get("expected").and_then(Value::as_str).unwrap();
+        assert_eq!(job.continue_on_error, expected == "failure");
+    }
+}
+
+#[test]
+fn parses_object_runs_on_group_and_labels() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+jobs:
+  deploy:
+    runs-on:
+      group: release-runners
+      labels: [self-hosted, linux]
+    steps:
+      - run: echo deploy
+"#,
+    )
+    .unwrap();
+    let jobs = expand_jobs(&workflow).unwrap();
+    assert_eq!(jobs[0].runner_group.as_deref(), Some("release-runners"));
+    assert_eq!(jobs[0].runs_on, vec!["self-hosted", "linux"]);
+}
+
+/// `runs-on: ${{ matrix.os }}` is the most common shape in real workflows
+/// (tokio, caddy, uv). An unresolved label is one no runner can advertise, so
+/// the cell queues forever and the cause looks like a scheduling bug.
+#[test]
+fn matrix_runs_on_resolves_per_combination() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+jobs:
+  cell:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+    let jobs = expand_jobs(&workflow).unwrap();
+
+    let labels: Vec<Vec<String>> = jobs.iter().map(|job| job.runs_on.clone()).collect();
+    assert_eq!(
+        labels,
+        vec![
+            vec!["ubuntu-latest".to_owned()],
+            vec!["ubuntu-22.04".to_owned()]
+        ]
+    );
+}
+
+/// The list form carries expressions too, and a literal label beside an
+/// expression must survive untouched.
+#[test]
+fn matrix_runs_on_resolves_inside_a_label_list() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+jobs:
+  cell:
+    strategy:
+      matrix:
+        include:
+          - arch: X64
+    runs-on: [self-hosted, "${{ matrix.arch }}"]
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+    let jobs = expand_jobs(&workflow).unwrap();
+
+    assert_eq!(jobs[0].runs_on, vec!["self-hosted", "X64"]);
+}
+
+#[test]
+fn parses_local_action_metadata() {
+    let action = parse_action_metadata(
+        r#"
+name: local composite
+description: test action
+inputs:
+  who:
+    required: true
+    default: world
+runs:
+  using: composite
+  steps:
+    - run: echo "hello ${{ inputs.who }}"
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(action.name, "local composite");
+    assert!(matches!(action.runs, ActionRuns::Composite { .. }));
+    assert!(action.inputs.get("who").is_some_and(|input| input.required));
+}
+
+#[test]
+fn expands_local_reusable_workflow_call_jobs() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/reusable.yml
+"#,
+    )
+    .unwrap();
+    let mut reusable = BTreeMap::new();
+    reusable.insert(
+        ".github/workflows/reusable.yml".to_owned(),
+        r#"
+on:
+  workflow_call:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo reusable
+"#
+        .to_owned(),
+    );
+
+    let jobs = expand_jobs_with_reusables(&caller, &reusable).unwrap().jobs;
+
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].id.0, "call");
+    assert!(
+        jobs[0].runs_on.is_empty(),
+        "caller placeholder nodes are never dispatched"
+    );
+    assert!(jobs[0].steps.is_empty());
+    let call = jobs[0].reusable_call.as_ref().expect("caller node");
+    assert_eq!(call.workflow_file, ".github/workflows/reusable.yml");
+
+    // Gate-pass materialization produces the callee subtree.
+    let called = parse_workflow(&reusable[".github/workflows/reusable.yml"]).unwrap();
+    let inner = crate::expand_reusable_call(&called, &jobs[0], &reusable, &BTreeMap::new())
+        .unwrap()
+        .jobs;
+    assert_eq!(inner.len(), 1);
+    assert_eq!(inner[0].id.0, "call/test");
+    assert_eq!(inner[0].runs_on, vec!["ubuntu-latest"]);
+    assert_eq!(inner[0].name, "call / test");
+}
+
+/// The caller's `if:` gates the whole invocation on GitHub: the callee subtree
+/// is materialized only at runtime once the gate passes. The caller node keeps
+/// the condition verbatim, the runtime expansion conjunctions it onto every
+/// inner job, and the call metadata preserves it for scheduling.
+#[test]
+fn reusable_call_carries_caller_if_onto_inner_jobs() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo plan
+  gated:
+    needs: plan
+    if: ${{ needs.plan.outputs.flag == 'true' }}
+    uses: ./.github/workflows/reusable.yml
+"#,
+    )
+    .unwrap();
+    let mut reusable = BTreeMap::new();
+    reusable.insert(
+        ".github/workflows/reusable.yml".to_owned(),
+        r#"
+on:
+  workflow_call:
+jobs:
+  plain:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo plain
+  conditional:
+    if: ${{ inputs.go == 'yes' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo conditional
+"#
+        .to_owned(),
+    );
+
+    let expanded = expand_jobs_with_reusables(&caller, &reusable).unwrap();
+    let jobs = expanded.jobs;
+
+    // Parse time: exactly the plan job and one caller node — no callee jobs.
+    assert_eq!(jobs.len(), 2);
+    let gated_node = jobs.iter().find(|job| job.id.0 == "gated").unwrap();
+    assert_eq!(
+        gated_node.if_condition.as_deref(),
+        Some("${{ needs.plan.outputs.flag == 'true' }}"),
+        "caller node must carry the `if:` verbatim for runtime gate evaluation"
+    );
+    assert!(jobs.iter().all(|job| !job.id.0.starts_with("gated/")));
+
+    // Runtime expansion (gate passed): inner jobs carry the merged condition.
+    let called = parse_workflow(&reusable[".github/workflows/reusable.yml"]).unwrap();
+    let jobs = crate::expand_reusable_call(&called, gated_node, &reusable, &BTreeMap::new())
+        .unwrap()
+        .jobs;
+
+    let plain = jobs.iter().find(|job| job.id.0 == "gated/plain").unwrap();
+    assert_eq!(
+        plain.if_condition.as_deref(),
+        Some("${{ needs.plan.outputs.flag == 'true' }}"),
+        "caller `if:` must be copied verbatim onto an inner job without its own condition"
+    );
+
+    let conditional = jobs
+        .iter()
+        .find(|job| job.id.0 == "gated/conditional")
+        .unwrap();
+    assert_eq!(
+        conditional.if_condition.as_deref(),
+        Some("(needs.plan.outputs.flag == 'true') && (inputs.go == 'yes')"),
+        "inner and caller conditions must be conjoined"
+    );
+
+    let call = expanded.reusable_calls.get("gated").unwrap();
+    assert_eq!(
+        call.if_condition.as_deref(),
+        Some("${{ needs.plan.outputs.flag == 'true' }}"),
+        "call metadata must preserve the caller `if:`"
+    );
+}
+
+#[test]
+fn records_oidc_permission_and_matrix_environment() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+permissions:
+  id-token: write
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ matrix.environment }}
+    strategy:
+      matrix:
+        environment: [staging, production]
+    steps:
+      - run: echo deploy
+"#,
+    )
+    .unwrap();
+
+    let jobs = expand_jobs(&workflow).unwrap();
+    assert_eq!(jobs.len(), 2);
+    assert!(jobs.iter().all(|job| job.oidc_id_token_granted));
+    assert_eq!(jobs[0].oidc_environment.as_deref(), Some("staging"));
+    assert_eq!(jobs[1].oidc_environment.as_deref(), Some("production"));
+}
+
+#[test]
+fn undeclared_permissions_resolve_to_the_restricted_default() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+"#,
+    )
+    .unwrap();
+
+    let jobs = expand_jobs(&workflow).unwrap();
+    assert_eq!(
+        jobs[0].permissions, None,
+        "nothing declared must stay distinguishable from an empty declaration"
+    );
+    assert_eq!(
+        *effective_token_permissions(jobs[0].permissions.as_ref()),
+        BTreeMap::from([
+            ("contents".to_owned(), "read".to_owned()),
+            ("metadata".to_owned(), "read".to_owned()),
+            ("packages".to_owned(), "read".to_owned()),
+        ]),
+        "an undeclared block is the restricted default, not everything"
+    );
+    assert!(
+        DEFAULT_TOKEN_PERMISSIONS
+            .iter()
+            .all(|&(_, level)| level == "read"),
+        "the default policy must never hand out a write scope"
+    );
+}
+
+#[test]
+fn empty_permissions_block_is_not_widened_to_the_default() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+permissions: {}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+"#,
+    )
+    .unwrap();
+
+    let jobs = expand_jobs(&workflow).unwrap();
+    assert_eq!(jobs[0].permissions, Some(BTreeMap::new()));
+    assert!(
+        effective_token_permissions(jobs[0].permissions.as_ref()).is_empty(),
+        "`permissions: {{}}` withholds every scope and must not gain the default back"
+    );
+}
+
+#[test]
+fn job_permissions_replace_workflow_permissions_entirely() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+permissions: write-all
+jobs:
+  narrow:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: none
+    steps:
+      - run: echo narrow
+  inherited:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo inherited
+"#,
+    )
+    .unwrap();
+
+    let jobs = expand_jobs(&workflow).unwrap();
+    let by_id = |id: &str| {
+        jobs.iter()
+            .find(|job| job.id.0 == id)
+            .and_then(|job| job.permissions.clone())
+            .unwrap()
+    };
+
+    assert_eq!(
+        by_id("narrow"),
+        BTreeMap::from([
+            ("contents".to_owned(), "read".to_owned()),
+            ("packages".to_owned(), "none".to_owned()),
+        ]),
+        "a job block replaces the workflow block instead of merging into it"
+    );
+
+    let inherited = by_id("inherited");
+    assert_eq!(inherited.len(), PERMISSION_SCOPES.len());
+    assert!(
+        PERMISSION_SCOPES
+            .iter()
+            .all(|scope| inherited.get(*scope).map(String::as_str) == Some("write")),
+        "`write-all` expands to every known scope: {inherited:?}"
+    );
+}
+
+#[test]
+fn reusable_oidc_permission_requires_caller_grant() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/reusable.yml
+"#,
+    )
+    .unwrap();
+    let mut reusable = BTreeMap::new();
+    reusable.insert(
+        ".github/workflows/reusable.yml".to_owned(),
+        r#"
+on:
+  workflow_call:
+permissions:
+  id-token: write
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - run: echo deploy
+"#
+        .to_owned(),
+    );
+
+    let caller_node = expand_jobs_with_reusables(&caller, &reusable).unwrap().jobs;
+    assert_eq!(caller_node.len(), 1);
+    assert!(
+        !caller_node[0].oidc_id_token_granted,
+        "caller node carries its own (denied) grant"
+    );
+
+    let called = parse_workflow(&reusable[".github/workflows/reusable.yml"]).unwrap();
+    let jobs = crate::expand_reusable_call(&called, &caller_node[0], &reusable, &BTreeMap::new())
+        .unwrap()
+        .jobs;
+    assert_eq!(jobs.len(), 1);
+    assert!(!jobs[0].oidc_id_token_granted);
+    assert_eq!(jobs[0].oidc_environment.as_deref(), Some("production"));
+    assert_eq!(
+        jobs[0].oidc_job_workflow_ref.as_deref(),
+        Some("./.github/workflows/reusable.yml")
+    );
+}
+
+#[test]
+fn reusable_permissions_cannot_exceed_caller_permissions() {
+    let caller = parse_workflow(
+        r#"
+on: push
+permissions:
+  contents: read
+jobs:
+  call:
+    uses: ./.github/workflows/reusable.yml
+"#,
+    )
+    .unwrap();
+    let reusable = BTreeMap::from([(
+        ".github/workflows/reusable.yml".to_owned(),
+        r#"
+on: workflow_call
+permissions:
+  contents: write
+  issues: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+"#
+        .to_owned(),
+    )]);
+
+    let caller_node = expand_jobs_with_reusables(&caller, &reusable).unwrap().jobs;
+    let called = parse_workflow(&reusable[".github/workflows/reusable.yml"]).unwrap();
+    let jobs = crate::expand_reusable_call(&called, &caller_node[0], &reusable, &BTreeMap::new())
+        .unwrap()
+        .jobs;
+
+    assert_eq!(
+        jobs[0].permissions,
+        Some(BTreeMap::from([("contents".to_owned(), "read".to_owned())]))
+    );
+}
+
+#[test]
+fn reusable_workflow_secrets_inherit_flag() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/reusable.yml
+    secrets: inherit
+"#,
+    )
+    .unwrap();
+    let mut reusable = BTreeMap::new();
+    reusable.insert(
+        ".github/workflows/reusable.yml".to_owned(),
+        r#"
+on:
+  workflow_call:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo reusable
+"#
+        .to_owned(),
+    );
+
+    let jobs = expand_jobs_with_reusables(&caller, &reusable).unwrap().jobs;
+    assert_eq!(jobs.len(), 1);
+    assert!(jobs[0].secrets_inherit);
+}
+#[test]
+fn reusable_workflow_input_validation_and_coercion() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/reusable.yml
+    with:
+      name: "Alice"
+      enable: "true"
+      count: "42"
+"#,
+    )
+    .unwrap();
+
+    let mut reusable = BTreeMap::new();
+    reusable.insert(
+        ".github/workflows/reusable.yml".to_owned(),
+        r#"
+on:
+  workflow_call:
+    inputs:
+      name:
+        type: string
+        required: true
+      enable:
+        type: boolean
+        required: false
+      count:
+        type: number
+        required: false
+        default: 100
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo reusable
+"#
+        .to_owned(),
+    );
+
+    let expanded = expand_jobs_with_reusables(&caller, &reusable).unwrap();
+    let jobs = expanded.jobs;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(
+        jobs[0].inputs.get("name"),
+        Some(&Value::String("Alice".to_string()))
+    );
+    assert_eq!(jobs[0].inputs.get("enable"), Some(&Value::Bool(true)));
+    assert_eq!(jobs[0].inputs.get("count"), Some(&Value::Number(42.into())));
+}
+
+#[test]
+fn reusable_workflow_missing_required_input() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/reusable.yml
+"#,
+    )
+    .unwrap();
+
+    let mut reusable = BTreeMap::new();
+    reusable.insert(
+        ".github/workflows/reusable.yml".to_owned(),
+        r#"
+on:
+  workflow_call:
+    inputs:
+      name:
+        type: string
+        required: true
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo reusable
+"#
+        .to_owned(),
+    );
+
+    let res = expand_jobs_with_reusables(&caller, &reusable);
+    assert!(res.is_err());
+    assert!(matches!(
+        res.unwrap_err(),
+        ParserError::MissingRequiredInput { .. }
+    ));
+}
+
+#[test]
+fn reusable_workflow_undeclared_input() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/reusable.yml
+    with:
+      age: 25
+"#,
+    )
+    .unwrap();
+
+    let mut reusable = BTreeMap::new();
+    reusable.insert(
+        ".github/workflows/reusable.yml".to_owned(),
+        r#"
+on:
+  workflow_call:
+    inputs:
+      name:
+        type: string
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo reusable
+"#
+        .to_owned(),
+    );
+
+    let res = expand_jobs_with_reusables(&caller, &reusable);
+    assert!(res.is_err());
+    assert!(matches!(
+        res.unwrap_err(),
+        ParserError::UndeclaredInput { .. }
+    ));
+}
+
+#[test]
+fn reusable_workflow_max_depth_exceeded() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  call1:
+    uses: ./.github/workflows/level1.yml
+"#,
+    )
+    .unwrap();
+
+    let mut reusable = BTreeMap::new();
+    reusable.insert(
+        ".github/workflows/level1.yml".to_owned(),
+        "on: { workflow_call: {} }\njobs:\n  call2:\n    uses: ./.github/workflows/level2.yml"
+            .to_owned(),
+    );
+    reusable.insert(
+        ".github/workflows/level2.yml".to_owned(),
+        "on: { workflow_call: {} }\njobs:\n  call3:\n    uses: ./.github/workflows/level3.yml"
+            .to_owned(),
+    );
+    reusable.insert(
+        ".github/workflows/level3.yml".to_owned(),
+        "on: { workflow_call: {} }\njobs:\n  call4:\n    uses: ./.github/workflows/level4.yml"
+            .to_owned(),
+    );
+    reusable.insert(
+        ".github/workflows/level4.yml".to_owned(),
+        "on: { workflow_call: {} }\njobs:\n  call5:\n    uses: ./.github/workflows/level5.yml"
+            .to_owned(),
+    );
+    reusable.insert(
+            ".github/workflows/level5.yml".to_owned(),
+            "on: { workflow_call: {} }\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo leaf".to_owned(),
+        );
+
+    // Deferred materialization: the root expansion emits a single caller node.
+    // Depth is enforced when each nested caller's subtree is expanded at
+    // runtime — the fifth nested call exceeds the limit of four.
+    let root = expand_jobs_with_reusables(&caller, &reusable).unwrap();
+    assert_eq!(root.jobs.len(), 1);
+    let mut node = root.jobs[0].clone();
+
+    for level in 1..=3 {
+        let called =
+            parse_workflow(&reusable[&format!(".github/workflows/level{level}.yml")]).unwrap();
+        let expanded =
+            crate::expand_reusable_call(&called, &node, &reusable, &BTreeMap::new()).unwrap();
+        node = expanded.jobs[0].clone();
+        assert!(node.reusable_call.is_some());
+    }
+
+    let level4 = parse_workflow(&reusable[".github/workflows/level4.yml"]).unwrap();
+    let res = crate::expand_reusable_call(&level4, &node, &reusable, &BTreeMap::new());
+    assert!(matches!(
+        res.unwrap_err(),
+        ParserError::MaxNestingDepthExceeded
+    ));
+}
+
+#[test]
+fn reusable_workflow_outer_needs_propagated() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+  call:
+    needs: build
+    uses: ./.github/workflows/reusable.yml
+"#,
+    )
+    .unwrap();
+
+    let mut reusable = BTreeMap::new();
+    reusable.insert(
+        ".github/workflows/reusable.yml".to_owned(),
+        r#"
+on:
+  workflow_call:
+jobs:
+  test1:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test1
+  test2:
+    needs: test1
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test2
+"#
+        .to_owned(),
+    );
+
+    let expanded = expand_jobs_with_reusables(&caller, &reusable).unwrap();
+    assert_eq!(expanded.jobs.len(), 2);
+    let caller_node = expanded.jobs.iter().find(|j| j.id.0 == "call").unwrap();
+    assert!(caller_node.needs.contains(&JobId("build".to_string())));
+
+    let called = parse_workflow(&reusable[".github/workflows/reusable.yml"]).unwrap();
+    let jobs = crate::expand_reusable_call(&called, caller_node, &reusable, &BTreeMap::new())
+        .unwrap()
+        .jobs;
+    assert_eq!(jobs.len(), 2);
+    let test1 = jobs.iter().find(|j| j.id.0 == "call/test1").unwrap();
+    let test2 = jobs.iter().find(|j| j.id.0 == "call/test2").unwrap();
+
+    assert!(test1.needs.contains(&JobId("build".to_string())));
+    assert!(test2.needs.contains(&JobId("call/test1".to_string())));
+    assert!(test2.needs.contains(&JobId("build".to_string())));
+}
+
+mod coerce_value_properties {
+    use super::coerce_value;
+    use crate::InputType;
+    use proptest::prelude::*;
+    use serde_json::Value;
+
+    /// Values that should be accepted for boolean coercion.
+    fn arb_valid_bool_value() -> impl Strategy<Value = Value> {
+        prop_oneof![
+            any::<bool>().prop_map(Value::Bool),
+            Just(Value::String("true".into())),
+            Just(Value::String("false".into())),
+            Just(Value::String("TRUE".into())),
+            Just(Value::String("False".into())),
+            Just(Value::String("${{ inputs.x }}".into())),
+        ]
+    }
+
+    /// Values that should be accepted for number coercion.
+    fn arb_valid_num_value() -> impl Strategy<Value = Value> {
+        prop_oneof![
+            (-1000i64..1000i64).prop_map(|n| Value::Number(n.into())),
+            Just(Value::String("42".into())),
+            Just(Value::String("-7".into())),
+            Just(Value::String("3.14".into())),
+            Just(Value::String("${{ inputs.x }}".into())),
+        ]
+    }
+
+    proptest! {
+        /// Idempotence: coercing an already-valid value twice = coercing once.
+        #[test]
+        fn coercion_idempotent_bool(val in arb_valid_bool_value()) {
+            let once = coerce_value(&val, InputType::Boolean, "test").unwrap();
+            let twice = coerce_value(&once, InputType::Boolean, "test").unwrap();
+            prop_assert_eq!(once, twice);
+        }
+
+        #[test]
+        fn coercion_idempotent_number(val in arb_valid_num_value()) {
+            let once = coerce_value(&val, InputType::Number, "test").unwrap();
+            let twice = coerce_value(&once, InputType::Number, "test").unwrap();
+            prop_assert_eq!(once, twice);
+        }
+
+        /// Never panics — any value + any type produces a Result (Ok or Err), never a panic.
+        #[test]
+        fn coercion_never_panics(val in prop_oneof![
+            Just(Value::Null),
+            any::<bool>().prop_map(Value::Bool),
+            (-1000i64..1000i64).prop_map(|n| Value::Number(n.into())),
+            r#"[a-zA-Z0-9_ -]{0,30}"#.prop_map(Value::String),
+        ]) {
+            let _ = coerce_value(&val, InputType::Boolean, "test");
+            let _ = coerce_value(&val, InputType::Number, "test");
+            let _ = coerce_value(&val, InputType::String, "test");
+        }
+
+        /// Boolean coercion of valid values produces only Bool (or expression passthrough).
+        #[test]
+        fn boolean_coercion_always_bool(val in arb_valid_bool_value()) {
+            let result = coerce_value(&val, InputType::Boolean, "test").unwrap();
+            // Expression passthrough stays as string
+            if !val.as_str().is_some_and(|s| s.starts_with("${{")) {
+                prop_assert!(result.is_boolean(),
+                    "boolean coercion of {:?} produced {:?}", val, result);
+            }
+        }
+
+        /// Number coercion of valid values produces only Number (or expression passthrough).
+        #[test]
+        fn number_coercion_always_number(val in arb_valid_num_value()) {
+            let result = coerce_value(&val, InputType::Number, "test").unwrap();
+            if !val.as_str().is_some_and(|s| s.starts_with("${{")) {
+                prop_assert!(result.is_number(),
+                    "number coercion of {:?} produced {:?}", val, result);
+            }
+        }
+
+        /// String coercion always succeeds.
+        #[test]
+        fn string_coercion_always_ok(val in prop_oneof![
+            Just(Value::Null),
+            any::<bool>().prop_map(Value::Bool),
+            (-1000i64..1000i64).prop_map(|n| Value::Number(n.into())),
+            r#"[a-zA-Z0-9_ -]{0,30}"#.prop_map(Value::String),
+        ]) {
+            let result = coerce_value(&val, InputType::String, "test");
+            prop_assert!(result.is_ok(), "string coercion should always succeed");
+            prop_assert!(result.unwrap().is_string());
+        }
+
+        /// Roundtrip: bool→string→bool preserves truth value.
+        #[test]
+        fn bool_string_bool_roundtrip(val in arb_valid_bool_value()) {
+            if let Ok(b) = coerce_value(&val, InputType::Boolean, "test") {
+                let s = coerce_value(&b, InputType::String, "test").unwrap();
+                if let Ok(b2) = coerce_value(&s, InputType::Boolean, "test") {
+                    if b.is_boolean() {
+                        prop_assert_eq!(b, b2);
+                    }
+                }
+            }
+        }
+    }
+
+    // Deterministic rejection tests matching GitHub behavior.
+
+    #[test]
+    fn rejects_arbitrary_string_as_boolean() {
+        let result = coerce_value(&Value::String("0".into()), InputType::Boolean, "flag");
+        assert!(result.is_err(), "\"0\" should be rejected for boolean");
+        let result = coerce_value(&Value::String("sure".into()), InputType::Boolean, "flag");
+        assert!(result.is_err(), "\"sure\" should be rejected for boolean");
+        let result = coerce_value(&Value::String("yes".into()), InputType::Boolean, "flag");
+        assert!(result.is_err(), "\"yes\" should be rejected for boolean");
+    }
+
+    #[test]
+    fn rejects_number_as_boolean() {
+        let result = coerce_value(&Value::Number(1.into()), InputType::Boolean, "flag");
+        assert!(result.is_err(), "number 1 should be rejected for boolean");
+    }
+
+    #[test]
+    fn rejects_null_as_boolean() {
+        let result = coerce_value(&Value::Null, InputType::Boolean, "flag");
+        assert!(result.is_err(), "null should be rejected for boolean");
+    }
+
+    #[test]
+    fn rejects_arbitrary_string_as_number() {
+        let result = coerce_value(&Value::String("abc".into()), InputType::Number, "count");
+        assert!(result.is_err(), "\"abc\" should be rejected for number");
+    }
+
+    #[test]
+    fn rejects_bool_as_number() {
+        let result = coerce_value(&Value::Bool(true), InputType::Number, "count");
+        assert!(result.is_err(), "bool should be rejected for number");
+    }
+
+    #[test]
+    fn rejects_null_as_number() {
+        let result = coerce_value(&Value::Null, InputType::Number, "count");
+        assert!(result.is_err(), "null should be rejected for number");
+    }
+
+    #[test]
+    fn accepts_true_false_strings_for_boolean() {
+        assert_eq!(
+            coerce_value(&Value::String("true".into()), InputType::Boolean, "f").unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            coerce_value(&Value::String("false".into()), InputType::Boolean, "f").unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            coerce_value(&Value::String("TRUE".into()), InputType::Boolean, "f").unwrap(),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn accepts_numeric_strings_for_number() {
+        assert_eq!(
+            coerce_value(&Value::String("42".into()), InputType::Number, "n").unwrap(),
+            Value::Number(42.into())
+        );
+        assert_eq!(
+            coerce_value(&Value::String("-7".into()), InputType::Number, "n").unwrap(),
+            Value::Number((-7).into())
+        );
+    }
+
+    #[test]
+    fn expression_passthrough() {
+        let expr = Value::String("${{ inputs.x }}".into());
+        assert_eq!(coerce_value(&expr, InputType::Boolean, "f").unwrap(), expr);
+        assert_eq!(coerce_value(&expr, InputType::Number, "n").unwrap(), expr);
+        assert_eq!(coerce_value(&expr, InputType::String, "s").unwrap(), expr);
+    }
+}
+#[test]
+fn preserves_job_output_expressions() {
+    let workflow = parse_workflow(
+        r#"jobs:
+  producer:
+    runs-on: self-hosted
+    outputs:
+      value: ${{ steps.gen.outputs.value }}
+    steps:
+      - id: gen
+        run: echo value=42 >> "$GITHUB_OUTPUT"
+"#,
+    )
+    .unwrap();
+    let plans = expand_jobs(&workflow).unwrap();
+    assert_eq!(
+        plans[0].job_outputs.get("value").map(String::as_str),
+        Some("${{ steps.gen.outputs.value }}")
+    );
+}
+
+#[test]
+fn job_outputs_reject_unknown_function_expression() {
+    let result = parse_workflow(
+        r#"on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      value: ${{ notARealFunction() }}
+    steps:
+      - run: echo ok
+"#,
+    );
+
+    match result {
+        Err(ParserError::InvalidExpression(message)) => {
+            assert!(
+                message.contains("output `value`"),
+                "output field context missing from error: {message}"
+            );
+        }
+        other => panic!("expected invalid output expression, got {other:?}"),
+    }
+}
+
+#[test]
+fn job_outputs_accept_steps_context_expression() {
+    let workflow = parse_workflow(
+        r#"on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      value: ${{ steps.build.outputs.value }}
+    steps:
+      - id: build
+        run: echo ok
+"#,
+    )
+    .expect("steps context is allowed in job outputs");
+
+    assert_eq!(
+        workflow.jobs["build"].outputs["value"]
+            .as_str()
+            .expect("job output expression should remain a string"),
+        "${{ steps.build.outputs.value }}"
+    );
+}
+
+#[test]
+fn job_container_rejects_secrets_context_expression() {
+    let result = parse_workflow(
+        r#"on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: ${{ secrets.IMAGE }}
+    steps:
+      - run: echo ok
+"#,
+    );
+
+    match result {
+        Err(ParserError::InvalidExpression(message)) => {
+            assert!(
+                message.contains("container"),
+                "container field context missing from error: {message}"
+            );
+            assert!(
+                message.contains("secrets"),
+                "forbidden context missing from error: {message}"
+            );
+        }
+        other => panic!("expected invalid container expression, got {other:?}"),
+    }
+}
+
+#[test]
+fn job_defaults_run_working_directory_rejects_secrets_and_accepts_matrix() {
+    let invalid = parse_workflow(
+        r#"on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ secrets.WORKING_DIR }}
+    steps:
+      - run: echo ok
+"#,
+    );
+
+    match invalid {
+        Err(ParserError::InvalidExpression(message)) => {
+            assert!(
+                message.contains("working-directory"),
+                "working-directory field context missing from error: {message}"
+            );
+            assert!(
+                message.contains("secrets"),
+                "forbidden context missing from error: {message}"
+            );
+        }
+        other => panic!("expected invalid defaults expression, got {other:?}"),
+    }
+
+    let workflow = parse_workflow(
+        r#"on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        directory: [workspace]
+    defaults:
+      run:
+        working-directory: ${{ matrix.directory }}
+    steps:
+      - run: echo ok
+"#,
+    )
+    .expect("matrix context is allowed in job defaults.run.working-directory");
+
+    assert_eq!(
+        workflow.jobs["build"]
+            .defaults
+            .as_ref()
+            .and_then(|defaults| defaults.run.as_ref())
+            .and_then(|run| run.working_directory.as_deref()),
+        Some("${{ matrix.directory }}")
+    );
+}
+
+#[test]
+fn concurrency_bare_string_shorthand() {
+    let wf = parse_workflow(
+        r#"
+on: push
+concurrency: ci-${{ github.ref }}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+    let c = wf.concurrency.unwrap();
+    assert_eq!(c.group, "ci-${{ github.ref }}");
+    assert_eq!(c.cancel_in_progress, None);
+    assert_eq!(c.queue, ConcurrencyQueue::Single);
+}
+
+#[test]
+fn concurrency_mapping_form() {
+    let wf = parse_workflow(
+        r#"
+on: push
+concurrency:
+  group: g
+  cancel-in-progress: true
+  queue: single
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+    let c = wf.concurrency.unwrap();
+    assert_eq!(c.group, "g");
+    assert_eq!(c.cancel_in_progress.as_deref(), Some("true"));
+}
+
+#[test]
+fn concurrency_preserves_expression_cancel() {
+    let wf = parse_workflow(
+        r#"
+on: push
+concurrency:
+  group: g
+  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+    let c = wf.concurrency.unwrap();
+    assert_eq!(
+        c.cancel_in_progress.as_deref(),
+        Some("${{ github.ref == 'refs/heads/main' }}")
+    );
+}
+
+#[test]
+fn concurrency_queue_max_with_literal_cancel_is_error() {
+    let err = parse_workflow(
+        r#"
+on: push
+concurrency:
+  group: g
+  cancel-in-progress: true
+  queue: max
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("queue: max") && msg.contains("cancel-in-progress"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
+fn job_level_concurrency_on_plan() {
+    let wf = parse_workflow(
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: jg
+      cancel-in-progress: false
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+    let plans = expand_jobs(&wf).unwrap();
+    assert_eq!(plans[0].concurrency_group.as_deref(), Some("jg"));
+    assert_eq!(
+        plans[0].concurrency_cancel_in_progress.as_deref(),
+        Some("false")
+    );
+}
+
+#[test]
+fn reusable_workflow_expression_matrix_uses_caller_inputs() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+    with:
+      test-matrix: '{"os":["ubuntu-latest","windows-latest"]}'
+    secrets: inherit
+"#,
+    )
+    .unwrap();
+    let called = r#"
+on:
+  workflow_call:
+    inputs:
+      test-matrix:
+        required: true
+        type: string
+jobs:
+  test:
+    strategy:
+      matrix: ${{ fromJSON(inputs.test-matrix) }}
+      fail-fast: ${{ matrix.os == 'ubuntu-latest' }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - run: echo ${{ matrix.os }}
+"#;
+    let mut reusable = std::collections::BTreeMap::new();
+    reusable.insert(".github/workflows/test.yml".to_owned(), called.to_owned());
+
+    let caller_node = expand_jobs_with_reusables(&caller, &reusable).unwrap().jobs;
+    let called_parsed = parse_workflow(called).unwrap();
+    let jobs =
+        crate::expand_reusable_call(&called_parsed, &caller_node[0], &reusable, &BTreeMap::new())
+            .unwrap()
+            .jobs;
+    assert_eq!(jobs.len(), 2);
+    assert!(jobs.iter().all(|job| job.matrix.get("os").is_some()));
+}
+
+#[test]
+fn strategy_expression_scalars_are_preserved_and_resolved() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+jobs:
+  build:
+    strategy:
+      fail-fast: ${{ matrix.experimental }}
+      max-parallel: ${{ matrix.parallelism }}
+      matrix:
+        include:
+          - experimental: true
+            parallelism: 3
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#,
+    )
+    .unwrap();
+    let plans = expand_jobs(&workflow).unwrap();
+    assert_eq!(plans.len(), 1);
+    assert!(plans[0].fail_fast);
+    assert_eq!(plans[0].max_parallel, Some(3));
+}
+
+#[test]
+fn reusable_workflow_sha_propagates_to_plans_and_call_metadata() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  call:
+    uses: octo/demo/.github/workflows/build.yml@v1
+"#,
+    )
+    .unwrap();
+    let called = r#"
+on:
+  workflow_call:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#;
+    let mut reusable = BTreeMap::new();
+    reusable.insert(
+        "octo/demo/.github/workflows/build.yml@v1".to_owned(),
+        called.to_owned(),
+    );
+    let mut shas = BTreeMap::new();
+    shas.insert(
+        "octo/demo/.github/workflows/build.yml@v1".to_owned(),
+        "0123456789abcdef".to_owned(),
+    );
+
+    let expanded = expand_jobs_with_reusables_and_shas(&caller, &reusable, &shas).unwrap();
+    assert_eq!(
+        expanded.jobs[0].workflow_sha.as_deref(),
+        Some("0123456789abcdef")
+    );
+    assert_eq!(
+        expanded.jobs[0].workflow_repository.as_deref(),
+        Some("octo/demo")
+    );
+    assert_eq!(
+        expanded.reusable_calls["call"].workflow_sha.as_deref(),
+        Some("0123456789abcdef")
+    );
+}
+
+#[test]
+fn matrix_expanded_reusable_workflow_needs_resolution() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  build:
+    uses: octo/demo/.github/workflows/build.yml@v1
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+  package:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#,
+    )
+    .unwrap();
+    let called = r#"
+on:
+  workflow_call:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test
+"#;
+    let mut reusable = BTreeMap::new();
+    reusable.insert(
+        "octo/demo/.github/workflows/build.yml@v1".to_owned(),
+        called.to_owned(),
+    );
+    let shas = BTreeMap::new();
+
+    let expanded = expand_jobs_with_reusables_and_shas(&caller, &reusable, &shas).unwrap();
+    // We expect package to depend on both matrix instances of the reusable
+    // workflow call. With deferred materialization those are the two caller
+    // nodes; their callee subtrees materialize at runtime per passed gate.
+    let package_job = expanded
+        .jobs
+        .iter()
+        .find(|j| j.base_id == "package")
+        .unwrap();
+    assert_eq!(package_job.needs.len(), 2);
+    let needs_ids: Vec<String> = package_job.needs.iter().map(|n| n.0.clone()).collect();
+    assert!(needs_ids.contains(&"build (ubuntu-latest)".to_owned()));
+    assert!(needs_ids.contains(&"build (windows-latest)".to_owned()));
+}
+
+#[test]
+fn parses_step_with_boolean_input() {
+    let yaml = r#"
+on: push
+jobs:
+  test:
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        if: true
+        with:
+          persist-credentials: false
+          fetch-depth: 25
+"#;
+    let parsed = parse_workflow(yaml).unwrap();
+    let expanded = expand_jobs(&parsed).unwrap();
+    assert_eq!(expanded.len(), 1);
+}
+
+#[test]
+fn dynamic_matrix_expansion_unresolved_expression() {
+    let yaml = r#"
+name: 101-dynamic-matrix-dataflow
+on: workflow_dispatch
+jobs:
+  setup:
+    runs-on: self-hosted
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        run: echo 'matrix={"include":[{"os":"ubuntu-latest","node":"18"},{"os":"ubuntu-latest","node":"20"}]}' >> $GITHUB_OUTPUT
+
+  build:
+    needs: setup
+    runs-on: self-hosted
+    strategy:
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+    steps:
+      - run: echo "Node version ${{ matrix.node }}"
+"#;
+    let parsed = parse_workflow(yaml).unwrap();
+    let expanded = expand_jobs(&parsed).unwrap();
+    println!(
+        "Expanded jobs: {:?}",
+        expanded.iter().map(|j| &j.id.0).collect::<Vec<_>>()
+    );
+    assert_eq!(expanded.len(), 2);
+    let build_deferred = expanded.iter().find(|j| j.base_id == "build").unwrap();
+    assert!(build_deferred.deferred_matrix.is_some());
+}
+
+/// A reusable-workflow caller whose matrix reads `needs.*` is deferred at
+/// parse time like any other needs-driven matrix, but at runtime the matrix
+/// must be resolved *before* the callee subtree materializes — one leg per
+/// combination, each inheriting the caller's matrix cell. Before the fix the
+/// caller was expanded as a single call with an empty matrix, so the callee
+/// never fanned out.
+#[test]
+fn deferred_matrix_reusable_caller_fans_out_per_cell() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  generator:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo gen
+  build:
+    needs: generator
+    uses: octo/demo/.github/workflows/build.yml@v1
+    strategy:
+      matrix: ${{ fromJson(needs.generator.outputs.matrix) }}
+"#,
+    )
+    .unwrap();
+    let called = r#"
+on:
+  workflow_call:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test
+"#;
+    let mut reusable = BTreeMap::new();
+    reusable.insert(
+        "octo/demo/.github/workflows/build.yml@v1".to_owned(),
+        called.to_owned(),
+    );
+
+    // Parse time: one un-suffixed deferred caller node; no callee jobs yet.
+    let expanded = expand_jobs_with_reusables(&caller, &reusable).unwrap();
+    let node = expanded.jobs.iter().find(|j| j.base_id == "build").unwrap();
+    assert!(node.deferred_matrix.is_some());
+    assert!(node.reusable_call.is_some());
+    assert!(node.matrix.is_empty());
+    let called_parsed = parse_workflow(called).unwrap();
+
+    // The caller cannot be materialized from the empty placeholder matrix:
+    // the deferred matrix must be resolved first, then one callee leg per
+    // combination.
+    assert!(
+        crate::expand_reusable_call(&called_parsed, node, &reusable, &BTreeMap::new()).is_err(),
+        "expanding a needs-deferred caller against the empty matrix must be refused"
+    );
+
+    // Runtime (needs complete): resolve the matrix, then materialize the
+    // callee once per combination.
+    let mut needs_outputs = BTreeMap::new();
+    let mut gen_outputs = BTreeMap::new();
+    gen_outputs.insert(
+        "matrix".to_string(),
+        json!("{\"include\": [{\"os\": \"ubuntu-latest\"}, {\"os\": \"macos-latest\"}]}"),
+    );
+    needs_outputs.insert("generator".to_string(), gen_outputs);
+
+    let jobs = crate::expand_deferred_reusable_call(
+        &called_parsed,
+        &caller,
+        node,
+        &needs_outputs,
+        &reusable,
+        &BTreeMap::new(),
+    )
+    .unwrap()
+    .jobs;
+    assert_eq!(
+        jobs.len(),
+        2,
+        "one callee leg per matrix combination, got: {:?}",
+        jobs.iter().map(|j| &j.id.0).collect::<Vec<_>>()
+    );
+    let ids: Vec<&str> = jobs.iter().map(|j| j.id.0.as_str()).collect();
+    assert!(ids.contains(&"build (ubuntu-latest)/test"));
+    assert!(ids.contains(&"build (macos-latest)/test"));
+    for job in &jobs {
+        assert!(
+            job.matrix.get("os").is_some(),
+            "each leg must inherit its caller's matrix cell: {:?}",
+            job.matrix
+        );
+        assert!(job.needs.contains(&JobId("generator".to_string())));
+    }
+}
+
+/// A deferred matrix job inside a reusable workflow is promoted at runtime
+/// with a caller-prefixed base id (`call/build`). Re-expansion must resolve
+/// that node against the *called* workflow — where the callee-local job id
+/// (`build`) is the key — not the root workflow. The prefixed run id stays,
+/// but the job lookup and the `needs.*` context use the callee-local keys.
+#[test]
+fn deferred_matrix_inside_reusable_resolves_via_callee() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  call:
+    uses: octo/demo/.github/workflows/build.yml@v1
+"#,
+    )
+    .unwrap();
+    let called = r#"
+on:
+  workflow_call:
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo gen
+  build:
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+    steps:
+      - run: echo ${{ matrix.os }}
+"#;
+    let mut reusable = BTreeMap::new();
+    reusable.insert(
+        "octo/demo/.github/workflows/build.yml@v1".to_owned(),
+        called.to_owned(),
+    );
+
+    let caller_node = &expand_jobs_with_reusables(&caller, &reusable).unwrap().jobs[0];
+    let called_parsed = parse_workflow(called).unwrap();
+    let subtree =
+        crate::expand_reusable_call(&called_parsed, caller_node, &reusable, &BTreeMap::new())
+            .unwrap()
+            .jobs;
+
+    let build_node = subtree.iter().find(|j| j.base_id == "call/build").unwrap();
+    assert_eq!(build_node.id.0, "call/build");
+    assert!(build_node.deferred_matrix.is_some());
+    assert!(build_node.needs.contains(&JobId("call/setup".to_string())));
+
+    // Runtime promotion: needs outputs arrive keyed by the base id the run
+    // recorded (`call/setup`), while the callee's expression references the
+    // callee-local job id (`setup`).
+    let mut needs_outputs = BTreeMap::new();
+    let mut setup_outputs = BTreeMap::new();
+    setup_outputs.insert(
+        "matrix".to_string(),
+        json!("{\"include\": [{\"os\": \"ubuntu-latest\"}, {\"os\": \"macos-latest\"}]}"),
+    );
+    needs_outputs.insert("call/setup".to_string(), setup_outputs);
+
+    let plans = crate::expand_deferred_matrix_job(
+        &called_parsed,
+        &build_node.base_id,
+        build_node.deferred_matrix.as_ref().unwrap(),
+        &needs_outputs,
+        None,
+    )
+    .unwrap();
+    assert_eq!(plans.len(), 2);
+    assert_eq!(plans[0].id.0, "call/build (ubuntu-latest)");
+    assert_eq!(plans[1].id.0, "call/build (macos-latest)");
+    for plan in &plans {
+        assert!(plan.needs.contains(&JobId("call/setup".to_string())));
+    }
+}
+
+/// A needs-deferred matrix leaves a single un-suffixed placeholder node whose
+/// matrix is intentionally empty. Matrix-dependent `fail-fast`, `max-parallel`
+/// and `continue-on-error` expressions cannot be evaluated against that empty
+/// placeholder — they resolve to null and are rejected at parse time — so the
+/// placeholder defers them: defaults apply until the runtime fan-out builds
+/// the concrete combinations and re-resolves them per cell.
+#[test]
+fn deferred_matrix_placeholder_defers_strategy_scalars() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo gen
+  build:
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+      fail-fast: ${{ matrix.experimental }}
+      max-parallel: ${{ matrix.parallelism }}
+    continue-on-error: ${{ matrix.experimental }}
+    steps:
+      - run: echo ${{ matrix.os }}
+"#,
+    )
+    .unwrap();
+    let jobs = expand_jobs(&workflow).unwrap();
+    let build = jobs.iter().find(|j| j.base_id == "build").unwrap();
+    assert!(build.deferred_matrix.is_some());
+    assert!(
+        build.fail_fast,
+        "placeholder keeps the default until fan-out"
+    );
+    assert_eq!(build.max_parallel, None);
+    assert!(!build.continue_on_error);
+
+    // The runtime fan-out resolves the scalars per concrete combination.
+    let mut needs_outputs = BTreeMap::new();
+    let mut setup_outputs = BTreeMap::new();
+    setup_outputs.insert(
+        "matrix".to_string(),
+        json!("{\"include\": [{\"os\": \"ubuntu-latest\", \"experimental\": true, \"parallelism\": 3}]}"),
+    );
+    needs_outputs.insert("setup".to_string(), setup_outputs);
+    let plans = crate::expand_deferred_matrix_job(
+        &workflow,
+        "build",
+        build.deferred_matrix.as_ref().unwrap(),
+        &needs_outputs,
+        None,
+    )
+    .unwrap();
+    assert_eq!(plans.len(), 1);
+    assert!(plans[0].fail_fast);
+    assert_eq!(plans[0].max_parallel, Some(3));
+}
+
+/// A needs-deferred matrix reusable caller nested inside another reusable
+/// keeps its caller-prefixed ids (`call/call2 (os)/test`). The composed
+/// expansion resolves the matrix from the *containing* called workflow, which
+/// keys jobs and needs callee-locally.
+#[test]
+fn nested_deferred_matrix_reusable_caller_keeps_prefixed_ids() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  call:
+    uses: octo/demo/.github/workflows/a.yml@v1
+"#,
+    )
+    .unwrap();
+    let a_yml = r#"
+on:
+  workflow_call:
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo gen
+  call2:
+    needs: setup
+    uses: octo/demo/.github/workflows/b.yml@v1
+    strategy:
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+"#;
+    let b_yml = r#"
+on:
+  workflow_call:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test
+"#;
+    let mut reusable = BTreeMap::new();
+    reusable.insert(
+        "octo/demo/.github/workflows/a.yml@v1".to_owned(),
+        a_yml.to_owned(),
+    );
+    reusable.insert(
+        "octo/demo/.github/workflows/b.yml@v1".to_owned(),
+        b_yml.to_owned(),
+    );
+
+    // Materialize A under the root caller, exactly as the runtime does.
+    let caller_node = &expand_jobs_with_reusables(&caller, &reusable).unwrap().jobs[0];
+    let a_parsed = parse_workflow(a_yml).unwrap();
+    let subtree = crate::expand_reusable_call(&a_parsed, caller_node, &reusable, &BTreeMap::new())
+        .unwrap()
+        .jobs;
+    let nested = subtree.iter().find(|j| j.id.0 == "call/call2").unwrap();
+    assert!(nested.deferred_matrix.is_some());
+    assert!(nested.reusable_call.is_some());
+    assert!(nested.needs.contains(&JobId("call/setup".to_string())));
+
+    // Runtime promotion of the nested caller: needs outputs are keyed by the
+    // prefixed run id, and the caller lives in workflow A under `call2`.
+    let mut needs_outputs = BTreeMap::new();
+    let mut setup_outputs = BTreeMap::new();
+    setup_outputs.insert(
+        "matrix".to_string(),
+        json!("{\"include\": [{\"os\": \"ubuntu-latest\"}, {\"os\": \"macos-latest\"}]}"),
+    );
+    needs_outputs.insert("call/setup".to_string(), setup_outputs);
+
+    let b_parsed = parse_workflow(b_yml).unwrap();
+    let composed = crate::expand_deferred_reusable_call(
+        &b_parsed,
+        &a_parsed,
+        nested,
+        &needs_outputs,
+        &reusable,
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    let jobs = composed.jobs;
+    assert_eq!(jobs.len(), 2);
+    let ids: Vec<&str> = jobs.iter().map(|j| j.id.0.as_str()).collect();
+    assert!(ids.contains(&"call/call2 (ubuntu-latest)/test"));
+    assert!(ids.contains(&"call/call2 (macos-latest)/test"));
+    for job in &jobs {
+        assert!(job.matrix.get("os").is_some());
+        assert!(job.needs.contains(&JobId("call/setup".to_string())));
+    }
+}
+
+/// A caller `name:` template that references the matrix renders per cell once
+/// the deferred matrix is resolved — `Build ubuntu-latest / test`, not the
+/// empty-matrix placeholder rendering.
+#[test]
+fn deferred_matrix_reusable_caller_renders_per_cell_names() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  generator:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo gen
+  build:
+    needs: generator
+    name: Build ${{ matrix.os }}
+    uses: octo/demo/.github/workflows/build.yml@v1
+    strategy:
+      matrix: ${{ fromJson(needs.generator.outputs.matrix) }}
+"#,
+    )
+    .unwrap();
+    let called = r#"
+on:
+  workflow_call:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test
+"#;
+    let mut reusable = BTreeMap::new();
+    reusable.insert(
+        "octo/demo/.github/workflows/build.yml@v1".to_owned(),
+        called.to_owned(),
+    );
+    let node = expand_jobs_with_reusables(&caller, &reusable)
+        .unwrap()
+        .jobs
+        .into_iter()
+        .find(|job| job.base_id == "build")
+        .unwrap();
+
+    let mut needs_outputs = BTreeMap::new();
+    let mut gen_outputs = BTreeMap::new();
+    gen_outputs.insert(
+        "matrix".to_string(),
+        json!("{\"include\": [{\"os\": \"ubuntu-latest\"}, {\"os\": \"macos-latest\"}]}"),
+    );
+    needs_outputs.insert("generator".to_string(), gen_outputs);
+
+    let called_parsed = parse_workflow(called).unwrap();
+    let jobs = crate::expand_deferred_reusable_call(
+        &called_parsed,
+        &caller,
+        &node,
+        &needs_outputs,
+        &reusable,
+        &BTreeMap::new(),
+    )
+    .unwrap()
+    .jobs;
+    assert_eq!(jobs.len(), 2);
+    assert!(jobs.iter().any(|j| j.name == "Build ubuntu-latest / test"));
+    assert!(jobs.iter().any(|j| j.name == "Build macos-latest / test"));
+}

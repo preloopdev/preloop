@@ -27,7 +27,7 @@ jobs:
             echo 'line two ::warning:: not a command'
             echo 'TEXT'
           } >> "$GITHUB_OUTPUT"
-          printf 'AKSH_ORACLE: produce seed=%s matrix_sha=%s\n' '${{ inputs.seed }}' "$(printf '%s' "$matrix" | sha256sum | cut -d' ' -f1)"
+          printf 'PRELOOP_ORACLE: produce seed=%s matrix_sha=%s\n' '${{ inputs.seed }}' "$(printf '%s' "$matrix" | sha256sum | cut -d' ' -f1)"
   matrix:
     needs: produce
     strategy:
@@ -49,7 +49,7 @@ jobs:
           set -euo pipefail
           test -n "$MATRIX_NAME"
           printf 'observed=%s=%s\n' "$MATRIX_NAME" "$MATRIX_VALUE" >> "$GITHUB_OUTPUT"
-          printf 'AKSH_ORACLE: matrix name=%s value=%s text_sha=%s\n' "$MATRIX_NAME" "$MATRIX_VALUE" "$(printf '%s' "$TEXT" | sha256sum | cut -d' ' -f1)"
+          printf 'PRELOOP_ORACLE: matrix name=%s value=%s text_sha=%s\n' "$MATRIX_NAME" "$MATRIX_VALUE" "$(printf '%s' "$TEXT" | sha256sum | cut -d' ' -f1)"
   aggregate:
     if: always()
     needs: [produce, matrix]
@@ -64,4 +64,4 @@ jobs:
           set -euo pipefail
           test "$PRODUCE" = success
           test "$MATRIX" = success
-          echo "AKSH_ORACLE: aggregate produce=$PRODUCE matrix=$MATRIX"
+          echo "PRELOOP_ORACLE: aggregate produce=$PRODUCE matrix=$MATRIX"

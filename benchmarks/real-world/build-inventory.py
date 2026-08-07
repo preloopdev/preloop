@@ -19,8 +19,8 @@ def find_flows(dirs):
 
 def extract(fpath):
     s = str(fpath)
-    for pat in [r'runner/protocol/(\d{2,3})-[^/]+?/(official|aksh)/',
-                r'/captures/(official|aksh|aksh-runner-aksh|runner-server)/(\d{2,3})-[^/]+?/',
+    for pat in [r'runner/protocol/(\d{2,3})-[^/]+?/(official|preloop)/',
+                r'/captures/(official|preloop|preloop-runner-preloop|runner-server)/(\d{2,3})-[^/]+?/',
                 r'/golden/[^/]+/(\d{2,3})-[^/]+?/flows\.jsonl']:
         m = re.search(pat, s)
         if m:
@@ -55,7 +55,7 @@ MITM_SCENARIOS = {f"{n:02d}": name for n, name in [
     (73,"path-env"),(74,"broker-poll-timing"),(75,"workflow-call-stress"),
 ]}
 
-official = {}; aksh = {}
+official = {}; preloop = {}
 for f in find_flows(WT):
     pair = extract(f)
     if not pair: continue
@@ -63,7 +63,7 @@ for f in find_flows(WT):
     c = cnt(f)
     if runner == "official":
         if num not in official or c > official[num]: official[num] = c
-    elif num not in aksh or c > aksh[num]: aksh[num] = c
+    elif num not in preloop or c > preloop[num]: preloop[num] = c
 
 diff_root = Path("benchmarks/compatibility/runner/protocol")
 def find_diff(num, name):
@@ -96,8 +96,8 @@ CONFORMANCE_NAMES = {
     "98":"outcome-vs-conclusion","99":"workspace-defaults","100":"tool-cache",
 }
 
-off_out = {}; aksh_out = {}
-for fn, store in [("conformance-official.jsonl", off_out), ("conformance-aksh.jsonl", aksh_out)]:
+off_out = {}; preloop_out = {}
+for fn, store in [("conformance-official.jsonl", off_out), ("conformance-preloop.jsonl", preloop_out)]:
     p = Path(f"benchmarks/compatibility/runner/behavior/{fn}")
     if not p.exists(): continue
     for line in open(p):
@@ -106,7 +106,7 @@ for fn, store in [("conformance-official.jsonl", off_out), ("conformance-aksh.js
         n = OFF_MAP.get(wf) or (m.group(1) if (m:=re.match(r"(\d+)", wf)) else None)
         if n and n in CONFORMANCE_NUMS:
             c = d.get("conclusion","") or "(empty)"
-            if store is aksh_out and c == "(empty)" and n in aksh_out: continue
+            if store is preloop_out and c == "(empty)" and n in preloop_out: continue
             store[n] = c
 
 # ── Generate report ─────────────────────────────────────────────────
@@ -123,18 +123,18 @@ L.append("")
 # ── Table 1: MITM ──────────────────────────────────────────────────
 
 off_n = sum(1 for n in MITM_SCENARIOS if n in official)
-aksh_n = sum(1 for n in MITM_SCENARIOS if n in aksh)
-both_n = sum(1 for n in MITM_SCENARIOS if n in official and n in aksh)
+preloop_n = sum(1 for n in MITM_SCENARIOS if n in preloop)
+both_n = sum(1 for n in MITM_SCENARIOS if n in official and n in preloop)
 
 L.append("## MITM Flow Captures")
-L.append(f"{len(MITM_SCENARIOS)} scenarios — {off_n} official — {aksh_n} aksh — {both_n} both — [diffs](runner/protocol/) linked where available")
+L.append(f"{len(MITM_SCENARIOS)} scenarios — {off_n} official — {preloop_n} preloop — {both_n} both — [diffs](runner/protocol/) linked where available")
 L.append("")
-L.append("| # | Scenario | Official | Aksh | Diff |")
+L.append("| # | Scenario | Official | Preloop | Diff |")
 L.append("|---|---:|---:|---|")
 
 for num in sorted(MITM_SCENARIOS, key=lambda x: int(x)):
     name = MITM_SCENARIOS[num]
-    of = official.get(num, 0); af = aksh.get(num, 0)
+    of = official.get(num, 0); af = preloop.get(num, 0)
     icon = "⚠️" if of and af else ("🔵" if of else ("🟡" if af else "⬜"))
     df = find_diff(num, name)
     of_s = str(of) if of else "—"; af_s = str(af) if af else "—"
@@ -142,29 +142,29 @@ for num in sorted(MITM_SCENARIOS, key=lambda x: int(x)):
 
 L.append("")
 L.append("### Gaps")
-g1 = [n for n in sorted(MITM_SCENARIOS, key=int) if n in official and n not in aksh]
-g2 = [n for n in sorted(MITM_SCENARIOS, key=int) if n not in official and n in aksh]
-g3 = [n for n in sorted(MITM_SCENARIOS, key=int) if n not in official and n not in aksh]
+g1 = [n for n in sorted(MITM_SCENARIOS, key=int) if n in official and n not in preloop]
+g2 = [n for n in sorted(MITM_SCENARIOS, key=int) if n not in official and n in preloop]
+g3 = [n for n in sorted(MITM_SCENARIOS, key=int) if n not in official and n not in preloop]
 L.append(f"**Official only ({len(g1)}):** " + ", ".join(f"{n} {MITM_SCENARIOS[n]}" for n in g1) if g1 else "**Official only:** _none_")
-L.append(f"**Aksh only ({len(g2)}):** " + ", ".join(f"{n} {MITM_SCENARIOS[n]}" for n in g2) if g2 else "**Aksh only:** _none_")
+L.append(f"**Preloop only ({len(g2)}):** " + ", ".join(f"{n} {MITM_SCENARIOS[n]}" for n in g2) if g2 else "**Preloop only:** _none_")
 L.append(f"**Neither ({len(g3)}):** " + ", ".join(f"{n}" for n in g3) if g3 else "**Neither:** _none_")
 L.append("")
 
 # ── Table 2: Conformance ───────────────────────────────────────────
 
-match_n = sum(1 for n in CONFORMANCE_NUMS if n in off_out and n in aksh_out and off_out[n]==aksh_out[n] and off_out[n] not in ("(empty)",""))
-fail_n = sum(1 for n in CONFORMANCE_NUMS if n in off_out and n in aksh_out and off_out[n]!=aksh_out[n] and off_out[n] not in ("(empty)","") and aksh_out[n] not in ("(empty)",""))
-inc_n  = sum(1 for n in CONFORMANCE_NUMS if n in off_out and n in aksh_out and (off_out[n]=="(empty)" or aksh_out[n]=="(empty)"))
+match_n = sum(1 for n in CONFORMANCE_NUMS if n in off_out and n in preloop_out and off_out[n]==preloop_out[n] and off_out[n] not in ("(empty)",""))
+fail_n = sum(1 for n in CONFORMANCE_NUMS if n in off_out and n in preloop_out and off_out[n]!=preloop_out[n] and off_out[n] not in ("(empty)","") and preloop_out[n] not in ("(empty)",""))
+inc_n  = sum(1 for n in CONFORMANCE_NUMS if n in off_out and n in preloop_out and (off_out[n]=="(empty)" or preloop_out[n]=="(empty)"))
 
 L.append("## Conformance Outcomes")
 L.append(f"Scenarios 80–100 dispatched against GitHub. {match_n} match, {fail_n} mismatch, {inc_n} incomplete.")
 L.append("")
-L.append("| # | Scenario | Official | Aksh | Match |")
+L.append("| # | Scenario | Official | Preloop | Match |")
 L.append("|---|---|---|---|---|")
 L.append("")
 for num in CONFORMANCE_NUMS:
     name = CONFORMANCE_NAMES.get(num, num)
-    oo = off_out.get(num, "—"); ao = aksh_out.get(num, "—")
+    oo = off_out.get(num, "—"); ao = preloop_out.get(num, "—")
     if oo != "—" and ao != "—":
         if oo == ao and oo not in ("(empty)",""):
             icon, display = "🟢", f"{oo}"
@@ -179,5 +179,5 @@ for num in CONFORMANCE_NUMS:
 OUT.parent.mkdir(parents=True, exist_ok=True)
 OUT.write_text("\n".join(L) + "\n")
 print(f"Written: {OUT}")
-print(f"  MITM: {off_n} official, {aksh_n} aksh, {both_n} both | Official-only: {len(g1)}, Aksh-only: {len(g2)}, Neither: {len(g3)}")
+print(f"  MITM: {off_n} official, {preloop_n} preloop, {both_n} both | Official-only: {len(g1)}, Preloop-only: {len(g2)}, Neither: {len(g3)}")
 print(f"  Conformance: {match_n} match, {fail_n} mismatch, {inc_n} incomplete")

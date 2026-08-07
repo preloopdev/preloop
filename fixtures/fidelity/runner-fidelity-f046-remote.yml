@@ -14,10 +14,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Clean workspace
-        run: rm -rf .aksh-fidelity && mkdir -p .aksh-fidelity
+        run: rm -rf .preloop-fidelity && mkdir -p .preloop-fidelity
 
       - name: Run remote Docker action with pre/post lifecycle
-        uses: preloopdev/aksh/fixtures/actions/docker-manifest-lifecycle@cachingv4
+        uses: preloopdev/preloop/fixtures/actions/docker-manifest-lifecycle@cachingv4
         with:
           arg-one: alpha
           env-value: beta
@@ -25,10 +25,10 @@ jobs:
       - name: Assert pre/main/post all executed
         run: |
           echo "=== Docker lifecycle log ==="
-          cat .aksh-fidelity/docker-lifecycle.log
+          cat .preloop-fidelity/docker-lifecycle.log
           echo "=== Checking entries ==="
-          grep -Fx 'pre|env=beta|arg=alpha' .aksh-fidelity/docker-lifecycle.log && echo "PRE: ok"
-          grep -Fx 'main|env=beta|arg=alpha' .aksh-fidelity/docker-lifecycle.log && echo "MAIN: ok"
-          grep -Fx 'post|env=beta|arg=alpha' .aksh-fidelity/docker-lifecycle.log && echo "POST: ok"
+          grep -Fx 'pre|env=beta|arg=alpha' .preloop-fidelity/docker-lifecycle.log && echo "PRE: ok"
+          grep -Fx 'main|env=beta|arg=alpha' .preloop-fidelity/docker-lifecycle.log && echo "MAIN: ok"
+          grep -Fx 'post|env=beta|arg=alpha' .preloop-fidelity/docker-lifecycle.log && echo "POST: ok"
           echo "F046: Docker pre-entrypoint/post-entrypoint lifecycle verified"
           echo "F047: Docker manifest entrypoint/args/env evaluation verified"

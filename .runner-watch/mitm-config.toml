@@ -1,6 +1,6 @@
 [general]
 runner_repo = "actions/runner"
-aksh_worktree = "."
+preloop_worktree = "."
 golden_dir = ".runner-watch/golden"
 mitm_dir = "../mitm-proxy/experiments/mitm"
 max_review_rounds = 3
@@ -13,7 +13,7 @@ implement = "codex"
 review = "claude"
 
 [surface_map]
-path = "docs/aksh-surface.toml"
+path = "docs/preloop-surface.toml"
 
 [tracked_dirs]
 dirs = ["src/Runner.Listener", "src/Runner.Worker", "src/Runner.Common", "src/Runner.Sdk"]

@@ -141,9 +141,9 @@ elif [ "$BACKEND" = "runner-server" ]; then
         STATUS="config_failed"
     fi
 elif [ "$BACKEND" = "aksh" ]; then
-    AKSH_URL=$(cat "$CACHE/aksh.url")
-    AKSH_TOKEN=$(cat "$CACHE/aksh.token")
-    if ! setup_runner "$AKSH_URL" "$AKSH_TOKEN" "mitm-aksh"; then
+    PRELOOP_URL=$(cat "$CACHE/aksh.url")
+    PRELOOP_TOKEN=$(cat "$CACHE/aksh.token")
+    if ! setup_runner "$PRELOOP_URL" "$PRELOOP_TOKEN" "mitm-aksh"; then
         STATUS="config_failed"
     fi
 else

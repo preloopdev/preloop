@@ -8,11 +8,11 @@ jobs:
         id: greet
         uses: ./fixtures/e2e/actions/greet
         with:
-          name: aksh
+          name: preloop
       - name: Check output
         run: |
           echo "Greeting: ${{ steps.greet.outputs.greeting }}"
-          if [ "${{ steps.greet.outputs.greeting }}" = "Hello, aksh!" ]; then
+          if [ "${{ steps.greet.outputs.greeting }}" = "Hello, preloop!" ]; then
             echo "Composite action output works!"
           else
             echo "Got: '${{ steps.greet.outputs.greeting }}'"

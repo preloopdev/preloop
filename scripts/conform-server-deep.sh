@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run official runner -> GitHub and official runner -> aksh comparisons.
+# Run official runner -> GitHub and official runner -> preloop comparisons.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

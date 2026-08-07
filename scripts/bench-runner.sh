@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bench-runner.sh — Performance and size benchmarking for aksh-runner
+# bench-runner.sh — Performance and size benchmarking for preloop-runner
 #
 # Measures binary size, cold start time, and memory footprint.
 # Emits METRIC lines to stdout (matching autoresearch.sh convention).
@@ -20,13 +20,13 @@ for arg in "$@"; do
     esac
 done
 
-echo "=== aksh-runner benchmark ==="
+echo "=== preloop-runner benchmark ==="
 echo ""
 
 # Build if needed
 if [ ! -f "$RUST_RUNNER" ]; then
-    echo "Building aksh-runner..."
-    cargo build --release -p aksh-runner --manifest-path "$REPO_ROOT/Cargo.toml"
+    echo "Building preloop-runner..."
+    cargo build --release -p preloop-runner --manifest-path "$REPO_ROOT/Cargo.toml"
 fi
 
 # ── Binary size ──────────────────────────────────────────────────────────

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# oidc-conformance-run.sh — 4 OIDC conformance tests through aksh-runner.
+# oidc-conformance-run.sh — 4 OIDC conformance tests through preloop-runner.
 # Each test: submit workflow → runner picks up job → step curls OIDC URL →
 # step runs a Python verifier → server captures step log with PASS/FAIL.
 set -uo pipefail
@@ -9,9 +9,9 @@ SERVER="$REPO/target/release/preloop-server"
 RUNNER="$REPO/target/release/preloop-runner"
 PORT=9192
 BASE="http://127.0.0.1:$PORT"
-SYSTEM_TOKEN="${AKSH_SYSTEM_TOKEN:-aksh-system-token}"
+SYSTEM_TOKEN="${PRELOOP_SYSTEM_TOKEN:-preloop-system-token}"
 NOW=$(date -u +%Y-%m-%dT%H-%M-%SZ)
-STATE=$(mktemp -d /tmp/aksh-oidc.XXXXXX)
+STATE=$(mktemp -d /tmp/preloop-oidc.XXXXXX)
 RESULTS="$REPO/benchmarks/real-world/results/runner-flow"
 
 RED='\033[1;31m'; GREEN='\033[1;32m'; BLUE='\033[1;34m'; NC='\033[0m'
@@ -21,7 +21,7 @@ cleanup() { kill "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; rm -rf "$STATE";
 trap cleanup EXIT
 
 # ── Python verifiers ─────────────────────────────────────────────────
-cat > "$STATE/aksh_oidc_verify.py" << PYEOF
+cat > "$STATE/preloop_oidc_verify.py" << PYEOF
 import base64, hashlib, json, urllib.request
 
 BASE = "$BASE"
@@ -52,7 +52,7 @@ def verify_token(token):
     return claims
 PYEOF
 cat > "$STATE/verify-push.py" << PYEOF
-import sys,json,os; sys.path.insert(0,os.path.dirname(os.path.abspath(__file__))); from aksh_oidc_verify import verify_token
+import sys,json,os; sys.path.insert(0,os.path.dirname(os.path.abspath(__file__))); from preloop_oidc_verify import verify_token
 t=json.load(sys.stdin)['value'];c=verify_token(t)
 assert c['ref_type']=='branch',f'ref_type={c["ref_type"]}'
 assert c['ref']=='refs/heads/main',f'ref={c["ref"]}'
@@ -63,7 +63,7 @@ print(f'PASS: sub={c["sub"]} aud={c["aud"]} ref_type={c["ref_type"]}')
 PYEOF
 
 cat > "$STATE/verify-tag.py" << PYEOF
-import sys,json,os; sys.path.insert(0,os.path.dirname(os.path.abspath(__file__))); from aksh_oidc_verify import verify_token
+import sys,json,os; sys.path.insert(0,os.path.dirname(os.path.abspath(__file__))); from preloop_oidc_verify import verify_token
 t=json.load(sys.stdin)['value'];c=verify_token(t)
 assert c['ref_type']=='tag',f'ref_type={c["ref_type"]}'
 assert ':ref:refs/tags/' in c['sub'],f'sub={c["sub"]}'
@@ -73,7 +73,7 @@ print(f'PASS: sub={c["sub"]} ref_type={c["ref_type"]} ref={c["ref"]} aud={c["aud
 PYEOF
 
 cat > "$STATE/verify-pr.py" << PYEOF
-import sys,json,os; sys.path.insert(0,os.path.dirname(os.path.abspath(__file__))); from aksh_oidc_verify import verify_token
+import sys,json,os; sys.path.insert(0,os.path.dirname(os.path.abspath(__file__))); from preloop_oidc_verify import verify_token
 t=json.load(sys.stdin)['value'];c=verify_token(t)
 assert c['event_name']=='pull_request',f'event={c["event_name"]}'
 assert c['sub'].endswith(':pull_request'),f'sub={c["sub"]}'
@@ -83,7 +83,7 @@ print(f'PASS: sub={c["sub"]} event={c["event_name"]} aud={c["aud"]}')
 PYEOF
 
 cat > "$STATE/verify-deploy.py" << PYEOF
-import sys,json,os; sys.path.insert(0,os.path.dirname(os.path.abspath(__file__))); from aksh_oidc_verify import verify_token
+import sys,json,os; sys.path.insert(0,os.path.dirname(os.path.abspath(__file__))); from preloop_oidc_verify import verify_token
 t=json.load(sys.stdin)['value'];c=verify_token(t)
 assert ':environment:staging:' in c['sub'] or c['sub'].endswith(':environment:staging'),f'sub must contain :environment:staging: got {c["sub"]}'
 assert c['event_name']=='deployment',f'event={c["event_name"]}'
@@ -93,7 +93,7 @@ PYEOF
 
 # ── Start server ────────────────────────────────────────────────────
 echo -e "${BLUE}▸${NC} Starting server on $PORT..."
-AKSH_PUBLIC_URL="$BASE" "$SERVER" serve --listen "127.0.0.1:$PORT" --state-dir "$STATE" \
+PRELOOP_PUBLIC_URL="$BASE" "$SERVER" serve --listen "127.0.0.1:$PORT" --state-dir "$STATE" \
     > "$STATE/server.log" 2>&1 &
 SPID=$!
 for i in $(seq 1 30); do curl -sf --max-time 1 "$BASE/healthz" >/dev/null 2>&1 && break; sleep 0.5; done
@@ -124,13 +124,13 @@ json.dump({'workflow_yaml':wf,'event':'$event','git_ref':'$ref','repository':'$r
     # Configure + run
     local log_marker="$STATE/log-marker-$name"
     touch "$log_marker"
-    local rd=$(mktemp -d /tmp/aksh-runner.XXXXXX)
+    local rd=$(mktemp -d /tmp/preloop-runner.XXXXXX)
     "$RUNNER" --runner-root "$rd" configure \
         --url "$BASE" --token t --name "$name" \
         --unattended --replace --ephemeral --labels "self-hosted" --no-externals \
         > /dev/null 2>&1
 
-    local log="$RESULTS/$name/aksh/$NOW/runner.log"
+    local log="$RESULTS/$name/preloop/$NOW/runner.log"
     mkdir -p "$(dirname "$log")"
     { echo "=== $name ==="; echo "run_id=$run_id  event=$event  ref=$ref  repo=$repo"; echo ""; } > "$log"
     local runner_exit=0
@@ -225,5 +225,5 @@ jobs:
 echo ""
 echo "═══════════════════════════════════"
 echo -e "${GREEN}$PASS passed${NC}  ${RED}$FAIL failed${NC}"
-echo "Results: $RESULTS/*/aksh/$NOW/"
+echo "Results: $RESULTS/*/preloop/$NOW/"
 exit $FAIL

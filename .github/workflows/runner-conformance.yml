@@ -44,17 +44,17 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64, smolvm-host]
     timeout-minutes: 180
     env:
-      GH_REPO: ${{ vars.RUNNER_CONFORMANCE_REPO || 'preloopdev/aksh-conformance' }}
+      GH_REPO: ${{ vars.RUNNER_CONFORMANCE_REPO || 'preloopdev/preloop-conformance' }}
       GH_TOKEN: ${{ secrets.RUNNER_CONFORMANCE_TOKEN }}
       HOST_WORKSPACE: ${{ vars.RUNNER_CONFORMANCE_HOST_WORKSPACE || '' }}
-      AKSH_RUNNER_HOST: ${{ github.workspace }}/target/aarch64-unknown-linux-musl/release/preloop-runner
+      PRELOOP_RUNNER_HOST: ${{ github.workspace }}/target/aarch64-unknown-linux-musl/release/preloop-runner
     steps:
       - uses: actions/checkout@v4
       - name: Build current PR runner for smolVM
-        run: cargo zigbuild -p aksh-runner --release --target aarch64-unknown-linux-musl
+        run: cargo zigbuild -p preloop-runner --release --target aarch64-unknown-linux-musl
       - name: Run deep runner conformance
         run: |
-          rm -f benchmarks/compatibility/runner/behavior/conformance-{aksh,official}.jsonl
+          rm -f benchmarks/compatibility/runner/behavior/conformance-{preloop,official}.jsonl
           bash ./benchmarks/real-world/batch-conformance.sh both '10[1-9]-*' '11[0-5]-*'
           python3 benchmarks/real-world/runner-conformance.py --mode deep
       - name: Upload deep report and captures

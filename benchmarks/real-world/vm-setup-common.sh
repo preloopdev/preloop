@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # vm-setup-common.sh — runs inside a per-job smolvm before the runner
 # Mounts expected:
-#   /workspace             — aksh source + binaries (macos-runners)
+#   /workspace             — preloop source + binaries (macos-runners)
 #   /workspace/.rustup     — Linux ARM64 toolchains (cachingv4/.rustup)
 #   /workspace/.cargo      — cargo registry cache (cachingv4/.cargo)
 #   /opt/actions-runner    — official C# runner (cachingv4/actions-runner)

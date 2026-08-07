@@ -6,7 +6,7 @@
 //! store the server injects into trusted jobs.
 
 use crate::preloop_home;
-use aksh_runner_server::config::{load_config, store_memory, write_config};
+use preloop_runner_server::config::{load_config, store_memory, write_config};
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use std::collections::BTreeMap;
@@ -192,7 +192,7 @@ async fn cmd_setup_github(args: GithubSetupArgs) -> anyhow::Result<()> {
                  \n\
                  Run `preloop setup github --via app --app-id <ID> --pem-file <KEY>` after\n\
                  creating the App:\n\
-                 \x20 1. github.com/settings/apps/new — name it (e.g. `dummy-aksh-app`),\n\
+                 \x20 1. github.com/settings/apps/new — name it (e.g. `dummy-preloop-app`),\n\
                  \x20    disable webhook, permissions: Contents: Read-only and\n\
                  \x20    Pull requests: Read-only (if your workflows read PRs).\n\
                  \x20 2. Generate a private key — save the PEM.\n\
@@ -221,7 +221,7 @@ async fn setup_app(args: &GithubSetupArgs) -> anyhow::Result<()> {
     let pem = std::fs::read_to_string(pem_path)
         .with_context(|| format!("reading App private key {}", pem_path.display()))?;
 
-    let mut config = aksh_runner_server::config::load_config()?;
+    let mut config = preloop_runner_server::config::load_config()?;
     config.github.app_id = Some(app_id.to_owned());
     config.github.app_pem = Some(pem.clone());
     if config.github.mint_failure.is_none() {
@@ -263,7 +263,7 @@ async fn setup_pat(args: &GithubSetupArgs) -> anyhow::Result<()> {
     println!("Metadata: Read-only is always required (GitHub enforces it).");
     if oidc_declared {
         println!(
-            "Note: your workflows also declare `id-token: write` — OIDC token issuance. For aksh\n             \x20 the ENGINE is the OIDC issuer (it mints the token with its own key); GitHub's\n             \x20 provider applies only to hosted runs. Either way it is not a PAT permission —\n             \x20 no action needed on the PAT. To consume the token, configure your cloud\n             \x20 provider's trust to accept the engine's OIDC issuer."
+            "Note: your workflows also declare `id-token: write` — OIDC token issuance. For preloop\n             \x20 the ENGINE is the OIDC issuer (it mints the token with its own key); GitHub's\n             \x20 provider applies only to hosted runs. Either way it is not a PAT permission —\n             \x20 no action needed on the PAT. To consume the token, configure your cloud\n             \x20 provider's trust to accept the engine's OIDC issuer."
         );
     }
 
@@ -316,7 +316,7 @@ async fn setup_pat(args: &GithubSetupArgs) -> anyhow::Result<()> {
         );
     }
 
-    let mut config = aksh_runner_server::config::load_config()?;
+    let mut config = preloop_runner_server::config::load_config()?;
     config.github.pat = Some(token.clone());
     config.github.mint_failure = Some("pat".into());
     let path = write_config(&config)?;
@@ -425,7 +425,7 @@ fn scalar_permission_lines(access: &str) -> Vec<String> {
         "write-all" => "write",
         _ => return Vec::new(),
     };
-    aksh_gha_parser::PERMISSION_SCOPES
+    preloop_gha_parser::PERMISSION_SCOPES
         .iter()
         .map(|scope| format!("{scope}: {level}"))
         .collect()
@@ -434,7 +434,7 @@ fn scalar_permission_lines(access: &str) -> Vec<String> {
 async fn doctor_app(app_id: &str, pem: &str, repos: &[String]) -> anyhow::Result<()> {
     let mut failed = false;
     for repo in repos {
-        match aksh_runner_server::github_app::verify_app_config(app_id, pem, repo).await {
+        match preloop_runner_server::github_app::verify_app_config(app_id, pem, repo).await {
             Ok(granted) => {
                 let names = granted
                     .iter()
@@ -456,7 +456,7 @@ async fn doctor_app(app_id: &str, pem: &str, repos: &[String]) -> anyhow::Result
 async fn doctor_pat(token: &str, repos: &[String]) -> anyhow::Result<()> {
     let mut failed = false;
     for repo in repos {
-        match aksh_runner_server::github_app::verify_repo_access_with_token(token, repo).await {
+        match preloop_runner_server::github_app::verify_repo_access_with_token(token, repo).await {
             Ok(granted) => {
                 let names = granted
                     .iter()
@@ -476,7 +476,7 @@ async fn doctor_pat(token: &str, repos: &[String]) -> anyhow::Result<()> {
 }
 
 pub(crate) async fn cmd_doctor(args: DoctorArgs) -> anyhow::Result<()> {
-    let path = aksh_runner_server::config::config_path();
+    let path = preloop_runner_server::config::config_path();
     if !path.exists() {
         anyhow::bail!(
             "no config file at {} — run `preloop setup github` first",
@@ -484,7 +484,7 @@ pub(crate) async fn cmd_doctor(args: DoctorArgs) -> anyhow::Result<()> {
         );
     }
     println!("config: {}", path.display());
-    let config = aksh_runner_server::config::load_config()?;
+    let config = preloop_runner_server::config::load_config()?;
     let mut failed = false;
 
     match (&config.github.app_id, &config.github.app_pem) {
@@ -1002,7 +1002,7 @@ mod tests {
         .unwrap();
         let (checklist, oidc) = workflow_permission_checklist(dir.path()).unwrap();
         assert!(oidc, "read-all/write-all cover id-token too");
-        for scope in aksh_gha_parser::PERMISSION_SCOPES {
+        for scope in preloop_gha_parser::PERMISSION_SCOPES {
             if scope == "id-token" {
                 continue;
             }

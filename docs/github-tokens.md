@@ -7,7 +7,7 @@ to a real GitHub credential.
 
 ## 1. How `GITHUB_TOKEN` works in Preloop
 
-Preloop runs its own control plane. `aksh-runner-server` implements the Actions
+Preloop runs its own control plane. `preloop-runner-server` implements the Actions
 runner protocol locally, so no GitHub-hosted orchestrator is in the loop.
 
 Each job gets **two independent credentials**, and keeping them straight is the
@@ -19,7 +19,7 @@ whole point of this document.
 | Job token | `GITHUB_TOKEN` | `system.github.token` / `github_token` | No — becomes a real GitHub credential when an App or PAT is configured |
 
 The **local HMAC JWT** is signed with a per-instance key persisted at
-`<state-dir>/hmac-key.bin` and carries `sub: aksh-job-<job-id>` plus
+`<state-dir>/hmac-key.bin` and carries `sub: preloop-job-<job-id>` plus
 `scp: Actions.Results:<plan-id>:<job-id>`. It authenticates against *the Preloop
 server*, and against nothing else — `api.github.com` will reject it.
 
@@ -30,7 +30,7 @@ logs, log files, step summaries, and OIDC id-tokens all authenticate with
 GitHub App or PAT cannot break any of those paths**.
 
 Checkout of a local workspace is the one case where a job-facing token talks to
-the Preloop server. When `AKSH_LOCAL_WORKSPACE` is set, submission captures the
+the Preloop server. When `PRELOOP_LOCAL_WORKSPACE` is set, submission captures the
 worktree as an immutable synthetic commit and rewrites the default
 `actions/checkout` step to fetch it from Preloop's Git smart-HTTP endpoint.
 That endpoint only accepts a local job JWT, so the server pins the local JWT
@@ -53,7 +53,7 @@ credential.
 
 | Capability | Notes |
 |---|---|
-| `actions/checkout` | For a repo in `AKSH_LOCAL_WORKSPACE`, served from the run's immutable snapshot over Preloop's authenticated Git smart-HTTP endpoint. |
+| `actions/checkout` | For a repo in `PRELOOP_LOCAL_WORKSPACE`, served from the run's immutable snapshot over Preloop's authenticated Git smart-HTTP endpoint. |
 | `actions/cache` | Both the v1 `_apis/artifactcache` API and the v2 `CacheService` Twirp API used when `ACTIONS_CACHE_SERVICE_V2` is on. |
 | `actions/upload-artifact`, `actions/download-artifact` | v1 and v4 (`ArtifactService` Twirp plus blob upload/download). |
 | All `run:` steps | Shell execution is entirely runner-local. |
@@ -61,7 +61,7 @@ credential.
 | Matrix, `needs`, `if:` conditions, expressions | Evaluated by Preloop's own planner. |
 | OIDC id-tokens | Needs `permissions: id-token: write`. Signed RS256 with the server's own keypair; the issuer defaults to `<public-base-url>/oidc` and is overridable with `--oidc-issuer`. Usable only if your cloud provider is configured to trust that issuer and its JWKS. |
 | Problem matchers, annotations, step summaries | Matchers run inside the runner, annotations travel as timeline issues, summaries upload to Preloop's blob store. |
-| Public actions in `uses:` | The server fetches action tarballs from `https://api.github.com/repos/{owner}/{repo}/tarball/{ref}` **unauthenticated** and caches them under `<state-dir>/actions/`. This path is hardcoded and does not honor `AKSH_GITHUB_API_URL`. Private actions will not download, and you share the anonymous API rate limit. |
+| Public actions in `uses:` | The server fetches action tarballs from `https://api.github.com/repos/{owner}/{repo}/tarball/{ref}` **unauthenticated** and caches them under `<state-dir>/actions/`. This path is hardcoded and does not honor `PRELOOP_GITHUB_API_URL`. Private actions will not download, and you share the anonymous API rate limit. |
 
 ---
 
@@ -101,22 +101,22 @@ repository the run belongs to and to the permissions that job declares.
 5. Configure the server and restart it:
 
    ```sh
-   export AKSH_GITHUB_APP_ID="123456"
-   export AKSH_GITHUB_APP_PEM_FILE="/secure/path/aksh-app.pem"
+   export PRELOOP_GITHUB_APP_ID="123456"
+   export PRELOOP_GITHUB_APP_PEM_FILE="/secure/path/preloop-app.pem"
    ```
 
 ### Configuration reference
 
 | Variable | Purpose |
 |---|---|
-| `AKSH_GITHUB_APP_ID` | App ID. Required to enable minting. |
-| `AKSH_GITHUB_APP_PEM` | Private key, inline PEM. Highest precedence. |
-| `AKSH_GITHUB_APP_PEM_FILE` | Path to a private-key PEM file. |
-| `AKSH_GITHUB_APP_PRIVATE_KEY` | Inline PEM, older alias. |
-| `AKSH_GITHUB_APP_PRIVATE_KEY_PATH` | PEM file path, older alias. |
-| `AKSH_GITHUB_APP_INSTALLATION_ID` | Pins one installation and skips discovery. |
-| `AKSH_GITHUB_APP_MINT_FAILURE` | What a job's `GITHUB_TOKEN` becomes if minting fails: `local` (default), `error`, or `pat`. See below. |
-| `AKSH_GITHUB_API_URL` | REST API base. Defaults to `https://api.github.com`; set it for GitHub Enterprise Server. |
+| `PRELOOP_GITHUB_APP_ID` | App ID. Required to enable minting. |
+| `PRELOOP_GITHUB_APP_PEM` | Private key, inline PEM. Highest precedence. |
+| `PRELOOP_GITHUB_APP_PEM_FILE` | Path to a private-key PEM file. |
+| `PRELOOP_GITHUB_APP_PRIVATE_KEY` | Inline PEM, older alias. |
+| `PRELOOP_GITHUB_APP_PRIVATE_KEY_PATH` | PEM file path, older alias. |
+| `PRELOOP_GITHUB_APP_INSTALLATION_ID` | Pins one installation and skips discovery. |
+| `PRELOOP_GITHUB_APP_MINT_FAILURE` | What a job's `GITHUB_TOKEN` becomes if minting fails: `local` (default), `error`, or `pat`. See below. |
+| `PRELOOP_GITHUB_API_URL` | REST API base. Defaults to `https://api.github.com`; set it for GitHub Enterprise Server. |
 
 The four private-key variables are tried in the order listed and the first
 non-blank one wins; blank and whitespace-only values count as unset. Both PKCS#1
@@ -129,7 +129,7 @@ Partial configuration (an App ID with no key, or a key with no App ID) logs a
 warning and simply disables minting. A key that *is* set but cannot be read or
 parsed is a hard startup error: the operator clearly meant to configure an App,
 and booting without one would silently downgrade every job token. An
-unrecognised `AKSH_GITHUB_APP_MINT_FAILURE` value is likewise fatal at startup,
+unrecognised `PRELOOP_GITHUB_APP_MINT_FAILURE` value is likewise fatal at startup,
 so a typo cannot quietly select a different policy.
 
 ### What happens per job
@@ -137,7 +137,7 @@ so a typo cannot quietly select a different policy.
 - The installation is resolved from the repository owner by paging
   `GET /app/installations` (100 per page, up to 10 pages) and matching
   `account.login` case-insensitively. The resulting id is cached in-process for
-  the server's lifetime; `AKSH_GITHUB_APP_INSTALLATION_ID` skips discovery
+  the server's lifetime; `PRELOOP_GITHUB_APP_INSTALLATION_ID` skips discovery
   altogether.
 - The token is minted with **both** `repositories` and `permissions` always
   present in the request body. `repositories` holds the single repository from
@@ -146,7 +146,7 @@ so a typo cannot quietly select a different policy.
   installation can reach", so neither is ever left out.
 - A run whose `repository` is not an `owner/repo` slug — a pure local-workspace
   submission, say — cannot be repository-scoped, so minting fails before any
-  network call and `AKSH_GITHUB_APP_MINT_FAILURE` takes over.
+  network call and `PRELOOP_GITHUB_APP_MINT_FAILURE` takes over.
 - Only the installation id is cached — never the token, since permissions vary
   per job. Every job mints a fresh one.
 - The App authenticates with an RS256 JWT that is backdated 60 seconds for clock
@@ -162,16 +162,16 @@ A mint can fail for many reasons: the App is not installed on that owner, the
 key was revoked, the API is rate-limited, the requested permissions exceed the
 installation's grant, or the run's `repository` is not a real slug.
 
-Falling back to `AKSH_GITHUB_TOKEN` automatically would be a silent privilege
+Falling back to `PRELOOP_GITHUB_TOKEN` automatically would be a silent privilege
 escalation — it trades a repository-scoped, `permissions:`-bounded token for a
-static PAT that is neither. `AKSH_GITHUB_APP_MINT_FAILURE` therefore makes the
+static PAT that is neither. `PRELOOP_GITHUB_APP_MINT_FAILURE` therefore makes the
 choice explicit:
 
 | Value | Behavior |
 |---|---|
 | `local` (default) | The job keeps the local HMAC JWT. It runs normally but cannot reach `api.github.com`. Scope can never widen. |
 | `error` | The submission is rejected with `502 Bad Gateway` before any state is mutated, so a misconfiguration is loud instead of silent. |
-| `pat` | The job receives `AKSH_GITHUB_TOKEN`, accepting that the PAT ignores `permissions:` and is not repository-scoped. |
+| `pat` | The job receives `PRELOOP_GITHUB_TOKEN`, accepting that the PAT ignores `permissions:` and is not repository-scoped. |
 
 ### How `permissions:` maps to token scopes
 
@@ -220,7 +220,7 @@ matters too: requesting a scope the App was *not* granted fails the mint with a
 - Orgs with strict App policies should skip the manifest flow, create the App by
   hand in org settings, and set the same env vars. Grant it at least the
   permissions your workflows request.
-- Store the PEM in a secrets manager and inject it as `AKSH_GITHUB_APP_PEM`.
+- Store the PEM in a secrets manager and inject it as `PRELOOP_GITHUB_APP_PEM`.
   Do not leave a `.pem` on disk in production, and never commit one.
 
 ---
@@ -230,7 +230,7 @@ matters too: requesting a scope the App was *not* granted fails the mint with a
 Set a Personal Access Token when starting the server:
 
 ```sh
-export AKSH_GITHUB_TOKEN="github_pat_..."
+export PRELOOP_GITHUB_TOKEN="github_pat_..."
 ```
 
 - The PAT is injected verbatim as `GITHUB_TOKEN` for **all** jobs. It is not
@@ -238,10 +238,10 @@ export AKSH_GITHUB_TOKEN="github_pat_..."
   declaring `permissions: contents: read` still receives the PAT's full rights.
   `permissions:` is only enforced on the GitHub App path. This is exactly why a
   failed App mint does not reach for the PAT unless
-  `AKSH_GITHUB_APP_MINT_FAILURE=pat` says so.
+  `PRELOOP_GITHUB_APP_MINT_FAILURE=pat` says so.
 - Fine-grained PATs are strongly preferred over classic tokens; scope them to
   the specific repositories and permissions your workflows need.
-- The same `AKSH_GITHUB_TOKEN` is also used server-side for Check Run
+- The same `PRELOOP_GITHUB_TOKEN` is also used server-side for Check Run
   create/update, remote workflow fetching, and pull-request changed-file
   lookups. With it unset, check runs are simulated in-memory and logged instead.
 
@@ -253,14 +253,14 @@ export AKSH_GITHUB_TOKEN="github_pat_..."
 GitHub App installation token
   (scoped to one repository and to `permissions:`, fresh per job, 1h TTL)
   ↓ configured? no App at all
-AKSH_GITHUB_TOKEN PAT (static, operator-provided, unscoped, ignores permissions:)
+PRELOOP_GITHUB_TOKEN PAT (static, operator-provided, unscoped, ignores permissions:)
   ↓ falls back to
 Local HMAC JWT (only works against the Preloop server)
 ```
 
 With App credentials configured, the App path is the *only* path a successful
 job token comes from — the PAT is not a silent second choice. A failed mint is
-resolved by `AKSH_GITHUB_APP_MINT_FAILURE` (see §4), which defaults to the local
+resolved by `PRELOOP_GITHUB_APP_MINT_FAILURE` (see §4), which defaults to the local
 HMAC JWT. With no App configured at all, the PAT is the primary job token.
 Either way every job receives some `GITHUB_TOKEN` value, unless the policy is
 `error`, which rejects the submission outright.

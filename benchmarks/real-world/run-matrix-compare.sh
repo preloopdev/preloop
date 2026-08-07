@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# run-matrix-compare.sh — Run 09-matrix-fan-out with official vs aksh runners
+# run-matrix-compare.sh — Run 09-matrix-fan-out with official vs preloop runners
 # and compare step-level conclusions
 set -euo pipefail
 
 WF="09-matrix-fan-out.yml"
 NUM_RUNNERS=3
-VM_OFFSET="${2:-4}"  # which bench-aksh-N to start from (4,5,6 have clean overlay)
-GH_REPO="preloopdev/aksh-conformance-sample"
+VM_OFFSET="${2:-4}"  # which bench-preloop-N to start from (4,5,6 have clean overlay)
+GH_REPO="preloopdev/preloop-conformance-sample"
 RESULTS_DIR="$(cd "$(dirname "$0")/results" && pwd)"
 WFBASE="09-matrix-fan-out"
-RUNNER="${1:-official}"  # official | aksh
+RUNNER="${1:-official}"  # official | preloop
 
 log() { echo "[$(date +%T.%3N)] $*"; }
 
@@ -31,8 +31,8 @@ gh api "repos/$GH_REPO/actions/runners" \
 
 # ── Kill stale processes in VMs ─────────────────────────────────────
 for i in $(seq 1 $NUM_RUNNERS); do
-  smolvm machine exec --name bench-aksh-$i -- bash -c \
-    'pkill -f "aksh-runner|Runner.Worker|Runner.Listener" 2>/dev/null; true' 2>/dev/null || true
+  smolvm machine exec --name bench-preloop-$i -- bash -c \
+    'pkill -f "preloop-runner|Runner.Worker|Runner.Listener" 2>/dev/null; true' 2>/dev/null || true
 done
 sleep 2
 
@@ -46,7 +46,7 @@ mkdir -p "$LOGDIR"
 
 # ── Start runners ────────────────────────────────────────────────────
 for i in $(seq 1 $NUM_RUNNERS); do
-  vm="bench-aksh-$((VM_OFFSET + i - 1))"
+  vm="bench-preloop-$((VM_OFFSET + i - 1))"
   name="${RUNNER}-matrix-${JOB_TS}-${i}"
   root="/tmp/runner-matrix-${JOB_TS}-${i}"
   log "Starting $RUNNER runner $i/$NUM_RUNNERS on $vm..."

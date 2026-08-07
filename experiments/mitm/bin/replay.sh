@@ -11,7 +11,7 @@ usage() {
     echo "The golden capture's flows.mitm file is replayed; the target backend answers as if live." >&2
     echo "" >&2
     echo "  --golden   Path to a golden capture directory (must contain flows.mitm)" >&2
-    echo "  --target   Backend to replay against (e.g. aksh, runner-server)" >&2
+    echo "  --target   Backend to replay against (e.g. preloop, runner-server)" >&2
     echo "  --port     Port for mitmdump to listen on (default: 8081)" >&2
     echo "  --timeout  Max seconds to run replay (default: 120)" >&2
     exit 1
@@ -51,12 +51,12 @@ fi
 
 # Determine target URL.
 case "$TARGET" in
-    aksh)
-        if [ ! -f "$CACHE/aksh.url" ]; then
-            echo "aksh not running — run bin/up-aksh.sh first" >&2
+    preloop)
+        if [ ! -f "$CACHE/preloop.url" ]; then
+            echo "preloop not running — run bin/up-preloop.sh first" >&2
             exit 3
         fi
-        TARGET_URL=$(cat "$CACHE/aksh.url")
+        TARGET_URL=$(cat "$CACHE/preloop.url")
         ;;
     runner-server)
         if [ ! -f "$CACHE/runner-server.url" ]; then
@@ -66,7 +66,7 @@ case "$TARGET" in
         TARGET_URL=$(cat "$CACHE/runner-server.url")
         ;;
     *)
-        echo "unknown target: $TARGET (expected: aksh, runner-server)" >&2
+        echo "unknown target: $TARGET (expected: preloop, runner-server)" >&2
         exit 1
         ;;
 esac

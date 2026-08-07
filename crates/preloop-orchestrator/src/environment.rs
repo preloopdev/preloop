@@ -1,6 +1,6 @@
 //! Toolchain and base-image resolution for disposable job environments.
 
-use aksh_gha_protocol::{oci_image_ref, JobPlan};
+use preloop_gha_protocol::{oci_image_ref, JobPlan};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -307,6 +307,12 @@ impl EnvironmentSpec {
         let normalized = serde_json::json!({
             "base": &base,
             "toolchains": &toolchains,
+            // The pool only rebuilds when the fingerprint-suffixed artifact
+            // file is missing, so bake-content changes MUST invalidate the
+            // fingerprint or the pool silently keeps the old golden forever
+            // (packages, resolv.conf, nvm, tool pins all live in the bake
+            // script, which interpolates the versions.toml pins).
+            "bake": crate::base_install_script(),
         });
         let bytes =
             serde_json::to_vec(&normalized).expect("normalized environment is serializable");
@@ -557,7 +563,7 @@ fn hex_digest(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aksh_gha_protocol::{JobId, StepPlan};
+    use preloop_gha_protocol::{JobId, StepPlan};
     use std::collections::{BTreeMap, BTreeSet};
 
     fn job(steps: Vec<StepPlan>, runs_on: Vec<String>) -> JobPlan {

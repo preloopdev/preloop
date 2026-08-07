@@ -1,4 +1,4 @@
-You are implementing an aksh protocol-sync spec. Follow existing Rust patterns exactly. Run cargo check and relevant tests, but do not run formatters or project-wide lint.
+You are implementing an preloop protocol-sync spec. Follow existing Rust patterns exactly. Run cargo check and relevant tests, but do not run formatters or project-wide lint.
 
 Spec:
 ```toml
@@ -34,9 +34,9 @@ POST /_apis/v1/AgentRequest/{poolId}/{requestId}?api-version=6.0
 '''
 expected_response = "204 No Content"
 
-[aksh_targets]
+[preloop_targets]
 files = [
-  { crate = "aksh-runner-server", path = "crates/aksh-runner-server/src/lib.rs", area = "AgentRequest routes" },
+  { crate = "preloop-runner-server", path = "crates/preloop-runner-server/src/lib.rs", area = "AgentRequest routes" },
 ]
 
 [implementation]

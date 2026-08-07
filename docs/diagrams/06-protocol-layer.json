@@ -11,7 +11,7 @@
     "id": "title",
     "x": 510,
     "y": 25,
-    "text": "aksh-gha-protocol \u2014 Wire & Crypto Architecture",
+    "text": "preloop-gha-protocol \u2014 Wire & Crypto Architecture",
     "fontSize": 28,
     "strokeColor": "#1e1e1e"
   },
@@ -45,7 +45,7 @@
     "id": "zone_l_wire",
     "x": 70,
     "y": 125,
-    "text": "Wire DTOs (aksh-gha-protocol / azdo)",
+    "text": "Wire DTOs (preloop-gha-protocol / azdo)",
     "fontSize": 18,
     "strokeColor": "#1e40af"
   },
@@ -323,7 +323,7 @@
       "type": 3
     },
     "label": {
-      "text": "debug_session.rs\ndebug protocol framing for aksh-dap",
+      "text": "debug_session.rs\ndebug protocol framing for preloop-dap",
       "fontSize": 15
     }
   },

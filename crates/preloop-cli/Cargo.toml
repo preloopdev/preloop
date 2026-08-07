@@ -17,8 +17,8 @@ path = "src/main.rs"
 [dependencies]
 preloop-orchestrator = { path = "../preloop-orchestrator" }
 preloop-vm = { path = "../preloop-vm" }
-aksh-runner-server = { path = "../aksh-runner-server" }
-aksh-gha-parser = { path = "../aksh-gha-parser" }
+preloop-runner-server = { path = "../preloop-runner-server" }
+preloop-gha-parser = { path = "../preloop-gha-parser" }
 anyhow = { workspace = true }
 base64 = { workspace = true }
 clap = { workspace = true }
@@ -32,7 +32,7 @@ reqwest = { workspace = true }
 rand = { workspace = true }
 futures-util = "0.3"
 libc = "0.2"
-aksh-gha-protocol = { path = "../aksh-gha-protocol" }
+preloop-gha-protocol = { path = "../preloop-gha-protocol" }
 self-replace = { workspace = true }
 semver = { workspace = true }
 sha2 = { workspace = true }

@@ -3,10 +3,10 @@
 # Usage: bash scripts/overnight-conformance.sh
 #
 # Runs:
-#   1. Release build of aksh-runner-server and runner-watch
+#   1. Release build of preloop-runner-server and runner-watch
 #   2. All 12 conformance scenarios via runner-watch conform
 #   3. Property tests with PROPTEST_CASES=10000
-#   4. Full unit test suite (excluding aksh-dap which has a pre-existing compile issue)
+#   4. Full unit test suite (excluding preloop-dap which has a pre-existing compile issue)
 #
 # Results are collected in /tmp/overnight-conformance-results/
 
@@ -34,7 +34,7 @@ trap cleanup EXIT
 
 # ── Phase 1: Build ──────────────────────────────────────────────────────────
 log "Phase 1: Building release binaries"
-cargo build --release -p aksh-runner-server -p runner-watch 2>&1 | tee -a "$LOG"
+cargo build --release -p preloop-runner-server -p runner-watch 2>&1 | tee -a "$LOG"
 log "Build complete"
 
 # ── Phase 2: Conformance replay ─────────────────────────────────────────────
@@ -69,7 +69,7 @@ for scenario in "${SCENARIOS[@]}"; do
         wait "$SERVER_PID" 2>/dev/null || true
     fi
 
-    cargo run --release -p aksh-runner-server -- serve --listen 127.0.0.1:9090 \
+    cargo run --release -p preloop-runner-server -- serve --listen 127.0.0.1:9090 \
         &>"$RESULTS_DIR/server-$scenario.log" &
     SERVER_PID=$!
 
@@ -92,7 +92,7 @@ for scenario in "${SCENARIOS[@]}"; do
     SCENARIO_LOG="$RESULTS_DIR/conform-$scenario.log"
     if cargo run --release -p runner-watch -- conform \
         --runner v2.335.1 \
-        --aksh-url http://127.0.0.1:9090 \
+        --preloop-url http://127.0.0.1:9090 \
         --scenario "$scenario" \
         --skip-cargo-test \
         >"$SCENARIO_LOG" 2>&1; then
@@ -131,7 +131,7 @@ echo "# Property Test Results — $TIMESTAMP" > "$PROP_RESULTS"
 
 # Concurrency pure properties
 log "  Concurrency pure properties"
-if PROPTEST_CASES=10000 cargo test --release -p aksh-runner-server \
+if PROPTEST_CASES=10000 cargo test --release -p preloop-runner-server \
     'concurrency::properties' -- --test-threads=1 \
     >>"$PROP_RESULTS" 2>&1; then
     log "  PASS: concurrency pure properties"
@@ -141,7 +141,7 @@ fi
 
 # Concurrency state machine
 log "  Concurrency state machine"
-if PROPTEST_CASES=10000 cargo test --release -p aksh-runner-server \
+if PROPTEST_CASES=10000 cargo test --release -p preloop-runner-server \
     'concurrency_properties' -- --test-threads=1 \
     >>"$PROP_RESULTS" 2>&1; then
     log "  PASS: concurrency state machine"
@@ -151,7 +151,7 @@ fi
 
 # HTTP sequence properties (lower case count — these are slow)
 log "  HTTP sequence properties"
-if PROPTEST_CASES=256 cargo test --release -p aksh-runner-server \
+if PROPTEST_CASES=256 cargo test --release -p preloop-runner-server \
     'concurrency_http_properties' -- --test-threads=1 \
     >>"$PROP_RESULTS" 2>&1; then
     log "  PASS: HTTP sequence properties"
@@ -161,7 +161,7 @@ fi
 
 # Expression properties
 log "  Expression properties"
-if PROPTEST_CASES=10000 cargo test --release -p aksh-gha-expressions \
+if PROPTEST_CASES=10000 cargo test --release -p preloop-gha-expressions \
     -- --test-threads=1 \
     >>"$PROP_RESULTS" 2>&1; then
     log "  PASS: expression properties"
@@ -171,7 +171,7 @@ fi
 
 # Parser concurrency properties
 log "  Parser concurrency properties"
-if cargo test --release -p aksh-gha-parser 'concurrency_' \
+if cargo test --release -p preloop-gha-parser 'concurrency_' \
     -- --test-threads=1 \
     >>"$PROP_RESULTS" 2>&1; then
     log "  PASS: parser concurrency properties"
@@ -181,7 +181,7 @@ fi
 
 # Runner timespan properties
 log "  Runner timespan properties"
-if PROPTEST_CASES=10000 cargo test --release -p aksh-runner 'timespan_tests' \
+if PROPTEST_CASES=10000 cargo test --release -p preloop-runner 'timespan_tests' \
     -- --test-threads=1 \
     >>"$PROP_RESULTS" 2>&1; then
     log "  PASS: runner timespan properties"
@@ -195,7 +195,7 @@ log "Phase 4: Full unit test suite"
 UNIT_RESULTS="$RESULTS_DIR/unit-tests-$TIMESTAMP.txt"
 echo "# Unit Test Results — $TIMESTAMP" > "$UNIT_RESULTS"
 
-for crate in aksh-runner-server aksh-gha-parser aksh-gha-expressions aksh-gha-protocol aksh-runner runner-watch; do
+for crate in preloop-runner-server preloop-gha-parser preloop-gha-expressions preloop-gha-protocol preloop-runner runner-watch; do
     log "  Testing $crate"
     if cargo test --release -p "$crate" --lib \
         >>"$UNIT_RESULTS" 2>&1; then

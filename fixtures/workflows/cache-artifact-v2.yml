@@ -6,7 +6,7 @@ on:
 
 # Verifies actions/cache@v4 (CacheService Twirp) and
 # actions/upload-artifact@v4 / download-artifact@v4 (ArtifactService Twirp)
-# against the local aksh server.
+# against the local preloop server.
 #
 # Requires ACTIONS_CACHE_SERVICE_V2=true, which the server injects via the
 # runtime token's scp claim and the CacheServerUrl endpoint data.
@@ -24,7 +24,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /tmp/cache-test
-          key: aksh-cache-v2-${{ github.run_id }}
+          key: preloop-cache-v2-${{ github.run_id }}
 
       - name: bust local copy
         run: rm -rf /tmp/cache-test
@@ -34,7 +34,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /tmp/cache-test
-          key: aksh-cache-v2-${{ github.run_id }}
+          key: preloop-cache-v2-${{ github.run_id }}
 
       - name: verify cache hit
         run: |
@@ -87,7 +87,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /tmp/restore-key-test
-          key: aksh-restore-key-base-${{ github.run_id }}
+          key: preloop-restore-key-base-${{ github.run_id }}
 
       - name: bust local copy
         run: rm -rf /tmp/restore-key-test
@@ -97,9 +97,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /tmp/restore-key-test
-          key: aksh-restore-key-new-${{ github.run_id }}
+          key: preloop-restore-key-new-${{ github.run_id }}
           restore-keys: |
-            aksh-restore-key-base-
+            preloop-restore-key-base-
 
       - name: verify prefix restore
         run: |

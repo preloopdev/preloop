@@ -1,12 +1,12 @@
 # GitHub App Webhook Integration Log & User Guide
 
-This document records the design, build log, and interaction guide for the end-to-end GitHub App Webhook receiver and Checks API status reporting system in `aksh`.
+This document records the design, build log, and interaction guide for the end-to-end GitHub App Webhook receiver and Checks API status reporting system in `preloop`.
 
 ---
 
 ## 1. Webhook Architecture Overview
 
-The webhook system enables `aksh` to receive push and pull_request notifications directly from GitHub, fetch matching workflow files, and queue jobs for self-hosted runners. It also integrates with the GitHub Checks API to report status back to the repository.
+The webhook system enables `preloop` to receive push and pull_request notifications directly from GitHub, fetch matching workflow files, and queue jobs for self-hosted runners. It also integrates with the GitHub Checks API to report status back to the repository.
 
 ### Data Flow diagram:
 
@@ -17,7 +17,7 @@ graph TD
     Auth -->|JWT / App Private Key| GH
     GH -->|Installation Token| Fetch[Workflow Fetcher]
     Fetch -->|3. Fetch .github/workflows/*.yml| AST[Workflow Evaluator]
-    AST -->|Matches? -> submit_run_inner| Core[aksh Control Plane]
+    AST -->|Matches? -> submit_run_inner| Core[preloop Control Plane]
     Core -->|4. Job InProgress/Done| Report[Checks Reporter]
     Report -->|Checks API / Commit Status| GH
 ```
@@ -30,9 +30,9 @@ The system is configured using the following environment variables:
 
 | Variable | Description | Example |
 |---|---|---|
-| `AKSH_WEBHOOK_SECRET` | Secret key configured on the GitHub App to verify payload signatures. | `my-secure-webhook-secret` |
-| `AKSH_LOCAL_WORKSPACE` | Path to a local Git worktree used for offline workflow loading and immutable local-source checkouts. | `/path/to/my-repo` |
-| `AKSH_GITHUB_TOKEN` | GitHub Personal Access Token or App Installation Token to fetch workflows and update check runs. | `ghp_...` or `ghs_...` |
+| `PRELOOP_WEBHOOK_SECRET` | Secret key configured on the GitHub App to verify payload signatures. | `my-secure-webhook-secret` |
+| `PRELOOP_LOCAL_WORKSPACE` | Path to a local Git worktree used for offline workflow loading and immutable local-source checkouts. | `/path/to/my-repo` |
+| `PRELOOP_GITHUB_TOKEN` | GitHub Personal Access Token or App Installation Token to fetch workflows and update check runs. | `ghp_...` or `ghs_...` |
 
 ### Security Best Practices
 
@@ -48,27 +48,27 @@ The system is configured using the following environment variables:
 
 <!-- Trigger Webhook Event Test 2026-07-01 13:38 -->
 
-`aksh` verifies that incoming webhooks are authentic:
-- When `AKSH_WEBHOOK_SECRET` is set, `aksh` computes the HMAC-SHA256 signature of the raw request body and verifies it against the `x-hub-signature-256` header.
+`preloop` verifies that incoming webhooks are authentic:
+- When `PRELOOP_WEBHOOK_SECRET` is set, `preloop` computes the HMAC-SHA256 signature of the raw request body and verifies it against the `x-hub-signature-256` header.
 - If verification fails or the header is missing, the endpoint returns `401 Unauthorized`.
-- If `AKSH_WEBHOOK_SECRET` is not configured, signature checking is skipped, enabling easier local testing.
+- If `PRELOOP_WEBHOOK_SECRET` is not configured, signature checking is skipped, enabling easier local testing.
 
 ---
 
 ## 4. Workflow Fetching Strategies
 
-When a push or PR webhook is received, `aksh` retrieves the workflow definitions:
+When a push or PR webhook is received, `preloop` retrieves the workflow definitions:
 1. **Local Filesystem (Offline/Dev Mode)**:
-   If `AKSH_LOCAL_WORKSPACE` is configured, `aksh` reads the `.github/workflows/`
+   If `PRELOOP_LOCAL_WORKSPACE` is configured, `preloop` reads the `.github/workflows/`
    directory directly from that local path. For a default
    `uses: actions/checkout@v4` step, submission also captures the worktree as an
    immutable synthetic Git commit and redirects the compiled checkout inputs to
-   aksh's authenticated smart-HTTP endpoint. Tracked modifications, deletions,
+   preloop's authenticated smart-HTTP endpoint. Tracked modifications, deletions,
    and untracked non-ignored files are included without modifying the user's
    index or workflow YAML. Explicit repository/ref/token/server checkout inputs
    retain their original remote behavior.
 2. **GitHub API (Remote/Production Mode)**:
-   If `AKSH_LOCAL_WORKSPACE` is not configured, but `AKSH_GITHUB_TOKEN` is set, `aksh` queries:
+   If `PRELOOP_LOCAL_WORKSPACE` is not configured, but `PRELOOP_GITHUB_TOKEN` is set, `preloop` queries:
    `GET /repos/{owner}/{repo}/contents/.github/workflows?ref={git_ref}`
    And downloads files dynamically.
 3. **Current Directory Fallback**:
@@ -81,9 +81,9 @@ When a push or PR webhook is received, `aksh` retrieves the workflow definitions
 The system maps the lifecycle of each job to a GitHub Check Run:
 1. **Queued**: When a run is accepted, a check run is created via `POST /repos/{owner}/{repo}/check-runs` with status `queued`. The check run ID is recorded in `RunRecord.job_check_run_ids`.
 2. **In Progress**: When the runner fetches and starts the job, the status is updated to `in_progress`.
-3. **Completed**: When the runner finishes (or `aksh` reaps it due to timeout/lease expiration), the check run is updated to `completed` with the corresponding conclusion (`success`, `failure`, or `cancelled`).
+3. **Completed**: When the runner finishes (or `preloop` reaps it due to timeout/lease expiration), the check run is updated to `completed` with the corresponding conclusion (`success`, `failure`, or `cancelled`).
 
-If `AKSH_GITHUB_TOKEN` is not configured, these requests are simulated in-memory and logged to the console, allowing fully offline execution.
+If `PRELOOP_GITHUB_TOKEN` is not configured, these requests are simulated in-memory and logged to the console, allowing fully offline execution.
 
 ---
 
@@ -91,23 +91,23 @@ If `AKSH_GITHUB_TOKEN` is not configured, these requests are simulated in-memory
 
 ### Step 1: Set up Webhook in GitHub
 1. Go to your GitHub App or Repository settings.
-2. Set the payload URL to `http://<your-aksh-url>/api/v1/github/webhooks`.
+2. Set the payload URL to `http://<your-preloop-url>/api/v1/github/webhooks`.
 3. Set the content type to `application/json`.
 4. Enter a secure Webhook Secret (e.g. `super-secret`).
 5. Select the **Push** and **Pull Request** events.
 
-### Step 2: Start `aksh-runner-server`
+### Step 2: Start `preloop-runner-server`
 Run the server with the environment variables set:
 ```sh
-export AKSH_WEBHOOK_SECRET="super-secret"
-export AKSH_LOCAL_WORKSPACE="/Users/bnjoroge/runner-watcher"
-export AKSH_GITHUB_TOKEN="ghp_optional_token_for_checks"
+export PRELOOP_WEBHOOK_SECRET="super-secret"
+export PRELOOP_LOCAL_WORKSPACE="/Users/bnjoroge/runner-watcher"
+export PRELOOP_GITHUB_TOKEN="ghp_optional_token_for_checks"
 
 just serve
 ```
 
 ### Step 3: Trigger workflows
-Push a commit or open a pull request. `aksh` will:
+Push a commit or open a pull request. `preloop` will:
 - Receive the webhook event.
 - Fetch the workflows.
 - Match filters (branches, tags, paths).
@@ -118,24 +118,24 @@ Push a commit or open a pull request. `aksh` will:
 
 ## 7. GitHub App Registration and Installation
 
-`aksh` supports the official **GitHub App Manifest** flow to create an App. Creating the App and installing it are separate GitHub operations.
+`preloop` supports the official **GitHub App Manifest** flow to create an App. Creating the App and installing it are separate GitHub operations.
 
-1. **Expose aksh at its final public HTTPS URL**:
-   Start `aksh-runner-server` behind a publicly reachable HTTPS address, then open:
+1. **Expose preloop at its final public HTTPS URL**:
+   Start `preloop-runner-server` behind a publicly reachable HTTPS address, then open:
    ```text
-   https://aksh.example.com/api/v1/github/register
+   https://preloop.example.com/api/v1/github/register
    ```
    `localhost` is suitable for viewing the form, but GitHub cannot deliver webhook events or callback redirects to it. The manifest only includes webhook settings for non-local hosts.
 
 2. **Create the App from the manifest**:
-   Click **Register App on GitHub**. GitHub opens its App-creation flow with aksh's redirect URL, webhook URL, default events, and default permissions pre-filled.
+   Click **Register App on GitHub**. GitHub opens its App-creation flow with preloop's redirect URL, webhook URL, default events, and default permissions pre-filled.
 
 3. **Capture the callback credentials**:
    After GitHub creates the App, it redirects to:
    ```text
-   https://aksh.example.com/api/v1/github/callback?code=...
+   https://preloop.example.com/api/v1/github/callback?code=...
    ```
-   aksh exchanges the one-time code for an App ID, webhook secret, and private-key PEM, then displays them. Treat the PEM and webhook secret as credentials: store them in a secret manager and do not commit them.
+   preloop exchanges the one-time code for an App ID, webhook secret, and private-key PEM, then displays them. Treat the PEM and webhook secret as credentials: store them in a secret manager and do not commit them.
 
 4. **Install the App**:
    In GitHub's App settings, install the newly created App on the target account or repository. Copy the installation ID from its installation settings URL, for example:
@@ -144,21 +144,21 @@ Push a commit or open a pull request. `aksh` will:
    ```
    The App cannot mint an installation access token until this step is complete.
 
-5. **Configure aksh and restart it**:
+5. **Configure preloop and restart it**:
    ```sh
-   export AKSH_WEBHOOK_SECRET="your-new-webhook-secret"
-   export AKSH_GITHUB_APP_ID="your-new-app-id"
-   export AKSH_GITHUB_APP_INSTALLATION_ID="your-installation-id"
-   export AKSH_GITHUB_APP_PRIVATE_KEY='-----BEGIN PRIVATE KEY-----
+   export PRELOOP_WEBHOOK_SECRET="your-new-webhook-secret"
+   export PRELOOP_GITHUB_APP_ID="your-new-app-id"
+   export PRELOOP_GITHUB_APP_INSTALLATION_ID="your-installation-id"
+   export PRELOOP_GITHUB_APP_PRIVATE_KEY='-----BEGIN PRIVATE KEY-----
    ...
    -----END PRIVATE KEY-----'
-   # Or: export AKSH_GITHUB_APP_PRIVATE_KEY_PATH=/secure/path/aksh-app.pem
+   # Or: export PRELOOP_GITHUB_APP_PRIVATE_KEY_PATH=/secure/path/preloop-app.pem
    ```
 
-   When these values are set, aksh signs a GitHub App JWT and exchanges it for a per-job installation access token scoped to the run's repository and to that job's effective `permissions:`. A job declaring no `permissions:` gets GitHub's restricted default (`contents`, `metadata`, `packages` at `read`), never the installation's full grant. If no App configuration is present at all, `AKSH_GITHUB_TOKEN` is the job token. If an App *is* configured but minting fails, `AKSH_GITHUB_APP_MINT_FAILURE` decides — `local` (the default) keeps the job on the local HMAC JWT rather than silently widening its authority to the PAT. See [GitHub Tokens](./github-tokens.md).
+   When these values are set, preloop signs a GitHub App JWT and exchanges it for a per-job installation access token scoped to the run's repository and to that job's effective `permissions:`. A job declaring no `permissions:` gets GitHub's restricted default (`contents`, `metadata`, `packages` at `read`), never the installation's full grant. If no App configuration is present at all, `PRELOOP_GITHUB_TOKEN` is the job token. If an App *is* configured but minting fails, `PRELOOP_GITHUB_APP_MINT_FAILURE` decides — `local` (the default) keeps the job on the local HMAC JWT rather than silently widening its authority to the PAT. See [GitHub Tokens](./github-tokens.md).
 
 6. **Confirm delivery and job credential use**:
-   Push a commit or open a pull request. aksh verifies the webhook and queues matching jobs. The installed App's scoped token is supplied to the runner job. Remote workflow retrieval and GitHub Check Run reporting currently continue to use `AKSH_GITHUB_TOKEN`; configure `AKSH_LOCAL_WORKSPACE` for offline workflow loading, or provide that token for those server-side GitHub API calls.
+   Push a commit or open a pull request. preloop verifies the webhook and queues matching jobs. The installed App's scoped token is supplied to the runner job. Remote workflow retrieval and GitHub Check Run reporting currently continue to use `PRELOOP_GITHUB_TOKEN`; configure `PRELOOP_LOCAL_WORKSPACE` for offline workflow loading, or provide that token for those server-side GitHub API calls.
 
 ---
 
@@ -170,15 +170,15 @@ This section documents operational best practices, lessons learned, and real-wor
 
 The `--public-url` parameter supplied to `preloop serve` serves two distinct purposes:
 1. **In-VM Control Plane Endpoint**: Tells the ephemeral runner microVM inside SmolVM where to connect back to the control plane.
-2. **GitHub Check Run Links**: Forms the base URL for the `details_url` field sent to GitHub when registering check runs on PRs and commits (e.g. `https://aksh.preloop.dev/runs/<run_id>`).
+2. **GitHub Check Run Links**: Forms the base URL for the `details_url` field sent to GitHub when registering check runs on PRs and commits (e.g. `https://preloop.preloop.dev/runs/<run_id>`).
 
-**Pitfall**: Setting `--public-url` to a local LAN IP (e.g. `http://192.168.1.221:9090`) during local testing will cause GitHub check runs to be registered with non-routable local IP links on GitHub PRs. Always keep `--public-url https://aksh.preloop.dev` in production deployments.
+**Pitfall**: Setting `--public-url` to a local LAN IP (e.g. `http://192.168.1.221:9090`) during local testing will cause GitHub check runs to be registered with non-routable local IP links on GitHub PRs. Always keep `--public-url https://preloop.preloop.dev` in production deployments.
 
 ### 8.2 Cloudflare Tunnel Configuration & Error 1033
 
-When routing public webhooks and check status requests through Cloudflare Tunnels (`aksh.preloop.dev`):
+When routing public webhooks and check status requests through Cloudflare Tunnels (`preloop.preloop.dev`):
 - **Error 1033 (`Argo Tunnel error`)**: Occurs when Cloudflare's edge cannot communicate with the local `cloudflared` process, or when port `9090` is down or un-routable.
-- **Correct Tunnel Target**: The production named tunnel `aksh-prod` (`16cc97ea-e9d5-4723-875a-6de90f880b07`) must be run with explicit local target port 9090:
+- **Correct Tunnel Target**: The production named tunnel `preloop-prod` (`16cc97ea-e9d5-4723-875a-6de90f880b07`) must be run with explicit local target port 9090:
   ```sh
   cloudflared tunnel --url http://127.0.0.1:9090 run 16cc97ea-e9d5-4723-875a-6de90f880b07
   ```
@@ -188,7 +188,7 @@ When routing public webhooks and check status requests through Cloudflare Tunnel
 
 GitHub App token minting is strictly all-or-nothing:
 - Requesting any scope ungranted by the GitHub App installation causes GitHub's API to return `HTTP 422 Unprocessable Entity`.
-- **Automatic Clamping**: For unrequested default scopes (e.g. `packages: read`), `aksh` automatically clamps token requests to the installation's granted intersection (`contents: read`, `metadata: read`).
+- **Automatic Clamping**: For unrequested default scopes (e.g. `packages: read`), `preloop` automatically clamps token requests to the installation's granted intersection (`contents: read`, `metadata: read`).
 - **Explicit Permissions**: Workflows declaring explicit `permissions:` blocks that exceed installation grants will intentionally fail loudly so missing permissions are never silently ignored.
 
 ### 8.4 Cross-Compiled Runner Bundle & `cargo clean`
@@ -200,7 +200,7 @@ The microVM orchestrator requires the cross-compiled Linux ARM64 runner binary a
   ```
 - **Recovery**: Rebuild the runner bundle with `cargo zigbuild` before starting the server:
   ```sh
-  cargo zigbuild -p aksh-runner --target aarch64-unknown-linux-gnu
+  cargo zigbuild -p preloop-runner --target aarch64-unknown-linux-gnu
   ```
 -
 ### 8.5 Skipping CI Runs
@@ -227,7 +227,7 @@ If **any** commit in a push batch contains a skip label, the entire push is supp
 Runner VMs run under `NetworkPolicy::PublicOnly` — guest egress can reach the public internet but the hypervisor's egress floor deliberately refuses guest→host private addresses (loopback or LAN IP; verified: guest curl domehan the host LAN URL hangs indefinitely). Guests reach the control plane through exactly one sanctioned path:
 
 1. **Runner transport** — the runner's own control-plane HTTP (connectionData, long-poll, broker) rides the mounted unix socket `/run/preloop-control/engine.sock` when `PRELOOP_CONTROL_SOCKET`/`PRELOOP_CONTROL_ORIGIN` are set (always set by the orchestrator when a control socket is configured).
-2. **Job-side programs** (`actions/checkout`'s git, `curl`, Node actions) only know URLs. The runner binds the advertised origin *inside the guest on loopback* and splices each accepted connection onto the socket (`aksh-runner/src/control_bridge.rs`). Blast radius: one host endpoint.
+2. **Job-side programs** (`actions/checkout`'s git, `curl`, Node actions) only know URLs. The runner binds the advertised origin *inside the guest on loopback* and splices each accepted connection onto the socket (`preloop-runner/src/control_bridge.rs`). Blast radius: one host endpoint.
 
 #### The advertised origin decides everything
 
@@ -237,24 +237,24 @@ The bridge only binds when the advertised origin is a loopback address the guest
 |---|---|---|---|
 | `http://127.0.0.1:9090` (dev) | socket | loopback bridge → socket | none |
 | `http://<lan-ip>:9090` | socket | **blackholes** (LAN IP refused by egress floor) | — |
-| `https://aksh.preloop.dev` (prod) | **public internet → Cloudflare → argo tunnel → host** | same hairpin | **hard dependency** |
+| `https://preloop.preloop.dev` (prod) | **public internet → Cloudflare → argo tunnel → host** | same hairpin | **hard dependency** |
 
 Consequences:
 
 - With the production hostname, *everything* guests do — registration, long-poll, artifact uploads, checkout fetches — physically leaves the host, traverses Cloudflare, and returns through the tunnel. A tunnel outage therefore breaks *local* CI: observed as `530 / error code: 1033` from in-VM `connectionData` fetches and as `actions/upload-artifact` timeouts (`runner-light` failure during the 2026-07-30 tunnel transition).
-- The hostname also has to keep resolving publicly; `aksh.preloop.dev` TLS and DNS are load-bearing for local jobs in this mode.
+- The hostname also has to keep resolving publicly; `preloop.preloop.dev` TLS and DNS are load-bearing for local jobs in this mode.
 
 #### Resolution: the runner-facing origin is split from the public URL
 
 `preloop serve` now publishes two origins:
 
-- **`AKSH_PUBLIC_URL`** (`--public-url`) — GitHub-facing only. Used for check-run `details_url` links and anything GitHub must reach. No guest ever dials it.
-- **`AKSH_RUNNER_URL`** — every URL handed to runners and their jobs (connectionData `brokerUrl`, endpoint data `ResultsServiceUrl`/`CacheServerUrl`, Twirp signed blob/cache URLs, `system.github.launch_endpoint`, OIDC issuer, live-log ws feed). `serve` pins it to `http://127.0.0.1:<port>` by default, which routes over the mounted unix socket (`PRELOOP_CONTROL_SOCKET`) for the runner itself and via the in-guest loopback bridge (`control_bridge.rs`) for job-side TCP programs.
+- **`PRELOOP_PUBLIC_URL`** (`--public-url`) — GitHub-facing only. Used for check-run `details_url` links and anything GitHub must reach. No guest ever dials it.
+- **`PRELOOP_RUNNER_URL`** — every URL handed to runners and their jobs (connectionData `brokerUrl`, endpoint data `ResultsServiceUrl`/`CacheServerUrl`, Twirp signed blob/cache URLs, `system.github.launch_endpoint`, OIDC issuer, live-log ws feed). `serve` pins it to `http://127.0.0.1:<port>` by default, which routes over the mounted unix socket (`PRELOOP_CONTROL_SOCKET`) for the runner itself and via the in-guest loopback bridge (`control_bridge.rs`) for job-side TCP programs.
 
 Consequences:
 
 - Job traffic never crosses the tunnel regardless of `--public-url`; the tunnel is load-bearing only for *GitHub→host* webhook delivery and check-run links — where it belongs.
 - A tunnel outage degrades webhook delivery/check-run UX, not in-VM CI execution.
-- **Remote runners** (runner on another machine, not the local smolvm pool): set `AKSH_RUNNER_URL=http://<host-reachable>:9090` — but note in-VM runners cannot reach LAN addresses under `PublicOnly` egress, so this override only works for runners outside the VM pool.
+- **Remote runners** (runner on another machine, not the local smolvm pool): set `PRELOOP_RUNNER_URL=http://<host-reachable>:9090` — but note in-VM runners cannot reach LAN addresses under `PublicOnly` egress, so this override only works for runners outside the VM pool.
 
 A host-side reverse proxy cannot solve the hairpin by itself — the guest resolves public names over public DNS and `PublicOnly` egress means packets leave the host before a proxy could intercept them. Origin separation is the fix; DNS-pinning the public hostname to guest loopback with a local CA achieves the same effect at strictly higher complexity.

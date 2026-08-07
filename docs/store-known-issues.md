@@ -1,7 +1,7 @@
 # Durable store — known issues
 
 Tracked follow-ups for the SQLite/Postgres control-plane store
-(`crates/aksh-runner-server/src/store.rs`, `store_pg.rs`). Five blockers found
+(`crates/preloop-runner-server/src/store.rs`, `store_pg.rs`). Five blockers found
 in the same review were fixed in `fix(store): five restart-correctness blockers
 in the durable store`; what follows is everything that was deliberately *not*
 fixed there, with enough detail to pick any item up cold.
@@ -138,7 +138,7 @@ actually needs one.
 
 `store.rs` (`pub(crate)`), `runner_lifecycle.rs` (private — and it *shadows* the
 glob-imported one via `use store::*`), and inlined again in
-`aksh-runner/src/configure.rs`. `REVIEW.md` §5: one way to do each thing.
+`preloop-runner/src/configure.rs`. `REVIEW.md` §5: one way to do each thing.
 
 ---
 
@@ -152,7 +152,7 @@ cleanup reintroduces a real bug.
 
 ```rust
 // store.rs
-// Salt = the root key itself, so two aksh installs that happen to load
+// Salt = the root key itself, so two preloop installs that happen to load
 // the same weak env var don't end up with the same sub-keys.
 let salt = Sha256::digest(root);
 ```
@@ -201,7 +201,7 @@ without zeroizing.
   into `job.needs`. The Postgres twin already has the clean
   `for depends_on in &job.needs`.
 - `nit:` **`Envelope::seal`** returns `Result` but cannot fail.
-- `nit:` **`aksh_gha_expressions::Context`** gained public `Serialize` /
+- `nit:` **`preloop_gha_expressions::Context`** gained public `Serialize` /
   `Deserialize` solely so the server can persist `QueuedJob.condition_context`.
   That makes a library crate's private field layout part of its public serde
   contract for a downstream persistence concern.
@@ -222,14 +222,14 @@ uncovered:
 - **Restart with a live lease.** No test restarts with a job actually claimed by
   a runner and an active session lease, then asserts the runner can renew.
 - **Postgres in CI.** Every `postgres_*` test `return`s unless
-  `AKSH_TEST_PG_URL` is set, so the backend is unexercised by `just test-ci`.
+  `PRELOOP_TEST_PG_URL` is set, so the backend is unexercised by `just test-ci`.
   Verified manually against PostgreSQL 16 in Docker:
 
   ```sh
-  docker run --rm -e POSTGRES_PASSWORD=aksh -e POSTGRES_USER=aksh \
-    -e POSTGRES_DB=aksh -p 55432:5432 postgres:16-alpine
-  AKSH_TEST_PG_URL=postgres://aksh:aksh@127.0.0.1:55432/aksh \
-    cargo test -p aksh-runner-server --lib -- postgres_
+  docker run --rm -e POSTGRES_PASSWORD=preloop -e POSTGRES_USER=preloop \
+    -e POSTGRES_DB=preloop -p 55432:5432 postgres:16-alpine
+  PRELOOP_TEST_PG_URL=postgres://preloop:preloop@127.0.0.1:55432/preloop \
+    cargo test -p preloop-runner-server --lib -- postgres_
   ```
 
   Wiring that into the gate is the single highest-value coverage addition here.
@@ -263,14 +263,14 @@ deliberately **not** fixed, so a future pass does not have to re-derive them.
    meta.byte_count` is unchanged by a zero-byte append, so the next empty
    append violates `PRIMARY KEY (log_key, chunk_index)` and the chunk is
    dropped with a `warn!`. Use a monotonic per-log sequence.
-4. **Postgres tests are not isolated.** They share one `AKSH_TEST_PG_URL`
+4. **Postgres tests are not isolated.** They share one `PRELOOP_TEST_PG_URL`
    database and each starts with a `TRUNCATE`, which erases concurrent tests'
    state when run with the default test threads. They now run with
    `--test-threads=1` locally; the durable fix is a unique database per test
    (or a schema per test).
 5. **The concurrent-migration test forces `NoTls`.** `postgres_concurrent_open_serializes_migrations`
    builds its temporary database URL without preserving the query string, so
-   it fails against a TLS `AKSH_TEST_PG_URL`. Reuse `tls_connector` and keep
+   it fails against a TLS `PRELOOP_TEST_PG_URL`. Reuse `tls_connector` and keep
    the query when splitting the URL.
 
 ### P2 concerns — fixed as a byproduct of the P1 work
@@ -284,11 +284,11 @@ deliberately **not** fixed, so a future pass does not have to re-derive them.
 
 - `docs/concurrency-plan.md:446` still calls the module `persist.rs`; line 334
   was renamed to `store.rs`. Fix the stale reference.
-- `AgentRsaPublicKey::to_xml_string` (aksh-gha-protocol/src/crypto.rs:61) is a
+- `AgentRsaPublicKey::to_xml_string` (preloop-gha-protocol/src/crypto.rs:61) is a
   byte-for-byte copy of `AgentRsaKeypair::public_key_xml`, and a third copy
   lives in `runner_lifecycle::rsa_public_key_xml_from_value`. Extract one
   helper on `rsa::RsaPublicKey` and delegate.
 - `--store` help text omits `sslmode=verify-ca` (server main.rs): the doc
   string lists `require|verify-full` only.
-- `postgres_concurrent_open_serializes_migrations` leaves an `aksh_race_*`
+- `postgres_concurrent_open_serializes_migrations` leaves an `preloop_race_*`
   database behind per run. Drop it in the test teardown.

@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MITM_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 usage() {
-    echo "Usage: $0 --backend {official|runner-server|aksh} [--non-interactive]" >&2
+    echo "Usage: $0 --backend  {official|runner-server|preloop} [--non-interactive]" >&2
     exit 1
 }
 

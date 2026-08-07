@@ -9,7 +9,7 @@ usage() {
     echo "Run a conformance test: replay golden capture against target backend, then compare." >&2
     echo "" >&2
     echo "  --golden    Path to golden capture dir, or scenario name (uses latest official capture)" >&2
-    echo "  --target    Backend to test (e.g. aksh, runner-server)" >&2
+    echo "  --target    Backend to test (e.g. preloop, runner-server)" >&2
     echo "  --scenario  Scenario name for the comparison report" >&2
     echo "  --timeout   Max seconds for replay (default: 120)" >&2
     exit 1

@@ -2,9 +2,9 @@
 """Concurrency Matrix Stress Testing and Log Comparison Harness.
 Supports 4 combinations:
 1. GitHub + Official Runner (github-official)
-2. GitHub + aksh-runner (github-aksh)
-3. aksh server + Official Runner (aksh-official)
-4. aksh server + aksh-runner (aksh-aksh)
+2. GitHub + preloop-runner (github-preloop)
+3. preloop server + Official Runner (preloop-official)
+4. preloop server + preloop-runner (preloop)
 
 Also compares any two captured results directories.
 """
@@ -94,12 +94,12 @@ def wait_for_new_github_run(workflow_file: str, repo: str, known_ids: set[str], 
             return sorted(list(new_ids))[-1]
     raise TimeoutError(f"New run for workflow {workflow_file} did not appear on GitHub within {timeout} seconds.")
 
-# ─── aksh API Helpers ────────────────────────────────────────────────────────
+# ─── preloop API Helpers ────────────────────────────────────────────────────────
 
 def api_request(method: str, url: str, body: dict = None) -> dict:
     data = None if body is None else json.dumps(body).encode("utf-8")
     headers = {
-        "Authorization": "Bearer aksh-system-token",
+        "Authorization": "Bearer preloop-system-token",
         "Content-Type": "application/json"
     }
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
@@ -255,18 +255,18 @@ def compare_scenarios(left: SideCapture, right: SideCapture) -> dict:
 
 # ─── Runner/Server Orchestration (Local) ──────────────────────────────────────
 
-def start_aksh_server(port: int, state_dir: Path) -> subprocess.Popen:
+def start_preloop_server(port: int, state_dir: Path) -> subprocess.Popen:
     print(f"Starting preloop-server serve on port {port}...")
     state_dir.mkdir(parents=True, exist_ok=True)
-    # We want to run aksh-runner-server from target/release/preloop-server
+    # We want to run preloop-runner-server from target/release/preloop-server
     server_bin = Path("target/release/preloop-server")
     if not server_bin.exists():
         server_bin = Path("target/debug/preloop-server")
     if not server_bin.exists():
-        raise FileNotFoundError("Could not find aksh-runner-server binary.")
+        raise FileNotFoundError("Could not find preloop-runner-server binary.")
     
     env = os.environ.copy()
-    env["AKSH_PUBLIC_URL"] = f"http://127.0.0.1:{port}"
+    env["PRELOOP_PUBLIC_URL"] = f"http://127.0.0.1:{port}"
     p = subprocess.Popen(
         [str(server_bin), "serve", "--listen", f"127.0.0.1:{port}", "--state-dir", str(state_dir)],
         stdout=subprocess.DEVNULL,
@@ -280,12 +280,12 @@ def start_aksh_server(port: int, state_dir: Path) -> subprocess.Popen:
             req = urllib.request.Request(f"http://127.0.0.1:{port}/healthz")
             with urllib.request.urlopen(req) as response:
                 if response.status == 200:
-                    print("aksh-runner-server is ready.")
+                    print("preloop-runner-server is ready.")
                     return p
         except Exception:
             time.sleep(0.5)
     p.terminate()
-    raise TimeoutError("aksh-runner-server failed to start in time.")
+    raise TimeoutError("preloop-runner-server failed to start in time.")
 
 def start_runner(runner_type: str, server_url: str, runner_dir: Path, state_dir: Path) -> subprocess.Popen:
     print(f"Configuring and starting {runner_type} runner...")
@@ -316,20 +316,20 @@ def start_runner(runner_type: str, server_url: str, runner_dir: Path, state_dir:
         p = subprocess.Popen([str(run_script)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=runner_dir)
         return p
     else:
-        # Configure aksh-runner
+        # Configure preloop-runner
         runner_bin = Path("target/release/preloop-runner")
         if not runner_bin.exists():
             runner_bin = Path("target/debug/preloop-runner")
         if not runner_bin.exists():
-            raise FileNotFoundError("Could not find aksh-runner binary.")
+            raise FileNotFoundError("Could not find preloop-runner binary.")
         # config
         work_dir = state_dir / "runner-work"
         work_dir.mkdir(parents=True, exist_ok=True)
         subprocess.run([
             str(runner_bin), "configure",
             "--url", server_url,
-            "--token", "aksh-system-token",
-            "--name", f"aksh-{int(time.time())}",
+            "--token", "preloop-system-token",
+            "--name", f"preloop-{int(time.time())}",
             "--labels", "self-hosted,fidelity-test",
             "--work", "_work",
             "--unattended",
@@ -428,7 +428,7 @@ def execute_local_scenario(scenario: str, server_url: str, state_dir: Path, out_
         log_text = ""
         try:
             req = urllib.request.Request(f"{server_url}/api/v1/runs/{run_id}/logs")
-            req.add_header("Authorization", "Bearer aksh-system-token")
+            req.add_header("Authorization", "Bearer preloop-system-token")
             with urllib.request.urlopen(req) as response:
                 log_text = response.read().decode("utf-8", "replace")
         except Exception as e:
@@ -545,16 +545,16 @@ def execute_github_scenario(scenario: str, repo: str, token: str, ref: str, out_
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Concurrency Matrix Comparison Harness")
-    ap.add_argument("--runner", choices=["official", "aksh"], default="aksh")
-    ap.add_argument("--server", choices=["github", "aksh"], default="aksh")
-    ap.add_argument("--repo", default="Bnjoroge1/aksh-concurrency-probe", help="GitHub repo for live runs")
+    ap.add_argument("--runner", choices=["official", "preloop"], default="preloop")
+    ap.add_argument("--server", choices=["github", "preloop"], default="preloop")
+    ap.add_argument("--repo", default="Bnjoroge1/preloop-concurrency-probe", help="GitHub repo for live runs")
     ap.add_argument("--ref", default="main", help="Git ref for GitHub workflow dispatch")
     ap.add_argument("--out-dir", type=Path, default=Path("benchmarks/real-world/results/matrix"))
     ap.add_argument("--compare-dirs", nargs=2, type=Path, default=None,
                     help="Compare two captured results directories and output comparison MD")
     ap.add_argument("--scenarios", default=None, help="Comma-separated scenarios to run (default: run all)")
-    ap.add_argument("--port", type=int, default=9090, help="aksh-runner-server local port")
-    ap.add_argument("--state-dir", type=Path, default=Path("/tmp/aksh-matrix-state"), help="Local aksh state dir")
+    ap.add_argument("--port", type=int, default=9090, help="preloop-runner-server local port")
+    ap.add_argument("--state-dir", type=Path, default=Path("/tmp/preloop-matrix-state"), help="Local preloop state dir")
     ap.add_argument("--runner-dir", type=Path, default=Path("/Users/bnjoroge/mitm-proxy/experiments/mitm/.cache/runner-official"),
                     help="Official runner directory")
     
@@ -615,10 +615,10 @@ def main() -> int:
     runner_proc = None
     
     try:
-        if args.server == "aksh":
+        if args.server == "preloop":
             # Start local server
-            server_proc = start_aksh_server(args.port, args.state_dir)
-            # Start local runner (aksh or official)
+            server_proc = start_preloop_server(args.port, args.state_dir)
+            # Start local runner (preloop or official)
             server_url = f"http://127.0.0.1:{args.port}"
             runner_proc = start_runner(args.runner, server_url, args.runner_dir, args.state_dir)
             
@@ -627,7 +627,7 @@ def main() -> int:
 
         results = {}
         for scenario in scenarios_to_run:
-            if args.server == "aksh":
+            if args.server == "preloop":
                 res = execute_local_scenario(scenario, f"http://127.0.0.1:{args.port}", args.state_dir, out_path)
             else:
                 token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN", "")
@@ -645,7 +645,7 @@ def main() -> int:
             runner_proc.terminate()
             runner_proc.wait()
         if server_proc:
-            print("Stopping aksh-runner-server...")
+            print("Stopping preloop-runner-server...")
             server_proc.terminate()
             server_proc.wait()
             

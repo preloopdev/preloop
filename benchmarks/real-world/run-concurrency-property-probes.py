@@ -13,7 +13,7 @@ Reject a contaminated corpus file (exits nonzero):
     python3 run-concurrency-property-probes.py --corpus fixtures/contaminated-case.json --dry-run
 
 Full differential (requires live credentials and privileged access):
-    GH_TOKEN=... GH_REPO=org/repo AKSH_SERVER=http://... \\
+    GH_TOKEN=... GH_REPO=org/repo PRELOOP_SERVER=http://... \\
         python3 run-concurrency-property-probes.py --corpus concurrency-property-cases.json
 
 Official runner commit (pinned):
@@ -573,7 +573,7 @@ def main() -> int:
 
     # Determine mode
     live_mode = not args.dry_run and (
-        os.environ.get("GH_TOKEN") or os.environ.get("AKSH_SERVER")
+        os.environ.get("GH_TOKEN") or os.environ.get("PRELOOP_SERVER")
     )
     mode = "differential" if live_mode else "dry_run"
 

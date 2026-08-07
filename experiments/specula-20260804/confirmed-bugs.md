@@ -51,7 +51,7 @@ running chmod +x /private/tmp/Specula/runs/20260804-120119-9811/preloop/.specula
 using read
 **Source**: MC
 **Novelty**: NEW
-**Location**: crates/aksh-runner-server/src/runtime_scheduling.rs:993
+**Location**: crates/preloop-runner-server/src/runtime_scheduling.rs:993
 
 ## Description
 Workflow-level `Holder::Run` gate leaks on `promote_ready_jobs` Skip/Error (no `release_concurrency_for_run`).
@@ -105,7 +105,7 @@ using write
 using read
 **Source**: MC
 **Novelty**: NEW (git/REVIEW.md search confirmed no prior report of promote-path gate bypass)
-**Location**: crates/aksh-runner-server/src/runs.rs:1077
+**Location**: crates/preloop-runner-server/src/runs.rs:1077
 
 ## Description
 Job concurrency gate (queued_job.concurrency) evaluated only at submit for needs-empty jobs; needs jobs carry gate through pending_jobs then bypass it in promote_ready_jobs (direct queue push, no try_enqueue_with_job_concurrency or on_job_enqueued).
@@ -125,7 +125,7 @@ State 5: <MCPromoteDispatchJob...> dispatchQueue=<<1>> (no gateHeld update)
 (changelog.md read-back confirms 6661 states, exact CE match).
 
 ## Recommendation
-Acquire gate in promote_ready_jobs Run arm before queue.extend (crates/aksh-runner-server/src/runtime_scheduling.rs:1048).
+Acquire gate in promote_ready_jobs Run arm before queue.extend (crates/preloop-runner-server/src/runtime_scheduling.rs:1048).
 
 1. yes
 2. n/a
@@ -164,7 +164,7 @@ using read
 using edit
 **Source**: MC
 **Novelty**: NEW
-**Location**: crates/aksh-runner/src/worker/server_queue.rs:189
+**Location**: crates/preloop-runner/src/worker/server_queue.rs:189
 
 ## Description
 take_steps_update_body clears dirty_keys before POST; failed flush (no mark_steps_published) loses terminal transition (empty next body). TLC violates StepTransitionDelivered. Maps to code (server_queue.rs:178-190, reporting.rs:19-77).
@@ -200,8 +200,8 @@ adapter tool error: skill: Skill "bug-confirmation" not found. Available skills:
 using read
 searching for template_string_token
 using read
-running git log --oneline -S brace -- crates/aksh-gha-protocol/src/azdo/job.rs crates/aksh-gha-parser/src/job_builder.rs
-running git log --oneline --grep=brace --grep=format --grep=escape -i -- crates/aksh-gha-protocol crates/aksh-gha-parser
+running git log --oneline -S brace -- crates/preloop-gha-protocol/src/azdo/job.rs crates/preloop-gha-parser/src/job_builder.rs
+running git log --oneline --grep=brace --grep=format --grep=escape -i -- crates/preloop-gha-protocol crates/preloop-gha-parser
 using write
 running timeout 30s bash /private/tmp/Specula/runs/20260804-120119-9811/preloop/.specula-output/repro/test_bugMC-S6-format-brace-escape_brace.sh 2>&1 | tee /tmp/repr...
 using read
@@ -215,7 +215,7 @@ running mkdir -p /private/tmp/Specula/runs/20260804-120119-9811/preloop/.specula
 using read
 **Source**: MC
 **Novelty**: NEW (git log, blame, and issue searches on protocol/parser brace handling found no prior reports of this exact escape divergence or FormatException path)
-**Location**: crates/aksh-gha-protocol/src/azdo/job.rs:590
+**Location**: crates/preloop-gha-protocol/src/azdo/job.rs:590
 
 ## Description
 Protocol's `template_string_token` (live in TaskStep serialize for AzDO/broker) escapes only `'`; parser's `append_format_literal` also does `{`→`{{`, `}`→`}}`. Official .NET runner throws `FormatException` on literal brace + expression. TLC CE: `SetEscapeBraces(FALSE) -> BuildFormat(TRUE,TRUE)` violates `FormatEscapeClosed`.
@@ -241,7 +241,7 @@ Unify on parser's `append_format_literal` (or shared escape fn) in protocol; upd
 
 1. yes
 2. n/a
-3. crates/aksh-gha-protocol/src/azdo/job.rs:537 (TaskStep::serialize + AzDO broker)
+3. crates/preloop-gha-protocol/src/azdo/job.rs:537 (TaskStep::serialize + AzDO broker)
 4. permanent (throws FormatException)
 
 ---
@@ -274,7 +274,7 @@ using read
 using write
 **Source**: Code Review
 **Novelty**: KNOWN (cite: 193986ce "fix runner provisioning and review findings"; fix-status: fixed)
-**Location**: crates/aksh-runner-server/src/broker.rs:253
+**Location**: crates/preloop-runner-server/src/broker.rs:253
 
 ## Description
 Server/runner disagree on claim/lease timing, cancel scoping (F1 global pop before session check; F2 msgId collisions; S1 reaper race; F5 missing lastRenewedAt; map cleanup gaps F4/R7/R10). S1 CE was spec artifact; fixed in 193986ce.

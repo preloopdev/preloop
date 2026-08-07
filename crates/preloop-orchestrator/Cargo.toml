@@ -9,9 +9,9 @@ description = "Job scheduling and VM lifecycle orchestration for Preloop CI"
 
 [dependencies]
 preloop-vm = { path = "../preloop-vm" }
-aksh-gha-protocol = { path = "../aksh-gha-protocol" }
-aksh-runner-server = { path = "../aksh-runner-server" }
-aksh-gha-parser = { path = "../aksh-gha-parser" }
+preloop-gha-protocol = { path = "../preloop-gha-protocol" }
+preloop-runner-server = { path = "../preloop-runner-server" }
+preloop-gha-parser = { path = "../preloop-gha-parser" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }

@@ -19,7 +19,7 @@ jobs:
         with:
           script: |
             core.setOutput('value', 'stable')
-            core.info('AKSH_ORACLE: github-script=executed')
+            core.info('PRELOOP_ORACLE: github-script=executed')
       - name: Verify downloaded trees
         shell: bash
         run: |
@@ -27,4 +27,4 @@ jobs:
           test -d primary/.git
           test -d secondary/.git
           test -f secondary/action.yml
-          echo 'AKSH_ORACLE: primary_git=true secondary_action=true'
+          echo 'PRELOOP_ORACLE: primary_git=true secondary_action=true'

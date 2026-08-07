@@ -1,18 +1,18 @@
 # MITM runner/control-plane experiment
 
-Captures exact HTTP traffic between the official `actions/runner` binary and control planes using mitmproxy, then compares the official GitHub control plane against custom ones (`ChristopherHX/runner.server` and `aksh`).
+Captures exact HTTP traffic between the official `actions/runner` binary and control planes using mitmproxy, then compares the official GitHub control plane against custom ones (`ChristopherHX/runner.server` and `preloop`).
 
 ## Use cases
 
 ### 1. Protocol fidelity testing
 
-You're building `aksh` — a custom GitHub Actions control plane. How do you know it speaks the same protocol as the real GitHub?
+You're building `preloop` — a custom GitHub Actions control plane. How do you know it speaks the same protocol as the real GitHub?
 
-Record the exact HTTP traffic between the official `actions/runner` binary and GitHub, then compare it against what aksh produces for the same scenario:
+Record the exact HTTP traffic between the official `actions/runner` binary and GitHub, then compare it against what preloop produces for the same scenario:
 
 ```
 runner ──→ mitmproxy ──→ GitHub        (golden capture)
-runner ──→ mitmproxy ──→ aksh          (target capture)
+runner ──→ mitmproxy ──→ preloop          (target capture)
                     ↓
               compare.sh               (diff report)
 ```
@@ -21,15 +21,15 @@ The comparison report shows every endpoint side-by-side: which ones match, which
 
 ### 2. Conformance regression gate
 
-You change something in aksh. Did you break protocol compatibility?
+You change something in preloop. Did you break protocol compatibility?
 
-Replay a golden capture (recorded once against real GitHub) against aksh without needing a live runner or GitHub access:
+Replay a golden capture (recorded once against real GitHub) against preloop without needing a live runner or GitHub access:
 
 ```sh
-bin/conform.sh --golden golden/v2.329.0/01-register-and-idle --target aksh --scenario 01-register-and-idle
+bin/conform.sh --golden golden/v2.329.0/01-register-and-idle --target preloop --scenario 01-register-and-idle
 ```
 
-This uses `mitmdump --server-replay` to feed the exact recorded requests to aksh and compare responses. No network access to GitHub needed — fast enough for CI.
+This uses `mitmdump --server-replay` to feed the exact recorded requests to preloop and compare responses. No network access to GitHub needed — fast enough for CI.
 
 ### 3. Protocol documentation
 
@@ -51,7 +51,7 @@ The captured `flows.jsonl` files are a machine-readable record of the entire pro
 - Python 3.11+ with `pip`
 - `mitmproxy` CLI (`brew install mitmproxy` or `pip install mitmproxy`)
 - `dotnet-sdk` 8.0+ (`brew install --cask dotnet-sdk`) — for runner.server only
-- Rust toolchain (`rustup.rs`) — for aksh only
+- Rust toolchain (`rustup.rs`) — for preloop only
 - `gh` CLI authenticated (`brew install gh && gh auth login`) — for official backend only
 - A throwaway GitHub repo with Actions enabled and a registration token — for official backend only
 
@@ -84,12 +84,12 @@ bin/record.sh --backend runner-server --scenario 01-register-and-idle
 bin/down-runner-server.sh
 ```
 
-### aksh capture
+### preloop capture
 
 ```sh
-bin/up-aksh.sh
-bin/record.sh --backend aksh --scenario 01-register-and-idle
-bin/down-aksh.sh
+bin/up-preloop.sh
+bin/record.sh --backend preloop --scenario 01-register-and-idle
+bin/down-preloop.sh
 ```
 
 ### Compare
@@ -99,8 +99,8 @@ bin/down-aksh.sh
 bin/compare.sh --scenario 01-register-and-idle
 
 # Custom backends
-bin/compare.sh --scenario 01-register-and-idle --left official --right aksh
-bin/compare.sh --scenario 01-register-and-idle --left runner-server --right aksh
+bin/compare.sh --scenario 01-register-and-idle --left official --right preloop
+bin/compare.sh --scenario 01-register-and-idle --left runner-server --right preloop
 ```
 
 Repeat for `02-trivial-job`, `03-cancellation`, `04-request-ack`, and `05-multi-job`.
@@ -133,19 +133,19 @@ Replay recorded traffic against a custom backend without needing GitHub or a liv
 
 ```sh
 # Start the target backend.
-bin/up-aksh.sh
+bin/up-preloop.sh
 
-# Replay golden traffic against aksh.
-bin/replay.sh --golden golden/v2.329.0/01-register-and-idle --target aksh
+# Replay golden traffic against preloop.
+bin/replay.sh --golden golden/v2.329.0/01-register-and-idle --target preloop
 
 # Or use the one-command conformance test.
-bin/conform.sh --golden golden/v2.329.0/01-register-and-idle --target aksh --scenario 01-register-and-idle
+bin/conform.sh --golden golden/v2.329.0/01-register-and-idle --target preloop --scenario 01-register-and-idle
 ```
 
 ### Record all scenarios for a backend
 
 ```sh
-bin/record-all.sh --backend aksh
+bin/record-all.sh --backend preloop
 bin/record-all.sh --backend runner-server
 ```
 
@@ -155,7 +155,7 @@ bin/record-all.sh --backend runner-server
 |---|---|---|---|
 | `official` | n/a (GitHub) | Requires env vars | Uses real GitHub Actions |
 | `runner-server` | 5000 | `bin/up-runner-server.sh` | ChristopherHX/runner.server (.NET) |
-| `aksh` | 9090 | `bin/up-aksh.sh` | aksh-runner-server (Rust) |
+| `preloop` | 9090 | `bin/up-preloop.sh` | preloop-runner-server (Rust) |
 
 ## TLS / mitmproxy CA
 
@@ -211,9 +211,9 @@ bin/clean-captures.sh --older-than 30 --dry-run
 All scripts support `--non-interactive` for non-TTY environments:
 
 ```sh
-bin/record.sh --backend aksh --scenario 01-register-and-idle --non-interactive
+bin/record.sh --backend preloop --scenario 01-register-and-idle --non-interactive
 bin/record-golden.sh --non-interactive
-bin/record-all.sh --backend aksh --non-interactive
+bin/record-all.sh --backend preloop --non-interactive
 ```
 
 ## Tests

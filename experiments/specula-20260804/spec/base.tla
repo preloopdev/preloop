@@ -1,7 +1,7 @@
 --------------------------- MODULE base ---------------------------
 (*
- * TLA+ specification for aksh / preloop — GitHub Actions control plane
- * (aksh-runner-server) and runner (aksh-runner Listener/Worker).
+ * TLA+ specification for preloop / preloop — GitHub Actions control plane
+ * (preloop-runner-server) and runner (preloop-runner Listener/Worker).
  *
  * Category A (distributed / message-passing) with a Category B overlay on
  * the runner side (Scenarios 4-5). Derived from the modeling brief
@@ -18,8 +18,8 @@
  *   S5  Worker step execution & reporting queue
  *       (worker/server_queue.rs, worker/reporting.rs, worker/completion.rs)
  *   S6  Secret masking & template tokenization
- *       (aksh-gha-protocol/src/masking.rs, azdo/job.rs,
- *        aksh-gha-parser/src/job_builder.rs)
+ *       (preloop-gha-protocol/src/masking.rs, azdo/job.rs,
+ *        preloop-gha-parser/src/job_builder.rs)
  *
  * Every action is annotated with the implementation source location it
  * models. Paths the brief identifies as buggy at HEAD are encoded exactly
@@ -161,7 +161,7 @@ VARIABLES
                                 \*   is the protocol copy (azdo/job.rs:579) *BUG F1*
     scanState,                  \* {Normal, InString} tokenizer transducer state
     formatError,                \* BOOLEAN BuildFormat produced InvalidFormat
-    scannerDiverged             \* BOOLEAN odd-quote-run diverged aksh vs official
+    scannerDiverged             \* BOOLEAN odd-quote-run diverged preloop vs official
 
 (* =========================================================================
  * VARIABLE GROUPS
@@ -2405,7 +2405,7 @@ BuildFormat(hasLiteralBrace, hasExpr) ==
 (* -------------------------------------------------------------------------
  * ScanStep: template-string transducer — advances scan state between Normal
  * and InString on quote runs (azdo/job.rs:586-613 find_expression_end vs the
- * official scanner). *BUG F3*: aksh treats `''` as an escape, the official
+ * official scanner). *BUG F3*: preloop treats `''` as an escape, the official
  * scanner toggles; divergence only on odd-length quote runs.
  * ------------------------------------------------------------------------- *)
 ScanStep(oddQuoteRun) ==

@@ -1,0 +1,80 @@
+[package]
+name = "preloop-runner-server"
+version = "0.2.0"
+edition.workspace = true
+# FSL-1.1-MIT: source-available, converts to MIT on the second anniversary
+# of each release (see LICENSE in this crate). The rest of the workspace is
+# MIT. `license-file` (not SPDX `license`) because FSL-1.1-MIT has no SPDX id.
+license-file = "LICENSE"
+publish = false
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+base64.workspace = true
+bytes.workspace = true
+clap.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+tower.workspace = true
+preloop-artifacts = { path = "../preloop-artifacts" }
+preloop-cache = { path = "../preloop-cache" }
+preloop-gha-parser = { path = "../preloop-gha-parser" }
+preloop-gha-expressions = { path = "../preloop-gha-expressions" }
+preloop-gha-protocol = { path = "../preloop-gha-protocol" }
+preloop-socket-activation = { path = "../preloop-socket-activation" }
+serde_urlencoded = "0.7"
+serde.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+hkdf = "0.12"
+sha1.workspace = true
+rand.workspace = true
+rsa.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+tokio-postgres.workspace = true
+postgres_rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-native-certs.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+indexmap.workspace = true
+tokio-tungstenite.workspace = true
+axum-server.workspace = true
+rcgen.workspace = true
+rustls = { version = "0.23", features = ["ring"] }
+x509-parser.workspace = true
+cron.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+serde_yaml.workspace = true
+utoipa.workspace = true
+
+toml = { workspace = true }
+parking_lot.workspace = true
+[[bin]]
+name = "preloop-server"
+path = "src/main.rs"
+
+[dev-dependencies]
+tempfile.workspace = true
+tower.workspace = true
+proptest.workspace = true
+preloop-runner = { path = "../preloop-runner" }
+filetime = "0.2.29"
+# Timer-driven behaviour (stream idle bounds) has to be exercised on a paused
+# clock; real sleeps would make those tests slow and flaky under load.
+tokio = { workspace = true, features = ["test-util"] }

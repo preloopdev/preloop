@@ -34,7 +34,7 @@ RESULTS_BLOB_HOST_RE = re.compile(r"^productionresultssa\d+\.blob\.core\.windows
 IGNORED_HOSTS = {
     "api.github.com",  # gh CLI dispatch/status if captured outside runner should be excluded by scripts, but guard anyway.
     # Node.js runtime provisioning is an intentional runner-environment choice,
-    # not a control-plane protocol disparity. The aksh VM may install a
+    # not a control-plane protocol disparity. The preloop VM may install a
     # runtime that is already present in the official runner image.
     "nodejs.org",
 }
@@ -75,7 +75,7 @@ def norm_path(host: str, path: str) -> str:
     # semantically useful part is the log object path.
     if RESULTS_BLOB_HOST_RE.match(host) and "?" in path:
         path = path.split("?", 1)[0]
-    # Official runner deletes /session; aksh currently deletes /session/{guid}.
+    # Official runner deletes /session; preloop currently deletes /session/{guid}.
     # Group them so the report can focus on request/response contract, not a
     # path spelling already covered by body/schema diffs.
     if host == "broker.actions.githubusercontent.com":
@@ -159,7 +159,7 @@ def compact_diff(left: Any, right: Any, max_chars: int = 2000) -> str:
     if a == b:
         return ""
     import difflib
-    text = "\n".join(difflib.unified_diff(a.splitlines(), b.splitlines(), fromfile="official", tofile="aksh", lineterm=""))
+    text = "\n".join(difflib.unified_diff(a.splitlines(), b.splitlines(), fromfile="official", tofile="preloop", lineterm=""))
     if len(text) > max_chars:
         return text[:max_chars] + "\n... truncated ..."
     return text
@@ -176,9 +176,9 @@ def compare(left_dir: Path, right_dir: Path, scenario: str, out: Path) -> int:
     lines.append(f"# Runner flow diff: {scenario}")
     lines.append("")
     lines.append(f"- official capture: `{left_dir}`")
-    lines.append(f"- aksh capture: `{right_dir}`")
+    lines.append(f"- preloop capture: `{right_dir}`")
     lines.append(f"- official summary: status={left_sum.get('status')} flows={len(left)}")
-    lines.append(f"- aksh summary: status={right_sum.get('status')} flows={len(right)}")
+    lines.append(f"- preloop summary: status={right_sum.get('status')} flows={len(right)}")
     lines.append("")
 
     lseq = [endpoint(f) for f in left]
@@ -187,7 +187,7 @@ def compare(left_dir: Path, right_dir: Path, scenario: str, out: Path) -> int:
     lcnt, rcnt = Counter(lseq), Counter(rseq)
     lines.append("## Endpoint counts")
     lines.append("")
-    lines.append("| endpoint | official | aksh |")
+    lines.append("| endpoint | official | preloop |")
     lines.append("|---|---:|---:|")
     for ep in sorted(set(lcnt) | set(rcnt)):
         lc, rc = lcnt[ep], rcnt[ep]
@@ -196,7 +196,7 @@ def compare(left_dir: Path, right_dir: Path, scenario: str, out: Path) -> int:
     lines.append("")
 
     if lseq != rseq:
-        issues.append(("endpoint-sequence", f"official={len(lseq)} aksh={len(rseq)}"))
+        issues.append(("endpoint-sequence", f"official={len(lseq)} preloop={len(rseq)}"))
         lines.append("## Endpoint sequence diff")
         lines.append("")
         lines.append("```diff")
@@ -221,7 +221,7 @@ def compare(left_dir: Path, right_dir: Path, scenario: str, out: Path) -> int:
             local: list[str] = []
             if a.get("status") != b.get("status"):
                 issues.append(("status", f"{ep} #{idx}: {a.get('status')} != {b.get('status')}"))
-                local.append(f"- status: official={a.get('status')} aksh={b.get('status')}")
+                local.append(f"- status: official={a.get('status')} preloop={b.get('status')}")
             for field in ("request", "response"):
                 ashape, aval, akind = body_sig(a, field)
                 bshape, bval, bkind = body_sig(b, field)
@@ -282,10 +282,10 @@ def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--scenario", required=True)
     p.add_argument("--official-dir", required=True, type=Path)
-    p.add_argument("--aksh-dir", required=True, type=Path)
+    p.add_argument("--preloop-dir", required=True, type=Path)
     p.add_argument("--output", required=True, type=Path)
     args = p.parse_args()
-    return compare(args.official_dir, args.aksh_dir, args.scenario, args.output)
+    return compare(args.official_dir, args.preloop_dir, args.scenario, args.output)
 
 
 if __name__ == "__main__":

@@ -17,7 +17,7 @@
 
 use std::io::{IsTerminal, Write};
 
-use aksh_gha_protocol::debug_session::{
+use preloop_gha_protocol::debug_session::{
     ChangeCategory, DebugSession, RevertPolicy, Verdict, VerdictRequest, WorkspaceChange,
 };
 use anyhow::{Context, Result};
@@ -168,7 +168,7 @@ pub async fn paused_for_run(
     client: &reqwest::Client,
     base_url: &str,
     token: Option<String>,
-    run_id: aksh_gha_protocol::RunId,
+    run_id: preloop_gha_protocol::RunId,
 ) -> Option<DebugSession> {
     let api = Api {
         client: client.clone(),
@@ -1120,10 +1120,10 @@ fn shell_quote(value: &str) -> String {
 }
 
 fn select_for_policy(
-    changes: &[aksh_gha_protocol::debug_session::WorkspaceChange],
+    changes: &[preloop_gha_protocol::debug_session::WorkspaceChange],
     policy: RevertPolicy,
 ) -> Vec<&str> {
-    use aksh_gha_protocol::debug_session::ChangeCategory;
+    use preloop_gha_protocol::debug_session::ChangeCategory;
     changes
         .iter()
         .filter(|c| match policy {
@@ -1249,10 +1249,10 @@ fn run_in_guest(session: &DebugSession, command: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aksh_gha_protocol::debug_session::{
+    use preloop_gha_protocol::debug_session::{
         AttemptRecord, Diagnostic, FailedStep, SessionState, StepSummary,
     };
-    use aksh_gha_protocol::{JobId, RunId};
+    use preloop_gha_protocol::{JobId, RunId};
 
     fn session() -> DebugSession {
         DebugSession {
@@ -1437,7 +1437,7 @@ mod tests {
 
     #[test]
     fn changes_render_with_category_guidance() {
-        use aksh_gha_protocol::debug_session::ChangeStatus;
+        use preloop_gha_protocol::debug_session::ChangeStatus;
         let changes = vec![
             WorkspaceChange {
                 path: "src/generated.rs".into(),
@@ -1470,7 +1470,7 @@ mod tests {
         let mut session = session();
         session.attempt_changes = vec![WorkspaceChange {
             path: "src/lib.rs".into(),
-            status: aksh_gha_protocol::debug_session::ChangeStatus::Modified,
+            status: preloop_gha_protocol::debug_session::ChangeStatus::Modified,
             category: ChangeCategory::Tracked,
         }];
         assert_eq!(

@@ -57,7 +57,7 @@ if [ "$ready" -eq 0 ]; then
     exit 1
 fi
 # Write artefacts.
-echo "http://aksh.local:5000/runner/server" > "$CACHE/runner-server.url"
+echo "http://preloop.local:5000/runner/server" > "$CACHE/runner-server.url"
 echo "ThisIsIgnored" > "$CACHE/runner-server.token"
 
 echo "runner.server running on $URL (pid $PID)"

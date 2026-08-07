@@ -24,7 +24,7 @@ jobs:
           restore-keys: overnight-cache-v1-${{ runner.os }}-
       - name: Record cache state
         shell: bash
-        run: "echo 'AKSH_ORACLE: cache_hit=${{ steps.restore.outputs.cache-hit }}'"
+        run: "echo 'PRELOOP_ORACLE: cache_hit=${{ steps.restore.outputs.cache-hit }}'"
       - name: Upload artifact
         uses: actions/upload-artifact@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
@@ -44,4 +44,4 @@ jobs:
         run: |
           set -euo pipefail
           test -s "$RUNNER_TEMP/downloaded/hashes.txt"
-          echo 'AKSH_ORACLE: artifact=present'
+          echo 'PRELOOP_ORACLE: artifact=present'

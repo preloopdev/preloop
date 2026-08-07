@@ -10,7 +10,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-SERVER_PORT="${AKSH_PORT:-9191}"
+SERVER_PORT="${PRELOOP_PORT:-9191}"
 SERVER_URL="http://127.0.0.1:${SERVER_PORT}"
 SERVER_BIN="$REPO_ROOT/target/release/preloop-server"
 RUNNER_BIN="$REPO_ROOT/target/aarch64-unknown-linux-musl/release/preloop-runner"
@@ -41,10 +41,10 @@ cleanup() {
 trap cleanup EXIT
 
 # Start server
-info "Starting aksh server on port $SERVER_PORT..."
+info "Starting preloop server on port $SERVER_PORT..."
 pkill -f "preloop-server.*${SERVER_PORT}" 2>/dev/null || true
 sleep 1
-RUST_LOG=info AKSH_PUBLIC_URL="$SERVER_URL" "$SERVER_BIN" serve --listen "0.0.0.0:${SERVER_PORT}" > /tmp/aksh-e2e-server.log 2>&1 &
+RUST_LOG=info PRELOOP_PUBLIC_URL="$SERVER_URL" "$SERVER_BIN" serve --listen "0.0.0.0:${SERVER_PORT}" > /tmp/preloop-e2e-server.log 2>&1 &
 sleep 2
 curl -sf "$SERVER_URL/healthz" > /dev/null || { red "Server failed to start"; exit 1; }
 info "Server running"
@@ -60,13 +60,13 @@ run_job_in_vm() {
 
     # Install deps and copy runner
     smolvm machine exec --name "$vm_name" -- sh -c 'apk add --no-cache bash curl git > /dev/null 2>&1'
-    smolvm machine cp "$RUNNER_BIN" "$vm_name:/workspace/aksh-runner"
-    smolvm machine exec --name "$vm_name" -- chmod +x /workspace/aksh-runner
+    smolvm machine cp "$RUNNER_BIN" "$vm_name:/workspace/preloop-runner"
+    smolvm machine exec --name "$vm_name" -- chmod +x /workspace/preloop-runner
 
     # Configure runner
-    smolvm machine exec --name "$vm_name" -- /workspace/aksh-runner configure \
+    smolvm machine exec --name "$vm_name" -- /workspace/preloop-runner configure \
         --url "$SERVER_URL" \
-        --token aksh-system-token \
+        --token preloop-system-token \
         --name "$runner_name" \
         --labels self-hosted,Linux,ARM64 \
         --work /workspace/_work \
@@ -75,7 +75,7 @@ run_job_in_vm() {
     # Run the runner (picks up one job)
     info "Running job in VM $vm_name..."
     smolvm machine exec --name "$vm_name" -- \
-        /workspace/aksh-runner run --once 2>&1 | tail -3
+        /workspace/preloop-runner run --once 2>&1 | tail -3
 
     # Cleanup
     smolvm machine stop --name "$vm_name" > /dev/null 2>&1
@@ -121,7 +121,7 @@ print(json.dumps({
 ")
 RESULT=$(curl -s -X POST "$SERVER_URL/api/v1/runs" \
     -H 'Content-Type: application/json' \
-    -H 'Authorization: Bearer aksh-system-token' \
+    -H 'Authorization: Bearer preloop-system-token' \
     -d "$PAYLOAD")
 RUN_ID=$(echo "$RESULT" | python3 -c 'import sys,json; print(json.load(sys.stdin)["run_id"])')
 QUEUED=$(echo "$RESULT" | python3 -c 'import sys,json; print(json.load(sys.stdin)["queued_jobs"])')
@@ -134,7 +134,7 @@ done
 
 # Check final status
 FINAL=$(curl -s "$SERVER_URL/api/v1/runs/$RUN_ID" \
-    -H 'Authorization: Bearer aksh-system-token')
+    -H 'Authorization: Bearer preloop-system-token')
 STATUS=$(echo "$FINAL" | python3 -c 'import sys,json; print(json.load(sys.stdin)["status"])')
 
 echo ""

@@ -1,4 +1,4 @@
-You are implementing an aksh protocol-sync spec. Follow existing Rust patterns exactly. Run cargo check and relevant tests, but do not run formatters or project-wide lint.
+You are implementing an preloop protocol-sync spec. Follow existing Rust patterns exactly. Run cargo check and relevant tests, but do not run formatters or project-wide lint.
 
 Spec:
 ```toml
@@ -32,9 +32,9 @@ WebSocket debugger endpoint when debug feature is active
 '''
 expected_response = "DAP frames proxied/stubbed according to runner expectation"
 
-[aksh_targets]
+[preloop_targets]
 files = [
-  { crate = "aksh-runner-server", path = "crates/aksh-runner-server/src/lib.rs", area = "broker/admin flow" },
+  { crate = "preloop-runner-server", path = "crates/preloop-runner-server/src/lib.rs", area = "broker/admin flow" },
 ]
 
 [implementation]

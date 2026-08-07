@@ -2,7 +2,7 @@ server := "http://127.0.0.1:9090"
 repo := "preloopdev/preloop"
 
 build:
-    cargo build --locked --release -p aksh-runner-server
+    cargo build --locked --release -p preloop-runner-server
 
 build-all:
     cargo build --locked --release --workspace
@@ -11,8 +11,8 @@ build-all:
 
 # Build the macOS CLI/server and the ARM64 Linux runner used inside SmolVM.
 build-preloop:
-    cargo zigbuild -p aksh-runner --target aarch64-unknown-linux-gnu
-    cargo build -p preloop-cli -p aksh-runner-server
+    cargo zigbuild -p preloop-runner --target aarch64-unknown-linux-gnu
+    cargo build -p preloop-cli -p preloop-runner-server
 
 # Run a workflow locally. A failed step pauses for `preloop debug`.
 preloop-run WF="fixtures/workflows/failing.yml": build-preloop
@@ -45,8 +45,8 @@ test:
     cargo test --locked --workspace --quiet
 
 test-properties-full:
-    PROPTEST_CASES=10000 cargo test --locked -p aksh-runner-server --quiet
-    PROPTEST_CASES=10000 cargo test --locked -p aksh-runner-server --quiet -- --ignored
+    PROPTEST_CASES=10000 cargo test --locked -p preloop-runner-server --quiet
+    PROPTEST_CASES=10000 cargo test --locked -p preloop-runner-server --quiet -- --ignored
 
 test-ci: fmt-check clippy
     PROPTEST_CASES=8 cargo test --locked --workspace --quiet
@@ -70,10 +70,10 @@ sg-scan:
 sg-scan-strict:
     sg scan --error
 
-#dogfood (e2e against aksh with real runner) 
+#dogfood (e2e against preloop with real runner) 
 
 dogfood: build
-    ./scripts/aksh-e2e-bench.sh
+    ./scripts/preloop-e2e-bench.sh
 
 # Preloop end-to-end performance benchmark (see benchmarks/preloop-perf/).
 bench-preloop:
@@ -97,26 +97,26 @@ e2e-teardown:
 #serve
 
 serve:
-    AKSH_LOCAL_WORKSPACE="${AKSH_LOCAL_WORKSPACE:-$PWD}" cargo run --release -p aksh-runner-server -- serve --listen 127.0.0.1:9090
+    PRELOOP_LOCAL_WORKSPACE="${PRELOOP_LOCAL_WORKSPACE:-$PWD}" cargo run --release -p preloop-runner-server -- serve --listen 127.0.0.1:9090
 
 serve-dev:
-    AKSH_LOCAL_WORKSPACE="${AKSH_LOCAL_WORKSPACE:-$PWD}" cargo run --release -p aksh-runner-server -- serve --listen 127.0.0.1:9090 --enable-test-api --test-api-token dev-token
+    PRELOOP_LOCAL_WORKSPACE="${PRELOOP_LOCAL_WORKSPACE:-$PWD}" cargo run --release -p preloop-runner-server -- serve --listen 127.0.0.1:9090 --enable-test-api --test-api-token dev-token
 
 #submit 
 
 submit-ci:
-    cargo run -p aksh-runner-client -- --server {{server}} submit -W .github/workflows/ci.yml --repository {{repo}}
+    cargo run -p preloop-runner-client -- --server {{server}} submit -W .github/workflows/ci.yml --repository {{repo}}
 
 submit-dogfood:
-    cargo run -p aksh-runner-client -- --server {{server}} submit -W fixtures/workflows/dogfood.yml
+    cargo run -p preloop-runner-client -- --server {{server}} submit -W fixtures/workflows/dogfood.yml
 
 #runner 
 
 build-runner:
-    cargo build --release -p aksh-runner
+    cargo build --release -p preloop-runner
 
 runner-e2e WF:
-    cargo run -p aksh-conformance -- runner-e2e --runner-bin target/release/preloop-runner --workflow {{WF}}
+    cargo run -p preloop-conformance -- runner-e2e --runner-bin target/release/preloop-runner --workflow {{WF}}
 
 # Replay every committed official-runner flow and fail on protocol drift.
 conform:
@@ -129,10 +129,10 @@ conform-server-light:
 # Build the current server, run live official-runner GitHub/server comparisons,
 # and fail on conclusion, job, step, or flow-count differences.
 conform-server-deep:
-    cargo zigbuild -p aksh-runner-server --release --target aarch64-unknown-linux-musl
+    cargo zigbuild -p preloop-runner-server --release --target aarch64-unknown-linux-musl
     bash ./scripts/conform-server-deep.sh
 
-# Compare workflow/job status responses from the official and aksh runners.
+# Compare workflow/job status responses from the official and preloop runners.
 conform-runner-light:
     python3 benchmarks/real-world/runner-conformance.py --mode light
 

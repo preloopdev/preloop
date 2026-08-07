@@ -34,10 +34,10 @@ jobs:
           test -f 'sub dir/unicode.txt'
           # shellcheck disable=SC2016
           test "$SPECIAL" = 'a $b `c` "d"'
-          echo 'AKSH_ORACLE: level=step spaces=true unicode=true special=true'
+          echo 'PRELOOP_ORACLE: level=step spaces=true unicode=true special=true'
       - name: Use explicit sh
         shell: sh
         run: |
           cd "$RUNNER_TEMP/space dir"
           test -n "$PATH_VALUE"
-          printf 'AKSH_ORACLE: sh=ok\n'
+          printf 'PRELOOP_ORACLE: sh=ok\n'

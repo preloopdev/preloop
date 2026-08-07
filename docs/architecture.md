@@ -1,30 +1,30 @@
 # Architecture
 
-aksh is split by protocol responsibility:
+preloop is split by protocol responsibility:
 
-- `aksh-gha-protocol` owns versioned wire/domain types. Anything sent to a
+- `preloop-gha-protocol` owns versioned wire/domain types. Anything sent to a
 runner or emitted to an agent passes through this crate. Includes AzDO wire
 DTOs, `SecretString`, NDJSON events, and session crypto.
-- `aksh-gha-parser` owns workflow YAML normalization, trigger matching, job graph
+- `preloop-gha-parser` owns workflow YAML normalization, trigger matching, job graph
 construction, matrix expansion, and expression evaluation.
-- `aksh-gha-expressions` owns expression parsing and evaluation (the core
+- `preloop-gha-expressions` owns expression parsing and evaluation (the core
 `${{ }}` engine).
-- `aksh-server` owns HTTP routes, queueing, cancellation, reruns, and
+- `preloop-server` owns HTTP routes, queueing, cancellation, reruns, and
 runner sessions. Exposes two protocol surfaces:
   - `_apis/...` — the AzDO protocol the official runner speaks (source of truth)
   - `/api/v1/...` — native REST + NDJSON for agents and tools (read projection)
-- `aksh-runner-client` is the local submission/inspection CLI.
-- `aksh-cache` and `aksh-artifacts` own file-backed protocol storage.
-- `aksh-conformance` owns comparisons against the pinned
+- `preloop-runner-client` is the local submission/inspection CLI.
+- `preloop-cache` and `preloop-artifacts` own file-backed protocol storage.
+- `preloop-conformance` owns comparisons against the pinned
 `ChristopherHX/runner.server` reference.
-- `aksh-runner` is the Rust reimplementation of the GitHub Actions runner
+- `preloop-runner` is the Rust reimplementation of the GitHub Actions runner
 (Listener + Worker). Single binary with `configure`/`run`/`worker` subcommands;
 the listener spawns a worker child process per job via stdin NDJSON IPC.
 See `docs/runner/00-architecture.md` for the full module map.
 
 ## Pluggable backends
 
-aksh is execution-agnostic. The only thing that differs between runner hosts
+preloop is execution-agnostic. The only thing that differs between runner hosts
 is how a runner instance is created and destroyed. This is modeled as the
 `RunnerProvider` trait in the orchestrator layer:
 
@@ -32,7 +32,7 @@ is how a runner instance is created and destroyed. This is modeled as the
   See [State Model](#state-model).
 - `**AuthProvider**` — loopback-trust (local) or OAuth + mTLS (server).
 - `**RunnerProvider**` — creates/destroys runners (process, container, libkrun,
-cloud VM, k8s pod, bare BYO). Optional — aksh works with external runners.
+cloud VM, k8s pod, bare BYO). Optional — preloop works with external runners.
 
 See [fidelity-gap.md §4](fidelity-gap.md) for the full design.
 
@@ -43,13 +43,13 @@ In-memory state is the source of truth. The HTTP layer reads and mutates
 a shared bus. Two servers pointed at one SQLite file or one Postgres database
 still diverge in memory.
 
-- `aksh-runner-server/src/store.rs` — the `Store` trait (async, object-safe:
+- `preloop-runner-server/src/store.rs` — the `Store` trait (async, object-safe:
   the only surface the rest of the server sees), the SQLite backend, the
   AEAD envelope, and the snapshot serialization shared by every backend.
-- `aksh-runner-server/src/store_pg.rs` — the Postgres backend.
+- `preloop-runner-server/src/store_pg.rs` — the Postgres backend.
 
-Backends are selected by `--store` / `AKSH_STORE_URL` (`sqlite://<path>`, a
-bare path, or `postgres://…`), defaulting to SQLite at `<state_dir>/aksh.db`.
+Backends are selected by `--store` / `PRELOOP_STORE_URL` (`sqlite://<path>`, a
+bare path, or `postgres://…`), defaulting to SQLite at `<state_dir>/preloop.db`.
 Both are single-writer: one connection behind a mutex. Per-backend
 `MIGRATIONS` is the schema source of truth — SQLite tracks the version in
 `PRAGMA user_version`, Postgres in a `schema_migrations` table under an
@@ -57,7 +57,7 @@ advisory lock.
 
 Writes are **best-effort**: a store failure is logged and the affected event is
 still broadcast (`state.rs::emit`). Cache and artifact payloads stay in
-file-backed stores under `.aksh/`; only control-plane state goes to the
+file-backed stores under `.preloop/`; only control-plane state goes to the
 database.
 
 Known gaps and their tradeoffs are tracked in
@@ -65,13 +65,13 @@ Known gaps and their tradeoffs are tracked in
 
 ## Secrets
 
-Secrets use `SecretString` in `aksh-gha-protocol`. It redacts `Debug`,
+Secrets use `SecretString` in `preloop-gha-protocol`. It redacts `Debug`,
 `Display`, and serialized output. Code that needs the raw payload must call
 `expose()` explicitly at a protocol boundary.
 
 ## Compatibility Position
 
-As of 2026-06-26, aksh is a proven working control plane for the official `actions/runner`.
+As of 2026-06-26, preloop is a proven working control plane for the official `actions/runner`.
 The runner completes the full lifecycle: configure → session → message → execute → complete.
 
 Implemented and verified with the real `Runner.Listener` v2.322.0:
@@ -99,7 +99,7 @@ Known limitations:
 
 ## Module Map (post-Plans 012–017)
 
-### `aksh-gha-protocol/src/`
+### `preloop-gha-protocol/src/`
 
 
 | Module       | Owns                                                                                                                                                                                                                                                                                                                                                                                                                   |
@@ -110,7 +110,7 @@ Known limitations:
 | `lib.rs`     | Shared protocol types: RunId, JobId, ExecutionStatus, OutputMap, NDJSON events, LiveLogFeedLinesWrapper                                                                                                                                                                                                                                                                                                                |
 
 
-### `aksh-gha-parser/src/`
+### `preloop-gha-parser/src/`
 
 
 | Module           | Owns                                                                                                         |
@@ -124,7 +124,7 @@ Known limitations:
 | `job_builder.rs` | Build `AgentJobRequestMessage` from parsed workflow data                                                     |
 
 
-### `aksh-gha-expressions/src/`
+### `preloop-gha-expressions/src/`
 
 
 | Module           | Owns                                                                 |
@@ -137,7 +137,7 @@ Known limitations:
 | `expr_parser.rs` | Recursive-descent expression parser                                  |
 
 
-### `aksh-runner-server/src/`
+### `preloop-runner-server/src/`
 
 
 | Module                | Owns                                                                    |
@@ -156,7 +156,7 @@ Known limitations:
 | `bootstrap.rs`        | Server startup, TLS, GitHub App registration                            |
 
 
-### `aksh-runner/src/worker/`
+### `preloop-runner/src/worker/`
 
 
 | Module                  | Owns                                                                    |

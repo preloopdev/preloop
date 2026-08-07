@@ -15,10 +15,10 @@ zero forking of OSS source and zero protocol divergence.
 |---|---|---|
 | Repo topology | **Two repos.** Public `preloop` (OSS) + private `preloop-cloud` embedding it as a **git submodule** | Real proprietary tier needs code + history off GitHub; submodule keeps one working tree |
 | OSS the server? | **Yes**, source-available | The server *is* the managed service — the one asset to protect |
-| Server license | **FSL-1.1-Apache-2.0** on `aksh-runner-server` | "Free for all except a competing managed service"; auto-converts to Apache-2.0 after 2 yrs |
+| Server license | **FSL-1.1-Apache-2.0** on `preloop-runner-server` | "Free for all except a competing managed service"; auto-converts to Apache-2.0 after 2 yrs |
 | Everything else | **MIT** | Max composability (esp. the runner: "any runner works with any server"); MIT inbound embeds into cloud freely |
 | Contributions | **DCO on MIT crates; CLA scoped to the server crate from day one** | DCO covers MIT embedding forever; server CLA preserves commercial-license revenue lever; retroactive CLA is painful |
-| OSS/proprietary boundary | **The trait seams**, not the `aksh`/`preloop` prefix | Prefixes already don't map to the boundary (server depends on `preloop-socket-activation`) |
+| OSS/proprietary boundary | **The trait seams**, not the `preloop`/`preloop` prefix | Prefixes already don't map to the boundary (server depends on `preloop-socket-activation`) |
 | How cloud extends the server | **Injected `Arc<dyn Trait>` impls via a `ServerBuilder`**, never forked files | One protocol implementation → zero wire drift |
 | Where cloud scheduler/providers live | **Orchestrator owns providers + placement; server owns protocol + a `Scheduler` seam** | Orchestrator already owns VM lifecycle; server stays the fidelity engine |
 
@@ -45,7 +45,7 @@ preloop (public)                         preloop-cloud (private, proprietary)
        runner/runner-client/cli             fair-share/priority Scheduler
        cache/artifacts/vm/orchestrator      distributed dedup CacheStore
        socket-activation      <—submodule—  sqlx RunStore + billing + tenancy
-  FSL: aksh-runner-server                    cloud control-plane bin
+  FSL: preloop-runner-server                    cloud control-plane bin
        (ServerBuilder + routes + defaults)   (composes ServerBuilder w/ above)
 ```
 
@@ -109,9 +109,9 @@ is sealed (`pub(crate)` fields, hardcoded construction).
   Scheduler methods already take `&mut InnerState` and can adopt `RunStore` internally.
 
 ### 3.3 Cache / Artifacts / Blob — NOT INJECTABLE (docs were aspirational)
-- **No store traits exist.** `aksh-cache` exposes a concrete `CacheStore`
-  (`aksh-cache/src/lib.rs:43`, methods `new/put/get/find_prefix`); `aksh-artifacts`
-  a concrete `ArtifactStore` (`aksh-artifacts/src/lib.rs:80`, `new/put/get/list_run`).
+- **No store traits exist.** `preloop-cache` exposes a concrete `CacheStore`
+  (`preloop-cache/src/lib.rs:43`, methods `new/put/get/find_prefix`); `preloop-artifacts`
+  a concrete `ArtifactStore` (`preloop-artifacts/src/lib.rs:80`, `new/put/get/list_run`).
   Wired as concrete `AppState` fields (`state.rs:215-216`), constructed at
   `state.rs:287-289`. (`architecture.md` claim of an existing trait is aspirational.)
 - A **third, un-abstracted** storage layer: blob handlers write `state_dir/blobs/...`
@@ -124,8 +124,8 @@ is sealed (`pub(crate)` fields, hardcoded construction).
 
 ### 3.4 Auth — NOT INJECTABLE
 - No auth trait. 7 middleware guards in `auth.rs` each compare against
-  `shared.state.system_token` (single instance credential, `AKSH_SYSTEM_TOKEN`, default
-  `"aksh-system-token"`, set at `state.rs:307-308`) or verify local JWT claims. Admin
+  `shared.state.system_token` (single instance credential, `PRELOOP_SYSTEM_TOKEN`, default
+  `"preloop-system-token"`, set at `state.rs:307-308`) or verify local JWT claims. Admin
   gate is `token == system_token` at `auth.rs:71`. No tenant namespace. Webhook route
   uses HMAC (`X-Hub-Signature-256`), not bearer.
 - **Seam:** `trait AuthProvider { fn authenticate(headers, scope) -> Result<Principal> }`
@@ -140,7 +140,7 @@ is sealed (`pub(crate)` fields, hardcoded construction).
 - Flow: `submit_run_inner` merges stored secrets gated by `trust_tier.allows_secrets()`
   (`runs.rs:119-140`) → `build_job_artifacts` exposes via `.expose()` (`runs.rs:582-585`)
   → `job_builder.rs:415-434` emits `VariableValue::secret` + mask hints. `SecretString`
-  (`aksh-gha-protocol/src/lib.rs:98`) redacts Debug/Display/Serialize; `.expose()` is
+  (`preloop-gha-protocol/src/lib.rs:98`) redacts Debug/Display/Serialize; `.expose()` is
   the only reader.
 - **Seam:** `trait SecretStore { async fn resolve(tenant, names) -> SecretMap }`
   defaulting to payload+config; cloud pulls from Vault/AWS SM. Inject at the
@@ -154,7 +154,7 @@ is sealed (`pub(crate)` fields, hardcoded construction).
   orchestrator edits.** This seam is done.
 - `RunnerProvider` exists **only in docs** — zero `.rs` matches. If wanted, add it in
   the orchestrator; but `VmProvider` already covers the local/cloud VM case.
-- Orchestrator lists `aksh-runner-server` as a dep but **never imports it** (unused
+- Orchestrator lists `preloop-runner-server` as a dep but **never imports it** (unused
   dep; runtime coupling is HTTP). Placement/label-routing belongs here, not the server.
 
 ### Audit summary table
@@ -201,7 +201,7 @@ Resolve the "Open inputs" in §1.
 
 ### Phase 3 — Licensing rollout
 - Root `LICENSE-MIT` + `LICENSE-FSL` (fill licensor / change date / change license).
-- Per-crate `license`: `aksh-runner-server = FSL-1.1-Apache-2.0`, all others `MIT`.
+- Per-crate `license`: `preloop-runner-server = FSL-1.1-Apache-2.0`, all others `MIT`.
   Drop the workspace-wide `license = "MIT"` default in favor of per-crate values.
 - `CONTRIBUTING.md` DCO note (`git commit -s`) + DCO bot; CLA-assistant scoped to the
   server crate path.
@@ -211,7 +211,7 @@ Resolve the "Open inputs" in §1.
 - Private `preloop-cloud` = public as submodule + `preloop-cloud-*` crates; pinned
   submodule commit is the gate for absorbing community fixes.
 - **Publish hygiene:** allowlist crates; the repo currently holds `.credentials`,
-  `*.pem`, `.aksh/` secrets that must never reach public.
+  `*.pem`, `.preloop/` secrets that must never reach public.
 
 ### Phase 5 — Proprietary tier
 - `preloop-cloud-store` (sqlx RunStore + billing/tenancy), `-scheduler`
@@ -221,7 +221,7 @@ Resolve the "Open inputs" in §1.
   `smolvm`-labeled pool so local workflows run remotely unchanged.
 
 ### Phase 6 — Seamless local↔remote CLI
-- `preloop context` (like `docker context`): `local` auto-boots `aksh-runner-server` on
+- `preloop context` (like `docker context`): `local` auto-boots `preloop-runner-server` on
   127.0.0.1 + smolvm; `cloud` targets the prod URL + `preloop login` token. Every
   subcommand hits the same `/api/v1/...` + NDJSON surface → identical local/remote.
   "Run remotely" = one context switch, zero workflow edits; label routing picks the host.

@@ -165,8 +165,8 @@ def cancel_workflow_runner_server(run_id: str):
     req = urllib.request.Request(url, method="POST", data=b"")
     urllib.request.urlopen(req)
 
-def submit_workflow_aksh(workflow_path: str) -> str | None:
-    """Submit a workflow to aksh via its native REST API."""
+def submit_workflow_preloop(workflow_path: str) -> str | None:
+    """Submit a workflow to preloop via its native REST API."""
     wf_path_obj = Path(workflow_path)
     wf_abs = str(wf_path_obj.resolve())
     wf_yaml = wf_path_obj.read_text()
@@ -180,8 +180,8 @@ def submit_workflow_aksh(workflow_path: str) -> str | None:
                 continue
             reusable_workflows[rel_str] = p.read_text()
 
-    aksh_url = os.environ.get("AKSH_API_URL") or os.environ.get("AKSH_URL", "http://127.0.0.1:9090")
-    aksh_url = aksh_url.removesuffix("/runner/server").rstrip("/")
+    preloop_url = os.environ.get("PRELOOP_API_URL") or os.environ.get("PRELOOP_URL", "http://127.0.0.1:9090")
+    preloop_url = preloop_url.removesuffix("/runner/server").rstrip("/")
     payload = json.dumps({
         "workflow_yaml": wf_yaml,
         "event": "workflow_dispatch",
@@ -189,9 +189,9 @@ def submit_workflow_aksh(workflow_path: str) -> str | None:
         "git_ref": "refs/heads/main",
         "reusable_workflows": reusable_workflows,
     }).encode()
-    log(f"submitting workflow {Path(workflow_path).name} to aksh")
+    log(f"submitting workflow {Path(workflow_path).name} to preloop")
     req = urllib.request.Request(
-        f"{aksh_url}/api/v1/runs",
+        f"{preloop_url}/api/v1/runs",
         data=payload,
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -203,11 +203,11 @@ def submit_workflow_aksh(workflow_path: str) -> str | None:
     return run_id
 
 
-def cancel_workflow_aksh(run_id: str):
-    """Cancel a run via aksh's native REST API."""
-    aksh_url = os.environ.get("AKSH_API_URL") or os.environ.get("AKSH_URL", "http://127.0.0.1:9090")
-    aksh_url = aksh_url.removesuffix("/runner/server").rstrip("/")
-    url = f"{aksh_url}/api/v1/runs/{run_id}/cancel"
+def cancel_workflow_preloop(run_id: str):
+    """Cancel a run via preloop's native REST API."""
+    preloop_url = os.environ.get("PRELOOP_API_URL") or os.environ.get("PRELOOP_URL", "http://127.0.0.1:9090")
+    preloop_url = preloop_url.removesuffix("/runner/server").rstrip("/")
+    url = f"{preloop_url}/api/v1/runs/{run_id}/cancel"
     log(f"cancelling run {run_id} via {url}")
     req = urllib.request.Request(url, method="POST", data=b"")
     urllib.request.urlopen(req)
@@ -217,7 +217,7 @@ def cancel_workflow_aksh(run_id: str):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--backend", required=True, choices=["official", "runner-server", "aksh"])
+    parser.add_argument("--backend", required=True, choices=["official", "runner-server", "preloop"])
     parser.add_argument("--scenario", required=True, help="path to scenario.toml")
     parser.add_argument("--capture-dir", required=True)
     parser.add_argument("--mitm-dir", required=True)
@@ -284,8 +284,8 @@ def main():
             wf_path = scenario_path.parent / wf
             if args.backend == "official":
                 last_run_id = submit_workflow_official(str(wf_path))
-            elif args.backend == "aksh":
-                last_run_id = submit_workflow_aksh(str(wf_path))
+            elif args.backend == "preloop":
+                last_run_id = submit_workflow_preloop(str(wf_path))
             else:
                 last_run_id = submit_workflow_runner_server(str(wf_path), mitm_dir)
 
@@ -295,8 +295,8 @@ def main():
                 sys.exit(1)
             if args.backend == "official":
                 cancel_workflow_official(last_run_id)
-            elif args.backend == "aksh":
-                cancel_workflow_aksh(last_run_id)
+            elif args.backend == "preloop":
+                cancel_workflow_preloop(last_run_id)
             else:
                 cancel_workflow_runner_server(last_run_id)
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Capture official and Aksh runner traffic for the overnight workflow corpus.
+# Capture official and Preloop runner traffic for the overnight workflow corpus.
 # The repository defaults to the personal conformance repo; override GH_REPO
 # when running against another fork.
 set -euo pipefail
@@ -11,8 +11,8 @@ SCENARIO_GLOB="${SCENARIO_GLOB:-10[1-9]|110}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 case "$MODE" in
-  official|aksh|both) ;;
-  *) echo "usage: $0 <official|aksh|both>" >&2; exit 2 ;;
+  official|preloop|both) ;;
+  *) echo "usage: $0 <official|preloop|both>" >&2; exit 2 ;;
 esac
 
 scenarios=()
@@ -31,7 +31,7 @@ done < <(
 for scenario in "${scenarios[@]}"; do
   number="${scenario%%-*}"
   [ "$number" -lt "$START_AT" ] && continue
-  echo "=== MITM capture: $scenario ($MODE) repo=${GH_REPO:-preloopdev/aksh-conformance} ==="
-  GH_REPO="${GH_REPO:-preloopdev/aksh-conformance}" \
+  echo "=== MITM capture: $scenario ($MODE) repo=${GH_REPO:-preloopdev/preloop-conformance} ==="
+  GH_REPO="${GH_REPO:-preloopdev/preloop-conformance}" \
     "$SCRIPT_DIR/runner-flow-capture.sh" "$scenario" "$MODE" "$JOB_COUNT"
 done

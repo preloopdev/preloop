@@ -40,10 +40,10 @@ jobs:
           set -euo pipefail
           test "$(tr '\n' , < "$RUNNER_TEMP/$TRACE")" = 'setup,nested-one,nested-two,'
           test "$LIFECYCLE_ENV" = visible-after-step
-          echo 'AKSH_ORACLE: lifecycle=setup,nested-one,nested-two env=visible-after-step'
+          echo 'PRELOOP_ORACLE: lifecycle=setup,nested-one,nested-two env=visible-after-step'
       - name: Post-like cleanup
         if: always()
         shell: bash
         run: |
           echo cleanup >> "$RUNNER_TEMP/$TRACE"
-          echo "AKSH_ORACLE: post=$(tail -1 "$RUNNER_TEMP/$TRACE")"
+          echo "PRELOOP_ORACLE: post=$(tail -1 "$RUNNER_TEMP/$TRACE")"

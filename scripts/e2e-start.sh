@@ -1,27 +1,27 @@
 #!/usr/bin/env bash
 #
-# e2e-start.sh — start aksh for E2E testing with the real runner.
+# e2e-start.sh — start preloop for E2E testing with the real runner.
 #
-# Verifies port redirect is active, starts aksh on 9090, submits a workflow,
+# Verifies port redirect is active, starts preloop on 9090, submits a workflow,
 # and runs the official runner against it. Captures all output for debugging.
 #
 # Usage:
 #   ./scripts/e2e-start.sh                    # full E2E run
-#   ./scripts/e2e-start.sh --skip-runner      # start aksh only (for manual testing)
+#   ./scripts/e2e-start.sh --skip-runner      # start preloop only (for manual testing)
 #   ./scripts/e2e-start.sh --log              # show last E2E log
 
 set -euo pipefail
 
-# The runner's mitm work sets proxy env vars; they hijack our curls to aksh.
+# The runner's mitm work sets proxy env vars; they hijack our curls to preloop.
 unset all_proxy ALL_PROXY http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY 2>/dev/null || true
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-AKSH_STATE="${AKSH_STATE:-$HOME/mitm-proxy/experiments/mitm/.cache/aksh-state}"
-AKSH_BIN="${AKSH_BIN:-$REPO_ROOT/target/release/preloop-server}"
+PRELOOP_STATE="${PRELOOP_STATE:-$HOME/mitm-proxy/experiments/mitm/.cache/preloop-state}"
+PRELOOP_BIN="${PRELOOP_BIN:-$REPO_ROOT/target/release/preloop-server}"
 RUNNER_DIR="${RUNNER_DIR:-$HOME/mitm-proxy/experiments/mitm/.cache/runner-official}"
-AKSH_PORT="${AKSH_PORT:-9090}"
-# aksh binds 9090, but clients (and the runner) reach it via the port-80 redirect.
+PRELOOP_PORT="${PRELOOP_PORT:-9090}"
+# preloop binds 9090, but clients (and the runner) reach it via the port-80 redirect.
 # Direct connections to 9090 are broken by the pf rdr rule's reverse NAT on lo0;
 # only the redirected 80→9090 path has correct bidirectional pf state. So every
 # client request below MUST go through port 80, exactly like the real runner.
@@ -29,7 +29,7 @@ CLIENT="${CLIENT:-http://127.0.0.1:80}"
 LOG_DIR="$REPO_ROOT/logs/e2e"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 LOG_FILE="$LOG_DIR/e2e-$TIMESTAMP.log"
-SYSTEM_TOKEN="${AKSH_SYSTEM_TOKEN:-aksh-system-token}"
+SYSTEM_TOKEN="${PRELOOP_SYSTEM_TOKEN:-preloop-system-token}"
 
 mkdir -p "$LOG_DIR"
 
@@ -52,8 +52,8 @@ except Exception:
 cleanup() {
     # Kill processes started by this script. Avoid broad `pkill -f` patterns
     # that could match unrelated runners/servers on the same host.
-    if [[ -n "${AKSH_PID:-}" ]]; then
-        kill "$AKSH_PID" 2>/dev/null || true
+    if [[ -n "${PRELOOP_PID:-}" ]]; then
+        kill "$PRELOOP_PID" 2>/dev/null || true
     fi
     # Reap any remaining direct children (e.g. perl/run.sh) of this shell.
     pkill -P $$ 2>/dev/null || true
@@ -65,12 +65,12 @@ trap cleanup EXIT
 preflight() {
     info "Preflight checks..."
 
-    # Check aksh binary
-    if [ ! -f "$AKSH_BIN" ]; then
-        red "aksh binary not found: $AKSH_BIN. Build it: cargo build --release -p aksh-runner-server"
+    # Check preloop binary
+    if [ ! -f "$PRELOOP_BIN" ]; then
+        red "preloop binary not found: $PRELOOP_BIN. Build it: cargo build --release -p preloop-runner-server"
         exit 1
     fi
-    dim "  aksh binary: $AKSH_BIN"
+    dim "  preloop binary: $PRELOOP_BIN"
 
     # Check runner binary
     if [ ! -f "$RUNNER_DIR/run.sh" ]; then
@@ -89,41 +89,41 @@ preflight() {
     fi
 
     # Check port 9090 is free
-    if lsof -i :"$AKSH_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-        red "  port $AKSH_PORT is already in use"
-        lsof -i :"$AKSH_PORT" -sTCP:LISTEN 2>/dev/null | head -3
+    if lsof -i :"$PRELOOP_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+        red "  port $PRELOOP_PORT is already in use"
+        lsof -i :"$PRELOOP_PORT" -sTCP:LISTEN 2>/dev/null | head -3
         exit 1
     fi
-    dim "  port $AKSH_PORT: free"
+    dim "  port $PRELOOP_PORT: free"
 
     green "Preflight OK"
 }
 
-# ── start aksh ───────────────────────────────────────────────────────────────
+# ── start preloop ───────────────────────────────────────────────────────────────
 
-start_aksh() {
-    info "Starting aksh on 127.0.0.1:$AKSH_PORT..."
-    mkdir -p "$AKSH_STATE"
+start_preloop() {
+    info "Starting preloop on 127.0.0.1:$PRELOOP_PORT..."
+    mkdir -p "$PRELOOP_STATE"
 
-    "$AKSH_BIN" serve \
-        --listen "127.0.0.1:$AKSH_PORT" \
-        --state-dir "$AKSH_STATE" \
+    "$PRELOOP_BIN" serve \
+        --listen "127.0.0.1:$PRELOOP_PORT" \
+        --state-dir "$PRELOOP_STATE" \
         >> "$LOG_FILE" 2>&1 &
-    AKSH_PID=$!
-    dim "  aksh PID: $AKSH_PID"
+    PRELOOP_PID=$!
+    dim "  preloop PID: $PRELOOP_PID"
 
-    # Wait for aksh to be ready — probe via the port-80 redirect (the working path)
+    # Wait for preloop to be ready — probe via the port-80 redirect (the working path)
     local retries=0
     while ! curl -sf --max-time 1 "$CLIENT/_apis/connectionData?connectOptions=0&lastChangeId=0&lastChangeId64=0" >/dev/null 2>&1; do
         retries=$((retries + 1))
         if [ $retries -gt 20 ]; then
-            red "aksh failed to start (timeout)"
+            red "preloop failed to start (timeout)"
             cat "$LOG_FILE" | tail -20
             exit 1
         fi
         sleep 0.5
     done
-    green "aksh ready"
+    green "preloop ready"
 }
 
 # ── configure runner ─────────────────────────────────────────────────────────
@@ -134,7 +134,7 @@ configure_runner() {
     cd "$RUNNER_DIR"
 
     # Clear any prior local config (don't call `config.sh remove` — it contacts
-    # aksh's unregister endpoint, which we don't need and which can hang).
+    # preloop's unregister endpoint, which we don't need and which can hang).
     rm -f .runner .credentials .credentials_rsaparams 2>/dev/null || true
 
     # Get registration token. `|| resp=""` stops set -e from killing us silently
@@ -178,7 +178,7 @@ submit_workflow() {
         -H "Authorization: Bearer $SYSTEM_TOKEN" \
         -H "Content-Type: application/json" \
         -d '{
-            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello from aksh\n      - run: whoami\n      - run: date\n",
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello from preloop\n      - run: whoami\n      - run: date\n",
             "event": "push",
             "repository": "owner/repo"
         }') || response=""
@@ -193,7 +193,7 @@ submit_workflow() {
 # ── run the runner ───────────────────────────────────────────────────────────
 
 run_runner() {
-    info "Running runner against aksh..."
+    info "Running runner against preloop..."
     cd "$RUNNER_DIR"
 
     # `timeout` is not available on macOS without coreutils; use perl as a portable substitute.
@@ -231,16 +231,16 @@ case "${1:-}" in
 Usage: $0 [OPTION]
 
 Options:
-  (none)            Full E2E: start aksh, configure runner, submit workflow, run
-  --skip-runner     Start aksh only (for manual testing)
+  (none)            Full E2E: start preloop, configure runner, submit workflow, run
+  --skip-runner     Start preloop only (for manual testing)
   --log             Show the latest E2E log
   -h, --help        Show this help
 
 Environment:
-  AKSH_STATE=~/mitm-proxy/experiments/mitm/.cache/aksh-state
+  PRELOOP_STATE=~/mitm-proxy/experiments/mitm/.cache/preloop-state
   RUNNER_DIR=~/mitm-proxy/experiments/mitm/.cache/runner-official
-  AKSH_PORT=9090
-  AKSH_BIN=target/release/preloop-server
+  PRELOOP_PORT=9090
+  PRELOOP_BIN=target/release/preloop-server
 EOF
         exit 0
         ;;
@@ -250,13 +250,13 @@ EOF
         ;;
     --skip-runner)
         preflight
-        start_aksh
-        info "aksh running. Press Ctrl+C to stop."
-        wait $AKSH_PID
+        start_preloop
+        info "preloop running. Press Ctrl+C to stop."
+        wait $PRELOOP_PID
         ;;
     *)
         preflight
-        start_aksh
+        start_preloop
         configure_runner
         submit_workflow
         run_runner

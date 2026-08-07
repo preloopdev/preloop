@@ -1,6 +1,6 @@
 # Code Review Guide
 
-This document explains how we review changes to `aksh`, a Rust reimplementation
+This document explains how we review changes to `preloop`, a Rust reimplementation
 of the GitHub Actions control plane and runner. Our north star is byte-for-byte
 protocol fidelity with the official `actions/runner`, and that goal reorders the
 usual review priorities. Correctness and wire compatibility come before
@@ -46,7 +46,7 @@ review effort belongs.
 
 Start by asking whether the change touches a runner-facing surface, meaning
 anything under `/_apis/`, `/broker/`, `/twirp/`, or the DTOs in
-`aksh-gha-protocol/src/azdo/`. If it does, walk through the CONTRIBUTING
+`preloop-gha-protocol/src/azdo/`. If it does, walk through the CONTRIBUTING
 compatibility checklist and confirm the change does not alter any JSON field
 name, casing, or default, any HTTP status code that a runner uses for retry or
 terminal decisions, or the lease timing, session lifetime, and message delivery
@@ -63,7 +63,7 @@ field rename without a matching `#[serde(rename)]` or a golden update is a
 blocker.
 
 Expression and parser semantics have to match GitHub, not whatever happens to
-seem reasonable. The `aksh-gha-expressions` and `aksh-gha-parser` crates mirror
+seem reasonable. The `preloop-gha-expressions` and `preloop-gha-parser` crates mirror
 upstream quirks such as truthiness rules, matrix ordering through `IndexMap`, and
 glob semantics, so any divergence introduced in the name of cleanliness is
 actually a bug.
@@ -130,7 +130,7 @@ Watch in particular for `.expose()` inside loops or iterators, which
 `rules/no-expose-in-loop.yml` is designed to catch.
 
 Make sure there is no inline masking, because all redaction has to go through
-`aksh_gha_protocol::masking::mask_secrets`, which guarantees longest-first
+`preloop_gha_protocol::masking::mask_secrets`, which guarantees longest-first
 ordering, empty-secret filtering, and DAP-keyword exclusion. A hand-rolled
 `.replace(secret, "****")` is banned by `rules/no-inline-masking` and
 `no-raw-secret-replace`.
@@ -212,9 +212,9 @@ changes the bytes then the clean version is wrong.
 ## 6. Maintainability
 
 Confirm that the change respects the crate layering, where wire and domain types
-live in `aksh-gha-protocol`, parsing lives in `aksh-gha-parser`, the expression
-engine lives in `aksh-gha-expressions`, and routes and queueing live in
-`aksh-runner-server`. A DTO defined outside the protocol crate, or business logic
+live in `preloop-gha-protocol`, parsing lives in `preloop-gha-parser`, the expression
+engine lives in `preloop-gha-expressions`, and routes and queueing live in
+`preloop-runner-server`. A DTO defined outside the protocol crate, or business logic
 leaking into a route handler, is a structural smell worth flagging.
 
 Check that error handling matches its layer, which means `thiserror` enums in

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SERVER=/workspace/target/aarch64-unknown-linux-musl/release/preloop-server
-CLIENT=/workspace/target/aarch64-unknown-linux-musl/release/aksh-runner-client
+CLIENT=/workspace/target/aarch64-unknown-linux-musl/release/preloop-runner-client
 # Prefer pinned v2.336.0; fall back to container layout.
 RUNNER_SRC="${RUNNER_SRC:-}"
 if [[ -z "$RUNNER_SRC" ]]; then
@@ -29,7 +29,7 @@ if [[ "$RUNNER_VER" != "2.336.0" ]]; then
   echo "warning: expected runner 2.336.0, got $RUNNER_VER" >&2
 fi
 
-OUTDIR=/workspace/benchmarks/v2336-official-vs-aksh
+OUTDIR=/workspace/benchmarks/v2336-official-vs-preloop
 FLOWS=$OUTDIR/combined-flows.jsonl
 
 pkill -f "preloop-server.*:80" 2>/dev/null || true
@@ -39,7 +39,7 @@ mkdir -p "$OUTDIR"
 chmod 777 "$OUTDIR"
 
 # Official runner strips non-default ports. Must listen on 80.
-AKSH_PUBLIC_URL=http://127.0.0.1 $SERVER serve --listen 127.0.0.1:80 --record-flows "$FLOWS" > /tmp/server.log 2>&1 &
+PRELOOP_PUBLIC_URL=http://127.0.0.1 $SERVER serve --listen 127.0.0.1:80 --record-flows "$FLOWS" > /tmp/server.log 2>&1 &
 SERVER_PID=$!
 sleep 2
 
@@ -58,15 +58,15 @@ run_wf() {
   local yaml=\$2
   
   echo \"=== Running Workflow \$num: \$yaml ===\"
-  $CLIENT --server http://127.0.0.1 submit -W /workspace/crates/aksh-conformance/fixtures/\$yaml > /tmp/submit.json
+  $CLIENT --server http://127.0.0.1 submit -W /workspace/crates/preloop-conformance/fixtures/\$yaml > /tmp/submit.json
   local run_id=\$(python3 -c \"import json; print(json.load(open('/tmp/submit.json'))['run_id'])\")
   echo \"RUN_ID=\$run_id\"
   
   ./run.sh --once > $OUTDIR/runner-\$num.log 2>&1
   
-  mkdir -p $OUTDIR/aksh/\$num
-  curl -s -H 'Authorization: Bearer aksh-system-token' http://127.0.0.1/api/v1/runs/\$run_id > $OUTDIR/aksh/\$num/run-result.json
-  curl -s -H 'Authorization: Bearer aksh-system-token' http://127.0.0.1/api/v1/runs/\$run_id/logs > $OUTDIR/aksh/\$num/run-logs.txt
+  mkdir -p $OUTDIR/preloop/\$num
+  curl -s -H 'Authorization: Bearer preloop-system-token' http://127.0.0.1/api/v1/runs/\$run_id > $OUTDIR/preloop/\$num/run-result.json
+  curl -s -H 'Authorization: Bearer preloop-system-token' http://127.0.0.1/api/v1/runs/\$run_id/logs > $OUTDIR/preloop/\$num/run-logs.txt
 }
 
 run_wf 200 v2336-combined.yml

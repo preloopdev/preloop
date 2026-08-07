@@ -4,7 +4,7 @@
 
 **preloop is not tied to any specific runner host.** It speaks the runner protocol and accepts
 
-incoming runner connections; the runner itself handles execution. This means aksh works
+incoming runner connections; the runner itself handles execution. This means preloop works
 
 equally well with:
 
@@ -14,15 +14,15 @@ equally well with:
 - Bare processes on the same machine
 - Remote runners on other servers
 
-**Preloop** is the *product* that combines aksh (control plane) + a libkrun-based
+**Preloop** is the *product* that combines preloop (control plane) + a libkrun-based
 
-ephemeral runner host for local CI. aksh is its control plane. But aksh is independently
+ephemeral runner host for local CI. preloop is its control plane. But preloop is independently
 
-usable: anyone can `cargo install aksh` and point their own runners at it.
+usable: anyone can `cargo install preloop` and point their own runners at it.
 
 Runner *provisioning* integrations live in separate repos/crates. The Rust runner
 
-protocol client (`aksh-runner`) lives in this workspace alongside the control plane.
+protocol client (`preloop-runner`) lives in this workspace alongside the control plane.
 
 Upstream reference: `actions/runner` v2.336.0 (commit `98aabcd429c4e8402406c56ce2d26387fed3b9ce`)
 
@@ -30,19 +30,19 @@ Previous baseline: `actions/runner` v2.335.1 (commit `7d737449ef346f6524f75688d0
 
 runner.server reference: `ChristopherHX/runner.server` v3.14.0 (commit `069646146c90d649c74dfd7a34569c9420195838`)
 
-(overridable via `AKSH_UPSTREAM_RUNNER_SERVER_REF`). 
+(overridable via `PRELOOP_UPSTREAM_RUNNER_SERVER_REF`). 
 
 ---
 
 ## 0b. v2.336.0 delta (2026-07-20)
 
 v2.336.0 was released 2026-07-20. This section tracks changes from v2.335.1 → v2.336.0
-and their impact on aksh.
+and their impact on preloop.
 
-### Protocol / behavioral changes requiring aksh work
+### Protocol / behavioral changes requiring preloop work
 
 
-| Priority | PR                                                                                                        | Change                                                     | Impact                                                                                                                                                                                                                                                                                                | aksh Status                 |
+| Priority | PR                                                                                                        | Change                                                     | Impact                                                                                                                                                                                                                                                                                                | preloop Status                 |
 | -------- | --------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------- |
 | P1       | [#4482](https://github.com/actions/runner/pull/4482)                                                      | **Canceled background steps should not impact job result** | Wire `background` from job message; `Cancelled` on `is_background` steps does not set job Cancelled (job cancel still via `cancel_rx`). Full `BackgroundStepCoordinator` + cancel-control steps still missing.                                                                                        | ⚠️ partial                  |
 | P1       | [#4527](https://github.com/actions/runner/pull/4527)                                                      | `**$GITHUB_ARTIFACTS` / `$GITHUB_ARTIFACTS_LIST`**         | Matches `CreateArtifactsFileCommand` / `ArtifactsListFileCommand`: env always exposed; process gated by `actions_runner_allow_artifacts_file`; `ref@sha{256,384,512}:hex` / `oci://` / `file://` / path; conflict+cap throw; list JSON v1 sorted. Job-local only (no wire upload — same as official). | ✅ good                      |
@@ -52,14 +52,14 @@ and their impact on aksh.
 | P2       | [#4538](https://github.com/actions/runner/pull/4538)                                                      | `**ACTIONS_CACHE_MODE**`                                   | `actions_cache_mode` variable → env; logged at job start.                                                                                                                                                                                                                                             | ✅ good                      |
 | P2       | [#4553](https://github.com/actions/runner/pull/4553)                                                      | **Wait for worker during cancel**                          | Existing `job.wait()` cancel path.                                                                                                                                                                                                                                                                    | ⚠️ partial                  |
 | P2       | [#4546](https://github.com/actions/runner/pull/4546)/[#4550](https://github.com/actions/runner/pull/4550) | **Locked deps log**                                        | "Using locked actions versions from the workflow's lockfile" when `actionsDependencies` non-empty.                                                                                                                                                                                                    | ✅ good                      |
-| P2       | [#4557](https://github.com/actions/runner/pull/4557)                                                      | **Migrated-settings session-conflict retry cap**           | N/A — aksh has no `.runner_migrated` path. Session 409 already retriable (~4 min) in message listener.                                                                                                                                                                                                | ✅ N/A                       |
+| P2       | [#4557](https://github.com/actions/runner/pull/4557)                                                      | **Migrated-settings session-conflict retry cap**           | N/A — preloop has no `.runner_migrated` path. Session 409 already retriable (~4 min) in message listener.                                                                                                                                                                                                | ✅ N/A                       |
 | P2       | [#4551](https://github.com/actions/runner/pull/4551)                                                      | **Session file cleanup**                                   | N/A — in-memory sessions.                                                                                                                                                                                                                                                                             | ✅ N/A                       |
 | P3       | [#4509](https://github.com/actions/runner/pull/4509)/[#4536](https://github.com/actions/runner/pull/4536) | **Action download logs**                                   | Archive size + resolve timing at info (not full telemetry payloads).                                                                                                                                                                                                                                  | ⚠️ partial (log-level only) |
 
 
 ### v2.336.0 summary
 
-Runner-side deltas for v2.336.0 are implemented where they map cleanly onto aksh.
+Runner-side deltas for v2.336.0 are implemented where they map cleanly onto preloop.
 Remaining gaps: full `BackgroundStepCoordinator` / cancel-control steps (#4482),
 worker-wait parity (#4553), and structured download telemetry vs info logs.
 The committed conformance corpus is recorded from the official v2.336.0 runner.
@@ -71,8 +71,8 @@ The committed conformance corpus is recorded from the official v2.336.0 runner.
 
 | Term                | Meaning                                                                        |
 | ------------------- | ------------------------------------------------------------------------------ |
-| **aksh**            | This repo: the GitHub Actions control plane service (protocol, scheduler, API) |
-| **Preloop**         | Local CI product: aksh + libkrun runner host for ephemeral microVMs            |
+| **preloop**            | This repo: the GitHub Actions control plane service (protocol, scheduler, API) |
+| **Preloop**         | Local CI product: preloop + libkrun runner host for ephemeral microVMs            |
 | **Runner.Provider** | Pluggable trait: creates/destroys runners (any substrate)                      |
 | **Runner.Listener** | The unmodified official `actions/runner` binary                                |
 
@@ -80,13 +80,13 @@ The committed conformance corpus is recorded from the official v2.336.0 runner.
 ## 0a. Product parity target
 
 The target is **not** byte-for-byte hosted GitHub/Azure implementation parity.
-aksh should be faithful where the unmodified official runner, user workflows, or
+preloop should be faithful where the unmodified official runner, user workflows, or
 GitHub PR/check UX depend on it, and intentionally local everywhere else.
 
 The product target is:
 
 > Users can keep their existing, unmodified `.github/workflows/*.yml` files.
-> Preloop/aksh evaluates those workflows, schedules jobs on local/self-hosted
+> Preloop/preloop evaluates those workflows, schedules jobs on local/self-hosted
 > runner capacity, and reports status/log/artifact links back to the existing
 > GitHub PR/checks UI.
 
@@ -127,13 +127,13 @@ those details.
 ## 1. Current fidelity scorecard
 
 **Evidence basis (latest, 2026-07-28):** runner-watch conformance replay of all 24
-official-runner v2.336.0 golden scenarios against aksh. All 24 pass: status codes,
+official-runner v2.336.0 golden scenarios against preloop. All 24 pass: status codes,
 request body schemas, and acquirejob response schemas match on every
 conformance-checked endpoint. `benchmarks/conformance/check_corpus.py` fails closed
 when any scenario definition lacks a non-empty, version-matched capture.
 
 **Evidence basis (live E2E, 2026-07-10):** official `actions/runner` v2.335.1 run against both
-GitHub Actions and aksh server in independent smolVMs. 12 conformance scenarios tested.
+GitHub Actions and preloop server in independent smolVMs. 12 conformance scenarios tested.
 Job-level match: 11/12 (92%). Full match (job + step): 6/12 (50%).
 See `benchmarks/real-world/results/server-compare/COMPARISON-REPORT.md` for details.
 
@@ -165,11 +165,11 @@ deprecation warnings, job-level annotations, and background step control-flow.
 | Runner session handshake (legacy AzDO path)                     | AES key exchange now RSA-wraps the session key with the runner's registered public key; plaintext is retained only as a no-key fallback                                                                                                                                                                                                                                                                                                                                              | ✅ good                                               |
 | Encrypted message queue (`TaskAgentMessage`)                    | older direct-message path remains AES-CBC encrypted; current v2.335.x broker-ref path is covered by a current-runner E2E test                                                                                                                                                                                                                                                                                                                                                        | ✅ good                                               |
 | `AgentJobRequestMessage`                                        | full DTO with plan, request, context, steps; reused by current broker acquire responses and covered by current-runner registration→broker E2E                                                                                                                                                                                                                                                                                                                                        | ✅ good                                               |
-| `connectionData` / location services                            | v2.335.1 replay returns `200`; aksh includes 28 service definitions covering broker/OAuth/pipelines resource locations and query-aware fresh-cache responses                                                                                                                                                                                                                                                                                                                         | ⚠️ runner-compatible, not full hosted-service parity |
-| GitHub runner registration endpoint                             | route exists and replays as `200`; response now returns JWT-shaped local `OAuthAccessToken` plus aksh service URL instead of echoing GitHub repo URL                                                                                                                                                                                                                                                                                                                                 | ⚠️ local token, runner-compatible                    |
+| `connectionData` / location services                            | v2.335.1 replay returns `200`; preloop includes 28 service definitions covering broker/OAuth/pipelines resource locations and query-aware fresh-cache responses                                                                                                                                                                                                                                                                                                                         | ⚠️ runner-compatible, not full hosted-service parity |
+| GitHub runner registration endpoint                             | route exists and replays as `200`; response now returns JWT-shaped local `OAuthAccessToken` plus preloop service URL instead of echoing GitHub repo URL                                                                                                                                                                                                                                                                                                                                 | ⚠️ local token, runner-compatible                    |
 | OAuth token endpoint                                            | route exists and replays as `200`; response now uses `token_type = JWT`, `expires_in = 2999`, and local signed JWT-shaped tokens                                                                                                                                                                                                                                                                                                                                                     | ⚠️ local token, runner-compatible                    |
 | DistributedTask pool/agent replay                               | runner-watch mapping is fixed and the latest replay returns `200` for pool discovery / agent lookup / agent registration                                                                                                                                                                                                                                                                                                                                                             | ✅ good                                               |
-| DistributedTask session/message replay                          | mapped requests now reach aksh; session status matches `201`; incomplete Busy long-polls are filtered as non-comparable capture artifacts                                                                                                                                                                                                                                                                                                                                            | ⚠️ partial                                           |
+| DistributedTask session/message replay                          | mapped requests now reach preloop; session status matches `201`; incomplete Busy long-polls are filtered as non-comparable capture artifacts                                                                                                                                                                                                                                                                                                                                            | ⚠️ partial                                           |
 | AgentRequest acknowledgement                                    | endpoint exists and now returns `200` like official v2.335.1                                                                                                                                                                                                                                                                                                                                                                                                                         | ✅ good                                               |
 | Broker acquire/renew/complete                                   | queue-backed routes pass targeted E2E; runner-watch now materializes replay state and rewrites captured broker IDs so acquire/renew/complete statuses match official                                                                                                                                                                                                                                                                                                                 | ✅ good                                               |
 | Broker message types                                            | 9 types handled: `RunnerJobRequest`, `PipelineAgentJobRequest`, `JobCancellation`, `AgentRefresh`, `BrokerMigration`, `ForceTokenRefresh`, `RunnerShutdown`, `RunnerRefresh`, `RunnerRefreshConfig`                                                                                                                                                                                                                                                                                  | ✅ good                                               |
@@ -180,8 +180,8 @@ deprecation warnings, job-level annotations, and background step control-flow.
 | Timeline / logs / web-console feed                              | PATCH timeline persists records with `lastModified` stamp and returns full stored set; GET timeline endpoint returns all records; POST/PUT logs, console log, WebSocket live-feed, Twirp log metadata all working                                                                                                                                                                                                                                                                    | ✅ good                                               |
 | Job/step completion events + annotations                        | broker completejob with planId, jobId, conclusion, outputs, stepResults, annotations, telemetry; annotation JSON shape matches golden 14                                                                                                                                                                                                                                                                                                                                             | ✅ good                                               |
 | Action download info                                            | server `action_download_info()`, `runnerresolve_actions()`, and `download_action_tarball()` fully implemented with ticket generation and tarball serving from cache; runner-side `actions_download.rs` has full batch `runnerresolve/actions` + bearer token for codeload; subpath keys normalized before resolution                                                                                                                                                                 | ✅ good                                               |
-| Cache v1 / Artifact v1 shapes                                   | full reserve/upload/commit/lookup for cache v1 and create/put/get/list for artifact v1, backed by file-backed `aksh-cache`/`aksh-artifacts` stores                                                                                                                                                                                                                                                                                                                                   | ✅ good                                               |
-| Cache v2 / Artifact v2 / blob/Twirp                             | fully implemented on the server via Twirp endpoints, backed by file-backed storage in `aksh-cache` and `aksh-artifacts`                                                                                                                                                                                                                                                                                                                                                              | ✅ good                                               |
+| Cache v1 / Artifact v1 shapes                                   | full reserve/upload/commit/lookup for cache v1 and create/put/get/list for artifact v1, backed by file-backed `preloop-cache`/`preloop-artifacts` stores                                                                                                                                                                                                                                                                                                                                   | ✅ good                                               |
+| Cache v2 / Artifact v2 / blob/Twirp                             | fully implemented on the server via Twirp endpoints, backed by file-backed storage in `preloop-cache` and `preloop-artifacts`                                                                                                                                                                                                                                                                                                                                                              | ✅ good                                               |
 | Runner worker: step execution                                   | full lifecycle: condition evaluation, timeout, continue-on-error, script/node/composite/container handlers, pre/post steps                                                                                                                                                                                                                                                                                                                                                           | ✅ good                                               |
 | Runner worker: file commands                                    | `GITHUB_ENV`, `GITHUB_PATH`, `GITHUB_OUTPUT`, `GITHUB_STATE`, `GITHUB_STEP_SUMMARY` all supported                                                                                                                                                                                                                                                                                                                                                                                    | ✅ good                                               |
 | Runner worker: workflow commands                                | `::set-output::`, `::set-env::`, `::add-path::`, `::add-mask::`, `::debug::`, `::warning::`, `::error::`, `::notice::`, `::group::`/`::endgroup::`, `::stop-commands::`                                                                                                                                                                                                                                                                                                              | ✅ good                                               |
@@ -197,9 +197,9 @@ deprecation warnings, job-level annotations, and background step control-flow.
 | Ephemeral ack exit on job-not-found (v2.336.0)                  | `acknowledge()` returns `AcknowledgeResult`; 404 + `AcknowledgeJobNotFound` → ephemeral exit                                                                                                                                                                                                                                                                                                                                                                                         | ✅ good                                               |
 | `RunnerSessionInvalid` structured error (v2.336.0)              | `is_session_expired` parses `{"errorKind": "RunnerSessionInvalid"}` on HTTP 400                                                                                                                                                                                                                                                                                                                                                                                                      | ✅ good                                               |
 | Locked dependencies announcement (v2.336.0)                     | "Using locked actions versions from the workflow's lockfile" when `actionsDependencies` non-empty                                                                                                                                                                                                                                                                                                                                                                                    | ✅ good                                               |
-| Session file cleanup on error (v2.336.0)                        | N/A — aksh-runner uses in-memory sessions; session recreation already handled                                                                                                                                                                                                                                                                                                                                                                                                        | ✅ N/A                                                |
+| Session file cleanup on error (v2.336.0)                        | N/A — preloop-runner uses in-memory sessions; session recreation already handled                                                                                                                                                                                                                                                                                                                                                                                                        | ✅ N/A                                                |
 | DAP debugger integration                                        | fully implemented: 4,527 LOC, 67 tests, WebSocket DAP server with breakpoints/stepping/variable inspection                                                                                                                                                                                                                                                                                                                                                                           | ✅ good                                               |
-| Runner self-update                                              | `AgentRefresh` / `RunnerRefresh` messages acknowledged with log; no actual update mechanism                                                                                                                                                                                                                                                                                                                                                                                          | ❌ intentional — aksh-runner does not self-update     |
+| Runner self-update                                              | `AgentRefresh` / `RunnerRefresh` messages acknowledged with log; no actual update mechanism                                                                                                                                                                                                                                                                                                                                                                                          | ❌ intentional — preloop-runner does not self-update     |
 | Runner config refresh                                           | `RunnerRefreshConfig` acknowledged with log; dynamic config updates not implemented                                                                                                                                                                                                                                                                                                                                                                                                  | ❌ missing                                            |
 | Server-enforced runner settings                                 | `RunnerServerSettings` DTO; `GET /_apis/v1/settings/runner` endpoint; broker acquire injects `runnerSettings` defaults                                                                                                                                                                                                                                                                                                                                                               | ✅ good                                               |
 | `run-name` expressions                                          | parsed via `Workflow.run_name`; evaluated with `github`/`inputs`/`vars` contexts at submit time; stored in `RunRecord`                                                                                                                                                                                                                                                                                                                                                               | ✅ good                                               |
@@ -213,7 +213,7 @@ deprecation warnings, job-level annotations, and background step control-flow.
 
 ### 1a.1 What the conformance replay proves
 
-runner-watch replays all 24 golden scenarios against aksh and compares wire output.
+runner-watch replays all 24 golden scenarios against preloop and compares wire output.
 **All 24 scenarios pass**: status codes match, request body schemas match, and
 acquirejob response body schemas match for all conformance-checked endpoints.
 
@@ -258,13 +258,13 @@ Body-value diffs (different URLs, IDs, tokens) are expected and not gated.
 
 ### 1a.3 Remaining body-value diffs (not gated)
 
-These are expected differences between official GitHub service URLs/tokens and aksh's
+These are expected differences between official GitHub service URLs/tokens and preloop's
 local equivalents. They do not cause conformance failure:
 
 - `GetStepLogsSignedBlobURL` / `GetJobLogsSignedBlobURL`: Azure Blob URLs vs local replay URLs
 - Registration/OAuth responses: local JWT tokens vs GitHub service tokens
-- Session `encryptionKey`: present in aksh, absent in some golden captures
-- `connectionData`: aksh response is smaller, lacks full hosted-service location metadata
+- Session `encryptionKey`: present in preloop, absent in some golden captures
+- `connectionData`: preloop response is smaller, lacks full hosted-service location metadata
 
 ### 1a.4 Source-diff-only gaps not exercised by conformance replay
 
@@ -272,7 +272,7 @@ These changes are tracked from upstream runner diffs but not yet exercised by an
 conformance scenario:
 
 
-| Priority | Change                                                 | Upstream Version | aksh Status                                                                                                                                               |
+| Priority | Change                                                 | Upstream Version | preloop Status                                                                                                                                               |
 | -------- | ------------------------------------------------------ | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | P0       | Background step fields in `TimelineRecord`             | v2.335.0         | ⚠️ DTO + `is_background` flag implemented; control-flow unexercised                                                                                       |
 | ~~P1~~   | `~~RunnerVersionDeprecated` feature flag~~             | v2.321.0         | ✅ resolved — server returns 403 + `AccessDeniedException`/`errorCode: 1`; runner detects and stops                                                        |
@@ -450,7 +450,7 @@ Grouped by the role they play for the official runner:
 
 Paths are in this repo. Updated 2026-07-18 after deep source review.
 
-- `aksh-gha-parser/src/`
+- `preloop-gha-parser/src/`
   - ✅ Typed `Workflow`/`Job`/`Step`/`Trigger`/`RunsOn`/`Needs`/`Strategy`/`Matrix`/`Concurrency`.
   - ✅ `Trigger::matches_with_context` — `branches`/`tags`/`paths`/`types`/`schedule`/`workflow_dispatch`.
   - ✅ `expand_matrix` uses `IndexMap` preserving declaration order; GitHub `name (v1, v2)` format.
@@ -462,14 +462,14 @@ Paths are in this repo. Updated 2026-07-18 after deep source review.
   - ✅ `container` / `services` parsed as raw `Value`.
   - ✅ Reusable workflows with `secrets: inherit`, input types, depth limit = 4.
   - ✅ `run-name` parsed via `Workflow.run_name` (`#[serde(rename = "run-name")]`); evaluated with expression contexts at submit time.
-- `aksh-gha-expressions/src/`
+- `preloop-gha-expressions/src/`
   - ✅ Pratt parser + evaluator; all 12 functions.
   - ✅ **Wired** into job builder — expressions resolved in env, with, run fields.
   - ✅ `success()/failure()/cancelled()/always()` use context state (not hardcoded).
   - ✅ Index/bracket access (`matrix['os']`), `*` object-filter (`steps.*.outputs`),
   `format` `{{`/`}}` escaping — all implemented.
   - ✅ Truthy: empty object/array is truthy (matches GitHub).
-- `aksh-runner-server/src/`
+- `preloop-runner-server/src/`
   - ✅ axum router with GHES org-prefix routing, graceful shutdown, NDJSON broadcast.
   - ✅ ~100+ routes covering GHES org-prefix, `/runner/server/` prefix, bare `/_apis/` prefix,
   broker paths, replay paths, Twirp paths, blob store paths.
@@ -483,11 +483,11 @@ Paths are in this repo. Updated 2026-07-18 after deep source review.
   - ✅ `needs` DAG scheduling with dependency-gated dispatch and outputs propagation.
   - ✅ `fail-fast` / `max-parallel` matrix strategy support.
   - ✅ `JobCancellation` wire shape with GUID `jobId` + `Timeout` TimeSpan.
-- `aksh-gha-protocol/src/`
+- `preloop-gha-protocol/src/`
   - ✅ `SecretString` redaction-safe; AzDO wire DTOs in `azdo` module.
   - ✅ `AgentJobRequestMessage` with `PlanReference`, `request_id`, `EndpointAuthorization`.
   - ✅ RSA/AES crypto module; .NET TimeSpan parsing.
-- `aksh-runner/src/`
+- `preloop-runner/src/`
   - ✅ Broker listener: 9 message types, GUID-based cancellation, `CancellationTiming`.
   - ✅ Worker: full step lifecycle with condition eval, timeout, continue-on-error.
   - ✅ Step handlers: Script, Node, Composite (with pre/post), Container.
@@ -503,11 +503,11 @@ Paths are in this repo. Updated 2026-07-18 after deep source review.
 - `runner-watch`
   - ✅ Records/diffs upstream runner releases and emits `.runner-watch/delta.json`.
   - ✅ Generates protocol-sync specs under `.runner-watch/specs/v{version}/`.
-  - ✅ Replays the complete v2.336.0 corpus into aksh: all 24 scenarios pass.
+  - ✅ Replays the complete v2.336.0 corpus into preloop: all 24 scenarios pass.
 
 ### 3a. Concurrency &amp; cancellation audit (2026-07-13, resolved 2026-07-18)
 
-Findings from a source audit of aksh vs official runner v2.335.1 sources (local mirror:
+Findings from a source audit of preloop vs official runner v2.335.1 sources (local mirror:
 `~/mitm-proxy/experiments/mitm/.cache/runner.server/src`, upstream paths cited as
 `src/Runner.Listener/...`). Implementation plan: `docs/concurrency-plan.md`.
 
@@ -515,7 +515,7 @@ Findings from a source audit of aksh vs official runner v2.335.1 sources (local 
 and regression tests.**
 
 - ✅ **GitHub `concurrency:` fully implemented.** Parsed at workflow and job level
-(`aksh-gha-parser/src/models.rs`), server-side enforcement in `aksh-runner-server/src/concurrency.rs`
+(`preloop-gha-parser/src/models.rs`), server-side enforcement in `preloop-runner-server/src/concurrency.rs`
 (722 lines of tests). Covers: case-insensitive group names; scope-aware expression evaluation
 (`github`/`inputs`/`vars`, plus `needs`/`strategy`/`matrix` at job level); at most one
 running holder per group; `queue: single` (default) / `queue: max` (up to 100 pending);
@@ -524,7 +524,7 @@ workflow runs, single jobs, and reusable job sets.
 - ✅ `**JobCancellation` wire shape fixed.** Now sends GUID `jobId` matching
 `AgentJobRequestMessage.jobId` plus `Timeout` in .NET TimeSpan format. The official runner
 can match and honour cancellation.
-- ✅ **aksh-runner cancel handling now matches `JobDispatcher`.** Fire-and-forget cancel with
+- ✅ **preloop-runner cancel handling now matches `JobDispatcher`.** Fire-and-forget cancel with
 `CancellationTiming`: effective timeout clamped to ≥60 s, hard-kill scheduled at
 `timeout − 15 s`. Listener continues polling during cancellation.
 - ✅ **Busy-runner overlap handling resolved.** Broker listener now handles new job messages
@@ -532,7 +532,7 @@ arriving while a job is active.
 - ✅ **Broker polling/session lifecycle fixed.** Online and Busy states both use the official
 50-second long-poll window; status transitions cancel the in-flight request, and every
 listener exit path attempts the broker session `DELETE` exactly once.
-- ✅ **Step/timeline updates: delta periodic drain.** aksh-runner flushes delta
+- ✅ **Step/timeline updates: delta periodic drain.** preloop-runner flushes delta
 `WorkflowStepsUpdate` (only dirty steps via `dirty_keys` tracking) every 500 ms and at
 job end, matching the official runner's `ProcessTimelinesUpdateQueueAsync` approach.
 No eager flushes on step failure — all updates are coalesced by the timer, matching the
@@ -542,7 +542,7 @@ counts match.
 ### 3b. Deep review findings (2026-07-18)
 
 Comprehensive source review of official `actions/runner` v2.335.1 and
-`ChristopherHX/runner.server` vs aksh codebase across all layers.
+`ChristopherHX/runner.server` vs preloop codebase across all layers.
 
 #### Confirmed good (newly verified)
 
@@ -579,7 +579,7 @@ Comprehensive source review of official `actions/runner` v2.335.1 and
 | `run-name`                      | Parsed via `Workflow.run_name` (`#[serde(rename = "run-name")]`); evaluated with `github`/`inputs`/`vars` expression contexts during submit; stored in `RunRecord.run_name`; falls back to raw string on eval failure                |
 | Twirp log metadata              | `CreateStepLogsMetadata`, `CreateJobLogsMetadata`, `CreateStepSummaryMetadata` now accept `State(shared)`, upsert `LogMetadata` entries (line count + byte estimate for logs, raw size for summaries) into `InnerState.log_metadata` |
 | Periodic step-status drain      | Background tokio task spawned in `run_job` with 500 ms interval (`MissedTickBehavior::Skip`); flushes `WorkflowStepsUpdate` via `flush_step_updates`; exits on job cancel; aborted before final flush                                |
-| Server-enforced runner settings | `RunnerServerSettings` DTO in `aksh-gha-protocol::azdo::lifecycle`; `GET /_apis/v1/settings/runner` (+ GHES prefix) returns defaults; broker acquire injects `runnerSettings` in response                                            |
+| Server-enforced runner settings | `RunnerServerSettings` DTO in `preloop-gha-protocol::azdo::lifecycle`; `GET /_apis/v1/settings/runner` (+ GHES prefix) returns defaults; broker acquire injects `runnerSettings` in response                                            |
 
 
 #### Resolved P2 gaps (2026-07-18)
@@ -588,7 +588,7 @@ Comprehensive source review of official `actions/runner` v2.335.1 and
 | Gap                       | Resolution                                                                                                                                                                                                        | Commit                |
 | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------- |
 | Runner groups server-side | `runs-on: { group: ... }` is parsed into `JobPlan.runner_group`; runner registration stores group ID/name; broker and legacy message acquisition match both labels and group; default runners remain in group 1   | `eaf9e21c`            |
-| `RunnerVersionDeprecated` | Opt-in `AKSH_RUNNER_VERSION_DEPRECATED=true                                                                                                                                                                       | 1                     |
+| `RunnerVersionDeprecated` | Opt-in `PRELOOP_RUNNER_VERSION_DEPRECATED=true                                                                                                                                                                       | 1                     |
 | `SendJobLevelAnnotations` | Feature-gated aggregation via `actions_send_job_level_annotations`; job annotations are projected into completejob, AzDO timeline issues, and NDJSON while step annotations remain intact                         | `bed9f86f`            |
 | `RunnerRefreshConfig`     | Parses official refresh metadata, posts the base64 `.runner` payload to `configRefreshURL`, validates runner identity, atomically persists supported settings, and handles malformed/unknown payloads non-fatally | `c4b4688b`, `f0f991d` |
 | AzDO error envelopes      | Runner-facing `/_apis`, `/broker`, and `/twirp` errors now use path-specific official-compatible envelopes; native `/api/v1` errors remain unchanged                                                              | `d0b4cb51`            |
@@ -614,7 +614,7 @@ expansion instead of GitHub's single skipped entry (uv `ci.yml` pull_request:
 callers are now deferred, mirroring the runtime deferred-matrix design:
 
 - The parser emits one placeholder node per caller (`JobPlan.reusable_call`);
-the callee subtree materializes via `aksh_gha_parser::expand_reusable_call`
+the callee subtree materializes via `preloop_gha_parser::expand_reusable_call`
 only when the caller's `needs` complete and its `if:` evaluates true. A
 false gate leaves exactly one skipped entry, as GitHub does.
 - Caller/embedded concurrency JobSet gates move from submission time to
@@ -641,7 +641,7 @@ adopts the shared `build_job_artifacts` helper.
 
 The official runner protocol already decouples execution from the control plane: the runner
 
-*connects in* and pulls work; aksh never reaches *out* to execute anything. So there is
+*connects in* and pulls work; preloop never reaches *out* to execute anything. So there is
 
 exactly **one plug point**: how a runner instance is created, given credentials, and torn
 
@@ -654,13 +654,13 @@ regardless of where the runner lives.
 ```rust
 use async_trait::async_trait;
 
-/// How aksh creates and destroys runner instances.
+/// How preloop creates and destroys runner instances.
 pub trait RunnerProvider: Send + Sync {
     /// Labels this provider can satisfy (for `runs-on` routing).
     fn labels(&self) -> &LabelMatcher;
 
     /// Start a runner that will phone home and self-register via the normal protocol.
-    /// aksh only handles birth; the protocol does the rest.
+    /// preloop only handles birth; the protocol does the rest.
     async fn provision(
         &self,
         spec: &RunnerSpec,
@@ -680,7 +680,7 @@ pub trait RunnerProvider: Send + Sync {
 }
 ```
 
-- `RunnerRegistration` = what the runner needs to call back: **aksh's URL** (reachable
+- `RunnerRegistration` = what the runner needs to call back: **preloop's URL** (reachable
 
   from *its* network namespace — the **provider's** responsibility), a **single-use scoped**
 
@@ -703,9 +703,9 @@ Each backend is an impl: `provision` = boot a container (`docker run`), a microV
 
 This is the critical design decision for generality:
 
-**Make aksh fully work with zero providers.** Self-hosted runners just register and poll.
+**Make preloop fully work with zero providers.** Self-hosted runners just register and poll.
 
-So aksh is usable without any provider crate at all — just point runners at it.
+So preloop is usable without any provider crate at all — just point runners at it.
 
 ```mermaid
 sequenceDiagram
@@ -746,7 +746,7 @@ All three are traits; default impls cover local use.
 | `sqlx` (SQLite or Postgres) | Server: durable, idempotent restart, multi-tenant |
 
 
-`**AuthProvider` / tenancy** — who can talk to aksh.
+`**AuthProvider` / tenancy** — who can talk to preloop.
 
 
 | Mode                              | Use case                                              |
@@ -766,7 +766,7 @@ All three are traits; default impls cover local use.
 
 ### 4.4 Local vs server = profiles, not two codebases
 
-One binary. One control plane. Different trait impls selected by `aksh serve --profile`.
+One binary. One control plane. Different trait impls selected by `preloop serve --profile`.
 
 
 | Concern       | `--profile local` (default)                                     | `--profile server`                                    |
@@ -782,24 +782,24 @@ One binary. One control plane. Different trait impls selected by `aksh serve --p
 ### 4.5 Suggested crate layout
 
 ```
-aksh/                              ← this repo (the control plane)
+preloop/                              ← this repo (the control plane)
 ├── crates/
-│   ├── aksh-server            # axum service; protocol-only; provider-agnostic
-│   ├── aksh-orchestrator      # RunnerProvider/RunnerSpec traits + scheduler
-│   ├── aksh-gha-protocol      # AzDO wire DTOs, SecretString, NDJSON, crypto
-│   ├── aksh-gha-parser        # Workflow YAML parse + expression eval + matrix
-│   ├── aksh-cache             # Cache store trait + file-backed impl
-│   ├── aksh-artifacts         # Artifact store trait + file-backed impl
-│   └── aksh-conformance       # Differential tests vs upstream runner.server
+│   ├── preloop-server            # axum service; protocol-only; provider-agnostic
+│   ├── preloop-orchestrator      # RunnerProvider/RunnerSpec traits + scheduler
+│   ├── preloop-gha-protocol      # AzDO wire DTOs, SecretString, NDJSON, crypto
+│   ├── preloop-gha-parser        # Workflow YAML parse + expression eval + matrix
+│   ├── preloop-cache             # Cache store trait + file-backed impl
+│   ├── preloop-artifacts         # Artifact store trait + file-backed impl
+│   └── preloop-conformance       # Differential tests vs upstream runner.server
 
 preloop-providers/              ← separate repo (runner hosts)
-├── aksh-provider-process      # spawn (fastest, least isolation)
-├── aksh-provider-container    # docker / podman
-├── aksh-provider-libkrun      # microVM (Preloop's default)
-└── aksh-provider-remote       # k8s / cloud VM / Firecracker / SSH
+├── preloop-provider-process      # spawn (fastest, least isolation)
+├── preloop-provider-container    # docker / podman
+├── preloop-provider-libkrun      # microVM (Preloop's default)
+└── preloop-provider-remote       # k8s / cloud VM / Firecracker / SSH
 
 preloop/                        ← the product that ties it together
-├── preloop-cli                # CLI that wraps aksh-server + a provider
+├── preloop-cli                # CLI that wraps preloop-server + a provider
 └── preloop-vm-image           # libkrun runner VM image builder
 ```
 
@@ -817,10 +817,10 @@ or a new cloud backend later = a new crate, zero control-plane edits. BYO mode =
 
    public URL for remote runners. This is why `control_plane_url` lives in
 
-   `RunnerRegistration` and is the **provider's** job to fill — aksh never hardcodes an
+   `RunnerRegistration` and is the **provider's** job to fill — preloop never hardcodes an
 
    address for the runner to use.
-2. **Scaling path.** For large deployments you'll eventually split into stateless aksh
+2. **Scaling path.** For large deployments you'll eventually split into stateless preloop
 
   replicas behind an LB + separate orchestrator(s) + a durable `RunStore`. The trait
 
@@ -830,12 +830,12 @@ or a new cloud backend later = a new crate, zero control-plane edits. BYO mode =
 
 ---
 
-## 5. Design principle: upstream truth + aksh projections
+## 5. Design principle: upstream truth + preloop projections
 
 Keep faithfulness and your added advantages **without forking semantics**:
 
-- Model the **AzDO/runner protocol as the source of truth** in `aksh-gha-protocol`.
-- Layer aksh extras as **read-model projections / sidecars**, never as replacements:
+- Model the **AzDO/runner protocol as the source of truth** in `preloop-gha-protocol`.
+- Layer preloop extras as **read-model projections / sidecars**, never as replacements:
   - **NDJSON agent feed** = a projection *derived from* timeline records, not a parallel
   
     status path.
@@ -861,7 +861,7 @@ correctly. Make **small commits per step** with the tradeoff notes called out.
 
 Steps:
 
-1. Add `aksh-gha-protocol::azdo` module: `ConnectionData`, `LocationServiceData`,
+1. Add `preloop-gha-protocol::azdo` module: `ConnectionData`, `LocationServiceData`,
 
   `TaskAgentSession`, `TaskAgent`, `TaskAgentMessage`, `AgentJobRequestMessage`,
 
@@ -904,7 +904,7 @@ Steps:
 
 **Validate (Phase B):**
 
-- Point the **real `Runner.Listener config`** at aksh; it must register and store
+- Point the **real `Runner.Listener config`** at preloop; it must register and store
 
   credentials without error (`./config.sh --url http://localhost:PORT --token X`).
 - Golden: our `connectionData` response contains the same service-location set as the
@@ -930,7 +930,7 @@ Steps:
   `unsafe` stays forbidden; use `rsa`/`aes-gcm`/`cbc` crates. Document algorithm choices.
 5. **Known FIPS gap:** upstream `actions/runner` uses RSA-OAEP-SHA1 by default but switches to
 
-  RSA-OAEP-SHA256 when `UseFipsEncryption` is enabled. aksh currently implements the default
+  RSA-OAEP-SHA256 when `UseFipsEncryption` is enabled. preloop currently implements the default
 
    SHA-1 OAEP path only; FIPS-mode runners require an explicit algorithm switch before they can
 
@@ -955,7 +955,7 @@ single job.)
 
 Steps:
 
-1. Create `aksh-gha-parser::eval` that **consumes `aksh-gha-expressions`** and produces
+1. Create `preloop-gha-parser::eval` that **consumes `preloop-gha-expressions`** and produces
 
   resolved job material:
   - interpolate `${{ }}` in `env`, `with`, `run`, `runs-on`, matrix values;
@@ -1066,7 +1066,7 @@ Steps:
 
 - Golden expansion diff vs upstream for every in-scope fixture (this is what
 
-  `aksh-conformance compare` should actually assert, not stdout-diff two arbitrary cmds).
+  `preloop-conformance compare` should actually assert, not stdout-diff two arbitrary cmds).
 - Fuzz (`cargo-fuzz`): `parse_workflow` never panics on arbitrary YAML; malformed triggers
 
   produce typed errors.
@@ -1082,14 +1082,14 @@ Steps:
   download URLs (proxy to GitHub or serve local tarballs for vendored actions).
 2. Cache v2 (`CacheControllerV2`) + Artifact v2 (`ArtifactControllerV2`) blob protocols;
 
-  back them with `aksh-cache`/`aksh-artifacts` (retire the in-memory duplicates).
+  back them with `preloop-cache`/`preloop-artifacts` (retire the in-memory duplicates).
 3. Wire the file-backed stores; remove `#[allow(dead_code)]`.
 
 **Validate (Phase H):**
 
 - Real `actions/checkout` + `actions/cache` + `actions/upload-artifact` run green against
 
-  aksh.
+  preloop.
 - Golden: cache reserve/commit/lookup and artifact create/upload/list responses match
 
   upstream shapes.
@@ -1098,7 +1098,7 @@ Steps:
 
 ## 7. Conformance harness (the spec's headline deliverable)
 
-Build `aksh-conformance` into a real differential tester:
+Build `preloop-conformance` into a real differential tester:
 
 - `record` — drive upstream `runner.server` (+ optionally a runner) over each fixture,
 
@@ -1115,7 +1115,7 @@ Build `aksh-conformance` into a real differential tester:
   - **Property tests** — expression eval + matrix expansion invariants.
   - **Protocol-compat tests** — DTO round-trips vs captured wire JSON.
   - **Fuzz tests** — `parse_workflow` + expression lexer/parser (`cargo-fuzz`).
-  - **Integration** — real `Runner.Listener` against aksh (later: inside a provider host).
+  - **Integration** — real `Runner.Listener` against preloop (later: inside a provider host).
 
 Normalization policy must be explicit and reviewed, so "match" is meaningful, not lax.
 
@@ -1125,7 +1125,7 @@ Normalization policy must be explicit and reviewed, so "match" is meaningful, no
 
 A run is faithful when, with the **unmodified official `actions/runner`**:
 
-1. `config.sh` registers the runner against aksh (Phases B–C).
+1. `config.sh` registers the runner against preloop (Phases B–C).
 2. A submitted workflow is parsed, triggered, matrix-expanded, and `needs`-scheduled
 
   matching upstream (Phases F–G).
@@ -1144,12 +1144,12 @@ A run is faithful when, with the **unmodified official `actions/runner`**:
 7. Cancellation mid-job delivers a `JobCancellation` message and the run/jobs settle to
 
   `cancelled`; rerun re-queues from a clean state.
-8. `aksh-conformance compare` is **green** across all in-scope fixtures, with golden,
+8. `preloop-conformance compare` is **green** across all in-scope fixtures, with golden,
 
   property, protocol, and fuzz suites passing.
 9. The NDJSON agent feed is a faithful projection of the same timeline/completion state —
 
-  aksh's added value, layered on a faithful core.
+  preloop's added value, layered on a faithful core.
 
 ### Product acceptance for Preloop/local and self-hosted control-plane modes
 
@@ -1161,14 +1161,14 @@ Once 1–9 hold against a local `Runner.Listener`:
 
     same golden fixtures through a real provider and confirming identical timeline/results.
 11. In GitHub App/self-hosted control-plane mode, a repository can keep its existing
-  `.github/workflows/*.yml` files unchanged. A push or pull-request webhook causes aksh
+  `.github/workflows/*.yml` files unchanged. A push or pull-request webhook causes preloop
   to fetch the workflow at the target ref, evaluate the same trigger semantics GitHub
   Actions would use, run the selected jobs on local/self-hosted capacity, and update the
   existing GitHub PR/checks UI with queued/in-progress/success/failure/cancelled states.
-12. GitHub Checks created by aksh link to Preloop/aksh-hosted logs, artifacts, and run
+12. GitHub Checks created by preloop link to Preloop/preloop-hosted logs, artifacts, and run
   details. The storage and URLs may be local equivalents; the user-visible contract is
   that developers can review CI status from the same GitHub PR interface while execution
-  and data storage are controlled by aksh/Preloop.
+  and data storage are controlled by preloop/Preloop.
 
 ---
 
@@ -1198,7 +1198,7 @@ claims with the more precise current state.
 ### Confirmed by 56-flow replay
 
 
-| Priority | Endpoint / surface                              | Observed official | Observed aksh | Status                                                                                                                   | Spec / follow-up                                               |
+| Priority | Endpoint / surface                              | Observed official | Observed preloop | Status                                                                                                                   | Spec / follow-up                                               |
 | -------- | ----------------------------------------------- | -----------------: | -------------: | ------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------- |
 | P1       | `/api/v3/actions/runner-registration`           | 200               | 200           | route works now, but token/url values are placeholder/local                                                              | add/update registration spec                                   |
 | P1       | `/_apis/v1/oauth2/token`                        | 200               | 200           | route works now, but token type/expiry/value differ from official                                                        | add/update OAuth spec                                          |

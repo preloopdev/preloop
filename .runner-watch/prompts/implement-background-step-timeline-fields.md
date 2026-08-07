@@ -1,4 +1,4 @@
-You are implementing an aksh protocol-sync spec. Follow existing Rust patterns exactly. Run cargo check and relevant tests, but do not run formatters or project-wide lint.
+You are implementing an preloop protocol-sync spec. Follow existing Rust patterns exactly. Run cargo check and relevant tests, but do not run formatters or project-wide lint.
 
 Spec:
 ```toml
@@ -19,7 +19,7 @@ runner_behavior = '''
 PATCH timeline records may include isBackground, backgroundControlType, backgroundControlStepIds, and parallelGroupId.
 '''
 failure_mode = '''
-Aksh must accept and preserve unknown timeline metadata; strict DTOs or storage projections can silently lose fidelity.
+Preloop must accept and preserve unknown timeline metadata; strict DTOs or storage projections can silently lose fidelity.
 '''
 
 [feature_flag]
@@ -33,10 +33,10 @@ PATCH /_apis/v1/Timeline/{scope}/{hub}/{planId}/{timelineId}
 '''
 expected_response = "200 JSON timeline record collection"
 
-[aksh_targets]
+[preloop_targets]
 files = [
-  { crate = "aksh-gha-protocol", path = "crates/aksh-gha-protocol/src/azdo.rs", area = "TimelineRecord DTO" },
-  { crate = "aksh-runner-server", path = "crates/aksh-runner-server/src/lib.rs", area = "timeline handlers" },
+  { crate = "preloop-gha-protocol", path = "crates/preloop-gha-protocol/src/azdo.rs", area = "TimelineRecord DTO" },
+  { crate = "preloop-runner-server", path = "crates/preloop-runner-server/src/lib.rs", area = "timeline handlers" },
 ]
 
 [implementation]

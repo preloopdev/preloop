@@ -11,7 +11,7 @@ Check whether this change touches the core runner protocol interface:
   - Twirp results-service / artifact-service payloads
   - check-run or OAuth wire behavior
 
-If it does, the gates below are REQUIRED before merge — aksh's compatibility
+If it does, the gates below are REQUIRED before merge — preloop's compatibility
 contract is byte-for-byte fidelity with the official runner (v2.336.0).
 -->
 
@@ -21,7 +21,7 @@ contract is byte-for-byte fidelity with the official runner (v2.336.0).
 
 - [ ] `just test-ci` passes locally (fmt-check + clippy `-D` + full test suite + runner-watch conformance)
 - [ ] If protocol/wire shapes changed: the change is validated against the official runner (golden replay via `runner-watch`, or a live capture showing the official bytes), not only unit tests
-- [ ] If the touched subsystem has property tests (`concurrency_properties`, scheduling, matrix expansion, …): they are extended for the changed contract and pass (`PROPTEST_CASES=256 cargo test -p aksh-runner-server`)
+- [ ] If the touched subsystem has property tests (`concurrency_properties`, scheduling, matrix expansion, …): they are extended for the changed contract and pass (`PROPTEST_CASES=256 cargo test -p preloop-runner-server`)
 - [ ] New wire fields/events are additive and serde-defaulted where the official runner would not send them
 - [ ] No secrets, credentials, or internal/deployment-specific paths are introduced (captures with live tokens must be redacted or excluded)
 

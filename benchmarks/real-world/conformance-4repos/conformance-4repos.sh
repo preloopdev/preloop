@@ -2,11 +2,11 @@
 # conformance-4repos.sh — Run the 4-repo conformance campaign.
 #
 # Cells:
-#   B: official runner (v2.336.0) vs local aksh server
-#   C: aksh runner (preloop-runner) vs local aksh server
+#   B: official runner (v2.336.0) vs local preloop server
+#   C: preloop runner (preloop-runner) vs local preloop server
 #
 # The workflows are the EXACT upstream files (runs-on labels only rewritten),
-# executed against a fresh aksh server per cell. Results land in
+# executed against a fresh preloop server per cell. Results land in
 # benchmarks/real-world/results/conformance-4repos/{repo}/{cell}/run.json
 #
 # Usage:
@@ -19,12 +19,12 @@ REPO_ROOT="$(cd "$ROOT/../../.." && pwd)"
 WS_ROOT="${WS_ROOT:-/tmp/conformance-workspaces}"
 OUT_ROOT="$REPO_ROOT/benchmarks/real-world/results/conformance-4repos"
 OFFICIAL="$HOME/.cache/actions-runner/current"
-CLIENT="$REPO_ROOT/target/debug/aksh-runner-client"
+CLIENT="$REPO_ROOT/target/debug/preloop-runner-client"
 SERVER_BIN="$REPO_ROOT/target/debug/preloop-server"
-AKSH_RUNNER="$REPO_ROOT/target/debug/preloop-runner"
+PRELOOP_RUNNER="$REPO_ROOT/target/debug/preloop-runner"
 PORT_B="${PORT_B:-9191}"
 PORT_C="${PORT_C:-9193}"
-TOKEN="aksh-system-token"
+TOKEN="preloop-system-token"
 mkdir -p "$OUT_ROOT"
 
 # repo -> (workspace dir, workflow path, event, git_ref)
@@ -62,7 +62,7 @@ make_git_shim() {
   mkdir -p "$dir"
   cat > "$dir/git" <<'EOF'
 #!/bin/bash
-# aksh campaign shim: inject checkout's snapshot credential into fetches.
+# preloop campaign shim: inject checkout's snapshot credential into fetches.
 if [[ "$*" == *"fetch"* ]]; then
   CREDS=$(/opt/homebrew/bin/git config --local --get-regexp '^includeIf\.' 2>/dev/null | awk '{print $2}' | grep -v /github/ | head -1)
   if [ -n "$CREDS" ] && [ -f "$CREDS" ]; then
@@ -94,8 +94,8 @@ start_server() {
   sleep 0.5
   rm -rf "$state"
   local public_port="${RUNNER_PORT:-$port}"
-  AKSH_GITHUB_TOKEN="$(gh auth token)" AKSH_PUBLIC_URL="http://127.0.0.1:$public_port" \
-    RUST_LOG=info,aksh=info "$SERVER_BIN" serve --listen "127.0.0.1:$port" --state-dir "$state" \
+  PRELOOP_GITHUB_TOKEN="$(gh auth token)" PRELOOP_PUBLIC_URL="http://127.0.0.1:$public_port" \
+    RUST_LOG=info,preloop=info "$SERVER_BIN" serve --listen "127.0.0.1:$port" --state-dir "$state" \
     > "$log" 2>&1 &
   local pid=$!
   for _ in $(seq 1 50); do
@@ -210,11 +210,11 @@ run_cell() {
       local root="/tmp/conformance-runner-$repo-$cell"
       if [ "$n" -eq 1 ]; then
         rm -rf "$root"; mkdir -p "$root"
-        "$AKSH_RUNNER" --runner-root "$root" configure --url "http://127.0.0.1:$port" \
+        "$PRELOOP_RUNNER" --runner-root "$root" configure --url "http://127.0.0.1:$port" \
           --token t --name "cf-$repo-$cell" --unattended --replace \
           --labels self-hosted,Linux,X64 >> "$log" 2>&1 || true
       fi
-      RUST_LOG=info,aksh=info run_with_timeout 1800 "$AKSH_RUNNER" --runner-root "$root" run --once >> "$log" 2>&1 || true
+      RUST_LOG=info,preloop=info run_with_timeout 1800 "$PRELOOP_RUNNER" --runner-root "$root" run --once >> "$log" 2>&1 || true
     fi
   done
 
@@ -232,7 +232,7 @@ REPO_ARG="${1:-all}"
 CELL_ARG="${2:-all}"
 
 if [ "$REPO_ARG" = "all" ]; then REPOS="bat vite uv nextcloud"; else REPOS="$REPO_ARG"; fi
-if [ "$CELL_ARG" = "all" ]; then CELLS="official aksh"; else CELLS="$CELL_ARG"; fi
+if [ "$CELL_ARG" = "all" ]; then CELLS="official preloop"; else CELLS="$CELL_ARG"; fi
 
 pids=()
 for repo in $REPOS; do

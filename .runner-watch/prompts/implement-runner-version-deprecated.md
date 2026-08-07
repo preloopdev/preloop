@@ -1,4 +1,4 @@
-You are implementing an aksh protocol-sync spec. Follow existing Rust patterns exactly. Run cargo check and relevant tests, but do not run formatters or project-wide lint.
+You are implementing an preloop protocol-sync spec. Follow existing Rust patterns exactly. Run cargo check and relevant tests, but do not run formatters or project-wide lint.
 
 Spec:
 ```toml
@@ -19,7 +19,7 @@ runner_behavior = '''
 Runner reads RunnerVersionDeprecated and emits upgrade/deprecation behavior.
 '''
 failure_mode = '''
-Ignoring it hides an upstream control-plane signal; not needed for local aksh execution.
+Ignoring it hides an upstream control-plane signal; not needed for local preloop execution.
 '''
 
 [feature_flag]
@@ -33,9 +33,9 @@ GET feature/connection capability endpoints
 '''
 expected_response = "JSON flag value"
 
-[aksh_targets]
+[preloop_targets]
 files = [
-  { crate = "aksh-runner-server", path = "crates/aksh-runner-server/src/lib.rs", area = "connectionData payload" },
+  { crate = "preloop-runner-server", path = "crates/preloop-runner-server/src/lib.rs", area = "connectionData payload" },
 ]
 
 [implementation]

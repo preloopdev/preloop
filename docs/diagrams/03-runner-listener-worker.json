@@ -11,7 +11,7 @@
     "id": "title",
     "x": 520,
     "y": 25,
-    "text": "aksh-runner \u2014 Listener + Worker Model",
+    "text": "preloop-runner \u2014 Listener + Worker Model",
     "fontSize": 28,
     "strokeColor": "#1e1e1e"
   },
@@ -64,7 +64,7 @@
       "type": 3
     },
     "label": {
-      "text": "Control Plane\naksh-runner-server",
+      "text": "Control Plane\npreloop-runner-server",
       "fontSize": 15
     }
   },

@@ -44,16 +44,16 @@
 
 ## Replay methodology and known gaps
 
-The conformance gate replays official golden flows through aksh and compares
+The conformance gate replays official golden flows through preloop and compares
 HTTP status codes. Several categories of flow are intentionally excluded or
 treated leniently; a ✅ gate result does **not** mean full protocol parity.
 
 ### Flows skipped from replay
 
-Two skip layers are applied before any request is sent to aksh:
+Two skip layers are applied before any request is sent to preloop:
 
 **Host/path skip list** (`should_skip_replay_path`) — flows to these
-destinations are dropped entirely; aksh is never involved:
+destinations are dropped entirely; preloop is never involved:
 
 | Host / path | Why skipped |
 |---|---|
@@ -76,7 +76,7 @@ the status-mismatch check (`status_mismatch_in_report`):
 
 | Endpoint pattern | Why excluded |
 |---|---|
-| `…/oauth2/token` | Official validates PSA256 client assertions and rejects job-scoped credentials; aksh is its own CA and accepts all. Unverifiable in replay. |
+| `…/oauth2/token` | Official validates PSA256 client assertions and rejects job-scoped credentials; preloop is its own CA and accepts all. Unverifiable in replay. |
 | `…/messages?…` | Broker proactively invalidates sessions via concurrent two-session pattern; timing-based and not reproducible from a static golden. |
 
 ### Cache and artifact replay
@@ -99,7 +99,7 @@ side effects directly rather than relying solely on HTTP responses:
 
 ### How Wire Compliance is Checked
 
-The conformance checker compares the local `aksh` server against the official
+The conformance checker compares the local `preloop` server against the official
 recorded golden baseline. For each non-skipped flow, it compares:
 
 1. **HTTP Status Codes**: Verifies status codes match exactly (e.g. `200` vs `200`, `204` vs `204`). Any mismatch fails the scenario.

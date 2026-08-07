@@ -39,7 +39,7 @@ class TestNormalizePath:
         assert normalize_path("/abc123/_apis/something") == "/_apis/something"
 
     def test_hyphenated_org_prefix_stripped(self):
-        """aksh uses GHES-style org prefix routing: /:org/_apis/..."""
+        """preloop uses GHES-style org prefix routing: /:org/_apis/..."""
         assert normalize_path("/my-org/_apis/v2/whatever") == "/_apis/v2/whatever"
 
     def test_multi_segment_org_not_stripped(self):
@@ -74,11 +74,11 @@ class TestNormalizePath:
         result = normalize_path("/")
         assert result == "/"
 
-    def test_aksh_compat_routes_normalize_same_as_runner_server(self):
-        """aksh and runner-server routes should normalize identically."""
+    def test_preloop_compat_routes_normalize_same_as_runner_server(self):
+        """preloop and runner-server routes should normalize identically."""
         rs_path = "/runner/server/_apis/distributedtask/pools/1/messages"
-        aksh_path = "/runner/server/_apis/distributedtask/pools/1/messages"
-        assert normalize_path(rs_path) == normalize_path(aksh_path)
+        preloop_path = "/runner/server/_apis/distributedtask/pools/1/messages"
+        assert normalize_path(rs_path) == normalize_path(preloop_path)
 
     def test_official_random_prefix_stripped(self):
         """Official runner uses a random single-segment prefix."""
@@ -96,8 +96,8 @@ class TestShortLabel:
     def test_two_words(self):
         assert _short_label("runner-server") == "rs"
 
-    def test_aksh(self):
-        assert _short_label("aksh") == "aksh"
+    def test_preloop(self):
+        assert _short_label("preloop") == "preloop"
 
     def test_underscores(self):
         assert _short_label("runner_server") == "rs"
@@ -232,10 +232,10 @@ class TestRenderReport:
             {"method": "GET", "path": "/_apis/connectionData", "status": 200, "duration_ms": 15},
         ])
         output = tmp_path / "report.md"
-        render_report("test-scenario", left, right, output, "official", "aksh")
+        render_report("test-scenario", left, right, output, "official", "preloop")
         text = output.read_text()
         assert "official" in text.lower()
-        assert "aksh" in text
+        assert "preloop" in text
         assert "/_apis/connectionData" in text
 
     def test_custom_labels_in_report(self, tmp_path):

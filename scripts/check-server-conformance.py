@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Strictly compare captured official-runner GitHub and aksh-server results."""
+"""Strictly compare captured official-runner GitHub and preloop-server results."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ def github_jobs(path: Path) -> list[dict[str, Any]]:
     return jobs if isinstance(jobs, list) else []
 
 
-def aksh_jobs(path: Path) -> list[dict[str, Any]]:
+def preloop_jobs(path: Path) -> list[dict[str, Any]]:
     value = read_json(path)
     jobs = value.get("jobs_list") if value else None
     if isinstance(jobs, list):
@@ -62,36 +62,36 @@ def step_signature(job: dict[str, Any]) -> list[tuple[str, str]]:
 def compare_scenario(root: Path, scenario: str) -> list[str]:
     base = root / scenario
     github_dir = base / "github"
-    aksh_dir = base / "aksh-server"
+    preloop_dir = base / "preloop-server"
     github_summary = read_json(github_dir / "summary.json")
-    aksh_summary = read_json(aksh_dir / "summary.json")
+    preloop_summary = read_json(preloop_dir / "summary.json")
     issues: list[str] = []
 
     if github_summary is None:
         issues.append(f"{scenario}: missing GitHub summary")
-    if aksh_summary is None:
-        issues.append(f"{scenario}: missing aksh-server summary")
-    if github_summary is None or aksh_summary is None:
+    if preloop_summary is None:
+        issues.append(f"{scenario}: missing preloop-server summary")
+    if github_summary is None or preloop_summary is None:
         return issues
 
     github_conclusion = str(github_summary.get("conclusion") or "")
-    aksh_conclusion = str(aksh_summary.get("conclusion") or "")
-    if not github_conclusion or not aksh_conclusion:
+    preloop_conclusion = str(preloop_summary.get("conclusion") or "")
+    if not github_conclusion or not preloop_conclusion:
         issues.append(f"{scenario}: incomplete conclusion")
-    elif github_conclusion != aksh_conclusion:
+    elif github_conclusion != preloop_conclusion:
         issues.append(
             f"{scenario}: conclusion differs "
-            f"GitHub={github_conclusion} aksh={aksh_conclusion}"
+            f"GitHub={github_conclusion} preloop={preloop_conclusion}"
         )
 
     official_jobs = github_jobs(github_dir / "jobs.json")
-    local_jobs = aksh_jobs(aksh_dir / "run.json")
+    local_jobs = preloop_jobs(preloop_dir / "run.json")
     official_by_name = {job_signature(job)[0]: job for job in official_jobs}
     local_by_name = {job_signature(job)[0]: job for job in local_jobs}
     if set(official_by_name) != set(local_by_name):
         issues.append(
             f"{scenario}: job names differ "
-            f"GitHub={sorted(official_by_name)} aksh={sorted(local_by_name)}"
+            f"GitHub={sorted(official_by_name)} preloop={sorted(local_by_name)}"
         )
     for name in sorted(set(official_by_name) & set(local_by_name)):
         official = official_by_name[name]
@@ -100,27 +100,27 @@ def compare_scenario(root: Path, scenario: str) -> list[str]:
             issues.append(
                 f"{scenario} job {name!r}: conclusion differs "
                 f"GitHub={job_signature(official)[1]} "
-                f"aksh={job_signature(local)[1]}"
+                f"preloop={job_signature(local)[1]}"
             )
         if step_signature(official) != step_signature(local):
             issues.append(
                 f"{scenario} job {name!r}: steps differ "
                 f"GitHub={step_signature(official)!r} "
-                f"aksh={step_signature(local)!r}"
+                f"preloop={step_signature(local)!r}"
             )
 
     github_flows = github_dir / "flows.jsonl"
-    aksh_flows = aksh_dir / "flows.jsonl"
-    if not github_flows.exists() or not aksh_flows.exists():
+    preloop_flows = preloop_dir / "flows.jsonl"
+    if not github_flows.exists() or not preloop_flows.exists():
         issues.append(f"{scenario}: missing flow capture")
     else:
         github_count = sum(1 for line in github_flows.read_text().splitlines() if line.strip())
-        aksh_count = sum(1 for line in aksh_flows.read_text().splitlines() if line.strip())
-        if not github_count or not aksh_count:
+        preloop_count = sum(1 for line in preloop_flows.read_text().splitlines() if line.strip())
+        if not github_count or not preloop_count:
             issues.append(f"{scenario}: empty flow capture")
-        elif github_count != aksh_count:
+        elif github_count != preloop_count:
             issues.append(
-                f"{scenario}: flow counts differ GitHub={github_count} aksh={aksh_count}"
+                f"{scenario}: flow counts differ GitHub={github_count} preloop={preloop_count}"
             )
     return issues
 

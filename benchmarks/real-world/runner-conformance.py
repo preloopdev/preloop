@@ -103,49 +103,49 @@ def validate_response(record: dict[str, Any], side: str, number: str) -> list[st
 
 def compare(
     official: dict[str, dict[str, Any]],
-    aksh: dict[str, dict[str, Any]],
+    preloop: dict[str, dict[str, Any]],
     mode: str,
 ) -> list[str]:
     issues: list[str] = []
     for number, description in EXPECTED.items():
         off = official.get(number)
-        local = aksh.get(number)
+        local = preloop.get(number)
         if off is None:
             issues.append(f"{number} {description}: missing official result")
             continue
         if local is None:
-            issues.append(f"{number} {description}: missing aksh result")
+            issues.append(f"{number} {description}: missing preloop result")
             continue
 
         issues.extend(validate_response(off, "official", number))
-        issues.extend(validate_response(local, "aksh", number))
+        issues.extend(validate_response(local, "preloop", number))
         off_conclusion, off_jobs = outcome_summary(off)
-        aksh_conclusion, aksh_jobs = outcome_summary(local)
+        preloop_conclusion, preloop_jobs = outcome_summary(local)
         if not off_conclusion or off_conclusion == "unknown":
             issues.append(f"{number} {description}: official result is incomplete")
-        if not aksh_conclusion or aksh_conclusion == "unknown":
-            issues.append(f"{number} {description}: aksh result is incomplete")
-        if off_conclusion != aksh_conclusion:
+        if not preloop_conclusion or preloop_conclusion == "unknown":
+            issues.append(f"{number} {description}: preloop result is incomplete")
+        if off_conclusion != preloop_conclusion:
             issues.append(
                 f"{number} {description}: workflow conclusion "
                 f"official={off_conclusion or '(empty)'} "
-                f"aksh={aksh_conclusion or '(empty)'}"
+                f"preloop={preloop_conclusion or '(empty)'}"
             )
-        if off_jobs != aksh_jobs:
+        if off_jobs != preloop_jobs:
             issues.append(
                 f"{number} {description}: job outcomes differ "
-                f"official={off_jobs!r} aksh={aksh_jobs!r}"
+                f"official={off_jobs!r} preloop={preloop_jobs!r}"
             )
 
         if mode != "deep":
             continue
 
         off_by_name = {str(job.get("name") or ""): job for job in jobs(off)}
-        aksh_by_name = {str(job.get("name") or ""): job for job in jobs(local)}
-        for job_name in sorted(set(off_by_name) | set(aksh_by_name)):
+        preloop_by_name = {str(job.get("name") or ""): job for job in jobs(local)}
+        for job_name in sorted(set(off_by_name) | set(preloop_by_name)):
             off_job = off_by_name.get(job_name)
-            aksh_job = aksh_by_name.get(job_name)
-            if off_job is None or aksh_job is None:
+            preloop_job = preloop_by_name.get(job_name)
+            if off_job is None or preloop_job is None:
                 continue  # already reported by the light job comparison
 
             off_steps = [
@@ -153,15 +153,15 @@ def compare(
                 for step in off_job.get("steps", [])
                 if isinstance(step, dict)
             ]
-            aksh_steps = [
+            preloop_steps = [
                 (str(step.get("name") or ""), str(step.get("conclusion") or ""))
-                for step in aksh_job.get("steps", [])
+                for step in preloop_job.get("steps", [])
                 if isinstance(step, dict)
             ]
-            if off_steps != aksh_steps:
+            if off_steps != preloop_steps:
                 issues.append(
                     f"{number} {description} job {job_name!r}: steps differ "
-                    f"official={off_steps!r} aksh={aksh_steps!r}"
+                    f"official={off_steps!r} preloop={preloop_steps!r}"
                 )
 
     return issues
@@ -171,7 +171,7 @@ def write_report(
     output: Path,
     mode: str,
     official: dict[str, dict[str, Any]],
-    aksh: dict[str, dict[str, Any]],
+    preloop: dict[str, dict[str, Any]],
     issues: list[str],
     loader_errors: list[str],
 ) -> None:
@@ -186,7 +186,7 @@ def write_report(
         "",
         f"- Expected workflows: {len(EXPECTED)}",
         f"- Official records: {len(official)}",
-        f"- Aksh records: {len(aksh)}",
+        f"- Preloop records: {len(preloop)}",
         f"- Verdict: **{'PASS' if not issues and not loader_errors else 'FAIL'}**",
         "",
     ]
@@ -208,9 +208,9 @@ def main() -> int:
         default=Path("benchmarks/compatibility/runner/behavior/conformance-official.jsonl"),
     )
     parser.add_argument(
-        "--aksh",
+        "--preloop",
         type=Path,
-        default=Path("benchmarks/compatibility/runner/behavior/conformance-aksh.jsonl"),
+        default=Path("benchmarks/compatibility/runner/behavior/conformance-preloop.jsonl"),
     )
     parser.add_argument(
         "--output",
@@ -220,10 +220,10 @@ def main() -> int:
     args = parser.parse_args()
 
     official, official_errors = load_latest(args.official)
-    aksh, aksh_errors = load_latest(args.aksh)
-    loader_errors = official_errors + aksh_errors
-    issues = compare(official, aksh, args.mode)
-    write_report(args.output, args.mode, official, aksh, issues, loader_errors)
+    preloop, preloop_errors = load_latest(args.preloop)
+    loader_errors = official_errors + preloop_errors
+    issues = compare(official, preloop, args.mode)
+    write_report(args.output, args.mode, official, preloop, issues, loader_errors)
 
     print(
         f"runner-{args.mode}: "

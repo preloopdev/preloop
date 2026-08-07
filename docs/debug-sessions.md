@@ -1,7 +1,7 @@
 # Debug Sessions
 
 **Status:** implemented (minimum lovable slice); core agent control API is shipped; `:verify` and VM/source agent operations remain outstanding
-**Scope:** `aksh-runner`, `aksh-dap`, `aksh-runner-server`, `preloop-orchestrator`, `preloop-cli`
+**Scope:** `preloop-runner`, `preloop-dap`, `preloop-runner-server`, `preloop-orchestrator`, `preloop-cli`
 
 A failed job becomes a live debugging session. You diagnose and repair it inside
 the same microVM, then re-run only what is necessary. The expensive setup —
@@ -268,7 +268,7 @@ Cost therefore scales with the size of the *change*, not the size of the
 repository. The one case that remains suboptimal is a one-line edit to a very
 large file, which sends the whole file; locally that is milliseconds. If it ever
 matters, the fix is a snapshot fetch, and the only real work is plumbing a
-job-scoped token (`authorize_snapshot_token` requires `sub: aksh-job-<uuid>`
+job-scoped token (`authorize_snapshot_token` requires `sub: preloop-job-<uuid>`
 with `Actions.Results:<plan>:<job>` scope) out to the CLI.
 
 ```
@@ -455,7 +455,7 @@ other side. Neither failure names a cause in any log the user reads.
 **This is why `paused` cannot be purely client-side.** Job *status* stays a
 presentation concern — no new state on the `/_apis/…` surface, no wire
 divergence. Timeout suspension is a separate concern and reaches the server via
-the native `/api/v1/…` surface, which is aksh's own API and not bound by
+the native `/api/v1/…` surface, which is preloop.s own API and not bound by
 runner-protocol fidelity.
 
 ### Session lifetime
@@ -608,7 +608,7 @@ fixtures, dependency error text, logs.
 **Authorization.** The worker-facing routes (`POST /api/v1/debug/sessions`,
 `GET …/verdict`, `POST …/close`) require a *debug-worker token*, and authorize
 against the job it names rather than against its validity. The token is minted
-per job as `sub: aksh-debug-worker-{agent_job_id}` with a matching
+per job as `sub: preloop-debug-worker-{agent_job_id}` with a matching
 `scp: DebugWorker:{plan}:{job}`, so it identifies exactly one caller:
 
 - a job may only open a session for itself;
@@ -703,11 +703,11 @@ transferring the lease.
 |---|---|
 | Pause hook (before step) | `on_step_starting`, `steps_runner.rs` ~435 |
 | **New:** pause hook (on failure) | same loop, post-execution branch |
-| DAP trait | `Debugger` in `aksh-dap/src/debugger.rs` ~134 |
+| DAP trait | `Debugger` in `preloop-dap/src/debugger.rs` ~134 |
 | Step verdict / retry loop | step loop in `steps_runner.rs` |
 | Workspace snapshot | `create_workspace_snapshot`, `redirect_primary_checkout` in `runs.rs` |
 | Wire flag | `preserve_on_failure` → `preloop_preserve_on_failure`, `azdo/job.rs` ~170 |
-| Session registry / HTTP surface | `debug_sessions.rs`, `aksh-runner-server` |
+| Session registry / HTTP surface | `debug_sessions.rs`, `preloop-runner-server` |
 | Worker authorization | `require_worker_bearer` + `WorkerJob`, `auth.rs`; `job_uuid_from_debug_token`, `state.rs` |
 | Credential acquisition | `issue_worker_token`, `debug_sessions.rs`; `require_job_runtime_bearer`, `auth.rs`; `DebugPauseClient::acquire`, `debug_pause.rs` |
 | Timeout suspension (server) | `reap_once`, `bootstrap.rs` |
@@ -755,7 +755,7 @@ Step 1 does not re-run; step 3 runs; the job finishes `Succeeded`.
 Four defects made the feature silently inert end to end while every unit test
 passed. All four lived at seams a mock would have hidden:
 
-- `akshDebugRunId` was populated only for DAP runs, so the pause client never
+- `preloopDebugRunId` was populated only for DAP runs, so the pause client never
   constructed and execution fell through to the old post-mortem path.
 - The client used a bare `reqwest::Client` instead of the crate's `HttpClient`,
   bypassing the Unix-socket control transport a guest requires.

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Batch capture remaining scenarios that have no MITM flow data yet.
-# Runs sequentially per scenario, using the same VM (bench-aksh-1).
+# Runs sequentially per scenario, using the same VM (bench-preloop-1).
 # Scenarios that already have captures are skipped.
 set -euo pipefail
 
@@ -33,7 +33,7 @@ log() { echo "[$(date -u +%H:%M:%S.%3NZ)] $*"; }
 
 already_captured() {
   local sc="${1%.yml}"
-  [ -d "$RESULTS/$sc/official" ] && [ -d "$RESULTS/$sc/aksh" ]
+  [ -d "$RESULTS/$sc/official" ] && [ -d "$RESULTS/$sc/preloop" ]
 }
 
 cd "$SCRIPT_DIR/.."

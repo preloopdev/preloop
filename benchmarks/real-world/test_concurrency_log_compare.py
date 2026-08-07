@@ -37,11 +37,11 @@ class CompareStrictParityTests(unittest.TestCase):
 
     def test_zero_jobs_does_not_match_one_failed_job(self) -> None:
         github = self.capture("github", conclusion="failure")
-        aksh = self.capture(
-            "aksh", conclusion="failure", jobs={"build": "failure"}
+        preloop = self.capture(
+            "preloop", conclusion="failure", jobs={"build": "failure"}
         )
 
-        result = compare(github, aksh)
+        result = compare(github, preloop)
 
         self.assertFalse(result["ok"])
         self.assertTrue(any("job count" in issue for issue in result["issues"]))
@@ -50,22 +50,22 @@ class CompareStrictParityTests(unittest.TestCase):
         github = self.capture(
             "github", step_conclusions={"expected": "success"}
         )
-        aksh = self.capture("aksh")
+        preloop = self.capture("preloop")
 
-        result = compare(github, aksh)
+        result = compare(github, preloop)
 
         self.assertFalse(result["ok"])
         self.assertTrue(
-            any("missing aksh step" in issue for issue in result["issues"])
+            any("missing preloop step" in issue for issue in result["issues"])
         )
 
     def test_missing_cancel_annotation_is_a_hard_failure(self) -> None:
         github = self.capture(
             "github", conclusion="cancelled", markers={"CANCEL_ERROR"}
         )
-        aksh = self.capture("aksh", conclusion="cancelled")
+        preloop = self.capture("preloop", conclusion="cancelled")
 
-        result = compare(github, aksh)
+        result = compare(github, preloop)
 
         self.assertFalse(result["ok"])
         self.assertTrue(
@@ -79,14 +79,14 @@ class CompareStrictParityTests(unittest.TestCase):
             step_conclusions={"exercise": "success"},
             markers={"SCENARIO=one", "DONE=one"},
         )
-        aksh = self.capture(
-            "aksh",
+        preloop = self.capture(
+            "preloop",
             jobs={"build": "success"},
             step_conclusions={"exercise": "success"},
             markers={"SCENARIO=one", "DONE=one"},
         )
 
-        result = compare(github, aksh)
+        result = compare(github, preloop)
 
         self.assertTrue(result["ok"], result["issues"])
 
@@ -103,7 +103,7 @@ class CompareStrictParityTests(unittest.TestCase):
             )
             (capture_dir / "run.log").write_text("")
 
-            capture = MODULE.load_aksh_capture(capture_dir)
+            capture = MODULE.load_preloop_capture(capture_dir)
 
         self.assertEqual(capture.jobs, {"build": "failure"})
         self.assertEqual(capture.conclusion, "failure")

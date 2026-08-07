@@ -1,6 +1,6 @@
 --------------------------- MODULE MC ---------------------------
 (*
- * Model checking specification for aksh / preloop.
+ * Model checking specification for preloop / preloop.
  *
  * Wraps the base spec with counter-bounded fault-injection actions.
  * Deterministic / reactive actions pass through unbounded.

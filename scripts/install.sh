@@ -6,7 +6,7 @@
 # What it does:
 #   1. Checks prerequisites (git, cargo/rustup; zig for the microVM runner).
 #   2. Clones preloopdev/preloop into $PRELOOP_SRC (default ~/.preloop-src).
-#   3. Builds preloop-cli + aksh-runner-server (release) on the host, and
+#   3. Builds preloop-cli + preloop-runner-server (release) on the host, and
 #      cross-compiles the Linux microVM runner when zig is available.
 #   4. Symlinks the binary into $PREFIX/bin (default ~/.local/bin).
 #   5. Prints next steps.
@@ -56,11 +56,11 @@ cd "$PRELOOP_SRC"
 # --- 3. build ---------------------------------------------------------------
 
 say "building preloop (release)..."
-cargo build --release -p preloop-cli -p aksh-runner-server
+cargo build --release -p preloop-cli -p preloop-runner-server
 
 if [ "$ZIGBUILD" = 1 ] && command -v cargo-zigbuild >/dev/null 2>&1; then
     say "cross-compiling the Linux microVM runner (aarch64)..."
-    cargo zigbuild --release -p aksh-runner --target aarch64-unknown-linux-gnu || \
+    cargo zigbuild --release -p preloop-runner --target aarch64-unknown-linux-gnu || \
         say "runner build failed — host CLI works, but microVM jobs need it (see docs/setup.md)"
 else
     say "skipping microVM runner cross-build (no zig/cargo-zigbuild) — see https://github.com/preloopdev/smolvm"

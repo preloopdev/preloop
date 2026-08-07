@@ -1,5 +1,5 @@
 name: Bug report
-description: Something misbehaves, or aksh diverges from the official runner
+description: Something misbehaves, or preloop diverges from the official runner
 labels: [bug]
 body:
   - type: markdown
@@ -7,13 +7,13 @@ body:
       value: |
         Thanks for filing. If you suspect a **divergence from the official
         runner**, the fastest path to a fix is a reproduction that shows what
-        the official runner does — aksh's compatibility target is
+        the official runner does — preloop's compatibility target is
         `actions/runner` v2.336.0 (see `versions.toml`).
 
   - type: input
     id: version
     attributes:
-      label: aksh version
+      label: preloop version
       description: "`preloop --version`, commit SHA, or release tag"
     validations:
       required: true
@@ -68,11 +68,11 @@ body:
 
         **Wire-accurate (recommended for protocol issues):** the repo ships
         `runner-watch`, which records the official runner's exact
-        request/response exchange and replays it against aksh:
+        request/response exchange and replays it against preloop:
 
         ```
         runner-watch record-golden --runner /path/to/actions-runner --scenario <name>
-        runner-watch conform --runner 2.336.0 --aksh-url http://127.0.0.1:9090
+        runner-watch conform --runner 2.336.0 --preloop-url http://127.0.0.1:9090
         ```
 
         Attach the generated `.runner-watch/golden/v2.336.0/<scenario>/flows.jsonl`

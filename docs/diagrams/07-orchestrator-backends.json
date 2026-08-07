@@ -102,7 +102,7 @@
       "type": 3
     },
     "label": {
-      "text": "File (current default)\n.aksh/ disk cache & artifact files",
+      "text": "File (current default)\n.preloop/ disk cache & artifact files",
       "fontSize": 15
     }
   },

@@ -3,7 +3,7 @@ message: |
   Calling .expose() inside a loop or iterator is a red flag — secret values
   should be resolved once and passed to the masker, not re-exposed per iteration.
   If you need the plaintext value for masking, collect it once before the loop
-  with aksh_gha_protocol::masking::expose_all() or expose_values().
+  with preloop_gha_protocol::masking::expose_all() or expose_values().
 severity: warning
 language: rust
 ignores:

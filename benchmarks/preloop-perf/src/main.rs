@@ -49,7 +49,7 @@ use tower::ServiceExt;
 
 // ── constants ───────────────────────────────────────────────────────────────
 
-const SYSTEM_TOKEN: &str = "aksh-system-token";
+const SYSTEM_TOKEN: &str = "preloop-system-token";
 
 const SIMPLE_WORKFLOW: &str = r#"
 on: push
@@ -207,18 +207,18 @@ fn env_u64(key: &str, default: u64) -> Result<u64> {
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
-async fn make_app(state_dir: &Path) -> Result<(Router, aksh_runner_server::AppState)> {
-    let state = aksh_runner_server::AppState::new(state_dir.to_path_buf())
+async fn make_app(state_dir: &Path) -> Result<(Router, preloop_runner_server::AppState)> {
+    let state = preloop_runner_server::AppState::new(state_dir.to_path_buf())
         .await
         .context("creating AppState")?;
     let shutdown = CancellationToken::new();
-    let app = aksh_runner_server::app_with_test_api(state.clone(), shutdown, "test-token");
+    let app = preloop_runner_server::app_with_test_api(state.clone(), shutdown, "test-token");
     Ok((app, state))
 }
 
 /// Fresh router on a fresh state directory. The returned `TempDir` must outlive
 /// the router: dropping it deletes the state the server is reading.
-async fn fresh_app() -> Result<(Router, aksh_runner_server::AppState, tempfile::TempDir)> {
+async fn fresh_app() -> Result<(Router, preloop_runner_server::AppState, tempfile::TempDir)> {
     let dir = tempfile::tempdir().context("creating temp state dir")?;
     let (app, state) = make_app(dir.path()).await?;
     Ok((app, state, dir))
@@ -654,7 +654,7 @@ fn bench_parser(cfg: BenchConfig) -> Result<()> {
     for _ in 0..cfg.trials {
         let start = Instant::now();
         for _ in 0..PARSER_ITERATIONS {
-            let wf = aksh_gha_parser::parse_workflow(SIMPLE_WORKFLOW)
+            let wf = preloop_gha_parser::parse_workflow(SIMPLE_WORKFLOW)
                 .context("simple workflow must parse")?;
             std::hint::black_box(&wf);
         }
@@ -662,20 +662,20 @@ fn bench_parser(cfg: BenchConfig) -> Result<()> {
 
         let start = Instant::now();
         for _ in 0..PARSER_ITERATIONS {
-            let wf = aksh_gha_parser::parse_workflow(MATRIX_WORKFLOW)
+            let wf = preloop_gha_parser::parse_workflow(MATRIX_WORKFLOW)
                 .context("matrix workflow must parse")?;
             let expanded =
-                aksh_gha_parser::expand_jobs(&wf).context("matrix workflow must expand")?;
+                preloop_gha_parser::expand_jobs(&wf).context("matrix workflow must expand")?;
             std::hint::black_box(&expanded);
         }
         matrix_us.push(start.elapsed().as_micros() as f64 / PARSER_ITERATIONS as f64);
 
         let start = Instant::now();
         for _ in 0..PARSER_ITERATIONS {
-            let wf = aksh_gha_parser::parse_workflow(COMPLEX_WORKFLOW)
+            let wf = preloop_gha_parser::parse_workflow(COMPLEX_WORKFLOW)
                 .context("complex workflow must parse")?;
             let expanded =
-                aksh_gha_parser::expand_jobs(&wf).context("complex workflow must expand")?;
+                preloop_gha_parser::expand_jobs(&wf).context("complex workflow must expand")?;
             std::hint::black_box(&expanded);
         }
         complex_us.push(start.elapsed().as_micros() as f64 / PARSER_ITERATIONS as f64);
@@ -697,8 +697,8 @@ fn bench_parser(cfg: BenchConfig) -> Result<()> {
 
 // ── expression evaluator benchmark ──────────────────────────────────────────
 
-fn expression_context() -> aksh_gha_expressions::Context {
-    let mut ctx = aksh_gha_expressions::Context::new();
+fn expression_context() -> preloop_gha_expressions::Context {
+    let mut ctx = preloop_gha_expressions::Context::new();
     ctx.insert(
         "github",
         json!({
@@ -742,7 +742,7 @@ fn bench_expressions(cfg: BenchConfig) -> Result<()> {
     // outside the documented filesystem-dependent exceptions.
     let mut evaluated = 0usize;
     for expr in EXPRESSION_BATTERY {
-        match aksh_gha_expressions::eval_expression(expr, &ctx) {
+        match preloop_gha_expressions::eval_expression(expr, &ctx) {
             Ok(_) => evaluated += 1,
             Err(err) if EXPRESSION_MAY_FAIL.contains(expr) => {
                 eprintln!("[loadtest]   skipped (needs filesystem context): {expr} — {err}");
@@ -762,7 +762,7 @@ fn bench_expressions(cfg: BenchConfig) -> Result<()> {
         let start = Instant::now();
         for _ in 0..EXPRESSION_ITERATIONS {
             for expr in EXPRESSION_BATTERY {
-                std::hint::black_box(aksh_gha_expressions::eval_expression(expr, &ctx).is_ok());
+                std::hint::black_box(preloop_gha_expressions::eval_expression(expr, &ctx).is_ok());
             }
         }
         let elapsed = start.elapsed();
@@ -772,7 +772,7 @@ fn bench_expressions(cfg: BenchConfig) -> Result<()> {
         let start = Instant::now();
         for _ in 0..EXPRESSION_ITERATIONS {
             for expr in EXPRESSION_BATTERY {
-                std::hint::black_box(aksh_gha_expressions::validate_expression(expr).is_ok());
+                std::hint::black_box(preloop_gha_expressions::validate_expression(expr).is_ok());
             }
         }
         validate_us.push(start.elapsed().as_micros() as f64 / total_evals as f64);
@@ -853,7 +853,7 @@ async fn bench_snapshots(cfg: BenchConfig) -> Result<()> {
             let mut state_with_ws = state.clone();
             state_with_ws.local_workspace = Some(ws_path.clone());
             let shutdown = CancellationToken::new();
-            let app = aksh_runner_server::app_with_test_api(state_with_ws, shutdown, "test-token");
+            let app = preloop_runner_server::app_with_test_api(state_with_ws, shutdown, "test-token");
 
             for iteration in 0..(1 + SNAPSHOT_WARM_REPEATS) {
                 let start = Instant::now();
@@ -893,7 +893,7 @@ async fn bench_cold_boot(cfg: BenchConfig) -> Result<()> {
         for _ in 0..COLD_BOOT_ITERATIONS {
             let temp = tempfile::tempdir().context("creating temp state dir")?;
             let start = Instant::now();
-            let state = aksh_runner_server::AppState::new(temp.path().to_path_buf())
+            let state = preloop_runner_server::AppState::new(temp.path().to_path_buf())
                 .await
                 .context("creating AppState")?;
             times_ms.push(start.elapsed().as_secs_f64() * 1000.0);
@@ -1027,8 +1027,8 @@ fn bench_protocol_serde(cfg: BenchConfig) -> Result<()> {
         cfg.trials
     );
 
-    let wf = aksh_gha_parser::parse_workflow(COMPLEX_WORKFLOW)?;
-    let expanded = aksh_gha_parser::expand_jobs(&wf)?;
+    let wf = preloop_gha_parser::parse_workflow(COMPLEX_WORKFLOW)?;
+    let expanded = preloop_gha_parser::expand_jobs(&wf)?;
     let payload = serde_json::to_string(&expanded)?;
     let payload_size = payload.len();
 
@@ -1045,7 +1045,7 @@ fn bench_protocol_serde(cfg: BenchConfig) -> Result<()> {
 
         let start = Instant::now();
         for _ in 0..SERDE_ITERATIONS {
-            let value: Vec<aksh_gha_protocol::JobPlan> = serde_json::from_str(&payload)
+            let value: Vec<preloop_gha_protocol::JobPlan> = serde_json::from_str(&payload)
                 .context("expanded protocol payload must deserialize into job plans")?;
             std::hint::black_box(&value);
         }

@@ -146,7 +146,7 @@
     "id": "zone_l_cp",
     "x": 370,
     "y": 125,
-    "text": "Control Plane (aksh-runner-server)",
+    "text": "Control Plane (preloop-runner-server)",
     "fontSize": 18,
     "strokeColor": "#1e40af"
   },
@@ -380,7 +380,7 @@
       "type": 3
     },
     "label": {
-      "text": "aksh-cache\naction dependency cache",
+      "text": "preloop-cache\naction dependency cache",
       "fontSize": 15
     }
   },
@@ -399,7 +399,7 @@
       "type": 3
     },
     "label": {
-      "text": "aksh-artifacts\nbuild artifact storage",
+      "text": "preloop-artifacts\nbuild artifact storage",
       "fontSize": 15
     }
   },
@@ -418,7 +418,7 @@
       "type": 3
     },
     "label": {
-      "text": "aksh-runner\nRust runner engine",
+      "text": "preloop-runner\nRust runner engine",
       "fontSize": 15
     }
   },
@@ -481,7 +481,7 @@
       "type": 3
     },
     "label": {
-      "text": "aksh-gha-protocol\nwire DTOs, crypto, masking",
+      "text": "preloop-gha-protocol\nwire DTOs, crypto, masking",
       "fontSize": 15
     }
   },
@@ -500,7 +500,7 @@
       "type": 3
     },
     "label": {
-      "text": "aksh-gha-parser\nworkflow YAML to DAG",
+      "text": "preloop-gha-parser\nworkflow YAML to DAG",
       "fontSize": 15
     }
   },
@@ -519,7 +519,7 @@
       "type": 3
     },
     "label": {
-      "text": "aksh-gha-expressions\n${{ }} expression engine",
+      "text": "preloop-gha-expressions\n${{ }} expression engine",
       "fontSize": 15
     }
   },
@@ -601,7 +601,7 @@
       "type": 3
     },
     "label": {
-      "text": "aksh-conformance\nprotocol diff vs reference",
+      "text": "preloop-conformance\nprotocol diff vs reference",
       "fontSize": 15
     }
   },
@@ -620,7 +620,7 @@
       "type": 3
     },
     "label": {
-      "text": "aksh-dap\nDebug Adapter bridge",
+      "text": "preloop-dap\nDebug Adapter bridge",
       "fontSize": 15
     }
   },

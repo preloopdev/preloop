@@ -14,7 +14,7 @@ jobs:
           set -euo pipefail
           test -d .git
           git rev-parse --verify HEAD
-          printf 'AKSH_ORACLE: primary_git=true head=%s\n' "$(git rev-parse HEAD)"
+          printf 'PRELOOP_ORACLE: primary_git=true head=%s\n' "$(git rev-parse HEAD)"
           test -f .gitignore
       - name: Explicit secondary checkout must remain explicit
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -28,4 +28,4 @@ jobs:
           set -euo pipefail
           test -d explicit-secondary/.git
           test -f explicit-secondary/action.yml
-          echo 'AKSH_ORACLE: secondary_explicit=true'
+          echo 'PRELOOP_ORACLE: secondary_explicit=true'

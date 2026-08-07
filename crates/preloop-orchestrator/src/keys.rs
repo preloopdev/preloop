@@ -32,7 +32,7 @@ use std::sync::{
     Arc,
 };
 
-use aksh_gha_protocol::crypto::AgentRsaKeypair;
+use preloop_gha_protocol::crypto::AgentRsaKeypair;
 use tokio::sync::Mutex;
 use tracing::warn;
 
@@ -206,7 +206,7 @@ mod tests {
         })
         .await
         .expect("the pool produces a keypair");
-        let params: aksh_gha_protocol::crypto::RsaParametersExport =
+        let params: preloop_gha_protocol::crypto::RsaParametersExport =
             serde_json::from_str(&key).unwrap();
         AgentRsaKeypair::from_rsaparams(&params).expect("a pre-generated key imports cleanly");
     }

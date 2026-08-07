@@ -10,9 +10,9 @@ inputs:
 runs:
   using: docker
   image: Dockerfile
-  pre-entrypoint: /aksh/pre.sh
-  entrypoint: /aksh/main.sh
-  post-entrypoint: /aksh/post.sh
+  pre-entrypoint: /preloop/pre.sh
+  entrypoint: /preloop/main.sh
+  post-entrypoint: /preloop/post.sh
   args:
     - ${{ inputs.arg-one }}
   env:

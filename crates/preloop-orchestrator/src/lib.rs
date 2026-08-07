@@ -7,11 +7,11 @@ include!(concat!(env!("OUT_DIR"), "/pins.rs"));
 
 use crate::environment::{EnvironmentResolver, EnvironmentSpec, ToolchainLayer};
 use crate::keys::{KeyPool, StagedKey};
-use aksh_gha_protocol::RUNNER_BUSY_SENTINEL;
+use preloop_gha_protocol::RUNNER_BUSY_SENTINEL;
 
 /// Line an ephemeral runner prints when it accepts a job. Re-exported so a
 /// `VmProvider` implementation can model the handshake this pool relies on.
-pub use aksh_gha_protocol::RUNNER_BUSY_SENTINEL as RUNNER_BUSY_LINE;
+pub use preloop_gha_protocol::RUNNER_BUSY_SENTINEL as RUNNER_BUSY_LINE;
 
 use futures::StreamExt as _;
 use preloop_vm::{
@@ -35,7 +35,7 @@ const GUEST_CONTROL_DIR: &str = "/run/preloop-control";
 const GUEST_CONTROL_SOCKET: &str = "/run/preloop-control/engine.sock";
 const GUEST_FAILURE_MARKER: &str = "/var/lib/preloop-runner/.preloop-job-failed";
 /// Guest variable `preloop-runner configure` reads a pre-generated keypair from.
-/// Must match `aksh_runner::configure::RSA_PARAMS_ENV`.
+/// Must match `preloop_runner::configure::RSA_PARAMS_ENV`.
 const RUNNER_RSA_PARAMS_ENV: &str = "PRELOOP_RUNNER_RSA_PARAMS";
 
 /// How long a preserved VM survives with nobody attached.

@@ -53,15 +53,15 @@ jobs:
           toolchain: "1.86"
           components: rustfmt,clippy
 
-      # inline run steps work against aksh
+      # inline run steps work against preloop
       - uses: Swatinem/rust-cache@v2
 
       - run: cargo fmt --all --check
       - run: |
           # Run clippy on warning-free crates with strict -D warnings
-          cargo clippy --locked -p aksh-gha-protocol -p aksh-gha-parser -p aksh-gha-expressions -p aksh-cache -p aksh-artifacts -p runner-watch -p aksh-conformance --all-targets -- -D warnings
+          cargo clippy --locked -p preloop-gha-protocol -p preloop-gha-parser -p preloop-gha-expressions -p preloop-cache -p preloop-artifacts -p runner-watch -p preloop-conformance --all-targets -- -D warnings
           # Run clippy on crates with pre-existing warnings without -D warnings
-          cargo clippy --locked -p aksh-runner -p aksh-runner-server -p aksh-runner-client -p aksh-dap --all-targets
+          cargo clippy --locked -p preloop-runner -p preloop-runner-server -p preloop-runner-client -p preloop-dap --all-targets
       - run: cargo test --locked --workspace
         env:
           RUSTFLAGS: "-A warnings"
@@ -80,25 +80,25 @@ jobs:
       # Zero-filter guard so just fail if no properties match the filter
       - name: Verify concurrency_properties filter matches at least one test
         run: |
-          count=$(PROPTEST_CASES=1 cargo test -p aksh-runner-server -- --list 2>/dev/null | grep -c 'concurrency_properties' || true)
+          count=$(PROPTEST_CASES=1 cargo test -p preloop-runner-server -- --list 2>/dev/null | grep -c 'concurrency_properties' || true)
           if [ "$count" -eq 0 ]; then
-            echo "ERROR: filter 'concurrency_properties' matched zero tests in aksh-runner-server" >&2
+            echo "ERROR: filter 'concurrency_properties' matched zero tests in preloop-runner-server" >&2
             exit 1
           fi
           echo "concurrency_properties: $count test(s) found"
 
       - name: Verify property filters match tests
         run: |
-          server=$(PROPTEST_CASES=1 cargo test -p aksh-runner-server -- --list 2>/dev/null | grep -Ec 'concurrency::properties|concurrency_properties|concurrency_http_properties' || true)
-          runner=$(cargo test -p aksh-runner -- --list 2>/dev/null | grep -c 'timespan_tests' || true)
-          parser=$(cargo test -p aksh-gha-parser -- --list 2>/dev/null | grep -c 'concurrency_' || true)
+          server=$(PROPTEST_CASES=1 cargo test -p preloop-runner-server -- --list 2>/dev/null | grep -Ec 'concurrency::properties|concurrency_properties|concurrency_http_properties' || true)
+          runner=$(cargo test -p preloop-runner -- --list 2>/dev/null | grep -c 'timespan_tests' || true)
+          parser=$(cargo test -p preloop-gha-parser -- --list 2>/dev/null | grep -c 'concurrency_' || true)
           if [ "$server" -eq 0 ] || [ "$runner" -eq 0 ] || [ "$parser" -eq 0 ]; then
             echo "ERROR: zero matching tests (server=$server runner=$runner parser=$parser)" >&2
             exit 1
           fi
       - name: Check no sleep() in property test files
         run: |
-          files="crates/aksh-runner-server/src/concurrency_properties.rs crates/aksh-runner-server/src/concurrency_http_properties.rs"
+          files="crates/preloop-runner-server/src/concurrency_properties.rs crates/preloop-runner-server/src/concurrency_http_properties.rs"
           bad=0
           for f in $files; do
             if [ -f "$f" ] && grep -q 'sleep(' "$f"; then
@@ -112,32 +112,32 @@ jobs:
       # Pure properties (256 cases)
       - name: Pure concurrency properties
         run: |
-          PROPTEST_CASES=256 cargo test -p aksh-runner-server \
+          PROPTEST_CASES=256 cargo test -p preloop-runner-server \
             'concurrency::properties' -- --test-threads=1
-          PROPTEST_CASES=256 cargo test -p aksh-runner-server \
+          PROPTEST_CASES=256 cargo test -p preloop-runner-server \
             concurrency_properties::pure -- --test-threads=1
 
       # Scheduler model properties (256 cases)
       - name: Scheduler model properties
         run: |
-          PROPTEST_CASES=256 cargo test -p aksh-runner-server \
+          PROPTEST_CASES=256 cargo test -p preloop-runner-server \
             concurrency_properties::state_machine -- --test-threads=1
 
       # Expression / parser properties (256 cases)
       - name: Expression and parser properties
         run: |
-          PROPTEST_CASES=256 cargo test -p aksh-gha-expressions -- --test-threads=1
-          cargo test -p aksh-gha-parser concurrency_ -- --test-threads=1
+          PROPTEST_CASES=256 cargo test -p preloop-gha-expressions -- --test-threads=1
+          cargo test -p preloop-gha-parser concurrency_ -- --test-threads=1
 
       # Runner dispatcher properties (256 cases)
       - name: Runner dispatcher properties
         run: |
-          cargo test -p aksh-runner timespan_tests -- --test-threads=1
+          cargo test -p preloop-runner timespan_tests -- --test-threads=1
 
       # HTTP sequence properties (64 cases — heavier)
       - name: HTTP sequence properties
         run: |
-          PROPTEST_CASES=64 cargo test -p aksh-runner-server \
+          PROPTEST_CASES=64 cargo test -p preloop-runner-server \
             concurrency_http_properties -- --test-threads=1
 
       # Differential harness dry-run (credential-free)
@@ -185,7 +185,7 @@ jobs:
       # Zero-filter guard
       - name: Verify concurrency_properties filter matches at least one test
         run: |
-          count=$(PROPTEST_CASES=1 cargo test -p aksh-runner-server -- --list 2>/dev/null | grep -c 'concurrency_properties' || true)
+          count=$(PROPTEST_CASES=1 cargo test -p preloop-runner-server -- --list 2>/dev/null | grep -c 'concurrency_properties' || true)
           if [ "$count" -eq 0 ]; then
             echo "ERROR: filter 'concurrency_properties' matched zero tests" >&2
             exit 1
@@ -193,9 +193,9 @@ jobs:
 
       - name: Verify property filters match tests
         run: |
-          server=$(PROPTEST_CASES=1 cargo test -p aksh-runner-server -- --list 2>/dev/null | grep -Ec 'concurrency::properties|concurrency_properties|concurrency_http_properties' || true)
-          runner=$(cargo test -p aksh-runner -- --list 2>/dev/null | grep -c 'timespan_tests' || true)
-          parser=$(cargo test -p aksh-gha-parser -- --list 2>/dev/null | grep -c 'concurrency_' || true)
+          server=$(PROPTEST_CASES=1 cargo test -p preloop-runner-server -- --list 2>/dev/null | grep -Ec 'concurrency::properties|concurrency_properties|concurrency_http_properties' || true)
+          runner=$(cargo test -p preloop-runner -- --list 2>/dev/null | grep -c 'timespan_tests' || true)
+          parser=$(cargo test -p preloop-gha-parser -- --list 2>/dev/null | grep -c 'concurrency_' || true)
           if [ "$server" -eq 0 ] || [ "$runner" -eq 0 ] || [ "$parser" -eq 0 ]; then
             echo "ERROR: zero matching tests (server=$server runner=$runner parser=$parser)" >&2
             exit 1
@@ -204,8 +204,8 @@ jobs:
         run: |
           bad=0
           for f in \
-            crates/aksh-runner-server/src/concurrency_properties.rs \
-            crates/aksh-runner-server/src/concurrency_http_properties.rs; do
+            crates/preloop-runner-server/src/concurrency_properties.rs \
+            crates/preloop-runner-server/src/concurrency_http_properties.rs; do
             if [ -f "$f" ] && grep -q 'sleep(' "$f"; then
               echo "ERROR: sleep() found in $f" >&2
               bad=1
@@ -217,26 +217,26 @@ jobs:
       - name: Intensive property profile (release)
         run: |
           PROPTEST_CASES=10000 PROPTEST_MAX_SHRINK_ITERS=100000 \
-            cargo test -p aksh-runner-server 'concurrency::properties' \
+            cargo test -p preloop-runner-server 'concurrency::properties' \
             --release -- --test-threads=1
           PROPTEST_CASES=10000 PROPTEST_MAX_SHRINK_ITERS=100000 \
-            cargo test -p aksh-runner-server concurrency_properties \
+            cargo test -p preloop-runner-server concurrency_properties \
             --release -- --test-threads=1
 
       - name: Intensive runner timing profile (release)
-        run: cargo test -p aksh-runner timespan_tests --release -- --test-threads=1
+        run: cargo test -p preloop-runner timespan_tests --release -- --test-threads=1
 
       - name: Intensive expression / parser profile (release)
         run: |
-          PROPTEST_CASES=10000 cargo test -p aksh-gha-expressions \
+          PROPTEST_CASES=10000 cargo test -p preloop-gha-expressions \
             --release -- --test-threads=1
-          cargo test -p aksh-gha-parser concurrency_ \
+          cargo test -p preloop-gha-parser concurrency_ \
             --release -- --test-threads=1
 
       - name: Intensive HTTP sequence profile (release)
         run: |
           PROPTEST_CASES=1000 PROPTEST_MAX_SHRINK_ITERS=100000 \
-            cargo test -p aksh-runner-server concurrency_http_properties \
+            cargo test -p preloop-runner-server concurrency_http_properties \
             --release -- --test-threads=1
 
       # ── Differential harness dry-run (always, never live probes in CI) ─
