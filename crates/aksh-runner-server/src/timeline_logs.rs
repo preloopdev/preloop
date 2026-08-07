@@ -178,15 +178,20 @@ pub(crate) async fn patch_timeline_records(
     }
 
     // Persist records (upsert by record ID) and return the full stored set.
-    let response_records = {
+    let (response_records, meta) = {
         let mut inner = shared.state.inner.lock().await;
         let stored = inner.timeline_records.entry(timeline_key).or_default();
         for record in records {
             stored.insert(record.id, record);
         }
         let vals: Vec<_> = stored.values().cloned().collect();
-        vals
+        (vals, crate::store::build_meta_snapshot(&inner))
     };
+    // Persist after the lock is released so a slow backend does not serialize
+    // the control plane behind the snapshot write.
+    if let Err(error) = shared.state.store.store_meta_only(&meta).await {
+        warn!(?error, "failed to persist timeline records");
+    }
 
     Json(json!({ "count": response_records.len(), "value": response_records }))
 }
@@ -220,13 +225,19 @@ pub(crate) async fn create_log(
     Path((_scope, _hub, plan_id)): Path<(String, String, String)>,
     Json(mut log): Json<azdo::TaskLog>,
 ) -> Json<serde_json::Value> {
-    let mut inner = shared.state.inner.lock().await;
-    let next_id = inner.next_log_id;
-    inner.next_log_id = next_id.wrapping_add(1);
-    log.id = next_id as i64;
-    let key = format!("{}/{}", plan_id, next_id);
-    inner.logs.entry(key.clone()).or_default();
-    inner.log_metadata.entry(key).or_default();
+    let meta = {
+        let mut inner = shared.state.inner.lock().await;
+        let next_id = inner.next_log_id;
+        inner.next_log_id = next_id.wrapping_add(1);
+        log.id = next_id as i64;
+        let key = format!("{}/{}", plan_id, next_id);
+        inner.logs.entry(key.clone()).or_default();
+        inner.log_metadata.entry(key).or_default();
+        crate::store::build_meta_snapshot(&inner)
+    };
+    if let Err(error) = shared.state.store.store_meta_only(&meta).await {
+        warn!(?error, "failed to persist created log");
+    }
     Json(serde_json::to_value(&log).unwrap_or(json!({ "ok": true })))
 }
 
@@ -237,18 +248,41 @@ pub(crate) async fn append_log(
     body: Bytes,
 ) -> StatusCode {
     let key = log_key(&plan_id, &log_id);
-    let mut inner = shared.state.inner.lock().await;
-    let masked = mask_log_bytes(&inner, &plan_id, &body);
-    let byte_count = masked.len();
-    let line_count = masked.iter().filter(|&&b| b == b'\n').count();
-    inner
-        .logs
-        .entry(key.clone())
-        .or_default()
-        .extend_from_slice(&masked);
-    let meta = inner.log_metadata.entry(key).or_default();
-    meta.byte_count += byte_count;
-    meta.line_count += line_count;
+    // Hot path: mutate and capture the chunk under the lock, then persist
+    // after releasing it.
+    let (masked, chunk_index, byte_count, line_count) = {
+        let mut inner = shared.state.inner.lock().await;
+        let masked = mask_log_bytes(&inner, &plan_id, &body);
+        let byte_count = masked.len();
+        let line_count = masked.iter().filter(|&&b| b == b'\n').count();
+        inner
+            .logs
+            .entry(key.clone())
+            .or_default()
+            .extend_from_slice(&masked);
+        let meta = inner.log_metadata.entry(key.clone()).or_default();
+        meta.byte_count += byte_count;
+        meta.line_count += line_count;
+        // Hot path: write the chunk to `log_chunks` and UPSERT the per-log
+        // counter, instead of rewriting the entire meta snapshot for every
+        // append. The counter is small and idempotent; the chunk is the
+        // append-only event stream. We use the new byte count as the chunk
+        // index so each append maps to a unique `(log_key, chunk_index)` row.
+        (
+            masked,
+            meta.byte_count as i64,
+            meta.byte_count as i64,
+            meta.line_count as i64,
+        )
+    };
+    if let Err(error) = shared
+        .state
+        .store
+        .store_log_chunk(&key, chunk_index, &masked, byte_count, line_count)
+        .await
+    {
+        warn!(?error, "failed to persist appended log chunk");
+    }
     StatusCode::ACCEPTED
 }
 

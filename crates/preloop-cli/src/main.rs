@@ -195,6 +195,12 @@ struct ServeArgs {
     /// Persist the supplied GitHub credentials so later runs reuse them.
     #[arg(long)]
     save: bool,
+
+    /// Durable-state backend: `sqlite://<path>`, a bare path, or
+    /// `postgres://…` (with optional `?sslmode=require|verify-full`).
+    /// Defaults to `AKSH_STORE_URL`, then to SQLite in the state dir.
+    #[arg(long, value_name = "URL")]
+    store: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -701,6 +707,7 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
             pending_registrations: pool_available.then_some(pending_registrations),
             require_job_assignments: env_flag("PRELOOP_REQUIRE_JOB_ASSIGNMENTS", false),
             state_dir,
+            store_url: args.store.clone(),
             record_flows: None,
             tls: aksh_runner_server::TlsMode::None,
             enable_test_api: false,

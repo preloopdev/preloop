@@ -28,7 +28,8 @@ aksh is execution-agnostic. The only thing that differs between runner hosts
 is how a runner instance is created and destroyed. This is modeled as the
 `RunnerProvider` trait in the orchestrator layer:
 
-- `**RunStore**` — in-memory (local) or `sqlx` (server).
+- `**Store**` — durable control-plane state: SQLite (default) or Postgres.
+  See [State Model](#state-model).
 - `**AuthProvider**` — loopback-trust (local) or OAuth + mTLS (server).
 - `**RunnerProvider**` — creates/destroys runners (process, container, libkrun,
 cloud VM, k8s pod, bare BYO). Optional — aksh works with external runners.
@@ -37,11 +38,30 @@ See [fidelity-gap.md §4](fidelity-gap.md) for the full design.
 
 ## State Model
 
-The default server uses an in-memory run queue and file-backed cache/artifact
-stores under `.aksh/`. This keeps the local feedback loop fast and makes the
-initial protocol behavior easy to inspect. Durable run state should be added
-behind an explicit repository trait before adopting `sqlx` or another database
-layer.
+In-memory state is the source of truth. The HTTP layer reads and mutates
+`InnerState` behind `Arc<Mutex<…>>`; the database is a **restart source**, not
+a shared bus. Two servers pointed at one SQLite file or one Postgres database
+still diverge in memory.
+
+- `aksh-runner-server/src/store.rs` — the `Store` trait (async, object-safe:
+  the only surface the rest of the server sees), the SQLite backend, the
+  AEAD envelope, and the snapshot serialization shared by every backend.
+- `aksh-runner-server/src/store_pg.rs` — the Postgres backend.
+
+Backends are selected by `--store` / `AKSH_STORE_URL` (`sqlite://<path>`, a
+bare path, or `postgres://…`), defaulting to SQLite at `<state_dir>/aksh.db`.
+Both are single-writer: one connection behind a mutex. Per-backend
+`MIGRATIONS` is the schema source of truth — SQLite tracks the version in
+`PRAGMA user_version`, Postgres in a `schema_migrations` table under an
+advisory lock.
+
+Writes are **best-effort**: a store failure is logged and the affected event is
+still broadcast (`state.rs::emit`). Cache and artifact payloads stay in
+file-backed stores under `.aksh/`; only control-plane state goes to the
+database.
+
+Known gaps and their tradeoffs are tracked in
+[store-known-issues.md](store-known-issues.md).
 
 ## Secrets
 

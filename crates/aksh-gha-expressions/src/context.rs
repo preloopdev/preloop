@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Hierarchical expression context.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Context {
     pub(crate) roots: BTreeMap<String, Value>,
     pub(crate) success: bool,
