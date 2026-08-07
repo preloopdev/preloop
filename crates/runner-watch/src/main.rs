@@ -1724,8 +1724,6 @@ async fn replay_flows_to_aksh(
     aksh_url: &str,
     scenario_root: &Path,
 ) -> anyhow::Result<PathBuf> {
-    let flows_path = golden_dir.join("flows.jsonl");
-    let flows = fs::read_to_string(&flows_path)?;
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .build()?;
@@ -1733,10 +1731,55 @@ async fn replay_flows_to_aksh(
         .parent()
         .unwrap_or(out_dir)
         .join("official-filtered");
-    fs::create_dir_all(&baseline_dir)?;
     let native_token =
         std::env::var("AKSH_SYSTEM_TOKEN").unwrap_or_else(|_| "aksh-system-token".to_owned());
-    let run_ids = materialize_replay_state(golden_dir, scenario_root, aksh_url, &client).await?;
+    // Runs are submitted by materialize before the replay starts; they must
+    // be cancelled on EVERY exit from here on — including a materialization
+    // or replay error — or the next scenario's acquire picks up this
+    // scenario's leftovers. The out-param keeps partially-materialized run
+    // ids cancellable even when materialize itself fails midway.
+    let mut run_ids = Vec::new();
+    let replay_result = replay_flows_to_aksh_inner(
+        golden_dir,
+        out_dir,
+        &baseline_dir,
+        aksh_url,
+        scenario_root,
+        &client,
+        &native_token,
+        &mut run_ids,
+    )
+    .await;
+    let cancel_result = cancel_scenario_runs(&client, aksh_url, &native_token, &run_ids).await;
+    match (replay_result, cancel_result) {
+        (Ok(dir), Ok(())) => Ok(dir),
+        (Ok(_), Err(cancel_error)) => Err(cancel_error),
+        (Err(replay_error), Ok(())) => Err(replay_error),
+        (Err(replay_error), Err(cancel_error)) => Err(replay_error).context(format!(
+            "additionally, cancelling the scenario's runs failed: {cancel_error:#}"
+        )),
+    }
+}
+
+/// Everything between run submission and the summaries — pre-flight, the
+/// replay loop and the capture writes. The wrapper owns cancellation on
+/// every exit path, so a post-submission failure cannot leave the scenario's
+/// runs queued for the next replay to acquire.
+#[allow(clippy::too_many_arguments)]
+async fn replay_flows_to_aksh_inner(
+    golden_dir: &Path,
+    out_dir: &Path,
+    baseline_dir: &Path,
+    aksh_url: &str,
+    scenario_root: &Path,
+    client: &reqwest::Client,
+    native_token: &str,
+    run_ids: &mut Vec<String>,
+) -> anyhow::Result<PathBuf> {
+    let flows_path = golden_dir.join("flows.jsonl");
+    let flows = fs::read_to_string(&flows_path)?;
+    fs::create_dir_all(baseline_dir)?;
+    materialize_replay_state(golden_dir, scenario_root, aksh_url, client, run_ids).await?;
     // Pre-flight: register a replay runner with an RSA keypair, then exchange a
     // signed client_assertion for a runner-listen token.  Broker endpoints require
     // a JWT whose sub is "aksh-runner-listen-{numeric_id}" — the system token
@@ -1928,7 +1971,7 @@ async fn replay_flows_to_aksh(
         }
         if is_external_blob_upload(method, host) {
             if let Some(upload_url) = blob_upload_urls.pop_front() {
-                replay_blob_upload(&client, &upload_url, &flow).await?;
+                replay_blob_upload(client, &upload_url, &flow).await?;
             }
             continue;
         }
@@ -1973,12 +2016,12 @@ async fn replay_flows_to_aksh(
                     saw_auth = true;
                 }
                 let header_value =
-                    rewritten_header_value(name, value, &path, &native_token, &broker_token);
+                    rewritten_header_value(name, value, &path, native_token, &broker_token);
                 req = req.header(name, header_value.as_ref());
             }
         }
         if !saw_auth {
-            if let Some(auth) = synthesized_authorization(&path, &native_token, &broker_token) {
+            if let Some(auth) = synthesized_authorization(&path, native_token, &broker_token) {
                 req = req.header("Authorization", auth.as_ref());
             }
         }
@@ -2088,23 +2131,70 @@ async fn replay_flows_to_aksh(
     let summary = serde_json::to_string_pretty(&json!({"status":"captured", "flows": count}))?;
     fs::write(out_dir.join("summary.json"), &summary)?;
     fs::write(baseline_dir.join("summary.json"), &summary)?;
-    // Cancel the scenario's runs once every captured flow has been replayed.
-    // A golden capture can end before the official run finished dispatching
-    // (scenario 101's needs-dependent dynamic matrix), leaving extra queued
-    // jobs behind. Uncancelled, those jobs leak into the next scenario's
-    // acquire and misalign every subsequent replay (the checker's OIDC
-    // plan/job mapping in particular ends up pointing at the wrong run).
-    for run_id in &run_ids {
-        let _ = client
-            .post(format!(
-                "{}/api/v1/runs/{run_id}/cancel",
-                aksh_url.trim_end_matches('/')
-            ))
-            .bearer_auth(&native_token)
-            .send()
-            .await;
+    Ok(baseline_dir.to_path_buf())
+}
+
+/// Cancel every submitted run once the replay has exited, however it exited.
+///
+/// A golden capture can end before the official run finished dispatching
+/// (scenario 101's needs-dependent dynamic matrix), leaving extra queued jobs
+/// behind. Uncancelled, those jobs leak into the next scenario's acquire and
+/// misalign every subsequent replay (the checker's OIDC plan/job mapping in
+/// particular ends up pointing at the wrong run).
+///
+/// Every id is attempted even when earlier ones fail, so one transport error
+/// cannot leave the rest of the scenario's runs queued. Failures are retried
+/// once (cancellation is idempotent) and any remaining failure is surfaced —
+/// a silently-uncancelled run is exactly the leak this guard exists to stop.
+async fn cancel_scenario_runs(
+    client: &reqwest::Client,
+    aksh_url: &str,
+    native_token: &str,
+    run_ids: &[String],
+) -> anyhow::Result<()> {
+    let mut failures: Vec<(String, String)> = Vec::new();
+    for run_id in run_ids {
+        if let Some(message) = cancel_run(client, aksh_url, native_token, run_id).await {
+            failures.push((run_id.clone(), message));
+        }
     }
-    Ok(baseline_dir)
+    let mut still_failing: Vec<String> = Vec::new();
+    for (run_id, _) in &failures {
+        if let Some(message) = cancel_run(client, aksh_url, native_token, run_id).await {
+            still_failing.push(message);
+        }
+    }
+    if still_failing.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "failed to cancel {} scenario run(s): {}",
+            still_failing.len(),
+            still_failing.join("; ")
+        )
+    }
+}
+
+/// Attempt one cancellation; `Some(message)` describes the failure.
+async fn cancel_run(
+    client: &reqwest::Client,
+    aksh_url: &str,
+    native_token: &str,
+    run_id: &str,
+) -> Option<String> {
+    let response = client
+        .post(format!(
+            "{}/api/v1/runs/{run_id}/cancel",
+            aksh_url.trim_end_matches('/')
+        ))
+        .bearer_auth(native_token)
+        .send()
+        .await;
+    match response {
+        Ok(response) if response.status().is_success() => None,
+        Ok(response) => Some(format!("{run_id}: HTTP {}", response.status())),
+        Err(error) => Some(format!("{run_id}: {error}")),
+    }
 }
 
 fn is_external_blob_upload(method: &str, host: &str) -> bool {
@@ -2350,7 +2440,8 @@ async fn materialize_replay_state(
     scenario_root: &Path,
     aksh_url: &str,
     client: &reqwest::Client,
-) -> anyhow::Result<Vec<String>> {
+    run_ids: &mut Vec<String>,
+) -> anyhow::Result<()> {
     let flows_path = golden_dir.join("flows.jsonl");
     let flows = fs::read_to_string(&flows_path)?;
     let broker_job_count = flows
@@ -2371,7 +2462,7 @@ async fn materialize_replay_state(
         })
         .count();
     if broker_job_count == 0 {
-        return Ok(Vec::new());
+        return Ok(());
     }
 
     let native_api_token =
@@ -2380,10 +2471,9 @@ async fn materialize_replay_state(
     // Idle scenarios have no submit_workflow steps — skip job creation.
     // The replay will use the golden capture's message responses directly.
     if submissions.is_empty() {
-        return Ok(Vec::new());
+        return Ok(());
     }
     let mut queued_jobs = 0_u64;
-    let mut run_ids = Vec::new();
     for submit_body in submissions {
         let accepted = client
             .post(format!("{}/api/v1/runs", aksh_url.trim_end_matches('/')))
@@ -2420,7 +2510,7 @@ async fn materialize_replay_state(
         "replay scenario queued {queued_jobs} jobs but golden capture delivers {broker_job_count}"
     );
 
-    Ok(run_ids)
+    Ok(())
 }
 
 fn normalize_request_path(_method: &str, path: &str) -> String {
@@ -3624,5 +3714,198 @@ mod tests {
         );
 
         assert!(!schema_mismatch_in_report(report));
+    }
+
+    /// Minimal isolated temp directory (runner-watch has no tempfile dev-dep;
+    /// the crate's convention is `std::env::temp_dir()` with a unique name).
+    struct TestTemp {
+        root: std::path::PathBuf,
+    }
+
+    impl TestTemp {
+        fn new(label: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "runner-watch-{label}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            Self { root }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.root
+        }
+    }
+
+    impl Drop for TestTemp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// Minimal HTTP stub for replay tests. `handle` maps `(method, path)` to
+    /// `(status, body)`; anything unhandled is a 404.
+    async fn spawn_replay_stub(
+        handle: impl Fn(&str, &str) -> (u16, String) + Send + Sync + 'static,
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind replay stub");
+        let address = listener.local_addr().expect("replay stub address");
+        let handle = std::sync::Arc::new(handle);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let handle = std::sync::Arc::clone(&handle);
+                tokio::spawn(async move {
+                    let mut buf = [0_u8; 4096];
+                    let Ok(n) = socket.read(&mut buf).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let mut parts = request.split_whitespace();
+                    let method = parts.next().unwrap_or("").to_owned();
+                    let path = parts.next().unwrap_or("/").to_owned();
+                    let (status, body) = handle(&method, &path);
+                    let response = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{address}")
+    }
+
+    /// A golden scenario fixture: one submit_workflow step, an acquirejob
+    /// flow (for the captured GitHub event) and one broker message flow.
+    /// `fail_replay` makes the replay loop itself error after the runs have
+    /// been submitted (an undecodable `request_body_b64`).
+    fn replay_scenario_fixture(
+        temp: &TestTemp,
+        fail_replay: bool,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let golden = temp.path().join("golden/99-replay-cancel");
+        let scenario_root = temp.path().join("scenarios");
+        let out = temp.path().join("replay-out");
+        std::fs::create_dir_all(&golden).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        let scenario = scenario_root.join("99-replay-cancel");
+        std::fs::create_dir_all(&scenario).unwrap();
+        std::fs::write(
+            scenario.join("scenario.toml"),
+            "[[steps]]\nkind = \"submit_workflow\"\npath = \"ci.yml\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            scenario.join("ci.yml"),
+            "name: ci\non: workflow_dispatch\njobs: {}\n",
+        )
+        .unwrap();
+        let acquirejob = serde_json::json!({
+            "method": "POST",
+            "host": "pipelines.actions.githubusercontent.com",
+            "path": "/_apis/v1/broker/jobs/acquirejob",
+            "status": 200,
+            "request_headers": [],
+            "response_body_json": {
+                "plan": {"planId": "p-1", "jobId": "j-1"},
+                "jobId": "j-1",
+                "contextData": {"github": {"d": [{"k": "event", "v": {"x": 1}}]}}
+            }
+        });
+        let mut message = serde_json::json!({
+            "method": "POST",
+            "host": "pipelines.actions.githubusercontent.com",
+            "path": "/message?sessionId=abc&status=Busy",
+            "status": 200,
+            "request_headers": [],
+            "response_body_json": {"body": "{\"runner_request_id\": \"rid-1\"}"}
+        });
+        if fail_replay {
+            message["request_body_b64"] = serde_json::json!("!!!not-base64!!!");
+        }
+        std::fs::write(
+            golden.join("flows.jsonl"),
+            format!("{acquirejob}\n{message}\n"),
+        )
+        .unwrap();
+        (golden, out, scenario_root)
+    }
+
+    /// A failed cancellation must surface as an error instead of being
+    /// swallowed (`let _ =`), so queued runs cannot silently survive.
+    #[tokio::test]
+    async fn replay_surfaces_failed_cancellation_instead_of_silently_succeeding() {
+        let temp = TestTemp::new("cancel-failure");
+        let (golden, out, scenario_root) = replay_scenario_fixture(&temp, false);
+        let cancels = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_cancels = std::sync::Arc::clone(&cancels);
+        let server_url = spawn_replay_stub(move |method, path| {
+            if method == "POST" && path == "/api/v1/runs" {
+                return (200, r#"{"run_id": "run-1", "queued_jobs": 1}"#.to_owned());
+            }
+            if method == "POST" && path.starts_with("/api/v1/runs/") && path.ends_with("/cancel") {
+                seen_cancels.lock().unwrap().push(path.to_owned());
+                return (500, "cancel exploded".to_owned());
+            }
+            (404, "not found".to_owned())
+        })
+        .await;
+
+        let result = replay_flows_to_aksh(&golden, &out, &server_url, &scenario_root).await;
+
+        assert!(
+            result.is_err(),
+            "a 500 from the cancel endpoint must fail the replay, not be swallowed: {result:?}"
+        );
+        assert!(
+            !cancels.lock().unwrap().is_empty(),
+            "the cancel endpoint must actually have been called"
+        );
+    }
+
+    /// Runs must be cancelled even when the replay itself errors after the
+    /// submissions: leftover queued runs contaminate the next scenario.
+    #[tokio::test]
+    async fn replay_cancels_runs_even_when_the_replay_errors() {
+        let temp = TestTemp::new("cancel-on-error");
+        let (golden, out, scenario_root) = replay_scenario_fixture(&temp, true);
+        let cancels = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_cancels = std::sync::Arc::clone(&cancels);
+        let server_url = spawn_replay_stub(move |method, path| {
+            if method == "POST" && path == "/api/v1/runs" {
+                return (200, r#"{"run_id": "run-1", "queued_jobs": 1}"#.to_owned());
+            }
+            if method == "POST" && path.starts_with("/api/v1/runs/") && path.ends_with("/cancel") {
+                seen_cancels.lock().unwrap().push(path.to_owned());
+                return (200, "{}".to_owned());
+            }
+            (404, "not found".to_owned())
+        })
+        .await;
+
+        let result = replay_flows_to_aksh(&golden, &out, &server_url, &scenario_root).await;
+
+        assert!(
+            result.is_err(),
+            "the invalid-method flow must fail the replay"
+        );
+        let cancels = cancels.lock().unwrap();
+        assert!(
+            cancels.iter().any(|path| path.contains("run-1")),
+            "the scenario run must be cancelled even when the replay errors: {cancels:?}"
+        );
     }
 }

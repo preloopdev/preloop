@@ -1,19 +1,27 @@
-# act vs agent-ci vs aksh: GitHub Actions Local Runners Compared
+# act vs agent-ci vs aksh vs Gitea Actions: GitHub Actions Runners Compared
 
 A detailed comparison between [nektos/act](https://github.com/nektos/act) and
 aksh (this repo). Both let you run GitHub Actions workflows locally. They take
 fundamentally different approaches to the problem.
 
+> **Updated 2026-08-05** — this comparison now includes **Gitea Actions
+> (`gitea.com/gitea/runner`, aka act_runner)**: the act fork running against
+> Gitea's own control plane. It reuses act's execution engine but adds a real
+> server/runner split with a proprietary Connect-RPC protocol, so several of
+> act's limitations are fixed (by the server or by the fork) while others
+> persist. Section 6 is the dedicated deep dive; the philosophy table below
+> positions it at a glance.
+
 ---
 
 ## 1. Philosophy
 
-| | act | agent-ci | aksh |
-|---|---|---|---|
-| **One-liner** | Reimplement the runner in Go | Reimplement the server in TypeScript | Reimplement server + runner in Rust |
-| **Strategy** | Replace the runner binary with a Go reimplementation that executes steps in Docker containers | Reimplement **both** the control plane (server) **and** the runner in Rust, with the full AzDO wire protocol between them |
-| **Compatibility target** | Behavioral: "workflows should mostly work" | Protocol: "the official runner v2.336.0 cannot tell the difference" |
-| **Verification method** | Manual testing + community bug reports | 24 golden wire-capture scenarios replayed against the server; differential conformance vs official runner |
+| | act | agent-ci | aksh | Gitea Actions (act_runner) |
+|---|---|---|---|---|
+| **One-liner** | Reimplement the runner in Go (CLI) | Reimplement the server in TypeScript | Reimplement **both** the control plane (server) **and** the runner in Rust, with the full AzDO wire protocol between them | Reimplement the runner in Go (act fork), **with a server**: Gitea's monolith does scheduling, the runner executes |
+| **Strategy** | Replace the runner binary with a Go reimplementation that executes steps in Docker containers | Emulate the GitHub API (DTU) locally, drive the unmodified official runner in Docker | Replace the server and the runner; speak the official AzDO protocol between them | Replace the runner; the Gitea server supplies scheduling (needs/matrix/concurrency/max-parallel) over a **proprietary Connect-RPC protocol** (`/api/actions`) |
+| **Compatibility target** | Behavioral: "workflows should mostly work" | Protocol: "the official runner v2.336.0 cannot tell the difference" | Protocol: "the official runner v2.336.0 cannot tell the difference" | Workflow-level: GitHub YAML syntax + the action ecosystem, on Gitea's own wire protocol — the official runner binary is never used |
+| **Verification method** | Manual testing + community bug reports | Differential conformance vs official runner | 24 golden wire-capture scenarios replayed against the server; differential conformance vs official runner | Unit tests + community bug reports; no official-runner wire conformance (by design) |
 
 ---
 
@@ -47,6 +55,47 @@ fundamentally different approaches to the problem.
 - **Container model**: One long-lived Docker container per job, entrypoint is `tail -f /dev/null`, steps execute via `docker exec`
 - **Host mode**: `-self-hosted` flag runs steps directly on the host (no container)
 - **Expression engine**: Custom evaluator built on `rhysd/actionlint`'s AST parser
+
+### Gitea Actions runner (act_runner)
+
+```
+┌──────────────────────────────────────────────┐
+│            Gitea server (Go monolith)         │
+│                                               │
+│  Workflow detect ─► job DAG ─► concurrency    │
+│  needs/matrix/max-parallel ─► label match     │
+│                                               │
+│  Task = workflow YAML + context + secrets     │
+└───────────────────────┬──────────────────────┘
+                        │ Connect RPC (protobuf)
+                        │ /api/actions: Ping,
+                        │ Register/Declare/
+                        │ FetchTask/UpdateTask/
+                        │ UpdateLog
+        ┌───────────────▼────────────────┐
+        │  act_runner (Go, act fork)     │
+        │  parses YAML, plans stages,    │
+        │  executes steps                │
+        │                                │
+        │  Docker job container + exec   │
+        │  or host mode (labels)         │
+        └────────────────────────────────┘
+```
+
+- **Language**: Go 1.26 (module `gitea.com/gitea/runner`); the act fork is
+  fully vendored in-tree under `act/`
+- **Execution**: Client–server — Gitea's monolith does all scheduling and
+  sends a `Task` protobuf (raw workflow YAML + `github` context + secrets +
+  vars + `needs` outputs); the runner **parses and interprets the workflow
+  itself** (`internal/app/run/workflow.go`)
+- **Wire protocol**: proprietary Connect RPC (`connectrpc.com/connect` +
+  `gitea.dev/actions-proto-go`), 5 unary methods + Ping; auth via
+  `x-runner-uuid` / `x-runner-token` headers
+- **Container model**: identical to act — per-job Docker container (label
+  `docker://image`), steps via `docker exec`, service containers on a job
+  network; `host` schema labels run steps directly on the host
+- **Expression engine**: fork's own `act/exprparser` on `rhysd/actionlint`
+  AST — includes `*` filter, `{{`/`}}` escapes, bracket access (see §6)
 
 ### aksh
 
@@ -85,137 +134,137 @@ fundamentally different approaches to the problem.
 
 ### Core Workflow Features
 
-| Feature | act | aksh | Notes |
-|---|:---:|:---:|---|
-| Workflow YAML parsing | ✅ | ✅ | Both parse the full workflow schema |
-| `run:` steps | ✅ | ✅ | |
-| `uses:` actions (remote) | ✅ | ✅ | |
-| `uses:` actions (local) | ✅ | ✅ | |
-| `uses:` Docker actions | ✅ | ✅ | |
-| `uses: $/` self-repo syntax | ❌ | ✅ | v2.336.0 feature |
-| Composite actions | ✅ | ✅ | aksh supports 10-deep nesting with pre/post |
-| Reusable workflows (`workflow_call`) | ✅ | ✅ | aksh: `secrets: inherit`, input validation, depth=4 |
-| Matrix strategy | ✅ | ✅ | aksh: IndexMap order preservation |
-| `include` / `exclude` in matrix | ✅ | ✅ | |
-| `needs` DAG | ✅ | ✅ | |
-| Job outputs | ✅ | ✅ | |
-| `if` conditionals (job/step) | ✅ | ✅ | |
-| `continue-on-error` | ✅ | ✅ | |
-| `timeout-minutes` | ✅ | ✅ | |
-| `defaults.run` (shell/working-directory) | ✅ | ✅ | |
-| `workflow_dispatch` inputs | ✅ | ✅ | |
-| `run-name` expression | ❌ | ✅ | aksh parses and evaluates at submit time |
+| Feature | act | aksh | Gitea | Notes |
+|---|:---:|:---:|:---:|---|
+| Workflow YAML parsing | ✅ | ✅ | ✅ | Gitea: server parses for scheduling, runner re-parses for execution |
+| `run:` steps | ✅ | ✅ | ✅ | |
+| `uses:` actions (remote) | ✅ | ✅ | ✅ | |
+| `uses:` actions (local) | ✅ | ✅ | ✅ | |
+| `uses:` Docker actions | ✅ | ✅ | ✅ | |
+| `uses: $/` self-repo syntax | ❌ | ✅ | ❌ | v2.336.0 feature |
+| Composite actions | ✅ | ✅ | ✅ | |
+| Reusable workflows (`workflow_call`) | ✅ | ✅ | ✅ | Gitea: depth 5; `github.event_name` overridden to `workflow_call` in callees (documented FIXME) |
+| Matrix strategy | ✅ | ✅ | ✅ | |
+| `include` / `exclude` in matrix | ✅ | ✅ | ✅ | |
+| `needs` DAG | ✅ | ✅ | ✅ | Gitea: resolved server-side (`jobEmitterQueue`) |
+| Job outputs | ✅ | ✅ | ✅ | |
+| `if` conditionals (job/step) | ✅ | ✅ | ✅ | |
+| `continue-on-error` | ✅ | ✅ | ✅ | |
+| `timeout-minutes` | ✅ | ✅ | ✅ | Gitea: `runner.timeout` (default 3h) + server-side `StopEndlessTasks` |
+| `defaults.run` (shell/working-directory) | ✅ | ✅ | ✅ | |
+| `workflow_dispatch` inputs | ✅ | ✅ | ✅ | Gitea: manual run with inputs |
+| `run-name` expression | ❌ | ✅ | ⚠️ | Gitea displays a run name; expression evaluation not verified in this audit |
 
 ### Environment & Contexts
 
-| Feature | act | aksh | Notes |
-|---|:---:|:---:|---|
-| `$GITHUB_ENV` | ✅ | ✅ | |
-| `$GITHUB_OUTPUT` | ✅ | ✅ | |
-| `$GITHUB_PATH` | ✅ | ✅ | |
-| `$GITHUB_STEP_SUMMARY` | ✅ | ✅ | |
-| `$GITHUB_STATE` | ✅ | ✅ | |
-| `$GITHUB_ARTIFACTS` | ❌ | ✅ | v2.336.0 feature |
-| `$GITHUB_ARTIFACTS_LIST` | ❌ | ✅ | v2.336.0 feature |
-| `ACTIONS_CACHE_MODE` | ❌ | ✅ | v2.336.0 feature |
-| `github.*` context | ✅ | ✅ | |
-| `env.*` context | ✅ | ✅ | |
-| `secrets.*` context | ✅ | ✅ | act reads `.secrets` file or `--secret` flag |
-| `vars.*` context | ✅ | ✅ | |
-| `steps.*` context | ✅ | ✅ | |
-| `needs.*` context | ✅ | ✅ | |
-| `matrix.*` context | ✅ | ✅ | |
-| `runner.*` context | ✅ | ✅ | |
-| `inputs.*` context | ✅ | ✅ | |
-| Comprehensive `GITHUB_*` env vars | ⚠️ partial | ✅ | aksh injects 40+ vars matching official runner |
+| Feature | act | aksh | Gitea | Notes |
+|---|:---:|:---:|:---:|---|
+| `$GITHUB_ENV` | ✅ | ✅ | ✅ | |
+| `$GITHUB_OUTPUT` | ✅ | ✅ | ✅ | |
+| `$GITHUB_PATH` | ✅ | ✅ | ✅ | |
+| `$GITHUB_STEP_SUMMARY` | ✅ | ✅ | ✅ | |
+| `$GITHUB_STATE` | ✅ | ✅ | ✅ | |
+| `$GITHUB_ARTIFACTS` | ❌ | ✅ | ❌ | v2.336.0 feature |
+| `$GITHUB_ARTIFACTS_LIST` | ❌ | ✅ | ❌ | v2.336.0 feature |
+| `ACTIONS_CACHE_MODE` | ❌ | ✅ | ❌ | Gitea uses `CACHE_SERVICE_V2=true` instead |
+| `github.*` context | ✅ | ✅ | ✅ | Gitea: `event_name` divergence under `workflow_call`; `gitea` context alias |
+| `env.*` context | ✅ | ✅ | ✅ | |
+| `secrets.*` context | ✅ | ✅ | ✅ | Gitea: server-scoped secrets (repo/org/global, encrypted) |
+| `vars.*` context | ✅ | ✅ | ✅ | Gitea: Repo > Org > Global precedence |
+| `steps.*` context | ✅ | ✅ | ✅ | |
+| `needs.*` context | ✅ | ✅ | ✅ | |
+| `matrix.*` context | ✅ | ✅ | ✅ | |
+| `runner.*` context | ✅ | ✅ | ✅ | Gitea: `runner.name` from registration |
+| `inputs.*` context | ✅ | ✅ | ✅ | |
+| Comprehensive `GITHUB_*` env vars | ⚠️ partial | ✅ | ⚠️ | Gitea injects GITEA_* extras; not the full official set |
 
 ### Expression Engine
 
-| Feature | act | aksh | Notes |
-|---|:---:|:---:|---|
-| `contains()` | ✅ | ✅ | |
-| `startsWith()` / `endsWith()` | ✅ | ✅ | |
-| `format()` | ✅ | ✅ | |
-| `join()` | ✅ | ✅ | |
-| `toJSON()` / `fromJSON()` | ✅ | ✅ | |
-| `hashFiles()` | ✅ | ✅ | act has two impls (local + container) |
-| `success()` / `failure()` / `cancelled()` / `always()` | ✅ | ✅ | |
-| Type coercion (string/number/bool/null) | ✅ | ✅ | |
-| `*` filter syntax | ❌ | ✅ | `steps.*.outputs` |
-| Bracket access `['key']` | ⚠️ | ✅ | |
-| `{{` / `}}` escape sequences | ❌ | ✅ | |
-| Case-insensitive `==` | ⚠️ | ✅ | |
-| Parser | `rhysd/actionlint` AST | Custom Pratt parser | aksh owns its parser |
+| Feature | act | aksh | Gitea | Notes |
+|---|:---:|:---:|:---:|---|
+| `contains()` | ✅ | ✅ | ✅ | |
+| `startsWith()` / `endsWith()` | ✅ | ✅ | ✅ | |
+| `format()` | ✅ | ✅ | ✅ | Gitea fork implements the `{{`/`}}` brace state machine |
+| `join()` | ✅ | ✅ | ✅ | |
+| `toJSON()` / `fromJSON()` | ✅ | ✅ | ✅ | |
+| `hashFiles()` | ✅ | ✅ | ✅ | Gitea: container + local impls |
+| `success()` / `failure()` / `cancelled()` / `always()` | ✅ | ✅ | ✅ | |
+| Type coercion (string/number/bool/null) | ✅ | ✅ | ✅ | |
+| `*` filter syntax | ❌ | ✅ | ✅ | fixed in the fork (`ArrayDerefNode`) |
+| Bracket access `['key']` | ⚠️ | ✅ | ✅ | fixed in the fork (`IndexAccessNode`) |
+| `{{` / `}}` escape sequences | ❌ | ✅ | ✅ | fixed in the fork |
+| Case-insensitive `==` | ⚠️ | ✅ | ✅ | fixed in the fork (`compareString` lowercases) |
+| Parser | `rhysd/actionlint` AST | Custom Pratt parser | `act/exprparser` on actionlint AST | Gitea: fork-owned evaluator, not the upstream act one |
 
 ### Workflow Commands
 
-| Feature | act | aksh | Notes |
-|---|:---:|:---:|---|
-| `::set-output::` | ✅ | ✅ | Deprecated but supported |
-| `::set-env::` | ✅ | ✅ | |
-| `::add-path::` | ✅ | ✅ | |
-| `::add-mask::` | ✅ | ✅ | |
-| `::debug::` / `::warning::` / `::error::` / `::notice::` | ✅ | ✅ | |
-| `::group::` / `::endgroup::` | ✅ | ✅ | |
-| `::stop-commands::` | ✅ | ✅ | |
-| Problem matchers | ❌ | ✅ | `::add-matcher::` / `::remove-matcher::` |
+| Feature | act | aksh | Gitea | Notes |
+|---|:---:|:---:|:---:|---|
+| `::set-output::` | ✅ | ✅ | ✅ | Deprecated but supported |
+| `::set-env::` | ✅ | ✅ | ✅ | |
+| `::add-path::` | ✅ | ✅ | ✅ | |
+| `::add-mask::` | ✅ | ✅ | ✅ | |
+| `::debug::` / `::warning::` / `::error::` / `::notice::` | ✅ | ✅ | ✅ | Gitea folds `::error::` etc. into the log with source location (no annotation store) |
+| `::group::` / `::endgroup::` | ✅ | ✅ | ✅ | Gitea: web UI folds on these |
+| `::stop-commands::` | ✅ | ✅ | ✅ | |
+| Problem matchers | ❌ | ✅ | ❌ | Gitea reporter handles no `::add-matcher::` |
 
 ### Protocol & Runner Features
 
-| Feature | act | aksh | Notes |
-|---|:---:|:---:|---|
-| Faithful runner reimplementation | ✅ | ✅ | act reimplements in Go; aksh reimplements in Rust (faithful port of v2.336.0) |
-| AzDO wire protocol | ❌ | ✅ | act doesn't speak the protocol at all |
-| Runner registration handshake | ❌ | ✅ | RSA key exchange, session crypto |
-| Broker acquire/renew/complete | ❌ | ✅ | Full broker message lifecycle |
-| OIDC id-token provider | ❌ | ✅ | RS256-signed JWTs, JWKS/discovery endpoints |
-| Concurrency groups | ❌ | ✅ | Queue modes, `cancel-in-progress`, 87 property tests |
-| Job permissions / GITHUB_TOKEN scoping | ❌ | ⚠️ partial | Server issues local JWTs |
-| Job cancellation (wire protocol) | ❌ | ✅ | `CancellationTiming` with clamped timeouts |
-| Runner self-update | N/A | ❌ intentional | aksh acknowledges but doesn't update |
-| Runner groups | N/A | ✅ | Server-side group routing |
-| Ephemeral runners | N/A | ✅ | Exit-on-ack, session invalidation |
-| Results-service (Twirp) | ❌ | ✅ | 5 Twirp routes, signed blob URLs |
-| Timeline / live logs | ❌ | ✅ | WebSocket live-feed + PATCH timeline |
-| Job annotations | ❌ | ✅ | Feature-gated aggregation |
-| `connectionData` / location services | N/A | ✅ | 28 service definitions |
-| Background steps (v2.336.0) | ❌ | ⚠️ partial | DTO + flag implemented; full coordinator missing |
-| Locked dependencies announcement | ❌ | ✅ | v2.336.0 feature |
+| Feature | act | aksh | Gitea | Notes |
+|---|:---:|:---:|:---:|---|
+| Faithful runner reimplementation | ✅ | ✅ | ✅ | act_runner embeds the act fork in-tree under `act/` |
+| AzDO wire protocol | ❌ | ✅ | ❌ | Gitea: proprietary Connect RPC (`/api/actions`) |
+| Runner registration handshake | ❌ | ✅ | ⚠️ | Gitea: own token → uuid/agent-token flow; no RSA/AES session crypto |
+| Broker acquire/renew/complete | ❌ | ✅ | ⚠️ | Gitea: `FetchTask` / `UpdateTask` (heartbeat) instead of broker messages |
+| OIDC id-token provider | ❌ | ✅ | ❌ | Gitea: not wired on main — server never sets `actions_id_token_request_url` |
+| Concurrency groups | ❌ | ✅ | ✅ | Gitea: server-side (`services/actions/concurrency.go`), cancel-in-progress |
+| Job permissions / GITHUB_TOKEN scoping | ❌ | ✅ | ⚠️ | aksh mints GitHub App installation tokens per job, scoped to the repo and the effective `permissions:` (declared sets minted verbatim, implicit defaults clamped to installation grants; PAT fallback is opt-in, never silent). Gitea: one repo-scoped task token (`GITEA_TOKEN`/`GITHUB_TOKEN`) |
+| Job cancellation (wire protocol) | ❌ | ✅ | ⚠️ | Gitea: `RESULT_CANCELLED` returned on `UpdateTask` heartbeat; no `CancellationTiming` |
+| Runner self-update | N/A | ❌ intentional | ❌ | Gitea: nightly Docker images instead |
+| Runner groups | N/A | ✅ | ✅ | Gitea: repo / org / global runner scoping |
+| Ephemeral runners | N/A | ✅ | ✅ | Gitea: `--ephemeral` / `GITEA_RUNNER_EPHEMERAL`, cleaned up server-side |
+| Results-service (Twirp) | ❌ | ✅ | ❌ | Gitea: log/artifact HTTP APIs instead of Twirp |
+| Timeline / live logs | ❌ | ✅ | ⚠️ | Gitea: `UpdateLog` rows → DBFS → object storage; web UI polls, no WebSocket timeline |
+| Job annotations | ❌ | ✅ | ❌ | Gitea folds annotations into log text |
+| `connectionData` / location services | N/A | ✅ | ❌ | not applicable to Gitea's protocol |
+| Background steps (v2.336.0) | ❌ | ⚠️ partial | ❌ | |
+| Locked dependencies announcement | ❌ | ✅ | ❌ | v2.336.0 feature |
 
 ### Container & Isolation
 
-| Feature | act | aksh | Notes |
-|---|:---:|:---:|---|
-| Docker job containers | ✅ | ✅ | Different models: act uses idle container + exec; aksh delegates to the runner |
-| Service containers | ✅ | ✅ | |
-| Docker-in-Docker | ✅ | ✅ | act mounts host Docker socket; aksh runs Docker natively inside SmolVM guest microVMs (cgroups + overlayfs2 kernel) |
-| MicroVM isolation (SmolVM/libkrun) | ❌ | ✅ | Primary backend. Fork-based warm pool, 131 MB idle RSS per VM (measured). Docker actions run inside the VM. |
-| Process execution (no container) | ✅ (`-self-hosted`) | ✅ | |
-| macOS native runner | ⚠️ (`-self-hosted` workaround) | ✅ | aksh: `somac` — ephemeral macOS VMs via Virtualization.framework, copy-on-write golden snapshots |
-| Windows native runner | ⚠️ (`-self-hosted` workaround) | ✅ | aksh: `vowin` — ephemeral Windows 11 VMs via QEMU (ARM64/HVF on macOS, x86_64/KVM on Linux), warm memory snapshot restore |
-| Custom platform images (`-P`) | ✅ | N/A | act-specific concept |
-| Podman support | ✅ | ✅ | act via `DOCKER_HOST`; aksh via runner backend |
+| Feature | act | aksh | Gitea | Notes |
+|---|:---:|:---:|:---:|---|
+| Docker job containers | ✅ | ✅ | ✅ | act and act_runner share the idle-container + `docker exec` model |
+| Service containers | ✅ | ✅ | ✅ | Gitea: not in host mode |
+| Docker-in-Docker | ✅ | ✅ | ✅ | Gitea: `dind` / `dind-rootless` image flavours bundle a private daemon |
+| MicroVM isolation (SmolVM/libkrun) | ❌ | ✅ | ❌ | Gitea: shared-kernel Docker only |
+| Process execution (no container) | ✅ (`-self-hosted`) | ✅ | ✅ (`host` labels) | |
+| macOS native runner | ⚠️ (`-self-hosted` workaround) | ✅ | ✅ (`macos:host`) | |
+| Windows native runner | ⚠️ (`-self-hosted` workaround) | ✅ | ✅ (`windows:host`) | |
+| Custom platform images (`-P`) | ✅ | N/A | ✅ | Gitea: label schema `name:docker://image` |
+| Podman support | ✅ | ✅ | ✅ | act/act_runner via `DOCKER_HOST`; aksh via runner backend |
 
 ### Cache & Artifacts
 
-| Feature | act | aksh | Notes |
-|---|:---:|:---:|---|
-| Cache v1 (reserve/upload/commit/lookup) | ✅ | ✅ | |
-| Cache v2 (Twirp) | ❌ | ✅ | |
-| Artifact v1 (create/put/get/list) | ✅ | ✅ | |
-| Artifact v2 (Twirp + blob) | ✅ (v3/v4) | ✅ | |
-| File-backed storage | ✅ | ✅ | |
+| Feature | act | aksh | Gitea | Notes |
+|---|:---:|:---:|:---:|---|
+| Cache v1 (reserve/upload/commit/lookup) | ✅ | ✅ | ✅ | Gitea: **runner-side** embedded cache server (per-runner, not shared) |
+| Cache v2 (Twirp) | ❌ | ✅ | ⚠️ | Gitea: runner-side v2 API; action bundles patched to redirect URLs; no Twirp |
+| Artifact v1 (create/put/get/list) | ✅ | ✅ | ✅ | Gitea: server-side v3 REST (AzDO-style chunked upload) |
+| Artifact v2 (Twirp + blob) | ✅ (v3/v4) | ✅ | ⚠️ | Gitea: v4 Connect API + HMAC-signed URLs (not Twirp); `upload-artifact@v4` works via patching |
+| File-backed storage | ✅ | ✅ | ✅ | Gitea: DBFS → object storage for logs/artifacts; local dir for cache |
 
 ### Developer Experience
 
-| Feature | act | aksh | Notes |
-|---|:---:|:---:|---|
-| DAP debugger | ❌ | ✅ | 4,527 LOC, breakpoints, stepping, variable inspection, REPL |
-| Workflow graph visualization | ✅ (`act --graph`) | ❌ | |
-| Event simulation | ✅ (`-e event.json`) | ✅ | |
-| Dry run / list | ✅ (`-l`, `-n`) | ❌ | |
-| `.actrc` config file | ✅ | N/A | |
-| `.secrets` / `.vars` files | ✅ | ✅ | |
+| Feature | act | aksh | Gitea | Notes |
+|---|:---:|:---:|:---:|---|
+| DAP debugger | ❌ | ✅ | ❌ | aksh: 4,527 LOC, breakpoints, stepping, variable inspection, REPL |
+| Workflow graph visualization | ✅ (`act --graph`) | ❌ | ❌ | |
+| Event simulation | ✅ (`-e event.json`) | ✅ | ⚠️ | Gitea: manual run via web UI; no event-file injection |
+| Dry run / list | ✅ (`-l`, `-n`) | ❌ | ❌ | |
+| `.actrc` config file | ✅ | N/A | N/A | Gitea: YAML config (`config.yaml`) |
+| `.secrets` / `.vars` files | ✅ | ✅ | N/A | Gitea: server-side secrets/vars instead |
 
 ---
 
@@ -285,7 +334,86 @@ and acquirejob response schemas.
 
 ---
 
-## 6. Performance
+## 6. Gitea Actions runner (act_runner): the act fork with a control plane
+
+Gitea Actions pairs a **server** (the Gitea monolith itself) with **act_runner**
+(`gitea.com/gitea/runner`), a Go daemon that embeds the act fork in-tree under
+`act/`. It is the only entry here that is GitHub-compatible at the *workflow*
+level while being wire-incompatible with GitHub by design: the official runner
+binary is never used, and the server/runner link is Gitea's own protocol.
+
+### Division of labor — the opposite of aksh
+
+| | aksh | Gitea Actions |
+|---|---|---|
+| Who parses the workflow YAML | **Server** — builds a fully materialized `AgentJobRequestMessage` (every step, env, context) | **Runner** — the server sends the raw YAML (`Task.WorkflowPayload`) plus `needs` outputs/results; `generateWorkflow()` re-parses it and the act engine plans/executes |
+| Who schedules | Server (needs DAG, matrix, concurrency, fail-fast) | Server (`jobEmitterQueue` resolves needs/if/matrix/concurrency/max-parallel; `TryPickTask` claims atomically) |
+| What the runner sees | A pre-built job message | Raw YAML + `github` context + secrets + vars + needs — it must interpret |
+
+### Wire protocol: Connect RPC, not AzDO
+
+Base URL `<instance>/api/actions`; auth via `x-runner-uuid` + `x-runner-token`
+headers (constant-time compare server-side). All unary Connect RPCs:
+
+| RPC | Request → Response | Purpose |
+|---|---|---|
+| `ping.v1.PingService/Ping` | name → ok | Pre-registration connectivity check |
+| `runner.v1.RunnerService/Register` | name, token, version, labels, ephemeral, capabilities → runner `{id, uuid, token}` | Registration token exchanged for a per-runner agent token |
+| `/Declare` | version, labels, capabilities | Re-declare on daemon start; capability negotiation via response header |
+| `/FetchTask` | `tasks_version` → task or empty | **Long-poll** with server-side version counter; empty = idle, exponential backoff |
+| `/UpdateTask` | task state (steps, result, timestamps) + outputs → ack | Heartbeat + state; server can reply `RESULT_CANCELLED` to cancel the job |
+| `/UpdateLog` | `{index, rows[], no_more}` → `ack_index` | Batched log upload with ack |
+
+Artifacts are the one AzDO-compatible surface: a **v3 REST API**
+(create-upload-url → PUT chunks with md5/content-range → confirm → download,
+Bearer JWT) plus a **v4 Connect API** with HMAC-signed URLs, both server-side
+under `/api/actions_pipeline/`.
+
+### act limitations: fixed vs persisting
+
+| act CLI limitation | Status in act_runner | Evidence |
+|---|---|---|
+| Concurrency groups ❌ | **Fixed — server-side** | `services/actions/concurrency.go`; `PrepareToStartJobWithConcurrency` cancels prior group members |
+| `*` filter (`steps.*.outputs`) ❌ | **Fixed in fork** | `act/exprparser/interpreter.go` (`ArrayDerefNode`, slice property walk) |
+| `{{` / `}}` escapes ❌ | **Fixed in fork** | `format()` brace state machine (`functions.go`) |
+| Bracket access / case-insensitive `==` ⚠️ | **Fixed** | `IndexAccessNode`; `compareString` lowercases both sides |
+| macOS / Windows native ⚠️ | **Fixed** | first-class `host` labels (`macos:host`, `windows:host`) |
+| OIDC id tokens ❌ | **Missing on current main** | `generateTaskContext` sets only `token` + `gitea_runtime_token` — no `actions_id_token_request_url`; the runner forwards `ACTIONS_ID_TOKEN_REQUEST_URL/TOKEN` only if the server provides it |
+| GITHUB_TOKEN scoping ❌ | **Partial** | one task token (`GITEA_TOKEN` or `GITHUB_TOKEN`), repo-scoped secret; no per-permission JWT |
+| Problem matchers ❌ | **Still missing** | reporter handles `add-mask`/`debug`/`notice`/`warning`/`error`/`group`/`endgroup`/`stop-commands` — no `add-matcher` |
+| Wire protocol ❌ | **Still not GitHub-compatible** | by design — Connect RPC, Gitea-proprietary |
+| DAP debugger ❌ | Still missing | |
+
+### Gitea-specific divergences (act-vs-aksh table items that do *not* carry over)
+
+- **Cache is runner-local** — Gitea's server implements no `@actions/cache`;
+  act_runner runs an embedded cache server (or an external shared
+  `cache-server`), and it **patches action bundles** (`toolkit_patch.go`) so
+  `actions/upload-artifact@v4` and cache v2 work against Gitea URLs.
+- **Annotations are folded into log text** — "Gitea has no annotation store"
+  (`internal/pkg/report/reporter.go`, `formatAnnotation`).
+- **Host-mode jobs get no service containers** (README: "Unlike GitHub, a job
+  whose steps run on the host starts no service containers").
+- **`workflow_call` diverges**: the server overrides `event_name` to
+  `"workflow_call"` for callee jobs — explicit `FIXME` in
+  `services/actions/context.go`.
+- Gitea extras: `ACT=true` and `GITEA_ACTIONS=true` env by default, `GITEA_TOKEN`
+  priority over `GITHUB_TOKEN`, configurable action shallow-clone, job
+  hooks / post-task scripts.
+- The execution model is **the same Docker model as act** (per-job container,
+  `docker exec` per step, service containers on a job network); `dind` image
+  flavours bundle a private daemon. No microVM story.
+
+### Conformance
+
+Gitea Actions has no wire-level conformance methodology: behavior is enforced
+by unit tests and real-world deployment. This is the mirror image of aksh's
+golden-capture pipeline — Gitea optimizes for *workflow* compatibility on its
+own protocol, aksh for *protocol* compatibility with the official runner.
+
+---
+
+## 7. Performance
 
 ### 6.1 Scenario Benchmark Comparison (39 Golden Scenarios)
 
@@ -341,7 +469,7 @@ Each Preloop job ran in its own isolated SmolVM microVM forked from the warm run
 | 38 | `35-container-lifecycle` | `35-container-lifecycle.yml` | ✅ PASS | 2.40s | ❌ FAIL | 12.60s | ❌ FAIL | 30.00s | Normal (Success expected) |
 | 39 | `36-docker-action` | `36-docker-action.yml` | ✅ PASS | 2.36s | ❌ FAIL | 13.78s | ❌ FAIL | 3.12s | Normal (Success expected) |
 
-## 7. Isolation & Security
+## 8. Isolation & Security
 
 | | act | aksh |
 |---|---|---|
@@ -354,7 +482,7 @@ Each Preloop job ran in its own isolated SmolVM microVM forked from the warm run
 
 ---
 
-## 8. Conformance & Testing
+## 9. Conformance & Testing
 
 ### act
 
@@ -373,7 +501,7 @@ Each Preloop job ran in its own isolated SmolVM microVM forked from the warm run
 
 ---
 
-## 9. Known Gaps
+## 10. Known Gaps
 
 ### act's known gaps (features it doesn't support)
 
@@ -403,39 +531,56 @@ Each Preloop job ran in its own isolated SmolVM microVM forked from the warm run
 | Workflow graph visualization | ❌ Not implemented |
 | Dry run mode | ❌ Not implemented |
 
----
+### act_runner's known gaps (features still missing despite the fork)
 
-## 10. Community & Ecosystem
-
-| | act | aksh |
-|---|---|---|
-| **Stars** | ~71,000 | Private |
-| **Language** | Go | Rust |
-| **Contributors** | 300+ | Small team |
-| **Latest release** | v0.2.89 (2026-06-01) | Continuous |
-| **Release cadence** | Monthly | Continuous |
-| **Ecosystem** | `gh-act` CLI extension, `github-act-runner`, VS Code extension | Preloop product, SmolVM integration |
-| **License** | MIT | Proprietary |
-
----
-
-## 11. When to Use Which
-
-| Scenario | act | aksh |
-|---|---|---|
-| Quick local smoke test of a simple workflow | ✅ Best choice | Overkill |
-| Full-fidelity local CI matching GitHub behavior | ⚠️ Gaps will bite | ✅ Designed for this |
-| Debugging workflow logic step by step | ❌ No debugger | ✅ DAP debugger |
-| OIDC token testing | ❌ Not supported | ✅ Full OIDC provider |
-| Concurrency group testing | ❌ Not supported | ✅ Full implementation |
-| Full wire-protocol fidelity (server + runner) | ❌ No protocol | ✅ Both sides reimplemented |
-| Windows/macOS container workflows | ❌ Linux Docker only | ✅ macOS via `somac`, Windows via `vowin`, Linux via SmolVM |
-| Zero-setup, zero-dependency quick start | ✅ `brew install act` | ❌ Requires Rust build or Preloop install |
-| CI infrastructure (self-hosted replacement) | ❌ Not designed for it | ✅ Ephemeral runners, runner groups, multi-tenancy |
+| Feature | Status |
+|---|---|
+| OIDC id tokens | ❌ Not wired on Gitea main — server never sets `actions_id_token_request_url` |
+| Problem matchers (`::add-matcher::`) | ❌ Not implemented |
+| `$GITHUB_ARTIFACTS` / `$GITHUB_ARTIFACTS_LIST` | ❌ Not implemented |
+| Fine-grained GITHUB_TOKEN permission scoping | ⚠️ Partial — one repo-scoped task token |
+| Server-side `@actions/cache` | ❌ Runner-local cache; action bundles are patched to redirect |
+| Annotation store | ❌ Annotations folded into log text |
+| Service containers in host mode | ❌ Not supported (GitHub does support them) |
+| `github.event_name` inside `workflow_call` callees | ❌ Overridden to `"workflow_call"` (documented FIXME) |
+| Wire compatibility with the official runner | ❌ By design — Gitea-proprietary Connect RPC |
+| DAP debugger | ❌ Not implemented |
+| MicroVM isolation | ❌ Docker shared-kernel only |
 
 ---
 
-## 12. Summary
+## 11. Community & Ecosystem
+
+| | act | act_runner | aksh |
+|---|---|---|---|
+| **Stars** | ~71,000 | Gitea org (~mirrors act_runner) | Private |
+| **Language** | Go | Go 1.26 | Rust |
+| **Contributors** | 300+ | Gitea team + community | Small team |
+| **Latest release** | v0.2.89 (2026-06-01) | Continuous (nightly images) | Continuous |
+| **Release cadence** | Monthly | Continuous | Continuous |
+| **Ecosystem** | `gh-act` CLI extension, `github-act-runner`, VS Code extension | Gitea server, Docker images (`basic`/`dind`/`dind-rootless`), runner fleet | Preloop product, SmolVM integration |
+| **License** | MIT | MIT | Proprietary |
+
+---
+
+## 12. When to Use Which
+
+| Scenario | act | act_runner | aksh |
+|---|---|---|---|
+| Quick local smoke test of a simple workflow | ✅ Best choice | ❌ Needs a Gitea server | Overkill |
+| Self-hosted CI platform for a team | ❌ | ✅ Mature product: approval gates, org runners, reruns, retention | ⚠️ In development |
+| Full-fidelity local CI matching GitHub behavior | ⚠️ Gaps will bite | ⚠️ Workflow-level compat; protocol is Gitea's | ✅ Designed for this |
+| Debugging workflow logic step by step | ❌ No debugger | ❌ No debugger | ✅ DAP debugger |
+| OIDC token testing | ❌ Not supported | ❌ Not wired | ✅ Full OIDC provider |
+| Concurrency group testing | ❌ Not supported | ✅ Server-side implementation | ✅ Full implementation |
+| Full wire-protocol fidelity (server + runner) | ❌ No protocol | ❌ Gitea-proprietary protocol | ✅ Both sides reimplemented |
+| Windows/macOS container workflows | ❌ Linux Docker only | ⚠️ `host` labels run natively; Docker jobs Linux-only | ✅ macOS via `somac`, Windows via `vowin`, Linux via SmolVM |
+| Zero-setup, zero-dependency quick start | ✅ `brew install act` | ❌ Needs a Gitea instance | ❌ Requires Rust build or Preloop install |
+| CI infrastructure (self-hosted replacement) | ❌ Not designed for it | ✅ Production-grade (MIT, deployed fleets) | ✅ Ephemeral runners, runner groups, multi-tenancy |
+
+---
+
+## 13. Summary
 
 **act** is a pragmatic tool for developers who want to quickly test workflows
 locally. It reimplements the runner in Go and runs steps in Docker. It's easy to
@@ -451,6 +596,20 @@ verified against golden captures. It has rigorous conformance testing, sub-host-
 performance, a DAP debugger, and full OIDC/concurrency support. It's more
 complex to set up but provides much higher fidelity.
 
-The fundamental difference is scope: **act reimplements only the runner; aksh
-implements both the server and the runner** with the real wire protocol between them. This single decision cascades through every other
-difference in the comparison.
+**Gitea Actions (act_runner)** is act with a control plane: the Gitea server
+does all scheduling (needs, matrix, concurrency, max-parallel, fork-PR
+approval) and hands each runner a task containing the raw workflow YAML; the
+runner interprets it with the in-tree act fork and executes in Docker (or on
+the host via `host` labels). The fork closed most of act's expression gaps
+(`*` filter, `{{`/`}}` escapes, bracket access) and the server fixed
+concurrency, but OIDC id tokens, problem matchers, fine-grained token scoping,
+and a server-side cache are still missing, and the wire protocol is Gitea's
+own Connect RPC — the official runner binary cannot connect. It is the most
+production-deployed entry here (MIT, mature server features), but "GitHub
+compatible" stops at the workflow syntax.
+
+The fundamental difference is scope: **act reimplements only the runner;
+act_runner reimplements the runner behind Gitea's own protocol; agent-ci
+reimplements the server; aksh implements both the server and the runner** with
+the real AzDO wire protocol between them. That single decision cascades
+through every other difference in the comparison.

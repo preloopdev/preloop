@@ -21,16 +21,26 @@ struct GithubCommitResponse {
 /// GitHub resolves these references before handing the expanded workflow to
 /// the runner. The server performs the equivalent resolution for references
 /// not already supplied by a caller (local workflows and test fixtures).
+///
+/// `github_token` is the engine's static credential (env `AKSH_GITHUB_TOKEN`
+/// or the config file's `github.pat` — the caller resolves the precedence),
+/// attached as a bearer header so private `uses: owner/repo/...` references
+/// resolve without a separately exported token.
 pub(crate) async fn resolve_remote_workflows(
     submission: &mut WorkflowSubmission,
     root_workflow: &aksh_gha_parser::Workflow,
+    github_token: Option<&str>,
 ) -> Result<(), ApiError> {
     if !root_workflow.jobs.values().any(|job| job.uses.is_some()) {
         return Ok(());
     }
 
     let mut client = None;
-    let token = std::env::var("AKSH_GITHUB_TOKEN").ok();
+    let token = github_token;
+    // Mirrors `github::fetch_workflows_at`: tests point this at a local mock,
+    // and GHES installs can point it at their instance.
+    let api_base = std::env::var("AKSH_GITHUB_API_URL")
+        .unwrap_or_else(|_| "https://api.github.com".to_owned());
     let mut queue = vec![(root_workflow.clone(), 0usize)];
     let mut visited = std::collections::BTreeSet::new();
     while let Some((workflow, depth)) = queue.pop() {
@@ -68,10 +78,10 @@ pub(crate) async fn resolve_remote_workflows(
             );
             let mut request = client
                 .get(format!(
-                    "https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={git_ref}"
+                    "{api_base}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}"
                 ))
                 .header(reqwest::header::ACCEPT, "application/vnd.github+json");
-            if let Some(token) = token.as_deref() {
+            if let Some(token) = token {
                 request = request.bearer_auth(token);
             }
             let response = request.send().await.map_err(|error| {
@@ -91,10 +101,9 @@ pub(crate) async fn resolve_remote_workflows(
                 ApiError::bad_gateway(format!("decode reusable workflow `{reference}`: {error}"))
             })?;
 
-            let mut commit_request = client.get(format!(
-                "https://api.github.com/repos/{owner}/{repo}/commits/{git_ref}"
-            ));
-            if let Some(token) = token.as_deref() {
+            let mut commit_request =
+                client.get(format!("{api_base}/repos/{owner}/{repo}/commits/{git_ref}"));
+            if let Some(token) = token {
                 commit_request = commit_request.bearer_auth(token);
             }
             let commit_response = commit_request.send().await.map_err(|error| {

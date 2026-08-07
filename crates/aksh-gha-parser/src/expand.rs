@@ -35,6 +35,33 @@ fn resolved_job_name(
     }
 }
 
+/// Resolve `runs-on` for one concrete matrix combination.
+///
+/// `runs-on: ${{ matrix.os }}` is the single most common shape in real
+/// workflows (tokio, caddy and uv all use it), and the label decides which
+/// machine the job can run on. Leaving the raw `${{ … }}` in place produces a
+/// label no runner can ever advertise, so the cell is expanded, queued, and
+/// then waits forever — the failure looks like a scheduling bug rather than an
+/// unevaluated expression. GitHub evaluates `runs-on` with the matrix in
+/// context, so every other per-cell field here already resolves the same way.
+fn resolved_runs_on(
+    labels: Vec<String>,
+    matrix: &IndexMap<String, Value>,
+    inputs: Option<&BTreeMap<String, Value>>,
+) -> Vec<String> {
+    let context = expression_context(matrix, inputs);
+    labels
+        .into_iter()
+        .map(|label| {
+            if !label.contains("${{") {
+                return label;
+            }
+            crate::eval::resolve_string(&label, &context).unwrap_or(label)
+        })
+        .filter(|label| !label.trim().is_empty())
+        .collect()
+}
+
 fn resolved_continue_on_error(
     job_id: &str,
     value: Option<&JobContinueOnError>,
@@ -329,6 +356,7 @@ pub fn expand_jobs(workflow: &Workflow) -> Result<Vec<JobPlan>, ParserError> {
     for (job_id, job) in &workflow.jobs {
         let (matrixes, deferred_matrix) =
             expand_matrix(job_id, job.strategy.matrix.as_ref(), None)?.into_cells();
+        let matrix_deferred = deferred_matrix.is_some();
         let matrix_count = matrixes.len();
         for (matrix_index, matrix) in matrixes.into_iter().enumerate() {
             let oidc_environment = oidc_environment(job.environment.as_ref(), &matrix);
@@ -341,10 +369,12 @@ pub fn expand_jobs(workflow: &Workflow) -> Result<Vec<JobPlan>, ParserError> {
                 expanded_id,
                 matrix,
                 (matrix_count > 1).then_some(matrix_index + 1),
+                (matrix_count > 1).then_some(matrix_count),
                 env,
                 oidc_environment,
                 workflow.permissions.as_ref(),
                 None,
+                matrix_deferred,
             )?;
             plan.deferred_matrix = deferred_matrix.clone();
             plans.push(plan);
@@ -361,23 +391,50 @@ fn job_plan_from_job(
     expanded_id: String,
     matrix: IndexMap<String, Value>,
     matrix_index: Option<usize>,
+    matrix_total: Option<usize>,
     env: BTreeMap<String, String>,
     oidc_environment: Option<String>,
     workflow_permissions: Option<&Value>,
     inputs: Option<&BTreeMap<String, Value>>,
+    matrix_deferred: bool,
 ) -> Result<JobPlan, ParserError> {
     let (concurrency_group, concurrency_cancel_in_progress, concurrency_queue) =
         concurrency_fields(job.concurrency.as_ref());
-    let continue_on_error =
-        resolved_continue_on_error(job_id, job.continue_on_error.as_ref(), &matrix)?;
-    let fail_fast = resolve_deferred_bool(job.strategy.fail_fast.as_ref(), &matrix, inputs, true)?;
-    let max_parallel =
-        resolve_deferred_number(job.strategy.max_parallel.as_ref(), &matrix, inputs)?;
+    // A needs-deferred matrix leaves a placeholder node with an intentionally
+    // empty matrix. Matrix-dependent `continue-on-error`/`fail-fast`/
+    // `max-parallel` expressions cannot be evaluated against it (they resolve
+    // to null and would be rejected), so they are deferred: literals still
+    // apply, expressions keep their defaults until the runtime fan-out
+    // re-resolves them per concrete combination.
+    let continue_on_error = if matrix_deferred {
+        match job.continue_on_error {
+            Some(JobContinueOnError::Bool(value)) => value,
+            _ => false,
+        }
+    } else {
+        resolved_continue_on_error(job_id, job.continue_on_error.as_ref(), &matrix)?
+    };
+    let fail_fast = if matrix_deferred {
+        match job.strategy.fail_fast {
+            Some(DeferredBool::Literal(value)) => value,
+            _ => true,
+        }
+    } else {
+        resolve_deferred_bool(job.strategy.fail_fast.as_ref(), &matrix, inputs, true)?
+    };
+    let max_parallel = if matrix_deferred {
+        match job.strategy.max_parallel {
+            Some(DeferredNumber::Literal(value)) => Some(value),
+            _ => None,
+        }
+    } else {
+        resolve_deferred_number(job.strategy.max_parallel.as_ref(), &matrix, inputs)?
+    };
     let steps = job
         .steps
         .iter()
         .cloned()
-        .map(|step| step_plan(step, &job.defaults, &matrix, inputs))
+        .map(|step| step_plan(step, &job.defaults, &matrix, inputs, matrix_deferred))
         .collect::<Result<Vec<_>, _>>()?;
     let name = resolved_job_name(job.name.as_deref(), &expanded_id, &matrix, inputs);
     Ok(JobPlan {
@@ -385,10 +442,11 @@ fn job_plan_from_job(
         base_id: job_id.to_owned(),
         name,
         runner_group: job.runs_on.group(),
-        runs_on: job.runs_on.labels(),
+        runs_on: resolved_runs_on(job.runs_on.labels(), &matrix, inputs),
         needs: job.needs.ids(),
         matrix,
         matrix_index,
+        matrix_total,
         // Set by the caller, which is what knows whether the matrix was
         // deferred; a concrete combination never carries an expression.
         deferred_matrix: None,
@@ -690,6 +748,7 @@ fn expand_jobs_with_reusables_internal(
                     needs: job.needs.ids(),
                     matrix,
                     matrix_index: (matrix_count > 1).then_some(matrix_index + 1),
+                    matrix_total: (matrix_count > 1).then_some(matrix_count),
                     deferred_matrix: deferred_matrix.clone(),
                     env,
                     steps: Vec::new(),
@@ -746,6 +805,7 @@ fn expand_jobs_with_reusables_internal(
         // (and its `if:` gating) until the runtime fan-out replaces it.
         let (matrix_cells, deferred_matrix) =
             expand_matrix(job_id, job.strategy.matrix.as_ref(), inputs)?.into_cells();
+        let matrix_deferred = deferred_matrix.is_some();
         let matrix_count = matrix_cells.len();
         for (matrix_index, matrix) in matrix_cells.into_iter().enumerate() {
             let oidc_environment = oidc_environment(job.environment.as_ref(), &matrix);
@@ -758,10 +818,12 @@ fn expand_jobs_with_reusables_internal(
                 expanded_id,
                 matrix,
                 (matrix_count > 1).then_some(matrix_index + 1),
+                (matrix_count > 1).then_some(matrix_count),
                 env,
                 oidc_environment,
                 workflow.permissions.as_ref(),
                 inputs,
+                matrix_deferred,
             )?;
             plan.deferred_matrix = deferred_matrix.clone();
             plans.push(plan);
@@ -861,6 +923,16 @@ pub fn expand_reusable_call(
             caller_plan.id.0
         )));
     };
+    if caller_plan.deferred_matrix.is_some() {
+        // A caller whose matrix reads `needs.*` cannot be materialized from
+        // the empty placeholder matrix: the matrix must be resolved against
+        // the completed needs outputs first, then one callee leg per
+        // combination. Refuse the single-empty-matrix expansion.
+        return Err(ParserError::InvalidExpression(format!(
+            "job `{}` has a needs-deferred matrix; resolve it with expand_deferred_reusable_call before materializing the callee subtree",
+            caller_plan.id.0
+        )));
+    }
     let uses = &call.uses;
     let mut reusable_calls = BTreeMap::new();
     let mut inner = expand_jobs_with_reusables_internal(
@@ -968,6 +1040,7 @@ fn step_plan(
     defaults: &Option<JobDefaults>,
     matrix: &IndexMap<String, Value>,
     inputs: Option<&BTreeMap<String, Value>>,
+    matrix_deferred: bool,
 ) -> Result<StepPlan, ParserError> {
     // Merge job-level defaults into step — step values take precedence.
     let working_directory = step.working_directory.or_else(|| {
@@ -993,7 +1066,16 @@ fn step_plan(
         working_directory,
         shell,
         continue_on_error: step.continue_on_error.as_ref().map_or(Ok(None), |value| {
-            resolve_deferred_bool(Some(value), matrix, inputs, false).map(Some)
+            if matrix_deferred {
+                // Same deferral as the job-level scalars: the placeholder's
+                // matrix is empty, so expressions wait for the fan-out.
+                Ok(match value {
+                    DeferredBool::Literal(value) => Some(*value),
+                    DeferredBool::Expression(_) => None,
+                })
+            } else {
+                resolve_deferred_bool(Some(value), matrix, inputs, false).map(Some)
+            }
         })?,
     })
 }
@@ -1083,6 +1165,14 @@ fn expand_matrix(
 }
 
 /// Dynamically expand a deferred matrix job given resolved `needs` outputs.
+///
+/// The node may live inside a reusable-workflow subtree: its runtime base id
+/// is caller-prefixed (`call/build`) for run-namespace uniqueness, but the
+/// called workflow's jobs are keyed by the callee-local id (`build`), and its
+/// expression references callee-local needs (`needs.setup`, not
+/// `needs.call/setup`). The prefixed run ids of the produced cells are kept;
+/// only the workflow lookup and the `needs` context use the callee-local
+/// forms.
 pub fn expand_deferred_matrix_job(
     workflow: &Workflow,
     job_id: &str,
@@ -1090,12 +1180,78 @@ pub fn expand_deferred_matrix_job(
     needs_outputs: &BTreeMap<String, BTreeMap<String, Value>>,
     inputs: Option<&BTreeMap<String, Value>>,
 ) -> Result<Vec<JobPlan>, ParserError> {
-    let Some(job) = workflow.jobs.get(job_id) else {
-        return Err(ParserError::InvalidExpression(format!(
-            "job `{job_id}` not found in workflow"
-        )));
-    };
+    let job = workflow
+        .jobs
+        .get(job_id)
+        .or_else(|| workflow.jobs.get(callee_local_key(job_id)))
+        .ok_or_else(|| {
+            ParserError::InvalidExpression(format!("job `{job_id}` not found in workflow"))
+        })?;
 
+    let combinations = resolve_deferred_matrix_cells(job_id, expression, needs_outputs, inputs)?;
+    let matrix_count = combinations.len();
+
+    let global_env = workflow.env.clone().into_strings();
+    let mut plans = Vec::new();
+    // The fan-out cells live in the run's namespace, where the callee's own
+    // needs are caller-prefixed (`call/setup`); re-apply the node's prefix so
+    // their dependencies resolve. A root-level node has no prefix.
+    let needs_prefix = job_id
+        .rsplit_once('/')
+        .map(|(prefix, _)| format!("{prefix}/"));
+
+    for (matrix_index, matrix) in combinations.into_iter().enumerate() {
+        let oidc_environment = oidc_environment(job.environment.as_ref(), &matrix);
+        let expanded_id = matrix_expand::expanded_job_id(job_id, &matrix);
+        let mut env = global_env.clone();
+        env.extend(job.env.clone().into_strings());
+        let mut plan = job_plan_from_job(
+            job_id,
+            job,
+            expanded_id,
+            matrix,
+            (matrix_count > 1).then_some(matrix_index + 1),
+            (matrix_count > 1).then_some(matrix_count),
+            env,
+            oidc_environment,
+            workflow.permissions.as_ref(),
+            inputs,
+            false,
+        )?;
+        if let Some(prefix) = &needs_prefix {
+            plan.needs = plan
+                .needs
+                .iter()
+                .map(|need| JobId(format!("{prefix}{}", need.0)))
+                .collect();
+        }
+        plans.push(plan);
+    }
+
+    Ok(plans)
+}
+
+/// Strip the reusable-caller prefix from a runtime job key, recovering the
+/// callee-local id that the called workflow's own expressions and job map
+/// use. Run ids keep their prefix; only workflow lookups and `needs` context
+/// keys take the callee-local form. A root-level key has no prefix.
+fn callee_local_key(key: &str) -> &str {
+    key.rsplit_once('/').map(|(_, tail)| tail).unwrap_or(key)
+}
+
+/// Resolve a deferred matrix expression against completed `needs` outputs,
+/// returning the concrete combinations in GitHub's matrix order.
+///
+/// `needs` outputs arrive keyed by the run's base ids — caller-prefixed when
+/// the node lives in a reusable subtree (`call/setup`) — while the expression
+/// references callee-local ids (`needs.setup`), so keys are normalized with
+/// [`callee_local_key`] when building the evaluation context.
+fn resolve_deferred_matrix_cells(
+    job_id: &str,
+    expression: &str,
+    needs_outputs: &BTreeMap<String, BTreeMap<String, Value>>,
+    inputs: Option<&BTreeMap<String, Value>>,
+) -> Result<Vec<IndexMap<String, Value>>, ParserError> {
     let mut ctx = Context::default();
     let mut needs_map = serde_json::Map::new();
     for (need_id, outputs) in needs_outputs {
@@ -1105,7 +1261,10 @@ pub fn expand_deferred_matrix_job(
             out_map.insert(k.clone(), v.clone());
         }
         job_map.insert("outputs".to_string(), Value::Object(out_map));
-        needs_map.insert(need_id.clone(), Value::Object(job_map));
+        needs_map.insert(
+            callee_local_key(need_id).to_string(),
+            Value::Object(job_map),
+        );
     }
     ctx.insert("needs", Value::Object(needs_map));
 
@@ -1119,31 +1278,96 @@ pub fn expand_deferred_matrix_job(
 
     let value = eval_expression(expression, &ctx)
         .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
-
     let spec = matrix_expand::value_to_matrix_spec(job_id, &value)?;
-    let combinations = matrix_expand::expand_matrix_spec(&spec);
-    let matrix_count = combinations.len();
+    Ok(matrix_expand::expand_matrix_spec(&spec)
+        .into_iter()
+        .map(|combination| combination.values)
+        .collect())
+}
 
-    let global_env = workflow.env.clone().into_strings();
-    let mut plans = Vec::new();
-
-    for (matrix_index, matrix) in combinations.into_iter().enumerate() {
-        let oidc_environment = oidc_environment(job.environment.as_ref(), &matrix.values);
-        let expanded_id = matrix_expand::expanded_job_id(job_id, &matrix.values);
-        let mut env = global_env.clone();
-        env.extend(job.env.clone().into_strings());
-        plans.push(job_plan_from_job(
-            job_id,
-            job,
-            expanded_id,
-            matrix.values,
-            (matrix_count > 1).then_some(matrix_index + 1),
-            env,
-            oidc_environment,
-            workflow.permissions.as_ref(),
-            inputs,
-        )?);
+/// Expand a deferred reusable-workflow caller whose matrix depends on
+/// `needs.*`, composing the two deferred expansions in the right order.
+///
+/// The caller node keeps a single un-suffixed placeholder at parse time — its
+/// matrix cannot be evaluated until `needs` outputs exist — but it cannot be
+/// materialized from that empty matrix either. At runtime the matrix is
+/// resolved against the completed `needs` outputs first, then the callee
+/// subtree is materialized once per combination, with each leg inheriting the
+/// caller's matrix cell: the same shape parse-time expansion produces for a
+/// static-matrix caller, where every cell has its own caller node.
+///
+/// `caller_workflow` must be the workflow containing the caller job: the root
+/// workflow for a root-level caller, or the called workflow that holds the
+/// caller for a nested one. Nested callers keep their prefixed ids and are
+/// expanded through this same path at their own runtime promotion.
+pub fn expand_deferred_reusable_call(
+    called: &Workflow,
+    caller_workflow: &Workflow,
+    caller_plan: &JobPlan,
+    needs_outputs: &BTreeMap<String, BTreeMap<String, Value>>,
+    reusable_workflows: &BTreeMap<String, String>,
+    reusable_workflow_shas: &BTreeMap<String, String>,
+) -> Result<ExpandedWorkflows, ParserError> {
+    if caller_plan.reusable_call.is_none() {
+        return Err(ParserError::InvalidExpression(format!(
+            "job `{}` is not a reusable-workflow caller",
+            caller_plan.id.0
+        )));
     }
+    let Some(expression) = caller_plan.deferred_matrix.as_deref() else {
+        return Err(ParserError::InvalidExpression(format!(
+            "job `{}` has no deferred matrix to resolve",
+            caller_plan.id.0
+        )));
+    };
 
-    Ok(plans)
+    // The caller's raw `name:` template renders each cell's display name the
+    // way parse-time expansion renders a static-matrix caller. The caller job
+    // lives in `caller_workflow` under the callee-local id (its base id minus
+    // any caller prefix).
+    let raw_name = caller_workflow
+        .jobs
+        .get(&caller_plan.base_id)
+        .or_else(|| {
+            caller_plan
+                .base_id
+                .rsplit_once('/')
+                .and_then(|(_, tail)| caller_workflow.jobs.get(tail))
+        })
+        .and_then(|job| job.name.clone());
+
+    let cells = resolve_deferred_matrix_cells(
+        &caller_plan.base_id,
+        expression,
+        needs_outputs,
+        Some(&caller_plan.inputs),
+    )?;
+    let matrix_count = cells.len();
+    let mut jobs = Vec::new();
+    let mut reusable_calls = BTreeMap::new();
+    for (matrix_index, cell) in cells.into_iter().enumerate() {
+        let mut cell_plan = caller_plan.clone();
+        cell_plan.id = JobId(matrix_expand::expanded_job_id(&caller_plan.id.0, &cell));
+        cell_plan.name = resolved_job_name(
+            raw_name.as_deref(),
+            &cell_plan.id.0,
+            &cell,
+            Some(&caller_plan.inputs),
+        );
+        cell_plan.matrix = cell;
+        cell_plan.matrix_index = (matrix_count > 1).then_some(matrix_index + 1);
+        cell_plan.deferred_matrix = None;
+        let expanded = expand_reusable_call(
+            called,
+            &cell_plan,
+            reusable_workflows,
+            reusable_workflow_shas,
+        )?;
+        jobs.extend(expanded.jobs);
+        reusable_calls.extend(expanded.reusable_calls);
+    }
+    Ok(ExpandedWorkflows {
+        jobs,
+        reusable_calls,
+    })
 }

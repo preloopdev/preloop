@@ -388,9 +388,14 @@
   }
   .matrix-table thead th:first-child { padding-left: var(--space-lg); }
   .matrix-table thead th.col-act,
-  .matrix-table thead th.col-aksh {
+  .matrix-table thead th.col-aksh,
+  .matrix-table thead th.col-gitea {
     text-align: center;
     width: 90px;
+  }
+  .matrix-table thead th.col-gitea {
+    background: var(--yellow-bg);
+    color: var(--yellow);
   }
   .matrix-table tbody tr {
     border-bottom: 1px solid var(--border-subtle);
@@ -687,6 +692,7 @@
     <a href="#matrix">Feature Matrix</a>
     <a href="#performance">Performance</a>
     <a href="#protocol">Protocol</a>
+    <a href="#gitea">Gitea</a>
     <a href="#conformance">Conformance</a>
     <a href="#gaps">Known Gaps</a>
   </div>
@@ -696,7 +702,7 @@
 <header class="hero">
   <div class="container">
     <p class="hero-subtitle">Architectural Comparison</p>
-    <h1>Three ways to run GitHub Actions locally. <em>One reimplements the runner. Two reimplement the server. Only one reimplements everything.</em></h1>
+    <h1>Four ways to run GitHub Actions locally. <em>Two reimplement the runner. Two reimplement the server. Only one reimplements everything.</em></h1>
     <p class="hero-desc">
       nektos/act reimplements the runner in Go and executes steps in Docker.
       agent-ci (RedwoodJS) reimplements the server in TypeScript, launching the official runner binary in Docker containers — with pause-on-failure for AI agents.
@@ -791,6 +797,57 @@
           <dt>Container</dt><dd>Docker required</dd>
           <dt>Host mode</dt><dd>-self-hosted flag</dd>
           <dt>Runner binary</dt><dd>Not used</dd>
+        </dl>
+      </div>
+
+      <!-- act_runner (Gitea Actions) -->
+      <div class="arch-card act">
+        <div class="arch-card-header">
+          <div class="icon">gta</div>
+          <div>
+            <h3>Gitea Actions (act_runner)</h3>
+            <span class="tag">Replaces the runner — with a server</span>
+          </div>
+        </div>
+        <p class="strategy">
+          <strong>Act with a control plane.</strong> The Gitea monolith detects workflows, resolves the
+          job DAG (needs / if / matrix / concurrency / max-parallel) and picks a runner by label. Each
+          task carries the <strong>raw workflow YAML</strong> plus the <code>github</code> context,
+          secrets, vars and <code>needs</code> outputs; the runner parses and executes it with an
+          in-tree fork of act (<code>act/</code>). Server ↔ runner link is a proprietary
+          <strong>Connect RPC</strong> protocol (<code>/api/actions</code>) — the official runner
+          binary is never used. The fork fixed most of act's expression gaps; OIDC id-tokens,
+          problem matchers and server-side cache are still missing.
+        </p>
+        <div class="diagram-wrap" style="margin-bottom: var(--space-lg);">
+          <pre>
+  ┌──────────────────────────────────┐
+  │    Gitea server (Go monolith)    │
+  │                                  │
+  │  detect ─► job DAG ─► concurrency│
+  │  needs/matrix/max-parallel ─►    │
+  │  label match                     │
+  └───────────────┬──────────────────┘
+                  │ Connect RPC (protobuf)
+                  │ Ping, Register/Declare,
+                  │ FetchTask/UpdateTask/
+                  │ UpdateLog
+  ┌───────────────▼──────────────────┐
+  │  act_runner (Go, act fork)       │
+  │  parses YAML, plans stages,      │
+  │  executes steps                  │
+  │                                  │
+  │  Docker job container + exec     │
+  │  or host mode (labels)           │
+  └──────────────────────────────────┘</pre>
+        </div>
+        <dl class="arch-meta">
+          <dt>Language</dt><dd>Go 1.26 (act fork in-tree)</dd>
+          <dt>Server</dt><dd>Gitea monolith (scheduling only)</dd>
+          <dt>Expression parser</dt><dd>act/exprparser + actionlint AST</dd>
+          <dt>Container</dt><dd>Docker per-job container + exec</dd>
+          <dt>Host mode</dt><dd>host schema labels (macos/windows)</dd>
+          <dt>Protocol</dt><dd>Gitea Connect RPC (not GitHub)</dd>
         </dl>
       </div>
 
@@ -937,733 +994,834 @@
             <th class="col-act">act</th>
             <th class="col-aksh" style="background: oklch(0.24 0.03 145);">agent-ci</th>
             <th class="col-aksh">aksh</th>
+            <th class="col-gitea">Gitea</th>
             <th>Notes</th>
           </tr>
         </thead>
         <tbody>
 
           <!-- WORKFLOW -->
-          <tr class="group-row" data-group="workflow"><td colspan="4">Core Workflow Features</td></tr>
+          <tr class="group-row" data-group="workflow"><td colspan="5">Core Workflow Features</td></tr>
           <tr data-group="workflow">
             <td>Workflow YAML parsing</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">Both parse the full schema. aksh uses typed model with IndexMap ordering.</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">Both parse the full schema. aksh uses typed model with IndexMap ordering.</td>
           </tr>
           <tr data-group="workflow">
             <td><code>run:</code> steps</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes"></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
           </tr>
           <tr data-group="workflow">
             <td><code>uses:</code> actions (remote)</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">aksh: batch <code>runnerresolve/actions</code> + tarball cache with ticket auth</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">aksh: batch <code>runnerresolve/actions</code> + tarball cache with ticket auth</td>
           </tr>
           <tr data-group="workflow">
             <td><code>uses:</code> actions (local)</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes"></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
           </tr>
           <tr data-group="workflow">
             <td><code>uses:</code> Docker actions</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">act builds/pulls separate container sharing job network</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">act builds/pulls separate container sharing job network</td>
           </tr>
           <tr data-group="workflow">
             <td><code>uses: $/</code> self-repo syntax</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">v2.336.0 feature. Feature-gated + composite parent root resolution.</td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">v2.336.0 feature. Feature-gated + composite parent root resolution.</td>
           </tr>
           <tr data-group="workflow">
             <td>Composite actions</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">agent-ci + aksh: official runner handles composites. aksh: 10-deep nesting, pre/post steps, output evaluation.</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">agent-ci + aksh: official runner handles composites. aksh: 10-deep nesting, pre/post steps, output evaluation.</td>
           </tr>
           <tr data-group="workflow">
             <td>Reusable workflows (<code>workflow_call</code>)</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">aksh: <code>secrets: inherit</code>, input type validation, OIDC propagation, depth=4</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">aksh: <code>secrets: inherit</code>, input type validation, OIDC propagation, depth=4 Gitea: depth 5; github.event_name overridden to workflow_call in callees</td>
           </tr>
           <tr data-group="workflow">
             <td>Matrix strategy</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">aksh preserves IndexMap insertion order (matches GitHub)</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">aksh preserves IndexMap insertion order (matches GitHub)</td>
           </tr>
           <tr data-group="workflow">
             <td><code>include</code> / <code>exclude</code> in matrix</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes"></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
           </tr>
           <tr data-group="workflow">
             <td><code>needs</code> DAG scheduling</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">act: stages (serial) × runs (parallel). aksh: dependency-gated scheduler with output propagation.</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">act: stages (serial) × runs (parallel). aksh: dependency-gated scheduler with output propagation. Gitea: resolved server-side (jobEmitterQueue)</td>
           </tr>
           <tr data-group="workflow">
             <td>Job outputs</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes"></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
           </tr>
           <tr data-group="workflow">
             <td><code>if</code> conditionals (job/step)</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes"></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
           </tr>
           <tr data-group="workflow">
             <td><code>continue-on-error</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes"></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
           </tr>
           <tr data-group="workflow">
             <td><code>timeout-minutes</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes"></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"> Gitea: runner.timeout default 3h + server StopEndlessTasks</td>
           </tr>
           <tr data-group="workflow">
             <td><code>defaults.run</code> (shell, working-directory)</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes"></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
           </tr>
           <tr data-group="workflow">
             <td><code>workflow_dispatch</code> inputs</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-partial">◐</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes"></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
           </tr>
           <tr data-group="workflow">
             <td><code>run-name</code> expression</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
                         <td class="col-status"><span class="badge badge-partial">◐</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">aksh parses and evaluates with <code>github</code>/<code>inputs</code>/<code>vars</code> contexts at submit</td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+<td class="col-notes">aksh parses and evaluates with <code>github</code>/<code>inputs</code>/<code>vars</code> contexts at submit Gitea: displayed; expression evaluation unverified</td>
           </tr>
           <tr data-group="workflow">
             <td>Concurrency groups</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">aksh: queue modes (single/max), cancel-in-progress, FIFO, 87 property tests</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">aksh: queue modes (single/max), cancel-in-progress, FIFO, 87 property tests Gitea: server-side, cancel-in-progress</td>
           </tr>
           <tr data-group="workflow">
             <td>Trigger matching (branches/tags/paths)</td>
             <td class="col-status"><span class="badge badge-partial">◐</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">act supports basic triggers; aksh: branches/tags/paths/types/schedule/dispatch</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">act supports basic triggers; aksh: branches/tags/paths/types/schedule/dispatch Gitea: server-side notifier filters</td>
           </tr>
 
           <!-- ENVIRONMENT -->
-          <tr class="group-row" data-group="env"><td colspan="4">Environment &amp; Contexts</td></tr>
+          <tr class="group-row" data-group="env"><td colspan="5">Environment &amp; Contexts</td></tr>
           <tr data-group="env">
             <td><code>$GITHUB_ENV</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes"></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
           </tr>
           <tr data-group="env">
             <td><code>$GITHUB_OUTPUT</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes"></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
           </tr>
           <tr data-group="env">
             <td><code>$GITHUB_PATH</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes"></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
           </tr>
           <tr data-group="env">
             <td><code>$GITHUB_STEP_SUMMARY</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes"></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
           </tr>
           <tr data-group="env">
             <td><code>$GITHUB_STATE</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes"></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
           </tr>
           <tr data-group="env">
             <td><code>$GITHUB_ARTIFACTS</code></td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">v2.336.0. SHA-256 digest, OCI parsing, conflict detection, 500-cap.</td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">v2.336.0. SHA-256 digest, OCI parsing, conflict detection, 500-cap.</td>
           </tr>
           <tr data-group="env">
             <td><code>$GITHUB_ARTIFACTS_LIST</code></td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">v2.336.0. Versioned JSON list, sorted.</td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">v2.336.0. Versioned JSON list, sorted.</td>
           </tr>
           <tr data-group="env">
             <td><code>ACTIONS_CACHE_MODE</code></td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">v2.336.0. Variable → env mapping, logged at job start.</td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">v2.336.0. Variable → env mapping, logged at job start. Gitea: uses CACHE_SERVICE_V2=true instead</td>
           </tr>
           <tr data-group="env">
             <td><code>github.*</code> context</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-partial">◐</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes"></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"> Gitea: gitea alias; event_name divergence under workflow_call</td>
           </tr>
           <tr data-group="env">
             <td><code>secrets.*</code> context</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">act: <code>.secrets</code> file or <code>--secret</code> flag. aksh: <code>SecretString</code> + wire masking.</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">act: <code>.secrets</code> file or <code>--secret</code> flag. aksh: <code>SecretString</code> + wire masking. Gitea: server-scoped, encrypted</td>
           </tr>
           <tr data-group="env">
             <td><code>vars.*</code> context</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes"></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"> Gitea: Repo > Org > Global precedence</td>
           </tr>
           <tr data-group="env">
             <td><code>env.*</code> / <code>steps.*</code> / <code>needs.*</code> / <code>matrix.*</code> / <code>runner.*</code> / <code>inputs.*</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-partial">◐</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">Both implement the full context set.</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">Both implement the full context set.</td>
           </tr>
           <tr data-group="env">
             <td>Comprehensive <code>GITHUB_*</code> env vars (40+)</td>
             <td class="col-status"><span class="badge badge-partial">◐</span></td>
                         <td class="col-status"><span class="badge badge-partial">◐</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">aksh injects CI, GITHUB_ACTIONS, WORKSPACE, REPOSITORY, SHA, REF, REF_NAME, REF_TYPE, HEAD_REF, BASE_REF, EVENT_NAME, RUN_ID, RUN_NUMBER, RUN_ATTEMPT, ACTOR, WORKFLOW, JOB, SERVER_URL, API_URL, GRAPHQL_URL, ACTION, TOKEN, ACTION_PATH, ACTION_REPOSITORY, ACTION_REF, REF_PROTECTED, REPOSITORY_ID, REPOSITORY_OWNER_ID, TRIGGERING_ACTOR, WORKFLOW_REF, WORKFLOW_SHA, RETENTION_DAYS, RUNNER_*</td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+<td class="col-notes">aksh injects CI, GITHUB_ACTIONS, WORKSPACE, REPOSITORY, SHA, REF, REF_NAME, REF_TYPE, HEAD_REF, BASE_REF, EVENT_NAME, RUN_ID, RUN_NUMBER, RUN_ATTEMPT, ACTOR, WORKFLOW, JOB, SERVER_URL, API_URL, GRAPHQL_URL, ACTION, TOKEN, ACTION_PATH, ACTION_REPOSITORY, ACTION_REF, REF_PROTECTED, REPOSITORY_ID, REPOSITORY_OWNER_ID, TRIGGERING_ACTOR, WORKFLOW_REF, WORKFLOW_SHA, RETENTION_DAYS, RUNNER_* Gitea: GITEA_* extras; not the full official set</td>
           </tr>
 
           <!-- EXPRESSIONS -->
-          <tr class="group-row" data-group="expr"><td colspan="4">Expression Engine</td></tr>
+          <tr class="group-row" data-group="expr"><td colspan="5">Expression Engine</td></tr>
           <tr data-group="expr">
             <td><code>contains()</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes"></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
           </tr>
           <tr data-group="expr">
             <td><code>startsWith()</code> / <code>endsWith()</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes"></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
           </tr>
           <tr data-group="expr">
             <td><code>format()</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes"></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
           </tr>
           <tr data-group="expr">
             <td><code>join()</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes"></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
           </tr>
           <tr data-group="expr">
             <td><code>toJSON()</code> / <code>fromJSON()</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes"></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
           </tr>
           <tr data-group="expr">
             <td><code>hashFiles()</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">act has two implementations: local filesystem walk + container-based Node.js</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">act has two implementations: local filesystem walk + container-based Node.js</td>
           </tr>
           <tr data-group="expr">
             <td><code>success()</code> / <code>failure()</code> / <code>cancelled()</code> / <code>always()</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes"></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
           </tr>
           <tr data-group="expr">
             <td>Type coercion (string/number/bool/null)</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">Both implement GitHub's full coercion rules</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">Both implement GitHub's full coercion rules</td>
           </tr>
           <tr data-group="expr">
             <td><code>*</code> filter syntax (<code>steps.*.outputs</code>)</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">Used for filtering arrays of objects in expressions</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">Used for filtering arrays of objects in expressions</td>
           </tr>
           <tr data-group="expr">
             <td>Bracket access <code>['key']</code></td>
             <td class="col-status"><span class="badge badge-partial">◐</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">Required for keys with special characters</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">Required for keys with special characters</td>
           </tr>
           <tr data-group="expr">
             <td><code>{{</code> / <code>}}</code> escape sequences</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">Literal brace output in expressions</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">Literal brace output in expressions</td>
           </tr>
           <tr data-group="expr">
             <td>Case-insensitive <code>==</code></td>
             <td class="col-status"><span class="badge badge-partial">◐</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">GitHub compares strings case-insensitively</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">GitHub compares strings case-insensitively</td>
           </tr>
           <tr data-group="expr">
             <td>Parser ownership</td>
             <td class="col-status"><span class="badge badge-na">dep</span></td>
                         <td class="col-status"><span class="badge badge-na">—</span></td>
             <td class="col-status"><span class="badge badge-yes">own</span></td>
-            <td class="col-notes">act depends on <code>rhysd/actionlint</code> AST. aksh owns a custom Pratt parser.</td>
+                        <td class="col-status"><span class="badge badge-na">—</span></td>
+<td class="col-notes">act depends on <code>rhysd/actionlint</code> AST. aksh owns a custom Pratt parser. Gitea: act/exprparser on actionlint AST (fork-owned)</td>
           </tr>
 
           <!-- COMMANDS -->
-          <tr class="group-row" data-group="commands"><td colspan="4">Workflow Commands</td></tr>
+          <tr class="group-row" data-group="commands"><td colspan="5">Workflow Commands</td></tr>
           <tr data-group="commands">
             <td><code>::set-output::</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">Deprecated but still supported by both</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">Deprecated but still supported by both</td>
           </tr>
           <tr data-group="commands">
             <td><code>::set-env::</code> / <code>::add-path::</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes"></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
           </tr>
           <tr data-group="commands">
             <td><code>::add-mask::</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes"></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
           </tr>
           <tr data-group="commands">
             <td><code>::debug::</code> / <code>::warning::</code> / <code>::error::</code> / <code>::notice::</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes"></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"> Gitea: folded into log with source location</td>
           </tr>
           <tr data-group="commands">
             <td><code>::group::</code> / <code>::endgroup::</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes"></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"> Gitea: web UI folds on these</td>
           </tr>
           <tr data-group="commands">
             <td><code>::stop-commands::</code></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes"></td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes"></td>
           </tr>
           <tr data-group="commands">
             <td>Problem matchers (<code>::add-matcher::</code>)</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes"><code>::add-matcher::</code> / <code>::remove-matcher::</code></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes"><code>::add-matcher::</code> / <code>::remove-matcher::</code></td>
           </tr>
 
           <!-- PROTOCOL -->
-          <tr class="group-row" data-group="protocol"><td colspan="4">Protocol &amp; Runner Infrastructure</td></tr>
+          <tr class="group-row" data-group="protocol"><td colspan="5">Protocol &amp; Runner Infrastructure</td></tr>
           <tr data-group="protocol">
             <td>Faithful runner reimplementation</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">act reimplements in Go. aksh reimplements in Rust (faithful port of v2.336.0 with Listener + Worker architecture).</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">act reimplements in Go. aksh reimplements in Rust (faithful port of v2.336.0 with Listener + Worker architecture). Gitea: in-tree act fork</td>
           </tr>
           <tr data-group="protocol">
             <td>AzDO wire protocol</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
                         <td class="col-status"><span class="badge badge-partial">◐</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">act has no wire protocol at all. aksh implements 100+ routes.</td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">act has no wire protocol at all. aksh implements 100+ routes. Gitea: proprietary Connect RPC (/api/actions)</td>
           </tr>
           <tr data-group="protocol">
             <td>Runner registration (RSA key exchange)</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
                         <td class="col-status"><span class="badge badge-partial">◐</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">RSA-wrapped session key, runner capabilities, labels</td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+<td class="col-notes">RSA-wrapped session key, runner capabilities, labels Gitea: own token → uuid/agent-token flow; no RSA/AES</td>
           </tr>
           <tr data-group="protocol">
             <td>Session crypto (AES-CBC encrypted messages)</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">Encrypted message queue with session renewal</td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">Encrypted message queue with session renewal</td>
           </tr>
           <tr data-group="protocol">
             <td>Broker lifecycle (acquire → renew → complete)</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">9 broker message types handled</td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+<td class="col-notes">9 broker message types handled Gitea: FetchTask / UpdateTask heartbeat instead</td>
           </tr>
           <tr data-group="protocol">
             <td>OIDC id-token provider</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">RS256-signed JWTs, X.509 certificate chain, JWKS endpoint, OpenID discovery</td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">RS256-signed JWTs, X.509 certificate chain, JWKS endpoint, OpenID discovery Gitea: not wired on main</td>
           </tr>
           <tr data-group="protocol">
             <td>Job permissions / <code>GITHUB_TOKEN</code> scoping</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
                         <td class="col-status"><span class="badge badge-partial">◐</span></td>
-            <td class="col-status"><span class="badge badge-partial">◐</span></td>
-            <td class="col-notes">aksh issues local JWTs; full scope enforcement partial</td>
+            <td class="col-status"><span class="badge badge-yes">✓</span></td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+<td class="col-notes">aksh: GitHub App installation tokens per job, scoped to repo + effective <code>permissions:</code> (declared verbatim, implicit clamped; PAT fallback opt-in). Gitea: single repo-scoped task token</td>
           </tr>
           <tr data-group="protocol">
             <td>Job cancellation (wire protocol)</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes"><code>JobCancelMessage</code> with GUID + TimeSpan, graceful → hard-kill phases</td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+<td class="col-notes"><code>JobCancelMessage</code> with GUID + TimeSpan, graceful → hard-kill phases Gitea: RESULT_CANCELLED via UpdateTask heartbeat</td>
           </tr>
           <tr data-group="protocol">
             <td>Results-service (Twirp)</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
                         <td class="col-status"><span class="badge badge-partial">◐</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">5 Twirp routes: step/job logs metadata, step summary, workflow steps update, signed blob URLs</td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">5 Twirp routes: step/job logs metadata, step summary, workflow steps update, signed blob URLs</td>
           </tr>
           <tr data-group="protocol">
             <td>Timeline / live logs (WebSocket)</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
                         <td class="col-status"><span class="badge badge-partial">◐</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">PATCH timeline with lastModified, GET for history, WebSocket live-feed</td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+<td class="col-notes">PATCH timeline with lastModified, GET for history, WebSocket live-feed Gitea: UpdateLog → DBFS; web UI polls</td>
           </tr>
           <tr data-group="protocol">
             <td>Job annotations</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">Feature-gated aggregation via <code>actions_send_job_level_annotations</code></td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">Feature-gated aggregation via <code>actions_send_job_level_annotations</code> Gitea: folded into log text</td>
           </tr>
           <tr data-group="protocol">
             <td>Runner groups (server-side routing)</td>
             <td class="col-status"><span class="badge badge-na">—</span></td>
                         <td class="col-status"><span class="badge badge-na">—</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">Name, ID, default group matching in scheduler</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">Name, ID, default group matching in scheduler Gitea: repo / org / global scoping</td>
           </tr>
           <tr data-group="protocol">
             <td>Ephemeral runners</td>
             <td class="col-status"><span class="badge badge-na">—</span></td>
                         <td class="col-status"><span class="badge badge-na">—</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">Exit-on-ack, session invalidation, RunnerSessionInvalid handling</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">Exit-on-ack, session invalidation, RunnerSessionInvalid handling</td>
           </tr>
           <tr data-group="protocol">
             <td>Location services (<code>connectionData</code>)</td>
             <td class="col-status"><span class="badge badge-na">—</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">28 service definitions, query-aware fresh-cache responses</td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">28 service definitions, query-aware fresh-cache responses</td>
           </tr>
           <tr data-group="protocol">
             <td>Background steps (v2.336.0)</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-partial">◐</span></td>
-            <td class="col-notes">DTO + <code>is_background</code> flag; full <code>BackgroundStepCoordinator</code> missing</td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">DTO + <code>is_background</code> flag; full <code>BackgroundStepCoordinator</code> missing</td>
           </tr>
           <tr data-group="protocol">
             <td>Locked dependencies announcement (v2.336.0)</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">Log message when <code>actionsDependencies</code> non-empty</td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">Log message when <code>actionsDependencies</code> non-empty</td>
           </tr>
           <tr data-group="protocol">
             <td>Version deprecation warnings</td>
             <td class="col-status"><span class="badge badge-na">—</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">Server returns 403 + <code>AccessDeniedException</code> for deprecated runners</td>
+                        <td class="col-status"><span class="badge badge-na">—</span></td>
+<td class="col-notes">Server returns 403 + <code>AccessDeniedException</code> for deprecated runners</td>
           </tr>
           <tr data-group="protocol">
             <td>Node 20→24 migration warnings</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">Flag source precedence, conflict warning, ARM32 fallback</td>
+                        <td class="col-status"><span class="badge badge-na">—</span></td>
+<td class="col-notes">Flag source precedence, conflict warning, ARM32 fallback Gitea: runner ships its own Node runtime</td>
           </tr>
 
           <!-- CONTAINER -->
-          <tr class="group-row" data-group="container"><td colspan="4">Container &amp; Isolation</td></tr>
+          <tr class="group-row" data-group="container"><td colspan="5">Container &amp; Isolation</td></tr>
           <tr data-group="container">
             <td>Docker job containers</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">Different models: act uses idle container + <code>docker exec</code>; aksh delegates to runner</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">Different models: act uses idle container + <code>docker exec</code>; aksh delegates to runner Gitea: same idle-container + docker exec model</td>
           </tr>
           <tr data-group="container">
             <td>Service containers</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">Both support health checks and network configuration</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">Both support health checks and network configuration Gitea: not in host mode</td>
           </tr>
           <tr data-group="container">
             <td>Docker-in-Docker</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">act mounts host Docker socket. aksh supports it natively inside SmolVM guest microVMs (bundled kernel with cgroups + overlayfs2).</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">act mounts host Docker socket. aksh supports it natively inside SmolVM guest microVMs (bundled kernel with cgroups + overlayfs2). Gitea: dind / dind-rootless image flavours</td>
           </tr>
           <tr data-group="container">
             <td>MicroVM isolation (SmolVM/libkrun)</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">Primary backend. Fork-based warm pool, 131 MB idle RSS per VM (measured). Runs on Linux + macOS. Docker actions run inside the VM (cgroups + overlayfs2).</td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">Primary backend. Fork-based warm pool, 131 MB idle RSS per VM (measured). Runs on Linux + macOS. Docker actions run inside the VM (cgroups + overlayfs2).</td>
           </tr>
           <tr data-group="container">
             <td>Process execution (no container)</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">act: <code>-self-hosted</code> flag. aksh: process backend.</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">act: <code>-self-hosted</code> flag. aksh: process backend. Gitea: host labels</td>
           </tr>
           <tr data-group="container">
             <td>macOS native runner</td>
             <td class="col-status"><span class="badge badge-partial">◐</span></td>
                         <td class="col-status"><span class="badge badge-partial">◐</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">act: workaround only (<code>-self-hosted</code>). aksh: <code>somac</code> — fast ephemeral macOS VMs via Apple Virtualization.framework with copy-on-write golden snapshots.</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">act: workaround only (<code>-self-hosted</code>). aksh: <code>somac</code> — fast ephemeral macOS VMs via Apple Virtualization.framework with copy-on-write golden snapshots. Gitea: macos:host label</td>
           </tr>
           <tr data-group="container">
             <td>Windows native runner</td>
             <td class="col-status"><span class="badge badge-partial">◐</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">act: workaround only (<code>-self-hosted</code>). aksh: <code>vowin</code> — ephemeral Windows 11 VMs via QEMU (ARM64 on macOS/HVF, x86_64 on Linux/KVM). Warm memory snapshot restore, qcow2 overlay per job.</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">act: workaround only (<code>-self-hosted</code>). aksh: <code>vowin</code> — ephemeral Windows 11 VMs via QEMU (ARM64 on macOS/HVF, x86_64 on Linux/KVM). Warm memory snapshot restore, qcow2 overlay per job. Gitea: windows:host label</td>
           </tr>
           <tr data-group="container">
             <td>Custom platform images (<code>-P</code>)</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-na">—</span></td>
             <td class="col-status"><span class="badge badge-na">—</span></td>
-            <td class="col-notes">act-specific concept: map <code>runs-on</code> labels to Docker images</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">act-specific concept: map <code>runs-on</code> labels to Docker images Gitea: label schema name:docker://image</td>
           </tr>
           <tr data-group="container">
             <td>Podman support</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">act: via <code>DOCKER_HOST</code>. aksh: via runner backend.</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">act: via <code>DOCKER_HOST</code>. aksh: via runner backend. Gitea: via DOCKER_HOST</td>
           </tr>
           <tr data-group="container">
             <td>Ephemeral macOS VMs (<code>somac</code>)</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
                         <td class="col-status"><span class="badge badge-partial">◐</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">Fast ephemeral macOS VMs via Apple Virtualization.framework. Copy-on-write clones from golden snapshots. OCI image push/pull for distribution.</td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">Fast ephemeral macOS VMs via Apple Virtualization.framework. Copy-on-write clones from golden snapshots. OCI image push/pull for distribution.</td>
           </tr>
           <tr data-group="container">
             <td>Ephemeral Windows VMs (<code>vowin</code>)</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">Ephemeral Windows 11 VMs via QEMU. ARM64 on macOS (HVF), x86_64 on Linux (KVM). Warm memory snapshot restore. qcow2 overlay per job, destroyed after.</td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">Ephemeral Windows 11 VMs via QEMU. ARM64 on macOS (HVF), x86_64 on Linux (KVM). Warm memory snapshot restore. qcow2 overlay per job, destroyed after.</td>
           </tr>
           <tr data-group="container">
             <td>Docker inside VM</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">SmolVM bundles a kernel with cgroups + overlayfs2 support. Docker actions run natively inside the guest — no Docker-in-Docker socket mount.</td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">SmolVM bundles a kernel with cgroups + overlayfs2 support. Docker actions run natively inside the guest — no Docker-in-Docker socket mount.</td>
           </tr>
           <tr data-group="container">
             <td>Network isolation (egress control)</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">SmolVM strict egress (<code>SMOLVM_EGRESS_FLOOR=strict</code>)</td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">SmolVM strict egress (<code>SMOLVM_EGRESS_FLOOR=strict</code>)</td>
           </tr>
           <tr data-group="container">
             <td>Secret masking on wire</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">aksh: <code>SecretString</code> type, mask hints in wire messages, <code>expose()</code> at boundaries</td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+<td class="col-notes">aksh: <code>SecretString</code> type, mask hints in wire messages, <code>expose()</code> at boundaries Gitea: log-row masking; no wire mask hints</td>
           </tr>
 
           <!-- CACHE & ARTIFACTS -->
-          <tr class="group-row" data-group="cache"><td colspan="4">Cache &amp; Artifacts</td></tr>
+          <tr class="group-row" data-group="cache"><td colspan="5">Cache &amp; Artifacts</td></tr>
           <tr data-group="cache">
             <td>Cache v1 (reserve/upload/commit/lookup)</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">File-backed storage in both</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">File-backed storage in both Gitea: runner-side embedded cache server</td>
           </tr>
           <tr data-group="cache">
             <td>Cache v2 (Twirp protocol)</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">Twirp endpoints backed by file storage</td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+<td class="col-notes">Twirp endpoints backed by file storage Gitea: runner-side v2; bundles patched; no Twirp</td>
           </tr>
           <tr data-group="cache">
             <td>Cache prefix matching</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-partial">◐</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">aksh: key/version immutability with prefix restore-key matching</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">aksh: key/version immutability with prefix restore-key matching</td>
           </tr>
           <tr data-group="cache">
             <td>Artifact v1 (create/put/get/list)</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">aksh: name validation per official toolkit</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">aksh: name validation per official toolkit Gitea: server-side v3 REST (AzDO-style)</td>
           </tr>
           <tr data-group="cache">
             <td>Artifact v2 / v3 / v4 (Twirp + blob)</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">Both support modern artifact protocols</td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+<td class="col-notes">Both support modern artifact protocols Gitea: v4 Connect + signed URLs; upload-artifact@v4 via patching</td>
           </tr>
 
           <!-- DEV EXPERIENCE -->
-          <tr class="group-row" data-group="dx"><td colspan="4">Developer Experience</td></tr>
+          <tr class="group-row" data-group="dx"><td colspan="5">Developer Experience</td></tr>
           <tr data-group="dx">
             <td>Pause-on-failure (interactive retry)</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">Supported by both agent-ci and aksh (preloop). <code>preloop debug &lt;session&gt;</code> provides host&lt;&ndash;&gt;VM source sync (<code>--sync</code> / <code>--export</code>), step rewind (<code>--from &lt;step&gt;</code> / <code>--from-start</code>), workspace debris revert (<code>--revert &lt;none|untracked|all&gt;</code>), DAP debugger, and interactive guest shell. Server suspends job timeouts while paused.</td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">Supported by both agent-ci and aksh (preloop). <code>preloop debug &lt;session&gt;</code> provides host&lt;&ndash;&gt;VM source sync (<code>--sync</code> / <code>--export</code>), step rewind (<code>--from &lt;step&gt;</code> / <code>--from-start</code>), workspace debris revert (<code>--revert &lt;none|untracked|all&gt;</code>), DAP debugger, and interactive guest shell. Server suspends job timeouts while paused.</td>
           </tr>
           <tr data-group="dx">
             <td>NDJSON event stream (AI agent output)</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
-            <td class="col-notes">agent-ci: <code>--json</code> emits structured events for AI agent consumption</td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">agent-ci: <code>--json</code> emits structured events for AI agent consumption</td>
           </tr>
           <tr data-group="dx">
             <td>Commit status posting</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">agent-ci: <code>--commit-status</code>. aksh: GitHub App integration.</td>
+                        <td class="col-status"><span class="badge badge-yes">✓</span></td>
+<td class="col-notes">agent-ci: <code>--commit-status</code>. aksh: GitHub App integration. Gitea: server-side commit statuses</td>
           </tr>
           <tr data-group="dx">
             <td>DAP debugger</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">4,527 LOC, 67 tests. WebSocket/TCP transport. Breakpoints, stepping, variable inspection, REPL DSL.</td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">4,527 LOC, 67 tests. WebSocket/TCP transport. Breakpoints, stepping, variable inspection, REPL DSL.</td>
           </tr>
           <tr data-group="dx">
             <td>Workflow graph visualization</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
-            <td class="col-notes"><code>act --graph</code> outputs Graphviz DOT</td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes"><code>act --graph</code> outputs Graphviz DOT</td>
           </tr>
           <tr data-group="dx">
             <td>Event simulation</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-partial">◐</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">act: <code>-e event.json</code></td>
+                        <td class="col-status"><span class="badge badge-partial">◐</span></td>
+<td class="col-notes">act: <code>-e event.json</code> Gitea: manual run via web UI; no event-file injection</td>
           </tr>
           <tr data-group="dx">
             <td>Dry run / list workflows</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-no">✗</span></td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
-            <td class="col-notes">act: <code>-l</code> (list), <code>-n</code> (dry run)</td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">act: <code>-l</code> (list), <code>-n</code> (dry run)</td>
           </tr>
           <tr data-group="dx">
             <td>Config file (<code>.actrc</code>)</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-na">—</span></td>
             <td class="col-status"><span class="badge badge-na">—</span></td>
-            <td class="col-notes">act-specific configuration</td>
+                        <td class="col-status"><span class="badge badge-na">—</span></td>
+<td class="col-notes">act-specific configuration Gitea: YAML config (config.yaml)</td>
           </tr>
           <tr data-group="dx">
             <td>Zero-dependency install</td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
                         <td class="col-status"><span class="badge badge-partial">◐</span></td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
-            <td class="col-notes"><code>brew install act</code> — single static binary. aksh requires Rust build.</td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes"><code>brew install act</code> — single static binary. aksh requires Rust build. Gitea: needs a Gitea server + Docker</td>
           </tr>
           <tr data-group="dx">
             <td>Conformance testing harness</td>
             <td class="col-status"><span class="badge badge-no">✗</span></td>
                         <td class="col-status"><span class="badge badge-partial">◐</span></td>
             <td class="col-status"><span class="badge badge-yes">✓</span></td>
-            <td class="col-notes">runner-watch: 24 golden scenarios, automated diffing, TOML specs, conformance gate</td>
+                        <td class="col-status"><span class="badge badge-no">✗</span></td>
+<td class="col-notes">runner-watch: 24 golden scenarios, automated diffing, TOML specs, conformance gate Gitea: no wire-level conformance</td>
           </tr>
         </tbody>
       </table>
@@ -2290,7 +2448,6 @@
         </table>
       </div>
     </div>
-  </div>
 </section>
 
 <!-- PROTOCOL -->
@@ -2355,10 +2512,85 @@
   </div>
 </section>
 
+<!-- GITEA ACTIONS -->
+<section id="gitea">
+  <div class="container">
+    <p class="section-label">05 — Gitea Actions (act_runner)</p>
+    <h2 class="section-title">The act fork with a control plane</h2>
+    <p class="section-desc">
+      Gitea Actions pairs Gitea's server with <code>act_runner</code> — the act fork running as a
+      daemon against Gitea's own Connect RPC protocol. GitHub-compatible at the <em>workflow</em>
+      level, wire-incompatible by design. The server does the scheduling; the runner interprets the
+      raw YAML and executes with the same Docker model as act.
+    </p>
+
+    <div class="protocol-comparison">
+      <div class="protocol-card">
+        <h4>Connect RPC — <code>/api/actions</code></h4>
+        <ul class="proto-list">
+          <li><span class="dot on"></span><code>ping.v1.PingService/Ping</code> — pre-registration check</li>
+          <li><span class="dot on"></span><code>runner.v1.RunnerService/Register</code> — token → uuid + agent token</li>
+          <li><span class="dot on"></span><code>/Declare</code> — version, labels, capabilities</li>
+          <li><span class="dot on"></span><code>/FetchTask</code> — long-poll, version counter, backoff</li>
+          <li><span class="dot on"></span><code>/UpdateTask</code> — heartbeat + state; server can reply <code>RESULT_CANCELLED</code></li>
+          <li><span class="dot on"></span><code>/UpdateLog</code> — batched rows with ack index</li>
+          <li><span class="dot on"></span>Auth: <code>x-runner-uuid</code> + <code>x-runner-token</code> headers</li>
+          <li><span class="dot on"></span>Artifacts: server-side v3 REST (AzDO-style chunks) + v4 Connect, signed URLs</li>
+        </ul>
+      </div>
+      <div class="protocol-card">
+        <h4>Division of labor — opposite of aksh</h4>
+        <ul class="proto-list">
+          <li><span class="dot on"></span>Server: detect workflows, needs/if/matrix/concurrency/max-parallel, label match, fork-PR approval</li>
+          <li><span class="dot on"></span>Task = raw workflow YAML + <code>github</code> context + secrets + vars + needs outputs</li>
+          <li><span class="dot on"></span>Runner: parses YAML (<code>generateWorkflow</code>), plans stages, executes via act engine</li>
+          <li><span class="dot on"></span>Same Docker model as act: per-job container, <code>docker exec</code> per step, service containers</li>
+          <li><span class="dot on"></span><code>host</code> labels run steps natively (macOS / Windows first-class)</li>
+          <li><span class="dot off"></span>No microVM isolation — shared-kernel Docker only</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="matrix-table-wrap" style="margin-top: var(--space-xl);">
+      <table class="matrix-table">
+        <thead>
+          <tr>
+            <th>act CLI limitation</th>
+            <th class="col-aksh">Status in act_runner</th>
+            <th class="col-notes">Evidence</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>Concurrency groups</td><td class="col-status"><span class="gap-tag partial">fixed — server-side</span></td><td class="col-notes"><code>services/actions/concurrency.go</code>; prior group members cancelled on arrival</td></tr>
+          <tr><td><code>*</code> filter (<code>steps.*.outputs</code>)</td><td class="col-status"><span class="gap-tag partial">fixed in fork</span></td><td class="col-notes"><code>act/exprparser/interpreter.go</code> — <code>ArrayDerefNode</code> + slice property walk</td></tr>
+          <tr><td><code>{{</code> / <code>}}</code> escapes</td><td class="col-status"><span class="gap-tag partial">fixed in fork</span></td><td class="col-notes"><code>format()</code> brace state machine in <code>functions.go</code></td></tr>
+          <tr><td>Bracket access / case-insensitive <code>==</code></td><td class="col-status"><span class="gap-tag partial">fixed</span></td><td class="col-notes"><code>IndexAccessNode</code>; <code>compareString</code> lowercases</td></tr>
+          <tr><td>macOS / Windows native</td><td class="col-status"><span class="gap-tag partial">fixed</span></td><td class="col-notes">first-class <code>host</code> labels (<code>macos:host</code>, <code>windows:host</code>)</td></tr>
+          <tr><td>OIDC id tokens</td><td class="col-status"><span class="gap-tag missing">missing</span></td><td class="col-notes">server never sets <code>actions_id_token_request_url</code>; runner only forwards what the server provides</td></tr>
+          <tr><td>GITHUB_TOKEN permission scoping</td><td class="col-status"><span class="gap-tag missing">partial</span></td><td class="col-notes">one repo-scoped task token (<code>GITEA_TOKEN</code> / <code>GITHUB_TOKEN</code>); no per-permission JWT</td></tr>
+          <tr><td>Problem matchers (<code>::add-matcher::</code>)</td><td class="col-status"><span class="gap-tag missing">missing</span></td><td class="col-notes">reporter handles add-mask/debug/notice/warning/error/group/stop-commands only</td></tr>
+          <tr><td>Wire compatibility with GitHub</td><td class="col-status"><span class="gap-tag missing">missing</span></td><td class="col-notes">by design — Gitea-proprietary Connect RPC; official runner cannot connect</td></tr>
+          <tr><td>Server-side <code>@actions/cache</code></td><td class="col-status"><span class="gap-tag missing">missing</span></td><td class="col-notes">runner-local cache server; action bundles are patched to redirect URLs</td></tr>
+          <tr><td>Annotation store</td><td class="col-status"><span class="gap-tag missing">missing</span></td><td class="col-notes">annotations folded into log text (<code>formatAnnotation</code>)</td></tr>
+          <tr><td>Service containers in host mode</td><td class="col-status"><span class="gap-tag missing">missing</span></td><td class="col-notes">README: host-label jobs start no service containers</td></tr>
+          <tr><td>DAP debugger / microVM isolation</td><td class="col-status"><span class="gap-tag missing">missing</span></td><td class="col-notes">neither exists in the runner</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="section-desc" style="margin-top: var(--space-lg);">
+      No wire-level conformance methodology: behavior is enforced by unit tests and real-world
+      deployment. The mirror image of aksh's golden-capture pipeline — Gitea optimizes for
+      <em>workflow</em> compatibility on its own protocol, aksh for <em>protocol</em> compatibility
+      with the official runner.
+    </p>
+  </div>
+</section>
+
 <!-- CONFORMANCE -->
 <section id="conformance">
   <div class="container">
-    <p class="section-label">05 — Conformance</p>
+    <p class="section-label">06 — Conformance</p>
     <h2 class="section-title">24 golden scenarios — all passing</h2>
     <p class="section-desc">
       aksh's runner-watch pipeline captures wire traffic from the official runner v2.336.0, then replays
@@ -2398,7 +2630,7 @@
 <!-- GAPS -->
 <section id="gaps">
   <div class="container">
-    <p class="section-label">06 — Known Gaps</p>
+    <p class="section-label">07 — Known Gaps</p>
     <h2 class="section-title">What each project doesn't do</h2>
 
     <div class="gaps-grid">
@@ -2447,7 +2679,6 @@
         <h4 style="color: var(--accent);">aksh — Missing features</h4>
         <ul class="gap-list">
           <li><span class="gap-tag partial">partial</span> BackgroundStepCoordinator — DTO + flag done, async coordinator missing</li>
-          <li><span class="gap-tag partial">partial</span> GITHUB_TOKEN scope enforcement</li>
                     <li><span class="gap-tag partial">partial</span> Action download telemetry (info logs only)</li>
           <li><span class="gap-tag intentional">intentional</span> Runner self-update — acknowledged but not implemented</li>
           <li><span class="gap-tag missing">missing</span> Runner config refresh (dynamic)</li>
@@ -2457,6 +2688,21 @@
           <li><span class="gap-tag missing">missing</span> Zero-dependency install (requires Rust build)</li>
         </ul>
       </div>
+      <div class="gap-card">
+        <h4 style="color: var(--yellow);">act_runner — Missing features</h4>
+        <ul class="gap-list">
+          <li><span class="gap-tag missing">missing</span> OIDC id tokens — server never sets <code>actions_id_token_request_url</code></li>
+          <li><span class="gap-tag missing">missing</span> Problem matchers (<code>::add-matcher::</code>)</li>
+          <li><span class="gap-tag missing">missing</span> <code>$GITHUB_ARTIFACTS</code> / <code>$GITHUB_ARTIFACTS_LIST</code></li>
+          <li><span class="gap-tag partial">partial</span> GITHUB_TOKEN scoping — one repo-scoped task token</li>
+          <li><span class="gap-tag missing">missing</span> Server-side <code>@actions/cache</code> — runner-local; bundles patched</li>
+          <li><span class="gap-tag missing">missing</span> Annotation store — folded into log text</li>
+          <li><span class="gap-tag missing">missing</span> Service containers in host mode</li>
+          <li><span class="gap-tag missing">missing</span> <code>github.event_name</code> in <code>workflow_call</code> callees (overridden)</li>
+          <li><span class="gap-tag missing">missing</span> Wire compatibility with the official runner — by design</li>
+          <li><span class="gap-tag missing">missing</span> DAP debugger / microVM isolation</li>
+        </ul>
+      </div>
     </div>
   </div>
 </section>
@@ -2464,14 +2710,27 @@
 <!-- SUMMARY -->
 <section>
   <div class="container">
-    <p class="section-label">07 — The Bottom Line</p>
+    <p class="section-label">08 — The Bottom Line</p>
     <h2 class="section-title">Different tools for different problems</h2>
 
     <div class="summary-card">
-      <blockquote>act reimplements the runner. agent-ci reimplements the server and uses the official runner. aksh reimplements both — and that's why the fidelity gap between them is what it is.</blockquote>
+      <blockquote>act reimplements the runner. act_runner reimplements the runner behind Gitea's own protocol. agent-ci reimplements the server and uses the official runner. aksh reimplements both — and that's why the fidelity gap between them is what it is.</blockquote>
     </div>
 
     <div class="arch-grid" style="margin-top: var(--space-xl);">
+      <div class="arch-card act">
+        <div class="arch-card-header">
+          <div class="icon">gta</div>
+          <h3>act_runner — Best for</h3>
+        </div>
+        <ul class="proto-list">
+          <li><span class="dot on"></span>Self-hosted CI platform for a team (Gitea)</li>
+          <li><span class="dot on"></span>GitHub-syntax workflows on a non-GitHub forge</li>
+          <li><span class="dot on"></span>Fork-PR approvals, org runners, reruns, retention</li>
+          <li><span class="dot on"></span>Open source (MIT), Docker/K8s images, deployed fleets</li>
+          <li><span class="dot on"></span>Native host-mode steps (macOS / Windows labels)</li>
+        </ul>
+      </div>
       <div class="arch-card act">
         <div class="arch-card-header">
           <div class="icon">act</div>
@@ -2508,7 +2767,7 @@
 
 <footer class="footer">
   <div class="container">
-    Generated from aksh fidelity-gap.md, nektos/act source, and redwoodjs/agent-ci source — July 2026. All benchmarks measured on Apple M4 Max, 16 cores, 128 GB RAM.
+    Generated from aksh fidelity-gap.md, nektos/act source, redwoodjs/agent-ci source, and gitea.com/gitea/runner + gitea.dev/actions-proto-go source — August 2026. All benchmarks measured on Apple M4 Max, 16 cores, 128 GB RAM.
   </div>
 </footer>
 

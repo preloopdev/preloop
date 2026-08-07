@@ -28,13 +28,11 @@ async fn serve_diagnostic_signed_url() -> (String, oneshot::Receiver<String>) {
 use super::super::action_preparation::parse_remote_uses;
 use super::super::reporting::diagnostic_logs_url;
 use super::*;
-use tempfile::TempDir;
 use tokio::sync::watch;
 
 #[tokio::test]
 async fn test_run_job_executes_successfully() {
-    let dir = TempDir::new().unwrap();
-    let workspace_dir = dir.path().join("work");
+    let (_ws, workspace_dir) = contained_workspace();
     let payload = serde_json::json!({
         "jobId": "job-1",
         "jobDisplayName": "Mock Job",
@@ -48,7 +46,7 @@ async fn test_run_job_executes_successfully() {
             }
         ],
         "fileTable": {
-            "workDirectory": workspace_dir.to_str().unwrap()
+            "workDirectory": workspace_dir
         }
     });
 
@@ -166,8 +164,7 @@ async fn test_run_job_propagates_step_failure() {
     // When a step fails, run_job still returns Ok(()) because the failure
     // is propagated in the completion report, not the function return.
     // The worker process exits 0 and the server sees the Failed result.
-    let dir = TempDir::new().unwrap();
-    let workspace_dir = dir.path().join("work");
+    let (_ws, workspace_dir) = contained_workspace();
     let payload = serde_json::json!({
         "jobId": "job-fail",
         "jobDisplayName": "Failing Job",
@@ -181,7 +178,7 @@ async fn test_run_job_propagates_step_failure() {
             }
         ],
         "fileTable": {
-            "workDirectory": workspace_dir.to_str().unwrap()
+            "workDirectory": workspace_dir
         }
     });
 
@@ -206,8 +203,7 @@ async fn test_run_job_propagates_step_failure() {
 
 #[tokio::test]
 async fn test_run_job_handles_cancelled() {
-    let dir = TempDir::new().unwrap();
-    let workspace_dir = dir.path().join("work");
+    let (_ws, workspace_dir) = contained_workspace();
     let payload = serde_json::json!({
         "jobId": "job-cancel",
         "jobDisplayName": "Cancel Job",
@@ -221,7 +217,7 @@ async fn test_run_job_handles_cancelled() {
             }
         ],
         "fileTable": {
-            "workDirectory": workspace_dir.to_str().unwrap()
+            "workDirectory": workspace_dir
         }
     });
 
@@ -249,8 +245,7 @@ async fn test_run_job_handles_cancelled() {
 
 #[tokio::test]
 async fn test_run_job_with_timeout() {
-    let dir = TempDir::new().unwrap();
-    let workspace_dir = dir.path().join("work");
+    let (_ws, workspace_dir) = contained_workspace();
     // jobTimeout of 0 means the timeout fires immediately (0 * 60 = 0s),
     // triggering the cancel channel before the step can finish.
     let payload = serde_json::json!({
@@ -267,7 +262,7 @@ async fn test_run_job_with_timeout() {
             }
         ],
         "fileTable": {
-            "workDirectory": workspace_dir.to_str().unwrap()
+            "workDirectory": workspace_dir
         }
     });
 
@@ -488,11 +483,7 @@ async fn serve_scripted_control(
     (format!("http://{addr}"), requests)
 }
 
-fn control_payload(
-    addr: &str,
-    dir: &tempfile::TempDir,
-    steps: serde_json::Value,
-) -> serde_json::Value {
+fn control_payload(addr: &str, work_dir: &str, steps: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "jobId": "job-lease-1",
         "jobDisplayName": "Lease Job",
@@ -506,7 +497,7 @@ fn control_payload(
         },
         "steps": steps,
         "fileTable": {
-            "workDirectory": dir.path().join("work").to_str().unwrap()
+            "workDirectory": work_dir
         }
     })
 }
@@ -518,6 +509,23 @@ fn fast_timing() -> LeaseTiming {
     }
 }
 
+/// Create a workspace directory strictly inside the test process's cwd — the
+/// "runner root" for in-process `run_job` tests — so `setup_workspace`'s
+/// containment check accepts it (job_extension rejects payloads whose
+/// workDirectory escapes the runner root). Returns the TempDir (kept alive
+/// for the test so the directory is auto-cleaned) and the workDirectory
+/// string for the job payload.
+fn contained_workspace() -> (tempfile::TempDir, String) {
+    let dir = tempfile::Builder::new()
+        .prefix("aksh-test-ws-")
+        .tempdir_in(std::env::current_dir().expect("test cwd"))
+        .expect("tempdir under cwd");
+    // Two components below the tempdir so setup_workspace's derived _temp,
+    // _actions and _tool dirs also land inside the tempdir.
+    let work = dir.path().join("_work").join("work");
+    (dir, work.to_string_lossy().into_owned())
+}
+
 fn recorded_completion(requests: &[(String, String, String)]) -> Option<&(String, String, String)> {
     requests
         .iter()
@@ -526,11 +534,11 @@ fn recorded_completion(requests: &[(String, String, String)]) -> Option<&(String
 
 #[tokio::test]
 async fn first_renew_gate_404_abandons_without_running_steps() {
-    let dir = TempDir::new().unwrap();
+    let (_ws, work_dir) = contained_workspace();
     let (addr, requests) = serve_scripted_control(vec![404]).await;
     let payload = control_payload(
         &addr,
-        &dir,
+        &work_dir,
         serde_json::json!([{
             "id": "step-1",
             "contextName": "step1",
@@ -572,13 +580,13 @@ async fn first_renew_gate_404_abandons_without_running_steps() {
 
 #[tokio::test]
 async fn first_renew_gate_abandons_after_retry_budget() {
-    let dir = TempDir::new().unwrap();
+    let (_ws, work_dir) = contained_workspace();
     // Six failures = initial attempt + official `firstRenewRetryLimit` (5)
     // retries of ~10 s each; the sixth exhausts the budget.
     let (addr, requests) = serve_scripted_control(vec![500; 6]).await;
     let payload = control_payload(
         &addr,
-        &dir,
+        &work_dir,
         serde_json::json!([{
             "id": "step-1",
             "contextName": "step1",
@@ -618,11 +626,11 @@ async fn first_renew_gate_abandons_after_retry_budget() {
 
 #[tokio::test]
 async fn first_renew_gate_cancellation_completes_canceled() {
-    let dir = TempDir::new().unwrap();
+    let (_ws, work_dir) = contained_workspace();
     let (addr, requests) = serve_scripted_control(vec![500]).await;
     let payload = control_payload(
         &addr,
-        &dir,
+        &work_dir,
         serde_json::json!([{
             "id": "step-1",
             "contextName": "step1",
@@ -660,14 +668,14 @@ async fn first_renew_gate_cancellation_completes_canceled() {
 
 #[tokio::test]
 async fn mid_job_lease_loss_reports_abandoned() {
-    let dir = TempDir::new().unwrap();
+    let (_ws, work_dir) = contained_workspace();
     // Gate renew succeeds (200), the loop's first renew succeeds (200), then
     // the server forgets the job (404) mid-step → the worker must cancel the
     // steps and complete as Abandoned, not Failed.
     let (addr, requests) = serve_scripted_control(vec![200, 200, 404]).await;
     let payload = control_payload(
         &addr,
-        &dir,
+        &work_dir,
         serde_json::json!([{
             "id": "step-1",
             "contextName": "step1",
@@ -693,5 +701,141 @@ async fn mid_job_lease_loss_reports_abandoned() {
         complete.2.contains("step-1"),
         "started steps are still recorded: {}",
         complete.2
+    );
+}
+
+/// Serve a control server whose `/renewjob` endpoint accepts connections but
+/// never responds (a stalled first-renew HTTP request — the server is
+/// unreachable, not failing), while every other request completes normally
+/// and is recorded. Records `(request-line, path, body)` like
+/// [`serve_scripted_control`].
+async fn serve_stalling_renew() -> (String, Arc<Mutex<Vec<(String, String, String)>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests: Arc<Mutex<Vec<(String, String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let requests_w = requests.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let requests = requests_w.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0_u8; 16384];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let raw = String::from_utf8_lossy(&buf[..n]).to_string();
+                let request_line = raw.lines().next().unwrap_or("").to_string();
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .to_string();
+                let body = raw.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+                requests
+                    .lock()
+                    .await
+                    .push((request_line, path.clone(), body));
+                if path == "/renewjob" {
+                    // Stall: hold the connection open without responding so
+                    // the renew request hangs instead of failing fast.
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    return;
+                }
+                let response = "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n";
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    (format!("http://{addr}"), requests)
+}
+
+#[tokio::test]
+async fn first_renew_cancel_preempts_stalled_renew_http() {
+    // A cancel arriving while the first renewjob request hangs (server
+    // unreachable — the request never completes) must win the race: the
+    // worker completes the job as Canceled without waiting out the stalled
+    // HTTP call. On the broken code the gate awaits renew_job to completion
+    // before looking at cancel_rx, so the job hangs far past the 45s kill
+    // window and the worker is killed without ever reporting.
+    let (_ws, work_dir) = contained_workspace();
+    let (addr, requests) = serve_stalling_renew().await;
+    let payload = control_payload(
+        &addr,
+        &work_dir,
+        serde_json::json!([{
+            "id": "step-1",
+            "contextName": "step1",
+            "displayName": "Step One",
+            "run": "echo step-one-executed",
+            "shell": "bash"
+        }]),
+    );
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let handle = tokio::spawn(run_job(
+        payload,
+        ProtocolPath::Broker,
+        cancel_rx,
+        fast_timing(),
+    ));
+    // Let the gate's renew request reach the stalled server, then cancel.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = cancel_tx.send(true);
+
+    tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("cancel must preempt the stalled first-renew request")
+        .expect("run_job panicked")
+        .expect("run_job failed");
+
+    let reqs = requests.lock().await.clone();
+    let complete = recorded_completion(&reqs).expect("completejob was reported");
+    assert!(
+        complete.2.contains("\"conclusion\":\"canceled\""),
+        "a job cancelled during the first-renew gate completes as canceled: {}",
+        complete.2
+    );
+    assert!(
+        !complete.2.contains("step-1"),
+        "no user step may run before the first renewal: {}",
+        complete.2
+    );
+}
+
+#[tokio::test]
+async fn first_renew_gate_failure_does_not_clear_existing_workspace() {
+    // The first-renew gate must run BEFORE any workspace setup: a job whose
+    // lease is invalid (renew 404 → abandoned) must not wipe an existing
+    // checkout that the runner does not own yet. On the broken code
+    // setup_workspace (remove_dir_all) runs first, destroying the marker.
+    let (_ws, work_dir) = contained_workspace();
+    let marker = std::path::Path::new(&work_dir).join("marker.txt");
+    std::fs::create_dir_all(std::path::Path::new(&work_dir)).unwrap();
+    std::fs::write(&marker, "fresh checkout").unwrap();
+
+    let (addr, requests) = serve_scripted_control(vec![404]).await;
+    let payload = control_payload(&addr, &work_dir, serde_json::json!([]));
+    let (_tx, cancel_rx) = watch::channel(false);
+    let res = run_job(
+        payload,
+        ProtocolPath::Broker,
+        cancel_rx,
+        LeaseTiming::default(),
+    )
+    .await;
+    assert!(res.is_ok(), "run_job failed: {res:?}");
+
+    let reqs = requests.lock().await.clone();
+    let complete = recorded_completion(&reqs).expect("completejob was reported");
+    assert!(
+        complete.2.contains("\"conclusion\":\"abandoned\""),
+        "invalid lease must abandon the job: {}",
+        complete.2
+    );
+    assert!(
+        marker.exists(),
+        "workspace must not be cleared before the lease is validated"
     );
 }

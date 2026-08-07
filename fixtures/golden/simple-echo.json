@@ -1,31 +1,33 @@
 [
   {
-    "base_id": "echo",
-    "env": {},
-    "fail_fast": true,
     "id": "echo",
-    "if_condition": null,
-    "matrix": {},
-    "max_parallel": null,
+    "base_id": "echo",
     "name": "echo",
-    "needs": [],
     "runs_on": [
       "self-hosted"
     ],
-    "secrets_inherit": false,
+    "needs": [],
+    "matrix": {},
+    "env": {},
     "steps": [
       {
-        "continue_on_error": null,
-        "env": {},
         "id": null,
-        "if_condition": null,
         "name": null,
         "run": "echo hello",
-        "shell": null,
         "uses": null,
+        "env": {},
         "with": {},
-        "working_directory": null
+        "if_condition": null,
+        "working_directory": null,
+        "shell": null,
+        "continue_on_error": null
       }
-    ]
+    ],
+    "if_condition": null,
+    "fail_fast": true,
+    "continue_on_error": false,
+    "max_parallel": null,
+    "secrets_inherit": false,
+    "oidc_id_token_granted": false
   }
 ]

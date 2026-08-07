@@ -4,6 +4,9 @@
 [cargo-vet]
 version = "0.10"
 
+[imports.mozilla]
+url = "https://raw.githubusercontent.com/mozilla/supply-chain/main/audits.toml"
+
 [[exemptions.adler2]]
 version = "2.0.1"
 criteria = "safe-to-deploy"
@@ -14,10 +17,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.aho-corasick]]
 version = "1.1.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.android_system_properties]]
-version = "0.1.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.anstream]]
@@ -38,10 +37,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.anstyle-wincon]]
 version = "3.0.11"
-criteria = "safe-to-deploy"
-
-[[exemptions.anyhow]]
-version = "1.0.104"
 criteria = "safe-to-deploy"
 
 [[exemptions.arbitrary]]
@@ -103,14 +98,6 @@ criteria = "safe-to-deploy"
 [[exemptions.base64ct]]
 version = "1.8.3"
 criteria = "safe-to-deploy"
-
-[[exemptions.bit-set]]
-version = "0.8.0"
-criteria = "safe-to-run"
-
-[[exemptions.bit-vec]]
-version = "0.8.0"
-criteria = "safe-to-run"
 
 [[exemptions.bitflags]]
 version = "2.13.0"
@@ -200,10 +187,6 @@ criteria = "safe-to-deploy"
 version = "0.9.6"
 criteria = "safe-to-deploy"
 
-[[exemptions.core-foundation]]
-version = "0.9.4"
-criteria = "safe-to-deploy"
-
 [[exemptions.core-foundation-sys]]
 version = "0.8.7"
 criteria = "safe-to-deploy"
@@ -282,14 +265,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.flate2]]
 version = "1.1.9"
-criteria = "safe-to-deploy"
-
-[[exemptions.fnv]]
-version = "1.0.7"
-criteria = "safe-to-deploy"
-
-[[exemptions.form_urlencoded]]
-version = "1.2.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.fs-err]]
@@ -565,6 +540,10 @@ version = "0.8.6"
 criteria = "safe-to-deploy"
 
 [[exemptions.num-conv]]
+version = "0.1.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.num-conv]]
 version = "0.2.2"
 criteria = "safe-to-deploy"
 
@@ -638,10 +617,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.potential_utf]]
 version = "0.1.5"
-criteria = "safe-to-deploy"
-
-[[exemptions.powerfmt]]
-version = "0.2.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.ppv-lite86]]
@@ -888,10 +863,6 @@ criteria = "safe-to-deploy"
 version = "0.6.4"
 criteria = "safe-to-deploy"
 
-[[exemptions.spin]]
-version = "0.9.9"
-criteria = "safe-to-deploy"
-
 [[exemptions.spki]]
 version = "0.7.3"
 criteria = "safe-to-deploy"
@@ -914,10 +885,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.sync_wrapper]]
 version = "1.0.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.synstructure]]
-version = "0.13.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.system-configuration]]
@@ -957,11 +924,23 @@ version = "1.1.9"
 criteria = "safe-to-deploy"
 
 [[exemptions.time]]
+version = "0.3.36"
+criteria = "safe-to-deploy"
+
+[[exemptions.time]]
 version = "0.3.55"
 criteria = "safe-to-deploy"
 
 [[exemptions.time-core]]
+version = "0.1.2"
+criteria = "safe-to-deploy"
+
+[[exemptions.time-core]]
 version = "0.1.9"
+criteria = "safe-to-deploy"
+
+[[exemptions.time-macros]]
+version = "0.2.18"
 criteria = "safe-to-deploy"
 
 [[exemptions.time-macros]]
@@ -1104,12 +1083,16 @@ criteria = "safe-to-deploy"
 version = "0.7.6"
 criteria = "safe-to-deploy"
 
-[[exemptions.utf8_iter]]
-version = "1.0.4"
-criteria = "safe-to-deploy"
-
 [[exemptions.utf8parse]]
 version = "0.2.2"
+criteria = "safe-to-deploy"
+
+[[exemptions.utoipa]]
+version = "5.5.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.utoipa-gen]]
+version = "5.5.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.uuid]]
@@ -1378,10 +1361,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.zerovec-derive]]
 version = "0.11.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.zip]]
-version = "2.4.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.zmij]]
