@@ -1,0 +1,38 @@
+name: golden-tier-coverage
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+jobs:
+  verify-tiers:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tier 1 — system utilities
+        run: |
+          for c in jq rsync unzip zip xz-utils locales net-tools openssh-client shellcheck sshpass p7zip patchelf gnupg2 dnsutils iputils-ping sqlite3 git-lfs cmake; do
+            command -v "$c" >/dev/null || { echo "MISSING: $c"; exit 1; }
+          done
+          echo "tier1 ok"
+      - name: Tier 2 — node ecosystem
+        run: |
+          node --version | grep -q '^v22' || { echo "node wrong: $(node --version)"; exit 1; }
+          pnpm --version | grep -q '^11\.' || exit 1
+          yarn --version | grep -q '^1\.22\.' || exit 1
+          export NVM_DIR=/usr/local/nvm
+          . "$NVM_DIR/nvm.sh" && nvm --version | grep -q '^0\.40\.' || exit 1
+          echo "tier2 ok"
+      - name: Tier 3 — legacy toolchains
+        run: |
+          python3.10 --version | grep -q '3\.10\.20' || exit 1
+          go version | grep -q 'go1\.24\.13' || exit 1
+          echo "tier3 ok"
+      - name: Tier 4 — bare-run CLIs
+        run: |
+          gh --version | grep -q 'gh version 2\.96\.0' || exit 1
+          yq --version | grep -q 'v4\.53\.3' || exit 1
+          echo "tier4 ok"
+      - name: nvm user pattern (documented hosted source)
+        run: |
+          export NVM_DIR=/usr/local/nvm
+          . "$NVM_DIR/nvm.sh" && nvm use 22 >/dev/null 2>&1 && node --version
