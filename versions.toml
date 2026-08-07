@@ -9,3 +9,18 @@ node20_externals_version = "20.19.0"
 node24_externals_version = "24.3.0"
 ubuntu_24_04_base = "ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90"
 ubuntu_22_04_base = "ubuntu:22.04@sha256:0e0a0fc6d18feda9db1590da249ac93e8d5abfea8f4c3c0c849ce512b5ef8982"
+
+# Node ecosystem tools baked into the golden (tier 2).
+pnpm_version = "11.20.0"
+yarn_version = "1.22.22"
+nvm_version = "0.40.6"
+
+# Legacy toolchains baked into the golden (tier 3). Python comes from
+# python-build-standalone (Ubuntu 24.04's apt archive only has 3.12).
+python_3_10_version = "3.10.20"
+python_standalone_release = "20260805"
+go_1_24_version = "1.24.13"
+
+# Bare-run CLI tools (tier 4).
+gh_version = "2.96.0"
+yq_version = "4.53.3"
