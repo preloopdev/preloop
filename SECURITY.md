@@ -11,7 +11,7 @@ official `actions/runner` (pinned in `versions.toml`).
 Do **not** open a public issue for security vulnerabilities. Report privately
 via GitHub's private vulnerability reporting:
 
-https://github.com/preloopdev/aksh/security/advisories/new
+https://github.com/preloopdev/preloop/security/advisories/new
 
 Please include:
 
