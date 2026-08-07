@@ -128,6 +128,10 @@ pub(crate) async fn cache_reserve(
             bytes: Vec::new(),
         },
     );
+    let meta = crate::store::build_meta_snapshot(&inner);
+    if let Err(error) = shared.state.store.store_meta_only(&meta).await {
+        tracing::warn!(?error, "failed to persist cache reservation");
+    }
     Json(CacheReserveResponse { cache_id })
 }
 
@@ -142,6 +146,10 @@ pub(crate) async fn cache_upload(
         .get_mut(&cache_id)
         .ok_or_else(|| ApiError::not_found("cache reservation not found"))?;
     pending.bytes.extend_from_slice(&bytes);
+    // No write-through here on purpose: the in-flight payload is not durable
+    // state (see `MetaSnapshot`), and snapshotting per chunk was quadratic in
+    // cache size. The committed cache is persisted by `CacheStore` in
+    // `cache_commit`.
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -157,6 +165,13 @@ pub(crate) async fn cache_commit(
             .remove(&cache_id)
             .ok_or_else(|| ApiError::not_found("cache reservation not found"))?
     };
+    let meta = {
+        let inner = shared.state.inner.lock().await;
+        crate::store::build_meta_snapshot(&inner)
+    };
+    if let Err(error) = shared.state.store.store_meta_only(&meta).await {
+        tracing::warn!(?error, "failed to persist cache commit");
+    }
     if let Some(size) = request.size {
         let actual = pending.bytes.len() as u64;
         if size != actual {
@@ -246,6 +261,10 @@ pub(crate) async fn put_artifact(
     };
     let mut inner = shared.state.inner.lock().await;
     inner.artifacts.insert(record.id.clone(), record.clone());
+    let meta = crate::store::build_meta_snapshot(&inner);
+    if let Err(error) = shared.state.store.store_meta_only(&meta).await {
+        tracing::warn!(?error, "failed to persist artifact metadata");
+    }
     Ok(Json(record))
 }
 

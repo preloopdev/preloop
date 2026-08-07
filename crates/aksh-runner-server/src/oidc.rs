@@ -61,7 +61,7 @@ impl OidcKeypair {
         Self::from_keypair_and_certificate(keypair, certificate_der.to_vec())
     }
 
-    /// Export for persistence.
+    /// Export for the store.
     pub fn params(&self) -> RsaParametersExport {
         self.keypair.to_rsaparams()
     }

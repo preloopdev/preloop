@@ -32,7 +32,7 @@ pub(crate) struct LogMetadata {
     pub(crate) line_count: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RunRecord {
     pub(crate) run_id: RunId,
     pub(crate) run_name: Option<String>,
@@ -130,7 +130,7 @@ pub(crate) struct AssignmentRecord {
     pub(crate) first_at: std::time::SystemTime,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct QueuedJob {
     pub(crate) run_id: RunId,
     pub(crate) job_id: JobId,
@@ -155,7 +155,7 @@ pub(crate) struct QueuedJob {
     pub(crate) reusable_call: Option<aksh_gha_protocol::ReusableCallPlan>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct GitHubTokenRequest {
     pub(crate) repository: String,
     pub(crate) permissions: BTreeMap<String, String>,
@@ -175,7 +175,7 @@ pub(crate) struct RunnerCapabilities {
     pub(crate) runner_group_name: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct QueuedCancellation {
     pub(crate) run_id: RunId,
     pub(crate) job_id: JobId,
@@ -195,14 +195,14 @@ pub(crate) enum WebhookDeliveryState {
     Completed(std::time::Instant),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PendingCache {
     pub(crate) key: String,
     pub(crate) version: String,
     pub(crate) bytes: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ArtifactRecord {
     pub(crate) id: String,
     pub(crate) run_id: RunId,
@@ -213,14 +213,14 @@ pub(crate) struct ArtifactRecord {
 }
 
 /// Pending cache v2 upload (Twirp CacheService).
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct CacheV2Pending {
     pub(crate) key: String,
     pub(crate) version: String,
 }
 
 /// Pending artifact v2 upload (Twirp ArtifactService).
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ArtifactV2Pending {
     /// Registry key = "{run_backend_id}/{job_backend_id}/{name}".
     pub(crate) registry_key: String,

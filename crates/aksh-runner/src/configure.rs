@@ -487,7 +487,19 @@ async fn create_agent(
         serde_json::json!({"id": 0, "name": current_arch_label(), "type": "system"}),
     ];
     if let Some(user_labels) = &args.labels {
+        // Dedupe case-insensitively, preserving first occurrence. A user who
+        // passes `--labels self-hosted,gpu` would otherwise ship a duplicate
+        // `self-hosted` that the server's `(runner_id, label)` primary key
+        // rejects with HTTP 500.
+        let mut seen: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(3 + user_labels.len());
+        for label in &["self-hosted", current_os_label(), current_arch_label()] {
+            seen.insert(label.to_lowercase());
+        }
         for l in user_labels {
+            if !seen.insert(l.to_lowercase()) {
+                continue;
+            }
             labels.push(serde_json::json!({"id": 0, "name": l, "type": "user"}));
         }
     }

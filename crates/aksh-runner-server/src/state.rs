@@ -281,6 +281,7 @@ pub(crate) static GITHUB_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::
 #[derive(Clone)]
 pub struct AppState {
     pub(crate) inner: Arc<Mutex<InnerState>>,
+    pub(crate) store: Arc<dyn Store>,
     pub(crate) events: broadcast::Sender<NdjsonEvent>,
     pub(crate) message_notify: Arc<Notify>,
     /// Atomic counter for pre-allocating request IDs outside the dispatch
@@ -394,7 +395,7 @@ impl std::fmt::Debug for SecretStore {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct OidcJobContext {
     pub(crate) environment: Option<String>,
     pub(crate) job_workflow_ref: Option<String>,
@@ -402,7 +403,7 @@ pub(crate) struct OidcJobContext {
     pub(crate) job_workflow_sha: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct JobSetId {
     pub(crate) run_id: RunId,
     pub(crate) job_ids: BTreeSet<JobId>,
@@ -417,7 +418,7 @@ impl JobSetId {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct JobSetGate {
     pub(crate) key: (String, String),
     pub(crate) display_name: String,
@@ -425,7 +426,7 @@ pub(crate) struct JobSetGate {
     pub(crate) queue: aksh_gha_parser::ConcurrencyQueue,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct JobSetAdmission {
     pub(crate) gates: Vec<JobSetGate>,
     pub(crate) acquired_keys: BTreeSet<(String, String)>,
@@ -451,6 +452,19 @@ impl AppState {
     /// whole life, and lets tests point at a temp file without mutating
     /// process-wide environment state that other tests race against.
     pub async fn new_with_config(state_dir: PathBuf, config_path: PathBuf) -> anyhow::Result<Self> {
+        Self::new_with_store(state_dir, config_path, None).await
+    }
+
+    /// [`AppState::new_with_config`] against an explicit store URL.
+    ///
+    /// `store_url` takes precedence over the `AKSH_STORE_URL` environment
+    /// variable; `None` falls back to the environment, then to SQLite at
+    /// `<state_dir>/aksh.db`.
+    pub async fn new_with_store(
+        state_dir: PathBuf,
+        config_path: PathBuf,
+        store_url: Option<&str>,
+    ) -> anyhow::Result<Self> {
         let cache = CacheStore::new(state_dir.join("cache")).await?;
         let artifacts = ArtifactStore::new(state_dir.join("artifacts")).await?;
         let (events, _) = broadcast::channel(1024);
@@ -499,6 +513,20 @@ impl AppState {
             oidc_keypair: Some(oidc_keypair),
             ..Default::default()
         };
+        let store = crate::store::open_store(store_url, &state_dir, &local_jwt_key).await?;
+        let mut recovered = inner;
+        store.load_into(&mut recovered).await?;
+        let next_request_id = recovered
+            .job_requests
+            .keys()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let inner = recovered;
+        // Capture queue length before moving `inner` into the Mutex so the
+        // `queue_depth` atomic is set to the recovered ready-queue size.
+        let recovered_queue_len = inner.queue.len();
         let webhook_secret = std::env::var("AKSH_WEBHOOK_SECRET").ok();
         let local_workspace = std::env::var("AKSH_LOCAL_WORKSPACE")
             .ok()
@@ -564,10 +592,13 @@ impl AppState {
         }));
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
+            store,
             events,
             message_notify: Arc::new(Notify::new()),
-            next_request_id: Arc::new(std::sync::atomic::AtomicI64::new(1)),
-            queue_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            next_request_id: Arc::new(std::sync::atomic::AtomicI64::new(next_request_id)),
+            // Mirror the recovered ready-queue size so an on-demand runner
+            // pool spawns against the right workload after restart.
+            queue_depth: Arc::new(std::sync::atomic::AtomicUsize::new(recovered_queue_len)),
             next_job_runs_on: Arc::new(std::sync::RwLock::new(Vec::new())),
             cache,
             artifacts,
@@ -590,6 +621,36 @@ impl AppState {
     }
 
     pub(crate) async fn emit(&self, event: NdjsonEvent) {
+        let run_id = match &event {
+            NdjsonEvent::RunAccepted { run_id, .. }
+            | NdjsonEvent::JobStatus { run_id, .. }
+            | NdjsonEvent::RunStatus { run_id, .. }
+            | NdjsonEvent::JobCompleted { run_id, .. } => Some(*run_id),
+            _ => None,
+        };
+        let has_run_projection = run_id.is_some();
+        // Capture the projection under the lock, then persist after releasing
+        // it: a slow or unavailable backend must not stall the control plane
+        // (runner polling, heartbeats, other state mutations).
+        if let Some(run_id) = run_id {
+            let projection = {
+                let inner = self.inner.lock().await;
+                crate::store::RunProjection::from_inner(&inner, run_id, event.clone())
+            };
+            if let Some(projection) = projection {
+                if let Err(error) = self.store.store_run_event(projection).await {
+                    error!(?error, %run_id, "failed to persist control-plane run event");
+                }
+            }
+        }
+        if !has_run_projection {
+            if let Err(error) = self.store.append_event(&event).await {
+                error!(?error, "failed to append durable control-plane event");
+            }
+        }
+        // Always broadcast: in-memory state is the source of truth and
+        // subscribers see live events. A store hiccup must never
+        // freeze the SSE/UI stream for a healthy run.
         let _ = self.events.send(event);
     }
 
@@ -679,7 +740,7 @@ pub(crate) fn load_or_generate_oidc_keypair(
             oidc::OidcKeypair::from_params_and_certificate(&params, &certificate_der)?
         } else {
             let kp = oidc::OidcKeypair::from_params(&params)?;
-            persist_private_file(&certificate_path, kp.certificate_der())?;
+            store_private_file(&certificate_path, kp.certificate_der())?;
             kp
         };
         return Ok(kp);
@@ -687,12 +748,12 @@ pub(crate) fn load_or_generate_oidc_keypair(
 
     let kp = oidc::OidcKeypair::generate()?;
     let json = serde_json::to_vec(&kp.params())?;
-    persist_private_file(&key_path, &json)?;
-    persist_private_file(&certificate_path, kp.certificate_der())?;
+    store_private_file(&key_path, &json)?;
+    store_private_file(&certificate_path, kp.certificate_der())?;
     Ok(kp)
 }
 
-fn persist_private_file(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+fn store_private_file(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
     let temp_path = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
