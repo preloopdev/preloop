@@ -48,6 +48,9 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Ensure cross target (dtolnay may skip it on self-hosted)
+        run: rustup target add ${{ matrix.target }}
+
       - name: Set up Zig cross toolchain
         uses: goto-bus-stop/setup-zig@v2
         with:

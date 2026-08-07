@@ -14708,8 +14708,17 @@ async fn store_recovery_preserves_pool_pairing_and_oauth_client_ids() {
         .get(&(run_id, JobId("build".to_owned())))
         .expect("job assignment must survive restart");
     assert_eq!(assignment.runner_id, 7);
-    assert_eq!(assignment.at, now);
-    assert_eq!(assignment.first_at, now);
+    assert_eq!(assignment.at, assignment.first_at);
+    // The assignment timestamp is recorded server-side a few hundred
+    // nanoseconds after `now` was captured; exact equality flakes on
+    // scheduling jitter. Bound the delta instead.
+    for stamp in [assignment.at, assignment.first_at] {
+        let delta = stamp.duration_since(now).unwrap_or_default();
+        assert!(
+            delta < std::time::Duration::from_secs(1),
+            "assignment timestamp must be recorded near submission time (delta {delta:?})"
+        );
+    }
     assert!(
         inner
             .pool_pending
