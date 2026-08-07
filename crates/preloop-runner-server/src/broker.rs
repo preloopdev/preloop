@@ -867,6 +867,47 @@ async fn fail_unclaimable_request(shared: &Arc<SharedState>, request_id: i64) {
     shared.state.message_notify.notify_waiters();
 }
 
+/// Fail job claims pinned to sessions that did not survive a restart.
+///
+/// Pool machines are ephemeral: a control-plane restart destroys their VMs,
+/// but `session_active_requests` is persisted. Those claims come back pinned
+/// to sessions that will never poll again, so no fresh machine can take the
+/// job — the run, and the GitHub check run it created, sit queued forever
+/// while the pool idles. Failing them once at startup makes the reported
+/// state honest and releases the concurrency slot.
+///
+/// Only claims whose session is gone are touched. A queued job that was never
+/// claimed still has its queue row and is dispatched normally, and a runner
+/// that outlived the control plane keeps a live session, so its job is left
+/// to the ordinary disconnect reaper.
+pub(crate) async fn reconcile_orphaned_claims(shared: &Arc<SharedState>) -> usize {
+    let orphaned: Vec<i64> = {
+        let inner = shared.state.inner.lock().await;
+        inner
+            .session_active_requests
+            .iter()
+            .filter(|(session_id, _)| !inner.sessions.contains_key(*session_id))
+            .map(|(_, request_id)| *request_id)
+            .filter(|request_id| {
+                inner
+                    .job_requests
+                    .get(request_id)
+                    .is_some_and(|record| record.result.is_none())
+            })
+            .collect()
+    };
+    for request_id in &orphaned {
+        fail_unclaimable_request(shared, *request_id).await;
+    }
+    if !orphaned.is_empty() {
+        warn!(
+            count = orphaned.len(),
+            "failed job claims orphaned by a control-plane restart"
+        );
+    }
+    orphaned.len()
+}
+
 pub(crate) async fn mint_dispatch_github_token(
     shared: &Arc<SharedState>,
     request: &GitHubTokenRequest,

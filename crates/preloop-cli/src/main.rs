@@ -404,7 +404,7 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
             std::env::consts::ARCH.into(),
         ],
         cpus: RUNNER_CPUS,
-        memory_mib: RUNNER_MEMORY_MIB,
+        memory_mib: runner_memory_mib(),
         storage_gib: 20,
         overlay_gib: std::env::var("PRELOOP_RUNNER_OVERLAY_GB")
             .ok()
@@ -944,7 +944,7 @@ fn local_runner_pool_config(
         registration_token_env: "PRELOOP_SYSTEM_TOKEN".into(),
         labels: runner_pool_labels(),
         cpus: RUNNER_CPUS,
-        memory_mib: RUNNER_MEMORY_MIB,
+        memory_mib: runner_memory_mib(),
         storage_gib: 20,
         overlay_gib: std::env::var("PRELOOP_RUNNER_OVERLAY_GB")
             .ok()
@@ -991,6 +991,23 @@ const RUNNER_CPUS: u16 = 4;
 /// Memory given to each runner VM, in MiB. SmolVM balloons this, so an idle
 /// runner commits far less than its ceiling.
 const RUNNER_MEMORY_MIB: u32 = 4096;
+
+/// Memory ceiling for each runner VM, honouring `PRELOOP_RUNNER_MEMORY_MIB`.
+///
+/// The 4 GiB default fits ordinary jobs, but a thin-LTO `codegen-units=1`
+/// release build of this workspace peaks past it and rustc dies with SIGKILL
+/// — which is exactly how the aarch64 release job failed. Pool size is
+/// already tunable via `PRELOOP_RUNNER_POOL_SIZE`; memory has to be too, or
+/// the only lever on a memory-bound host is running fewer machines.
+/// Ballooning means a raised ceiling costs nothing while runners sit idle.
+fn runner_memory_mib() -> u32 {
+    const MIN_MEMORY_MIB: u32 = 1024;
+    std::env::var("PRELOOP_RUNNER_MEMORY_MIB")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .filter(|value| *value >= MIN_MEMORY_MIB)
+        .unwrap_or(RUNNER_MEMORY_MIB)
+}
 
 /// Resident memory an idle runner VM actually holds, in MiB.
 ///

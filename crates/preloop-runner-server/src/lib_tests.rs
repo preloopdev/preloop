@@ -15315,3 +15315,97 @@ async fn postgres_recovery_preserves_claim_state_across_run_events() {
         "claimed job stays dequeued; the unclaimed job stays queued (PG)"
     );
 }
+
+/// A restart destroys every pool machine but persists its claim, so the
+/// request returns pinned to a session that will never poll again. Nothing
+/// can complete it and nothing can re-claim it: the run — and the GitHub
+/// check run it created — would sit queued forever while the pool idles.
+/// Startup reconciliation must settle those claims, and only those.
+#[tokio::test]
+async fn startup_fails_claims_orphaned_by_a_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let workflow =
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 1\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 2\n";
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({"workflow_yaml": workflow, "event": "push", "repository": "owner/repo"}),
+    )
+    .await;
+    let _run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    // A pool machine claimed `build`, then the control plane restarted: the
+    // pin survives, its session does not.
+    let (claimed_request, queued_request) = {
+        let mut inner = state.inner.lock().await;
+        let claimed = inner
+            .queue
+            .iter()
+            .find(|job| job.job_id.0 == "build")
+            .cloned()
+            .expect("build job queued");
+        inner.queue.retain(|job| job.job_id.0 != "build");
+        let claimed_request = inner
+            .job_requests
+            .values()
+            .find(|record| record.job_id.0 == "build")
+            .map(|record| record.request_id)
+            .expect("build request");
+        let queued_request = inner
+            .job_requests
+            .values()
+            .find(|record| record.job_id.0 == "test")
+            .map(|record| record.request_id)
+            .expect("test request");
+        inner
+            .session_active_requests
+            .insert("dead-session".to_owned(), claimed_request);
+        inner
+            .broker_messages
+            .insert(claimed_request, claimed.message.clone());
+        assert!(
+            inner.sessions.is_empty(),
+            "no session survives the restart in this scenario"
+        );
+        (claimed_request, queued_request)
+    };
+
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+    let settled = crate::broker::reconcile_orphaned_claims(&shared).await;
+    assert_eq!(settled, 1, "exactly the orphaned claim is settled");
+
+    let inner = state.inner.lock().await;
+    assert_eq!(
+        inner
+            .job_requests
+            .get(&claimed_request)
+            .and_then(|record| record.result),
+        Some(ExecutionStatus::Failure),
+        "an unclaimable job must be reported failed, not left queued forever"
+    );
+    assert!(
+        !inner
+            .session_active_requests
+            .values()
+            .any(|request_id| *request_id == claimed_request),
+        "the dead session's claim must be released"
+    );
+    assert_eq!(
+        inner
+            .job_requests
+            .get(&queued_request)
+            .and_then(|record| record.result),
+        None,
+        "a job that was never claimed stays runnable"
+    );
+    assert!(
+        inner.queue.iter().any(|job| job.job_id.0 == "test"),
+        "the unclaimed job stays in the queue for a fresh machine"
+    );
+}

@@ -883,13 +883,14 @@ pub struct RunnerPoolConfig {
 /// Cache of environment-specific golden VMs.
 pub(crate) struct GoldenRegistry {
     goldens: RwLock<HashMap<String, MachineName>>,
-    /// Serializes golden construction. Held across the whole build so two
-    /// slots cannot create the same golden concurrently — the second would
+    /// Per-fingerprint construction locks. A single build_lock used to be
+    /// held across the whole bake, so one environment's golden build parked
+    /// every other slot on the mutex — silently, with no logs — freezing the
+    /// pool until a restart. Distinct fingerprints now build concurrently;
+    /// the same fingerprint is still serialized (the second caller would
     /// otherwise delete the first's half-built VM, since
-    /// `prepare_golden_for_env` removes any existing machine of that name.
-    /// Builds are rare and expensive, so serializing distinct environments
-    /// too costs nothing measurable.
-    build_lock: tokio::sync::Mutex<()>,
+    /// `prepare_golden_for_env` removes any existing machine of that name).
+    build_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     name_prefix: String,
 }
 
@@ -897,7 +898,7 @@ impl GoldenRegistry {
     pub fn new(name_prefix: String) -> Self {
         Self {
             goldens: RwLock::new(HashMap::new()),
-            build_lock: tokio::sync::Mutex::new(()),
+            build_locks: RwLock::new(HashMap::new()),
             name_prefix,
         }
     }
@@ -926,13 +927,24 @@ impl GoldenRegistry {
         if let Some(golden) = self.get(fingerprint).await {
             return Ok(golden);
         }
-        // Held across `build` so a concurrent caller cannot start a second
-        // build of the same golden.
-        let _guard = self.build_lock.lock().await;
+        // Per-fingerprint lock, so one environment's bake cannot park every
+        // other slot. Only builds of the *same* fingerprint serialize.
+        let build_lock = {
+            let mut locks = self.build_locks.write().await;
+            locks
+                .entry(fingerprint.to_owned())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _guard = build_lock.lock().await;
         // Re-check: another caller may have built it while we waited.
         if let Some(golden) = self.get(fingerprint).await {
             return Ok(golden);
         }
+        info!(
+            fingerprint,
+            "building golden for environment; other environments proceed concurrently"
+        );
         let name = build.await?;
         self.insert(fingerprint.to_owned(), name.clone()).await;
         Ok(name)
@@ -3501,5 +3513,77 @@ mod golden_download_tests {
         assert!(!downloaded);
         assert!(!payload.exists());
         assert!(leftovers(directory.path()).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod golden_registry_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// Distinct environments must build concurrently: one fingerprint's bake
+    /// must not park other slots (the pre-freeze `build_lock` behavior).
+    #[tokio::test]
+    async fn distinct_fingerprints_build_concurrently() {
+        let registry = GoldenRegistry::new("test".to_owned());
+        let started = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+
+        let build = |fp: &'static str,
+                     started: Arc<AtomicUsize>,
+                     active: Arc<AtomicUsize>,
+                     max_active: Arc<AtomicUsize>| async move {
+            started.fetch_add(1, Ordering::SeqCst);
+            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+            max_active.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            active.fetch_sub(1, Ordering::SeqCst);
+            Ok(MachineName::new(format!("{fp}-golden")).unwrap())
+        };
+
+        let (fp_a, fp_b) = ("env-a", "env-b");
+        let (a, b) = tokio::join!(
+            registry.get_or_prepare(
+                fp_a,
+                build(fp_a, started.clone(), active.clone(), max_active.clone())
+            ),
+            registry.get_or_prepare(
+                fp_b,
+                build(fp_b, started.clone(), active.clone(), max_active.clone())
+            ),
+        );
+        a.unwrap();
+        b.unwrap();
+        assert_eq!(max_active.load(Ordering::SeqCst), 2, "builds must overlap");
+        assert_eq!(started.load(Ordering::SeqCst), 2);
+    }
+
+    /// The same fingerprint must build exactly once; the second caller gets
+    /// the first caller's golden via the re-check.
+    #[tokio::test]
+    async fn same_fingerprint_builds_once() {
+        let registry = GoldenRegistry::new("test".to_owned());
+        let builds = Arc::new(AtomicUsize::new(0));
+        let build = |builds: Arc<AtomicUsize>| async move {
+            builds.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok(MachineName::new("shared-golden").unwrap())
+        };
+
+        let (a, b) = tokio::join!(
+            registry.get_or_prepare("same", build(builds.clone())),
+            registry.get_or_prepare("same", build(builds.clone())),
+        );
+        let a = a.unwrap();
+        let b = b.unwrap();
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "duplicate build must not run"
+        );
+        assert_eq!(a.as_str(), b.as_str());
+        assert_eq!(a.as_str(), "shared-golden");
     }
 }

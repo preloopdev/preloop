@@ -35,8 +35,12 @@ jobs:
         with:
           version: 0.14.1
 
+      # Prebuilt binary: `cargo install` rebuilt this from source on every
+      # release run for no benefit.
       - name: Install cargo-zigbuild
-        run: cargo install cargo-zigbuild --locked
+        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad
+        with:
+          tool: cargo-zigbuild@0.23.0
 
       - name: Build release binaries
         run: |

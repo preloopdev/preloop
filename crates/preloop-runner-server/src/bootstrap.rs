@@ -370,6 +370,11 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         run_background_reaper(checker_shared).await;
     });
 
+    // Claims held by machines the restart destroyed can never be completed by
+    // anyone; settle them before serving so the pool is not handed a queue of
+    // jobs it is structurally unable to claim.
+    crate::broker::reconcile_orphaned_claims(&shared).await;
+
     match config.tls {
         TlsMode::None => {
             #[cfg(unix)]
