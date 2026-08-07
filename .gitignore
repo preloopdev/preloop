@@ -94,7 +94,7 @@ benchmarks/preloop-perf/results/
 benchmarks/real-world/results/three-engine-smoke
 *.smolmachine
 rust_out
-/goal
+goals
  # Conformance capture artifacts (timestamped runs, crypto material)                                                                             
 /benchmarks/compatibility/conformance/
 benchmarks/real-world/externals
@@ -121,8 +121,7 @@ benchmarks/compatibility/runner/behavior/*-new.jsonl
 benchmarks/real-world/goldens/
 benchmarks/real-world/results/conformance-4repos/**/run.json*
 benchmarks/real-world/conformance-4repos/payloads/
-/goals
-/plans
+plans
 
 # Conformance campaign captures: multi-MB run records and logs, regenerated
 # by the harness and not reviewable in a diff.
@@ -133,3 +132,4 @@ benchmarks/real-world/results/conformance-4repos/**/run*.log
 docs/internal/
 .agents/
 skills-lock.json
+.claude/
