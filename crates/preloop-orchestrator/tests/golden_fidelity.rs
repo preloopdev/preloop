@@ -110,11 +110,14 @@ const REQUIRED_DOCKER: &[&str] = &[
 
 #[test]
 fn golden_carries_container_engine_packages() {
-    let packages: Vec<&str> = docker_packages().split_whitespace().collect();
+    let baseline = docker_packages();
+    let packages: Vec<&str> = baseline.split_whitespace().collect();
     let missing: Vec<&str> = REQUIRED_DOCKER
         .iter()
         .copied()
-        .filter(|p| !packages.contains(p))
+        // Packages carry apt version pins (`docker-ce=28.0.4*`) — match the
+        // package name prefix.
+        .filter(|p| !packages.iter().any(|entry| entry.starts_with(p)))
         .collect();
     assert!(
         missing.is_empty(),

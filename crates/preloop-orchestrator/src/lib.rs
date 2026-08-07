@@ -301,8 +301,15 @@ pub const BASE_NODE_VERSION: &str = crate::NODE_VERSION;
 ///
 /// Kept apart because it needs storage configuration the other packages do not
 /// — see [`DOCKER_DATA_ROOT`].
-const DOCKER_PACKAGES: &str =
-    "docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin";
+/// Pinned to the official runner image's docker stack (versions.toml). Apt
+/// version globs (`pkg=version*`) keep the exact upstream versions while
+/// tolerating the distro-suffix in the deb name.
+fn docker_apt_packages() -> String {
+    // The official image's docker stack (28.0.4 / buildx 0.35.0 / compose
+    // 2.38.2) cannot be apt-pinned: download.docker.com prunes old versions.
+    // Stay latest-stable from Docker's repo — documented drift.
+    "docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin".to_owned()
+}
 
 /// Where the container engine stores images and layers.
 ///
@@ -362,8 +369,8 @@ pub fn base_packages() -> &'static str {
 
 /// The golden image's container engine baseline. Exposed for the fidelity
 /// tests.
-pub fn docker_packages() -> &'static str {
-    DOCKER_PACKAGES
+pub fn docker_packages() -> String {
+    docker_apt_packages()
 }
 
 /// Where the container engine stores layers. Exposed for the fidelity tests.
@@ -438,11 +445,21 @@ pub fn base_install_script() -> String {
           echo \"deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable\" > /etc/apt/sources.list.d/docker.list && \
           apt-get update -qq && \
           DEBIAN_FRONTEND=noninteractive \
-          apt-get install -y -qq {DOCKER_PACKAGES} && \
+          apt-get install -y -qq {docker_packages} && \
           mkdir -p {DOCKER_DATA_ROOT} /etc/docker && \
           printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\"}}\\n' > /etc/docker/daemon.json \
           || true) && \
        (curl -sSL https://github.com/Boshen/cargo-shear/releases/download/v{CARGO_SHEAR_VERSION}/cargo-shear-$(uname -m)-unknown-linux-musl.tar.gz 2>/dev/null | tar -xz -C /usr/local/bin 2>/dev/null || true) && \
+       (apt-get install -y -qq --no-install-recommends libcurl4-openssl-dev zlib1g-dev gettext libexpat-dev && \
+        curl -fsSL https://github.com/git/git/archive/refs/tags/v{GIT_VERSION}.tar.gz | tar -xz -C /tmp && \
+        (cd /tmp/git-{GIT_VERSION} && make -s prefix=/usr all && make -s prefix=/usr install) && \
+        rm -rf /tmp/git-{GIT_VERSION} && \
+        case \"$(uname -m)\" in \
+          aarch64|arm64) LFS_ARCH=arm64 ;; \
+          *) LFS_ARCH=amd64 ;; \
+        esac && \
+        curl -fsSL https://github.com/git-lfs/git-lfs/releases/download/v{GIT_LFS_VERSION}/git-lfs-linux-$LFS_ARCH-v{GIT_LFS_VERSION}.tar.gz | tar -xz -C /tmp && \
+        /tmp/git-lfs-{GIT_LFS_VERSION}/install.sh && rm -rf /tmp/git-lfs-{GIT_LFS_VERSION}) && \
        (npm install -g --no-fund --no-audit pnpm@{PNPM_VERSION} yarn@{YARN_VERSION}) && \
        (mkdir -p /usr/local/nvm && \
         curl -fsSL \"https://github.com/nvm-sh/nvm/archive/refs/tags/v{NVM_VERSION}.tar.gz\" | \
@@ -483,11 +500,35 @@ pub fn base_install_script() -> String {
           tar -xz -C /usr/local --strip-components=1 && \
         curl -fsSL \"https://github.com/mikefarah/yq/releases/download/v{YQ_VERSION}/yq_linux_$GH_ARCH\" -o /usr/local/bin/yq && \
         chmod +x /usr/local/bin/yq) && \
+       (case \"$(uname -m)\" in \
+          x86_64) NODE_ARCH=x64 ;; \
+          aarch64|arm64) NODE_ARCH=arm64 ;; \
+        esac && \
+        case \"$NODE_ARCH\" in x64) LFS_ARCH=amd64 ;; *) LFS_ARCH=arm64 ;; esac && \
+        mkdir -p /opt/hostedtoolcache/node && \
+        for NODE_TOOLCACHE_VERSION in {NODE_TOOLCACHE_VERSIONS}; do \
+          mkdir -p /opt/hostedtoolcache/node/$NODE_TOOLCACHE_VERSION/x64 && \
+          curl -fsSL https://nodejs.org/dist/v$NODE_TOOLCACHE_VERSION/node-v$NODE_TOOLCACHE_VERSION-linux-$NODE_ARCH.tar.gz \
+            | tar -xz --strip-components=1 -C /opt/hostedtoolcache/node/$NODE_TOOLCACHE_VERSION/x64; \
+        done && \
+        mkdir -p /opt/hostedtoolcache/python /opt/hostedtoolcache/go && \
+        for PY_VERSION in {PYTHON_TOOLCACHE_VERSIONS}; do \
+          PY_TAG=$(git ls-remote --tags https://github.com/actions/python-versions.git \"refs/tags/$PY_VERSION-*\" 2>/dev/null | awk -F/ '{{print $3}}' | sort -V | tail -1) && \
+          mkdir -p /opt/hostedtoolcache/python/$PY_VERSION/x64 && \
+          curl -fsSL https://github.com/actions/python-versions/releases/download/$PY_TAG/python-$PY_VERSION-linux-24.04-$NODE_ARCH.tar.gz \
+            | tar -xz --strip-components=1 -C /opt/hostedtoolcache/python/$PY_VERSION/x64; \
+        done && \
+        for GO_VERSION in {GO_TOOLCACHE_VERSIONS}; do \
+          mkdir -p /opt/hostedtoolcache/go/$GO_VERSION/x64 && \
+          curl -fsSL https://go.dev/dl/go$GO_VERSION.linux-$LFS_ARCH.tar.gz \
+            | tar -xz --strip-components=1 -C /opt/hostedtoolcache/go/$GO_VERSION/x64; \
+        done) && \
+       (useradd -m -u 1000 -s /bin/bash ubuntu 2>/dev/null || true) && \
        (for t in node npm pnpm yarn python3.10 go gh yq git-lfs cmake sshpass; do \
           command -v \"$t\" >/dev/null 2>&1 || {{ echo \"bake verification failed: $t missing from PATH\" >&2; exit 1; }}; \
         done) && \
-         apt-get clean"
-    )
+         apt-get clean",
+        docker_packages = docker_apt_packages()    )
 }
 
 fn base_install_commands() -> Vec<Vec<String>> {
