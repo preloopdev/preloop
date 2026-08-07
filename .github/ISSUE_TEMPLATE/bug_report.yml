@@ -59,13 +59,25 @@ body:
       label: What does the official runner do?
       description: |
         If you believe this is a divergence, run the **same workflow** against
-        GitHub-hosted runners or the official runner binary and record the
-        difference:
+        GitHub-hosted runners or the official runner binary, and record the
+        difference. Two ways to record:
 
-        - job/step names, order, and conclusions (`gh run view --log` works)
-        - the exact failing protocol exchange, if it is one (a `runner-watch`
-          capture or `/_apis/...` request/response pair)
-        - anything that shows the expected wire bytes or event shape
+        **Easy (no tooling):** run the workflow on GitHub (or with the
+        official runner binary) and paste `gh run view --log <run-id>` — job
+        and step names, order, and conclusions.
+
+        **Wire-accurate (recommended for protocol issues):** the repo ships
+        `runner-watch`, which records the official runner's exact
+        request/response exchange and replays it against aksh:
+
+        ```
+        runner-watch record-golden --runner /path/to/actions-runner --scenario <name>
+        runner-watch conform --runner 2.336.0 --aksh-url http://127.0.0.1:9090
+        ```
+
+        Attach the generated `.runner-watch/golden/v2.336.0/<scenario>/flows.jsonl`
+        and the `conform` output. The pinned compatibility target is in
+        `versions.toml` (v2.336.0).
 
         A reproduction that includes the official behavior is what makes a
         divergence report reviewable.
