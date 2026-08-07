@@ -568,6 +568,10 @@ async fn run_runner_e2e(
     let mut server_cmd = Command::new(server_bin);
     server_cmd
         .env("PRELOOP_PUBLIC_URL", &server_url)
+        // The goldens carry real GitHub-issued registration tokens this
+        // control plane cannot verify; the harness is the one sanctioned
+        // consumer of the permissive policy.
+        .env("PRELOOP_REGISTRATION_POLICY", "permissive")
         .arg("serve")
         .arg("--listen")
         .arg(&listen)

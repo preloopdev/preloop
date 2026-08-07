@@ -2917,7 +2917,7 @@ async fn registration_and_oauth_return_runner_compatible_tokens() {
 /// code inside a VM can reach, only the system credential — the token the
 /// pool injects into its own configure invocation — may mint.
 #[tokio::test]
-async fn registration_mint_credential_rules_follow_the_surface() {
+async fn registration_mint_credential_rules_are_strict_by_default() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
         AppState::new(temp.path().to_path_buf()).await.unwrap(),
@@ -2940,17 +2940,59 @@ async fn registration_mint_credential_rules_follow_the_surface() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
-    // TCP: any non-empty credential mints — GitHub-equivalent, and what the
-    // official runner and the conformance replay need.
+    // Strict-by-default: a made-up credential must NOT mint. This is the
+    // registration hole: anyone able to reach the port could previously mint
+    // a RunnerManage JWT and register a rogue runner that receives job
+    // messages carrying a minted installation token plus job secrets.
+    let forged = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v3/actions/runner-registration")
+                .header(header::AUTHORIZATION, "RemoteAuth totally-made-up-token")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        forged.status(),
+        StatusCode::UNAUTHORIZED,
+        "strict policy must refuse an unrecognized credential"
+    );
+
+    // The system credential is the one thing strict accepts.
     let minted = request_json_with_bearer(
         &app,
         Method::POST,
         "/api/v3/actions/runner-registration",
         body,
-        "an-operator-supplied-token",
+        DEFAULT_PRELOOP_SYSTEM_TOKEN,
     )
     .await;
     assert_eq!(minted["token_schema"], "OAuthAccessToken");
+}
+
+#[tokio::test]
+async fn registration_mint_permissive_only_under_an_explicit_env_opt_in() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.registration_policy = RegistrationPolicy::Permissive;
+    let app = app(state, CancellationToken::new());
+    let minted = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/api/v3/actions/runner-registration",
+        json!({"url": "https://github.com/preloopdev/preloop", "runner_event": "register"}),
+        "any-non-empty-credential",
+    )
+    .await;
+    assert_eq!(
+        minted["token_schema"], "OAuthAccessToken",
+        "permissive policy is the conformance-harness opt-in"
+    );
 }
 
 #[tokio::test]
@@ -5844,7 +5886,9 @@ async fn try_req(app: &Router, method: Method, uri: &str, body: Value) -> (Statu
     } else if uri.starts_with("/api/v3/actions/runner-registration") {
         builder = builder.header(
             header::AUTHORIZATION,
-            "RemoteAuth preloop-registration-token",
+            // Strict-by-default registration accepts only the system
+            // credential; test servers run with the default token.
+            &format!("RemoteAuth {DEFAULT_PRELOOP_SYSTEM_TOKEN}"),
         );
     }
     let request = if body.is_null() {

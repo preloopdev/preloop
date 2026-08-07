@@ -243,6 +243,40 @@ pub struct SharedState {
     pub shutdown: CancellationToken,
 }
 
+/// Who may register a runner with the control plane.
+///
+/// `Strict` is the default and the only safe choice for a deployment reachable
+/// over a network: it accepts exactly the system credential. `Permissive`
+/// accepts any non-empty credential — matching what GitHub itself cannot do
+/// for us (validate third-party registration tokens) but recreating the
+/// original "anyone who can reach the port can register a runner" hole, so it
+/// exists only for the conformance harness, which replays real GitHub-issued
+/// registration tokens this control plane could never have minted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationPolicy {
+    /// Only the system credential may register a runner.
+    Strict,
+    /// Any non-empty credential may register a runner (conformance only).
+    Permissive,
+}
+
+impl RegistrationPolicy {
+    /// Parse the `PRELOOP_REGISTRATION_POLICY` environment variable.
+    ///
+    /// Unknown or missing values fall back to [`RegistrationPolicy::Strict`]:
+    /// a typo must fail closed, never open.
+    pub(crate) fn from_env() -> Self {
+        match std::env::var("PRELOOP_REGISTRATION_POLICY")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("permissive") => RegistrationPolicy::Permissive,
+            _ => RegistrationPolicy::Strict,
+        }
+    }
+}
+
 /// Application state.
 /// Server-visible GitHub endpoints for `github.server_url` / `api_url` /
 /// `graphql_url` and their `GITHUB_*` env counterparts. GitHub's server
@@ -306,6 +340,8 @@ pub struct AppState {
     pub state_dir: PathBuf,
     /// Native API administrator credential for this server instance.
     pub(crate) system_token: String,
+    /// Registration policy for new runners; see [`RegistrationPolicy`].
+    pub(crate) registration_policy: RegistrationPolicy,
     /// Per-instance HMAC key for runner and job JWTs.
     pub(crate) local_jwt_key: Vec<u8>,
     /// When enabled, message polling returns the official AccessDenied/ErrorCode=1
@@ -634,6 +670,7 @@ impl AppState {
             local_workspace,
             state_dir,
             system_token,
+            registration_policy: RegistrationPolicy::from_env(),
             local_jwt_key,
             runner_version_deprecated,
             scheduler: None,

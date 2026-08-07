@@ -433,7 +433,12 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             } else {
                 TcpListener::bind(config.listen).await?
             };
-            info!(listen = %config.listen, scheme = "http", "preloop runner server listening");
+            info!(
+                listen = %config.listen,
+                scheme = "http",
+                registration_policy = ?shared.state.registration_policy,
+                "preloop runner server listening"
+            );
             axum::serve(listener, router)
                 .with_graceful_shutdown(shutdown_signal(shutdown))
                 .await?;

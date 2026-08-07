@@ -11,16 +11,11 @@ pub(crate) async fn github_registration_token(
     // The runner sends `Authorization: RemoteAuth <token>` (the official
     // runner does the same against GitHub, where the token is one GitHub
     // issued). GitHub validates because it issued the token; this control
-    // plane cannot validate third-party credentials, so any non-empty one is
-    // accepted — that is what keeps the official runner and the conformance
-    // replays working (the golden sends a real GitHub registration token).
-    //
-    // The mounted control socket is different: workflow code inside a runner
-    // VM can reach it, and accepting any credential there would let a
-    // malicious step mint a RunnerManage JWT and register a rogue runner.
-    // The pool injects the system credential into its own configure
-    // invocation and nothing in a job's environment carries it, so the
-    // socket requires it.
+    // plane cannot validate third-party credentials, so the only credential
+    // it accepts is its own system token. The conformance harness replays
+    // goldens that carry a real GitHub-issued registration token, which this
+    // control plane could never have minted; that harness opts into
+    // permissive mode explicitly (PRELOOP_REGISTRATION_POLICY=permissive).
     let auth = request
         .headers()
         .get("authorization")
@@ -29,12 +24,15 @@ pub(crate) async fn github_registration_token(
     let provided = auth
         .strip_prefix("RemoteAuth ")
         .or_else(|| auth.strip_prefix("Bearer "));
-    let on_socket = request
-        .extensions()
-        .get::<crate::auth::SocketSurface>()
-        .is_some();
     let missing = provided.is_none_or(|token| token.is_empty());
-    if missing || (on_socket && provided != Some(shared.state.system_token.as_str())) {
+    let trusted = provided == Some(shared.state.system_token.as_str());
+    let accepted = match shared.state.registration_policy {
+        RegistrationPolicy::Strict => trusted,
+        // Conformance replays send a real GitHub-issued token this control
+        // plane cannot verify; the harness opts in explicitly.
+        RegistrationPolicy::Permissive => true,
+    };
+    if missing || !accepted {
         return Err(ApiError::unauthorized("invalid registration credential"));
     }
 
