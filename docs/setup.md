@@ -18,6 +18,21 @@ run unmodified.
 - [smolvm] for the default VM runner pool (`preloop runner` works without it)
 - A GitHub account for credentials (see below)
 
+### Windows
+
+Windows is supported **via WSL2** for now — native Windows support is coming
+(the Windows binaries and the WHP-backed VM backend already exist in the
+pipeline). Inside WSL2, everything works like Linux:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/preloopdev/preloop/main/install.sh | sh
+```
+
+- For the full microVM runner pool, enable nested virtualization in
+  `.wslconfig` (`[wsl2] nestedVirtualization=true`) so `/dev/kvm` is exposed.
+- Without it, `preloop runner` still works (jobs run as WSL processes); only
+  the VM pool needs KVM.
+
 ## Quick start
 
 ```sh
@@ -52,7 +67,8 @@ apps):
 
 1. Create the app at <https://github.com/settings/apps/new>. You only need a
    name; leave webhooks off. Note the **App ID** and download the **private
-   key** (PEM).
+   key** (PEM). Set the app avatar to `logo.png` from the repo root (GitHub has
+   no API for app avatars — it is a browser-only field on this form).
 2. Install the app on the account(s) whose repos you run:
    <https://github.com/apps/YOUR-APP/installations/new>. Grant it the repos
    you want to run — the engine cannot mint tokens for repos outside the
