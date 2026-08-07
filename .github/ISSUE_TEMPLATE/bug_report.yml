@@ -1,0 +1,96 @@
+name: Bug report
+description: Something misbehaves, or aksh diverges from the official runner
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing. If you suspect a **divergence from the official
+        runner**, the fastest path to a fix is a reproduction that shows what
+        the official runner does — aksh's compatibility target is
+        `actions/runner` v2.336.0 (see `versions.toml`).
+
+  - type: input
+    id: version
+    attributes:
+      label: aksh version
+      description: "`preloop --version`, commit SHA, or release tag"
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: Host OS/arch (e.g. macOS arm64, Linux x86_64) and runner mode (host, VM pool, registered runner)
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What should happen
+      description: The behavior you expect (including which jobs/steps should run and in what order)
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What actually happens
+      description: Error messages, wrong step order/conclusions, missing runs, protocol failures
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: |
+        A minimal workflow file (or a link to a repo) plus the exact command
+        line used. Include the event (`push`, `pull_request`, …) and any
+        `runs-on` labels.
+    validations:
+      required: true
+
+  - type: textarea
+    id: official
+    attributes:
+      label: What does the official runner do?
+      description: |
+        If you believe this is a divergence, run the **same workflow** against
+        GitHub-hosted runners or the official runner binary and record the
+        difference:
+
+        - job/step names, order, and conclusions (`gh run view --log` works)
+        - the exact failing protocol exchange, if it is one (a `runner-watch`
+          capture or `/_apis/...` request/response pair)
+        - anything that shows the expected wire bytes or event shape
+
+        A reproduction that includes the official behavior is what makes a
+        divergence report reviewable.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: protocol
+    attributes:
+      label: Does this touch the runner protocol interface?
+      options:
+        - "No"
+        - "Yes — registration/`/_apis/...` messages"
+        - "Yes — broker / Twirp results-service protocol"
+        - "Not sure"
+      description: Runner registration, job messages, check runs, results/artifacts Twirp, NDJSON events
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Server/runner logs with secrets redacted. If the bug is a protocol
+        divergence, the raw exchange is more useful than a summary.
+    validations:
+      required: false

@@ -44,7 +44,7 @@ jobs:
       GH_REPO: ${{ vars.SERVER_CONFORMANCE_REPO || 'preloopdev/aksh-conformance' }}
       AKSH_GITHUB_TOKEN: ${{ secrets.SERVER_CONFORMANCE_TOKEN }}
       TEMPLATE: ${{ vars.SERVER_CONFORMANCE_TEMPLATE || '/private/tmp/bench-runner.smolmachine' }}
-      OFFICIAL_RUNNER_HOST: ${{ vars.SERVER_CONFORMANCE_RUNNER_HOST || '/Users/bnjoroge/cachingv4' }}
+      OFFICIAL_RUNNER_HOST: ${{ vars.SERVER_CONFORMANCE_RUNNER_HOST || '' }}
     steps:
       - uses: actions/checkout@v4
       - name: Build current PR server for smolVM
