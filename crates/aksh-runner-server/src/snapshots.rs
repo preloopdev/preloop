@@ -20,7 +20,7 @@ const SNAPSHOT_REF: &str = "refs/heads/snapshot";
 const MAX_GIT_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 
 /// The checkout coordinates for one immutable workspace snapshot.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct WorkspaceSnapshot {
     pub(crate) commit_sha: String,
     /// The workspace's real HEAD commit (the commit the submission is based

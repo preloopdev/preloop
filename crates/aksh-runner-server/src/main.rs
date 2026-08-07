@@ -15,6 +15,7 @@ struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Start the server.
     Serve {
@@ -24,6 +25,11 @@ enum Command {
         /// State directory.
         #[arg(long, default_value = ".aksh")]
         state_dir: PathBuf,
+        /// Durable-state backend: `sqlite://<path>`, a bare path, or
+        /// `postgres://…` (with optional `?sslmode=require|verify-full`).
+        /// Defaults to `AKSH_STORE_URL`, then to SQLite in the state dir.
+        #[arg(long, env = "AKSH_STORE_URL")]
+        store: Option<String>,
         /// File path to write recorded flows to (NDJSON format).
         #[arg(long)]
         record_flows: Option<PathBuf>,
@@ -95,6 +101,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve {
             listen,
             state_dir,
+            store,
             record_flows,
             tls_cert,
             tls_key,
@@ -118,6 +125,7 @@ async fn main() -> anyhow::Result<()> {
                 systemd_socket_activation: false,
                 unix_socket,
                 state_dir,
+                store_url: store,
                 record_flows,
                 tls,
                 enable_test_api,
