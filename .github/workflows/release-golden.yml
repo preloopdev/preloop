@@ -11,6 +11,10 @@ jobs:
   build-and-publish-linux-binaries:
     name: Build Linux ${{ matrix.arch }} release
     runs-on: self-hosted
+    # 4 GB pool VMs: parallel crate builds with LTO peak past the limit and
+    # the linker gets OOM-killed mid-link (seen on the aarch64 musl build).
+    env:
+      CARGO_BUILD_JOBS: "1"
     strategy:
       fail-fast: false
       matrix:
