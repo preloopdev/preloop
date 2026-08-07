@@ -1,4 +1,4 @@
-# act vs others: GitHub Actions local runners compared
+# Preloop vs others: GitHub Actions local runners compared
 
 A detailed comparison between [nektos/act](https://github.com/nektos/act),
 agent-ci, and aksh (this repo) — plus the adjacent options (Gitea/Forgejo
@@ -90,137 +90,141 @@ different approaches to the problem.
 
 ### Core Workflow Features
 
-| Feature | act | aksh | Notes |
-|---|:---:|:---:|---|
-| Workflow YAML parsing | ✅ | ✅ | Both parse the full workflow schema |
-| `run:` steps | ✅ | ✅ | |
-| `uses:` actions (remote) | ✅ | ✅ | |
-| `uses:` actions (local) | ✅ | ✅ | |
-| `uses:` Docker actions | ✅ | ✅ | |
-| `uses: $/` self-repo syntax | ❌ | ✅ | v2.336.0 feature |
-| Composite actions | ✅ | ✅ | aksh supports 10-deep nesting with pre/post |
-| Reusable workflows (`workflow_call`) | ✅ | ✅ | aksh: `secrets: inherit`, input validation, depth=4 |
-| Matrix strategy | ✅ | ✅ | aksh: IndexMap order preservation |
-| `include` / `exclude` in matrix | ✅ | ✅ | |
-| `needs` DAG | ✅ | ✅ | |
-| Job outputs | ✅ | ✅ | |
-| `if` conditionals (job/step) | ✅ | ✅ | |
-| `continue-on-error` | ✅ | ✅ | |
-| `timeout-minutes` | ✅ | ✅ | |
-| `defaults.run` (shell/working-directory) | ✅ | ✅ | |
-| `workflow_dispatch` inputs | ✅ | ✅ | |
-| `run-name` expression | ❌ | ✅ | aksh parses and evaluates at submit time |
+| Feature | act | agent-ci | aksh | Notes |
+|---|:---:|:---:|:---:|---|
+| Workflow YAML parsing | ✅ | ✅ | ✅ | Both parse the full workflow schema |
+| `run:` steps | ✅ | ✅ | ✅ | |
+| `uses:` actions (remote) | ✅ | ✅ | ✅ | |
+| `uses:` actions (local) | ✅ | ✅ | ✅ | |
+| `uses:` Docker actions | ✅ | ❌ | ✅ | agent-ci treats every `uses:` as a repo action — `docker://` fails with action-not-found |
+| `uses: $/` self-repo syntax | ❌ | ❌ | ✅ | v2.336.0 feature |
+| Composite actions | ✅ | ✅ | ✅ | aksh supports 10-deep nesting with pre/post |
+| Reusable workflows (`workflow_call`) | ✅ | ✅ | ✅ | aksh: `secrets: inherit`, input validation, depth=4 |
+| Matrix strategy | ✅ | ✅ | ✅ | aksh: IndexMap order preservation |
+| `include` / `exclude` in matrix | ✅ | ❌ | ✅ | agent-ci silently drops object-valued `include`/`exclude` entries |
+| `needs` DAG | ✅ | ✅ | ✅ | |
+| Job outputs | ✅ | ✅ | ✅ | |
+| `if` conditionals (job/step) | ✅ | ✅ | ✅ | |
+| `continue-on-error` | ✅ | ❌ | ✅ | agent-ci: intentional — pause-on-failure instead |
+| `timeout-minutes` | ✅ | ❌ | ✅ | agent-ci: intentional — pause-on-failure instead |
+| `defaults.run` (shell/working-directory) | ✅ | ✅ | ✅ | |
+| `workflow_dispatch` inputs | ✅ | ⚠️ | ✅ | agent-ci: parsed but not injectable |
+| `run-name` expression | ❌ | ⚠️ | ✅ | aksh parses and evaluates at submit time |
 
 ### Environment & Contexts
 
-| Feature | act | aksh | Notes |
-|---|:---:|:---:|---|
-| `$GITHUB_ENV` | ✅ | ✅ | |
-| `$GITHUB_OUTPUT` | ✅ | ✅ | |
-| `$GITHUB_PATH` | ✅ | ✅ | |
-| `$GITHUB_STEP_SUMMARY` | ✅ | ✅ | |
-| `$GITHUB_STATE` | ✅ | ✅ | |
-| `$GITHUB_ARTIFACTS` | ❌ | ✅ | v2.336.0 feature |
-| `$GITHUB_ARTIFACTS_LIST` | ❌ | ✅ | v2.336.0 feature |
-| `ACTIONS_CACHE_MODE` | ❌ | ✅ | v2.336.0 feature |
-| `github.*` context | ✅ | ✅ | |
-| `env.*` context | ✅ | ✅ | |
-| `secrets.*` context | ✅ | ✅ | act reads `.secrets` file or `--secret` flag |
-| `vars.*` context | ✅ | ✅ | |
-| `steps.*` context | ✅ | ✅ | |
-| `needs.*` context | ✅ | ✅ | |
-| `matrix.*` context | ✅ | ✅ | |
-| `runner.*` context | ✅ | ✅ | |
-| `inputs.*` context | ✅ | ✅ | |
-| Comprehensive `GITHUB_*` env vars | ⚠️ partial | ✅ | aksh injects 40+ vars matching official runner |
+| Feature | act | agent-ci | aksh | Notes |
+|---|:---:|:---:|:---:|---|
+| `$GITHUB_ENV` | ✅ | ✅ | ✅ | |
+| `$GITHUB_OUTPUT` | ✅ | ✅ | ✅ | |
+| `$GITHUB_PATH` | ✅ | ✅ | ✅ | |
+| `$GITHUB_STEP_SUMMARY` | ✅ | ✅ | ✅ | |
+| `$GITHUB_STATE` | ✅ | ✅ | ✅ | |
+| `$GITHUB_ARTIFACTS` | ❌ | ❌ | ✅ | v2.336.0 feature |
+| `$GITHUB_ARTIFACTS_LIST` | ❌ | ❌ | ✅ | v2.336.0 feature |
+| `ACTIONS_CACHE_MODE` | ❌ | ❌ | ✅ | v2.336.0 feature |
+| `github.*` context | ✅ | ⚠️ | ✅ | agent-ci: static defaults (`main`, actor = owner, run_id 1) |
+| `env.*` context | ✅ | ⚠️ | ✅ | agent-ci: merged step env in `with:`/`run:`/`name:`; not in `if:` |
+| `secrets.*` context | ✅ | ✅ | ✅ | act reads `.secrets` file or `--secret` flag; agent-ci `.env.local-ci` |
+| `vars.*` context | ✅ | ✅ | ✅ | |
+| `steps.*` context | ✅ | ⚠️ | ✅ | agent-ci: outputs resolve empty at parse time |
+| `needs.*` context | ✅ | ✅ | ✅ | |
+| `matrix.*` context | ✅ | ✅ | ✅ | |
+| `runner.*` context | ✅ | ⚠️ | ✅ | agent-ci: only `runner.os`/`runner.arch` populated |
+| `inputs.*` context | ✅ | ✅ | ✅ | |
+| Comprehensive `GITHUB_*` env vars | ⚠️ partial | ⚠️ | ✅ | aksh injects 40+ vars matching official runner |
 
 ### Expression Engine
 
-| Feature | act | aksh | Notes |
-|---|:---:|:---:|---|
-| `contains()` | ✅ | ✅ | |
-| `startsWith()` / `endsWith()` | ✅ | ✅ | |
-| `format()` | ✅ | ✅ | |
-| `join()` | ✅ | ✅ | |
-| `toJSON()` / `fromJSON()` | ✅ | ✅ | |
-| `hashFiles()` | ✅ | ✅ | act has two impls (local + container) |
-| `success()` / `failure()` / `cancelled()` / `always()` | ✅ | ✅ | |
-| Type coercion (string/number/bool/null) | ✅ | ✅ | |
-| `*` filter syntax | ❌ | ✅ | `steps.*.outputs` |
-| Bracket access `['key']` | ⚠️ | ✅ | |
-| `{{` / `}}` escape sequences | ❌ | ✅ | |
-| Case-insensitive `==` | ⚠️ | ✅ | |
-| Parser | `rhysd/actionlint` AST | Custom Pratt parser | aksh owns its parser |
+| Feature | act | agent-ci | aksh | Notes |
+|---|:---:|:---:|:---:|---|
+| `contains()` | ✅ | ✅ | ✅ | |
+| `startsWith()` / `endsWith()` | ✅ | ✅ | ✅ | |
+| `format()` | ✅ | ✅ | ✅ | |
+| `join()` | ✅ | ✅ | ✅ | |
+| `toJSON()` / `fromJSON()` | ✅ | ✅ | ✅ | |
+| `hashFiles()` | ✅ | ✅ | ✅ | act has two impls (local + container) |
+| `success()` / `failure()` / `cancelled()` / `always()` | ✅ | ✅ | ✅ | |
+| Type coercion (string/number/bool/null) | ✅ | ✅ | ✅ | |
+| `*` filter syntax | ❌ | ❌ | ✅ | `steps.*.outputs` |
+| Bracket access `['key']` | ⚠️ | ❌ | ✅ | |
+| `{{` / `}}` escape sequences | ❌ | ❌ | ✅ | |
+| Case-insensitive `==` | ⚠️ | ✅ | ✅ | |
+| Parser | `rhysd/actionlint` AST | delegated to official runner | Custom Pratt parser | aksh owns its parser |
 
 ### Workflow Commands
 
-| Feature | act | aksh | Notes |
-|---|:---:|:---:|---|
-| `::set-output::` | ✅ | ✅ | Deprecated but supported |
-| `::set-env::` | ✅ | ✅ | |
-| `::add-path::` | ✅ | ✅ | |
-| `::add-mask::` | ✅ | ✅ | |
-| `::debug::` / `::warning::` / `::error::` / `::notice::` | ✅ | ✅ | |
-| `::group::` / `::endgroup::` | ✅ | ✅ | |
-| `::stop-commands::` | ✅ | ✅ | |
-| Problem matchers | ❌ | ✅ | `::add-matcher::` / `::remove-matcher::` |
+| Feature | act | agent-ci | aksh | Notes |
+|---|:---:|:---:|:---:|---|
+| `::set-output::` | ✅ | ✅ | ✅ | Deprecated but supported |
+| `::set-env::` | ✅ | ✅ | ✅ | |
+| `::add-path::` | ✅ | ✅ | ✅ | |
+| `::add-mask::` | ✅ | ✅ | ✅ | |
+| `::debug::` / `::warning::` / `::error::` / `::notice::` | ✅ | ✅ | ✅ | |
+| `::group::` / `::endgroup::` | ✅ | ✅ | ✅ | |
+| `::stop-commands::` | ✅ | ✅ | ✅ | |
+| Problem matchers | ❌ | ✅ | ✅ | `::add-matcher::` / `::remove-matcher::` |
 
 ### Protocol & Runner Features
 
-| Feature | act | aksh | Notes |
-|---|:---:|:---:|---|
-| Faithful runner reimplementation | ✅ | ✅ | act reimplements in Go; aksh reimplements in Rust (faithful port of v2.336.0) |
-| AzDO wire protocol | ❌ | ✅ | act doesn't speak the protocol at all |
-| Runner registration handshake | ❌ | ✅ | RSA key exchange, session crypto |
-| Broker acquire/renew/complete | ❌ | ✅ | Full broker message lifecycle |
-| OIDC id-token provider | ❌ | ✅ | RS256-signed JWTs, JWKS/discovery endpoints |
-| Concurrency groups | ❌ | ✅ | Queue modes, `cancel-in-progress`, 87 property tests |
-| Job permissions / GITHUB_TOKEN scoping | ❌ | ⚠️ partial | Server issues local JWTs |
-| Job cancellation (wire protocol) | ❌ | ✅ | `CancellationTiming` with clamped timeouts |
-| Runner self-update | N/A | ❌ intentional | aksh acknowledges but doesn't update |
-| Runner groups | N/A | ✅ | Server-side group routing |
-| Ephemeral runners | N/A | ✅ | Exit-on-ack, session invalidation |
-| Results-service (Twirp) | ❌ | ✅ | 5 Twirp routes, signed blob URLs |
-| Timeline / live logs | ❌ | ✅ | WebSocket live-feed + PATCH timeline |
-| Job annotations | ❌ | ✅ | Feature-gated aggregation |
-| `connectionData` / location services | N/A | ✅ | 28 service definitions |
-| Background steps (v2.336.0) | ❌ | ⚠️ partial | DTO + flag implemented; full coordinator missing |
-| Locked dependencies announcement | ❌ | ✅ | v2.336.0 feature |
+| Feature | act | agent-ci | aksh | Notes |
+|---|:---:|:---:|:---:|---|
+| Faithful runner reimplementation | ✅ | ❌ | ✅ | act reimplements in Go; aksh reimplements in Rust (faithful port of v2.336.0); agent-ci runs the official runner |
+| Official runner image / binary | ❌ | ✅ | ❌ | agent-ci runs the official `actions/runner` binary in the official image (same .NET process as GitHub-hosted). act in Go, aksh in Rust (faithful v2.336.0 port, ~99% compatible) |
+| AzDO wire protocol | ❌ | ⚠️ | ✅ | act doesn't speak the protocol; agent-ci emulates just enough for the official runner |
+| Runner registration handshake | ❌ | ⚠️ | ✅ | agent-ci pre-bakes `.runner`/`.credentials`; aksh does real RSA key exchange, session crypto |
+| Broker acquire/renew/complete | ❌ | ❌ | ✅ | Full broker message lifecycle |
+| OIDC id-token provider | ❌ | ❌ | ✅ | RS256-signed JWTs, JWKS/discovery endpoints |
+| Concurrency groups | ❌ | ❌ | ✅ | Queue modes, `cancel-in-progress`, 87 property tests |
+| Job permissions / GITHUB_TOKEN scoping | ❌ | ⚠️ | ⚠️ partial | agent-ci: token opt-in via `--github-token`; aksh issues local JWTs |
+| Job cancellation (wire protocol) | ❌ | ❌ | ✅ | `CancellationTiming` with clamped timeouts |
+| Runner self-update | N/A | — | ❌ intentional | aksh acknowledges but doesn't update |
+| Runner groups | N/A | — | ✅ | Server-side group routing |
+| Ephemeral runners | N/A | ✅ | ✅ | agent-ci: pre-baked `.runner` with `ephemeral: true`, fresh container + per-job DTU. aksh: exit-on-ack, session invalidation |
+| Results-service (Twirp) | ❌ | ⚠️ | ✅ | 5 Twirp routes, signed blob URLs |
+| Timeline / live logs | ❌ | ⚠️ | ✅ | WebSocket live-feed + PATCH timeline |
+| Job annotations | ❌ | ❌ | ✅ | Feature-gated aggregation |
+| `connectionData` / location services | N/A | ❌ | ✅ | 28 service definitions |
+| Background steps (v2.336.0) | ❌ | ❌ | ⚠️ partial | DTO + flag implemented; full coordinator missing |
+| Locked dependencies announcement | ❌ | ❌ | ✅ | v2.336.0 feature |
 
 ### Container & Isolation
 
-| Feature | act | aksh | Notes |
-|---|:---:|:---:|---|
-| Docker job containers | ✅ | ✅ | Different models: act uses idle container + exec; aksh delegates to the runner |
-| Service containers | ✅ | ✅ | |
-| Docker-in-Docker | ✅ | ✅ | act mounts host Docker socket; aksh runs Docker natively inside SmolVM guest microVMs (cgroups + overlayfs2 kernel) |
-| MicroVM isolation (SmolVM/libkrun) | ❌ | ✅ | Primary backend. Fork-based warm pool, 131 MB idle RSS per VM (measured). Docker actions run inside the VM. |
-| Process execution (no container) | ✅ (`-self-hosted`) | ✅ | |
-| macOS native runner | ⚠️ (`-self-hosted` workaround) | 🚧 planned | aksh: `somac` (Virtualization.framework) is designed but not yet shipped |
-| Windows native runner | ⚠️ (`-self-hosted` workaround) | 🚧 planned | aksh: `vowin` (QEMU) is designed but not yet shipped |
-| Custom platform images (`-P`) | ✅ | N/A | act-specific concept |
-| Podman support | ✅ | ✅ | act via `DOCKER_HOST`; aksh via runner backend |
+| Feature | act | agent-ci | aksh | Notes |
+|---|:---:|:---:|:---:|---|
+| Docker job containers | ✅ | ✅ | ✅ | Different models: act uses idle container + exec; aksh delegates to the runner |
+| Service containers | ✅ | ✅ | ✅ | |
+| Docker-in-Docker | ✅ | ❌ | ✅ | Docker-in-Docker works in SmolVM: aksh bundles a guest kernel with cgroups + overlayfs2; act mounts the host Docker socket |
+| MicroVM isolation (SmolVM/libkrun) | ❌ | ❌ | ✅ | Primary backend. Fork-based warm pool, 131 MB idle RSS per VM (measured). Docker actions run inside the VM. |
+| Process execution (no container) | ✅ (`-self-hosted`) | ❌ | ✅ | |
+| macOS native runner | ⚠️ (`-self-hosted` workaround) | ⚠️ | 🚧 planned | agent-ci: real macOS VM via tart on Apple Silicon. aksh: Virtualization.framework-based ephemeral macOS VMs designed but not yet shipped |
+| Windows native runner | ⚠️ (`-self-hosted` workaround) | ❌ | 🚧 planned | aksh: QEMU-based ephemeral Windows VMs designed but not yet shipped |
+| Custom platform images (`-P`) | ✅ | — | N/A | act-specific concept |
+| Podman support | ✅ | ❌ | ✅ | act via `DOCKER_HOST`; aksh via runner backend |
 
 ### Cache & Artifacts
 
-| Feature | act | aksh | Notes |
-|---|:---:|:---:|---|
-| Cache v1 (reserve/upload/commit/lookup) | ✅ | ✅ | |
-| Cache v2 (Twirp) | ❌ | ✅ | |
-| Artifact v1 (create/put/get/list) | ✅ | ✅ | |
-| Artifact v2 (Twirp + blob) | ✅ (v3/v4) | ✅ | |
-| File-backed storage | ✅ | ✅ | |
+| Feature | act | agent-ci | aksh | Notes |
+|---|:---:|:---:|:---:|---|
+| Cache v1 (reserve/upload/commit/lookup) | ✅ | ✅ | ✅ | |
+| Cache v2 (Twirp) | ❌ | ❌ | ✅ | |
+| Artifact v1 (create/put/get/list) | ✅ | ✅ | ✅ | |
+| Artifact v2 (Twirp + blob) | ✅ (v3/v4) | ✅ | ✅ | |
+| File-backed storage | ✅ | ✅ | ✅ | |
 
 ### Developer Experience
 
-| Feature | act | aksh | Notes |
-|---|:---:|:---:|---|
-| DAP debugger | ❌ | ✅ | 4,527 LOC, breakpoints, stepping, variable inspection, REPL |
-| Workflow graph visualization | ✅ (`act --graph`) | ❌ | |
-| Event simulation | ✅ (`-e event.json`) | ✅ | |
-| Dry run / list | ✅ (`-l`, `-n`) | ❌ | |
-| `.actrc` config file | ✅ | N/A | |
-| `.secrets` / `.vars` files | ✅ | ✅ | |
+| Feature | act | agent-ci | aksh | Notes |
+|---|:---:|:---:|:---:|---|
+| DAP debugger | ❌ | ❌ | ✅ | WebSocket/TCP transport, breakpoints, stepping, variable inspection, REPL |
+| NDJSON event stream (AI agent output) | ❌ | ✅ | ✅ | agent-ci: `--json`. aksh: `events.ndjson` per run (`aksh-runner-client events <run_id>`) |
+| Pause-on-failure (interactive retry) | ❌ | ✅ | ✅ | Both pause for in-place debugging; aksh adds step rewind, DAP, source sync |
+| Commit status posting | ❌ | ✅ | ✅ | agent-ci: `--commit-status`. aksh: GitHub App integration |
+| Workflow graph visualization | ✅ (`act --graph`) | ❌ | ❌ | |
+| Event simulation | ✅ (`-e event.json`) | ⚠️ | ✅ | agent-ci: events parsed but not triggered — run manually |
+| Dry run / list | ✅ (`-l`, `-n`) | ❌ | ❌ | |
+| `.actrc` config file | ✅ | — | N/A | |
+| `.secrets` / `.vars` files | ✅ | ✅ | ✅ | |
 
 ---
 
