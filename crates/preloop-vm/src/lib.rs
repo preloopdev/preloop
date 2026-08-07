@@ -786,16 +786,31 @@ impl VmProvider for SmolVmProvider {
         } else {
             output.to_path_buf()
         };
+        let mut args = vec![
+            "pack".into(),
+            "create".into(),
+            "--from-vm".into(),
+            name.as_str().into(),
+            "-o".into(),
+            output.display().to_string(),
+        ];
+        // `pack create --from-vm` pulls the base image *inside* the export
+        // VM (layers extract to its local disk). On hosts where the guest's
+        // gateway DNS relay does not answer (observed on macOS with smolvm
+        // 1.7.2), that pull fails with a raw resolver timeout. smolvm's
+        // official escape hatch is `--proxy`: the in-VM registry client
+        // routes through a host-side HTTP(S) proxy, which resolves DNS on
+        // the host. Set PRELOOP_PACK_PROXY (e.g. http://<host-lan-ip>:3128)
+        // on such hosts.
+        if let Ok(proxy) = std::env::var("PRELOOP_PACK_PROXY") {
+            if !proxy.trim().is_empty() {
+                args.push("--proxy".into());
+                args.push(proxy.into());
+            }
+        }
         self.exclusive_with_staging(
             "pack",
-            &[
-                "pack".into(),
-                "create".into(),
-                "--from-vm".into(),
-                name.as_str().into(),
-                "-o".into(),
-                output.display().to_string(),
-            ],
+            &args,
             staging_dir,
         )
         .await
