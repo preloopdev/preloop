@@ -133,3 +133,6 @@ docs/internal/
 .agents/
 skills-lock.json
 .claude/
+
+# Release build output — 863 MB golden artifact, never tracked
+/dist/
