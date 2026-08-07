@@ -277,7 +277,10 @@ jobs:
   audit-vet-deny:
     runs-on: self-hosted
     timeout-minutes: 30
-    if: github.event_name != 'schedule'
+    # Supply-chain checks are expensive (installs audit/deny/vet) and run
+    # nightly + on main pushes; PRs skip them — new dependency versions are
+    # still caught at merge time via the push-triggered run.
+    if: github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
