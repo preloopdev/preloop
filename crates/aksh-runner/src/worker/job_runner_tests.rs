@@ -30,6 +30,48 @@ use super::super::reporting::diagnostic_logs_url;
 use super::*;
 use tokio::sync::watch;
 
+#[test]
+fn any_step_failed_counts_continue_on_error_failures() {
+    use crate::worker::contexts::StepResult;
+    use indexmap::IndexMap;
+    use std::collections::HashMap;
+
+    let mut steps = IndexMap::new();
+    steps.insert(
+        "ok".to_string(),
+        StepResult {
+            outcome: "Success".to_string(),
+            conclusion: "Success".to_string(),
+            outputs: HashMap::new(),
+        },
+    );
+    assert!(!any_step_failed(&steps));
+
+    // A tolerated failure (continue-on-error) still counts: its outcome stays
+    // Failure while the job conclusion is green — the VM must be preserved so
+    // the failure can be inspected.
+    steps.insert(
+        "tolerated".to_string(),
+        StepResult {
+            outcome: "Failure".to_string(),
+            conclusion: "Success".to_string(),
+            outputs: HashMap::new(),
+        },
+    );
+    assert!(any_step_failed(&steps));
+
+    steps.clear();
+    steps.insert(
+        "skipped".to_string(),
+        StepResult {
+            outcome: "Skipped".to_string(),
+            conclusion: "Skipped".to_string(),
+            outputs: HashMap::new(),
+        },
+    );
+    assert!(!any_step_failed(&steps));
+}
+
 #[tokio::test]
 async fn test_run_job_executes_successfully() {
     let (_ws, workspace_dir) = contained_workspace();
