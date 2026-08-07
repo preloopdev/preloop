@@ -10,7 +10,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Tier 1 — system utilities
         run: |
-          for c in jq rsync unzip zip xz-utils locales net-tools openssh-client shellcheck sshpass p7zip patchelf gnupg2 dnsutils iputils-ping sqlite3 git-lfs cmake; do
+          for c in jq rsync unzip zip xz locale netstat ssh shellcheck sshpass 7z patchelf gpg dig ping sqlite3 git-lfs cmake; do
             command -v "$c" >/dev/null || { echo "MISSING: $c"; exit 1; }
           done
           echo "tier1 ok"
