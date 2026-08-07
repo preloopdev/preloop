@@ -1,101 +1,64 @@
-# aksh — GitHub Actions Control Plane
+# preloop
 
-**aksh** is a faithful Rust reimplementation of the GitHub Actions control plane
-([`ChristopherHX/runner.server`](https://github.com/ChristopherHX/runner.server)). It
-speaks the official runner protocol so the unmodified `actions/runner` (`Runner.Listener`)
-can register, poll for jobs, execute, and report — without GitHub-hosted minutes.
+<video src="docs/demo/debug.mp4" autoplay loop muted playsinline width="100%"></video>
 
-aksh is **execution-agnostic**: it doesn't care whether runners live in containers, VMs,
-microVMs, or bare processes. The runner connects to aksh; aksh feeds it jobs.
+> A failed step, a fix in another pane, and a re-run — all local, no push required.
 
-**[Preloop](https://github.com/preloop/preloop)** is a local CI product that combines
-aksh with libkrun microVM runner hosts. aksh is Preloop's control plane. But aksh is
-independently usable — anyone can `cargo install aksh` and point their own runners at it.
+---
 
-## Crates
+preloop is a local, self-hosted equivalent of GitHub Actions. The engine (`preloop serve`) accepts workflows the same way GitHub does: `${{ }}` expressions, matrix builds, reusable workflows, concurrency groups, OIDC. It executes them on local machines (smolvm microVMs by default). Your `.github/workflows` run unmodified.
 
-- `aksh-runner-server`: host-side HTTP service, runner-compatible APIs, run queue,
-  cancellation, reruns, NDJSON event stream.
-- `aksh-runner-client`: CLI equivalent to `Runner.Client` for submitting workflows and
-  inspecting runs.
-- `aksh-gha-parser`: typed GitHub Actions workflow parsing, trigger matching, job graph
-  construction, matrix expansion.
-- `aksh-gha-expressions`: expression parser/evaluator for `${{ }}` in workflows, matrices,
-  `if`, contexts, and outputs.
-- `aksh-gha-protocol`: versioned domain and wire models (AzDO wire DTOs, `SecretString`,
-  runner session DTOs, NDJSON events).
-- `aksh-cache`: local cache service compatible with the runner cache protocol shape.
-- `aksh-artifacts`: local artifact/container service compatible with runner
-  upload/download behavior.
-- `aksh-conformance`: fixtures and harnesses comparing aksh behavior with upstream
-  `runner.server`.
-- `aksh-runner`: Rust reimplementation of the GitHub Actions runner (Listener + Worker),
-  faithful to `actions/runner` v2.336.0. Registers, polls, executes workflows, and reports results.
-  See [`crates/aksh-runner/README.md`](crates/aksh-runner/README.md) for details.
-- `aksh-dap`: Debug Adapter Protocol bridge for step-level workflow debugging.
+It speaks the official `actions/runner` protocol, so you can use the official runner to register, poll, execute, and report against it — without GitHub-hosted minutes. You can also use our Rust-equivalent runner with up to 10x smaller binary sizes and 10x lower memory RSS.
 
-## Why aksh Exists
+Runs on macOS, Linux, and Windows.
 
-aksh keeps the upstream runner-server contract where it matters, but adds features useful
-for anyone building or testing GitHub Actions workflows outside GitHub:
-
-- single native Rust host process with a small distribution footprint
-- execution-agnostic: works with any runner substrate (containers, VMs, microVMs, bare)
-- NDJSON event output for AI agents and developer tooling
-- redaction-safe secret types in the protocol layer
-- pluggable backend traits (`RunnerProvider`, `RunStore`, `AuthProvider`, `SecretStore`)
-- local cache and artifact stores that work without GitHub-hosted infrastructure
-- runner-compatible HTTP surfaces compatible with the official `Runner.Listener`
-
-## Current Status
-
-**As of 2026-07-21, aksh is tracked by runner-watch against the official `actions/runner` v2.336.0 protocol surface.**
-
-aksh currently supports the core runner lifecycle:
-
-1. Registers against aksh (GHES-style org URL)
-2. Creates encrypted sessions (AES key exchange)
-3. Receives and decrypts job messages
-4. Executes jobs and reports completion
-5. Supports `needs` DAG, matrix strategies, trigger matching, expression evaluation
-
-Workspace tests pass via `cargo test --workspace`. runner-watch records protocol-sync artifacts under `.runner-watch/`; remaining fidelity work is tracked in [docs/fidelity-gap.md](docs/fidelity-gap.md).
-
-## Toolchain
-
-The workspace targets Rust 1.97 or newer and uses `tokio`, `axum`, `serde_yaml`, `tracing`,
-`anyhow`, and `clap`.
+## Quick start
 
 ```sh
-cargo fmt --all
-cargo test --workspace
-cargo run -p aksh-runner-server -- serve --listen 127.0.0.1:9090
-cargo run -p aksh-runner-client -- submit -W .github/workflows/ci.yml
+preloop serve            # engine on 127.0.0.1:9090
+cd my-repo
+preloop run -f .github/workflows/ci.yml --event push
 ```
 
-## Upstream Reference
+Setup, GitHub App and PAT credentials, secrets, config file, and the troubleshooting guide: [docs/setup.md](docs/setup.md)
 
-The conformance target is `ChristopherHX/runner.server` at commit
-`992ccbbbf9afcde477c38c316e053b1af457ad40` unless `AKSH_UPSTREAM_RUNNER_SERVER_REF` is
-set. See [docs/fidelity-gap.md](docs/fidelity-gap.md) for the mapped surface and
-deliberate differences.
+## What makes it different
 
-## Architecture
+- The real runner protocol, not a behavior approximation: the official runner binary works against it unchanged.
+- Execution agnostic: smolvm microVMs, containers, or bare processes.
+- GitHub App and fine-grained PAT support with per-job token minting.
+- Step debugger with breakpoints, pause, and retry.
+- OIDC issuer for local runs.
+- Secrets with GitHub-compatible masking and global/repo tiers.
+- NDJSON event output for agents and developer tooling.
 
-aksh exposes two protocol surfaces simultaneously:
+## Documentation
 
-1. **Runner-compatible `_apis/...`** — the AzDO protocol the official runner speaks
-   (encrypted messages, timeline, logs, OAuth). This is the source of truth.
-2. **Agent-friendly `/api/v1/...`** — native REST + NDJSON for AI agents, CLIs, and
-   developer tools. A projection of the same internal state.
+| Topic | Doc |
+|---|---|
+| Setup, credentials, secrets, config | [docs/setup.md](docs/setup.md) |
+| GitHub App webhooks and check runs | [docs/github-app-webhook.md](docs/github-app-webhook.md) |
+| Job tokens, minting, OIDC | [docs/github-tokens.md](docs/github-tokens.md) |
+| Debug sessions (pause, inspect, retry) | [docs/debug-sessions.md](docs/debug-sessions.md) |
+| Architecture and crate map | [docs/architecture.md](docs/architecture.md) |
+| Protocol conformance | [docs/conformance.md](docs/conformance.md) |
+| Fidelity gaps and roadmap | [docs/fidelity-gap.md](docs/fidelity-gap.md) |
+| Contributing and CI requirements | [CONTRIBUTING.md](CONTRIBUTING.md) |
 
-Both read from and write to the same state; the native surface is strictly additive.
-See [docs/architecture.md](docs/architecture.md) for the design.
+## Requirements
+
+macOS (Apple Silicon) or Linux, 64-bit, Rust 1.97+, and [smolvm] for the default VM runner pool. `preloop runner` works without smolvm. Postgres is optional.
 
 ## License
 
-MIT for all crates except `aksh-runner-server` (the control plane), which is
-licensed under **FSL-1.1-MIT** (`crates/aksh-runner-server/LICENSE`):
-source-available — you may use, modify, and redistribute it for any
-non-competing purpose — and it converts to MIT on the second anniversary of
-each release.
+MIT for all crates except the control plane (`aksh-runner-server`), which is
+licensed under FSL-1.1-MIT (`crates/aksh-runner-server/LICENSE`):
+source-available (you may use, modify, and redistribute it for any
+non-competing purpose), converting to MIT on the second anniversary of each release.
+
+## Credits
+
+This project wouldn't be possible without:
+
+[smolvm]: https://github.com/preloopdev/smolvm
+[runner.server]: https://github.com/ChristopherHX/runner.server

@@ -126,3 +126,7 @@ benchmarks/real-world/conformance-4repos/payloads/
 # by the harness and not reviewable in a diff.
 benchmarks/real-world/results/conformance-4repos/**/run*.json
 benchmarks/real-world/results/conformance-4repos/**/run*.log
+
+# Internal documentation
+docs/internal/
+.
