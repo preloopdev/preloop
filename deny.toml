@@ -104,6 +104,7 @@ allow = [
     "OpenSSL",
     "Unicode-3.0",
     "Unicode-DFS-2016",
+    "curl",
     # webpki-roots (Mozilla CA bundle data).
     "CDLA-Permissive-2.0",
 ]
