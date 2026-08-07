@@ -145,9 +145,10 @@ pub(crate) async fn cache_upload(
         .get_mut(&cache_id)
         .ok_or_else(|| ApiError::not_found("cache reservation not found"))?;
     pending.bytes.extend_from_slice(&bytes);
-    if let Err(error) = shared.state.store.store_meta_only(&inner).await {
-        tracing::warn!(?error, "failed to persist cache upload");
-    }
+    // No write-through here on purpose: the in-flight payload is not durable
+    // state (see `MetaSnapshot`), and snapshotting per chunk was quadratic in
+    // cache size. The committed cache is persisted by `CacheStore` in
+    // `cache_commit`.
     Ok(StatusCode::ACCEPTED)
 }
 

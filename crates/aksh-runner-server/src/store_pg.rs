@@ -14,11 +14,15 @@
 //! `sslmode=disable` stay plaintext for loopback databases.
 
 use super::*;
-use aksh_gha_protocol::{SecretMap, SessionId};
+use aksh_gha_protocol::SessionId;
 use async_trait::async_trait;
 use postgres_rustls::MakeTlsConnector;
 use std::future::Future;
 use tokio_postgres::{connect, Client, NoTls};
+
+/// Advisory-lock key guarding schema migration. Any stable constant works; it
+/// only has to agree across every aksh process pointed at one database.
+const MIGRATION_LOCK_KEY: i64 = 0x616b_7368_5f6d_6772; // "aksh_mgr"
 
 /// Postgres backend: one client behind a mutex.
 pub(crate) struct PgStore {
@@ -124,7 +128,30 @@ impl PgStore {
     /// Apply pending migrations. `schema_migrations` doubles as the version
     /// pointer (SQLite uses `PRAGMA user_version`); steps are append-only and
     /// each runs in its own transaction.
+    ///
+    /// The whole sequence runs under a session-level advisory lock. Postgres
+    /// `CREATE TABLE IF NOT EXISTS` is *not* race-safe: the existence check and
+    /// the `pg_type` insert are separate, so two servers booting against one
+    /// database collide with
+    /// `duplicate key value violates unique constraint "pg_type_typname_nsp_index"`
+    /// and the loser fails to start. The lock also serialises the
+    /// read-max-version / insert-version pair below.
     async fn migrate(client: &mut Client) -> anyhow::Result<()> {
+        // Arbitrary but stable key: "aksh-store" as a 64-bit constant. Session
+        // scoped (not `_xact_`) so it spans the per-step transactions.
+        client
+            .execute("SELECT pg_advisory_lock($1)", &[&MIGRATION_LOCK_KEY])
+            .await?;
+        let result = Self::migrate_locked(client).await;
+        // Release even when a step failed, otherwise a crashed migration wedges
+        // every future boot until the connection is reaped.
+        client
+            .execute("SELECT pg_advisory_unlock($1)", &[&MIGRATION_LOCK_KEY])
+            .await?;
+        result
+    }
+
+    async fn migrate_locked(client: &mut Client) -> anyhow::Result<()> {
         client
             .batch_execute(
                 "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -188,15 +215,6 @@ impl PgStore {
                 &run.completed_at.map(unix_us),
                 &sealed,
             ],
-        )
-        .await?;
-        let sealed_secrets = self
-            .cipher
-            .seal(&serde_json::to_vec(&run.submission.secrets)?)?;
-        tx.execute(
-            "INSERT INTO run_secrets(run_id, secret_blob) VALUES ($1, $2)
-             ON CONFLICT(run_id) DO UPDATE SET secret_blob = EXCLUDED.secret_blob",
-            &[&run.run_id.to_string(), &sealed_secrets],
         )
         .await?;
         Ok(())
@@ -317,20 +335,8 @@ impl Store for PgStore {
             .await?;
         for row in rows {
             let blob: Vec<u8> = row.get(0);
-            let mut run = restore_run_record(&self.cipher, &blob)?;
+            let run = restore_run_record(&self.cipher, &blob)?;
             let run_id = run.run_id;
-            if let Some(row) = client
-                .query_opt(
-                    "SELECT secret_blob FROM run_secrets WHERE run_id = $1",
-                    &[&run_id.to_string()],
-                )
-                .await?
-            {
-                let secret_blob: Vec<u8> = row.get(0);
-                let secrets: SecretMap =
-                    serde_json::from_slice(&self.cipher.unseal(&secret_blob)?)?;
-                Arc::make_mut(&mut run.submission).secrets = secrets;
-            }
             inner.runs.insert(run_id, run);
         }
 
@@ -471,10 +477,34 @@ impl Store for PgStore {
             let request_id: i64 = row.get(1);
             inner.session_active_requests.insert(session_id, request_id);
         }
-        // Restore per-session broker message queues (dequeued but not delivered).
-        // `broker_messages` in the in-memory state is keyed by request_id and
-        // lives in the meta snapshot; `inflight_messages` (per-session) is
-        // also restored from the same snapshot below.
+        // Restore per-session broker message queues (dequeued but not yet
+        // delivered to the runner) from the `broker_messages` table that
+        // `store_inner` writes. `inner.broker_messages` (keyed by request_id)
+        // is a separate map and comes back with the meta snapshot below.
+        let rows = client
+            .query(
+                "SELECT session_id, message_id, payload_json FROM broker_messages
+                 ORDER BY session_id, message_id",
+                &[],
+            )
+            .await?;
+        for row in rows {
+            let session_id: String = row.get(0);
+            let message_id: i64 = row.get(1);
+            let payload_json: String = row.get(2);
+            match serde_json::from_str::<azdo::TaskAgentMessage>(&payload_json) {
+                Ok(message) => {
+                    inner
+                        .inflight_messages
+                        .entry(session_id)
+                        .or_default()
+                        .insert(message_id, message);
+                }
+                Err(error) => {
+                    tracing::warn!(%session_id, message_id, %error, "dropping undecodable broker message");
+                }
+            }
+        }
         let rows = client
             .query("SELECT request_id, request_blob FROM job_requests", &[])
             .await?;
@@ -570,7 +600,6 @@ impl Store for PgStore {
         for table in [
             "broker_messages",
             "session_active_requests",
-            "run_secrets",
             "job_requests",
             "job_dependencies",
             "jobs",
@@ -585,26 +614,8 @@ impl Store for PgStore {
             self.store_run_tx(&tx, run).await?;
         }
 
-        let mut position = 0i64;
-        for (kind, jobs) in [
-            ("ready", inner.queue.iter().collect::<Vec<_>>()),
-            ("pending", inner.pending_jobs.iter().collect::<Vec<_>>()),
-            (
-                "blocked",
-                inner.concurrency_blocked.iter().collect::<Vec<_>>(),
-            ),
-        ] {
-            for job in jobs {
-                self.insert_job(&tx, job, kind, position).await?;
-                position += 1;
-            }
-        }
-        for (run_id, jobs) in &inner.held_runs {
-            for job in jobs {
-                self.insert_job(&tx, job, "held", position).await?;
-                position += 1;
-            }
-            let _ = run_id;
+        for (kind, job, position) in queue_rows(inner) {
+            self.insert_job(&tx, job, kind, position).await?;
         }
 
         for runner in inner.runners.values() {
@@ -786,43 +797,8 @@ impl Store for PgStore {
         self.store_run_tx(&tx, run).await?;
         tx.execute("DELETE FROM jobs WHERE run_id = $1", &[&run_id.to_string()])
             .await?;
-        let mut position = 0i64;
-        for (kind, jobs) in [
-            (
-                "ready",
-                inner
-                    .queue
-                    .iter()
-                    .filter(|job| job.run_id == run_id)
-                    .collect::<Vec<_>>(),
-            ),
-            (
-                "pending",
-                inner
-                    .pending_jobs
-                    .iter()
-                    .filter(|job| job.run_id == run_id)
-                    .collect::<Vec<_>>(),
-            ),
-            (
-                "blocked",
-                inner
-                    .concurrency_blocked
-                    .iter()
-                    .filter(|job| job.run_id == run_id)
-                    .collect::<Vec<_>>(),
-            ),
-        ] {
-            for job in jobs {
-                self.insert_job(&tx, job, kind, position).await?;
-                position += 1;
-            }
-        }
-        if let Some(jobs) = inner.held_runs.get(&run_id) {
-            for job in jobs {
-                self.insert_job(&tx, job, "held", position).await?;
-                position += 1;
-            }
+        for (kind, job, position) in queue_rows_for_run(inner, run_id) {
+            self.insert_job(&tx, job, kind, position).await?;
         }
         tx.execute(
             "DELETE FROM job_requests WHERE run_id = $1",
@@ -914,10 +890,11 @@ impl Store for PgStore {
 /// SQLite-only constructs (`STRICT`, `WITHOUT ROWID`, `json_valid` checks —
 /// payloads always come from `serde_json`). `BIGSERIAL` replaces
 /// `AUTOINCREMENT` for `control_events.event_id`.
-const MIGRATIONS: &[(u32, &str, &str)] = &[(
-    1,
-    "initial-control-plane-schema",
-    r#"
+const MIGRATIONS: &[(u32, &str, &str)] = &[
+    (
+        1,
+        "initial-control-plane-schema",
+        r#"
         CREATE TABLE IF NOT EXISTS workflow_run_counters (
           repository_key TEXT NOT NULL,
           workflow_path TEXT NOT NULL,
@@ -1062,4 +1039,13 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[(
           written_at_us BIGINT NOT NULL
         );
         "#,
-)];
+    ),
+    (
+        2,
+        "drop-redundant-run-secrets",
+        // See the SQLite twin: this table stored `"<redacted>"`, not secrets.
+        r#"
+        DROP TABLE IF EXISTS run_secrets;
+        "#,
+    ),
+];

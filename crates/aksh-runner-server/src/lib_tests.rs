@@ -172,12 +172,11 @@ async fn sqlite_recovery_restores_queued_runs_and_next_run_number() {
     assert_eq!(accepted["run_number"], first_number + 1);
 }
 
-/// Each post-restart gap that was documented in the original review
-/// (session_keys, runner_rsa_public_keys, github_token_requests,
-/// broker_messages, session_active_requests, cancellation_queue,
-/// queue_depth) gets a single round-trip through restart and is checked
-/// here in one scenario. Adding a separate test per gap would multiply
-/// the boilerplate without adding coverage.
+/// Restart round-trip for the state this scenario can reach through the HTTP
+/// surface: `session_keys`, `runner_rsa_public_keys`, run status after a
+/// cancel, `log_chunks`, and `queue_depth`. The message queues, run secrets
+/// and cross-run queue order have their own tests below, because they need
+/// state this scenario does not produce.
 #[tokio::test]
 async fn sqlite_recovery_restores_post_restart_state() {
     let temp = tempfile::tempdir().unwrap();
@@ -422,7 +421,7 @@ async fn postgres_recovery_restores_post_restart_state() {
     if has_schema {
         client
             .batch_execute(
-                "TRUNCATE workflow_run_counters, runs, run_secrets, runners, runner_labels,
+                "TRUNCATE workflow_run_counters, runs, runners, runner_labels,
                          runner_sessions, jobs, job_dependencies, job_requests, control_events,
                          session_active_requests, broker_messages, log_files, log_chunks,
                          runtime_snapshots RESTART IDENTITY CASCADE",
@@ -14111,4 +14110,301 @@ jobs:
             "fan-out job {id} must still be inflight"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Durable-store restart contracts.
+//
+// Each test below writes state, drops the store, reopens it, and asserts on
+// the recovered `InnerState`. Before the fixes they accompany, every one of
+// them failed while `just test-ci` stayed green — the gate had no restart
+// dimension at all.
+// ---------------------------------------------------------------------------
+
+/// Secrets must come back as themselves. `SecretString::Serialize` emits the
+/// literal `"<redacted>"`, so any persistence path that does not go through
+/// `WorkflowSubmission::to_request_json` silently substitutes the redaction
+/// marker for every secret and the resumed run authenticates with garbage.
+#[tokio::test]
+async fn store_recovery_preserves_run_secrets() {
+    let temp = tempfile::tempdir().unwrap();
+    let workflow =
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+    let run_id = {
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": workflow,
+                "event": "push",
+                "repository": "owner/repo",
+                "secrets": {"MY_TOKEN": "s3cr3t-value", "OTHER": "second-value"}
+            }),
+        )
+        .await;
+        accepted["run_id"]
+            .as_str()
+            .unwrap()
+            .parse::<RunId>()
+            .unwrap()
+    };
+
+    let recovered = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let inner = recovered.inner.lock().await;
+    let secrets = &inner
+        .runs
+        .get(&run_id)
+        .expect("run survives restart")
+        .submission
+        .secrets;
+    assert_eq!(
+        secrets.get("MY_TOKEN").map(|s| s.expose()),
+        Some("s3cr3t-value")
+    );
+    assert_eq!(
+        secrets.get("OTHER").map(|s| s.expose()),
+        Some("second-value")
+    );
+}
+
+/// The ready queue is FIFO across runs, not just within one. `store_run_event`
+/// rewrites a single run's rows, so its `queue_position` values have to stay on
+/// the same global scale as every other writer's; numbering from zero per run
+/// gave every run a `position = 0` job and interleaved them on restore.
+#[tokio::test]
+async fn store_recovery_preserves_cross_run_queue_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let workflow = "on: push\njobs:\n  one:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 1\n  two:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 2\n";
+    let before: Vec<String> = {
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+        for repo in ["owner/alpha", "owner/beta", "owner/gamma"] {
+            request_json(
+                &app,
+                Method::POST,
+                "/api/v1/runs",
+                json!({"workflow_yaml": workflow, "event": "push", "repository": repo}),
+            )
+            .await;
+        }
+        let inner = state.inner.lock().await;
+        inner
+            .queue
+            .iter()
+            .map(|job| format!("{}:{}", job.run_id, job.job_id.0))
+            .collect()
+    };
+    assert_eq!(before.len(), 6, "three runs of two jobs must all be queued");
+
+    let recovered = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let inner = recovered.inner.lock().await;
+    let after: Vec<String> = inner
+        .queue
+        .iter()
+        .map(|job| format!("{}:{}", job.run_id, job.job_id.0))
+        .collect();
+    assert_eq!(before, after, "ready-queue FIFO order must survive restart");
+}
+
+/// A job message that was dequeued but not yet delivered has to be re-delivered
+/// after a restart, otherwise the runner polls forever for an assignment the
+/// server believes it already handed out.
+#[tokio::test]
+async fn store_recovery_preserves_broker_and_inflight_messages() {
+    let temp = tempfile::tempdir().unwrap();
+    {
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let mut inner = state.inner.lock().await;
+        inner
+            .inflight_messages
+            .entry("sess-1".to_owned())
+            .or_default()
+            .insert(
+                7,
+                azdo::TaskAgentMessage {
+                    message_id: 7,
+                    message_type: "PipelineAgentJobRequest".to_owned(),
+                    body: "e30=".to_owned(),
+                    iv: None,
+                },
+            );
+        state.store.store_inner(&inner).await.unwrap();
+    }
+
+    let recovered = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let inner = recovered.inner.lock().await;
+    let session = inner
+        .inflight_messages
+        .get("sess-1")
+        .expect("undelivered broker message must survive restart");
+    let message = session.get(&7).expect("message id must be preserved");
+    assert_eq!(message.message_type, "PipelineAgentJobRequest");
+    assert_eq!(message.body, "e30=");
+}
+
+/// The in-flight cache payload must never enter the runtime snapshot. It is a
+/// `Vec<u8>` holding the whole upload, and the snapshot is cloned, serialized
+/// and AES-sealed on every `store_meta_only` — putting it there made
+/// `cache_upload` quadratic in cache size with the global state lock held.
+#[tokio::test]
+async fn cache_upload_payload_stays_out_of_the_runtime_snapshot() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let reserve = request_json(
+        &app,
+        Method::POST,
+        "/_apis/artifactcache/cache",
+        json!({"key": "big", "version": "v1"}),
+    )
+    .await;
+    let cache_id = reserve["cacheId"].as_i64().unwrap();
+
+    let payload = vec![b'x'; 1 << 20]; // 1 MiB (under the default body limit)
+    let upload = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!("/_apis/artifactcache/cache/{cache_id}"))
+                .header(header::AUTHORIZATION, "Bearer aksh-system-token")
+                .body(Body::from(payload.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), StatusCode::ACCEPTED);
+
+    // Force a snapshot with the upload still buffered in memory.
+    {
+        let inner = state.inner.lock().await;
+        assert_eq!(
+            inner.pending_caches.get(&cache_id).map(|c| c.bytes.len()),
+            Some(payload.len()),
+            "the upload is buffered in memory"
+        );
+        state.store.store_meta_only(&inner).await.unwrap();
+    }
+
+    let db = temp.path().join("aksh.db");
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    let blob_len: i64 = connection
+        .query_row(
+            "SELECT length(meta_blob) FROM runtime_snapshots WHERE snapshot_id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        blob_len < 64 * 1024,
+        "runtime snapshot is {blob_len} bytes after a {} byte upload — the cache \
+         payload leaked into the meta blob",
+        payload.len()
+    );
+}
+
+/// Two servers booting against one Postgres database must both start.
+/// `CREATE TABLE IF NOT EXISTS` is not race-safe in Postgres: the existence
+/// check and the `pg_type` insert are separate, so an unguarded migration makes
+/// the loser fail with a `pg_type_typname_nsp_index` unique violation.
+#[tokio::test]
+async fn postgres_concurrent_open_serializes_migrations() {
+    let Ok(base) = std::env::var("AKSH_TEST_PG_URL") else {
+        eprintln!("skipping: set AKSH_TEST_PG_URL to a disposable Postgres URL");
+        return;
+    };
+    if base.trim().is_empty() {
+        return;
+    }
+    let dbname = format!("aksh_race_{}", uuid::Uuid::new_v4().simple());
+    {
+        let connect_url = crate::store_pg::connect_url(&base);
+        let (client, connection) = tokio_postgres::connect(&connect_url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .execute(&format!("CREATE DATABASE {dbname}"), &[])
+            .await
+            .unwrap();
+    }
+    let fresh = base
+        .rsplit_once('/')
+        .map(|(host, _)| format!("{host}/{dbname}"))
+        .unwrap();
+
+    let key = b"concurrent-open-root-key";
+    let dir = std::path::Path::new("/tmp");
+    let (first, second) = tokio::join!(
+        crate::store::open_store(Some(&fresh), dir, key),
+        crate::store::open_store(Some(&fresh), dir, key),
+    );
+    assert!(first.is_ok(), "first opener failed: {:?}", first.err());
+    assert!(second.is_ok(), "second opener failed: {:?}", second.err());
+}
+
+/// Postgres twin of `store_recovery_preserves_run_secrets`. The redaction bug
+/// lived in the shared serialization path, so both backends have to prove it.
+#[tokio::test]
+async fn postgres_recovery_preserves_run_secrets() {
+    let Ok(pg_url) = std::env::var("AKSH_TEST_PG_URL") else {
+        eprintln!("skipping: set AKSH_TEST_PG_URL to a disposable Postgres URL");
+        return;
+    };
+    if pg_url.trim().is_empty() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = crate::config::config_path();
+    let workflow =
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+    let run_id = {
+        let state = AppState::new_with_store(
+            temp.path().to_path_buf(),
+            config_path.clone(),
+            Some(&pg_url),
+        )
+        .await
+        .unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+        let accepted = request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": workflow,
+                "event": "push",
+                "repository": "owner/pg-secrets",
+                "secrets": {"MY_TOKEN": "s3cr3t-value"}
+            }),
+        )
+        .await;
+        accepted["run_id"]
+            .as_str()
+            .unwrap()
+            .parse::<RunId>()
+            .unwrap()
+    };
+
+    let recovered = AppState::new_with_store(temp.path().to_path_buf(), config_path, Some(&pg_url))
+        .await
+        .unwrap();
+    let inner = recovered.inner.lock().await;
+    assert_eq!(
+        inner
+            .runs
+            .get(&run_id)
+            .expect("run survives restart")
+            .submission
+            .secrets
+            .get("MY_TOKEN")
+            .map(|s| s.expose()),
+        Some("s3cr3t-value")
+    );
 }
