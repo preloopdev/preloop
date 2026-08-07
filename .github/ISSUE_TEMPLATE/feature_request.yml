@@ -1,0 +1,25 @@
+name: Feature request
+description: Something aksh should do that it doesn't yet
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The user-facing goal, not the mechanism. Example: "run CI without waiting for GitHub webhooks" — not "add a polling endpoint".
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Desired behavior
+      description: What should happen end to end, including how it should interact with the official runner protocol (new events, new endpoints, new wire fields?).
+    validations:
+      required: true
+  - type: textarea
+    id: alternative
+    attributes:
+      label: Alternatives considered
+      description: Workarounds or partial solutions that already exist (e.g. `preloop run`, reconciliation sweeps).
+    validations:
+      required: false
