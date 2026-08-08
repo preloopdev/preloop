@@ -165,8 +165,18 @@ pub(crate) fn manifest(
             manifest["default_events"] = serde_json::json!(DEFAULT_EVENTS);
         }
         // An inactive hook still gets a secret from GitHub, so a later
-        // `--public-url` only has to flip the switch in App settings.
-        None => manifest["hook_attributes"] = serde_json::json!({ "active": false }),
+        // `--public-url` only has to flip the switch in App settings. The
+        // manifest schema requires `hook_attributes.url` whenever the object
+        // is present — GitHub rejects a url-less object with the misleading
+        // `"url" wasn't supplied` even though the top-level url is set. Use
+        // the loopback redirect as the placeholder; it is never delivered to
+        // while the hook is inactive.
+        None => {
+            manifest["hook_attributes"] = serde_json::json!({
+                "url": redirect_url,
+                "active": false,
+            })
+        }
     }
     manifest
 }
