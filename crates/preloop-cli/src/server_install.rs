@@ -45,7 +45,7 @@ pub(crate) enum ServerCommand {
 
 #[derive(Debug, Args)]
 pub(crate) struct InstallArgs {
-    /// Address to bind. Defaults to the engine default (0.0.0.0:9090); on
+    /// Address to bind. Defaults to the engine default (127.0.0.1:9090); on
     /// Linux the port is published through socket activation.
     #[arg(long, value_name = "ADDR")]
     listen: Option<SocketAddr>,
@@ -487,7 +487,7 @@ fn readwrite_paths(exe: &Path, home: &Path, user: bool) -> String {
 fn render_systemd_socket(listen: Option<SocketAddr>) -> String {
     let addr = listen
         .map(|addr| addr.to_string())
-        .unwrap_or_else(|| "9090".to_owned());
+        .unwrap_or_else(|| "127.0.0.1:9090".to_owned());
     format!(
         r#"[Unit]
 Description=Preloop HTTP control-plane socket
@@ -1086,8 +1086,8 @@ mod tests {
     }
 
     #[test]
-    fn systemd_socket_defaults_to_9090_and_honors_listen() {
-        assert!(render_systemd_socket(None).contains("ListenStream=9090"));
+    fn systemd_socket_defaults_to_loopback_and_honors_listen() {
+        assert!(render_systemd_socket(None).contains("ListenStream=127.0.0.1:9090"));
         let custom: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let unit = render_systemd_socket(Some(custom));
         assert!(unit.contains("ListenStream=127.0.0.1:8080"));

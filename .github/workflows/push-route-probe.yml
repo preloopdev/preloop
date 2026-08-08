@@ -1,0 +1,11 @@
+name: push-route-probe
+
+# Proves the submit-driven route end to end: this run is submitted straight
+# to the control plane, so no GitHub webhook is involved in triggering it.
+on: [workflow_dispatch]
+
+jobs:
+  probe:
+    runs-on: self-hosted
+    steps:
+      - run: echo "submit-driven CI - no webhook involved"

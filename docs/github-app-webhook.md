@@ -196,7 +196,7 @@ GitHub App token minting is strictly all-or-nothing:
 The microVM orchestrator requires the cross-compiled Linux ARM64 runner binary at `target/aarch64-unknown-linux-gnu/debug/preloop-runner`:
 - Running `cargo clean` removes this binary, causing `preloop serve` to log:
   ```text
-  WARN preloop: local runner pool unavailable... error=Linux runner bundle unavailable
+  WARN preloop: local runner provisioning unavailable; jobs queue until a runner is available error=Linux runner bundle unavailable...
   ```
 - **Recovery**: Rebuild the runner bundle with `cargo zigbuild` before starting the server:
   ```sh

@@ -900,6 +900,7 @@ pub(crate) async fn submit_run_inner(
                     workflow_path_str: workflow_path.clone(),
                     event: event.clone(),
                     conclusion: Some("failure".to_owned()),
+                    push_state: None,
                 },
             );
             drop(inner);
@@ -1059,6 +1060,7 @@ pub(crate) async fn submit_run_inner(
                             workflow_path_str: workflow_path.clone(),
                             event: event.clone(),
                             conclusion: Some("cancelled".to_owned()),
+                            push_state: None,
                         },
                     );
                     drop(inner);
@@ -1125,6 +1127,7 @@ pub(crate) async fn submit_run_inner(
                     workflow_path_str: workflow_path.clone(),
                     event: event.clone(),
                     conclusion: None,
+                    push_state: None,
                 },
             );
             drop(inner);
@@ -1183,6 +1186,7 @@ pub(crate) async fn submit_run_inner(
                 workflow_path_str: workflow_path.clone(),
                 event: event.clone(),
                 conclusion: None,
+                push_state: None,
             },
         );
 
@@ -1320,6 +1324,7 @@ pub(crate) async fn submit_run_inner(
                 workflow_path_str: workflow_path.clone(),
                 event: event.clone(),
                 conclusion: None,
+                push_state: None,
             },
         );
         // Deferred reusable-caller nodes whose needs are already satisfied
@@ -1407,7 +1412,62 @@ pub(crate) async fn submit_run(
                 .map_err(|_| ApiError::bad_request("local workspace path is not UTF-8"))?,
         );
     }
-    submit_run_inner(&shared, submission).await.map(Json)
+
+    // A run that asks for push-back must be a real GitHub branch at a real
+    // commit; anything else can never produce a PR or honest checks. Refuse
+    // before queueing a single job so the failure is loud and immediate.
+    let push_requested = submission.push.is_some();
+    if push_requested {
+        crate::github_push::validate_push_target(
+            &submission.repository,
+            &submission.sha,
+            &submission.git_ref,
+            submission.push_tree.as_deref().unwrap_or_default(),
+        )?;
+    }
+
+    let accepted = submit_run_inner(&shared, submission).await?;
+    if push_requested {
+        // Report queued check runs for every job, exactly like the webhook
+        // adapter does for delivered events, so GitHub shows the run from
+        // the moment it is accepted. Jobs resolved terminal at submission
+        // (skipped, unsatisfiable needs) get their completion immediately.
+        let run_id = accepted.run_id;
+        let (repository, sha, jobs) = {
+            let inner = shared.state.inner.lock().await;
+            let Some(run) = inner.runs.get(&run_id) else {
+                return Ok(Json(accepted));
+            };
+            (
+                run.submission.repository.clone(),
+                run.submission.sha.clone(),
+                run.jobs.keys().cloned().collect::<Vec<_>>(),
+            )
+        };
+        for job_id in &jobs {
+            crate::github::report_check_run_queued(&shared, &repository, &sha, job_id, run_id)
+                .await;
+            let status = {
+                let inner = shared.state.inner.lock().await;
+                inner
+                    .runs
+                    .get(&run_id)
+                    .and_then(|run| run.jobs.get(job_id).copied())
+            };
+            if let Some(status) = status.filter(|status| status.is_terminal()) {
+                crate::github::report_check_run_completed(&shared, run_id, job_id, status).await;
+            }
+        }
+        let mut inner = shared.state.inner.lock().await;
+        if let Some(run) = inner.runs.get_mut(&run_id) {
+            run.push_state = Some(PushState {
+                status: PushStatus::Pending,
+                error: None,
+                pr_number: None,
+            });
+        }
+    }
+    Ok(Json(accepted))
 }
 
 pub(crate) async fn get_scheduler_history(

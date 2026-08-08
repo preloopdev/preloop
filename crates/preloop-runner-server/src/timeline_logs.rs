@@ -618,6 +618,7 @@ mod tests {
                     workflow_path_str: ".github/workflows/ci.yml".to_owned(),
                     event: "push".to_owned(),
                     conclusion: None,
+                    push_state: None,
                 },
             );
             inner.plan_requests.insert(plan_id.clone(), request_id);

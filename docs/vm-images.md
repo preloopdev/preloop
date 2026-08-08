@@ -60,6 +60,22 @@ preloop build-golden \
 - When the pool warms a golden, it also pre-pulls the `container:` /
   `services:` images declared by the current workspace's workflows.
 
+## Where the engine finds the runner bundle
+
+The pool needs a **Linux** `preloop-runner` (the runner executes inside a
+Linux microVM, so the host's own binary never qualifies). The engine searches,
+in order:
+
+1. `PRELOOP_RUNNER_BUNDLE` — a directory containing a Linux `preloop-runner`.
+2. `<prefix>/lib/preloop/runner/<triple>/` — where `install.sh` and
+   `preloop update` place the bundle on macOS releases (the host's Linux
+   triple first, then any installed triple).
+3. `target/<triple>/{debug,release}` under a development build.
+
+On Linux hosts the installed `preloop-runner` is already a Linux binary, so no
+bundle is needed. Missing on macOS, the engine logs a startup warning and
+submitted jobs queue until a runner exists.
+
 ## Version tracking (`versions.toml`)
 
 Every pinned version lives in one place — `versions.toml` — and is consumed

@@ -43,7 +43,8 @@ jobs:
     runs-on: self-hosted
     timeout-minutes: 60
     env:
-      
+      # 2 parallel rustc jobs keep peak memory under the runner VM's 6 GiB
+      # ceiling (4 jobs in a VM plus a 4-VM pool OOM-killed the host).
       CARGO_BUILD_JOBS: "2"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262

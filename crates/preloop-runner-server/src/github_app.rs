@@ -901,6 +901,61 @@ async fn verify_app_config_at(
     Ok(granted)
 }
 
+/// Point an existing App's webhook at `url` with `secret`.
+///
+/// Creating a second App just to change a URL is the alternative, and it
+/// leaves the first one installed and minting tokens — so a deployment that
+/// starts on loopback and later gains a public address updates the App it
+/// already has. Authenticates with the App JWT, the only credential
+/// `/app/hook/config` accepts.
+///
+/// GitHub exposes no `active` flag on this endpoint: an App created with
+/// `hook_attributes.active = false` keeps that checkbox until it is flipped
+/// in the App's settings. The caller is expected to say so.
+pub async fn set_app_webhook_config(
+    app_id: &str,
+    pem: &str,
+    url: &str,
+    secret: &str,
+) -> anyhow::Result<()> {
+    set_app_webhook_config_at(&api_base(), app_id, pem, url, secret).await
+}
+
+/// [`set_app_webhook_config`] against an explicit API base.
+async fn set_app_webhook_config_at(
+    api_base: &str,
+    app_id: &str,
+    pem: &str,
+    url: &str,
+    secret: &str,
+) -> anyhow::Result<()> {
+    let creds = credentials_for(app_id, pem)?;
+    let app_jwt = sign_app_jwt(&creds.app_id, &creds.private_key)?;
+    let response = crate::shared_http::CLIENT
+        .patch(format!("{api_base}/app/hook/config"))
+        .bearer_auth(&app_jwt)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "preloop")
+        .json(&serde_json::json!({
+            "url": url,
+            "content_type": "json",
+            "secret": secret,
+            "insecure_ssl": "0",
+        }))
+        .send()
+        .await
+        .context("calling GitHub to update the App webhook configuration")?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body = response.text().await.unwrap_or_default();
+    anyhow::bail!(
+        "GitHub refused the webhook update ({status}): {}",
+        body.trim()
+    )
+}
+
 /// Build credentials from raw config pieces (no environment involved).
 fn credentials_for(app_id: &str, pem: &str) -> anyhow::Result<GitHubAppCredentials> {
     let private_key = parse_private_key(pem).context("parsing the GitHub App private key")?;
@@ -1412,6 +1467,98 @@ mod tests {
             .to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)
             .expect("encode PKCS#1")
             .to_string()
+    }
+
+    /// `/app/hook/config` is JWT-only and silently ignores anything else, so
+    /// the request must carry the App JWT — not an installation token — and
+    /// the exact url/secret pair the caller asked for.
+    #[tokio::test]
+    async fn webhook_config_update_sends_app_jwt_and_payload() {
+        use axum::{Json, Router};
+
+        let seen: Arc<std::sync::Mutex<Option<(String, serde_json::Value)>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let stub = Router::new().route(
+            "/app/hook/config",
+            axum::routing::patch({
+                let seen = Arc::clone(&seen);
+                move |headers: axum::http::HeaderMap, Json(body): Json<serde_json::Value>| {
+                    let seen = Arc::clone(&seen);
+                    async move {
+                        let auth = headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_owned();
+                        *seen.lock().expect("stub state") = Some((auth, body));
+                        Json(json!({"url": "https://ci.example.com/api/v1/github/webhooks"}))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub API");
+        let api_base = format!("http://{}", listener.local_addr().expect("stub address"));
+        tokio::spawn(async move { axum::serve(listener, stub).await.expect("serve stub API") });
+
+        set_app_webhook_config_at(
+            &api_base,
+            "424",
+            &test_pem(),
+            "https://ci.example.com/api/v1/github/webhooks",
+            "hook-secret",
+        )
+        .await
+        .expect("update the webhook configuration");
+
+        let seen = seen.lock().expect("stub state");
+        let (auth, body) = seen.as_ref().expect("the stub received the PATCH");
+        let token = auth
+            .strip_prefix("Bearer ")
+            .expect("bearer authorization header");
+        // An App JWT is RS256 with the App id as `iss`; an installation token
+        // would be an opaque `ghs_…` string and GitHub would reject it.
+        let claims = token.split('.').nth(1).expect("jwt payload segment");
+        let claims: serde_json::Value = serde_json::from_slice(
+            &base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, claims)
+                .expect("decode jwt claims"),
+        )
+        .expect("parse jwt claims");
+        assert_eq!(claims["iss"], "424", "the App id signs the request");
+        assert_eq!(body["url"], "https://ci.example.com/api/v1/github/webhooks");
+        assert_eq!(body["secret"], "hook-secret");
+        assert_eq!(body["content_type"], "json");
+        assert_eq!(body["insecure_ssl"], "0", "TLS verification stays on");
+    }
+
+    /// A refusal must surface GitHub's reason instead of reporting success.
+    #[tokio::test]
+    async fn webhook_config_update_reports_refusal() {
+        use axum::Router;
+
+        let stub = Router::new().route(
+            "/app/hook/config",
+            axum::routing::patch(|| async {
+                (
+                    axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                    "url is invalid",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub API");
+        let api_base = format!("http://{}", listener.local_addr().expect("stub address"));
+        tokio::spawn(async move { axum::serve(listener, stub).await.expect("serve stub API") });
+
+        let error = set_app_webhook_config_at(&api_base, "424", &test_pem(), "nope", "s")
+            .await
+            .expect_err("an invalid url must fail");
+        assert!(
+            format!("{error:#}").contains("url is invalid"),
+            "GitHub's reason must reach the operator: {error:#}"
+        );
     }
 
     /// A contents-only probe token makes the pull-requests, actions and issues

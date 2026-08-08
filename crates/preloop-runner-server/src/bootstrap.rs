@@ -418,7 +418,19 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
                                         .serve_connection_with_upgrades(io, service)
                                         .await
                                     {
-                                        warn!(%error, "Unix socket HTTP connection failed");
+                                        // Clients routinely drop the socket after
+                                        // their request (the CLI's own readiness
+                                        // probe included); a failed final
+                                        // write-shutdown is teardown noise, not a
+                                        // protocol failure.
+                                        let is_shutdown = error
+                                            .downcast_ref::<hyper::Error>()
+                                            .is_some_and(|e| e.is_shutdown());
+                                        if is_shutdown {
+                                            debug!(%error, "Unix socket connection closed");
+                                        } else {
+                                            warn!(%error, "Unix socket HTTP connection failed");
+                                        }
                                     }
                                 });
                             }

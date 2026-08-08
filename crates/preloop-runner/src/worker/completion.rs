@@ -345,6 +345,17 @@ pub(crate) async fn report_completion(
 
     // Use reporting context if available, otherwise fall back to creating a new client
     if let Some(rpt) = reporting {
+        // The token may have expired during the final long step. The renew
+        // loop keeps it fresh while running, but it is aborted before
+        // completion — refresh once so the terminal completejob is not
+        // rejected with 401.
+        if rpt.access_token.due_for_refresh() {
+            if let Some((fresh, refresh_at)) = super::job_runner::refresh_worker_oauth_token().await
+            {
+                rpt.access_token.update(fresh, refresh_at);
+                info!("OAuth token refreshed before completion");
+            }
+        }
         match via {
             ProtocolPath::Broker => {
                 let url = format!("{}/completejob", rpt.run_service.base_url());
@@ -352,11 +363,7 @@ pub(crate) async fn report_completion(
                 match rpt
                     .results
                     .http()
-                    .post_json_bearer::<serde_json::Value>(
-                        &url,
-                        &completion_body,
-                        &rpt.access_token,
-                    )
+                    .post_json_bearer::<serde_json::Value>(&url, &completion_body, &rpt.token())
                     .await
                 {
                     Ok(_) => info!("Job completion reported successfully"),
@@ -391,7 +398,7 @@ pub(crate) async fn report_completion(
                     });
                     match azdo
                         .client
-                        .update_timeline(&rpt.access_token, plan_id, &azdo.timeline_id, &job_record)
+                        .update_timeline(&rpt.token(), plan_id, &azdo.timeline_id, &job_record)
                         .await
                     {
                         Ok(_) => info!("AzDO: job timeline record set to Completed"),
@@ -414,7 +421,7 @@ pub(crate) async fn report_completion(
                 match rpt
                     .results
                     .http()
-                    .post_json_bearer::<serde_json::Value>(&url, &event, &rpt.access_token)
+                    .post_json_bearer::<serde_json::Value>(&url, &event, &rpt.token())
                     .await
                 {
                     Ok(_) => info!("Job completion reported successfully"),

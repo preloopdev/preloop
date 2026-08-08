@@ -124,7 +124,7 @@ async fn periodic_drain_flushes_queued_step_updates() {
     let reporting = Arc::new(ReportingContext {
         results: crate::client::results::ResultsClient::new(http.clone(), base_url.clone()),
         run_service: crate::client::run_service::RunServiceClient::new(http, base_url),
-        access_token: "test-token".to_string(),
+        access_token: super::LiveToken::new("test-token".to_string()),
         plan_id: "plan-1".to_string(),
         job_id: "job-1".to_string(),
         azdo: None,
@@ -880,4 +880,52 @@ async fn first_renew_gate_failure_does_not_clear_existing_workspace() {
         marker.exists(),
         "workspace must not be cleared before the lease is validated"
     );
+}
+
+#[test]
+fn live_token_starts_with_the_initial_value() {
+    let token = super::LiveToken::new("initial".to_string());
+    assert_eq!(token.get(), "initial");
+    assert!(!token.due_for_refresh(), "no deadline means never due");
+}
+
+#[test]
+fn live_token_update_publishes_for_all_readers() {
+    let token = super::LiveToken::new("initial".to_string());
+    let clone = token.clone();
+    token.update(
+        "fresh".to_string(),
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(60)),
+    );
+    assert_eq!(
+        clone.get(),
+        "fresh",
+        "update must be visible through clones"
+    );
+    assert!(!clone.due_for_refresh(), "fresh token is not due yet");
+}
+
+#[test]
+fn live_token_is_due_after_the_refresh_deadline() {
+    let token = super::LiveToken::new("initial".to_string());
+    token.update(
+        "fresh".to_string(),
+        Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
+    );
+    assert!(token.due_for_refresh(), "past deadline must be due");
+}
+
+#[test]
+fn unauthorized_error_is_detected_for_token_expiry() {
+    let error = anyhow::anyhow!(crate::client::http::HttpError::Status {
+        status: reqwest::StatusCode::UNAUTHORIZED,
+        body: "runner or job protocol token required".to_string(),
+    });
+    assert!(super::is_unauthorized(&error));
+
+    let not_found = anyhow::anyhow!(crate::client::http::HttpError::Status {
+        status: reqwest::StatusCode::NOT_FOUND,
+        body: "gone".to_string(),
+    });
+    assert!(!super::is_unauthorized(&not_found));
 }

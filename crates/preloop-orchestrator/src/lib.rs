@@ -116,41 +116,45 @@ fn runner_volumes(
 ///
 /// Reuses the same shell routine the golden bake used — it is pure
 /// `curl | tar` plus an atomic temp-dir publish, so it runs identically on
-/// the host. Skips when the external is already present, so a concurrent
-/// engine start or an operator-provided directory is left untouched.
+/// the host. Skips the download when the external is already present, so a
+/// concurrent engine start or an operator-provided directory keeps its
+/// contents. Permissions are still normalized on every call: the download is
+/// what gets skipped, not the repair, or a host that published its externals
+/// before the guest runner went non-root would stay broken forever.
 fn ensure_host_externals(config: &RunnerPoolConfig) -> Result<(), OrchestratorError> {
     let externals = config.externals_dir.join("externals");
-    if externals.join("node24").join("bin").join("node").is_file() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(&externals).map_err(|error| {
-        OrchestratorError::Config(format!(
-            "failed to create externals directory {}: {error}",
-            externals.display()
-        ))
-    })?;
-    for command in node_externals_at(config.externals_dir.to_string_lossy().as_ref()) {
-        let status = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&command[2])
-            .status()
-            .map_err(|error| {
-                OrchestratorError::Config(format!(
-                    "failed to spawn host externals install: {error}"
-                ))
-            })?;
-        if !status.success() {
-            return Err(OrchestratorError::Config(
-                "host node externals install failed; \
-                 check network egress to nodejs.org"
-                    .to_owned(),
-            ));
+    if !externals.join("node24").join("bin").join("node").is_file() {
+        std::fs::create_dir_all(&externals).map_err(|error| {
+            OrchestratorError::Config(format!(
+                "failed to create externals directory {}: {error}",
+                externals.display()
+            ))
+        })?;
+        for command in node_externals_at(config.externals_dir.to_string_lossy().as_ref()) {
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&command[2])
+                .status()
+                .map_err(|error| {
+                    OrchestratorError::Config(format!(
+                        "failed to spawn host externals install: {error}"
+                    ))
+                })?;
+            if !status.success() {
+                return Err(OrchestratorError::Config(
+                    "host node externals install failed; \
+                     check network egress to nodejs.org"
+                        .to_owned(),
+                ));
+            }
         }
+        info!(
+            path = %externals.display(),
+            "Node externals installed on host; mounting into runners"
+        );
     }
-    info!(
-        path = %externals.display(),
-        "Node externals installed on host; mounting into runners"
-    );
+    // Repair directories published before the guest runner went non-root.
+    relax_externals_permissions(&externals);
     // Artifact-based machines reach node through the baked symlink
     // `<root>/externals -> /opt/preloop/bin/externals` (the packed launcher
     // has no IRQ headroom for a third virtiofs mount), so the runner bundle
@@ -189,8 +193,65 @@ fn ensure_host_externals(config: &RunnerPoolConfig) -> Result<(), OrchestratorEr
             ),
         }
     }
+    // `cp -a` preserves the source mode, so the bundle copy needs the same
+    // repair as the host directory.
+    relax_externals_permissions(&bundle_externals);
     Ok(())
 }
+
+/// Make published Node externals traversable by the unprivileged guest account.
+///
+/// `mktemp -d` publishes 0700 and `cp -a` preserves it. That was invisible
+/// while the guest runner ran as root; it now drops to uid 1001
+/// (`as_runner_user`), which cannot traverse a 0700 directory owned by
+/// another uid. The runner probes the interpreter with `is_file()`, and
+/// EACCES is indistinguishable from absent there — so every JS action dies
+/// with "bundled node24 is missing" while the binary sits right there,
+/// readable, one directory down.
+///
+/// Only the group/other read+execute bits are added: enough to run the
+/// interpreter, never enough to modify it. Best-effort — a bundle inside a
+/// root-owned release directory is the deploy step's responsibility, and a
+/// failure here must not stop the pool from starting.
+#[cfg(unix)]
+fn relax_externals_permissions(externals: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    const TRAVERSABLE: u32 = 0o055;
+
+    let Ok(entries) = std::fs::read_dir(externals) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        let mode = metadata.permissions().mode();
+        if mode & TRAVERSABLE == TRAVERSABLE {
+            continue;
+        }
+        match std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode | TRAVERSABLE)) {
+            Ok(()) => info!(
+                path = %path.display(),
+                "Relaxed node externals permissions for the non-root guest runner"
+            ),
+            Err(error) => warn!(
+                path = %path.display(),
+                %error,
+                "Could not relax node externals permissions; \
+                 JS actions will fail as the non-root guest user"
+            ),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn relax_externals_permissions(_externals: &Path) {}
+
 async fn download_prebaked_golden(payload: &Path) -> bool {
     let default_url = format!(
         "https://github.com/preloopdev/preloop/releases/download/v{}/preloop-ubuntu-24.04-{}",
@@ -457,10 +518,12 @@ fn node_externals_at(runner_root: &str) -> Vec<Vec<String>> {
                NAME=$1; VERSION=$2; \
                DEST=$RUNNER_EXTERNALS/$NAME; \
                if [ -f \"$DEST/bin/node\" ]; then \
+                 chmod 755 \"$DEST\"; \
                  echo \"$NAME already present, skipping\"; continue; \
                fi; \
                echo \"Installing $NAME $VERSION into golden...\"; \
                TEMP=$(mktemp -d \"$RUNNER_EXTERNALS/.$NAME.XXXXXX\") && \
+                chmod 755 \"$TEMP\" && \
                 ARCH=$(uname -m); \
                 if [ \"$ARCH\" = \"aarch64\" ] || [ \"$ARCH\" = \"arm64\" ]; then NODE_ARCH=linux-arm64; else NODE_ARCH=linux-x64; fi; \
                 curl -fsSL \"https://nodejs.org/dist/$VERSION/node-$VERSION-$NODE_ARCH.tar.gz\" | \
@@ -2947,6 +3010,101 @@ chmod +x "$destination/bin/node"
         assert!(status.success());
         assert!(root.join("externals/node20/bin/node").is_file());
         assert!(root.join("externals/node24/bin/node").is_file());
+    }
+
+    /// The guest runner drops to uid 1001, so a 0700 `node24/` hides a
+    /// perfectly good interpreter behind EACCES and every JS action fails
+    /// with "bundled node24 is missing". `mktemp -d` publishes exactly that
+    /// mode, so the publish step has to widen it.
+    #[test]
+    fn published_node_externals_are_traversable_by_other_users() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let bin = root.join("stub-bin");
+        std::fs::create_dir_all(&bin).unwrap();
+
+        let curl = bin.join("curl");
+        std::fs::write(&curl, "#!/bin/sh\nprintf archive\n").unwrap();
+        std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let tar = bin.join("tar");
+        std::fs::write(
+            &tar,
+            r#"#!/bin/sh
+input=$(cat)
+[ "$input" = archive ] || exit 41
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = -C ]; then
+    shift
+    destination=$1
+  fi
+  shift
+done
+mkdir -p "$destination/bin"
+printf '#!/bin/sh\nexit 0\n' > "$destination/bin/node"
+chmod +x "$destination/bin/node"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&tar, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let command = node_externals_at(root.to_str().unwrap()).pop().unwrap();
+        let status = Command::new(&command[0])
+            .args(&command[1..])
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        for name in ["node20", "node24"] {
+            let mode = std::fs::metadata(root.join("externals").join(name))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o055,
+                0o055,
+                "{name} must stay traversable for the non-root guest runner (mode {mode:o})"
+            );
+        }
+    }
+
+    /// Externals published before the non-root switch are already on disk at
+    /// 0700, and the installer skips directories that already carry a node
+    /// binary — so start-up has to repair them in place or the host never
+    /// recovers without manual intervention.
+    #[test]
+    fn existing_externals_are_repaired_in_place() {
+        let directory = tempfile::tempdir().unwrap();
+        let externals = directory.path().join("externals");
+        let node24 = externals.join("node24").join("bin");
+        std::fs::create_dir_all(&node24).unwrap();
+        std::fs::write(node24.join("node"), "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(
+            externals.join("node24"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+
+        relax_externals_permissions(&externals);
+
+        let mode = std::fs::metadata(externals.join("node24"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o055, 0o055, "0700 externals must be repaired");
+        assert_eq!(
+            mode & 0o022,
+            0,
+            "repair must not grant write access to other users"
+        );
     }
 
     #[test]

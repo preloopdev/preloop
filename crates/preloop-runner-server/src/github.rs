@@ -123,6 +123,16 @@ fn decode_hex(hex: &str) -> Result<Vec<u8>, &'static str> {
     Ok(bytes)
 }
 
+/// GitHub REST root, overridable for GHES and for tests that point the server
+/// at a stub API.
+pub(crate) fn github_api_base() -> String {
+    std::env::var("PRELOOP_GITHUB_API_URL")
+        .ok()
+        .map(|base| base.trim_end_matches('/').to_owned())
+        .filter(|base| !base.is_empty())
+        .unwrap_or_else(|| "https://api.github.com".to_owned())
+}
+
 async fn resolve_check_run_token(shared: &Arc<SharedState>, repo: &str) -> Option<String> {
     if let Some(app_creds) = &shared.state.github_app {
         let mut permissions = std::collections::BTreeMap::new();
@@ -157,7 +167,7 @@ async fn send_github_check_request(
     body: Value,
 ) -> anyhow::Result<Value> {
     let client = crate::shared_http::CLIENT.clone();
-    let url = format!("https://api.github.com/repos/{}/{}", repo, path);
+    let url = format!("{}/repos/{}/{}", github_api_base(), repo, path);
     let res = client
         .request(method, &url)
         .header("User-Agent", "preloop")
@@ -181,7 +191,7 @@ async fn send_github_check_request(
     Ok(val)
 }
 
-fn run_details_url(run_id: RunId) -> Option<String> {
+pub(crate) fn run_details_url(run_id: RunId) -> Option<String> {
     std::env::var("PRELOOP_PUBLIC_URL")
         .ok()
         .map(|base| format!("{}/runs/{run_id}", base.trim_end_matches('/')))
@@ -425,8 +435,7 @@ pub(crate) async fn fetch_workflows(
     repo: &str,
     git_ref: &str,
 ) -> anyhow::Result<BTreeMap<String, String>> {
-    let api_base = std::env::var("PRELOOP_GITHUB_API_URL")
-        .unwrap_or_else(|_| "https://api.github.com".to_owned());
+    let api_base = github_api_base();
     fetch_workflows_at(shared, repo, git_ref, &api_base).await
 }
 
@@ -1086,7 +1095,30 @@ async fn process_github_webhook(
                 selected_jobs: vec![],
                 base_ref: None,
                 preserve_on_failure: false,
+                push: None,
+                push_tree: None,
             };
+
+            // Push-back already ran this exact workflow against this exact
+            // commit and published its checks; the delivery we are handling
+            // is the echo of that push. Re-running would duplicate the work
+            // and overwrite good results with a second set.
+            if let Some(tested_by) = crate::github_push::already_published(
+                shared,
+                &repo_full_name,
+                &submission.sha,
+                submission.workflow_path.as_deref().unwrap_or_default(),
+            )
+            .await
+            {
+                info!(
+                    workflow = %filename,
+                    sha = %submission.sha,
+                    run_id = %tested_by,
+                    "skipping webhook run: this commit was already tested and published by push-back"
+                );
+                continue;
+            }
 
             // Call submit_run_inner — it performs the authoritative trigger match.
             match submit_run_inner(shared, submission).await {
@@ -1202,6 +1234,13 @@ pub(crate) async fn github_register(headers: HeaderMap) -> impl IntoResponse {
         <input type="hidden" name="manifest" value='{}'>
         <button type="submit" style="font-size: 16px; padding: 10px 20px; cursor: pointer; background: #2da44e; color: white; border: none; border-radius: 6px; font-weight: bold;">Register App on GitHub</button>
     </form>
+    <p style="color: #57606a; font-size: 14px;">
+        If you want to run CI before creating a pull request
+        (<code>preloop run --push --create-pr</code>), grant the App
+        <code>pull_requests: write</code>: GitHub App settings &rarr;
+        Permissions &rarr; Pull requests &rarr; Read and write. Check-run
+        reporting works with just <code>checks: write</code>.
+    </p>
 </body>
 </html>"#,
         manifest_json
@@ -1243,6 +1282,8 @@ pub(crate) async fn github_callback(
     #[derive(Deserialize)]
     struct AppManifestConversion {
         id: u64,
+        #[serde(default)]
+        slug: Option<String>,
         pem: String,
         webhook_secret: Option<String>,
     }
@@ -1263,6 +1304,10 @@ pub(crate) async fn github_callback(
         "GitHub App credentials received"
     );
 
+    let install = credentials
+        .slug
+        .as_ref()
+        .map(|slug| format!("https://github.com/apps/{slug}/installations/new"));
     let credentials_html = format!(
         r#"<!DOCTYPE html>
 <html>
@@ -1275,18 +1320,29 @@ pub(crate) async fn github_callback(
     <p><strong>Webhook Secret:</strong> {}</p>
     <p><strong>Private Key PEM:</strong></p>
     <pre style="background: #f6f8fa; padding: 16px; border-radius: 6px; overflow-x: auto;">{}</pre>
-    <p>To use this App, configure your local environment and restart `preloop`:</p>
+    <p>Save the key to a file, then hand both to the engine and restart it:</p>
     <pre style="background: #f6f8fa; padding: 16px; border-radius: 6px;">
+preloop setup github --via app --app-id {} --pem-file ./app.pem
 export PRELOOP_WEBHOOK_SECRET="{}"
-export PRELOOP_GITHUB_APP_ID="{}"
     </pre>
+    <p>{}</p>
+    <p>On the machine running the engine, <code>preloop setup github --via app</code>
+       does all of this without copying anything out of a browser.</p>
 </body>
 </html>"#,
         credentials.id,
         credentials.webhook_secret.as_deref().unwrap_or("none"),
         credentials.pem,
+        credentials.id,
         credentials.webhook_secret.as_deref().unwrap_or("none"),
-        credentials.id
+        install
+            .as_ref()
+            .map(|url| format!(
+                r#"Then install it on your repositories: <a href="{url}">{url}</a>"#
+            ))
+            .unwrap_or_else(|| {
+                "Then install it on your repositories from the App's settings page.".to_owned()
+            }),
     );
 
     Ok(axum::response::Html(credentials_html))

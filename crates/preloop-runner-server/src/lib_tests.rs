@@ -5888,7 +5888,7 @@ async fn try_req(app: &Router, method: Method, uri: &str, body: Value) -> (Statu
             header::AUTHORIZATION,
             // Strict-by-default registration accepts only the system
             // credential; test servers run with the default token.
-            &format!("RemoteAuth {DEFAULT_PRELOOP_SYSTEM_TOKEN}"),
+            format!("RemoteAuth {DEFAULT_PRELOOP_SYSTEM_TOKEN}"),
         );
     }
     let request = if body.is_null() {
@@ -8477,6 +8477,109 @@ async fn pat_only_config_supplies_job_github_token() {
         .expect("job message carries a GitHub token variable");
     assert_eq!(token.value.as_deref(), Some("github_pat_testvalue"));
     assert_eq!(token.is_secret, Some(true));
+}
+
+/// The App-manifest setup flow receives the webhook secret from GitHub and
+/// stores it in the config file. Before that key existed the secret lived
+/// only in `PRELOOP_WEBHOOK_SECRET`, so a configured engine still rejected
+/// every signed delivery until the operator re-exported it by hand.
+#[tokio::test]
+async fn config_webhook_secret_verifies_signed_deliveries() {
+    let temp = tempfile::tempdir().unwrap();
+    let ws_dir = temp.path().join("workspace");
+    tokio::fs::create_dir_all(ws_dir.join(".github/workflows"))
+        .await
+        .unwrap();
+    tokio::fs::write(
+        ws_dir.join(".github/workflows/build.yml"),
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+    )
+    .await
+    .unwrap();
+    let config_path = temp.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        "[github]\nwebhook_secret = \"from-config-file\"\n",
+    )
+    .unwrap();
+
+    // Explicit config path rather than `PRELOOP_CONFIG`, which would race
+    // every other test building an `AppState`.
+    let mut state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
+        .await
+        .unwrap();
+    assert_eq!(
+        state.webhook_secret.as_deref(),
+        Some("from-config-file"),
+        "the config file is a valid source for the webhook secret"
+    );
+    state.local_workspace = Some(ws_dir);
+    let app = app(state.clone(), CancellationToken::new());
+
+    let payload = serde_json::json!({
+        "ref": "refs/heads/main",
+        "before": "0000000000000000000000000000000000000000",
+        "after": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+        "repository": {"full_name": "owner/repo", "default_branch": "main"},
+        "commits": [{
+            "id": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+            "added": ["src/main.rs"],
+            "modified": [],
+            "removed": []
+        }],
+    });
+    let body = serde_json::to_vec(&payload).unwrap();
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = Hmac::<Sha256>::new_from_slice(b"from-config-file").unwrap();
+    mac.update(&body);
+    let signature = format!(
+        "sha256={}",
+        mac.finalize()
+            .into_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/github/webhooks")
+                .header("x-github-event", "push")
+                .header("x-github-delivery", "config-secret-delivery")
+                .header("x-hub-signature-256", &signature)
+                .header("content-type", "application/json")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a correctly signed delivery is accepted with only the config file configured"
+    );
+
+    // The same body under a different secret must still be rejected —
+    // otherwise the check is decorative.
+    let forged = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/github/webhooks")
+                .header("x-github-event", "push")
+                .header("x-github-delivery", "forged-delivery")
+                .header("x-hub-signature-256", "sha256=deadbeef")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(forged.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -15127,7 +15230,19 @@ async fn store_recovery_preserves_pool_pairing_and_oauth_client_ids() {
         )
         .await;
         let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+        // The store persists SystemTime as microseconds
+        // (`system_time_us`/`system_time_from_us`), so a nanosecond-precision
+        // `now` can never equal the recovered value on Linux hosts (where
+        // SystemTime has ns resolution). Round to the store's precision —
+        // the same fix `5f96d0dd` applied to the sibling assertions here.
         let now = std::time::SystemTime::now();
+        let now = std::time::UNIX_EPOCH
+            + std::time::Duration::from_micros(
+                now.duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_micros()
+                    .min(u64::MAX as u128) as u64,
+            );
         {
             let mut inner = state.inner.lock().await;
             inner.runner_client_ids.insert("client-abc".to_owned(), 42);
@@ -15452,4 +15567,284 @@ async fn startup_fails_claims_orphaned_by_a_restart() {
         inner.queue.iter().any(|job| job.job_id.0 == "test"),
         "the unclaimed job stays in the queue for a fresh machine"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Submit-driven CI push-back (`--push`): the server verifies the tested tree,
+// creates the draft PR, and stays idempotent across replays.
+// ---------------------------------------------------------------------------
+
+async fn submit_push_run(app: &Router, sha: &str, push_tree: &str) -> Value {
+    request_json(
+        app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "git_ref": "refs/heads/feat/x",
+            "sha": sha,
+            "push_tree": push_tree,
+            "push": {"create_pr": true, "draft_pr": true}
+        }),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const TREE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    let pr_creates = Arc::new(AtomicUsize::new(0));
+    let pr_bodies = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let check_completions = Arc::new(Mutex::new(Vec::<Value>::new()));
+
+    let mock_app = Router::new()
+        .route(
+            "/repos/owner/repo",
+            get(|| async { Json(json!({"default_branch": "main"})) }),
+        )
+        .route(
+            "/repos/owner/repo/commits/:sha",
+            get(|Path(_sha): Path<String>| async move {
+                Json(json!({"commit": {"tree": {"sha": TREE}}}))
+            }),
+        )
+        .route(
+            "/repos/owner/repo/pulls",
+            get(|| async { Json(json!([])) }).post({
+                let pr_creates = pr_creates.clone();
+                let pr_bodies = pr_bodies.clone();
+                move |body: axum::extract::Json<Value>| {
+                    let pr_creates = pr_creates.clone();
+                    let pr_bodies = pr_bodies.clone();
+                    async move {
+                        pr_creates.fetch_add(1, Ordering::SeqCst);
+                        pr_bodies.lock().unwrap().push(body.0);
+                        Json(json!({"number": 42}))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/repos/owner/repo/check-runs",
+            post(|| async { Json(json!({"id": 7})) }),
+        )
+        .route(
+            "/repos/owner/repo/check-runs/:id",
+            axum::routing::patch({
+                let check_completions = check_completions.clone();
+                move |Path(id): Path<u64>, body: axum::extract::Json<Value>| {
+                    let check_completions = check_completions.clone();
+                    async move {
+                        check_completions.lock().unwrap().push(body.0);
+                        Json(json!({"id": id}))
+                    }
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, mock_app).await.unwrap();
+    });
+
+    // Held for the whole test: the GitHub env vars are process-global.
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    std::env::set_var("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}"));
+    std::env::set_var("PRELOOP_GITHUB_TOKEN", "sync-test-token");
+
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    // 1. A --push submission reports queued check runs at accept time and
+    //    starts in `pending`.
+    let accepted = submit_push_run(&app, SHA, TREE).await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+    {
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&run_id.parse::<RunId>().unwrap()).unwrap();
+        assert_eq!(run.job_check_run_ids.len(), 1, "queued check run at submit");
+        assert_eq!(
+            *run.job_check_run_ids.values().next().unwrap(),
+            7,
+            "check run id comes from the (mock) GitHub API"
+        );
+        assert_eq!(run.push_state.as_ref().unwrap().status, PushStatus::Pending);
+    }
+
+    // 2. Sync before the run is terminal is refused.
+    let (status, _) = request_json_status(
+        &app,
+        Method::POST,
+        &format!("/api/v1/runs/{run_id}/push"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // 3. Terminal run: the sync verifies the tree, creates the draft PR,
+    //    and marks the run pushed.
+    {
+        let mut inner = state.inner.lock().await;
+        let run = inner
+            .runs
+            .get_mut(&run_id.parse::<RunId>().unwrap())
+            .unwrap();
+        run.conclusion = Some("success".to_owned());
+    }
+    let pushed = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/runs/{run_id}/push"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(pushed["status"], "pushed");
+    assert_eq!(pushed["pr_number"], 42);
+    assert!(pushed["pr_url"].as_str().unwrap().ends_with("/pull/42"));
+
+    {
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&run_id.parse::<RunId>().unwrap()).unwrap();
+        assert_eq!(run.push_state.as_ref().unwrap().status, PushStatus::Synced);
+        assert_eq!(run.push_state.as_ref().unwrap().pr_number, Some(42));
+    }
+    let pr_body = pr_bodies.lock().unwrap().first().unwrap().clone();
+    assert_eq!(pr_body["head"], "feat/x");
+    assert_eq!(pr_body["base"], "main");
+    assert_eq!(pr_body["draft"], true, "new PRs are drafts by default");
+    assert!(pr_body["body"].as_str().unwrap().contains(SHA));
+    assert_eq!(pr_creates.load(Ordering::SeqCst), 1);
+    assert!(
+        check_completions.lock().unwrap().is_empty(),
+        "jobs with a check run at submit are not re-reported by the sync"
+    );
+
+    // 4. Replay is a no-op: no second PR, same response.
+    let again = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/runs/{run_id}/push"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(again["pr_number"], 42);
+    assert_eq!(pr_creates.load(Ordering::SeqCst), 1, "idempotent replay");
+
+    // 5. A pushed tree that differs from the tested tree blocks the sync.
+    let accepted = submit_push_run(&app, SHA, "cccccccccccccccccccccccccccccccccccccccc").await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+    {
+        let mut inner = state.inner.lock().await;
+        let run = inner
+            .runs
+            .get_mut(&run_id.parse::<RunId>().unwrap())
+            .unwrap();
+        run.conclusion = Some("success".to_owned());
+    }
+    let (status, _) = request_json_status(
+        &app,
+        Method::POST,
+        &format!("/api/v1/runs/{run_id}/push"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    {
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&run_id.parse::<RunId>().unwrap()).unwrap();
+        assert_eq!(run.push_state.as_ref().unwrap().status, PushStatus::Blocked);
+        assert!(run
+            .push_state
+            .as_ref()
+            .unwrap()
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("does not match"));
+    }
+
+    // 6. A run submitted without --push can never be pushed.
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo",
+        }),
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+    let (status, _) = request_json_status(
+        &app,
+        Method::POST,
+        &format!("/api/v1/runs/{run_id}/push"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // 7. Push-back lands the commit on GitHub, which answers with a push
+    //    webhook for that same commit. The workflow that was already tested
+    //    and published must not run a second time, while a workflow the user
+    //    never submitted still has to.
+    const PUBLISHED_WORKFLOW: &str = ".github/workflows/ci.yml";
+    let accepted = submit_push_run(&app, SHA, TREE).await;
+    let published_id = accepted["run_id"]
+        .as_str()
+        .unwrap()
+        .parse::<RunId>()
+        .unwrap();
+    {
+        let mut inner = state.inner.lock().await;
+        let run = inner.runs.get_mut(&published_id).unwrap();
+        run.conclusion = Some("success".to_owned());
+        let mut submission = (*run.submission).clone();
+        submission.workflow_path = Some(PUBLISHED_WORKFLOW.to_owned());
+        run.submission = Arc::new(submission);
+    }
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+    assert_eq!(
+        crate::github_push::already_published(&shared, "owner/repo", SHA, PUBLISHED_WORKFLOW).await,
+        Some(published_id),
+        "the echo of our own push must be recognised"
+    );
+    assert_eq!(
+        crate::github_push::already_published(
+            &shared,
+            "owner/repo",
+            SHA,
+            ".github/workflows/other.yml"
+        )
+        .await,
+        None,
+        "a workflow that was never submitted is new work and must still run"
+    );
+    assert_eq!(
+        crate::github_push::already_published(
+            &shared,
+            "owner/repo",
+            "dddddddddddddddddddddddddddddddddddddddd",
+            PUBLISHED_WORKFLOW
+        )
+        .await,
+        None,
+        "a different commit is different work"
+    );
+
+    std::env::remove_var("PRELOOP_GITHUB_TOKEN");
+    std::env::remove_var("PRELOOP_GITHUB_API_URL");
 }

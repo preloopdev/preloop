@@ -14,7 +14,7 @@ run unmodified.
 
 ## Requirements
 
-- macOS (Apple Silicon) or Linux, 64-bit
+- macOS (Apple Silicon), Windows or Linux, 64-bit
 - [smolvm] for the default VM runner pool (`preloop runner` works without it)
 - A GitHub account for credentials (see below)
 
@@ -30,8 +30,7 @@ curl -fsSL https://raw.githubusercontent.com/preloopdev/preloop/main/install.sh 
 
 - For the full microVM runner pool, enable nested virtualization in
   `.wslconfig` (`[wsl2] nestedVirtualization=true`) so `/dev/kvm` is exposed.
-- Without it, `preloop runner` still works (jobs run as WSL processes); only
-  the VM pool needs KVM.
+- Without it, `preloop runner` still works (jobs run as WSL processes); only the VM pool needs KVM.
 
 ## Quick start
 
@@ -66,26 +65,72 @@ you what you are doing.
 
 ### Option A — GitHub App
 
-App creation is a browser-only step (GitHub has no API for creating user
-apps):
+GitHub has no API for creating an App, but it does accept a *manifest*: a
+form POST that pre-fills the creation page. `preloop setup github --via app`
+uses it, so the only manual step is clicking **Create on GitHub**.
 
-1. Create the app at <https://github.com/settings/apps/new>. You only need a
-   name; leave webhooks off. Note the **App ID** and download the **private
-   key** (PEM). Set the app avatar to `logo.png` from the repo root (GitHub has
-   no API for app avatars — it is a browser-only field on this form).
-2. Install the app on the account(s) whose repos you run:
-   <https://github.com/apps/YOUR-APP/installations/new>. Grant it the repos
-   you want to run — the engine cannot mint tokens for repos outside the
-   installation.
-3. Configure the engine:
+```sh
+preloop setup github --via app
+```
 
-   ```sh
-   preloop setup github --via app --app-id 123456 --pem-file app.pem
-   preloop doctor --repo owner/repo
-   ```
+The command binds a single-use listener on loopback, opens it in your
+browser, and uses it as the manifest's redirect target. You click **Create on
+GitHub**; GitHub redirects back with a one-time code, and the CLI converts it
+into the App id, private key, and webhook secret and writes them to
+`~/.preloop/config.toml` (mode 0600). The browser then lands on the
+installation page — pick the repositories you run, and the CLI reports the
+installation id and exits.
 
-   The engine mints a fresh installation token per job — no long-lived
-   secret sits in the config.
+The private key never leaves the machine: the redirect target is
+`127.0.0.1`, not a hosted page.
+
+| Flag | Effect |
+|---|---|
+| `--org NAME` | Create the App under an organization instead of your account. |
+| `--public-url URL` | Also enable webhook delivery to that URL. Omitted, the App is created with webhooks off — GitHub cannot reach `localhost`. |
+| `--app-name NAME` | App name (GitHub requires global uniqueness). Default `preloop-local`. |
+| `--port N` | Pin the loopback port instead of taking a free one. |
+| `--no-browser` | Print the URL instead of opening a browser (headless/SSH). |
+
+#### What "webhooks off" means
+
+Without `--public-url` the App is created with its webhook inactive, because
+GitHub cannot reach `127.0.0.1`. That only removes GitHub's ability to *call
+you*; everything outbound still works:
+
+| | webhooks off (default) | `--public-url` |
+|---|---|---|
+| What starts a run | you do: `preloop run`, `just submit-ci` | a `push`/`pull_request` on GitHub |
+| Private-repo checkout, `gh`, API steps | works — the App mints a token per job | same |
+| Check runs on the commit | published (outbound to GitHub) | same |
+
+So a laptop setup is a complete CI system you trigger yourself. When you later
+get a reachable address — a tunnel is enough — point the App you already have
+at it:
+
+```sh
+cloudflared tunnel --url http://127.0.0.1:9090      # → https://xxx.trycloudflare.com
+preloop setup github --via app --public-url https://xxx.trycloudflare.com
+```
+
+That updates the existing App's webhook URL and secret through GitHub's API
+(`PATCH /app/hook/config`) instead of creating a second App, and stores the
+secret so deliveries verify. GitHub exposes no API for the webhook **Active**
+checkbox, so an App created without `--public-url` needs that ticked once in
+its settings; the command says so.
+
+Already have an App — or your org blocks manifest creation? Create it by hand
+at <https://github.com/settings/apps/new> (name it, leave webhooks off,
+download the PEM), install it on the accounts whose repos you run at
+<https://github.com/apps/YOUR-APP/installations/new>, then:
+
+```sh
+preloop setup github --via app --app-id 123456 --pem-file app.pem
+preloop doctor --repo owner/repo
+```
+
+Either way the engine mints a fresh installation token per job — no
+long-lived secret sits in the config.
 
 ### Option B — fine-grained PAT
 
@@ -98,6 +143,25 @@ or without `--token` (prompted, hidden input):
 ```sh
 preloop setup github --via pat --repo owner/repo
 ```
+
+Unlike Apps, PATs have no manifest flow — GitHub exposes no API for creating
+one — so this path opens the creation page and waits at a hidden prompt.
+`--no-browser` skips the opening; piping the token in (or setting
+`PRELOOP_GITHUB_PAT`) skips the prompt entirely, so automation is unaffected.
+
+Two things a PAT does not get you:
+
+- **Check runs.** GitHub's checks API only accepts App installation tokens, so
+  a PAT-configured engine records check runs locally instead of publishing
+  them to the commit. Jobs still get the PAT as `GITHUB_TOKEN`, so checkout,
+  `gh`, and API steps work normally.
+- **A webhook secret.** The App flow receives one from GitHub; here you create
+  the webhook yourself (repository → Settings → Webhooks, pointed at
+  `<public-url>/api/v1/github/webhooks`) and store its secret:
+
+  ```sh
+  preloop setup github --via pat --webhook-secret "$(openssl rand -hex 32)"
+  ```
 
 Create the PAT at <https://github.com/settings/personal-access-tokens/new>
 with **Repository access → Only select repositories** and the permissions the
@@ -188,6 +252,7 @@ app_id = "123456"
 app_pem = "-----BEGIN RSA PRIVATE KEY-----…"
 mint_failure = "pat"        # "local" | "error" | "pat"
 pat = "github_pat_…"
+webhook_secret = "…"        # written by `setup github --via app`
 
 [secrets]
 DOCKERHUB_TOKEN = "…"
@@ -197,9 +262,10 @@ AWS_CREDS = "…"
 ```
 
 Environment variables override the file per field (`PRELOOP_GITHUB_APP_ID`,
-`PRELOOP_GITHUB_APP_PEM`, `PRELOOP_GITHUB_PAT`, …) — the file is the durable store,
-env vars are the escape hatch for containers. GitHub credential changes are
-picked up on engine restart; secrets changes apply live.
+`PRELOOP_GITHUB_APP_PEM`, `PRELOOP_GITHUB_PAT`, `PRELOOP_WEBHOOK_SECRET`, …) —
+the file is the durable store, env vars are the escape hatch for containers.
+GitHub credential changes are picked up on engine restart; secrets changes
+apply live.
 
 ## doctor
 
@@ -207,6 +273,25 @@ picked up on engine restart; secrets changes apply live.
 it mints an App token (or uses the PAT) and probes the repository for
 contents/pull-requests/actions/issues read. Run it after setup and any time a
 job's `GITHUB_TOKEN` misbehaves.
+
+## One engine, one user (for now)
+
+An engine is built for a single operator. Nothing stops several people from
+pointing `PRELOOP_URL` at the same server, but the server does not yet model
+*who* submitted a run, so treat a shared engine as unsupported:
+
+- **One identity.** Every caller authenticates with the same native token, so
+  the server cannot tell two people apart. Anyone who can reach the API can
+  read every run's logs and secrets-bearing job messages.
+- **`preloop push` defaults to the server's most recent run**, not to yours.
+  On a shared engine that may be a colleague's run — publishing their commit
+  and opening their pull request under *your* git credentials. Pass an
+  explicit run id (`preloop push <run_id>`) if you share an engine anyway.
+- **One credential set.** The configured App or PAT is used for every run, so
+  check runs and pull requests are always attributed to that identity rather
+  than to the person who submitted.
+
+Give each person their own engine until per-user identity lands.
 
 ## Durable state (SQLite by default, Postgres optional)
 

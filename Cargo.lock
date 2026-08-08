@@ -1852,6 +1852,7 @@ name = "preloop-cli"
 version = "0.27.0"
 dependencies = [
  "anyhow",
+ "axum",
  "base64",
  "clap",
  "flate2",

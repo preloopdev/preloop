@@ -191,7 +191,7 @@ impl StoredAuth {
             (None, Some(source)) => {
                 format!("DISABLED — {source} set but no {APP_ID_ENV}; jobs get a local JWT")
             }
-            (None, None) => "disabled — no App configured".to_owned(),
+            (None, None) => "disabled — no App configured (local-only mode)".to_owned(),
         };
 
         let webhooks = if webhook {
@@ -201,6 +201,13 @@ impl StoredAuth {
         };
 
         format!("github: tokens: {tokens}; webhooks: {webhooks}")
+    }
+
+    /// Whether the effective configuration is empty — no App, no webhook
+    /// secret. Reads the environment like [`Self::report`], so values that
+    /// came from outside this file count.
+    pub fn is_unconfigured() -> bool {
+        env_value(APP_ID_ENV).is_none() && !env_present(WEBHOOK_SECRET_ENV)
     }
 }
 

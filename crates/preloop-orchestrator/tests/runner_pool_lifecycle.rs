@@ -293,10 +293,45 @@ impl VmProvider for RecordingVmProvider {
 
 struct Fixture {
     _env_guard: std::sync::MutexGuard<'static, ()>,
+    _golden_url_guard: GoldenUrlGuard,
     root: PathBuf,
     config: RunnerPoolConfig,
     token_env: String,
     token: String,
+}
+
+/// Pins `PRELOOP_GOLDEN_URL` to an unreachable address for the fixture's
+/// lifetime and restores the previous value on drop.
+///
+/// The pool downloads a prebaked golden before building when one is
+/// reachable (`prepare_artifact` → `download_prebaked_golden`). The
+/// artifact-preparation tests assert the LOCAL build+pack path, so a host
+/// with network egress to the release asset would silently skip the pack and
+/// hang `wait_until(Event::Pack)` forever. Pinning the URL keeps the fixture
+/// hermetic — the pool falls back to building and packing locally, which is
+/// what the tests exercise.
+struct GoldenUrlGuard {
+    previous: Option<String>,
+}
+
+impl GoldenUrlGuard {
+    fn new() -> Self {
+        let previous = std::env::var("PRELOOP_GOLDEN_URL").ok();
+        std::env::set_var(
+            "PRELOOP_GOLDEN_URL",
+            "http://127.0.0.1:1/preloop-golden-unreachable",
+        );
+        Self { previous }
+    }
+}
+
+impl Drop for GoldenUrlGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var("PRELOOP_GOLDEN_URL", value),
+            None => std::env::remove_var("PRELOOP_GOLDEN_URL"),
+        }
+    }
 }
 
 impl Fixture {
@@ -356,6 +391,7 @@ impl Fixture {
         };
         Self {
             _env_guard: env_guard,
+            _golden_url_guard: GoldenUrlGuard::new(),
             root,
             config,
             token_env,

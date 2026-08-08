@@ -20,6 +20,7 @@ preloop-vm = { path = "../preloop-vm" }
 preloop-runner-server = { path = "../preloop-runner-server" }
 preloop-gha-parser = { path = "../preloop-gha-parser" }
 anyhow = { workspace = true }
+axum = { workspace = true }
 base64 = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }

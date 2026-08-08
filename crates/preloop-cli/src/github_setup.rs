@@ -42,6 +42,36 @@ pub struct GithubSetupArgs {
     #[arg(long)]
     pub pem_file: Option<PathBuf>,
 
+    /// Create the App under this organization instead of your personal
+    /// account (with --via app, browser flow).
+    #[arg(long)]
+    pub org: Option<String>,
+
+    /// Port for the loopback listener GitHub redirects back to
+    /// (with --via app, browser flow). 0 picks a free port.
+    #[arg(long, default_value_t = 0)]
+    pub port: u16,
+
+    /// Public HTTPS URL of this engine. Enables webhook delivery on the
+    /// created App; without it the App is created with webhooks off.
+    #[arg(long)]
+    pub public_url: Option<String>,
+
+    /// Name of the created App (with --via app, browser flow). GitHub
+    /// requires it to be globally unique.
+    #[arg(long, default_value = "preloop-local")]
+    pub app_name: String,
+
+    /// Print the URL instead of opening a browser.
+    #[arg(long)]
+    pub no_browser: bool,
+
+    /// Webhook secret to store. The App flow receives one from GitHub
+    /// automatically; set this when you created the webhook yourself
+    /// (any `--via pat` deployment that wants push triggers).
+    #[arg(long)]
+    pub webhook_secret: Option<String>,
+
     /// PAT to store (with --via pat). Falls back to PRELOOP_GITHUB_PAT,
     /// then an interactive prompt.
     #[arg(long)]
@@ -64,6 +94,12 @@ impl std::fmt::Debug for GithubSetupArgs {
             .field("via", &self.via)
             .field("app_id", &self.app_id)
             .field("pem_file", &self.pem_file)
+            .field("org", &self.org)
+            .field("port", &self.port)
+            .field("public_url", &self.public_url)
+            .field("app_name", &self.app_name)
+            .field("no_browser", &self.no_browser)
+            .field("webhook_secret", &redacted(self.webhook_secret.is_some()))
             .field("token", &redacted(self.token.is_some()))
             .field("repos", &self.repos)
             .field("workspace", &self.workspace)
@@ -190,20 +226,28 @@ async fn cmd_setup_github(args: GithubSetupArgs) -> anyhow::Result<()> {
                  \x20     scoped to each workflow's `permissions:` block.\n\
                  pat  Fine-grained PAT — for orgs that gate app installations.\n\
                  \n\
-                 Run `preloop setup github --via app --app-id <ID> --pem-file <KEY>` after\n\
-                 creating the App:\n\
-                 \x20 1. github.com/settings/apps/new — name it (e.g. `dummy-preloop-app`),\n\
-                 \x20    disable webhook, permissions: Contents: Read-only and\n\
-                 \x20    Pull requests: Read-only (if your workflows read PRs).\n\
-                 \x20    Upload the repo-root logo.png as the App avatar.\n\
-                 \x20 2. Generate a private key — save the PEM.\n\
-                 \x20 3. Install the App on your repositories:\n\
-                 \x20    https://github.com/apps/<slug>/installations/new\n\
-                 \x20 4. Re-run this command with --app-id and --pem-file."
+                 `preloop setup github --via app` creates the App for you: it opens a\n\
+                 local page, GitHub asks you to confirm, and the App id, private key,\n\
+                 and webhook secret are written to your config automatically.\n\
+                 \x20 --org <NAME>       create it under an organization\n\
+                 \x20 --public-url <URL> also enable webhook delivery to this engine\n\
+                 \n\
+                 Already have an App? Skip the browser:\n\
+                 \x20 preloop setup github --via app --app-id <ID> --pem-file <KEY>"
             );
             return Ok(());
         }
     };
+    // Applied before the credential path runs, so `--via app --public-url`
+    // pushes this exact secret to GitHub rather than minting a fresh one.
+    // App *creation* still wins: GitHub generates the secret it will sign
+    // with, and nothing local can override that.
+    if let Some(secret) = args.webhook_secret.as_deref() {
+        let mut config = preloop_runner_server::config::load_config()?;
+        config.github.webhook_secret = Some(secret.to_owned());
+        let path = write_config(&config)?;
+        println!("Webhook secret stored in {}", path.display());
+    }
     match via {
         Via::App => setup_app(&args).await,
         Via::Pat => setup_pat(&args).await,
@@ -211,24 +255,48 @@ async fn cmd_setup_github(args: GithubSetupArgs) -> anyhow::Result<()> {
 }
 
 async fn setup_app(args: &GithubSetupArgs) -> anyhow::Result<()> {
-    let app_id = args
-        .app_id
-        .as_deref()
-        .context("--app-id is required with --via app")?;
-    let pem_path = args
-        .pem_file
-        .as_deref()
-        .context("--pem-file is required with --via app")?;
-    let pem = std::fs::read_to_string(pem_path)
-        .with_context(|| format!("reading App private key {}", pem_path.display()))?;
+    // Nothing supplied means "create the App for me"; either flag on its own
+    // is a half-finished manual setup, and silently starting a browser flow
+    // would create a second App the operator did not ask for.
+    let (app_id, pem, webhook_secret) = match (args.app_id.as_deref(), args.pem_file.as_deref()) {
+        (None, None) => {
+            // An App is already configured: creating a second one would leave
+            // the first installed and minting tokens, and the operator almost
+            // certainly meant "point the one I have at this URL".
+            let existing = preloop_runner_server::config::load_config()?.github;
+            if let (Some(app_id), Some(pem)) = (existing.app_id, existing.app_pem) {
+                return match args.public_url.as_deref() {
+                    Some(public_url) => {
+                        enable_webhooks(&app_id, &pem, public_url, existing.webhook_secret).await
+                    }
+                    None => {
+                        println!(
+                            "App {app_id} is already configured in {}.\n\
+                             \x20 --public-url <URL>  point its webhook at a reachable address\n\
+                             \x20 --app-id/--pem-file replace it with a different App\n\
+                             Delete the [github] keys from that file to start over.",
+                            preloop_runner_server::config::config_path().display()
+                        );
+                        Ok(())
+                    }
+                };
+            }
+            return setup_app_via_browser(args).await;
+        }
+        (Some(app_id), Some(pem_path)) => {
+            let pem = std::fs::read_to_string(pem_path)
+                .with_context(|| format!("reading App private key {}", pem_path.display()))?;
+            (app_id.to_owned(), pem, None)
+        }
+        (Some(_), None) => anyhow::bail!(
+            "--pem-file is required alongside --app-id (omit both to create the App in a browser)"
+        ),
+        (None, Some(_)) => anyhow::bail!(
+            "--app-id is required alongside --pem-file (omit both to create the App in a browser)"
+        ),
+    };
 
-    let mut config = preloop_runner_server::config::load_config()?;
-    config.github.app_id = Some(app_id.to_owned());
-    config.github.app_pem = Some(pem.clone());
-    if config.github.mint_failure.is_none() {
-        config.github.mint_failure = Some("local".into());
-    }
-    let path = write_config(&config)?;
+    let path = save_app_credentials(&app_id, &pem, webhook_secret)?;
     println!("Wrote {}", path.display());
     println!(
         "App {app_id} configured. If the App is not yet installed on your repositories:\n\
@@ -239,7 +307,104 @@ async fn setup_app(args: &GithubSetupArgs) -> anyhow::Result<()> {
         println!("Tip: verify with `preloop doctor --repo owner/name`.");
         return Ok(());
     }
-    doctor_app(app_id, &pem, &args.repos).await
+    doctor_app(&app_id, &pem, &args.repos).await
+}
+
+/// Persist App credentials to the engine's config file.
+///
+/// The webhook secret only exists on the manifest path — GitHub generates it
+/// during creation — so it is written when present and left untouched
+/// otherwise, which keeps a manual re-run from clearing a working secret.
+fn save_app_credentials(
+    app_id: &str,
+    pem: &str,
+    webhook_secret: Option<String>,
+) -> anyhow::Result<PathBuf> {
+    let mut config = preloop_runner_server::config::load_config()?;
+    config.github.app_id = Some(app_id.to_owned());
+    config.github.app_pem = Some(pem.to_owned());
+    if config.github.mint_failure.is_none() {
+        config.github.mint_failure = Some("local".into());
+    }
+    if webhook_secret.is_some() {
+        config.github.webhook_secret = webhook_secret;
+    }
+    write_config(&config)
+}
+
+/// Create the App through GitHub's manifest flow and store what comes back.
+async fn setup_app_via_browser(args: &GithubSetupArgs) -> anyhow::Result<()> {
+    let registration = crate::app_manifest::register(
+        &args.app_name,
+        args.org.as_deref(),
+        args.port,
+        args.public_url.as_deref(),
+        !args.no_browser,
+    )
+    .await?;
+    let credentials = &registration.credentials;
+    let app_id = credentials.id.to_string();
+    let path = save_app_credentials(
+        &app_id,
+        &credentials.pem,
+        credentials.webhook_secret.clone(),
+    )?;
+    println!("Created App {app_id} and wrote {}", path.display());
+    if credentials.webhook_secret.is_some() {
+        println!("Webhook secret stored — signed deliveries will verify.");
+    }
+    match registration.installation_id {
+        Some(id) => println!("Installed (installation {id})."),
+        None => {
+            if let Some(url) = credentials.install_url() {
+                println!("Install it on your repositories to finish:\n  {url}");
+            }
+        }
+    }
+    println!("Restart the engine (`preloop serve`) to pick up the config.");
+    if args.repos.is_empty() {
+        println!("Tip: verify with `preloop doctor --repo owner/name`.");
+        return Ok(());
+    }
+    doctor_app(&app_id, &credentials.pem, &args.repos).await
+}
+
+/// Point an already-configured App's webhook at a reachable URL.
+///
+/// Reuses the stored secret when there is one — rotating it would silently
+/// break any other consumer of the same App — and generates one otherwise,
+/// since GitHub only signs deliveries when a secret is set.
+async fn enable_webhooks(
+    app_id: &str,
+    pem: &str,
+    public_url: &str,
+    stored_secret: Option<String>,
+) -> anyhow::Result<()> {
+    let secret = match stored_secret.filter(|secret| !secret.is_empty()) {
+        Some(secret) => secret,
+        None => {
+            let bytes: [u8; 32] = rand::random();
+            bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        }
+    };
+    let hook_url = format!(
+        "{}/api/v1/github/webhooks",
+        public_url.trim_end_matches('/')
+    );
+    preloop_runner_server::github_app::set_app_webhook_config(app_id, pem, &hook_url, &secret)
+        .await?;
+    let mut config = preloop_runner_server::config::load_config()?;
+    config.github.webhook_secret = Some(secret);
+    let path = write_config(&config)?;
+    println!("App {app_id} webhook now delivers to {hook_url}");
+    println!("Secret stored in {}", path.display());
+    println!(
+        "If deliveries do not arrive, tick **Active** under Webhook in the App's\n\
+         settings — GitHub's API cannot set that flag, and an App created\n\
+         without --public-url starts with it off."
+    );
+    println!("Restart the engine (`preloop serve`) to pick up the secret.");
+    Ok(())
 }
 
 async fn setup_pat(args: &GithubSetupArgs) -> anyhow::Result<()> {
@@ -262,6 +427,14 @@ async fn setup_pat(args: &GithubSetupArgs) -> anyhow::Result<()> {
         println!("  - {line}");
     }
     println!("Metadata: Read-only is always required (GitHub enforces it).");
+    // GitHub has no API for minting a fine-grained PAT — unlike Apps, which
+    // have the manifest flow — so the browser is unavoidable here. Opening
+    // the page is the most that can be automated.
+    println!(
+        "Note: check runs are App-only at GitHub's end, so a PAT-configured engine\n\
+         \x20 records them locally instead of publishing them to the commit. Use\n\
+         \x20 `--via app` if you want status checks on PRs."
+    );
     if oidc_declared {
         println!(
             "Note: your workflows also declare `id-token: write` — OIDC token issuance. For preloop\n             \x20 the ENGINE is the OIDC issuer (it mints the token with its own key); GitHub's\n             \x20 provider applies only to hosted runs. Either way it is not a PAT permission —\n             \x20 no action needed on the PAT. To consume the token, configure your cloud\n             \x20 provider's trust to accept the engine's OIDC issuer."
@@ -280,6 +453,13 @@ async fn setup_pat(args: &GithubSetupArgs) -> anyhow::Result<()> {
                 // when a human is typing, but keep plain stdin for pipes so
                 // automation still works. Same convention as `secret set`.
                 if std::io::stdin().is_terminal() {
+                    // Only for a human at a prompt: a piped token means
+                    // automation, which has no use for a browser window.
+                    if !args.no_browser {
+                        let _ = crate::app_manifest::open_in_browser(
+                            "https://github.com/settings/personal-access-tokens/new",
+                        );
+                    }
                     rpassword::prompt_password("Paste the PAT (hidden): ")?
                         .trim()
                         .to_owned()
@@ -480,7 +660,8 @@ pub(crate) async fn cmd_doctor(args: DoctorArgs) -> anyhow::Result<()> {
     let path = preloop_runner_server::config::config_path();
     if !path.exists() {
         anyhow::bail!(
-            "no config file at {} — run `preloop setup github` first",
+            "no config file at {} — run `preloop setup github --via app` first \
+             (creates the GitHub App in your browser)",
             path.display()
         );
     }
