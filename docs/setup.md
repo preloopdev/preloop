@@ -274,6 +274,25 @@ it mints an App token (or uses the PAT) and probes the repository for
 contents/pull-requests/actions/issues read. Run it after setup and any time a
 job's `GITHUB_TOKEN` misbehaves.
 
+## One engine, one user (for now)
+
+An engine is built for a single operator. Nothing stops several people from
+pointing `PRELOOP_URL` at the same server, but the server does not yet model
+*who* submitted a run, so treat a shared engine as unsupported:
+
+- **One identity.** Every caller authenticates with the same native token, so
+  the server cannot tell two people apart. Anyone who can reach the API can
+  read every run's logs and secrets-bearing job messages.
+- **`preloop push` defaults to the server's most recent run**, not to yours.
+  On a shared engine that may be a colleague's run — publishing their commit
+  and opening their pull request under *your* git credentials. Pass an
+  explicit run id (`preloop push <run_id>`) if you share an engine anyway.
+- **One credential set.** The configured App or PAT is used for every run, so
+  check runs and pull requests are always attributed to that identity rather
+  than to the person who submitted.
+
+Give each person their own engine until per-user identity lands.
+
 ## Durable state (SQLite by default, Postgres optional)
 
 Run history, queued jobs, runners, sessions, and logs survive restarts. The

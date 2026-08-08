@@ -15782,6 +15782,57 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
+    // 7. Push-back lands the commit on GitHub, which answers with a push
+    //    webhook for that same commit. The workflow that was already tested
+    //    and published must not run a second time, while a workflow the user
+    //    never submitted still has to.
+    const PUBLISHED_WORKFLOW: &str = ".github/workflows/ci.yml";
+    let accepted = submit_push_run(&app, SHA, TREE).await;
+    let published_id = accepted["run_id"]
+        .as_str()
+        .unwrap()
+        .parse::<RunId>()
+        .unwrap();
+    {
+        let mut inner = state.inner.lock().await;
+        let run = inner.runs.get_mut(&published_id).unwrap();
+        run.conclusion = Some("success".to_owned());
+        let mut submission = (*run.submission).clone();
+        submission.workflow_path = Some(PUBLISHED_WORKFLOW.to_owned());
+        run.submission = Arc::new(submission);
+    }
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+    assert_eq!(
+        crate::github_push::already_published(&shared, "owner/repo", SHA, PUBLISHED_WORKFLOW).await,
+        Some(published_id),
+        "the echo of our own push must be recognised"
+    );
+    assert_eq!(
+        crate::github_push::already_published(
+            &shared,
+            "owner/repo",
+            SHA,
+            ".github/workflows/other.yml"
+        )
+        .await,
+        None,
+        "a workflow that was never submitted is new work and must still run"
+    );
+    assert_eq!(
+        crate::github_push::already_published(
+            &shared,
+            "owner/repo",
+            "dddddddddddddddddddddddddddddddddddddddd",
+            PUBLISHED_WORKFLOW
+        )
+        .await,
+        None,
+        "a different commit is different work"
+    );
+
     std::env::remove_var("PRELOOP_GITHUB_TOKEN");
     std::env::remove_var("PRELOOP_GITHUB_API_URL");
 }

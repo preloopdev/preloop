@@ -48,6 +48,18 @@ tree against the tested tree and blocks on mismatch.
 diverged branch is refused with instructions — never a force-push.
 - **Default branches are refused.** Pushing `main` is blocked client-side
 (before the push) and server-side. Main stays webhook-driven.
+- **The work is not repeated.** Landing the commit makes GitHub send a push
+webhook for that very commit, which would otherwise re-run the workflow the
+server just finished and report a second set of check runs over the ones
+push-back published. The server recognises the echo of its own push and
+skips it. The match is deliberately narrow — same commit *and* same workflow
+file, and only against a completed run that requested push-back — so a
+workflow you never submitted still runs when the branch lands, and an
+ordinary webhook redelivery is still honoured as the retry it is.
+
+> **Single-user.** `preloop push` with no run id resolves to the server's most
+> recent run, not to yours, and the server has no per-user identity. See
+> [One engine, one user](setup.md#one-engine-one-user-for-now).
 
 ## The run ID
 

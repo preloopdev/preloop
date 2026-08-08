@@ -1099,6 +1099,27 @@ async fn process_github_webhook(
                 push_tree: None,
             };
 
+            // Push-back already ran this exact workflow against this exact
+            // commit and published its checks; the delivery we are handling
+            // is the echo of that push. Re-running would duplicate the work
+            // and overwrite good results with a second set.
+            if let Some(tested_by) = crate::github_push::already_published(
+                shared,
+                &repo_full_name,
+                &submission.sha,
+                submission.workflow_path.as_deref().unwrap_or_default(),
+            )
+            .await
+            {
+                info!(
+                    workflow = %filename,
+                    sha = %submission.sha,
+                    run_id = %tested_by,
+                    "skipping webhook run: this commit was already tested and published by push-back"
+                );
+                continue;
+            }
+
             // Call submit_run_inner — it performs the authoritative trigger match.
             match submit_run_inner(shared, submission).await {
                 Ok(accepted) => {

@@ -31,6 +31,44 @@ pub(crate) async fn push_run(
     Ok(Json(push_run_to_github(&shared, run_id).await?))
 }
 
+/// The run that already tested `sha` for `workflow_path` through push-back,
+/// if there is one.
+///
+/// Push-back lands the tested commit on GitHub, and GitHub answers with a
+/// push webhook for that very commit — so without this the server would
+/// re-run the exact workflow it just finished, on the exact tree it just
+/// tested, and report a second set of check runs over the ones push-back
+/// already published. The whole point of submitting to the server first is
+/// that the work is done by the time the branch appears.
+///
+/// Deliberately narrow. It matches only a terminal run that carried a
+/// push-back request, keyed on the same commit AND the same workflow file:
+/// a plain webhook run must never suppress a later one (redeliveries are a
+/// retry mechanism, not a duplicate), and workflows the user never submitted
+/// are genuinely new work that still has to run.
+pub(crate) async fn already_published(
+    shared: &Arc<SharedState>,
+    repository: &str,
+    sha: &str,
+    workflow_path: &str,
+) -> Option<RunId> {
+    let inner = shared.state.inner.lock().await;
+    inner
+        .runs
+        .values()
+        .find(|run| {
+            run.push_state.is_some()
+                // `conclusion` is what the push path itself treats as
+                // terminal, so the two must agree or a published run would
+                // still be re-run by its own echo.
+                && run.conclusion.is_some()
+                && run.submission.repository == repository
+                && run.submission.sha == sha
+                && run.submission.workflow_path.as_deref() == Some(workflow_path)
+        })
+        .map(|run| run.run_id)
+}
+
 pub(crate) async fn push_run_to_github(
     shared: &Arc<SharedState>,
     run_id: RunId,
@@ -339,7 +377,13 @@ pub(crate) fn validate_push_target(
 const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
 
 /// Installation token covering everything the sync touches, or the ambient
-/// `PRELOOP_GITHUB_TOKEN` when no App is configured.
+/// PAT when no App is configured.
+///
+/// The PAT is resolved through `AppState`, which already applies the
+/// env-then-config precedence every other credential here uses. Reading
+/// `PRELOOP_GITHUB_TOKEN` directly instead would leave a server configured
+/// by `preloop setup github --via pat` able to run CI but never able to push
+/// its result back, because that flow only ever writes the config file.
 async fn push_token(shared: &Arc<SharedState>, repository: &str) -> Option<String> {
     if let Some(app_creds) = &shared.state.github_app {
         let permissions = std::collections::BTreeMap::from([
@@ -352,7 +396,7 @@ async fn push_token(shared: &Arc<SharedState>, repository: &str) -> Option<Strin
             Err(error) => tracing::warn!(%repository, %error, "push token mint failed"),
         }
     }
-    std::env::var("PRELOOP_GITHUB_TOKEN").ok()
+    shared.state.static_github_pat()
 }
 
 /// One GitHub REST call returning the parsed JSON body. Errors carry the
