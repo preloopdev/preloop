@@ -74,6 +74,22 @@ pub(crate) async fn run(args: UpdateArgs) -> anyhow::Result<()> {
 
     let remote_version = parse_release_version(&release.tag_name)?;
     let current_version = Version::parse(env!("CARGO_PKG_VERSION"))?;
+
+    // macOS installs execute workflows inside Linux VMs, so the engine is
+    // unusable without the bundled Linux guest runner. Ensure it is present
+    // on every `preloop update`, not just when a newer CLI is downloaded:
+    // a source-built install (install.sh) matches the release version and
+    // would otherwise never receive the bundle — the engine then warns that
+    // provisioning is unavailable and every job queues forever. Idempotent:
+    // the destination is simply overwritten with the current release's
+    // runner. A release missing the asset is a warning, not a failure —
+    // the engine's startup message explains the consequence.
+    #[cfg(target_os = "macos")]
+    match update_linux_runner_bundle(&client, &release).await {
+        Ok(()) => println!("installed Linux runner bundle"),
+        Err(error) => println!("warning: Linux runner bundle not updated: {error:#}"),
+    }
+
     if remote_version <= current_version {
         println!("preloop {} is already up to date", current_version);
         return Ok(());
@@ -100,17 +116,6 @@ pub(crate) async fn run(args: UpdateArgs) -> anyhow::Result<()> {
     )
     .await?;
     verify_checksum(&client, selected.archive, selected.checksum, &archive_path).await?;
-
-    // macOS installs run workflows inside Linux VMs: refresh the bundled
-    // Linux runner before replacing the CLI, so a successful update never
-    // leaves a runner from an older release behind. A release missing the
-    // asset is a warning, not a failure — the engine's startup message
-    // explains the consequence.
-    #[cfg(target_os = "macos")]
-    match update_linux_runner_bundle(&client, &release).await {
-        Ok(()) => println!("installed Linux runner bundle"),
-        Err(error) => println!("warning: Linux runner bundle not updated: {error:#}"),
-    }
 
     let staged_binary = temp_dir.path().join(binary_name());
     extract_binary(&archive_path, &staged_binary)?;
