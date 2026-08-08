@@ -79,8 +79,10 @@ install_from_release() {
     tag="$(printf '%s' "$json" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
     [ -n "$tag" ] || return 1
 
-    local short="preloop-${os}-${arch}-${tag}.tar.gz"
-    local full="preloop-$(full_triple)-${tag}.tar.gz"
+    # cargo-dist names the per-platform archive after the package
+    # (`preloop-cli-<triple>.tar.gz`); the tag is not part of the filename.
+    local short="preloop-cli-${os}-${arch}.tar.gz"
+    local full="preloop-cli-$(full_triple).tar.gz"
     local url asset
     asset="$(printf '%s' "$json" | sed -n "s/.*\"browser_download_url\":[[:space:]]*\"\([^\"]*\/$short\)\".*/\1/p" | head -1)"
     if [ -z "$asset" ]; then
@@ -140,49 +142,34 @@ install_from_release() {
             say "installed $BIN_DIR/$bin"
         fi
     done
+    [ -x "$BIN_DIR/preloop" ] || return 1
 
-    # macOS installs run workflows inside Linux microVMs, so the release must
-    # also carry the Linux runner binary. Install it where the engine looks:
-    # <prefix>/lib/preloop/runner/<linux-triple>/preloop-runner. Best effort —
-    # a release without the asset still installs; the engine's startup warning
-    # explains the consequence.
+    # macOS installs execute workflows inside Linux microVMs, so the engine
+    # needs the Linux guest runner at the path it discovers
+    # (<prefix>/lib/preloop/runner/<linux-triple>/preloop-runner). Without it
+    # every job queues forever with "Linux runner bundle unavailable". A
+    # release missing the asset is a warning, not a failure — the engine's
+    # startup message explains the consequence.
     if [ "$os" = "darwin" ]; then
+        local runner_triple
         case "$arch" in
-            x86_64) linux_triple="x86_64-unknown-linux-gnu" ;;
-            aarch64) linux_triple="aarch64-unknown-linux-gnu" ;;
+            x86_64) runner_triple="x86_64-unknown-linux-gnu" ;;
+            aarch64) runner_triple="aarch64-unknown-linux-gnu" ;;
         esac
-        bundle="preloop-runner-$linux_triple"
-        # Trailing quote anchors the match so the `.sha256` asset's URL
-        # (same prefix, longer name) cannot be captured instead.
-        bundle_url="$(printf '%s' "$json" | sed -n "s/.*\"browser_download_url\":[[:space:]]*\"\([^\"]*\/$bundle\)\".*/\1/p" | head -1)"
-        if [ -n "$bundle_url" ]; then
-            say "downloading $bundle..."
-            local bundle_archive="$tmp/$bundle"
-            if command -v curl >/dev/null 2>&1; then
-                curl -fsSL "$bundle_url" -o "$bundle_archive" 2>/dev/null || bundle_archive=""
-            elif command -v wget >/dev/null 2>&1; then
-                wget -q "$bundle_url" -O "$bundle_archive" 2>/dev/null || bundle_archive=""
-            fi
-            if [ -n "${bundle_archive:-}" ] && [ -s "$bundle_archive" ]; then
-                expected="$(curl -fsSL "${bundle_url}.sha256" 2>/dev/null | awk '{print $1}')"
-                if [ -n "$expected" ]; then
-                    if command -v sha256sum >/dev/null 2>&1; then
-                        actual="$(sha256sum "$bundle_archive" | awk '{print $1}')"
-                    else
-                        actual="$(shasum -a 256 "$bundle_archive" | awk '{print $1}')"
-                    fi
-                    [ "$actual" = "$expected" ] || die "runner bundle checksum mismatch — refusing to install"
-                fi
-                runner_dir="$PREFIX/lib/preloop/runner/$linux_triple"
-                mkdir -p "$runner_dir"
-                install -m 0755 "$bundle_archive" "$runner_dir/preloop-runner"
-                say "installed $runner_dir/preloop-runner"
-            else
-                say "runner bundle download failed — workflows will not execute locally (see docs/vm-images.md)"
-            fi
+        local runner_asset="preloop-runner-${runner_triple}"
+        local runner_url
+        runner_url="$(printf '%s' "$json" | sed -n "s/.*\"browser_download_url\":[[:space:]]*\"\([^\"]*\/$runner_asset\)\".*/\1/p" | head -1)"
+        if [ -n "$runner_url" ]; then
+            local runner_dest="$PREFIX/lib/preloop/runner/$runner_triple"
+            mkdir -p "$runner_dest"
+            curl -fsSL "$runner_url" -o "$runner_dest/preloop-runner" 2>/dev/null \
+                && chmod 0755 "$runner_dest/preloop-runner" \
+                && say "installed $runner_dest/preloop-runner" \
+                || say "warning: could not install Linux runner bundle — microVM jobs need it"
+        else
+            say "warning: release $tag has no $runner_asset asset — microVM jobs need it"
         fi
     fi
-    [ -x "$BIN_DIR/preloop" ] || return 1
     return 0
 }
 
@@ -221,11 +208,6 @@ else
     ZIGBUILD=0
 fi
 
-case "$arch" in
-    x86_64) RUNNER_TARGET="x86_64-unknown-linux-gnu" ;;
-    aarch64) RUNNER_TARGET="aarch64-unknown-linux-gnu" ;;
-esac
-
 PRELOOP_SRC="${PRELOOP_SRC:-$HOME/.preloop-src}"
 REPO_URL="${PRELOOP_REPO:-https://github.com/preloopdev/preloop.git}"
 mkdir -p "$PRELOOP_SRC"
@@ -243,16 +225,10 @@ say "building preloop (release)..."
 cargo build --release -p preloop-cli -p preloop-runner-server 2>/dev/null \
     || cargo build --release -p preloop-cli -p aksh-runner-server
 if [ "$ZIGBUILD" = 1 ] && command -v cargo-zigbuild >/dev/null 2>&1; then
-    say "cross-compiling the Linux microVM runner ($RUNNER_TARGET)..."
-    cargo zigbuild --release -p preloop-runner --target "$RUNNER_TARGET" 2>/dev/null || \
-        cargo zigbuild --release -p aksh-runner --target "$RUNNER_TARGET" 2>/dev/null || \
+    say "cross-compiling the Linux microVM runner (aarch64)..."
+    cargo zigbuild --release -p preloop-runner --target aarch64-unknown-linux-gnu 2>/dev/null || \
+        cargo zigbuild --release -p aksh-runner --target aarch64-unknown-linux-gnu 2>/dev/null || \
         say "runner build failed — host CLI works, but microVM jobs need it (see docs/setup.md)"
-    if [ -x "$PRELOOP_SRC/target/$RUNNER_TARGET/release/preloop-runner" ]; then
-        runner_dir="$PREFIX/lib/preloop/runner/$RUNNER_TARGET"
-        mkdir -p "$runner_dir"
-        install -m 0755 "$PRELOOP_SRC/target/$RUNNER_TARGET/release/preloop-runner" "$runner_dir/preloop-runner"
-        say "installed $runner_dir/preloop-runner (source build)"
-    fi
 else
     say "skipping microVM runner cross-build (no zig/cargo-zigbuild)"
 fi
