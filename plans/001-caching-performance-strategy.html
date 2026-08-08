@@ -1,0 +1,1238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Plan 001 — Caching Strategy for Local CI</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Source+Serif+4:ital,opsz,wght@0,8..60,300;0,8..60,400;0,8..60,600;0,8..60,700;1,8..60,400&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: oklch(96.5% 0.008 80);
+    --bg-sheet: oklch(99% 0.004 80);
+    --bg-raised: oklch(97.5% 0.006 80);
+    --bg-code: oklch(95% 0.008 80);
+    --bg-code-inline: oklch(93.5% 0.01 80);
+    --border: oklch(88% 0.01 80);
+    --border-strong: oklch(78% 0.012 80);
+    --text: oklch(22% 0.012 67);
+    --text-secondary: oklch(42% 0.01 67);
+    --text-muted: oklch(55% 0.008 67);
+    --accent: oklch(55% 0.16 55);
+    --accent-soft: oklch(93% 0.04 55);
+    --accent-hover: oklch(48% 0.18 55);
+    --green: oklch(52% 0.14 155);
+    --green-soft: oklch(94% 0.04 155);
+    --red: oklch(55% 0.18 25);
+    --red-soft: oklch(94% 0.04 25);
+    --blue: oklch(52% 0.14 255);
+    --blue-soft: oklch(94% 0.04 255);
+    --yellow: oklch(75% 0.14 85);
+    --yellow-soft: oklch(95% 0.04 85);
+    --toc-width: 240px;
+    --content-max: 72ch;
+    --font-display: 'Outfit', system-ui, sans-serif;
+    --font-body: 'Source Serif 4', Georgia, serif;
+    --font-mono: 'Fira Code', 'Menlo', monospace;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html { scroll-behavior: smooth; scroll-padding-top: 2rem; }
+
+  body {
+    font-family: var(--font-body);
+    font-size: 1.05rem;
+    line-height: 1.72;
+    color: var(--text);
+    background: var(--bg);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ── Layout ── */
+  .page-grid {
+    display: grid;
+    grid-template-columns: var(--toc-width) minmax(0, 1fr);
+    gap: 3rem;
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 3rem 2rem 6rem;
+  }
+
+  /* ── TOC Sidebar ── */
+  .toc {
+    position: sticky;
+    top: 2rem;
+    align-self: start;
+    max-height: calc(100vh - 4rem);
+    overflow-y: auto;
+    padding-right: 1rem;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border-strong) transparent;
+  }
+
+  .toc-title {
+    font-family: var(--font-display);
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--text-muted);
+    margin-bottom: 1rem;
+  }
+
+  .toc ol {
+    list-style: none;
+    counter-reset: toc-counter;
+  }
+
+  .toc li {
+    counter-increment: toc-counter;
+    margin-bottom: 0.35rem;
+  }
+
+  .toc a {
+    font-family: var(--font-display);
+    font-size: 0.78rem;
+    font-weight: 400;
+    color: var(--text-secondary);
+    text-decoration: none;
+    line-height: 1.4;
+    display: block;
+    padding: 0.2rem 0.6rem;
+    border-radius: 4px;
+    transition: color 0.15s, background 0.15s;
+  }
+
+  .toc a:hover {
+    color: var(--accent);
+    background: var(--accent-soft);
+  }
+
+  .toc a.active {
+    color: var(--accent);
+    font-weight: 500;
+    background: var(--accent-soft);
+  }
+
+  .toc .toc-h3 { padding-left: 1.4rem; font-size: 0.73rem; }
+
+  /* ── Main Content ── */
+  .content {
+    min-width: 0;
+    max-width: var(--content-max);
+  }
+
+  /* ── Hero / Title Block ── */
+  .hero {
+    margin-bottom: 3rem;
+    padding-bottom: 2rem;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .hero-eyebrow {
+    font-family: var(--font-display);
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    color: var(--accent);
+    margin-bottom: 0.75rem;
+  }
+
+  .hero h1 {
+    font-family: var(--font-display);
+    font-size: clamp(2rem, 4vw, 2.8rem);
+    font-weight: 800;
+    line-height: 1.1;
+    color: var(--text);
+    letter-spacing: -0.02em;
+    margin-bottom: 1rem;
+  }
+
+  .hero-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem 1.5rem;
+    font-family: var(--font-display);
+    font-size: 0.78rem;
+    color: var(--text-muted);
+  }
+
+  .hero-meta .meta-item {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+  }
+
+  .hero-meta .meta-label {
+    font-weight: 500;
+    color: var(--text-secondary);
+  }
+
+  .status-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.15rem 0.55rem;
+    border-radius: 100px;
+    font-family: var(--font-display);
+    font-size: 0.7rem;
+    font-weight: 600;
+    background: var(--yellow-soft);
+    color: oklch(45% 0.12 85);
+  }
+
+  .status-badge::before {
+    content: '';
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--yellow);
+  }
+
+  /* ── Sections ── */
+  .content > h2 {
+    font-family: var(--font-display);
+    font-size: clamp(1.3rem, 2.5vw, 1.65rem);
+    font-weight: 700;
+    line-height: 1.2;
+    color: var(--text);
+    margin-top: 3.5rem;
+    margin-bottom: 1rem;
+    letter-spacing: -0.015em;
+    scroll-margin-top: 1.5rem;
+  }
+
+  .content > h3 {
+    font-family: var(--font-display);
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: var(--text);
+    margin-top: 2rem;
+    margin-bottom: 0.6rem;
+    scroll-margin-top: 1.5rem;
+  }
+
+  .content > h4 {
+    font-family: var(--font-display);
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+    margin-top: 1.5rem;
+    margin-bottom: 0.5rem;
+  }
+
+  .content > p,
+  .content > ul,
+  .content > ol {
+    margin-bottom: 1rem;
+  }
+
+  .content > ul, .content > ol {
+    padding-left: 1.4rem;
+  }
+
+  .content > li {
+    margin-bottom: 0.35rem;
+  }
+
+  .content > li::marker {
+    color: var(--accent);
+  }
+
+  /* ── Blockquote (Executive Decision) ── */
+  blockquote.callout {
+    background: var(--bg-sheet);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.25rem 1.5rem;
+    margin: 1.5rem 0;
+    font-size: 0.95rem;
+  }
+
+  blockquote.callout p {
+    margin-bottom: 0.5rem;
+  }
+
+  blockquote.callout p:last-child {
+    margin-bottom: 0;
+  }
+
+  blockquote.callout strong {
+    color: var(--accent);
+  }
+
+  /* ── Numbered List (Executive Priorities) ── */
+  .priority-list {
+    list-style: none;
+    counter-reset: priority;
+    padding-left: 0;
+    margin: 1rem 0 1.5rem;
+  }
+
+  .priority-list li {
+    counter-increment: priority;
+    display: flex;
+    gap: 0.75rem;
+    align-items: flex-start;
+    padding: 0.6rem 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .priority-list li:last-child { border-bottom: none; }
+
+  .priority-list li::before {
+    content: counter(priority);
+    font-family: var(--font-display);
+    font-size: 0.75rem;
+    font-weight: 700;
+    color: var(--accent);
+    background: var(--accent-soft);
+    min-width: 1.6rem;
+    height: 1.6rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    flex-shrink: 0;
+    margin-top: 0.15rem;
+  }
+
+  /* ── Tables ── */
+  .table-wrap {
+    overflow-x: auto;
+    margin: 1.25rem 0 1.5rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-sheet);
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.88rem;
+    line-height: 1.55;
+  }
+
+  thead {
+    background: var(--bg-raised);
+  }
+
+  th {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-secondary);
+    text-align: left;
+    padding: 0.65rem 1rem;
+    border-bottom: 1px solid var(--border-strong);
+    white-space: nowrap;
+  }
+
+  td {
+    padding: 0.55rem 1rem;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+
+  tr:last-child td { border-bottom: none; }
+
+  tbody tr:hover {
+    background: oklch(97% 0.006 80);
+  }
+
+  td code, th code {
+    font-family: var(--font-mono);
+    font-size: 0.82em;
+    background: var(--bg-code-inline);
+    padding: 0.1em 0.35em;
+    border-radius: 3px;
+    white-space: nowrap;
+  }
+
+  /* ── Code Blocks ── */
+  pre {
+    background: var(--bg-code);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1rem 1.25rem;
+    overflow-x: auto;
+    margin: 1rem 0 1.5rem;
+    font-family: var(--font-mono);
+    font-size: 0.82rem;
+    line-height: 1.65;
+    color: var(--text);
+    scrollbar-width: thin;
+  }
+
+  pre code {
+    background: none;
+    padding: 0;
+    border-radius: 0;
+    font-size: inherit;
+  }
+
+  /* inline code */
+  .content > p code,
+  .content > li code,
+  .content > td code {
+    font-family: var(--font-mono);
+    font-size: 0.85em;
+    background: var(--bg-code-inline);
+    padding: 0.1em 0.35em;
+    border-radius: 3px;
+    white-space: nowrap;
+  }
+
+  /* ── Callout Boxes ── */
+  .callout {
+    border-radius: 8px;
+    padding: 1rem 1.25rem;
+    margin: 1.25rem 0;
+    font-size: 0.92rem;
+    line-height: 1.6;
+  }
+
+  .callout-title {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 0.4rem;
+  }
+
+  .callout-evidence {
+    background: var(--blue-soft);
+    border: 1px solid oklch(82% 0.04 255);
+  }
+  .callout-evidence .callout-title { color: var(--blue); }
+
+  .callout-stop {
+    background: var(--red-soft);
+    border: 1px solid oklch(82% 0.04 25);
+  }
+  .callout-stop .callout-title { color: var(--red); }
+
+  .callout-decision {
+    background: var(--green-soft);
+    border: 1px solid oklch(82% 0.04 155);
+  }
+  .callout-decision .callout-title { color: var(--green); }
+
+  /* ── Metric Cards ── */
+  .metric-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 0.75rem;
+    margin: 1.25rem 0 1.5rem;
+  }
+
+  .metric-card {
+    background: var(--bg-sheet);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem 1.1rem;
+  }
+
+  .metric-value {
+    font-family: var(--font-display);
+    font-size: 1.6rem;
+    font-weight: 700;
+    line-height: 1.1;
+    color: var(--text);
+    letter-spacing: -0.02em;
+  }
+
+  .metric-value.preloop { color: var(--red); }
+  .metric-value.agent-ci { color: var(--green); }
+
+  .metric-label {
+    font-family: var(--font-display);
+    font-size: 0.72rem;
+    font-weight: 500;
+    color: var(--text-muted);
+    margin-top: 0.25rem;
+    line-height: 1.3;
+  }
+
+  /* ── Phase Indicator ── */
+  .phase-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    font-family: var(--font-display);
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    padding: 0.2rem 0.6rem;
+    border-radius: 4px;
+    margin-bottom: 0.5rem;
+  }
+
+  .phase-tag.current {
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+
+  .phase-tag.future {
+    background: var(--bg-raised);
+    color: var(--text-muted);
+  }
+
+  /* ── Section Divider ── */
+  .section-divider {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 2.5rem 0 0;
+  }
+
+  /* ── Responsive ── */
+  @media (max-width: 860px) {
+    .page-grid {
+      grid-template-columns: 1fr;
+      padding: 1.5rem 1.25rem 4rem;
+      gap: 0;
+    }
+    .toc {
+      position: static;
+      max-height: none;
+      overflow: visible;
+      padding-right: 0;
+      margin-bottom: 2rem;
+      padding-bottom: 1.5rem;
+      border-bottom: 1px solid var(--border);
+    }
+    .hero h1 { font-size: 1.8rem; }
+    .metric-row { grid-template-columns: 1fr 1fr; }
+  }
+
+  /* ── Print ── */
+  @media print {
+    .toc { display: none; }
+    .page-grid { grid-template-columns: 1fr; max-width: 100%; }
+    body { background: white; }
+    pre { border: 1px solid #ccc; }
+  }
+</style>
+</head>
+<body>
+
+<div class="page-grid">
+
+<!-- ════════════════════ TOC ════════════════════ -->
+<nav class="toc" aria-label="Table of contents">
+  <div class="toc-title">Contents</div>
+  <ol>
+    <li><a href="#executive-decision">Executive Decision</a></li>
+    <li><a href="#goals">Goals</a></li>
+    <li><a href="#non-goals">Non-Goals</a></li>
+    <li><a href="#current-state">Current State &amp; Evidence</a></li>
+    <li><a href="#cache-taxonomy">Cache Taxonomy</a></li>
+    <li><a href="#storage-model">The Storage Model</a></li>
+    <li><a href="#cache-key-design">Cache Key Design</a></li>
+    <li><a href="#placement">Placement &amp; Data Flow</a></li>
+    <li><a href="#deployment-profile">Deployment Profile</a></li>
+    <li><a href="#security">Security Design</a></li>
+    <li><a href="#correctness">Correctness Rules</a></li>
+    <li><a href="#admission">Admission, Retention &amp; Eviction</a></li>
+    <li><a href="#performance">Performance Techniques</a></li>
+    <li><a href="#observability">Observability</a></li>
+    <li><a href="#verification">Verification &amp; Benchmarks</a></li>
+    <li><a href="#roadmap">Phased Roadmap</a></li>
+    <li><a href="#boundaries">Implementation Boundaries</a></li>
+    <li><a href="#rejected">Rejected Approaches</a></li>
+    <li><a href="#stop-conditions">Stop Conditions</a></li>
+    <li><a href="#checklist">Review Checklist</a></li>
+  </ol>
+</nav>
+
+<!-- ════════════════════ CONTENT ════════════════════ -->
+<main class="content">
+
+<!-- Hero -->
+<header class="hero">
+  <div class="hero-eyebrow">Plan 001 · Architecture</div>
+  <h1>Caching Strategy for Local CI</h1>
+  <div class="hero-meta">
+    <span class="meta-item"><span class="status-badge">Proposed</span></span>
+    <span class="meta-item"><span class="meta-label">Priority</span> P1</span>
+    <span class="meta-item"><span class="meta-label">Category</span> Performance · Correctness · Architecture</span>
+    <span class="meta-item"><span class="meta-label">Planned</span> commit <code>1342346a</code></span>
+  </div>
+</header>
+
+<!-- Executive Decision -->
+<h2 id="executive-decision">Executive Decision</h2>
+
+<p>Preloop should not build one undifferentiated cache. It should build a layered cache system with three properties:</p>
+
+<ol class="priority-list">
+  <li><strong>Immutable content-addressed blobs</strong> hold bytes once and are addressed by a verified digest.</li>
+  <li><strong>Scoped metadata</strong> maps workflow-visible keys to those blobs.</li>
+  <li><strong>Guest-local materialization</strong> makes hot content available to a runner without making a shared writable filesystem part of job correctness.</li>
+</ol>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Layer</th><th>Storage</th></tr></thead>
+  <tbody>
+    <tr><td>Durable metadata</td><td>SQLite under <code>~/.preloop/cache/v1</code></td></tr>
+    <tr><td>Durable blobs</td><td>Local content-addressed files under <code>~/.preloop/cache/v1/blobs/</code></td></tr>
+    <tr><td>Hot tier</td><td>Golden/COW disk and host page cache</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>The same logical model extends to self-hosted (Postgres + S3) and managed (Postgres + object store + KMS) deployments in future phases. The local profile uses one developer machine, one implicit tenant, loopback control plane, and disposable SmolVM runners.</p>
+
+<div class="callout callout-evidence">
+  <div class="callout-title">Measured Losses — Evidence, Not Speculation</div>
+  <p>The first performance work targets measured losses, not speculative caching.</p>
+</div>
+
+<div class="metric-row">
+  <div class="metric-card">
+    <div class="metric-value preloop">92.45s</div>
+    <div class="metric-label">Vite warm<br>Preloop</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-value agent-ci">38.71s</div>
+    <div class="metric-label">Vite warm<br>Agent CI</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-value">34.24s</div>
+    <div class="metric-label">setup-node / cache<br>handling</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-value">16.50s</div>
+    <div class="metric-label">pnpm install</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-value">28.31s</div>
+    <div class="metric-label">Post-job<br>cache save</div>
+  </div>
+</div>
+
+<p>The cache restore emitted <code>File name too long</code>, so dependency installation ran on a cache miss. Cold time before the first guest step was 48.54s for ripgrep, 545.84s for Vite, and 18.59s for testcontainers-go — VM/image preparation, not workload execution.</p>
+
+<p>This evidence establishes the priority order:</p>
+
+<ol class="priority-list">
+  <li>Make declared toolchains discoverable in the official toolcache layout.</li>
+  <li>Make Actions cache restore/save correct, indexed, and streaming.</li>
+  <li>Persist package download stores across disposable runners.</li>
+  <li>Resolve and cache immutable action/image/tool artifacts by digest.</li>
+  <li>Move VM preparation out of the run critical path.</li>
+</ol>
+
+<hr class="section-divider">
+
+<!-- Goals -->
+<h2 id="goals">Goals</h2>
+<ul>
+  <li>Preserve official-runner and unmodified-workflow compatibility.</li>
+  <li>Make a cache miss equivalent to normal uncached execution, except when a workflow explicitly requests <code>fail-on-cache-miss</code>.</li>
+  <li>Eliminate repeated downloads and archive work that dominates warm jobs.</li>
+  <li>Keep process memory usage proportional to a transfer chunk, not cache size.</li>
+  <li>Bound disk growth with quotas, expiration, admission, and eviction.</li>
+  <li>Give operators enough telemetry to explain every hit, miss, restore, save, and eviction.</li>
+  <li>Design metadata/blob interfaces that extend to self-hosted and managed deployments later.</li>
+</ul>
+
+<!-- Non-Goals -->
+<h2 id="non-goals">Non-Goals</h2>
+<ul>
+  <li>Making local CI pass because an undeclared tool happens to exist. Workflows must remain portable to GitHub Actions.</li>
+  <li>Treating artifacts or logs as disposable caches. They are user-visible outputs with separate retention semantics.</li>
+  <li>Reusing complete workspaces across jobs. Workspaces remain disposable unless a workflow explicitly saves paths through the cache protocol.</li>
+  <li>Sharing mutable build caches across security boundaries.</li>
+  <li>Replacing package-manager integrity checks or OCI digest verification.</li>
+  <li>Guaranteeing that a cache survives eviction. A job must remain correct on a miss.</li>
+</ul>
+
+<hr class="section-divider">
+
+<!-- Current State -->
+<h2 id="current-state">Current State &amp; Evidence</h2>
+
+<h3>Actions cache store</h3>
+<p><code>crates/aksh-cache/src/lib.rs</code> implements a local file-backed <code>CacheStore</code>:</p>
+<ul>
+  <li>Cache identity is a SHA-256-derived directory.</li>
+  <li>Original key, version, and creation time are stored as metadata.</li>
+  <li>Entries are immutable.</li>
+  <li>Restore order supports exact key and prefix matching.</li>
+  <li>Prefix lookup scans every cache directory.</li>
+  <li>Complete archives are read into <code>Vec&lt;u8&gt;</code> on restore.</li>
+  <li>There is no quota, expiration, eviction policy, or indexed lookup.</li>
+</ul>
+
+<p><code>crates/aksh-runner-server/src/blob_store.rs</code> stages v2 blocks on disk, then assembles all blocks in a single <code>Vec&lt;u8&gt;</code>, writes a second complete copy, and reads complete blobs to return downloads.</p>
+
+<h3>Cache scoping and authorization</h3>
+<p><code>results_twirp::scoped_cache_key</code> currently combines workflow-requested <code>repository</code> and <code>scope</code> fields. Managed isolation cannot trust these values. The server must derive tenant, repository, ref/trust class, plan, and job identity from authenticated server state.</p>
+
+<h3>Toolcache mismatch</h3>
+<p>The runner exports <code>RUNNER_TOOL_CACHE=/var/lib/preloop-runner/_work/_tool</code>, but the JavaScript action runtime is installed separately at <code>/var/lib/preloop-runner/externals/node24/bin/node</code>. <code>actions/setup-node</code> therefore downloads Node even though the runner has a Node executable.</p>
+
+<p>A declared Node installation must be materialized in the official toolcache shape:</p>
+
+<pre><code>$RUNNER_TOOL_CACHE/node/&lt;exact-version&gt;/&lt;arch&gt;/bin/node
+$RUNNER_TOOL_CACHE/node/&lt;exact-version&gt;/&lt;arch&gt;.complete</code></pre>
+
+<p>Do not merely put <code>/externals/node24/bin</code> on <code>PATH</code> and call the setup step satisfied. The setup action owns version selection and must observe the version it requested.</p>
+
+<h3>Golden VMs and images</h3>
+<p><code>crates/preloop-orchestrator/src/environment.rs</code> computes an environment fingerprint from a base-image string and declared toolchain layers. A mutable tag is not a durable compatibility identity; the fingerprint must ultimately include the resolved base-image digest.</p>
+
+<p>An additional virtiofs cache mount caused 20–50 second fork stalls and instability. The cache design must not add one mount per ecosystem or per cache.</p>
+
+<h3>Other useful caches</h3>
+<ul>
+  <li><strong>Actions:</strong> streams action tarballs into an atomic on-disk cache keyed by owner/repository/ref. Mutable tags are cached indefinitely — resolve tags to commit SHA.</li>
+  <li><strong>Git snapshots:</strong> lock-protected Git object cache improves <code>git add</code> from 156ms to 16ms for a 6,000-file workspace.</li>
+  <li><strong>Keys:</strong> deliberately gives every runner a unique RSA key. Runner private keys must never enter a shared cache or golden image.</li>
+</ul>
+
+<hr class="section-divider">
+
+<!-- Cache Taxonomy -->
+<h2 id="cache-taxonomy">Cache Taxonomy</h2>
+
+<div class="table-wrap">
+<table>
+  <thead>
+    <tr><th>Class</th><th>Examples</th><th>Cache?</th><th>Scope</th><th>Placement</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Runner internals</td><td>Node 20/24 for JS actions</td><td>Yes, immutable</td><td>Release + OS + arch</td><td>Base/golden <code>externals/</code></td></tr>
+    <tr><td>Declared toolchains</td><td>Node, Python, Go, Rust, .NET</td><td>Yes</td><td>Version + platform + format</td><td>Host tool CAS → <code>$RUNNER_TOOL_CACHE</code></td></tr>
+    <tr><td>Action source</td><td><code>actions/checkout</code>, <code>setup-node</code></td><td>Yes, immutable</td><td>Owner/repo/SHA</td><td>Shared verified action CAS</td></tr>
+    <tr><td>OCI images/layers</td><td>Base VM, containers, services</td><td>Yes, immutable</td><td>Registry/digest/platform</td><td>Registry mirror + node cache + golden</td></tr>
+    <tr><td>Package download stores</td><td>pnpm, npm, Cargo, Go, uv</td><td>Yes</td><td>Integrity + platform</td><td>Persistent host/node store</td></tr>
+    <tr><td>Compiler/build cache</td><td>sccache, Go build, Vite</td><td>Cautiously</td><td>Source/config/toolchain</td><td>Repository/trust-scoped</td></tr>
+    <tr><td>Actions cache archives</td><td><code>actions/cache</code> paths</td><td>Yes</td><td>Namespace + key/version</td><td>Indexed metadata + blob CAS</td></tr>
+    <tr><td>Git snapshot objects</td><td>Immutable objects, stat index</td><td>Yes</td><td>Git identity</td><td>Host-local persistent store</td></tr>
+    <tr><td>Workspace</td><td>Source, generated files</td><td style="color:var(--red)">No reuse</td><td>One job/run</td><td>Disposable guest disk</td></tr>
+    <tr><td>Artifacts &amp; logs</td><td>Builds, reports, logs</td><td>Store, not cache</td><td>Retention policy</td><td>Artifact/log store</td></tr>
+    <tr><td>Secrets &amp; identity</td><td>Tokens, keys, <code>.credentials</code></td><td style="color:var(--red)">Never</td><td>One job or runner</td><td>Ephemeral only</td></tr>
+  </tbody>
+</table>
+</div>
+
+<hr class="section-divider">
+
+<!-- Storage Model -->
+<h2 id="storage-model">The Storage Model</h2>
+
+<h3>Separate logical identity from physical bytes</h3>
+
+<p>A logical cache entry is metadata:</p>
+
+<pre><code>CacheEntry {
+  namespace,
+  cache_class,
+  user_key,
+  version,
+  blob_digest,
+  compressed_size,
+  uncompressed_size,
+  compression,
+  created_at,
+  last_accessed_at,
+  expires_at,
+  producer_identity,
+  trust_domain,
+  state
+}</code></pre>
+
+<p>The physical blob is immutable:</p>
+
+<pre><code>blobs/sha256/ab/cd/&lt;digest&gt;</code></pre>
+
+<p>Benefits: user-controlled keys never become filesystem paths; identical bytes may be deduplicated without weakening logical isolation; atomic publication is simple; metadata lookup does not scan directories; eviction can remove logical references before garbage-collecting unreferenced blobs; blob integrity is verified independently from cache-key correctness.</p>
+
+<h3>Required operations</h3>
+<ol>
+  <li><strong>Reserve</strong> a logical key/version under an authenticated namespace.</li>
+  <li><strong>Upload</strong> chunks or multipart blocks to a staging identity.</li>
+  <li><strong>Finalize</strong> only after size and digest verification; atomically publish metadata.</li>
+  <li><strong>Lookup</strong> exact key, then restore prefixes in official order.</li>
+  <li><strong>Download</strong> by an expiring, read-only capability.</li>
+  <li><strong>Touch</strong> access metadata asynchronously.</li>
+  <li><strong>Expire/evict</strong> metadata, then garbage-collect unreferenced blobs after a grace period.</li>
+</ol>
+
+<p>Readers must never observe pending uploads. Concurrent writers for the same immutable key/version produce one winner; the loser gets "already exists."</p>
+
+<h3>Streaming requirements</h3>
+<ul>
+  <li>Upload memory use: <code>O(chunk_size)</code>.</li>
+  <li>Block assembly: concatenate using streaming file/object-store operations, never a complete <code>Vec&lt;u8&gt;</code>.</li>
+  <li>Finalization: compute digest and size while streaming; avoid staging-to-store-to-memory copies.</li>
+  <li>Download: stream with backpressure and range support where the client uses it.</li>
+  <li>Managed CI: issue short-lived direct object-store URLs after authorization.</li>
+  <li>Self-hosted: <code>sendfile</code>/streamed file responses are sufficient.</li>
+</ul>
+
+<hr class="section-divider">
+
+<!-- Cache Key Design -->
+<h2 id="cache-key-design">Cache Key Design</h2>
+
+<h3>General rule</h3>
+<p>A key must include every input that can change the cached output. If that set cannot be identified, do not cache the output.</p>
+
+<p>Use canonical serialization followed by a hash for storage identity. Keep human-readable components in metadata and telemetry.</p>
+
+<pre><code>schema_version
++ tenant_id
++ repository_id
++ trust_domain
++ cache_class
++ workflow-visible key/version</code></pre>
+
+<h3>Key Recipes</h3>
+
+<h4>Toolchains</h4>
+<pre><code>tool/v1/&lt;tool&gt;/&lt;exact-version&gt;/&lt;os&gt;/&lt;arch&gt;/&lt;libc&gt;/&lt;toolcache-format&gt;/&lt;upstream-sha256&gt;</code></pre>
+<p>Include exact version, not only major. A workflow may request <code>24</code>, but the resolved cache entry should identify <code>24.18.0</code> with a separately expiring major-to-exact resolution record.</p>
+
+<h4>Action source</h4>
+<pre><code>action/v1/&lt;owner&gt;/&lt;repo&gt;/&lt;resolved-commit-sha&gt;/&lt;archive-sha256&gt;</code></pre>
+<p>Mutable refs such as <code>v4</code>, branches, and tags are resolution records with a short TTL pointing to immutable commit/archive entries.</p>
+
+<h4>OCI images</h4>
+<pre><code>oci/v1/&lt;registry&gt;/&lt;repository&gt;/&lt;manifest-digest&gt;/&lt;platform-os&gt;/&lt;platform-arch&gt;</code></pre>
+<p>Cache layers by OCI digest. Golden compatibility must use the resolved base manifest/config digest, never <code>ubuntu:24.04</code> alone.</p>
+
+<h4>Package download stores</h4>
+<pre><code>package/v1/&lt;ecosystem&gt;/&lt;content-integrity&gt;/&lt;platform-if-native&gt;</code></pre>
+<p>Prefer the ecosystem's verified content store over archiving an installed dependency tree.</p>
+
+<h4>Actions cache archive</h4>
+<pre><code>&lt;os&gt;-&lt;arch&gt;-&lt;package-manager-major&gt;-&lt;runtime-abi&gt;-&lt;lockfile-hash&gt;</code></pre>
+<p>Do not silently rewrite the workflow's visible key. Namespace it server-side.</p>
+
+<h4>Build outputs</h4>
+<pre><code>build/v1/&lt;repo&gt;/&lt;tool&gt;/&lt;tool-version&gt;/&lt;target&gt;/&lt;profile&gt;/
+         &lt;feature-hash&gt;/&lt;relevant-env-hash&gt;/&lt;source-and-config-hash&gt;</code></pre>
+
+<h4>Golden VM</h4>
+<pre><code>golden/v1/&lt;base-image-digest&gt;/&lt;guest-arch&gt;/&lt;kernel-and-smolvm-version&gt;/
+          &lt;runner-bundle-sha&gt;/&lt;provisioner-sha&gt;/
+          &lt;declared-toolchain-set-hash&gt;/&lt;baseline-packages-hash&gt;</code></pre>
+<p>Preload OCI digest set and action digest set are optimization metadata, not compatibility identity.</p>
+
+<hr class="section-divider">
+
+<!-- Placement -->
+<h2 id="placement">Placement &amp; Data Flow</h2>
+
+<h3>L0: process-local coordination</h3>
+<p>Cache only small metadata: in-flight reservation deduplication, short negative cache for failed mutable-ref resolutions, recently resolved metadata entries. Do not retain archive bytes in process memory.</p>
+
+<h3>L1: guest-local ephemeral state</h3>
+<p>Use for active job extraction, package-manager working state, and compiler scratch data. Disappears with the runner.</p>
+
+<h3>L2: node-local persistent CAS</h3>
+<p>Use for hot tools, actions, package objects, OCI layers, and recently restored cache archives. A node-local entry is an optimization. Its loss must fall back to L3 or origin.</p>
+
+<h3>L3: durable blob and metadata store</h3>
+<ul>
+  <li><strong>Local:</strong> host filesystem plus SQLite.</li>
+  <li><strong>Self-hosted:</strong> persistent disk or S3-compatible object store; SQLite for one node, Postgres for multiple.</li>
+  <li><strong>Managed:</strong> object storage plus Postgres, with regional placement and KMS encryption.</li>
+</ul>
+
+<hr class="section-divider">
+
+<!-- Deployment Profile -->
+<h2 id="deployment-profile">Deployment Profile: Local CI</h2>
+
+<p>One developer machine, one implicit tenant, loopback control plane, disposable SmolVM runners, latency matters more than cross-host durability.</p>
+
+<pre><code>~/.preloop/cache/v1/
+├── index.sqlite
+├── blobs/sha256/
+├── staging/
+├── locks/
+├── tools/
+├── actions/
+├── packages/
+└── metrics/</code></pre>
+
+<p>Write-through to local disk; one cache root, not one virtiofs mount per cache class; seed declared toolchains into an environment-specific golden/toolcache; keep runner internals in <code>externals/</code>, separate from declared workflow tools; default starting quota: 20 GiB soft target and configurable hard limit.</p>
+
+<h3>Performance targets</h3>
+<div class="metric-row">
+  <div class="metric-card">
+    <div class="metric-value">&lt;10ms</div>
+    <div class="metric-label">Metadata lookup p95</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-value">&lt;1s</div>
+    <div class="metric-label">Node/tool cache hit materialization</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-value">&lt;2s</div>
+    <div class="metric-label">Vite setup-node / cache phase</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-value">&lt;45s</div>
+    <div class="metric-label">Vite warm total</div>
+  </div>
+</div>
+
+<hr class="section-divider">
+
+<!-- Security -->
+<h2 id="security">Security Design (Local CI)</h2>
+
+<p>In local CI, the trust boundary is the developer's OS account. No adversarial tenants, no untrusted fork PRs, no remote runners.</p>
+
+<h3>Never cache (even locally)</h3>
+<ul>
+  <li>Runner RSA private keys or shared runner credentials</li>
+  <li>OAuth, GitHub, cloud, package-registry, or signing tokens</li>
+  <li><code>.runner</code>, <code>.credentials</code>, <code>.credentials_rsaparams</code></li>
+  <li><code>.npmrc</code>, <code>.pypirc</code>, <code>.netrc</code>, Docker auth config, cloud CLI credential directories</li>
+  <li>Secret-bearing <code>$GITHUB_ENV</code>, <code>$GITHUB_OUTPUT</code>, process environments, or debug state</li>
+  <li>Decrypted job messages; arbitrary home directories</li>
+</ul>
+
+<p>Path deny-lists are defense in depth. The primary controls are narrow cache paths and no implicit whole-workspace caching.</p>
+
+<h3>Deduplication</h3>
+<p>Physical byte reuse is safe locally because the OS account is the sole trust boundary. Dedup across repos is a win, not a risk.</p>
+
+<hr class="section-divider">
+
+<!-- Correctness -->
+<h2 id="correctness">Correctness Rules</h2>
+
+<ol>
+  <li><strong>Misses are normal.</strong> Backend failure should degrade to a miss/warning when official cache semantics allow it.</li>
+  <li><strong>Explicit failure remains explicit.</strong> Preserve <code>fail-on-cache-miss</code> and action-defined failure behavior.</li>
+  <li><strong>Immutable publication.</strong> Write staging, verify, atomically publish; never mutate a finalized key/version.</li>
+  <li><strong>No partial reads.</strong> Readers see pending or complete, never both.</li>
+  <li><strong>Version archive semantics.</strong> Compression method and cached path set contribute to cache version.</li>
+  <li><strong>Safe restore keys.</strong> Prefix matches follow official order within the authenticated namespace.</li>
+  <li><strong>Reproducibility first.</strong> Preload only declared toolchains/containers. A faster local pass that would fail on GitHub is incorrect.</li>
+  <li><strong>Resolved identities.</strong> Mutable labels are lookup hints, not immutable storage identities.</li>
+  <li><strong>Crash recovery.</strong> Finalization and metadata/blob reference updates are transactional or restart-reconcilable.</li>
+  <li><strong>Clock independence.</strong> Ordering uses server timestamps or monotonic sequence IDs.</li>
+  <li><strong>Bounded retries.</strong> Cache outages cannot add minutes of exponential backoff to a job.</li>
+  <li><strong>Isolation before deduplication.</strong> Physical byte reuse must not change logical authorization.</li>
+</ol>
+
+<hr class="section-divider">
+
+<!-- Admission -->
+<h2 id="admission">Admission, Retention &amp; Eviction</h2>
+
+<p>Track for each entry: compressed/uncompressed size, restore count, last access, save/restore/origin-download cost, producer and trust scope, expiration and pin state.</p>
+
+<h3>Eviction policy</h3>
+<ol>
+  <li>Never evict active uploads or blobs with active readers.</li>
+  <li>Expire logical entries first.</li>
+  <li>Prefer evicting unreferenced, old, low-hit, cheap-to-recreate bytes.</li>
+  <li>Bias toward retaining high-download-cost tools/images and frequently restored dependency caches.</li>
+  <li>GC a physical blob only after no metadata references it and a grace period has elapsed.</li>
+  <li>Keep soft and hard quotas separate so background eviction runs before writes must be rejected.</li>
+</ol>
+
+<h3>Starting retention classes</h3>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Class</th><th>Policy</th><th>Reason</th></tr></thead>
+  <tbody>
+    <tr><td>Mutable tag/ref resolution</td><td>Minutes to hours</td><td>Must observe upstream movement</td></tr>
+    <tr><td>Immutable action/tool/image blob</td><td>LRU under capacity; long TTL</td><td>Verified and expensive to redownload</td></tr>
+    <tr><td>Package content store</td><td>LRU under capacity</td><td>Content-addressed and broadly reusable</td></tr>
+    <tr><td>Branch dependency cache</td><td>7–30 days since last access</td><td>Useful during active development</td></tr>
+    <tr><td>PR/fork writable cache</td><td>PR lifetime + short grace</td><td>Limits untrusted accumulation</td></tr>
+    <tr><td>Build output cache</td><td>Shorter TTL, cost-aware admission</td><td>Large and sensitive to weak keys</td></tr>
+    <tr><td>Staging upload</td><td>Hours, never days</td><td>Incomplete and not restorable</td></tr>
+    <tr><td>Negative lookup</td><td>Seconds to minutes</td><td>Avoids hiding newly published content</td></tr>
+  </tbody>
+</table>
+</div>
+
+<hr class="section-divider">
+
+<!-- Performance -->
+<h2 id="performance">Performance Techniques by Layer</h2>
+
+<h3>Toolchains</h3>
+<ul>
+  <li>Maintain a host-side immutable tool distribution CAS.</li>
+  <li>During golden preparation, materialize only toolchains explicitly declared by parsed setup actions/version files.</li>
+  <li>Write official toolcache completion markers only after verification.</li>
+  <li>Prefer reflink/hardlink/COW materialization where filesystem rules permit.</li>
+  <li>Keep the internal JavaScript action runtime separate from workflow-selected Node.</li>
+</ul>
+
+<h3>Package managers</h3>
+<ul>
+  <li>Set stable package-store locations, not action-installation-relative paths.</li>
+  <li>Cache package content, not arbitrary home directories.</li>
+  <li>Let pnpm/npm/Cargo/Go/uv perform their integrity checks.</li>
+  <li>Avoid archiving huge stores on every job when a node-local read-through store can serve immutable objects directly.</li>
+</ul>
+
+<h3>Actions cache protocol</h3>
+<ul>
+  <li>Replace directory scans with indexed exact/prefix lookup.</li>
+  <li>Stream archive bytes end to end.</li>
+  <li>Avoid recompressing an already compressed cache archive.</li>
+  <li>Keep post-job cache work visible in step telemetry.</li>
+</ul>
+
+<h3>VM and OCI preparation</h3>
+<ul>
+  <li>Resolve base images to digests before fingerprinting.</li>
+  <li>Use a prepared, digest-pinned Ubuntu image to avoid base pulls.</li>
+  <li>Mirror Docker Hub dependencies to avoid anonymous pull-rate limits.</li>
+  <li>Build/refresh goldens in the background and maintain warm capacity.</li>
+  <li>Do not add per-cache virtiofs mounts to forked goldens.</li>
+</ul>
+
+<h3>Metadata and control plane</h3>
+<ul>
+  <li>Keep cache metadata out of the global <code>Arc&lt;Mutex&lt;InnerState&gt;&gt;</code>.</li>
+  <li>Use database uniqueness for reservation and idempotent finalize.</li>
+  <li>Update <code>last_accessed_at</code> asynchronously/batched.</li>
+  <li>Separate cache data transfer from scheduling/control-plane request pools.</li>
+</ul>
+
+<hr class="section-divider">
+
+<!-- Observability -->
+<h2 id="observability">Observability</h2>
+
+<p>Every cache operation emits structured metrics and trace fields:</p>
+
+<pre><code>cache.class
+cache.namespace_hash
+cache.visible_key_hash
+cache.version_hash
+cache.outcome = exact_hit | prefix_hit | miss | rejected | corrupt | error
+cache.tier = guest | node | durable | origin
+cache.bytes_compressed / cache.bytes_uncompressed
+cache.lookup_ms / cache.first_byte_ms / cache.transfer_ms
+cache.archive_ms / cache.extract_ms / cache.verify_ms / cache.save_ms
+cache.eviction_reason
+cache.trust_domain</code></pre>
+
+<p>Job UI/logs should make the critical path obvious:</p>
+
+<pre><code>setup-node: toolcache exact hit, Node 24.18.0, 180 ms
+pnpm cache: prefix miss, reason=not_found, lookup 12 ms
+pnpm install: 16.5 s
+cache save: 1.2 GiB, archive 8.1 s, upload 3.4 s</code></pre>
+
+<p>A hit ratio alone is not enough. A 95% hit ratio can still lose time if archive/extraction costs exceed origin installation.</p>
+
+<hr class="section-divider">
+
+<!-- Verification -->
+<h2 id="verification">Verification &amp; Benchmark Plan</h2>
+
+<h3>Correctness matrix</h3>
+<p>Test with the official runner and <code>actions/cache@v4</code>:</p>
+<ul>
+  <li>exact-key hit; ordered restore-prefix hit; version mismatch</li>
+  <li>immutable duplicate save; concurrent save of one key</li>
+  <li>interrupted multipart upload; restart between upload and finalize</li>
+  <li>corrupt block/digest; quota exhaustion</li>
+  <li>eviction while another entry downloads</li>
+  <li>untrusted PR cannot write/read trusted-only entries</li>
+  <li>tenant/repository scope cannot be forged through request fields</li>
+  <li>expired/replayed signed URL</li>
+  <li>multi-gigabyte transfer with bounded process RSS</li>
+  <li>backend outage degrades according to action semantics</li>
+</ul>
+
+<h3>Performance matrix</h3>
+<p>For each representative repository, record cold, warm, and forced-miss runs. Keep existing five-repository slices and add synthetic cases: 10 MiB / 1 GiB / 10 GiB archives; many small vs. few large files; concurrent readers/writers; cold node-local tier with warm object storage.</p>
+
+<h3>Success criteria</h3>
+<div class="callout callout-decision">
+  <div class="callout-title">First Campaign Targets</div>
+  <ul style="margin-bottom:0">
+    <li>Vite build/lint within 10% of existing 9.91s</li>
+    <li>Vite warm total below 45s</li>
+    <li>Setup-node exact toolcache hit below 2s</li>
+    <li>Cache restore/save no longer reports <code>File name too long</code></li>
+    <li>Server RSS does not scale with archive size</li>
+    <li>Cold first-step latency returns to prepared-image target range</li>
+  </ul>
+</div>
+
+<hr class="section-divider">
+
+<!-- Roadmap -->
+<h2 id="roadmap">Phased Roadmap</h2>
+
+<div class="phase-tag current">Phase 0 — Current Scope</div>
+<h3>Instrument before changing policy</h3>
+<p>Structured phase metrics, cache hit/miss reasons, byte and latency accounting, benchmark command that produces a comparable JSON record.</p>
+
+<div class="phase-tag current">Phase 1 — Current Scope</div>
+<h3>Fix local correctness and measured Vite losses</h3>
+<ol>
+  <li>Reproduce and fix the cache backend <code>File name too long</code> failure.</li>
+  <li>Add indexed metadata for exact and prefix lookup.</li>
+  <li>Stream v1/v2 upload, finalize, and download without complete in-memory buffers.</li>
+  <li>Materialize workflow-declared Node into <code>$RUNNER_TOOL_CACHE</code> in the official layout.</li>
+  <li>Configure a stable pnpm store and verify a real warm restore.</li>
+  <li>Add quota/status/prune controls before automatic eviction.</li>
+</ol>
+
+<div class="phase-tag future">Phase 2 — Future</div>
+<h3>Immutable supply and VM caches</h3>
+<p>Action digest resolution, OCI digest pinning, prepared base artifacts.</p>
+
+<div class="phase-tag future">Phase 3 — Future</div>
+<h3>Self-hosted durable backend</h3>
+<p>Postgres metadata, S3 blobs, node-local read-through CAS.</p>
+
+<div class="phase-tag future">Phase 4 — Future</div>
+<h3>Managed multi-tenancy</h3>
+<p>KMS encryption, tenant isolation, regional object storage.</p>
+
+<hr class="section-divider">
+
+<!-- Boundaries -->
+<h2 id="boundaries">Implementation Boundaries</h2>
+
+<p>The architecture introduces narrow interfaces, not a generic cache framework:</p>
+
+<pre><code>CacheMetadataStore
+  reserve(namespace, key, version)
+  lookup(namespace, key, version, restore_keys)
+  finalize(reservation, blob, metadata)
+  expire(entry)
+
+BlobStore
+  begin_upload(limits)
+  put_part(upload, part, stream)
+  finalize_upload(upload, expected_digest)
+  open(digest, range)
+  delete(digest)
+
+HotCache
+  get(digest)
+  populate(digest, stream)
+  evict(policy)</code></pre>
+
+<p>Toolchains, actions, OCI layers, and Git objects may use the same underlying blob CAS, but retain class-specific resolvers and policy. Do not force Git object semantics through the user-facing Actions cache API.</p>
+
+<hr class="section-divider">
+
+<!-- Rejected -->
+<h2 id="rejected">Rejected Approaches</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Approach</th><th>Why Rejected</th></tr></thead>
+  <tbody>
+    <tr><td>One shared writable tool/package directory mounted into every VM</td><td>Concurrent jobs can corrupt it; extra virtiofs mounts caused measurable fork stalls</td></tr>
+    <tr><td>Bake every common tool into one universal golden</td><td>Undeclared tools make workflows pass locally and fail on GitHub</td></tr>
+    <tr><td>Cache complete workspaces</td><td>Stale files create false passes, cross-branch contamination, and secret leakage</td></tr>
+    <tr><td>Branch-only build keys</td><td>Toolchain, flags, lockfiles, source, and architecture can change without the branch name changing</td></tr>
+    <tr><td>Share mutable caches across tenants</td><td>Cache poisoning can turn a trusted build into code execution from another tenant</td></tr>
+    <tr><td>Keep uploads/downloads in <code>Vec&lt;u8&gt;</code></td><td>Server memory becomes proportional to cache size; concurrent transfers multiply the problem</td></tr>
+    <tr><td>Cache mutable action tags forever</td><td><code>v4</code> and branches may move; cache immutable bytes, refresh resolution records</td></tr>
+    <tr><td>Add one virtiofs mount per ecosystem cache</td><td>Every golden mount is inherited and paid by every clone</td></tr>
+    <tr><td>Cache secrets with encryption</td><td>Encryption reduces disclosure risk but does not make cross-job replay of credentials correct</td></tr>
+  </tbody>
+</table>
+</div>
+
+<hr class="section-divider">
+
+<!-- Stop Conditions -->
+<h2 id="stop-conditions">Stop Conditions</h2>
+
+<div class="callout callout-stop">
+  <div class="callout-title">Stop and Revisit</div>
+  <p>Do not improvise if any of these arise:</p>
+  <ul style="margin-bottom:0">
+    <li>Official <code>actions/cache@v4</code> behavior requires a different exact/prefix/version order than <code>CacheStore</code> currently models</li>
+    <li>A proposed shared cache cannot prove its trust boundary and producer identity</li>
+    <li>A cache hit changes job output compared with a clean miss</li>
+    <li>Implementing persistence requires exposing host paths directly to untrusted jobs</li>
+    <li>A performance improvement depends on undeclared tools or stale workspace files</li>
+    <li>Storage deduplication exposes cross-tenant existence or timing information</li>
+    <li>Cache save/restore costs more than the origin operation for the target workload</li>
+    <li>The SmolVM transport requires another inherited mount and the fork regression has not been re-benchmarked</li>
+  </ul>
+</div>
+
+<hr class="section-divider">
+
+<!-- Checklist -->
+<h2 id="checklist">Maintenance &amp; Review Checklist</h2>
+
+<p>For every new cache class or key revision:</p>
+
+<ol>
+  <li>What exact computation/download is avoided?</li>
+  <li>What are all correctness inputs and where are they represented in the key?</li>
+  <li>Who may write it? Who may read it?</li>
+  <li>Can an untrusted producer affect a trusted consumer?</li>
+  <li>What verifies content integrity?</li>
+  <li>Where does it live in local, self-hosted, and managed profiles?</li>
+  <li>What happens on miss, corruption, backend outage, and partial upload?</li>
+  <li>How is it bounded, expired, evicted, and deleted?</li>
+  <li>What telemetry proves it saves time and bytes?</li>
+  <li>Does it preserve behavior against the official runner and GitHub-compatible workflow semantics?</li>
+</ol>
+
+<hr class="section-divider">
+
+<p style="text-align:center; color:var(--text-muted); font-family:var(--font-display); font-size:0.78rem; margin-top:2rem;">
+  Drift check before implementation: <code>git diff --stat 1342346a..HEAD -- crates/aksh-cache crates/aksh-runner-server crates/aksh-runner crates/preloop-orchestrator docs</code>
+</p>
+
+</main>
+</div>
+
+<script>
+// ── Active TOC highlighting ──
+(function() {
+  const tocLinks = document.querySelectorAll('.toc a');
+  const headings = [];
+  tocLinks.forEach(link => {
+    const id = link.getAttribute('href').slice(1);
+    const el = document.getElementById(id);
+    if (el) headings.push({ el, link });
+  });
+
+  if (!headings.length) return;
+
+  const observer = new IntersectionObserver(entries => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        tocLinks.forEach(l => l.classList.remove('active'));
+        const match = headings.find(h => h.el === entry.target);
+        if (match) match.link.classList.add('active');
+      }
+    });
+  }, { rootMargin: '-10% 0px -80% 0px', threshold: 0 });
+
+  headings.forEach(h => observer.observe(h.el));
+})();
+</script>
+
+</body>
+</html>
