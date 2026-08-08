@@ -284,6 +284,11 @@ jobs:
           rm -f artifacts/*-dist-manifest.json
       - name: Create GitHub Release
         env:
+          # The org disables workflow write tokens, so GITHUB_TOKEN can never
+          # create a release (HTTP 403 "Resource not accessible by
+          # integration"). The upload steps only need read; this one needs
+          # contents: write, which the scoped RELEASES_TOKEN provides.
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
           PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
           ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
