@@ -40,8 +40,13 @@ cargo build --quiet -p preloop-runner-server
 # startup, failing the run for reasons that have nothing to do with protocol
 # fidelity. The path intentionally does not exist: a missing file loads the
 # default (unconfigured) engine config.
+# The goldens carry real GitHub-issued registration tokens this control plane
+# cannot verify, so the replay server opts into the permissive registration
+# policy — the same sanctioned exception `preloop-conformance` uses. Without
+# it every scenario 401s on /api/v3/actions/runner-registration.
 PRELOOP_PUBLIC_URL="$REPLAY_URL" \
   PRELOOP_CONFIG="$STATE_DIR/config.toml" \
+  PRELOOP_REGISTRATION_POLICY="permissive" \
   ./target/debug/preloop-server serve --listen "127.0.0.1:$REPLAY_PORT" \
   --state-dir "$STATE_DIR/server-state" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
