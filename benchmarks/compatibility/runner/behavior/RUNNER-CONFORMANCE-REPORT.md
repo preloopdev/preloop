@@ -6,7 +6,7 @@ The official runner and `preloop-runner` are compared against the same GitHub wo
 
 - Expected workflows: 14
 - Official records: 14
-- Aksh records: 14
+- Preloop records: 14
 - Verdict: **PASS**
 
 No differences found.
