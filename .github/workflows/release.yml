@@ -60,6 +60,10 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+          # Golden captures are LFS-tracked; the global/host jobs rebuild the
+          # source tarball and smudge them. Without an authenticated fetch the
+          # unauthenticated LFS API rate limit kills the run.
+          lfs: true
       - name: Install dist
         # we specify bash to get pipefail; it guards against the `curl` command
         # failing. otherwise `sh` won't catch that `curl` returned non-0
@@ -120,6 +124,10 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+          # Golden captures are LFS-tracked; the global/host jobs rebuild the
+          # source tarball and smudge them. Without an authenticated fetch the
+          # unauthenticated LFS API rate limit kills the run.
+          lfs: true
       - name: Install Rust non-interactively if not already installed
         if: ${{ matrix.container }}
         run: |
@@ -179,6 +187,10 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+          # Golden captures are LFS-tracked; the global/host jobs rebuild the
+          # source tarball and smudge them. Without an authenticated fetch the
+          # unauthenticated LFS API rate limit kills the run.
+          lfs: true
       - name: Install cached dist
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
@@ -229,6 +241,10 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+          # Golden captures are LFS-tracked; the global/host jobs rebuild the
+          # source tarball and smudge them. Without an authenticated fetch the
+          # unauthenticated LFS API rate limit kills the run.
+          lfs: true
       - name: Install cached dist
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
@@ -294,3 +310,7 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+          # Golden captures are LFS-tracked; the global/host jobs rebuild the
+          # source tarball and smudge them. Without an authenticated fetch the
+          # unauthenticated LFS API rate limit kills the run.
+          lfs: true
