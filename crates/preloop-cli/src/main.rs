@@ -1364,6 +1364,10 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         return Ok(());
     }
     let mut seen_events = HashSet::new();
+    // A mid-stream connection drop (EOF, reset) is the same "stream ended
+    // early" condition as `None` and deserves a reconnect, not a hard
+    // failure. Bounded so a dead engine does not spin forever.
+    let mut consecutive_stream_errors = 0u32;
     loop {
         let mut events_request = client.get(format!(
             "{url}/api/v1/runs/{}/events.ndjson",
@@ -1382,6 +1386,7 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         let mut stream = events_response.bytes_stream();
         let mut pending = String::new();
         let mut paused: Option<preloop_gha_protocol::debug_session::DebugSession> = None;
+        let mut stream_error: Option<reqwest::Error> = None;
         loop {
             // The server holds this stream open until the run is terminal, and
             // a job paused at a failed step never gets there. Watching only the
@@ -1390,7 +1395,13 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
             let chunk = tokio::select! {
                 biased;
                 chunk = stream.next() => match chunk {
-                    Some(chunk) => chunk?,
+                    Some(chunk) => match chunk {
+                        Ok(chunk) => chunk,
+                        Err(error) => {
+                            stream_error = Some(error);
+                            break;
+                        }
+                    },
                     None => break,
                 },
                 () = tokio::time::sleep(Duration::from_millis(750)) => {
@@ -1419,6 +1430,21 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                 break;
             }
         }
+
+        if let Some(error) = stream_error {
+            consecutive_stream_errors += 1;
+            if consecutive_stream_errors > 5 {
+                return Err(anyhow::anyhow!(error).context(
+                    "the run's event stream kept dropping; is the engine still running?",
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(
+                250 * u64::from(consecutive_stream_errors),
+            ))
+            .await;
+            continue;
+        }
+        consecutive_stream_errors = 0;
 
         if let Some(session) = paused {
             match debug_session::prompt_at_failure(&client, &url, api_token(), session).await {

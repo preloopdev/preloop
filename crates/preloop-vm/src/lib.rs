@@ -212,6 +212,24 @@ pub enum VmError {
     /// Invalid SmolVM JSON output.
     #[error("invalid smolvm response: {0}")]
     Protocol(String),
+    /// The resolved SmolVM predates generic socket forwarding.
+    ///
+    /// `--mount-socket` (added upstream in the 2026-07 socket-forwarding
+    /// work) generalizes the old docker-only bridge into a host→guest
+    /// mount, which is what preloop needs to hand the control socket to
+    /// the guest. Older binaries only accept `--docker-socket` (guest→host,
+    /// docker specific), which cannot carry that mount. `smolvm --version`
+    /// reports the wrapper's version, not the binary's, so the capability
+    /// probe (help text) is the reliable check.
+    #[error(
+        "the resolved smolvm (`{binary}`) does not support `machine create --mount-socket`, \
+         which preloop needs to mount the control socket into the guest; check which smolvm \
+         the engine resolves (PATH) and update it, e.g. https://smolmachines.com/install.sh"
+    )]
+    UnsupportedSocketMount {
+        /// Program path.
+        binary: String,
+    },
 }
 
 /// Provider contract consumed by the Preloop orchestrator.
@@ -263,6 +281,9 @@ pub struct SmolVmProvider {
     /// Serializes operations that build or replace a machine's base against
     /// everything else. See [`SmolVmProvider::exclusive`].
     lifecycle_lock: Arc<tokio::sync::RwLock<()>>,
+    /// Whether the resolved binary's `machine create` accepts
+    /// `--mount-socket`, probed once per provider.
+    socket_mount_supported: Arc<tokio::sync::OnceCell<bool>>,
 }
 
 impl Default for SmolVmProvider {
@@ -278,6 +299,7 @@ impl SmolVmProvider {
             binary: binary.into(),
             capture_limit: DEFAULT_CAPTURE_LIMIT,
             lifecycle_lock: Arc::new(tokio::sync::RwLock::new(())),
+            socket_mount_supported: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -289,6 +311,34 @@ impl SmolVmProvider {
 
     fn command(&self) -> Command {
         Command::new(&self.binary)
+    }
+
+    /// Whether `machine create` accepts `--mount-socket`, probed from the
+    /// binary's own help text and cached. SmolVM's wrapper scripts can
+    /// report a recent `--version` while resolving to an old binary, so the
+    /// flag's presence is the reliable capability check.
+    async fn supports_mount_socket(&self) -> bool {
+        let mut command = self.command();
+        command
+            .args(["machine", "create", "--help"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let Ok(mut child) = command.spawn() else {
+            return false;
+        };
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let (stdout, stderr, status) = tokio::join!(
+            read_bounded(stdout, self.capture_limit),
+            read_bounded(stderr, self.capture_limit),
+            child.wait(),
+        );
+        let (Ok((stdout, _)), Ok(_), Ok(status)) = (stdout, stderr, status) else {
+            return false;
+        };
+        status.success() && String::from_utf8_lossy(&stdout).contains("--mount-socket")
     }
 
     async fn checked(
@@ -492,6 +542,16 @@ impl VmProvider for SmolVmProvider {
                 value.push_str(":ro");
             }
             args.extend(["--volume".into(), value]);
+        }
+        if !spec.sockets.is_empty()
+            && !*self
+                .socket_mount_supported
+                .get_or_init(|| self.supports_mount_socket())
+                .await
+        {
+            return Err(VmError::UnsupportedSocketMount {
+                binary: self.binary.display().to_string(),
+            });
         }
         for mount in &spec.sockets {
             args.extend([

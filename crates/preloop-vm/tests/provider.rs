@@ -58,6 +58,11 @@ if [ "${1-}:${2-}" = "machine:update" ] && [ -f "$0.fail-update" ]; then
   exit 42
 fi
 
+if [ "${1-}:${2-}:${3-}" = "machine:create:--help" ]; then
+  printf '%s\n' "Usage: smolvm machine create --name <NAME> --mount-socket <HOST:GUEST>"
+  exit 0
+fi
+
 case "${1-}:${2-}" in
   machine:create)
     exit 0
@@ -136,6 +141,36 @@ esac
             dns: None,
             rosetta: false,
         }
+    }
+
+    /// A smolvm whose `machine create` predates `--mount-socket`: only the
+    /// old docker-specific flag exists, so the capability probe must fail.
+    fn fake_old_smolvm() -> (TempDir, PathBuf) {
+        let (directory, executable) = fake_smolvm();
+        fs::write(
+            &executable,
+            r##"#!/bin/sh
+set -eu
+
+args="$0.args"
+: > "$args"
+for arg in "$@"; do
+  printf '%s\n' "$arg" >> "$args"
+done
+
+if [ "${1-}:${2-}:${3-}" = "machine:create:--help" ]; then
+  printf '%s\n' "Usage: smolvm machine create --name <NAME> --docker-socket [-- <COMMAND>...]"
+  exit 0
+fi
+
+exit 0
+"##,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+        (directory, executable)
     }
 
     #[tokio::test]
@@ -217,6 +252,36 @@ esac
                 "--mount-socket".to_owned(),
                 format!("{}:/run/preloop-engine.sock", host_socket.display()),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn create_with_socket_mount_rejects_smolvm_without_the_flag() {
+        let (directory, executable) = fake_old_smolvm();
+        let host_socket = directory.path().join("engine.sock");
+        let _socket = std::os::unix::net::UnixListener::bind(&host_socket).unwrap();
+        let mut spec = valid_spec(MachineName::new("ci-01").unwrap());
+        spec.sockets.push(SocketMount {
+            host: host_socket,
+            guest: PathBuf::from("/run/preloop-engine.sock"),
+        });
+
+        let error = SmolVmProvider::new(&executable)
+            .create(&spec)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, VmError::UnsupportedSocketMount { .. }),
+            "expected UnsupportedSocketMount, got {error}"
+        );
+        assert!(
+            !executable.with_extension("args").exists()
+                || !fs::read_to_string(executable.with_extension("args"))
+                    .unwrap()
+                    .lines()
+                    .any(|arg| arg == "--mount-socket"),
+            "create must not run when the binary lacks --mount-socket"
         );
     }
 

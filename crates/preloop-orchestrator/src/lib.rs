@@ -1576,11 +1576,32 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                 result
             });
 
-            // Reap any finished tasks without blocking.
+            // Reap any finished tasks without blocking. A failed slot is
+            // usually transient, but an environment-level failure (missing
+            // or outdated smolvm, disk full) fails every attempt, and
+            // respawning as fast as slots drain turns that into a log
+            // storm. Back off exponentially after failures so a broken
+            // setup logs a few lines per minute instead of a flood; any
+            // success resets the backoff.
+            let mut failure_backoff = Duration::ZERO;
             while let Some(result) = slots.try_join_next() {
-                if let Ok(Err(error)) = result {
-                    warn!(%error, "on-demand runner slot error");
+                match result {
+                    Ok(Ok(())) => failure_backoff = Duration::ZERO,
+                    Ok(Err(error)) => {
+                        warn!(%error, "on-demand runner slot error");
+                        failure_backoff = if failure_backoff.is_zero() {
+                            Duration::from_millis(500)
+                        } else {
+                            failure_backoff
+                                .saturating_mul(2)
+                                .min(Duration::from_secs(30))
+                        };
+                    }
+                    Err(error) => warn!(%error, "runner slot task failed"),
                 }
+            }
+            if !failure_backoff.is_zero() {
+                tokio::time::sleep(failure_backoff).await;
             }
         }
 
