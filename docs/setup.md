@@ -433,4 +433,4 @@ named Cloudflare tunnel or the domain path above.
   minting fails: `local` (fall back to the local JWT), `error` (fail the
   job), `pat` (fall back to the PAT).
 
-[smolvm]: https://github.com/preloopdev/smolvm
+[smolvm]: https://github.com/smol-machines/smolvm

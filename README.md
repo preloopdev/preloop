@@ -1,7 +1,8 @@
 # preloop
 
-[![Watch the demo](docs/demo/poster.png)](docs/demo/debug.mp4)
+![Watch the preloop demo: a failed step, a fix in another pane, and a re-run, all local, no push required](docs/demo/demo.gif)
 
+> Full-resolution video: [debug.mp4](docs/demo/debug.mp4)
 
 > A failed step, a fix in another pane, and a re-run, all local, with no push required.
 
@@ -82,5 +83,5 @@ This project wouldn't be possible without:
 - [smolvm] — the microVM runtime every job executes in
 - [runner.server] — the protocol reverse-engineering this project builds on
 
-[smolvm]: https://github.com/preloopdev/smolvm
+[smolvm]: https://github.com/smol-machines/smolvm
 [runner.server]: https://github.com/ChristopherHX/runner.server
