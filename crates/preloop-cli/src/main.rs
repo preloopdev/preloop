@@ -69,14 +69,14 @@ pub(crate) fn api_token() -> Option<String> {
 }
 
 pub(crate) fn build_client() -> reqwest::Client {
-    let builder = reqwest::Client::builder();
-    #[cfg(unix)]
-    let builder = if std::env::var("PRELOOP_URL").is_err() {
-        builder.unix_socket(preloop_home().join("preloop.sock"))
-    } else {
-        builder
-    };
-    builder.build().expect("valid HTTP client configuration")
+    // The CLI talks to the native management surface, which the engine
+    // serves on TCP (`server_url`, default 127.0.0.1:9090). The unix socket
+    // is the runner/guest surface: it deliberately refuses native APIs
+    // (`/api/v1/runs` and friends 404 there), so it must never be the
+    // default transport for CLI commands.
+    reqwest::Client::builder()
+        .build()
+        .expect("valid HTTP client configuration")
 }
 
 pub(crate) fn preloop_home() -> PathBuf {
