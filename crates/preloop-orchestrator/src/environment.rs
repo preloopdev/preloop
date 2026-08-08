@@ -201,7 +201,7 @@ impl ToolchainLayer {
                          VERSION=$(curl -fsSL 'https://go.dev/dl/?mode=json&include=all' | python3 -c '\n\
                          import json, sys\n\
                          want = sys.argv[1]\n\
-                         if not want.startswith(\"go\"):\n\
+                         if not want.startswith(\"go\"):\n    \
                              want = \"go\" + want\n\
                          idx = json.load(sys.stdin)\n\
                          print(next((e[\"version\"] for e in idx if e[\"version\"] == want or e[\"version\"].startswith(want + \".\")), \"\"))\n\
@@ -828,5 +828,66 @@ mod tests {
         ] {
             assert!(!layer.install_commands().is_empty());
         }
+    }
+
+    /// The Go layer emits an inline Python resolver whose body must survive
+    /// the Rust line-continuation string. A `\n\` continuation strips the
+    /// leading whitespace of the following source line, which used to flatten
+    /// the `if` body to column zero — the emitted script then died with
+    /// `IndentationError` on every provisioning run and no runner ever
+    /// registered. Run the actual emitted Python against a sample release
+    /// index so a regression fails the suite instead of the pool.
+    #[test]
+    fn go_toolchain_python_resolver_is_valid_and_resolves() {
+        let commands = ToolchainLayer::Go("1.24".into()).install_commands();
+        let shell = &commands[0][2];
+        assert!(
+            shell.contains("python3 -c"),
+            "resolver must be inline python"
+        );
+
+        // Extract the python -c program: everything between the single-quoted
+        // `python3 -c '` and the closing `' "$WANT"`.
+        let start = shell.find("python3 -c '").expect("inline python") + "python3 -c '".len();
+        let end = shell[start..]
+            .find("' \"$WANT\"")
+            .map(|offset| start + offset)
+            .expect("closing quote");
+        let program = &shell[start..end];
+
+        // The emitted shell wraps the python in its own quoting; decode the
+        // `\\n` -> `\n` and `\"` -> `"` escapes the Rust string introduced.
+        let program = program.replace("\\n", "\n").replace("\\\"", "\"");
+
+        // The program reads JSON from stdin and prints the matching version.
+        // go.dev serves the index newest-first, which is what makes `next`
+        // resolve a `1.24` minimum to the newest 1.24.x.
+        let index = r#"[{"version":"go1.25.0"},{"version":"go1.24.2"},{"version":"go1.24.1"},{"version":"go1.24.0"}]"#;
+        let mut child = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(&program)
+            .arg("1.24")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("python3 available for the test");
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(index.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "emitted python must parse and run: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let resolved = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        assert_eq!(
+            resolved, "go1.24.2",
+            "a `go 1.24` minimum must resolve to the newest 1.24.x"
+        );
     }
 }
