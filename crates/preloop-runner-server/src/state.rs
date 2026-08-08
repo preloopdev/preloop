@@ -936,6 +936,11 @@ pub(crate) struct InnerState {
     pub(crate) runs: BTreeMap<RunId, RunRecord>,
     pub(crate) workflow_run_counters: BTreeMap<String, u64>,
     pub(crate) queue: VecDeque<QueuedJob>,
+    /// When each ready-queue job was first seen by the reaper, used to fail
+    /// jobs no runner can ever claim. Maintained by the reaper itself, so it
+    /// needs no enqueue-site coordination: entries are inserted on first
+    /// observation and dropped when the job leaves the queue.
+    pub(crate) queued_at: BTreeMap<(RunId, JobId), std::time::SystemTime>,
     pub(crate) pending_jobs: VecDeque<QueuedJob>,
     /// Reusable-caller and dynamic-matrix nodes whose gates are already held
     /// and whose callee subtree still has to be built.

@@ -5994,6 +5994,67 @@ async fn request_json_with_bearer(
 }
 
 #[tokio::test]
+async fn queued_job_with_no_runner_is_failed_after_the_grace_window() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+
+    // A fresh server: no pool, no runners registered.
+    let accepted = submit_simple_run(&app).await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    // First reaper tick stamps the queued-at time; the job is not yet old
+    // enough to fail.
+    reap_once(&shared).await;
+    {
+        let inner = state.inner.lock().await;
+        assert_eq!(
+            inner.queue.len(),
+            1,
+            "job still queued inside the grace window"
+        );
+        assert!(inner
+            .queued_at
+            .contains_key(&(run_id, JobId("build".to_owned()))));
+    }
+
+    // Backdate the first-seen mark past the grace window and reap again: the
+    // job must be failed with a visible reason and the run must conclude.
+    {
+        let mut inner = state.inner.lock().await;
+        inner.queued_at.insert(
+            (run_id, JobId("build".to_owned())),
+            SystemTime::now() - Duration::from_secs(300),
+        );
+    }
+    reap_once(&shared).await;
+
+    {
+        let inner = state.inner.lock().await;
+        assert!(
+            inner.queue.is_empty(),
+            "starving job must leave the ready queue"
+        );
+        assert!(!inner
+            .queued_at
+            .contains_key(&(run_id, JobId("build".to_owned()))));
+        let run = inner.runs.get(&run_id).expect("run record must survive");
+        assert_eq!(
+            run.jobs.get(&JobId("build".to_owned())),
+            Some(&ExecutionStatus::Failure),
+            "a job no runner can ever claim must fail, not queue forever"
+        );
+        assert_eq!(run.status, ExecutionStatus::Failure);
+        assert!(run.completed_at.is_some(), "run must conclude");
+    }
+}
+
+#[tokio::test]
 async fn job_timeout_enforcement_cancels_job() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();

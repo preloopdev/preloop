@@ -127,6 +127,9 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
     let now = SystemTime::now();
     let mut cancellations = Vec::new();
     let mut disconnected_completions = Vec::new();
+    // Jobs failed by the starvation sweep, emitted after the lock is
+    // released so the event fan-out never runs under the state lock.
+    let mut starved: Vec<(RunId, JobId, String)> = Vec::new();
 
     let mut active_reqs = Vec::new();
     for (request_id, request) in &inner.job_requests {
@@ -156,6 +159,55 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
         .map(|(id, ..)| (*id, inner.debug_sessions.paused_for_request(*id, now)))
         .collect();
     crate::debug_sessions::sweep(&mut inner.debug_sessions, now, &active_request_ids);
+
+    // Starvation sweep: a ready-queue job that no runner can ever claim must
+    // not sit queued forever with no explanation. The pool is provisioned on
+    // demand and external runners may register at any moment, so a job is
+    // only failed after a grace window during which nothing matched its
+    // labels. The `queued_at` map is maintained here, from the queue itself:
+    // first observation stamps the time, a match clears it, and jobs that
+    // left the queue drop their entry, so no enqueue-site coordination is
+    // needed and the map cannot go stale.
+    const QUEUED_JOB_GRACE: Duration = Duration::from_secs(120);
+    let queued_jobs: Vec<_> = inner.queue.iter().cloned().collect();
+    let in_queue: std::collections::BTreeSet<(RunId, JobId)> = queued_jobs
+        .iter()
+        .map(|job| (job.run_id, job.job_id.clone()))
+        .collect();
+    inner.queued_at.retain(|key, _| in_queue.contains(key));
+    let mut starved_keys: Vec<(RunId, JobId, String)> = Vec::new();
+    for job in &queued_jobs {
+        let key = (job.run_id, job.job_id.clone());
+        let matching = inner.runners.values().any(|runner| {
+            crate::runtime_scheduling::job_matches_runner(&job.runs_on, &runner.labels)
+        });
+        if matching {
+            inner.queued_at.remove(&key);
+            continue;
+        }
+        let first_seen = *inner.queued_at.entry(key.clone()).or_insert(now);
+        if now.duration_since(first_seen).unwrap_or_default() < QUEUED_JOB_GRACE {
+            continue;
+        }
+        let reason = format!(
+            "no runner is registered for `runs-on: {}` and none appeared \
+             within {}s, so the job cannot be scheduled",
+            job.runs_on.join(", "),
+            QUEUED_JOB_GRACE.as_secs()
+        );
+        tracing::warn!(
+            run_id = %job.run_id,
+            job_id = %job.job_id.0,
+            labels = ?job.runs_on,
+            "starving queued job failed after {}s without a matching runner",
+            QUEUED_JOB_GRACE.as_secs()
+        );
+        starved_keys.push((job.run_id, job.job_id.clone(), reason));
+    }
+    for (run_id, job_id, reason) in starved_keys {
+        inner.queued_at.remove(&(run_id, job_id.clone()));
+        starved.push((run_id, job_id, reason));
+    }
 
     for (request_id, run_id, job_id, started_at, last_renewed_at, timeout_triggered) in active_reqs
     {
@@ -241,11 +293,39 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
         inner.cancellation_queue.extend(cancellations);
     }
 
+    // Apply starvation failures: remove each job from the ready queue and
+    // mark it terminal in its run, so dependents unblock and a run with no
+    // surviving jobs concludes. The reason is emitted after the lock.
+    for (run_id, job_id, _reason) in &starved {
+        inner
+            .queue
+            .retain(|job| job.run_id != *run_id || job.job_id != *job_id);
+        if let Some(run) = inner.runs.get_mut(run_id) {
+            run.jobs.insert(job_id.clone(), ExecutionStatus::Failure);
+            run.status = crate::runtime_scheduling::summarize_run(run.jobs.values().copied());
+            crate::runtime_scheduling::finalize_run_if_complete(run);
+        }
+    }
+
     drop(inner);
 
-    // Notify if cancellations occurred
-    if cancellation_count > 0 {
+    // Notify if cancellations or starvation failures occurred
+    if cancellation_count > 0 || !starved.is_empty() {
         shared.state.message_notify.notify_waiters();
+    }
+
+    // Surface why a queued job was failed. Without this the only record is a
+    // server-side log line the workflow author never sees.
+    for (run_id, job_id, reason) in &starved {
+        shared
+            .state
+            .emit(NdjsonEvent::JobStatus {
+                run_id: *run_id,
+                job_id: job_id.clone(),
+                status: ExecutionStatus::Failure,
+                reason: Some(reason.clone()),
+            })
+            .await;
     }
 
     // Process completions for disconnected runners
