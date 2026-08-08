@@ -28,7 +28,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{TcpListener, TcpStream, UnixStream};
+#[cfg(unix)]
+use tokio::net::UnixStream;
+use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
 /// Number of consecutive upstream connect failures before the bridge exits.
@@ -48,6 +50,7 @@ pub const CONTROL_UPSTREAM_ENV: &str = "PRELOOP_CONTROL_UPSTREAM";
 #[derive(Debug, Clone)]
 enum Upstream {
     /// Forward to a mounted Unix socket (vsock bridge).
+    #[cfg(unix)]
     Socket(PathBuf),
     /// Forward to a TCP address (virtio-net path).
     Tcp(SocketAddr),
@@ -82,7 +85,21 @@ pub async fn spawn_from_env() -> Option<ControlBridge> {
     let socket = std::env::var_os(CONTROL_SOCKET_ENV).map(PathBuf::from);
     let upstream_addr = std::env::var(CONTROL_UPSTREAM_ENV).ok();
     let upstream = match (socket, upstream_addr) {
+        #[cfg(unix)]
         (Some(socket), _) => Upstream::Socket(socket),
+        #[cfg(not(unix))]
+        (Some(_), _) => {
+            // No Unix domain sockets on this platform; a control socket env
+            // cannot be honored. Prefer the TCP upstream when one is
+            // configured; otherwise no bridge at all.
+            match upstream_addr {
+                Some(addr) => {
+                    let addr = upstream_tcp_address(&addr)?;
+                    Upstream::Tcp(addr)
+                }
+                None => return None,
+            }
+        }
         (None, Some(addr)) => {
             let addr = upstream_tcp_address(&addr)?;
             Upstream::Tcp(addr)
@@ -207,6 +224,7 @@ async fn splice(client: TcpStream, upstream: &Upstream) -> std::io::Result<()> {
     // control plane exchanges.
     client.set_nodelay(true)?;
     match upstream {
+        #[cfg(unix)]
         Upstream::Socket(socket) => {
             let stream = UnixStream::connect(socket).await?;
             pump(client, stream).await
@@ -298,6 +316,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn bridged_tcp_connection_reaches_the_unix_socket() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("control.sock");
@@ -324,6 +343,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn bridge_exits_after_consecutive_upstream_failures() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("control.sock");
