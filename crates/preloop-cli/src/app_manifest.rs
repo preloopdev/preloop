@@ -700,6 +700,12 @@ mod tests {
     fn manifest_disables_webhooks_without_a_public_url() {
         let manifest = manifest("preloop", "http://127.0.0.1:4000/callback", None);
         assert_eq!(manifest["hook_attributes"]["active"], false);
+        assert_eq!(
+            manifest["hook_attributes"]["url"], "http://127.0.0.1:4000/callback",
+            "GitHub's schema requires hook_attributes.url whenever the object \
+             is present; a url-less inactive hook is rejected with the \
+             misleading `\"url\" wasn't supplied`"
+        );
         assert!(manifest.get("default_events").is_none());
         assert_eq!(
             manifest["setup_url"], "http://127.0.0.1:4000/installed",
