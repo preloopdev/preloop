@@ -51,7 +51,7 @@ access at all** — see option A.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/preloopdev/preloop/main/install.sh | sh
-preloop setup github          # store GitHub App credentials
+preloop setup github --via app --public-url https://ci.example.com
 ```
 
 Then install it as a supervised service — systemd on Linux, launchd on macOS:
@@ -95,7 +95,7 @@ All configuration is environment variables; CLI flags override them.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `PRELOOP_LISTEN` | `0.0.0.0:9090` | Bind address. **The default is all interfaces — see §6.** |
+| `PRELOOP_LISTEN` | `127.0.0.1:9090` | Bind address. Loopback by default — expose with `--listen 0.0.0.0:9090` behind a proxy or tunnel (see §6). |
 | `PRELOOP_PUBLIC_URL` | `http://127.0.0.1:<port>` | Externally reachable base URL. Used for `details_url` on check runs |
 | `PRELOOP_HOME` | `$HOME/.preloop` | State directory (database, blobs, cache, credentials) |
 | `PRELOOP_STORE_URL` | SQLite in the state dir | `sqlite://<path>`, a bare path, or `postgres://…?sslmode=require\|verify-full` |
@@ -251,9 +251,11 @@ path exposes job logs.
 
 ## 6. Security: what must not be public
 
-**`PRELOOP_LISTEN` defaults to `0.0.0.0:9090`.** On a host with a public IP that
-publishes the control plane to the internet. Bind loopback or a private address
-and put a proxy in front.
+**`PRELOOP_LISTEN` defaults to `127.0.0.1:9090`**, so a bare `preloop serve` is
+only reachable from the host. To expose the control plane (tunnels reach it via
+`127.0.0.1` anyway), bind a private address or `0.0.0.0` — and put a proxy in
+front. Publishing `0.0.0.0` on a host with a public IP exposes the API to the
+internet with no authentication on the queue path.
 
 **Never publish the whole API surface.** Restrict your proxy or tunnel to
 `/api/v1/github/webhooks`, as every example above does.

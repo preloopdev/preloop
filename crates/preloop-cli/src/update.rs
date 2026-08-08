@@ -101,6 +101,17 @@ pub(crate) async fn run(args: UpdateArgs) -> anyhow::Result<()> {
     .await?;
     verify_checksum(&client, selected.archive, selected.checksum, &archive_path).await?;
 
+    // macOS installs run workflows inside Linux VMs: refresh the bundled
+    // Linux runner before replacing the CLI, so a successful update never
+    // leaves a runner from an older release behind. A release missing the
+    // asset is a warning, not a failure — the engine's startup message
+    // explains the consequence.
+    #[cfg(target_os = "macos")]
+    match update_linux_runner_bundle(&client, &release).await {
+        Ok(()) => println!("installed Linux runner bundle"),
+        Err(error) => println!("warning: Linux runner bundle not updated: {error:#}"),
+    }
+
     let staged_binary = temp_dir.path().join(binary_name());
     extract_binary(&archive_path, &staged_binary)?;
     let executable = std::env::current_exe().context("locate running preloop executable")?;
@@ -109,6 +120,43 @@ pub(crate) async fn run(args: UpdateArgs) -> anyhow::Result<()> {
 
     println!("installed preloop {}", remote_version);
     restart_systemd_service().await?;
+    Ok(())
+}
+
+/// Download the release's Linux runner bundle and install it at
+/// `<prefix>/lib/preloop/runner/<triple>/preloop-runner`, the layout
+/// `local_runner_pool_config` discovers.
+#[cfg(target_os = "macos")]
+async fn update_linux_runner_bundle(client: &Client, release: &Release) -> anyhow::Result<()> {
+    let triple = crate::linux_guest_triple();
+    let asset_name = format!("preloop-runner-{triple}");
+    let asset = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == asset_name)
+        .with_context(|| format!("release {} has no {asset_name} asset", release.tag_name))?;
+    let checksum = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == format!("{asset_name}.sha256"));
+    let staging = tempfile::tempdir().context("create runner bundle staging directory")?;
+    let bundle_path = staging.path().join(&asset.name);
+    download(client, &asset.browser_download_url, &bundle_path).await?;
+    verify_checksum(client, asset, checksum, &bundle_path).await?;
+
+    let executable = std::env::current_exe().context("locate running preloop executable")?;
+    let prefix = executable
+        .parent()
+        .and_then(|dir| dir.parent())
+        .context("expected install layout <prefix>/bin/preloop")?;
+    let destination_dir = prefix.join("lib/preloop/runner").join(triple);
+    std::fs::create_dir_all(&destination_dir)
+        .with_context(|| format!("create {}", destination_dir.display()))?;
+    let destination = destination_dir.join("preloop-runner");
+    tokio::fs::copy(&bundle_path, &destination)
+        .await
+        .with_context(|| format!("install {}", destination.display()))?;
+    set_executable_permissions(&destination)?;
     Ok(())
 }
 
