@@ -302,6 +302,18 @@ async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
     verify_checksum(client, archive_asset, checksum_asset, &archive_path).await?;
     install_smolvm_from_archive(&archive_path, version, &install)?;
     println!("installed smolvm {version}");
+    // The install lands in `~/.local/bin`; if PATH still resolves another
+    // binary, the engine keeps failing and the user is left confused about
+    // why the update did not help. Say so explicitly.
+    if !smolvm_supports_mount_socket().await {
+        println!(
+            "warning: installed smolvm {version} to {}, but `smolvm` on PATH still \
+             resolves to a binary without --mount-socket; the engine resolves `smolvm` \
+             from PATH, so make sure {} comes first",
+            install.prefix.display(),
+            install.bin_dir.display()
+        );
+    }
     Ok(())
 }
 
