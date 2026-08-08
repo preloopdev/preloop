@@ -43,8 +43,10 @@ jobs:
     runs-on: self-hosted
     timeout-minutes: 60
     env:
-      
-      CARGO_BUILD_JOBS: "2"
+      # The dogfood pool's runner VMs expose 4 vCPUs (see the orchestrator's
+      # default CPU count); 2 parallel rustc jobs left half the machine idle
+      # and made the workspace test take hours on every cold run.
+      CARGO_BUILD_JOBS: "4"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
