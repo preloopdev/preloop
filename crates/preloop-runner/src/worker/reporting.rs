@@ -34,7 +34,7 @@ pub async fn flush_step_updates(rpt: &ReportingContext, queue: &Arc<Mutex<Server
         let payload = serde_json::json!({ "count": count, "value": records });
         match azdo
             .client
-            .update_timeline(&rpt.access_token, &rpt.plan_id, &azdo.timeline_id, &payload)
+            .update_timeline(&rpt.token(), &rpt.plan_id, &azdo.timeline_id, &payload)
             .await
         {
             Ok(_) => {
@@ -54,7 +54,7 @@ pub async fn flush_step_updates(rpt: &ReportingContext, queue: &Arc<Mutex<Server
         let body_json = serde_json::to_value(&body).unwrap_or_default();
         match rpt
             .results
-            .update_workflow_steps(&rpt.access_token, &body_json)
+            .update_workflow_steps(&rpt.token(), &body_json)
             .await
         {
             Ok(_) => {
@@ -149,7 +149,7 @@ pub async fn upload_step_log(rpt: &ReportingContext, step_id: &str, content: &st
         });
         let log_id = match azdo
             .client
-            .create_log(&rpt.access_token, &rpt.plan_id, &log_body)
+            .create_log(&rpt.token(), &rpt.plan_id, &log_body)
             .await
         {
             Ok(resp) => match resp.get("id").and_then(|v| v.as_i64()) {
@@ -168,7 +168,7 @@ pub async fn upload_step_log(rpt: &ReportingContext, step_id: &str, content: &st
         match azdo
             .client
             .append_log(
-                &rpt.access_token,
+                &rpt.token(),
                 &rpt.plan_id,
                 log_id,
                 content.as_bytes().to_vec(),
@@ -190,7 +190,7 @@ pub async fn upload_step_log(rpt: &ReportingContext, step_id: &str, content: &st
         match azdo
             .client
             .update_timeline(
-                &rpt.access_token,
+                &rpt.token(),
                 &rpt.plan_id,
                 &azdo.timeline_id,
                 &log_ref_patch,
@@ -212,7 +212,7 @@ pub async fn upload_step_log(rpt: &ReportingContext, step_id: &str, content: &st
 
     let signed_url = match rpt
         .results
-        .get_step_logs_signed_url(&rpt.access_token, &body)
+        .get_step_logs_signed_url(&rpt.token(), &body)
         .await
     {
         Ok(resp) => resp
@@ -248,7 +248,7 @@ pub async fn upload_step_log(rpt: &ReportingContext, step_id: &str, content: &st
             });
             match rpt
                 .results
-                .create_step_logs_metadata(&rpt.access_token, &metadata)
+                .create_step_logs_metadata(&rpt.token(), &metadata)
                 .await
             {
                 Ok(_) => info!("CreateStepLogsMetadata succeeded for step {step_id}"),
@@ -286,7 +286,7 @@ pub async fn upload_step_summary(rpt: &ReportingContext, step_id: &str, content:
 
     let signed_url = match rpt
         .results
-        .get_step_summary_signed_url(&rpt.access_token, &body)
+        .get_step_summary_signed_url(&rpt.token(), &body)
         .await
     {
         Ok(resp) => resp
@@ -327,7 +327,7 @@ pub async fn upload_step_summary(rpt: &ReportingContext, step_id: &str, content:
     });
     match rpt
         .results
-        .create_step_summary_metadata(&rpt.access_token, &metadata)
+        .create_step_summary_metadata(&rpt.token(), &metadata)
         .await
     {
         Ok(_) => info!("CreateStepSummaryMetadata succeeded for step {step_id}"),
@@ -353,7 +353,7 @@ pub(crate) async fn upload_job_log(rpt: &ReportingContext, content: &str) {
 
     let signed_url = match rpt
         .results
-        .get_job_logs_signed_url(&rpt.access_token, &body)
+        .get_job_logs_signed_url(&rpt.token(), &body)
         .await
     {
         Ok(resp) => resp
@@ -388,7 +388,7 @@ pub(crate) async fn upload_job_log(rpt: &ReportingContext, content: &str) {
             });
             match rpt
                 .results
-                .create_job_logs_metadata(&rpt.access_token, &metadata)
+                .create_job_logs_metadata(&rpt.token(), &metadata)
                 .await
             {
                 Ok(_) => info!("CreateJobLogsMetadata succeeded"),
@@ -503,7 +503,7 @@ pub(crate) async fn upload_diagnostic_logs(
 
     let signed_url = match rpt
         .results
-        .get_diagnostic_logs_signed_url(&rpt.access_token, &body)
+        .get_diagnostic_logs_signed_url(&rpt.token(), &body)
         .await
     {
         Ok(response) => diagnostic_logs_url(&response).unwrap_or("").to_owned(),

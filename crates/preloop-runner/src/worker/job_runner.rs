@@ -39,11 +39,87 @@ pub struct AzdoReportingContext {
     pub timeline_id: String,
 }
 
+/// The OAuth token the worker presents for renew/complete/reporting.
+///
+/// The server mints runner OAuth tokens with a ~50-minute TTL
+/// (`PRELOOP_TOKEN_TTL_SECS`, default 2999s). The listener refreshes its own
+/// copy proactively, but the worker is a separate process spawned with the
+/// token frozen into the job message — so a job that runs past the TTL loses
+/// its lease the moment the token expires: renewjob 401s forever and the
+/// final completejob 401s too, leaving the run stuck `in_progress` with a
+/// pinned VM.
+///
+/// The official runner renews from the listener, which holds a live token.
+/// Preloop's renew loop lives in the worker, so the worker re-acquires the
+/// token itself through the same client-credentials exchange the listener
+/// uses — the runner root it was configured from is its current directory.
+#[derive(Clone)]
+pub struct LiveToken {
+    inner: Arc<std::sync::Mutex<LiveTokenInner>>,
+}
+
+struct LiveTokenInner {
+    value: String,
+    /// When to refresh proactively (5 minutes before server-reported expiry).
+    refresh_at: Option<std::time::Instant>,
+}
+
+impl LiveToken {
+    fn new(value: String) -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(LiveTokenInner {
+                value,
+                refresh_at: None,
+            })),
+        }
+    }
+
+    /// The token to present right now.
+    pub fn get(&self) -> String {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .value
+            .clone()
+    }
+
+    /// Whether the token is due for a proactive refresh.
+    pub fn due_for_refresh(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .refresh_at
+            .is_some_and(|at| std::time::Instant::now() >= at)
+    }
+
+    /// Publish a freshly acquired token and its proactive-refresh deadline.
+    pub fn update(&self, value: String, refresh_at: Option<std::time::Instant>) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.value = value;
+        inner.refresh_at = refresh_at;
+    }
+}
+
+/// Re-acquire a runner OAuth token from the worker's own credentials.
+///
+/// The worker's current directory is the runner root (the listener spawns it
+/// there), so the same `.runner` / `.credentials` / `.credentials_rsaparams`
+/// the listener uses are available. Returns `None` when the credentials are
+/// missing or the exchange fails — the caller keeps the current token.
+pub(crate) async fn refresh_worker_oauth_token() -> Option<(String, Option<std::time::Instant>)> {
+    let root = std::env::current_dir().ok()?;
+    let config = crate::settings::RunnerConfig::load(&root).ok()?;
+    let http = HttpClient::new(None).ok()?;
+    crate::listener::oauth::get_oauth_token(&http, &config)
+        .await
+        .ok()
+}
+
 /// Shared reporting context for step updates and log uploads.
 pub struct ReportingContext {
     pub results: ResultsClient,
     pub run_service: RunServiceClient,
-    pub access_token: String,
+    pub access_token: LiveToken,
     pub plan_id: String,
     pub job_id: String,
     /// Populated when running via the AzDO (legacy) protocol path.
@@ -52,6 +128,15 @@ pub struct ReportingContext {
     /// Connectivity checks performed after the first lease renewal. The
     /// official runner includes these in completejob telemetry.
     pub connectivity_telemetry: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+impl ReportingContext {
+    /// The current OAuth token. The renew loop swaps in fresh tokens as the
+    /// server-issued ones expire, so every caller must read through this
+    /// rather than holding a copy from job start.
+    pub fn token(&self) -> String {
+        self.access_token.get()
+    }
 }
 
 fn create_reporting_context(
@@ -88,7 +173,7 @@ fn create_reporting_context(
     Ok(Some(Arc::new(ReportingContext {
         results: ResultsClient::new(http.clone(), results_url),
         run_service: RunServiceClient::new(http, service_url),
-        access_token,
+        access_token: LiveToken::new(access_token),
         plan_id: plan_id.to_owned(),
         job_id: job_id.to_owned(),
         azdo,
@@ -342,7 +427,7 @@ pub async fn run_job(
             });
             match azdo
                 .client
-                .update_timeline(&rpt.access_token, &plan_id, &azdo.timeline_id, &job_record)
+                .update_timeline(&rpt.token(), &plan_id, &azdo.timeline_id, &job_record)
                 .await
             {
                 Ok(_) => info!("AzDO: job timeline record set to InProgress"),
@@ -354,7 +439,7 @@ pub async fn run_job(
     {
         let token = reporting
             .as_ref()
-            .map(|rpt| rpt.access_token.clone())
+            .map(|rpt| rpt.token())
             .unwrap_or_default();
         Some(super::live_logs::LiveLogQueue::connect(feed_url, token))
     } else {
@@ -807,7 +892,25 @@ fn spawn_renew_loop(
                 "jobId": rpt.job_id,
             });
 
-            let delay = match rpt.run_service.renew_job(&rpt.access_token, &body).await {
+            // The server-issued OAuth token expires mid-job (default TTL
+            // 2999s). Refresh proactively before it does; a stale token makes
+            // renewjob 401 forever and the run hangs `in_progress` with a
+            // pinned VM. A refresh failure is not fatal — renew with what we
+            // have and let the 401 path retry.
+            if rpt.access_token.due_for_refresh() {
+                match refresh_worker_oauth_token().await {
+                    Some((fresh, refresh_at)) => {
+                        rpt.access_token.update(fresh, refresh_at);
+                        info!("OAuth token refreshed proactively for job renewal");
+                        failures = 0;
+                    }
+                    None => warn!(
+                        "OAuth token refresh before renewal failed; continuing with current token"
+                    ),
+                }
+            }
+
+            let delay = match rpt.run_service.renew_job(&rpt.token(), &body).await {
                 Ok(resp) => {
                     lease_deadline = resp
                         .get("lockedUntil")
@@ -825,6 +928,18 @@ fn spawn_renew_loop(
                     break;
                 }
                 Err(error) => {
+                    // 401 means the token expired despite the proactive
+                    // schedule (clock skew, or the mint happened at acquire
+                    // and the TTL elapsed before the first refresh tick).
+                    // Re-acquire and retry once immediately.
+                    if is_unauthorized(&error) {
+                        warn!("renewjob unauthorized; re-acquiring OAuth token");
+                        if let Some((fresh, refresh_at)) = refresh_worker_oauth_token().await {
+                            rpt.access_token.update(fresh, refresh_at);
+                            failures = 0;
+                            continue;
+                        }
+                    }
                     failures += 1;
                     warn!(failures, "renewjob failed: {error:#}");
                     let exhausted = lease_deadline
@@ -873,7 +988,7 @@ fn spawn_renew_loop(
                         let ws_key = base64::engine::general_purpose::STANDARD.encode(nonce);
                         http.client_for(&results_ws)
                             .get(&results_ws)
-                            .header("Authorization", format!("Bearer {}", rpt.access_token))
+                            .header("Authorization", format!("Bearer {}", rpt.token()))
                             .header("Connection", "Upgrade")
                             .header("Upgrade", "websocket")
                             .header("Sec-WebSocket-Version", "13")
@@ -995,7 +1110,8 @@ async fn first_renew_gate(
         if *cancel_rx.borrow() {
             return FirstRenewOutcome::Cancelled;
         }
-        let renew = rpt.run_service.renew_job(&rpt.access_token, &body);
+        let token = rpt.token();
+        let renew = rpt.run_service.renew_job(&token, &body);
         tokio::pin!(renew);
         let result = tokio::select! {
             result = &mut renew => result,
@@ -1119,6 +1235,16 @@ fn is_job_not_found(error: &anyhow::Error) -> bool {
     matches!(
         error.downcast_ref::<HttpError>(),
         Some(HttpError::Status { status, .. }) if *status == reqwest::StatusCode::NOT_FOUND
+    )
+}
+
+/// Whether an error is an HTTP 401 — the token the worker presents was
+/// rejected, which for a long-running job means the server-issued OAuth
+/// token expired mid-job and must be re-acquired.
+fn is_unauthorized(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<HttpError>(),
+        Some(HttpError::Status { status, .. }) if *status == reqwest::StatusCode::UNAUTHORIZED
     )
 }
 #[cfg(test)]
