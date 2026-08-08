@@ -136,8 +136,11 @@ pub(crate) fn creation_url(org: Option<&str>, state: &str) -> String {
 /// The manifest GitHub renders as a pre-filled App-creation form.
 ///
 /// `hook_attributes` is only meaningful when GitHub can reach the engine, so
-/// a loopback-only setup ships the App with webhooks inactive rather than
-/// pointing them at an address that will never resolve from GitHub's side.
+/// a loopback-only setup ships the App with no webhook configured rather
+/// than pointing one at an address that will never resolve from GitHub's
+/// side. GitHub rejects any `hook_attributes.url` it cannot reach over the
+/// public Internet — including an `active: false` one — so the field is
+/// omitted entirely.
 pub(crate) fn manifest(
     name: &str,
     redirect_url: &str,
@@ -164,19 +167,11 @@ pub(crate) fn manifest(
             });
             manifest["default_events"] = serde_json::json!(DEFAULT_EVENTS);
         }
-        // An inactive hook still gets a secret from GitHub, so a later
-        // `--public-url` only has to flip the switch in App settings. The
-        // manifest schema requires `hook_attributes.url` whenever the object
-        // is present — GitHub rejects a url-less object with the misleading
-        // `"url" wasn't supplied` even though the top-level url is set. Use
-        // the loopback redirect as the placeholder; it is never delivered to
-        // while the hook is inactive.
-        None => {
-            manifest["hook_attributes"] = serde_json::json!({
-                "url": redirect_url,
-                "active": false,
-            })
-        }
+        // No webhook at all: GitHub validates hook URL reachability even for
+        // inactive hooks and rejects loopback addresses. Omitting the object
+        // means no `webhook_secret` is minted, so a later `--public-url`
+        // has to add the secret when enabling the hook in App settings.
+        None => {}
     }
     manifest
 }
@@ -699,12 +694,11 @@ mod tests {
     #[test]
     fn manifest_disables_webhooks_without_a_public_url() {
         let manifest = manifest("preloop", "http://127.0.0.1:4000/callback", None);
-        assert_eq!(manifest["hook_attributes"]["active"], false);
-        assert_eq!(
-            manifest["hook_attributes"]["url"], "http://127.0.0.1:4000/callback",
-            "GitHub's schema requires hook_attributes.url whenever the object \
-             is present; a url-less inactive hook is rejected with the \
-             misleading `\"url\" wasn't supplied`"
+        assert!(
+            manifest.get("hook_attributes").is_none(),
+            "GitHub rejects hook URLs it cannot reach over the public \
+             Internet (127.0.0.1), even when the hook is inactive; no \
+             public URL must mean no webhook configured"
         );
         assert!(manifest.get("default_events").is_none());
         assert_eq!(
