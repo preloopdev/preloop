@@ -414,8 +414,17 @@ fn copy_dir_all(source: &Path, target: &Path) -> anyhow::Result<()> {
         let entry = entry?;
         let from = entry.path();
         let to = target.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
+        let meta = fs::symlink_metadata(&from)?;
+        if meta.is_dir() {
             copy_dir_all(&from, &to)?;
+        } else if meta.file_type().is_symlink() {
+            // Preserve links instead of following them: `agent-rootfs`
+            // contains busybox-style absolute links whose targets do not
+            // resolve on the host, so `fs::copy` would fail with ENOENT.
+            // This mirrors the official installer's `cp -a`.
+            let link = fs::read_link(&from)?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&link, &to)?;
         } else {
             fs::copy(&from, &to)?;
         }
@@ -823,6 +832,25 @@ mod tests {
         builder
             .append_dir_all("smolvm-9.9.9-darwin-arm64", &source)
             .unwrap();
+        // A busybox-style absolute link whose target does not resolve on
+        // the host. `append_dir_all` follows links and would fail on it,
+        // so append the link entry by hand; the install must preserve the
+        // link, not follow it.
+        #[cfg(unix)]
+        {
+            let mut link_header = tar::Header::new_gnu();
+            link_header.set_entry_type(tar::EntryType::Symlink);
+            link_header.set_size(0);
+            link_header.set_mode(0o777);
+            link_header.set_cksum();
+            builder
+                .append_link(
+                    &mut link_header,
+                    "smolvm-9.9.9-darwin-arm64/agent-rootfs/sh",
+                    "/bin/busybox",
+                )
+                .unwrap();
+        }
         builder.into_inner().unwrap().finish().unwrap();
 
         let install = SmolvmInstall {
@@ -830,7 +858,10 @@ mod tests {
             data_dir: directory.path().join("data"),
             bin_dir: directory.path().join("bin"),
         };
-        install_smolvm_from_archive(&archive_path, "9.9.9", &install).unwrap();
+        if let Err(error) = install_smolvm_from_archive(&archive_path, "9.9.9", &install) {
+            eprintln!("install error: {error:?}");
+            panic!("install failed: {error}");
+        }
 
         assert_eq!(
             std::fs::read_to_string(install.prefix.join(".version")).unwrap(),
@@ -850,6 +881,20 @@ mod tests {
             std::fs::read(install.data_dir.join("agent-rootfs/rootfs.txt")).unwrap(),
             b"rootfs"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let link_meta =
+                std::fs::symlink_metadata(install.data_dir.join("agent-rootfs/sh")).unwrap();
+            assert!(
+                link_meta.file_type().is_symlink(),
+                "symlink must be preserved"
+            );
+            assert_eq!(
+                std::fs::read_link(install.data_dir.join("agent-rootfs/sh")).unwrap(),
+                std::path::Path::new("/bin/busybox")
+            );
+        }
         #[cfg(target_os = "linux")]
         assert_eq!(
             std::fs::read(install.data_dir.join("init.krun")).unwrap(),
@@ -903,3 +948,4 @@ mod tests {
         assert_eq!(std::fs::read(output_path).expect("binary"), contents);
     }
 }
+
