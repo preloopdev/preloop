@@ -141,7 +141,7 @@ Client-side (`preloop` CLI): `PRELOOP_URL` (default `http://127.0.0.1:9090`) and
 | `PRELOOP_RUNNER_LABELS` | — | Extra labels on every pool runner. **Jobs only dispatch to runners whose labels match `runs-on`** |
 | `PRELOOP_RUNNER_NAME_PREFIX` | `preloop-runner` | Machine naming prefix |
 | `PRELOOP_RUNNER_DNS` | host resolver | Force a resolver inside guests (e.g. `8.8.8.8`) when the host's is unreachable from the VM network |
-| `PRELOOP_WORKSPACE` | — | Workspace scanned for toolchains (`rust-toolchain.toml`, `.nvmrc`, …) when baking goldens |
+| `PRELOOP_WORKSPACE` | — | Workspace whose `container:` / `services:` images the golden pre-pulls; toolchains are a fixed curated set baked into every golden |
 | `PRELOOP_REQUIRE_JOB_ASSIGNMENTS` | — | Only let a runner claim jobs explicitly assigned to it |
 
 ---

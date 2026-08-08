@@ -25,20 +25,20 @@ The golden is a single self-contained file built from:
 2. **The runner**: `preloop-runner` cross-built for `aarch64-unknown-linux-gnu`
    (cargo-zigbuild), fidelity-tracked against the official `actions/runner`
    (see `versions.toml`).
-3. **Pre-baked toolchains**: at build time the workspace is scanned for
-   version files — `rust-toolchain.toml`, `.nvmrc` / `.node-version`,
-   `.python-version` — and for `setup-*` action pins
-   (`dtolnay/rust-toolchain`, `actions-rust-lang/setup-rust-toolchain`,
-   `setup-node`) in the workflow(s). Those exact versions are installed into
-   the image so jobs don't download toolchains per run. Anything not baked is
-   installed at job time.
+3. **Curated toolchains**: a fixed toolchain set is baked into every golden —
+   currently Rust stable, plus the GitHub-hosted parity toolset in
+   `base_install_script` (node/python/go toolcaches, git, git-lfs, docker,
+   nvm, yarn). The bake is deliberately *not* workspace-derived: per-project
+   version files were fragile (a broken resolver silently stalled every
+   provisioning attempt) and every project would need bespoke resolution
+   code. `setup-*` actions download any version a job asks for at job time —
+   the same model GitHub-hosted runners use.
 4. **Base dependencies**: the apt set `install_base_dependencies` installs
    (git, curl, build-essential, python3, jq, unzip/zip, locales, …).
 5. **Docker**: daemon + CLI, so `container:` / `services:` jobs work.
 
-Because the toolchains are baked from the *workspace's* version files, the
-same golden serves different projects: build it with
-`--workspace <repo>` to get that project's toolchain set.
+Because the toolchain set is fixed, the same golden serves every project;
+`--workspace` only contributes the `container:` / `services:` image preload.
 
 ## Building a golden
 
@@ -51,8 +51,9 @@ preloop build-golden \
 
 - `--runner-bundle`: directory containing the Linux `preloop-runner` binary
   (`just build-preloop` cross-builds it; `--base-image` overrides the OS).
-- `--workspace`: the repo whose toolchain files are baked
-  (`PRELOOP_WORKSPACE` overrides it for daemon deployments).
+- `--workspace`: the repo whose `container:` / `services:` images are
+  pre-pulled into the golden (`PRELOOP_WORKSPACE` overrides it for daemon
+  deployments). Toolchains are the fixed curated set, not workspace-derived.
 - On releases, `release-golden.yml` builds this artifact and uploads it as
   `preloop-ubuntu-24.04-aarch64`. The pool looks for it at
   `<preloop_home>/vms/preloop-ubuntu-24.04-<arch>` (`preloop_home` is
@@ -144,7 +145,7 @@ naming the official image version they were taken from.
 | `PRELOOP_USE_PACKED_GOLDEN` | Use the packed golden artifact for the pool (default off; the release layout enables it) |
 | `PRELOOP_USE_FORK` | Run the pool as host forks instead of booting microVMs (default true with a golden) |
 | `PRELOOP_RUNNER_POOL_SIZE` | Pool size (warm forks / VMs) |
-| `PRELOOP_WORKSPACE` | Workspace whose toolchains the golden should carry (build-time) |
+| `PRELOOP_WORKSPACE` | Workspace whose `container:` / `services:` images the golden pre-pulls (build-time); toolchains are the fixed curated set |
 | `PRELOOP_RUNNER_BASE_IMAGE` | Override the base image at serve time (default: digest-pinned Ubuntu 24.04) |
 | `PRELOOP_RUNNER_LABELS` | Extra `runs-on` labels the pool's runners declare (comma-separated) |
 | `PRELOOP_RUNNER_USER` / `PRELOOP_RUNNER_UID` | Guest runner account (default `runner`/1001, GitHub-hosted parity); `root` restores root; empty disables switching |
@@ -153,9 +154,10 @@ naming the official image version they were taken from.
 
 - **A job misbehaves after a golden change**: the pool caches unpacked pack
   dirs per VM; deleting the per-VM pack cache forces a clean unpack.
-- **Missing toolchain in the VM**: the version file wasn't present in
-  `--workspace` at build time (or the workflow uses a version range that
-  resolves differently at job time). Rebuild the golden with the repo as the
-  workspace — or accept the per-job install.
+- **Missing toolchain in the VM**: the toolchain is not in the curated bake
+  (or the workflow pins a version outside the baked toolcache). `setup-*`
+  actions download the exact version at job time — the intended path. If a
+  toolchain is needed implicitly (no setup action), add it to the curated
+  bake in `base_install_script`.
 - **Wrong OS inside the VM**: `--base-image` was overridden; the default is
   the digest-pinned Ubuntu 24.04.

@@ -5,7 +5,7 @@ mod keys;
 
 include!(concat!(env!("OUT_DIR"), "/pins.rs"));
 
-use crate::environment::{EnvironmentResolver, EnvironmentSpec, ToolchainLayer};
+use crate::environment::{curated_toolchains, EnvironmentSpec, ToolchainLayer};
 use crate::keys::{KeyPool, StagedKey};
 use preloop_gha_protocol::RUNNER_BUSY_SENTINEL;
 
@@ -1409,16 +1409,14 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         }
         self.remove_stale_machines().await?;
 
-        let resolver = Arc::new(EnvironmentResolver::new(self.config.base_image.clone()));
         let golden_registry = Arc::new(GoldenRegistry::new(self.config.name_prefix.clone()));
 
         // If fork mode is enabled, prepare a golden fork base VM for the
         // workspace's default environment (base image plus any toolchains
         // detected from version files like rust-toolchain.toml).
         if self.config.use_fork {
-            let default_environment = resolver
-                .resolve_workspace(self.config.workspace.as_deref())
-                .with_base(self.config.base_image.clone());
+            let default_environment =
+                EnvironmentSpec::new(self.config.base_image.clone(), curated_toolchains());
             let golden = MachineName::new(format!("{}-golden", golden_registry.name_prefix))?;
             let result = if self.config.use_packed_artifact {
                 prepare_packed_golden(&self.provider, &self.config, &golden).await
@@ -1448,7 +1446,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // jobs arrive, capped by the host's CPU budget.
         if self.config.size == 0 {
             return self
-                .run_on_demand(shutdown, golden_registry, resolver, idle, keys, building)
+                .run_on_demand(shutdown, golden_registry, idle, keys, building)
                 .await;
         }
 
@@ -1457,7 +1455,6 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             let config = self.config.clone();
             let slot_shutdown = shutdown.child_token();
             let slot_registry = golden_registry.clone();
-            let slot_resolver = resolver.clone();
             let slot_handles = PoolHandles {
                 idle: idle.clone(),
                 keys: keys.clone(),
@@ -1470,7 +1467,6 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     slot,
                     slot_shutdown,
                     slot_registry,
-                    slot_resolver,
                     slot_handles,
                 )
                 .await
@@ -1507,7 +1503,6 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         &self,
         shutdown: CancellationToken,
         golden_registry: Arc<GoldenRegistry>,
-        resolver: Arc<EnvironmentResolver>,
         idle: Arc<AtomicUsize>,
         keys: Arc<KeyPool>,
         building: Arc<AtomicUsize>,
@@ -1558,7 +1553,6 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             let config = self.config.clone();
             let slot_shutdown = shutdown.child_token();
             let slot_registry = golden_registry.clone();
-            let slot_resolver = resolver.clone();
             let slot_handles = PoolHandles {
                 idle: idle.clone(),
                 keys: keys.clone(),
@@ -1573,7 +1567,6 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     slot,
                     slot_shutdown,
                     slot_registry,
-                    slot_resolver,
                     slot_handles,
                 )
                 .await;
@@ -1650,12 +1643,12 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             let _ = self.provider.delete(&name).await;
             return Err(error);
         }
-        // Bake the workspace's toolchains (rust-toolchain.toml, .nvmrc, etc.)
-        // into the artifact so every runner forked from it carries them
-        // pre-installed, instead of installing per job.
-        let toolchains = EnvironmentResolver::new(self.config.base_image.clone())
-            .resolve_workspace(self.config.workspace.as_deref())
-            .toolchains;
+        // Bake the curated toolchain set into the artifact so every runner
+        // forked from it carries it pre-installed. The base install script
+        // already covers the GitHub-hosted parity toolset (node/python/go
+        // toolcaches, git, docker, nvm, yarn); `setup-*` actions download any
+        // other version a job asks for at job time.
+        let toolchains = curated_toolchains();
         for layer in &toolchains {
             for command in layer.install_commands() {
                 if let Err(error) = self.provider.exec(&name, &command).await {
@@ -1871,7 +1864,6 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     slot: usize,
     shutdown: CancellationToken,
     golden_registry: Arc<GoldenRegistry>,
-    environment_resolver: Arc<EnvironmentResolver>,
     handles: PoolHandles,
 ) -> Result<(), OrchestratorError> {
     // Resolve the golden for the queued job's environment.
@@ -1887,9 +1879,7 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
             }
             None => config.base_image.clone(),
         };
-        let env_spec = environment_resolver
-            .resolve_workspace(config.workspace.as_deref())
-            .with_base(env_base.clone());
+        let env_spec = EnvironmentSpec::new(env_base.clone(), curated_toolchains());
         let fingerprint = env_spec.fingerprint.clone();
         let toolchains = env_spec.toolchains.clone();
         let selected = golden_registry
@@ -1922,9 +1912,7 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
             },
         )
     } else {
-        let env_spec = environment_resolver
-            .resolve_workspace(config.workspace.as_deref())
-            .with_base(config.base_image.clone());
+        let env_spec = EnvironmentSpec::new(config.base_image.clone(), curated_toolchains());
         (
             None,
             RunnerEnvironment {
@@ -1985,7 +1973,6 @@ async fn run_slot<P: VmProvider + 'static>(
     slot: usize,
     shutdown: CancellationToken,
     golden_registry: Arc<GoldenRegistry>,
-    environment_resolver: Arc<EnvironmentResolver>,
     handles: PoolHandles,
 ) -> Result<(), OrchestratorError> {
     let PoolHandles {
@@ -2011,13 +1998,9 @@ async fn run_slot<P: VmProvider + 'static>(
                 }
                 None => config.base_image.clone(),
             };
-            // Resolve toolchains from the workspace (rust-toolchain.toml,
-            // .nvmrc, etc.) so the golden carries the project's toolchain
-            // pre-installed. Base image still comes from the queued job's
-            // `runs-on` labels; `with_base` recomputes the fingerprint.
-            let env_spec = environment_resolver
-                .resolve_workspace(config.workspace.as_deref())
-                .with_base(env_base.clone());
+            // The golden carries the curated toolchain set; base image still
+            // comes from the queued job's `runs-on` labels.
+            let env_spec = EnvironmentSpec::new(env_base.clone(), curated_toolchains());
             let fingerprint = env_spec.fingerprint.clone();
             let toolchains = env_spec.toolchains.clone();
 
@@ -2059,10 +2042,7 @@ async fn run_slot<P: VmProvider + 'static>(
             )
         } else {
             // create-per-runner path: no golden, provision fresh each time.
-            // Toolchains are installed per runner after boot.
-            let env_spec = environment_resolver
-                .resolve_workspace(config.workspace.as_deref())
-                .with_base(config.base_image.clone());
+            let env_spec = EnvironmentSpec::new(config.base_image.clone(), curated_toolchains());
             (
                 None,
                 RunnerEnvironment {

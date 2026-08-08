@@ -1,6 +1,6 @@
 //! Toolchain and base-image resolution for disposable job environments.
 
-use preloop_gha_protocol::{oci_image_ref, JobPlan};
+use preloop_gha_protocol::oci_image_ref;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -241,6 +241,18 @@ impl ToolchainLayer {
     }
 }
 
+/// The fixed set of toolchains baked into every golden.
+///
+/// Deliberately not workspace-derived. The base install script already bakes
+/// the GitHub-hosted parity toolset (node/python/go toolcaches, git, git-lfs,
+/// docker, nvm, yarn — see `base_install_script`), so per-project version
+/// files add nothing there. Rust is the one toolchain the base bake lacks,
+/// so it is baked for everyone. `setup-*` actions download any other version
+/// a job asks for at job time — the same model GitHub-hosted runners use.
+pub fn curated_toolchains() -> Vec<ToolchainLayer> {
+    vec![ToolchainLayer::Rust("stable".into())]
+}
+
 /// Digest-pinned Ubuntu base images.
 ///
 /// The floating tags (`ubuntu:24.04`) move whenever Canonical publishes a
@@ -325,225 +337,6 @@ impl EnvironmentSpec {
     }
 }
 
-/// Resolves VM base images and toolchain layers from a workflow job.
-#[derive(Debug, Clone)]
-pub struct EnvironmentResolver {
-    default_base: String,
-}
-
-impl EnvironmentResolver {
-    /// Construct a resolver using `default_base` when it is non-empty.
-    pub fn new(default_base: String) -> Self {
-        Self { default_base }
-    }
-
-    /// Resolve environment requirements from workspace toolchain files only.
-    ///
-    /// Used by the runner pool, which knows the workspace but not the full
-    /// job plan. Reads `rust-toolchain.toml`, `.nvmrc`, `.python-version`,
-    /// and `go.mod` so the golden is pre-baked with the project's toolchains.
-    pub fn resolve_workspace(&self, workspace: Option<&Path>) -> EnvironmentSpec {
-        let mut detected = BTreeSet::new();
-        if let Some(workspace) = workspace {
-            if let Some(version) = first_existing_line(workspace, &[".nvmrc", ".node-version"]) {
-                detected.insert(ToolchainLayer::Node(strip_node_prefix(version)));
-            }
-            let rust_version = read_rust_toolchain_toml(workspace)
-                .or_else(|| first_existing_line(workspace, &["rust-toolchain"]));
-            if let Some(version) = rust_version {
-                detected.insert(ToolchainLayer::Rust(version));
-            }
-            if let Some(version) = first_existing_line(workspace, &[".python-version"]) {
-                detected.insert(ToolchainLayer::Python(version));
-            }
-            if let Some(version) = read_go_mod(workspace) {
-                detected.insert(ToolchainLayer::Go(version));
-            }
-        }
-        let base = if self.default_base.trim().is_empty() {
-            "ubuntu:24.04".into()
-        } else {
-            self.default_base.clone()
-        };
-        EnvironmentSpec::new(base, detected.into_iter().collect())
-    }
-
-    /// Resolve environment requirements from a job plan and optional workspace.
-    pub fn resolve(&self, job: &JobPlan, workspace: Option<&Path>) -> EnvironmentSpec {
-        let mut detected = BTreeSet::new();
-        let mut explicit_node = false;
-        let mut explicit_rust = false;
-        let mut explicit_python = false;
-        let mut explicit_go = false;
-
-        for step in &job.steps {
-            let Some(uses) = step.uses.as_deref() else {
-                continue;
-            };
-            let Some((action, reference)) = uses.split_once('@') else {
-                continue;
-            };
-            let action = action.to_ascii_lowercase();
-            let reference = reference.trim();
-            if action == "actions/setup-node" {
-                if let Some(version) =
-                    setup_input_version(&step.with, "node-version", "node-version-file", workspace)
-                {
-                    detected.insert(ToolchainLayer::Node(version));
-                    explicit_node = true;
-                }
-            } else if action == "actions/setup-python" {
-                if let Some(version) = setup_input_version(
-                    &step.with,
-                    "python-version",
-                    "python-version-file",
-                    workspace,
-                ) {
-                    detected.insert(ToolchainLayer::Python(version));
-                    explicit_python = true;
-                }
-            } else if action == "actions/setup-go" {
-                if let Some(version) =
-                    setup_input_version(&step.with, "go-version", "go-version-file", workspace)
-                {
-                    detected.insert(ToolchainLayer::Go(version));
-                    explicit_go = true;
-                }
-            } else if action == "dtolnay/rust-toolchain" {
-                if !reference.is_empty() {
-                    detected.insert(ToolchainLayer::Rust(reference.to_owned()));
-                    explicit_rust = true;
-                }
-            } else if action == "actions-rust-lang/setup-rust-toolchain" {
-                if let Some(version) = value_string(step.with.get("toolchain")) {
-                    detected.insert(ToolchainLayer::Rust(version));
-                    explicit_rust = true;
-                }
-            }
-        }
-
-        if let Some(workspace) = workspace {
-            if !explicit_node {
-                if let Some(version) = first_existing_line(workspace, &[".nvmrc", ".node-version"])
-                {
-                    detected.insert(ToolchainLayer::Node(strip_node_prefix(version)));
-                }
-            }
-            if !explicit_rust {
-                let version = read_rust_toolchain_toml(workspace)
-                    .or_else(|| first_existing_line(workspace, &["rust-toolchain"]));
-                if let Some(version) = version {
-                    detected.insert(ToolchainLayer::Rust(version));
-                }
-            }
-            if !explicit_python {
-                if let Some(version) = first_existing_line(workspace, &[".python-version"]) {
-                    detected.insert(ToolchainLayer::Python(version));
-                }
-            }
-            if !explicit_go {
-                if let Some(version) = read_go_mod(workspace) {
-                    detected.insert(ToolchainLayer::Go(version));
-                }
-            }
-        }
-
-        let base = if self.default_base.trim().is_empty() {
-            EnvironmentSpec::default_base(&job.runs_on)
-        } else {
-            self.default_base.clone()
-        };
-        EnvironmentSpec::new(base, detected.into_iter().collect())
-    }
-}
-
-fn value_string(value: Option<&Value>) -> Option<String> {
-    let value = value?;
-    let value = match value {
-        Value::String(value) => value.clone(),
-        Value::Number(value) => value.to_string(),
-        _ => return None,
-    };
-    let value = value.trim().to_owned();
-    (!value.is_empty()).then_some(value)
-}
-
-fn setup_input_version(
-    inputs: &std::collections::BTreeMap<String, Value>,
-    direct_key: &str,
-    file_key: &str,
-    workspace: Option<&Path>,
-) -> Option<String> {
-    if let Some(version) = value_string(inputs.get(direct_key)) {
-        return Some(version);
-    }
-    let file = value_string(inputs.get(file_key))?;
-    let workspace = workspace?;
-    let path = workspace.join(file);
-    // go.mod requires special parsing to extract the `go X.Y` directive.
-    if direct_key == "go-version" && path.file_name().is_some_and(|n| n == "go.mod") {
-        return read_go_mod(workspace);
-    }
-    first_line(&path).map(|version| {
-        if direct_key == "node-version" {
-            strip_node_prefix(version)
-        } else {
-            version
-        }
-    })
-}
-
-fn first_existing_line(workspace: &Path, names: &[&str]) -> Option<String> {
-    names
-        .iter()
-        .find_map(|name| first_line(&workspace.join(name)))
-}
-
-fn first_line(path: &Path) -> Option<String> {
-    fs::read_to_string(path)
-        .ok()?
-        .lines()
-        .next()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-fn strip_node_prefix(version: String) -> String {
-    version
-        .strip_prefix('v')
-        .unwrap_or(&version)
-        .trim()
-        .to_owned()
-}
-
-fn read_rust_toolchain_toml(workspace: &Path) -> Option<String> {
-    let content = fs::read_to_string(workspace.join("rust-toolchain.toml")).ok()?;
-    let mut in_toolchain = false;
-    for line in content.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            in_toolchain = line == "[toolchain]";
-            continue;
-        }
-        if in_toolchain && line.starts_with("channel") {
-            let value = line.split_once('=')?.1.trim();
-            let value = value.split('#').next()?.trim();
-            return Some(value.trim_matches(['"', '\'']).trim().to_owned());
-        }
-    }
-    None
-}
-
-fn read_go_mod(workspace: &Path) -> Option<String> {
-    let content = fs::read_to_string(workspace.join("go.mod")).ok()?;
-    content.lines().find_map(|line| {
-        let line = line.trim();
-        let version = line.strip_prefix("go")?.split_whitespace().next()?;
-        (!version.is_empty()).then(|| version.to_owned())
-    })
-}
-
 fn safe_component(value: &str) -> String {
     value
         .chars()
@@ -563,114 +356,7 @@ fn hex_digest(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use preloop_gha_protocol::{JobId, StepPlan};
-    use std::collections::{BTreeMap, BTreeSet};
-
-    fn job(steps: Vec<StepPlan>, runs_on: Vec<String>) -> JobPlan {
-        JobPlan {
-            id: JobId("test".into()),
-            base_id: "test".into(),
-            name: "test".into(),
-            runner_group: None,
-            runs_on,
-            needs: Vec::new(),
-            matrix: Default::default(),
-            matrix_index: None,
-            matrix_total: None,
-            deferred_matrix: None,
-            env: BTreeMap::new(),
-            steps,
-            if_condition: None,
-            fail_fast: true,
-            continue_on_error: false,
-            max_parallel: None,
-            secrets_inherit: false,
-            container: None,
-            services: None,
-            inputs: BTreeMap::new(),
-            workflow_file: None,
-            workflow_ref: None,
-            workflow_sha: None,
-            workflow_repository: None,
-            secrets_map: BTreeMap::new(),
-            job_outputs: BTreeMap::new(),
-            oidc_id_token_granted: false,
-            permissions: None,
-            oidc_environment: None,
-            oidc_job_workflow_ref: None,
-            concurrency_group: None,
-            concurrency_cancel_in_progress: None,
-            concurrency_queue: None,
-            reusable_call: None,
-        }
-    }
-
-    fn setup(uses: &str, with: &[(&str, &str)]) -> StepPlan {
-        StepPlan {
-            id: None,
-            name: None,
-            run: None,
-            uses: Some(uses.into()),
-            env: BTreeMap::new(),
-            with: with
-                .iter()
-                .map(|(key, value)| ((*key).into(), Value::String((*value).into())))
-                .collect(),
-            if_condition: None,
-            working_directory: None,
-            shell: None,
-            continue_on_error: None,
-        }
-    }
-
-    #[test]
-    fn detects_setup_node() {
-        let plan = job(
-            vec![setup("Actions/Setup-Node@v4", &[("node-version", "22")])],
-            vec!["ubuntu-latest".into()],
-        );
-        let spec = EnvironmentResolver::new(String::new()).resolve(&plan, None);
-        assert_eq!(spec.toolchains, vec![ToolchainLayer::Node("22".into())]);
-    }
-
-    #[test]
-    fn detects_rust_action_tag() {
-        let plan = job(
-            vec![setup("dtolnay/rust-toolchain@1.85.1", &[])],
-            vec!["ubuntu-24.04".into()],
-        );
-        let spec = EnvironmentResolver::new(String::new()).resolve(&plan, None);
-        assert_eq!(spec.toolchains, vec![ToolchainLayer::Rust("1.85.1".into())]);
-    }
-
-    #[test]
-    fn falls_back_to_version_files() {
-        let path =
-            std::env::temp_dir().join(format!("preloop-environment-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&path).unwrap();
-        fs::write(path.join(".nvmrc"), "v20.11.0\n").unwrap();
-        fs::write(
-            path.join("rust-toolchain.toml"),
-            "[toolchain]\nchannel = \"stable\"\n",
-        )
-        .unwrap();
-        fs::write(path.join(".python-version"), "3.12\n").unwrap();
-        fs::write(path.join("go.mod"), "module example\n\ngo 1.24\n").unwrap();
-        let plan = job(Vec::new(), vec!["ubuntu-22.04".into()]);
-        let spec = EnvironmentResolver::new(String::new()).resolve(&plan, Some(&path));
-        let expected = BTreeSet::from([
-            ToolchainLayer::Node("20.11.0".into()),
-            ToolchainLayer::Rust("stable".into()),
-            ToolchainLayer::Python("3.12".into()),
-            ToolchainLayer::Go("1.24".into()),
-        ]);
-        assert_eq!(
-            spec.toolchains.iter().cloned().collect::<BTreeSet<_>>(),
-            expected
-        );
-        assert_eq!(spec.base, UBUNTU_22_04_PIN);
-        fs::remove_dir_all(path).unwrap();
-    }
+    use std::collections::BTreeSet;
 
     #[test]
     fn default_base_returns_digest_pinned_images() {
@@ -768,35 +454,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_workspace_detects_toolchains_without_job_plan() {
-        let path = std::env::temp_dir().join(format!("preloop-workspace-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&path).unwrap();
-        fs::write(
-            path.join("rust-toolchain.toml"),
-            "[toolchain]\nchannel = \"1.97\"\ncomponents = [\"rustfmt\", \"clippy\"]\n",
-        )
-        .unwrap();
-        fs::write(path.join(".nvmrc"), "22\n").unwrap();
-
-        let spec = EnvironmentResolver::new("ubuntu:24.04".into()).resolve_workspace(Some(&path));
-        let expected = BTreeSet::from([
-            ToolchainLayer::Rust("1.97".into()),
-            ToolchainLayer::Node("22".into()),
-        ]);
-        assert_eq!(
-            spec.toolchains.iter().cloned().collect::<BTreeSet<_>>(),
-            expected
-        );
-        assert_eq!(spec.base, "ubuntu:24.04");
-        fs::remove_dir_all(path).unwrap();
-    }
-
-    #[test]
     fn with_base_recomputes_fingerprint() {
-        let spec = EnvironmentSpec::new(
-            "ubuntu:24.04".into(),
-            vec![ToolchainLayer::Rust("1.97".into())],
-        );
+        let spec = EnvironmentSpec::new("ubuntu:24.04".into(), curated_toolchains());
         let original_fingerprint = spec.fingerprint.clone();
         let rebased = spec.clone().with_base("ubuntu:22.04".into());
         assert_eq!(rebased.base, "ubuntu:22.04");
@@ -805,17 +464,18 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_is_stable_and_deduplicated() {
-        let steps = vec![
-            setup("actions/setup-node@v4", &[("node-version", "22")]),
-            setup("actions/setup-node@v4", &[("node-version", "22")]),
-        ];
-        let plan = job(steps.clone(), vec!["ubuntu-24.04".into()]);
-        let resolver = EnvironmentResolver::new(String::new());
-        let first = resolver.resolve(&plan, None);
-        let second = resolver.resolve(&job(steps, vec!["ubuntu-24.04".into()]), None);
-        assert_eq!(first.fingerprint, second.fingerprint);
-        assert_eq!(first.toolchains, vec![ToolchainLayer::Node("22".into())]);
+    fn curated_toolchains_is_fixed_and_deduped() {
+        let first = curated_toolchains();
+        let second = curated_toolchains();
+        assert_eq!(first, second, "the curated set must be deterministic");
+        assert_eq!(
+            first.iter().collect::<BTreeSet<_>>().len(),
+            first.len(),
+            "no duplicate toolchains"
+        );
+        // Rust is the one toolchain the base bake does not cover, so it is
+        // the deliberate member of the curated set.
+        assert!(first.contains(&ToolchainLayer::Rust("stable".into())));
     }
 
     #[test]
