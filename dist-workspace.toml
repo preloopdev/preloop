@@ -2,6 +2,7 @@
 members = ["cargo:crates/preloop-cli"]
 
 [dist]
+allow-dirty = ["ci"]
 cargo-dist-version = "0.32.0"
 dist = false
 packages = ["preloop-cli"]
