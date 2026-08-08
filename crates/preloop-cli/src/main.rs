@@ -753,7 +753,18 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
     let pool_available = match &pool_config {
         Ok(_) => true,
         Err(error) => {
-            tracing::warn!(%error, "local runner provisioning unavailable; jobs queue until a runner is available");
+            // "jobs queue until a runner is available" was the old message,
+            // but a missing bundle means no runner will EVER become
+            // available — the queue is a dead end the user only discovers by
+            // staring at `preloop status`. Name the cause and the fix so the
+            // first run fails loudly and instructively instead.
+            tracing::warn!(
+                %error,
+                "no runner pool: jobs will fail after the queue grace window. \
+                 Install the Linux guest runner with `preloop update`, or set \
+                 PRELOOP_RUNNER_BUNDLE to a directory containing preloop-runner \
+                 (see docs/vm-images.md)"
+            );
             false
         }
     };
