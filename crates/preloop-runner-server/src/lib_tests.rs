@@ -15230,7 +15230,19 @@ async fn store_recovery_preserves_pool_pairing_and_oauth_client_ids() {
         )
         .await;
         let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+        // The store persists SystemTime as microseconds
+        // (`system_time_us`/`system_time_from_us`), so a nanosecond-precision
+        // `now` can never equal the recovered value on Linux hosts (where
+        // SystemTime has ns resolution). Round to the store's precision —
+        // the same fix `5f96d0dd` applied to the sibling assertions here.
         let now = std::time::SystemTime::now();
+        let now = std::time::UNIX_EPOCH
+            + std::time::Duration::from_micros(
+                now.duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_micros()
+                    .min(u64::MAX as u128) as u64,
+            );
         {
             let mut inner = state.inner.lock().await;
             inner.runner_client_ids.insert("client-abc".to_owned(), 42);
