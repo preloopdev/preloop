@@ -1243,6 +1243,8 @@ pub(crate) async fn github_callback(
     #[derive(Deserialize)]
     struct AppManifestConversion {
         id: u64,
+        #[serde(default)]
+        slug: Option<String>,
         pem: String,
         webhook_secret: Option<String>,
     }
@@ -1263,6 +1265,10 @@ pub(crate) async fn github_callback(
         "GitHub App credentials received"
     );
 
+    let install = credentials
+        .slug
+        .as_ref()
+        .map(|slug| format!("https://github.com/apps/{slug}/installations/new"));
     let credentials_html = format!(
         r#"<!DOCTYPE html>
 <html>
@@ -1275,18 +1281,29 @@ pub(crate) async fn github_callback(
     <p><strong>Webhook Secret:</strong> {}</p>
     <p><strong>Private Key PEM:</strong></p>
     <pre style="background: #f6f8fa; padding: 16px; border-radius: 6px; overflow-x: auto;">{}</pre>
-    <p>To use this App, configure your local environment and restart `preloop`:</p>
+    <p>Save the key to a file, then hand both to the engine and restart it:</p>
     <pre style="background: #f6f8fa; padding: 16px; border-radius: 6px;">
+preloop setup github --via app --app-id {} --pem-file ./app.pem
 export PRELOOP_WEBHOOK_SECRET="{}"
-export PRELOOP_GITHUB_APP_ID="{}"
     </pre>
+    <p>{}</p>
+    <p>On the machine running the engine, <code>preloop setup github --via app</code>
+       does all of this without copying anything out of a browser.</p>
 </body>
 </html>"#,
         credentials.id,
         credentials.webhook_secret.as_deref().unwrap_or("none"),
         credentials.pem,
+        credentials.id,
         credentials.webhook_secret.as_deref().unwrap_or("none"),
-        credentials.id
+        install
+            .as_ref()
+            .map(|url| format!(
+                r#"Then install it on your repositories: <a href="{url}">{url}</a>"#
+            ))
+            .unwrap_or_else(|| {
+                "Then install it on your repositories from the App's settings page.".to_owned()
+            }),
     );
 
     Ok(axum::response::Html(credentials_html))

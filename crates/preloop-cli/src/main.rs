@@ -15,6 +15,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
 
+mod app_manifest;
 mod debug_session;
 mod github_auth;
 mod github_setup;
@@ -629,6 +630,9 @@ fn resolve_github_auth(args: &ServeArgs, state_dir: &std::path::Path) -> anyhow:
 
     auth.apply();
     eprintln!("[preloop] {}", github_auth::StoredAuth::report());
+    if github_auth::StoredAuth::is_unconfigured() {
+        eprintln!("[preloop] connect GitHub with `preloop setup` — until then, jobs get local tokens and webhooks are unverified");
+    }
     Ok(())
 }
 
@@ -644,7 +648,7 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
         .listen
         .clone()
         .or_else(|| std::env::var("PRELOOP_LISTEN").ok())
-        .unwrap_or_else(|| "0.0.0.0:9090".to_owned())
+        .unwrap_or_else(|| "127.0.0.1:9090".to_owned())
         .parse()
         .context("--listen / PRELOOP_LISTEN must be a socket address")?;
     let public_url = args
@@ -707,7 +711,7 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
     let pool_available = match &pool_config {
         Ok(_) => true,
         Err(error) => {
-            tracing::warn!(%error, "local runner provisioning unavailable; control plane remains available");
+            tracing::warn!(%error, "local runner provisioning unavailable; jobs queue until a runner is available");
             false
         }
     };
@@ -841,22 +845,39 @@ fn local_runner_pool_config(
         .or_else(|| {
             let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
             let target_dir = exe_dir.parent()?;
-            // Prefer Linux guest binaries when the CLI itself is a macOS
-            // development build. The runner executes inside Linux VMs.
-            let candidates = [
+            let mut candidates = Vec::new();
+            // Released installs (`install.sh`, `preloop update`) place the
+            // Linux guest runner under <prefix>/lib/preloop/runner/<triple>/.
+            // Prefer the host's own Linux triple, then any installed triple.
+            if let Some(prefix) = exe_dir.parent() {
+                let runner_dir = prefix.join("lib/preloop/runner");
+                candidates.push(runner_dir.join(linux_guest_triple()));
+                if let Ok(entries) = std::fs::read_dir(&runner_dir) {
+                    let mut installed: Vec<_> = entries
+                        .flatten()
+                        .map(|entry| entry.path())
+                        .filter(|path| path.is_dir())
+                        .collect();
+                    installed.sort();
+                    candidates.extend(installed);
+                }
+            }
+            // Development builds keep the guest binary under target/<triple>/;
+            // the runner executes inside Linux VMs.
+            candidates.extend([
                 target_dir.join("aarch64-unknown-linux-gnu/debug"),
                 target_dir.join("aarch64-unknown-linux-musl/debug"),
                 target_dir.join("aarch64-unknown-linux-gnu/release"),
                 target_dir.join("aarch64-unknown-linux-musl/release"),
                 exe_dir.join("preloop-runner"),
                 exe_dir.to_path_buf(),
-            ];
+            ]);
             candidates
                 .into_iter()
                 .find(|directory| directory.join("preloop-runner").is_file())
         })
         .filter(|path| linux_runner_bundle(path))
-        .context("Linux runner bundle unavailable; run `just build-preloop` to build target/aarch64-unknown-linux-gnu/debug/preloop-runner")?;
+        .context("Linux runner bundle unavailable; set PRELOOP_RUNNER_BUNDLE to a directory containing a Linux preloop-runner, or build one with `just build-preloop` (docs/vm-images.md)")?;
     let use_packed_artifact = env_flag("PRELOOP_USE_PACKED_GOLDEN", false);
     // The workspace is scanned for toolchain version files (rust-toolchain.toml,
     // .nvmrc, etc.) so the golden can be built with the project's toolchains
@@ -1104,6 +1125,15 @@ fn linux_runner_bundle(path: &std::path::Path) -> bool {
     };
     let mut magic = [0_u8; 4];
     file.read_exact(&mut magic).is_ok() && magic == *b"\x7fELF"
+}
+
+/// The Linux guest triple the local microVM pool runs on this host.
+pub(crate) fn linux_guest_triple() -> &'static str {
+    if cfg!(target_arch = "x86_64") {
+        "x86_64-unknown-linux-gnu"
+    } else {
+        "aarch64-unknown-linux-gnu"
+    }
 }
 
 fn env_flag(name: &str, default: bool) -> bool {

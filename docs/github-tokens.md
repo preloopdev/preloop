@@ -86,7 +86,26 @@ setup: Preloop always supplies *some* `GITHUB_TOKEN` value.
 A GitHub App gives each job a short-lived installation token scoped to the
 repository the run belongs to and to the permissions that job declares.
 
-1. Visit `http://<server>/api/v1/github/register` in a browser. Use the
+On the machine running the engine, one command does the whole thing:
+
+```sh
+preloop setup github --via app          # add --org NAME for an org App
+```
+
+It serves the manifest from a single-use loopback listener, GitHub redirects
+the one-time code back to it, and the App id, private key, and webhook secret
+land in `~/.preloop/config.toml` (mode 0600). Add `--public-url https://…` to
+create the App with webhook delivery enabled; without it webhooks are off,
+since GitHub cannot reach `localhost`. Restart the engine to pick the
+credentials up.
+
+### From a browser, against a remote engine
+
+When the engine already runs somewhere GitHub can reach, the same manifest is
+served by the engine itself. This path *displays* the credentials rather than
+storing them — you copy them to the engine yourself:
+
+1. Visit `https://<server>/api/v1/github/register` in a browser. Use the
    server's final public HTTPS URL if you also want webhook delivery — GitHub
    cannot reach `localhost`, and the manifest only includes webhook settings for
    non-local hosts.
@@ -101,8 +120,8 @@ repository the run belongs to and to the permissions that job declares.
 5. Configure the server and restart it:
 
    ```sh
-   export PRELOOP_GITHUB_APP_ID="123456"
-   export PRELOOP_GITHUB_APP_PEM_FILE="/secure/path/preloop-app.pem"
+   preloop setup github --via app --app-id 123456 --pem-file /secure/path/preloop-app.pem
+   export PRELOOP_WEBHOOK_SECRET="…"   # or set github.webhook_secret in config.toml
    ```
 
 ### Configuration reference
