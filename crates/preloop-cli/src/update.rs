@@ -6,9 +6,11 @@ use reqwest::Client;
 use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::fs;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use tar::Archive;
+use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
 const DEFAULT_REPOSITORY: &str = "preloopdev/preloop";
@@ -90,6 +92,23 @@ pub(crate) async fn run(args: UpdateArgs) -> anyhow::Result<()> {
         Err(error) => println!("warning: Linux runner bundle not updated: {error:#}"),
     }
 
+    // The engine cannot provision VMs without a smolvm whose `machine
+    // create` accepts --mount-socket (the host-to-guest control-socket
+    // mount). Updating only the preloop binary and runner bundle left an
+    // old smolvm failing every provisioning attempt after an update, so
+    // probe the resolved binary and install the current smolvm release
+    // when the flag is missing. `--check` stays read-only.
+    #[cfg(unix)]
+    if !args.check {
+        match ensure_smolvm(&client).await {
+            Ok(()) => {}
+            Err(error) => println!(
+                "warning: smolvm not updated: {error:#}\n  \
+                 install it with: curl -sSL https://smolmachines.com/install.sh | bash"
+            ),
+        }
+    }
+
     if remote_version <= current_version {
         println!("preloop {} is already up to date", current_version);
         return Ok(());
@@ -162,6 +181,233 @@ async fn update_linux_runner_bundle(client: &Client, release: &Release) -> anyho
         .await
         .with_context(|| format!("install {}", destination.display()))?;
     set_executable_permissions(&destination)?;
+    Ok(())
+}
+
+/// Install layout for smolvm, matching the official installer's locations.
+/// Tests point these at tempdirs.
+#[derive(Debug, Clone)]
+struct SmolvmInstall {
+    /// `~/.smolvm`: the wrapper, binary, `lib/`, and disk templates.
+    prefix: PathBuf,
+    /// macOS: `~/Library/Application Support/smolvm`; Linux:
+    /// `$XDG_DATA_HOME/smolvm` or `~/.local/share/smolvm`.
+    data_dir: PathBuf,
+    /// `~/.local/bin`: where the `smolvm` symlink lives.
+    bin_dir: PathBuf,
+}
+
+fn default_smolvm_install() -> Option<SmolvmInstall> {
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    #[cfg(target_os = "macos")]
+    let data_dir = home
+        .join("Library")
+        .join("Application Support")
+        .join("smolvm");
+    #[cfg(target_os = "linux")]
+    let data_dir = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local").join("share"))
+        .join("smolvm");
+    Some(SmolvmInstall {
+        prefix: home.join(".smolvm"),
+        data_dir,
+        bin_dir: home.join(".local").join("bin"),
+    })
+}
+
+/// Host triple naming used by the smolvm release assets.
+fn smolvm_platform() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Some("darwin-arm64"),
+        ("macos", "x86_64") => Some("darwin-x86_64"),
+        ("linux", "aarch64") => Some("linux-arm64"),
+        ("linux", "x86_64") => Some("linux-x86_64"),
+        _ => None,
+    }
+}
+
+/// Whether a smolvm binary's `machine create` accepts `--mount-socket`.
+///
+/// The wrapper scripts can report a recent `--version` while resolving to
+/// an old binary, so the flag's presence in the help text is the reliable
+/// check (the same probe preloop-vm runs before provisioning).
+async fn probe_mount_socket(binary: &Path) -> bool {
+    let mut command = tokio::process::Command::new(binary);
+    command
+        .args(["machine", "create", "--help"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    let stdout = child.stdout.take();
+    let Ok(status) = child.wait().await else {
+        return false;
+    };
+    if !status.success() {
+        return false;
+    }
+    let Some(mut stdout) = stdout else {
+        return false;
+    };
+    let mut output = String::new();
+    stdout.read_to_string(&mut output).await.is_ok() && output.contains("--mount-socket")
+}
+
+/// Probe the `smolvm` on PATH, the same binary the engine resolves.
+async fn smolvm_supports_mount_socket() -> bool {
+    probe_mount_socket(Path::new("smolvm")).await
+}
+
+/// Probe the resolved smolvm and install the current release when it cannot
+/// mount sockets into the guest.
+async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
+    if smolvm_supports_mount_socket().await {
+        return Ok(());
+    }
+    let platform = smolvm_platform().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no smolvm release asset for {}-{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    })?;
+    let release = fetch_release(
+        client,
+        "https://api.github.com/repos/smol-machines/smolvm/releases",
+        None,
+    )
+    .await?;
+    let version = release
+        .tag_name
+        .strip_prefix('v')
+        .unwrap_or(&release.tag_name);
+    let archive_name = format!("smolvm-{version}-{platform}.tar.gz");
+    let archive_asset = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == archive_name)
+        .with_context(|| format!("release {} has no {archive_name} asset", release.tag_name))?;
+    let checksum_asset = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == "checksums.sha256");
+    let install = default_smolvm_install().context("HOME is not set")?;
+    let staging = tempfile::tempdir().context("create smolvm download directory")?;
+    let archive_path = staging.path().join(&archive_name);
+    download(client, &archive_asset.browser_download_url, &archive_path).await?;
+    verify_checksum(client, archive_asset, checksum_asset, &archive_path).await?;
+    install_smolvm_from_archive(&archive_path, version, &install)?;
+    println!("installed smolvm {version}");
+    Ok(())
+}
+
+/// Install a downloaded (and checksum-verified) smolvm release archive,
+/// replicating the official installer's layout.
+fn install_smolvm_from_archive(
+    archive_path: &Path,
+    version: &str,
+    install: &SmolvmInstall,
+) -> anyhow::Result<()> {
+    let staging = tempfile::tempdir().context("create smolvm staging directory")?;
+    let extracted = staging.path().join("extracted");
+    extract_tar_gz(archive_path, &extracted)?;
+
+    // The archive carries a single top-level `smolvm-<version>-<platform>/`.
+    let top = fs::read_dir(&extracted)?
+        .next()
+        .context("smolvm archive is empty")?
+        .context("read smolvm archive entry")?
+        .path();
+
+    fs::create_dir_all(&install.prefix)?;
+    // `lib/` is replaced wholesale; everything else in the prefix (machine
+    // state, databases) is left alone.
+    let lib = top.join("lib");
+    if lib.is_dir() {
+        let target = install.prefix.join("lib");
+        let _ = fs::remove_dir_all(&target);
+        copy_dir_all(&lib, &target)?;
+    }
+    for name in [
+        "smolvm",
+        "smolvm-bin",
+        "storage-template.ext4",
+        "overlay-template.ext4",
+    ] {
+        let source = top.join(name);
+        if source.is_file() {
+            fs::copy(&source, install.prefix.join(name))?;
+        }
+    }
+    set_executable_permissions(&install.prefix.join("smolvm"))?;
+    set_executable_permissions(&install.prefix.join("smolvm-bin"))?;
+    fs::write(install.prefix.join(".version"), format!("{version}\n"))?;
+
+    let agent_rootfs = top.join("agent-rootfs");
+    if agent_rootfs.is_dir() {
+        fs::create_dir_all(&install.data_dir)?;
+        let target = install.data_dir.join("agent-rootfs");
+        let _ = fs::remove_dir_all(&target);
+        copy_dir_all(&agent_rootfs, &target)?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let init_krun = top.join("init.krun");
+        if init_krun.is_file() {
+            fs::create_dir_all(&install.data_dir)?;
+            fs::copy(&init_krun, install.data_dir.join("init.krun"))?;
+            set_executable_permissions(&install.data_dir.join("init.krun"))?;
+        }
+    }
+
+    fs::create_dir_all(&install.bin_dir)?;
+    let link = install.bin_dir.join("smolvm");
+    let _ = fs::remove_file(&link);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&install.prefix.join("smolvm"), &link)?;
+    Ok(())
+}
+
+/// Extract a .tar.gz into `destination`, rejecting entries that escape it.
+fn extract_tar_gz(archive_path: &Path, destination: &Path) -> anyhow::Result<()> {
+    let file = fs::File::open(archive_path)?;
+    let mut archive = Archive::new(GzDecoder::new(file));
+    fs::create_dir_all(destination)?;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?;
+        let mut safe = PathBuf::new();
+        for component in path.components() {
+            match component {
+                Component::Normal(part) => safe.push(part),
+                Component::CurDir => {}
+                _ => bail!("unsafe path in smolvm archive: {}", path.display()),
+            }
+        }
+        if safe.as_os_str().is_empty() {
+            continue;
+        }
+        entry.unpack(&destination.join(safe))?;
+    }
+    Ok(())
+}
+
+fn copy_dir_all(source: &Path, target: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(target)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = target.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&from, &to)?;
+        } else {
+            fs::copy(&from, &to)?;
+        }
+    }
     Ok(())
 }
 
@@ -494,6 +740,125 @@ mod tests {
         assert!(is_binary_entry(Path::new(
             "preloop-v0.22.0-aarch64-apple-darwin/preloop"
         )));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_detects_mount_socket_in_help_text() {
+        let directory = tempfile::tempdir().unwrap();
+        for (flag, expected) in [
+            ("--mount-socket <HOST:GUEST>", true),
+            ("--docker-socket [-- <COMMAND>...]", false),
+        ] {
+            let executable = directory.path().join(format!("smolvm-{expected}"));
+            std::fs::write(
+                &executable,
+                format!(
+                    "#!/bin/sh\nif [ \"${{1-}}:${{2-}}:${{3-}}\" = \"machine:create:--help\" ]; then\n  printf '%s\\n' \"Usage: smolvm machine create {flag}\"\n  exit 0\nfi\nexit 0\n"
+                ),
+            )
+            .unwrap();
+            let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&executable, permissions).unwrap();
+
+            assert_eq!(
+                probe_mount_socket(&executable).await,
+                expected,
+                "help containing `{flag}`"
+            );
+        }
+    }
+
+    #[test]
+    fn platform_naming_covers_apple_silicon_and_linux() {
+        match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("macos", "aarch64") => assert_eq!(smolvm_platform(), Some("darwin-arm64")),
+            ("macos", "x86_64") => assert_eq!(smolvm_platform(), Some("darwin-x86_64")),
+            ("linux", "aarch64") => assert_eq!(smolvm_platform(), Some("linux-arm64")),
+            ("linux", "x86_64") => assert_eq!(smolvm_platform(), Some("linux-x86_64")),
+            other => assert_eq!(smolvm_platform(), None, "unexpected host {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_from_archive_places_the_official_layout() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let directory = tempfile::tempdir().unwrap();
+        // Build a fake smolvm release tree.
+        let source = directory.path().join("smolvm-9.9.9-darwin-arm64");
+        let lib = source.join("lib");
+        std::fs::create_dir_all(lib.join("nested")).unwrap();
+        std::fs::write(lib.join("nested").join("libfile"), b"lib").unwrap();
+        std::fs::write(source.join("smolvm"), "#!/bin/sh\n").unwrap();
+        std::fs::write(source.join("smolvm-bin"), "#!/bin/sh\n").unwrap();
+        std::fs::write(source.join("storage-template.ext4"), b"template").unwrap();
+        let rootfs = source.join("agent-rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        std::fs::write(rootfs.join("rootfs.txt"), b"rootfs").unwrap();
+        #[cfg(target_os = "linux")]
+        std::fs::write(source.join("init.krun"), b"init").unwrap();
+
+        // Tar it up the way the release does.
+        let archive_path = directory.path().join("smolvm-9.9.9-darwin-arm64.tar.gz");
+        let file = std::fs::File::create(&archive_path).unwrap();
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        builder
+            .append_dir_all("smolvm-9.9.9-darwin-arm64", &source)
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+
+        let install = SmolvmInstall {
+            prefix: directory.path().join("prefix"),
+            data_dir: directory.path().join("data"),
+            bin_dir: directory.path().join("bin"),
+        };
+        install_smolvm_from_archive(&archive_path, "9.9.9", &install).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(install.prefix.join(".version")).unwrap(),
+            "9.9.9\n"
+        );
+        assert_eq!(
+            std::fs::read(install.prefix.join("lib/nested/libfile")).unwrap(),
+            b"lib"
+        );
+        assert!(install.prefix.join("smolvm").is_file());
+        assert!(install.prefix.join("smolvm-bin").is_file());
+        assert_eq!(
+            std::fs::read(install.prefix.join("storage-template.ext4")).unwrap(),
+            b"template"
+        );
+        assert_eq!(
+            std::fs::read(install.data_dir.join("agent-rootfs/rootfs.txt")).unwrap(),
+            b"rootfs"
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            std::fs::read(install.data_dir.join("init.krun")).unwrap(),
+            b"init"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        assert_ne!(
+            std::fs::metadata(install.prefix.join("smolvm"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0,
+            "smolvm wrapper must stay executable"
+        );
+        let link = std::fs::symlink_metadata(install.bin_dir.join("smolvm")).unwrap();
+        assert!(link.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_link(install.bin_dir.join("smolvm")).unwrap(),
+            install.prefix.join("smolvm")
+        );
     }
 
     #[test]
