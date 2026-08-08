@@ -5888,7 +5888,7 @@ async fn try_req(app: &Router, method: Method, uri: &str, body: Value) -> (Statu
             header::AUTHORIZATION,
             // Strict-by-default registration accepts only the system
             // credential; test servers run with the default token.
-            &format!("RemoteAuth {DEFAULT_PRELOOP_SYSTEM_TOKEN}"),
+            format!("RemoteAuth {DEFAULT_PRELOOP_SYSTEM_TOKEN}"),
         );
     }
     let request = if body.is_null() {
@@ -8477,6 +8477,109 @@ async fn pat_only_config_supplies_job_github_token() {
         .expect("job message carries a GitHub token variable");
     assert_eq!(token.value.as_deref(), Some("github_pat_testvalue"));
     assert_eq!(token.is_secret, Some(true));
+}
+
+/// The App-manifest setup flow receives the webhook secret from GitHub and
+/// stores it in the config file. Before that key existed the secret lived
+/// only in `PRELOOP_WEBHOOK_SECRET`, so a configured engine still rejected
+/// every signed delivery until the operator re-exported it by hand.
+#[tokio::test]
+async fn config_webhook_secret_verifies_signed_deliveries() {
+    let temp = tempfile::tempdir().unwrap();
+    let ws_dir = temp.path().join("workspace");
+    tokio::fs::create_dir_all(ws_dir.join(".github/workflows"))
+        .await
+        .unwrap();
+    tokio::fs::write(
+        ws_dir.join(".github/workflows/build.yml"),
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+    )
+    .await
+    .unwrap();
+    let config_path = temp.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        "[github]\nwebhook_secret = \"from-config-file\"\n",
+    )
+    .unwrap();
+
+    // Explicit config path rather than `PRELOOP_CONFIG`, which would race
+    // every other test building an `AppState`.
+    let mut state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
+        .await
+        .unwrap();
+    assert_eq!(
+        state.webhook_secret.as_deref(),
+        Some("from-config-file"),
+        "the config file is a valid source for the webhook secret"
+    );
+    state.local_workspace = Some(ws_dir);
+    let app = app(state.clone(), CancellationToken::new());
+
+    let payload = serde_json::json!({
+        "ref": "refs/heads/main",
+        "before": "0000000000000000000000000000000000000000",
+        "after": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+        "repository": {"full_name": "owner/repo", "default_branch": "main"},
+        "commits": [{
+            "id": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+            "added": ["src/main.rs"],
+            "modified": [],
+            "removed": []
+        }],
+    });
+    let body = serde_json::to_vec(&payload).unwrap();
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = Hmac::<Sha256>::new_from_slice(b"from-config-file").unwrap();
+    mac.update(&body);
+    let signature = format!(
+        "sha256={}",
+        mac.finalize()
+            .into_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/github/webhooks")
+                .header("x-github-event", "push")
+                .header("x-github-delivery", "config-secret-delivery")
+                .header("x-hub-signature-256", &signature)
+                .header("content-type", "application/json")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a correctly signed delivery is accepted with only the config file configured"
+    );
+
+    // The same body under a different secret must still be rejected —
+    // otherwise the check is decorative.
+    let forged = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/github/webhooks")
+                .header("x-github-event", "push")
+                .header("x-github-delivery", "forged-delivery")
+                .header("x-hub-signature-256", "sha256=deadbeef")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(forged.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

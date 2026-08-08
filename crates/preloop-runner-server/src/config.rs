@@ -37,6 +37,11 @@ pub struct GitHubConfig {
     /// policy. Also the credential for the `--via pat` setup path.
     #[serde(default)]
     pub pat: Option<String>,
+    /// Shared secret for `X-Hub-Signature-256` webhook verification.
+    /// Written by the App-manifest setup flow, which receives it from
+    /// GitHub. Env: `PRELOOP_WEBHOOK_SECRET`.
+    #[serde(default)]
+    pub webhook_secret: Option<String>,
     /// GitHub server URL exposed to workflows as `github.server_url` /
     /// `GITHUB_SERVER_URL`. Defaults to `https://github.com`; point it at a
     /// GHES-style host when the engine fronts one. Env: `PRELOOP_GITHUB_SERVER_URL`.
@@ -75,6 +80,7 @@ impl std::fmt::Debug for GitHubConfig {
             .field("app_pem", &redacted(self.app_pem.is_some()))
             .field("mint_failure", &self.mint_failure)
             .field("pat", &redacted(self.pat.is_some()))
+            .field("webhook_secret", &redacted(self.webhook_secret.is_some()))
             .finish()
     }
 }
@@ -347,6 +353,7 @@ mod tests {
                 ),
                 mint_failure: Some("pat".into()),
                 pat: Some("ghp_secret".into()),
+                webhook_secret: None,
                 server_url: None,
                 api_url: None,
                 graphql_url: None,

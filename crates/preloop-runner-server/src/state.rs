@@ -583,7 +583,6 @@ impl AppState {
         // Capture queue length before moving `inner` into the Mutex so the
         // `queue_depth` atomic is set to the recovered ready-queue size.
         let recovered_queue_len = inner.queue.len();
-        let webhook_secret = std::env::var("PRELOOP_WEBHOOK_SECRET").ok();
         let local_workspace = std::env::var("PRELOOP_LOCAL_WORKSPACE")
             .ok()
             .map(PathBuf::from);
@@ -605,6 +604,19 @@ impl AppState {
         let credential = crate::config::load_credential_secrets()?;
         crate::config::merge_secret_stores(&mut config, credential);
         let github_app = crate::github_app::load_from(&config)?;
+        // Env wins over the config file, matching every other credential
+        // here. An empty value in either source counts as unset: a blank
+        // export must not disable signature verification silently.
+        let webhook_secret = env::var("PRELOOP_WEBHOOK_SECRET")
+            .ok()
+            .filter(|secret| !secret.is_empty())
+            .or_else(|| {
+                config
+                    .github
+                    .webhook_secret
+                    .clone()
+                    .filter(|secret| !secret.is_empty())
+            });
         // Env wins over the config file, matching every other `PRELOOP_GITHUB_*`
         // override. An empty value in either source counts as unset.
         let github_pat = env::var("PRELOOP_GITHUB_TOKEN")
