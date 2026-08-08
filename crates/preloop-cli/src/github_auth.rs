@@ -147,6 +147,26 @@ impl StoredAuth {
         }
     }
 
+    /// Fill only the fields that are still unset.
+    ///
+    /// For merging a lower-precedence store (`config.toml`, written by
+    /// `preloop setup`) under the flags and `github-app.json` values
+    /// [`Self::overlay`] has already applied.
+    pub fn fill_gaps(&mut self, other: Self) {
+        if self.app_id.is_none() {
+            self.app_id = other.app_id;
+        }
+        if self.installation_id.is_none() {
+            self.installation_id = other.installation_id;
+        }
+        if self.private_key_pem.is_none() {
+            self.private_key_pem = other.private_key_pem;
+        }
+        if self.webhook_secret.is_none() {
+            self.webhook_secret = other.webhook_secret;
+        }
+    }
+
     /// Publish these credentials to the environment the server reads.
     ///
     /// Only fills variables that are unset, preserving the documented
@@ -351,6 +371,35 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>();
         assert_eq!(entries, [std::ffi::OsString::from(FILE)]);
+    }
+
+    #[test]
+    fn fill_gaps_only_sets_fields_that_are_still_unset() {
+        let mut auth = sample();
+        auth.installation_id = None;
+        let lower_precedence = StoredAuth {
+            app_id: Some("other-app".to_owned()),
+            installation_id: Some(7),
+            private_key_pem: Some("lower-pem".to_owned()),
+            webhook_secret: None,
+        };
+
+        auth.fill_gaps(lower_precedence);
+
+        assert_eq!(
+            auth,
+            StoredAuth {
+                // app_id and private key already set: untouched.
+                app_id: Some("4429171".to_owned()),
+                installation_id: Some(7),
+                private_key_pem: Some(
+                    "-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----"
+                        .to_owned()
+                ),
+                // still None after the merge: lower store had nothing.
+                webhook_secret: Some("s3cret".to_owned()),
+            }
+        );
     }
 
     #[test]

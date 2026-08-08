@@ -638,8 +638,10 @@ fn prepare_engine_token(
 /// Merge stored and command-line GitHub credentials into the environment the
 /// server reads, optionally persisting them, and report the effective state.
 ///
-/// Precedence, widest to narrowest: existing environment, then `--flags`, then
-/// the stored file. The environment stays authoritative so a container that
+/// Precedence, widest to narrowest: existing environment, then `--flags`,
+/// then `github-app.json` (written by `--save`), then `config.toml`'s
+/// `[github]` section (written by `preloop setup` and read by the server at
+/// startup). The environment stays authoritative so a container that
 /// injects secrets is never overridden by a file left behind by `--save`.
 fn resolve_github_auth(args: &ServeArgs, state_dir: &std::path::Path) -> anyhow::Result<()> {
     let mut auth = github_auth::StoredAuth::load(state_dir)?;
@@ -661,6 +663,17 @@ fn resolve_github_auth(args: &ServeArgs, state_dir: &std::path::Path) -> anyhow:
     };
     let supplied = from_flags != github_auth::StoredAuth::default();
     auth.overlay(from_flags);
+
+    // `preloop setup` stores credentials in config.toml's [github] section,
+    // which is what the server itself loads at startup. Fill any gaps from
+    // it so the startup report matches what the server will actually see.
+    let file_config = preloop_runner_server::config::load_config()?;
+    auth.fill_gaps(github_auth::StoredAuth {
+        app_id: file_config.github.app_id,
+        installation_id: None,
+        private_key_pem: file_config.github.app_pem,
+        webhook_secret: file_config.github.webhook_secret,
+    });
 
     if args.save {
         if !supplied {
