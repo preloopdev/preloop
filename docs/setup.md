@@ -77,6 +77,7 @@ The App and its webhook are one object; the webhook only adds GitHub's
 ability to call you. You can enable it later with `--public-url`, so
 starting without it is never a dead end.
 
+
 ### Option A — GitHub App
 
 GitHub has no API for creating an App, but it does accept a *manifest*: a
@@ -126,7 +127,6 @@ at it:
 cloudflared tunnel --url http://127.0.0.1:9090      # → https://xxx.trycloudflare.com
 preloop setup github --via app --public-url https://xxx.trycloudflare.com
 ```
-
 For anything persistent, prefer a named tunnel: the `trycloudflare.com`
 address above changes every restart, which would leave the webhook URL
 pointing at a dead address. A named tunnel keeps a stable hostname:
@@ -142,6 +142,7 @@ Point the webhook at the stable hostname once:
 ```sh
 preloop setup github --via app --public-url https://ci.example.com
 ```
+
 
 That updates the existing App's webhook URL and secret through GitHub's API
 (`PATCH /app/hook/config`) instead of creating a second App, and stores the
