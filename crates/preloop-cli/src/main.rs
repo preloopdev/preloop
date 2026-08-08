@@ -19,6 +19,7 @@ mod app_manifest;
 mod debug_session;
 mod github_auth;
 mod github_setup;
+mod push;
 mod server_install;
 mod update;
 
@@ -130,6 +131,13 @@ enum Command {
 
     /// Attach to a job paused at a failed step: inspect, fix, retry.
     Debug(debug_session::DebugArgs),
+
+    /// Publish a completed run's result to GitHub: push the tested commit,
+    /// create or update the pull request, and report check runs.
+    ///
+    /// Defaults to the most recent run. Re-running is safe — every step is
+    /// idempotent.
+    Push(PushArgs),
 
     /// Poll GitHub Releases and atomically install the matching binary.
     Update(update::UpdateArgs),
@@ -259,6 +267,39 @@ struct RunArgs {
     /// Submit and return immediately without streaming events.
     #[arg(short = 'd', long)]
     detach: bool,
+
+    /// After the run completes, push the tested commit to GitHub and
+    /// publish the result: create or update the pull request for the branch
+    /// and report check runs for the commit. Requires a clean working tree
+    /// (the pushed commit must be exactly what was tested) and a GitHub
+    /// origin.
+    #[arg(long)]
+    push: bool,
+
+    /// Create a pull request for the branch when none is open. Implies
+    /// `--push`.
+    #[arg(long)]
+    create_pr: bool,
+
+    /// Create newly-created pull requests as drafts, so reviewers are not
+    /// notified until you mark them ready. Only affects PR creation.
+    ///
+    /// A bare `--pr-draft` means draft; `--pr-draft=false` opens new pull
+    /// requests ready for review.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_value_t = true,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set
+    )]
+    pr_draft: bool,
+}
+
+#[derive(Debug, Parser)]
+struct PushArgs {
+    /// Run ID. Defaults to the most recent run.
+    run_id: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -349,6 +390,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Debug(args) => {
             debug_session::run(args, build_client(), server_url(), api_token()).await
         }
+        Command::Push(args) => cmd_push(args).await,
         Command::Update(_)
         | Command::Serve(_)
         | Command::Engine
@@ -1206,7 +1248,25 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         }
     }
 
-    let submission = WorkflowSubmission {
+    // Push-back requires the tested commit to be exactly what lands on
+    // GitHub: a dirty tree would run CI on commit + local edits, then push
+    // the commit alone — untested code. Refuse loudly instead of lying.
+    let push_requested = args.push || args.create_pr;
+    let tested_head = if push_requested {
+        let dirty = git_porcelain().context("failed to check the working tree for --push")?;
+        if !dirty.is_empty() {
+            anyhow::bail!(
+                "--push requires a clean working tree so the pushed commit is exactly what \
+                 was tested. Uncommitted changes:\n  {}\n\nCommit or stash them first.",
+                dirty.join("\n  ")
+            );
+        }
+        Some((git_rev_parse("HEAD")?, git_rev_parse("HEAD^{tree}")?))
+    } else {
+        None
+    };
+
+    let mut submission = WorkflowSubmission {
         workflow_yaml,
         event: event.to_owned(),
         payload,
@@ -1228,6 +1288,20 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                 || (!args.detach && std::io::IsTerminal::is_terminal(&std::io::stdin()))),
         ..Default::default()
     };
+    // Overridden rather than set in the literal so a plain run keeps the
+    // protocol's own defaults for `sha` and `actor`.
+    if let Some((head_sha, head_tree)) = tested_head {
+        submission.sha = head_sha;
+        // The server names the requester in the PR body it opens.
+        if let Some(name) = git_config_user_name() {
+            submission.actor = name;
+        }
+        submission.push = Some(preloop_gha_protocol::PushRequest {
+            create_pr: args.create_pr,
+            draft_pr: args.pr_draft,
+        });
+        submission.push_tree = Some(head_tree);
+    }
 
     let client = build_client();
     let url = server_url();
@@ -1358,8 +1432,28 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
             "✗"
         };
         println!("{symbol} Run: {status:?}");
+        // Push-back runs on any conclusion: a draft PR with red checks is
+        // the reviewable state. Sync progress goes to stderr so piped
+        // stdout stays clean.
+        let push_error = if push_requested {
+            push::push_run(&client, &url, api_token(), &accepted.run_id.to_string())
+                .await
+                .err()
+        } else {
+            None
+        };
+        if let Some(error) = &push_error {
+            eprintln!(
+                "push failed: {error:#}\n\
+                 fix the problem and rerun: `preloop push {}`",
+                accepted.run_id
+            );
+        }
         if status != ExecutionStatus::Success {
             anyhow::bail!("run completed with status {status:?}");
+        }
+        if let Some(error) = push_error {
+            anyhow::bail!("{error:#}");
         }
     }
 
@@ -1502,6 +1596,63 @@ fn detect_git_ref() -> String {
     "refs/heads/main".to_owned()
 }
 
+/// Uncommitted tracked and untracked files, one per line (`git status
+/// --porcelain`). Empty means the working tree is exactly HEAD.
+fn git_porcelain() -> anyhow::Result<Vec<String>> {
+    let output = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .context("git status")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect())
+}
+
+fn git_rev_parse(rev: &str) -> anyhow::Result<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", rev])
+        .output()
+        .with_context(|| format!("git rev-parse {rev}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git rev-parse {rev} failed (are you in a git checkout?): {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn git_config_user_name() -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["config", "user.name"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!name.is_empty()).then_some(name)
+}
+
+async fn cmd_push(args: PushArgs) -> anyhow::Result<()> {
+    let client = build_client();
+    let url = server_url();
+    let run_id = match args.run_id {
+        Some(run_id) => run_id,
+        None => latest_run_id(&client, &url, None).await?.ok_or_else(|| {
+            anyhow::anyhow!("no runs found; pass a run id: `preloop push <run_id>`")
+        })?,
+    };
+    push::push_run(&client, &url, api_token(), &run_id).await
+}
+
 async fn cmd_plan(args: PlanArgs) -> anyhow::Result<()> {
     let workflow = args
         .file
@@ -1535,10 +1686,10 @@ async fn cmd_status() -> anyhow::Result<()> {
         return Ok(());
     }
     println!(
-        "{:<38}  {:<6}  {:<12}  {:<12}  WORKFLOW",
-        "RUN ID", "#", "STATUS", "EVENT"
+        "{:<38}  {:<6}  {:<12}  {:<12}  {:<10}  WORKFLOW",
+        "RUN ID", "#", "STATUS", "EVENT", "PUSH"
     );
-    println!("{}", "-".repeat(90));
+    println!("{}", "-".repeat(104));
     for run in &runs {
         let run_id = run["run_id"].as_str().unwrap_or("?");
         let run_number = run
@@ -1568,9 +1719,19 @@ async fn cmd_status() -> anyhow::Result<()> {
                     .and_then(serde_json::Value::as_str)
             })
             .unwrap_or("?");
+        let push = match run.get("push_state").and_then(|state| state.get("status")) {
+            Some(status) => {
+                let status = status.as_str().unwrap_or("?");
+                match run["push_state"]["pr_number"].as_u64() {
+                    Some(number) => format!("{status} #{number}"),
+                    None => status.to_owned(),
+                }
+            }
+            None => "-".to_owned(),
+        };
         println!(
-            "{:<38}  {:<6}  {:<12}  {:<12}  {}",
-            run_id, run_number, status, event, workflow
+            "{:<38}  {:<6}  {:<12}  {:<12}  {:<10}  {}",
+            run_id, run_number, status, event, push, workflow
         );
     }
     Ok(())
@@ -1966,6 +2127,27 @@ mod tests {
         assert!(args.base.is_none());
         assert!(!args.no_debug, "pausing on failure is the default");
         assert!(args.secrets.is_empty());
+    }
+
+    #[test]
+    fn run_push_flags() {
+        let draft = |args: &[&str]| {
+            let cli = parse(args).unwrap();
+            let Command::Run(args) = cli.command else {
+                panic!("expected Run");
+            };
+            (args.push, args.create_pr, args.pr_draft)
+        };
+        assert_eq!(draft(&["run"]), (false, false, true));
+        assert_eq!(draft(&["run", "--push"]), (true, false, true));
+        // `--create-pr` implies `--push` in `cmd_run`, not in the parser.
+        assert_eq!(draft(&["run", "--create-pr"]), (false, true, true));
+        // A bare flag still means draft; only an explicit value opts out.
+        assert_eq!(draft(&["run", "--push", "--pr-draft"]), (true, false, true));
+        assert_eq!(
+            draft(&["run", "--push", "--pr-draft=false"]),
+            (true, false, false)
+        );
     }
 
     #[test]

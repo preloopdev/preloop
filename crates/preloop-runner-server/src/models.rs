@@ -1,5 +1,28 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum PushStatus {
+    /// The run requested push-back and it has not been performed yet.
+    Pending,
+    /// The tested commit is on GitHub and the PR/check runs are in place.
+    Synced,
+    /// The sync could not be performed (diverged branch, tree mismatch,
+    /// GitHub unreachable, …). `error` carries the reason; a later
+    /// `preloop push` retry may clear it.
+    Blocked,
+}
+
+/// Push-back state for a run that requested `submission.push`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PushState {
+    pub(crate) status: PushStatus,
+    pub(crate) error: Option<String>,
+    /// Pull request number, when the branch has an open PR (created or
+    /// pre-existing).
+    pub(crate) pr_number: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct DapPortRegistration {
     pub(crate) port: u16,
@@ -85,6 +108,8 @@ pub(crate) struct RunRecord {
     pub(crate) workflow_path_str: String,
     pub(crate) event: String,
     pub(crate) conclusion: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) push_state: Option<PushState>,
 }
 
 #[derive(Debug, Clone)]

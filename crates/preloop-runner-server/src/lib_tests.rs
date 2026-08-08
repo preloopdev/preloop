@@ -15556,3 +15556,232 @@ async fn startup_fails_claims_orphaned_by_a_restart() {
         "the unclaimed job stays in the queue for a fresh machine"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Submit-driven CI push-back (`--push`): the server verifies the tested tree,
+// creates the draft PR, and stays idempotent across replays.
+// ---------------------------------------------------------------------------
+
+async fn submit_push_run(app: &Router, sha: &str, push_tree: &str) -> Value {
+    request_json(
+        app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "git_ref": "refs/heads/feat/x",
+            "sha": sha,
+            "push_tree": push_tree,
+            "push": {"create_pr": true, "draft_pr": true}
+        }),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const TREE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    let pr_creates = Arc::new(AtomicUsize::new(0));
+    let pr_bodies = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let check_completions = Arc::new(Mutex::new(Vec::<Value>::new()));
+
+    let mock_app = Router::new()
+        .route(
+            "/repos/owner/repo",
+            get(|| async { Json(json!({"default_branch": "main"})) }),
+        )
+        .route(
+            "/repos/owner/repo/commits/:sha",
+            get(|Path(_sha): Path<String>| async move {
+                Json(json!({"commit": {"tree": {"sha": TREE}}}))
+            }),
+        )
+        .route(
+            "/repos/owner/repo/pulls",
+            get(|| async { Json(json!([])) }).post({
+                let pr_creates = pr_creates.clone();
+                let pr_bodies = pr_bodies.clone();
+                move |body: axum::extract::Json<Value>| {
+                    let pr_creates = pr_creates.clone();
+                    let pr_bodies = pr_bodies.clone();
+                    async move {
+                        pr_creates.fetch_add(1, Ordering::SeqCst);
+                        pr_bodies.lock().unwrap().push(body.0);
+                        Json(json!({"number": 42}))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/repos/owner/repo/check-runs",
+            post(|| async { Json(json!({"id": 7})) }),
+        )
+        .route(
+            "/repos/owner/repo/check-runs/:id",
+            axum::routing::patch({
+                let check_completions = check_completions.clone();
+                move |Path(id): Path<u64>, body: axum::extract::Json<Value>| {
+                    let check_completions = check_completions.clone();
+                    async move {
+                        check_completions.lock().unwrap().push(body.0);
+                        Json(json!({"id": id}))
+                    }
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, mock_app).await.unwrap();
+    });
+
+    // Held for the whole test: the GitHub env vars are process-global.
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    std::env::set_var("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}"));
+    std::env::set_var("PRELOOP_GITHUB_TOKEN", "sync-test-token");
+
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    // 1. A --push submission reports queued check runs at accept time and
+    //    starts in `pending`.
+    let accepted = submit_push_run(&app, SHA, TREE).await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+    {
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&run_id.parse::<RunId>().unwrap()).unwrap();
+        assert_eq!(run.job_check_run_ids.len(), 1, "queued check run at submit");
+        assert_eq!(
+            *run.job_check_run_ids.values().next().unwrap(),
+            7,
+            "check run id comes from the (mock) GitHub API"
+        );
+        assert_eq!(run.push_state.as_ref().unwrap().status, PushStatus::Pending);
+    }
+
+    // 2. Sync before the run is terminal is refused.
+    let (status, _) = request_json_status(
+        &app,
+        Method::POST,
+        &format!("/api/v1/runs/{run_id}/push"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // 3. Terminal run: the sync verifies the tree, creates the draft PR,
+    //    and marks the run pushed.
+    {
+        let mut inner = state.inner.lock().await;
+        let run = inner
+            .runs
+            .get_mut(&run_id.parse::<RunId>().unwrap())
+            .unwrap();
+        run.conclusion = Some("success".to_owned());
+    }
+    let pushed = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/runs/{run_id}/push"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(pushed["status"], "pushed");
+    assert_eq!(pushed["pr_number"], 42);
+    assert!(pushed["pr_url"].as_str().unwrap().ends_with("/pull/42"));
+
+    {
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&run_id.parse::<RunId>().unwrap()).unwrap();
+        assert_eq!(run.push_state.as_ref().unwrap().status, PushStatus::Synced);
+        assert_eq!(run.push_state.as_ref().unwrap().pr_number, Some(42));
+    }
+    let pr_body = pr_bodies.lock().unwrap().first().unwrap().clone();
+    assert_eq!(pr_body["head"], "feat/x");
+    assert_eq!(pr_body["base"], "main");
+    assert_eq!(pr_body["draft"], true, "new PRs are drafts by default");
+    assert!(pr_body["body"].as_str().unwrap().contains(SHA));
+    assert_eq!(pr_creates.load(Ordering::SeqCst), 1);
+    assert!(
+        check_completions.lock().unwrap().is_empty(),
+        "jobs with a check run at submit are not re-reported by the sync"
+    );
+
+    // 4. Replay is a no-op: no second PR, same response.
+    let again = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/runs/{run_id}/push"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(again["pr_number"], 42);
+    assert_eq!(pr_creates.load(Ordering::SeqCst), 1, "idempotent replay");
+
+    // 5. A pushed tree that differs from the tested tree blocks the sync.
+    let accepted = submit_push_run(&app, SHA, "cccccccccccccccccccccccccccccccccccccccc").await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+    {
+        let mut inner = state.inner.lock().await;
+        let run = inner
+            .runs
+            .get_mut(&run_id.parse::<RunId>().unwrap())
+            .unwrap();
+        run.conclusion = Some("success".to_owned());
+    }
+    let (status, _) = request_json_status(
+        &app,
+        Method::POST,
+        &format!("/api/v1/runs/{run_id}/push"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    {
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&run_id.parse::<RunId>().unwrap()).unwrap();
+        assert_eq!(run.push_state.as_ref().unwrap().status, PushStatus::Blocked);
+        assert!(run
+            .push_state
+            .as_ref()
+            .unwrap()
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("does not match"));
+    }
+
+    // 6. A run submitted without --push can never be pushed.
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo",
+        }),
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+    let (status, _) = request_json_status(
+        &app,
+        Method::POST,
+        &format!("/api/v1/runs/{run_id}/push"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    std::env::remove_var("PRELOOP_GITHUB_TOKEN");
+    std::env::remove_var("PRELOOP_GITHUB_API_URL");
+}

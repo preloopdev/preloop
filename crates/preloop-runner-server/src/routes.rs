@@ -413,6 +413,13 @@ pub(crate) fn build_app(
             )),
         )
         .route(
+            "/api/v1/runs/:run_id/push",
+            post(crate::github_push::push_run).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
+        .route(
             "/api/v1/runs/:run_id/events.ndjson",
             get(run_events).route_layer(middleware::from_fn_with_state(
                 shared.clone(),

@@ -198,6 +198,7 @@ mod tests {
             workflow_path_str: ".github/workflows/workflow.yml".to_owned(),
             event: "push".to_owned(),
             conclusion: None,
+            push_state: None,
         }
     }
 
