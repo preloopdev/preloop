@@ -2,8 +2,6 @@
 
 ![Watch the preloop demo: a failed step, a fix in another pane, and a re-run, all local, no push required](docs/demo/demo.gif)
 
-> Full-resolution video: [debug.mp4](docs/demo/debug.mp4)
-
 > A failed step, a fix in another pane, and a re-run, all local, with no push required.
 
 ---
