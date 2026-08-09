@@ -1,4 +1,5 @@
 use super::*;
+use futures::StreamExt as _;
 use std::collections::BTreeSet;
 
 pub(crate) async fn healthz(State(shared): State<Arc<SharedState>>) -> Json<serde_json::Value> {
@@ -2114,21 +2115,26 @@ pub(crate) async fn cancel_run(
     if cancellation_count > 0 {
         shared.state.message_notify.notify_waiters();
     }
-    for job_id in cancelled_jobs {
-        crate::github::report_check_run_completed(
-            &shared,
-            run_id,
-            &job_id,
-            ExecutionStatus::Cancelled,
-        )
-        .await;
-    }
     shared
         .state
         .emit(NdjsonEvent::RunStatus {
             run_id,
             status: ExecutionStatus::Cancelled,
             reason: None,
+        })
+        .await;
+    futures::stream::iter(cancelled_jobs)
+        .for_each_concurrent(Some(8), |job_id| {
+            let shared = Arc::clone(&shared);
+            async move {
+                crate::github::report_check_run_completed(
+                    &shared,
+                    run_id,
+                    &job_id,
+                    ExecutionStatus::Cancelled,
+                )
+                .await;
+            }
         })
         .await;
     Ok(Json(record))

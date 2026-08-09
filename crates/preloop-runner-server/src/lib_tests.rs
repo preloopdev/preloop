@@ -5043,14 +5043,28 @@ jobs:
 #[tokio::test]
 async fn cancel_run_completes_github_checks_and_terminal_metadata() {
     let check_completions = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+    let completion_starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let all_completions_started = Arc::new(tokio::sync::Notify::new());
+    let release_completions = Arc::new(tokio::sync::Notify::new());
     let mock_app = Router::new().route(
         "/repos/owner/repo/check-runs/:id",
         axum::routing::patch({
             let check_completions = check_completions.clone();
+            let completion_starts = completion_starts.clone();
+            let all_completions_started = all_completions_started.clone();
+            let release_completions = release_completions.clone();
             move |Path(id): Path<u64>, body: axum::extract::Json<Value>| {
                 let check_completions = check_completions.clone();
+                let completion_starts = completion_starts.clone();
+                let all_completions_started = all_completions_started.clone();
+                let release_completions = release_completions.clone();
                 async move {
                     check_completions.lock().unwrap().push(body.0);
+                    if completion_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == 2
+                    {
+                        all_completions_started.notify_one();
+                    }
+                    release_completions.notified().await;
                     Json(json!({"id": id}))
                 }
             }
@@ -5063,18 +5077,20 @@ async fn cancel_run_completes_github_checks_and_terminal_metadata() {
     });
 
     let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    std::env::set_var("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}"));
-    std::env::set_var("PRELOOP_GITHUB_TOKEN", "cancel-test-token");
+    let _api_url =
+        crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}"));
+    let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "cancel-test-token");
 
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
+    let mut events = state.events.subscribe();
     let accepted = request_json(
         &app,
         Method::POST,
         "/api/v1/runs",
         json!({
-            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo build\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo lint\n",
             "event": "push",
             "repository": "owner/repo"
         }),
@@ -5085,18 +5101,42 @@ async fn cancel_run_completes_github_checks_and_terminal_metadata() {
         let mut inner = state.inner.lock().await;
         let run = inner.runs.get_mut(&run_id).unwrap();
         run.job_check_run_ids.insert(JobId("build".into()), 7);
+        run.job_check_run_ids.insert(JobId("lint".into()), 8);
     }
 
-    let cancelled = request_json(
-        &app,
-        Method::POST,
-        &format!("/api/v1/runs/{run_id}/cancel"),
-        Value::Null,
-    )
-    .await;
+    let cancel_app = app.clone();
+    let cancel_task = tokio::spawn(async move {
+        request_json(
+            &cancel_app,
+            Method::POST,
+            &format!("/api/v1/runs/{run_id}/cancel"),
+            Value::Null,
+        )
+        .await
+    });
 
-    std::env::remove_var("PRELOOP_GITHUB_API_URL");
-    std::env::remove_var("PRELOOP_GITHUB_TOKEN");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        all_completions_started.notified(),
+    )
+    .await
+    .expect("independent GitHub check updates must start concurrently");
+    let cancellation_event = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if let NdjsonEvent::RunStatus { status, .. } = events.recv().await.unwrap() {
+                break status;
+            }
+        }
+    })
+    .await
+    .expect("run cancellation must publish before GitHub responds");
+    assert_eq!(cancellation_event, ExecutionStatus::Cancelled);
+    assert!(
+        !cancel_task.is_finished(),
+        "the mock GitHub updates remain blocked until the test releases them"
+    );
+    release_completions.notify_waiters();
+    let cancelled = cancel_task.await.unwrap();
 
     assert_eq!(cancelled["status"], "cancelled");
     assert_eq!(cancelled["conclusion"], "cancelled");
@@ -5105,9 +5145,10 @@ async fn cancel_run_completes_github_checks_and_terminal_metadata() {
         "cancelled run must carry terminal completion metadata"
     );
     let completions = check_completions.lock().unwrap();
-    assert_eq!(completions.len(), 1);
-    assert_eq!(completions[0]["status"], "completed");
-    assert_eq!(completions[0]["conclusion"], "cancelled");
+    assert_eq!(completions.len(), 2);
+    assert!(completions
+        .iter()
+        .all(|body| { body["status"] == "completed" && body["conclusion"] == "cancelled" }));
 }
 
 #[tokio::test]

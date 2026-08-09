@@ -25,9 +25,9 @@ use preloop_gha_protocol::{AnnotationLevel, JobId, NdjsonEvent, RunId, WorkflowS
 /// GitHub, rather than Preloop, owns. This keeps release and artifact-publish
 /// workflows out of the local webhook dispatcher while leaving the default
 /// generic forges-only behavior unchanged.
-const GITHUB_OWNED_WORKFLOWS_ENV: &str = "PRELOOP_GITHUB_SKIP_WORKFLOWS";
+pub(crate) const GITHUB_OWNED_WORKFLOWS_ENV: &str = "PRELOOP_GITHUB_SKIP_WORKFLOWS";
 
-fn configured_github_owned_workflows() -> BTreeSet<String> {
+pub(crate) fn configured_github_owned_workflows() -> BTreeSet<String> {
     std::env::var(GITHUB_OWNED_WORKFLOWS_ENV)
         .ok()
         .map(|value| {
@@ -41,11 +41,13 @@ fn configured_github_owned_workflows() -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
-fn is_github_owned_workflow(filename: &str, configured: &BTreeSet<String>) -> bool {
-    let path = format!(".github/workflows/{filename}");
+pub(crate) fn is_github_owned_workflow(workflow_path: &str, configured: &BTreeSet<String>) -> bool {
+    let filename = workflow_path
+        .strip_prefix(".github/workflows/")
+        .unwrap_or(workflow_path);
     configured
         .iter()
-        .any(|entry| entry == filename || entry == &path)
+        .any(|entry| entry.strip_prefix(".github/workflows/").unwrap_or(entry) == filename)
 }
 
 /// Webhook push event payload.
@@ -1419,6 +1421,10 @@ mod tests {
             "release-linux-runner.yml",
             &configured
         ));
+        assert!(is_github_owned_workflow(
+            ".github/workflows/release.yml",
+            &configured
+        ));
         assert!(!is_github_owned_workflow("ci.yml", &configured));
     }
 
@@ -1653,7 +1659,7 @@ mod tests {
     #[tokio::test]
     async fn webhook_skips_github_owned_workflows() {
         let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        std::env::set_var(GITHUB_OWNED_WORKFLOWS_ENV, "release.yml");
+        let _skip = crate::state::TestEnvVar::set(GITHUB_OWNED_WORKFLOWS_ENV, "release.yml");
 
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = temp.path().join("ws");
@@ -1674,8 +1680,6 @@ mod tests {
         assert!(inner.webhook_deliveries.iter().any(|(id, state)| {
             id == "delivery-github-owned" && matches!(state, WebhookDeliveryState::Completed(_))
         }));
-
-        std::env::remove_var(GITHUB_OWNED_WORKFLOWS_ENV);
     }
 
     /// Issue 2: a delivery whose processing future is cancelled (client

@@ -1,7 +1,7 @@
 # Conformance
 
-preloop treats compatibility as a test artifact,The evidence lives in four layers, from raw wire bytes to whole-repo  
-behavior; the index below maps each layer to its artifacts and commands.
+preloop treats compatibility as a test artifact. The evidence lives in four layers, from raw wire bytes to whole-repo  
+behavior.
 
 ```
 Layer 5  whole-repo behavior   ~28 real-world repos, 39-scenario benchmark
@@ -50,9 +50,9 @@ experiments/mitm/bin/conform.sh --golden golden/v2.329.0/01-register-and-idle \
   --target preloop --scenario 01-register-and-idle
 ```
 
-The replay gate compares status codes, request-body schemas, and
+The replay gate compares status codes, job/step level conclusions/jobs/annotations request-body schemas, and
 `acquirejob` response schemas byte-for-byte; anything volatile (timing,
-tokens) is normalized before comparison.
+tokens) is normalized before comparison. 
 
 ## Tracking new official runner versions
 
@@ -140,7 +140,7 @@ the [Specula](https://github.com/SpeculaIO/Specula) pipeline (code analysis
 → TLA+ spec generation → validation → bug confirmation) built a TLA+
 specification of the server's scheduling/gate logic from the Rust source,
 repaired it against TLC's strict typing during validation, and hunted bugs
-with real SANY + TLC runs (`experiments/specula-20260804/`). 
+with real SANY + TLC runs (`experiments/specula-20260804/`).
 
 **Six findings, all fixed and reconciled into the current tree** (2026-08-06):
 
