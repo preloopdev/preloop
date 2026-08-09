@@ -2695,9 +2695,39 @@ async fn provision_runner<P: VmProvider + 'static>(
     environment_base: &str,
     toolchains: &[ToolchainLayer],
 ) -> Result<Vec<String>, OrchestratorError> {
-    if let Some(golden) = golden {
+    let forked_golden = match golden {
+        Some(golden) => match provider.fork(golden, name).await {
+            Ok(()) => Some(golden),
+            Err(error)
+                if config.use_packed_artifact
+                    && golden.as_str() == format!("{}-golden", config.name_prefix) =>
+            {
+                warn!(
+                    machine = name.as_str(),
+                    golden = golden.as_str(),
+                    %error,
+                    "packed golden fork failed; creating runner directly from packed artifact"
+                );
+                // A failed fork can leave a partial clone behind. Best-effort
+                // cleanup makes the direct create safe; if cleanup itself is
+                // still racing SmolVM state, create returns the actionable
+                // error and the slot supervisor retries normally.
+                if let Err(cleanup) = provider.delete(name).await {
+                    debug!(
+                        machine = name.as_str(),
+                        %cleanup,
+                        "failed fork left no removable clone"
+                    );
+                }
+                None
+            }
+            Err(error) => return Err(error.into()),
+        },
+        None => None,
+    };
+
+    if let Some(golden) = forked_golden {
         // Fork from the already-booted golden VM instant CoW clone.
-        provider.fork(golden, name).await?;
         // The PACKED golden carries its bake inside the artifact's flattened
         // rootfs, which forks inherit through the storage chain — so the apt
         // baseline is already there. Environment goldens are different:
@@ -3078,6 +3108,7 @@ mod lifecycle_tests {
     struct TestProvider {
         machines: Mutex<HashMap<String, MachineState>>,
         events: Mutex<Vec<String>>,
+        fail_fork: bool,
         fail_start: bool,
         fail_install: bool,
         fail_configure: bool,
@@ -3099,6 +3130,7 @@ mod lifecycle_tests {
             Self {
                 machines: Mutex::new(HashMap::new()),
                 events: Mutex::new(Vec::new()),
+                fail_fork: false,
                 fail_start,
                 fail_install,
                 fail_configure,
@@ -3111,6 +3143,11 @@ mod lifecycle_tests {
 
         fn announcing_busy(mut self) -> Self {
             self.announce_busy = true;
+            self
+        }
+
+        fn failing_fork(mut self) -> Self {
+            self.fail_fork = true;
             self
         }
 
@@ -3515,7 +3552,14 @@ chmod +x "$destination/bin/node"
             self.start(name).await
         }
 
-        async fn fork(&self, _golden: &MachineName, clone: &MachineName) -> Result<(), VmError> {
+        async fn fork(&self, golden: &MachineName, clone: &MachineName) -> Result<(), VmError> {
+            self.events
+                .lock()
+                .await
+                .push(format!("fork:{}:{}", golden.as_str(), clone.as_str()));
+            if self.fail_fork {
+                return Err(test_error("fork-failure"));
+            }
             self.events
                 .lock()
                 .await
@@ -3713,6 +3757,92 @@ chmod +x "$destination/bin/node"
         config.use_fork = true;
         config.use_packed_artifact = true;
         config
+    }
+
+    /// A retained SmolVM checkpoint can become unusable after the packed
+    /// golden has been prepared. Retrying the same fork forever starves every
+    /// queued job, while creating a runner directly from the same packed
+    /// artifact remains valid.
+    #[tokio::test]
+    async fn packed_golden_fork_failure_falls_back_to_direct_creation() {
+        let provider =
+            Arc::new(TestProvider::new(false, false, false, false, false).failing_fork());
+        let config = packed_fork_config();
+        let golden = MachineName::new("lifecycle-test-golden").unwrap();
+        let name = MachineName::new("lifecycle-test-0-4").unwrap();
+
+        provision_runner(
+            &provider,
+            &config,
+            &name,
+            Some(&golden),
+            &Arc::new(KeyPool::new()),
+            &config.base_image,
+            &[],
+        )
+        .await
+        .expect("a broken packed-golden fork falls back to direct creation");
+
+        let events = provider.events().await;
+        let fork = format!("fork:{}:{}", golden.as_str(), name.as_str());
+        let delete = format!("delete:{}", name.as_str());
+        let create = format!("create:{}", name.as_str());
+        let start = format!("start:{}", name.as_str());
+        let fork_index = events
+            .iter()
+            .position(|event| event == &fork)
+            .expect("fork was attempted first");
+        let delete_index = events
+            .iter()
+            .position(|event| event == &delete)
+            .expect("a partial clone was cleaned up");
+        let create_index = events
+            .iter()
+            .position(|event| event == &create)
+            .expect("runner was created from the packed artifact");
+        let start_index = events
+            .iter()
+            .position(|event| event == &start)
+            .expect("directly created runner was started");
+        assert!(
+            fork_index < delete_index && delete_index < create_index && create_index < start_index,
+            "fallback order must be fork, cleanup, create, start: {events:?}"
+        );
+        assert!(provider.has_machine(&name).await);
+    }
+
+    /// An environment-specific golden may represent a different `runs-on`
+    /// image from the packed artifact. Falling back there would run the job
+    /// on the wrong operating system, so only the default packed golden may
+    /// take the direct-create recovery path.
+    #[tokio::test]
+    async fn environment_golden_fork_failure_does_not_change_the_job_image() {
+        let provider =
+            Arc::new(TestProvider::new(false, false, false, false, false).failing_fork());
+        let config = packed_fork_config();
+        let golden = MachineName::new("lifecycle-test-golden-environment").unwrap();
+        let name = MachineName::new("lifecycle-test-0-5").unwrap();
+
+        let error = provision_runner(
+            &provider,
+            &config,
+            &name,
+            Some(&golden),
+            &Arc::new(KeyPool::new()),
+            "mirror.gcr.io/library/ubuntu:22.04",
+            &[],
+        )
+        .await
+        .expect_err("an environment-golden fork failure must propagate");
+
+        assert!(error.to_string().contains("fork-failure"));
+        let events = provider.events().await;
+        assert!(
+            !events
+                .iter()
+                .any(|event| event == &format!("create:{}", name.as_str())),
+            "must not replace an environment-specific image with the default pack: {events:?}"
+        );
     }
 
     /// A published pack can be older than the workspace's toolchain pin, so a
