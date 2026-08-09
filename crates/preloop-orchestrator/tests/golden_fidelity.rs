@@ -5,14 +5,13 @@
 //! class Preloop exists to eliminate. These tests pin the baseline so a package
 //! cannot quietly fall out of the list.
 //!
-//! Scope is deliberate: the *apt package* baseline only, not `ubuntu-latest`'s
-//! preinstalled toolchains. Android SDK, five JDKs, .NET, browsers, and cloud
-//! CLIs come to roughly 90 GB and are the job of `actions/setup-*` and
-//! `container:` — which is also what keeps workflows portable.
+//! Scope is deliberate: the apt baseline plus compiler families that workflows
+//! invoke implicitly. Android SDK, five JDKs, .NET, browsers, and cloud CLIs
+//! come to roughly 90 GB and are the job of setup actions and containers.
 
 use preloop_orchestrator::{
-    base_install_script, base_packages, docker_data_root, docker_packages, loopback_hosts,
-    BASE_NODE_VERSION,
+    base_install_script, base_packages, compiler_packages, docker_data_root, docker_packages,
+    loopback_hosts, BASE_NODE_VERSION,
 };
 
 /// Commands a workflow may reasonably assume exist, because `ubuntu-latest`
@@ -132,6 +131,30 @@ fn golden_carries_container_engine_packages() {
 }
 
 #[test]
+fn golden_carries_official_compiler_matrix() {
+    let baseline = compiler_packages();
+    let packages: Vec<&str> = baseline.split_whitespace().collect();
+    for version in ["16", "17", "18"] {
+        for tool in ["clang", "clang-format", "clang-tidy"] {
+            let package = format!("{tool}-{version}");
+            assert!(
+                packages.contains(&package.as_str()),
+                "compiler baseline is missing {package}"
+            );
+        }
+    }
+    for version in ["12", "13", "14"] {
+        for tool in ["gcc", "g++", "gfortran"] {
+            let package = format!("{tool}-{version}");
+            assert!(
+                packages.contains(&package.as_str()),
+                "compiler baseline is missing {package}"
+            );
+        }
+    }
+}
+
+#[test]
 fn install_script_pins_docker_repo_and_cargo_shear() {
     // The container engine is only installable after Docker's apt repo is
     // bootstrapped (keyring + sources.list), and cargo-shear is a release
@@ -141,8 +164,9 @@ fn install_script_pins_docker_repo_and_cargo_shear() {
     for fragment in [
         "https://download.docker.com/linux/ubuntu/gpg",
         "/etc/apt/sources.list.d/docker.list",
-        "docker-buildx-plugin",
-        "docker-compose-plugin",
+        "docker-28.0.4.tgz",
+        "buildx-v0.35.0.linux-$DOCKER_PLUGIN_ARCH",
+        "docker-compose-linux-$COMPOSE_ARCH",
         "cargo-shear-$(uname -m)-unknown-linux-musl.tar.gz",
     ] {
         assert!(

@@ -436,14 +436,30 @@ pub const BASE_NODE_VERSION: &str = crate::NODE_VERSION;
 ///
 /// Kept apart because it needs storage configuration the other packages do not
 /// — see [`DOCKER_DATA_ROOT`].
-/// The official image's docker stack (28.0.4 / buildx 0.35.0 / compose
-/// 2.38.2) cannot be apt-pinned: download.docker.com prunes old versions and
-/// currently retains only the 29.x line (verified 2026-08). The official
-/// image builds docker from its own mirror. So the stack stays latest-stable
-/// from Docker's repo — a documented drift — while every other parity pin is
-/// exact.
+/// Docker's apt repository supplies the service unit and runtime dependencies.
+/// Its retained package set floats, so the bake overlays the exact official
+/// image engine/CLI and plugin binaries afterward.
 fn docker_apt_packages() -> String {
     "docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin".to_owned()
+}
+
+/// Compiler families preinstalled by GitHub's Ubuntu 24.04 image.
+///
+/// Clang includes the compiler, formatter, and tidy tools for each version.
+/// GNU C, C++, and Fortran are all present for 12, 13, and 14.
+fn compiler_apt_packages() -> String {
+    let mut packages = Vec::new();
+    for version in CLANG_VERSIONS.split_whitespace() {
+        for package in ["clang", "clang-format", "clang-tidy"] {
+            packages.push(format!("{package}-{version}"));
+        }
+    }
+    for version in GCC_VERSIONS.split_whitespace() {
+        for package in ["gcc", "g++", "gfortran"] {
+            packages.push(format!("{package}-{version}"));
+        }
+    }
+    packages.join(" ")
 }
 
 /// Where the container engine stores images and layers.
@@ -565,6 +581,11 @@ pub fn docker_packages() -> String {
     docker_apt_packages()
 }
 
+/// The golden image's hosted compiler package baseline.
+pub fn compiler_packages() -> String {
+    compiler_apt_packages()
+}
+
 /// Where the container engine stores layers. Exposed for the fidelity tests.
 pub fn docker_data_root() -> &'static str {
     DOCKER_DATA_ROOT
@@ -631,7 +652,24 @@ pub fn base_install_script() -> String {
          printf 'APT::Get::Assume-Yes \"true\";\\n' > /etc/apt/apt.conf.d/90assumeyes && \
          arch=$(uname -m); \
          case \"$arch\" in x86_64) NODE_ARCH=x64 ;; aarch64|arm64) NODE_ARCH=arm64 ;; *) NODE_ARCH=x64 ;; esac; \
-         case \"$NODE_ARCH\" in x64) LFS_ARCH=amd64 ;; *) LFS_ARCH=arm64 ;; esac; \
+         case \"$NODE_ARCH\" in \
+           x64) LFS_ARCH=amd64; DOCKER_STATIC_ARCH=x86_64; DOCKER_PLUGIN_ARCH=amd64; COMPOSE_ARCH=x86_64 ;; \
+           *) LFS_ARCH=arm64; DOCKER_STATIC_ARCH=aarch64; DOCKER_PLUGIN_ARCH=arm64; COMPOSE_ARCH=aarch64 ;; \
+         esac; \
+         (echo \"### install hosted compiler matrix\" >&2 && \
+          DEBIAN_FRONTEND=noninteractive \
+          apt-get install -y -qq --no-install-recommends {compiler_packages} && \
+          update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-{CLANG_DEFAULT_VERSION} 100 && \
+          update-alternatives --install /usr/bin/clang clang /usr/bin/clang-{CLANG_DEFAULT_VERSION} 100 && \
+          update-alternatives --install /usr/bin/clang-format clang-format /usr/bin/clang-format-{CLANG_DEFAULT_VERSION} 100 && \
+          update-alternatives --install /usr/bin/clang-tidy clang-tidy /usr/bin/clang-tidy-{CLANG_DEFAULT_VERSION} 100 && \
+          update-alternatives --install /usr/bin/run-clang-tidy run-clang-tidy /usr/bin/run-clang-tidy-{CLANG_DEFAULT_VERSION} 100 && \
+          clang-16 --version | head -1 | grep -F '{CLANG_16_VERSION}' && \
+          clang-17 --version | head -1 | grep -F '{CLANG_17_VERSION}' && \
+          clang-18 --version | head -1 | grep -F '{CLANG_18_VERSION}' && \
+          test \"$(gcc-12 -dumpfullversion)\" = '{GCC_12_VERSION}' && \
+          test \"$(gcc-13 -dumpfullversion)\" = '{GCC_13_VERSION}' && \
+          test \"$(gcc-14 -dumpfullversion)\" = '{GCC_14_VERSION}') && \
          (echo \"### fetch system node v{BASE_NODE_VERSION}\" >&2 && \
           curl -fsSL \"https://nodejs.org/dist/v{BASE_NODE_VERSION}/node-v{BASE_NODE_VERSION}-linux-$NODE_ARCH.tar.gz\" \
             | tar -xz --strip-components=1 -C /usr/local) && \
@@ -642,9 +680,24 @@ pub fn base_install_script() -> String {
           apt-get update -qq && \
           DEBIAN_FRONTEND=noninteractive \
           apt-get install -y -qq {docker_packages} && \
+          echo \"### overlay docker v{DOCKER_VERSION}\" >&2 && \
+          rm -rf /tmp/docker-static && mkdir -p /tmp/docker-static && \
+          curl -fsSL \"https://download.docker.com/linux/static/stable/$DOCKER_STATIC_ARCH/docker-{DOCKER_VERSION}.tgz\" \
+            | tar -xz -C /tmp/docker-static && \
+          install -m 0755 /tmp/docker-static/docker/* /usr/local/bin/ && \
+          rm -rf /tmp/docker-static && \
+          install -m 0755 -d /usr/local/lib/docker/cli-plugins && \
+          curl -fsSL \"https://github.com/docker/buildx/releases/download/v{DOCKER_BUILDX_VERSION}/buildx-v{DOCKER_BUILDX_VERSION}.linux-$DOCKER_PLUGIN_ARCH\" \
+            -o /usr/local/lib/docker/cli-plugins/docker-buildx && \
+          curl -fsSL \"https://github.com/docker/compose/releases/download/v{DOCKER_COMPOSE_VERSION}/docker-compose-linux-$COMPOSE_ARCH\" \
+            -o /usr/local/lib/docker/cli-plugins/docker-compose && \
+          chmod 0755 /usr/local/lib/docker/cli-plugins/docker-buildx /usr/local/lib/docker/cli-plugins/docker-compose && \
+          docker --version | grep -F '{DOCKER_VERSION}' && \
+          dockerd --version | grep -F '{DOCKER_VERSION}' && \
+          docker buildx version | grep -F 'v{DOCKER_BUILDX_VERSION}' && \
+          docker compose version --short | grep -F '{DOCKER_COMPOSE_VERSION}' && \
           mkdir -p {DOCKER_DATA_ROOT} /etc/docker && \
-          printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\"}}\\n' > /etc/docker/daemon.json \
-          || true) && \
+          printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\"}}\\n' > /etc/docker/daemon.json) && \
          (echo \"### fetch cargo-shear\" >&2 && \
           curl -sSL https://github.com/Boshen/cargo-shear/releases/download/v{CARGO_SHEAR_VERSION}/cargo-shear-$(uname -m)-unknown-linux-musl.tar.gz 2>/dev/null | tar -xz -C /usr/local/bin 2>/dev/null || true) && \
          (echo \"### bake git v{GIT_VERSION}\" >&2 && \
@@ -686,6 +739,7 @@ pub fn base_install_script() -> String {
          (useradd -m -u 1000 -s /bin/bash ubuntu 2>/dev/null || true) && \
          apt-get clean",
         docker_packages = docker_apt_packages(),
+        compiler_packages = compiler_apt_packages(),
         base_packages_pinned = base_packages_pinned()
     )
 }
