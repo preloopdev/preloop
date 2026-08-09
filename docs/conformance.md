@@ -140,7 +140,7 @@ the [Specula](https://github.com/SpeculaIO/Specula) pipeline (code analysis
 → TLA+ spec generation → validation → bug confirmation) built a TLA+
 specification of the server's scheduling/gate logic from the Rust source,
 repaired it against TLC's strict typing during validation, and hunted bugs
-with real SANY + TLC runs (`experiments/specula-20260804/`).
+with real SANY + TLC runs (`experiments/specula-20260804/`). 
 
 **Six findings, all fixed and reconciled into the current tree** (2026-08-06):
 
