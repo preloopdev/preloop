@@ -2455,6 +2455,7 @@ pub(crate) async fn drain_expansions(shared: &SharedState) -> SchedulingOutcome 
             .state
             .queue_depth
             .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
+        sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
     }
 }
 

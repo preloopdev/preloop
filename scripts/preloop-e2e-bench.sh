@@ -16,7 +16,7 @@
 set -euo pipefail
 
 unset all_proxy ALL_PROXY http_proxy https_proxy HTTP_PROXY HTTPS_PROXY \
-      no_proxy NO_PROXY 2>/dev/null || true
+      no_proxy NO_PROXY PRELOOP_RUNNER_URL PRELOOP_CONTROL_UPSTREAM 2>/dev/null || true
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -24,6 +24,7 @@ PRELOOP_BIN="$REPO_ROOT/target/release/preloop-server"
 RUNNER_DIR="${RUNNER_DIR:-$HOME/.cache/actions-runner/current}"
 PRELOOP_PORT="${PRELOOP_PORT:-9090}"
 CLIENT_URL="${CLIENT_URL:-http://127.0.0.1:$PRELOOP_PORT}"
+REGISTRATION_TOKEN="${PRELOOP_SYSTEM_TOKEN:-preloop-system-token}"
 STATE_DIR="$(mktemp -d /tmp/preloop-bench-XXXXXX)"
 LOG="$STATE_DIR/preloop.log"
 PRELOOP_PID=""
@@ -98,7 +99,10 @@ import urllib.request, json
 req = urllib.request.Request(
     '${CLIENT_URL}/api/v3/repos/owner/repo/actions/runners/registration-token',
     data=b'{}',
-    headers={'Content-Type':'application/json','Authorization':'RemoteAuth test'},
+    headers={
+        'Content-Type':'application/json',
+        'Authorization':'RemoteAuth ${REGISTRATION_TOKEN}',
+    },
     method='POST'
 )
 with urllib.request.urlopen(req, timeout=5) as r:

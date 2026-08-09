@@ -5041,6 +5041,131 @@ jobs:
 }
 
 #[tokio::test]
+async fn cancel_run_completes_github_checks_and_terminal_metadata() {
+    let check_completions = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+    let mock_app = Router::new().route(
+        "/repos/owner/repo/check-runs/:id",
+        axum::routing::patch({
+            let check_completions = check_completions.clone();
+            move |Path(id): Path<u64>, body: axum::extract::Json<Value>| {
+                let check_completions = check_completions.clone();
+                async move {
+                    check_completions.lock().unwrap().push(body.0);
+                    Json(json!({"id": id}))
+                }
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, mock_app).await.unwrap();
+    });
+
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    std::env::set_var("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}"));
+    std::env::set_var("PRELOOP_GITHUB_TOKEN", "cancel-test-token");
+
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    {
+        let mut inner = state.inner.lock().await;
+        let run = inner.runs.get_mut(&run_id).unwrap();
+        run.job_check_run_ids.insert(JobId("build".into()), 7);
+    }
+
+    let cancelled = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/runs/{run_id}/cancel"),
+        Value::Null,
+    )
+    .await;
+
+    std::env::remove_var("PRELOOP_GITHUB_API_URL");
+    std::env::remove_var("PRELOOP_GITHUB_TOKEN");
+
+    assert_eq!(cancelled["status"], "cancelled");
+    assert_eq!(cancelled["conclusion"], "cancelled");
+    assert!(
+        cancelled["completed_at"].is_string(),
+        "cancelled run must carry terminal completion metadata"
+    );
+    let completions = check_completions.lock().unwrap();
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0]["status"], "completed");
+    assert_eq!(completions[0]["conclusion"], "cancelled");
+}
+
+#[tokio::test]
+async fn cancel_run_refreshes_runner_pool_queue_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let first = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-22.04\n    steps:\n      - run: echo first\n",
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: echo second\n",
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+    assert_eq!(
+        *state.next_job_runs_on.read().unwrap(),
+        vec!["ubuntu-22.04"]
+    );
+    assert_eq!(
+        state.queue_depth.load(std::sync::atomic::Ordering::Acquire),
+        2
+    );
+
+    let cancelled = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/runs/{}/cancel", first["run_id"].as_str().unwrap()),
+        Value::Null,
+    )
+    .await;
+
+    assert_eq!(cancelled["conclusion"], "cancelled");
+    assert_eq!(
+        state.queue_depth.load(std::sync::atomic::Ordering::Acquire),
+        1
+    );
+    assert_eq!(
+        *state.next_job_runs_on.read().unwrap(),
+        vec!["ubuntu-24.04"]
+    );
+}
+
+#[tokio::test]
 async fn message_poll_waits_until_work_is_enqueued() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(

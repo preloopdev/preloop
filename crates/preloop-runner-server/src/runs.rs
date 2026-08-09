@@ -1348,6 +1348,7 @@ pub(crate) async fn submit_run_inner(
             .state
             .queue_depth
             .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
+        runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
         let cancel_count = inner.cancellation_queue.len();
         drop(inner);
         // The sweep above only recorded the intent to expand; the subtree build
@@ -2087,14 +2088,40 @@ pub(crate) async fn cancel_run(
     }
     let cancellation_count =
         cancel_run_inner(&mut inner, run_id, None /* no concurrency reason */);
+    let cancelled_jobs = {
+        let run = inner
+            .runs
+            .get_mut(&run_id)
+            .ok_or_else(|| ApiError::not_found("run not found"))?;
+        runtime_scheduling::finalize_run_if_complete(run);
+        run.jobs
+            .iter()
+            .filter(|(_, status)| **status == ExecutionStatus::Cancelled)
+            .map(|(job_id, _)| job_id.clone())
+            .collect::<Vec<_>>()
+    };
     let record = inner
         .runs
         .get(&run_id)
         .cloned()
         .ok_or_else(|| ApiError::not_found("run not found"))?;
+    shared
+        .state
+        .queue_depth
+        .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
+    runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
     drop(inner);
     if cancellation_count > 0 {
         shared.state.message_notify.notify_waiters();
+    }
+    for job_id in cancelled_jobs {
+        crate::github::report_check_run_completed(
+            &shared,
+            run_id,
+            &job_id,
+            ExecutionStatus::Cancelled,
+        )
+        .await;
     }
     shared
         .state
