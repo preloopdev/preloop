@@ -538,8 +538,14 @@ exit 0
         );
     }
 
+    /// Serializes tests that mutate `PRELOOP_SMOLVM_NET_BACKEND` in the
+    /// process environment.
+    static NET_BACKEND_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     #[tokio::test]
-    async fn public_only_selects_virtio_net_and_sets_smolvm_egress_floor_strict() {
+    async fn public_only_selects_the_platform_backend_and_sets_smolvm_egress_floor_strict() {
+        let _env_guard = NET_BACKEND_ENV_LOCK.lock();
+        std::env::remove_var("PRELOOP_SMOLVM_NET_BACKEND");
         let (_directory, executable) = fake_smolvm();
         let provider = SmolVmProvider::new(executable.clone());
         let mut spec = valid_spec(MachineName::new("test-floor").unwrap());
@@ -547,8 +553,28 @@ exit 0
         provider.create(&spec).await.unwrap();
         assert!(captured_args(&executable)
             .windows(2)
-            .any(|args| args == ["--net-backend", "virtio-net"]));
+            .any(|args| args == ["--net-backend", "tsi"]));
         assert_eq!(captured_env(&executable), "SMOLVM_EGRESS_FLOOR=strict");
+    }
+
+    #[tokio::test]
+    async fn public_only_net_backend_override_is_respected() {
+        let _env_guard = NET_BACKEND_ENV_LOCK.lock();
+        for (override_value, expected) in [("tsi", "tsi"), ("virtio-net", "virtio-net")] {
+            let (_directory, executable) = fake_smolvm();
+            let provider = SmolVmProvider::new(executable.clone());
+            let mut spec = valid_spec(MachineName::new("test-override").unwrap());
+            spec.network = NetworkPolicy::PublicOnly;
+            std::env::set_var("PRELOOP_SMOLVM_NET_BACKEND", override_value);
+            provider.create(&spec).await.unwrap();
+            assert!(
+                captured_args(&executable)
+                    .windows(2)
+                    .any(|args| args == ["--net-backend", expected]),
+                "override {override_value} must select {expected}"
+            );
+        }
+        std::env::remove_var("PRELOOP_SMOLVM_NET_BACKEND");
     }
 
     #[tokio::test]

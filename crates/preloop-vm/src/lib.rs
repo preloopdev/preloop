@@ -89,8 +89,9 @@ pub enum NetworkPolicy {
     Unrestricted,
     /// Full outbound networking with the egress hard-floor enabled: loopback,
     /// RFC 1918, link-local / cloud metadata, CGNAT, and IPv6 private ranges
-    /// are denied. Enforced by the virtio-net backend with
-    /// `SMOLVM_EGRESS_FLOOR=strict` in the provider.
+    /// are denied. Enforced by the chosen backend with
+    /// `SMOLVM_EGRESS_FLOOR=strict` in the provider; see
+    /// [`public_only_net_backend`] for which backend that is per platform.
     PublicOnly,
     /// Restrict outbound traffic to these host names and CIDRs.
     Restricted {
@@ -99,6 +100,27 @@ pub enum NetworkPolicy {
         /// IP address ranges allowed for egress.
         cidrs: Vec<String>,
     },
+}
+
+/// The smolvm network backend used for the egress-only policy.
+///
+/// virtio-net carries the host-side egress floor, but it needs libkrun's
+/// `krun_add_net_unixstream`, which the macOS libkrun builds do not expose
+/// ("libkrun does not expose krun_add_net_unixstream; update libkrun or
+/// use --net-backend tsi"). TSI is the light outbound-only backend and is
+/// smolvm's own default for machines without an egress allow-list, so
+/// PublicOnly uses TSI on macOS and keeps virtio-net elsewhere.
+/// `PRELOOP_SMOLVM_NET_BACKEND=tsi|virtio-net` overrides the choice.
+fn public_only_net_backend() -> &'static str {
+    match std::env::var("PRELOOP_SMOLVM_NET_BACKEND").as_deref() {
+        Ok("tsi") => return "tsi",
+        Ok("virtio-net") => return "virtio-net",
+        _ => {}
+    }
+    match std::env::consts::OS {
+        "macos" => "tsi",
+        _ => "virtio-net",
+    }
 }
 
 /// Where a guest environment value is resolved from, at launch time.
@@ -522,7 +544,11 @@ impl VmProvider for SmolVmProvider {
             NetworkPolicy::Disabled => {}
             NetworkPolicy::Unrestricted => args.push("--net".into()),
             NetworkPolicy::PublicOnly => {
-                args.extend(["--net".into(), "--net-backend".into(), "virtio-net".into()]);
+                args.extend([
+                    "--net".into(),
+                    "--net-backend".into(),
+                    public_only_net_backend().into(),
+                ]);
             }
             NetworkPolicy::Restricted { hosts, cidrs } => {
                 for host in hosts {
