@@ -543,7 +543,7 @@ exit 0
     static NET_BACKEND_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     #[tokio::test]
-    async fn public_only_selects_the_platform_backend_and_sets_smolvm_egress_floor_strict() {
+    async fn public_only_selects_virtio_net_and_sets_smolvm_egress_floor_strict() {
         let _env_guard = NET_BACKEND_ENV_LOCK.lock();
         std::env::remove_var("PRELOOP_SMOLVM_NET_BACKEND");
         let (_directory, executable) = fake_smolvm();
@@ -553,7 +553,7 @@ exit 0
         provider.create(&spec).await.unwrap();
         assert!(captured_args(&executable)
             .windows(2)
-            .any(|args| args == ["--net-backend", "tsi"]));
+            .any(|args| args == ["--net-backend", "virtio-net"]));
         assert_eq!(captured_env(&executable), "SMOLVM_EGRESS_FLOOR=strict");
     }
 
