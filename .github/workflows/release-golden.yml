@@ -163,6 +163,12 @@ jobs:
     name: Build & Publish aarch64 Golden (macOS)
     if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
     runs-on: macos-14
+    env:
+      # GitHub's hosted macOS guests reject libkrun's virtio-net device under
+      # their virtualization boundary (krun_start_enter EINVAL). TSI keeps
+      # outbound access inside libkrun and is sufficient for this one-shot
+      # image build; job VMs still default to policy-enforced virtio-net.
+      PRELOOP_SMOLVM_NET_BACKEND: tsi
     permissions:
       contents: write
     steps:
