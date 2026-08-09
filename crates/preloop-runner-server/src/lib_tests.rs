@@ -6686,10 +6686,17 @@ fn open_session_body(run_id: RunId, agent_job_id: uuid::Uuid) -> Value {
 async fn the_debug_worker_token_exchange_is_narrowly_authorized() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
-    let app = app(state.clone(), CancellationToken::new());
+    let native_app = app(state.clone(), CancellationToken::new());
+    // This is the path used by a runner inside a microVM. The worker reaches
+    // the server through the mounted control socket, so the socket guard must
+    // admit the narrowly authenticated worker routes without exposing the
+    // controller's native debug surface.
+    let app = native_app
+        .clone()
+        .layer(middleware::from_fn(crate::auth::runner_surface_only));
 
     let accepted = request_json(
-        &app,
+        &native_app,
         Method::POST,
         "/api/v1/runs",
         json!({
@@ -6774,7 +6781,7 @@ async fn the_debug_worker_token_exchange_is_narrowly_authorized() {
         &worker_token,
     )
     .await;
-    assert!(opened["session_id"].as_str().is_some());
+    let session_id = opened["session_id"].as_str().expect("opened session");
     assert_eq!(
         request_status_with_bearer(
             &app,
@@ -6787,6 +6794,25 @@ async fn the_debug_worker_token_exchange_is_narrowly_authorized() {
         StatusCode::UNAUTHORIZED,
         "the exchange must not have widened what a runtime token can reach"
     );
+
+    let polled = request_json_with_bearer(
+        &app,
+        Method::GET,
+        &format!("/api/v1/debug/sessions/{session_id}/verdict?wait=0"),
+        Value::Null,
+        &worker_token,
+    )
+    .await;
+    assert!(polled["verdict"].is_null());
+    let closed = request_json_with_bearer(
+        &app,
+        Method::POST,
+        &format!("/api/v1/debug/sessions/{session_id}/close"),
+        json!({ "state": "aborted" }),
+        &worker_token,
+    )
+    .await;
+    assert_eq!(closed["ok"], true);
 
     // One shot. A step that later finds `ACTIONS_RUNTIME_TOKEN` in its
     // environment has nothing left to spend.
@@ -13968,6 +13994,9 @@ async fn control_socket_surface_denies_native_and_test_apis() {
     for denied in [
         "/api/v1/secrets/owner/repo",
         "/api/v1/runs",
+        "/api/v1/debug/sessions",
+        "/api/v1/debug/sessions/dbg-controller-only",
+        "/api/v1/agent/debug/sessions/dbg-controller-only/events",
         "/internal/test/jobs/complete",
     ] {
         let response = socket_app
@@ -13988,6 +14017,24 @@ async fn control_socket_surface_denies_native_and_test_apis() {
             "socket must not expose {denied}"
         );
     }
+    let controller_verdict = socket_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/debug/sessions/dbg-controller-only/verdict")
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"verdict":"abort"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        controller_verdict.status(),
+        StatusCode::NOT_FOUND,
+        "the controller verdict API must stay off the guest socket"
+    );
 
     // The v3 registration-token endpoints mint runner-management JWTs
     // (`RunnerManage` scope) for the GitHub-compatible registration flow.
