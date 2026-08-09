@@ -2,6 +2,10 @@
 
 ![Watch the preloop demo: a failed step, a fix in another pane, and a re-run, all local, no push required](docs/demo/demo.gif)
 
+![Watch an omp agent attach to a live preloop job with DAP, inspect runtime context, diagnose the failure, and rerun successfully](docs/demo/dap/demo-highlight.gif)
+
+[Open the pausable DAP demo video](docs/demo/dap/demo-highlight.mp4) · [Replay the full terminal recording](docs/demo/dap/demo.cast)
+
 
 > A failed step, a fix in another pane, and a re-run, all local, with no push required.
 
