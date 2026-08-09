@@ -366,6 +366,7 @@ impl Fixture {
             base_image: "ghcr.io/preloop/base:latest".to_owned(),
             workspace: None,
             artifact_stem,
+            release_version: "9.9.9".to_owned(),
             runner_bundle: bundle,
             externals_dir: PathBuf::from("/tmp/test-externals"),
             runner_binary_name: "preloop-runner".to_owned(),

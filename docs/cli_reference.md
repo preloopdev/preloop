@@ -235,7 +235,7 @@ self-hosting entry point (webhook + Checks endpoints, microVM provisioning).
 | `PRELOOP_RUNNER_POOL_ENABLED` | Enable the local microVM runner pool (default off) |
 | `PRELOOP_RUNNER_POOL_SIZE` | Pool size (warm forks/VMs) |
 | `PRELOOP_USE_FORK` | Run the pool as forked microVMs (default true with a packed golden) |
-| `PRELOOP_USE_PACKED_GOLDEN` | Use the packed golden artifact for the pool |
+| `PRELOOP_USE_PACKED_GOLDEN` | Use a release or locally cached packed golden (default on; set `false` for cold OCI provisioning) |
 | `PRELOOP_GOLDEN_URL` | Override the pre-baked golden download URL |
 | `PRELOOP_RUNNER_BASE_IMAGE` | Override the base image at serve time |
 | `PRELOOP_RUNNER_LABELS` | Extra `runs-on` labels the pool's runners declare |

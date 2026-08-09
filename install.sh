@@ -68,6 +68,27 @@ release_json() { # tag or latest
     return 1
 }
 
+ensure_runtime() {
+    say "installing pinned smolvm runtime..."
+    PATH="$BIN_DIR:$HOME/.local/bin:$PATH" \
+        "$BIN_DIR/preloop" update --ensure-runtime \
+        || die "could not install the pinned smolvm runtime"
+
+    local smolvm_bin="$HOME/.local/bin/smolvm"
+    [ -x "$smolvm_bin" ] || die "smolvm was not installed at $smolvm_bin"
+    local smolvm_version
+    smolvm_version="$("$smolvm_bin" --version 2>/dev/null | awk '{print $NF}')"
+    [ "$smolvm_version" = "1.7.4" ] \
+        || die "expected smolvm 1.7.4, found ${smolvm_version:-unknown}"
+
+    # Keep custom-prefix installs self-contained and ahead of any incompatible
+    # system smolvm already on PATH.
+    if [ "$BIN_DIR" != "$HOME/.local/bin" ]; then
+        ln -sfn "$smolvm_bin" "$BIN_DIR/smolvm"
+    fi
+    say "installed smolvm 1.7.4"
+}
+
 install_from_release() {
     local tag="$VERSION"
     local json
@@ -170,6 +191,7 @@ install_from_release() {
             say "warning: release $tag has no $runner_asset asset — microVM jobs need it"
         fi
     fi
+    ensure_runtime
     return 0
 }
 
@@ -236,6 +258,7 @@ fi
 mkdir -p "$BIN_DIR"
 ln -sfn "$PRELOOP_SRC/target/release/preloop" "$BIN_DIR/preloop"
 say "installed $BIN_DIR/preloop (source build)"
+ensure_runtime
 case ":$PATH:" in
     *":$BIN_DIR:"*) ;;
     *) say "add $BIN_DIR to your PATH:  export PATH=\"$BIN_DIR:\$PATH\"" ;;

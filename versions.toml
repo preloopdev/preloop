@@ -7,8 +7,8 @@ rustup_version = "1.29.0"
 cargo_shear_version = "1.12.4"
 node20_externals_version = "20.19.0"
 node24_externals_version = "24.3.0"
-ubuntu_24_04_base = "ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90"
-ubuntu_22_04_base = "ubuntu:22.04@sha256:0e0a0fc6d18feda9db1590da249ac93e8d5abfea8f4c3c0c849ce512b5ef8982"
+ubuntu_24_04_base = "mirror.gcr.io/library/ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90"
+ubuntu_22_04_base = "mirror.gcr.io/library/ubuntu:22.04@sha256:0e0a0fc6d18feda9db1590da249ac93e8d5abfea8f4c3c0c849ce512b5ef8982"
 
 # GitHub-hosted parity bake list — exact versions from the official
 # ubuntu-24.04 runner image toolset (20260720.247.2). Baked into the golden

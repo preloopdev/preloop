@@ -133,7 +133,7 @@ Client-side (`preloop` CLI): `PRELOOP_URL` (default `http://127.0.0.1:9090`) and
 | `PRELOOP_RUNNER_OVERLAY_GB` | — | Per-VM writable overlay size |
 | `PRELOOP_RUNNER_USER` / `PRELOOP_RUNNER_UID` | `runner` / `1001` | Guest account steps run as, for GitHub-hosted parity. `root` restores root; empty disables switching |
 | `PRELOOP_USE_FORK` | — | Fork machines from a prepared golden instead of building each |
-| `PRELOOP_USE_PACKED_GOLDEN` | — | Use the packed golden artifact as the fork base |
+| `PRELOOP_USE_PACKED_GOLDEN` | `true` | Use a release or locally cached packed golden for on-demand and pooled runners |
 | `PRELOOP_GOLDEN_URL` | release asset | Where the prebaked golden is downloaded from |
 | `PRELOOP_RUNNER_BUNDLE` | — | Directory of runner binaries mounted into guests |
 | `PRELOOP_RUNNER_EXTERNALS` | temp dir | Host-side Node externals directory |

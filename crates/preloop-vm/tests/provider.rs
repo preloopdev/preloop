@@ -540,11 +540,11 @@ exit 0
 
     /// Serializes tests that mutate `PRELOOP_SMOLVM_NET_BACKEND` in the
     /// process environment.
-    static NET_BACKEND_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    static NET_BACKEND_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[tokio::test]
     async fn public_only_selects_virtio_net_and_sets_smolvm_egress_floor_strict() {
-        let _env_guard = NET_BACKEND_ENV_LOCK.lock();
+        let _env_guard = NET_BACKEND_ENV_LOCK.lock().await;
         std::env::remove_var("PRELOOP_SMOLVM_NET_BACKEND");
         let (_directory, executable) = fake_smolvm();
         let provider = SmolVmProvider::new(executable.clone());
@@ -559,7 +559,7 @@ exit 0
 
     #[tokio::test]
     async fn public_only_net_backend_override_is_respected() {
-        let _env_guard = NET_BACKEND_ENV_LOCK.lock();
+        let _env_guard = NET_BACKEND_ENV_LOCK.lock().await;
         for (override_value, expected) in [("tsi", "tsi"), ("virtio-net", "virtio-net")] {
             let (_directory, executable) = fake_smolvm();
             let provider = SmolVmProvider::new(executable.clone());

@@ -9,7 +9,7 @@ match to the official GitHub runner image to avoid drift.
 
 | Mode | How jobs run | Enabled by |
 |---|---|---|
-| **MicroVM** | A libkrun guest (Hypervisor.framework on macOS, KVM on Linux) boots the packed golden image and runs the job inside it | `preloop serve` with a golden present (`PRELOOP_USE_PACKED_GOLDEN=true`) |
+| **MicroVM** | A libkrun guest (Hypervisor.framework on macOS, KVM on Linux) boots the packed golden image and runs the job inside it | `preloop serve`; packed golden use is the default |
 | **Fork pool** | The runner runs as a host process tree — no VM, same job semantics, much faster warm start | `PRELOOP_USE_FORK=true` (default when a packed golden is present) |
 | **External runners** | Any runner that registers against the server: the official `actions/runner`, `preloop-runner` on another machine, containers | `preloop-runner configure` + `run` |
 
@@ -142,7 +142,7 @@ naming the official image version they were taken from.
 
 | Env var | Effect |
 |---|---|
-| `PRELOOP_USE_PACKED_GOLDEN` | Use the packed golden artifact for the pool (default off; the release layout enables it) |
+| `PRELOOP_USE_PACKED_GOLDEN` | Use a release or locally cached packed golden (default on; set `false` for cold OCI provisioning) |
 | `PRELOOP_USE_FORK` | Run the pool as host forks instead of booting microVMs (default true with a golden) |
 | `PRELOOP_RUNNER_POOL_SIZE` | Pool size (warm forks / VMs) |
 | `PRELOOP_WORKSPACE` | Workspace whose `container:` / `services:` images the golden pre-pulls (build-time); toolchains are the fixed curated set |

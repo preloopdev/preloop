@@ -16,8 +16,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 mod app_manifest;
-mod debug_session;
 mod dap_client;
+mod debug_session;
 mod github_auth;
 mod github_setup;
 mod push;
@@ -435,6 +435,7 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         base_image: args.base_image,
         workspace: args.workspace.or_else(|| std::env::current_dir().ok()),
         artifact_stem: output.clone(),
+        release_version: env!("CARGO_PKG_VERSION").to_owned(),
         runner_bundle,
         externals_dir: std::env::var_os("PRELOOP_RUNNER_EXTERNALS")
             .map(PathBuf::from)
@@ -763,7 +764,7 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
             String,
             std::time::SystemTime,
         >::new()));
-    let pool_enabled = env_flag("PRELOOP_RUNNER_POOL_ENABLED", false);
+    let pool_enabled = env_flag("PRELOOP_RUNNER_POOL_ENABLED", DEFAULT_RUNNER_POOL_ENABLED);
     let pool_config = local_runner_pool_config(
         &home,
         runner_url.clone(),
@@ -958,7 +959,7 @@ fn local_runner_pool_config(
         })
         .filter(|path| linux_runner_bundle(path))
         .context("Linux runner bundle unavailable; set PRELOOP_RUNNER_BUNDLE to a directory containing a Linux preloop-runner, or build one with `just build-preloop` (docs/vm-images.md)")?;
-    let use_packed_artifact = env_flag("PRELOOP_USE_PACKED_GOLDEN", false);
+    let use_packed_artifact = env_flag("PRELOOP_USE_PACKED_GOLDEN", DEFAULT_USE_PACKED_GOLDEN);
     // The workspace is scanned for toolchain version files (rust-toolchain.toml,
     // .nvmrc, etc.) so the golden can be built with the project's toolchains
     // pre-installed instead of installing them per job. PRELOOP_WORKSPACE
@@ -993,7 +994,10 @@ fn local_runner_pool_config(
     // (ubuntu:24.04@sha256:…) still count as stock Ubuntu images.
     let custom_base = !matches!(
         preloop_orchestrator::environment::base_name(&base_image),
-        "ubuntu:24.04" | "ubuntu:22.04"
+        "ubuntu:24.04"
+            | "ubuntu:22.04"
+            | "mirror.gcr.io/library/ubuntu:24.04"
+            | "mirror.gcr.io/library/ubuntu:22.04"
     );
     Ok(RunnerPoolConfig {
         // Size zero is the deliberate low-memory mode: keep the local
@@ -1044,6 +1048,7 @@ fn local_runner_pool_config(
             base_image.replace(['/', ':', '@'], "-"),
             std::env::consts::ARCH
         )),
+        release_version: env!("CARGO_PKG_VERSION").to_owned(),
         runner_bundle,
         // Node externals shared with every VM via a read-only mount. The
         // operator may point this anywhere; the default lives next to the
@@ -1105,6 +1110,10 @@ fn runner_pool_labels() -> Vec<String> {
 
 /// vCPUs given to each runner VM.
 const RUNNER_CPUS: u16 = 4;
+/// Low-memory on-demand provisioning is the default; opt into idle warm VMs.
+const DEFAULT_RUNNER_POOL_ENABLED: bool = false;
+/// Published or locally cached packed images avoid cold OCI bootstrap per job.
+const DEFAULT_USE_PACKED_GOLDEN: bool = true;
 /// Memory given to each runner VM, in MiB. SmolVM balloons this, so an idle
 /// runner commits far less than its ceiling.
 const RUNNER_MEMORY_MIB: u32 = 4096;
@@ -2047,6 +2056,14 @@ mod tests {
         assert_eq!(parse_flag("maybe"), None);
         assert!(env_flag("__PRELOOP_TEST_FLAG_UNSET__", true));
         assert!(!env_flag("__PRELOOP_TEST_FLAG_UNSET__", false));
+        assert!(!env_flag(
+            "__PRELOOP_TEST_POOL_FLAG_UNSET__",
+            DEFAULT_RUNNER_POOL_ENABLED
+        ));
+        assert!(env_flag(
+            "__PRELOOP_TEST_GOLDEN_FLAG_UNSET__",
+            DEFAULT_USE_PACKED_GOLDEN
+        ));
     }
 
     #[test]
@@ -2092,6 +2109,7 @@ mod tests {
         .unwrap();
         unsafe {
             std::env::set_var("PRELOOP_RUNNER_BUNDLE", bundle.path());
+            std::env::remove_var("PRELOOP_USE_PACKED_GOLDEN");
         }
         let queue_depth = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let next_job_runs_on =
@@ -2118,11 +2136,30 @@ mod tests {
             config
         };
         // Stock base: environment-based replacement stays enabled.
-        assert!(config("ubuntu:24.04").next_job_runs_on.is_some());
+        let stock = config("ubuntu:24.04");
+        assert!(stock.next_job_runs_on.is_some());
+        assert!(
+            stock.use_packed_artifact,
+            "packed golden use must be enabled by default"
+        );
+        assert!(
+            config("mirror.gcr.io/library/ubuntu:24.04")
+                .next_job_runs_on
+                .is_some(),
+            "the mirrored pinned Ubuntu image is still a stock environment"
+        );
         // Custom base (artifact): disabled, so idle runners are never
         // replaced by the job's implied stock base.
         assert!(config("/tmp/custom.smolmachine").next_job_runs_on.is_none());
         unsafe {
+            std::env::set_var("PRELOOP_USE_PACKED_GOLDEN", "false");
+        }
+        assert!(
+            !config("ubuntu:24.04").use_packed_artifact,
+            "operators can still disable packed golden use explicitly"
+        );
+        unsafe {
+            std::env::remove_var("PRELOOP_USE_PACKED_GOLDEN");
             std::env::remove_var("PRELOOP_RUNNER_BUNDLE");
         }
     }

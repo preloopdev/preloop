@@ -43,6 +43,10 @@ pub(crate) struct UpdateArgs {
     /// Override the GitHub releases API endpoint.
     #[arg(long, env = "PRELOOP_RELEASES_API", hide = true)]
     pub api_url: Option<String>,
+
+    /// Install and verify Preloop's pinned VM runtime without updating Preloop.
+    #[arg(long, hide = true)]
+    pub ensure_runtime: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,6 +75,15 @@ pub(crate) async fn run(args: UpdateArgs) -> anyhow::Result<()> {
         .user_agent(USER_AGENT)
         .build()
         .context("build release API client")?;
+    if args.ensure_runtime {
+        #[cfg(unix)]
+        {
+            ensure_smolvm(&client).await?;
+            return Ok(());
+        }
+        #[cfg(not(unix))]
+        bail!("the smolvm runtime is supported only on Unix hosts");
+    }
     let repository = args
         .repository
         .as_deref()
@@ -102,12 +115,10 @@ pub(crate) async fn run(args: UpdateArgs) -> anyhow::Result<()> {
         Err(error) => println!("warning: Linux runner bundle not updated: {error:#}"),
     }
 
-    // The engine cannot provision VMs without a smolvm whose `machine
-    // create` accepts --mount-socket (the host-to-guest control-socket
-    // mount). Updating only the preloop binary and runner bundle left an
-    // old smolvm failing every provisioning attempt after an update, so
-    // probe the resolved binary and install the current smolvm release
-    // when the flag is missing. `--check` stays read-only.
+    // The engine cannot provision VMs without the pinned compatible smolvm.
+    // Checking only `--mount-socket` accepted 1.7.5 on macOS even though its
+    // libkrun omitted krun_add_net_unixstream, so require both the capability
+    // and the exact release whose packaged runtime was verified.
     #[cfg(unix)]
     if !args.check {
         match ensure_smolvm(&client).await {
@@ -267,15 +278,34 @@ async fn probe_mount_socket(binary: &Path) -> bool {
     stdout.read_to_string(&mut output).await.is_ok() && output.contains("--mount-socket")
 }
 
-/// Probe the `smolvm` on PATH, the same binary the engine resolves.
-async fn smolvm_supports_mount_socket() -> bool {
-    probe_mount_socket(Path::new("smolvm")).await
+async fn probe_smolvm_version(binary: &Path) -> Option<String> {
+    let mut command = tokio::process::Command::new(binary);
+    command
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let output = command.output().await.ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()?
+        .split_whitespace()
+        .last()
+        .map(|version| version.trim_start_matches('v').to_owned())
 }
 
-/// Probe the resolved smolvm and install the current release when it cannot
-/// mount sockets into the guest.
+async fn smolvm_is_compatible(binary: &Path) -> bool {
+    probe_mount_socket(binary).await
+        && probe_smolvm_version(binary).await.as_deref() == Some(SMOLVM_VERSION)
+}
+
+/// Probe the resolved smolvm and install the exact verified release when its
+/// version or required socket-mount capability differs.
 async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
-    if smolvm_supports_mount_socket().await {
+    if smolvm_is_compatible(Path::new("smolvm")).await {
         return Ok(());
     }
     let platform = smolvm_platform().ok_or_else(|| {
@@ -315,11 +345,10 @@ async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
     // The install lands in `~/.local/bin`; if PATH still resolves another
     // binary, the engine keeps failing and the user is left confused about
     // why the update did not help. Say so explicitly.
-    if !smolvm_supports_mount_socket().await {
-        println!(
-            "warning: installed smolvm {version} to {}, but `smolvm` on PATH still \
-             resolves to a binary without --mount-socket; the engine resolves `smolvm` \
-             from PATH, so make sure {} comes first",
+    if !smolvm_is_compatible(Path::new("smolvm")).await {
+        bail!(
+            "installed smolvm {version} to {}, but `smolvm` on PATH still resolves \
+             to an incompatible version or lacks --mount-socket; make sure {} comes first",
             install.prefix.display(),
             install.bin_dir.display()
         );
@@ -390,7 +419,7 @@ fn install_smolvm_from_archive(
     let link = install.bin_dir.join("smolvm");
     let _ = fs::remove_file(&link);
     #[cfg(unix)]
-    std::os::unix::fs::symlink(&install.prefix.join("smolvm"), &link)?;
+    std::os::unix::fs::symlink(install.prefix.join("smolvm"), &link)?;
     Ok(())
 }
 
@@ -413,7 +442,7 @@ fn extract_tar_gz(archive_path: &Path, destination: &Path) -> anyhow::Result<()>
         if safe.as_os_str().is_empty() {
             continue;
         }
-        entry.unpack(&destination.join(safe))?;
+        entry.unpack(destination.join(safe))?;
     }
     Ok(())
 }
@@ -802,6 +831,47 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compatibility_requires_pinned_version_and_mount_socket() {
+        let directory = tempfile::tempdir().unwrap();
+        for (version, flag, expected) in [
+            (SMOLVM_VERSION, "--mount-socket <HOST:GUEST>", true),
+            ("1.7.5", "--mount-socket <HOST:GUEST>", false),
+            (SMOLVM_VERSION, "--docker-socket", false),
+        ] {
+            let executable = directory
+                .path()
+                .join(format!("smolvm-{version}-{expected}"));
+            std::fs::write(
+                &executable,
+                format!(
+                    "#!/bin/sh\n\
+                     if [ \"${{1-}}\" = \"--version\" ]; then\n\
+                       printf '%s\\n' \"smolvm {version}\"\n\
+                       exit 0\n\
+                     fi\n\
+                     if [ \"${{1-}}:${{2-}}:${{3-}}\" = \"machine:create:--help\" ]; then\n\
+                       printf '%s\\n' \"Usage: smolvm machine create {flag}\"\n\
+                       exit 0\n\
+                     fi\n\
+                     exit 1\n"
+                ),
+            )
+            .unwrap();
+            let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&executable, permissions).unwrap();
+
+            assert_eq!(
+                smolvm_is_compatible(&executable).await,
+                expected,
+                "version={version}, flag={flag}"
+            );
+        }
+    }
+
     #[test]
     fn platform_naming_covers_apple_silicon_and_linux() {
         match (std::env::consts::OS, std::env::consts::ARCH) {
@@ -893,7 +963,6 @@ mod tests {
         );
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
             let link_meta =
                 std::fs::symlink_metadata(install.data_dir.join("agent-rootfs/sh")).unwrap();
             assert!(

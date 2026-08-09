@@ -172,10 +172,13 @@ fn ensure_host_externals(config: &RunnerPoolConfig) -> Result<(), OrchestratorEr
         .join("node")
         .is_file()
     {
-        let copy = std::process::Command::new("cp")
-            .args(["-a", externals.to_str().unwrap_or_default()])
-            .arg(format!("{}/.", bundle_externals.display()))
-            .output();
+        let copy = std::fs::create_dir_all(&bundle_externals).and_then(|()| {
+            std::process::Command::new("cp")
+                .arg("-a")
+                .arg(externals.join("."))
+                .arg(&bundle_externals)
+                .output()
+        });
         match copy {
             Ok(output) if output.status.success() => info!(
                 bundle = %bundle_externals.display(),
@@ -252,12 +255,15 @@ fn relax_externals_permissions(externals: &Path) {
 #[cfg(not(unix))]
 fn relax_externals_permissions(_externals: &Path) {}
 
-async fn download_prebaked_golden(payload: &Path) -> bool {
-    let default_url = format!(
-        "https://github.com/preloopdev/preloop/releases/download/v{}/preloop-ubuntu-24.04-{}",
-        env!("CARGO_PKG_VERSION"),
+fn default_golden_url(release_version: &str) -> String {
+    format!(
+        "https://github.com/preloopdev/preloop/releases/download/v{release_version}/preloop-ubuntu-24.04-{}",
         std::env::consts::ARCH
-    );
+    )
+}
+
+async fn download_prebaked_golden(payload: &Path, release_version: &str) -> bool {
+    let default_url = default_golden_url(release_version);
     let url = std::env::var("PRELOOP_GOLDEN_URL").unwrap_or(default_url);
 
     info!(url = %url, target = %payload.display(), "Attempting to download pre-baked golden microVM image");
@@ -940,6 +946,11 @@ pub struct RunnerPoolConfig {
     pub workspace: Option<PathBuf>,
     /// Host path stem for the reusable packed VM artifact.
     pub artifact_stem: PathBuf,
+    /// Preloop release whose architecture-specific golden asset should be used.
+    ///
+    /// This comes from the embedding CLI rather than this crate's package
+    /// version: workspace crates are versioned independently.
+    pub release_version: String,
     /// Host directory containing the Linux `preloop-runner` executable.
     pub runner_bundle: PathBuf,
     /// Host directory holding the Node externals shared with every VM.
@@ -1122,9 +1133,12 @@ impl RunnerPoolConfig {
             ));
         }
         MachineName::new(format!("{}-0", self.name_prefix))?;
-        if self.base_image.trim().is_empty() || self.server_url.trim().is_empty() {
+        if self.base_image.trim().is_empty()
+            || self.server_url.trim().is_empty()
+            || self.release_version.trim().is_empty()
+        {
             return Err(OrchestratorError::Config(
-                "base image and server URL are required".into(),
+                "base image, server URL, and release version are required".into(),
             ));
         }
         if !self.runner_bundle.is_absolute() || !self.runner_bundle.is_dir() {
@@ -1598,6 +1612,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         info!(max_concurrent, "on-demand runner pool (size=0)");
 
         let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+        let provisioning = Arc::new(AtomicUsize::new(0));
         let mut slots = JoinSet::new();
         let mut next_slot: usize = 0;
 
@@ -1642,6 +1657,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                 keys: keys.clone(),
                 building: building.clone(),
             };
+            let slot_provisioning = provisioning.clone();
 
             slots.spawn(async move {
                 let _permit = permit; // held until this task exits
@@ -1652,6 +1668,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     slot_shutdown,
                     slot_registry,
                     slot_handles,
+                    slot_provisioning,
                 )
                 .await;
                 if let Err(error) = &result {
@@ -1718,7 +1735,8 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         if let Some(parent) = self.config.artifact_stem.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        if allow_download && download_prebaked_golden(&payload).await {
+        if allow_download && download_prebaked_golden(&payload, &self.config.release_version).await
+        {
             return Ok(());
         }
 
@@ -1962,6 +1980,36 @@ impl Drop for Reservation<'_> {
     }
 }
 
+/// Keeps the server's starvation clock paused while any on-demand runner is
+/// still being provisioned. A counter is required because size-zero mode can
+/// create several runners concurrently; the first completed runner must not
+/// clear the signal while another job's runner is still bootstrapping.
+struct PreparingGuard {
+    active: Arc<AtomicUsize>,
+    signal: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl PreparingGuard {
+    fn enter(active: Arc<AtomicUsize>, signal: Option<Arc<std::sync::atomic::AtomicBool>>) -> Self {
+        if active.fetch_add(1, Ordering::AcqRel) == 0 {
+            if let Some(signal) = &signal {
+                signal.store(true, Ordering::Release);
+            }
+        }
+        Self { active, signal }
+    }
+}
+
+impl Drop for PreparingGuard {
+    fn drop(&mut self) {
+        if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            if let Some(signal) = &self.signal {
+                signal.store(false, Ordering::Release);
+            }
+        }
+    }
+}
+
 /// Single-shot on-demand runner: provision, run exactly one job, clean up.
 async fn run_on_demand_slot<P: VmProvider + 'static>(
     provider: Arc<P>,
@@ -1970,7 +2018,9 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     shutdown: CancellationToken,
     golden_registry: Arc<GoldenRegistry>,
     handles: PoolHandles,
+    provisioning: Arc<AtomicUsize>,
 ) -> Result<(), OrchestratorError> {
+    let preparing = PreparingGuard::enter(provisioning, config.preparing_signal.clone());
     // Resolve the golden for the queued job's environment.
     let (golden, environment) = if config.use_fork {
         let env_base = match &config.next_job_runs_on {
@@ -2040,6 +2090,9 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
         environment.clone(),
     )
     .await?;
+    // `provision_slot` returns only after runner registration succeeds. From
+    // this point the starvation sweep can see a matching runner directly.
+    drop(preparing);
 
     // Run exactly one job — no successor pre-provisioning.
     let result = run_one_runner(
@@ -3317,6 +3370,32 @@ chmod +x "$destination/bin/node"
         );
     }
 
+    #[test]
+    fn golden_download_url_uses_embedding_release_version() {
+        let url = default_golden_url("9.8.7");
+        assert!(url.contains("/releases/download/v9.8.7/"), "{url}");
+        assert!(!url.contains(env!("CARGO_PKG_VERSION")), "{url}");
+    }
+
+    #[test]
+    fn concurrent_on_demand_provisioning_keeps_preparing_signal_raised() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let first = PreparingGuard::enter(active.clone(), Some(signal.clone()));
+        let second = PreparingGuard::enter(active.clone(), Some(signal.clone()));
+        assert!(signal.load(Ordering::Acquire));
+
+        drop(first);
+        assert!(
+            signal.load(Ordering::Acquire),
+            "one completed provision must not expose the other to starvation"
+        );
+
+        drop(second);
+        assert!(!signal.load(Ordering::Acquire));
+    }
+
     fn test_config(control_socket: bool) -> RunnerPoolConfig {
         RunnerPoolConfig {
             size: 1,
@@ -3326,6 +3405,7 @@ chmod +x "$destination/bin/node"
             base_image: "base-image".to_owned(),
             workspace: None,
             artifact_stem: PathBuf::from("/tmp/lifecycle-artifact"),
+            release_version: "9.9.9".to_owned(),
             runner_bundle: PathBuf::from("/tmp"),
             externals_dir: PathBuf::from("/tmp/lifecycle-externals"),
             runner_binary_name: "runner".to_owned(),
@@ -3856,7 +3936,7 @@ mod golden_download_tests {
         .await;
         std::env::set_var("PRELOOP_GOLDEN_URL", &url);
 
-        let downloaded = download_prebaked_golden(&payload).await;
+        let downloaded = download_prebaked_golden(&payload, "9.9.9").await;
 
         std::env::remove_var("PRELOOP_GOLDEN_URL");
         assert!(downloaded);
@@ -3883,7 +3963,7 @@ mod golden_download_tests {
         .await;
         std::env::set_var("PRELOOP_GOLDEN_URL", &url);
 
-        let downloaded = download_prebaked_golden(&payload).await;
+        let downloaded = download_prebaked_golden(&payload, "9.9.9").await;
 
         std::env::remove_var("PRELOOP_GOLDEN_URL");
         // The caller reads `false` as "build the golden locally", so a partial
@@ -3913,7 +3993,7 @@ mod golden_download_tests {
         .await;
         std::env::set_var("PRELOOP_GOLDEN_URL", &url);
 
-        let downloaded = download_prebaked_golden(&payload).await;
+        let downloaded = download_prebaked_golden(&payload, "9.9.9").await;
 
         std::env::remove_var("PRELOOP_GOLDEN_URL");
         assert!(downloaded);
@@ -3936,7 +4016,7 @@ mod golden_download_tests {
         .await;
         std::env::set_var("PRELOOP_GOLDEN_URL", &url);
 
-        let downloaded = download_prebaked_golden(&payload).await;
+        let downloaded = download_prebaked_golden(&payload, "9.9.9").await;
 
         std::env::remove_var("PRELOOP_GOLDEN_URL");
         // A corrupted artifact must never be published as the payload: the

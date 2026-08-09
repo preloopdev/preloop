@@ -159,20 +159,18 @@ pub(crate) fn manifest(
         "public": false,
         "default_permissions": permissions,
     });
-    match public_url {
-        Some(public) => {
-            manifest["hook_attributes"] = serde_json::json!({
-                "url": format!("{}/api/v1/github/webhooks", public.trim_end_matches('/')),
-                "active": true,
-            });
-            manifest["default_events"] = serde_json::json!(DEFAULT_EVENTS);
-        }
-        // No webhook at all: GitHub validates hook URL reachability even for
-        // inactive hooks and rejects loopback addresses. Omitting the object
-        // means no `webhook_secret` is minted, so a later `--public-url`
-        // has to add the secret when enabling the hook in App settings.
-        None => {}
+    if let Some(public) = public_url {
+        manifest["hook_attributes"] = serde_json::json!({
+            "url": format!("{}/api/v1/github/webhooks", public.trim_end_matches('/')),
+            "active": true,
+        });
+        manifest["default_events"] = serde_json::json!(DEFAULT_EVENTS);
     }
+    // With no public URL there is no webhook at all: GitHub validates hook URL
+    // reachability even for inactive hooks and rejects loopback addresses.
+    // Omitting the object means no `webhook_secret` is minted, so a later
+    // `--public-url` has to add the secret when enabling the hook in App
+    // settings.
     manifest
 }
 
