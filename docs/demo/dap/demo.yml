@@ -1,0 +1,21 @@
+name: dap-demo
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        type: string
+        default: release
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    steps:
+      - name: Announce
+        run: echo "Deploying target=${{ github.event.inputs.target }}"
+      - name: Verify production target
+        run: |
+          if [ "${{ github.event.inputs.target }}" != "prod" ]; then
+            echo "::error::refusing to deploy target='${{ github.event.inputs.target }}' to production"
+            exit 1
+          fi
+          echo "deploy OK"

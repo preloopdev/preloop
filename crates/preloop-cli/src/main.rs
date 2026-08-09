@@ -17,6 +17,7 @@ use std::time::Duration;
 
 mod app_manifest;
 mod debug_session;
+mod dap_client;
 mod github_auth;
 mod github_setup;
 mod push;
@@ -131,6 +132,9 @@ enum Command {
 
     /// Attach to a job paused at a failed step: inspect, fix, retry.
     Debug(debug_session::DebugArgs),
+
+    /// Attach an interactive DAP client to a debugger-enabled run.
+    Dap(dap_client::DapArgs),
 
     /// Publish a completed run's result to GitHub: push the tested commit,
     /// create or update the pull request, and report check runs.
@@ -390,6 +394,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Debug(args) => {
             debug_session::run(args, build_client(), server_url(), api_token()).await
         }
+        Command::Dap(args) => dap_client::run(args, server_url(), api_token()).await,
         Command::Push(args) => cmd_push(args).await,
         Command::Update(_)
         | Command::Serve(_)

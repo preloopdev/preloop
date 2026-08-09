@@ -1767,6 +1767,20 @@ pub(crate) fn build_job_artifacts(
     if submission.enable_debugger || submission.preserve_on_failure {
         agent_msg.preloop_debug_run_id = Some(run_id.to_string());
         agent_msg.preloop_debug_transport = Some("local".to_string());
+        if submission.enable_debugger {
+            // The runner refuses to start the debugger without a valid
+            // DebuggerTunnelInfo (id/cluster/host_token non-empty, port != 0).
+            // In local server-proxy mode the relay fields are placeholders;
+            // only `port` is real — the runner's WebSocketDapBridge binds it
+            // so the engine's `/api/v1/runs/{id}/debug` proxy can connect.
+            // 4711 is preloop_dap::DAP_TUNNEL_PORT (official default).
+            agent_msg.debugger_tunnel = Some(preloop_gha_protocol::DebuggerTunnelInfo {
+                tunnel_id: "local".to_string(),
+                cluster_id: "local".to_string(),
+                host_token: "local".to_string(),
+                port: 4711,
+            });
+        }
     }
 
     let oidc_ctx = OidcJobContext {

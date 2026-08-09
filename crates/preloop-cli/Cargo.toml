@@ -32,6 +32,7 @@ serde = { workspace = true }
 reqwest = { workspace = true }
 rand = { workspace = true }
 futures-util = "0.3"
+tokio-tungstenite = { workspace = true }
 libc = "0.2"
 preloop-gha-protocol = { path = "../preloop-gha-protocol" }
 self-replace = { workspace = true }

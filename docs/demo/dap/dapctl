@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""dapctl — drive a preloop DAP debug session from the command line.
+
+Two roles in one script:
+
+  dapctl daemon --url WS_URL --token TOKEN --socket PATH
+      Connect to the engine's DAP proxy WebSocket and hold the session.
+      Listens on a unix socket for commands (one JSON line per command).
+
+  dapctl CMD [ARGS]  (with --socket PATH, default /tmp/dapctl.sock)
+      Send one command to the daemon and print the JSON reply.
+
+Commands:
+  init                 send DAP initialize; print capabilities
+  ready                send configurationDone (job steps start running)
+  wait [SECS]          block for the next DAP event (stopped/continued/...)
+  source               fetch the synthetic execution.yml source view
+  threads              list threads
+  scopes               list variable scopes
+  vars REF             list variables for a scope/variable reference
+  eval EXPR            evaluate an expression (REPL: run("..."), help)
+  continue             resume the job
+  quit                 close the session
+
+The daemon talks DAP over the engine's WebSocket proxy
+(GET /api/v1/runs/{id}/debug); the proxy forwards bare-JSON text frames to
+the runner's WebSocketDapBridge, which adds Content-Length framing for the
+raw TCP DAP server.
+"""
+
+import asyncio
+import json
+import os
+import socket
+import sys
+
+DEFAULT_SOCKET = "/tmp/dapctl.sock"
+
+
+# ── daemon ────────────────────────────────────────────────────────────────
+
+class DapDaemon:
+    def __init__(self, url: str, token: str):
+        self.url = url
+        self.token = token
+        self.ws = None
+        self.seq = 0
+        self.pending: dict[int, asyncio.Future] = {}
+        self.events: asyncio.Queue = asyncio.Queue()
+        self.reader_task = None
+
+    async def run(self, sock_path: str) -> None:
+        import websockets
+
+        extra = {"Authorization": f"Bearer {self.token}"}
+        self.ws = await websockets.connect(self.url, additional_headers=extra)
+        print(f"connected to {self.url}", flush=True)
+        self.reader_task = asyncio.create_task(self._read_loop())
+        server = await asyncio.start_unix_server(self._handle_client, sock_path)
+        async with server:
+            await asyncio.get_running_loop().create_future()  # run forever
+
+    async def _read_loop(self) -> None:
+        async for raw in self.ws:
+            msg = json.loads(raw)
+            if msg.get("type") == "event":
+                await self.events.put(msg)
+            elif msg.get("type") == "response":
+                fut = self.pending.pop(msg.get("request_seq"), None)
+                if fut and not fut.done():
+                    fut.set_result(msg)
+            elif msg.get("type") == "request":
+                # The runner never sends requests to the client in this
+                # implementation; ignore defensively.
+                continue
+
+    async def _send(self, command: str, arguments: dict | None = None) -> dict:
+        self.seq += 1
+        req = {"seq": self.seq, "type": "request", "command": command}
+        if arguments:
+            req["arguments"] = arguments
+        fut = asyncio.get_running_loop().create_future()
+        self.pending[self.seq] = fut
+        await self.ws.send(json.dumps(req))
+        return await asyncio.wait_for(fut, timeout=30)
+
+    async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            line = await asyncio.wait_for(reader.readline(), timeout=5)
+            if not line:
+                return
+            cmd = json.loads(line)
+            op = cmd.get("op")
+            if op == "init":
+                out = await self._send("initialize", {"adapterID": "preloop", "clientID": "dapctl"})
+            elif op == "ready":
+                out = await self._send("configurationDone")
+            elif op == "wait":
+                timeout = float(cmd.get("args", 30))
+                try:
+                    ev = await asyncio.wait_for(self.events.get(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    out = {"timeout": True}
+                else:
+                    out = ev
+            elif op == "source":
+                out = await self._send("source", {"source": {"name": "execution.yml"}})
+            elif op == "threads":
+                out = await self._send("threads")
+            elif op == "scopes":
+                out = await self._send("scopes", {"frameId": 1})
+            elif op == "vars":
+                out = await self._send("variables", {"variablesReference": int(cmd["args"])})
+            elif op == "eval":
+                out = await self._send("evaluate", {"expression": cmd["args"], "context": "repl"})
+            elif op == "continue":
+                out = await self._send("continue", {"threadId": 1})
+            elif op == "quit":
+                await self.ws.close()
+                os._exit(0)
+            else:
+                out = {"error": f"unknown op {op}"}
+            writer.write((json.dumps(out) + "\n").encode())
+            await writer.drain()
+        except Exception as exc:  # noqa: BLE001 - report any daemon-side failure to the caller
+            try:
+                writer.write((json.dumps({"error": repr(exc)}) + "\n").encode())
+                await writer.drain()
+            except Exception:
+                pass
+        finally:
+            writer.close()
+
+
+# ── client ────────────────────────────────────────────────────────────────
+
+def client(sock_path: str, op: str, args: str | None) -> None:
+    payload = {"op": op}
+    if args is not None:
+        payload["args"] = args
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.connect(sock_path)
+        s.sendall((json.dumps(payload) + "\n").encode())
+        s.shutdown(socket.SHUT_WR)
+        buf = b""
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    out = json.loads(buf.decode())
+    print(json.dumps(out, indent=2))
+
+
+def main() -> None:
+    argv = sys.argv[1:]
+    if argv and argv[0] == "daemon":
+        url = token = None
+        sock = DEFAULT_SOCKET
+        i = 1
+        while i < len(argv):
+            if argv[i] == "--url":
+                url = argv[i + 1]
+                i += 2
+            elif argv[i] == "--token":
+                token = argv[i + 1]
+                i += 2
+            elif argv[i] == "--socket":
+                sock = argv[i + 1]
+                i += 2
+            else:
+                i += 1
+        if not url or not token:
+            print("usage: dapctl daemon --url WS_URL --token TOKEN [--socket PATH]", file=sys.stderr)
+            sys.exit(2)
+        if os.path.exists(sock):
+            os.unlink(sock)
+        asyncio.run(DapDaemon(url, token).run(sock))
+        return
+    op = argv[0] if argv else "help"
+    args = None
+    if len(argv) > 1:
+        args = " ".join(argv[1:])
+    try:
+        client(DEFAULT_SOCKET, op, args)
+    except (ConnectionRefusedError, FileNotFoundError):
+        print("no dapctl daemon running; start one with: dapctl daemon --url WS_URL --token TOKEN", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
