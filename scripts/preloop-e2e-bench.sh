@@ -94,14 +94,14 @@ RUNNER_URL="$CLIENT_URL/runner/server"
 EXISTING_URL=$(python3 -c "import json; d=json.load(open('.runner', encoding='utf-8-sig')); print(d.get('serverUrl',''))" 2>/dev/null || echo "")
 
 if [ "$EXISTING_URL" != "$RUNNER_URL" ]; then
-    resp=$(python3 -c "
-import urllib.request, json
+    resp=$(REGISTRATION_TOKEN="$REGISTRATION_TOKEN" python3 -c "
+import os, urllib.request, json
 req = urllib.request.Request(
     '${CLIENT_URL}/api/v3/repos/owner/repo/actions/runners/registration-token',
     data=b'{}',
     headers={
         'Content-Type':'application/json',
-        'Authorization':'RemoteAuth ${REGISTRATION_TOKEN}',
+        'Authorization':'RemoteAuth ' + os.environ['REGISTRATION_TOKEN'],
     },
     method='POST'
 )
