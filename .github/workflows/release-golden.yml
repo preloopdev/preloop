@@ -155,20 +155,13 @@ jobs:
           if-no-files-found: error
 
   # The aarch64 golden can only be built on an arm64 host (the guest VM runs
-  # on the host's own architecture), and GitHub-hosted Linux runners have no
-  # KVM. Apple Silicon macOS runners expose HVF, so the aarch64 golden is
-  # built there; the engine fetches it as `preloop-ubuntu-24.04-aarch64` on
-  # first run and skips the local toolchain bake entirely.
+  # on the host's own architecture). GitHub-hosted Apple Silicon runners do
+  # not support nested virtualization, so this must run on a bare-metal
+  # self-hosted Mac with Hypervisor.framework access.
   build-and-publish-golden-macos:
     name: Build & Publish aarch64 Golden (macOS)
     if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
-    runs-on: macos-14
-    env:
-      # GitHub's hosted macOS guests reject libkrun's virtio-net device under
-      # their virtualization boundary (krun_start_enter EINVAL). TSI keeps
-      # outbound access inside libkrun and is sufficient for this one-shot
-      # image build; job VMs still default to policy-enforced virtio-net.
-      PRELOOP_SMOLVM_NET_BACKEND: tsi
+    runs-on: [self-hosted, macOS, ARM64]
     permissions:
       contents: write
     steps:

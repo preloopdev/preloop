@@ -708,13 +708,6 @@ pub fn base_install_script() -> String {
           echo \"### bake git-lfs v{GIT_LFS_VERSION}\" >&2 && \
           curl -fsSL https://github.com/git-lfs/git-lfs/releases/download/v{GIT_LFS_VERSION}/git-lfs-linux-$LFS_ARCH-v{GIT_LFS_VERSION}.tar.gz | tar -xz -C /tmp && \
           /tmp/git-lfs-{GIT_LFS_VERSION}/install.sh && rm -rf /tmp/git-lfs-{GIT_LFS_VERSION}) && \
-         (mkdir -p /opt/hostedtoolcache/node && \
-          for NODE_TOOLCACHE_VERSION in {NODE_TOOLCACHE_VERSIONS}; do \
-            echo \"### bake node toolcache $NODE_TOOLCACHE_VERSION\" >&2 && \
-            mkdir -p /opt/hostedtoolcache/node/$NODE_TOOLCACHE_VERSION/x64 && \
-            curl -fsSL https://nodejs.org/dist/v$NODE_TOOLCACHE_VERSION/node-v$NODE_TOOLCACHE_VERSION-linux-$NODE_ARCH.tar.gz \
-              | tar -xz --strip-components=1 -C /opt/hostedtoolcache/node/$NODE_TOOLCACHE_VERSION/x64; \
-          done) && \
          (mkdir -p /usr/local/share && \
           echo \"### bake nvm v{NVM_VERSION}\" >&2 && \
           curl -fsSL https://github.com/nvm-sh/nvm/archive/refs/tags/v{NVM_VERSION}.tar.gz | tar -xz -C /usr/local/share && \
@@ -722,22 +715,10 @@ pub fn base_install_script() -> String {
           printf 'export NVM_DIR=/usr/local/share/nvm\\n[ -s \"$NVM_DIR/nvm.sh\" ] && \\. \"$NVM_DIR/nvm.sh\"\\n' > /etc/profile.d/nvm.sh) && \
          echo \"### bake yarn v{YARN_VERSION}\" >&2 && \
          npm install -g yarn@{YARN_VERSION} && \
-         (mkdir -p /opt/hostedtoolcache/python /opt/hostedtoolcache/go && \
-          for PY_VERSION in {PYTHON_TOOLCACHE_VERSIONS}; do \
-            echo \"### bake python $PY_VERSION\" >&2 && \
-            PY_TAG=$(git ls-remote --tags https://github.com/actions/python-versions.git \"refs/tags/$PY_VERSION-*\" 2>/dev/null | awk -F/ '{{print $3}}' | sort -V | tail -1) && \
-            mkdir -p /opt/hostedtoolcache/python/$PY_VERSION/x64 && \
-            curl -fsSL https://github.com/actions/python-versions/releases/download/$PY_TAG/python-$PY_VERSION-linux-24.04-$NODE_ARCH.tar.gz \
-              | tar -xz --strip-components=1 -C /opt/hostedtoolcache/python/$PY_VERSION/x64; \
-          done && \
-          for GO_VERSION in {GO_TOOLCACHE_VERSIONS}; do \
-            echo \"### bake go $GO_VERSION\" >&2 && \
-            mkdir -p /opt/hostedtoolcache/go/$GO_VERSION/x64 && \
-            curl -fsSL https://go.dev/dl/go$GO_VERSION.linux-$LFS_ARCH.tar.gz \
-              | tar -xz --strip-components=1 -C /opt/hostedtoolcache/go/$GO_VERSION/x64; \
-          done) && \
+         install -d -m 0775 -o 1001 -g 1001 /opt/hostedtoolcache && \
          (useradd -m -u 1000 -s /bin/bash ubuntu 2>/dev/null || true) && \
-         apt-get clean",
+         apt-get clean && \
+         rm -rf /usr/share/doc/* /usr/share/man/* /usr/share/info/*",
         docker_packages = docker_apt_packages(),
         compiler_packages = compiler_apt_packages(),
         base_packages_pinned = base_packages_pinned()

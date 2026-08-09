@@ -161,7 +161,7 @@ impl ToolchainLayer {
                          esac\n\
                          curl -fsSL \"https://static.rust-lang.org/rustup/archive/{}/$RUST_ARCH-unknown-linux-gnu/rustup-init\" -o /tmp/rustup-init\n\
                          chmod +x /tmp/rustup-init\n\
-                         /tmp/rustup-init -y --default-toolchain {}\n\
+                         /tmp/rustup-init -y --profile minimal --default-toolchain {}\n\
                          rm -f /tmp/rustup-init",
                         crate::RUSTUP_VERSION,
                         safe_component(channel)
@@ -426,6 +426,7 @@ mod tests {
             "static.rust-lang.org/rustup/archive/{}",
             crate::RUSTUP_VERSION
         )));
+        assert!(script.contains("--profile minimal"));
         assert!(script.contains("--default-toolchain stable"));
         assert!(!script.contains("sh.rustup.rs"));
     }

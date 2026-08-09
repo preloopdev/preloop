@@ -96,6 +96,31 @@ fn golden_bakes_pinned_node_from_dist_tarball() {
     );
 }
 
+/// First-party setup actions own their requested runtime versions. Baking a
+/// matrix of Node, Python, and Go duplicates those actions' distribution
+/// mechanism and pushes the flattened golden beyond smolvm's 4 GiB export
+/// limit. The baked Rust layer uses rustup's minimal profile for the same
+/// reason. Keep only system Node/Python for direct shell use, and leave a
+/// writable toolcache for setup actions.
+#[test]
+fn setup_actions_own_versioned_runtime_toolcaches() {
+    let script = base_install_script();
+    for fragment in [
+        "bake node toolcache",
+        "actions/python-versions",
+        "https://go.dev/dl/go$GO_VERSION",
+    ] {
+        assert!(
+            !script.contains(fragment),
+            "setup-managed runtime must not be baked: {fragment}"
+        );
+    }
+    assert!(
+        script.contains("install -d -m 0775 -o 1001 -g 1001 /opt/hostedtoolcache"),
+        "setup actions need a runner-writable toolcache"
+    );
+}
+
 /// Docker's official repo packages (docker-ce stack), not Ubuntu's
 /// `docker.io`: the CLI and the buildx/compose plugins must be the official
 /// artifacts so container jobs behave exactly like they do on `ubuntu-latest`.
@@ -191,6 +216,10 @@ fn golden_keeps_apt_lists_for_workflow_installs() {
     assert!(
         script.contains("apt-get clean"),
         "cached .deb archives are still dropped"
+    );
+    assert!(
+        script.contains("rm -rf /usr/share/doc/* /usr/share/man/* /usr/share/info/*"),
+        "non-runtime documentation must not push the packed image past smolvm's 4 GiB export cap"
     );
 }
 

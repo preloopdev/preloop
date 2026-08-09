@@ -110,7 +110,6 @@ results on Preloop match GitHub:
 | Item | Exact version (official image) | Why |
 |---|---|---|
 | Node.js (system) | **22.23.1** | The #1 proven failure: workflows call `node`/`npm`/`npx` directly — 6/7 repos in the 2026-07-28 campaign failed on "Node 24 missing". Runner-internal node is covered by externals; system node is not |
-| Node toolcache | **22.23.1, 24.18.0** | `setup-node` hits the toolcache first; without it every job re-downloads and "is Node X installed?" checks drift |
 | npm / yarn / nvm | **npm 10.9.8, yarn 1.22.22, nvm 0.40.6** | Same hidden-dependency class |
 | Docker stack | **client 28.0.4, server 28.0.4, buildx 0.35.0, compose 2.38.2** | Container/service jobs are a whole workflow category; apt's older docker + missing buildx/compose changes `docker buildx` / `docker compose` behavior |
 | Clang family | **clang/format/tidy 16.0.6, 17.0.6, 18.1.3** | There is no standard GitHub setup action; C/C++ workflows commonly invoke versioned binaries directly |
@@ -122,8 +121,6 @@ results on Preloop match GitHub:
 | Item | Exact version (official image) | Why |
 |---|---|---|
 | git | **2.54.0** + **Git LFS 3.7.1** | checkout-adjacent behavior: safe.directory, submodules, protocol quirks (apt ships 2.43.x) |
-| Python toolcache | **3.10.20, 3.11.15, 3.12.13, 3.13.14, 3.14.6** (system 3.12.3 already matches via apt) | `setup-python` version checks + no per-job download |
-| Go toolcache | **1.24.13, 1.25.12, 1.26.5** | Same for `setup-go` |
 | `ubuntu` admin user | **uid 1000** | Workflows/actions that `chown` to 1000 or assume the admin account (a documented GitHub container-job gotcha) |
 
 ### Setup-action boundary
@@ -133,6 +130,9 @@ GitHub maintains first-party setup actions for Node
 (`actions/setup-go`), Java (`actions/setup-java`), and .NET
 (`actions/setup-dotnet`). Those toolchains do not need every hosted-image
 version baked for correctness; their actions install a requested version.
+The golden therefore does not pre-populate versioned Node, Python, or Go
+toolcaches. It provides a runner-writable `/opt/hostedtoolcache` for those
+actions, plus system Node and Python for workflows that invoke them directly.
 
 The following have ecosystem-owned setup actions: Ruby (`ruby/setup-ruby`),
 Julia (`julia-actions/setup-julia`), Haskell (`haskell-actions/setup`), PHP
