@@ -21,6 +21,33 @@ use crate::{
 };
 use preloop_gha_protocol::{AnnotationLevel, JobId, NdjsonEvent, RunId, WorkflowSubmission};
 
+/// Comma-separated workflow filenames or `.github/workflows/...` paths that
+/// GitHub, rather than Preloop, owns. This keeps release and artifact-publish
+/// workflows out of the local webhook dispatcher while leaving the default
+/// generic forges-only behavior unchanged.
+const GITHUB_OWNED_WORKFLOWS_ENV: &str = "PRELOOP_GITHUB_SKIP_WORKFLOWS";
+
+fn configured_github_owned_workflows() -> BTreeSet<String> {
+    std::env::var(GITHUB_OWNED_WORKFLOWS_ENV)
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(|entry| entry.trim_start_matches("./").to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn is_github_owned_workflow(filename: &str, configured: &BTreeSet<String>) -> bool {
+    let path = format!(".github/workflows/{filename}");
+    configured
+        .iter()
+        .any(|entry| entry == filename || entry == &path)
+}
+
 /// Webhook push event payload.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub(crate) struct PushEvent {
@@ -920,6 +947,7 @@ async fn process_github_webhook(
     };
 
     let mut triggered_runs = Vec::new();
+    let github_owned_workflows = configured_github_owned_workflows();
 
     // 5. For each effective event, fetch workflows and submit runs
     for effective in &effective_events {
@@ -990,6 +1018,14 @@ async fn process_github_webhook(
         }
 
         for (filename, content) in workflows {
+            if is_github_owned_workflow(&filename, &github_owned_workflows) {
+                info!(
+                    workflow = %filename,
+                    event = %effective.event,
+                    "Skipping workflow owned by GitHub"
+                );
+                continue;
+            }
             // Scheduler reconciliation runs once for the complete workflow
             // inventory above so deletions are observable too.
             // Validate filter keys / conflicting filters (warning only — submit_run_inner
@@ -1368,6 +1404,24 @@ mod tests {
         format!("sha256={hex}")
     }
 
+    #[test]
+    fn github_owned_workflow_filter_matches_filename_or_path() {
+        let configured =
+            "release.yml, .github/workflows/release-golden.yml, ./release-linux-runner.yml"
+                .split(',')
+                .map(str::trim)
+                .map(|entry| entry.trim_start_matches("./").to_owned())
+                .collect();
+
+        assert!(is_github_owned_workflow("release.yml", &configured));
+        assert!(is_github_owned_workflow("release-golden.yml", &configured));
+        assert!(is_github_owned_workflow(
+            "release-linux-runner.yml",
+            &configured
+        ));
+        assert!(!is_github_owned_workflow("ci.yml", &configured));
+    }
+
     /// The signed push payload GitHub would deliver for `owner/repo`.
     fn signed_push_payload() -> (Vec<u8>, String) {
         let payload = serde_json::json!({
@@ -1592,6 +1646,36 @@ mod tests {
             "a delivery that triggered no workflow is still processed"
         );
         assert!(inner.runs.is_empty());
+    }
+
+    /// A deployment can leave release and artifact workflows to GitHub while
+    /// Preloop owns the ordinary CI workflows in the same repository.
+    #[tokio::test]
+    async fn webhook_skips_github_owned_workflows() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        std::env::set_var(GITHUB_OWNED_WORKFLOWS_ENV, "release.yml");
+
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = temp.path().join("ws");
+        std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
+        std::fs::write(
+            ws_dir.join(".github/workflows/release.yml"),
+            "on: push\njobs:\n  release:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo release\n",
+        )
+        .unwrap();
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+
+        assert_eq!(
+            fixture.post("delivery-github-owned", Some("push")).await,
+            StatusCode::OK
+        );
+        let inner = fixture.state.inner.lock().await;
+        assert!(inner.runs.is_empty());
+        assert!(inner.webhook_deliveries.iter().any(|(id, state)| {
+            id == "delivery-github-owned" && matches!(state, WebhookDeliveryState::Completed(_))
+        }));
+
+        std::env::remove_var(GITHUB_OWNED_WORKFLOWS_ENV);
     }
 
     /// Issue 2: a delivery whose processing future is cancelled (client
