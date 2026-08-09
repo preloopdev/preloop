@@ -9,6 +9,25 @@ Releases before v0.27.0 predate the changelog.
 
 ## [Unreleased]
 
+## [0.29.5] - 2026-08-08
+
+### Added
+
+- `preloop dap`: integrated DAP client for debugger-enabled runs (demo under `docs/demo/dap`)
+- Pool: pause the queued-job starvation clock while the warm runs, so the first job on a fresh machine survives the artifact download or build
+- Pool: verify the downloaded pre-baked golden against the release checksum before using it
+- Release CI: publish the golden checksum and build the aarch64 golden on GitHub-hosted macOS runners
+
+### Changed
+
+- smolvm installs are pinned to 1.7.4, the last macOS release exposing the virtio-net symbol; virtio-net remains the default net backend
+
+### Fixed
+
+- Pool: on-demand slot failure backoff now escalates across reap cycles instead of resetting every cycle
+- `preloop update`: install a smolvm with `--mount-socket` support, warn when PATH shadows the install, and preserve symlinks when copying the agent rootfs
+- `preloop serve`: report the GitHub App stored in `config.toml` when env vars are absent
+
 ## [0.29.1] - 2026-08-08
 
 ### Fixed
