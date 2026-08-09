@@ -317,6 +317,29 @@ pub(crate) fn effective_claim_runner(
     }
 }
 
+/// Worker-authenticated debug operations that the trusted runner performs
+/// through the guest's mounted control socket.
+fn is_worker_debug_route(method: &axum::http::Method, path: &str) -> bool {
+    use axum::http::Method;
+
+    if method == Method::POST {
+        if matches!(
+            path,
+            "/api/v1/debug/worker-token" | "/api/v1/debug/sessions"
+        ) {
+            return true;
+        }
+        return debug_session_member(path, "/close");
+    }
+    method == Method::GET && debug_session_member(path, "/verdict")
+}
+
+fn debug_session_member(path: &str, suffix: &str) -> bool {
+    path.strip_prefix("/api/v1/debug/sessions/")
+        .and_then(|rest| rest.strip_suffix(suffix))
+        .is_some_and(|session_id| !session_id.is_empty() && !session_id.contains('/'))
+}
+
 /// Socket-surface guard: the mounted control socket is reachable from inside
 /// every runner VM, so anything not part of the runner/broker protocol is
 /// refused there. Native management and GUI API prefixes have no legitimate
@@ -327,6 +350,7 @@ pub(crate) async fn runner_surface_only(
 ) -> Result<Response, ApiError> {
     const DENIED_PREFIXES: &[&str] = &["/internal/", "/runs/"];
     let path = request.uri().path();
+    let worker_debug_route = is_worker_debug_route(request.method(), path);
     let denied = DENIED_PREFIXES
         .iter()
         .any(|prefix| path.starts_with(prefix))
@@ -336,7 +360,10 @@ pub(crate) async fn runner_surface_only(
         // control socket. `/replay/*` is the other half of the same class:
         // the in-VM runner uploads its step logs and summaries to the signed
         // blob URLs its own Twirp handlers minted. Every other native prefix
-        // stays off the guest surface: workflow code is untrusted.
+        // stays off the guest surface except the worker half of live debugging:
+        // token exchange, session open, verdict poll, and close. Those routes
+        // authenticate a single active job and deliberately exclude the
+        // controller's list/read/verdict APIs.
         // `/api/v3/*` mints runner-management JWTs (`RunnerManage` scope) for
         // the GitHub-compatible registration flow — an engine-facing service
         // that untrusted workflow code must never reach through the mounted
@@ -346,7 +373,9 @@ pub(crate) async fn runner_surface_only(
         // system credential, which workflow code never holds — so the carve
         // out cannot be used to mint anything.
         || (path.starts_with("/api/v3/") && path != "/api/v3/actions/runner-registration")
-        || (path.starts_with("/api/v1/") && !path.starts_with("/api/v1/actions/"));
+        || (path.starts_with("/api/v1/")
+            && !path.starts_with("/api/v1/actions/")
+            && !worker_debug_route);
     if denied {
         return Err(ApiError::not_found(format!(
             "{path} not available on this endpoint"
