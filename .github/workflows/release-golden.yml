@@ -13,6 +13,7 @@ on:
 jobs:
   build-and-publish-linux-binaries:
     name: Build Linux ${{ matrix.arch }} release
+    if: github.event_name == 'release'
     # Cross-compilation needs no KVM. Keep the scarce self-hosted executor
     # available for the golden VM build and the repository's normal CI.
     runs-on: ubuntu-latest
@@ -78,15 +79,6 @@ jobs:
             "dist/preloop-${{ matrix.arch }}-linux-musl.tar.gz" \
             "dist/preloop-${{ matrix.arch }}-linux-musl.tar.gz.sha256" \
             --clobber
-
-      - name: Retain Linux binaries for non-release builds
-        if: github.event_name != 'release'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: preloop-${{ matrix.arch }}-linux-musl
-          path: |
-            dist/preloop-${{ matrix.arch }}-linux-musl.tar.gz
-            dist/preloop-${{ matrix.arch }}-linux-musl.tar.gz.sha256
 
   build-and-publish-golden:
     name: Build & Publish Golden MicroVM Artifact
