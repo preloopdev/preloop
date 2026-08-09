@@ -201,6 +201,21 @@ fn install_script_pins_docker_repo_and_cargo_shear() {
     }
 }
 
+#[test]
+fn install_script_survives_archive_pin_drift() {
+    let script = base_install_script();
+    assert!(
+        script.contains("exact hosted apt pins are unavailable")
+            && script.contains("apt-get install -y -qq --no-install-recommends git curl wget"),
+        "the baseline must fall back to packages currently available in the archive"
+    );
+    assert!(
+        script.contains("hosted compiler matrix is not available")
+            && script.contains("for package in clang clang-format clang-tidy gcc g++ gfortran"),
+        "missing historical compiler packages must not strand the runner pool"
+    );
+}
+
 /// Hosted images keep their apt package lists, so real workflows install
 /// system packages with a bare `sudo apt-get install <pkg>` and no preceding
 /// `apt-get update` — uv's musl cell (`apt-get install musl-tools`) is one.

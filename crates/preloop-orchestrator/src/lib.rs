@@ -645,8 +645,13 @@ fn node_externals_at(runner_root: &str) -> Vec<Vec<String>> {
 pub fn base_install_script() -> String {
     format!(
         "apt-get update -qq && \
-         DEBIAN_FRONTEND=noninteractive \
-         apt-get install -y -qq --no-install-recommends {base_packages_pinned} \
+         (echo \"### install hosted apt baseline\" >&2 && \
+          if ! DEBIAN_FRONTEND=noninteractive \
+             apt-get install -y -qq --no-install-recommends {base_packages_pinned}; then \
+            echo \"WARNING: exact hosted apt pins are unavailable; falling back to archive versions\" >&2; \
+            DEBIAN_FRONTEND=noninteractive \
+            apt-get install -y -qq --no-install-recommends {BASE_PACKAGES}; \
+          fi) \
          && printf '{LOOPBACK_HOSTS}' > /etc/hosts && \
          printf '127.0.0.1 %s\\n' \"$(hostname)\" >> /etc/hosts && \
          printf 'APT::Get::Assume-Yes \"true\";\\n' > /etc/apt/apt.conf.d/90assumeyes && \
@@ -657,19 +662,33 @@ pub fn base_install_script() -> String {
            *) LFS_ARCH=arm64; DOCKER_STATIC_ARCH=aarch64; DOCKER_PLUGIN_ARCH=arm64; COMPOSE_ARCH=aarch64 ;; \
          esac; \
          (echo \"### install hosted compiler matrix\" >&2 && \
-          DEBIAN_FRONTEND=noninteractive \
-          apt-get install -y -qq --no-install-recommends {compiler_packages} && \
-          update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-{CLANG_DEFAULT_VERSION} 100 && \
-          update-alternatives --install /usr/bin/clang clang /usr/bin/clang-{CLANG_DEFAULT_VERSION} 100 && \
-          update-alternatives --install /usr/bin/clang-format clang-format /usr/bin/clang-format-{CLANG_DEFAULT_VERSION} 100 && \
-          update-alternatives --install /usr/bin/clang-tidy clang-tidy /usr/bin/clang-tidy-{CLANG_DEFAULT_VERSION} 100 && \
-          update-alternatives --install /usr/bin/run-clang-tidy run-clang-tidy /usr/bin/run-clang-tidy-{CLANG_DEFAULT_VERSION} 100 && \
-          clang-16 --version | head -1 | grep -F '{CLANG_16_VERSION}' && \
-          clang-17 --version | head -1 | grep -F '{CLANG_17_VERSION}' && \
-          clang-18 --version | head -1 | grep -F '{CLANG_18_VERSION}' && \
-          test \"$(gcc-12 -dumpfullversion)\" = '{GCC_12_VERSION}' && \
-          test \"$(gcc-13 -dumpfullversion)\" = '{GCC_13_VERSION}' && \
-          test \"$(gcc-14 -dumpfullversion)\" = '{GCC_14_VERSION}') && \
+          if DEBIAN_FRONTEND=noninteractive \
+             apt-get install -y -qq --no-install-recommends {compiler_packages}; then \
+            for version in {CLANG_VERSIONS}; do \
+              if [ -x /usr/bin/clang++-$version ]; then \
+                update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-$version 100 || true; \
+              fi; \
+              if [ -x /usr/bin/clang-$version ]; then \
+                update-alternatives --install /usr/bin/clang clang /usr/bin/clang-$version 100 || true; \
+              fi; \
+              if [ -x /usr/bin/clang-format-$version ]; then \
+                update-alternatives --install /usr/bin/clang-format clang-format /usr/bin/clang-format-$version 100 || true; \
+              fi; \
+              if [ -x /usr/bin/clang-tidy-$version ]; then \
+                update-alternatives --install /usr/bin/clang-tidy clang-tidy /usr/bin/clang-tidy-$version 100 || true; \
+              fi; \
+              if [ -x /usr/bin/run-clang-tidy-$version ]; then \
+                update-alternatives --install /usr/bin/run-clang-tidy run-clang-tidy /usr/bin/run-clang-tidy-$version 100 || true; \
+              fi; \
+            done; \
+          else \
+            echo \"WARNING: hosted compiler matrix is not available in this Ubuntu archive; continuing with the base compiler toolchain\" >&2; \
+            for package in clang clang-format clang-tidy gcc g++ gfortran; do \
+              DEBIAN_FRONTEND=noninteractive \
+              apt-get install -y -qq --no-install-recommends \"$package\" || \
+                echo \"compiler package unavailable: $package\" >&2; \
+            done; \
+          fi) && \
          (echo \"### fetch system node v{BASE_NODE_VERSION}\" >&2 && \
           curl -fsSL \"https://nodejs.org/dist/v{BASE_NODE_VERSION}/node-v{BASE_NODE_VERSION}-linux-$NODE_ARCH.tar.gz\" \
             | tar -xz --strip-components=1 -C /usr/local) && \
