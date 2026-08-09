@@ -540,6 +540,8 @@ exit 0
 
     #[tokio::test]
     async fn public_only_selects_virtio_net_and_sets_smolvm_egress_floor_strict() {
+        let _env_guard = NET_BACKEND_ENV_LOCK.lock();
+        std::env::remove_var("PRELOOP_SMOLVM_NET_BACKEND");
         let (_directory, executable) = fake_smolvm();
         let provider = SmolVmProvider::new(executable.clone());
         let mut spec = valid_spec(MachineName::new("test-floor").unwrap());

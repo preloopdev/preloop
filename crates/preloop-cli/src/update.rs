@@ -16,6 +16,16 @@ use tokio::io::AsyncWriteExt;
 const DEFAULT_REPOSITORY: &str = "preloopdev/preloop";
 const USER_AGENT: &str = concat!("preloop/", env!("CARGO_PKG_VERSION"));
 
+/// smolvm version `preloop update` installs when the resolved binary cannot
+/// mount sockets.
+///
+/// Pinned to the last release whose macOS artifact ships a NET=1 libkrun:
+/// 1.7.5's `lib/libkrun.dylib` does not export `krun_add_net_unixstream`,
+/// so `--net-backend virtio-net` (the egress-floor backend preloop-vm
+/// selects) cannot boot a machine on macOS with it. Revisit when upstream
+/// ships a release with the symbol again.
+const SMOLVM_VERSION: &str = "1.7.4";
+
 #[derive(Debug, clap::Args)]
 pub(crate) struct UpdateArgs {
     /// Only check for a newer release; do not install it.
@@ -278,7 +288,7 @@ async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
     let release = fetch_release(
         client,
         "https://api.github.com/repos/smol-machines/smolvm/releases",
-        None,
+        Some(SMOLVM_VERSION),
     )
     .await?;
     let version = release
