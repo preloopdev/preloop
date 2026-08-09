@@ -154,6 +154,7 @@ fn forward_worker_stream(
     stream: impl tokio::io::AsyncRead + Unpin + Send + 'static,
     capture: Arc<Mutex<WorkerOutputCapture>>,
     to_stderr: bool,
+    emit: bool,
 ) {
     tokio::spawn(async move {
         let mut reader = tokio::io::BufReader::new(stream);
@@ -173,11 +174,13 @@ fn forward_worker_stream(
                 Ok(n) => {
                     // Forward the raw bytes exactly as read (the
                     // inherited-descriptor behavior this pipe replaces).
-                    let _ = if to_stderr {
-                        tokio::io::stderr().write_all(&chunk[..n]).await
-                    } else {
-                        tokio::io::stdout().write_all(&chunk[..n]).await
-                    };
+                    if emit {
+                        let _ = if to_stderr {
+                            tokio::io::stderr().write_all(&chunk[..n]).await
+                        } else {
+                            tokio::io::stdout().write_all(&chunk[..n]).await
+                        };
+                    }
                     // Split the chunk into logical lines, retaining only the
                     // bounded tail of any line for the capture.
                     let mut start = 0;
@@ -631,10 +634,10 @@ pub async fn spawn_job(
     // chatty worker from blocking on a full pipe buffer.
     let worker_output = Arc::new(Mutex::new(WorkerOutputCapture::default()));
     if let Some(stdout) = child.stdout.take() {
-        forward_worker_stream(stdout, worker_output.clone(), false);
+        forward_worker_stream(stdout, worker_output.clone(), false, true);
     }
     if let Some(stderr) = child.stderr.take() {
-        forward_worker_stream(stderr, worker_output.clone(), true);
+        forward_worker_stream(stderr, worker_output.clone(), true, true);
     }
 
     // Send job message via stdin — but keep stdin open for cancel messages
@@ -1075,7 +1078,7 @@ mod tests {
         bytes.extend_from_slice(b"after-invalid-2\n");
 
         let capture = Arc::new(Mutex::new(WorkerOutputCapture::default()));
-        forward_worker_stream(std::io::Cursor::new(bytes), capture.clone(), false);
+        forward_worker_stream(std::io::Cursor::new(bytes), capture.clone(), false, true);
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let tail = loop {
@@ -1108,7 +1111,9 @@ mod tests {
         bytes.extend_from_slice(&[b'x'; 1024 * 1024]);
 
         let capture = Arc::new(Mutex::new(WorkerOutputCapture::default()));
-        forward_worker_stream(std::io::Cursor::new(bytes), capture.clone(), false);
+        // This test validates bounded capture, not terminal throughput. Do not
+        // inject a 1 MiB unterminated line into CI's Actions log transport.
+        forward_worker_stream(std::io::Cursor::new(bytes), capture.clone(), false, false);
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let tail = loop {
