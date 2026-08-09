@@ -1406,15 +1406,17 @@ mod tests {
         format!("sha256={hex}")
     }
 
-    #[test]
-    fn github_owned_workflow_filter_matches_filename_or_path() {
-        let configured =
-            "release.yml, .github/workflows/release-golden.yml, ./release-linux-runner.yml"
-                .split(',')
-                .map(str::trim)
-                .map(|entry| entry.trim_start_matches("./").to_owned())
-                .collect();
+    #[tokio::test]
+    async fn github_owned_workflow_filter_matches_filename_or_path() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _configured = crate::state::TestEnvVar::set(
+            GITHUB_OWNED_WORKFLOWS_ENV,
+            "release.yml, .github/workflows/release-golden.yml, \
+             ./release-linux-runner.yml, ,",
+        );
+        let configured = configured_github_owned_workflows();
 
+        assert_eq!(configured.len(), 3);
         assert!(is_github_owned_workflow("release.yml", &configured));
         assert!(is_github_owned_workflow("release-golden.yml", &configured));
         assert!(is_github_owned_workflow(

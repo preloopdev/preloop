@@ -447,6 +447,9 @@ pub(crate) fn build_app(
         // The credential those worker routes need is not in the job message —
         // an official runner would republish it as `${{ secrets[...] }}` — so
         // the worker exchanges its job runtime token for it here first.
+        // Worker access to these four routes through the mounted control
+        // socket is mirrored by `auth::is_worker_debug_route`. Keep that
+        // fail-closed allowlist in sync when changing this route group.
         .route(
             "/api/v1/debug/worker-token",
             post(crate::debug_sessions::issue_worker_token).route_layer(

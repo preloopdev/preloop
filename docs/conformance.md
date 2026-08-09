@@ -1,6 +1,6 @@
 # Conformance
 
-preloop treats compatibility as a test artifact. The evidence lives in four layers, from raw wire bytes to whole-repo  
+preloop treats compatibility as a test artifact. The evidence lives in four layers, from raw wire bytes to whole-repo
 behavior.
 
 ```
@@ -50,9 +50,10 @@ experiments/mitm/bin/conform.sh --golden golden/v2.329.0/01-register-and-idle \
   --target preloop --scenario 01-register-and-idle
 ```
 
-The replay gate compares status codes, job/step level conclusions/jobs/annotations request-body schemas, and
+The replay gate compares status codes, job and step conclusions, request-body
+schemas for jobs and annotations, and
 `acquirejob` response schemas byte-for-byte; anything volatile (timing,
-tokens) is normalized before comparison. 
+tokens) is normalized before comparison.
 
 ## Tracking new official runner versions
 
