@@ -278,6 +278,93 @@ pub(crate) async fn report_check_run_queued(
     }
 }
 
+/// Move an existing GitHub check run back to the queue after a rerequest.
+pub(crate) async fn report_existing_check_run_queued(
+    shared: &Arc<SharedState>,
+    repo: &str,
+    job_id: &JobId,
+    run_id: RunId,
+    check_run_id: u64,
+) {
+    let token = resolve_check_run_token(shared, repo).await;
+    if let Some(token) = &token {
+        let mut body = serde_json::json!({
+            "status": "queued",
+        });
+        if let Some(url) = run_details_url(run_id) {
+            body["details_url"] = serde_json::json!(url);
+        }
+        let path = format!("check-runs/{check_run_id}");
+        if let Err(error) =
+            send_github_check_request(token, repo, reqwest::Method::PATCH, &path, body).await
+        {
+            warn!(
+                %run_id,
+                %job_id,
+                check_run_id,
+                %error,
+                "Failed to requeue GitHub check run"
+            );
+        }
+    } else {
+        info!(
+            %run_id,
+            %job_id,
+            check_run_id,
+            "Mock requeued GitHub check run"
+        );
+    }
+}
+
+/// Publish queued/completed checks for a native rerun.
+pub(crate) async fn report_check_runs_for_run(
+    shared: &Arc<SharedState>,
+    run_id: RunId,
+    reused_check_run: Option<(JobId, u64)>,
+) {
+    let (repository, sha, jobs) = {
+        let inner = shared.state.inner.lock().await;
+        let Some(run) = inner.runs.get(&run_id) else {
+            return;
+        };
+        (
+            run.submission.repository.clone(),
+            run.submission.sha.clone(),
+            run.jobs.keys().cloned().collect::<Vec<_>>(),
+        )
+    };
+
+    for job_id in jobs {
+        if let Some((reused_job_id, check_run_id)) = &reused_check_run {
+            if reused_job_id == &job_id {
+                report_existing_check_run_queued(
+                    shared,
+                    &repository,
+                    &job_id,
+                    run_id,
+                    *check_run_id,
+                )
+                .await;
+            } else {
+                report_check_run_queued(shared, &repository, &sha, &job_id, run_id).await;
+            }
+        } else {
+            report_check_run_queued(shared, &repository, &sha, &job_id, run_id).await;
+        }
+
+        let status = {
+            let inner = shared.state.inner.lock().await;
+            inner
+                .runs
+                .get(&run_id)
+                .and_then(|run| run.jobs.get(&job_id).copied())
+        };
+        if let Some(status) = status.filter(|status| status.is_terminal()) {
+            report_check_run_completed(shared, run_id, &job_id, status).await;
+        }
+    }
+}
+
 /// Report check run status to in_progress on GitHub or simulate it locally.
 pub(crate) async fn report_check_run_in_progress(
     shared: &Arc<SharedState>,
@@ -868,6 +955,110 @@ impl Drop for InFlightReservationGuard {
     }
 }
 
+/// Handle GitHub's Checks API rerequest action by resubmitting the native run
+/// that owns the requested check. GitHub sends this as a `check_run` webhook,
+/// not as a workflow trigger event.
+async fn process_check_run_rerequest(
+    shared: &Arc<SharedState>,
+    payload: &Value,
+) -> Result<(StatusCode, Json<Value>), StatusCode> {
+    if payload.get("action").and_then(Value::as_str) != Some("rerequested") {
+        return Ok((StatusCode::OK, Json(serde_json::json!([]))));
+    }
+
+    let Some(check_run) = payload.get("check_run") else {
+        warn!("check_run rerequest is missing check_run payload");
+        return Ok((StatusCode::OK, Json(serde_json::json!([]))));
+    };
+    let Some(check_run_id) = check_run.get("id").and_then(Value::as_u64) else {
+        warn!("check_run rerequest is missing check_run.id");
+        return Ok((StatusCode::OK, Json(serde_json::json!([]))));
+    };
+    let repository = payload
+        .get("repository")
+        .and_then(|repository| repository.get("full_name"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let head_sha = check_run
+        .get("head_sha")
+        .and_then(Value::as_str)
+        .filter(|sha| !sha.is_empty());
+    let job_name = check_run.get("name").and_then(Value::as_str);
+    let details_run_id = check_run
+        .get("details_url")
+        .and_then(Value::as_str)
+        .and_then(|url| {
+            url.trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .and_then(|value| value.parse::<RunId>().ok())
+        });
+
+    let target = {
+        let inner = shared.state.inner.lock().await;
+        let mut candidates = Vec::new();
+        if let Some(run_id) = details_run_id {
+            candidates.push(run_id);
+        }
+        candidates.extend(
+            inner
+                .runs
+                .keys()
+                .filter(|run_id| Some(**run_id) != details_run_id),
+        );
+
+        candidates.into_iter().find_map(|run_id| {
+            let run = inner.runs.get(&run_id)?;
+            if run.submission.repository != repository
+                || head_sha.is_some_and(|sha| run.head_sha != sha)
+                || !run.status.is_terminal()
+            {
+                return None;
+            }
+
+            let job_id = run
+                .job_check_run_ids
+                .iter()
+                .find_map(|(job_id, id)| (*id == check_run_id).then(|| job_id.clone()))
+                .or_else(|| {
+                    job_name
+                        .map(|name| JobId(name.to_owned()))
+                        .filter(|job_id| run.jobs.contains_key(job_id))
+                })?;
+            Some((run_id, job_id))
+        })
+    };
+
+    let Some((run_id, job_id)) = target else {
+        warn!(
+            repository,
+            check_run_id, "check_run rerequest does not match a known terminal run"
+        );
+        return Ok((StatusCode::OK, Json(serde_json::json!([]))));
+    };
+
+    let accepted = crate::rerun_run_inner(shared, run_id, Some((job_id.clone(), check_run_id)))
+        .await
+        .map_err(|error| {
+            error!(
+                %run_id,
+                %job_id,
+                check_run_id,
+                ?error,
+                "failed to resubmit check_run rerequest"
+            );
+            error.into_response().status()
+        })?;
+    info!(
+        %run_id,
+        rerun_run_id = %accepted.run_id,
+        %job_id,
+        check_run_id,
+        "resubmitted check_run rerequest"
+    );
+    Ok((StatusCode::OK, Json(serde_json::json!([accepted]))))
+}
+
 /// Processing half of [`handle_github_webhook`], after signature verification
 /// and delivery reservation.
 async fn process_github_webhook(
@@ -883,6 +1074,10 @@ async fn process_github_webhook(
 
     // 3. Parse the event payload
     let payload_val: Value = serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    if event_name == "check_run" {
+        return process_check_run_rerequest(shared, &payload_val).await;
+    }
 
     // 4. Look up the event adapter
     let adapter = match crate::events::adapter_for(event_name) {
