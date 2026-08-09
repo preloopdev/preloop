@@ -9,8 +9,48 @@ on:
         description: Release tag to receive the generated assets (defaults to latest)
         required: false
         type: string
+      reuse_previous_goldens:
+        description: Copy existing goldens instead of rebuilding them
+        required: false
+        default: false
+        type: boolean
+      previous_release_tag:
+        description: Release tag whose goldens should be reused
+        required: false
+        default: v0.29.5
+        type: string
 
 jobs:
+  reuse-previous-goldens:
+    name: Reuse Previous Golden Artifacts
+    if: github.event_name == 'workflow_dispatch' && inputs.reuse_previous_goldens
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Copy goldens to target release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_TAG: ${{ inputs.release_tag }}
+          PREVIOUS_TAG: ${{ inputs.previous_release_tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TARGET_TAG" ]; then
+            TARGET_TAG="$(gh release view --json tagName --jq .tagName)"
+          fi
+          mkdir -p dist
+          gh release download "$PREVIOUS_TAG" \
+            --pattern 'preloop-ubuntu-24.04-*' \
+            --dir dist \
+            --repo "$GITHUB_REPOSITORY"
+          gh release upload "$TARGET_TAG" \
+            dist/preloop-ubuntu-24.04-aarch64 \
+            dist/preloop-ubuntu-24.04-aarch64.sha256 \
+            dist/preloop-ubuntu-24.04-x86_64 \
+            dist/preloop-ubuntu-24.04-x86_64.sha256 \
+            --clobber \
+            --repo "$GITHUB_REPOSITORY"
+
   build-and-publish-linux-binaries:
     name: Build Linux ${{ matrix.arch }} release
     if: github.event_name == 'release'
@@ -84,7 +124,7 @@ jobs:
     name: Build & Publish Golden MicroVM Artifact
     # Binary-only hotfixes can retain the previous golden. Add the hidden
     # `preloop:skip-golden` marker to the release notes for those releases.
-    if: github.event_name == 'workflow_dispatch' || !contains(github.event.release.body, '<!-- preloop:skip-golden -->')
+    if: (github.event_name == 'workflow_dispatch' && !inputs.reuse_previous_goldens) || (github.event_name == 'release' && !contains(github.event.release.body, '<!-- preloop:skip-golden -->'))
     runs-on: [self-hosted, Linux, X64]
     permissions:
       contents: write
@@ -154,7 +194,7 @@ jobs:
   # self-hosted Mac with Hypervisor.framework access.
   build-and-publish-golden-macos:
     name: Build & Publish aarch64 Golden (macOS)
-    if: github.event_name == 'workflow_dispatch' || !contains(github.event.release.body, '<!-- preloop:skip-golden -->')
+    if: (github.event_name == 'workflow_dispatch' && !inputs.reuse_previous_goldens) || (github.event_name == 'release' && !contains(github.event.release.body, '<!-- preloop:skip-golden -->'))
     runs-on: [self-hosted, macOS, ARM64]
     permissions:
       contents: write
