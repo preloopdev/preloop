@@ -372,6 +372,12 @@ async fn run_background_reaper(shared: Arc<SharedState>) {
     }
 }
 
+fn is_routine_unix_disconnect(error: &(dyn std::error::Error + 'static)) -> bool {
+    error
+        .downcast_ref::<hyper::Error>()
+        .is_some_and(|error| error.is_shutdown() || error.is_incomplete_message())
+}
+
 /// Start the server and block until shutdown.
 pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     let mut state = AppState::new_with_store(
@@ -523,12 +529,8 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
                                         // Clients routinely drop the socket after
                                         // their request (the CLI's own readiness
                                         // probe included); a failed final
-                                        // write-shutdown is teardown noise, not a
-                                        // protocol failure.
-                                        let is_shutdown = error
-                                            .downcast_ref::<hyper::Error>()
-                                            .is_some_and(|e| e.is_shutdown());
-                                        if is_shutdown {
+                                        // write-shutdown is teardown noise
+                                        if is_routine_unix_disconnect(error.as_ref()) {
                                             debug!(%error, "Unix socket connection closed");
                                         } else {
                                             warn!(%error, "Unix socket HTTP connection failed");
@@ -610,4 +612,38 @@ async fn shutdown_signal(shutdown: CancellationToken) {
     };
     ctrl_c.await;
     shutdown.cancel();
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt as _;
+
+    #[tokio::test]
+    async fn incomplete_unix_http_message_is_a_routine_disconnect() {
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+        use hyper_util::server::conn::auto::Builder as AutoBuilder;
+        use hyper_util::service::TowerToHyperService;
+
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        let connection = tokio::spawn(async move {
+            let router = Router::new().route("/", get(|| async { "ok" }));
+            AutoBuilder::new(TokioExecutor::new())
+                .serve_connection_with_upgrades(
+                    TokioIo::new(server),
+                    TowerToHyperService::new(router),
+                )
+                .await
+                .expect_err("partial request must produce an incomplete-message error")
+        });
+
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: preloop")
+            .await
+            .unwrap();
+        drop(client);
+
+        let error = connection.await.unwrap();
+        assert!(is_routine_unix_disconnect(error.as_ref()));
+    }
 }

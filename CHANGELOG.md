@@ -9,6 +9,15 @@ Releases before v0.27.0 predate the changelog.
 
 ## [Unreleased]
 
+## [0.29.7] - 2026-08-09
+
+### Fixed
+
+- Keep packed golden forking enabled when the warm runner pool is disabled.
+- Avoid pre-provisioning unused replacement runners in on-demand mode.
+- Treat routine Unix socket shutdowns as debug-level teardown noise.
+- Default local pull request runs to the `synchronize` activity.
+
 ## [0.29.6] - 2026-08-09
 
 <!-- preloop:skip-golden -->
@@ -91,7 +100,9 @@ live-logs (8), and golden (8).
 Bootstrap the cargo-dist release pipeline for `preloop-cli` (binary
 installers for macOS and Linux).
 
-[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.29.1...HEAD
+[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.29.7...HEAD
+[0.29.7]: https://github.com/preloopdev/preloop/compare/v0.29.6...v0.29.7
+[0.29.6]: https://github.com/preloopdev/preloop/compare/v0.29.5...v0.29.6
 [0.29.1]: https://github.com/preloopdev/preloop/compare/v0.29.0...v0.29.1
 [0.29.0]: https://github.com/preloopdev/preloop/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/preloopdev/preloop/compare/v0.27.0...v0.28.0

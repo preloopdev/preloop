@@ -825,7 +825,13 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
     let mut pool = match pool_config {
         Ok(config) => {
             if !pool_enabled {
-                tracing::info!("local runner pool disabled; provisioning one VM per queued job");
+                if config.use_fork {
+                    tracing::info!(
+                        "warm runner pool disabled; forking one VM per queued job from the golden"
+                    );
+                } else {
+                    tracing::info!("warm runner pool disabled; provisioning one VM per queued job");
+                }
             }
             let pool_shutdown = shutdown.clone();
             Some(tokio::spawn(async move {
@@ -1010,11 +1016,11 @@ fn local_runner_pool_config(
         } else {
             0
         },
-        // Forking is safe only when the warm pool has a prepared packed
-        // artifact. A live OCI golden does not carry post-create filesystem
-        // mutations into SmolVM forks.
+        // Forking is safe whenever the packed artifact is enabled. The warm
+        // pool switch controls whether idle runners stay registered; size-zero
+        // mode still prepares one golden and forks a disposable VM per job.
         use_packed_artifact,
-        use_fork: pool_enabled && use_packed_artifact && env_flag("PRELOOP_USE_FORK", true),
+        use_fork: use_packed_artifact && env_flag("PRELOOP_USE_FORK", true),
         // Multiple engines on one host must not share a namespace: smolvm
         // keys machines and persistent overlays by name, and cross-engine
         // reuse boots a runner whose persisted state points at the other
@@ -1241,6 +1247,23 @@ fn parse_flag(value: &str) -> Option<bool> {
     }
 }
 
+fn default_local_activity_type(event: &str, payload: &serde_json::Value) -> Option<String> {
+    if matches!(event, "pull_request" | "pull_request_target")
+        && payload
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+    {
+        // A local run represents testing the current checkout against the PR
+        // workflow. `synchronize` is one of GitHub's default PR activity types
+        // and avoids requiring a synthetic webhook payload just to pass the
+        // trigger gate.
+        Some("synchronize".to_owned())
+    } else {
+        None
+    }
+}
+
 async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     let workflow_path = resolve_workflow_path(args.file.as_deref())?;
     let workflow_yaml = std::fs::read_to_string(&workflow_path)
@@ -1283,6 +1306,7 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         }
         None => serde_json::json!({}),
     };
+    let activity_type = default_local_activity_type(event, &payload);
 
     let mut secrets = preloop_gha_protocol::SecretMap::default();
     for secret in &args.secrets {
@@ -1326,6 +1350,7 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         reusable_workflows,
         selected_jobs: args.job.into_iter().collect(),
         base_ref: args.base,
+        activity_type,
         // On by default where it can be acted on: a paused job blocks until a
         // controller answers, so pausing a piped or detached run would hang
         // something with no way to respond. `--preserve-on-failure` is the
@@ -2143,6 +2168,10 @@ mod tests {
             "packed golden use must be enabled by default"
         );
         assert!(
+            stock.use_fork,
+            "packed golden forks must remain enabled when the warm pool is off"
+        );
+        assert!(
             config("mirror.gcr.io/library/ubuntu:24.04")
                 .next_job_runs_on
                 .is_some(),
@@ -2231,6 +2260,23 @@ mod tests {
         assert!(args.base.is_none());
         assert!(!args.no_debug, "pausing on failure is the default");
         assert!(args.secrets.is_empty());
+    }
+
+    #[test]
+    fn local_pull_request_defaults_to_synchronize_activity() {
+        assert_eq!(
+            default_local_activity_type("pull_request", &serde_json::json!({})).as_deref(),
+            Some("synchronize")
+        );
+        assert_eq!(
+            default_local_activity_type("pull_request", &serde_json::json!({"action": "opened"}))
+                .as_deref(),
+            None
+        );
+        assert_eq!(
+            default_local_activity_type("push", &serde_json::json!({})),
+            None
+        );
     }
 
     #[test]

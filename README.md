@@ -4,18 +4,16 @@
 
 ![Watch an omp agent attach to a live preloop job with DAP, inspect runtime context, diagnose the failure, and rerun successfully](docs/demo/dap/demo-highlight.gif)
 
-[Open the pausable DAP demo video](docs/demo/dap/demo-highlight.mp4) · [Replay the full terminal recording](docs/demo/dap/demo.cast)
 
 
 > A failed step, a fix in another pane, and a re-run, all local, with no push required.
 
 
-preloop is a local, self-hosted equivalent of GitHub Actions. The engine (`preloop serve`) accepts workflows the same way GitHub does: `${{ }}` expressions, matrix builds, reusable workflows, concurrency groups, OIDC etc. It executes them on hardware-isolated microvms that work on Windows/MacOS or Linux. Your `.github/workflows` run unmodified, and you can run CI against your uncomitted changes(respects .gitignored/untracked ones)
+preloop is a local, self-hosted equivalent of GitHub Actions. The engine (`preloop serve`) accepts workflows the same way GitHub does: `${{ }}` expressions, matrix builds, reusable workflows, concurrency groups, OIDC etc. It executes them on hardware-isolated microvms that work on Windows/MacOS or Linux, and resume in 300ms. Your `.github/workflows` run unmodified, and you can run CI against your uncomitted changes(respects .gitignored/untracked ones).
 
 
 It speaks the official `actions/runner` protocol, so you can use the official runner to register, poll, execute, and report against it without GitHub-hosted minutes. You can also use our Rust-equivalent runner with up to 10x smaller binary sizes and 10x lower memory RSS.
 Preloop doesnt rely only on Github Webhooks to update the status of the CI. You can run your committed changes and run workflows locally and pass a `-push` or `create-pr` that would create a draft PR with the checks correctly updated. This can be useful if/when Github's webhook service is down.
-Runs on macOS, Linux, and Windows.
 
 ## Quick start
 
@@ -27,13 +25,16 @@ preloop serve            # engine on 127.0.0.1:9090
 cd my-repo
 preloop run -f .github/workflows/ci.yml --event pull_request
 ```
-This starts the server in the foreground, but you can detach it too(add a `-d`). You can simulate most if not all Github events locally. For some events, you might need to add a payload.
+This starts the server in the foreground, but you can detach it too(add a `-d`). First run can take 1-5 minutes depending on your internet speed as we need to download the base image. Once we download the image, we create a "golden" vm that will be forked per job in 300 ms. The vm dynamically increases or decreases its memory consumption.
+
+Regarding official-image compatibility, we build a curated base image that includes most of the systems deps you need, but it's certainly not the exact official one(it's around 90GB). We avoid including deps that are often installed by actions. You can, however, set your own images, or install the deps you need in the "golden" vm. Please see [docs/vm-images.md](docs/vm-images.md) for more detailed info.
+
+You can simulate most if not all Github events locally. For some events, you might need to add a payload.
 See [docs/cli_reference.md](docs/cli_refernce.md) for more flags you can pass.
 
 To continue with the setup, see GitHub App and PAT credentials, secrets, config file, and the troubleshooting guide: [docs/setup.md](docs/setup.md)
 
-Run it as a server, service install, every runtime knob, and how to
-expose it (tailnet only, Tailscale Funnel, Cloudflare Tunnel, or your own
+Run it as a server, service install, every runtime knob, and how to expose it (tailnet only, Tailscale Funnel, Cloudflare Tunnel, or your own
 domain): [docs/self-hosting.md](docs/self-hosting.md)
 
 ## What makes it different vs others.
@@ -61,10 +62,6 @@ wrong.
 ```sh
 preloop dap <run-id>
 ```
-
-Normal runs work without any DAP client. `dapctl` remains only as a tiny
-reference client for the recorded demo; it is not a runtime dependency.
-
 
 
 ## Documentation on where to go to find info.

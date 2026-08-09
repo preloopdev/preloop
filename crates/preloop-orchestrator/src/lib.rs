@@ -1980,6 +1980,8 @@ struct SlotPlan<'a> {
     keys: &'a Arc<KeyPool>,
     /// Replacements currently being built across the whole pool.
     building: &'a AtomicUsize,
+    /// Whether this slot keeps a warm successor after the current job.
+    prebuild_successor: bool,
 }
 
 /// A claim on one of the replacement builds the backlog justifies.
@@ -2143,12 +2145,13 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
             idle: &handles.idle,
             keys: &handles.keys,
             building: &handles.building,
+            prebuild_successor: false,
         },
     )
     .await;
 
-    // Discard any successor that was pre-built (on-demand does not keep warm
-    // runners around).
+    // Size-zero mode never asks for a successor. Keep defensive cleanup here
+    // so a future lifecycle change cannot leak an unexpectedly returned VM.
     match result {
         Ok(Some(successor)) => {
             notify_runner_gone(&config, &successor.name).await;
@@ -2303,6 +2306,7 @@ async fn run_slot<P: VmProvider + 'static>(
                 idle: &idle,
                 keys: &keys,
                 building: &building,
+                prebuild_successor: true,
             },
         )
         .await;
@@ -2448,6 +2452,7 @@ async fn run_one_runner<P: VmProvider + 'static>(
         idle,
         keys,
         building,
+        prebuild_successor,
     } = plan;
 
     let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
@@ -2469,6 +2474,10 @@ async fn run_one_runner<P: VmProvider + 'static>(
             return None;
         }
         successor_claimed.store(true, Ordering::Release);
+        let idle_after = idle.fetch_sub(1, Ordering::AcqRel).saturating_sub(1);
+        if !prebuild_successor {
+            return None;
+        }
         // Booting a VM costs real CPU, and it would be spent alongside the job
         // that just started, so build exactly as many replacements as the
         // backlog needs and no more.
@@ -2478,7 +2487,6 @@ async fn run_one_runner<P: VmProvider + 'static>(
         // decides which of them actually build: without it, a matrix one job
         // wider than the pool had all four slots boot a replacement to serve a
         // single straggler, and the contention cost more than the wait.
-        let idle_after = idle.fetch_sub(1, Ordering::AcqRel).saturating_sub(1);
         let queued = pending_jobs.map_or(0, |pending| pending.load(Ordering::Acquire));
         // With nothing queued still keep one runner coming, so the pool is not
         // empty for whatever arrives next.
@@ -3075,6 +3083,7 @@ mod lifecycle_tests {
         fail_configure: bool,
         fail_run: bool,
         fail_delete: bool,
+        announce_busy: bool,
         /// Binary that `command -v` cannot find until its toolchain installs.
         absent_binary: Mutex<Option<&'static str>>,
     }
@@ -3095,8 +3104,14 @@ mod lifecycle_tests {
                 fail_configure,
                 fail_run,
                 fail_delete,
+                announce_busy: false,
                 absent_binary: Mutex::new(None),
             }
+        }
+
+        fn announcing_busy(mut self) -> Self {
+            self.announce_busy = true;
+            self
         }
 
         /// A provider whose guests lack `binary` until an install command for
@@ -3592,12 +3607,20 @@ chmod +x "$destination/bin/node"
             &self,
             name: &MachineName,
             argv: &[String],
-            _output: tokio::sync::mpsc::Sender<OutputChunk>,
+            output: tokio::sync::mpsc::Sender<OutputChunk>,
         ) -> Result<i32, VmError> {
             self.events
                 .lock()
                 .await
                 .push(format!("run:{}", name.as_str()));
+            if self.announce_busy {
+                output
+                    .send(OutputChunk::Stdout(
+                        format!("{RUNNER_BUSY_SENTINEL}\n").into_bytes(),
+                    ))
+                    .await
+                    .unwrap();
+            }
             if self.fail_run && argv.iter().any(|arg| arg == "run") {
                 return Err(test_error("run-failure"));
             }
@@ -3878,12 +3901,50 @@ chmod +x "$destination/bin/node"
                 idle: &idle,
                 keys: &Arc::new(KeyPool::new()),
                 building: &AtomicUsize::new(0),
+                prebuild_successor: true,
             },
         )
         .await
         .expect_err("runner failure must propagate");
         assert!(error.to_string().contains("run-failure"));
         assert!(!error.to_string().contains("delete-failure"));
+    }
+
+    #[tokio::test]
+    async fn on_demand_slot_does_not_build_a_throwaway_successor() {
+        let provider =
+            Arc::new(TestProvider::new(false, false, false, false, false).announcing_busy());
+        let mut config = test_config(false);
+        config.size = 0;
+        let handles = PoolHandles {
+            idle: Arc::new(AtomicUsize::new(0)),
+            keys: Arc::new(KeyPool::new()),
+            building: Arc::new(AtomicUsize::new(0)),
+        };
+
+        run_on_demand_slot(
+            provider.clone(),
+            config.clone(),
+            0,
+            CancellationToken::new(),
+            Arc::new(GoldenRegistry::new(config.name_prefix.clone())),
+            handles,
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await
+        .unwrap();
+
+        let creates = provider
+            .events()
+            .await
+            .into_iter()
+            .filter(|event| event.starts_with("create:"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            creates,
+            vec!["create:lifecycle-test-0-1"],
+            "size-zero mode must not provision a successor it immediately deletes"
+        );
     }
 }
 
