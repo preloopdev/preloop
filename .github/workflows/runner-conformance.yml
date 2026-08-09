@@ -7,7 +7,8 @@ on:
     branches: [main]
   pull_request:
   schedule:
-    - cron: "30 3 * * *"
+    # Weekly deep-runner probe (Monday 03:00 UTC). runner-light still gates every PR/push.
+    - cron: "0 3 * * 1"
   workflow_dispatch:
 
 jobs:
@@ -34,17 +35,18 @@ jobs:
           path: benchmarks/compatibility/runner/behavior/RUNNER-CONFORMANCE-REPORT.md
           if-no-files-found: error
 
-  # The deep profile needs the repository's pre-packed smolVM machines,
-  # macOS/ARM64 host, gh credentials, and official runner cache. The host-only
-  # variable is also the explicit opt-in: webhook CI runs inside disposable
-  # Linux guests and must not try to launch nested host smolVMs. Once enabled,
-  # a missing or failed prerequisite fails instead of degrading to light.
+  # The deep profile builds the runner from source and boots it inside the
+  # repository's pre-packed smolVM machines on the macOS/ARM64 host, so it is
+  # expensive (180-min timeout) and runs only on the weekly schedule or manual
+  # dispatch, never on PRs or pushes. The host-only variable is the explicit
+  # opt-in: webhook CI runs inside disposable Linux guests and must not try to
+  # launch nested host smolVMs. Once enabled, a missing or failed prerequisite
+  # fails instead of degrading to light.
   runner-deep:
     name: Runner deep conformance
-    # This job builds and runs PR code on a macOS host WITH a GH token
-    # secret, so fork PRs are hard-excluded: only same-repo PRs (write
-    # access), pushes, schedule, and manual runs may trigger it.
-    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.RUNNER_CONFORMANCE_HOST_WORKSPACE != ''
+    # Schedule and manual dispatch only; PR and push events never reach this
+    # job. The GH token secret is trusted-context-only by construction.
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && vars.RUNNER_CONFORMANCE_HOST_WORKSPACE != ''
     runs-on: [self-hosted, macOS, ARM64, smolvm-host]
     timeout-minutes: 180
     env:

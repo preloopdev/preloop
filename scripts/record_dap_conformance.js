@@ -48,7 +48,7 @@ async function runScenario(backend) {
                 ...process.env,
                 RUST_LOG: "info",
                 PRELOOP_SYSTEM_TOKEN: SYSTEM_TOKEN,
-                // Official runner needs LAN IP (port 80 redirect via mitm).
+                // Official runner uses the development service URL directly.
                 // Preloop runner connects directly to localhost.
                 PRELOOP_PUBLIC_URL: backend === "official"
                     ? "http://192.168.1.221:9090"
@@ -113,9 +113,8 @@ async function runScenario(backend) {
     const token = tokenData.token;
     console.log(`Registration token: ${token}`);
 
-    // Set proxy environment variables for the runner.
-    // Official runner needs the proxy for port 80 → 9090 redirect.
-    // Preloop runner connects directly — proxy breaks its WebSocket live-log connection.
+    // Set proxy environment variables for the official runner's MITM capture.
+    // Preloop runner connects directly; proxying it breaks WebSocket logs.
     const baseEnv = {
         ...process.env,
         GITHUB_ACTIONS_RUNNER_TLS_NO_VERIFY: "1",

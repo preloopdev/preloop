@@ -1,26 +1,12 @@
 # Setup guide
 
-This page is the "what to tell users" companion to the `preloop setup github`
-wizard. It covers installing the engine, connecting it to GitHub, and storing
+This page covers installing the engine, connecting it to GitHub, config and storing
 secrets.
 
-## What preloop is
-
-`preloop` is a local GitHub Actions control plane. The engine (`preloop
-serve`) accepts workflows the same way GitHub does — `${{ }}` expressions,
-matrix builds, reusable workflows, concurrency groups, OIDC — and executes
-them on local machines (smolvm microVMs by default). Your `.github/workflows`
-run unmodified.
-
-## Requirements
-
-- macOS (Apple Silicon), Windows or Linux, 64-bit
-- [smolvm] for the default VM runner pool (`preloop runner` works without it)
-- A GitHub account for credentials (see below)
 
 ### Windows
 
-Windows is supported **via WSL2** for now — native Windows support is coming
+Windows is supported **via WSL2** for now tho native Windows support is coming
 (the Windows binaries and the WHP-backed VM backend already exist in the
 pipeline). Inside WSL2, everything works like Linux:
 
@@ -41,16 +27,16 @@ preloop run -f .github/workflows/ci.yml --event push
 ```
 
 `preloop run` snapshots the local workspace (dirty changes included) so a run
-never depends on what is pushed to GitHub.
+ will run your workflows locally. It doesnt depends on what is pushed to GitHub or create a commit locally.
 
-Running it as an always-on server for a team — service install, every runtime
-knob, and how to expose it (tunnel, funnel, or your own domain) — is covered in
+If you are running it as an always-on server, service install, every runtime
+knob, and how to expose it (tunnel, funnel, or your own domain)  is covered in
 [self-hosting.md](self-hosting.md).
 
 ## Connecting GitHub credentials
 
-Workflows reference GitHub — `${{ github.repository }}`, `GITHUB_TOKEN`,
-`secrets.*` — so the engine needs a credential. Two kinds are supported:
+Workflows reference GitHub (`${{ github.repository }}`, `GITHUB_TOKEN`,
+`secrets.*` etc) so the engine needs a credential. Two kinds are supported:
 
 | | GitHub App (recommended) | Fine-grained PAT |
 |---|---|---|
@@ -77,12 +63,9 @@ The App and its webhook are one object; the webhook only adds GitHub's
 ability to call you. You can enable it later with `--public-url`, so
 starting without it is never a dead end.
 
+### Option A : GitHub App
 
-### Option A — GitHub App
-
-GitHub has no API for creating an App, but it does accept a *manifest*: a
-form POST that pre-fills the creation page. `preloop setup github --via app`
-uses it, so the only manual step is clicking **Create on GitHub**.
+Run this command:
 
 ```sh
 preloop setup github --via app
@@ -93,7 +76,7 @@ browser, and uses it as the manifest's redirect target. You click **Create on
 GitHub**; GitHub redirects back with a one-time code, and the CLI converts it
 into the App id, private key, and webhook secret and writes them to
 `~/.preloop/config.toml` (mode 0600). The browser then lands on the
-installation page — pick the repositories you run, and the CLI reports the
+installation page, pick the repositories you run, and the CLI reports the
 installation id and exits.
 
 The private key never leaves the machine: the redirect target is
@@ -102,7 +85,7 @@ The private key never leaves the machine: the redirect target is
 | Flag | Effect |
 |---|---|
 | `--org NAME` | Create the App under an organization instead of your account. |
-| `--public-url URL` | Also enable webhook delivery to that URL. Omitted, the App is created with webhooks off — GitHub cannot reach `localhost`. |
+| `--public-url URL` | Also enable webhook delivery to that URL. Omitted, the App is created with webhooks off since GitHub cannot reach `localhost`. |
 | `--app-name NAME` | App name (GitHub requires global uniqueness). Default `preloop-local`. |
 | `--port N` | Pin the loopback port instead of taking a free one. |
 | `--no-browser` | Print the URL instead of opening a browser (headless/SSH). |
@@ -120,13 +103,14 @@ you*; everything outbound still works:
 | Check runs on the commit | published (outbound to GitHub) | same |
 
 So a laptop setup is a complete CI system you trigger yourself. When you later
-get a reachable address — a tunnel is enough — point the App you already have
+get a reachable address — soemthing like a tunnel is enough — point the App you already have
 at it:
 
 ```sh
 cloudflared tunnel --url http://127.0.0.1:9090      # → https://xxx.trycloudflare.com
 preloop setup github --via app --public-url https://xxx.trycloudflare.com
 ```
+
 For anything persistent, prefer a named tunnel: the `trycloudflare.com`
 address above changes every restart, which would leave the webhook URL
 pointing at a dead address. A named tunnel keeps a stable hostname:
@@ -143,14 +127,13 @@ Point the webhook at the stable hostname once:
 preloop setup github --via app --public-url https://ci.example.com
 ```
 
-
 That updates the existing App's webhook URL and secret through GitHub's API
 (`PATCH /app/hook/config`) instead of creating a second App, and stores the
 secret so deliveries verify. GitHub exposes no API for the webhook **Active**
 checkbox, so an App created without `--public-url` needs that ticked once in
-its settings; the command says so.
+its settings.
 
-Already have an App — or your org blocks manifest creation? Create it by hand
+Already have an App or your org blocks manifest creation? Create it by hand
 at <https://github.com/settings/apps/new> (name it, leave webhooks off,
 download the PEM), install it on the accounts whose repos you run at
 <https://github.com/apps/YOUR-APP/installations/new>, then:
@@ -160,7 +143,7 @@ preloop setup github --via app --app-id 123456 --pem-file app.pem
 preloop doctor --repo owner/repo
 ```
 
-Either way the engine mints a fresh installation token per job — no
+Either way the engine mints a fresh installation token per job with no
 long-lived secret sits in the config.
 
 ### Option B — fine-grained PAT
@@ -175,8 +158,8 @@ or without `--token` (prompted, hidden input):
 preloop setup github --via pat --repo owner/repo
 ```
 
-Unlike Apps, PATs have no manifest flow — GitHub exposes no API for creating
-one — so this path opens the creation page and waits at a hidden prompt.
+Unlike Apps, PATs have no manifest flow. GitHub exposes no API for creating
+one so this path opens the creation page and waits at a hidden prompt.
 `--no-browser` skips the opening; piping the token in (or setting
 `PRELOOP_GITHUB_PAT`) skips the prompt entirely, so automation is unaffected.
 
@@ -210,23 +193,32 @@ repos is the supported fallback.
 
 ## Secrets
 
-`preloop secret` mirrors GitHub's secret model: a **global tier** (like
-org-level secrets, injected into every trusted job) and a **per-repository
-tier** (like repo secrets, injected only into that repository's jobs).
-Per-repo secrets override the global tier per name; values a submission
-passes explicitly win over both.
+`preloop secret` mirrors GitHub's secret model, three tiers:
+
+- **global** (like org-level secrets): injected into every trusted job
+- **per-repository** (like repo secrets): injected only into that
+  repository's jobs
+- **per-environment** (like environment secrets): injected only into jobs
+  that declare that environment for that repository
+
+Per-repo secrets override the global tier per name; per-environment secrets
+override both; values a submission passes explicitly win over all three.
 
 ```sh
 preloop secret set DOCKERHUB_TOKEN                     # prompts, hidden
 preloop secret set AWS_CREDS --repo owner/repo --value …
+preloop secret set DB_PASSWORD --repo owner/repo --env prod --value …
 preloop secret list                                   # names only, never values
 preloop secret list --repo owner/repo
+preloop secret list --repo owner/repo --env prod
 preloop secret rm DOCKERHUB_TOKEN
 preloop secret rm AWS_CREDS --repo owner/repo
+preloop secret rm DB_PASSWORD --repo owner/repo --env prod
 ```
 
 Names must be `UPPER_SNAKE`; values are masked in logs exactly like GitHub
-(`***`).
+(`***`). Environment names are GitHub-style (`prod`, `staging`, …): letters,
+digits, hyphens, underscores, at most 255 chars, not starting with `-` or `_`.
 
 Secrets apply **live**: when an engine is running, `set`/`rm` go through the
 engine API and affect the very next submitted run. With no engine running
@@ -246,8 +238,9 @@ not receive stored secrets; native `preloop run` submissions always do.
 
 ### Where secrets live
 
-By default stored secrets persist in the config file (`[secrets]`, mode
-0600). For deployments that must not hold plaintext at rest, two options:
+By default stored secrets persist in the config file (`[secrets]`,
+`[repo_secrets…]`, `[env_secrets…]`, mode 0600). For deployments that must
+not hold plaintext at rest, two options:
 
 - **Memory-only store** — set `secrets_store = "memory"` in the config file
   (or `PRELOOP_SECRETS_STORE=memory`): the live secrets API keeps values in
@@ -275,28 +268,43 @@ By default stored secrets persist in the config file (`[secrets]`, mode
 ## Config file
 
 Everything lives in `~/.preloop/config.toml` (mode 0600; `PRELOOP_CONFIG`
-overrides the path). Fields:
+overrides the path, `PRELOOP_HOME` the default directory). A missing or
+empty file is fine (everything defaults); a malformed one fails startup, so
+a typo is caught before a mint or a job hits it. `preloop setup github`
+writes the `[github]` section; `preloop secret` writes the secret tables.
+Fields:
 
 ```toml
 [github]
 app_id = "123456"
 app_pem = "-----BEGIN RSA PRIVATE KEY-----…"
 mint_failure = "pat"        # "local" | "error" | "pat"
-pat = "github_pat_…"
+pat = "github_pat_…"        # fallback under `pat` policy; `--via pat` credential
 webhook_secret = "…"        # written by `setup github --via app`
+server_url = "https://github.com"          # GHES: point at your host
+api_url = "https://api.github.com"         # GHES: REST base
+graphql_url = "https://api.github.com/graphql"
+
+secrets_store = "file"      # "file" (default) | "memory" (see above)
 
 [secrets]
 DOCKERHUB_TOKEN = "…"
 
 [repo_secrets."owner/repo"]
 AWS_CREDS = "…"
+
+[env_secrets."owner/repo"."prod"]
+DB_PASSWORD = "…"
 ```
 
-Environment variables override the file per field (`PRELOOP_GITHUB_APP_ID`,
-`PRELOOP_GITHUB_APP_PEM`, `PRELOOP_GITHUB_PAT`, `PRELOOP_WEBHOOK_SECRET`, …) —
-the file is the durable store, env vars are the escape hatch for containers.
-GitHub credential changes are picked up on engine restart; secrets changes
-apply live.
+Every field is overridable by its environment variable
+(`PRELOOP_GITHUB_APP_ID`, `PRELOOP_GITHUB_APP_PEM`,
+`PRELOOP_GITHUB_APP_MINT_FAILURE`, `PRELOOP_GITHUB_PAT`,
+`PRELOOP_WEBHOOK_SECRET`, `PRELOOP_GITHUB_SERVER_URL`,
+`PRELOOP_GITHUB_API_URL`, `PRELOOP_GITHUB_GRAPHQL_URL`,
+`PRELOOP_SECRETS_STORE`) — the file is the durable store, env vars are the
+escape hatch for containers. GitHub credential changes are picked up on
+engine restart; secrets changes apply live.
 
 ## doctor
 
@@ -437,7 +445,7 @@ sudo preloop server install \
     --webhook-secret '…'
 ```
 
-**Trying it out — a tunnel.** No DNS record or inbound port needed:
+**Trying it out use a tunnel.** No DNS record or inbound port needed:
 
 ```sh
 cloudflared tunnel --url http://127.0.0.1:9090   # quick tunnel → https://xxx.trycloudflare.com

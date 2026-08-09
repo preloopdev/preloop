@@ -37,7 +37,9 @@ pub async fn run(args: DapArgs, base_url: String, token: Option<String>) -> Resu
     if let Some(token) = token {
         request.headers_mut().insert(
             "Authorization",
-            format!("Bearer {token}").parse().context("invalid API token")?,
+            format!("Bearer {token}")
+                .parse()
+                .context("invalid API token")?,
         );
     }
     let (mut socket, _) = tokio_tungstenite::connect_async(request)
@@ -51,10 +53,16 @@ pub async fn run(args: DapArgs, base_url: String, token: Option<String>) -> Resu
     loop {
         print!("dap> ");
         std::io::stdout().flush()?;
-        let Some(line) = lines.next_line().await? else { break };
+        let Some(line) = lines.next_line().await? else {
+            break;
+        };
         let line = line.trim();
-        if line.is_empty() { continue; }
-        if line == "quit" || line == "exit" { break; }
+        if line.is_empty() {
+            continue;
+        }
+        if line == "quit" || line == "exit" {
+            break;
+        }
         if line == "wait" {
             let value = next_event(&mut socket).await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
@@ -63,12 +71,15 @@ pub async fn run(args: DapArgs, base_url: String, token: Option<String>) -> Resu
         let (command, arguments) = parse_command(line)?;
         seq += 1;
         socket
-            .send(Message::Text(json!({
-                "seq": seq,
-                "type": "request",
-                "command": command,
-                "arguments": arguments,
-            }).to_string()))
+            .send(Message::Text(
+                json!({
+                    "seq": seq,
+                    "type": "request",
+                    "command": command,
+                    "arguments": arguments,
+                })
+                .to_string(),
+            ))
             .await
             .context("sending DAP request")?;
         let response = response_for(&mut socket, seq).await?;
@@ -88,23 +99,38 @@ fn parse_command(line: &str) -> Result<(&str, Value)> {
         "source" => json!({"source":{"name":"execution.yml"}}),
         "threads" => json!({}),
         "scopes" => json!({"frameId":1}),
-        "vars" => json!({"variablesReference": rest.parse::<i64>().context("vars requires a numeric reference")?}),
+        "vars" => {
+            json!({"variablesReference": rest.parse::<i64>().context("vars requires a numeric reference")?})
+        }
         "eval" => json!({"expression":rest,"context":"repl"}),
         "continue" => json!({"threadId":1}),
-        "help" => { println!("init ready wait source scopes vars REF eval EXPR continue quit"); return Ok(("threads", json!({}))); }
+        "help" => {
+            println!("init ready wait source scopes vars REF eval EXPR continue quit");
+            return Ok(("threads", json!({})));
+        }
         other => anyhow::bail!("unknown DAP command `{other}`"),
     };
-    let command = match command { "init" => "initialize", "ready" => "configurationDone", "vars" => "variables", "eval" => "evaluate", other => other };
+    let command = match command {
+        "init" => "initialize",
+        "ready" => "configurationDone",
+        "vars" => "variables",
+        "eval" => "evaluate",
+        other => other,
+    };
     Ok((command, args))
 }
 
 async fn response_for<S>(socket: &mut S, request_seq: i64) -> Result<Value>
 where
-    S: futures_util::Sink<Message> + futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    S: futures_util::Sink<Message>
+        + futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + Unpin,
     <S as futures_util::Sink<Message>>::Error: std::error::Error + Send + Sync + 'static,
 {
     while let Some(message) = socket.next().await {
-        let Message::Text(text) = message.context("reading DAP response")? else { continue };
+        let Message::Text(text) = message.context("reading DAP response")? else {
+            continue;
+        };
         let value: Value = serde_json::from_str(&text).context("invalid DAP JSON")?;
         if value.get("type").and_then(Value::as_str) == Some("event") {
             println!("event: {}", serde_json::to_string_pretty(&value)?);
@@ -122,9 +148,13 @@ where
     S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
     while let Some(message) = socket.next().await {
-        let Message::Text(text) = message.context("reading DAP event")? else { continue };
+        let Message::Text(text) = message.context("reading DAP event")? else {
+            continue;
+        };
         let value: Value = serde_json::from_str(&text).context("invalid DAP JSON")?;
-        if value.get("type").and_then(Value::as_str) == Some("event") { return Ok(value); }
+        if value.get("type").and_then(Value::as_str) == Some("event") {
+            return Ok(value);
+        }
     }
     anyhow::bail!("DAP connection closed while waiting for event")
 }

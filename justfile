@@ -85,15 +85,6 @@ bench-preloop-quick:
 
 # e2e redirect (one-time setup) 
 
-e2e-setup:
-    sudo ./scripts/e2e-setup.sh
-
-e2e-status:
-    ./scripts/e2e-setup.sh --status
-
-e2e-teardown:
-    sudo ./scripts/e2e-setup.sh --teardown
-
 #serve
 
 serve:
@@ -141,3 +132,11 @@ conform-runner-light:
 conform-runner-deep:
     bash ./benchmarks/real-world/batch-conformance.sh both '10[1-9]-*' '110-*'
     python3 benchmarks/real-world/runner-conformance.py --mode deep
+
+#release
+
+# Promote the [Unreleased] changelog section into a dated release entry
+# (VERSION as X.Y.Z or vX.Y.Z). Fill in the section body before tagging: the
+# release workflow fails tags without a matching entry in CHANGELOG.md.
+changelog-release VERSION:
+    python3 scripts/changelog-release.py "{{VERSION}}"

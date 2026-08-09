@@ -2,8 +2,8 @@
 #
 # e2e-start.sh — start preloop for E2E testing with the real runner.
 #
-# Verifies port redirect is active, starts preloop on 9090, submits a workflow,
-# and runs the official runner against it. Captures all output for debugging.
+# Starts preloop on 9090, submits a workflow, and runs the official runner
+# against it using USE_DEV_ACTIONS_SERVICE_URL. Captures all output.
 #
 # Usage:
 #   ./scripts/e2e-start.sh                    # full E2E run
@@ -21,11 +21,7 @@ PRELOOP_STATE="${PRELOOP_STATE:-$HOME/mitm-proxy/experiments/mitm/.cache/preloop
 PRELOOP_BIN="${PRELOOP_BIN:-$REPO_ROOT/target/release/preloop-server}"
 RUNNER_DIR="${RUNNER_DIR:-$HOME/mitm-proxy/experiments/mitm/.cache/runner-official}"
 PRELOOP_PORT="${PRELOOP_PORT:-9090}"
-# preloop binds 9090, but clients (and the runner) reach it via the port-80 redirect.
-# Direct connections to 9090 are broken by the pf rdr rule's reverse NAT on lo0;
-# only the redirected 80→9090 path has correct bidirectional pf state. So every
-# client request below MUST go through port 80, exactly like the real runner.
-CLIENT="${CLIENT:-http://127.0.0.1:80}"
+CLIENT="${CLIENT:-http://127.0.0.1:$PRELOOP_PORT}"
 LOG_DIR="$REPO_ROOT/logs/e2e"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 LOG_FILE="$LOG_DIR/e2e-$TIMESTAMP.log"
@@ -79,15 +75,6 @@ preflight() {
     fi
     dim "  runner: $RUNNER_DIR"
 
-    # Check port redirect
-    if "$SCRIPT_DIR/e2e-setup.sh" --status 2>/dev/null; then
-        green "  port redirect: active"
-    else
-        red "  port redirect: not active"
-        info "Run: $SCRIPT_DIR/e2e-setup.sh"
-        exit 1
-    fi
-
     # Check port 9090 is free
     if lsof -i :"$PRELOOP_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
         red "  port $PRELOOP_PORT is already in use"
@@ -112,7 +99,7 @@ start_preloop() {
     PRELOOP_PID=$!
     dim "  preloop PID: $PRELOOP_PID"
 
-    # Wait for preloop to be ready — probe via the port-80 redirect (the working path)
+    # Wait for preloop to be ready.
     local retries=0
     while ! curl -sf --max-time 1 "$CLIENT/_apis/connectionData?connectOptions=0&lastChangeId=0&lastChangeId64=0" >/dev/null 2>&1; do
         retries=$((retries + 1))
@@ -151,9 +138,10 @@ configure_runner() {
         exit 1
     fi
 
-    # Configure with pfctl redirect (port 80 goes to 9090)
+    # Preserve the explicit development service port in the official runner.
+    export USE_DEV_ACTIONS_SERVICE_URL=1
     ./config.sh --unattended \
-        --url "http://127.0.0.1/runner/server" \
+        --url "$CLIENT/runner/server" \
         --token "$token" \
         --name "e2e-$(date +%s)" \
         --labels "mitm,self-hosted" \

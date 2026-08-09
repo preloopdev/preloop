@@ -52,6 +52,8 @@ captures before merging.
 - `.runner-watch/golden/` — golden wire captures by runner version. New protocol behaviors should ship with a golden.
 - `docs/fidelity-gap.md` — known protocol gaps and roadmap. If you're fixing a gap, link it.
 
+
+
 ## Project structure
 
 - `docs/architecture.md` — crate map + module map.
@@ -73,13 +75,17 @@ just test-ci      # fmt-check + clippy + test (the full CI gate)
 
 ## E2E testing
 
-The official runner strips non-default HTTP ports, so local E2E requires a port-80
-redirect:
+For local HTTP E2E, configure the official runner with
+`USE_DEV_ACTIONS_SERVICE_URL=1`. This tells the runner to treat the supplied
+URL as a development Actions service URL and preserve its explicit port. The
+runner's normal GitHub URL flow normalizes the service URL and strips a
+non-default HTTP port.
 
 ```sh
-just e2e-setup     # sudo: redirects :80 → :9090
 just serve         # start preloop on :9090
-# In another terminal: configure + run the official runner against http://127.0.0.1
-just e2e-status    # check redirect is active
-just e2e-teardown  # remove redirect
+# In another terminal, from the official runner directory:
+USE_DEV_ACTIONS_SERVICE_URL=1 ./config.sh \
+  --url http://127.0.0.1:9090 --token <runner-token> \
+  --unattended --name e2e-runner
+USE_DEV_ACTIONS_SERVICE_URL=1 ./run.sh --once
 ```

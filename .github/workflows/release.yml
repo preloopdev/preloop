@@ -74,6 +74,21 @@ jobs:
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/dist
+      # Every release must ship a changelog entry. This must run before the
+      # plan step: on tag pushes that step runs `dist host --steps=create`,
+      # which would create the GitHub Release before the guard could fail.
+      - name: Verify changelog entry for this release
+        if: ${{ !github.event.pull_request }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          python3 - "$version" <<'PY'
+          import re, sys
+          version = sys.argv[1]
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          if not re.search(rf"^## \[{re.escape(version)}\]", text, re.M):
+              sys.exit(f"CHANGELOG.md has no entry for [{version}]; add one before cutting the release")
+          print(f"CHANGELOG.md entry for [{version}] found")
+          PY
       # sure would be cool if github gave us proper conditionals...
       # so here's a doubly-nested ternary-via-truthiness to try to provide the best possible
       # functionality based on whether this is a pull_request, and whether it's from a fork.

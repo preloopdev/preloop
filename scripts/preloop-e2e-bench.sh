@@ -1,12 +1,8 @@
 #!/usr/bin/env bash
 # autoresearch.sh — benchmark preloop E2E protocol latency.
 #
-# Prerequisites (one-time sudo setup):
-#   ./scripts/e2e-setup.sh         # sets up pfctl redirect 80→9090
-#
-# Starts preloop on 127.0.0.1:9090, uses the pfctl 80→9090 redirect so the
-# runner can reach it on port 80 (the runner strips non-default HTTP ports
-# from URLs; the redirect makes port 80 work without root on preloop itself).
+# Starts preloop on 127.0.0.1:9090 and uses the official runner's development
+# service override so the explicit port is preserved.
 #
 # Submits fixtures/workflows/dogfood.yml and measures wall-clock time from
 # submission to the runner's JobCompletedEvent.
@@ -27,8 +23,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PRELOOP_BIN="$REPO_ROOT/target/release/preloop-server"
 RUNNER_DIR="${RUNNER_DIR:-$HOME/.cache/actions-runner/current}"
 PRELOOP_PORT="${PRELOOP_PORT:-9090}"
-# Clients use port 80 via pfctl redirect (runner strips non-default HTTP ports)
-CLIENT_URL="${CLIENT_URL:-http://127.0.0.1:80}"
+CLIENT_URL="${CLIENT_URL:-http://127.0.0.1:$PRELOOP_PORT}"
 STATE_DIR="$(mktemp -d /tmp/preloop-bench-XXXXXX)"
 LOG="$STATE_DIR/preloop.log"
 PRELOOP_PID=""
@@ -66,9 +61,6 @@ except Exception:
 
 lsof -i :"$PRELOOP_PORT" -sTCP:LISTEN >/dev/null 2>&1 \
     && die "port $PRELOOP_PORT already in use; run: lsof -ti:$PRELOOP_PORT | xargs kill"
-
-# Verify port-80 redirect is active by probing it after preloop starts
-# (checked after preloop is ready, below)
 
 # ── start preloop ───────────────────────────────────────────────────────────────
 
@@ -119,7 +111,7 @@ with urllib.request.urlopen(req, timeout=5) as r:
     rm -f .runner .credentials .credentials_rsaparams
 
     # Run config.sh directly and capture output in log
-    ./config.sh --unattended \
+    USE_DEV_ACTIONS_SERVICE_URL=1 ./config.sh --unattended \
         --url "$RUNNER_URL" \
         --token "$token" \
         --name "preloop-bench" \
@@ -133,7 +125,7 @@ fi
 
 # ── start runner ─────────────────────────────────────────────────────────────
 
-./run.sh >> "$LOG" 2>&1 &
+USE_DEV_ACTIONS_SERVICE_URL=1 ./run.sh >> "$LOG" 2>&1 &
 RUNNER_PID=$!
 sleep 1   # let runner connect and start long-polling
 

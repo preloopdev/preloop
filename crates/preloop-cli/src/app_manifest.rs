@@ -407,8 +407,8 @@ async fn page_installed(
 /// Exchange the one-time manifest code for the App's credentials.
 async fn convert(api_base: &str, code: &str) -> Result<AppCredentials> {
     let url = format!("{}/app-manifests/{}/conversions", api_base, urlencode(code));
-    // Not `crate::build_client()`: that one is pinned to the engine's unix
-    // socket, and this call goes to api.github.com.
+    // Not `crate::build_client()`: that one targets the engine's native API
+    // surface, and this call goes to api.github.com.
     let response = reqwest::Client::new()
         .post(&url)
         .header("User-Agent", "preloop")
