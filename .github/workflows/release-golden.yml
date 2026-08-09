@@ -26,6 +26,10 @@ jobs:
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
+          # Pin the workspace toolchain: the action's `stable` default does
+          # not reliably install the cross std on self-hosted runners
+          # (E0463: can't find crate for `core`).
+          toolchain: "1.97"
           targets: ${{ matrix.target }}
 
       - name: Set up Zig cross toolchain
@@ -194,9 +198,12 @@ jobs:
           mkdir -p "$HOME/.smolvm"
           rm -rf "$HOME/.smolvm/lib"
           cp -R "$SRC/lib" "$HOME/.smolvm/lib"
-          cp "$SRC/smolvm" "$SRC/smolvm-bin" \
-             "$SRC/storage-template.ext4" "$SRC/overlay-template.ext4" \
-             "$HOME/.smolvm/"
+          # The darwin tarball ships no storage/overlay templates; copy
+          # whatever the archive actually carries (mirrors the update
+          # installer, which copies only files that exist).
+          for f in smolvm smolvm-bin storage-template.ext4 overlay-template.ext4; do
+            [ -f "$SRC/$f" ] && cp "$SRC/$f" "$HOME/.smolvm/"
+          done
           echo "$SMOLVM_VERSION" > "$HOME/.smolvm/.version"
           mkdir -p "$HOME/Library/Application Support/smolvm"
           rm -rf "$HOME/Library/Application Support/smolvm/agent-rootfs"
