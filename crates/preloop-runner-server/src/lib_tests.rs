@@ -6055,6 +6055,82 @@ async fn queued_job_with_no_runner_is_failed_after_the_grace_window() {
 }
 
 #[tokio::test]
+async fn queued_job_survives_the_grace_window_while_the_pool_is_preparing() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+
+    // A co-hosted pool is warming its machine image: no runner can register
+    // until the download/build and golden prep finish, so the starvation
+    // clock must not expire while the signal is raised.
+    state.pool_preparing = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+        true,
+    )));
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+
+    let accepted = submit_simple_run(&app).await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    reap_once(&shared).await;
+    // Backdate the first-seen mark far past the grace window.
+    {
+        let mut inner = state.inner.lock().await;
+        inner.queued_at.insert(
+            (run_id, JobId("build".to_owned())),
+            SystemTime::now() - Duration::from_secs(300),
+        );
+    }
+    reap_once(&shared).await;
+    {
+        let inner = state.inner.lock().await;
+        assert_eq!(
+            inner.queue.len(),
+            1,
+            "job queued during the pool warm must not starve"
+        );
+    }
+
+    // The pool finished warming: the clock resets and the grace window
+    // counts from the first sweep that sees a runnable-but-unclaimed job.
+    state
+        .pool_preparing
+        .as_ref()
+        .unwrap()
+        .store(false, std::sync::atomic::Ordering::Release);
+    reap_once(&shared).await;
+    {
+        let inner = state.inner.lock().await;
+        assert_eq!(
+            inner.queue.len(),
+            1,
+            "a fresh grace window starts once the pool is ready"
+        );
+    }
+
+    // With nothing having claimed the job after a full fresh window, the
+    // sweep fails it as before.
+    {
+        let mut inner = state.inner.lock().await;
+        inner.queued_at.insert(
+            (run_id, JobId("build".to_owned())),
+            SystemTime::now() - Duration::from_secs(300),
+        );
+    }
+    reap_once(&shared).await;
+    {
+        let inner = state.inner.lock().await;
+        assert!(
+            inner.queue.is_empty(),
+            "a job nobody can claim still fails once the pool is ready"
+        );
+    }
+}
+
+#[tokio::test]
 async fn job_timeout_enforcement_cancels_job() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -15370,6 +15446,7 @@ fn server_config_debug_redacts_store_url_password() {
         tls: TlsMode::None,
         queue_depth: None,
         next_job_runs_on: None,
+        pool_preparing: None,
         enable_test_api: false,
         test_api_token: Some("super-secret-token".to_owned()),
         oidc_issuer: None,

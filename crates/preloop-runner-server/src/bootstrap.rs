@@ -26,6 +26,11 @@ pub struct ServerConfig {
     /// the job at the front of the dispatch queue. Supply one to let a
     /// co-hosted runner pool select the correct base-image golden.
     pub next_job_runs_on: Option<Arc<std::sync::RwLock<Vec<String>>>>,
+    /// Raised while a co-hosted runner pool is still preparing its
+    /// immutable machine image (artifact download or build, golden prep)
+    /// and cannot register a runner yet. The starvation sweep pauses the
+    /// queued-job grace clock while it is set.
+    pub pool_preparing: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Enable privileged local/CI simulation endpoints.
     pub enable_test_api: bool,
     /// Bearer token required by privileged simulation endpoints.
@@ -167,8 +172,17 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
     // labels. The `queued_at` map is maintained here, from the queue itself:
     // first observation stamps the time, a match clears it, and jobs that
     // left the queue drop their entry, so no enqueue-site coordination is
-    // needed and the map cannot go stale.
+    // needed and the map cannot go stale. While a co-hosted pool is still
+    // preparing its machine image (artifact download or build, golden prep)
+    // it cannot register a runner no matter how long the job waits, so the
+    // clock is reset for the whole warm: a job queued mid-warm gets a full
+    // grace window once provisioning actually starts.
     const QUEUED_JOB_GRACE: Duration = Duration::from_secs(120);
+    let pool_preparing = shared
+        .state
+        .pool_preparing
+        .as_ref()
+        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
     let queued_jobs: Vec<_> = inner.queue.iter().cloned().collect();
     let in_queue: std::collections::BTreeSet<(RunId, JobId)> = queued_jobs
         .iter()
@@ -182,6 +196,13 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
             crate::runtime_scheduling::job_matches_runner(&job.runs_on, &runner.labels)
         });
         if matching {
+            inner.queued_at.remove(&key);
+            continue;
+        }
+        if pool_preparing {
+            // The pool is warming and cannot register a runner yet; do not
+            // let the grace window expire while the first machine image is
+            // still being produced.
             inner.queued_at.remove(&key);
             continue;
         }
@@ -440,6 +461,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     };
     let router = build_app(state.clone(), shutdown.clone(), test_api_token);
 
+    state.pool_preparing = config.pool_preparing.clone();
     let shared = Arc::new(SharedState {
         state,
         shutdown: shutdown.clone(),

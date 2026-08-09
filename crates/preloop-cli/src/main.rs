@@ -465,6 +465,7 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         runner_uid: None,
         next_job_runs_on: None,
         pending_registrations: None,
+        preparing_signal: None,
     };
     RunnerPool::new(std::sync::Arc::new(SmolVmProvider::default()), config)?
         .rebuild_artifact()
@@ -747,6 +748,11 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
     // actually waiting, not just to whether it has an idle runner left.
     let queue_depth = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let next_job_runs_on = std::sync::Arc::new(std::sync::RwLock::new(Vec::new()));
+    // Raised while the pool is warming its machine image (artifact download
+    // or build, golden prep); the server pauses the queued-job starvation
+    // clock for the whole warm so a first job does not die before the pool
+    // can register a runner.
+    let pool_preparing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Shared one-time provision-token map. The pool writes a token for every
     // machine it provisions and forwards it into the guest's `configure`;
     // the control plane trusts only registrations presenting a match, which
@@ -766,6 +772,7 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
         queue_depth.clone(),
         next_job_runs_on.clone(),
         pool_enabled,
+        pool_preparing.clone(),
         pending_registrations.clone(),
     );
     let pool_available = match &pool_config {
@@ -793,6 +800,7 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
             unix_socket: Some(socket.clone()),
             queue_depth: Some(queue_depth.clone()),
             next_job_runs_on: Some(next_job_runs_on.clone()),
+            pool_preparing: Some(pool_preparing.clone()),
             pending_registrations: pool_available.then_some(pending_registrations),
             require_job_assignments: env_flag("PRELOOP_REQUIRE_JOB_ASSIGNMENTS", false),
             state_dir,
@@ -903,6 +911,7 @@ fn local_runner_pool_config(
     queue_depth: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     next_job_runs_on: std::sync::Arc<std::sync::RwLock<Vec<String>>>,
     pool_enabled: bool,
+    preparing_signal: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pending_registrations: std::sync::Arc<
         std::sync::RwLock<std::collections::BTreeMap<String, std::time::SystemTime>>,
     >,
@@ -1066,6 +1075,7 @@ fn local_runner_pool_config(
         pending_jobs: Some(queue_depth),
         next_job_runs_on: (!custom_base).then_some(next_job_runs_on),
         pending_registrations: Some(pending_registrations),
+        preparing_signal: Some(preparing_signal),
     })
 }
 
@@ -2098,6 +2108,7 @@ mod tests {
                 queue_depth.clone(),
                 next_job_runs_on.clone(),
                 false,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 std::sync::Arc::new(std::sync::RwLock::new(std::collections::BTreeMap::new())),
             )
             .unwrap();
@@ -2147,6 +2158,7 @@ mod tests {
                 queue_depth.clone(),
                 next_job_runs_on.clone(),
                 false,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 std::sync::Arc::new(std::sync::RwLock::new(std::collections::BTreeMap::new())),
             )
             .unwrap();

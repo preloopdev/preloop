@@ -121,6 +121,7 @@ async fn main() -> anyhow::Result<()> {
             serve(ServerConfig {
                 queue_depth: None,
                 next_job_runs_on: None,
+                pool_preparing: None,
                 listen,
                 systemd_socket_activation: false,
                 unix_socket,

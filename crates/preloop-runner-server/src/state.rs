@@ -326,6 +326,10 @@ pub struct AppState {
     /// is claimed. A supervising runner pool reads it to decide whether the
     /// work already queued outruns the runners it has left.
     pub queue_depth: Arc<std::sync::atomic::AtomicUsize>,
+    /// Raised while a co-hosted runner pool is still preparing its machine
+    /// image and cannot register a runner yet; see [`ServerConfig`]. The
+    /// starvation sweep pauses the queued-job grace clock while it is set.
+    pub pool_preparing: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// `runs-on` labels of the job at the front of the dispatch queue,
     /// refreshed after each claim so a co-hosted runner pool can select the
     /// right golden before the next fork.
@@ -675,6 +679,7 @@ impl AppState {
             // Mirror the recovered ready-queue size so an on-demand runner
             // pool spawns against the right workload after restart.
             queue_depth: Arc::new(std::sync::atomic::AtomicUsize::new(recovered_queue_len)),
+            pool_preparing: None,
             next_job_runs_on: Arc::new(std::sync::RwLock::new(Vec::new())),
             cache,
             artifacts,

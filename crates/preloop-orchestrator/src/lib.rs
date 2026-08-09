@@ -278,6 +278,27 @@ async fn download_prebaked_golden(payload: &Path) -> bool {
         }
     };
 
+    // Fetch the companion checksum before committing bandwidth to the body.
+    // A truncated or corrupted golden only fails much later, when a VM tries
+    // to boot it, so a mismatch must be caught here. Releases that do not
+    // publish a checksum are tolerated with a warning (the download is still
+    // the best path when the alternative is a full local build).
+    let expected_sha256 = match tokio::time::timeout(
+        Duration::from_secs(15),
+        client.get(format!("{url}.sha256")).send(),
+    )
+    .await
+    {
+        Ok(Ok(res)) if res.status().is_success() => match res.text().await {
+            Ok(text) => parse_sha256_checksum(&text),
+            Err(_) => None,
+        },
+        _ => None,
+    };
+    if expected_sha256.is_none() {
+        warn!(url = %format!("{url}.sha256"), "no golden checksum published; downloading without verification");
+    }
+
     let tmp_payload = match payload.parent() {
         Some(parent) => parent.join(format!(".tmp-golden-{}", uuid::Uuid::new_v4())),
         None => return false,
@@ -318,6 +339,41 @@ async fn download_prebaked_golden(payload: &Path) -> bool {
     }
     drop(file);
 
+    if let Some(expected) = expected_sha256 {
+        let actual = match tokio::task::spawn_blocking({
+            let tmp_payload = tmp_payload.clone();
+            move || {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                let mut file = std::fs::File::open(&tmp_payload)?;
+                std::io::copy(&mut file, &mut hasher)?;
+                let mut hex = String::with_capacity(64);
+                for byte in hasher.finalize() {
+                    use std::fmt::Write as _;
+                    let _ = write!(hex, "{byte:02x}");
+                }
+                Ok::<String, std::io::Error>(hex)
+            }
+        })
+        .await
+        {
+            Ok(Ok(actual)) => actual,
+            _ => {
+                let _ = tokio::fs::remove_file(&tmp_payload).await;
+                return false;
+            }
+        };
+        if actual != expected {
+            warn!(
+                expected,
+                %actual,
+                "golden checksum mismatch; discarding download and building locally"
+            );
+            let _ = tokio::fs::remove_file(&tmp_payload).await;
+            return false;
+        }
+    }
+
     if tokio::fs::rename(&tmp_payload, payload).await.is_err() {
         let _ = tokio::fs::remove_file(&tmp_payload).await;
         return false;
@@ -325,6 +381,18 @@ async fn download_prebaked_golden(payload: &Path) -> bool {
 
     info!(target = %payload.display(), "Downloaded pre-baked golden microVM image successfully");
     true
+}
+
+/// First whitespace-separated token of a `sha256sum`-style checksum file
+/// (`<hex>  <filename>`), lowercased. `None` when the file does not parse.
+fn parse_sha256_checksum(text: &str) -> Option<String> {
+    let token = text.split_whitespace().next()?;
+    let token = token.strip_prefix("sha256:").unwrap_or(token);
+    if token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(token.to_ascii_lowercase())
+    } else {
+        None
+    }
 }
 /// Packages the golden image carries.
 ///
@@ -950,6 +1018,12 @@ pub struct RunnerPoolConfig {
     /// a queued job to a specific machine's runner identity.
     pub pending_registrations:
         Option<Arc<std::sync::RwLock<std::collections::BTreeMap<String, std::time::SystemTime>>>>,
+    /// Signal raised while the pool is still preparing its immutable
+    /// machine image (artifact download or build, golden prep) and cannot
+    /// register a runner yet. The control plane reads it to pause the
+    /// queued-job starvation clock during the warm; it is cleared before
+    /// the pool serves its first job.
+    pub preparing_signal: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Cache of environment-specific golden VMs.
@@ -1403,6 +1477,9 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
 
     /// Prepare the immutable runner image once, then supervise all slots until cancellation.
     pub async fn run(&self, shutdown: CancellationToken) -> Result<(), OrchestratorError> {
+        if let Some(signal) = &self.config.preparing_signal {
+            signal.store(true, std::sync::atomic::Ordering::Release);
+        }
         ensure_host_externals(&self.config)?;
         if self.config.use_packed_artifact || self.config.control_socket.is_none() {
             self.prepare_artifact(true).await?;
@@ -1431,6 +1508,13 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     .insert(default_environment.fingerprint, golden)
                     .await;
             }
+        }
+
+        // The warm is done: the pool can now register runners for queued
+        // jobs. Clear the signal so the control plane's starvation sweep
+        // counts the full grace window from here.
+        if let Some(signal) = &self.config.preparing_signal {
+            signal.store(false, std::sync::atomic::Ordering::Release);
         }
 
         let mut slots = JoinSet::new();
@@ -3264,6 +3348,7 @@ chmod +x "$destination/bin/node"
             runner_uid: None,
             next_job_runs_on: None,
             pending_registrations: None,
+            preparing_signal: None,
         }
     }
 
@@ -3715,6 +3800,38 @@ mod golden_download_tests {
         format!("http://{address}/golden")
     }
 
+    /// Answers the payload request, then one more connection with
+    /// `checksum_body` (the `.sha256` companion). Used to exercise the
+    /// checksum verification path.
+    async fn serve_with_checksum(
+        payload_head: String,
+        payload_body: Vec<u8>,
+        checksum_body: Vec<u8>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for (head, body) in [
+                (payload_head, payload_body),
+                (
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                        checksum_body.len()
+                    ),
+                    checksum_body,
+                ),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 1024];
+                let _ = socket.read(&mut request).await;
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(&body).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        format!("http://{address}/golden")
+    }
+
     fn leftovers(directory: &Path) -> Vec<String> {
         std::fs::read_dir(directory)
             .unwrap()
@@ -3771,6 +3888,59 @@ mod golden_download_tests {
         std::env::remove_var("PRELOOP_GOLDEN_URL");
         // The caller reads `false` as "build the golden locally", so a partial
         // file surviving here would be booted as if it were complete.
+        assert!(!downloaded);
+        assert!(!payload.exists());
+        assert!(leftovers(directory.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn matching_checksum_is_verified_before_the_payload_lands() {
+        let _serialized = GOLDEN_URL.lock().await;
+        let directory = tempfile::tempdir().unwrap();
+        let payload = directory.path().join("golden.smolmachine");
+
+        let body: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+        use sha2::{Digest, Sha256};
+        let digest: String = Sha256::digest(&body)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let url = serve_with_checksum(
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()),
+            body.clone(),
+            format!("{digest}  golden\n").into_bytes(),
+        )
+        .await;
+        std::env::set_var("PRELOOP_GOLDEN_URL", &url);
+
+        let downloaded = download_prebaked_golden(&payload).await;
+
+        std::env::remove_var("PRELOOP_GOLDEN_URL");
+        assert!(downloaded);
+        assert_eq!(std::fs::read(&payload).unwrap(), body);
+        assert!(leftovers(directory.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn mismatched_checksum_discards_the_download() {
+        let _serialized = GOLDEN_URL.lock().await;
+        let directory = tempfile::tempdir().unwrap();
+        let payload = directory.path().join("golden.smolmachine");
+
+        let body = vec![0xCD_u8; 64 * 1024];
+        let url = serve_with_checksum(
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()),
+            body,
+            format!("{}  golden\n", "00".repeat(32)).into_bytes(),
+        )
+        .await;
+        std::env::set_var("PRELOOP_GOLDEN_URL", &url);
+
+        let downloaded = download_prebaked_golden(&payload).await;
+
+        std::env::remove_var("PRELOOP_GOLDEN_URL");
+        // A corrupted artifact must never be published as the payload: the
+        // pool would boot it and only fail when a VM cannot start.
         assert!(!downloaded);
         assert!(!payload.exists());
         assert!(leftovers(directory.path()).is_empty());

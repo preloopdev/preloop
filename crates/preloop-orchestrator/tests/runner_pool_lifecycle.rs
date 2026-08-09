@@ -388,6 +388,7 @@ impl Fixture {
             runner_uid: None,
             next_job_runs_on: None,
             pending_registrations: None,
+            preparing_signal: None,
         };
         Self {
             _env_guard: env_guard,
