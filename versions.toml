@@ -1,18 +1,28 @@
 runner_version = "2.336.0"
 
-# Provisioning version pins for the runner base image / golden. Tracks the official runner image.
-#
+# Image inputs for the runner golden. The OCI bases are immutable filesystem
+# inputs. `github_runner_image_version` is the actions/runner-images snapshot
+# used as the parity source for the tool and package versions below.
+# crates/preloop-orchestrator/build.rs compiles this file into the CLI; rebuild
+# and reinstall Preloop after changing a pin.
+github_runner_image_version = "20260720.247.2"
+
+# Keep base images digest-pinned. Tags are useful labels but are not immutable.
+# Custom organization images are runtime/build inputs (`--base-image` and
+# PRELOOP_RUNNER_BASE_IMAGE), not project defaults in this file.
+ubuntu_24_04_base = "mirror.gcr.io/library/ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90"
+ubuntu_22_04_base = "mirror.gcr.io/library/ubuntu:22.04@sha256:0e0a0fc6d18feda9db1590da249ac93e8d5abfea8f4c3c0c849ce512b5ef8982"
+
+# Provisioning version pins baked into the runner golden.
 node_version = "22.23.1"
 rustup_version = "1.29.0"
 cargo_shear_version = "1.12.4"
 node20_externals_version = "20.19.0"
 node24_externals_version = "24.3.0"
-ubuntu_24_04_base = "mirror.gcr.io/library/ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90"
-ubuntu_22_04_base = "mirror.gcr.io/library/ubuntu:22.04@sha256:0e0a0fc6d18feda9db1590da249ac93e8d5abfea8f4c3c0c849ce512b5ef8982"
 
 # GitHub-hosted parity bake list — exact versions from the official
-# ubuntu-24.04 runner image toolset (20260720.247.2). Baked into the golden
-# at build time; see docs/vm-images.md for the tier rationale.
+# ubuntu-24.04 runner image toolset named above. Baked into the golden at
+# build time; see docs/vm-images.md for the tier rationale.
 git_version = "2.54.0"
 git_lfs_version = "3.7.1"
 docker_version = "28.0.4"
@@ -32,9 +42,9 @@ yarn_version = "1.22.22"
 
 # Apt packages baked into the golden, pinned exactly. Versions marked
 # EXACT match the official ubuntu-24.04 runner image toolset
-# (20260720.247.2); the rest are the archive's current version where the
-# official pin has been superseded in noble. Re-verify against the image
-# readme + the noble archive when bumping.
+# named by `github_runner_image_version`; the rest are the archive's current
+# version where the official pin has been superseded in noble. Re-verify
+# against the image readme + the noble archive when bumping.
 apt_git = "1:2.43.0-1ubuntu7.3"
 apt_curl = "8.5.0-2ubuntu10.11"
 apt_wget = "1.21.4-1ubuntu4.4"

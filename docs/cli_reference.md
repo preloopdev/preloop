@@ -222,6 +222,25 @@ self-hosting entry point (webhook + Checks endpoints, microVM provisioning).
 | `--save` | Persist the supplied GitHub credentials for later runs |
 | `--store <URL>` | Durable-state backend: `sqlite://<path>`, a bare path, or `postgres://…` (with optional `?sslmode=require\|verify-full`). Defaults to `PRELOOP_STORE_URL`, then SQLite in the state dir |
 
+## Golden image automation
+
+Release automation and operators building organization-specific images can
+pack a golden with:
+
+```sh
+preloop build-golden \
+  --runner-bundle target/aarch64-unknown-linux-gnu/release \
+  --base-image ghcr.io/acme/preloop-base@sha256:<digest> \
+  --output dist/acme-ubuntu-24.04-aarch64
+```
+
+The command is hidden from the normal help because it is an operator/build
+command rather than part of workflow submission. The base must currently be
+Ubuntu-derived, and its architecture must match the runner bundle and host.
+See [VM images and version tracking](vm-images.md#building-a-golden) for the
+stock build, custom OCI base, checksum, publishing, and runtime configuration
+steps.
+
 ## Environment variables
 
 | Variable | Purpose |
@@ -236,11 +255,11 @@ self-hosting entry point (webhook + Checks endpoints, microVM provisioning).
 | `PRELOOP_RUNNER_POOL_SIZE` | Pool size (warm forks/VMs) |
 | `PRELOOP_USE_FORK` | Run the pool as forked microVMs (default true with a packed golden) |
 | `PRELOOP_USE_PACKED_GOLDEN` | Use a release or locally cached packed golden (default on; set `false` for cold OCI provisioning) |
-| `PRELOOP_GOLDEN_URL` | Override the pre-baked golden download URL |
-| `PRELOOP_RUNNER_BASE_IMAGE` | Override the base image at serve time |
+| `PRELOOP_GOLDEN_URL` | Override the packed golden URL; checksum URL is this value plus `.sha256` |
+| `PRELOOP_RUNNER_BASE_IMAGE` | Override the digest-pinned Ubuntu base identity at serve time; set it with `PRELOOP_GOLDEN_URL` for a custom packed golden |
 | `PRELOOP_RUNNER_LABELS` | Extra `runs-on` labels the pool's runners declare |
 | `PRELOOP_RUNNER_USER` / `PRELOOP_RUNNER_UID` | Guest runner account (default `runner`/1001); `root` restores root; empty disables switching |
-| `PRELOOP_WORKSPACE` | Workspace whose toolchains the golden carries (build-time) |
+| `PRELOOP_WORKSPACE` | Workspace context for daemon deployments; not a package or toolchain installation input |
 | `AKSH_URL` | Server URL for the client commands (default `http://127.0.0.1:9090`) |
 | `AKSH_SYSTEM_TOKEN` | Native API bearer token (also `AKSH_TOKEN`) |
 | `AKSH_PUBLIC_URL` | Public URL used in check-run details links |

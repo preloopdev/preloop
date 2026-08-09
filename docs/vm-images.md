@@ -16,6 +16,22 @@ match to the official GitHub runner image to avoid drift.
 The VM image and the fork pool share the same artifact (the golden); fork
 mode just skips the boot.
 
+## Image layers and pins
+
+Four different kinds of image appear in the execution path:
+
+| Image | Purpose | How it is selected |
+|---|---|---|
+| **GitHub runner image snapshot** | Upstream parity reference for preinstalled tool and package versions | `github_runner_image_version` in `versions.toml` |
+| **OCI base image** | Root filesystem from which Preloop provisions a golden | `ubuntu_24_04_base` / `ubuntu_22_04_base` in `versions.toml`, or `--base-image` / `PRELOOP_RUNNER_BASE_IMAGE` |
+| **Packed golden** | Pre-provisioned, architecture-specific microVM artifact used by the pool | Release asset by default, or `PRELOOP_GOLDEN_URL` |
+| **Workflow images** | Job `container:` and `services:` environments | Workflow YAML |
+
+The GitHub runner image snapshot is not downloaded or booted. It is the
+versioned source of truth used when selecting the parity pins in
+`versions.toml`. The OCI base is the actual guest filesystem input. Preloop
+adds its runner baseline to that filesystem and packs the result as a golden.
+
 ## What the golden contains
 
 The golden is a single self-contained file built from:
@@ -37,29 +53,152 @@ The golden is a single self-contained file built from:
    (git, curl, build-essential, python3, jq, unzip/zip, locales, …).
 5. **Docker**: daemon + CLI, so `container:` / `services:` jobs work.
 
-Because the toolchain set is fixed, the same golden serves every project;
-`--workspace` only contributes the `container:` / `services:` image preload.
+Because the toolchain set is fixed, the same stock golden serves every
+project. A workspace is not a package or toolchain installation input.
 
 ## Building a golden
 
+Goldens are native-architecture artifacts. The runner bundle, OCI image, and
+host must all use the same guest architecture.
+
+| Host / guest | Runner target | Suggested artifact suffix |
+|---|---|---|
+| ARM64 | `aarch64-unknown-linux-gnu` | `aarch64` |
+| x86-64 | `x86_64-unknown-linux-gnu` | `x86_64` |
+
+Build the Linux runner bundle, then pack the default digest-pinned Ubuntu
+base:
+
 ```sh
+just build-preloop
+
 preloop build-golden \
   --runner-bundle target/aarch64-unknown-linux-gnu/release \
-  --workspace . \
   --output dist/preloop-ubuntu-24.04-aarch64
 ```
 
 - `--runner-bundle`: directory containing the Linux `preloop-runner` binary
-  (`just build-preloop` cross-builds it; `--base-image` overrides the OS).
-- `--workspace`: the repo whose `container:` / `services:` images are
-  pre-pulled into the golden (`PRELOOP_WORKSPACE` overrides it for daemon
-  deployments). Toolchains are the fixed curated set, not workspace-derived.
+  (`just build-preloop` cross-builds it).
+- `--base-image`: optional Ubuntu-derived OCI image or `.smolmachine`
+  artifact. It defaults to the digest-pinned Ubuntu 24.04 image compiled from
+  `versions.toml`.
+- `--workspace`: retained as workspace context for build automation. It does
+  not currently change the packed artifact, install packages, or derive
+  toolchains from `.nvmrc`, `rust-toolchain.toml`, or similar files.
+- `--output`: destination for the packed golden.
 - On releases, `release-golden.yml` builds this artifact and uploads it as
-  `preloop-ubuntu-24.04-aarch64`. The pool looks for it at
-  `<preloop_home>/vms/preloop-ubuntu-24.04-<arch>` (`preloop_home` is
+  `preloop-ubuntu-24.04-<arch>`. The pool looks for it at
+  a base-image-specific path below `<preloop_home>/vms/` (`preloop_home` is
   `~/.config/preloop` unless `PRELOOP_HOME` says otherwise).
 - When the pool warms a golden, it also pre-pulls the `container:` /
   `services:` images declared by the current workspace's workflows.
+
+### Adding organization-wide software
+
+`build-golden` does not accept an apt package list, Dockerfile, or
+post-provisioning script. Put organization-wide software in an Ubuntu-derived
+OCI base, then ask Preloop to provision and pack that image. Use workflow
+steps or setup actions instead when software differs by repository.
+
+Example custom base:
+
+```dockerfile
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      cmake \
+      ninja-build \
+      postgresql-client \
+ && rm -rf /var/lib/apt/lists/*
+```
+
+Build and publish it for the architecture on which the golden will run. Pass
+the current `ubuntu_24_04_base` value from `versions.toml` as `BASE_IMAGE`:
+
+```sh
+docker buildx build \
+  --platform linux/arm64 \
+  --build-arg BASE_IMAGE='<ubuntu_24_04_base from versions.toml>' \
+  --tag ghcr.io/acme/preloop-base:2026-08-08 \
+  --push \
+  .
+```
+
+Use the immutable digest returned by the registry, not the mutable tag, when
+building the golden:
+
+```sh
+CUSTOM_BASE='ghcr.io/acme/preloop-base@sha256:<digest>'
+GOLDEN='acme-ubuntu-24.04-aarch64'
+
+preloop build-golden \
+  --runner-bundle target/aarch64-unknown-linux-gnu/release \
+  --base-image "$CUSTOM_BASE" \
+  --output "dist/$GOLDEN"
+
+(cd dist && shasum -a 256 "$GOLDEN" > "$GOLDEN.sha256")
+```
+
+On Linux, use `sha256sum "$GOLDEN" > "$GOLDEN.sha256"` instead.
+
+Publish both files:
+
+```text
+https://artifacts.acme.example/acme-ubuntu-24.04-aarch64
+https://artifacts.acme.example/acme-ubuntu-24.04-aarch64.sha256
+```
+
+Configure both the base identity and packed artifact URL:
+
+```sh
+PRELOOP_RUNNER_BASE_IMAGE='ghcr.io/acme/preloop-base@sha256:<digest>' \
+PRELOOP_GOLDEN_URL='https://artifacts.acme.example/acme-ubuntu-24.04-aarch64' \
+preloop serve
+```
+
+The pool fetches the checksum from exactly
+`${PRELOOP_GOLDEN_URL}.sha256`. A missing checksum is tolerated with a
+warning, but publishing it is strongly recommended. Setting both variables
+keeps the golden's cache identity and its packed payload tied to the same OCI
+base.
+
+To provision directly from the custom OCI base without publishing a packed
+golden:
+
+```sh
+PRELOOP_RUNNER_BASE_IMAGE='ghcr.io/acme/preloop-base@sha256:<digest>' \
+PRELOOP_USE_PACKED_GOLDEN=false \
+preloop serve
+```
+
+Provisioning currently assumes an Ubuntu 24.04 or 22.04 userspace and uses
+`apt-get`. Use a workflow `container:` image for another distribution.
+
+### Installing repository-specific software
+
+Keep repository-specific versions in the workflow so it stays portable to
+GitHub Actions:
+
+```yaml
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+      - run: npm test
+```
+
+Use a job `container:` for a fully controlled userspace and `services:` for
+databases. These installs and setup-action tool downloads belong to the
+ephemeral job environment; they do not mutate the shared golden.
 
 ## Where the engine finds the runner bundle
 
@@ -85,10 +224,11 @@ by the build:
 | Key | What it pins | Bump when |
 |---|---|---|
 | `runner_version` | Official `actions/runner` protocol target (currently `2.336.0`) | Upstream runner changes protocol surface |
+| `github_runner_image_version` | Official `actions/runner-images` Ubuntu 24.04 snapshot used as the parity source | Refreshing the hosted-image parity bake list |
 | `ubuntu_24_04_base` | Base image by digest (`ubuntu:24.04@sha256:…`) | You want a newer OS snapshot — always bump the digest, never a bare tag |
 | `ubuntu_22_04_base` | Second pinned base | Same |
 | `node_version` | Node baked as the runner's externals | A workflow needs a newer default Node |
-| `node20_externals` / `node24_externals` | Additional Node externals | Same |
+| `node20_externals_version` / `node24_externals_version` | Additional Node externals | Same |
 | `rustup_version` | Rustup used to install baked Rust toolchains | Toolchain bootstrap changes |
 | `cargo_shear_version` | Auxiliary cargo tooling | Same |
 
@@ -96,14 +236,34 @@ The protocol target (`runner_version`) and the VM image are independent:
 the image always runs *our* runner; `runner_version` is the fidelity oracle
 that `runner-watch` compares against.
 
+`versions.toml` defines Preloop's compiled distribution defaults. It is not a
+per-install user configuration file. Operators select custom OCI bases and
+packed goldens with `--base-image`, `PRELOOP_RUNNER_BASE_IMAGE`, and
+`PRELOOP_GOLDEN_URL`; downstream distributions can change the pins before
+compiling. Editing `versions.toml` does not change an already-built or
+installed `preloop` executable. Rebuild the CLI and replace the deployed
+binary before expecting `preloop serve` to use a changed pin:
+
+```sh
+just build-preloop
+./target/debug/preloop serve
+
+# For a release-mode deployment:
+cargo build --release -p preloop-cli
+```
+
+Install or deploy `target/release/preloop` through the same mechanism used for
+the existing executable. Check `which preloop` when a shell still launches an
+older installed copy.
+
 ## GitHub-hosted parity bake list
 
 The official runner image (`actions/runner-images` ubuntu-24.04) preinstalls
 ~100 tools; our golden deliberately bakes only the ones workflows touch
 *implicitly* — the hidden dependencies that cause drift when missing. The
 versions below are taken directly from the official image's toolset
-(20260720.247.2). These are the parity targets to bake (or pin) so CI
-results on Preloop match GitHub:
+identified by `github_runner_image_version` in `versions.toml`. These are the
+parity targets to bake (or pin) so CI results on Preloop match GitHub:
 
 ### Tier 1 — proven drift sources (bake these)
 
@@ -166,9 +326,10 @@ naming the official image version they were taken from.
 | Env var | Effect |
 |---|---|
 | `PRELOOP_USE_PACKED_GOLDEN` | Use a release or locally cached packed golden (default on; set `false` for cold OCI provisioning) |
+| `PRELOOP_GOLDEN_URL` | Override the packed golden URL; its optional checksum is fetched from the same URL plus `.sha256` |
 | `PRELOOP_USE_FORK` | Run the pool as host forks instead of booting microVMs (default true with a golden) |
 | `PRELOOP_RUNNER_POOL_SIZE` | Pool size (warm forks / VMs) |
-| `PRELOOP_WORKSPACE` | Workspace whose `container:` / `services:` images the golden pre-pulls (build-time); toolchains are the fixed curated set |
+| `PRELOOP_WORKSPACE` | Workspace context for daemon deployments; it does not install packages or derive toolchains for a packed golden |
 | `PRELOOP_RUNNER_BASE_IMAGE` | Override the base image at serve time (default: digest-pinned Ubuntu 24.04) |
 | `PRELOOP_RUNNER_LABELS` | Extra `runs-on` labels the pool's runners declare (comma-separated) |
 | `PRELOOP_RUNNER_USER` / `PRELOOP_RUNNER_UID` | Guest runner account (default `runner`/1001, GitHub-hosted parity); `root` restores root; empty disables switching |
@@ -184,3 +345,51 @@ naming the official image version they were taken from.
   bake in `base_install_script`.
 - **Wrong OS inside the VM**: `--base-image` was overridden; the default is
   the digest-pinned Ubuntu 24.04.
+- **A job VM pulls the OCI base instead of using a packed golden**:
+  `PRELOOP_USE_PACKED_GOLDEN` defaults to `true` in current builds. At startup,
+  an enabled packed path logs `Attempting to download pre-baked golden
+  microVM image`. If the download is unavailable, Preloop pulls the OCI base
+  once in a machine named `<prefix>-builder`, provisions it, and packs a local
+  artifact. That one-time builder pull is expected.
+
+  A pull from a job machine such as `preloop-runner-0-1`, with no preceding
+  golden download attempt, means the running process has packed golden use
+  disabled. Check for an override and for a stale executable:
+
+  ```sh
+  printenv PRELOOP_USE_PACKED_GOLDEN
+  which preloop
+  preloop --version
+  ```
+
+  Force the current behavior while diagnosing the installed copy:
+
+  ```sh
+  PRELOOP_USE_PACKED_GOLDEN=true ./target/debug/preloop serve
+  ```
+
+  Rebuild first with `cargo build -p preloop-cli` if that debug binary predates
+  the current `versions.toml`. `PRELOOP_RUNNER_POOL_ENABLED=false` only
+  disables the warm pool; it does not disable packed artifacts in current
+  builds.
+- **Docker Hub reports `TOOMANYREQUESTS` while pulling Ubuntu**: current stock
+  pins use `mirror.gcr.io`, so a log that says `Pulling ubuntu:24.04` or
+  fetches `index.docker.io` means the running CLI has an older compiled pin or
+  `PRELOOP_RUNNER_BASE_IMAGE` overrides it. Check both:
+
+  ```sh
+  which preloop
+  printenv PRELOOP_RUNNER_BASE_IMAGE
+  ```
+
+  Rebuild or reinstall Preloop after changing `versions.toml`. As an immediate
+  override, pass the current digest-pinned `ubuntu_24_04_base` value:
+
+  ```sh
+  PRELOOP_RUNNER_BASE_IMAGE='mirror.gcr.io/library/ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90' \
+  preloop serve
+  ```
+
+  The subsequent SmolVM log must name
+  `mirror.gcr.io/library/ubuntu:24.04@sha256:...`, not a bare
+  `ubuntu:24.04@sha256:...`.

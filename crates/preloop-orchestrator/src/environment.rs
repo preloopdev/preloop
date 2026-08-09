@@ -379,6 +379,26 @@ mod tests {
     }
 
     #[test]
+    fn stock_base_pins_use_explicit_mirror_and_digest() {
+        for pin in [UBUNTU_24_04_PIN, UBUNTU_22_04_PIN] {
+            let digest = pin
+                .strip_prefix("mirror.gcr.io/library/ubuntu:")
+                .and_then(|reference| reference.split_once("@sha256:"))
+                .map(|(_, digest)| digest)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "stock image must use the explicit mirror.gcr.io registry and a sha256 digest: {pin}"
+                    )
+                });
+            assert_eq!(digest.len(), 64, "sha256 digest has the wrong length");
+            assert!(
+                digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "sha256 digest is not hexadecimal: {digest}"
+            );
+        }
+    }
+
+    #[test]
     fn base_name_strips_digest() {
         assert_eq!(base_name("ubuntu:24.04@sha256:abc"), "ubuntu:24.04");
         assert_eq!(base_name("ubuntu:24.04"), "ubuntu:24.04");

@@ -9,6 +9,21 @@ Releases before v0.27.0 predate the changelog.
 
 ## [Unreleased]
 
+## [0.29.6] - 2026-08-09
+
+### Added
+
+- Document stock and custom golden image construction, publishing, and
+  runtime configuration.
+
+### Fixed
+
+- Enable packed golden downloads by default.
+- Build the packed-golden release URL from the CLI release version rather than
+  the independently versioned orchestrator crate.
+- Pin stock Ubuntu bases to the explicit `mirror.gcr.io` registry so fallback
+  provisioning does not depend on unauthenticated Docker Hub pulls.
+
 ## [0.29.5] - 2026-08-08
 
 ### Added

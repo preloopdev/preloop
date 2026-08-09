@@ -134,15 +134,22 @@ Client-side (`preloop` CLI): `PRELOOP_URL` (default `http://127.0.0.1:9090`) and
 | `PRELOOP_RUNNER_USER` / `PRELOOP_RUNNER_UID` | `runner` / `1001` | Guest account steps run as, for GitHub-hosted parity. `root` restores root; empty disables switching |
 | `PRELOOP_USE_FORK` | — | Fork machines from a prepared golden instead of building each |
 | `PRELOOP_USE_PACKED_GOLDEN` | `true` | Use a release or locally cached packed golden for on-demand and pooled runners |
-| `PRELOOP_GOLDEN_URL` | release asset | Where the prebaked golden is downloaded from |
+| `PRELOOP_GOLDEN_URL` | release asset | Packed golden URL; the optional checksum is fetched from the same URL plus `.sha256` |
 | `PRELOOP_RUNNER_BUNDLE` | — | Directory of runner binaries mounted into guests |
 | `PRELOOP_RUNNER_EXTERNALS` | temp dir | Host-side Node externals directory |
-| `PRELOOP_RUNNER_BASE_IMAGE` | `ubuntu-24.04` | Base image for `runs-on` resolution |
+| `PRELOOP_RUNNER_BASE_IMAGE` | digest-pinned Ubuntu 24.04 | OCI base identity for `runs-on` resolution; set it with `PRELOOP_GOLDEN_URL` for a custom packed golden |
 | `PRELOOP_RUNNER_LABELS` | — | Extra labels on every pool runner. **Jobs only dispatch to runners whose labels match `runs-on`** |
 | `PRELOOP_RUNNER_NAME_PREFIX` | `preloop-runner` | Machine naming prefix |
 | `PRELOOP_RUNNER_DNS` | host resolver | Force a resolver inside guests (e.g. `8.8.8.8`) when the host's is unreachable from the VM network |
-| `PRELOOP_WORKSPACE` | — | Workspace whose `container:` / `services:` images the golden pre-pulls; toolchains are a fixed curated set baked into every golden |
+| `PRELOOP_WORKSPACE` | — | Workspace context for daemon deployments; not a package or toolchain installation input |
 | `PRELOOP_REQUIRE_JOB_ASSIGNMENTS` | — | Only let a runner claim jobs explicitly assigned to it |
+
+To add organization-wide software, derive an OCI image from one of Preloop's
+digest-pinned Ubuntu bases and build a custom packed golden. For the complete
+build, checksum, publishing, and runtime configuration flow, see
+[VM images and version tracking](vm-images.md#adding-organization-wide-software).
+Keep repository-specific software in workflow setup actions, install steps,
+or a job `container:`.
 
 ---
 

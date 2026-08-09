@@ -40,11 +40,13 @@ domain): [docs/self-hosting.md](docs/self-hosting.md)
 
 - The real runner protocol, not a behavior approximation: the official runner binary works against it unchanged.
 - Hardware-isolated microvms for each job that spin up in 200ms, and are forked instantly.
-- GitHub App and fine-grained PAT support with per-job token minting.
+- GitHub App and fine-grained PAT support with per-job token minting so your checks get updated.
 - DAP-powered job inspection: attach at entry, inspect live GitHub/job context, pause, and continue.
-- OIDC issuer for local runs.
+- Heavily tested with property tests, differential tests, and formal verification.
 - Secrets with GitHub-compatible masking and global/repo tiers.
 - NDJSON event output for agents and developer tooling.
+
+For a more detailed comparison of how we compare, please see: [docs/preloop_vs_others.md](docs/preloop_vs_others.md)
 
 ### Agent-driven debugging
 
@@ -55,11 +57,6 @@ scopes before continuing the job. This is useful when the workflow YAML looks
 right but the runtime event payload, matrix values, or generated context is
 wrong.
 
-See the [47-second agent-driven DAP demo](docs/demo/dap/demo-highlight.mp4)
-and the [full demo instructions](docs/demo/dap/README.md).
-
-Users do not need Python or `dapctl`. The integrated Rust client attaches to
-an enabled run:
 
 ```sh
 preloop dap <run-id>
@@ -68,7 +65,7 @@ preloop dap <run-id>
 Normal runs work without any DAP client. `dapctl` remains only as a tiny
 reference client for the recorded demo; it is not a runtime dependency.
 
-For a more detailed comparison of how we compare, please see: [docs/preloop_vs_others.md](docs/preloop_vs_others.md)
+
 
 ## Documentation on where to go to find info.
 
@@ -77,6 +74,7 @@ For a more detailed comparison of how we compare, please see: [docs/preloop_vs_o
 | Setup, credentials, secrets, config | [docs/setup.md](docs/setup.md) |
 | CLI reference | [docs/cli_reference.md](docs/cli_reference.md) |
 | Hosting it yourself: service install, knobs, exposure | [docs/self-hosting.md](docs/self-hosting.md) |
+| VM images, version pins, and custom goldens | [docs/vm-images.md](docs/vm-images.md) |
 | GitHub App webhooks and check runs | [docs/github-app-webhook.md](docs/github-app-webhook.md) |
 | Job tokens, minting, OIDC | [docs/github-tokens.md](docs/github-tokens.md) |
 | Debug sessions (pause, inspect, retry) | [docs/debug-sessions.md](docs/debug-sessions.md) |
