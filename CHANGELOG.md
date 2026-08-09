@@ -11,6 +11,8 @@ Releases before v0.27.0 predate the changelog.
 
 ## [0.29.6] - 2026-08-09
 
+<!-- preloop:skip-golden -->
+
 ### Added
 
 - Document stock and custom golden image construction, publishing, and

@@ -82,7 +82,9 @@ jobs:
 
   build-and-publish-golden:
     name: Build & Publish Golden MicroVM Artifact
-    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    # Binary-only hotfixes can retain the previous golden. Add the hidden
+    # `preloop:skip-golden` marker to the release notes for those releases.
+    if: github.event_name == 'workflow_dispatch' || !contains(github.event.release.body, '<!-- preloop:skip-golden -->')
     runs-on: [self-hosted, Linux, X64]
     permissions:
       contents: write
@@ -152,7 +154,7 @@ jobs:
   # self-hosted Mac with Hypervisor.framework access.
   build-and-publish-golden-macos:
     name: Build & Publish aarch64 Golden (macOS)
-    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' || !contains(github.event.release.body, '<!-- preloop:skip-golden -->')
     runs-on: [self-hosted, macOS, ARM64]
     permissions:
       contents: write
