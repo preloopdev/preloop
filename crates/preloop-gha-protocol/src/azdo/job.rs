@@ -693,7 +693,11 @@ pub struct TaskReference {
     pub name: Option<String>,
     #[serde(rename = "path", skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    #[serde(rename = "version", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "version",
+        alias = "ref",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub version: Option<String>,
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub reference_type: Option<String>,
@@ -713,6 +717,51 @@ pub struct ActionsDownloadInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_action_reference_survives_wire_roundtrip() {
+        let step = TaskStep {
+            id: uuid::Uuid::nil(),
+            name: Some("Upload artifact".to_owned()),
+            context_name: None,
+            display_name: None,
+            display_name_token: None,
+            condition: None,
+            script: None,
+            reference: Some(TaskReference {
+                id: None,
+                name: Some("actions/upload-artifact".to_owned()),
+                path: None,
+                version: Some("v4".to_owned()),
+                reference_type: None,
+            }),
+            inputs: BTreeMap::new(),
+            env: BTreeMap::new(),
+            continue_on_error: None,
+            working_directory: None,
+            timeout_in_minutes: None,
+        };
+
+        let wire = serde_json::to_value(&step).unwrap();
+        assert_eq!(wire["reference"]["ref"], "v4");
+        assert!(
+            wire["reference"].get("version").is_none(),
+            "wire format must use the canonical `ref` field"
+        );
+
+        let decoded: TaskStep = serde_json::from_value(wire).unwrap();
+        assert_eq!(
+            decoded
+                .reference
+                .as_ref()
+                .and_then(|r| r.version.as_deref()),
+            Some("v4")
+        );
+
+        let reserialized = serde_json::to_value(&decoded).unwrap();
+        assert_eq!(reserialized["reference"]["ref"], "v4");
+        assert!(reserialized["reference"].get("version").is_none());
+    }
 
     /// The snapshot credential must never appear in Debug output of the job
     /// message DTO — `AgentJobRequestMessage` derives Debug and embeds
