@@ -46,6 +46,11 @@ jobs:
       # 2 parallel rustc jobs keep peak memory under the runner VM's 6 GiB
       # ceiling (4 jobs in a VM plus a 4-VM pool OOM-killed the host).
       CARGO_BUILD_JOBS: "2"
+      # The dedicated property job carries the 256-case profile. Keep this
+      # workspace gate aligned with `just test-ci` and bound libtest
+      # concurrency so the 6 GiB dogfood VM survives preloop-runner's suite.
+      PROPTEST_CASES: "8"
+      RUST_TEST_THREADS: "2"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
