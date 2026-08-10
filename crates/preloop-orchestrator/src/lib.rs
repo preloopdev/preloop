@@ -34,6 +34,12 @@ use tracing::{debug, info, warn};
 const GUEST_CONTROL_DIR: &str = "/run/preloop-control";
 const GUEST_CONTROL_SOCKET: &str = "/run/preloop-control/engine.sock";
 const GUEST_FAILURE_MARKER: &str = "/var/lib/preloop-runner/.preloop-job-failed";
+/// Written by the worker while a job is paused in a debug session and removed
+/// when the session closes. The pool probes it to release the slot's
+/// concurrency permit for the pause's duration — without it a paused job
+/// pins a permit (and with `max_concurrent` permits total, eventually the
+/// whole pool) until the session ends or the pause credit expires.
+const GUEST_PAUSE_MARKER: &str = "/var/lib/preloop-runner/.preloop-job-paused";
 /// Guest variable `preloop-runner configure` reads a pre-generated keypair from.
 /// Must match `preloop_runner::configure::RSA_PARAMS_ENV`.
 const RUNNER_RSA_PARAMS_ENV: &str = "PRELOOP_RUNNER_RSA_PARAMS";
@@ -972,6 +978,7 @@ fn guest_env_prefix(config: &RunnerPoolConfig, name: &MachineName) -> Vec<String
     }
     if config.debug_dir.is_some() {
         env.push(format!("PRELOOP_FAILURE_MARKER={GUEST_FAILURE_MARKER}"));
+        env.push(format!("PRELOOP_PAUSE_MARKER={GUEST_PAUSE_MARKER}"));
     }
     if !env.is_empty() {
         env.insert(0, "/usr/bin/env".to_owned());
@@ -1712,9 +1719,15 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                 building: building.clone(),
             };
             let slot_provisioning = provisioning.clone();
+            // Shared with the slot's pause watcher: a job parked in a debug
+            // session hands the permit back to the pool and re-acquires it
+            // when the session closes, so a paused job cannot pin a
+            // concurrency slot (and eventually the whole pool) for the
+            // duration of the pause.
+            let permit_slot = Arc::new(std::sync::Mutex::new(Some(permit)));
+            let slot_semaphore = semaphore.clone();
 
             slots.spawn(async move {
-                let _permit = permit; // held until this task exits
                 let result = run_on_demand_slot(
                     provider,
                     config,
@@ -1723,6 +1736,8 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     slot_registry,
                     slot_handles,
                     slot_provisioning,
+                    slot_semaphore,
+                    permit_slot,
                 )
                 .await;
                 if let Err(error) = &result {
@@ -2066,7 +2081,113 @@ impl Drop for PreparingGuard {
     }
 }
 
+/// How often the pool probes a running machine's pause marker.
+///
+/// Latency here is how long a slot stays pinned after a job pauses: the
+/// probe cadence bounds it, and one exec per interval per active machine is
+/// negligible against the guest work happening anyway.
+const PAUSE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Watch a machine's guest pause marker and release its pool concurrency
+/// permit for the duration of a debug-session pause.
+///
+/// A paused job blocks its worker on a verdict, so the host-side slot task
+/// keeps waiting for the runner to exit and the slot's permit stays held —
+/// with `max_concurrent` permits in total, two unanswered pauses take the
+/// pool to zero and every later run queues forever. The worker writes
+/// [`GUEST_PAUSE_MARKER`] when a session opens and removes it when it
+/// closes; this hands the permit back while the marker is present and
+/// re-acquires it on resume. Runs forever; the caller aborts it.
+async fn watch_guest_pause<P: VmProvider + 'static>(
+    provider: Arc<P>,
+    name: MachineName,
+    permit: Arc<std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
+    semaphore: Arc<tokio::sync::Semaphore>,
+    poll_interval: Duration,
+) {
+    let probe = [
+        "test".to_owned(),
+        "-f".to_owned(),
+        GUEST_PAUSE_MARKER.to_owned(),
+    ];
+    let mut was_paused = false;
+    let mut last_probe_warn: Option<tokio::time::Instant> = None;
+    loop {
+        tokio::time::sleep(poll_interval).await;
+        // `smolvm machine exec` propagates the guest exit code as its own
+        // exit code, so the normal absent-marker probe surfaces as
+        // `VmError::Command` with exit 1 — a real result, not a transport
+        // failure; `test -f` only ever exits 0 or 1. Any other error says
+        // nothing about the pause state: treating it as "resumed" would
+        // re-pin the permit mid-pause and revive the starvation this
+        // watcher exists to remove, so preserve the last known state.
+        let paused = match provider.exec(&name, &probe).await {
+            Ok(output) => output.exit_code == 0,
+            Err(VmError::Command {
+                exit_code: code @ (0 | 1),
+                ..
+            }) => code == 0,
+            Err(error) => {
+                let now = tokio::time::Instant::now();
+                if last_probe_warn
+                    .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(60))
+                {
+                    warn!(
+                        machine = name.as_str(),
+                        %error,
+                        "pause marker probe failed — keeping previous state"
+                    );
+                    last_probe_warn = Some(now);
+                }
+                was_paused
+            }
+        };
+        if paused == was_paused {
+            continue;
+        }
+        if paused {
+            let released = { permit.lock().unwrap().take() }.is_some();
+            if released {
+                info!(
+                    machine = name.as_str(),
+                    "job paused in debug session — released pool concurrency permit"
+                );
+            }
+        } else {
+            // Re-acquire before treating the machine as active again, so
+            // future forks stay bounded by `max_concurrent` plus whatever is
+            // genuinely paused. The guest resumes on its own after the
+            // verdict, so this acquire can transiently lag the resume by up
+            // to a poll interval — the over-subscription window is bounded
+            // and short. A hard gate needs a host/worker resume handshake;
+            // until then, a slow acquire is surfaced here.
+            let started = tokio::time::Instant::now();
+            let fresh = semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("semaphore is never closed");
+            let waited = started.elapsed();
+            if waited >= Duration::from_secs(5) {
+                warn!(
+                    machine = name.as_str(),
+                    waited_ms = waited.as_millis(),
+                    "resumed job waited for a pool permit — active VMs may have \
+                     transiently exceeded max_concurrent"
+                );
+            }
+            permit.lock().unwrap().replace(fresh);
+            info!(
+                machine = name.as_str(),
+                "debug session ended — re-acquired pool concurrency permit"
+            );
+        }
+        was_paused = paused;
+    }
+}
+
 /// Single-shot on-demand runner: provision, run exactly one job, clean up.
+#[allow(clippy::too_many_arguments)]
 async fn run_on_demand_slot<P: VmProvider + 'static>(
     provider: Arc<P>,
     config: RunnerPoolConfig,
@@ -2075,6 +2196,8 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     golden_registry: Arc<GoldenRegistry>,
     handles: PoolHandles,
     provisioning: Arc<AtomicUsize>,
+    semaphore: Arc<tokio::sync::Semaphore>,
+    permit: Arc<std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
 ) -> Result<(), OrchestratorError> {
     let preparing = PreparingGuard::enter(provisioning, config.preparing_signal.clone());
     // Resolve the golden for the queued job's environment.
@@ -2150,7 +2273,22 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     // this point the starvation sweep can see a matching runner directly.
     drop(preparing);
 
-    // Run exactly one job — no successor pre-provisioning.
+    // Run exactly one job — no successor pre-provisioning. While the job
+    // runs, watch the guest pause marker: a debug-session pause must hand
+    // the concurrency permit back to the pool instead of pinning it.
+    let pause_watch = (config.debug_dir.is_some()).then(|| {
+        let provider = provider.clone();
+        let name = runner.name.clone();
+        let permit = permit.clone();
+        let semaphore = semaphore.clone();
+        tokio::spawn(watch_guest_pause(
+            provider,
+            name,
+            permit,
+            semaphore,
+            PAUSE_POLL_INTERVAL,
+        ))
+    });
     let result = run_one_runner(
         provider.clone(),
         &config,
@@ -2168,6 +2306,10 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
         },
     )
     .await;
+    if let Some(watch) = pause_watch {
+        watch.abort();
+        let _ = watch.await;
+    }
 
     // Size-zero mode never asks for a successor. Keep defensive cleanup here
     // so a future lifecycle change cannot leak an unexpectedly returned VM.
@@ -3136,6 +3278,12 @@ mod lifecycle_tests {
         announce_busy: bool,
         /// Binary that `command -v` cannot find until its toolchain installs.
         absent_binary: Mutex<Option<&'static str>>,
+        /// Guest pause marker state: when set, the exec probe for the debug
+        /// pause marker succeeds, so `watch_guest_pause` sees a paused job.
+        pause_marker: std::sync::atomic::AtomicBool,
+        /// When set, the pause-marker probe fails like a wedged VM
+        /// (transport error), which the watcher must not read as "resumed".
+        probe_transport_error: std::sync::atomic::AtomicBool,
     }
 
     impl TestProvider {
@@ -3157,6 +3305,8 @@ mod lifecycle_tests {
                 fail_delete,
                 announce_busy: false,
                 absent_binary: Mutex::new(None),
+                pause_marker: std::sync::atomic::AtomicBool::new(false),
+                probe_transport_error: std::sync::atomic::AtomicBool::new(false),
             }
         }
 
@@ -3194,6 +3344,105 @@ mod lifecycle_tests {
             exit_code: 1,
             message: message.to_owned(),
         }
+    }
+
+    /// A job paused in a debug session must hand its pool concurrency permit
+    /// back and re-acquire it on resume — otherwise two unanswered pauses
+    /// pin every slot and later runs queue forever.
+    #[tokio::test]
+    async fn paused_job_releases_and_reacquires_the_pool_permit() {
+        use std::sync::atomic::Ordering;
+
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::new(std::sync::Mutex::new(Some(
+            semaphore.clone().acquire_owned().await.unwrap(),
+        )));
+        let name = MachineName::new("preloop-runner-pause-test".to_owned()).unwrap();
+
+        let watch = tokio::spawn(watch_guest_pause(
+            provider.clone(),
+            name,
+            permit.clone(),
+            semaphore.clone(),
+            Duration::from_millis(10),
+        ));
+
+        // Not paused: the slot keeps its permit.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            permit.lock().unwrap().is_some(),
+            "a running job keeps its pool permit"
+        );
+
+        // Paused: the permit is handed back to the pool so other jobs can
+        // fork runners.
+        provider.pause_marker.store(true, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            permit.lock().unwrap().is_none(),
+            "a paused job must not pin a pool permit"
+        );
+        assert_eq!(
+            semaphore.available_permits(),
+            1,
+            "the released permit must be available to the pool"
+        );
+
+        // Resumed: the permit is re-acquired, restoring the bound.
+        provider.pause_marker.store(false, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            permit.lock().unwrap().is_some(),
+            "resuming the job must re-acquire its pool permit"
+        );
+
+        watch.abort();
+        let _ = watch.await;
+    }
+
+    /// A transport failure while probing must not read as "resumed": the
+    /// permit stays released for the (still paused) job, and the pool does
+    /// not re-pin it on a transient smolvm error.
+    #[tokio::test]
+    async fn probe_transport_errors_preserve_pause_state() {
+        use std::sync::atomic::Ordering;
+
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::new(std::sync::Mutex::new(Some(
+            semaphore.clone().acquire_owned().await.unwrap(),
+        )));
+        let name = MachineName::new("preloop-runner-pause-probe".to_owned()).unwrap();
+
+        let watch = tokio::spawn(watch_guest_pause(
+            provider.clone(),
+            name,
+            permit.clone(),
+            semaphore.clone(),
+            Duration::from_millis(10),
+        ));
+
+        // Pause, release the permit, then make the probe fail like a wedged VM.
+        provider.pause_marker.store(true, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(permit.lock().unwrap().is_none());
+        provider.probe_transport_error.store(true, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            permit.lock().unwrap().is_none(),
+            "a transport error must not re-pin the permit of a paused job"
+        );
+
+        // Probe recovers while still paused: still no permit.
+        provider
+            .probe_transport_error
+            .store(false, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(permit.lock().unwrap().is_none());
+
+        watch.abort();
+        let _ = watch.await;
     }
 
     fn test_output() -> ExecOutput {
@@ -3629,6 +3878,34 @@ chmod +x "$destination/bin/node"
                 .lock()
                 .await
                 .push(format!("exec:{}:{:?}", name.as_str(), argv));
+            if argv.len() == 3
+                && argv[0] == "test"
+                && argv[1] == "-f"
+                && argv[2].ends_with("preloop-job-paused")
+            {
+                // The real provider surfaces a guest exit 1 as
+                // `VmError::Command` (smolvm propagates the guest exit code),
+                // so the absent-marker probe must be modelled the same way —
+                // the watcher's resume path depends on it.
+                if self
+                    .probe_transport_error
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(VmError::Launch {
+                        program: "smolvm".to_owned(),
+                        source: std::io::Error::new(std::io::ErrorKind::BrokenPipe, "vm wedged"),
+                    });
+                }
+                let marker = self.pause_marker.load(std::sync::atomic::Ordering::SeqCst);
+                if marker {
+                    return Ok(test_output());
+                }
+                return Err(VmError::Command {
+                    operation: "exec",
+                    exit_code: 1,
+                    message: "test -f: marker absent".to_owned(),
+                });
+            }
             let mut absent = self.absent_binary.lock().await;
             if let Some(binary) = *absent {
                 let probe = format!("command -v {binary}");
@@ -4079,6 +4356,8 @@ chmod +x "$destination/bin/node"
             Arc::new(GoldenRegistry::new(config.name_prefix.clone())),
             handles,
             Arc::new(AtomicUsize::new(0)),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            Arc::new(std::sync::Mutex::new(None)),
         )
         .await
         .unwrap();

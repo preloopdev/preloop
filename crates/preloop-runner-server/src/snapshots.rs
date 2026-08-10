@@ -1414,6 +1414,7 @@ pub(crate) fn redirect_primary_checkout(
     runtime_token: &str,
 ) -> usize {
     let mut redirected = 0;
+    let mut pinned = Vec::new();
     for step in &mut message.steps {
         let is_checkout = step
             .reference
@@ -1473,7 +1474,11 @@ pub(crate) fn redirect_primary_checkout(
             .insert("github-server-url".to_owned(), github_server_url.to_owned());
         step.inputs
             .insert("token".to_owned(), runtime_token.to_owned());
+        pinned.push(step.id.to_string());
         redirected += 1;
+    }
+    if !pinned.is_empty() {
+        message.preloop_snapshot_token_steps = Some(pinned);
     }
     redirected
 }
@@ -1488,9 +1493,24 @@ pub(crate) async fn snapshot_git_http(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(snapshot_authorization_token)
-        .ok_or_else(|| ApiError::unauthorized("snapshot Git authentication required"))?;
-    authorize_snapshot_token(&shared.state, &token, run_id).await?;
+        .and_then(snapshot_authorization_token);
+    let authorization = match token {
+        Some(token) => authorize_snapshot_token(&shared.state, &token, run_id).await,
+        None => Err(ApiError::unauthorized(
+            "snapshot Git authentication required",
+        )),
+    };
+    // A bare 401 makes git fall back to Basic semantics and prompt for a
+    // username ("could not read Username ... terminal prompts disabled").
+    // The Bearer challenge tells git the failure is an authentication
+    // rejection, so it reports it instead of prompting.
+    if let Err(error) = authorization {
+        return if error.status() == StatusCode::UNAUTHORIZED {
+            Ok(snapshot_unauthorized_response(error.message()))
+        } else {
+            Err(error)
+        };
+    }
 
     let method = request.method().clone();
     let query = request.uri().query().unwrap_or_default().to_owned();
@@ -1631,6 +1651,25 @@ pub(crate) async fn snapshot_git_http(
         .status(status)
         .body(Body::from_stream(ReaderStream::new(reader)))
         .map_err(|error| ApiError::internal(format!("failed to build Git response: {error}")))
+}
+
+/// 401 response for the snapshot Git surface.
+///
+/// Carries a `WWW-Authenticate: Bearer` challenge so git reports the
+/// rejection instead of falling back to interactive Basic credential
+/// prompts that cannot be answered inside a job.
+fn snapshot_unauthorized_response(message: &str) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header(
+            header::WWW_AUTHENTICATE,
+            "Bearer realm=\"preloop-snapshot\"",
+        )
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({ "error": message }).to_string(),
+        ))
+        .expect("static 401 response is valid")
 }
 
 async fn authorize_snapshot_token(
