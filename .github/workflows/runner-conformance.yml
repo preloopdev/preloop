@@ -6,6 +6,8 @@ on:
   push:
     branches: [main]
   pull_request:
+    paths-ignore:
+      - "**/*.md"
   schedule:
     # Weekly deep-runner probe (Monday 03:00 UTC). runner-light still gates every PR/push.
     - cron: "0 3 * * 1"

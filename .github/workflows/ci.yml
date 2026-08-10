@@ -7,6 +7,10 @@ on:
     branches: [main]
     # Keep push-triggered checks observable while the self-hosted pool boots.
   pull_request:
+    # Docs-only PRs must not burn pool time: skip when every changed file
+    # is a markdown document.
+    paths-ignore:
+      - "**/*.md"
   schedule:
     # Nightly intensive property profile at 02:00 UTC
     - cron: "0 2 * * *"
