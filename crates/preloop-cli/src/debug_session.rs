@@ -925,10 +925,10 @@ fn sync_workspace(session: &DebugSession, force: bool) -> Result<String> {
         }
 
         let bytes = std::fs::metadata(&archive).map(|m| m.len()).unwrap_or(0);
-        // Staged in `/var/tmp`, never `/tmp`. `/tmp` is a guest tmpfs and is a
-        // poor place for a transfer that must survive until `tar -xf` runs.
-        // Transfer itself goes through `push_to_guest` (`machine exec -i`),
-        // not `machine cp` — see that helper for why.
+        // Staged in `/var/tmp`, never `/tmp`. `/tmp` is a guest tmpfs mounted
+        // over the persistent overlay: `machine cp` writes into the overlay
+        // layer beneath it, so the bytes are invisible to `tar -xf` in the
+        // live guest. `/var/tmp` is plain overlay, so cp and exec agree.
         //
         // Outside the workspace on purpose — an archive dropped inside it
         // would surface as an untracked file in the very `git status` the
@@ -1172,40 +1172,29 @@ fn next_revision(current: &str) -> String {
 
 /// Copy a host file into the machine, then prove it arrived.
 ///
-/// Streams bytes through `smolvm machine exec -i` (`cat > remote`) rather than
-/// `machine cp`. On current guests `machine cp` reports 100% success while the
-/// file never appears at a path the guest process tree can read — including
-/// outside tmpfs mounts. The post-copy `wc -c` check keeps a regression loud
-/// instead of producing a retry that silently ran the old code.
+/// `machine cp` resolves paths through the guest agent into the persistent
+/// overlay's merged root, so a copy to a plain overlay path (like `/var/tmp`)
+/// is visible to later `machine exec` calls. The one known trap is a guest
+/// tmpfs mount: `cp` writes the bytes into the overlay layer *underneath*
+/// `/tmp`, exec sees the empty tmpfs, and the upload still reports 100%.
+/// Callers stage outside those paths, and this `wc -c` check makes a
+/// regression loud instead of producing a retry that silently ran the old
+/// code.
 fn push_to_guest(machine: &str, local: &std::path::Path, remote: &str) -> Result<()> {
     let expected = std::fs::metadata(local)
         .with_context(|| format!("reading {}", local.display()))?
         .len();
 
     guest_check(machine, &format!("rm -f {}", shell_quote(remote)))?;
-    // Prefer `machine exec -i` with stdin over `machine cp`.
-    //
-    // On current smolvm guests, `machine cp` reports 100% success while the
-    // bytes never appear at a path the guest process tree can read (even on
-    // non-tmpfs paths like `/var/tmp`). Streaming through `exec -i` writes
-    // into the live mount namespace and is verifiable with `wc -c`.
-    let file = std::fs::File::open(local)
-        .with_context(|| format!("opening {} for guest transfer", local.display()))?;
     let output = std::process::Command::new("smolvm")
         .args([
             "machine",
-            "exec",
-            "-i",
-            "--name",
-            machine,
-            "--",
-            "sh",
-            "-lc",
-            &format!("cat > {}", shell_quote(remote)),
+            "cp",
+            &local.to_string_lossy(),
+            &format!("{machine}:{remote}"),
         ])
-        .stdin(std::process::Stdio::from(file))
         .output()
-        .context("streaming file into guest via smolvm machine exec -i")?;
+        .context("running smolvm machine cp")?;
     if !output.status.success() {
         anyhow::bail!(
             "copying into {machine} failed: {}",
