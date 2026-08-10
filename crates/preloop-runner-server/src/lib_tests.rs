@@ -13009,6 +13009,11 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
     );
 
     assert_eq!(redirected, 1);
+    assert_eq!(
+        message.preloop_snapshot_token_steps,
+        Some(vec!["00000000-0000-0000-0000-000000000010".to_owned()]),
+        "the pinned checkout step must be recorded by id so claim and retry can re-mint it"
+    );
     let primary = &message.steps[0].inputs;
     assert_eq!(
         primary.get("repository"),
@@ -13095,6 +13100,197 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
         Some(&"${{ inputs.head-sha }}".to_owned()),
         "an expression ref must survive the redirect pass untouched"
     );
+}
+
+/// A job that sat queued past the pinned token's lifetime must get a fresh
+/// credential at claim, scoped to itself, and unpinned steps must be
+/// untouched.
+#[tokio::test]
+async fn claim_remints_expired_snapshot_checkout_tokens() {
+    let mut message = checkout_test_message(json!([
+        {
+            "id": "00000000-0000-0000-0000-000000000020",
+            "name": "checkout",
+            "reference": {"name": "actions/checkout", "version": "v4", "type": "repository"},
+            "inputs": {"token": "expired-pinned-token", "fetch-depth": "0"},
+            "continueOnError": false,
+            "timeoutInMinutes": null
+        },
+        {
+            "id": "00000000-0000-0000-0000-000000000021",
+            "name": "run",
+            "reference": {"name": "actions/setup-node", "version": "v4", "type": "repository"},
+            "inputs": {"node-version": "22"},
+            "continueOnError": false,
+            "timeoutInMinutes": null
+        }
+    ]));
+    message.preloop_snapshot_token_steps =
+        Some(vec!["00000000-0000-0000-0000-000000000020".to_owned()]);
+
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+
+    let refreshed = crate::broker::re_mint_snapshot_tokens(&mut message, &state);
+    assert_eq!(refreshed, 1);
+
+    let token = message.steps[0].inputs.get("token").unwrap();
+    assert_ne!(token, "expired-pinned-token");
+    let claims = state
+        .verify_local_jwt_claims(token)
+        .expect("re-minted token must verify");
+    assert_eq!(
+        claims["sub"],
+        format!("preloop-job-{}", message.job_id),
+        "the fresh token must be scoped to this job"
+    );
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(
+        claims["exp"].as_u64().unwrap() > now,
+        "the re-minted token must not be already expired"
+    );
+    assert_eq!(
+        message.steps[1].inputs.get("token"),
+        None,
+        "unpinned steps keep their inputs untouched"
+    );
+
+    // Without the pinned-step marker nothing is refreshed.
+    message.preloop_snapshot_token_steps = None;
+    assert_eq!(
+        crate::broker::re_mint_snapshot_tokens(&mut message, &state),
+        0
+    );
+}
+
+/// A retry verdict must carry a freshly minted snapshot credential: the
+/// worker replays the failed step from the message it already holds, whose
+/// pinned token may be long expired.
+#[tokio::test]
+async fn retry_verdict_carries_a_fresh_snapshot_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: \"false\"\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "preserve_on_failure": true
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    request_json(
+        &app,
+        Method::GET,
+        "/runner/server/_apis/v1/Message/1?sessionId=default",
+        Value::Null,
+    )
+    .await;
+
+    let (agent_job_id, worker_token) = {
+        let inner = state.inner.lock().await;
+        let record = inner.job_requests.iter().next().unwrap().1;
+        (
+            record.agent_job_id,
+            state.mint_debug_worker_token(&record.plan_id, &record.agent_job_id),
+        )
+    };
+
+    let opened = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/api/v1/debug/sessions",
+        json!({
+            "run_id": run_id,
+            "job_id": "build",
+            "agent_job_id": agent_job_id,
+            "job_name": "build",
+            "step": {
+                "index": 0,
+                "total": 1,
+                "context_name": "__run",
+                "display_name": "Run false",
+                "command": "false",
+                "exit_code": 1,
+                "elapsed_ms": 20,
+                "diagnostics": []
+            }
+        }),
+        &worker_token,
+    )
+    .await;
+    let session_id = opened["session_id"].as_str().unwrap().to_owned();
+
+    request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/debug/sessions/{session_id}/verdict"),
+        json!({ "verdict": "retry", "controller": "test" }),
+    )
+    .await;
+
+    let polled = request_json_with_bearer(
+        &app,
+        Method::GET,
+        &format!("/api/v1/debug/sessions/{session_id}/verdict?wait=0"),
+        Value::Null,
+        &worker_token,
+    )
+    .await;
+    assert_eq!(polled["verdict"], "retry");
+    let token = polled["snapshot_token"]
+        .as_str()
+        .expect("retry verdict must carry a fresh snapshot credential");
+    let claims = state
+        .verify_local_jwt_claims(token)
+        .expect("verdict-supplied token must verify");
+    assert_eq!(claims["sub"], format!("preloop-job-{agent_job_id}"));
+}
+
+/// The snapshot surface must reject bad credentials with a Bearer challenge:
+/// a bare 401 makes git fall back to Basic semantics and prompt for a
+/// username no job can answer.
+#[tokio::test]
+async fn snapshot_401_advertises_a_bearer_challenge() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(
+                    "/snapshots/00000000-0000-0000-0000-000000000001/info/refs?service=git-upload-pack",
+                )
+                .header(header::AUTHORIZATION, "Bearer not-a-real-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer realm=\"preloop-snapshot\"")
+    );
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"], "invalid snapshot Git token");
 }
 
 #[tokio::test]

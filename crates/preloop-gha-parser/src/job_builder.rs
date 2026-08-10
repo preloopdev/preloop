@@ -594,6 +594,7 @@ pub fn build_agent_job_message_with_normalized_context(
         preloop_debug_transport: None,
         preloop_preserve_on_failure: None,
         preloop_snapshot_commit: None,
+        preloop_snapshot_token_steps: None,
         preloop_snapshot_origin_rewrite: None,
     })
 }

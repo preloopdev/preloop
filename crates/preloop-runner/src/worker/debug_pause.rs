@@ -97,6 +97,12 @@ pub struct Decision {
     /// When set, re-execute from this step index instead of only the failed
     /// step. The worker must jump the outer step loop back to this index.
     pub retry_from_step: Option<usize>,
+    /// Fresh snapshot checkout credential supplied with a retry verdict.
+    ///
+    /// The pinned token in the job message expires ~50 minutes after
+    /// submission; a retry replays the step with that stale value unless the
+    /// worker swaps it for this one.
+    pub snapshot_token: Option<String>,
 }
 
 /// Everything needed to talk to the control plane about one job's sessions.
@@ -116,6 +122,14 @@ pub struct DebugPauseClient {
     machine: Option<String>,
     workspace: Option<String>,
     snapshot_commit: Option<String>,
+    /// Ids of steps whose `token` input the server pinned to a snapshot
+    /// checkout credential. Only those steps may have their token refreshed
+    /// from a verdict.
+    pinned_snapshot_steps: Vec<String>,
+    /// Guest path of the pause marker the orchestrator watches to release
+    /// its pool permit while this job sits paused. Absent when the pool did
+    /// not configure debug preservation.
+    pause_marker: Option<std::path::PathBuf>,
     /// Bumped each time a controller supplies a new source revision, so the
     /// attempt journal records what each attempt actually ran against.
     revision: Arc<AtomicU32>,
@@ -183,6 +197,8 @@ impl DebugPauseClient {
             machine: std::env::var("PRELOOP_MACHINE_NAME").ok(),
             workspace: None,
             snapshot_commit: None,
+            pinned_snapshot_steps: Vec::new(),
+            pause_marker: std::env::var_os("PRELOOP_PAUSE_MARKER").map(std::path::PathBuf::from),
             revision: Arc::new(AtomicU32::new(0)),
             paused: Arc::new(AtomicBool::new(false)),
             resolved: Arc::new(AtomicBool::new(false)),
@@ -211,6 +227,8 @@ impl DebugPauseClient {
             machine: std::env::var("PRELOOP_MACHINE_NAME").ok(),
             workspace: None,
             snapshot_commit: None,
+            pinned_snapshot_steps: Vec::new(),
+            pause_marker: std::env::var_os("PRELOOP_PAUSE_MARKER").map(std::path::PathBuf::from),
             revision: Arc::new(AtomicU32::new(0)),
             paused: Arc::new(AtomicBool::new(false)),
             resolved: Arc::new(AtomicBool::new(false)),
@@ -239,6 +257,36 @@ impl DebugPauseClient {
         self.workspace = workspace;
         self.snapshot_commit = snapshot_commit;
         self
+    }
+
+    /// Record which steps carry a pinned snapshot checkout credential, so a
+    /// verdict-supplied replacement is applied only to them.
+    pub fn with_pinned_snapshot_steps(mut self, ids: Vec<String>) -> Self {
+        self.pinned_snapshot_steps = ids;
+        self
+    }
+
+    /// Swap the pinned snapshot checkout credential on the named steps.
+    ///
+    /// Called with the token a retry verdict carried: the submission-time
+    /// token may have expired while the job waited, and the replayed step
+    /// must not re-run the stale value.
+    pub fn refresh_snapshot_tokens(&self, steps: &mut [super::steps_runner::Step], token: &str) {
+        if self.pinned_snapshot_steps.is_empty() {
+            return;
+        }
+        for step in steps {
+            if !self
+                .pinned_snapshot_steps
+                .iter()
+                .any(|pinned| pinned == &step.id)
+            {
+                continue;
+            }
+            if let super::steps_runner::StepType::Action { with, .. } = &mut step.step_type {
+                with["token"] = serde_json::Value::String(token.to_owned());
+            }
+        }
     }
 
     /// Label for the source revision the next attempt will run against.
@@ -277,6 +325,10 @@ impl DebugPauseClient {
         // Held across the whole wait, including reconnect backoff: every
         // second here is debugging, not execution.
         self.paused.store(true, Ordering::SeqCst);
+        // The orchestrator watches this marker to release its pool permit
+        // while the job is paused; without it a paused job pins a concurrency
+        // slot for the whole session and starves every other queued run.
+        let _marker = PauseMarker::new(self.pause_marker.as_deref());
         let decision = self.await_verdict(&session_id).await;
         self.paused.store(false, Ordering::SeqCst);
         if decision.is_some() {
@@ -380,6 +432,7 @@ impl DebugPauseClient {
             revert: response.revert,
             source_revision: response.source_revision,
             retry_from_step: response.retry_from_step,
+            snapshot_token: response.snapshot_token,
         }))
     }
 
@@ -394,6 +447,31 @@ impl DebugPauseClient {
             .await?
             .error_for_status()?;
         Ok(())
+    }
+}
+
+/// Guest marker the orchestrator probes to learn that a job is paused in a
+/// debug session. Written when the session opens, removed when it closes.
+struct PauseMarker(Option<std::path::PathBuf>);
+
+impl PauseMarker {
+    fn new(path: Option<&std::path::Path>) -> Self {
+        let Some(path) = path else {
+            return Self(None);
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(path, "paused");
+        Self(Some(path.to_owned()))
+    }
+}
+
+impl Drop for PauseMarker {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 

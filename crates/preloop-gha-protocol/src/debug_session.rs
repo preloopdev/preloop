@@ -348,6 +348,15 @@ pub struct VerdictResponse {
     /// connection must never be read as a decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verdict: Option<Verdict>,
+    /// Fresh snapshot checkout credential for retry verdicts.
+    ///
+    /// A retry replays the failed step from the job message the worker
+    /// already holds — including the snapshot checkout token pinned at
+    /// submission, which may be long expired by the time a human answers.
+    /// The server mints a replacement at verdict time; the worker applies it
+    /// only to steps the message marks as pinned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_token: Option<String>,
     /// Session version at the time of the response.
     pub version: u64,
     /// Revert policy the controller chose.
