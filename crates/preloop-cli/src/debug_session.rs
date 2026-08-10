@@ -870,40 +870,65 @@ fn sync_workspace(session: &DebugSession, force: bool) -> Result<String> {
     if !modified.is_empty() {
         let archive = std::env::temp_dir().join(format!("preloop-sync-{}.tar", std::process::id()));
         let list = std::env::temp_dir().join(format!("preloop-sync-{}.list", std::process::id()));
-        let mut list_contents = Vec::new();
-        for path in &modified {
-            list_contents.extend_from_slice(path.as_bytes());
-            list_contents.push(0);
-        }
-        std::fs::write(&list, list_contents).context("staging the sync file list")?;
-
         // tar carries mode bits, so a synced `check.sh` keeps its +x. Losing
         // that would fail the retry for a reason unrelated to the fix.
-        let tar = std::process::Command::new("tar")
-            .current_dir(&host)
-            .arg("-cf")
-            .arg(&archive)
-            .arg("--null")
-            .arg("--verbatim-files-from")
-            .arg("-T")
-            .arg(&list)
-            .output()
-            .context("building the sync archive")?;
-        let _ = std::fs::remove_file(&list);
-        if !tar.status.success() {
-            let _ = std::fs::remove_file(&archive);
-            anyhow::bail!(
-                "tar failed: {}",
-                String::from_utf8_lossy(&tar.stderr).trim()
-            );
+        //
+        // macOS BSD tar doesn't support --verbatim-files-from or --null with -T,
+        // so on macOS we write newline-separated paths and drop both flags.
+        #[cfg(target_os = "macos")]
+        {
+            let list_contents: String = modified.iter().map(|p| format!("{p}\n")).collect();
+            std::fs::write(&list, list_contents).context("staging the sync file list")?;
+            let tar = std::process::Command::new("tar")
+                .current_dir(&host)
+                .arg("-cf")
+                .arg(&archive)
+                .arg("-T")
+                .arg(&list)
+                .output()
+                .context("building the sync archive")?;
+            let _ = std::fs::remove_file(&list);
+            if !tar.status.success() {
+                let _ = std::fs::remove_file(&archive);
+                anyhow::bail!(
+                    "tar failed: {}",
+                    String::from_utf8_lossy(&tar.stderr).trim()
+                );
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let mut list_contents = Vec::new();
+            for path in &modified {
+                list_contents.extend_from_slice(path.as_bytes());
+                list_contents.push(0);
+            }
+            std::fs::write(&list, list_contents).context("staging the sync file list")?;
+            let tar = std::process::Command::new("tar")
+                .current_dir(&host)
+                .arg("-cf")
+                .arg(&archive)
+                .arg("--null")
+                .arg("--verbatim-files-from")
+                .arg("-T")
+                .arg(&list)
+                .output()
+                .context("building the sync archive")?;
+            let _ = std::fs::remove_file(&list);
+            if !tar.status.success() {
+                let _ = std::fs::remove_file(&archive);
+                anyhow::bail!(
+                    "tar failed: {}",
+                    String::from_utf8_lossy(&tar.stderr).trim()
+                );
+            }
         }
 
         let bytes = std::fs::metadata(&archive).map(|m| m.len()).unwrap_or(0);
-        // Staged in `/var/tmp`, never `/tmp`. `/tmp` is a tmpfs mounted over
-        // the machine's overlay root, and `machine cp` resolves against the
-        // overlay beneath it: the copy reports `100.0%` and exit 0 while the
-        // bytes land somewhere no process in the machine can read. `/var/tmp`
-        // is plain overlay, so cp and exec agree on it.
+        // Staged in `/var/tmp`, never `/tmp`. `/tmp` is a guest tmpfs and is a
+        // poor place for a transfer that must survive until `tar -xf` runs.
+        // Transfer itself goes through `push_to_guest` (`machine exec -i`),
+        // not `machine cp` — see that helper for why.
         //
         // Outside the workspace on purpose — an archive dropped inside it
         // would surface as an untracked file in the very `git status` the
@@ -1147,27 +1172,40 @@ fn next_revision(current: &str) -> String {
 
 /// Copy a host file into the machine, then prove it arrived.
 ///
-/// `machine cp` cannot be taken at its word. Where a tmpfs is mounted over the
-/// machine's overlay root -- `/tmp`, `/run`, `/dev/shm` -- it resolves against
-/// the overlay underneath, so the write succeeds into a directory no process
-/// in the machine can read, and still reports `100.0%` and exit 0. Callers
-/// stage outside those paths, and this check makes a regression loud instead
-/// of producing a retry that silently ran the old code.
+/// Streams bytes through `smolvm machine exec -i` (`cat > remote`) rather than
+/// `machine cp`. On current guests `machine cp` reports 100% success while the
+/// file never appears at a path the guest process tree can read — including
+/// outside tmpfs mounts. The post-copy `wc -c` check keeps a regression loud
+/// instead of producing a retry that silently ran the old code.
 fn push_to_guest(machine: &str, local: &std::path::Path, remote: &str) -> Result<()> {
     let expected = std::fs::metadata(local)
         .with_context(|| format!("reading {}", local.display()))?
         .len();
 
     guest_check(machine, &format!("rm -f {}", shell_quote(remote)))?;
+    // Prefer `machine exec -i` with stdin over `machine cp`.
+    //
+    // On current smolvm guests, `machine cp` reports 100% success while the
+    // bytes never appear at a path the guest process tree can read (even on
+    // non-tmpfs paths like `/var/tmp`). Streaming through `exec -i` writes
+    // into the live mount namespace and is verifiable with `wc -c`.
+    let file = std::fs::File::open(local)
+        .with_context(|| format!("opening {} for guest transfer", local.display()))?;
     let output = std::process::Command::new("smolvm")
         .args([
             "machine",
-            "cp",
-            &local.to_string_lossy(),
-            &format!("{machine}:{remote}"),
+            "exec",
+            "-i",
+            "--name",
+            machine,
+            "--",
+            "sh",
+            "-lc",
+            &format!("cat > {}", shell_quote(remote)),
         ])
+        .stdin(std::process::Stdio::from(file))
         .output()
-        .context("running smolvm machine cp")?;
+        .context("streaming file into guest via smolvm machine exec -i")?;
     if !output.status.success() {
         anyhow::bail!(
             "copying into {machine} failed: {}",
