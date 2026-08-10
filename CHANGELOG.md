@@ -9,6 +9,22 @@ Releases before v0.27.0 predate the changelog.
 
 ## [Unreleased]
 
+## [0.29.8] - 2026-08-09
+
+### Fixed
+
+- Preserve remote action references across job restarts: the job wire format
+  now uses the canonical `ref` field and still accepts the legacy `version`
+  name when reading.
+- Recover golden runner provisioning when the exact hosted package pins are
+  unavailable by falling back to archive versions.
+- Complete cancellation bookkeeping so cancelled runs settle terminal state
+  and next-job label scheduling stays in sync.
+- Expose the worker half of live debugging (token exchange, session verdict,
+  and close) through the runner control socket.
+- Fall back to direct VM creation when forking the default packed golden
+  fails, without changing the job image for environment-specific goldens.
+
 ## [0.29.7] - 2026-08-09
 
 ### Fixed
@@ -100,7 +116,8 @@ live-logs (8), and golden (8).
 Bootstrap the cargo-dist release pipeline for `preloop-cli` (binary
 installers for macOS and Linux).
 
-[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.29.7...HEAD
+[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.29.8...HEAD
+[0.29.8]: https://github.com/preloopdev/preloop/compare/v0.29.7...v0.29.8
 [0.29.7]: https://github.com/preloopdev/preloop/compare/v0.29.6...v0.29.7
 [0.29.6]: https://github.com/preloopdev/preloop/compare/v0.29.5...v0.29.6
 [0.29.1]: https://github.com/preloopdev/preloop/compare/v0.29.0...v0.29.1
