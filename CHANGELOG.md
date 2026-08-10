@@ -9,6 +9,36 @@ Releases before v0.27.0 predate the changelog.
 
 ## [Unreleased]
 
+## [0.29.9] - 2026-08-10
+
+### Added
+
+- Custom base images (`PRELOOP_RUNNER_BASE_IMAGE` / `build-golden --base-image`)
+  are now used as-is: the curated toolchain bake applies only to the stock
+  digest-pinned Ubuntu bases, so an operator's own image is never modified.
+- `check_run` / `check_suite` rerequest webhook handling, so GitHub's "re-run
+  failed jobs" lands on the right run.
+- Background-step execution in the runner, and runner-internal job variables
+  are filtered out of step environments.
+- Docs-only pull requests skip CI via `paths-ignore` filters.
+
+### Fixed
+
+- Debug-session starvation: a job paused in a debug session no longer pins a
+  pool concurrency permit — the pool releases the slot for the pause's
+  duration and re-acquires it on resume, so unanswered sessions cannot freeze
+  the pool.
+- Stale snapshot checkout tokens: the credential pinned onto the checkout
+  step at submission is re-minted when a job is finally claimed and refreshed
+  again on retry verdicts; the snapshot Git surface answers with a Bearer
+  challenge instead of prompting for a username.
+- `preloop run` reports queued-job and paused-session counts when a run
+  stalls instead of hanging silently, and detaches cleanly from the debug
+  prompt.
+- `macos`/`windows` jobs wait for a registered external host instead of being
+  failed by the Linux-only starvation sweep.
+- macOS BSD `tar` missing `--verbatim-files-from` is handled in sync.
+
 ## [0.29.8] - 2026-08-09
 
 ### Fixed
