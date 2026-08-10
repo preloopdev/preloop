@@ -925,11 +925,10 @@ fn sync_workspace(session: &DebugSession, force: bool) -> Result<String> {
         }
 
         let bytes = std::fs::metadata(&archive).map(|m| m.len()).unwrap_or(0);
-        // Staged in `/var/tmp`, never `/tmp`. `/tmp` is a tmpfs mounted over
-        // the machine's overlay root, and `machine cp` resolves against the
-        // overlay beneath it: the copy reports `100.0%` and exit 0 while the
-        // bytes land somewhere no process in the machine can read. `/var/tmp`
-        // is plain overlay, so cp and exec agree on it.
+        // Staged in `/var/tmp`, never `/tmp`. `/tmp` is a guest tmpfs mounted
+        // over the persistent overlay: `machine cp` writes into the overlay
+        // layer beneath it, so the bytes are invisible to `tar -xf` in the
+        // live guest. `/var/tmp` is plain overlay, so cp and exec agree.
         //
         // Outside the workspace on purpose — an archive dropped inside it
         // would surface as an untracked file in the very `git status` the
@@ -1173,12 +1172,14 @@ fn next_revision(current: &str) -> String {
 
 /// Copy a host file into the machine, then prove it arrived.
 ///
-/// `machine cp` cannot be taken at its word. Where a tmpfs is mounted over the
-/// machine's overlay root -- `/tmp`, `/run`, `/dev/shm` -- it resolves against
-/// the overlay underneath, so the write succeeds into a directory no process
-/// in the machine can read, and still reports `100.0%` and exit 0. Callers
-/// stage outside those paths, and this check makes a regression loud instead
-/// of producing a retry that silently ran the old code.
+/// `machine cp` resolves paths through the guest agent into the persistent
+/// overlay's merged root, so a copy to a plain overlay path (like `/var/tmp`)
+/// is visible to later `machine exec` calls. The one known trap is a guest
+/// tmpfs mount: `cp` writes the bytes into the overlay layer *underneath*
+/// `/tmp`, exec sees the empty tmpfs, and the upload still reports 100%.
+/// Callers stage outside those paths, and this `wc -c` check makes a
+/// regression loud instead of producing a retry that silently ran the old
+/// code.
 fn push_to_guest(machine: &str, local: &std::path::Path, remote: &str) -> Result<()> {
     let expected = std::fs::metadata(local)
         .with_context(|| format!("reading {}", local.display()))?
