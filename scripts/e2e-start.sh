@@ -17,9 +17,9 @@ unset all_proxy ALL_PROXY http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-PRELOOP_STATE="${PRELOOP_STATE:-$HOME/mitm-proxy/experiments/mitm/.cache/preloop-state}"
+PRELOOP_STATE="${PRELOOP_STATE:-$HOME/.preloop/state}"
 PRELOOP_BIN="${PRELOOP_BIN:-$REPO_ROOT/target/release/preloop-server}"
-RUNNER_DIR="${RUNNER_DIR:-$HOME/mitm-proxy/experiments/mitm/.cache/runner-official}"
+RUNNER_DIR="${RUNNER_DIR:-$HOME/.cache/actions-runner/current}"
 PRELOOP_PORT="${PRELOOP_PORT:-9090}"
 CLIENT="${CLIENT:-http://127.0.0.1:$PRELOOP_PORT}"
 LOG_DIR="$REPO_ROOT/logs/e2e"
@@ -225,8 +225,8 @@ Options:
   -h, --help        Show this help
 
 Environment:
-  PRELOOP_STATE=~/mitm-proxy/experiments/mitm/.cache/preloop-state
-  RUNNER_DIR=~/mitm-proxy/experiments/mitm/.cache/runner-official
+  PRELOOP_STATE=$HOME/.preloop/state
+  RUNNER_DIR=$HOME/.cache/actions-runner/current
   PRELOOP_PORT=9090
   PRELOOP_BIN=target/release/preloop-server
 EOF

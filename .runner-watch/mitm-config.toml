@@ -2,7 +2,7 @@
 runner_repo = "actions/runner"
 preloop_worktree = "."
 golden_dir = ".runner-watch/golden"
-mitm_dir = "../mitm-proxy/experiments/mitm"
+mitm_dir = "<path-to-mitm-capture-checkout>"
 max_review_rounds = 3
 max_conformance_rounds = 2
 max_implement_iterations = 10

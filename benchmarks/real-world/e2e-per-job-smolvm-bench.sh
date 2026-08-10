@@ -20,8 +20,8 @@ MODE="${1:?Usage: $0 <github-official|github-preloop|preloop-server> <serde|axum
 WF_SELECTOR="${2:?}"
 
 GH_REPO="preloopdev/preloop-conformance-sample"
-HOST_WORKSPACE="/Users/bnjoroge/macos-runners"
-WARM_CACHE="/Users/bnjoroge/cachingv4"
+HOST_WORKSPACE="${HOST_WORKSPACE:-$HOME/macos-runners}"
+WARM_CACHE="${WARM_CACHE:-$HOME/cachingv4}"
 WARM_RUSTUP="$WARM_CACHE/.rustup"
 WARM_CARGO="$WARM_CACHE/.cargo"
 WARM_OFFICIAL="$WARM_CACHE/actions-runner"

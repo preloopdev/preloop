@@ -12,8 +12,8 @@ EVENT=${3:?event}
 OUT=${4:?out key}
 PAYLOAD=${5:-}
 
-PRELOOP=/Users/bnjoroge/preloop/target/debug/preloop
-RUNNER=/Users/bnjoroge/preloop/target/debug/preloop-runner
+PRELOOP=$HOME/preloop/target/debug/preloop
+RUNNER=$HOME/preloop/target/debug/preloop-runner
 ENGINE_PORT=127.0.0.1:9091
 RESULT_DIR=benchmarks/real-world/results/conformance-4repos/$OUT/c
 RUNNER_ROOT=/tmp/conformance-host-runner

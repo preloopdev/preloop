@@ -42,7 +42,7 @@ Use the right template. Each one collects exactly the evidence a maintainer need
 - [ ] Does this change check-run or OAuth wire behavior?
 
 If any answer is **yes**, verify against the official runner source
-(`/Users/bnjoroge/mitm-proxy/experiments/mitm/.cache/runner.server/src`) and golden wire
+(the pinned official runner source checkout per `versions.toml`) and golden wire
 captures before merging.
 
 ## Conformance documentation

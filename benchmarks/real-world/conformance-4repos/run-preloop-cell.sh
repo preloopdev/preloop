@@ -24,7 +24,7 @@ WORKFLOW=${2:?workflow path relative to repo}
 EVENT=${3:-push}
 OUT=${4:-$(basename "$REPO_DIR")}
 
-PRELOOP=${PRELOOP:-/Users/bnjoroge/preloop/target/debug/preloop}
+PRELOOP=${PRELOOP:-$HOME/preloop/target/debug/preloop}
 ENGINE_PORT=${PRELOOP_LISTEN:-127.0.0.1:9091}
 RESULT_DIR=benchmarks/real-world/results/conformance-4repos/$OUT/c
 

@@ -555,7 +555,7 @@ def main() -> int:
     ap.add_argument("--scenarios", default=None, help="Comma-separated scenarios to run (default: run all)")
     ap.add_argument("--port", type=int, default=9090, help="preloop-runner-server local port")
     ap.add_argument("--state-dir", type=Path, default=Path("/tmp/preloop-matrix-state"), help="Local preloop state dir")
-    ap.add_argument("--runner-dir", type=Path, default=Path("/Users/bnjoroge/mitm-proxy/experiments/mitm/.cache/runner-official"),
+    ap.add_argument("--runner-dir", type=Path, default=Path.home() / ".cache" / "actions-runner" / "current",
                     help="Official runner directory")
     
     args = ap.parse_args()

@@ -100,7 +100,7 @@ If `PRELOOP_GITHUB_TOKEN` is not configured, these requests are simulated in-mem
 Run the server with the environment variables set:
 ```sh
 export PRELOOP_WEBHOOK_SECRET="super-secret"
-export PRELOOP_LOCAL_WORKSPACE="/Users/bnjoroge/runner-watcher"
+export PRELOOP_LOCAL_WORKSPACE="/path/to/runner-watcher"
 export PRELOOP_GITHUB_TOKEN="ghp_optional_token_for_checks"
 
 just serve
