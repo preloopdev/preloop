@@ -865,32 +865,58 @@ fn sync_workspace(session: &DebugSession, force: bool) -> Result<String> {
     if !modified.is_empty() {
         let archive = std::env::temp_dir().join(format!("preloop-sync-{}.tar", std::process::id()));
         let list = std::env::temp_dir().join(format!("preloop-sync-{}.list", std::process::id()));
-        let mut list_contents = Vec::new();
-        for path in &modified {
-            list_contents.extend_from_slice(path.as_bytes());
-            list_contents.push(0);
-        }
-        std::fs::write(&list, list_contents).context("staging the sync file list")?;
-
         // tar carries mode bits, so a synced `check.sh` keeps its +x. Losing
         // that would fail the retry for a reason unrelated to the fix.
-        let tar = std::process::Command::new("tar")
-            .current_dir(&host)
-            .arg("-cf")
-            .arg(&archive)
-            .arg("--null")
-            .arg("--verbatim-files-from")
-            .arg("-T")
-            .arg(&list)
-            .output()
-            .context("building the sync archive")?;
-        let _ = std::fs::remove_file(&list);
-        if !tar.status.success() {
-            let _ = std::fs::remove_file(&archive);
-            anyhow::bail!(
-                "tar failed: {}",
-                String::from_utf8_lossy(&tar.stderr).trim()
-            );
+        //
+        // macOS BSD tar doesn't support --verbatim-files-from or --null with -T,
+        // so on macOS we write newline-separated paths and drop both flags.
+        #[cfg(target_os = "macos")]
+        {
+            let list_contents: String = modified.iter().map(|p| format!("{p}\n")).collect();
+            std::fs::write(&list, list_contents).context("staging the sync file list")?;
+            let tar = std::process::Command::new("tar")
+                .current_dir(&host)
+                .arg("-cf")
+                .arg(&archive)
+                .arg("-T")
+                .arg(&list)
+                .output()
+                .context("building the sync archive")?;
+            let _ = std::fs::remove_file(&list);
+            if !tar.status.success() {
+                let _ = std::fs::remove_file(&archive);
+                anyhow::bail!(
+                    "tar failed: {}",
+                    String::from_utf8_lossy(&tar.stderr).trim()
+                );
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let mut list_contents = Vec::new();
+            for path in &modified {
+                list_contents.extend_from_slice(path.as_bytes());
+                list_contents.push(0);
+            }
+            std::fs::write(&list, list_contents).context("staging the sync file list")?;
+            let tar = std::process::Command::new("tar")
+                .current_dir(&host)
+                .arg("-cf")
+                .arg(&archive)
+                .arg("--null")
+                .arg("--verbatim-files-from")
+                .arg("-T")
+                .arg(&list)
+                .output()
+                .context("building the sync archive")?;
+            let _ = std::fs::remove_file(&list);
+            if !tar.status.success() {
+                let _ = std::fs::remove_file(&archive);
+                anyhow::bail!(
+                    "tar failed: {}",
+                    String::from_utf8_lossy(&tar.stderr).trim()
+                );
+            }
         }
 
         let bytes = std::fs::metadata(&archive).map(|m| m.len()).unwrap_or(0);

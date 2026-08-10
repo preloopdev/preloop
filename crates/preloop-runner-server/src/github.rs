@@ -25,10 +25,7 @@ use preloop_gha_protocol::{AnnotationLevel, JobId, NdjsonEvent, RunId, WorkflowS
 /// GitHub, rather than Preloop, owns. This keeps release and artifact-publish
 /// workflows out of the local webhook dispatcher while leaving the default
 /// generic forges-only behavior unchanged.
-pub(crate) const GITHUB_OWNED_WORKFLOWS_ENV: &str = "PRELOOP_GITHUB_SKIP_WORKFLOWS";
-
-type ReusedCheckRuns = BTreeMap<JobId, u64>;
-type LatestWorkflowRun = (RunId, chrono::DateTime<chrono::Utc>, ReusedCheckRuns);
+const GITHUB_OWNED_WORKFLOWS_ENV: &str = "PRELOOP_GITHUB_SKIP_WORKFLOWS";
 
 pub(crate) fn configured_github_owned_workflows() -> BTreeSet<String> {
     std::env::var(GITHUB_OWNED_WORKFLOWS_ENV)
@@ -44,13 +41,11 @@ pub(crate) fn configured_github_owned_workflows() -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
-pub(crate) fn is_github_owned_workflow(workflow_path: &str, configured: &BTreeSet<String>) -> bool {
-    let filename = workflow_path
-        .strip_prefix(".github/workflows/")
-        .unwrap_or(workflow_path);
+pub(crate) fn is_github_owned_workflow(filename: &str, configured: &BTreeSet<String>) -> bool {
+    let path = format!(".github/workflows/{filename}");
     configured
         .iter()
-        .any(|entry| entry.strip_prefix(".github/workflows/").unwrap_or(entry) == filename)
+        .any(|entry| entry == filename || entry == &path)
 }
 
 /// Webhook push event payload.
@@ -322,13 +317,10 @@ pub(crate) async fn report_existing_check_run_queued(
 }
 
 /// Publish queued/completed checks for a native rerun.
-///
-/// A webhook rerequest reuses the check IDs GitHub already knows about. A
-/// native rerun has no reused IDs and creates fresh checks instead.
 pub(crate) async fn report_check_runs_for_run(
     shared: &Arc<SharedState>,
     run_id: RunId,
-    reused_check_runs: &BTreeMap<JobId, u64>,
+    reused_check_run: Option<(JobId, u64)>,
 ) {
     let (repository, sha, jobs) = {
         let inner = shared.state.inner.lock().await;
@@ -343,9 +335,19 @@ pub(crate) async fn report_check_runs_for_run(
     };
 
     for job_id in jobs {
-        if let Some(check_run_id) = reused_check_runs.get(&job_id).copied() {
-            report_existing_check_run_queued(shared, &repository, &job_id, run_id, check_run_id)
+        if let Some((reused_job_id, check_run_id)) = &reused_check_run {
+            if reused_job_id == &job_id {
+                report_existing_check_run_queued(
+                    shared,
+                    &repository,
+                    &job_id,
+                    run_id,
+                    *check_run_id,
+                )
                 .await;
+            } else {
+                report_check_run_queued(shared, &repository, &sha, &job_id, run_id).await;
+            }
         } else {
             report_check_run_queued(shared, &repository, &sha, &job_id, run_id).await;
         }
@@ -953,7 +955,9 @@ impl Drop for InFlightReservationGuard {
     }
 }
 
-/// Resolve a check-run rerequest to the terminal run that owns the check.
+/// Handle GitHub's Checks API rerequest action by resubmitting the native run
+/// that owns the requested check. GitHub sends this as a `check_run` webhook,
+/// not as a workflow trigger event.
 async fn process_check_run_rerequest(
     shared: &Arc<SharedState>,
     payload: &Value,
@@ -979,7 +983,7 @@ async fn process_check_run_rerequest(
         .get("head_sha")
         .and_then(Value::as_str)
         .filter(|sha| !sha.is_empty());
-
+    let job_name = check_run.get("name").and_then(Value::as_str);
     let details_run_id = check_run
         .get("details_url")
         .and_then(Value::as_str)
@@ -1015,12 +1019,17 @@ async fn process_check_run_rerequest(
             let job_id = run
                 .job_check_run_ids
                 .iter()
-                .find_map(|(job_id, id)| (*id == check_run_id).then(|| job_id.clone()))?;
-            Some((run_id, BTreeMap::from([(job_id, check_run_id)])))
+                .find_map(|(job_id, id)| (*id == check_run_id).then(|| job_id.clone()))
+                .or_else(|| {
+                    job_name
+                        .map(|name| JobId(name.to_owned()))
+                        .filter(|job_id| run.jobs.contains_key(job_id))
+                })?;
+            Some((run_id, job_id))
         })
     };
 
-    let Some((run_id, reused_check_runs)) = target else {
+    let Some((run_id, job_id)) = target else {
         warn!(
             repository,
             check_run_id, "check_run rerequest does not match a known terminal run"
@@ -1028,11 +1037,12 @@ async fn process_check_run_rerequest(
         return Ok((StatusCode::OK, Json(serde_json::json!([]))));
     };
 
-    let accepted = crate::rerun_run_inner(shared, run_id, reused_check_runs)
+    let accepted = crate::rerun_run_inner(shared, run_id, Some((job_id.clone(), check_run_id)))
         .await
         .map_err(|error| {
             error!(
                 %run_id,
+                %job_id,
                 check_run_id,
                 ?error,
                 "failed to resubmit check_run rerequest"
@@ -1042,113 +1052,11 @@ async fn process_check_run_rerequest(
     info!(
         %run_id,
         rerun_run_id = %accepted.run_id,
+        %job_id,
         check_run_id,
         "resubmitted check_run rerequest"
     );
     Ok((StatusCode::OK, Json(serde_json::json!([accepted]))))
-}
-
-/// Rerun the latest completed workflow attempt for each workflow represented
-/// in a GitHub check suite.
-async fn process_check_suite_rerequest(
-    shared: &Arc<SharedState>,
-    payload: &Value,
-) -> Result<(StatusCode, Json<Value>), StatusCode> {
-    if payload.get("action").and_then(Value::as_str) != Some("rerequested") {
-        return Ok((StatusCode::OK, Json(serde_json::json!([]))));
-    }
-
-    let Some(check_suite) = payload.get("check_suite") else {
-        warn!("check_suite rerequest is missing check_suite payload");
-        return Ok((StatusCode::OK, Json(serde_json::json!([]))));
-    };
-    let Some(head_sha) = check_suite
-        .get("head_sha")
-        .and_then(Value::as_str)
-        .filter(|sha| !sha.is_empty())
-    else {
-        warn!("check_suite rerequest is missing check_suite.head_sha");
-        return Ok((StatusCode::OK, Json(serde_json::json!([]))));
-    };
-    let repository = payload
-        .get("repository")
-        .and_then(|repository| repository.get("full_name"))
-        .and_then(Value::as_str)
-        .filter(|repository| !repository.is_empty())
-        .unwrap_or_default();
-    if repository.is_empty() {
-        warn!("check_suite rerequest is missing repository.full_name");
-        return Ok((StatusCode::OK, Json(serde_json::json!([]))));
-    }
-
-    // A suite groups all checks for an app and commit. If a workflow has
-    // already been rerun, only its latest terminal attempt should be
-    // rerequested; otherwise one suite event would rerun every historical
-    // attempt for the same commit.
-    let targets = {
-        let inner = shared.state.inner.lock().await;
-        let mut latest_by_workflow: BTreeMap<String, LatestWorkflowRun> = BTreeMap::new();
-        for (run_id, run) in &inner.runs {
-            if run.submission.repository != repository
-                || run.head_sha != head_sha
-                || !run.status.is_terminal()
-                || run.job_check_run_ids.is_empty()
-            {
-                continue;
-            }
-
-            let workflow = run.workflow_path_str.clone();
-            let replace = latest_by_workflow
-                .get(&workflow)
-                .is_none_or(|(_, created_at, _)| run.created_at > *created_at);
-            if replace {
-                latest_by_workflow.insert(
-                    workflow,
-                    (*run_id, run.created_at, run.job_check_run_ids.clone()),
-                );
-            }
-        }
-        latest_by_workflow
-            .into_values()
-            .map(|(run_id, _, reused_check_runs)| (run_id, reused_check_runs))
-            .collect::<Vec<_>>()
-    };
-
-    if targets.is_empty() {
-        warn!(
-            repository,
-            head_sha, "check_suite rerequest does not match a known terminal run"
-        );
-        return Ok((StatusCode::OK, Json(serde_json::json!([]))));
-    }
-
-    let mut accepted = Vec::with_capacity(targets.len());
-    for (run_id, reused_check_runs) in targets {
-        match crate::rerun_run_inner(shared, run_id, reused_check_runs).await {
-            Ok(run) => {
-                info!(
-                    %run_id,
-                    rerun_run_id = %run.run_id,
-                    repository,
-                    head_sha,
-                    "resubmitted check_suite rerequest"
-                );
-                accepted.push(run);
-            }
-            Err(error) => {
-                error!(
-                    %run_id,
-                    repository,
-                    head_sha,
-                    ?error,
-                    "failed to resubmit check_suite rerequest"
-                );
-                return Err(error.into_response().status());
-            }
-        }
-    }
-
-    Ok((StatusCode::OK, Json(serde_json::json!(accepted))))
 }
 
 /// Processing half of [`handle_github_webhook`], after signature verification
@@ -1167,15 +1075,8 @@ async fn process_github_webhook(
     // 3. Parse the event payload
     let payload_val: Value = serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    if event_name == "check_run"
-        && payload_val.get("action").and_then(Value::as_str) == Some("rerequested")
-    {
+    if event_name == "check_run" {
         return process_check_run_rerequest(shared, &payload_val).await;
-    }
-    if event_name == "check_suite"
-        && payload_val.get("action").and_then(Value::as_str) == Some("rerequested")
-    {
-        return process_check_suite_rerequest(shared, &payload_val).await;
     }
 
     // 4. Look up the event adapter
@@ -1698,25 +1599,19 @@ mod tests {
         format!("sha256={hex}")
     }
 
-    #[tokio::test]
-    async fn github_owned_workflow_filter_matches_filename_or_path() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _configured = crate::state::TestEnvVar::set(
-            GITHUB_OWNED_WORKFLOWS_ENV,
-            "release.yml, .github/workflows/release-golden.yml, \
-             ./release-linux-runner.yml, ,",
-        );
-        let configured = configured_github_owned_workflows();
+    #[test]
+    fn github_owned_workflow_filter_matches_filename_or_path() {
+        let configured =
+            "release.yml, .github/workflows/release-golden.yml, ./release-linux-runner.yml"
+                .split(',')
+                .map(str::trim)
+                .map(|entry| entry.trim_start_matches("./").to_owned())
+                .collect();
 
-        assert_eq!(configured.len(), 3);
         assert!(is_github_owned_workflow("release.yml", &configured));
         assert!(is_github_owned_workflow("release-golden.yml", &configured));
         assert!(is_github_owned_workflow(
             "release-linux-runner.yml",
-            &configured
-        ));
-        assert!(is_github_owned_workflow(
-            ".github/workflows/release.yml",
             &configured
         ));
         assert!(!is_github_owned_workflow("ci.yml", &configured));
@@ -1953,7 +1848,7 @@ mod tests {
     #[tokio::test]
     async fn webhook_skips_github_owned_workflows() {
         let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _skip = crate::state::TestEnvVar::set(GITHUB_OWNED_WORKFLOWS_ENV, "release.yml");
+        std::env::set_var(GITHUB_OWNED_WORKFLOWS_ENV, "release.yml");
 
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = temp.path().join("ws");
@@ -1974,6 +1869,8 @@ mod tests {
         assert!(inner.webhook_deliveries.iter().any(|(id, state)| {
             id == "delivery-github-owned" && matches!(state, WebhookDeliveryState::Completed(_))
         }));
+
+        std::env::remove_var(GITHUB_OWNED_WORKFLOWS_ENV);
     }
 
     /// Issue 2: a delivery whose processing future is cancelled (client
