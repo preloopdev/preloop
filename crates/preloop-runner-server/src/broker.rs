@@ -762,6 +762,20 @@ pub(crate) async fn broker_acquire_job(
             "broker acquire: no dispatch token request for job"
         );
     }
+    // The snapshot checkout token is pinned onto the step at submission,
+    // but a job can sit queued well past its ~50-minute lifetime. The
+    // checkout would then be answered with a git 401 that the step can
+    // never recover from — it replays whatever the message carries. Re-mint
+    // the pinned inputs at claim so the token is fresh exactly when the job
+    // first runs.
+    let re_minted = re_mint_snapshot_tokens(&mut message, &shared.state);
+    if re_minted > 0 {
+        tracing::info!(
+            request_id,
+            steps = re_minted,
+            "re-minted snapshot checkout tokens at claim"
+        );
+    }
     message.message_type = Some(azdo::message_type::RUNNER_JOB_REQUEST.to_owned());
     let run_service_url = broker_run_service_url(runner_id);
     for endpoint in &mut message.resources.endpoints {
@@ -812,6 +826,30 @@ pub(crate) async fn broker_acquire_job(
     let payload = serde_json::to_value(&message)
         .map_err(|error| ApiError::internal(format!("serialize broker job payload: {error}")))?;
     Ok(Json(payload))
+}
+
+/// Replace every snapshot checkout credential pinned at submission with a
+/// freshly minted runtime token.
+///
+/// Returns the number of steps refreshed. The pinned ids travel on the
+/// message ([`azdo::AgentJobRequestMessage::preloop_snapshot_token_steps`]),
+/// so this deliberately matches by step id rather than by token shape.
+pub(crate) fn re_mint_snapshot_tokens(
+    message: &mut preloop_gha_protocol::azdo::AgentJobRequestMessage,
+    state: &AppState,
+) -> usize {
+    let Some(pinned) = message.preloop_snapshot_token_steps.clone() else {
+        return 0;
+    };
+    let fresh = state.mint_runtime_token(&message.plan.plan_id, &message.job_id);
+    let mut re_minted = 0;
+    for step in &mut message.steps {
+        if pinned.iter().any(|id| id == &step.id.to_string()) {
+            step.inputs.insert("token".to_owned(), fresh.clone());
+            re_minted += 1;
+        }
+    }
+    re_minted
 }
 
 /// A dispatched job's `GITHUB_TOKEN` and, when the App installation could not

@@ -10,7 +10,7 @@ match to the official GitHub runner image to avoid drift.
 | Mode | How jobs run | Enabled by |
 |---|---|---|
 | **MicroVM** | A libkrun guest (Hypervisor.framework on macOS, KVM on Linux) boots the packed golden image and runs the job inside it | `preloop serve`; packed golden use is the default |
-| **Fork pool** | The runner runs as a host process tree — no VM, same job semantics, much faster warm start | `PRELOOP_USE_FORK=true` (default when a packed golden is present) |
+| **Fork pool** | The runner runs as a host process tree so no VM, same job semantics, much faster warm start | `PRELOOP_USE_FORK=true` (default when a packed golden is present) |
 | **External runners** | Any runner that registers against the server: the official `actions/runner`, `preloop-runner` on another machine, containers | `preloop-runner configure` + `run` |
 
 The VM image and the fork pool share the same artifact (the golden); fork
@@ -36,25 +36,24 @@ adds its runner baseline to that filesystem and packs the result as a golden.
 
 The golden is a single self-contained file built from:
 
-1. **Base OS**: Ubuntu 24.04, pinned by **digest** (immutable — a tag alone
-   would drift). Ubuntu 22.04 is also pinned for workflows that select it.
+1. **Base OS**: Ubuntu 24.04, pinned by **digest**. Ubuntu 22.04 is also pinned for workflows that select it.
 2. **The runner**: `preloop-runner` cross-built for `aarch64-unknown-linux-gnu`
    (cargo-zigbuild), fidelity-tracked against the official `actions/runner`
    (see `versions.toml`).
-3. **Curated toolchains**: a fixed toolchain set is baked into every golden —
+3. **Curated toolchains**: a fixed toolchain set is baked into every golden 
    currently Rust stable, plus the GitHub-hosted parity toolset in
    `base_install_script` (node/python/go toolcaches, git, git-lfs, docker,
    nvm, yarn). The bake is deliberately *not* workspace-derived: per-project
    version files were fragile (a broken resolver silently stalled every
    provisioning attempt) and every project would need bespoke resolution
-   code. `setup-*` actions download any version a job asks for at job time —
+   code. `setup-*` actions download any version a job asks for at job time so
    the same model GitHub-hosted runners use.
 4. **Base dependencies**: the apt set `install_base_dependencies` installs
    (git, curl, build-essential, python3, jq, unzip/zip, locales, …).
 5. **Docker**: daemon + CLI, so `container:` / `services:` jobs work.
 
 Because the toolchain set is fixed, the same stock golden serves every
-project. A workspace is not a package or toolchain installation input.
+project.
 
 ## Building a golden
 
@@ -82,6 +81,11 @@ preloop build-golden \
 - `--base-image`: optional Ubuntu-derived OCI image or `.smolmachine`
   artifact. It defaults to the digest-pinned Ubuntu 24.04 image compiled from
   `versions.toml`.
+- `PRELOOP_RUNNER_PACK_PROXY`: optional HTTP proxy passed to smolvm's export
+  VM when it re-pulls and flattens the registry image. `HTTPS_PROXY`,
+  `https_proxy`, `HTTP_PROXY`, and `http_proxy` are fallback sources.
+- `PRELOOP_RUNNER_PACK_NO_PROXY`: optional proxy bypass list for the export
+  VM. `NO_PROXY` and `no_proxy` are fallback sources.
 - `--workspace`: retained as workspace context for build automation. It does
   not currently change the packed artifact, install packages, or derive
   toolchains from `.nvmrc`, `rust-toolchain.toml`, or similar files.
@@ -93,9 +97,25 @@ preloop build-golden \
 - When the pool warms a golden, it also pre-pulls the `container:` /
   `services:` images declared by the current workspace's workflows.
 
+smolvm packs a registry-backed builder by starting a separate export VM and
+re-pulling the base image before flattening it. If that export VM cannot reach
+the registry directly, configure its proxy explicitly:
+
+```sh
+PRELOOP_RUNNER_PACK_PROXY='http://proxy.example:8080' \
+PRELOOP_RUNNER_PACK_NO_PROXY='localhost,127.0.0.1,.internal' \
+preloop build-golden \
+  --runner-bundle target/aarch64-unknown-linux-gnu/release \
+  --output dist/preloop-ubuntu-24.04-aarch64
+```
+
+Local Docker-save archives can provision a VM but cannot be exported by
+smolvm's `pack create --from-vm`; use a registry reference when building a
+golden.
+
 ### Adding organization-wide software
 
-`build-golden` does not accept an apt package list, Dockerfile, or
+`build-golden` does not yet accept an apt package list, Dockerfile, or
 post-provisioning script. Put organization-wide software in an Ubuntu-derived
 OCI base, then ask Preloop to provision and pack that image. Use workflow
 steps or setup actions instead when software differs by repository.
@@ -176,10 +196,71 @@ preloop serve
 Provisioning currently assumes an Ubuntu 24.04 or 22.04 userspace and uses
 `apt-get`. Use a workflow `container:` image for another distribution.
 
+### Using a snapshot of the official hosted image
+
+Preloop can also start from a community-published OCI snapshot of a
+GitHub-hosted runner image. The
+[runner-image-blobs project](https://github.com/ChristopherHX/runner-image-blobs)
+captures the root filesystem of an official hosted runner and publishes
+architecture-specific registry tags. A fork can publish the same tags under
+its own GHCR namespace:
+
+```sh
+OFFICIAL_IMAGE='ghcr.io/<owner>/runner-images:ubuntu24-runner-large-latest-arm64'
+
+preloop build-golden \
+  --runner-bundle target/aarch64-unknown-linux-gnu/release \
+  --base-image "$OFFICIAL_IMAGE" \
+  --storage-gb 80 \
+  --output dist/official-ubuntu-24.04-aarch64
+```
+
+The equivalent environment-based configuration is useful for a long-running
+server:
+
+```sh
+OFFICIAL_IMAGE='ghcr.io/<owner>/runner-images:ubuntu24-runner-large-latest-arm64'
+PRELOOP_RUNNER_BASE_IMAGE="$OFFICIAL_IMAGE" \
+PRELOOP_RUNNER_STORAGE_GB=80 \
+preloop build-golden \
+  --runner-bundle target/aarch64-unknown-linux-gnu/release \
+  --output dist/official-ubuntu-24.04-aarch64
+```
+
+Use `arm64` with an `aarch64-unknown-linux-gnu` runner bundle and an ARM64
+host. Use `amd64` with an `x86_64-unknown-linux-gnu` bundle and an x86-64
+host. The snapshot is an OCI registry reference, so Preloop pulls it directly
+when provisioning; no Dockerfile conversion is required.
+
+These snapshots are large, approximately 20 GB compressed and 60 GB
+extracted according to the publishing project. Set
+`PRELOOP_RUNNER_STORAGE_GB` to at least `80` for the full image and leave
+additional host disk headroom for the image cache, temporary layers, and the
+packed golden. The value is per guest and applies to both golden builds and
+runtime VMs.
+
+The snapshot is a copy maintained by the publishing project, not a
+GitHub-supported Preloop artifact. Pin a digest when reproducibility matters,
+and rebuild the golden when the snapshot changes. Preloop still adds its own
+runner bundle and provisioning steps, while workflow `container:` and
+`services:` images remain separate job environments.
+
+For a custom packed golden, publish it and its optional checksum, then set
+both variables:
+
+```sh
+PRELOOP_RUNNER_BASE_IMAGE="$OFFICIAL_IMAGE" \
+PRELOOP_GOLDEN_URL='https://artifacts.acme.example/official-ubuntu-24.04-aarch64' \
+preloop serve
+```
+
+If `PRELOOP_GOLDEN_URL` is not set, a custom base builds its golden locally;
+Preloop does not silently use the stock release golden for that base.
+
 ### Installing repository-specific software
 
 Keep repository-specific versions in the workflow so it stays portable to
-GitHub Actions:
+GitHub Actions. It's also the idiomatic way to run Actions.
 
 ```yaml
 jobs:

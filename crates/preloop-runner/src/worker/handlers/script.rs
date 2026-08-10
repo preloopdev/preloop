@@ -244,8 +244,9 @@ fn resolve_shell(
     script_id: &uuid::Uuid,
 ) -> Result<(std::path::PathBuf, String, Vec<String>)> {
     let shell = shell.unwrap_or_else(|| {
-        // Default: bash if available, else sh
-        if Path::new("/bin/bash").exists() || Path::new("/usr/bin/bash").exists() {
+        if cfg!(target_os = "windows") {
+            "pwsh"
+        } else if Path::new("/bin/bash").exists() || Path::new("/usr/bin/bash").exists() {
             "bash"
         } else {
             "sh"
@@ -292,6 +293,22 @@ fn resolve_shell(
                 vec![
                     "-command".to_string(),
                     format!(". '{}'", path.to_string_lossy()),
+                ],
+            ))
+        }
+        "powershell" => {
+            let path = temp_dir.join(format!("{script_id}.ps1"));
+            Ok((
+                path.clone(),
+                "powershell".to_string(),
+                vec![
+                    "-NoLogo".to_string(),
+                    "-NoProfile".to_string(),
+                    "-NonInteractive".to_string(),
+                    "-ExecutionPolicy".to_string(),
+                    "Bypass".to_string(),
+                    "-File".to_string(),
+                    path.to_string_lossy().to_string(),
                 ],
             ))
         }

@@ -16,7 +16,7 @@
 set -euo pipefail
 
 unset all_proxy ALL_PROXY http_proxy https_proxy HTTP_PROXY HTTPS_PROXY \
-      no_proxy NO_PROXY PRELOOP_RUNNER_URL PRELOOP_CONTROL_UPSTREAM 2>/dev/null || true
+      no_proxy NO_PROXY 2>/dev/null || true
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -24,7 +24,7 @@ PRELOOP_BIN="$REPO_ROOT/target/release/preloop-server"
 RUNNER_DIR="${RUNNER_DIR:-$HOME/.cache/actions-runner/current}"
 PRELOOP_PORT="${PRELOOP_PORT:-9090}"
 CLIENT_URL="${CLIENT_URL:-http://127.0.0.1:$PRELOOP_PORT}"
-REGISTRATION_TOKEN="${PRELOOP_SYSTEM_TOKEN:-preloop-system-token}"
+SYSTEM_TOKEN="${PRELOOP_SYSTEM_TOKEN:-preloop-system-token}"
 STATE_DIR="$(mktemp -d /tmp/preloop-bench-XXXXXX)"
 LOG="$STATE_DIR/preloop.log"
 PRELOOP_PID=""
@@ -65,7 +65,8 @@ lsof -i :"$PRELOOP_PORT" -sTCP:LISTEN >/dev/null 2>&1 \
 
 # ── start preloop ───────────────────────────────────────────────────────────────
 
-PRELOOP_PUBLIC_URL="$CLIENT_URL" RUST_LOG=info "$PRELOOP_BIN" serve \
+PRELOOP_PUBLIC_URL="$CLIENT_URL" PRELOOP_RUNNER_URL="$CLIENT_URL" \
+    RUST_LOG=info "$PRELOOP_BIN" serve \
     --listen "127.0.0.1:${PRELOOP_PORT}" \
     --state-dir "$STATE_DIR/state" \
     >> "$LOG" 2>&1 &
@@ -87,45 +88,56 @@ except Exception as e:
     import sys; print('ERROR: runner origin not reachable:', e, file=sys.stderr); sys.exit(1)
 " || die "runner origin unavailable: $CLIENT_URL"
 
-# ── configure runner (skip if already configured for this URL) ───────────────
+# ── configure runner ─────────────────────────────────────────────────────────
 
 cd "$RUNNER_DIR"
 RUNNER_URL="$CLIENT_URL/runner/server"
-EXISTING_URL=$(python3 -c "import json; d=json.load(open('.runner', encoding='utf-8-sig')); print(d.get('serverUrl',''))" 2>/dev/null || echo "")
-
-if [ "$EXISTING_URL" != "$RUNNER_URL" ]; then
-    resp=$(REGISTRATION_TOKEN="$REGISTRATION_TOKEN" python3 -c "
-import os, urllib.request, json
+resp=$(python3 -c "
+import urllib.request, json
 req = urllib.request.Request(
     '${CLIENT_URL}/api/v3/repos/owner/repo/actions/runners/registration-token',
     data=b'{}',
     headers={
-        'Content-Type':'application/json',
-        'Authorization':'RemoteAuth ' + os.environ['REGISTRATION_TOKEN'],
+        'Content-Type': 'application/json',
+        'Authorization': 'RemoteAuth $SYSTEM_TOKEN',
     },
     method='POST'
 )
 with urllib.request.urlopen(req, timeout=5) as r:
     print(r.read().decode())
 ") || resp=""
-    token=$(printf '%s' "$resp" | json_field token) \
-        || die "failed to get registration token: $resp"
+token=$(printf '%s' "$resp" | json_field token) \
+    || die "failed to get registration token: $resp"
 
-    # Clean up old runner config files so config.sh can run cleanly
-    rm -f .runner .credentials .credentials_rsaparams
+# The server uses a fresh state directory for each benchmark, so an existing
+# .runner file can refer to a client id the new server does not know.
+rm -f .runner .credentials .credentials_rsaparams
 
-    # Run config.sh directly and capture output in log
-    USE_DEV_ACTIONS_SERVICE_URL=1 ./config.sh --unattended \
-        --url "$RUNNER_URL" \
-        --token "$token" \
-        --name "preloop-bench" \
-        --labels "self-hosted,mitm" \
-        --work _work \
-        --replace >> "$LOG" 2>&1 \
-        || die "runner config failed"
+# The official runner also caches the Actions service location (access
+# mappings keyed by the server's instance GUID) in the SDK client cache.
+# Every preloop server shares one stable instance GUID, so a cache written
+# against an earlier server on a different port makes the next config resolve
+# service locations to that stale origin, and config.sh never reaches this
+# server. Wipe it like the other runner state. The root depends on the
+# platform's LocalApplicationData mapping.
+for cache_root in \
+    "$HOME/Library/Application Support/GitHub/ActionsService" \
+    "$HOME/.config/GitHub/ActionsService" \
+    "$HOME/.local/share/GitHub/ActionsService"; do
+    rm -rf "$cache_root"/*/Cache 2>/dev/null || true
+done
 
-    [ -f .runner ] || die "runner config failed: .runner not created"
-fi
+# Run config.sh directly and capture output in log
+USE_DEV_ACTIONS_SERVICE_URL=1 ./config.sh --unattended \
+    --url "$RUNNER_URL" \
+    --token "$token" \
+    --name "preloop-bench" \
+    --labels "self-hosted,mitm" \
+    --work _work \
+    --replace >> "$LOG" 2>&1 \
+    || die "runner config failed"
+
+[ -f .runner ] || die "runner config failed: .runner not created"
 
 # ── start runner ─────────────────────────────────────────────────────────────
 
@@ -142,7 +154,7 @@ import json
 import pathlib
 import urllib.request
 
-repo = pathlib.Path("$SCRIPT_DIR").resolve()
+repo = pathlib.Path("$REPO_ROOT").resolve()
 workflow = repo.joinpath("fixtures", "workflows", "dogfood.yml").read_text()
 payload = json.dumps({
     "workflow_yaml": workflow,
@@ -155,7 +167,10 @@ payload = json.dumps({
 req = urllib.request.Request(
     "$CLIENT_URL/api/v1/runs",
     data=payload,
-    headers={"Content-Type": "application/json"},
+    headers={
+        "Content-Type": "application/json",
+        "Authorization": "Bearer $SYSTEM_TOKEN",
+    },
     method="POST",
 )
 with urllib.request.urlopen(req, timeout=10) as r:

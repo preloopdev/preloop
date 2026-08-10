@@ -290,11 +290,18 @@ pub async fn run_node_action(
             break;
         }
     }
-    let bundled_node = runner_root
-        .join("externals")
-        .join(node_version)
-        .join("bin")
-        .join("node");
+    let bundled_node = if cfg!(target_os = "windows") {
+        runner_root
+            .join("externals")
+            .join(node_version)
+            .join("node.exe")
+    } else {
+        runner_root
+            .join("externals")
+            .join(node_version)
+            .join("bin")
+            .join("node")
+    };
     // The official runner invokes the bundled Node by absolute path and never
     // prepends its directory to PATH. Child processes inherit the job's PATH
     // unchanged — this is what lets setup-node's toolcache entry win.

@@ -730,14 +730,15 @@ async fn guest_environment_tracks_control_socket_and_debug_dir_independently() {
     const ORIGIN: &str = "PRELOOP_CONTROL_ORIGIN=https://preloop.example";
     const SOCKET: &str = "PRELOOP_CONTROL_SOCKET=/run/preloop-control/engine.sock";
     const MARKER: &str = "PRELOOP_FAILURE_MARKER=/var/lib/preloop-runner/.preloop-job-failed";
+    const PAUSE_MARKER: &str = "PRELOOP_PAUSE_MARKER=/var/lib/preloop-runner/.preloop-job-paused";
 
     // `PRELOOP_MACHINE_NAME` is unconditional and slot-dependent, so each case
     // lists only the knob-driven tail.
     let cases: [(bool, bool, Vec<&str>); 4] = [
         (false, false, vec![]),
         (true, false, vec![ORIGIN, SOCKET]),
-        (false, true, vec![MARKER]),
-        (true, true, vec![ORIGIN, SOCKET, MARKER]),
+        (false, true, vec![MARKER, PAUSE_MARKER]),
+        (true, true, vec![ORIGIN, SOCKET, MARKER, PAUSE_MARKER]),
     ];
 
     for (with_socket, with_debug_dir, expected) in cases {

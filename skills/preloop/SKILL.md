@@ -123,6 +123,8 @@ the URL GitHub and remote runners can actually reach. Hidden alias: `engine`.
 | `PRELOOP_LISTEN` / `PRELOOP_PUBLIC_URL` | override `serve --listen` / `--public-url` |
 | `PRELOOP_RUNNER_LABELS` | comma-separated extra `runs-on` labels (e.g. declare `X64` on an ARM host) |
 | `PRELOOP_RUNNER_POOL_SIZE` | override warm runner pool size (memory-bounded, cap 8) |
+| `PRELOOP_RUNNER_STORAGE_GB` | persistent guest storage per runner; use `80` or more for full hosted-image OCI snapshots |
+| `PRELOOP_RUNNER_PACK_PROXY` / `PRELOOP_RUNNER_PACK_NO_PROXY` | proxy and bypass list for smolvm's registry export VM during golden packing |
 | `PRELOOP_RUNNER_BASE_IMAGE` / `PRELOOP_RUNNER_BUNDLE` / `PRELOOP_RUNNER_DNS` / `PRELOOP_RUNNER_OVERLAY_GB` / `PRELOOP_RUNNER_NAME_PREFIX` / `PRELOOP_RUNNER_POOL_ENABLED` / `PRELOOP_USE_FORK` / `PRELOOP_USE_PACKED_GOLDEN` / `PRELOOP_WORKSPACE` | runner pool / VM tuning knobs (full semantics in `crates/preloop-cli/src/main.rs`) |
 
 Runner execution defaults: packed goldens enabled, warm pool disabled, one

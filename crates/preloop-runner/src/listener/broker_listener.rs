@@ -957,7 +957,13 @@ async fn acquire_job_from_ref(
             crate::client::run_service::RunServiceClient::new(http.clone(), rs_url.to_string());
         let acquire_body = serde_json::json!({
             "jobMessageId": runner_request_id,
-            "runnerOS": if cfg!(target_os = "macos") { "macOS" } else { "Linux" },
+            "runnerOS": if cfg!(target_os = "macos") {
+                "macOS"
+            } else if cfg!(target_os = "windows") {
+                "Windows"
+            } else {
+                "Linux"
+            },
             "billingOwnerId": job_ref.get("billing_owner_id")
                 .or_else(|| job_ref.get("billingOwnerId")),
         });

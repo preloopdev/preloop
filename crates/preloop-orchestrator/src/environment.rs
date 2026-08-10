@@ -273,6 +273,21 @@ pub fn base_name(image_ref: &str) -> &str {
     image_ref.split('@').next().unwrap_or(image_ref)
 }
 
+/// Whether an image reference is one of Preloop's stock Ubuntu bases.
+///
+/// Stock bases can still switch between the digest-pinned 22.04 and 24.04
+/// images when a queued job's `runs-on` labels require it. A custom OCI image
+/// or packed artifact is deliberately used for every job instead.
+pub fn is_stock_base_image(image_ref: &str) -> bool {
+    matches!(
+        base_name(image_ref),
+        "ubuntu:24.04"
+            | "ubuntu:22.04"
+            | "mirror.gcr.io/library/ubuntu:24.04"
+            | "mirror.gcr.io/library/ubuntu:22.04"
+    )
+}
+
 /// Resolved base image and toolchains for one job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentSpec {
@@ -403,6 +418,24 @@ mod tests {
         assert_eq!(base_name("ubuntu:24.04@sha256:abc"), "ubuntu:24.04");
         assert_eq!(base_name("ubuntu:24.04"), "ubuntu:24.04");
         assert_eq!(base_name(""), "");
+    }
+
+    #[test]
+    fn stock_base_detection_ignores_digest_but_rejects_custom_images() {
+        for image in [
+            "ubuntu:24.04",
+            "ubuntu:24.04@sha256:abc",
+            "mirror.gcr.io/library/ubuntu:22.04@sha256:def",
+        ] {
+            assert!(is_stock_base_image(image), "{image}");
+        }
+        for image in [
+            "ghcr.io/acme/runner-image:ubuntu24",
+            "ghcr.io/christopherhx/runner-images:ubuntu24-runner-large-latest-arm64",
+            "/tmp/custom.smolmachine",
+        ] {
+            assert!(!is_stock_base_image(image), "{image}");
+        }
     }
 
     #[test]

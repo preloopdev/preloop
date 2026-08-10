@@ -2,59 +2,58 @@
 
 `preloop serve` is the whole server: the control plane (runner protocol, native
 API, GitHub Checks reporting) plus the microVM runner pool that executes jobs.
-One binary, one process.
+Unfortunately currently, the data plane and control plane are pretty tightly coupled, but a refactor is top of mind so should hopefully make it easier to deploy both of them. Bare with me for now. 
 
 This guide covers what has to be reachable, how to install it as a service,
-every runtime knob, four ways to expose it — including one with no third party
-involved — and how to operate it.
+every runtime knob, four ways to expose it and how to operate it.
 
 ---
 
 ## 1. What actually needs to be reachable
 
-This decision drives everything else, and the answer is narrower than it looks:
 
-| Traffic | Direction | Needs a public address? |
-|---|---|---|
-| Job execution (pool VMs ↔ control plane) | in-host, over the mounted control socket and an in-guest loopback bridge | **No** |
-| Native API (`/api/v1/*`, the `preloop` CLI) | inbound, authenticated | No — loopback or a private network is enough |
-| Reporting check runs, minting tokens, pushing | **outbound** to GitHub | No |
-| GitHub webhook delivery | **inbound** from GitHub | **Yes** — the only thing that forces it |
-| `details_url` links on check runs | inbound, from a browser | Only for whoever clicks them |
+| Traffic                                       | Direction                                                                | Needs a public address?                       |
+| --------------------------------------------- | ------------------------------------------------------------------------ | --------------------------------------------- |
+| Job execution (pool VMs ↔ control plane)      | in-host, over the mounted control socket and an in-guest loopback bridge | **No**                                        |
+| Native API (`/api/v1/*`, the `preloop` CLI)   | inbound, authenticated                                                   | No, a loopback or a private network is enough |
+| Reporting check runs, minting tokens, pushing | **outbound** to GitHub                                                   | No                                            |
+| GitHub webhook delivery                       | **inbound** from GitHub                                                  | **Yes**, athe only thing that forces it       |
+| `details_url` links on check runs             | inbound, from a browser                                                  | Only for whoever clicks them                  |
+
 
 Jobs never traverse your public endpoint. `PRELOOP_RUNNER_URL` is pinned to the
 loopback listen address at startup, and in-VM runners reach the control plane
 through the mounted control socket plus a loopback bridge inside the guest. So
 if you can live without webhook-triggered runs, you can run with **no inbound
-access at all** — see option A.
+access at all**  
 
 ---
 
 ## 2. Requirements
 
 - **Host**: Linux with KVM (x86_64 or arm64). macOS on Apple Silicon works for
-  local development.
+local development. I havent tested using Windows as a server. 
 - **Memory**: `PRELOOP_RUNNER_POOL_SIZE × PRELOOP_RUNNER_MEMORY_MIB`, plus a few
-  GB for the control plane. Ceilings are ballooned, so idle runners hold far
-  less than their ceiling — but concurrent heavy builds really do use it.
+GB for the control plane. Ceilings are ballooned, so idle runners hold far
+less than their ceiling.
 - **CPU**: each runner VM gets 4 vCPUs. `pool_size × 4` well above your core
-  count means jobs contend and wall-clock-sensitive tests turn flaky.
-- **Disk**: golden images (roughly 0.7–6 GB each, and superseded ones
-  accumulate) plus the cache directory, which grows with every distinct key.
+count means jobs contend and wall-clock-sensitive tests turn flaky. Also configurable.
+- **Disk**: golden images (roughly 1 GB each, and superseded ones
+accumulate) plus the cache directory, which grows with every distinct key.
 - **GitHub App**: app id, private key PEM, installation id, and a webhook secret
-  if you use webhooks. A GitHub App — not a PAT — is required to report check
-  runs; GitHub rejects PAT-authored check runs.
+if you use webhooks. A GitHub App — not a PAT — is required to report check
+runs. GitHub rejects PAT-authored check runs.
 
 ---
 
-## 3. Install
+## 3. Install if you ahvent already
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/preloopdev/preloop/main/install.sh | sh
 preloop setup github --via app --public-url https://ci.example.com
 ```
 
-Then install it as a supervised service — systemd on Linux, launchd on macOS:
+Then install it as a supervised service. Currently, it supports systemd on Linux, launchd on macOS. Please open a PR for alternative supervisors, and deployment options(k8s controllers etc)
 
 ```sh
 sudo preloop server install \
@@ -68,13 +67,15 @@ sudo preloop server install \
 
 Useful flags:
 
-| Flag | Effect |
-|---|---|
-| `--dry-run` | Print every file and command without touching the system |
-| `--user` | Per-user service (systemd user unit / LaunchAgent), no root, state in `~/.preloop`. On Linux pair with `sudo loginctl enable-linger $USER` so it survives logout |
-| `--systemd-credential PATH` | Mount an encrypted secrets file via `LoadCredentialEncrypted`; create it with `systemd-creds encrypt --name=preloop-secrets secrets.toml PATH` |
-| `--no-update-timer` | Skip the systemd self-update timer |
-| `--listen ADDR` | Bind address; on Linux the port is published through socket activation |
+
+| Flag                        | Effect                                                                                                                                                           |
+| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--dry-run`                 | Print every file and command without touching the system                                                                                                         |
+| `--user`                    | Per-user service (systemd user unit / LaunchAgent), no root, state in `~/.preloop`. On Linux pair with `sudo loginctl enable-linger $USER` so it survives logout |
+| `--systemd-credential PATH` | Mount an encrypted secrets file via `LoadCredentialEncrypted`; create it with `systemd-creds encrypt --name=preloop-secrets secrets.toml PATH`                   |
+| `--no-update-timer`         | Skip the systemd self-update timer                                                                                                                               |
+| `--listen ADDR`             | Bind address; on Linux the port is published through socket activation                                                                                           |
+
 
 `preloop server uninstall` removes the units and config, keeping `PRELOOP_HOME`
 unless you pass `--purge-data`.
@@ -93,61 +94,75 @@ All configuration is environment variables; CLI flags override them.
 
 ### Core
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `PRELOOP_LISTEN` | `127.0.0.1:9090` | Bind address. Loopback by default — expose with `--listen 0.0.0.0:9090` behind a proxy or tunnel (see §6). |
-| `PRELOOP_PUBLIC_URL` | `http://127.0.0.1:<port>` | Externally reachable base URL. Used for `details_url` on check runs |
-| `PRELOOP_HOME` | `$HOME/.preloop` | State directory (database, blobs, cache, credentials) |
-| `PRELOOP_STORE_URL` | SQLite in the state dir | `sqlite://<path>`, a bare path, or `postgres://…?sslmode=require\|verify-full` |
-| `PRELOOP_UNIX_SOCKET` | — | Control socket path; mounted into runner VMs, serves the runner surface only |
-| `PRELOOP_SYSTEM_TOKEN` | generated | Admin credential for `/api/v1/*`. Treat it as root for the control plane |
-| `PRELOOP_TOKEN_TTL_SECS` | `2999` | Issued runner token lifetime |
-| `PRELOOP_CONFIG` | `$PRELOOP_HOME/config.toml` | Config file path |
-| `PRELOOP_SECRETS_STORE` | config file | Secrets backend selector |
-| `PRELOOP_RUNNER_URL` | loopback listen address | Origin handed to runners. Set automatically; override only for remote runners |
-| `PRELOOP_CONTROL_UPSTREAM` | — | LAN address remote runners use when loopback is not reachable |
+
+| Variable                   | Default                     | Meaning                                                                                                    |
+| -------------------------- | --------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `PRELOOP_LISTEN`           | `127.0.0.1:9090`            | Bind address. Loopback by default — expose with `--listen 0.0.0.0:9090` behind a proxy or tunnel (see §6). |
+| `PRELOOP_PUBLIC_URL`       | `http://127.0.0.1:<port>`   | Externally reachable base URL. Used for `details_url` on check runs                                        |
+| `PRELOOP_HOME`             | `$HOME/.preloop`            | State directory (database, blobs, cache, credentials)                                                      |
+| `PRELOOP_STORE_URL`        | SQLite in the state dir     | `sqlite://<path>`, a bare path, or `postgres://…?sslmode=require|verify-full`                              |
+| `PRELOOP_UNIX_SOCKET`      | —                           | Control socket path; mounted into runner VMs, serves the runner surface only                               |
+| `PRELOOP_SYSTEM_TOKEN`     | generated                   | Admin credential for `/api/v1/*`. Treat it as root for the control plane                                   |
+| `PRELOOP_TOKEN_TTL_SECS`   | `2999`                      | Issued runner token lifetime                                                                               |
+| `PRELOOP_CONFIG`           | `$PRELOOP_HOME/config.toml` | Config file path                                                                                           |
+| `PRELOOP_SECRETS_STORE`    | config file                 | Secrets backend selector                                                                                   |
+| `PRELOOP_RUNNER_URL`       | loopback listen address     | Origin handed to runners. Set automatically; override only for remote runners                              |
+| `PRELOOP_CONTROL_UPSTREAM` | —                           | LAN address remote runners use when loopback is not reachable                                              |
+
 
 Client-side (`preloop` CLI): `PRELOOP_URL` (default `http://127.0.0.1:9090`) and
 `PRELOOP_TOKEN`.
 
 ### GitHub
 
-| Variable | Meaning |
-|---|---|
-| `PRELOOP_GITHUB_APP_ID` | App id |
-| `PRELOOP_GITHUB_APP_PEM` / `_PEM_FILE` / `_PRIVATE_KEY` / `_PRIVATE_KEY_PATH` | Private key, inline or by path |
-| `PRELOOP_GITHUB_APP_INSTALLATION_ID` | Installation id; skips discovery |
-| `PRELOOP_WEBHOOK_SECRET` | Verifies `X-Hub-Signature-256` |
-| `PRELOOP_GITHUB_TOKEN` | PAT fallback; also fetches **private remote reusable workflows** |
-| `PRELOOP_GITHUB_APP_MINT_FAILURE` | Policy when installation-token minting fails |
-| `PRELOOP_GITHUB_SERVER_URL` / `_API_URL` / `_GRAPHQL_URL` | Point at GitHub Enterprise Server |
-| `PRELOOP_GITHUB_REPOSITORY` | Repository the scheduler scans for `schedule:` workflows at startup |
+
+| Variable                                                                      | Meaning                                                             |
+| ----------------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| `PRELOOP_GITHUB_APP_ID`                                                       | App id                                                              |
+| `PRELOOP_GITHUB_APP_PEM` / `_PEM_FILE` / `_PRIVATE_KEY` / `_PRIVATE_KEY_PATH` | Private key, inline or by path                                      |
+| `PRELOOP_GITHUB_APP_INSTALLATION_ID`                                          | Installation id; skips discovery                                    |
+| `PRELOOP_WEBHOOK_SECRET`                                                      | Verifies `X-Hub-Signature-256`                                      |
+| `PRELOOP_GITHUB_TOKEN`                                                        | PAT fallback; also fetches **private remote reusable workflows**    |
+| `PRELOOP_GITHUB_APP_MINT_FAILURE`                                             | Policy when installation-token minting fails                        |
+| `PRELOOP_GITHUB_SERVER_URL` / `_API_URL` / `_GRAPHQL_URL`                     | Point at GitHub Enterprise Server                                   |
+| `PRELOOP_GITHUB_REPOSITORY`                                                   | Repository the scheduler scans for `schedule:` workflows at startup |
+
 
 ### Runner pool
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `PRELOOP_RUNNER_POOL_ENABLED` | off | Master switch for the microVM pool |
-| `PRELOOP_RUNNER_POOL_SIZE` | derived from host CPU/RAM | Warm machines; `0` forks on demand |
-| `PRELOOP_RUNNER_MEMORY_MIB` | `4096` | Memory ceiling per VM. Raise it for LTO release builds — rustc is `SIGKILL`ed at 4 GiB on large workspaces |
-| `PRELOOP_RUNNER_OVERLAY_GB` | — | Per-VM writable overlay size |
-| `PRELOOP_RUNNER_USER` / `PRELOOP_RUNNER_UID` | `runner` / `1001` | Guest account steps run as, for GitHub-hosted parity. `root` restores root; empty disables switching |
-| `PRELOOP_USE_FORK` | — | Fork machines from a prepared golden instead of building each |
-| `PRELOOP_USE_PACKED_GOLDEN` | `true` | Use a release or locally cached packed golden for on-demand and pooled runners |
-| `PRELOOP_GOLDEN_URL` | release asset | Packed golden URL; the optional checksum is fetched from the same URL plus `.sha256` |
-| `PRELOOP_RUNNER_BUNDLE` | — | Directory of runner binaries mounted into guests |
-| `PRELOOP_RUNNER_EXTERNALS` | temp dir | Host-side Node externals directory |
-| `PRELOOP_RUNNER_BASE_IMAGE` | digest-pinned Ubuntu 24.04 | OCI base identity for `runs-on` resolution; set it with `PRELOOP_GOLDEN_URL` for a custom packed golden |
-| `PRELOOP_RUNNER_LABELS` | — | Extra labels on every pool runner. **Jobs only dispatch to runners whose labels match `runs-on`** |
-| `PRELOOP_RUNNER_NAME_PREFIX` | `preloop-runner` | Machine naming prefix |
-| `PRELOOP_RUNNER_DNS` | host resolver | Force a resolver inside guests (e.g. `8.8.8.8`) when the host's is unreachable from the VM network |
-| `PRELOOP_WORKSPACE` | — | Workspace context for daemon deployments; not a package or toolchain installation input |
-| `PRELOOP_REQUIRE_JOB_ASSIGNMENTS` | — | Only let a runner claim jobs explicitly assigned to it |
+
+| Variable                                     | Default                    | Meaning                                                                                                    |
+| -------------------------------------------- | -------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `PRELOOP_RUNNER_POOL_ENABLED`                | off                        | Master switch for the microVM pool                                                                         |
+| `PRELOOP_RUNNER_POOL_SIZE`                   | derived from host CPU/RAM  | Warm machines; `0` forks on demand                                                                         |
+| `PRELOOP_RUNNER_MEMORY_MIB`                  | `4096`                     | Memory ceiling per VM. Raise it for LTO release builds — rustc is `SIGKILL`ed at 4 GiB on large workspaces |
+| `PRELOOP_RUNNER_OVERLAY_GB`                  | —                          | Per-VM writable overlay size                                                                               |
+| `PRELOOP_RUNNER_USER` / `PRELOOP_RUNNER_UID` | `runner` / `1001`          | Guest account steps run as, for GitHub-hosted parity. `root` restores root; empty disables switching       |
+| `PRELOOP_USE_FORK`                           | —                          | Fork machines from a prepared golden instead of building each                                              |
+| `PRELOOP_USE_PACKED_GOLDEN`                  | `true`                     | Use a release or locally cached packed golden for on-demand and pooled runners                             |
+| `PRELOOP_GOLDEN_URL`                         | release asset              | Packed golden URL; the optional checksum is fetched from the same URL plus `.sha256`                       |
+| `PRELOOP_RUNNER_BUNDLE`                      | —                          | Directory of runner binaries mounted into guests                                                           |
+| `PRELOOP_RUNNER_EXTERNALS`                   | temp dir                   | Host-side Node externals directory                                                                         |
+| `PRELOOP_RUNNER_BASE_IMAGE`                  | digest-pinned Ubuntu 24.04 | OCI base identity for `runs-on` resolution; set it with `PRELOOP_GOLDEN_URL` for a custom packed golden    |
+| `PRELOOP_RUNNER_STORAGE_GB`                  | `20`                       | Persistent storage per runner VM and golden build; use `80` or more for full hosted-image snapshots       |
+| `PRELOOP_RUNNER_PACK_PROXY`                  | standard proxy environment | HTTP proxy used by smolvm's separate registry export VM during golden packing                             |
+| `PRELOOP_RUNNER_PACK_NO_PROXY`               | standard proxy environment | Proxy bypass list used during golden packing                                                               |
+| `PRELOOP_RUNNER_LABELS`                      | —                          | Extra labels on every pool runner. **Jobs only dispatch to runners whose labels match `runs-on`**          |
+| `PRELOOP_RUNNER_NAME_PREFIX`                 | `preloop-runner`           | Machine naming prefix                                                                                      |
+| `PRELOOP_RUNNER_DNS`                         | host resolver              | Force a resolver inside guests (e.g. `8.8.8.8`) when the host's is unreachable from the VM network         |
+| `PRELOOP_WORKSPACE`                          | —                          | Workspace context for daemon deployments; not a package or toolchain installation input                    |
+| `PRELOOP_REQUIRE_JOB_ASSIGNMENTS`            | —                          | Only let a runner claim jobs explicitly assigned to it                                                     |
+
 
 To add organization-wide software, derive an OCI image from one of Preloop's
 digest-pinned Ubuntu bases and build a custom packed golden. For the complete
 build, checksum, publishing, and runtime configuration flow, see
 [VM images and version tracking](vm-images.md#adding-organization-wide-software).
+For a larger snapshot of the official hosted image, set
+`PRELOOP_RUNNER_BASE_IMAGE` to the registry reference from a trusted
+`runner-image-blobs` fork and raise `PRELOOP_RUNNER_STORAGE_GB` to at least
+`80`. If no `PRELOOP_GOLDEN_URL` is configured, Preloop builds that custom
+base locally instead of adopting the stock release golden.
 Keep repository-specific software in workflow setup actions, install steps,
 or a job `container:`.
 
@@ -192,7 +207,7 @@ Webhook URL: `https://<host>.<tailnet>.ts.net/api/v1/github/webhooks`
 
 ### C. Cloudflare Tunnel
 
-An outbound connector — no inbound firewall rule and no public IP. Traffic
+An outbound connector so no inbound firewall rule and no public IP. Traffic  
 transits Cloudflare.
 
 ```yaml
@@ -200,7 +215,7 @@ transits Cloudflare.
 tunnel: <tunnel-id>
 credentials-file: /etc/cloudflared/<tunnel-id>.json
 ingress:
-  # Publish ONLY the webhook path — see §6.
+  # Publish ONLY the webhook path see §6.
   - hostname: ci.example.com
     path: ^/api/v1/github/webhooks$
     service: http://127.0.0.1:9090
@@ -258,9 +273,9 @@ path exposes job logs.
 
 ## 6. Security: what must not be public
 
-**`PRELOOP_LISTEN` defaults to `127.0.0.1:9090`**, so a bare `preloop serve` is
+`**PRELOOP_LISTEN` defaults to `127.0.0.1:9090`**, so a bare `preloop serve` is
 only reachable from the host. To expose the control plane (tunnels reach it via
-`127.0.0.1` anyway), bind a private address or `0.0.0.0` — and put a proxy in
+`127.0.0.1` anyway), bind a private address or `0.0.0.0`  and put a proxy in  
 front. Publishing `0.0.0.0` on a host with a public IP exposes the API to the
 internet with no authentication on the queue path.
 
@@ -275,8 +290,8 @@ endpoint can:
 
 1. obtain a runner-management credential,
 2. register a runner with labels matching your jobs,
-3. receive a job message — which carries a freshly minted GitHub App
-   installation token and any secrets scoped to that job, and
+3. receive a job message which carries a freshly minted GitHub App  
+ installation token and any secrets scoped to that job, and
 4. report fabricated job conclusions.
 
 Requests arriving on the mounted control socket are held to a stricter rule (the
@@ -288,12 +303,12 @@ Also worth knowing:
 
 - `/api/v1/*` requires `PRELOOP_SYSTEM_TOKEN` and returns `401` without it.
 - The control socket is path-restricted to the runner surface: guests cannot
-  reach native management endpoints through it.
+reach native management endpoints through it.
 - Job messages carry live credentials by design. Anything that can claim a job
-  can read them.
+can read them.
 - Workflow code is untrusted: every dependency's `build.rs` and proc macro
-  executes inside the VM. Don't run fork pull requests on a pool that shares a
-  host with your App private key.
+executes inside the VM. Don't run fork pull requests on a pool that shares a
+host with your App private key.
 
 ---
 
@@ -303,13 +318,15 @@ Also worth knowing:
 
 `$PRELOOP_HOME` holds everything durable:
 
-| Path | Contents |
-|---|---|
-| `state/*.db`, `-wal`, `-shm` | Runs, jobs, requests, sessions, check-run ids |
-| `state/github-app.json` | GitHub App private key and installation details |
-| `state/blobs/`, `state/replay/` | Step logs and job artifacts |
-| `state/cache/` | Actions cache entries |
-| `vms/` | Golden images and per-machine state |
+
+| Path                            | Contents                                        |
+| ------------------------------- | ----------------------------------------------- |
+| `state/*.db`, `-wal`, `-shm`    | Runs, jobs, requests, sessions, check-run ids   |
+| `state/github-app.json`         | GitHub App private key and installation details |
+| `state/blobs/`, `state/replay/` | Step logs and job artifacts                     |
+| `state/cache/`                  | Actions cache entries                           |
+| `vms/`                          | Golden images and per-machine state             |
+
 
 Back up at least the database and `github-app.json`. Losing the database strands
 any check run GitHub is still waiting on; losing the key means re-keying the App.
@@ -318,28 +335,29 @@ any check run GitHub is still waiting on; losing the key means re-keying the App
 
 A restart settles in-flight work rather than stranding it. Pool machines are
 destroyed with the control plane, so their claims can never be completed;
-startup fails them explicitly (`failed job claims orphaned by a control-plane
-restart count=N`) so the run and its check run reach a terminal state. Those
+startup fails them explicitly (`failed job claims orphaned by a control-plane restart count=N`) so the run and its check run reach a terminal state. Those
 jobs are lost, not resumed — restart during a quiet period and re-run after.
 
 ### Capacity
 
 - Memory: `pool_size × PRELOOP_RUNNER_MEMORY_MIB` should fit with headroom.
-  4 × 6 GiB on a 22 GiB host is already oversubscribed and relies on ballooning.
+4 × 6 GiB on a 22 GiB host is already oversubscribed and relies on ballooning.
 - CPU: `pool_size × 4` vCPUs against your core count. Past roughly 2× the box
-  thrashes and timing-sensitive tests flake.
+thrashes and timing-sensitive tests flake.
 - Disk: prune superseded golden directories and cap the cache directory.
 
 ### Troubleshooting
 
-| Symptom | Check |
-|---|---|
-| Checks stay `queued`, pool idle | Are machines running? Do runner labels match `runs-on`? A runner with no labels is never assigned work |
-| `could not compile … (signal: 9, SIGKILL)` | Out of memory — raise `PRELOOP_RUNNER_MEMORY_MIB` |
-| Jobs never resume after a restart | Expected; see *Restarts* |
-| Guest cannot resolve DNS | Set `PRELOOP_RUNNER_DNS` |
-| Webhook delivered but nothing runs | Confirm `PRELOOP_WEBHOOK_SECRET` matches the App, and that the workflow's `on:` matches the event |
-| `401` from the CLI | `PRELOOP_TOKEN` must match the server's `PRELOOP_SYSTEM_TOKEN` |
+
+| Symptom                                    | Check                                                                                                  |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------ |
+| Checks stay `queued`, pool idle            | Are machines running? Do runner labels match `runs-on`? A runner with no labels is never assigned work |
+| `could not compile … (signal: 9, SIGKILL)` | Out of memory, maybe raise `PRELOOP_RUNNER_MEMORY_MIB`                                                 |
+| Jobs never resume after a restart          | Expected; see *Restarts*                                                                               |
+| Guest cannot resolve DNS                   | Set `PRELOOP_RUNNER_DNS`                                                                               |
+| Webhook delivered but nothing runs         | Confirm `PRELOOP_WEBHOOK_SECRET` matches the App, and that the workflow's `on:` matches the event      |
+| `401` from the CLI                         | `PRELOOP_TOKEN` must match the server's `PRELOOP_SYSTEM_TOKEN`                                         |
+
 
 ---
 
@@ -350,3 +368,4 @@ jobs are lost, not resumed — restart during a quiet period and re-run after.
 - [`cli_reference.md`](cli_reference.md) — every command, flag, and variable
 - [`push.md`](push.md) — CI before push, with no inbound access
 - [`vm-images.md`](vm-images.md) — golden image contents and how they are baked
+

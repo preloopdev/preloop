@@ -766,7 +766,7 @@ pub(crate) async fn submit_run_inner(
         pre_job_continue_on_error.insert(job.id.to_string(), job.continue_on_error);
         pre_statuses.insert(job.id.clone(), ExecutionStatus::Queued);
         pre_job_names.insert(job.id.clone(), job.name.clone());
-        if job.reusable_call.is_some() {
+        if job.reusable_call.is_some() || job.deferred_matrix.is_some() {
             pre_caller_plans.insert(job.id.clone(), job.clone());
         }
 
@@ -865,9 +865,6 @@ pub(crate) async fn submit_run_inner(
         let job_continue_on_error = pre_job_continue_on_error;
         let mut ready_by_base: BTreeMap<String, u64> = BTreeMap::new();
         let initially_skipped = pre_initially_skipped;
-        // Jobs concluded at submit because no runner can host their platform,
-        // paired with the explanation emitted to watchers below.
-        let mut unhostable_reasons: Vec<(JobId, String)> = Vec::new();
         let mut built_jobs: Vec<QueuedJob> = Vec::new();
         if empty_workflow_concurrency_group {
             let queued_jobs = 0;
@@ -1207,39 +1204,6 @@ pub(crate) async fn submit_run_inner(
                 continue;
             }
 
-            // No runner host for this platform: conclude the job rather than
-            // queue one nothing can ever claim. Checked here, before the job
-            // reaches either the ready queue or `pending_jobs`, so a
-            // needs-gated job on an unhostable platform concludes too and its
-            // dependents see a terminal status.
-            //
-            // The conclusion is `Failure`, never `Skipped`. A skipped job folds
-            // into `summarize_run` as success, so a workflow whose macOS leg
-            // could not run anywhere would report green while its steps never
-            // executed — the worst outcome available, and worse than the
-            // indefinite queue GitHub would leave behind. Failing is loud,
-            // and the annotation below puts the reason where the user reads it
-            // rather than only in the server log.
-            let platforms = runtime_scheduling::registered_runner_platforms(&inner);
-            if let Some(platform) =
-                runtime_scheduling::unhostable_platform(&queued_job.runs_on, platforms)
-            {
-                let reason = format!(
-                    "no {platform} runner is registered with this server, so `runs-on: {}` \
-                     cannot be scheduled",
-                    queued_job.runs_on.join(", ")
-                );
-                tracing::warn!(
-                    job = %job_id.0,
-                    labels = ?queued_job.runs_on,
-                    platform,
-                    "no {platform} runner is registered; failing the job"
-                );
-                unhostable_reasons.push((job_id.clone(), reason));
-                statuses.insert(job_id, ExecutionStatus::Failure);
-                continue;
-            }
-
             let needs_empty = queued_job.needs.is_empty();
             let max_parallel = queued_job.max_parallel;
             let under_mp = max_parallel
@@ -1366,19 +1330,6 @@ pub(crate) async fn submit_run_inner(
                     job_id,
                     status: ExecutionStatus::Skipped,
                     reason: None,
-                })
-                .await;
-        }
-        // Surface why a job could never be scheduled. Without this the only
-        // record is a server-side log line the workflow author never sees.
-        for (job_id, reason) in unhostable_reasons {
-            shared
-                .state
-                .emit(NdjsonEvent::JobStatus {
-                    run_id,
-                    job_id,
-                    status: ExecutionStatus::Failure,
-                    reason: Some(reason),
                 })
                 .await;
         }
@@ -2139,10 +2090,11 @@ pub(crate) async fn cancel_run(
         .await;
     Ok(Json(record))
 }
-pub(crate) async fn rerun_run(
-    State(shared): State<Arc<SharedState>>,
-    Path(run_id): Path<RunId>,
-) -> Result<Json<RunAccepted>, ApiError> {
+pub(crate) async fn rerun_run_inner(
+    shared: &Arc<SharedState>,
+    run_id: RunId,
+    reused_check_runs: BTreeMap<JobId, u64>,
+) -> Result<RunAccepted, ApiError> {
     let submission = {
         let inner = shared.state.inner.lock().await;
         inner
@@ -2151,7 +2103,29 @@ pub(crate) async fn rerun_run(
             .map(|run| (*run.submission).clone())
             .ok_or_else(|| ApiError::not_found("run not found"))?
     };
-    submit_run_inner(&shared, submission).await.map(Json)
+    let accepted = submit_run_inner(shared, submission).await?;
+
+    if !reused_check_runs.is_empty() {
+        let mut inner = shared.state.inner.lock().await;
+        if let Some(run) = inner.runs.get_mut(&accepted.run_id) {
+            for (job_id, check_run_id) in &reused_check_runs {
+                if run.jobs.contains_key(job_id) {
+                    run.job_check_run_ids.insert(job_id.clone(), *check_run_id);
+                }
+            }
+        }
+    }
+    crate::github::report_check_runs_for_run(shared, accepted.run_id, &reused_check_runs).await;
+    Ok(accepted)
+}
+
+pub(crate) async fn rerun_run(
+    State(shared): State<Arc<SharedState>>,
+    Path(run_id): Path<RunId>,
+) -> Result<Json<RunAccepted>, ApiError> {
+    rerun_run_inner(&shared, run_id, BTreeMap::new())
+        .await
+        .map(Json)
 }
 
 /// Upper bound on how long an event stream waits for the next event.

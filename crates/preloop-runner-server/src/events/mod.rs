@@ -4,6 +4,8 @@
 //! tuple from a raw webhook payload, mirroring the dispatch table in
 //! runner.server's MessageController.cs::ExecuteWebhook (lines 6250-6325).
 
+pub mod check_run;
+pub mod check_suite;
 pub mod pull_request;
 pub mod pull_request_review;
 pub mod pull_request_target;
@@ -83,6 +85,8 @@ pub fn adapter_for(event_name: &str) -> Option<&'static dyn EventAdapter> {
         "pull_request_review" => Some(&pull_request_review::Adapter),
         "workflow_dispatch" => Some(&workflow_dispatch::Adapter),
         "workflow_run" => Some(&workflow_run::Adapter),
+        "check_run" => Some(&check_run::Adapter),
+        "check_suite" => Some(&check_suite::Adapter),
         "repository_dispatch" => Some(&repository_dispatch::Adapter),
         "create" => Some(&create::Adapter),
         "delete" => Some(&delete::Adapter),
@@ -115,6 +119,8 @@ pub fn all_event_names() -> &'static [&'static str] {
         "pull_request_review",
         "workflow_dispatch",
         "workflow_run",
+        "check_run",
+        "check_suite",
         "repository_dispatch",
         "create",
         "delete",
