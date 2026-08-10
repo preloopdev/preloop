@@ -2111,20 +2111,34 @@ async fn watch_guest_pause<P: VmProvider + 'static>(
         GUEST_PAUSE_MARKER.to_owned(),
     ];
     let mut was_paused = false;
+    let mut last_probe_warn: Option<tokio::time::Instant> = None;
     loop {
         tokio::time::sleep(poll_interval).await;
-        // A failed probe (smolvm transport error, wedged VM) says nothing
-        // about the pause state: treating it as "resumed" would re-pin the
-        // permit mid-pause and revive the starvation this watcher exists to
-        // remove. Preserve the last known state; the next poll decides.
+        // `smolvm machine exec` propagates the guest exit code as its own
+        // exit code, so the normal absent-marker probe surfaces as
+        // `VmError::Command` with exit 1 — a real result, not a transport
+        // failure; `test -f` only ever exits 0 or 1. Any other error says
+        // nothing about the pause state: treating it as "resumed" would
+        // re-pin the permit mid-pause and revive the starvation this
+        // watcher exists to remove, so preserve the last known state.
         let paused = match provider.exec(&name, &probe).await {
             Ok(output) => output.exit_code == 0,
+            Err(VmError::Command {
+                exit_code: code @ (0 | 1),
+                ..
+            }) => code == 0,
             Err(error) => {
-                warn!(
-                    machine = name.as_str(),
-                    %error,
-                    "pause marker probe failed — keeping previous state"
-                );
+                let now = tokio::time::Instant::now();
+                if last_probe_warn
+                    .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(60))
+                {
+                    warn!(
+                        machine = name.as_str(),
+                        %error,
+                        "pause marker probe failed — keeping previous state"
+                    );
+                    last_probe_warn = Some(now);
+                }
                 was_paused
             }
         };
@@ -3267,6 +3281,9 @@ mod lifecycle_tests {
         /// Guest pause marker state: when set, the exec probe for the debug
         /// pause marker succeeds, so `watch_guest_pause` sees a paused job.
         pause_marker: std::sync::atomic::AtomicBool,
+        /// When set, the pause-marker probe fails like a wedged VM
+        /// (transport error), which the watcher must not read as "resumed".
+        probe_transport_error: std::sync::atomic::AtomicBool,
     }
 
     impl TestProvider {
@@ -3289,6 +3306,7 @@ mod lifecycle_tests {
                 announce_busy: false,
                 absent_binary: Mutex::new(None),
                 pause_marker: std::sync::atomic::AtomicBool::new(false),
+                probe_transport_error: std::sync::atomic::AtomicBool::new(false),
             }
         }
 
@@ -3378,6 +3396,50 @@ mod lifecycle_tests {
             permit.lock().unwrap().is_some(),
             "resuming the job must re-acquire its pool permit"
         );
+
+        watch.abort();
+        let _ = watch.await;
+    }
+
+    /// A transport failure while probing must not read as "resumed": the
+    /// permit stays released for the (still paused) job, and the pool does
+    /// not re-pin it on a transient smolvm error.
+    #[tokio::test]
+    async fn probe_transport_errors_preserve_pause_state() {
+        use std::sync::atomic::Ordering;
+
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::new(std::sync::Mutex::new(Some(
+            semaphore.clone().acquire_owned().await.unwrap(),
+        )));
+        let name = MachineName::new("preloop-runner-pause-probe".to_owned()).unwrap();
+
+        let watch = tokio::spawn(watch_guest_pause(
+            provider.clone(),
+            name,
+            permit.clone(),
+            semaphore.clone(),
+            Duration::from_millis(10),
+        ));
+
+        // Pause, release the permit, then make the probe fail like a wedged VM.
+        provider.pause_marker.store(true, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(permit.lock().unwrap().is_none());
+        provider.probe_transport_error.store(true, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            permit.lock().unwrap().is_none(),
+            "a transport error must not re-pin the permit of a paused job"
+        );
+
+        // Probe recovers while still paused: still no permit.
+        provider
+            .probe_transport_error
+            .store(false, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(permit.lock().unwrap().is_none());
 
         watch.abort();
         let _ = watch.await;
@@ -3821,16 +3883,27 @@ chmod +x "$destination/bin/node"
                 && argv[1] == "-f"
                 && argv[2].ends_with("preloop-job-paused")
             {
-                // `test -f` semantics: exit 0 when the marker exists, 1 when
-                // it does not. A transport error is modelled separately and
-                // must not be conflated with "not paused".
-                return Ok(ExecOutput {
-                    exit_code: i32::from(
-                        !self.pause_marker.load(std::sync::atomic::Ordering::SeqCst),
-                    ),
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
-                    truncated: false,
+                // The real provider surfaces a guest exit 1 as
+                // `VmError::Command` (smolvm propagates the guest exit code),
+                // so the absent-marker probe must be modelled the same way —
+                // the watcher's resume path depends on it.
+                if self
+                    .probe_transport_error
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(VmError::Launch {
+                        program: "smolvm".to_owned(),
+                        source: std::io::Error::new(std::io::ErrorKind::BrokenPipe, "vm wedged"),
+                    });
+                }
+                let marker = self.pause_marker.load(std::sync::atomic::Ordering::SeqCst);
+                if marker {
+                    return Ok(test_output());
+                }
+                return Err(VmError::Command {
+                    operation: "exec",
+                    exit_code: 1,
+                    message: "test -f: marker absent".to_owned(),
                 });
             }
             let mut absent = self.absent_binary.lock().await;
