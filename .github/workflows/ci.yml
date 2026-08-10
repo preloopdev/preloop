@@ -7,6 +7,10 @@ on:
     branches: [main]
     # Keep push-triggered checks observable while the self-hosted pool boots.
   pull_request:
+    # Docs-only PRs must not burn pool time: skip when every changed file
+    # is a markdown document.
+    paths-ignore:
+      - "**/*.md"
   schedule:
     # Nightly intensive property profile at 02:00 UTC
     - cron: "0 2 * * *"
@@ -52,7 +56,7 @@ jobs:
       PROPTEST_CASES: "8"
       RUST_TEST_THREADS: "2"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           # Conformance goldens are LFS-tracked; without this they arrive
           # as pointer stubs and every test that reads them fails.
@@ -91,7 +95,7 @@ jobs:
     timeout-minutes: 30
     if: github.event_name != 'schedule'
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           # Conformance goldens are LFS-tracked; without this they arrive
           # as pointer stubs and every test that reads them fails.
@@ -200,7 +204,7 @@ jobs:
     timeout-minutes: 120
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.profile == 'intensive')
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           # Conformance goldens are LFS-tracked; without this they arrive
           # as pointer stubs and every test that reads them fails.

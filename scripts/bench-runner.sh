@@ -10,7 +10,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUST_RUNNER="$REPO_ROOT/target/release/preloop-runner"
-OFFICIAL_RUNNER_DIR="${OFFICIAL_RUNNER_DIR:-$HOME/mitm-proxy/experiments/mitm/.cache/runner-official}"
+OFFICIAL_RUNNER_DIR="${OFFICIAL_RUNNER_DIR:-$HOME/.cache/actions-runner/current}"
 JSON_OUTPUT=""
 
 for arg in "$@"; do

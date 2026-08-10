@@ -7,7 +7,7 @@ WF="${1:?Usage: $0 <workflow-file> [vm-name]}"
 VM="${2:-bench-golden}"
 GH_REPO="preloopdev/preloop-conformance-sample"
 RESULTS_DIR="$(cd "$(dirname "$0")/results" && pwd)"
-WORKSPACE="/Users/bnjoroge/macos-runners"
+WORKSPACE="${WORKSPACE:-$HOME/macos-runners}"
 
 log() { echo "[$(date +%T.%3N)] $*"; }
 

@@ -53,6 +53,71 @@ pub enum StepType {
     },
 }
 
+/// Owns background step tasks until the main step loop reaches its implicit
+/// wait-all boundary.  Background actions are deliberately detached from the
+/// foreground step's mutable context, but their observable result is merged
+/// back in one place after all tasks have been joined.
+struct BackgroundStepCoordinator {
+    semaphore: Arc<tokio::sync::Semaphore>,
+    tasks: Vec<tokio::task::JoinHandle<BackgroundStepResult>>,
+}
+
+struct BackgroundStepResult {
+    context_name: String,
+    result: StepResult,
+    step_id: String,
+    logs: String,
+    annotations: Vec<crate::worker::execution_types::Annotation>,
+}
+
+struct BackgroundStepStart {
+    step: Step,
+    workspace: String,
+    cancel_rx: watch::Receiver<bool>,
+    queue: Arc<Mutex<ServerQueue>>,
+    step_number: u32,
+    display_name: String,
+}
+
+impl BackgroundStepCoordinator {
+    fn new(max_concurrent: usize) -> Self {
+        Self {
+            semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1))),
+            tasks: Vec::new(),
+        }
+    }
+
+    fn start(&mut self, job: &JobContext, start: BackgroundStepStart) {
+        let permit = self.semaphore.clone();
+        let mut bg_job = job.clone();
+        self.tasks.push(tokio::spawn(async move {
+            let _permit = permit.acquire_owned().await.expect("background semaphore");
+            run_background_step(
+                start.step,
+                &mut bg_job,
+                &start.workspace,
+                start.cancel_rx,
+                start.queue,
+                start.step_number,
+                start.display_name,
+            )
+            .await
+        }));
+    }
+
+    async fn wait_all(&mut self) -> Vec<BackgroundStepResult> {
+        let tasks = std::mem::take(&mut self.tasks);
+        let mut results = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            match task.await {
+                Ok(result) => results.push(result),
+                Err(error) => warn!("background step task terminated: {error}"),
+            }
+        }
+        results
+    }
+}
+
 /// Attempts a single step may be retried from a debug session before the
 /// runner stops offering.
 ///
@@ -86,6 +151,7 @@ pub async fn run_steps(
     let mut any_failed = false;
     let mut init_failed = false;
     let mut cancelled = false;
+    let mut background = BackgroundStepCoordinator::new(10);
     let now = crate::worker::helpers::iso_now();
 
     // F019: Queue initial "Set up job" step as completed (number 1, official convention)
@@ -398,6 +464,35 @@ pub async fn run_steps(
             }
         }
 
+        if step.is_background {
+            info!("Starting background step: {}", resolved_display_name);
+            let step_start = crate::worker::helpers::iso_now();
+            {
+                let mut q = queue.lock().await;
+                q.queue_update(StepUpdate {
+                    external_id: step.id.clone(),
+                    number: step_number,
+                    name: resolved_display_name.clone(),
+                    status: step_status::IN_PROGRESS,
+                    started_at: Some(step_start),
+                    completed_at: None,
+                    conclusion: 0,
+                });
+            }
+            background.start(
+                job,
+                BackgroundStepStart {
+                    step: step.clone(),
+                    workspace: workspace.to_owned(),
+                    cancel_rx: cancel_rx.clone(),
+                    queue: queue.clone(),
+                    step_number,
+                    display_name: resolved_display_name,
+                },
+            );
+            continue;
+        }
+
         info!("Running step: {}", resolved_display_name);
         let step_start = crate::worker::helpers::iso_now();
 
@@ -453,6 +548,10 @@ pub async fn run_steps(
         // upload and the file-command cleanup below, leaving the server with a
         // step stuck in progress.
         let mut jump_to: Option<usize> = None;
+        // Snapshot checkout credential a retry verdict carried. Applied to the
+        // current step before the replay and to every step of a jumped range
+        // once the step borrow is released.
+        let mut pending_snapshot_token: Option<String> = None;
 
         // Retry loop. Exactly one pass unless a debug controller says `retry`.
         let (conclusion_str, file_command_paths) = loop {
@@ -932,8 +1031,19 @@ pub async fn run_steps(
                             ));
                             attempt += 1;
                             source_revision = decision
-                                .and_then(|d| d.source_revision)
+                                .as_ref()
+                                .and_then(|d| d.source_revision.clone())
                                 .unwrap_or_else(|| client.current_revision());
+                            // The snapshot checkout token pinned at submission
+                            // may be expired by now; the verdict carried a
+                            // fresh one. Swap it in before the replay so the
+                            // re-run does not fail with a git 401.
+                            if let Some(token) =
+                                decision.as_ref().and_then(|d| d.snapshot_token.as_deref())
+                            {
+                                client.refresh_snapshot_tokens(std::slice::from_mut(step), token);
+                                pending_snapshot_token = Some(token.to_owned());
+                            }
 
                             match target {
                                 Some(target) if target <= idx && target < step_count => {
@@ -1139,6 +1249,14 @@ pub async fn run_steps(
         // Replay an earlier range, now that this attempt has been reported.
         if let Some(target) = jump_to {
             let context_name = step.context_name.clone();
+            // A jumped range may include other pinned checkout steps whose
+            // submission-time credential expired while the job waited. Swap
+            // in the verdict's replacement for all of them before the replay.
+            if let Some(token) = pending_snapshot_token.as_deref() {
+                if let Some(client) = debug_client.as_ref() {
+                    client.refresh_snapshot_tokens(&mut steps, token);
+                }
+            }
             // Clear every runner-managed per-step value for the range about to
             // re-run. Restoring only the target snapshot leaves saveState and
             // annotations from later steps visible during their second pass.
@@ -1171,6 +1289,31 @@ pub async fn run_steps(
             );
             step_idx = target;
             continue 'step_loop;
+        }
+    }
+
+    // The official runner waits for every background action before post-job
+    // actions and before publishing the terminal job result.  Joining here is
+    // also the shutdown guarantee: no process task survives run_steps.
+    for result in background.wait_all().await {
+        if result.result.conclusion == "Failure" {
+            any_failed = true;
+            job.job_status = JobStatus::Failure;
+        }
+        if result.result.conclusion == "Cancelled" && *cancel_rx.borrow() {
+            cancelled = true;
+            job.job_status = JobStatus::Cancelled;
+        }
+        job.steps
+            .insert(result.context_name.clone(), result.result.clone());
+        if !result.annotations.is_empty() {
+            job.step_annotations
+                .insert(result.context_name.clone(), result.annotations.clone());
+        }
+        if let Some(rpt) = reporting {
+            if !result.logs.is_empty() {
+                crate::worker::reporting::upload_step_log(rpt, &result.step_id, &result.logs).await;
+            }
         }
     }
 
@@ -1403,6 +1546,127 @@ async fn execute_step(
         StepType::Action { uses, with } => {
             super::handlers::action::run_action(uses, with, workspace, ctx, cancel_rx).await
         }
+    }
+}
+
+async fn run_background_step(
+    step: Step,
+    job: &mut JobContext,
+    workspace: &str,
+    cancel_rx: watch::Receiver<bool>,
+    queue: Arc<Mutex<ServerQueue>>,
+    step_number: u32,
+    display_name: String,
+) -> BackgroundStepResult {
+    let started_at = crate::worker::helpers::iso_now();
+    let mut ctx = StepContext::new(job, step.context_name.clone(), display_name.clone());
+    {
+        let expr_ctx = ctx.job.build_expression_context();
+        for (key, value) in &step.env {
+            ctx.env.insert(
+                key.clone(),
+                crate::worker::template::evaluate_template(value, &expr_ctx)
+                    .unwrap_or_else(|_| value.clone()),
+            );
+        }
+    }
+
+    let temp_dir = std::path::Path::new(workspace)
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("_temp");
+    let paths = match super::file_commands::create_file_commands_with_job(&temp_dir, Some(ctx.job))
+    {
+        Ok(paths) => {
+            for (key, value) in super::file_commands::file_command_env(&paths) {
+                ctx.env.insert(key, value);
+            }
+            Some(paths)
+        }
+        Err(error) => {
+            ctx.log(&format!("##[error]File command setup failed: {error:#}"));
+            None
+        }
+    };
+
+    let outcome = if paths.is_some() {
+        execute_step(&step.step_type, &mut ctx, workspace, cancel_rx.clone()).await
+    } else {
+        Err(anyhow::anyhow!("file command setup failed"))
+    };
+    let cancelled = outcome
+        .as_ref()
+        .err()
+        .is_some_and(|error| error.to_string().contains("cancel"));
+    let (outcome_name, conclusion) = match outcome {
+        Ok(()) => ("Success".to_string(), "Success".to_string()),
+        Err(_error) if cancelled || *cancel_rx.borrow() => {
+            ctx.log("##[error]The operation was canceled.");
+            ("Cancelled".to_string(), "Cancelled".to_string())
+        }
+        Err(error) => {
+            if !error.to_string().contains("process exit code") {
+                ctx.log(&format!("##[error]{error:#}"));
+            }
+            if step.continue_on_error {
+                ("Failure".to_string(), "Success".to_string())
+            } else {
+                ("Failure".to_string(), "Failure".to_string())
+            }
+        }
+    };
+
+    let mut result = StepResult {
+        outcome: outcome_name,
+        conclusion: conclusion.clone(),
+        outputs: std::collections::HashMap::new(),
+    };
+    ctx.job
+        .steps
+        .insert(step.context_name.clone(), result.clone());
+    if let Some(paths) = &paths {
+        if let Err(error) =
+            super::file_commands::apply_file_commands(paths, &step.context_name, ctx.job)
+        {
+            ctx.log(&format!("##[error]{error:#}"));
+            result.outcome = "Failure".to_string();
+            result.conclusion = if step.continue_on_error {
+                "Success".to_string()
+            } else {
+                "Failure".to_string()
+            };
+        }
+        super::file_commands::cleanup_file_commands(paths);
+    }
+    if let Some(updated) = ctx.job.steps.get(&step.context_name) {
+        result.outputs = updated.outputs.clone();
+    }
+
+    let completed_at = crate::worker::helpers::iso_now();
+    let conclusion_proto = ServerQueue::conclusion_to_proto(&result.conclusion);
+    let logs = ctx.log_content();
+    {
+        let mut q = queue.lock().await;
+        let external_id = step.id.clone();
+        q.queue_update(StepUpdate {
+            external_id: external_id.clone(),
+            number: step_number,
+            name: display_name,
+            status: step_status::COMPLETED,
+            started_at: Some(started_at),
+            completed_at: Some(completed_at),
+            conclusion: conclusion_proto,
+        });
+        if !logs.is_empty() {
+            q.record_step_logs(&external_id, &logs);
+        }
+    }
+    BackgroundStepResult {
+        context_name: step.context_name,
+        result,
+        step_id: step.id,
+        logs,
+        annotations: ctx.annotations,
     }
 }
 

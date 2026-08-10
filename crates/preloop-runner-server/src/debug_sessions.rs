@@ -601,6 +601,7 @@ impl DebugSessionRegistry {
         }
         Some(VerdictResponse {
             verdict,
+            snapshot_token: None,
             version: record.session.version,
             revert: record.pending_revert,
             source_revision: record.pending_revision.clone(),
@@ -1042,11 +1043,28 @@ pub(crate) async fn poll_verdict(
         {
             let mut inner = shared.state.inner.lock().await;
             owned_session(&inner, &session_id, caller)?;
-            let response = inner
+            let mut response = inner
                 .debug_sessions
                 .take_verdict(&session_id, SystemTime::now())
                 .ok_or_else(|| ApiError::not_found(format!("no such session: {session_id}")))?;
             if response.verdict.is_some() || tokio::time::Instant::now() >= deadline {
+                // A retry replays the failed step from the job message the
+                // worker already holds — including the snapshot checkout
+                // token pinned at submission, which may be long expired by
+                // the time a human answers. Mint a replacement now so the
+                // replayed checkout authenticates. The worker only applies
+                // it to steps the message marks as pinned.
+                if response.verdict == Some(Verdict::Retry) && response.snapshot_token.is_none() {
+                    if let Some(record) = inner.debug_sessions.get(&session_id) {
+                        if let Some(request) = inner.job_requests.get(&record.request_id) {
+                            response.snapshot_token = Some(
+                                shared
+                                    .state
+                                    .mint_runtime_token(&request.plan_id, &record.agent_job_id),
+                            );
+                        }
+                    }
+                }
                 return Ok(Json(response));
             }
         }

@@ -508,7 +508,7 @@ Paths are in this repo. Updated 2026-07-18 after deep source review.
 ### 3a. Concurrency &amp; cancellation audit (2026-07-13, resolved 2026-07-18)
 
 Findings from a source audit of preloop vs official runner v2.335.1 sources (local mirror:
-`~/mitm-proxy/experiments/mitm/.cache/runner.server/src`, upstream paths cited as
+`<official-runner-source>/src`, upstream paths cited as
 `src/Runner.Listener/...`). Implementation plan: `docs/concurrency-plan.md`.
 
 **All findings below have been fully resolved, implemented, and verified by 87 property

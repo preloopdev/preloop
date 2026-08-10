@@ -347,6 +347,18 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
     if let Some(env_tokens) = msg.get("environmentVariables").and_then(|v| v.as_array()) {
         for token in env_tokens {
             for (key, value) in extract_template_map(token) {
+                // EnvironmentVariables is the wire-level projection of the
+                // job environment, but the broker can include runner
+                // bookkeeping in the same template map. Those values are
+                // available to the runner internally through `variables`;
+                // they are not ordinary workflow environment variables and
+                // must not be handed to a step process. Keep the check here,
+                // before the values enter JobContext.env, so all step
+                // handlers (host, container, and actions) share the same
+                // boundary.
+                if is_internal_job_variable(&key) {
+                    continue;
+                }
                 job.env.insert(key, value);
             }
         }
@@ -493,6 +505,15 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
             job.add_mask(auth_header);
         }
     }
+}
+
+/// Whether a wire environment key is runner/job bookkeeping rather than an
+/// environment variable exported by GitHub to workflow steps.
+fn is_internal_job_variable(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    lower.starts_with("system.")
+        || lower.starts_with("distributedtask.")
+        || lower.starts_with("actions_")
 }
 
 /// Number of git config entries [`inject_github_env`] appends for a snapshot
@@ -1064,6 +1085,8 @@ fn str_from_json_or(val: &serde_json::Value, key: &str, default: &str) -> String
 fn runner_os() -> &'static str {
     if cfg!(target_os = "macos") {
         "macOS"
+    } else if cfg!(target_os = "windows") {
+        "Windows"
     } else if cfg!(target_os = "linux") {
         "Linux"
     } else {

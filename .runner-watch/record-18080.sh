@@ -2,8 +2,8 @@
 set -euo pipefail
 # Strip stale OAuth token so it never leaks into scripts or captures.
 unset GITHUB_TOKEN 2>/dev/null || true
-SCRIPT_DIR="/Users/bnjoroge/mitm-proxy/experiments/mitm/bin"
-MITM_DIR="/Users/bnjoroge/mitm-proxy/experiments/mitm"
+MITM_DIR="${MITM_DIR:-<path-to-mitm-capture-checkout>}"
+SCRIPT_DIR="$MITM_DIR/bin"
 CACHE="$MITM_DIR/.cache"
 
 usage() {

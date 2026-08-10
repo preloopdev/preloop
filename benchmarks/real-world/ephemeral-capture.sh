@@ -18,7 +18,7 @@ HOST_WORKSPACE="$PWD"
 RESULTS_ROOT="${RESULTS_ROOT:-$PWD/benchmarks/compatibility/runner/protocol}"
 PRELOOP_RUNNER="/usr/local/bin/preloop-runner"
 # Host path to the official runner install (mounted read-only into each VM)
-OFFICIAL_RUNNER_HOST="${OFFICIAL_RUNNER_HOST:-/Users/bnjoroge/cachingv4}"
+OFFICIAL_RUNNER_HOST="${OFFICIAL_RUNNER_HOST:-$HOME/cachingv4}"
 OFFICIAL_SRC="/opt/runners/actions-runner"   # guest mount point
 MITM_ADDON="/workspace/experiments/mitm/addons/capture.py"
 

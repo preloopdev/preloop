@@ -147,6 +147,8 @@ pub fn is_runner_version_deprecated(error: &anyhow::Error) -> bool {
 fn os_label() -> &'static str {
     if cfg!(target_os = "macos") {
         "macOS"
+    } else if cfg!(target_os = "windows") {
+        "Windows"
     } else {
         "Linux"
     }

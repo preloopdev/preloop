@@ -199,6 +199,17 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
             inner.queued_at.remove(&key);
             continue;
         }
+        // Unlike the Linux microVM pool, non-Linux jobs can only run on a
+        // registered host. Keep them queued until that host appears rather
+        // than converting a temporarily empty host pool into a failed job.
+        let needs_external_host = job.runs_on.iter().any(|label| {
+            let label = label.to_ascii_lowercase();
+            label.starts_with("macos") || label.starts_with("windows")
+        });
+        if needs_external_host {
+            inner.queued_at.remove(&key);
+            continue;
+        }
         if pool_preparing {
             // The pool is warming and cannot register a runner yet; do not
             // let the grace window expire while the first machine image is

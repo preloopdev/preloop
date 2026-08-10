@@ -27,7 +27,7 @@ preloop run -f .github/workflows/ci.yml --event push
 ```
 
 `preloop run` snapshots the local workspace (dirty changes included) so a run
- will run your workflows locally. It doesnt depends on what is pushed to GitHub or create a commit locally.
+ will run your workflows locally. It doesnt depends on what is pushed to GitHub or require you to create a commit locally.
 
 If you are running it as an always-on server, service install, every runtime
 knob, and how to expose it (tunnel, funnel, or your own domain)  is covered in
@@ -61,7 +61,7 @@ Decide first whether you need webhooks:
 
 The App and its webhook are one object; the webhook only adds GitHub's
 ability to call you. You can enable it later with `--public-url`, so
-starting without it is never a dead end.
+starting without it is fine.
 
 ### Option A : GitHub App
 
@@ -335,7 +335,7 @@ Give each person their own engine until per-user identity lands.
 ## Durable state (SQLite by default, Postgres optional)
 
 Run history, queued jobs, runners, sessions, and logs survive restarts. The
-default backend is **SQLite** at `<state dir>/preloop.db` — zero configuration,
+default backend is **SQLite** at `<state dir>/preloop.db` zero config,
 correct for a single machine, and the right choice unless you have a reason
 to move off it.
 
@@ -354,11 +354,11 @@ preloop serve --store 'postgres://user:password@host:5432/preloop?sslmode=requir
   writer connection, so the database must not be shared with a second engine
   process.
 - **TLS**: add `?sslmode=require` (or `verify-ca` / `verify-full`) for remote
-  databases — managed Postgres (Neon, RDS, Supabase, …) typically requires
+  managed Postgres (Neon, RDS, Supabase, …) typically requires
   it. Verification always uses the system root store. Plaintext is the
   default for loopback databases.
 
-Run Postgres however you like — a managed service, a `postgres` container on
+Run Postgres however you like, a managed service, a `postgres` container on
 the same host, or an OS package. The engine does not bundle or spawn a
 database server; SQLite is the embedded option, Postgres is an external
 dependency you point at.
@@ -377,18 +377,18 @@ sudo preloop server install \
 
 What it does:
 
-- **Linux (systemd)** — writes hardened units to
+- **Linux (systemd)**  writes hardened units to
   `/etc/systemd/system/preloop.{service,socket}` plus a self-update timer
   (`preloop-update.{service,timer}`, hourly, polls GitHub Releases). The
   control plane is socket-activated on the port of `--listen` (default 9090).
-- **macOS (launchd)** — writes a LaunchDaemon plist to
+- **macOS (launchd)** writes a LaunchDaemon plist to
   `/Library/LaunchDaemons/dev.preloop.server.plist` (mode 0600).
 - `--systemd-credential PATH` (Linux) — mounts an encrypted systemd
   credential (`LoadCredentialEncrypted=preloop-secrets:PATH`) so stored secrets come
   from an encrypted, host-bound blob instead of the config file; see
   "Where secrets live" in the Secrets section.
 - Configuration is written to a mode-0600 environment file
-  (`/var/lib/preloop/environment` on Linux) — the webhook secret never lands
+  (`/var/lib/preloop/environment` on Linux) the webhook secret never lands
   in a world-readable unit.
 - State lives in `/var/lib/preloop` (mode 0700; `--home` overrides).
 

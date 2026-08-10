@@ -560,6 +560,15 @@ fn injects_job_environment_variables_from_acquire_payload() {
             "map": [{
                 "Key": { "type": 0, "lit": "MEGA_GLOBAL_ENV" },
                 "Value": { "type": 0, "lit": "global-env-ok" }
+            }, {
+                "Key": { "type": 0, "lit": "system.orchestrationId" },
+                "Value": { "type": 0, "lit": "internal-plan-id" }
+            }, {
+                "Key": { "type": 0, "lit": "DistributedTask.EnableCompositeActions" },
+                "Value": { "type": 0, "lit": "true" }
+            }, {
+                "Key": { "type": 0, "lit": "actions_runner_allow_artifacts_file" },
+                "Value": { "type": 0, "lit": "false" }
             }]
         }]
     });
@@ -570,6 +579,11 @@ fn injects_job_environment_variables_from_acquire_payload() {
         job.env.get("MEGA_GLOBAL_ENV").map(String::as_str),
         Some("global-env-ok")
     );
+    assert!(!job.env.contains_key("system.orchestrationId"));
+    assert!(!job
+        .env
+        .contains_key("DistributedTask.EnableCompositeActions"));
+    assert!(!job.env.contains_key("actions_runner_allow_artifacts_file"));
 }
 
 #[test]

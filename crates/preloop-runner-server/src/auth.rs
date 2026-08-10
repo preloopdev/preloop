@@ -325,17 +325,18 @@ fn is_worker_debug_route(method: &axum::http::Method, path: &str) -> bool {
     if method == Method::POST {
         if matches!(
             path,
-            "/api/v1/debug/worker-token" | "/api/v1/debug/sessions"
+            crate::routes::DEBUG_WORKER_TOKEN_PATH | crate::routes::DEBUG_SESSIONS_PATH
         ) {
             return true;
         }
-        return debug_session_member(path, "/close");
+        return debug_session_member(path, crate::routes::DEBUG_SESSION_CLOSE_SUFFIX);
     }
-    method == Method::GET && debug_session_member(path, "/verdict")
+    method == Method::GET && debug_session_member(path, crate::routes::DEBUG_SESSION_VERDICT_SUFFIX)
 }
 
 fn debug_session_member(path: &str, suffix: &str) -> bool {
-    path.strip_prefix("/api/v1/debug/sessions/")
+    path.strip_prefix(crate::routes::DEBUG_SESSIONS_PATH)
+        .and_then(|rest| rest.strip_prefix('/'))
         .and_then(|rest| rest.strip_suffix(suffix))
         .is_some_and(|session_id| !session_id.is_empty() && !session_id.contains('/'))
 }

@@ -145,6 +145,16 @@ pub struct ApiError {
 }
 
 impl ApiError {
+    /// Human-readable error text, for handlers that render their own response.
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// HTTP status this error maps to.
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
+    }
+
     pub(crate) fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
