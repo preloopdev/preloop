@@ -591,6 +591,45 @@ pub fn docker_data_root() -> &'static str {
     DOCKER_DATA_ROOT
 }
 
+/// The OCI runtime shim wired as the golden's docker `default-runtime`.
+///
+/// Byte-identical to the shim proven live on the smolvm side
+/// (`scripts/rosetta/crun-rosetta` in the rosetta-mount-shim work; its sha256
+/// is pinned in `tests/golden_fidelity.rs` so an edit here fails loudly).
+/// dockerd resolves a named runtime to a binary path and execs it with the
+/// full OCI runtime CLI, so this POSIX sh wrapper rewrites the bundle's
+/// `config.json` before exec'ing the real crun:
+///
+/// 1. Drops dockerd's always-present empty `blockIO` section. The VM's
+///    libkrunfw kernel is built without `CONFIG_BLK_DEV_THROTTLING`, so crun
+///    treats the section as a directive to write `io.max` / `io.weight` and
+///    fails EVERY container create with the kernel-side error
+///    "open `io.max`: No such file or directory". runc silently skips the
+///    empty section; the strip mirrors it so crun can replace runc at all
+///    (arm64 included). Real IO limits are left untouched.
+///
+/// 2. Injects a read-only `/mnt/rosetta` bind mount, but only when Rosetta
+///    is enabled for the machine (`SMOLVM_ROSETTA=1` in the shim's
+///    environment, or the translator visible at `/mnt/rosetta/rosetta`) and
+///    no user mount already claims the path. Without it, amd64-only images
+///    die inside dockerd-created containers with `rosetta-wrapper:
+///    unexpected initial stop: 32512` — the binfmt wrapper's
+///    `execve("/mnt/rosetta/rosetta")` misses in the container's mount
+///    namespace, because the smolvm agent only injects the mount into specs
+///    it assembles itself, not ones dockerd builds.
+///
+/// Buildx's embedded executor (`docker build` on Docker >= 23) never consults
+/// the daemon's runtime config; it execs `runc` by PATH lookup. The bake
+/// therefore also symlinks `/usr/local/bin/runc` (PATH-prior to the real
+/// `/usr/bin/runc`, which stays untouched) at this shim.
+const CRUN_ROSETTA_SHIM: &str = include_str!("../assets/crun-rosetta");
+
+/// The docker `default-runtime` shim baked into the golden. Exposed for the
+/// fidelity tests.
+pub fn crun_rosetta_shim() -> &'static str {
+    CRUN_ROSETTA_SHIM
+}
+
 /// Loopback `/etc/hosts` contents. Exposed for the fidelity tests.
 pub fn loopback_hosts() -> &'static str {
     LOOPBACK_HOSTS
@@ -716,7 +755,14 @@ pub fn base_install_script() -> String {
           docker buildx version | grep -F 'v{DOCKER_BUILDX_VERSION}' && \
           docker compose version --short | grep -F '{DOCKER_COMPOSE_VERSION}' && \
           mkdir -p {DOCKER_DATA_ROOT} /etc/docker && \
-          printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\"}}\\n' > /etc/docker/daemon.json) && \
+         printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\",\"runtimes\":{{\"crun-rosetta\":{{\"path\":\"/usr/local/bin/crun-rosetta\"}}}},\"default-runtime\":\"crun-rosetta\"}}\\n' > /etc/docker/daemon.json && \
+         echo \"### install crun v{CRUN_VERSION} + rosetta runtime shim\" >&2 && \
+         curl -fsSL \"https://github.com/containers/crun/releases/download/{CRUN_VERSION}/crun-{CRUN_VERSION}-linux-$LFS_ARCH\" -o /usr/bin/crun && \
+         chmod 0755 /usr/bin/crun && \
+         /usr/bin/crun --version | grep -F '{CRUN_VERSION}' && \
+         printf '%s' {crun_rosetta_shim_quoted} > /usr/local/bin/crun-rosetta && \
+         chmod 0755 /usr/local/bin/crun-rosetta && \
+         ln -sf crun-rosetta /usr/local/bin/runc) && \
          (echo \"### fetch cargo-shear\" >&2 && \
           curl -sSL https://github.com/Boshen/cargo-shear/releases/download/v{CARGO_SHEAR_VERSION}/cargo-shear-$(uname -m)-unknown-linux-musl.tar.gz 2>/dev/null | tar -xz -C /usr/local/bin 2>/dev/null || true) && \
          (echo \"### bake git v{GIT_VERSION}\" >&2 && \
@@ -740,7 +786,10 @@ pub fn base_install_script() -> String {
          rm -rf /usr/share/doc/* /usr/share/man/* /usr/share/info/*",
         docker_packages = docker_apt_packages(),
         compiler_packages = compiler_apt_packages(),
-        base_packages_pinned = base_packages_pinned()
+        base_packages_pinned = base_packages_pinned(),
+        // One single-quoted shell word: the shim embeds verbatim, and only a
+        // NUL (which a shell script cannot contain) would break the quoting.
+        crun_rosetta_shim_quoted = shell_quote(CRUN_ROSETTA_SHIM)
     )
 }
 
