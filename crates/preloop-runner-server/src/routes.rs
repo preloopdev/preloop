@@ -453,9 +453,6 @@ pub(crate) fn build_app(
         // controller-facing routes are native-authenticated. Both live on the
         // native surface so `/_apis/...` stays byte-identical.
         //
-        // The credential those worker routes need is not in the job message —
-        // an official runner would republish it as `${{ secrets[...] }}` — so
-        // the worker exchanges its job runtime token for it here first.
         // Worker access to these four routes through the mounted control
         // socket is mirrored by `auth::is_worker_debug_route`. Keep that
         // fail-closed allowlist in sync when changing this route group.
@@ -473,14 +470,14 @@ pub(crate) fn build_app(
             )),
         )
         .route(
-            &format!("{DEBUG_SESSIONS_PATH}/:session_id/verdict"),
+            &format!("{DEBUG_SESSIONS_PATH}/:session_id{DEBUG_SESSION_VERDICT_SUFFIX}"),
             get(crate::debug_sessions::poll_verdict).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_worker_bearer,
             )),
         )
         .route(
-            &format!("{DEBUG_SESSIONS_PATH}/:session_id/close"),
+            &format!("{DEBUG_SESSIONS_PATH}/:session_id{DEBUG_SESSION_CLOSE_SUFFIX}"),
             post(crate::debug_sessions::close_session).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_worker_bearer,
@@ -501,7 +498,7 @@ pub(crate) fn build_app(
             )),
         )
         .route(
-            &format!("{DEBUG_SESSIONS_PATH}/:session_id/verdict"),
+            &format!("{DEBUG_SESSIONS_PATH}/:session_id{DEBUG_SESSION_VERDICT_SUFFIX}"),
             post(crate::debug_sessions::post_verdict).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,

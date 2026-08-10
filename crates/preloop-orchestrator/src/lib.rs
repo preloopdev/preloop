@@ -2163,11 +2163,21 @@ async fn watch_guest_pause<P: VmProvider + 'static>(
     let mut was_paused = false;
     loop {
         tokio::time::sleep(poll_interval).await;
-        let paused = provider
-            .exec(&name, &probe)
-            .await
-            .map(|output| output.exit_code == 0)
-            .unwrap_or(false);
+        // A failed probe (smolvm transport error, wedged VM) says nothing
+        // about the pause state: treating it as "resumed" would re-pin the
+        // permit mid-pause and revive the starvation this watcher exists to
+        // remove. Preserve the last known state; the next poll decides.
+        let paused = match provider.exec(&name, &probe).await {
+            Ok(output) => output.exit_code == 0,
+            Err(error) => {
+                warn!(
+                    machine = name.as_str(),
+                    %error,
+                    "pause marker probe failed — keeping previous state"
+                );
+                was_paused
+            }
+        };
         if paused == was_paused {
             continue;
         }
@@ -2180,16 +2190,28 @@ async fn watch_guest_pause<P: VmProvider + 'static>(
                 );
             }
         } else {
-            // Re-acquire before marking the machine as running again, so the
-            // pool's machine count stays bounded by `max_concurrent` plus
-            // whatever is genuinely paused. Blocking here cannot deadlock
-            // the job: the guest resumes on its own after the verdict, and
-            // this task only holds the permit for bookkeeping.
+            // Re-acquire before treating the machine as active again, so
+            // future forks stay bounded by `max_concurrent` plus whatever is
+            // genuinely paused. The guest resumes on its own after the
+            // verdict, so this acquire can transiently lag the resume by up
+            // to a poll interval — the over-subscription window is bounded
+            // and short. A hard gate needs a host/worker resume handshake;
+            // until then, a slow acquire is surfaced here.
+            let started = tokio::time::Instant::now();
             let fresh = semaphore
                 .clone()
                 .acquire_owned()
                 .await
                 .expect("semaphore is never closed");
+            let waited = started.elapsed();
+            if waited >= Duration::from_secs(5) {
+                warn!(
+                    machine = name.as_str(),
+                    waited_ms = waited.as_millis(),
+                    "resumed job waited for a pool permit — active VMs may have \
+                     transiently exceeded max_concurrent"
+                );
+            }
             permit.lock().unwrap().replace(fresh);
             info!(
                 machine = name.as_str(),
@@ -3863,11 +3885,17 @@ chmod +x "$destination/bin/node"
                 && argv[1] == "-f"
                 && argv[2].ends_with("preloop-job-paused")
             {
-                return if self.pause_marker.load(std::sync::atomic::Ordering::SeqCst) {
-                    Ok(test_output())
-                } else {
-                    Err(test_error("pause marker absent"))
-                };
+                // `test -f` semantics: exit 0 when the marker exists, 1 when
+                // it does not. A transport error is modelled separately and
+                // must not be conflated with "not paused".
+                return Ok(ExecOutput {
+                    exit_code: i32::from(
+                        !self.pause_marker.load(std::sync::atomic::Ordering::SeqCst),
+                    ),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                    truncated: false,
+                });
             }
             let mut absent = self.absent_binary.lock().await;
             if let Some(binary) = *absent {

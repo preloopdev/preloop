@@ -2,6 +2,8 @@
 
 ![Watch the preloop demo: a failed step, a fix in another pane, and a re-run, all local, no push required](docs/demo/demo.gif)
 
+![Watch a preloop debug session: a step fails and pauses, fix the file in another pane, `:sync` + `:retry` from the paused job, and it continues — no re-run of the whole workflow](demo/debug/debug.gif)
+
 ![Watch an omp agent attach to a live preloop job with DAP, inspect runtime context, diagnose the failure, and rerun successfully](docs/demo/dap/demo-highlight.gif)
 
 
