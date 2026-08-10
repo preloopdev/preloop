@@ -691,4 +691,132 @@ exit 0
             ["machine", "delete", "--name", "test-rosetta", "-f"]
         );
     }
+
+    /// A smolvm whose `machine fork` records entry and exit around a barrier,
+    /// so a test can observe whether two forks are in flight at once.
+    fn fake_blocking_fork_smolvm() -> (TempDir, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("smolvm");
+        write_executable(
+            &executable,
+            r##"#!/bin/sh
+set -eu
+if [ "${1-}:${2-}" != "machine:fork" ]; then
+  exit 0
+fi
+printf 'enter %s\n' "$6" >> "$0.forklog"
+while [ ! -f "$0.release" ]; do sleep 0.02; done
+printf 'exit %s\n' "$6" >> "$0.forklog"
+"##,
+        );
+        (directory, executable)
+    }
+
+    fn fork_log(executable: &Path) -> Vec<String> {
+        fs::read_to_string(executable.with_extension("forklog"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    async fn wait_for_entries(executable: &Path, count: usize) -> bool {
+        for _ in 0..250 {
+            if fork_log(executable)
+                .iter()
+                .filter(|line| line.starts_with("enter"))
+                .count()
+                >= count
+            {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    /// SmolVM keeps one RAM checkpoint per golden: the first fork freezes the
+    /// base and later forks restore from the retained checkpoint. A second fork
+    /// racing the first FORKs an already-paused VM, and that failure's rollback
+    /// resumes the base and drops the checkpoint — after which every fork from
+    /// that golden fails and queued jobs stall until the golden is rebuilt.
+    #[tokio::test]
+    async fn forks_from_one_golden_never_overlap() {
+        let (_directory, executable) = fake_blocking_fork_smolvm();
+        let provider = SmolVmProvider::new(&executable);
+        let golden = MachineName::new("runner-golden").unwrap();
+        let first = MachineName::new("runner-0-1").unwrap();
+        let second = MachineName::new("runner-1-1").unwrap();
+
+        let one = {
+            let provider = provider.clone();
+            let (golden, first) = (golden.clone(), first.clone());
+            tokio::spawn(async move { provider.fork(&golden, &first).await })
+        };
+        let two = {
+            let provider = provider.clone();
+            let (golden, second) = (golden.clone(), second.clone());
+            tokio::spawn(async move { provider.fork(&golden, &second).await })
+        };
+
+        assert!(
+            wait_for_entries(&executable, 1).await,
+            "the first fork must start"
+        );
+        // The barrier holds fork one inside smolvm. If forks were concurrent,
+        // fork two would enter here rather than wait for the lock.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            fork_log(&executable)
+                .iter()
+                .filter(|line| line.starts_with("enter"))
+                .count(),
+            1,
+            "second fork must wait for the first to finish: {:?}",
+            fork_log(&executable)
+        );
+
+        fs::write(executable.with_extension("release"), "").unwrap();
+        one.await.unwrap().unwrap();
+        two.await.unwrap().unwrap();
+
+        let log = fork_log(&executable);
+        let order: Vec<&str> = log.iter().map(|line| &line[..5]).collect();
+        assert_eq!(
+            order,
+            ["enter", "exit ", "enter", "exit "],
+            "strictly one fork at a time: {log:?}"
+        );
+    }
+
+    /// Serialization is per golden, not global: independent base images must
+    /// still refill in parallel, which is the whole point of a fork pool.
+    #[tokio::test]
+    async fn forks_from_different_goldens_still_overlap() {
+        let (_directory, executable) = fake_blocking_fork_smolvm();
+        let provider = SmolVmProvider::new(&executable);
+        let first_golden = MachineName::new("runner-golden-a").unwrap();
+        let second_golden = MachineName::new("runner-golden-b").unwrap();
+
+        let one = {
+            let provider = provider.clone();
+            let clone = MachineName::new("runner-0-1").unwrap();
+            tokio::spawn(async move { provider.fork(&first_golden, &clone).await })
+        };
+        let two = {
+            let provider = provider.clone();
+            let clone = MachineName::new("runner-1-1").unwrap();
+            tokio::spawn(async move { provider.fork(&second_golden, &clone).await })
+        };
+
+        assert!(
+            wait_for_entries(&executable, 2).await,
+            "both forks must be in flight: {:?}",
+            fork_log(&executable)
+        );
+
+        fs::write(executable.with_extension("release"), "").unwrap();
+        one.await.unwrap().unwrap();
+        two.await.unwrap().unwrap();
+    }
 }
