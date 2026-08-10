@@ -7613,6 +7613,92 @@ jobs:
     assert!(*check_run_id > 0);
 }
 
+#[tokio::test]
+async fn github_check_run_rerequest_resubmits_the_owning_run() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.webhook_secret = Some("super-secret".to_owned());
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+        }),
+    )
+    .await;
+    let original_run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let original_check_run_id = 1234;
+    {
+        let mut inner = state.inner.lock().await;
+        let run = inner.runs.get_mut(&original_run_id).unwrap();
+        run.jobs
+            .insert(JobId("build".to_owned()), ExecutionStatus::Failure);
+        run.status = ExecutionStatus::Failure;
+        run.conclusion = Some("failure".to_owned());
+        run.job_check_run_ids
+            .insert(JobId("build".to_owned()), original_check_run_id);
+    }
+
+    let payload = serde_json::json!({
+        "action": "rerequested",
+        "repository": {"full_name": "owner/repo"},
+        "check_run": {
+            "id": original_check_run_id,
+            "name": "build"
+        }
+    });
+    let payload_bytes = serde_json::to_vec(&payload).unwrap();
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = HmacSha256::new_from_slice(b"super-secret").unwrap();
+    mac.update(&payload_bytes);
+    let signature = format!(
+        "sha256={}",
+        mac.finalize()
+            .into_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/github/webhooks")
+                .header("x-github-event", "check_run")
+                .header("x-github-delivery", "rerun-delivery")
+                .header("x-hub-signature-256", signature)
+                .header("content-type", "application/json")
+                .body(Body::from(payload_bytes))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let inner = state.inner.lock().await;
+    assert_eq!(inner.runs.len(), 2);
+    let rerun = inner
+        .runs
+        .values()
+        .find(|run| run.run_id != original_run_id)
+        .expect("rerequest should create a new run");
+    assert_eq!(rerun.status, ExecutionStatus::Queued);
+    assert_eq!(
+        rerun.job_check_run_ids.get(&JobId("build".to_owned())),
+        Some(&original_check_run_id),
+        "the rerequest must continue reporting through the requested check run"
+    );
+}
+
 /// Scaffolding shared by the webhook delivery dedup tests: a workspace holding
 /// one push-triggered workflow, a server with a webhook secret, and the signed
 /// push payload GitHub would deliver.

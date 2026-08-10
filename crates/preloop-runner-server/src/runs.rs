@@ -2133,10 +2133,11 @@ pub(crate) async fn cancel_run(
         .await;
     Ok(Json(record))
 }
-pub(crate) async fn rerun_run(
-    State(shared): State<Arc<SharedState>>,
-    Path(run_id): Path<RunId>,
-) -> Result<Json<RunAccepted>, ApiError> {
+pub(crate) async fn rerun_run_inner(
+    shared: &Arc<SharedState>,
+    run_id: RunId,
+    reused_check_run: Option<(JobId, u64)>,
+) -> Result<RunAccepted, ApiError> {
     let submission = {
         let inner = shared.state.inner.lock().await;
         inner
@@ -2145,7 +2146,25 @@ pub(crate) async fn rerun_run(
             .map(|run| (*run.submission).clone())
             .ok_or_else(|| ApiError::not_found("run not found"))?
     };
-    submit_run_inner(&shared, submission).await.map(Json)
+    let accepted = submit_run_inner(shared, submission).await?;
+
+    if let Some((job_id, check_run_id)) = reused_check_run.as_ref() {
+        let mut inner = shared.state.inner.lock().await;
+        if let Some(run) = inner.runs.get_mut(&accepted.run_id) {
+            if run.jobs.contains_key(job_id) {
+                run.job_check_run_ids.insert(job_id.clone(), *check_run_id);
+            }
+        }
+    }
+    crate::github::report_check_runs_for_run(shared, accepted.run_id, reused_check_run).await;
+    Ok(accepted)
+}
+
+pub(crate) async fn rerun_run(
+    State(shared): State<Arc<SharedState>>,
+    Path(run_id): Path<RunId>,
+) -> Result<Json<RunAccepted>, ApiError> {
+    rerun_run_inner(&shared, run_id, None).await.map(Json)
 }
 
 /// Upper bound on how long an event stream waits for the next event.
