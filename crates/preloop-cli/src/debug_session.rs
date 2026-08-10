@@ -82,7 +82,7 @@ pub async fn run(
 
     let sessions = ctx.list().await?;
     let session = match (&args.session, sessions.len()) {
-        (Some(reference), _) => ctx.get(reference).await?,
+        (Some(reference), _) => resolve(&ctx, &sessions, reference).await?,
         (None, 0) => {
             println!("No paused jobs.");
             println!();
@@ -97,14 +97,7 @@ pub async fn run(
             println!("{} paused jobs:", sessions.len());
             println!();
             for session in &sessions {
-                println!(
-                    "  {}  {}  step {}/{} {}",
-                    session.session_id,
-                    session.job_name,
-                    session.step.index + 1,
-                    session.step.total,
-                    session.step.display_name
-                );
+                println!("{}", session_line(session));
             }
             println!();
             println!("Attach with: preloop debug <session-id>");
@@ -175,6 +168,85 @@ pub async fn list_sessions(
         token,
     };
     api.list().await
+}
+
+/// One line per paused job: what to type, which job, which run, where it broke.
+///
+/// The run is part of the identity rather than decoration. A stalled `preloop
+/// run` reports how many sessions are paused on the server without saying
+/// whose, and the pauses in the way are frequently an *earlier* run's — so the
+/// id a user has at hand matches nothing and the listing has to say why.
+fn session_line(session: &DebugSession) -> String {
+    format!(
+        "  {}  {}  run {}  step {}/{} {}",
+        session.session_id,
+        session.job_name,
+        short_run(session.run_id),
+        session.step.index + 1,
+        session.step.total,
+        session.step.display_name
+    )
+}
+
+fn short_run(run: preloop_gha_protocol::RunId) -> String {
+    run.to_string().chars().take(8).collect()
+}
+
+fn session_lines(sessions: &[&DebugSession]) -> String {
+    sessions.iter().fold(String::new(), |mut lines, session| {
+        lines.push_str(&session_line(session));
+        lines.push('\n');
+        lines
+    })
+}
+
+/// Every paused session a user-supplied reference could mean.
+///
+/// Mirrors the server's resolver — session id, session-id prefix, run-id
+/// prefix, job name — but keeps all matches instead of collapsing to "unique or
+/// nothing". A run with two failed jobs has two paused sessions under one run
+/// id, and the server answers that reference with a 404, which reads as
+/// "nothing is paused" at the exact moment two jobs are.
+fn matching<'a>(sessions: &'a [DebugSession], reference: &str) -> Vec<&'a DebugSession> {
+    if let Some(exact) = sessions
+        .iter()
+        .find(|session| session.session_id == reference)
+    {
+        return vec![exact];
+    }
+    sessions
+        .iter()
+        .filter(|session| {
+            session.session_id.starts_with(reference)
+                || session.run_id.to_string().starts_with(reference)
+                || session.job_name == reference
+        })
+        .collect()
+}
+
+/// Pick the session a reference names, or say what is paused instead.
+async fn resolve(ctx: &Api, sessions: &[DebugSession], reference: &str) -> Result<DebugSession> {
+    match matching(sessions, reference).as_slice() {
+        [single] => Ok((*single).clone()),
+        // The listing carries open sessions only, so a closed session's id
+        // still has to go to the server, which keeps an archive of them.
+        [] => match ctx.get(reference).await {
+            Ok(session) => Ok(session),
+            Err(error) if sessions.is_empty() => Err(error),
+            Err(error) => {
+                let open: Vec<&DebugSession> = sessions.iter().collect();
+                anyhow::bail!(
+                    "{error:#}\n\nthese are paused instead:\n{}\nattach one with: preloop debug <session-id>",
+                    session_lines(&open)
+                )
+            }
+        },
+        ambiguous => anyhow::bail!(
+            "`{reference}` matches {} paused jobs:\n{}\nattach one with: preloop debug <session-id>",
+            ambiguous.len(),
+            session_lines(ambiguous)
+        ),
+    }
 }
 
 /// Offer the choice at the moment of failure, inline in `preloop run`.
@@ -1324,6 +1396,62 @@ mod tests {
             !rendered.contains("more noise"),
             "the excerpt is a fallback and must not appear alongside diagnostics"
         );
+    }
+
+    /// A run whose two jobs both failed has two paused sessions under one run
+    /// id. The reference a user has is that run id, so it must resolve to both
+    /// rather than to nothing.
+    #[test]
+    fn a_run_id_resolves_to_every_paused_job_in_that_run() {
+        let first = session();
+        let mut second = session();
+        second.session_id = "dbg_def456".into();
+        second.job_name = "lint".into();
+        second.run_id = first.run_id;
+        let sessions = vec![first.clone(), second.clone()];
+
+        let matched = matching(&sessions, &first.run_id.to_string());
+        assert_eq!(matched.len(), 2, "both paused jobs belong to the run");
+
+        let prefix = &first.run_id.to_string()[..8];
+        assert_eq!(matching(&sessions, prefix).len(), 2, "a prefix matches too");
+    }
+
+    #[test]
+    fn a_session_id_resolves_to_exactly_that_session() {
+        let first = session();
+        let mut second = session();
+        second.session_id = "dbg_def456".into();
+        second.run_id = first.run_id;
+        let sessions = vec![first, second];
+
+        let matched = matching(&sessions, "dbg_def456");
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].session_id, "dbg_def456");
+        assert_eq!(
+            matching(&sessions, "build").len(),
+            2,
+            "job name matches both"
+        );
+    }
+
+    /// The id from a run that never started matches nothing — the paused jobs
+    /// holding the pool belong to an earlier run.
+    #[test]
+    fn an_unrelated_run_id_matches_nothing() {
+        let sessions = vec![session()];
+        assert!(matching(&sessions, &RunId::new().to_string()).is_empty());
+        assert!(matching(&sessions, "dbg_nope").is_empty());
+    }
+
+    #[test]
+    fn a_session_line_names_the_run_it_belongs_to() {
+        let session = session();
+        let line = session_line(&session);
+        assert!(line.contains(&session.session_id));
+        assert!(line.contains("build"));
+        assert!(line.contains(&short_run(session.run_id)));
+        assert!(line.contains("step 4/6"), "1-based step index: {line}");
     }
 
     #[test]

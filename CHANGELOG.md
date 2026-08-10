@@ -9,7 +9,24 @@ Releases before v0.27.0 predate the changelog.
 
 ## [Unreleased]
 
-## [0.29.9] - 2026-08-10
+### Fixed
+
+- Serialize `machine fork` per golden VM. SmolVM keeps one RAM checkpoint per
+  golden; concurrent forks raced the freeze, and the loser's rollback resumed
+  the base and dropped the checkpoint, after which every fork failed with
+  `golden '<name>' is already paused; a valid retained checkpoint is required`
+  and queued jobs stalled until the engine restarted. Forks from different
+  goldens still run in parallel.
+- Re-arm a spent fork base (stop + restart forkable) and retry the fork once
+  when no clone still depends on it, instead of degrading every runner to a
+  full VM create. A base with live clones is never restarted — it falls back
+  to direct creation with an error explaining why.
+- `preloop debug <reference>` now resolves a run id that has several paused
+  jobs: it lists them (with their run ids) instead of answering
+  `no paused job matching`. When nothing matches but other sessions are
+  paused, the reply says what is paused instead of a bare 404.
+
+## [0.29.8] - 2026-08-09
 
 ### Added
 

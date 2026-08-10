@@ -31,7 +31,7 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 const GUEST_CONTROL_DIR: &str = "/run/preloop-control";
 const GUEST_CONTROL_SOCKET: &str = "/run/preloop-control/engine.sock";
@@ -2909,6 +2909,28 @@ async fn run_until_exit<P: VmProvider + 'static>(
     }
 }
 
+/// Whether a fork failure means this golden can never serve another fork.
+///
+/// A SmolVM fork base carries one RAM checkpoint. Lose it — a raced fork whose
+/// rollback resumed the base, a pruned snapshot directory, a golden restarted
+/// out from under the record — and the base is paused with nothing to restore
+/// from, so *every* later fork fails identically. The pool keeps working, but
+/// each runner now pays a full VM create, which reads as "jobs are queued and
+/// nothing is happening" rather than as a broken fork base. Matching SmolVM's
+/// wording is deliberate: these strings are the only signal the CLI gives, and
+/// a missed match costs a log line, not correctness.
+fn fork_base_unusable(error: &VmError) -> bool {
+    let message = error.to_string();
+    [
+        "is already paused",
+        "is not running forkable",
+        "control socket not responding",
+        "is not ready to fork",
+    ]
+    .iter()
+    .any(|signature| message.contains(signature))
+}
+
 /// Create, boot, and register one ephemeral runner; return its `run` argv.
 ///
 /// The caller owns cleanup: on any error the machine may already exist.
@@ -2929,24 +2951,76 @@ async fn provision_runner<P: VmProvider + 'static>(
                 if config.use_packed_artifact
                     && golden.as_str() == format!("{}-golden", config.name_prefix) =>
             {
-                warn!(
-                    machine = name.as_str(),
-                    golden = golden.as_str(),
-                    %error,
-                    "packed golden fork failed; creating runner directly from packed artifact"
-                );
                 // A failed fork can leave a partial clone behind. Best-effort
                 // cleanup makes the direct create safe; if cleanup itself is
                 // still racing SmolVM state, create returns the actionable
                 // error and the slot supervisor retries normally.
-                if let Err(cleanup) = provider.delete(name).await {
-                    debug!(
+                let cleanup = async {
+                    if let Err(cleanup) = provider.delete(name).await {
+                        debug!(
+                            machine = name.as_str(),
+                            %cleanup,
+                            "failed fork left no removable clone"
+                        );
+                    }
+                };
+                if fork_base_unusable(&error) && !provider.has_live_forks(golden).await {
+                    // The base is spent but nothing depends on it: re-arm the
+                    // golden (stop + start forkable) and retry the fork once.
+                    // A full engine restart and golden rebuild was the only
+                    // recovery before, which stalled the queue until someone
+                    // noticed; a re-arm is a few seconds.
+                    warn!(
                         machine = name.as_str(),
-                        %cleanup,
-                        "failed fork left no removable clone"
+                        golden = golden.as_str(),
+                        %error,
+                        "fork base spent; re-arming the golden once"
                     );
+                    cleanup.await;
+                    let rearmed = provider.stop(golden).await.is_ok()
+                        && provider.start_forkable(golden).await.is_ok();
+                    if rearmed {
+                        info!(golden = golden.as_str(), "golden fork base re-armed");
+                        match provider.fork(golden, name).await {
+                            Ok(()) => Some(golden),
+                            Err(retry_error) => {
+                                error!(
+                                    machine = name.as_str(),
+                                    golden = golden.as_str(),
+                                    %retry_error,
+                                    "re-armed golden still cannot fork; falling back to \
+                                     direct creation"
+                                );
+                                let _ = provider.delete(name).await;
+                                None
+                            }
+                        }
+                    } else {
+                        error!(
+                            golden = golden.as_str(),
+                            "failed to re-arm spent fork base; falling back to direct creation"
+                        );
+                        None
+                    }
+                } else {
+                    if fork_base_unusable(&error) {
+                        error!(
+                            golden = golden.as_str(),
+                            %error,
+                            "fork base is spent and live clones still depend on it, so it \
+                             cannot be re-armed; runners now cost a full VM create each until \
+                             the engine restarts and rebuilds the golden"
+                        );
+                    }
+                    warn!(
+                        machine = name.as_str(),
+                        golden = golden.as_str(),
+                        %error,
+                        "packed golden fork failed; creating runner directly from packed artifact"
+                    );
+                    cleanup.await;
+                    None
                 }
-                None
             }
             Err(error) => return Err(error.into()),
         },
@@ -3349,6 +3423,12 @@ mod lifecycle_tests {
         machines: Mutex<HashMap<String, MachineState>>,
         events: Mutex<Vec<String>>,
         fail_fork: bool,
+        /// Fail the next fork with the "spent fork base" signature, then
+        /// succeed. Mirrors a golden whose retained checkpoint vanished.
+        fail_fork_once_spent: Mutex<bool>,
+        /// Report live clones for `has_live_forks`; true by default so a spent
+        /// base with dependents is never re-armed in tests either.
+        live_forks: Mutex<bool>,
         fail_start: bool,
         fail_install: bool,
         fail_configure: bool,
@@ -3377,6 +3457,8 @@ mod lifecycle_tests {
                 machines: Mutex::new(HashMap::new()),
                 events: Mutex::new(Vec::new()),
                 fail_fork: false,
+                fail_fork_once_spent: Mutex::new(false),
+                live_forks: Mutex::new(true),
                 fail_start,
                 fail_install,
                 fail_configure,
@@ -3396,6 +3478,18 @@ mod lifecycle_tests {
 
         fn failing_fork(mut self) -> Self {
             self.fail_fork = true;
+            self
+        }
+
+        /// Fail the next fork with the spent-fork-base signature, then succeed.
+        fn failing_fork_once_spent(mut self) -> Self {
+            *self.fail_fork_once_spent.get_mut() = true;
+            self
+        }
+
+        /// Report whether clones of the golden still exist.
+        fn with_live_forks(mut self, live: bool) -> Self {
+            *self.live_forks.get_mut() = live;
             self
         }
 
@@ -3918,6 +4012,16 @@ chmod +x "$destination/bin/node"
                 .lock()
                 .await
                 .push(format!("fork:{}:{}", golden.as_str(), clone.as_str()));
+            {
+                let mut spent = self.fail_fork_once_spent.lock().await;
+                if *spent {
+                    *spent = false;
+                    return Err(test_error(
+                        "smolvm fork failed with exit code 1: golden 'lifecycle-test-golden' \
+                         is already paused; a valid retained checkpoint is required",
+                    ));
+                }
+            }
             if self.fail_fork {
                 return Err(test_error("fork-failure"));
             }
@@ -3932,7 +4036,15 @@ chmod +x "$destination/bin/node"
             Ok(())
         }
 
+        async fn has_live_forks(&self, _golden: &MachineName) -> bool {
+            *self.live_forks.lock().await
+        }
+
         async fn stop(&self, name: &MachineName) -> Result<(), VmError> {
+            self.events
+                .lock()
+                .await
+                .push(format!("stop:{}", name.as_str()));
             self.machines
                 .lock()
                 .await
@@ -4155,6 +4267,24 @@ chmod +x "$destination/bin/node"
     /// artifact remains valid.
     #[tokio::test]
     async fn packed_golden_fork_failure_falls_back_to_direct_creation() {
+        // Verbatim from SmolVM 1.7.x: a spent fork base is reported through the
+        // CLI's stderr, so the signature match is the only handle on it.
+        const SPENT_BASE: &str = "smolvm fork failed with exit code 1: Freezing golden \
+             'preloop-runner-golden' as fork base...\nError: agent operation failed: fork: \
+             golden 'preloop-runner-golden' is already paused; a valid retained checkpoint \
+             is required";
+
+        assert!(fork_base_unusable(&VmError::Command {
+            operation: "fork",
+            exit_code: 1,
+            message: SPENT_BASE.to_owned(),
+        }));
+        assert!(!fork_base_unusable(&VmError::Command {
+            operation: "fork",
+            exit_code: 1,
+            message: "host port 8080 is assigned to more than one clone".to_owned(),
+        }));
+
         let provider =
             Arc::new(TestProvider::new(false, false, false, false, false).failing_fork());
         let config = packed_fork_config();
@@ -4200,6 +4330,93 @@ chmod +x "$destination/bin/node"
             "fallback order must be fork, cleanup, create, start: {events:?}"
         );
         assert!(provider.has_machine(&name).await);
+    }
+
+    /// A spent fork base with no surviving clones is re-armed (stop, start
+    /// forkable) and the fork retried — the queue recovers in seconds instead
+    /// of stalling until someone restarts the engine and rebuilds the golden.
+    #[tokio::test]
+    async fn spent_fork_base_with_no_live_clones_is_rearmed_and_retried() {
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, false)
+                .with_live_forks(false)
+                .failing_fork_once_spent(),
+        );
+        let config = packed_fork_config();
+        let golden = MachineName::new("lifecycle-test-golden").unwrap();
+        let name = MachineName::new("lifecycle-test-0-6").unwrap();
+
+        provision_runner(
+            &provider,
+            &config,
+            &name,
+            Some(&golden),
+            &Arc::new(KeyPool::new()),
+            &config.base_image,
+            &[],
+            true,
+        )
+        .await
+        .expect("the re-armed golden serves the fork");
+
+        let events = provider.events().await;
+        let expected = [
+            format!("fork:{}:{}", golden.as_str(), name.as_str()),
+            format!("delete:{}", name.as_str()),
+            format!("stop:{}", golden.as_str()),
+            format!("start:{}", golden.as_str()),
+            format!("fork:{}:{}", golden.as_str(), name.as_str()),
+        ];
+        let mut cursor = 0;
+        for event in &expected {
+            let position = events[cursor..]
+                .iter()
+                .position(|seen| seen == event)
+                .expect("re-arm sequence must include every step");
+            cursor += position + 1;
+        }
+        assert!(
+            provider.has_machine(&name).await,
+            "the retried fork must leave the clone provisioned"
+        );
+    }
+
+    /// A spent base that still has live clones must NOT be re-armed: resuming
+    /// it would corrupt the copy-on-write clones. The pool falls back to a
+    /// full create instead.
+    #[tokio::test]
+    async fn spent_fork_base_with_live_clones_is_not_rearmed() {
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, false)
+                .with_live_forks(true)
+                .failing_fork_once_spent(),
+        );
+        let config = packed_fork_config();
+        let golden = MachineName::new("lifecycle-test-golden").unwrap();
+        let name = MachineName::new("lifecycle-test-0-7").unwrap();
+
+        provision_runner(
+            &provider,
+            &config,
+            &name,
+            Some(&golden),
+            &Arc::new(KeyPool::new()),
+            &config.base_image,
+            &[],
+            true,
+        )
+        .await
+        .expect("falls back to direct creation");
+
+        let events = provider.events().await;
+        assert!(
+            !events.iter().any(|event| event.starts_with("stop:")),
+            "the golden must not be touched while clones exist: {events:?}"
+        );
+        assert!(
+            events.contains(&format!("delete:{}", name.as_str())),
+            "the partial clone is cleaned up: {events:?}"
+        );
     }
 
     /// An environment-specific golden may represent a different `runs-on`

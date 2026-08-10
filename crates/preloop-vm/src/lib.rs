@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -280,6 +281,16 @@ pub trait VmProvider: Send + Sync {
         argv: &[String],
         secrets: &[(String, SecretSource)],
     ) -> Result<ExecOutput, VmError>;
+    /// Whether any machine forked from `golden` is still alive.
+    ///
+    /// A golden that has been frozen as a fork base must never be started
+    /// again while a clone exists — the clone's disks are copy-on-write over
+    /// the golden's, and resuming the base would corrupt them. Defaults to
+    /// `true` so a provider that does not track clones refuses to re-arm a
+    /// spent fork base rather than risk live clones.
+    async fn has_live_forks(&self, _golden: &MachineName) -> bool {
+        true
+    }
     /// Execute while forwarding output fragments to the caller.
     async fn exec_stream(
         &self,
@@ -305,6 +316,14 @@ pub struct SmolVmProvider {
     /// Serializes operations that build or replace a machine's base against
     /// everything else. See [`SmolVmProvider::exclusive`].
     lifecycle_lock: Arc<tokio::sync::RwLock<()>>,
+    /// One in-flight `machine fork` per golden. See [`SmolVmProvider::fork`].
+    fork_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Machines forked from a golden, by clone name, while they still exist.
+    ///
+    /// A golden is a copy-on-write base: once paused it must outlive every
+    /// clone, and starting it again would corrupt them. This census is how the
+    /// orchestrator knows a spent fork base may be safely re-armed.
+    forked_machines: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
     /// Whether the resolved binary's `machine create` accepts
     /// `--mount-socket`, probed once per provider.
     socket_mount_supported: Arc<tokio::sync::OnceCell<bool>>,
@@ -352,6 +371,8 @@ impl SmolVmProvider {
             pack_proxy: None,
             pack_no_proxy: None,
             lifecycle_lock: Arc::new(tokio::sync::RwLock::new(())),
+            fork_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            forked_machines: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             socket_mount_supported: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
@@ -519,12 +540,12 @@ impl SmolVmProvider {
     ///
     /// These run concurrently with each other: a pool replenishing several
     /// slots at once issues a delete and a fork per slot, and serializing them
-    /// made the whole refill wait one VM operation at a time. Forking four
-    /// clones from the same golden — including the first forks, which trigger
-    /// the base freeze — measured 101-119 ms concurrently against 271-283 ms
-    /// serially, with every clone usable and no failures across three trials.
-    /// They stay excluded from base construction, so a golden cannot be
-    /// replaced underneath a fork.
+    /// made the whole refill wait one VM operation at a time. They stay
+    /// excluded from base construction, so a golden cannot be replaced
+    /// underneath a fork.
+    ///
+    /// Forks additionally serialize per golden: see [`SmolVmProvider::fork`]
+    /// for the checkpoint invariant that requires it.
     async fn concurrent(
         &self,
         operation: &'static str,
@@ -532,6 +553,19 @@ impl SmolVmProvider {
     ) -> Result<ExecOutput, VmError> {
         let _guard = self.lifecycle_lock.read().await;
         self.checked(operation, args).await
+    }
+
+    /// The mutex guarding forks from one golden, created on first use.
+    ///
+    /// Keyed by name rather than held on the golden record because a provider
+    /// outlives any single golden and forks arrive from independent slot tasks.
+    async fn fork_lock(&self, golden: &MachineName) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.fork_locks.lock().await;
+        Arc::clone(
+            locks
+                .entry(golden.as_str().to_owned())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
     }
 }
 
@@ -684,20 +718,45 @@ impl VmProvider for SmolVmProvider {
         .map(|_| ())
     }
 
+    /// Fork one clone from a golden, one fork per golden at a time.
+    ///
+    /// SmolVM holds exactly one RAM checkpoint per golden: the first fork
+    /// freezes the base and publishes a retained checkpoint, and later forks
+    /// restore from that checkpoint instead of re-freezing. Two forks racing
+    /// the same golden break the invariant — the loser issues a second FORK
+    /// against an already-paused VM, and that failure's rollback resumes the
+    /// base and deletes the retained checkpoint. Every later fork then fails
+    /// with `golden '<name>' is already paused; a valid retained checkpoint is
+    /// required`, so the pool cannot produce another runner until the golden is
+    /// rebuilt from scratch: queued jobs stall indefinitely, in exchange for
+    /// the few hundred milliseconds a concurrent refill saves. SmolVM's own
+    /// fork-pool controller serializes on the golden for the same reason.
+    ///
+    /// Different goldens still fork concurrently, and forks remain excluded
+    /// from base construction, so a golden cannot be replaced underneath one.
     async fn fork(&self, golden: &MachineName, clone: &MachineName) -> Result<(), VmError> {
-        self.concurrent(
-            "fork",
-            &[
-                "machine".into(),
-                "fork".into(),
-                "--golden".into(),
-                golden.as_str().into(),
-                "--name".into(),
-                clone.as_str().into(),
-            ],
-        )
-        .await
-        .map(|_| ())
+        let fork_lock = self.fork_lock(golden).await;
+        let _fork_guard = fork_lock.lock().await;
+        let result = self
+            .concurrent(
+                "fork",
+                &[
+                    "machine".into(),
+                    "fork".into(),
+                    "--golden".into(),
+                    golden.as_str().into(),
+                    "--name".into(),
+                    clone.as_str().into(),
+                ],
+            )
+            .await;
+        if result.is_ok() {
+            self.forked_machines
+                .lock()
+                .await
+                .insert(clone.as_str().to_owned(), golden.as_str().to_owned());
+        }
+        result.map(|_| ())
     }
 
     async fn stop(&self, name: &MachineName) -> Result<(), VmError> {
@@ -715,18 +774,22 @@ impl VmProvider for SmolVmProvider {
     }
 
     async fn delete(&self, name: &MachineName) -> Result<(), VmError> {
-        self.concurrent(
-            "delete",
-            &[
-                "machine".into(),
-                "delete".into(),
-                "--name".into(),
-                name.as_str().into(),
-                "-f".into(),
-            ],
-        )
-        .await
-        .map(|_| ())
+        let result = self
+            .concurrent(
+                "delete",
+                &[
+                    "machine".into(),
+                    "delete".into(),
+                    "--name".into(),
+                    name.as_str().into(),
+                    "-f".into(),
+                ],
+            )
+            .await;
+        if result.is_ok() {
+            self.forked_machines.lock().await.remove(name.as_str());
+        }
+        result.map(|_| ())
     }
 
     async fn status(&self, name: &MachineName) -> Result<MachineState, VmError> {
@@ -929,6 +992,14 @@ impl VmProvider for SmolVmProvider {
         self.exclusive_with_staging("pack", &args, staging_dir)
             .await
             .map(|_| ())
+    }
+
+    async fn has_live_forks(&self, golden: &MachineName) -> bool {
+        self.forked_machines
+            .lock()
+            .await
+            .values()
+            .any(|owner| owner == golden.as_str())
     }
 }
 
