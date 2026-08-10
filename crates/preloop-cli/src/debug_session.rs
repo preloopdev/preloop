@@ -163,23 +163,18 @@ struct Api {
     token: Option<String>,
 }
 
-/// Find a paused session belonging to a run, if one exists.
-pub async fn paused_for_run(
+/// All open sessions on the server, newest first.
+pub async fn list_sessions(
     client: &reqwest::Client,
     base_url: &str,
     token: Option<String>,
-    run_id: preloop_gha_protocol::RunId,
-) -> Option<DebugSession> {
+) -> Result<Vec<DebugSession>> {
     let api = Api {
         client: client.clone(),
         base_url: base_url.to_owned(),
         token,
     };
-    api.list()
-        .await
-        .ok()?
-        .into_iter()
-        .find(|session| session.run_id == run_id)
+    api.list().await
 }
 
 /// Offer the choice at the moment of failure, inline in `preloop run`.

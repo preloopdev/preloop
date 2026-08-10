@@ -16,12 +16,15 @@ use preloop_gha_protocol::{JobId, RunId};
 use serde_json::{json, Value};
 
 use super::debug_pause::DebugPauseClient;
+use super::steps_runner::{Step, StepType};
 
 /// What the fake control plane observed and will answer.
 #[derive(Default)]
 struct Fake {
     /// Verdict handed out once `polls` reaches `verdict_after`.
     verdict: Option<Verdict>,
+    /// Snapshot credential the fake control plane mints for retry verdicts.
+    snapshot_token: Option<String>,
     /// Empty polls to serve before answering, simulating a human thinking.
     verdict_after: u32,
     polls: AtomicU32,
@@ -61,7 +64,11 @@ async fn spawn_fake(fake: Arc<Fake>) -> String {
                 } else {
                     None
                 };
-                Json(json!({ "verdict": verdict, "version": seen + 1 }))
+                Json(json!({
+                    "verdict": verdict,
+                    "version": seen + 1,
+                    "snapshot_token": fake.snapshot_token,
+                }))
             }),
         )
         .route(
@@ -99,6 +106,89 @@ fn client(base_url: &str) -> DebugPauseClient {
     )
     .unwrap()
     .with_workspace(Some("/work".to_owned()), Some("deadbeef".to_owned()))
+}
+
+/// A retry verdict must surface the fresh snapshot credential the server
+/// minted at verdict time, so the replayed step can swap out its stale
+/// pinned token.
+#[tokio::test]
+async fn retry_verdict_carries_the_fresh_snapshot_token() {
+    let fake = Arc::new(Fake {
+        verdict: Some(Verdict::Retry),
+        verdict_after: 0,
+        snapshot_token: Some("fresh-snapshot-jwt".to_owned()),
+        ..Default::default()
+    });
+    let base_url = spawn_fake(fake).await;
+    let client = client(&base_url);
+
+    let decision = client
+        .pause(failed_step(), Vec::new(), Vec::new(), Vec::new())
+        .await
+        .expect("pause returns a decision");
+    assert_eq!(decision.verdict, Verdict::Retry);
+    assert_eq!(
+        decision.snapshot_token.as_deref(),
+        Some("fresh-snapshot-jwt"),
+        "the verdict must carry the server-minted snapshot credential"
+    );
+}
+
+/// Token refresh applies only to the steps the message marks as pinned; a
+/// retry must never rewrite a step whose token the workflow set itself.
+#[test]
+fn refresh_snapshot_tokens_replaces_only_pinned_steps() {
+    let client = client("http://127.0.0.1:1")
+        .with_pinned_snapshot_steps(vec!["00000000-0000-0000-0000-000000000030".to_owned()]);
+    let mut steps = vec![
+        Step {
+            id: "00000000-0000-0000-0000-000000000030".to_owned(),
+            context_name: "__run".to_owned(),
+            display_name: "Run checkout".to_owned(),
+            step_type: StepType::Action {
+                uses: "actions/checkout@v4".to_owned(),
+                with: json!({ "token": "expired-pinned-token" }),
+            },
+            condition: None,
+            continue_on_error: false,
+            timeout_minutes: None,
+            env: Default::default(),
+            raw: json!({}),
+            is_background: false,
+        },
+        Step {
+            id: "00000000-0000-0000-0000-000000000031".to_owned(),
+            context_name: "__run_2".to_owned(),
+            display_name: "Run setup".to_owned(),
+            step_type: StepType::Action {
+                uses: "actions/setup-node@v4".to_owned(),
+                with: json!({ "token": "workflow-own-token" }),
+            },
+            condition: None,
+            continue_on_error: false,
+            timeout_minutes: None,
+            env: Default::default(),
+            raw: json!({}),
+            is_background: false,
+        },
+    ];
+
+    client.refresh_snapshot_tokens(&mut steps, "fresh-snapshot-jwt");
+
+    match &steps[0].step_type {
+        StepType::Action { with, .. } => assert_eq!(
+            with["token"], "fresh-snapshot-jwt",
+            "the pinned checkout step gets the fresh credential"
+        ),
+        _ => panic!("pinned step must be an action step"),
+    }
+    match &steps[1].step_type {
+        StepType::Action { with, .. } => assert_eq!(
+            with["token"], "workflow-own-token",
+            "unpinned steps keep the token the workflow set"
+        ),
+        _ => panic!("unpinned step must be an action step"),
+    }
 }
 
 /// What the fake control plane recorded about the credential exchange.

@@ -1200,6 +1200,17 @@ async fn build_debug_pause_client(
     )
     .await?
     .with_pause_flag(paused)
+    .with_pinned_snapshot_steps(
+        job_message
+            .get("preloopSnapshotTokenSteps")
+            .and_then(serde_json::Value::as_array)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| id.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    )
     .with_workspace(
         Some(workspace.to_owned()),
         job_message

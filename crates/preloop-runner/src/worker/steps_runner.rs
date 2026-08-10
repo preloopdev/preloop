@@ -453,6 +453,10 @@ pub async fn run_steps(
         // upload and the file-command cleanup below, leaving the server with a
         // step stuck in progress.
         let mut jump_to: Option<usize> = None;
+        // Snapshot checkout credential a retry verdict carried. Applied to the
+        // current step before the replay and to every step of a jumped range
+        // once the step borrow is released.
+        let mut pending_snapshot_token: Option<String> = None;
 
         // Retry loop. Exactly one pass unless a debug controller says `retry`.
         let (conclusion_str, file_command_paths) = loop {
@@ -932,8 +936,19 @@ pub async fn run_steps(
                             ));
                             attempt += 1;
                             source_revision = decision
-                                .and_then(|d| d.source_revision)
+                                .as_ref()
+                                .and_then(|d| d.source_revision.clone())
                                 .unwrap_or_else(|| client.current_revision());
+                            // The snapshot checkout token pinned at submission
+                            // may be expired by now; the verdict carried a
+                            // fresh one. Swap it in before the replay so the
+                            // re-run does not fail with a git 401.
+                            if let Some(token) =
+                                decision.as_ref().and_then(|d| d.snapshot_token.as_deref())
+                            {
+                                client.refresh_snapshot_tokens(std::slice::from_mut(step), token);
+                                pending_snapshot_token = Some(token.to_owned());
+                            }
 
                             match target {
                                 Some(target) if target <= idx && target < step_count => {
@@ -1139,6 +1154,14 @@ pub async fn run_steps(
         // Replay an earlier range, now that this attempt has been reported.
         if let Some(target) = jump_to {
             let context_name = step.context_name.clone();
+            // A jumped range may include other pinned checkout steps whose
+            // submission-time credential expired while the job waited. Swap
+            // in the verdict's replacement for all of them before the replay.
+            if let Some(token) = pending_snapshot_token.as_deref() {
+                if let Some(client) = debug_client.as_ref() {
+                    client.refresh_snapshot_tokens(&mut steps, token);
+                }
+            }
             // Clear every runner-managed per-step value for the range about to
             // re-run. Restoring only the target snapshot leaves saveState and
             // annotations from later steps visible during their second pass.

@@ -1361,6 +1361,21 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                 || (!args.detach && std::io::IsTerminal::is_terminal(&std::io::stdin()))),
         ..Default::default()
     };
+    // The terminal gate is silent by design (a piped run must not hang
+    // waiting for a controller), but a user who expects the debug shell on
+    // failure needs to know it was disabled before the run fails — the
+    // alternative is a plain `✗` with no explanation and no way to attach.
+    if !submission.preserve_on_failure && !args.no_debug {
+        eprintln!(
+            "[preloop] failure shells are off ({}); pass --preserve-on-failure to \
+             pause on failure for `preloop debug`/`preloop shell`",
+            if args.detach {
+                "detached run"
+            } else {
+                "stdin is not a terminal"
+            }
+        );
+    }
     // Overridden rather than set in the literal so a plain run keeps the
     // protocol's own defaults for `sha` and `actor`.
     if let Some((head_sha, head_tree)) = tested_head {
@@ -1417,6 +1432,20 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     // early" condition as `None` and deserves a reconnect, not a hard
     // failure. Bounded so a dead engine does not spin forever.
     let mut consecutive_stream_errors = 0u32;
+    // A paused session the watcher cannot see is a job hung forever with no
+    // explanation, so the first poll failure is reported instead of being
+    // folded into "no session".
+    let mut poll_warned = false;
+    // Set when the run loop leaves through the debug prompt (abort, detach,
+    // or a session error). The run is not terminal in those cases — the job
+    // is paused and reattachable — so the generic conclusion below must not
+    // report a finished status.
+    let mut left_via_pause = false;
+    // Per-job status seen on the event stream, for the backpressure line.
+    let mut job_statuses: std::collections::HashMap<String, ExecutionStatus> =
+        std::collections::HashMap::new();
+    let mut last_activity = std::time::Instant::now();
+    let mut last_backpressure = std::time::Instant::now();
     loop {
         let mut events_request = client.get(format!(
             "{url}/api/v1/runs/{}/events.ndjson",
@@ -1454,15 +1483,57 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                     None => break,
                 },
                 () = tokio::time::sleep(Duration::from_millis(750)) => {
-                    paused = debug_session::paused_for_run(
-                        &client,
-                        &url,
-                        api_token(),
-                        accepted.run_id,
-                    )
-                    .await;
-                    if paused.is_some() {
-                        break;
+                    match debug_session::list_sessions(&client, &url, api_token()).await {
+                        Ok(sessions) => {
+                            let paused_total = sessions
+                                .iter()
+                                .filter(|session| {
+                                    session.state
+                                        == preloop_gha_protocol::debug_session::SessionState::Paused
+                                })
+                                .count();
+                            if let Some(session) =
+                                sessions.into_iter().find(|session| {
+                                    session.run_id == accepted.run_id
+                                })
+                            {
+                                paused = Some(session);
+                                break;
+                            }
+                            // A run that produces no events for a while is
+                            // usually waiting on pool capacity — often held
+                            // by other runs' paused debug sessions. Say so
+                            // instead of hanging silently on the last status
+                            // line.
+                            if !final_status.is_some_and(ExecutionStatus::is_terminal)
+                                && last_activity.elapsed() >= Duration::from_secs(15)
+                                && last_backpressure.elapsed() >= Duration::from_secs(15)
+                            {
+                                let queued = job_statuses
+                                    .values()
+                                    .filter(|status| {
+                                        matches!(
+                                            status,
+                                            ExecutionStatus::Queued | ExecutionStatus::Pending
+                                        )
+                                    })
+                                    .count();
+                                eprintln!(
+                                    "[preloop] still waiting: {queued} job(s) queued, \
+                                     {paused_total} debug session(s) paused on the server \
+                                     (preloop debug <id> to inspect)"
+                                );
+                                last_backpressure = std::time::Instant::now();
+                            }
+                        }
+                        Err(error) => {
+                            if !poll_warned {
+                                eprintln!(
+                                    "[preloop] cannot check for paused debug sessions: {error:#}"
+                                );
+                                poll_warned = true;
+                            }
+                        }
                     }
                     continue;
                 }
@@ -1472,6 +1543,12 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                 let line = pending[..newline].trim().to_owned();
                 pending.drain(..=newline);
                 if seen_events.insert(line.clone()) {
+                    if let Ok(NdjsonEvent::JobStatus { job_id, status, .. }) =
+                        serde_json::from_str::<NdjsonEvent>(&line)
+                    {
+                        job_statuses.insert(job_id.0, status);
+                    }
+                    last_activity = std::time::Instant::now();
                     update_run_status(&mut final_status, render_event(&line));
                 }
             }
@@ -1499,10 +1576,15 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
             match debug_session::prompt_at_failure(&client, &url, api_token(), session).await {
                 // Resumed: reconnect and keep reporting the run.
                 Ok(true) => continue,
-                Ok(false) => break,
+                Ok(false) => {
+                    // Aborted or detached: the prompt already explained the
+                    // outcome and printed the reattach command.
+                    left_via_pause = true;
+                    break;
+                }
                 Err(error) => {
                     eprintln!("debug session error: {error:#}");
-                    break;
+                    return Err(error);
                 }
             }
         }
@@ -1522,6 +1604,10 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         // reaching here means the stream dropped early. Retry promptly rather
         // than adding a fixed poll interval to every run's wall clock.
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    if left_via_pause {
+        return Ok(());
     }
 
     if let Some(status) = final_status {
