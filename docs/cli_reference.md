@@ -231,12 +231,16 @@ pack a golden with:
 preloop build-golden \
   --runner-bundle target/aarch64-unknown-linux-gnu/release \
   --base-image ghcr.io/acme/preloop-base@sha256:<digest> \
+  --storage-gb 80 \
   --output dist/acme-ubuntu-24.04-aarch64
 ```
 
 The command is hidden from the normal help because it is an operator/build
 command rather than part of workflow submission. The base must currently be
 Ubuntu-derived, and its architecture must match the runner bundle and host.
+`--base-image` also accepts a registry snapshot of the official hosted image.
+Set `--storage-gb` or `PRELOOP_RUNNER_STORAGE_GB` for large snapshots; the
+default is 20 GiB.
 See [VM images and version tracking](vm-images.md#building-a-golden) for the
 stock build, custom OCI base, checksum, publishing, and runtime configuration
 steps.
@@ -257,6 +261,9 @@ steps.
 | `PRELOOP_USE_PACKED_GOLDEN` | Use a release or locally cached packed golden (default on; set `false` for cold OCI provisioning) |
 | `PRELOOP_GOLDEN_URL` | Override the packed golden URL; checksum URL is this value plus `.sha256` |
 | `PRELOOP_RUNNER_BASE_IMAGE` | Override the digest-pinned Ubuntu base identity at serve time; set it with `PRELOOP_GOLDEN_URL` for a custom packed golden |
+| `PRELOOP_RUNNER_STORAGE_GB` | Persistent guest storage per runner and golden build (default 20 GiB; use 80 or more for full hosted-image snapshots) |
+| `PRELOOP_RUNNER_PACK_PROXY` | HTTP proxy for smolvm's separate registry export VM during golden packing; standard HTTP(S) proxy variables are fallbacks |
+| `PRELOOP_RUNNER_PACK_NO_PROXY` | Proxy bypass list for golden packing; `NO_PROXY` and `no_proxy` are fallbacks |
 | `PRELOOP_RUNNER_LABELS` | Extra `runs-on` labels the pool's runners declare |
 | `PRELOOP_RUNNER_USER` / `PRELOOP_RUNNER_UID` | Guest runner account (default `runner`/1001); `root` restores root; empty disables switching |
 | `PRELOOP_WORKSPACE` | Workspace context for daemon deployments; not a package or toolchain installation input |

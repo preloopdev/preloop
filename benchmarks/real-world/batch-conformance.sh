@@ -15,7 +15,7 @@ WF_PATTERNS=("$@")
 
 GH_REPO="${GH_REPO:-preloopdev/preloop-conformance}"
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-HOST_WORKSPACE="${HOST_WORKSPACE:-/Users/bnjoroge/macos-runners}"
+HOST_WORKSPACE="${HOST_WORKSPACE:-$HOME/macos-runners}"
 RESULTS_DIR="${RESULTS_DIR:-$REPO_ROOT/benchmarks/compatibility/runner/behavior}"
 TMP_DIR="/tmp/batch-conformance-$$"
 BATCH_SIZE=4

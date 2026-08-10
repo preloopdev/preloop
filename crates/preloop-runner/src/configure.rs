@@ -582,6 +582,8 @@ async fn download_externals(http: &HttpClient, root: &std::path::Path) -> Result
 
     let os = if cfg!(target_os = "macos") {
         "darwin"
+    } else if cfg!(target_os = "windows") {
+        "win"
     } else {
         "linux"
     };
@@ -593,19 +595,25 @@ async fn download_externals(http: &HttpClient, root: &std::path::Path) -> Result
 
     for (name, version) in &node_versions {
         let dest = externals_dir.join(name);
-        if dest.join("bin/node").is_file() {
+        let node_binary = if cfg!(target_os = "windows") {
+            dest.join("node.exe")
+        } else {
+            dest.join("bin/node")
+        };
+        if node_binary.is_file() {
             info!("Externals {name} already present, skipping");
             continue;
         }
 
-        let tarball_name = format!("node-{version}-{os}-{arch}.tar.gz");
-        let url = format!("https://nodejs.org/dist/{version}/{tarball_name}");
+        let archive_name = if cfg!(target_os = "windows") {
+            format!("node-{version}-{os}-{arch}.zip")
+        } else {
+            format!("node-{version}-{os}-{arch}.tar.gz")
+        };
+        let url = format!("https://nodejs.org/dist/{version}/{archive_name}");
         info!("Downloading {name} from {url}");
 
         let bytes = http.get_bytes(&url).await?;
-        let decoder = flate2::read::GzDecoder::new(bytes.as_ref());
-        let mut archive = tar::Archive::new(decoder);
-
         // Extract into a temporary directory, then publish atomically. A
         // failed download or extraction must not leave a directory that a
         // later configure mistakenly treats as a complete external.
@@ -614,21 +622,55 @@ async fn download_externals(http: &HttpClient, root: &std::path::Path) -> Result
             std::fs::remove_dir_all(&temp)?;
         }
         std::fs::create_dir_all(&temp)?;
-        for entry in archive.entries()? {
-            let mut entry = entry?;
-            let path = entry.path()?.into_owned();
-            // Strip the first path component (node-v20.x.y-os-arch/)
-            let stripped: std::path::PathBuf = path.components().skip(1).collect();
-            if stripped.components().count() == 0 {
-                continue;
+        if cfg!(target_os = "windows") {
+            let reader = std::io::Cursor::new(bytes.as_ref());
+            let mut archive = zip::ZipArchive::new(reader)?;
+            for index in 0..archive.len() {
+                let mut entry = archive.by_index(index)?;
+                let path = entry
+                    .enclosed_name()
+                    .ok_or_else(|| anyhow::anyhow!("invalid path in Node archive"))?
+                    .to_owned();
+                // Strip the first path component (node-v20.x.y-win-x64/)
+                let stripped: std::path::PathBuf = path.components().skip(1).collect();
+                if stripped.components().count() == 0 {
+                    continue;
+                }
+                let target = temp.join(&stripped);
+                if entry.is_dir() {
+                    std::fs::create_dir_all(&target)?;
+                } else {
+                    if let Some(parent) = target.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    let mut output = std::fs::File::create(&target)?;
+                    std::io::copy(&mut entry, &mut output)?;
+                }
             }
-            let target = temp.join(&stripped);
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
+        } else {
+            let decoder = flate2::read::GzDecoder::new(bytes.as_ref());
+            let mut archive = tar::Archive::new(decoder);
+            for entry in archive.entries()? {
+                let mut entry = entry?;
+                let path = entry.path()?.into_owned();
+                // Strip the first path component (node-v20.x.y-os-arch/)
+                let stripped: std::path::PathBuf = path.components().skip(1).collect();
+                if stripped.components().count() == 0 {
+                    continue;
+                }
+                let target = temp.join(&stripped);
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                entry.unpack(&target)?;
             }
-            entry.unpack(&target)?;
         }
-        if !temp.join("bin/node").is_file() {
+        let extracted_binary = if cfg!(target_os = "windows") {
+            temp.join("node.exe")
+        } else {
+            temp.join("bin/node")
+        };
+        if !extracted_binary.is_file() {
             std::fs::remove_dir_all(&temp)?;
             anyhow::bail!("downloaded {name} archive did not contain bin/node");
         }
@@ -647,6 +689,8 @@ fn current_os_label() -> &'static str {
         "macOS"
     } else if cfg!(target_os = "linux") {
         "Linux"
+    } else if cfg!(target_os = "windows") {
+        "Windows"
     } else {
         "Unknown"
     }

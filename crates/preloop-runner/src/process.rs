@@ -428,7 +428,41 @@ async fn wait_for_exit(child: &mut AsyncGroupChild, timeout: Duration) -> bool {
 #[cfg(unix)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::sync::mpsc as std_mpsc;
+
+    const SIGNAL_TARGET_ENV: &str = "PRELOOP_PROCESS_SIGNAL_TEST_TARGET";
+
+    /// Runs as a subprocess for the cancellation tests below. Registering the
+    /// handlers in the target process makes the tests independent of the
+    /// surrounding test host's signal dispositions. In particular, the
+    /// official Actions runner ignores SIGINT and that disposition survives
+    /// exec, so a shell trap cannot observe the signal during dogfood.
+    #[tokio::test]
+    async fn cancellation_signal_target() {
+        let Ok(target) = std::env::var(SIGNAL_TARGET_ENV) else {
+            return;
+        };
+        let mut interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .expect("register SIGINT handler");
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("register SIGTERM handler");
+
+        println!("\nready");
+        std::io::stdout().flush().expect("flush readiness");
+        interrupt.recv().await.expect("receive SIGINT");
+
+        match target.as_str() {
+            "interrupt" => println!("got-int"),
+            "terminate" => {
+                terminate.recv().await.expect("receive SIGTERM");
+                println!("got-term");
+            }
+            other => panic!("unknown signal test target {other}"),
+        }
+    }
 
     /// A step that reads stdin must see EOF, not block. The runner runs as a
     /// child of a guest `exec` whose stdin never closes, so an inherited stdin
@@ -470,35 +504,40 @@ mod tests {
     async fn cancel_sends_sigint_before_hard_kill() {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (line_tx, line_rx) = std_mpsc::channel();
+        let test_binary = std::env::current_exe().expect("resolve test binary");
+        let test_binary = test_binary.to_str().expect("UTF-8 test binary path");
+        let env = HashMap::from([(SIGNAL_TARGET_ENV.to_owned(), "interrupt".to_owned())]);
 
-        let cancel_task = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let _ = cancel_tx.send(true);
-        });
-
-        let _result = invoke(
-            "sh",
-            &[
-                "-c",
-                "trap 'echo got-int; exit 0' INT; echo ready; while true; do sleep 1; done",
-            ],
-            Path::new("."),
-            &HashMap::new(),
-            Some(Box::new(move |chunk: &[u8]| {
-                for seg in chunk.split(|&b| b == b'\n') {
-                    if let Ok(s) = std::str::from_utf8(seg) {
-                        if !s.is_empty() {
-                            let _ = line_tx.send(s.to_string());
+        let _result = tokio::time::timeout(
+            Duration::from_secs(5),
+            invoke(
+                test_binary,
+                &[
+                    "--exact",
+                    "process::tests::cancellation_signal_target",
+                    "--nocapture",
+                ],
+                Path::new("."),
+                &env,
+                Some(Box::new(move |chunk: &[u8]| {
+                    for seg in chunk.split(|&b| b == b'\n') {
+                        if let Ok(s) = std::str::from_utf8(seg) {
+                            let s = s.trim();
+                            if !s.is_empty() {
+                                let _ = line_tx.send(s.to_string());
+                                if s == "ready" {
+                                    let _ = cancel_tx.send(true);
+                                }
+                            }
                         }
                     }
-                }
-            })),
-            Some(cancel_rx),
-            true,
+                })),
+                Some(cancel_rx),
+                true,
+            ),
         )
-        .await;
-
-        let _ = cancel_task.await;
+        .await
+        .expect("cancelled process should exit");
 
         let lines: Vec<String> = line_rx.try_iter().collect();
         assert!(
@@ -511,35 +550,40 @@ mod tests {
     async fn cancel_falls_back_to_sigterm_when_sigint_is_ignored() {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (line_tx, line_rx) = std_mpsc::channel();
+        let test_binary = std::env::current_exe().expect("resolve test binary");
+        let test_binary = test_binary.to_str().expect("UTF-8 test binary path");
+        let env = HashMap::from([(SIGNAL_TARGET_ENV.to_owned(), "terminate".to_owned())]);
 
-        let cancel_task = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let _ = cancel_tx.send(true);
-        });
-
-        let _result = invoke(
-            "sh",
-            &[
-                "-c",
-                "trap '' INT; trap 'echo got-term; exit 0' TERM; echo ready; while true; do sleep 1; done",
-            ],
-            Path::new("."),
-            &HashMap::new(),
-            Some(Box::new(move |chunk: &[u8]| {
-                for seg in chunk.split(|&b| b == b'\n') {
-                    if let Ok(s) = std::str::from_utf8(seg) {
-                        if !s.is_empty() {
-                            let _ = line_tx.send(s.to_string());
+        let _result = tokio::time::timeout(
+            Duration::from_secs(5),
+            invoke(
+                test_binary,
+                &[
+                    "--exact",
+                    "process::tests::cancellation_signal_target",
+                    "--nocapture",
+                ],
+                Path::new("."),
+                &env,
+                Some(Box::new(move |chunk: &[u8]| {
+                    for seg in chunk.split(|&b| b == b'\n') {
+                        if let Ok(s) = std::str::from_utf8(seg) {
+                            let s = s.trim();
+                            if !s.is_empty() {
+                                let _ = line_tx.send(s.to_string());
+                                if s == "ready" {
+                                    let _ = cancel_tx.send(true);
+                                }
+                            }
                         }
                     }
-                }
-            })),
-            Some(cancel_rx),
-            true,
+                })),
+                Some(cancel_rx),
+                true,
+            ),
         )
-        .await;
-
-        let _ = cancel_task.await;
+        .await
+        .expect("cancelled process should exit");
 
         let lines: Vec<String> = line_rx.try_iter().collect();
         assert!(

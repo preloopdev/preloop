@@ -130,6 +130,7 @@ pub(crate) fn cancel_run_inner(
     reason: Option<&str>,
 ) -> usize {
     let mut in_progress: Vec<JobId> = Vec::new();
+    let mut deferred_nodes: Vec<JobId> = Vec::new();
     {
         let Some(record) = inner.runs.get_mut(&run_id) else {
             return 0;
@@ -144,6 +145,13 @@ pub(crate) fn cancel_run_inner(
                 ExecutionStatus::Queued | ExecutionStatus::Pending | ExecutionStatus::InProgress
             ) {
                 *status = ExecutionStatus::Cancelled;
+                if record
+                    .caller_plans
+                    .get(job_id)
+                    .is_some_and(|plan| plan.deferred_matrix.is_some())
+                {
+                    deferred_nodes.push(job_id.clone());
+                }
             }
         }
     }
@@ -173,6 +181,17 @@ pub(crate) fn cancel_run_inner(
     // of folding cancelled jobs back into the run.
     inner.pending_expansions.retain(|job| job.run_id != run_id);
     inner.expanding.retain(|(id, _)| *id != run_id);
+    // Deferred matrix placeholders have a submit-time request record, but are
+    // never delivered to a runner. No RenewJob/CompleteJob callback can retire
+    // that record after cancellation, so settle it explicitly.
+    for job_id in deferred_nodes {
+        retire_node_requests(
+            inner,
+            run_id,
+            &job_id,
+            RequestRetirement::Settle(ExecutionStatus::Cancelled),
+        );
+    }
 
     // Release any concurrency holders belonging to this run and promote next.
     release_concurrency_for_run(inner, run_id);
@@ -238,6 +257,19 @@ pub(crate) fn cancel_job_inner(inner: &mut InnerState, run_id: RunId, job_id: &J
         .pending_expansions
         .retain(|j| !(j.run_id == run_id && j.job_id == *job_id));
     inner.expanding.remove(&(run_id, job_id.clone()));
+    let deferred_matrix = inner
+        .runs
+        .get(&run_id)
+        .and_then(|run| run.caller_plans.get(job_id))
+        .is_some_and(|plan| plan.deferred_matrix.is_some());
+    if deferred_matrix {
+        retire_node_requests(
+            inner,
+            run_id,
+            job_id,
+            RequestRetirement::Settle(ExecutionStatus::Cancelled),
+        );
+    }
 
     // Cancelling a reusable caller cancels its materialized subtree with it.
     let inner_ids = inner

@@ -5,7 +5,9 @@ mod keys;
 
 include!(concat!(env!("OUT_DIR"), "/pins.rs"));
 
-use crate::environment::{curated_toolchains, EnvironmentSpec, ToolchainLayer};
+use crate::environment::{
+    curated_toolchains, is_stock_base_image, EnvironmentSpec, ToolchainLayer,
+};
 use crate::keys::{KeyPool, StagedKey};
 use preloop_gha_protocol::RUNNER_BUSY_SENTINEL;
 
@@ -268,9 +270,16 @@ fn default_golden_url(release_version: &str) -> String {
     )
 }
 
+fn should_download_prebaked_golden(base_image: &str, custom_golden_url: bool) -> bool {
+    is_stock_base_image(base_image) || custom_golden_url
+}
+
 async fn download_prebaked_golden(payload: &Path, release_version: &str) -> bool {
     let default_url = default_golden_url(release_version);
-    let url = std::env::var("PRELOOP_GOLDEN_URL").unwrap_or(default_url);
+    let url = std::env::var("PRELOOP_GOLDEN_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(default_url);
 
     info!(url = %url, target = %payload.display(), "Attempting to download pre-baked golden microVM image");
 
@@ -652,8 +661,11 @@ pub fn base_install_script() -> String {
     format!(
         "apt-get update -qq && \
          (echo \"### install hosted apt baseline\" >&2 && \
-          if ! DEBIAN_FRONTEND=noninteractive \
-             apt-get install -y -qq --no-install-recommends {base_packages_pinned}; then \
+          if DEBIAN_FRONTEND=noninteractive \
+             apt-get -s install -qq --no-install-recommends {base_packages_pinned} >/dev/null 2>&1; then \
+            DEBIAN_FRONTEND=noninteractive \
+            apt-get install -y -qq --no-install-recommends {base_packages_pinned}; \
+          else \
             echo \"WARNING: exact hosted apt pins are unavailable; falling back to archive versions\" >&2; \
             DEBIAN_FRONTEND=noninteractive \
             apt-get install -y -qq --no-install-recommends {BASE_PACKAGES}; \
@@ -668,33 +680,55 @@ pub fn base_install_script() -> String {
            *) LFS_ARCH=arm64; DOCKER_STATIC_ARCH=aarch64; DOCKER_PLUGIN_ARCH=arm64; COMPOSE_ARCH=aarch64 ;; \
          esac; \
          (echo \"### install hosted compiler matrix\" >&2 && \
-          if DEBIAN_FRONTEND=noninteractive \
-             apt-get install -y -qq --no-install-recommends {compiler_packages}; then \
-            for version in {CLANG_VERSIONS}; do \
-              if [ -x /usr/bin/clang++-$version ]; then \
-                update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-$version 100 || true; \
-              fi; \
-              if [ -x /usr/bin/clang-$version ]; then \
-                update-alternatives --install /usr/bin/clang clang /usr/bin/clang-$version 100 || true; \
-              fi; \
-              if [ -x /usr/bin/clang-format-$version ]; then \
-                update-alternatives --install /usr/bin/clang-format clang-format /usr/bin/clang-format-$version 100 || true; \
-              fi; \
-              if [ -x /usr/bin/clang-tidy-$version ]; then \
-                update-alternatives --install /usr/bin/clang-tidy clang-tidy /usr/bin/clang-tidy-$version 100 || true; \
-              fi; \
-              if [ -x /usr/bin/run-clang-tidy-$version ]; then \
-                update-alternatives --install /usr/bin/run-clang-tidy run-clang-tidy /usr/bin/run-clang-tidy-$version 100 || true; \
-              fi; \
-            done; \
+          available_compiler_packages=''; \
+          compiler_matrix_complete=1; \
+          for package in {compiler_packages}; do \
+            if DEBIAN_FRONTEND=noninteractive \
+               apt-get -s install -qq --no-install-recommends \"$package\" >/dev/null 2>&1; then \
+              available_compiler_packages=\"$available_compiler_packages $package\"; \
+            else \
+              compiler_matrix_complete=0; \
+              echo \"compiler package unavailable: $package\" >&2; \
+            fi; \
+          done; \
+          if [ -n \"$available_compiler_packages\" ]; then \
+            DEBIAN_FRONTEND=noninteractive \
+            apt-get install -y -qq --no-install-recommends $available_compiler_packages || exit 1; \
+          fi; \
+          if [ \"$compiler_matrix_complete\" = 1 ]; then \
+            clang-16 --version | head -1 | grep -F '{CLANG_16_VERSION}' && \
+            clang-17 --version | head -1 | grep -F '{CLANG_17_VERSION}' && \
+            clang-18 --version | head -1 | grep -F '{CLANG_18_VERSION}' && \
+            test \"$(gcc-12 -dumpfullversion)\" = '{GCC_12_VERSION}' && \
+            test \"$(gcc-13 -dumpfullversion)\" = '{GCC_13_VERSION}' && \
+            test \"$(gcc-14 -dumpfullversion)\" = '{GCC_14_VERSION}' || exit 1; \
           else \
-            echo \"WARNING: hosted compiler matrix is not available in this Ubuntu archive; continuing with the base compiler toolchain\" >&2; \
-            for package in clang clang-format clang-tidy gcc g++ gfortran; do \
-              DEBIAN_FRONTEND=noninteractive \
-              apt-get install -y -qq --no-install-recommends \"$package\" || \
-                echo \"compiler package unavailable: $package\" >&2; \
-            done; \
-          fi) && \
+            echo \"WARNING: hosted compiler matrix is incomplete in this Ubuntu archive; adding the archive-default compiler toolchain\" >&2; \
+            DEBIAN_FRONTEND=noninteractive \
+            apt-get install -y -qq --no-install-recommends clang clang-format clang-tidy gcc g++ gfortran || exit 1; \
+          fi; \
+          for version in {CLANG_VERSIONS}; do \
+            if [ -x /usr/bin/clang++-$version ]; then \
+              update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-$version 100 || true; \
+            fi; \
+            if [ -x /usr/bin/clang-$version ]; then \
+              update-alternatives --install /usr/bin/clang clang /usr/bin/clang-$version 100 || true; \
+            fi; \
+            if [ -x /usr/bin/clang-format-$version ]; then \
+              update-alternatives --install /usr/bin/clang-format clang-format /usr/bin/clang-format-$version 100 || true; \
+            fi; \
+            if [ -x /usr/bin/clang-tidy-$version ]; then \
+              update-alternatives --install /usr/bin/clang-tidy clang-tidy /usr/bin/clang-tidy-$version 100 || true; \
+            fi; \
+            if [ -x /usr/bin/run-clang-tidy-$version ]; then \
+              update-alternatives --install /usr/bin/run-clang-tidy run-clang-tidy /usr/bin/run-clang-tidy-$version 100 || true; \
+            fi; \
+          done; \
+          for tool in clang clang++ clang-format clang-tidy run-clang-tidy; do \
+            if [ -x \"/usr/bin/$tool-{CLANG_DEFAULT_VERSION}\" ]; then \
+              update-alternatives --set \"$tool\" \"/usr/bin/$tool-{CLANG_DEFAULT_VERSION}\" || exit 1; \
+            fi; \
+          done) && \
          (echo \"### fetch system node v{BASE_NODE_VERSION}\" >&2 && \
           curl -fsSL \"https://nodejs.org/dist/v{BASE_NODE_VERSION}/node-v{BASE_NODE_VERSION}-linux-$NODE_ARCH.tar.gz\" \
             | tar -xz --strip-components=1 -C /usr/local) && \
@@ -1193,6 +1227,11 @@ impl RunnerPoolConfig {
                 "runner pool size must be between 0 and 64".into(),
             ));
         }
+        if self.storage_gib == 0 {
+            return Err(OrchestratorError::Config(
+                "runner storage must be greater than zero".into(),
+            ));
+        }
         MachineName::new(format!("{}-0", self.name_prefix))?;
         if self.base_image.trim().is_empty()
             || self.server_url.trim().is_empty()
@@ -1452,9 +1491,11 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
         let _ = provider.delete(golden).await;
         return Err(error);
     }
-    if let Err(error) = install_base_dependencies(provider.as_ref(), golden).await {
-        let _ = provider.delete(golden).await;
-        return Err(error);
+    if env_spec.curated {
+        if let Err(error) = install_base_dependencies(provider.as_ref(), golden).await {
+            let _ = provider.delete(golden).await;
+            return Err(error);
+        }
     }
     for layer in &env_spec.toolchains {
         for command in layer.install_commands() {
@@ -1567,8 +1608,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // workspace's default environment (base image plus any toolchains
         // detected from version files like rust-toolchain.toml).
         if self.config.use_fork {
-            let default_environment =
-                EnvironmentSpec::new(self.config.base_image.clone(), curated_toolchains());
+            let default_environment = EnvironmentSpec::for_base(self.config.base_image.clone());
             let golden = MachineName::new(format!("{}-golden", golden_registry.name_prefix))?;
             let result = if self.config.use_packed_artifact {
                 prepare_packed_golden(&self.provider, &self.config, &golden).await
@@ -1804,9 +1844,20 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         if let Some(parent) = self.config.artifact_stem.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        if allow_download && download_prebaked_golden(&payload, &self.config.release_version).await
+        let custom_golden_url = std::env::var("PRELOOP_GOLDEN_URL")
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty());
+        if allow_download
+            && should_download_prebaked_golden(&self.config.base_image, custom_golden_url)
         {
-            return Ok(());
+            if download_prebaked_golden(&payload, &self.config.release_version).await {
+                return Ok(());
+            }
+        } else if allow_download {
+            info!(
+                base_image = %self.config.base_image,
+                "custom base image has no PRELOOP_GOLDEN_URL; building its golden locally"
+            );
         }
 
         let name = MachineName::new(format!("{}-builder", self.config.name_prefix))?;
@@ -1831,21 +1882,23 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         };
         self.provider.create(&spec).await?;
         self.provider.start(&name).await?;
-        if let Err(error) = install_base_dependencies(self.provider.as_ref(), &name).await {
-            let _ = self.provider.delete(&name).await;
-            return Err(error);
-        }
-        // Bake the curated toolchain set into the artifact so every runner
-        // forked from it carries it pre-installed. The base install script
-        // already covers the GitHub-hosted parity toolset (node/python/go
-        // toolcaches, git, docker, nvm, yarn); `setup-*` actions download any
-        // other version a job asks for at job time.
-        let toolchains = curated_toolchains();
-        for layer in &toolchains {
-            for command in layer.install_commands() {
-                if let Err(error) = self.provider.exec(&name, &command).await {
-                    let _ = self.provider.delete(&name).await;
-                    return Err(error.into());
+        // A custom base image is the operator's contract: use it as-is. Only
+        // the stock digest-pinned Ubuntu bases get the curated bake (the
+        // GitHub-hosted parity toolset — node/python/go toolcaches, git,
+        // docker, nvm, yarn — plus the Rust layer; `setup-*` actions download
+        // any other version a job asks for at job time).
+        if is_stock_base_image(&self.config.base_image) {
+            if let Err(error) = install_base_dependencies(self.provider.as_ref(), &name).await {
+                let _ = self.provider.delete(&name).await;
+                return Err(error);
+            }
+            let toolchains = curated_toolchains();
+            for layer in &toolchains {
+                for command in layer.install_commands() {
+                    if let Err(error) = self.provider.exec(&name, &command).await {
+                        let _ = self.provider.delete(&name).await;
+                        return Err(error.into());
+                    }
                 }
             }
         }
@@ -1877,7 +1930,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     .unwrap_or("unknown")
             )));
         }
-        let env_spec = EnvironmentSpec::new(self.config.base_image.clone(), toolchains);
+        let env_spec = EnvironmentSpec::for_base(self.config.base_image.clone());
         if let Err(error) = write_bake_manifest(self.provider.as_ref(), &name, &env_spec).await {
             // Provenance is an audit aid, not a build gate.
             warn!(machine = name.as_str(), %error, "bake manifest not written");
@@ -1985,6 +2038,9 @@ struct RunnerEnvironment {
     /// Toolchains this runner must carry (installed after boot when the
     /// runner is created fresh rather than forked from a prepared golden).
     toolchains: Vec<ToolchainLayer>,
+    /// Whether Preloop's curated bake applies to this base. Custom base
+    /// images are used as-is and must not receive the apt/toolchain bake.
+    curated: bool,
 }
 
 /// Handles every slot in the pool shares.
@@ -2213,7 +2269,8 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
             }
             None => config.base_image.clone(),
         };
-        let env_spec = EnvironmentSpec::new(env_base.clone(), curated_toolchains());
+        let env_spec = EnvironmentSpec::for_base(env_base.clone());
+        let curated = env_spec.curated;
         let fingerprint = env_spec.fingerprint.clone();
         let toolchains = env_spec.toolchains.clone();
         let selected = golden_registry
@@ -2243,16 +2300,19 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
                 fingerprint: Some(fingerprint),
                 base: env_base,
                 toolchains,
+                curated,
             },
         )
     } else {
-        let env_spec = EnvironmentSpec::new(config.base_image.clone(), curated_toolchains());
+        let env_spec = EnvironmentSpec::for_base(config.base_image.clone());
+        let curated = env_spec.curated;
         (
             None,
             RunnerEnvironment {
                 fingerprint: None,
                 base: env_spec.base.clone(),
                 toolchains: env_spec.toolchains,
+                curated,
             },
         )
     };
@@ -2357,7 +2417,8 @@ async fn run_slot<P: VmProvider + 'static>(
             };
             // The golden carries the curated toolchain set; base image still
             // comes from the queued job's `runs-on` labels.
-            let env_spec = EnvironmentSpec::new(env_base.clone(), curated_toolchains());
+            let env_spec = EnvironmentSpec::for_base(env_base.clone());
+            let curated = env_spec.curated;
             let fingerprint = env_spec.fingerprint.clone();
             let toolchains = env_spec.toolchains.clone();
 
@@ -2395,17 +2456,20 @@ async fn run_slot<P: VmProvider + 'static>(
                     fingerprint: Some(fingerprint),
                     base: env_base,
                     toolchains,
+                    curated,
                 },
             )
         } else {
             // create-per-runner path: no golden, provision fresh each time.
-            let env_spec = EnvironmentSpec::new(config.base_image.clone(), curated_toolchains());
+            let env_spec = EnvironmentSpec::for_base(config.base_image.clone());
+            let curated = env_spec.curated;
             (
                 None,
                 RunnerEnvironment {
                     fingerprint: None,
                     base: env_spec.base.clone(),
                     toolchains: env_spec.toolchains,
+                    curated,
                 },
             )
         };
@@ -2513,6 +2577,7 @@ async fn provision_slot<P: VmProvider + 'static>(
         keys,
         &environment.base,
         &environment.toolchains,
+        environment.curated,
     )
     .await
     {
@@ -2855,6 +2920,7 @@ async fn provision_runner<P: VmProvider + 'static>(
     keys: &Arc<KeyPool>,
     environment_base: &str,
     toolchains: &[ToolchainLayer],
+    curated: bool,
 ) -> Result<Vec<String>, OrchestratorError> {
     let forked_golden = match golden {
         Some(golden) => match provider.fork(golden, name).await {
@@ -2902,12 +2968,15 @@ async fn provision_runner<P: VmProvider + 'static>(
             && golden.as_str() == format!("{}-golden", config.name_prefix);
         if golden_is_packed {
             // The pack carries the apt baseline, but not necessarily apt's
-            // indices — restore them before any workflow apt-installs.
-            if let Err(error) = provider.exec(name, &apt_lists_refresh_command()).await {
-                warn!(
+            // indices — restore them before any workflow apt-installs. A
+            // custom base is used as-is: no apt assumptions.
+            if curated {
+                if let Err(error) = provider.exec(name, &apt_lists_refresh_command()).await {
+                    warn!(
                     machine = name.as_str(),
-                    %error, "apt list refresh failed; workflow apt installs may not resolve"
-                );
+                        %error, "apt list refresh failed; workflow apt installs may not resolve"
+                    );
+                }
             }
             // A pack is only as baked as whoever produced it: `prepare_artifact`
             // bakes the workspace toolchains, but `download_prebaked_golden`
@@ -2936,7 +3005,7 @@ async fn provision_runner<P: VmProvider + 'static>(
                 }
                 verify_toolchain_installed(provider.as_ref(), name, layer).await?;
             }
-        } else {
+        } else if curated {
             install_base_dependencies(provider.as_ref(), name).await?;
             for layer in toolchains {
                 for command in layer.install_commands() {
@@ -2946,6 +3015,13 @@ async fn provision_runner<P: VmProvider + 'static>(
                 }
                 verify_toolchain_installed(provider.as_ref(), name, layer).await?;
             }
+        } else {
+            // Custom base image: used as-is, no apt bake, no toolchains.
+            debug!(
+                machine = name.as_str(),
+                base = %environment_base,
+                "custom base image — skipping the curated bake"
+            );
         }
     } else {
         let uses_packed_artifact = config.use_packed_artifact;
@@ -2981,15 +3057,18 @@ async fn provision_runner<P: VmProvider + 'static>(
         // baseline itself — otherwise node actions die with "curl: command
         // not found" and rust jobs with "cargo: command not found". The
         // installs are idempotent, so a fully baked artifact only pays the
-        // presence checks.
-        install_base_dependencies(provider.as_ref(), name).await?;
-        for layer in toolchains {
-            for command in layer.install_commands() {
-                if let Err(error) = provider.exec(name, &command).await {
-                    return Err(error.into());
+        // presence checks. A custom base is the operator's contract: no apt
+        // baseline, no toolchain curation.
+        if curated {
+            install_base_dependencies(provider.as_ref(), name).await?;
+            for layer in toolchains {
+                for command in layer.install_commands() {
+                    if let Err(error) = provider.exec(name, &command).await {
+                        return Err(error.into());
+                    }
                 }
+                verify_toolchain_installed(provider.as_ref(), name, layer).await?;
             }
-            verify_toolchain_installed(provider.as_ref(), name, layer).await?;
         }
     }
 
@@ -3787,6 +3866,20 @@ chmod +x "$destination/bin/node"
         }
     }
 
+    #[test]
+    fn zero_runner_storage_is_rejected() {
+        let mut config = test_config(false);
+        config.storage_gib = 0;
+
+        let error = config.validate().expect_err("zero storage must be invalid");
+        assert!(
+            error
+                .to_string()
+                .contains("storage must be greater than zero"),
+            "{error}"
+        );
+    }
+
     #[async_trait]
     impl VmProvider for TestProvider {
         async fn create(&self, spec: &MachineSpec) -> Result<(), VmError> {
@@ -3993,6 +4086,7 @@ chmod +x "$destination/bin/node"
                 fingerprint: None,
                 base: config.base_image.clone(),
                 toolchains: Vec::new(),
+                curated: true,
             },
         )
         .await
@@ -4075,6 +4169,7 @@ chmod +x "$destination/bin/node"
             &Arc::new(KeyPool::new()),
             &config.base_image,
             &[],
+            true,
         )
         .await
         .expect("a broken packed-golden fork falls back to direct creation");
@@ -4127,6 +4222,7 @@ chmod +x "$destination/bin/node"
             &Arc::new(KeyPool::new()),
             "mirror.gcr.io/library/ubuntu:22.04",
             &[],
+            true,
         )
         .await
         .expect_err("an environment-golden fork failure must propagate");
@@ -4160,6 +4256,7 @@ chmod +x "$destination/bin/node"
             &Arc::new(KeyPool::new()),
             &config.base_image.clone(),
             &[ToolchainLayer::Rust("1.97".to_owned())],
+            true,
         )
         .await
         .expect("the fork installs the toolchain its pack lacks");
@@ -4201,6 +4298,7 @@ chmod +x "$destination/bin/node"
             &Arc::new(KeyPool::new()),
             &config.base_image.clone(),
             &[],
+            true,
         )
         .await
         .expect("provisioning succeeds");
@@ -4231,6 +4329,7 @@ chmod +x "$destination/bin/node"
             &Arc::new(KeyPool::new()),
             &config.base_image.clone(),
             &[ToolchainLayer::Rust("1.97".to_owned())],
+            true,
         )
         .await
         .expect("provisioning succeeds");
@@ -4305,6 +4404,7 @@ chmod +x "$destination/bin/node"
                 fingerprint: None,
                 base: config.base_image.clone(),
                 toolchains: Vec::new(),
+                curated: true,
             },
         )
         .await
@@ -4323,6 +4423,7 @@ chmod +x "$destination/bin/node"
                     fingerprint: None,
                     base: config.base_image.clone(),
                     toolchains: Vec::new(),
+                    curated: true,
                 },
                 idle: &idle,
                 keys: &Arc::new(KeyPool::new()),
@@ -4374,6 +4475,65 @@ chmod +x "$destination/bin/node"
             "size-zero mode must not provision a successor it immediately deletes"
         );
     }
+
+    /// A custom base image is the operator's contract: the golden must not
+    /// receive Preloop's curated bake. Stock bases still get it.
+    #[tokio::test]
+    async fn custom_base_golden_skips_the_curated_bake() {
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let config = test_config(false);
+        let golden = MachineName::new("lifecycle-test-nobake-golden").unwrap();
+
+        let custom = EnvironmentSpec::for_base("ghcr.io/acme/runner:latest".to_owned());
+        assert!(!custom.curated);
+        prepare_golden_for_env(&provider, &config, &golden, &custom)
+            .await
+            .expect("custom base golden provision succeeds");
+        let custom_events = provider.events().await;
+        assert!(
+            !custom_events.iter().any(|event| event.contains("apt-get")),
+            "a custom base golden must not run the curated apt bake: {custom_events:?}"
+        );
+
+        let stock = EnvironmentSpec::for_base(crate::environment::UBUNTU_24_04_PIN.to_owned());
+        assert!(stock.curated);
+        prepare_golden_for_env(&provider, &config, &golden, &stock)
+            .await
+            .expect("stock base golden provision succeeds");
+        let stock_events = provider.events().await;
+        assert!(
+            stock_events.iter().any(|event| event.contains("apt-get")),
+            "a stock base golden must run the curated apt bake"
+        );
+    }
+
+    /// Direct (no-golden) provisioning of a custom base must not run the
+    /// curated apt bake either — the image is the operator's contract.
+    #[tokio::test]
+    async fn custom_base_direct_provision_skips_the_curated_bake() {
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let config = test_config(false);
+        let name = MachineName::new("lifecycle-test-nobake-direct").unwrap();
+
+        provision_runner(
+            &provider,
+            &config,
+            &name,
+            None,
+            &Arc::new(KeyPool::new()),
+            "ghcr.io/acme/runner:latest",
+            &[],
+            false,
+        )
+        .await
+        .expect("custom base provisioning succeeds");
+
+        let events = provider.events().await;
+        assert!(
+            !events.iter().any(|event| event.contains("apt-get")),
+            "a custom base must not receive the curated apt bake: {events:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4386,6 +4546,19 @@ mod golden_download_tests {
     /// which every test in this binary shares, so two of them pointing at
     /// different servers would otherwise interleave.
     static GOLDEN_URL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn custom_base_without_golden_url_does_not_adopt_stock_release() {
+        assert!(should_download_prebaked_golden("ubuntu:24.04", false));
+        assert!(!should_download_prebaked_golden(
+            "ghcr.io/acme/runner-images:ubuntu24-runner-large-latest-arm64",
+            false
+        ));
+        assert!(should_download_prebaked_golden(
+            "ghcr.io/acme/runner-images:ubuntu24-runner-large-latest-arm64",
+            true
+        ));
+    }
 
     /// Answers exactly one request with `head` followed by `body`, then closes
     /// the connection. Closing is what lets a deliberately short body reach the

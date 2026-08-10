@@ -207,18 +207,32 @@ impl Scheduler {
         push_payload: serde_json::Value,
         shared: Arc<SharedState>,
     ) {
-        let (current_crons, timezones) = match parse_workflow(workflow_yaml) {
-            Ok(wf) => (
-                extract_schedule_crons(&wf.on),
-                extract_schedule_timezones(&wf.on),
-            ),
-            Err(e) => {
-                warn!("scheduler: could not parse {workflow_path}: {e}");
-                (vec![], BTreeMap::new())
+        let canonical_path = canonical_workflow_path(workflow_path);
+        // `is_github_owned_workflow` matches on the bare workflow filename
+        // (the shape the webhook path feeds it), not the repository-relative
+        // path.
+        let filename = canonical_path
+            .strip_prefix(".github/workflows/")
+            .unwrap_or(&canonical_path);
+        let skipped = crate::github::is_github_owned_workflow(
+            filename,
+            &crate::github::configured_github_owned_workflows(),
+        );
+        let (current_crons, timezones) = if skipped {
+            info!("scheduler: skipping GitHub-owned workflow {canonical_path}");
+            (vec![], BTreeMap::new())
+        } else {
+            match parse_workflow(workflow_yaml) {
+                Ok(wf) => (
+                    extract_schedule_crons(&wf.on),
+                    extract_schedule_timezones(&wf.on),
+                ),
+                Err(e) => {
+                    warn!("scheduler: could not parse {workflow_path}: {e}");
+                    (vec![], BTreeMap::new())
+                }
             }
         };
-
-        let canonical_path = canonical_workflow_path(workflow_path);
 
         let mut jobs = self.jobs.lock().await;
 
@@ -946,6 +960,60 @@ jobs:
             let jobs = scheduler.jobs.lock().await;
             assert!(jobs.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn skipped_github_owned_workflow_has_no_cron_schedule() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let initial_skip =
+            crate::state::TestEnvVar::set(crate::github::GITHUB_OWNED_WORKFLOWS_ENV, "other.yml");
+        let temp = tempfile::tempdir().unwrap();
+        let state = crate::AppState::new(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        let shared = Arc::new(crate::SharedState {
+            state,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        });
+        let scheduler = Scheduler::new();
+        let workflow_path = ".github/workflows/release.yml";
+        let workflow_yaml = r#"
+on:
+  schedule:
+    - cron: '0 2 * * *'
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo release
+"#;
+        let push_payload = serde_json::json!({
+            "repository": {
+                "full_name": "local/repo",
+                "default_branch": "main",
+            }
+        });
+
+        scheduler
+            .reconcile(
+                workflow_path,
+                workflow_yaml,
+                push_payload.clone(),
+                shared.clone(),
+            )
+            .await;
+        assert_eq!(scheduler.jobs.lock().await.len(), 1);
+
+        drop(initial_skip);
+        let _skip =
+            crate::state::TestEnvVar::set(crate::github::GITHUB_OWNED_WORKFLOWS_ENV, "release.yml");
+        scheduler
+            .reconcile(workflow_path, workflow_yaml, push_payload, shared)
+            .await;
+        assert!(
+            scheduler.jobs.lock().await.is_empty(),
+            "skipping a workflow must remove an already-registered schedule"
+        );
     }
 
     use proptest::prelude::*;

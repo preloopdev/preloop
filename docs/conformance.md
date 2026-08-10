@@ -1,7 +1,7 @@
 # Conformance
 
-preloop treats compatibility as a test artifact,The evidence lives in four layers, from raw wire bytes to whole-repo  
-behavior; the index below maps each layer to its artifacts and commands.
+preloop treats compatibility as a test artifact. The evidence lives in four layers, from raw wire bytes to whole-repo
+behavior.
 
 ```
 Layer 5  whole-repo behavior   ~28 real-world repos, 39-scenario benchmark
@@ -31,10 +31,53 @@ runner ──→ mitmproxy ──→ preloop        (target capture: preloop's b
               compare                (side-by-side diff report)
 ```
 
-Recording a golden against real GitHub produces `.runner-watch/golden/<v>/<scenario>/flows.jsonl` —
-every request method, path, header, and body, plus the response, timestamped.
+Recording a golden against real GitHub produces `.runner-watch/golden/<v>/<scenario>/flows.jsonl`
 This is the "eye-level" check: we look at the request/response bodies
 directly, not at aggregate behavior.
+
+Specifically, we check:
+
+ - HTTP method and normalized endpoint path
+ - Endpoint presence and call counts
+ - HTTP status codes
+ - Request header names
+ - Response header names
+ - Request JSON body shape and values
+ - Response JSON body shape and values
+ - acquirejob response schema
+ - Timeline PATCH payloads
+ - Job and step completion payloads
+ - Job conclusions
+ - Step conclusions and results
+ - Job outputs
+ - Annotations
+ - Log-file and console-log protocol requests
+ - Results-service/Twirp requests when included in the scenario
+ - Cache/artifact/OIDC protocol exchanges in their scenarios
+
+For full workflow comparisons, we compare:                                                                                                                             
+ - Job count
+ - Job names
+ - Job order
+ - Step names
+ - Step order
+ - Job conclusions
+ - Step conclusions
+ - Skipped versus executed jobs
+ - Matrix expansion
+ - Dependency and output behavior
+ - Cancellation and failure behavior
+ - Annotations where the scenario exercises them    
+
+Dynamic values are normalized or ignored:                                                                                                                              
+ - Tokens
+ - GUIDs
+ - Runner/session IDs
+ - Random URL path segments
+ - Timestamps
+ - Date, Server, Content-Length, request IDs  
+
+ The goal is generally to ensure wire-level compatibility where it makes sense.  
 
 ```sh
 # Record the official runner's exchange through the proxy (needs the
@@ -50,7 +93,8 @@ experiments/mitm/bin/conform.sh --golden golden/v2.329.0/01-register-and-idle \
   --target preloop --scenario 01-register-and-idle
 ```
 
-The replay gate compares status codes, request-body schemas, and
+The replay gate compares status codes, job and step conclusions, request-body
+schemas for jobs and annotations, and
 `acquirejob` response schemas byte-for-byte; anything volatile (timing,
 tokens) is normalized before comparison.
 
@@ -140,7 +184,7 @@ the [Specula](https://github.com/SpeculaIO/Specula) pipeline (code analysis
 → TLA+ spec generation → validation → bug confirmation) built a TLA+
 specification of the server's scheduling/gate logic from the Rust source,
 repaired it against TLC's strict typing during validation, and hunted bugs
-with real SANY + TLC runs (`experiments/specula-20260804/`). 
+with real SANY + TLC runs (`experiments/specula-20260804/`). Project moves fast so the model can be abit outdated. We try to run them atleast every week. For instance we found these bugs from the latest run. 
 
 **Six findings, all fixed and reconciled into the current tree** (2026-08-06):
 
@@ -183,8 +227,7 @@ and step names, order, and conclusions.
 
 **39-scenario benchmark.** The `experiments/mitm/scenarios/` corpus (trivial
 jobs, cancellation, matrix fan-out, OIDC, container jobs, service health,
-artifacts, annotations, reusable callers) is executed on act, agent-ci, and
-Preloop on the same host; results are recorded per scenario in
+artifacts, annotations, reusable callers) is executed. Results are recorded per scenario in
 `benchmarks/{act,agent_ci,preloop}_scenarios_results.json`. 
 
 **Real-world repos.** Unmodified workflows from ~28 distinct public repos

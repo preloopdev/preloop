@@ -205,14 +205,56 @@ fn install_script_pins_docker_repo_and_cargo_shear() {
 fn install_script_survives_archive_pin_drift() {
     let script = base_install_script();
     assert!(
-        script.contains("exact hosted apt pins are unavailable")
+        script.contains("apt-get -s install -qq --no-install-recommends git=")
+            && script.contains("exact hosted apt pins are unavailable")
             && script.contains("apt-get install -y -qq --no-install-recommends git curl wget"),
-        "the baseline must fall back to packages currently available in the archive"
+        "the baseline must probe exact pins before falling back to archive packages"
     );
     assert!(
-        script.contains("hosted compiler matrix is not available")
-            && script.contains("for package in clang clang-format clang-tidy gcc g++ gfortran"),
-        "missing historical compiler packages must not strand the runner pool"
+        script.contains("for package in clang-16 clang-format-16 clang-tidy-16")
+            && script.contains("apt-get -s install -qq --no-install-recommends \"$package\"")
+            && script.contains("available_compiler_packages=\"$available_compiler_packages $package\"")
+            && script.contains("hosted compiler matrix is incomplete")
+            && script.contains(
+                "apt-get install -y -qq --no-install-recommends clang clang-format clang-tidy gcc g++ gfortran",
+            ),
+        "the compiler fallback must retain available versioned tools and add archive defaults"
+    );
+}
+
+#[test]
+fn install_script_preserves_compiler_fidelity_when_pins_resolve() {
+    let script = base_install_script();
+    for fragment in [
+        "clang-16 --version | head -1 | grep -F '16.0.6'",
+        "clang-17 --version | head -1 | grep -F '17.0.6'",
+        "clang-18 --version | head -1 | grep -F '18.1.3'",
+        "test \"$(gcc-12 -dumpfullversion)\" = '12.4.0'",
+        "test \"$(gcc-13 -dumpfullversion)\" = '13.3.0'",
+        "test \"$(gcc-14 -dumpfullversion)\" = '14.2.0' || exit 1",
+        "apt-get install -y -qq --no-install-recommends $available_compiler_packages || exit 1",
+        "update-alternatives --set \"$tool\" \"/usr/bin/$tool-18\" || exit 1",
+    ] {
+        assert!(
+            script.contains(fragment),
+            "install script lost compiler fidelity check/default: {fragment}"
+        );
+    }
+    assert!(
+        script.contains("if [ \"$compiler_matrix_complete\" = 1 ]"),
+        "exact version checks must run only when the complete hosted matrix resolved"
+    );
+}
+
+#[test]
+fn install_script_is_valid_shell() {
+    let status = std::process::Command::new("sh")
+        .args(["-n", "-c", &base_install_script()])
+        .status()
+        .expect("run the shell parser");
+    assert!(
+        status.success(),
+        "base install script must parse as POSIX shell"
     );
 }
 

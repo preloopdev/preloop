@@ -600,6 +600,8 @@ fn github_env_key(key: &str) -> Option<String> {
 fn current_os() -> &'static str {
     if cfg!(target_os = "macos") {
         "macOS"
+    } else if cfg!(target_os = "windows") {
+        "Windows"
     } else if cfg!(target_os = "linux") {
         "Linux"
     } else {

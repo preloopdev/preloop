@@ -428,6 +428,63 @@ async fn run_steps_outputs_are_visible_to_later_step_expressions() {
 }
 
 #[tokio::test]
+async fn run_steps_do_not_expose_outputs_from_future_steps() {
+    let dir = TempDir::new().unwrap();
+    let mut job = JobContext::new(
+        "job".into(),
+        "Job".into(),
+        serde_json::json!({}),
+        serde_json::json!({}),
+    );
+    let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+    let (_tx, cancel_rx) = watch::channel(false);
+
+    let mut before = test_step("before", None);
+    before.step_type = StepType::Script {
+        script: "echo seen=${{ steps.future.outputs.value }} >> \"$GITHUB_OUTPUT\"".to_string(),
+        shell: Some("bash".to_string()),
+        working_directory: None,
+    };
+    let mut future = test_step("future", None);
+    future.step_type = StepType::Script {
+        script: "echo value=runtime >> \"$GITHUB_OUTPUT\"".to_string(),
+        shell: Some("bash".to_string()),
+        working_directory: None,
+    };
+
+    let result = run_steps(
+        &[before, future],
+        &mut job,
+        dir.path().to_str().unwrap(),
+        cancel_rx,
+        queue,
+        None,
+        None,
+        &[],
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result, "Succeeded");
+    assert_eq!(
+        job.steps
+            .get("before")
+            .and_then(|step| step.outputs.get("seen"))
+            .map(String::as_str),
+        Some("")
+    );
+    assert_eq!(
+        job.steps
+            .get("future")
+            .and_then(|step| step.outputs.get("value"))
+            .map(String::as_str),
+        Some("runtime")
+    );
+}
+
+#[tokio::test]
 async fn run_steps_multiline_outputs_are_visible_to_later_steps() {
     let dir = TempDir::new().unwrap();
     let mut job = JobContext::new(

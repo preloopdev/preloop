@@ -298,6 +298,10 @@ pub trait VmProvider: Send + Sync {
 pub struct SmolVmProvider {
     binary: PathBuf,
     capture_limit: usize,
+    /// Proxy forwarded to smolvm's separate export VM during `pack create`.
+    pack_proxy: Option<String>,
+    /// Hosts and CIDRs that the pack export VM should bypass the proxy for.
+    pack_no_proxy: Option<String>,
     /// Serializes operations that build or replace a machine's base against
     /// everything else. See [`SmolVmProvider::exclusive`].
     lifecycle_lock: Arc<tokio::sync::RwLock<()>>,
@@ -308,8 +312,35 @@ pub struct SmolVmProvider {
 
 impl Default for SmolVmProvider {
     fn default() -> Self {
-        Self::new("smolvm")
+        Self::from_environment("smolvm")
     }
+}
+
+impl SmolVmProvider {
+    /// Construct a provider and resolve pack-export proxy settings.
+    ///
+    /// Preloop-specific variables take precedence over the conventional proxy
+    /// variables inherited by the process.
+    pub fn from_environment(binary: impl Into<PathBuf>) -> Self {
+        Self::new(binary).with_pack_network(
+            first_nonempty_env(&[
+                "PRELOOP_RUNNER_PACK_PROXY",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "HTTP_PROXY",
+                "http_proxy",
+            ]),
+            first_nonempty_env(&["PRELOOP_RUNNER_PACK_NO_PROXY", "NO_PROXY", "no_proxy"]),
+        )
+    }
+}
+
+fn first_nonempty_env(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    })
 }
 
 impl SmolVmProvider {
@@ -318,6 +349,8 @@ impl SmolVmProvider {
         Self {
             binary: binary.into(),
             capture_limit: DEFAULT_CAPTURE_LIMIT,
+            pack_proxy: None,
+            pack_no_proxy: None,
             lifecycle_lock: Arc::new(tokio::sync::RwLock::new(())),
             socket_mount_supported: Arc::new(tokio::sync::OnceCell::new()),
         }
@@ -326,6 +359,16 @@ impl SmolVmProvider {
     /// Override the maximum bytes retained from each process stream.
     pub fn with_capture_limit(mut self, bytes: usize) -> Self {
         self.capture_limit = bytes.max(1024);
+        self
+    }
+
+    /// Configure networking for smolvm's separate registry export VM.
+    ///
+    /// The export VM re-pulls the base image while flattening a machine, so
+    /// its network path can differ from the VM Preloop already provisioned.
+    pub fn with_pack_network(mut self, proxy: Option<String>, no_proxy: Option<String>) -> Self {
+        self.pack_proxy = proxy.filter(|value| !value.trim().is_empty());
+        self.pack_no_proxy = no_proxy.filter(|value| !value.trim().is_empty());
         self
     }
 
@@ -870,20 +913,22 @@ impl VmProvider for SmolVmProvider {
         } else {
             output.to_path_buf()
         };
-        self.exclusive_with_staging(
-            "pack",
-            &[
-                "pack".into(),
-                "create".into(),
-                "--from-vm".into(),
-                name.as_str().into(),
-                "-o".into(),
-                output.display().to_string(),
-            ],
-            staging_dir,
-        )
-        .await
-        .map(|_| ())
+        let mut args = vec![
+            "pack".into(),
+            "create".into(),
+            "--from-vm".into(),
+            name.as_str().into(),
+        ];
+        if let Some(proxy) = &self.pack_proxy {
+            args.extend(["--proxy".into(), proxy.clone()]);
+        }
+        if let Some(no_proxy) = &self.pack_no_proxy {
+            args.extend(["--no-proxy".into(), no_proxy.clone()]);
+        }
+        args.extend(["-o".into(), output.display().to_string()]);
+        self.exclusive_with_staging("pack", &args, staging_dir)
+            .await
+            .map(|_| ())
     }
 }
 

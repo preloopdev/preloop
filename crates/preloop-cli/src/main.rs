@@ -5,7 +5,7 @@ use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
 use preloop_gha_protocol::{ExecutionStatus, NdjsonEvent, RunAccepted, WorkflowSubmission};
-use preloop_orchestrator::environment::DEFAULT_BASE_IMAGE;
+use preloop_orchestrator::environment::{is_stock_base_image, DEFAULT_BASE_IMAGE};
 use preloop_orchestrator::{RunnerPool, RunnerPoolConfig};
 use preloop_vm::SmolVmProvider;
 use rand::RngCore;
@@ -181,9 +181,19 @@ struct BuildGoldenArgs {
     #[arg(long)]
     output: PathBuf,
 
-    /// OCI base image to pack.
-    #[arg(long, default_value = DEFAULT_BASE_IMAGE)]
+    /// OCI base image or packed artifact to use. Explicit CLI input overrides
+    /// PRELOOP_RUNNER_BASE_IMAGE.
+    #[arg(
+        long,
+        env = "PRELOOP_RUNNER_BASE_IMAGE",
+        default_value = DEFAULT_BASE_IMAGE
+    )]
     base_image: String,
+
+    /// Persistent guest storage in GiB. Large official runner snapshots may
+    /// need 80 GiB or more.
+    #[arg(long = "storage-gb", env = "PRELOOP_RUNNER_STORAGE_GB")]
+    storage_gib: Option<u32>,
 }
 
 #[derive(Debug, Default, clap::Args)]
@@ -454,7 +464,7 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         ],
         cpus: RUNNER_CPUS,
         memory_mib: runner_memory_mib(),
-        storage_gib: 20,
+        storage_gib: args.storage_gib.unwrap_or_else(runner_storage_gib),
         overlay_gib: std::env::var("PRELOOP_RUNNER_OVERLAY_GB")
             .ok()
             .and_then(|v| v.parse().ok()),
@@ -998,13 +1008,7 @@ fn local_runner_pool_config(
     // the configured image and idle runners would be replaced forever.
     // Compare on the plain `repository:tag`, so the digest-pinned defaults
     // (ubuntu:24.04@sha256:…) still count as stock Ubuntu images.
-    let custom_base = !matches!(
-        preloop_orchestrator::environment::base_name(&base_image),
-        "ubuntu:24.04"
-            | "ubuntu:22.04"
-            | "mirror.gcr.io/library/ubuntu:24.04"
-            | "mirror.gcr.io/library/ubuntu:22.04"
-    );
+    let custom_base = !is_stock_base_image(&base_image);
     Ok(RunnerPoolConfig {
         // Size zero is the deliberate low-memory mode: keep the local
         // supervisor alive, but build a runner only when a job is queued.
@@ -1072,7 +1076,7 @@ fn local_runner_pool_config(
         labels: runner_pool_labels(),
         cpus: RUNNER_CPUS,
         memory_mib: runner_memory_mib(),
-        storage_gib: 20,
+        storage_gib: runner_storage_gib(),
         overlay_gib: std::env::var("PRELOOP_RUNNER_OVERLAY_GB")
             .ok()
             .and_then(|v| v.parse().ok()),
@@ -1123,6 +1127,12 @@ const DEFAULT_USE_PACKED_GOLDEN: bool = true;
 /// Memory given to each runner VM, in MiB. SmolVM balloons this, so an idle
 /// runner commits far less than its ceiling.
 const RUNNER_MEMORY_MIB: u32 = 4096;
+/// Persistent storage given to each runner VM, in GiB.
+///
+/// The default is enough for the minimal golden. Full snapshots of the
+/// official GitHub-hosted image are much larger and should set
+/// `PRELOOP_RUNNER_STORAGE_GB` to 80 or more.
+const RUNNER_STORAGE_GIB: u32 = 20;
 
 /// Memory ceiling for each runner VM, honouring `PRELOOP_RUNNER_MEMORY_MIB`.
 ///
@@ -1139,6 +1149,16 @@ fn runner_memory_mib() -> u32 {
         .and_then(|raw| raw.trim().parse::<u32>().ok())
         .filter(|value| *value >= MIN_MEMORY_MIB)
         .unwrap_or(RUNNER_MEMORY_MIB)
+}
+
+/// Persistent storage for each runner VM, honouring
+/// `PRELOOP_RUNNER_STORAGE_GB`.
+fn runner_storage_gib() -> u32 {
+    std::env::var("PRELOOP_RUNNER_STORAGE_GB")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(RUNNER_STORAGE_GIB)
 }
 
 /// Resident memory an idle runner VM actually holds, in MiB.
@@ -2104,8 +2124,9 @@ mod tests {
 
     /// Serializes tests that mutate process-global env vars read by
     /// `local_runner_pool_config` (`PRELOOP_RUNNER_BUNDLE`,
-    /// `PRELOOP_RUNNER_BASE_IMAGE`): parallel test threads would otherwise
-    /// race each other's set_var/remove_var pairs.
+    /// `PRELOOP_RUNNER_BASE_IMAGE`, `PRELOOP_RUNNER_STORAGE_GB`): parallel
+    /// test threads would otherwise race each other's set_var/remove_var
+    /// pairs.
     static TEST_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
@@ -2141,6 +2162,51 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("preloop").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn build_golden_accepts_custom_image_and_storage_override() {
+        let cli = parse(&[
+            "build-golden",
+            "--runner-bundle",
+            "/tmp/runner",
+            "--output",
+            "/tmp/golden",
+            "--base-image",
+            "ghcr.io/acme/runner-images:ubuntu24-runner-large-latest-arm64",
+            "--storage-gb",
+            "80",
+        ])
+        .unwrap();
+
+        let Command::BuildGolden(args) = cli.command else {
+            panic!("expected build-golden command");
+        };
+        assert_eq!(
+            args.base_image,
+            "ghcr.io/acme/runner-images:ubuntu24-runner-large-latest-arm64"
+        );
+        assert_eq!(args.storage_gib, Some(80));
+    }
+
+    #[test]
+    fn runner_storage_gib_ignores_invalid_or_zero_values() {
+        let _env_guard = TEST_ENV_MUTEX.lock().unwrap();
+        for (value, expected) in [
+            ("80", 80),
+            (" 96 ", 96),
+            ("0", RUNNER_STORAGE_GIB),
+            ("not-a-number", RUNNER_STORAGE_GIB),
+        ] {
+            unsafe {
+                std::env::set_var("PRELOOP_RUNNER_STORAGE_GB", value);
+            }
+            assert_eq!(runner_storage_gib(), expected, "{value}");
+        }
+        unsafe {
+            std::env::remove_var("PRELOOP_RUNNER_STORAGE_GB");
+        }
+        assert_eq!(runner_storage_gib(), RUNNER_STORAGE_GIB);
     }
 
     #[test]
@@ -2229,6 +2295,7 @@ mod tests {
         .unwrap();
         unsafe {
             std::env::set_var("PRELOOP_RUNNER_BUNDLE", bundle.path());
+            std::env::set_var("PRELOOP_RUNNER_STORAGE_GB", "80");
             std::env::remove_var("PRELOOP_USE_PACKED_GOLDEN");
         }
         let queue_depth = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2266,6 +2333,7 @@ mod tests {
             stock.use_fork,
             "packed golden forks must remain enabled when the warm pool is off"
         );
+        assert_eq!(stock.storage_gib, 80);
         assert!(
             config("mirror.gcr.io/library/ubuntu:24.04")
                 .next_job_runs_on
@@ -2285,6 +2353,7 @@ mod tests {
         unsafe {
             std::env::remove_var("PRELOOP_USE_PACKED_GOLDEN");
             std::env::remove_var("PRELOOP_RUNNER_BUNDLE");
+            std::env::remove_var("PRELOOP_RUNNER_STORAGE_GB");
         }
     }
 

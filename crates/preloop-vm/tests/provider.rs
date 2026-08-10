@@ -35,10 +35,23 @@ mod unix {
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
+    static TEST_ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn write_executable(path: &Path, contents: &str) {
+        // Publish only after the writer is closed. Executing a script while
+        // its final path is still open for writing can fail with ETXTBSY.
+        let staged = path.with_extension("staged");
+        fs::write(&staged, contents).unwrap();
+        let mut permissions = fs::metadata(&staged).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&staged, permissions).unwrap();
+        fs::rename(staged, path).unwrap();
+    }
+
     fn fake_smolvm() -> (TempDir, PathBuf) {
         let directory = tempfile::tempdir().unwrap();
         let executable = directory.path().join("smolvm");
-        fs::write(
+        write_executable(
             &executable,
             r##"#!/bin/sh
 set -eu
@@ -97,11 +110,7 @@ case "${1-}:${2-}" in
     ;;
 esac
 "##,
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&executable).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&executable, permissions).unwrap();
+        );
         (directory, executable)
     }
 
@@ -147,7 +156,7 @@ esac
     /// old docker-specific flag exists, so the capability probe must fail.
     fn fake_old_smolvm() -> (TempDir, PathBuf) {
         let (directory, executable) = fake_smolvm();
-        fs::write(
+        write_executable(
             &executable,
             r##"#!/bin/sh
 set -eu
@@ -165,11 +174,7 @@ fi
 
 exit 0
 "##,
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&executable).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&executable, permissions).unwrap();
+        );
         (directory, executable)
     }
 
@@ -505,6 +510,82 @@ exit 0
             matches!(error, VmError::InvalidSpec(message) if message == "pack output path must be absolute")
         );
         assert!(!relative_executable.with_extension("args").exists());
+    }
+
+    #[tokio::test]
+    async fn pack_forwards_proxy_configuration_to_export_vm() {
+        let (directory, executable) = fake_smolvm();
+        let provider = SmolVmProvider::new(&executable).with_pack_network(
+            Some("http://192.168.1.10:18080".to_owned()),
+            Some("localhost,127.0.0.1,.internal".to_owned()),
+        );
+        let name = MachineName::new("runner").unwrap();
+        let output = directory.path().join("runner");
+
+        provider.pack(&name, &output).await.unwrap();
+
+        assert_eq!(
+            captured_args(&executable),
+            vec![
+                "pack".to_owned(),
+                "create".to_owned(),
+                "--from-vm".to_owned(),
+                "runner".to_owned(),
+                "--proxy".to_owned(),
+                "http://192.168.1.10:18080".to_owned(),
+                "--no-proxy".to_owned(),
+                "localhost,127.0.0.1,.internal".to_owned(),
+                "-o".to_owned(),
+                output.display().to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_environment_prefers_preloop_pack_proxy() {
+        let _env_guard = TEST_ENV_MUTEX.lock().await;
+        let (directory, executable) = fake_smolvm();
+        let saved = [
+            (
+                "PRELOOP_RUNNER_PACK_PROXY",
+                std::env::var_os("PRELOOP_RUNNER_PACK_PROXY"),
+            ),
+            (
+                "PRELOOP_RUNNER_PACK_NO_PROXY",
+                std::env::var_os("PRELOOP_RUNNER_PACK_NO_PROXY"),
+            ),
+            ("HTTPS_PROXY", std::env::var_os("HTTPS_PROXY")),
+            ("NO_PROXY", std::env::var_os("NO_PROXY")),
+        ];
+        unsafe {
+            std::env::set_var("PRELOOP_RUNNER_PACK_PROXY", "http://preloop.proxy:8080");
+            std::env::set_var("PRELOOP_RUNNER_PACK_NO_PROXY", ".preloop.internal");
+            std::env::set_var("HTTPS_PROXY", "http://standard.proxy:8080");
+            std::env::set_var("NO_PROXY", ".standard.internal");
+        }
+
+        let provider = SmolVmProvider::from_environment(&executable);
+        let name = MachineName::new("runner").unwrap();
+        let output = directory.path().join("runner");
+        provider.pack(&name, &output).await.unwrap();
+        let args = captured_args(&executable);
+
+        for (name, value) in saved {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+        assert!(args
+            .windows(2)
+            .any(|pair| { pair == ["--proxy", "http://preloop.proxy:8080"] }));
+        assert!(args
+            .windows(2)
+            .any(|pair| { pair == ["--no-proxy", ".preloop.internal"] }));
+        assert!(!args.iter().any(|arg| arg.contains("standard.proxy")));
+        assert!(!args.iter().any(|arg| arg.contains("standard.internal")));
     }
 
     #[tokio::test]

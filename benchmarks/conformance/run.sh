@@ -50,7 +50,11 @@ PRELOOP_PUBLIC_URL="$REPLAY_URL" \
   ./target/debug/preloop-server serve --listen "127.0.0.1:$REPLAY_PORT" \
   --state-dir "$STATE_DIR/server-state" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
-for _ in $(seq 1 100); do
+# Fresh state generates both the runner session and OIDC RSA keypairs. Prime
+# generation is nondeterministic and can exceed ten seconds even on otherwise
+# idle hosts, so give startup the same minute-scale allowance as other local
+# service probes instead of making conformance timing-dependent.
+for _ in $(seq 1 600); do
   kill -0 "$SERVER_PID" >/dev/null 2>&1 ||
     { cat "$SERVER_LOG" >&2; echo "conform: replay server exited" >&2; exit 1; }
   curl -fsS "$REPLAY_URL/healthz" >/dev/null 2>&1 && break

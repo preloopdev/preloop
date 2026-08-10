@@ -312,6 +312,34 @@ pub(crate) type ActionShaCache = std::sync::Mutex<
 #[cfg(test)]
 pub(crate) static GITHUB_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Restores one process-global environment variable when a test exits,
+/// including during panic unwinding.
+#[cfg(test)]
+pub(crate) struct TestEnvVar {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl TestEnvVar {
+    pub(crate) fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestEnvVar {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            std::env::set_var(self.key, previous);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub(crate) inner: Arc<Mutex<InnerState>>,

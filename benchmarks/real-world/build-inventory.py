@@ -5,7 +5,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 HOME = Path.home()
-WT = [HOME / "macos-runners", HOME / "cachingv4", HOME / "mitm-proxy", HOME / "runner-watcher", HOME / "workflow-support"]
+WT = [HOME / "macos-runners", HOME / "cachingv4", HOME / "capture-checkouts", HOME / "runner-watcher", HOME / "workflow-support"]
 OUT = Path("benchmarks/compatibility/INVENTORY.md")
 
 def find_flows(dirs):
