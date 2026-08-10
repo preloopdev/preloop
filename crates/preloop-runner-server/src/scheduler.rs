@@ -208,8 +208,14 @@ impl Scheduler {
         shared: Arc<SharedState>,
     ) {
         let canonical_path = canonical_workflow_path(workflow_path);
+        // `is_github_owned_workflow` matches on the bare workflow filename
+        // (the shape the webhook path feeds it), not the repository-relative
+        // path.
+        let filename = canonical_path
+            .strip_prefix(".github/workflows/")
+            .unwrap_or(&canonical_path);
         let skipped = crate::github::is_github_owned_workflow(
-            &canonical_path,
+            filename,
             &crate::github::configured_github_owned_workflows(),
         );
         let (current_crons, timezones) = if skipped {
