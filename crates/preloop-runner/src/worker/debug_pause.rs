@@ -484,13 +484,18 @@ impl PauseMarker {
 impl Drop for PauseMarker {
     fn drop(&mut self) {
         if let Some(path) = &self.0 {
-            if let Err(error) = std::fs::remove_file(path) {
-                warn!(
+            match std::fs::remove_file(path) {
+                // The marker may never have been written (a failed create)
+                // or already be gone — that is not a leak, and Drop must
+                // stay quiet for the normal path.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => warn!(
                     pause_marker = %path.display(),
                     %error,
                     "failed to remove pause marker — the pool may keep this \
                      job's permit released while it runs"
-                );
+                ),
+                Ok(()) => {}
             }
         }
     }
