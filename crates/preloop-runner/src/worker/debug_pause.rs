@@ -460,9 +460,23 @@ impl PauseMarker {
             return Self(None);
         };
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                warn!(
+                    pause_marker = %path.display(),
+                    %error,
+                    "failed to create pause marker directory — the pool will not \
+                     release its permit while this job is paused"
+                );
+            }
         }
-        let _ = std::fs::write(path, "paused");
+        if let Err(error) = std::fs::write(path, "paused") {
+            warn!(
+                pause_marker = %path.display(),
+                %error,
+                "failed to write pause marker — the pool will not release its \
+                 permit while this job is paused"
+            );
+        }
         Self(Some(path.to_owned()))
     }
 }
@@ -470,7 +484,14 @@ impl PauseMarker {
 impl Drop for PauseMarker {
     fn drop(&mut self) {
         if let Some(path) = &self.0 {
-            let _ = std::fs::remove_file(path);
+            if let Err(error) = std::fs::remove_file(path) {
+                warn!(
+                    pause_marker = %path.display(),
+                    %error,
+                    "failed to remove pause marker — the pool may keep this \
+                     job's permit released while it runs"
+                );
+            }
         }
     }
 }

@@ -838,13 +838,20 @@ pub(crate) fn re_mint_snapshot_tokens(
     message: &mut preloop_gha_protocol::azdo::AgentJobRequestMessage,
     state: &AppState,
 ) -> usize {
-    let Some(pinned) = message.preloop_snapshot_token_steps.clone() else {
+    let Some(pinned) = message.preloop_snapshot_token_steps.as_ref() else {
         return 0;
     };
+    let pinned: std::collections::HashSet<uuid::Uuid> = pinned
+        .iter()
+        .filter_map(|id| uuid::Uuid::parse_str(id).ok())
+        .collect();
+    if pinned.is_empty() {
+        return 0;
+    }
     let fresh = state.mint_runtime_token(&message.plan.plan_id, &message.job_id);
     let mut re_minted = 0;
     for step in &mut message.steps {
-        if pinned.iter().any(|id| id == &step.id.to_string()) {
+        if pinned.contains(&step.id) {
             step.inputs.insert("token".to_owned(), fresh.clone());
             re_minted += 1;
         }

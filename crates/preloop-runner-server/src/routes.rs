@@ -470,14 +470,14 @@ pub(crate) fn build_app(
             )),
         )
         .route(
-            &format!("{DEBUG_SESSIONS_PATH}/:session_id/verdict"),
+            &format!("{DEBUG_SESSIONS_PATH}/:session_id{DEBUG_SESSION_VERDICT_SUFFIX}"),
             get(crate::debug_sessions::poll_verdict).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_worker_bearer,
             )),
         )
         .route(
-            &format!("{DEBUG_SESSIONS_PATH}/:session_id/close"),
+            &format!("{DEBUG_SESSIONS_PATH}/:session_id{DEBUG_SESSION_CLOSE_SUFFIX}"),
             post(crate::debug_sessions::close_session).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_worker_bearer,
@@ -498,7 +498,7 @@ pub(crate) fn build_app(
             )),
         )
         .route(
-            &format!("{DEBUG_SESSIONS_PATH}/:session_id/verdict"),
+            &format!("{DEBUG_SESSIONS_PATH}/:session_id{DEBUG_SESSION_VERDICT_SUFFIX}"),
             post(crate::debug_sessions::post_verdict).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,

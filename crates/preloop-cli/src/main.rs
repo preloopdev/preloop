@@ -1365,7 +1365,9 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     // waiting for a controller), but a user who expects the debug shell on
     // failure needs to know it was disabled before the run fails — the
     // alternative is a plain `✗` with no explanation and no way to attach.
-    if !submission.preserve_on_failure && !args.no_debug {
+    // A piped pipeline never expects a failure shell, so the notice would be
+    // noise on every CI run; it targets interactive-ish invocations only.
+    if !submission.preserve_on_failure && !args.no_debug && std::env::var("CI").is_err() {
         eprintln!(
             "[preloop] failure shells are off ({}); pass --preserve-on-failure to \
              pause on failure for `preloop debug`/`preloop shell`",
@@ -1495,6 +1497,8 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                             if let Some(session) =
                                 sessions.into_iter().find(|session| {
                                     session.run_id == accepted.run_id
+                                        && session.state
+                                            == preloop_gha_protocol::debug_session::SessionState::Paused
                                 })
                             {
                                 paused = Some(session);
@@ -1518,12 +1522,17 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                                         )
                                     })
                                     .count();
-                                eprintln!(
-                                    "[preloop] still waiting: {queued} job(s) queued, \
-                                     {paused_total} debug session(s) paused on the server \
-                                     (preloop debug <id> to inspect)"
-                                );
-                                last_backpressure = std::time::Instant::now();
+                                // A slow in-progress step is not a stall: only
+                                // claim one when jobs or sessions are actually
+                                // waiting on capacity.
+                                if queued > 0 || paused_total > 0 {
+                                    eprintln!(
+                                        "[preloop] still waiting: {queued} job(s) queued, \
+                                         {paused_total} debug session(s) paused on the server \
+                                         (preloop debug <id> to inspect)"
+                                    );
+                                    last_backpressure = std::time::Instant::now();
+                                }
                             }
                         }
                         Err(error) => {

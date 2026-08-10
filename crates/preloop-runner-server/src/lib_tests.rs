@@ -13252,6 +13252,147 @@ async fn claim_remints_expired_snapshot_checkout_tokens() {
     );
 }
 
+/// The claim-time re-mint must actually run on the real claim path: a queued
+/// redirected checkout carries the submission-time pinned token, and the job
+/// the runner acquires must carry a freshly minted one.
+#[tokio::test]
+async fn claim_remints_snapshot_tokens_on_the_real_claim_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let (state_dir, workspace) = create_snapshot_fixture(temp.path());
+    let mut state = AppState::new(state_dir.clone()).await.unwrap();
+    state.local_workspace = Some(workspace.clone());
+    let app = app(state.clone(), CancellationToken::new());
+
+    submit_yaml(
+        &app,
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+"#,
+        "owner/repo",
+    )
+    .await;
+    // The re-mint produces a fresh JWT; within the same second it is
+    // byte-identical to the pinned one, so give the clock room to move.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    // The pinned submission-time token, as it sits on the queued message.
+    let pinned_token = {
+        let inner = state.inner.lock().await;
+        let queued = inner.queue.front().expect("job should be queued");
+        let checkout = queued
+            .message
+            .steps
+            .iter()
+            .find(|step| {
+                step.reference
+                    .as_ref()
+                    .and_then(|reference| reference.name.as_deref())
+                    .is_some_and(|name| name.eq_ignore_ascii_case("actions/checkout"))
+            })
+            .expect("queued job should contain the redirected checkout step");
+        checkout.inputs.get("token").cloned().expect("pinned token")
+    };
+    assert!(
+        state.verify_local_jwt_claims(&pinned_token).is_some(),
+        "the queued token must be a valid local JWT"
+    );
+
+    let session = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/distributedtask/pools/1/sessions",
+        json!({
+            "agent": {"id": 1, "name": "remint-runner"},
+            "ownerName": "remint test",
+            "sessionId": "00000000-0000-0000-0000-000000000000",
+            "useFipsEncryption": false
+        }),
+    )
+    .await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    let broker_message = request_json(
+        &app,
+        Method::GET,
+        &format!(
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_id}&waitSeconds=0"
+        ),
+        Value::Null,
+    )
+    .await;
+    let broker_body: Value =
+        serde_json::from_str(broker_message["body"].as_str().unwrap()).unwrap();
+    let runner_request_id = broker_body["runner_request_id"]
+        .as_str()
+        .expect("broker message should identify the queued request");
+    let runner_token = state
+        .local_jwt(json!({
+            "sub": "preloop-runner-listen-1",
+            "scp": "ActionsRuntime.RunnerListen",
+        }))
+        .unwrap();
+
+    let acquired = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/broker/1/acquirejob",
+        json!({
+            "jobMessageId": runner_request_id,
+            "billingOwnerId": "local",
+            "runnerOS": "linux"
+        }),
+        &runner_token,
+    )
+    .await;
+
+    let checkout = acquired["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["reference"]["name"].as_str() == Some("actions/checkout"))
+        .expect("the acquired job should contain the checkout step");
+    fn acquired_input<'a>(step: &'a Value, name: &str) -> Option<&'a str> {
+        step["inputs"]
+            .get(name)
+            .and_then(Value::as_str)
+            .or_else(|| {
+                let found = step["inputs"]["map"].as_array()?.iter().find(|entry| {
+                    entry
+                        .get("Key")
+                        .or_else(|| entry.get("key"))
+                        .and_then(|key| key.get("lit"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|key| key == name)
+                })?;
+                found
+                    .get("Value")
+                    .or_else(|| found.get("value"))
+                    .and_then(|value| value.get("lit"))
+                    .and_then(Value::as_str)
+            })
+    }
+    let claimed_token = acquired_input(&checkout, "token").expect("claimed pinned token");
+    assert_ne!(
+        claimed_token, pinned_token,
+        "claim must replace the submission-time token with a fresh one"
+    );
+    let claims = state
+        .verify_local_jwt_claims(claimed_token)
+        .expect("the claimed token must verify as a local JWT");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(
+        claims["exp"].as_u64().unwrap() > now,
+        "the claimed token must not be expired"
+    );
+}
+
 /// A retry verdict must carry a freshly minted snapshot credential: the
 /// worker replays the failed step from the message it already holds, whose
 /// pinned token may be long expired.
