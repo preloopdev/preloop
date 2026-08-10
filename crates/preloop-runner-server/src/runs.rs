@@ -2038,20 +2038,26 @@ pub(crate) async fn cancel_run(
     if !inner.runs.contains_key(&run_id) {
         return Err(ApiError::not_found("run not found"));
     }
+    let cancelled_check_jobs = inner
+        .runs
+        .get(&run_id)
+        .expect("run existence checked above")
+        .jobs
+        .iter()
+        .filter(|(_, status)| {
+            matches!(**status, ExecutionStatus::Queued | ExecutionStatus::Pending)
+        })
+        .map(|(job_id, _)| job_id.clone())
+        .collect::<Vec<_>>();
     let cancellation_count =
         cancel_run_inner(&mut inner, run_id, None /* no concurrency reason */);
-    let cancelled_jobs = {
+    {
         let run = inner
             .runs
             .get_mut(&run_id)
             .ok_or_else(|| ApiError::not_found("run not found"))?;
         runtime_scheduling::finalize_run_if_complete(run);
-        run.jobs
-            .iter()
-            .filter(|(_, status)| **status == ExecutionStatus::Cancelled)
-            .map(|(job_id, _)| job_id.clone())
-            .collect::<Vec<_>>()
-    };
+    }
     let record = inner
         .runs
         .get(&run_id)
@@ -2074,20 +2080,24 @@ pub(crate) async fn cancel_run(
             reason: None,
         })
         .await;
-    futures::stream::iter(cancelled_jobs)
-        .for_each_concurrent(Some(8), |job_id| {
-            let shared = Arc::clone(&shared);
-            async move {
-                crate::github::report_check_run_completed(
-                    &shared,
-                    run_id,
-                    &job_id,
-                    ExecutionStatus::Cancelled,
-                )
+    if !cancelled_check_jobs.is_empty() {
+        std::mem::drop(tokio::spawn(async move {
+            futures::stream::iter(cancelled_check_jobs)
+                .for_each_concurrent(Some(8), |job_id| {
+                    let shared = Arc::clone(&shared);
+                    async move {
+                        crate::github::report_check_run_completed(
+                            &shared,
+                            run_id,
+                            &job_id,
+                            ExecutionStatus::Cancelled,
+                        )
+                        .await;
+                    }
+                })
                 .await;
-            }
-        })
-        .await;
+        }));
+    }
     Ok(Json(record))
 }
 pub(crate) async fn rerun_run_inner(

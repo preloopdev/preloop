@@ -5180,7 +5180,7 @@ async fn cancel_run_completes_github_checks_and_terminal_metadata() {
         Method::POST,
         "/api/v1/runs",
         json!({
-            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo build\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo lint\n",
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo build\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo lint\n  deploy:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo deploy\n",
             "event": "push",
             "repository": "owner/repo"
         }),
@@ -5192,25 +5192,23 @@ async fn cancel_run_completes_github_checks_and_terminal_metadata() {
         let run = inner.runs.get_mut(&run_id).unwrap();
         run.job_check_run_ids.insert(JobId("build".into()), 7);
         run.job_check_run_ids.insert(JobId("lint".into()), 8);
+        run.job_check_run_ids.insert(JobId("deploy".into()), 9);
+        run.jobs
+            .insert(JobId("deploy".into()), ExecutionStatus::InProgress);
     }
 
-    let cancel_app = app.clone();
-    let cancel_task = tokio::spawn(async move {
+    let cancelled = tokio::time::timeout(std::time::Duration::from_secs(1), async {
         request_json(
-            &cancel_app,
+            &app,
             Method::POST,
             &format!("/api/v1/runs/{run_id}/cancel"),
             Value::Null,
         )
         .await
-    });
-
-    tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        all_completions_started.notified(),
-    )
+    })
     .await
-    .expect("independent GitHub check updates must start concurrently");
+    .expect("cancellation response must not await GitHub check updates");
+
     let cancellation_event = tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
             if let NdjsonEvent::RunStatus { status, .. } = events.recv().await.unwrap() {
@@ -5219,14 +5217,40 @@ async fn cancel_run_completes_github_checks_and_terminal_metadata() {
         }
     })
     .await
-    .expect("run cancellation must publish before GitHub responds");
+    .expect("run cancellation must publish immediately");
     assert_eq!(cancellation_event, ExecutionStatus::Cancelled);
-    assert!(
-        !cancel_task.is_finished(),
-        "the mock GitHub updates remain blocked until the test releases them"
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        all_completions_started.notified(),
+    )
+    .await
+    .expect("independent GitHub check updates must start concurrently");
+    assert_eq!(
+        completion_starts.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the active runner owns completion of its in-progress check"
     );
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        request_json(
+            &app,
+            Method::POST,
+            &format!("/api/v1/runs/{run_id}/cancel"),
+            Value::Null,
+        )
+        .await
+    })
+    .await
+    .expect("repeated cancellation must remain idempotent");
+    tokio::task::yield_now().await;
+    assert_eq!(
+        completion_starts.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "repeated cancellation must not re-complete terminal checks"
+    );
+
     release_completions.notify_waiters();
-    let cancelled = cancel_task.await.unwrap();
 
     assert_eq!(cancelled["status"], "cancelled");
     assert_eq!(cancelled["conclusion"], "cancelled");

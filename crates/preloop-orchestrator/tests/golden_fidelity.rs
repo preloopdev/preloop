@@ -231,8 +231,9 @@ fn install_script_preserves_compiler_fidelity_when_pins_resolve() {
         "clang-18 --version | head -1 | grep -F '18.1.3'",
         "test \"$(gcc-12 -dumpfullversion)\" = '12.4.0'",
         "test \"$(gcc-13 -dumpfullversion)\" = '13.3.0'",
-        "test \"$(gcc-14 -dumpfullversion)\" = '14.2.0'",
-        "update-alternatives --set \"$tool\" \"/usr/bin/$tool-18\"",
+        "test \"$(gcc-14 -dumpfullversion)\" = '14.2.0' || exit 1",
+        "apt-get install -y -qq --no-install-recommends $available_compiler_packages || exit 1",
+        "update-alternatives --set \"$tool\" \"/usr/bin/$tool-18\" || exit 1",
     ] {
         assert!(
             script.contains(fragment),

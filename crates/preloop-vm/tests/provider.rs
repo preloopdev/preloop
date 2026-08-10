@@ -37,10 +37,21 @@ mod unix {
 
     static TEST_ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    fn write_executable(path: &Path, contents: &str) {
+        // Publish only after the writer is closed. Executing a script while
+        // its final path is still open for writing can fail with ETXTBSY.
+        let staged = path.with_extension("staged");
+        fs::write(&staged, contents).unwrap();
+        let mut permissions = fs::metadata(&staged).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&staged, permissions).unwrap();
+        fs::rename(staged, path).unwrap();
+    }
+
     fn fake_smolvm() -> (TempDir, PathBuf) {
         let directory = tempfile::tempdir().unwrap();
         let executable = directory.path().join("smolvm");
-        fs::write(
+        write_executable(
             &executable,
             r##"#!/bin/sh
 set -eu
@@ -99,11 +110,7 @@ case "${1-}:${2-}" in
     ;;
 esac
 "##,
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&executable).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&executable, permissions).unwrap();
+        );
         (directory, executable)
     }
 
@@ -149,7 +156,7 @@ esac
     /// old docker-specific flag exists, so the capability probe must fail.
     fn fake_old_smolvm() -> (TempDir, PathBuf) {
         let (directory, executable) = fake_smolvm();
-        fs::write(
+        write_executable(
             &executable,
             r##"#!/bin/sh
 set -eu
@@ -167,11 +174,7 @@ fi
 
 exit 0
 "##,
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&executable).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&executable, permissions).unwrap();
+        );
         (directory, executable)
     }
 

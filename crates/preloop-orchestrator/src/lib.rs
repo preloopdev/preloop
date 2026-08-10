@@ -693,7 +693,7 @@ pub fn base_install_script() -> String {
           done; \
           if [ -n \"$available_compiler_packages\" ]; then \
             DEBIAN_FRONTEND=noninteractive \
-            apt-get install -y -qq --no-install-recommends $available_compiler_packages; \
+            apt-get install -y -qq --no-install-recommends $available_compiler_packages || exit 1; \
           fi; \
           if [ \"$compiler_matrix_complete\" = 1 ]; then \
             clang-16 --version | head -1 | grep -F '{CLANG_16_VERSION}' && \
@@ -701,11 +701,11 @@ pub fn base_install_script() -> String {
             clang-18 --version | head -1 | grep -F '{CLANG_18_VERSION}' && \
             test \"$(gcc-12 -dumpfullversion)\" = '{GCC_12_VERSION}' && \
             test \"$(gcc-13 -dumpfullversion)\" = '{GCC_13_VERSION}' && \
-            test \"$(gcc-14 -dumpfullversion)\" = '{GCC_14_VERSION}'; \
+            test \"$(gcc-14 -dumpfullversion)\" = '{GCC_14_VERSION}' || exit 1; \
           else \
             echo \"WARNING: hosted compiler matrix is incomplete in this Ubuntu archive; adding the archive-default compiler toolchain\" >&2; \
             DEBIAN_FRONTEND=noninteractive \
-            apt-get install -y -qq --no-install-recommends clang clang-format clang-tidy gcc g++ gfortran; \
+            apt-get install -y -qq --no-install-recommends clang clang-format clang-tidy gcc g++ gfortran || exit 1; \
           fi; \
           for version in {CLANG_VERSIONS}; do \
             if [ -x /usr/bin/clang++-$version ]; then \
@@ -726,7 +726,7 @@ pub fn base_install_script() -> String {
           done; \
           for tool in clang clang++ clang-format clang-tidy run-clang-tidy; do \
             if [ -x \"/usr/bin/$tool-{CLANG_DEFAULT_VERSION}\" ]; then \
-              update-alternatives --set \"$tool\" \"/usr/bin/$tool-{CLANG_DEFAULT_VERSION}\"; \
+              update-alternatives --set \"$tool\" \"/usr/bin/$tool-{CLANG_DEFAULT_VERSION}\" || exit 1; \
             fi; \
           done) && \
          (echo \"### fetch system node v{BASE_NODE_VERSION}\" >&2 && \
