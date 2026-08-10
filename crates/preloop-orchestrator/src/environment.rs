@@ -545,8 +545,6 @@ mod tests {
         assert_ne!(rebased.fingerprint, original_fingerprint);
     }
 
-    #[test]
-
     /// Stock bases get Preloop's curated toolchain bake; a custom base is
     /// the operator's contract and must be used as-is.
     #[test]
@@ -570,6 +568,7 @@ mod tests {
         assert!(EnvironmentSpec::for_base(UBUNTU_22_04_PIN.to_owned()).curated);
     }
 
+    #[test]
     fn curated_toolchains_is_fixed_and_deduped() {
         let first = curated_toolchains();
         let second = curated_toolchains();
