@@ -22,19 +22,19 @@ Preloop doesnt rely only on Github Webhooks to update the status of the CI. You 
 ```sh
 # Install (macOS/Linux): downloads the release binary and verifies its sha256
 curl -fsSL https://raw.githubusercontent.com/preloopdev/preloop/main/install.sh | sh
-```
 
-```sh
 preloop serve            # engine on 127.0.0.1:9090
 cd my-repo
 preloop run -f .github/workflows/ci.yml --event pull_request
 ```
-This starts the server in the foreground, but you can detach it too(add a `-d`). First run can take 1-5 minutes depending on your internet speed as we need to download the base image. Once we download the image, we create a "golden" vm that will be forked per job in 300 ms. The vm dynamically increases or decreases its memory consumption.
+This starts the server in the foreground, but you can detach it too(add a `-d`). First run can take 1-5 minutes as we need to download the base image(see below), and create a "golden" vm. This golden vm will be forked per job in 300 ms. Each vm's memory is elastic so it only consumes what's actually being used in the job. The control plane rss is around ~15MB. 
 
-Regarding official-image compatibility, we build a curated base image that includes most of the systems deps you need, but it's certainly not the exact official one(it's around 90GB). We avoid including deps that are often installed by actions. You can, however, set your own images, or install the deps you need in the "golden" vm. Please see [docs/vm-images.md](docs/vm-images.md) for more detailed info. That said, direct support for using the official image is coming soon. 
+Regarding official-image compatibility, we build a curated base image that includes most of the systems deps you need, but it's certainly not the exact official one(it's around 90GB). We avoid including deps that are often installed by actions. You can, however, set your own images, or install the deps you need in the "golden" vm. Please see [docs/vm-images.md](docs/vm-images.md) for more detailed info. We support using an OCI version of the official image, which you can then build the golden vm
+
+On Apple Silicon, x86_64 goldens also run through Rosetta 2 translation (enabled automatically for every VM). Performance is slightly slower than arm64 native, so prefer arm64 goldens on Apple Silicon when you can. Docker actions are not supported yet on this path: amd64 images inside the VM's Docker lack the Rosetta mount, so they fail with a cryptic `rosetta-wrapper` error.
 
 You can simulate most if not all Github events locally. For some events, you might need to add a payload.
-See [docs/cli_reference.md](docs/cli_reference.md) for more flags you can pass.
+See [docs/cli_reference.md](docs/cli_refernce.md) for more flags you can pass.
 
 To continue with the setup, see GitHub App and PAT credentials, secrets, config file, and the troubleshooting guide: [docs/setup.md](docs/setup.md)
 

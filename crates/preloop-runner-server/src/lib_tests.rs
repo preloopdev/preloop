@@ -14331,6 +14331,132 @@ async fn rebinding_churn_cannot_starve_an_established_runner() {
 }
 
 #[tokio::test]
+async fn stale_binding_requeues_behind_newer_waits() {
+    // A job whose machine died before claiming must not monopolize the pool:
+    // its stale binding is released and the job re-enters the waitlist at the
+    // *back*, so a job that has been waiting with no machine gets the next
+    // one. The released job is still served afterwards — nothing is dropped.
+    let temp = tempfile::tempdir().unwrap();
+    let state = pool_managed_state(&temp).await;
+    let app = app(state.clone(), CancellationToken::new());
+
+    // Job A is paired to machine-a, which dies before claiming.
+    let accepted = submit_simple_run(&app).await;
+    assert_eq!(accepted["queued_jobs"], 1);
+    stage_provision_token(&state, "token-a");
+    let (runner_a, _) =
+        register_runner_with_token(&app, "machine-a", &["self-hosted"], Some("token-a")).await;
+    let key_a = {
+        let inner = state.inner.lock().await;
+        let key = inner.job_assignments.keys().next().cloned().unwrap();
+        assert_eq!(
+            inner.job_assignments.get(&key).map(|r| r.runner_id),
+            Some(runner_a),
+            "registration pairing bound job A to machine-a"
+        );
+        key
+    };
+
+    // Job B arrives afterwards and waits for its machine (machine-a has no
+    // session, so queue-time binding cannot take it).
+    let accepted = submit_simple_run(&app).await;
+    assert_eq!(accepted["queued_jobs"], 1);
+    let key_b = {
+        let inner = state.inner.lock().await;
+        let key = inner.pool_pending.keys().next().cloned().unwrap();
+        assert!(key.0 != key_a.0, "second submission is a distinct run");
+        key
+    };
+
+    // Age machine-a's binding past the claim window, then machine-b
+    // registers: the stale binding is released, and the earlier wait (job B)
+    // is paired — not the dying job re-adopted with priority.
+    {
+        let mut inner = state.inner.lock().await;
+        let keys: Vec<_> = inner.job_assignments.keys().cloned().collect();
+        for key in keys {
+            if let Some(record) = inner.job_assignments.get_mut(&key) {
+                record.at = std::time::SystemTime::now()
+                    - crate::runtime_scheduling::CLAIM_BINDING_TTL
+                    - std::time::Duration::from_secs(1);
+                record.first_at = record.at;
+            }
+        }
+    }
+    stage_provision_token(&state, "token-b");
+    let (runner_b, _) =
+        register_runner_with_token(&app, "machine-b", &["self-hosted"], Some("token-b")).await;
+    {
+        let inner = state.inner.lock().await;
+        assert_eq!(
+            inner.job_assignments.len(),
+            1,
+            "the stale binding was released, not re-adopted"
+        );
+        assert_eq!(
+            inner.job_assignments.get(&key_b).map(|r| r.runner_id),
+            Some(runner_b),
+            "the newer wait gets the machine before the re-queued dying job"
+        );
+        assert!(
+            inner.pool_pending.contains_key(&key_a),
+            "released job is back in the waitlist, not dropped"
+        );
+    }
+
+    // The released job is still served by the next machine: it re-entered at
+    // the back, not into invisibility.
+    stage_provision_token(&state, "token-c");
+    let (runner_c, _) =
+        register_runner_with_token(&app, "machine-c", &["self-hosted"], Some("token-c")).await;
+    {
+        let inner = state.inner.lock().await;
+        assert_eq!(
+            inner.job_assignments.get(&key_a).map(|r| r.runner_id),
+            Some(runner_c),
+            "released job is paired once it reaches the front of the waitlist"
+        );
+    }
+}
+
+#[tokio::test]
+async fn stale_pending_mark_is_still_offered_to_a_registering_runner() {
+    // A job whose machine never landed (pool-pending mark older than the
+    // assignment TTL) used to be filtered out of the pairing offer set and
+    // left invisible: never paired, and nothing re-armed it. A registering
+    // machine must still take it over.
+    let temp = tempfile::tempdir().unwrap();
+    let state = pool_managed_state(&temp).await;
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = submit_simple_run(&app).await;
+    assert_eq!(accepted["queued_jobs"], 1);
+    {
+        let mut inner = state.inner.lock().await;
+        let pending: Vec<_> = inner.pool_pending.keys().cloned().collect();
+        for key in pending {
+            inner.pool_pending.insert(
+                key,
+                std::time::SystemTime::now()
+                    - crate::runtime_scheduling::ASSIGNMENT_TTL
+                    - std::time::Duration::from_secs(1),
+            );
+        }
+    }
+    stage_provision_token(&state, "token-a");
+    let (runner_a, _) =
+        register_runner_with_token(&app, "machine-a", &["self-hosted"], Some("token-a")).await;
+    {
+        let inner = state.inner.lock().await;
+        assert_eq!(
+            inner.job_assignments.values().next().map(|r| r.runner_id),
+            Some(runner_a),
+            "stale pool-pending mark must still be offered to a registering runner"
+        );
+    }
+}
+
+#[tokio::test]
 async fn queue_time_assignment_prefers_idle_registered_runner() {
     let temp = tempfile::tempdir().unwrap();
     let state = pool_managed_state(&temp).await;
