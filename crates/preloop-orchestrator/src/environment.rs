@@ -295,20 +295,44 @@ pub struct EnvironmentSpec {
     pub base: String,
     /// Sorted, deduplicated toolchain layers.
     pub toolchains: Vec<ToolchainLayer>,
+    /// Whether Preloop's curated toolchain bake applies to this base.
+    ///
+    /// True only for the stock digest-pinned Ubuntu bases: those get the
+    /// GitHub-hosted parity toolset layered on top. A custom base image is
+    /// the operator's contract — it is used as-is, without the bake.
+    pub curated: bool,
     /// SHA-256 hex digest of the normalized base and toolchain list.
     pub fingerprint: String,
 }
 
 impl EnvironmentSpec {
     /// Build a normalized environment specification and compute its fingerprint.
+    ///
+    /// Explicit constructions are curated: callers that want the bare
+    /// treatment for a custom base use [`Self::for_base`].
     pub fn new(base: String, toolchains: Vec<ToolchainLayer>) -> Self {
-        Self::from_parts(base, toolchains)
+        Self::from_parts(base, toolchains, true)
+    }
+
+    /// Resolve the environment for a base image.
+    ///
+    /// Stock digest-pinned Ubuntu bases get Preloop's curated toolchain
+    /// bake; a custom base image is used exactly as given — the operator
+    /// chose it, so layering our toolset on top would break the contract.
+    pub fn for_base(base: String) -> Self {
+        let curated = is_stock_base_image(&base);
+        let toolchains = if curated {
+            curated_toolchains()
+        } else {
+            Vec::new()
+        };
+        Self::from_parts(base, toolchains, curated)
     }
 
     /// Replace the base image, recomputing the fingerprint.
     pub fn with_base(mut self, base: String) -> Self {
         self.base = base;
-        Self::from_parts(self.base.clone(), self.toolchains.clone())
+        Self::from_parts(self.base.clone(), self.toolchains.clone(), self.curated)
     }
 
     /// Select the default Ubuntu image from GitHub runner labels.
@@ -328,18 +352,21 @@ impl EnvironmentSpec {
         UBUNTU_24_04_PIN.into()
     }
 
-    fn from_parts(base: String, mut toolchains: Vec<ToolchainLayer>) -> Self {
+    fn from_parts(base: String, mut toolchains: Vec<ToolchainLayer>, curated: bool) -> Self {
         toolchains.sort();
         toolchains.dedup();
         let normalized = serde_json::json!({
             "base": &base,
             "toolchains": &toolchains,
+            "curated": curated,
             // The pool only rebuilds when the fingerprint-suffixed artifact
             // file is missing, so bake-content changes MUST invalidate the
             // fingerprint or the pool silently keeps the old golden forever
             // (packages, resolv.conf, nvm, tool pins all live in the bake
-            // script, which interpolates the versions.toml pins).
-            "bake": crate::base_install_script(),
+            // script, which interpolates the versions.toml pins). Custom
+            // bases skip the bake entirely, so the fingerprint records that
+            // too.
+            "bake": if curated { crate::base_install_script() } else { String::new() },
         });
         let bytes =
             serde_json::to_vec(&normalized).expect("normalized environment is serializable");
@@ -347,6 +374,7 @@ impl EnvironmentSpec {
         Self {
             base,
             toolchains,
+            curated,
             fingerprint,
         }
     }
@@ -518,6 +546,30 @@ mod tests {
     }
 
     #[test]
+
+    /// Stock bases get Preloop's curated toolchain bake; a custom base is
+    /// the operator's contract and must be used as-is.
+    #[test]
+    fn for_base_curates_stock_but_never_custom_bases() {
+        let stock = EnvironmentSpec::for_base(UBUNTU_24_04_PIN.to_owned());
+        assert!(stock.curated, "stock bases must carry the curated bake");
+        assert!(!stock.toolchains.is_empty());
+
+        let custom = EnvironmentSpec::for_base("ghcr.io/acme/runner:latest".to_owned());
+        assert!(!custom.curated, "custom bases must not be curated");
+        assert!(
+            custom.toolchains.is_empty(),
+            "custom bases must run without the curated toolchain layer"
+        );
+        assert_ne!(
+            stock.fingerprint, custom.fingerprint,
+            "the bake decision must invalidate the golden fingerprint"
+        );
+
+        // The stock 22.04 pin curates too.
+        assert!(EnvironmentSpec::for_base(UBUNTU_22_04_PIN.to_owned()).curated);
+    }
+
     fn curated_toolchains_is_fixed_and_deduped() {
         let first = curated_toolchains();
         let second = curated_toolchains();

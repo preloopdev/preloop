@@ -257,6 +257,12 @@ preloop serve
 If `PRELOOP_GOLDEN_URL` is not set, a custom base builds its golden locally;
 Preloop does not silently use the stock release golden for that base.
 
+A custom base is the operator's contract and is used **as-is**: the curated
+toolchain bake (section 3) applies only to the stock digest-pinned Ubuntu
+bases. A custom OCI image gets the runner mounted, but no apt/toolchain
+curation on top — if the image needs extra packages, put them in the image
+or in workflow `setup-*` actions.
+
 ### Installing repository-specific software
 
 Keep repository-specific versions in the workflow so it stays portable to

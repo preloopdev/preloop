@@ -1491,9 +1491,11 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
         let _ = provider.delete(golden).await;
         return Err(error);
     }
-    if let Err(error) = install_base_dependencies(provider.as_ref(), golden).await {
-        let _ = provider.delete(golden).await;
-        return Err(error);
+    if env_spec.curated {
+        if let Err(error) = install_base_dependencies(provider.as_ref(), golden).await {
+            let _ = provider.delete(golden).await;
+            return Err(error);
+        }
     }
     for layer in &env_spec.toolchains {
         for command in layer.install_commands() {
@@ -1881,21 +1883,23 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         };
         self.provider.create(&spec).await?;
         self.provider.start(&name).await?;
-        if let Err(error) = install_base_dependencies(self.provider.as_ref(), &name).await {
-            let _ = self.provider.delete(&name).await;
-            return Err(error);
-        }
-        // Bake the curated toolchain set into the artifact so every runner
-        // forked from it carries it pre-installed. The base install script
-        // already covers the GitHub-hosted parity toolset (node/python/go
-        // toolcaches, git, docker, nvm, yarn); `setup-*` actions download any
-        // other version a job asks for at job time.
-        let toolchains = curated_toolchains();
-        for layer in &toolchains {
-            for command in layer.install_commands() {
-                if let Err(error) = self.provider.exec(&name, &command).await {
-                    let _ = self.provider.delete(&name).await;
-                    return Err(error.into());
+        // A custom base image is the operator's contract: use it as-is. Only
+        // the stock digest-pinned Ubuntu bases get the curated bake (the
+        // GitHub-hosted parity toolset — node/python/go toolcaches, git,
+        // docker, nvm, yarn — plus the Rust layer; `setup-*` actions download
+        // any other version a job asks for at job time).
+        if is_stock_base_image(&self.config.base_image) {
+            if let Err(error) = install_base_dependencies(self.provider.as_ref(), &name).await {
+                let _ = self.provider.delete(&name).await;
+                return Err(error);
+            }
+            let toolchains = curated_toolchains();
+            for layer in &toolchains {
+                for command in layer.install_commands() {
+                    if let Err(error) = self.provider.exec(&name, &command).await {
+                        let _ = self.provider.delete(&name).await;
+                        return Err(error.into());
+                    }
                 }
             }
         }
@@ -1927,7 +1931,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     .unwrap_or("unknown")
             )));
         }
-        let env_spec = EnvironmentSpec::new(self.config.base_image.clone(), toolchains);
+        let env_spec = EnvironmentSpec::for_base(self.config.base_image.clone());
         if let Err(error) = write_bake_manifest(self.provider.as_ref(), &name, &env_spec).await {
             // Provenance is an audit aid, not a build gate.
             warn!(machine = name.as_str(), %error, "bake manifest not written");
@@ -2263,7 +2267,7 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
             }
             None => config.base_image.clone(),
         };
-        let env_spec = EnvironmentSpec::new(env_base.clone(), curated_toolchains());
+        let env_spec = EnvironmentSpec::for_base(env_base.clone());
         let fingerprint = env_spec.fingerprint.clone();
         let toolchains = env_spec.toolchains.clone();
         let selected = golden_registry
@@ -2296,7 +2300,7 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
             },
         )
     } else {
-        let env_spec = EnvironmentSpec::new(config.base_image.clone(), curated_toolchains());
+        let env_spec = EnvironmentSpec::for_base(config.base_image.clone());
         (
             None,
             RunnerEnvironment {
@@ -2407,7 +2411,7 @@ async fn run_slot<P: VmProvider + 'static>(
             };
             // The golden carries the curated toolchain set; base image still
             // comes from the queued job's `runs-on` labels.
-            let env_spec = EnvironmentSpec::new(env_base.clone(), curated_toolchains());
+            let env_spec = EnvironmentSpec::for_base(env_base.clone());
             let fingerprint = env_spec.fingerprint.clone();
             let toolchains = env_spec.toolchains.clone();
 
@@ -2449,7 +2453,7 @@ async fn run_slot<P: VmProvider + 'static>(
             )
         } else {
             // create-per-runner path: no golden, provision fresh each time.
-            let env_spec = EnvironmentSpec::new(config.base_image.clone(), curated_toolchains());
+            let env_spec = EnvironmentSpec::for_base(config.base_image.clone());
             (
                 None,
                 RunnerEnvironment {
@@ -4436,6 +4440,37 @@ chmod +x "$destination/bin/node"
             creates,
             vec!["create:lifecycle-test-0-1"],
             "size-zero mode must not provision a successor it immediately deletes"
+        );
+    }
+
+    /// A custom base image is the operator's contract: the golden must not
+    /// receive Preloop's curated bake. Stock bases still get it.
+    #[tokio::test]
+    async fn custom_base_golden_skips_the_curated_bake() {
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let config = test_config(false);
+        let golden = MachineName::new("lifecycle-test-nobake-golden").unwrap();
+
+        let custom = EnvironmentSpec::for_base("ghcr.io/acme/runner:latest".to_owned());
+        assert!(!custom.curated);
+        prepare_golden_for_env(&provider, &config, &golden, &custom)
+            .await
+            .expect("custom base golden provision succeeds");
+        let custom_events = provider.events().await;
+        assert!(
+            !custom_events.iter().any(|event| event.contains("apt-get")),
+            "a custom base golden must not run the curated apt bake: {custom_events:?}"
+        );
+
+        let stock = EnvironmentSpec::for_base(crate::environment::UBUNTU_24_04_PIN.to_owned());
+        assert!(stock.curated);
+        prepare_golden_for_env(&provider, &config, &golden, &stock)
+            .await
+            .expect("stock base golden provision succeeds");
+        let stock_events = provider.events().await;
+        assert!(
+            stock_events.iter().any(|event| event.contains("apt-get")),
+            "a stock base golden must run the curated apt bake"
         );
     }
 }
