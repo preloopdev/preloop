@@ -1,6 +1,15 @@
 use super::*;
 use utoipa::OpenApi;
 
+// The worker-facing debug surface is fail-closed in two places: the route
+// registration here and `auth::is_worker_debug_route`, which decides what the
+// guest control socket may reach. Shared constants keep the two from
+// drifting when a route is added or renamed.
+pub(crate) const DEBUG_WORKER_TOKEN_PATH: &str = "/api/v1/debug/worker-token";
+pub(crate) const DEBUG_SESSIONS_PATH: &str = "/api/v1/debug/sessions";
+pub(crate) const DEBUG_SESSION_VERDICT_SUFFIX: &str = "/verdict";
+pub(crate) const DEBUG_SESSION_CLOSE_SUFFIX: &str = "/close";
+
 /// Build the production server router without simulation endpoints.
 pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
     build_app(state, shutdown, None)
@@ -451,48 +460,48 @@ pub(crate) fn build_app(
         // socket is mirrored by `auth::is_worker_debug_route`. Keep that
         // fail-closed allowlist in sync when changing this route group.
         .route(
-            "/api/v1/debug/worker-token",
+            DEBUG_WORKER_TOKEN_PATH,
             post(crate::debug_sessions::issue_worker_token).route_layer(
                 middleware::from_fn_with_state(shared.clone(), require_job_runtime_bearer),
             ),
         )
         .route(
-            "/api/v1/debug/sessions",
+            DEBUG_SESSIONS_PATH,
             post(crate::debug_sessions::open_session).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_worker_bearer,
             )),
         )
         .route(
-            "/api/v1/debug/sessions/:session_id/verdict",
+            &format!("{DEBUG_SESSIONS_PATH}/:session_id/verdict"),
             get(crate::debug_sessions::poll_verdict).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_worker_bearer,
             )),
         )
         .route(
-            "/api/v1/debug/sessions/:session_id/close",
+            &format!("{DEBUG_SESSIONS_PATH}/:session_id/close"),
             post(crate::debug_sessions::close_session).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_worker_bearer,
             )),
         )
         .route(
-            "/api/v1/debug/sessions",
+            DEBUG_SESSIONS_PATH,
             get(crate::debug_sessions::list_sessions).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
             )),
         )
         .route(
-            "/api/v1/debug/sessions/:session_id",
+            &format!("{DEBUG_SESSIONS_PATH}/:session_id"),
             get(crate::debug_sessions::get_session).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
             )),
         )
         .route(
-            "/api/v1/debug/sessions/:session_id/verdict",
+            &format!("{DEBUG_SESSIONS_PATH}/:session_id/verdict"),
             post(crate::debug_sessions::post_verdict).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
