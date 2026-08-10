@@ -58,3 +58,25 @@ just dogfood    # E2E with real runner
 - **Local CI is mandatory.** After every large chunk of work or task, run `just test-ci` to validate the changes and dogfood the workflow.
 - **Drop-in workflows.** Users should be able to run their workflows in local CI unmodified.
 
+## Debugging Dogfood (mandatory)
+
+When investigating CI behavior — queue stalls, job failures, check-run state,
+runner churn — default to preloop's own debug features before log-diving.
+Dogfood them; any divergence from `docs/debug-sessions.md` is a bug to report.
+
+- **Sessions**: failed jobs pause into debug sessions (state machine in
+  `docs/debug-sessions.md` §2). List: `preloop debug` or
+  `GET /api/v1/debug/sessions` (native bearer). Attach:
+  `preloop debug [--session <ref>]` — in-VM verbs `:retry`, `:retry --sync`,
+  `:retry --from <step>`, `:sync`, `:verify`, `:export`. Non-interactive:
+  `preloop debug --verdict retry|continue|abort`.
+- **Agent API** (native bearer): lease
+  `POST /api/v1/agent/debug/sessions/<id>/lease`, stream
+  `GET .../events`, drive `POST .../operations`, audit `GET .../audit`.
+- **DAP**: attach over WS `GET /api/v1/runs/<run_id>/debug` (native bearer);
+  `preloop-dap` bridges DAP to the session state machine.
+- **Hold VMs**: `preloop run --preserve-on-failure` keeps the VM for a later
+  `preloop shell`/attach when nothing can answer interactively (piped/detached/CI).
+- Leaked sessions (terminal states `expired_while_detached`, `worker_crashed`,
+  sessions that never close) count as findings, not noise.
+

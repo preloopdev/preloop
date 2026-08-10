@@ -389,9 +389,13 @@ pub(crate) async fn purge_runner_identity(shared: &Arc<SharedState>, runner_id: 
         if crate::runtime_scheduling::clear_assignment(&mut inner, key.0, &key.1)
             && inner.pool_assignments_enabled
         {
-            // Keep the *first* mark: a pool that keeps provisioning and
-            // losing machines for the same job would otherwise refresh the
-            // hold on every purge and block healthy runners forever.
+            // Requeue at the *back* of the waitlist with a fresh mark: a job
+            // whose machines keep dying must not hold the front of the line
+            // forever. `clear_assignment` removed the old mark, so this is a
+            // fresh stamp (not the original one). The pairing path re-arms
+            // stale marks and `claim_permitted` opens the hold once a mark
+            // ages past the binding window, so a fresh mark cannot wedge the
+            // job — it simply waits its turn again.
             inner
                 .pool_pending
                 .entry(key)

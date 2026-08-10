@@ -1461,14 +1461,40 @@ pub(crate) fn pair_registered_runner(inner: &mut InnerState, runner_id: i64) {
     };
     let caps = capabilities_of(&runner);
     let now = std::time::SystemTime::now();
-    // Also adopt jobs whose pairing went stale: the pool provisions a burst
-    // of machines per backlog entry and individual runners die — the next
-    // registration for the same job must take the pairing over or dispatch
-    // hangs behind a dead owner.
-    let stale_owned = inner
+    // A binding that outlived the claim window belongs to a machine that is
+    // presumed dead. Release those jobs back to the waitlist with a fresh
+    // mark — the *back* of the line — instead of letting every new
+    // registration re-adopt the same job with priority. A job whose machines
+    // keep dying must not monopolize the pool (observed in production: one
+    // job re-paired nine times in a row while newer jobs waited). Between
+    // sweeps `claim_permitted` still lets a verified runner take over the
+    // stale record, so nothing is stranded.
+    let dead: Vec<(RunId, JobId)> = inner
         .job_assignments
         .iter()
         .filter(|(_, record)| !binding_fresh(record.at, now))
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in dead {
+        if clear_assignment(inner, key.0, &key.1) && inner.pool_assignments_enabled {
+            info!(
+                run_id = %key.0,
+                job_id = %key.1.0,
+                "stale binding released; job requeued at back of pool waitlist"
+            );
+            inner.pool_pending.insert(key, now);
+        }
+    }
+
+    // Pair the earliest-waiting job this runner can serve. Every mark is
+    // offerable: a fresh mark means a machine may still be booting for it
+    // (pairing re-stamps the job to this runner and the booting machine falls
+    // back to the FIFO claim path), a stale mark means that provisioning died
+    // before any machine registered — filtering those out is what left
+    // long-waiting jobs invisible to the pool.
+    let chosen = inner
+        .pool_pending
+        .iter()
         .filter(|(key, _)| {
             inner
                 .queue
@@ -1477,24 +1503,8 @@ pub(crate) fn pair_registered_runner(inner: &mut InnerState, runner_id: i64) {
                 .map(|job| job_matches_runner_capabilities(job, &caps))
                 .unwrap_or(false)
         })
-        .min_by_key(|(_, record)| record.at)
+        .min_by_key(|(_, at)| **at)
         .map(|(key, _)| key.clone());
-    let chosen = stale_owned.or_else(|| {
-        inner
-            .pool_pending
-            .iter()
-            .filter(|(_, at)| assignment_fresh(**at, now))
-            .filter(|(key, _)| {
-                inner
-                    .queue
-                    .iter()
-                    .find(|job| job.run_id == key.0 && job.job_id == key.1)
-                    .map(|job| job_matches_runner_capabilities(job, &caps))
-                    .unwrap_or(false)
-            })
-            .min_by_key(|(_, at)| **at)
-            .map(|(key, _)| key.clone())
-    });
     if let Some(key) = chosen {
         // Rebinding to a replacement machine keeps the original first-bound
         // stamp, so repeated provisioning failures cannot extend the window
