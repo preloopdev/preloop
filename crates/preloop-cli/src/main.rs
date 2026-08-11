@@ -2023,17 +2023,103 @@ async fn cmd_push(args: PushArgs) -> anyhow::Result<()> {
 }
 
 async fn cmd_plan(args: PlanArgs) -> anyhow::Result<()> {
-    let workflow = args
-        .file
-        .as_ref()
-        .map_or("all workflows".into(), |p| p.display().to_string());
+    let workflow_path = resolve_workflow_path(args.file.as_deref())?;
+    let workflow_yaml = std::fs::read_to_string(&workflow_path)
+        .with_context(|| format!("failed to read workflow: {}", workflow_path.display()))?;
 
-    println!("preloop plan: {workflow}");
-    if args.json {
-        println!("  format: json");
+    // Local reusable workflows (`uses: ./.github/workflows/…`) are inlined
+    // exactly like `preloop run` inlines them, so a plan shows the same job
+    // set a run would execute.
+    let mut reusable_workflows = BTreeMap::new();
+    if let Ok(current_dir) = std::env::current_dir() {
+        let workflows_dir = current_dir.join(".github").join("workflows");
+        if let Ok(entries) = std::fs::read_dir(&workflows_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !matches!(
+                    path.extension().and_then(|ext| ext.to_str()),
+                    Some("yml" | "yaml")
+                ) || same_file_path(&path, &workflow_path)
+                {
+                    continue;
+                }
+                let Some(relative) = path.strip_prefix(&current_dir).ok() else {
+                    continue;
+                };
+                let yaml = std::fs::read_to_string(&path)
+                    .with_context(|| format!("read reusable workflow {}", path.display()))?;
+                reusable_workflows.insert(relative.to_string_lossy().into_owned(), yaml);
+            }
+        }
     }
 
-    anyhow::bail!("")
+    let workflow = preloop_gha_parser::parse_workflow(&workflow_yaml)
+        .map_err(|error| anyhow::anyhow!("parse {}: {error}", workflow_path.display()))?;
+    let expanded =
+        preloop_gha_parser::expand_jobs_with_reusables(&workflow, &reusable_workflows)
+            .map_err(|error| anyhow::anyhow!("expand {}: {error}", workflow_path.display()))?;
+    let plans = expanded.jobs;
+
+    if args.json {
+        let value = serde_json::json!({
+            "workflow": workflow_path.display().to_string(),
+            "jobs": plans.iter().map(plan_json).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+
+    println!(
+        "workflow: {} ({} jobs expanded from {} declared)",
+        workflow_path.display(),
+        plans.len(),
+        workflow.jobs.len()
+    );
+    let name = workflow.name.as_deref().unwrap_or("(unnamed)");
+    println!("name:     {name}");
+    println!();
+    for plan in &plans {
+        let matrix = if plan.matrix.is_empty() {
+            String::new()
+        } else {
+            let cells: Vec<String> = plan
+                .matrix
+                .iter()
+                .map(|(key, value)| match value {
+                    serde_json::Value::String(value) => format!("{key}={value}"),
+                    other => format!("{key}={other}"),
+                })
+                .collect();
+            format!("  [{}]", cells.join(", "))
+        };
+        let needs = if plan.needs.is_empty() {
+            String::new()
+        } else {
+            let ids: Vec<&str> = plan.needs.iter().map(|need| need.0.as_str()).collect();
+            format!("  needs: {}", ids.join(", "))
+        };
+        println!(
+            "{}{}  runs-on: {}{}{}",
+            plan.id.0,
+            matrix,
+            plan.runs_on.join(", "),
+            needs,
+            format!("  steps: {}", plan.steps.len())
+        );
+    }
+    Ok(())
+}
+
+fn plan_json(plan: &preloop_gha_protocol::JobPlan) -> serde_json::Value {
+    serde_json::json!({
+        "id": plan.id.0,
+        "base_id": plan.base_id,
+        "name": plan.name,
+        "runs_on": plan.runs_on,
+        "needs": plan.needs.iter().map(|need| need.0.clone()).collect::<Vec<_>>(),
+        "matrix": plan.matrix,
+        "steps": plan.steps.len(),
+    })
 }
 
 async fn cmd_status() -> anyhow::Result<()> {
