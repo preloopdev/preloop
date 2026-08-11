@@ -87,6 +87,72 @@ pub(crate) fn preloop_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".preloop"))
 }
 
+/// A `smolvm` command carrying Preloop's Linux VM-sandbox environment.
+///
+/// Direct `machine exec`/`cp`/`shell` calls can implicitly boot or restart a
+/// stopped machine — upstream's exec path connects to the machine, starting
+/// it when needed, and `machine shell` does the same — so these spawns must
+/// carry the exact seccomp/Landlock/cgroup environment the VM provider
+/// applies to its own boots. This is the single chokepoint for them; the
+/// policy lives in [`preloop_vm::smolvm_sandbox_env`] and is a no-op on
+/// macOS, matching the provider.
+pub(crate) fn smolvm_command() -> anyhow::Result<std::process::Command> {
+    let mut command = std::process::Command::new("smolvm");
+    preloop_vm::apply_smolvm_sandbox_env(&mut command)?;
+    Ok(command)
+}
+
+#[cfg(test)]
+pub(crate) static SMOLVM_PATH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// A fake `smolvm` on PATH that records the sandbox environment it was given
+/// and answers the debug-session byte-count probe. Serialized with
+/// [`SMOLVM_PATH_LOCK`]: `PATH` is process-global and the debug-session and
+/// shell tests run in the same binary.
+#[cfg(test)]
+pub(crate) fn fake_smolvm_on_path() -> (tempfile::TempDir, PathBuf) {
+    let directory = tempfile::tempdir().unwrap();
+    let executable = directory.path().join("smolvm");
+    std::fs::write(
+        &executable,
+        r##"#!/bin/sh
+printf 'SMOLVM_SECCOMP=%s\n' "${SMOLVM_SECCOMP-}" > "$0.seccomp"
+printf 'SMOLVM_LANDLOCK=%s\n' "${SMOLVM_LANDLOCK-}" > "$0.landlock"
+printf 'SMOLVM_CGROUP_ROOT=%s\n' "${SMOLVM_CGROUP_ROOT-}" > "$0.cgroup"
+case "$*" in
+  *"wc -c"*) printf '12345\n' ;;
+esac
+exit 0
+"##,
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+    use std::os::unix::fs::PermissionsExt;
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&executable, permissions).unwrap();
+    (directory, executable)
+}
+
+/// Run `test` with a fake `smolvm` first on PATH, restoring PATH afterwards.
+#[cfg(test)]
+pub(crate) fn with_fake_smolvm_path<T>(test: impl FnOnce(&PathBuf) -> T) -> T {
+    let _guard = SMOLVM_PATH_LOCK.blocking_lock();
+    let (directory, executable) = fake_smolvm_on_path();
+    let previous = std::env::var_os("PATH");
+    let mut path = directory.path().as_os_str().to_owned();
+    path.push(":");
+    if let Some(previous) = &previous {
+        path.push(previous);
+    }
+    std::env::set_var("PATH", path);
+    let result = test(&executable);
+    match previous {
+        Some(previous) => std::env::set_var("PATH", previous),
+        None => std::env::remove_var("PATH"),
+    }
+    result
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "preloop", about = "Local CI with hardware isolation")]
 struct Cli {
@@ -844,6 +910,15 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
                 }
             }
             let pool_shutdown = shutdown.clone();
+            // Supervisor-side, once, before any VM boots: systemd's
+            // `Delegate=cpu memory pids` chowns this unit's cgroup subtree but
+            // leaves `cgroup.subtree_control` empty, so a `vm-<pid>` leaf would
+            // get no cpu/memory/pids limit files. This performs the same
+            // vacate-then-enable dance `smolvm serve` does. It is the only
+            // place Preloop writes to the cgroup hierarchy — the CLI paths
+            // (`preloop shell`, debug-session `machine exec`/`cp`) resolve the
+            // root read-only and never mutate it.
+            preloop_vm::init_vm_cgroup_delegation();
             Some(tokio::spawn(async move {
                 RunnerPool::new(std::sync::Arc::new(SmolVmProvider::default()), config)?
                     .run(pool_shutdown)
@@ -2061,8 +2136,10 @@ async fn cmd_shell(args: ShellArgs) -> anyhow::Result<()> {
         }
     });
 
-    // Run smolvm machine shell interactively.
-    let status = std::process::Command::new("smolvm")
+    // Run smolvm machine shell interactively. The shell boots a stopped
+    // machine, so the sandbox environment applies exactly as for a provider
+    // spawn.
+    let status = crate::smolvm_command()?
         .args(["machine", "shell", "--name", &machine_name])
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
@@ -2695,11 +2772,63 @@ mod tests {
 
     #[test]
     fn shell_explicit_ref() {
-        let cli = parse(&["shell", "run-42"]).unwrap();
+        let cli = parse(&["shell", "0"]).unwrap();
         let Command::Shell(args) = cli.command else {
             panic!("expected Shell");
         };
-        assert_eq!(args.run_ref.unwrap(), "run-42");
+        assert_eq!(args.run_ref.as_deref(), Some("0"));
+    }
+
+    /// `preloop shell` spawns `smolvm machine shell`, which boots a stopped
+    /// machine — the sandbox environment must reach it exactly like a
+    /// provider spawn. The observable contract is the environment of the
+    /// spawned process.
+    #[tokio::test]
+    async fn shell_spawn_carries_the_sandbox_environment() {
+        let _guard = crate::SMOLVM_PATH_LOCK.lock().await;
+        let (directory, executable) = crate::fake_smolvm_on_path();
+        let previous_path = std::env::var_os("PATH");
+        let mut path = directory.path().as_os_str().to_owned();
+        path.push(":");
+        if let Some(previous) = &previous_path {
+            path.push(previous);
+        }
+        std::env::set_var("PATH", path);
+
+        let home = tempfile::tempdir().unwrap();
+        let debug_dir = home.path().join("state/debug");
+        std::fs::create_dir_all(&debug_dir).unwrap();
+        std::fs::write(debug_dir.join("preloop-runner-0-1"), "claimed").unwrap();
+        std::env::set_var("PRELOOP_HOME", home.path());
+
+        let result = cmd_shell(ShellArgs {
+            run_ref: Some("preloop-runner-0-1".to_owned()),
+        })
+        .await;
+
+        std::env::remove_var("PRELOOP_HOME");
+        match previous_path {
+            Some(previous) => std::env::set_var("PATH", previous),
+            None => std::env::remove_var("PATH"),
+        }
+        result.unwrap();
+
+        let read = |suffix: &str| {
+            std::fs::read_to_string(executable.with_extension(suffix))
+                .unwrap()
+                .trim()
+                .to_owned()
+        };
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(read("seccomp"), "SMOLVM_SECCOMP=enforce");
+            assert_eq!(read("landlock"), "SMOLVM_LANDLOCK=enforce");
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(read("seccomp"), "SMOLVM_SECCOMP=");
+            assert_eq!(read("landlock"), "SMOLVM_LANDLOCK=");
+        }
     }
 
     // -- top-level --

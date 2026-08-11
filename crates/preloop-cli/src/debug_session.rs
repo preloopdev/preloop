@@ -1061,7 +1061,7 @@ fn export_from_guest(session: &DebugSession, apply: bool) -> Result<()> {
 
     // Use a temporary index so `git add -N` can expose untracked files in the
     // patch without changing the guest workspace's real index.
-    let output = std::process::Command::new("smolvm")
+    let output = crate::smolvm_command()?
         .args(["machine", "exec", "--name", machine, "--", "sh", "-lc"])
         .arg(format!(
             "cd {} && \
@@ -1128,7 +1128,7 @@ fn guest_modified(
     candidates: &[String],
 ) -> Result<Vec<String>> {
     let quoted: Vec<String> = candidates.iter().map(|p| shell_quote(p)).collect();
-    let output = std::process::Command::new("smolvm")
+    let output = crate::smolvm_command()?
         .args(["machine", "exec", "--name", machine, "--", "sh", "-lc"])
         .arg(format!(
             "cd {} && git --literal-pathspecs status --porcelain -- {} 2>/dev/null || true",
@@ -1259,7 +1259,7 @@ fn push_to_guest(machine: &str, local: &std::path::Path, remote: &str) -> Result
         .len();
 
     guest_check(machine, &format!("rm -f {}", shell_quote(remote)))?;
-    let output = std::process::Command::new("smolvm")
+    let output = crate::smolvm_command()?
         .args([
             "machine",
             "cp",
@@ -1275,7 +1275,7 @@ fn push_to_guest(machine: &str, local: &std::path::Path, remote: &str) -> Result
         );
     }
 
-    let seen = std::process::Command::new("smolvm")
+    let seen = crate::smolvm_command()?
         .args(["machine", "exec", "--name", machine, "--", "sh", "-lc"])
         .arg(format!("wc -c < {} 2>/dev/null", shell_quote(remote)))
         .output()
@@ -1295,7 +1295,7 @@ fn push_to_guest(machine: &str, local: &std::path::Path, remote: &str) -> Result
 
 /// Run a command in the guest, failing loudly on a non-zero exit.
 fn guest_check(machine: &str, command: &str) -> Result<()> {
-    let output = std::process::Command::new("smolvm")
+    let output = crate::smolvm_command()?
         .args([
             "machine", "exec", "--name", machine, "--", "sh", "-lc", command,
         ])
@@ -1327,7 +1327,14 @@ fn run_in_guest(session: &DebugSession, command: &str) {
     };
     let workspace = session.workspace.as_deref().unwrap_or("/");
     let script = guest_command_script(workspace, command);
-    let status = std::process::Command::new("smolvm")
+    let mut command = match crate::smolvm_command() {
+        Ok(command) => command,
+        Err(error) => {
+            println!("  Could not build the smolvm command: {error}");
+            return;
+        }
+    };
+    let status = command
         .args([
             "machine", "exec", "--name", machine, "--", "sh", "-lc", &script,
         ])
@@ -1689,5 +1696,75 @@ mod tests {
         assert_eq!(next_revision("original"), "repair-1");
         assert_eq!(next_revision("repair-1"), "repair-2");
         assert_eq!(next_revision("repair-9"), "repair-10");
+    }
+
+    /// Every direct `smolvm machine exec/cp` spawn in the debug-session flow
+    /// can implicitly boot or restart a stopped machine (upstream connects,
+    /// starting the VM when needed), so each must carry the sandbox
+    /// environment the provider applies to its own boots. The observable
+    /// contract is the environment of the spawned process, captured by a
+    /// fake `smolvm` on PATH.
+    fn assert_sandbox_carried(executable: &std::path::Path) {
+        let read = |suffix: &str| {
+            std::fs::read_to_string(executable.with_extension(suffix))
+                .unwrap()
+                .trim()
+                .to_owned()
+        };
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(read("seccomp"), "SMOLVM_SECCOMP=enforce");
+            assert_eq!(read("landlock"), "SMOLVM_LANDLOCK=enforce");
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(read("seccomp"), "SMOLVM_SECCOMP=");
+            assert_eq!(read("landlock"), "SMOLVM_LANDLOCK=");
+        }
+    }
+
+    #[test]
+    fn guest_check_carries_the_sandbox_environment() {
+        crate::with_fake_smolvm_path(|executable| {
+            guest_check("vm-1", "echo ok").unwrap();
+            assert_sandbox_carried(executable);
+        });
+    }
+
+    #[test]
+    fn guest_modified_carries_the_sandbox_environment() {
+        crate::with_fake_smolvm_path(|executable| {
+            let modified = guest_modified("vm-1", "/work", &["src/a.rs".into()]).unwrap();
+            assert!(modified.is_empty());
+            assert_sandbox_carried(executable);
+        });
+    }
+
+    #[test]
+    fn push_to_guest_carries_the_sandbox_environment() {
+        crate::with_fake_smolvm_path(|executable| {
+            let staging = tempfile::tempdir().unwrap();
+            let local = staging.path().join("artifact.bin");
+            // The fake answers the post-copy byte-count probe with 12345.
+            std::fs::write(&local, vec![b'x'; 12_345]).unwrap();
+            push_to_guest("vm-1", &local, "/work/artifact.bin").unwrap();
+            assert_sandbox_carried(executable);
+        });
+    }
+
+    #[test]
+    fn export_from_guest_carries_the_sandbox_environment() {
+        crate::with_fake_smolvm_path(|executable| {
+            export_from_guest(&session(), true).unwrap();
+            assert_sandbox_carried(executable);
+        });
+    }
+
+    #[test]
+    fn run_in_guest_carries_the_sandbox_environment() {
+        crate::with_fake_smolvm_path(|executable| {
+            run_in_guest(&session(), "echo hi");
+            assert_sandbox_carried(executable);
+        });
     }
 }
