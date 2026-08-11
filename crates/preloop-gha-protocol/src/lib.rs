@@ -833,6 +833,17 @@ pub enum NdjsonEvent {
         #[serde(default)]
         outputs: BTreeMap<String, String>,
     },
+    /// GitHub check runs were created for this run's jobs.
+    ///
+    /// Carries no job data: it exists so the run record — which holds the
+    /// `job_check_run_ids` mapping — is persisted the moment the ids are
+    /// known, not on the next job status event. A restart between check-run
+    /// creation and the job's first status event used to lose the mapping,
+    /// leaving GitHub checks permanently "queued" while the jobs ran.
+    CheckRunCreated {
+        /// Run the check runs belong to.
+        run_id: RunId,
+    },
 }
 
 impl NdjsonEvent {
@@ -844,7 +855,8 @@ impl NdjsonEvent {
             | Self::Log { run_id, .. }
             | Self::Annotation { run_id, .. }
             | Self::RunStatus { run_id, .. }
-            | Self::JobCompleted { run_id, .. } => *run_id,
+            | Self::JobCompleted { run_id, .. }
+            | Self::CheckRunCreated { run_id } => *run_id,
         }
     }
 

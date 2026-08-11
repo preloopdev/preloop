@@ -7613,6 +7613,108 @@ jobs:
     assert!(*check_run_id > 0);
 }
 
+/// Check-run ids must survive a restart even when no job status event ever
+/// fired — a long queue can sit between check-run creation and the job's
+/// first status event, and a deploy in that window used to restore the run
+/// with an empty mapping, orphaning the GitHub check in "queued" forever.
+#[tokio::test]
+async fn check_run_ids_survive_a_restart_before_any_job_event() {
+    // Held for the whole test: the GitHub env vars are process-global, and a
+    // parallel test's token would flip the check-run path from mock to a real
+    // GitHub API call. The mock path is the contract under test.
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    std::env::remove_var("PRELOOP_GITHUB_TOKEN");
+    std::env::remove_var("PRELOOP_GITHUB_API_URL");
+
+    let temp = tempfile::tempdir().unwrap();
+    let ws_dir = temp.path().join("workspace");
+    tokio::fs::create_dir_all(ws_dir.join(".github/workflows"))
+        .await
+        .unwrap();
+    let workflow_content = r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hello
+"#;
+    tokio::fs::write(ws_dir.join(".github/workflows/build.yml"), workflow_content)
+        .await
+        .unwrap();
+
+    let run_id = {
+        let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        state.webhook_secret = Some("super-secret".to_owned());
+        state.local_workspace = Some(ws_dir.clone());
+        let app = app(state.clone(), CancellationToken::new());
+
+        let payload = serde_json::json!({
+            "ref": "refs/heads/main",
+            "before": "0000000000000000000000000000000000000000",
+            "after": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+            "repository": {
+                "full_name": "owner/repo",
+                "default_branch": "main"
+            },
+            "commits": [
+                {
+                    "id": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+                    "added": ["src/main.rs"],
+                    "modified": [],
+                    "removed": []
+                }
+            ]
+        });
+        let payload_bytes = serde_json::to_vec(&payload).unwrap();
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = HmacSha256::new_from_slice(b"super-secret").unwrap();
+        mac.update(&payload_bytes);
+        let sig_bytes = mac.finalize().into_bytes();
+        let sig_hex = sig_bytes
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/github/webhooks")
+                    .header("x-github-event", "push")
+                    .header("x-hub-signature-256", format!("sha256={sig_hex}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload_bytes))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let inner = state.inner.lock().await;
+        let (run_id, run) = inner.runs.iter().next().expect("webhook created a run");
+        assert_eq!(
+            run.job_check_run_ids.len(),
+            1,
+            "mock check run id recorded at submission"
+        );
+        *run_id
+    };
+
+    // Restart with no job event in between: the mapping must come back.
+    let recovered = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let inner = recovered.inner.lock().await;
+    let run = inner.runs.get(&run_id).expect("run must survive restart");
+    assert_eq!(
+        run.job_check_run_ids.len(),
+        1,
+        "check run id must survive a restart before the job's first status event"
+    );
+}
+
 #[tokio::test]
 async fn github_check_run_rerequest_resubmits_the_owning_run() {
     let temp = tempfile::tempdir().unwrap();
