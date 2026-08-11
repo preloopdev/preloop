@@ -735,7 +735,8 @@ impl AppState {
             NdjsonEvent::RunAccepted { run_id, .. }
             | NdjsonEvent::JobStatus { run_id, .. }
             | NdjsonEvent::RunStatus { run_id, .. }
-            | NdjsonEvent::JobCompleted { run_id, .. } => Some(*run_id),
+            | NdjsonEvent::JobCompleted { run_id, .. }
+            | NdjsonEvent::CheckRunCreated { run_id } => Some(*run_id),
             _ => None,
         };
         let has_run_projection = run_id.is_some();

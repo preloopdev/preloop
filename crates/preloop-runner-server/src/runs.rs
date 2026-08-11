@@ -2149,12 +2149,23 @@ pub(crate) async fn rerun_run_inner(
     let accepted = submit_run_inner(shared, submission).await?;
 
     if let Some((job_id, check_run_id)) = reused_check_run.as_ref() {
-        let mut inner = shared.state.inner.lock().await;
-        if let Some(run) = inner.runs.get_mut(&accepted.run_id) {
-            if run.jobs.contains_key(job_id) {
-                run.job_check_run_ids.insert(job_id.clone(), *check_run_id);
+        {
+            let mut inner = shared.state.inner.lock().await;
+            if let Some(run) = inner.runs.get_mut(&accepted.run_id) {
+                if run.jobs.contains_key(job_id) {
+                    run.job_check_run_ids.insert(job_id.clone(), *check_run_id);
+                }
             }
         }
+        // Same persistence obligation as `report_check_run_queued`: the
+        // reused check id must survive a restart before the job's first
+        // status event.
+        shared
+            .state
+            .emit(preloop_gha_protocol::NdjsonEvent::CheckRunCreated {
+                run_id: accepted.run_id,
+            })
+            .await;
     }
     crate::github::report_check_runs_for_run(shared, accepted.run_id, reused_check_run).await;
     Ok(accepted)

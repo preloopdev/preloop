@@ -271,10 +271,21 @@ pub(crate) async fn report_check_run_queued(
     }
 
     if let Some(check_id) = check_run_id {
-        let mut inner = shared.state.inner.lock().await;
-        if let Some(run) = inner.runs.get_mut(&run_id) {
-            run.job_check_run_ids.insert(job_id.clone(), check_id);
+        {
+            let mut inner = shared.state.inner.lock().await;
+            if let Some(run) = inner.runs.get_mut(&run_id) {
+                run.job_check_run_ids.insert(job_id.clone(), check_id);
+            }
         }
+        // Persist the record now. The mapping is only meaningful while the
+        // run lives, and the next status event may be hours away (a long
+        // queue); a restart in that window used to restore the run with an
+        // empty mapping, silently orphaning the GitHub check in "queued"
+        // forever even though the job ran and completed.
+        shared
+            .state
+            .emit(preloop_gha_protocol::NdjsonEvent::CheckRunCreated { run_id })
+            .await;
     }
 }
 
