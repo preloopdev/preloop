@@ -113,13 +113,11 @@ pub enum NetworkPolicy {
 /// `preloop update` pins the smolvm install to the last known-good release.
 /// `PRELOOP_SMOLVM_NET_BACKEND=tsi|virtio-net` overrides the choice for
 /// setups stuck on a broken artifact.
-fn public_only_net_backend() -> &'static str {
-    match std::env::var("PRELOOP_SMOLVM_NET_BACKEND").as_deref() {
-        Ok("tsi") => return "tsi",
-        Ok("virtio-net") => return "virtio-net",
-        _ => {}
+fn public_only_net_backend(lookup: impl Fn(&str) -> Option<String>) -> &'static str {
+    match lookup("PRELOOP_SMOLVM_NET_BACKEND").as_deref() {
+        Some("tsi") => "tsi",
+        _ => "virtio-net",
     }
-    "virtio-net"
 }
 
 /// Where a guest environment value is resolved from, at launch time.
@@ -251,6 +249,22 @@ pub enum VmError {
         /// Program path.
         binary: String,
     },
+    /// An operator-set SmolVM sandbox override has a value upstream would
+    /// silently treat as "control off". Preloop fails closed instead of
+    /// forwarding an unrecognized mode that would boot VMs unconfined.
+    #[error(
+        "invalid {variable} value `{value}` for the VM sandbox (expected {expected}); \
+         refusing to run VMs with an unvalidated override — remove the variable or set a \
+         supported mode"
+    )]
+    InvalidSandboxEnv {
+        /// The environment variable carrying the override.
+        variable: &'static str,
+        /// The offending value.
+        value: String,
+        /// Modes upstream accepts.
+        expected: &'static str,
+    },
 }
 
 /// Provider contract consumed by the Preloop orchestrator.
@@ -340,6 +354,11 @@ pub struct SmolVmProvider {
     /// Whether the resolved binary's `machine create` accepts
     /// `--mount-socket`, probed once per provider.
     socket_mount_supported: Arc<tokio::sync::OnceCell<bool>>,
+    /// Where this provider reads host environment overrides from (the sandbox
+    /// modes and the network backend). Production is always the process
+    /// environment; unit tests substitute a pure lookup so the policy can be
+    /// exercised without mutating global state.
+    env_lookup: EnvLookup,
 }
 
 impl Default for SmolVmProvider {
@@ -387,6 +406,7 @@ impl SmolVmProvider {
             fork_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             forked_machines: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             socket_mount_supported: Arc::new(tokio::sync::OnceCell::new()),
+            env_lookup: process_env,
         }
     }
 
@@ -406,16 +426,43 @@ impl SmolVmProvider {
         self
     }
 
+    /// Substitute the host-environment lookup this provider reads.
+    /// Test-only seam: nothing outside the crate's own tests can build a
+    /// provider that resolves overrides from anywhere but the process
+    /// environment. Only the Linux sandbox-override test needs it — off
+    /// Linux the policy injects nothing, so there is no override to fake.
+    #[cfg(all(test, target_os = "linux"))]
+    fn with_env_lookup(mut self, lookup: EnvLookup) -> Self {
+        self.env_lookup = lookup;
+        self
+    }
+
     fn command(&self) -> Command {
         Command::new(&self.binary)
+    }
+
+    /// A command ready to run against the resolved SmolVM binary with the
+    /// sandbox environment applied. Every operation goes through here, so
+    /// the sandbox reaches any command that can spawn or restart SmolVM's
+    /// `_boot-vm` subprocess — create, start, start_forkable, fork, exec,
+    /// pack — not just machine creation.
+    fn sandboxed_command(&self) -> Result<Command, VmError> {
+        let mut command = self.command();
+        apply_sandbox_env(&mut command, self.env_lookup)?;
+        Ok(command)
     }
 
     /// Whether `machine create` accepts `--mount-socket`, probed from the
     /// binary's own help text and cached. SmolVM's wrapper scripts can
     /// report a recent `--version` while resolving to an old binary, so the
     /// flag's presence is the reliable capability check.
-    async fn supports_mount_socket(&self) -> bool {
-        let mut command = self.command();
+    ///
+    /// An invalid sandbox override is reported as such instead of being
+    /// folded into a `false` answer: the caller caches the probe result for
+    /// the provider's lifetime, and a rejected environment says nothing
+    /// about the binary's capabilities.
+    async fn supports_mount_socket(&self) -> Result<bool, VmError> {
+        let mut command = self.sandboxed_command()?;
         command
             .args(["machine", "create", "--help"])
             .stdin(Stdio::null())
@@ -423,7 +470,7 @@ impl SmolVmProvider {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         let Ok(mut child) = command.spawn() else {
-            return false;
+            return Ok(false);
         };
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
@@ -433,9 +480,9 @@ impl SmolVmProvider {
             child.wait(),
         );
         let (Ok((stdout, _)), Ok(_), Ok(status)) = (stdout, stderr, status) else {
-            return false;
+            return Ok(false);
         };
-        status.success() && String::from_utf8_lossy(&stdout).contains("--mount-socket")
+        Ok(status.success() && String::from_utf8_lossy(&stdout).contains("--mount-socket"))
     }
 
     async fn checked(
@@ -453,7 +500,7 @@ impl SmolVmProvider {
         network: Option<&NetworkPolicy>,
         staging_dir: Option<&Path>,
     ) -> Result<ExecOutput, VmError> {
-        let mut command = self.command();
+        let mut command = self.sandboxed_command()?;
         match network {
             Some(NetworkPolicy::PublicOnly) => {
                 command.env("SMOLVM_EGRESS_FLOOR", "strict");
@@ -635,7 +682,7 @@ impl VmProvider for SmolVmProvider {
                 args.extend([
                     "--net".into(),
                     "--net-backend".into(),
-                    public_only_net_backend().into(),
+                    public_only_net_backend(self.env_lookup).into(),
                 ]);
             }
             NetworkPolicy::Restricted { hosts, cidrs } => {
@@ -660,8 +707,8 @@ impl VmProvider for SmolVmProvider {
         if !spec.sockets.is_empty()
             && !*self
                 .socket_mount_supported
-                .get_or_init(|| self.supports_mount_socket())
-                .await
+                .get_or_try_init(|| self.supports_mount_socket())
+                .await?
         {
             return Err(VmError::UnsupportedSocketMount {
                 binary: self.binary.display().to_string(),
@@ -926,7 +973,7 @@ impl VmProvider for SmolVmProvider {
         if argv.is_empty() {
             return Err(VmError::InvalidSpec("guest command is empty".into()));
         }
-        let mut command = self.command();
+        let mut command = self.sandboxed_command()?;
         command
             .args(["machine", "exec", "--stream", "--name", name.as_str(), "--"])
             .args(argv)
@@ -1069,6 +1116,317 @@ fn is_env_identifier(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
+// ---------------------------------------------------------------------------
+// VM sandbox environment (seccomp / Landlock / per-VM cgroup)
+// ---------------------------------------------------------------------------
+//
+// SmolVM's `_boot-vm` always hardens the process (no_new_privs, non-dumpable,
+// core limit zero), but its seccomp syscall allowlist and Landlock filesystem
+// confinement are opt-in knobs: `smolvm serve` defaults `SMOLVM_SECCOMP` and
+// `SMOLVM_LANDLOCK` to `enforce`, while the standalone `machine ...` commands
+// Preloop drives do not. Preloop therefore applies the same defaults itself,
+// on Linux, for every invocation that can boot or restart a VM.
+//
+// The upstream convention is preserved: a value the operator already set in
+// the environment wins over the default — exactly what `serve` documents
+// ("a pre-set SMOLVM_SECCOMP env var takes precedence"). Unlike upstream,
+// Preloop validates the pre-set value instead of forwarding garbage: smolvm
+// treats any unrecognized mode as "off", so forwarding a typo would silently
+// boot VMs unconfined. An unrecognized override is a hard error.
+//
+// On non-Linux hosts both controls are no-ops upstream (Landlock is a Linux
+// LSM; the seccomp filter installs only on Linux), so nothing is injected and
+// macOS behavior is unchanged.
+//
+// The per-VM cgroup root is separate, because claiming one *writes* to the
+// cgroup hierarchy. Only a supervisor may do that, and only once, through
+// [`init_vm_cgroup_delegation`]; every other process (the CLI's `shell`,
+// `machine exec`, `machine cp`) resolves the root read-only and simply goes
+// without caps when there is no usable delegation already in place.
+
+/// How the sandbox policy resolves an operator override. Production passes
+/// [`process_env`]; unit tests pass a pure map so the policy is exercised
+/// without mutating process-global state.
+type EnvLookup = fn(&str) -> Option<String>;
+
+/// The process environment — the production [`EnvLookup`].
+fn process_env(key: &str) -> Option<String> {
+    std::env::var(key).ok()
+}
+
+/// The cgroup v2 root passed to `_boot-vm` as `SMOLVM_CGROUP_ROOT`, resolved
+/// at most once per process. Whichever path runs first wins, so a supervisor
+/// that called [`init_vm_cgroup_delegation`] keeps the delegated root it
+/// established, and every other process observes only what already exists.
+///
+/// `OnceLock`, not `LazyLock`: the initializer is precisely what differs
+/// between the two paths, so it cannot be fixed at the declaration.
+#[cfg(target_os = "linux")]
+static CGROUP_ROOT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// Claim the cgroup v2 delegation the per-VM resource caps need.
+///
+/// Call this exactly once, from the supervisor (`preloop serve`) at startup,
+/// before the async runtime spawns the VM pool — it mirrors what `smolvm
+/// serve` does through its own `setup_cgroup_delegation_root`. It is the only
+/// entry point allowed to mutate the cgroup hierarchy: it may create a
+/// `preloop-supervisor` leaf, move this process into it, and enable
+/// `cpu`/`memory`/`pids` distribution on the parent.
+///
+/// That write is what makes the caps exist. systemd's `Delegate=cpu memory
+/// pids` chowns the unit's subtree to the service user and lists the
+/// controllers in `cgroup.controllers`, but leaves `cgroup.subtree_control`
+/// **empty**; a `vm-<pid>` leaf created under it then has no `cpu.max`,
+/// `memory.max` or `pids.max` at all. Enabling the controllers ourselves is
+/// what turns a delegated subtree into one that can actually cap VMs.
+///
+/// Best-effort: any failure leaves the process without a cgroup root, so VMs
+/// boot uncapped rather than not at all. No-op off Linux.
+pub fn init_vm_cgroup_delegation() {
+    #[cfg(target_os = "linux")]
+    {
+        CGROUP_ROOT.get_or_init(delegated_cgroup_root_mutating);
+    }
+}
+
+/// The Linux VM-sandbox environment for a pending SmolVM invocation.
+///
+/// This is the single source of the sandbox policy: the provider applies it
+/// to every command it builds, and the CLI applies it to its direct
+/// `machine exec/cp/shell` calls, which can implicitly boot or restart a
+/// stopped machine. Returns `(variable, value)` pairs; non-Linux hosts get
+/// an empty list (both controls are no-ops upstream there).
+///
+/// - Seccomp: default `enforce`; a pre-set operator value
+///   (`enforce`/`audit`/`off`) wins — upstream precedence — but only modes
+///   SmolVM honors pass; anything else is an error rather than the silent
+///   "off" upstream would treat it as.
+/// - Landlock: default `enforce`; pre-set `enforce`/`off` wins, validated.
+/// - Per-VM cgroup: `SMOLVM_CGROUP_ROOT` names whichever root this process
+///   resolved first. In a supervisor that called
+///   [`init_vm_cgroup_delegation`] that is the root it established, writes
+///   included. In every other process it is read-only: the variable is set
+///   only when this process already sits in a cgroup v2 subtree that has
+///   `cpu`/`memory`/`pids` enabled in its `cgroup.subtree_control` and can
+///   host child leaves, and is otherwise absent.
+pub fn smolvm_sandbox_env() -> Result<Vec<(String, String)>, VmError> {
+    sandbox_env_with(process_env)
+}
+
+/// [`smolvm_sandbox_env`] over an explicit environment lookup.
+fn sandbox_env_with(lookup: EnvLookup) -> Result<Vec<(String, String)>, VmError> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut env = sandbox_env_from(lookup)?;
+        if let Some(root) = CGROUP_ROOT.get_or_init(read_only_cgroup_root) {
+            env.push(("SMOLVM_CGROUP_ROOT".to_owned(), root.display().to_string()));
+        }
+        Ok(env)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = lookup;
+        Ok(Vec::new())
+    }
+}
+
+/// The seccomp/Landlock half of the sandbox policy, over an environment
+/// lookup: defaults to `enforce`, honors a validated operator override, and
+/// rejects any value upstream would silently read as "control off".
+#[cfg(any(target_os = "linux", test))]
+fn sandbox_env_from(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Vec<(String, String)>, VmError> {
+    fn invalid(variable: &'static str, value: String, expected: &'static str) -> VmError {
+        VmError::InvalidSandboxEnv {
+            variable,
+            value,
+            expected,
+        }
+    }
+
+    let mut env = Vec::with_capacity(3);
+    match lookup("SMOLVM_SECCOMP") {
+        Some(value) if matches!(value.as_str(), "enforce" | "audit" | "off") => {
+            env.push(("SMOLVM_SECCOMP".to_owned(), value));
+        }
+        Some(value) => {
+            return Err(invalid("SMOLVM_SECCOMP", value, "enforce, audit, or off"));
+        }
+        None => env.push(("SMOLVM_SECCOMP".to_owned(), "enforce".to_owned())),
+    }
+    match lookup("SMOLVM_LANDLOCK") {
+        Some(value) if matches!(value.as_str(), "enforce" | "off") => {
+            env.push(("SMOLVM_LANDLOCK".to_owned(), value));
+        }
+        Some(value) => {
+            return Err(invalid("SMOLVM_LANDLOCK", value, "enforce or off"));
+        }
+        None => env.push(("SMOLVM_LANDLOCK".to_owned(), "enforce".to_owned())),
+    }
+    Ok(env)
+}
+
+/// Apply [`smolvm_sandbox_env`] to a synchronous command (the CLI's direct
+/// `smolvm machine exec/cp/shell` spawns).
+pub fn apply_smolvm_sandbox_env(command: &mut std::process::Command) -> Result<(), VmError> {
+    for (key, value) in smolvm_sandbox_env()? {
+        command.env(key, value);
+    }
+    Ok(())
+}
+
+/// Apply the sandbox policy to a provider command.
+#[cfg(target_os = "linux")]
+fn apply_sandbox_env(command: &mut Command, lookup: EnvLookup) -> Result<(), VmError> {
+    for (key, value) in sandbox_env_with(lookup)? {
+        command.env(key, value);
+    }
+    Ok(())
+}
+
+/// Non-Linux: seccomp and Landlock are no-ops upstream; nothing to set.
+#[cfg(not(target_os = "linux"))]
+fn apply_sandbox_env(_command: &mut Command, _lookup: EnvLookup) -> Result<(), VmError> {
+    Ok(())
+}
+
+/// This process's own cgroup v2 directory, or `None` on a cgroup v1 / hybrid
+/// host (no unified `0::` line). Mirrors upstream's `cgroup_v2_self_dir`.
+#[cfg(target_os = "linux")]
+fn process_cgroup_dir() -> Option<PathBuf> {
+    // Not cgroup v2 (no unified hierarchy).
+    if !Path::new("/sys/fs/cgroup/cgroup.controllers").is_file() {
+        return None;
+    }
+    let rel = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?
+        .trim()
+        .to_owned();
+    if rel.is_empty() {
+        return None;
+    }
+    Some(cgroup_root_dir(&rel))
+}
+
+/// Resolve a cgroup v2 root without changing anything in the hierarchy: the
+/// answer for every process that is not the supervisor. `None` means no
+/// usable delegation, so VMs run without host resource caps (the seccomp and
+/// Landlock variables are unaffected).
+#[cfg(target_os = "linux")]
+fn read_only_cgroup_root() -> Option<PathBuf> {
+    process_cgroup_dir().filter(|root| is_usable_delegation(root))
+}
+
+/// Resolve a cgroup v2 root, establishing the delegation when one is missing
+/// and this process is privileged enough to create it. Supervisor-only — see
+/// [`init_vm_cgroup_delegation`], the sole caller.
+#[cfg(target_os = "linux")]
+fn delegated_cgroup_root_mutating() -> Option<PathBuf> {
+    let root = process_cgroup_dir()?;
+    // Already delegated (e.g. a systemd unit with `Delegate=cpu memory pids`
+    // that also enabled the controllers in `cgroup.subtree_control`):
+    // VMM leaves can be created and capped immediately. The cgroup may hold
+    // this process (controllers were enabled by systemd while it was empty),
+    // which is fine — the no-internal-process rule only constrains enabling,
+    // not hosting children — but the root must actually accept child leaves:
+    // an unprivileged process in an undelegated cgroup must not be handed a
+    // root whose `vm-<pid>` leaf creation would silently fail.
+    if is_usable_delegation(&root) {
+        return Some(root);
+    }
+    // The controllers are not distributed yet, but this process may be able
+    // to enable them itself (a root supervisor, or a systemd unit with
+    // `Delegate=` — which chowns the subtree to the service user yet leaves
+    // `cgroup.subtree_control` empty, so without this write the per-VM
+    // leaves get no `cpu.max`/`memory.max`/`pids.max` at all). The kernel
+    // only accepts a `cgroup.subtree_control` write on a cgroup with no
+    // member processes, so move into a leaf first — upstream's
+    // `setup_cgroup_delegation_root` does exactly this.
+    // Any failure means no delegation: caps are skipped, never fatal.
+    let leaf = root.join("preloop-supervisor");
+    let pid = std::process::id().to_string();
+    // A leaf left behind by an earlier run is fine — an empty cgroup still
+    // accepts new members, and re-enabling already-enabled controllers is a
+    // no-op, so only the two writes matter.
+    let _ = std::fs::create_dir(&leaf);
+    let ok = fs_write(&leaf.join("cgroup.procs"), &pid)
+        && fs_write(&root.join("cgroup.subtree_control"), "+cpu +memory +pids")
+        && can_host_child_leaf(&root);
+    ok.then_some(root)
+}
+
+/// Whether `root` is a delegation Preloop can actually cap VMs with: the
+/// controllers are distributed to children and a child leaf can be created.
+#[cfg(target_os = "linux")]
+fn is_usable_delegation(root: &Path) -> bool {
+    cgroup_controllers_enabled(root) && can_host_child_leaf(root)
+}
+
+/// The cgroup can host `_boot-vm`'s `vm-<pid>` child leaves: creating a
+/// directory inside it — the exact first step of SmolVM's `place_in_cgroup`
+/// — must succeed. Under systemd delegation the subtree is chowned to the
+/// service user; anywhere else an unprivileged service cannot create leaves
+/// and must not receive a root that would silently run VMs uncapped.
+///
+/// The probe leaf is removed again; a leaf that cannot be removed is not a
+/// usable root either, and reporting `false` keeps `.preloop-probe` from
+/// being left behind on a path that claims success.
+#[cfg(target_os = "linux")]
+fn can_host_child_leaf(root: &Path) -> bool {
+    let probe = root.join(".preloop-probe");
+    std::fs::create_dir(&probe)
+        .and_then(|()| std::fs::remove_dir(&probe))
+        .is_ok()
+}
+
+#[cfg(target_os = "linux")]
+fn fs_write(path: &Path, value: &str) -> bool {
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(value.as_bytes()))
+        .is_ok()
+}
+
+/// Whether `dir/cgroup.subtree_control` enables the controllers Preloop caps
+/// on (`cpu`, `memory`, `pids`) — the kernel's record of a delegation.
+///
+/// Accepts both readback spellings seen in the wild: `+cpu +memory +pids`
+/// (sign-prefixed) and `cpu memory pids` (bare). A `-`-prefixed controller
+/// is disabled either way.
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_controllers_enabled(dir: &Path) -> bool {
+    let Ok(control) = std::fs::read_to_string(dir.join("cgroup.subtree_control")) else {
+        return false;
+    };
+    let enabled: std::collections::HashSet<&str> = control
+        .split_whitespace()
+        .filter_map(|token| match token.strip_prefix('-') {
+            Some(_) => None,
+            None => Some(token.strip_prefix('+').unwrap_or(token)),
+        })
+        .collect();
+    enabled.contains("cpu") && enabled.contains("memory") && enabled.contains("pids")
+}
+
+/// Map a `/proc/self/cgroup` v2 entry to the on-disk cgroup directory.
+///
+/// The file prints `0::/system.slice/preloop.service` — an absolute-looking
+/// path whose leading slash `Path::join` would treat as a fresh root and
+/// discard `/sys/fs/cgroup` — so the slash is trimmed before joining. That
+/// is the whole mapping, exactly as upstream's `cgroup_v2_self_dir` does it:
+/// the on-disk directory name is the systemd unit name verbatim, `\xHH`
+/// escapes included (`mnt-my\x2ddir.mount` is a real directory; the
+/// unescaped `mnt-my-dir.mount` is not).
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_root_dir(rel: &str) -> PathBuf {
+    Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/'))
+}
+
 fn validate_spec(spec: &MachineSpec) -> Result<(), VmError> {
     if spec.image.trim().is_empty()
         || spec.cpus == 0
@@ -1172,6 +1530,223 @@ async fn forward(
         };
         if output.send(value).await.is_err() {
             return Ok(());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cgroup_root_dir_trims_the_leading_slash_of_proc_self_cgroup_paths() {
+        // `/proc/self/cgroup` prints `0::/system.slice/preloop.service` with
+        // an absolute-looking path; Path::join would discard the /sys/fs/cgroup
+        // base entirely.
+        assert_eq!(
+            cgroup_root_dir("/system.slice/preloop.service"),
+            PathBuf::from("/sys/fs/cgroup/system.slice/preloop.service")
+        );
+        assert_eq!(
+            cgroup_root_dir("user.slice/user-1000.slice/user@1000.service/app.slice"),
+            PathBuf::from("/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice")
+        );
+        // The root cgroup prints `/`.
+        assert_eq!(cgroup_root_dir("/"), PathBuf::from("/sys/fs/cgroup"));
+    }
+
+    /// systemd's `\xHH` escaping is part of the directory name on disk:
+    /// `/sys/fs/cgroup/system.slice/mnt-my\x2ddir.mount` exists while the
+    /// unescaped spelling does not, and `/proc/self/cgroup` reports the
+    /// escaped form. Decoding it would name a directory that is not there.
+    #[test]
+    fn cgroup_root_dir_preserves_systemd_escapes_verbatim() {
+        assert_eq!(
+            cgroup_root_dir("/system.slice/mnt-my\\x2ddir.mount"),
+            PathBuf::from("/sys/fs/cgroup/system.slice/mnt-my\\x2ddir.mount")
+        );
+    }
+
+    #[test]
+    fn cgroup_controllers_enabled_requires_all_three_controllers() {
+        let directory = tempfile::tempdir().unwrap();
+        let control = directory.path().join("cgroup.subtree_control");
+        // Kernel readback with sign prefixes.
+        std::fs::write(&control, "+cpu +memory +pids\n").unwrap();
+        assert!(cgroup_controllers_enabled(directory.path()));
+        // Readback without sign prefixes.
+        std::fs::write(&control, "cpu memory pids\n").unwrap();
+        assert!(cgroup_controllers_enabled(directory.path()));
+        std::fs::write(&control, "+cpu +memory +pids +io\n").unwrap();
+        assert!(cgroup_controllers_enabled(directory.path()));
+        std::fs::write(&control, "+cpu +memory\n").unwrap();
+        assert!(!cgroup_controllers_enabled(directory.path()));
+        std::fs::write(&control, "cpu memory\n").unwrap();
+        assert!(!cgroup_controllers_enabled(directory.path()));
+        std::fs::write(&control, "-cpu +memory +pids\n").unwrap();
+        assert!(!cgroup_controllers_enabled(directory.path()));
+        std::fs::write(&control, "+cpu -memory +pids\n").unwrap();
+        assert!(!cgroup_controllers_enabled(directory.path()));
+        std::fs::remove_file(&control).unwrap();
+        assert!(!cgroup_controllers_enabled(directory.path()));
+    }
+
+    /// The exported policy is the exact observable contract: on Linux every
+    /// invocation defaults to seccomp/Landlock `enforce` and honors only
+    /// validated overrides; everywhere else nothing is injected.
+    #[test]
+    fn sandbox_env_defaults_to_enforce_and_validates_overrides() {
+        assert_eq!(
+            sandbox_env_from(fake_env(&[])).unwrap(),
+            vec![
+                ("SMOLVM_SECCOMP".to_owned(), "enforce".to_owned()),
+                ("SMOLVM_LANDLOCK".to_owned(), "enforce".to_owned()),
+            ]
+        );
+
+        // A pre-set value upstream honors wins over the default.
+        for (seccomp, landlock) in [("enforce", "enforce"), ("audit", "off"), ("off", "enforce")] {
+            assert_eq!(
+                sandbox_env_from(fake_env(&[
+                    ("SMOLVM_SECCOMP", seccomp),
+                    ("SMOLVM_LANDLOCK", landlock),
+                ]))
+                .unwrap(),
+                vec![
+                    ("SMOLVM_SECCOMP".to_owned(), seccomp.to_owned()),
+                    ("SMOLVM_LANDLOCK".to_owned(), landlock.to_owned()),
+                ]
+            );
+        }
+
+        // Anything else is a hard error: upstream would read it as "off".
+        for (variable, value) in [
+            ("SMOLVM_SECCOMP", "banana"),
+            ("SMOLVM_SECCOMP", ""),
+            ("SMOLVM_SECCOMP", "Enforce"),
+            ("SMOLVM_LANDLOCK", "banana"),
+            ("SMOLVM_LANDLOCK", "audit"),
+            ("SMOLVM_LANDLOCK", ""),
+        ] {
+            assert!(
+                matches!(
+                    sandbox_env_from(fake_env(&[(variable, value)])),
+                    Err(VmError::InvalidSandboxEnv { variable: v, value: ref got, .. })
+                        if v == variable && got == value
+                ),
+                "{variable}={value} must fail closed"
+            );
+        }
+    }
+
+    /// An [`EnvLookup`]-shaped view over a fixed set of pairs: the sandbox
+    /// policy is exercised without touching the process environment, so
+    /// these tests carry no ordering dependence.
+    fn fake_env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |key| {
+            pairs
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| (*value).to_owned())
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn sandbox_env_is_empty_off_linux() {
+        assert_eq!(
+            smolvm_sandbox_env().unwrap(),
+            Vec::<(String, String)>::new()
+        );
+    }
+
+    /// A rejected sandbox override must surface as
+    /// [`VmError::InvalidSandboxEnv`] — never as the misleading
+    /// `UnsupportedSocketMount`, which would blame the binary — and must not
+    /// be remembered as a capability verdict: once the operator fixes the
+    /// environment the very next call probes the binary for real, on the
+    /// same provider whose probe cell the failure could have poisoned.
+    /// Linux-only: the sandbox policy (and so any override) applies there.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn invalid_sandbox_override_never_poisons_the_socket_mount_probe() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn rejected(key: &str) -> Option<String> {
+            (key == "SMOLVM_SECCOMP").then(|| "banana".to_owned())
+        }
+        fn unset(_key: &str) -> Option<String> {
+            None
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        // Advertises `--mount-socket` to the capability probe and accepts
+        // every other invocation.
+        let binary = directory.path().join("smolvm");
+        std::fs::write(&binary, "#!/bin/sh\nprintf -- '--mount-socket\\n'\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let host_socket = directory.path().join("engine.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&host_socket).unwrap();
+        let spec = MachineSpec {
+            name: MachineName::new("probe").unwrap(),
+            image: "ghcr.io/acme/runner:latest".to_owned(),
+            cpus: 2,
+            memory_mib: 256,
+            storage_gib: 10,
+            overlay_gib: None,
+            network: NetworkPolicy::Disabled,
+            volumes: Vec::new(),
+            sockets: vec![SocketMount {
+                host: host_socket,
+                guest: PathBuf::from("/run/preloop-engine.sock"),
+            }],
+            dns: None,
+            rosetta: false,
+        };
+
+        let provider = SmolVmProvider::new(&binary).with_env_lookup(rejected);
+        let error = provider.create(&spec).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                VmError::InvalidSandboxEnv {
+                    variable: "SMOLVM_SECCOMP",
+                    ..
+                }
+            ),
+            "expected InvalidSandboxEnv, got {error}"
+        );
+
+        // Same provider, same (still unset) probe cell, corrected environment.
+        provider
+            .clone()
+            .with_env_lookup(unset)
+            .create(&spec)
+            .await
+            .unwrap();
+    }
+
+    /// The egress-floor policy needs a backend that carries it, so
+    /// virtio-net is the default and the only recognized escape hatch is an
+    /// exact `tsi`; anything else (including a typo) keeps virtio-net rather
+    /// than silently dropping the floor.
+    #[test]
+    fn public_only_net_backend_defaults_to_virtio_net_and_honors_only_exact_overrides() {
+        assert_eq!(public_only_net_backend(fake_env(&[])), "virtio-net");
+        assert_eq!(
+            public_only_net_backend(fake_env(&[("PRELOOP_SMOLVM_NET_BACKEND", "tsi")])),
+            "tsi"
+        );
+        assert_eq!(
+            public_only_net_backend(fake_env(&[("PRELOOP_SMOLVM_NET_BACKEND", "virtio-net")])),
+            "virtio-net"
+        );
+        for bogus in ["", "TSI", "gvproxy"] {
+            assert_eq!(
+                public_only_net_backend(fake_env(&[("PRELOOP_SMOLVM_NET_BACKEND", bogus)])),
+                "virtio-net",
+                "`{bogus}` must not select a backend that cannot carry the egress floor"
+            );
         }
     }
 }

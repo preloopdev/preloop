@@ -31,20 +31,44 @@ mod unix {
         VmProvider, VolumeMount,
     };
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     static TEST_ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn write_executable(path: &Path, contents: &str) {
-        // Publish only after the writer is closed. Executing a script while
-        // its final path is still open for writing can fail with ETXTBSY.
+        // Write through a child process rather than `fs::write`, then publish
+        // with a rename.
+        //
+        // These tests run concurrently in one process. Any write descriptor
+        // this process holds is inherited by every other test's `fork` and
+        // stays open until that child reaches `exec`; executing the script
+        // inside that window fails with ETXTBSY ("Text file busy") even though
+        // our own writer is already closed. Staging plus rename alone does not
+        // help, because the inherited descriptor refers to the same inode the
+        // rename publishes. Reproduced at ~1 run in 16 under CPU load.
+        // Keeping the file descriptor out of this process closes the window:
+        // only `sh` ever holds it, and our forks cannot inherit its table.
+        use std::io::Write;
+
         let staged = path.with_extension("staged");
-        fs::write(&staged, contents).unwrap();
-        let mut permissions = fs::metadata(&staged).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&staged, permissions).unwrap();
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
+            .arg(&staged)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(contents.as_bytes())
+            .unwrap();
+        assert!(
+            child.wait().unwrap().success(),
+            "staging {}",
+            staged.display()
+        );
         fs::rename(staged, path).unwrap();
     }
 
@@ -61,6 +85,9 @@ args="$0.args"
 printf 'SMOLVM_EGRESS_FLOOR=%s\n' "${SMOLVM_EGRESS_FLOOR-}" > "$0.env"
 env_file="$0.env"
 printf 'SMOLVM_EGRESS_FLOOR=%s\n' "${SMOLVM_EGRESS_FLOOR-}" > "$env_file"
+printf 'SMOLVM_SECCOMP=%s\n' "${SMOLVM_SECCOMP-}" > "$0.seccomp"
+printf 'SMOLVM_LANDLOCK=%s\n' "${SMOLVM_LANDLOCK-}" > "$0.landlock"
+printf 'SMOLVM_CGROUP_ROOT=%s\n' "${SMOLVM_CGROUP_ROOT-}" > "$0.cgroup"
 printf 'TMPDIR=%s\n' "${TMPDIR-}" > "$0.tmpdir"
 for arg in "$@"; do
   printf '%s\n' "$arg" >> "$args"
@@ -124,6 +151,13 @@ esac
 
     fn captured_env(executable: &Path) -> String {
         fs::read_to_string(executable.with_extension("env"))
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    }
+
+    fn captured_sandbox_var(executable: &Path, suffix: &str) -> String {
+        fs::read_to_string(executable.with_extension(suffix))
             .unwrap_or_default()
             .trim()
             .to_owned()
@@ -619,14 +653,8 @@ exit 0
         );
     }
 
-    /// Serializes tests that mutate `PRELOOP_SMOLVM_NET_BACKEND` in the
-    /// process environment.
-    static NET_BACKEND_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     #[tokio::test]
     async fn public_only_selects_virtio_net_and_sets_smolvm_egress_floor_strict() {
-        let _env_guard = NET_BACKEND_ENV_LOCK.lock().await;
-        std::env::remove_var("PRELOOP_SMOLVM_NET_BACKEND");
         let (_directory, executable) = fake_smolvm();
         let provider = SmolVmProvider::new(executable.clone());
         let mut spec = valid_spec(MachineName::new("test-floor").unwrap());
@@ -636,26 +664,6 @@ exit 0
             .windows(2)
             .any(|args| args == ["--net-backend", "virtio-net"]));
         assert_eq!(captured_env(&executable), "SMOLVM_EGRESS_FLOOR=strict");
-    }
-
-    #[tokio::test]
-    async fn public_only_net_backend_override_is_respected() {
-        let _env_guard = NET_BACKEND_ENV_LOCK.lock().await;
-        for (override_value, expected) in [("tsi", "tsi"), ("virtio-net", "virtio-net")] {
-            let (_directory, executable) = fake_smolvm();
-            let provider = SmolVmProvider::new(executable.clone());
-            let mut spec = valid_spec(MachineName::new("test-override").unwrap());
-            spec.network = NetworkPolicy::PublicOnly;
-            std::env::set_var("PRELOOP_SMOLVM_NET_BACKEND", override_value);
-            provider.create(&spec).await.unwrap();
-            assert!(
-                captured_args(&executable)
-                    .windows(2)
-                    .any(|args| args == ["--net-backend", expected]),
-                "override {override_value} must select {expected}"
-            );
-        }
-        std::env::remove_var("PRELOOP_SMOLVM_NET_BACKEND");
     }
 
     #[tokio::test]
@@ -818,5 +826,144 @@ printf 'exit %s\n' "$6" >> "$0.forklog"
         fs::write(executable.with_extension("release"), "").unwrap();
         one.await.unwrap().unwrap();
         two.await.unwrap().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_sandbox_defaults(executable: &Path) {
+        assert_eq!(
+            captured_sandbox_var(executable, "seccomp"),
+            "SMOLVM_SECCOMP=enforce",
+            "every operation must default seccomp to enforce"
+        );
+        assert_eq!(
+            captured_sandbox_var(executable, "landlock"),
+            "SMOLVM_LANDLOCK=enforce",
+            "every operation must default Landlock to enforce"
+        );
+    }
+
+    /// The sandbox environment must reach every operation that can spawn or
+    /// restart `_boot-vm` — not just machine creation — because a stopped
+    /// machine's `start`, a fork clone's boot, and a pack all re-boot a VMM
+    /// from the CLI process's environment. Override precedence and the
+    /// validation of a pre-set mode are unit-tested against the policy
+    /// itself (`sandbox_env_from`), which needs no process-global state.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn sandbox_enforce_reaches_every_operation() {
+        let name = MachineName::new("runner").unwrap();
+
+        let (_directory, executable) = fake_smolvm();
+        SmolVmProvider::new(executable.clone())
+            .create(&valid_spec(name.clone()))
+            .await
+            .unwrap();
+        assert_sandbox_defaults(&executable);
+
+        let (_directory, executable) = fake_smolvm();
+        SmolVmProvider::new(executable.clone())
+            .start(&name)
+            .await
+            .unwrap();
+        assert_sandbox_defaults(&executable);
+
+        let (_directory, executable) = fake_smolvm();
+        SmolVmProvider::new(executable.clone())
+            .start_forkable(&name)
+            .await
+            .unwrap();
+        assert_sandbox_defaults(&executable);
+
+        let (_directory, executable) = fake_smolvm();
+        SmolVmProvider::new(executable.clone())
+            .fork(&name, &MachineName::new("clone").unwrap())
+            .await
+            .unwrap();
+        assert_sandbox_defaults(&executable);
+
+        let (_directory, executable) = fake_smolvm();
+        SmolVmProvider::new(executable.clone())
+            .exec(&name, &["echo".to_owned()])
+            .await
+            .unwrap();
+        assert_sandbox_defaults(&executable);
+
+        let (_directory, executable) = fake_smolvm();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(16);
+        SmolVmProvider::new(executable.clone())
+            .exec_stream(&name, &["echo".to_owned()], sender)
+            .await
+            .unwrap();
+        assert_sandbox_defaults(&executable);
+
+        let (directory, executable) = fake_smolvm();
+        let output = directory.path().join("packed");
+        SmolVmProvider::new(executable.clone())
+            .pack(&name, &output)
+            .await
+            .unwrap();
+        assert_sandbox_defaults(&executable);
+    }
+
+    /// The cgroup root is handed to `_boot-vm` only when this process really
+    /// sits in a usable cgroup v2 delegation. A test process never calls
+    /// `init_vm_cgroup_delegation`, so it takes the read-only path: the
+    /// variable is absent unless a delegation already exists, and when it is
+    /// present it must name this process's own cgroup directory — the
+    /// `/proc/self/cgroup` path appended to `/sys/fs/cgroup` verbatim,
+    /// systemd `\xHH` escapes included.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cgroup_root_env_matches_actual_delegation() {
+        let (_directory, executable) = fake_smolvm();
+        SmolVmProvider::new(executable.clone())
+            .create(&valid_spec(MachineName::new("cgroup").unwrap()))
+            .await
+            .unwrap();
+        let captured = captured_sandbox_var(&executable, "cgroup");
+        let root = captured
+            .strip_prefix("SMOLVM_CGROUP_ROOT=")
+            .expect("the fake smolvm always records the variable");
+        if root.is_empty() {
+            return;
+        }
+        let proc_cgroup = fs::read_to_string("/proc/self/cgroup").unwrap();
+        let expected = proc_cgroup
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .expect("cgroup v2 entry")
+            .trim()
+            .trim_start_matches('/');
+        // Compared as paths: the root cgroup prints `/`, whose join leaves a
+        // trailing separator that a string comparison would trip over.
+        assert_eq!(
+            PathBuf::from(root),
+            Path::new("/sys/fs/cgroup").join(expected)
+        );
+    }
+
+    /// On non-Linux hosts seccomp and Landlock are no-ops in SmolVM; Preloop
+    /// must not inject them (or a cgroup root that cannot exist), preserving
+    /// macOS behavior.
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn non_linux_injects_no_sandbox_env() {
+        let (_directory, executable) = fake_smolvm();
+        SmolVmProvider::new(executable.clone())
+            .create(&valid_spec(MachineName::new("macos").unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(
+            captured_sandbox_var(&executable, "seccomp"),
+            "SMOLVM_SECCOMP="
+        );
+        assert_eq!(
+            captured_sandbox_var(&executable, "landlock"),
+            "SMOLVM_LANDLOCK="
+        );
+        assert_eq!(
+            captured_sandbox_var(&executable, "cgroup"),
+            "SMOLVM_CGROUP_ROOT="
+        );
     }
 }
