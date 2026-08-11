@@ -2951,11 +2951,69 @@ async fn provision_runner<P: VmProvider + 'static>(
                 if config.use_packed_artifact
                     && golden.as_str() == format!("{}-golden", config.name_prefix) =>
             {
-                // A failed fork can leave a partial clone behind. Best-effort
-                // cleanup makes the direct create safe; if cleanup itself is
-                // still racing SmolVM state, create returns the actionable
-                // error and the slot supervisor retries normally.
-                let cleanup = async {
+                if fork_base_unusable(&error) {
+                    // The base is spent. Re-arm it atomically with forking:
+                    // partial-clone cleanup, the live-clone check, and the
+                    // stop/start happen under the provider's per-golden fork
+                    // lock, so a concurrent slot cannot create a clone mid
+                    // re-arm. A full engine restart and golden rebuild was
+                    // the only recovery before; a re-arm is a few seconds.
+                    warn!(
+                        machine = name.as_str(),
+                        golden = golden.as_str(),
+                        %error,
+                        "fork base spent; re-arming the golden once"
+                    );
+                    match provider.rearm_fork_base(golden, Some(name)).await {
+                        Ok(true) => {
+                            info!(golden = golden.as_str(), "golden fork base re-armed");
+                            match provider.fork(golden, name).await {
+                                Ok(()) => Some(golden),
+                                Err(retry_error) => {
+                                    error!(
+                                        machine = name.as_str(),
+                                        golden = golden.as_str(),
+                                        %retry_error,
+                                        "re-armed golden still cannot fork; falling back to \
+                                         direct creation"
+                                    );
+                                    let _ = provider.delete(name).await;
+                                    None
+                                }
+                            }
+                        }
+                        Ok(false) => {
+                            error!(
+                                golden = golden.as_str(),
+                                "fork base spent and cannot be re-armed (a live clone still \
+                                 depends on it, or the partial clone could not be removed); \
+                                 falling back to direct creation"
+                            );
+                            let _ = provider.delete(name).await;
+                            None
+                        }
+                        Err(rearm_error) => {
+                            error!(
+                                golden = golden.as_str(),
+                                %rearm_error,
+                                "failed to re-arm spent fork base; falling back to direct \
+                                 creation"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    // A failed fork can leave a partial clone behind.
+                    // Best-effort cleanup makes the direct create safe; if
+                    // cleanup itself is still racing SmolVM state, create
+                    // returns the actionable error and the slot supervisor
+                    // retries normally.
+                    warn!(
+                        machine = name.as_str(),
+                        golden = golden.as_str(),
+                        %error,
+                        "packed golden fork failed; creating runner directly from packed artifact"
+                    );
                     if let Err(cleanup) = provider.delete(name).await {
                         debug!(
                             machine = name.as_str(),
@@ -2963,62 +3021,6 @@ async fn provision_runner<P: VmProvider + 'static>(
                             "failed fork left no removable clone"
                         );
                     }
-                };
-                if fork_base_unusable(&error) && !provider.has_live_forks(golden).await {
-                    // The base is spent but nothing depends on it: re-arm the
-                    // golden (stop + start forkable) and retry the fork once.
-                    // A full engine restart and golden rebuild was the only
-                    // recovery before, which stalled the queue until someone
-                    // noticed; a re-arm is a few seconds.
-                    warn!(
-                        machine = name.as_str(),
-                        golden = golden.as_str(),
-                        %error,
-                        "fork base spent; re-arming the golden once"
-                    );
-                    cleanup.await;
-                    let rearmed = provider.stop(golden).await.is_ok()
-                        && provider.start_forkable(golden).await.is_ok();
-                    if rearmed {
-                        info!(golden = golden.as_str(), "golden fork base re-armed");
-                        match provider.fork(golden, name).await {
-                            Ok(()) => Some(golden),
-                            Err(retry_error) => {
-                                error!(
-                                    machine = name.as_str(),
-                                    golden = golden.as_str(),
-                                    %retry_error,
-                                    "re-armed golden still cannot fork; falling back to \
-                                     direct creation"
-                                );
-                                let _ = provider.delete(name).await;
-                                None
-                            }
-                        }
-                    } else {
-                        error!(
-                            golden = golden.as_str(),
-                            "failed to re-arm spent fork base; falling back to direct creation"
-                        );
-                        None
-                    }
-                } else {
-                    if fork_base_unusable(&error) {
-                        error!(
-                            golden = golden.as_str(),
-                            %error,
-                            "fork base is spent and live clones still depend on it, so it \
-                             cannot be re-armed; runners now cost a full VM create each until \
-                             the engine restarts and rebuilds the golden"
-                        );
-                    }
-                    warn!(
-                        machine = name.as_str(),
-                        golden = golden.as_str(),
-                        %error,
-                        "packed golden fork failed; creating runner directly from packed artifact"
-                    );
-                    cleanup.await;
                     None
                 }
             }
@@ -3426,7 +3428,7 @@ mod lifecycle_tests {
         /// Fail the next fork with the "spent fork base" signature, then
         /// succeed. Mirrors a golden whose retained checkpoint vanished.
         fail_fork_once_spent: Mutex<bool>,
-        /// Report live clones for `has_live_forks`; true by default so a spent
+        /// Report live clones to `rearm_fork_base`; true by default so a spent
         /// base with dependents is never re-armed in tests either.
         live_forks: Mutex<bool>,
         fail_start: bool,
@@ -4036,8 +4038,24 @@ chmod +x "$destination/bin/node"
             Ok(())
         }
 
-        async fn has_live_forks(&self, _golden: &MachineName) -> bool {
-            *self.live_forks.lock().await
+        async fn rearm_fork_base(
+            &self,
+            golden: &MachineName,
+            partial: Option<&MachineName>,
+        ) -> Result<bool, VmError> {
+            self.events
+                .lock()
+                .await
+                .push(format!("rearm:{}", golden.as_str()));
+            if let Some(partial) = partial {
+                self.delete(partial).await?;
+            }
+            if *self.live_forks.lock().await {
+                return Ok(false);
+            }
+            self.stop(golden).await?;
+            self.start(golden).await?;
+            Ok(true)
         }
 
         async fn stop(&self, name: &MachineName) -> Result<(), VmError> {
@@ -4362,6 +4380,7 @@ chmod +x "$destination/bin/node"
         let events = provider.events().await;
         let expected = [
             format!("fork:{}:{}", golden.as_str(), name.as_str()),
+            format!("rearm:{}", golden.as_str()),
             format!("delete:{}", name.as_str()),
             format!("stop:{}", golden.as_str()),
             format!("start:{}", golden.as_str()),
@@ -4416,6 +4435,39 @@ chmod +x "$destination/bin/node"
         assert!(
             events.contains(&format!("delete:{}", name.as_str())),
             "the partial clone is cleaned up: {events:?}"
+        );
+    }
+
+    /// A partial clone that cannot be removed must block the re-arm: the
+    /// untracked clone would otherwise share the resumed base's disks.
+    #[tokio::test]
+    async fn spent_fork_base_with_failed_partial_cleanup_is_not_rearmed() {
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, true)
+                .with_live_forks(false)
+                .failing_fork_once_spent(),
+        );
+        let config = packed_fork_config();
+        let golden = MachineName::new("lifecycle-test-golden").unwrap();
+        let name = MachineName::new("lifecycle-test-0-8").unwrap();
+
+        provision_runner(
+            &provider,
+            &config,
+            &name,
+            Some(&golden),
+            &Arc::new(KeyPool::new()),
+            &config.base_image,
+            &[],
+            true,
+        )
+        .await
+        .expect("falls back to direct creation");
+
+        let events = provider.events().await;
+        assert!(
+            !events.iter().any(|event| event.starts_with("stop:")),
+            "the golden must not be touched when cleanup failed: {events:?}"
         );
     }
 

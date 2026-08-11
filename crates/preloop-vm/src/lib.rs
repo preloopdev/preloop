@@ -281,15 +281,28 @@ pub trait VmProvider: Send + Sync {
         argv: &[String],
         secrets: &[(String, SecretSource)],
     ) -> Result<ExecOutput, VmError>;
-    /// Whether any machine forked from `golden` is still alive.
+    /// Re-arm a spent fork base so it can serve forks again.
     ///
-    /// A golden that has been frozen as a fork base must never be started
-    /// again while a clone exists — the clone's disks are copy-on-write over
-    /// the golden's, and resuming the base would corrupt them. Defaults to
-    /// `true` so a provider that does not track clones refuses to re-arm a
-    /// spent fork base rather than risk live clones.
-    async fn has_live_forks(&self, _golden: &MachineName) -> bool {
-        true
+    /// Atomic with forking: takes the same per-golden exclusion `fork` uses,
+    /// so a concurrent fork can neither observe the golden mid-re-arm nor
+    /// create a clone between the live-clone check and the golden being
+    /// stopped. Removes a partial clone left by the failed fork (when
+    /// `partial` is given) — only if that cleanup succeeds, because an
+    /// untracked clone would otherwise share the resumed base's disks — then
+    /// verifies no live clone still depends on the golden, and only then
+    /// stops and restarts it forkable.
+    ///
+    /// Returns `Ok(true)` when the golden can serve forks again, `Ok(false)`
+    /// when it cannot (a live clone exists, or the partial clone could not be
+    /// removed), and `Err` on operational failure. The default implementation
+    /// never re-arms, so providers without the machinery conservatively fall
+    /// back to direct creation.
+    async fn rearm_fork_base(
+        &self,
+        _golden: &MachineName,
+        _partial: Option<&MachineName>,
+    ) -> Result<bool, VmError> {
+        Ok(false)
     }
     /// Execute while forwarding output fragments to the caller.
     async fn exec_stream(
@@ -787,7 +800,12 @@ impl VmProvider for SmolVmProvider {
             )
             .await;
         if result.is_ok() {
-            self.forked_machines.lock().await.remove(name.as_str());
+            let mut forked = self.forked_machines.lock().await;
+            forked.remove(name.as_str());
+            // Deleting a golden must evict every clone forked from it. Without
+            // this, a rebaked or recreated golden name would report live
+            // clones forever, silently disabling the re-arm recovery.
+            forked.retain(|_, owner| owner != name.as_str());
         }
         result.map(|_| ())
     }
@@ -994,12 +1012,52 @@ impl VmProvider for SmolVmProvider {
             .map(|_| ())
     }
 
-    async fn has_live_forks(&self, golden: &MachineName) -> bool {
-        self.forked_machines
-            .lock()
-            .await
-            .values()
-            .any(|owner| owner == golden.as_str())
+    async fn rearm_fork_base(
+        &self,
+        golden: &MachineName,
+        partial: Option<&MachineName>,
+    ) -> Result<bool, VmError> {
+        let fork_lock = self.fork_lock(golden).await;
+        let _fork_guard = fork_lock.lock().await;
+        if let Some(partial) = partial {
+            match self.delete(partial).await {
+                Ok(()) => {}
+                // A failed fork that never registered its clone leaves
+                // nothing to remove; "not found" positively establishes the
+                // clone is gone, which is all the cleanup contract needs.
+                Err(VmError::Command { message, .. })
+                    if message.to_ascii_lowercase().contains("not found") => {}
+                Err(error) => return Err(error),
+            }
+        }
+        {
+            let forked = self.forked_machines.lock().await;
+            if forked.values().any(|owner| owner == golden.as_str()) {
+                return Ok(false);
+            }
+        }
+        self.concurrent(
+            "stop",
+            &[
+                "machine".into(),
+                "stop".into(),
+                "--name".into(),
+                golden.as_str().into(),
+            ],
+        )
+        .await?;
+        self.concurrent(
+            "start",
+            &[
+                "machine".into(),
+                "start".into(),
+                "--name".into(),
+                golden.as_str().into(),
+                "--forkable".into(),
+            ],
+        )
+        .await?;
+        Ok(true)
     }
 }
 
