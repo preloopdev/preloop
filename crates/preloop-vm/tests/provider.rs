@@ -815,7 +815,6 @@ printf 'exit %s\n' "$6" >> "$0.forklog"
             "second fork must wait for the first to finish: {:?}",
             fork_log(&executable)
         );
-
         fs::write(executable.with_extension("release"), "").unwrap();
         one.await.unwrap().unwrap();
         let error = two

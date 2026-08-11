@@ -106,13 +106,10 @@ pub enum NetworkPolicy {
 /// The smolvm network backend used for the egress-only policy.
 ///
 /// virtio-net carries the host-side egress floor, which TSI cannot provide
-/// (TSI has no host network stack), so PublicOnly needs it. The macOS
-/// release artifacts 1.7.2-1.7.4 bundle a NET=1 libkrun that exports
-/// `krun_add_net_unixstream`; the 1.7.5 artifact shipped a libkrun without
-/// it ("libkrun does not expose krun_add_net_unixstream"), which is why
-/// `preloop update` pins the smolvm install to the last known-good release.
-/// `PRELOOP_SMOLVM_NET_BACKEND=tsi|virtio-net` overrides the choice for
-/// setups stuck on a broken artifact.
+/// (TSI has no host network stack), so PublicOnly needs it. The official
+/// SmolVM release pinned by `preloop update` bundles a NET=1 libkrun that
+/// exports `krun_add_net_unixstream`. `PRELOOP_SMOLVM_NET_BACKEND=tsi|virtio-net`
+/// overrides the choice for setups that need a different backend.
 fn public_only_net_backend(lookup: impl Fn(&str) -> Option<String>) -> &'static str {
     match lookup("PRELOOP_SMOLVM_NET_BACKEND").as_deref() {
         Some("tsi") => "tsi",

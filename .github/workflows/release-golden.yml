@@ -262,7 +262,7 @@ jobs:
 
       - name: Install pinned smolvm
         env:
-          SMOLVM_VERSION: "1.7.4"
+          SMOLVM_VERSION: "1.7.7"
         run: |
           set -euo pipefail
           ARCHIVE="smolvm-${SMOLVM_VERSION}-darwin-arm64.tar.gz"
@@ -275,10 +275,11 @@ jobs:
           mkdir -p "$HOME/.smolvm"
           rm -rf "$HOME/.smolvm/lib"
           cp -R "$SRC/lib" "$HOME/.smolvm/lib"
-          # The darwin tarball ships no storage/overlay templates; copy
-          # whatever the archive actually carries (mirrors the update
-          # installer, which copies only files that exist).
-          for f in smolvm smolvm-bin storage-template.ext4 overlay-template.ext4; do
+          # Copy whichever storage/overlay template format the archive
+          # carries (mirrors the update installer, which copies only files
+          # that exist).
+          for f in smolvm smolvm-bin storage-template.ext4 overlay-template.ext4 \
+              storage-template.ext4.zst overlay-template.ext4.zst; do
             [ -f "$SRC/$f" ] && cp "$SRC/$f" "$HOME/.smolvm/"
           done
           echo "$SMOLVM_VERSION" > "$HOME/.smolvm/.version"
