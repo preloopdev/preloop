@@ -233,12 +233,18 @@ async fn resolve(ctx: &Api, sessions: &[DebugSession], reference: &str) -> Resul
         [] => match ctx.get(reference).await {
             Ok(session) => Ok(session),
             Err(error) if sessions.is_empty() => Err(error),
-            Err(error) => {
+            // Only the 404 case means "the reference names nothing" — the
+            // listing is the right answer then. A transport or 5xx failure is
+            // a real error and must not be dressed up as a session mismatch.
+            Err(error) if error.to_string().starts_with("no paused job matching") => {
                 let open: Vec<&DebugSession> = sessions.iter().collect();
                 anyhow::bail!(
                     "{error:#}\n\nthese are paused instead:\n{}\nattach one with: preloop debug <session-id>",
                     session_lines(&open)
                 )
+            }
+            Err(error) => {
+                Err(error)
             }
         },
         ambiguous => anyhow::bail!(
