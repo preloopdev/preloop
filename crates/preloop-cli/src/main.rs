@@ -98,6 +98,17 @@ pub(crate) fn preloop_home() -> PathBuf {
 /// macOS, matching the provider.
 pub(crate) fn smolvm_command() -> anyhow::Result<std::process::Command> {
     let mut command = std::process::Command::new("smolvm");
+    // The service unit pins `SMOLVM_DATA_DIR=<PRELOOP_HOME>/smolvm`
+    // (see crates/preloop-cli/src/server_install.rs), so the engine records
+    // its machines in that registry. A separately invoked `preloop shell` /
+    // `preloop debug` must consult the SAME registry or it cannot find the
+    // paused, service-owned machine — the caller's default data dir would
+    // resolve a different one. An operator value wins, so this only fills
+    // the gap, never overrides.
+    if std::env::var_os("SMOLVM_DATA_DIR").is_none() {
+        let data_dir = preloop_home().join("smolvm");
+        command.env("SMOLVM_DATA_DIR", data_dir);
+    }
     preloop_vm::apply_smolvm_sandbox_env(&mut command)?;
     Ok(command)
 }
@@ -119,6 +130,7 @@ pub(crate) fn fake_smolvm_on_path() -> (tempfile::TempDir, PathBuf) {
 printf 'SMOLVM_SECCOMP=%s\n' "${SMOLVM_SECCOMP-}" > "$0.seccomp"
 printf 'SMOLVM_LANDLOCK=%s\n' "${SMOLVM_LANDLOCK-}" > "$0.landlock"
 printf 'SMOLVM_CGROUP_ROOT=%s\n' "${SMOLVM_CGROUP_ROOT-}" > "$0.cgroup"
+printf 'SMOLVM_DATA_DIR=%s\n' "${SMOLVM_DATA_DIR-}" > "$0.datadir"
 case "$*" in
   *"wc -c"*) printf '12345\n' ;;
 esac
@@ -2120,6 +2132,13 @@ async fn cmd_shell(args: ShellArgs) -> anyhow::Result<()> {
     eprintln!("[preloop] Connecting to preserved VM: {machine_name}");
     eprintln!("[preloop] Exit the shell to release the VM.");
 
+    // Build the smolvm command BEFORE claiming the marker: an invalid
+    // sandbox override makes this fail, and the marker claim + heartbeat
+    // below must not exist yet when it does — otherwise the preserved VM
+    // would stay marked ACTIVE (and the heartbeat would keep touching the
+    // marker) until the orchestrator's idle timeout, with nobody attached.
+    let mut command = crate::smolvm_command()?;
+
     // Claim the session before starting so the orchestrator stops counting down.
     let _ = std::fs::write(&marker, preloop_orchestrator::DEBUG_MARKER_ACTIVE);
 
@@ -2139,7 +2158,7 @@ async fn cmd_shell(args: ShellArgs) -> anyhow::Result<()> {
     // Run smolvm machine shell interactively. The shell boots a stopped
     // machine, so the sandbox environment applies exactly as for a provider
     // spawn.
-    let status = crate::smolvm_command()?
+    let status = command
         .args(["machine", "shell", "--name", &machine_name])
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
@@ -2788,6 +2807,7 @@ mod tests {
         let _guard = crate::SMOLVM_PATH_LOCK.lock().await;
         let (directory, executable) = crate::fake_smolvm_on_path();
         let previous_path = std::env::var_os("PATH");
+        let previous_home = std::env::var_os("PRELOOP_HOME");
         let mut path = directory.path().as_os_str().to_owned();
         path.push(":");
         if let Some(previous) = &previous_path {
@@ -2806,7 +2826,10 @@ mod tests {
         })
         .await;
 
-        std::env::remove_var("PRELOOP_HOME");
+        match previous_home {
+            Some(previous) => std::env::set_var("PRELOOP_HOME", previous),
+            None => std::env::remove_var("PRELOOP_HOME"),
+        }
         match previous_path {
             Some(previous) => std::env::set_var("PATH", previous),
             None => std::env::remove_var("PATH"),
@@ -2829,6 +2852,14 @@ mod tests {
             assert_eq!(read("seccomp"), "SMOLVM_SECCOMP=");
             assert_eq!(read("landlock"), "SMOLVM_LANDLOCK=");
         }
+        // The direct CLI spawn must consult the engine's registry, not the
+        // caller's: pinned to <PRELOOP_HOME>/smolvm, which the unit sets for
+        // the service and this test sets to a temp dir.
+        let data_dir = home.path().join("smolvm");
+        assert_eq!(
+            read("datadir"),
+            format!("SMOLVM_DATA_DIR={}", data_dir.display())
+        );
     }
 
     // -- top-level --

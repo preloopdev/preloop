@@ -178,11 +178,23 @@ fn install(args: InstallArgs) -> Result<()> {
         );
     }
     if let Some(key) = &args.github_app_key {
-        anyhow::ensure!(
-            key.exists(),
-            "--github-app-key {} does not exist",
-            key.display()
-        );
+        // Distinguish "missing" from "not readable by *you*": a system
+        // dry-run is allowed without root, so a key under /root reports
+        // false from a bare `exists()` and would otherwise be reported as
+        // nonexistent when it is merely unreadable from this account.
+        if let Err(error) = std::fs::metadata(key) {
+            match error.kind() {
+                std::io::ErrorKind::NotFound => {
+                    bail!("--github-app-key {} does not exist", key.display())
+                }
+                std::io::ErrorKind::PermissionDenied => bail!(
+                    "--github-app-key {} is not readable by the current user ({error}); \
+                     re-run with sudo",
+                    key.display()
+                ),
+                _ => bail!("--github-app-key {}: {error}", key.display()),
+            }
+        }
     }
     // A system install runs as the dedicated `preloop` account, which cannot
     // traverse a 0700 /home/<user> or /root. Such a --home would produce an
@@ -195,6 +207,33 @@ fn install(args: InstallArgs) -> Result<()> {
              account cannot traverse /home, /root, or /run/user. Use {DEFAULT_HOME} \
              (the default) or another root-reachable path, or install with --user.",
             home.display()
+        );
+    }
+    // The state dir is chowned to the service account recursively, so it must
+    // be a directory dedicated to Preloop — never a shared system root.
+    #[cfg(any(target_os = "linux", test))]
+    if !args.user {
+        if let Some(protected) = shared_system_path(&home) {
+            bail!(
+                "--home {} is too broad for a system install: the state directory is \
+                 chowned to `{SERVICE_USER}` recursively, which would hand it {}. \
+                 Use {DEFAULT_HOME} (the default) or another dedicated directory.",
+                home.display(),
+                protected.display()
+            );
+        }
+    }
+    // The service must be able to execute the binary the unit points at. An
+    // exe under a 0700 /home/<user> or /root is unreachable for the same
+    // traversal reason as the state dir, and the unit would restart-loop.
+    #[cfg(any(target_os = "linux", test))]
+    if !args.user && home_blocked_by_protect_home(&exe) {
+        bail!(
+            "the running executable {} is under a directory the `{SERVICE_USER}` service \
+             account cannot traverse, so the unit could never start it. Install the \
+             binary system-wide first (e.g. /usr/local/bin/preloop) and re-run, or \
+             install with --user.",
+            exe.display()
         );
     }
     // The state dir must exist before anything is staged into it: the very
@@ -311,6 +350,8 @@ fn install_systemd(
 
     if !args.user {
         bootstrap_system_smolvm(dry)?;
+        bootstrap_smolvm_data(home, dry)?;
+        migrate_legacy_env_file(home, dry)?;
         chown_state_dir(home, dry)?;
     }
     // Written after chown_state_dir, and deliberately outside it for a system
@@ -335,6 +376,18 @@ fn install_systemd(
     }
 
     run_systemctl(&systemctl_args(args.user, &["daemon-reload"]), dry)?;
+    // Upgrades: `enable --now` starts an inactive unit but leaves a running
+    // one alone, so an existing service would keep its old identity and an
+    // unhardened environment until it happened to fail or the host rebooted.
+    // `try-restart` restarts it only if it is already active, so exactly one
+    // start happens either way: restart here for an upgrade, or the
+    // `enable --now` below for a fresh install.
+    run_ok(
+        "systemctl",
+        &systemctl_args(args.user, &["try-restart", "preloop.service"]),
+        dry,
+        "restart a running preloop.service onto the new unit",
+    );
     run_systemctl(
         &systemctl_args(
             args.user,
@@ -462,6 +515,26 @@ fn ensure_service_user(home: &Path, dry_run: bool) -> Result<()> {
                 Err(error) => {
                     return Err(error).with_context(|| format!("run useradd {SERVICE_USER}"))
                 }
+            }
+        }
+    }
+    // The unit pins `Group=preloop` and the chowns use `preloop:preloop`, so
+    // the group must exist even when a pre-existing passwd entry made us skip
+    // useradd (which creates the user's primary group by default).
+    let group_exists = Command::new("getent")
+        .args(["group", SERVICE_USER])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !group_exists {
+        if dry_run {
+            eprintln!("[preloop] would create system group {SERVICE_USER} (groupadd --system)");
+        } else {
+            let status = Command::new("groupadd")
+                .args(["--system", SERVICE_USER])
+                .status()
+                .with_context(|| format!("create system group {SERVICE_USER}"))?;
+            if !status.success() {
+                bail!("groupadd {SERVICE_USER} failed ({status})");
             }
         }
     }
@@ -659,6 +732,82 @@ fn bootstrap_system_smolvm(dry_run: bool) -> Result<()> {
         .with_context(|| "symlink /usr/local/bin/smolvm".to_string())?;
     if !status.success() {
         bail!("symlinking /usr/local/bin/smolvm failed ({status})");
+    }
+    Ok(())
+}
+
+/// Copy the bundled SmolVM *data assets* into the service's data directory.
+///
+/// `preloop update` installs the immutable assets — the agent rootfs and
+/// Linux's `init.krun` — into the data directory, not the prefix:
+/// `update.rs` writes `agent-rootfs` and `init.krun` under
+/// `~/.local/share/smolvm` (the default `data_dir`), while only the binary,
+/// libs, and templates go into `~/.smolvm`. The unit pins
+/// `SMOLVM_DATA_DIR` to a fresh `PRELOOP_HOME/smolvm`, so without this copy
+/// the service's first VM boot would find no agent rootfs and no init and
+/// fail before ever reaching the sandbox. The root user's machine database
+/// stays behind, exactly as for the prefix copy.
+#[cfg(target_os = "linux")]
+fn bootstrap_smolvm_data(home: &Path, dry_run: bool) -> Result<()> {
+    let source_dir = Path::new("/root/.local/share/smolvm");
+    let destination_dir = home.join("smolvm");
+    if !source_dir.is_dir() {
+        // No root-side install to copy; the note for the prefix covers this.
+        return Ok(());
+    }
+    let needs_copy = |name: &str| -> bool {
+        let destination = destination_dir.join(name);
+        let source = source_dir.join(name);
+        !destination.exists() || newer_than(&source, &destination)
+    };
+    let assets: Vec<&str> = ["agent-rootfs", "init.krun"]
+        .into_iter()
+        .filter(|name| source_dir.join(name).exists() && needs_copy(name))
+        .collect();
+    if assets.is_empty() {
+        return Ok(());
+    }
+    if dry_run {
+        eprintln!(
+            "[preloop] would copy smolvm data assets ({}) into {}",
+            assets.join(", "),
+            destination_dir.display()
+        );
+        return Ok(());
+    }
+    std::fs::create_dir_all(&destination_dir)
+        .with_context(|| format!("create {}", destination_dir.display()))?;
+    for name in assets {
+        let source = source_dir.join(name);
+        let destination = destination_dir.join(name);
+        // Copy as root, then hand the tree to the service account: the data
+        // dir is service-owned (the recursive chown runs after this), and the
+        // agent rootfs is read-only for the VMM.
+        std::fs::create_dir_all(&destination)
+            .with_context(|| format!("create {}", destination.display()))?;
+        let status = Command::new("cp")
+            .args(["-a"])
+            .arg(format!("{}/.", source.display()))
+            .arg(format!("{}/", destination.display()))
+            .status()
+            .with_context(|| format!("copy {} into {}", source.display(), destination.display()))?;
+        if !status.success() {
+            bail!(
+                "copying {} into {} failed ({status})",
+                source.display(),
+                destination.display()
+            );
+        }
+    }
+    // `init.krun` needs its executable bit for the boot path; `cp -a` keeps
+    // it from the source. Re-assert it explicitly so a filesystem that drops
+    // the bit cannot break the first boot.
+    let init_krun = destination_dir.join("init.krun");
+    if init_krun.exists() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&init_krun)?.permissions();
+        permissions.set_mode(permissions.mode() | 0o500);
+        std::fs::set_permissions(&init_krun, permissions)?;
     }
     Ok(())
 }
@@ -1148,6 +1297,48 @@ fn home_blocked_by_protect_home(home: &Path) -> bool {
     home.starts_with("/home/") || home.starts_with("/root") || home.starts_with("/run/user")
 }
 
+/// A shared system location `home` would swallow, or `None` when `home` is a
+/// directory Preloop may own outright.
+///
+/// The installer chowns the state directory to the service account
+/// *recursively*, so `--home /var/lib` or `--home /` would silently reassign
+/// unrelated host data. A candidate is rejected when it *is* a protected
+/// path or is an ancestor of one; `/var/lib/preloop` (the default) and
+/// `/srv/preloop` are ancestors of nothing and pass.
+#[cfg(any(target_os = "linux", test))]
+fn shared_system_path(home: &Path) -> Option<&'static Path> {
+    const PROTECTED: &[&str] = &[
+        "/",
+        "/bin",
+        "/boot",
+        "/dev",
+        "/etc",
+        "/home",
+        "/lib",
+        "/lib64",
+        "/mnt",
+        "/opt",
+        "/proc",
+        "/root",
+        "/run",
+        "/sbin",
+        "/srv",
+        "/sys",
+        "/tmp",
+        "/usr",
+        "/var",
+        "/var/lib",
+        "/var/log",
+        "/var/tmp",
+        SYSTEM_CONFIG_DIR,
+        SMOLVM_PREFIX_PARENT,
+    ];
+    PROTECTED
+        .iter()
+        .map(Path::new)
+        .find(|protected| *protected == home || protected.starts_with(home))
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn render_systemd_socket(listen: Option<SocketAddr>) -> String {
     let addr = listen
@@ -1510,6 +1701,40 @@ fn write_env_file(path: &Path, env_lines: &[String], dry_run: bool) -> Result<()
     Ok(())
 }
 
+/// Move a pre-existing `<home>/environment` into the root-owned config dir.
+///
+/// Releases before the hardened layout read the environment file from the
+/// state dir. Upgrading must not strand the operator's `--github-app-*` and
+/// `--webhook-secret` values: a re-install without repeating those flags
+/// writes no new env file, and the new unit no longer reads the old path, so
+/// the credentials would silently vanish on the first restart. Migrate once,
+/// then stop looking (the old path is in the service-writable state dir and
+/// must not become authoritative again).
+#[cfg(target_os = "linux")]
+fn migrate_legacy_env_file(home: &Path, dry_run: bool) -> Result<()> {
+    let legacy = home.join("environment");
+    let destination = env_file_path(home, false);
+    if !legacy.is_file() || destination.exists() {
+        return Ok(());
+    }
+    if dry_run {
+        eprintln!(
+            "[preloop] would migrate legacy {} -> {} (0600 root-owned)",
+            legacy.display(),
+            destination.display()
+        );
+        return Ok(());
+    }
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    std::fs::rename(&legacy, &destination)
+        .with_context(|| format!("migrate {} to {}", legacy.display(), destination.display()))?;
+    set_private_file_permissions(&destination)
+        .with_context(|| format!("chmod 0600 {}", destination.display()))?;
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn write_unit(path: &Path, contents: &str, dry_run: bool) -> Result<()> {
     if dry_run {
@@ -1776,8 +2001,33 @@ WantedBy=multi-user.target
                 "{blocked}: {error}"
             );
         }
+        // A home the service account CAN traverse is still rejected when it
+        // is a shared system path: the recursive chown would hand unrelated
+        // host data to the service account.
+        for blocked in ["/", "/var/lib", "/var", "/srv", "/opt", "/etc/preloop"] {
+            let error = install(InstallArgs {
+                home: Some(PathBuf::from(blocked)),
+                user: false,
+                dry_run: true,
+                listen: None,
+                public_url: None,
+                github_app_id: None,
+                github_app_key: None,
+                github_app_installation_id: None,
+                webhook_secret: None,
+                no_update_timer: false,
+                systemd_credential: None,
+            })
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("too broad for a system install"),
+                "{blocked}: {error}"
+            );
+        }
         // Root-reachable custom home: allowed, no carve-out, no StateDirectory.
         assert!(!home_blocked_by_protect_home(Path::new("/srv/preloop")));
+        assert!(shared_system_path(Path::new(DEFAULT_HOME)).is_none());
+        assert!(shared_system_path(Path::new("/srv/preloop")).is_none());
         let open = render_systemd_service(
             Path::new("/usr/local/bin/preloop"),
             Path::new("/srv/preloop"),

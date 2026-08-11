@@ -666,6 +666,38 @@ exit 0
         assert_eq!(captured_env(&executable), "SMOLVM_EGRESS_FLOOR=strict");
     }
 
+    /// The `PRELOOP_SMOLVM_NET_BACKEND` override must reach the spawned
+    /// command as `--net-backend tsi` — the mapping function alone is not
+    /// the contract, the wiring through `create` is. Driven through the
+    /// `with_env_lookup` seam so no process-global environment is mutated.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn public_only_net_backend_override_reaches_the_spawned_command() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("smolvm");
+        fs::write(
+            &executable,
+            r##"#!/bin/sh
+for arg in "$@"; do printf '%s\n' "$arg" >> "$0.args"; done
+"##,
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let provider = SmolVmProvider::new(executable.clone())
+            .with_env_lookup(|key| (key == "PRELOOP_SMOLVM_NET_BACKEND").then(|| "tsi".to_owned()));
+        let mut spec = valid_spec(MachineName::new("test-tsi").unwrap());
+        spec.network = NetworkPolicy::PublicOnly;
+        provider.create(&spec).await.unwrap();
+        let args = captured_args(&executable);
+        assert!(
+            args.windows(2).any(|pair| pair == ["--net-backend", "tsi"]),
+            "the override must reach create's command line: {args:?}"
+        );
+    }
+
     #[tokio::test]
     async fn unrestricted_removes_smolvm_egress_floor() {
         let (_directory, executable) = fake_smolvm();

@@ -427,12 +427,13 @@ impl SmolVmProvider {
     }
 
     /// Substitute the host-environment lookup this provider reads.
-    /// Test-only seam: nothing outside the crate's own tests can build a
-    /// provider that resolves overrides from anywhere but the process
-    /// environment. Only the Linux sandbox-override test needs it — off
-    /// Linux the policy injects nothing, so there is no override to fake.
-    #[cfg(all(test, target_os = "linux"))]
-    fn with_env_lookup(mut self, lookup: EnvLookup) -> Self {
+    ///
+    /// Test seam for the Linux override tests: integration tests compile the
+    /// library without `cfg(test)`, so this is unconditionally available on
+    /// Linux. In production nothing constructs a provider with anything but
+    /// [`process_env`], so the seam cannot redirect a real deployment.
+    #[cfg(target_os = "linux")]
+    pub fn with_env_lookup(mut self, lookup: EnvLookup) -> Self {
         self.env_lookup = lookup;
         self
     }
@@ -450,6 +451,93 @@ impl SmolVmProvider {
         let mut command = self.command();
         apply_sandbox_env(&mut command, self.env_lookup)?;
         Ok(command)
+    }
+
+    /// A command for an operation that can never boot or restart `_boot-vm`
+    /// (status, list, stop, delete): the validated sandbox policy when it
+    /// resolves, otherwise the sandbox variables stripped.
+    ///
+    /// Fail-closed validation must not extend here. A single operator typo
+    /// in `SMOLVM_SECCOMP`/`SMOLVM_LANDLOCK` is recoverable *because* the
+    /// pool can still be enumerated and torn down; hard-failing `status`,
+    /// `list`, `stop`, and `delete` on the same typo would make the very
+    /// operations needed to fix it unusable. The variables are still never
+    /// forwarded unvalidated: on an invalid override they are removed, so a
+    /// recovery command runs without sandbox variables (no VMM is spawned
+    /// here, so nothing boots unconfined) rather than with garbage.
+    fn recovery_command(&self) -> Command {
+        let mut command = self.command();
+        match sandbox_env_with(self.env_lookup) {
+            Ok(sandbox) => {
+                for key in sandbox.remove {
+                    command.env_remove(key);
+                }
+                for (key, value) in sandbox.set {
+                    command.env(key, value);
+                }
+            }
+            Err(_) => {
+                command.env_remove("SMOLVM_SECCOMP");
+                command.env_remove("SMOLVM_LANDLOCK");
+                command.env_remove("SMOLVM_CGROUP_ROOT");
+            }
+        }
+        command
+    }
+
+    /// Run an operation that can never boot or restart a VMM, using
+    /// [`Self::recovery_command`] so a bad sandbox override cannot wedge the
+    /// recovery paths. Mirrors [`Self::checked`]'s plumbing.
+    async fn recovery(
+        &self,
+        operation: &'static str,
+        args: &[String],
+    ) -> Result<ExecOutput, VmError> {
+        let mut command = self.recovery_command();
+        command
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn().map_err(|source| VmError::Launch {
+            program: self.binary.display().to_string(),
+            source,
+        })?;
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let (stdout, stderr, status) = tokio::join!(
+            read_bounded(stdout, self.capture_limit),
+            read_bounded(stderr, self.capture_limit),
+            child.wait(),
+        );
+        let (stdout, stdout_truncated) = stdout.map_err(|source| VmError::Launch {
+            program: self.binary.display().to_string(),
+            source,
+        })?;
+        let (stderr, stderr_truncated) = stderr.map_err(|source| VmError::Launch {
+            program: self.binary.display().to_string(),
+            source,
+        })?;
+        let status = status.map_err(|source| VmError::Launch {
+            program: self.binary.display().to_string(),
+            source,
+        })?;
+        let result = ExecOutput {
+            exit_code: status.code().unwrap_or(-1),
+            stdout,
+            stderr,
+            truncated: stdout_truncated || stderr_truncated,
+        };
+        if !status.success() {
+            let message = String::from_utf8_lossy(&result.stderr).trim().to_owned();
+            return Err(VmError::Command {
+                operation,
+                exit_code: result.exit_code,
+                message,
+            });
+        }
+        Ok(result)
     }
 
     /// Whether `machine create` accepts `--mount-socket`, probed from the
@@ -820,7 +908,7 @@ impl VmProvider for SmolVmProvider {
     }
 
     async fn stop(&self, name: &MachineName) -> Result<(), VmError> {
-        self.concurrent(
+        self.recovery(
             "stop",
             &[
                 "machine".into(),
@@ -835,7 +923,7 @@ impl VmProvider for SmolVmProvider {
 
     async fn delete(&self, name: &MachineName) -> Result<(), VmError> {
         let result = self
-            .concurrent(
+            .recovery(
                 "delete",
                 &[
                     "machine".into(),
@@ -864,7 +952,7 @@ impl VmProvider for SmolVmProvider {
             "--name".into(),
             name.as_str().into(),
         ];
-        match self.concurrent("status", &args).await {
+        match self.recovery("status", &args).await {
             Ok(output) => {
                 let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
                 Ok(if text.contains("running") {
@@ -886,7 +974,7 @@ impl VmProvider for SmolVmProvider {
 
     async fn list(&self) -> Result<Vec<MachineName>, VmError> {
         let output = self
-            .concurrent("list", &["machine".into(), "ls".into(), "--json".into()])
+            .recovery("list", &["machine".into(), "ls".into(), "--json".into()])
             .await?;
         let values: serde_json::Value = serde_json::from_slice(&output.stdout)
             .map_err(|error| VmError::Protocol(error.to_string()))?;
@@ -1194,8 +1282,9 @@ pub fn init_vm_cgroup_delegation() {
 /// This is the single source of the sandbox policy: the provider applies it
 /// to every command it builds, and the CLI applies it to its direct
 /// `machine exec/cp/shell` calls, which can implicitly boot or restart a
-/// stopped machine. Returns `(variable, value)` pairs; non-Linux hosts get
-/// an empty list (both controls are no-ops upstream there).
+/// stopped machine. Returns `(variable, value)` pairs plus removals;
+/// non-Linux hosts get an empty list (both controls are no-ops upstream
+/// there).
 ///
 /// - Seccomp: default `enforce`; a pre-set operator value
 ///   (`enforce`/`audit`/`off`) wins — upstream precedence — but only modes
@@ -1208,26 +1297,45 @@ pub fn init_vm_cgroup_delegation() {
 ///   included. In every other process it is read-only: the variable is set
 ///   only when this process already sits in a cgroup v2 subtree that has
 ///   `cpu`/`memory`/`pids` enabled in its `cgroup.subtree_control` and can
-///   host child leaves, and is otherwise absent.
-pub fn smolvm_sandbox_env() -> Result<Vec<(String, String)>, VmError> {
+///   host child leaves, and is otherwise **removed from the child
+///   environment** — Preloop is authoritative for all three variables, so an
+///   inherited value (from the operator's environment or a parent service)
+///   never reaches `_boot-vm` with a root we did not validate.
+pub fn smolvm_sandbox_env() -> Result<SandboxEnv, VmError> {
     sandbox_env_with(process_env)
 }
 
 /// [`smolvm_sandbox_env`] over an explicit environment lookup.
-fn sandbox_env_with(lookup: EnvLookup) -> Result<Vec<(String, String)>, VmError> {
+fn sandbox_env_with(lookup: EnvLookup) -> Result<SandboxEnv, VmError> {
     #[cfg(target_os = "linux")]
     {
         let mut env = sandbox_env_from(lookup)?;
+        // Authoritative: if this process resolved no usable cgroup root, an
+        // inherited SMOLVM_CGROUP_ROOT must be stripped, not merely left unset
+        // (the child would inherit it and _boot-vm would place itself in a
+        // cgroup we never validated).
+        let mut remove = Vec::new();
         if let Some(root) = CGROUP_ROOT.get_or_init(read_only_cgroup_root) {
             env.push(("SMOLVM_CGROUP_ROOT".to_owned(), root.display().to_string()));
+        } else {
+            remove.push("SMOLVM_CGROUP_ROOT");
         }
-        Ok(env)
+        Ok(SandboxEnv { set: env, remove })
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = lookup;
-        Ok(Vec::new())
+        Ok(SandboxEnv::default())
     }
+}
+
+/// The sandbox policy as command-environment operations.
+#[derive(Default)]
+pub struct SandboxEnv {
+    /// Variables to set on the child command.
+    pub set: Vec<(String, String)>,
+    /// Variables to strip from the child command's inherited environment.
+    pub remove: Vec<&'static str>,
 }
 
 /// The seccomp/Landlock half of the sandbox policy, over an environment
@@ -1270,7 +1378,11 @@ fn sandbox_env_from(
 /// Apply [`smolvm_sandbox_env`] to a synchronous command (the CLI's direct
 /// `smolvm machine exec/cp/shell` spawns).
 pub fn apply_smolvm_sandbox_env(command: &mut std::process::Command) -> Result<(), VmError> {
-    for (key, value) in smolvm_sandbox_env()? {
+    let sandbox = smolvm_sandbox_env()?;
+    for key in sandbox.remove {
+        command.env_remove(key);
+    }
+    for (key, value) in sandbox.set {
         command.env(key, value);
     }
     Ok(())
@@ -1279,7 +1391,11 @@ pub fn apply_smolvm_sandbox_env(command: &mut std::process::Command) -> Result<(
 /// Apply the sandbox policy to a provider command.
 #[cfg(target_os = "linux")]
 fn apply_sandbox_env(command: &mut Command, lookup: EnvLookup) -> Result<(), VmError> {
-    for (key, value) in sandbox_env_with(lookup)? {
+    let sandbox = sandbox_env_with(lookup)?;
+    for key in sandbox.remove {
+        command.env_remove(key);
+    }
+    for (key, value) in sandbox.set {
         command.env(key, value);
     }
     Ok(())
@@ -1317,7 +1433,7 @@ fn process_cgroup_dir() -> Option<PathBuf> {
 /// Landlock variables are unaffected).
 #[cfg(target_os = "linux")]
 fn read_only_cgroup_root() -> Option<PathBuf> {
-    process_cgroup_dir().filter(|root| is_usable_delegation(root))
+    process_cgroup_dir().filter(|root| is_usable_delegation_read_only(root))
 }
 
 /// Resolve a cgroup v2 root, establishing the delegation when one is missing
@@ -1334,7 +1450,7 @@ fn delegated_cgroup_root_mutating() -> Option<PathBuf> {
     // not hosting children — but the root must actually accept child leaves:
     // an unprivileged process in an undelegated cgroup must not be handed a
     // root whose `vm-<pid>` leaf creation would silently fail.
-    if is_usable_delegation(&root) {
+    if is_usable_delegation_read_only(&root) {
         return Some(root);
     }
     // The controllers are not distributed yet, but this process may be able
@@ -1358,18 +1474,44 @@ fn delegated_cgroup_root_mutating() -> Option<PathBuf> {
     ok.then_some(root)
 }
 
-/// Whether `root` is a delegation Preloop can actually cap VMs with: the
-/// controllers are distributed to children and a child leaf can be created.
+/// Whether `root` is a delegation Preloop can actually cap VMs with, using
+/// only reads: the controllers are distributed to children and the current
+/// user can create a child leaf.
+///
+/// Deliberately non-mutating. This predicate runs on the read-only path used
+/// by `preloop shell` and the debug session, which must never write to the
+/// cgroup hierarchy; the mutating probe below is confined to the
+/// supervisor's delegation setup where a write is already expected.
 #[cfg(target_os = "linux")]
-fn is_usable_delegation(root: &Path) -> bool {
-    cgroup_controllers_enabled(root) && can_host_child_leaf(root)
+fn is_usable_delegation_read_only(root: &Path) -> bool {
+    cgroup_controllers_enabled(root) && can_create_child_leaf(root)
 }
 
-/// The cgroup can host `_boot-vm`'s `vm-<pid>` child leaves: creating a
-/// directory inside it — the exact first step of SmolVM's `place_in_cgroup`
-/// — must succeed. Under systemd delegation the subtree is chowned to the
-/// service user; anywhere else an unprivileged service cannot create leaves
-/// and must not receive a root that would silently run VMs uncapped.
+/// Whether the current user can create a child cgroup directory under `root`
+/// without creating anything. A directory may be writable/executable while
+/// the cgroup filesystem still refuses `mkdir` — under systemd delegation
+/// the subtree is chowned to the service user, and `CGROUP_DELEGATE` file
+/// ownership is what actually authorizes child creation — so this checks
+/// write+execute permission on the directory (the closest read-only proxy)
+/// rather than assuming.
+#[cfg(target_os = "linux")]
+fn can_create_child_leaf(root: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(root) else {
+        return false;
+    };
+    use std::os::unix::fs::PermissionsExt;
+    let mode = metadata.permissions().mode();
+    // Owner w+x for the owner, group w+x for the group, other w+x for the
+    // rest — exactly the permissions `mkdir` requires of the parent.
+    let owner_wx = mode & 0o300 == 0o300;
+    let group_wx = mode & 0o030 == 0o030;
+    let other_wx = mode & 0o003 == 0o003;
+    owner_wx || group_wx || other_wx
+}
+
+/// The cgroup can host `_boot-vm`'s `vm-<pid>` child leaves, proven by
+/// actually creating and removing a probe leaf. Supervisor-only: this is a
+/// write, so it must never run on the read-only CLI path.
 ///
 /// The probe leaf is removed again; a leaf that cannot be removed is not a
 /// usable root either, and reporting `false` keeps `.preloop-probe` from
@@ -1654,10 +1796,110 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn sandbox_env_is_empty_off_linux() {
-        assert_eq!(
-            smolvm_sandbox_env().unwrap(),
-            Vec::<(String, String)>::new()
+        let sandbox = smolvm_sandbox_env().unwrap();
+        assert!(sandbox.set.is_empty());
+        assert!(sandbox.remove.is_empty());
+    }
+
+    /// Preloop is authoritative for `SMOLVM_CGROUP_ROOT`: when no usable
+    /// delegation exists, an inherited value must be removed from the child
+    /// environment, never forwarded. The test environment never calls
+    /// `init_vm_cgroup_delegation`, so this process takes the read-only path;
+    /// on a host with a delegation the variable is set instead, and the
+    /// assertion below reflects that.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_policy_strips_an_inherited_cgroup_root_without_delegation() {
+        let sandbox = smolvm_sandbox_env().unwrap();
+        let resolved_root = sandbox
+            .set
+            .iter()
+            .any(|(key, _)| key == "SMOLVM_CGROUP_ROOT");
+        if resolved_root {
+            // Delegated host: the variable is set to our own validated root,
+            // and must not ALSO be scheduled for removal.
+            assert!(!sandbox.remove.contains(&"SMOLVM_CGROUP_ROOT"));
+        } else {
+            assert!(sandbox.remove.contains(&"SMOLVM_CGROUP_ROOT"));
+        }
+        // Regardless of the host, the seccomp/Landlock halves are enforced.
+        assert!(sandbox
+            .set
+            .iter()
+            .any(|(key, value)| key == "SMOLVM_SECCOMP" && value == "enforce"));
+        assert!(sandbox
+            .set
+            .iter()
+            .any(|(key, value)| key == "SMOLVM_LANDLOCK" && value == "enforce"));
+    }
+
+    /// An invalid override must not wedge the recovery operations: a typo in
+    /// `SMOLVM_SECCOMP` must make `create` fail closed while `list`, `status`,
+    /// `stop`, and `delete` still work — they are the only way to fix the
+    /// typo. The recovery command strips the invalid variables rather than
+    /// forwarding them.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn invalid_override_keeps_recovery_operations_usable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("smolvm");
+        std::fs::write(
+            &binary,
+            "#!/bin/sh\ncase \"$*\" in\n  *ls*) echo '[]';;\n  *status*) echo running;;\nesac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        fn rejected(key: &str) -> Option<String> {
+            (key == "SMOLVM_SECCOMP").then(|| "Enforce".to_owned())
+        }
+        let provider = SmolVmProvider::new(&binary).with_env_lookup(rejected);
+
+        // Boot-capable path: fails closed.
+        let spec = MachineSpec {
+            name: MachineName::new("runner").unwrap(),
+            image: "ghcr.io/acme/runner:latest".to_owned(),
+            cpus: 2,
+            memory_mib: 256,
+            storage_gib: 10,
+            overlay_gib: None,
+            network: NetworkPolicy::Disabled,
+            volumes: Vec::new(),
+            sockets: Vec::new(),
+            dns: None,
+            rosetta: false,
+        };
+        let create_error = provider.create(&spec).await.unwrap_err();
+        assert!(
+            matches!(create_error, VmError::InvalidSandboxEnv { .. }),
+            "create must fail closed, got {create_error}"
         );
+
+        // Recovery paths: still usable, with the invalid variables stripped.
+        assert_eq!(
+            provider
+                .list()
+                .await
+                .unwrap_or_else(|error| panic!("list must stay usable: {error}")),
+            Vec::<MachineName>::new()
+        );
+        assert_eq!(
+            provider
+                .status(&MachineName::new("runner").unwrap())
+                .await
+                .unwrap_or_else(|error| panic!("status must stay usable: {error}")),
+            MachineState::Running
+        );
+        provider
+            .stop(&MachineName::new("runner").unwrap())
+            .await
+            .unwrap();
+        provider
+            .delete(&MachineName::new("runner").unwrap())
+            .await
+            .unwrap();
     }
 
     /// A rejected sandbox override must surface as

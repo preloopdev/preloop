@@ -133,7 +133,8 @@ Releases before v0.27.0 predate the changelog.
   clone cleanup, the live-clone check, and the stop/restart run under the
   provider's per-golden fork lock, and cleanup must succeed before the base
   is touched. A base with live clones is never restarted — it falls back to
-  direct creation with an error explaining why.- `preloop debug <reference>` now resolves a run id that has several paused
+  direct creation with an error explaining why.
+- `preloop debug <reference>` now resolves a run id that has several paused
   jobs: it lists them (with their run ids) instead of answering
   `no paused job matching`; non-404 failures propagate their real cause.
   When nothing matches but other sessions are paused, the reply says what is
