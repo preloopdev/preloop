@@ -525,6 +525,9 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
     {
         verify_base_image(&args.base_image).await?;
     }
+    if env_flag("PRELOOP_REQUIRE_BASE_DIGEST", false) {
+        require_digest_pinned_base(&args.base_image)?;
+    }
     let config = RunnerPoolConfig {
         size: 1,
         use_fork: false,
@@ -599,6 +602,7 @@ async fn verify_base_image(base_image: &str) -> anyhow::Result<()> {
     if !base_image.contains('/') || base_image.starts_with('.') || base_image.starts_with('/') {
         anyhow::bail!("base image `{base_image}` is not a registry reference; nothing to verify");
     }
+    require_digest_pinned_base(base_image)?;
     verify_base_image_with(&repo, base_image)
 }
 
@@ -623,6 +627,29 @@ fn verify_base_image_with(repo: &str, base_image: &str) -> anyhow::Result<()> {
         ],
         "cosign signature",
     )
+}
+
+fn require_digest_pinned_base(base_image: &str) -> anyhow::Result<()> {
+    // Packed artifacts and local paths are already immutable inputs; this
+    // policy applies to registry references only. Release workflows enable
+    // this before baking so a mutable tag cannot silently become the golden's
+    // input after the provenance sidecars were captured.
+    if base_image.starts_with('.') || base_image.starts_with('/') {
+        return Ok(());
+    }
+    let digest = base_image
+        .split_once("@sha256:")
+        .map(|(_, digest)| digest)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "base image `{base_image}` must use an immutable @sha256:<digest> reference"
+            )
+        })?;
+    anyhow::ensure!(
+        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "base image `{base_image}` has an invalid sha256 digest"
+    );
+    Ok(())
 }
 
 fn run_verifier(binary: &str, args: &[&str], what: &str) -> anyhow::Result<()> {
@@ -2351,6 +2378,17 @@ mod tests {
             "ghcr.io/acme/runner-images:ubuntu24-runner-large-latest-arm64"
         );
         assert_eq!(args.storage_gib, Some(80));
+    }
+
+    #[test]
+    fn base_digest_policy_rejects_mutable_registry_references() {
+        assert!(require_digest_pinned_base(
+            "mirror.gcr.io/library/ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90"
+        )
+        .is_ok());
+        assert!(require_digest_pinned_base("/tmp/preloop.smolmachine").is_ok());
+        assert!(require_digest_pinned_base("ghcr.io/acme/base:latest").is_err());
+        assert!(require_digest_pinned_base("ghcr.io/acme/base@sha256:not-a-digest").is_err());
     }
 
     #[test]
