@@ -119,6 +119,49 @@ Releases before v0.27.0 predate the changelog.
   the install summary print
   `units:  + preloop-update.{service,timer}/preloop.{service,socket}/etc/...`.
 
+## [0.30.0] - 2026-08-11
+
+### Security
+
+- Confine SmolVM VMMs against hostile workflow code (#114): one sandbox policy
+  (seccomp + Landlock) applies to every operation that can boot or restart a
+  VMM — including `preloop shell` and debug-session exec paths — and
+  operator-set values are validated instead of silently booting unconfined on
+  a typo.
+- Run the control plane as a dedicated non-root service identity (#114): the
+  smolvm prefix, the environment file, the staged App key, and the engine
+  state each move to least-privilege ownership, closing reproduced privilege
+  escalations (root execution through the smolvm wrapper, service-persisted
+  `SMOLVM_SECCOMP=off` via EnvironmentFile, and a writable App key). `server
+  uninstall` removes the moved artifacts so secrets do not outlive the state
+  dir.
+
+### Fixed
+
+- Serialize `machine fork` per golden VM (#112). SmolVM keeps one RAM
+  checkpoint per golden; concurrent forks raced the freeze, and the loser's
+  rollback resumed the base and dropped the checkpoint, after which every
+  fork failed with `golden '<name>' is already paused; a valid retained
+  checkpoint is required` and queued jobs stalled until the engine restarted.
+  Forks from different goldens still run in parallel.
+- Re-arm a spent fork base atomically and retry the fork once (#112): partial
+  clone cleanup, the live-clone check, and the stop/restart run under the
+  provider's per-golden fork lock, and cleanup must succeed before the base
+  is touched. A base with live clones is never restarted — it falls back to
+  direct creation with an error explaining why.
+- `preloop debug <reference>` now resolves a run id that has several paused
+  jobs: it lists them (with their run ids) instead of answering
+  `no paused job matching`; non-404 failures propagate their real cause.
+  When nothing matches but other sessions are paused, the reply says what is
+  paused instead of a bare 404 (#112).
+- Persist GitHub check-run ids at creation so a server restart mid-queue no
+  longer orphans checks in "queued" forever while the jobs run and complete
+  (#113).
+- Dead-bound job requeue: stale bindings stay claimable in strict non-pool
+  mode (no more stranded jobs), and the original first-bound stamp survives
+  the requeue so repeated provisioning failures cannot extend the bounded
+  claim window (#113).
+
 ## [0.29.9-rc] - 2026-08-11
 
 ### Fixed
