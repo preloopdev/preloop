@@ -341,6 +341,10 @@ jobs:
           # Copy whichever storage/overlay template format the archive
           # carries (mirrors the update installer, which copies only files
           # that exist).
+          rm -f "$HOME/.smolvm/storage-template.ext4" \
+              "$HOME/.smolvm/overlay-template.ext4" \
+              "$HOME/.smolvm/storage-template.ext4.zst" \
+              "$HOME/.smolvm/overlay-template.ext4.zst"
           for f in smolvm smolvm-bin storage-template.ext4 overlay-template.ext4 \
               storage-template.ext4.zst overlay-template.ext4.zst; do
             [ -f "$SRC/$f" ] && cp "$SRC/$f" "$HOME/.smolvm/"

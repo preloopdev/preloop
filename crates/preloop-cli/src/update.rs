@@ -398,6 +398,14 @@ fn install_smolvm_from_archive(
         let _ = fs::remove_file(install.prefix.join(stale));
     }
     for name in [
+        "storage-template.ext4",
+        "overlay-template.ext4",
+        "storage-template.ext4.zst",
+        "overlay-template.ext4.zst",
+    ] {
+        let _ = fs::remove_file(install.prefix.join(name));
+    }
+    for name in [
         "smolvm",
         "smolvm-bin",
         "storage-template.ext4",
@@ -916,7 +924,6 @@ mod tests {
         std::fs::write(lib.join("nested").join("libfile"), b"lib").unwrap();
         std::fs::write(source.join("smolvm"), "#!/bin/sh\n").unwrap();
         std::fs::write(source.join("smolvm-bin"), "#!/bin/sh\n").unwrap();
-        std::fs::write(source.join("storage-template.ext4"), b"template").unwrap();
         std::fs::write(
             source.join("storage-template.ext4.zst"),
             b"compressed-template",
@@ -967,6 +974,19 @@ mod tests {
             data_dir: directory.path().join("data"),
             bin_dir: directory.path().join("bin"),
         };
+        std::fs::create_dir_all(&install.prefix).unwrap();
+        std::fs::write(install.prefix.join("storage-template.ext4"), b"stale").unwrap();
+        std::fs::write(install.prefix.join("overlay-template.ext4"), b"stale").unwrap();
+        std::fs::write(
+            install.prefix.join("storage-template.ext4.zst"),
+            b"stale-compressed",
+        )
+        .unwrap();
+        std::fs::write(
+            install.prefix.join("overlay-template.ext4.zst"),
+            b"stale-compressed",
+        )
+        .unwrap();
         if let Err(error) = install_smolvm_from_archive(&archive_path, "9.9.9", &install) {
             eprintln!("install error: {error:?}");
             panic!("install failed: {error}");
@@ -982,10 +1002,8 @@ mod tests {
         );
         assert!(install.prefix.join("smolvm").is_file());
         assert!(install.prefix.join("smolvm-bin").is_file());
-        assert_eq!(
-            std::fs::read(install.prefix.join("storage-template.ext4")).unwrap(),
-            b"template"
-        );
+        assert!(!install.prefix.join("storage-template.ext4").exists());
+        assert!(!install.prefix.join("overlay-template.ext4").exists());
         assert_eq!(
             std::fs::read(install.prefix.join("storage-template.ext4.zst")).unwrap(),
             b"compressed-template"
