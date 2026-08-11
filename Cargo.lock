@@ -1849,7 +1849,7 @@ dependencies = [
 
 [[package]]
 name = "preloop-cli"
-version = "0.29.9"
+version = "0.29.9-rc"
 dependencies = [
  "anyhow",
  "axum",
