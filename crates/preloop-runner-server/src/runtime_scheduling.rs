@@ -1476,14 +1476,31 @@ pub(crate) fn pair_registered_runner(inner: &mut InnerState, runner_id: i64) {
         .map(|(key, _)| key.clone())
         .collect();
     for key in dead {
-        if clear_assignment(inner, key.0, &key.1) && inner.pool_assignments_enabled {
-            info!(
-                run_id = %key.0,
-                job_id = %key.1.0,
-                "stale binding released; job requeued at back of pool waitlist"
-            );
-            inner.pool_pending.insert(key, now);
+        // Only the pool waitlist can re-mark a released job. In strict
+        // non-pool mode there is no waitlist: clearing the stale binding
+        // would leave the job with neither a binding nor a mark, and strict
+        // claim_permitted requires one — the job would strand forever.
+        // Keep the stale record there; claim_permitted still lets verified
+        // runners take it over once it ages past the binding TTL.
+        if !inner.pool_assignments_enabled {
+            continue;
         }
+        // Preserve the original first-bound stamp. Clearing the record would
+        // reset the bounded claim window on the replacement pairing, so
+        // repeated provisioning failures could again starve healthy runners
+        // for as long as the churn continues. Keep the record (re-stamped
+        // fresh so the claim gate behaves like the fresh waitlist mark) and
+        // re-mark the job at the back of the line; the pairing rebinds with
+        // the preserved first_at.
+        if let Some(record) = inner.job_assignments.get_mut(&key) {
+            record.at = now;
+        }
+        info!(
+            run_id = %key.0,
+            job_id = %key.1.0,
+            "stale binding released; job requeued at back of pool waitlist"
+        );
+        inner.pool_pending.insert(key, now);
     }
 
     // Pair the earliest-waiting job this runner can serve. Every mark is

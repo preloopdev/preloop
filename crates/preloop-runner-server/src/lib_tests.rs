@@ -7623,8 +7623,24 @@ async fn check_run_ids_survive_a_restart_before_any_job_event() {
     // parallel test's token would flip the check-run path from mock to a real
     // GitHub API call. The mock path is the contract under test.
     let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let saved_token = std::env::var_os("PRELOOP_GITHUB_TOKEN");
+    let saved_api_url = std::env::var_os("PRELOOP_GITHUB_API_URL");
     std::env::remove_var("PRELOOP_GITHUB_TOKEN");
     std::env::remove_var("PRELOOP_GITHUB_API_URL");
+    struct RestoreGitHubEnv(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
+    impl Drop for RestoreGitHubEnv {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => std::env::set_var("PRELOOP_GITHUB_TOKEN", value),
+                None => std::env::remove_var("PRELOOP_GITHUB_TOKEN"),
+            }
+            match &self.1 {
+                Some(value) => std::env::set_var("PRELOOP_GITHUB_API_URL", value),
+                None => std::env::remove_var("PRELOOP_GITHUB_API_URL"),
+            }
+        }
+    }
+    let _restore = RestoreGitHubEnv(saved_token, saved_api_url);
 
     let temp = tempfile::tempdir().unwrap();
     let ws_dir = temp.path().join("workspace");
@@ -14485,6 +14501,14 @@ async fn stale_binding_requeues_behind_newer_waits() {
             }
         }
     }
+    let key_a_first_at = {
+        let inner = state.inner.lock().await;
+        inner
+            .job_assignments
+            .get(&key_a)
+            .map(|r| r.first_at)
+            .unwrap()
+    };
     stage_provision_token(&state, "token-b");
     let (runner_b, _) =
         register_runner_with_token(&app, "machine-b", &["self-hosted"], Some("token-b")).await;
@@ -14492,8 +14516,8 @@ async fn stale_binding_requeues_behind_newer_waits() {
         let inner = state.inner.lock().await;
         assert_eq!(
             inner.job_assignments.len(),
-            1,
-            "the stale binding was released, not re-adopted"
+            2,
+            "the stale record is kept (its first_at rides the requeue), the newer wait still gets the machine"
         );
         assert_eq!(
             inner.job_assignments.get(&key_b).map(|r| r.runner_id),
@@ -14503,6 +14527,11 @@ async fn stale_binding_requeues_behind_newer_waits() {
         assert!(
             inner.pool_pending.contains_key(&key_a),
             "released job is back in the waitlist, not dropped"
+        );
+        assert_eq!(
+            inner.job_assignments.get(&key_a).map(|r| r.first_at),
+            Some(key_a_first_at),
+            "the requeue must not reset the bounded claim window"
         );
     }
 
@@ -14517,6 +14546,11 @@ async fn stale_binding_requeues_behind_newer_waits() {
             inner.job_assignments.get(&key_a).map(|r| r.runner_id),
             Some(runner_c),
             "released job is paired once it reaches the front of the waitlist"
+        );
+        assert_eq!(
+            inner.job_assignments.get(&key_a).map(|r| r.first_at),
+            Some(key_a_first_at),
+            "the replacement pairing keeps the original first-bound stamp"
         );
     }
 }
@@ -14667,6 +14701,70 @@ async fn strict_mode_refuses_unassigned_dispatch() {
     assert!(
         delivered.is_null(),
         "strict mode: unassigned job is never dispatched: {delivered}"
+    );
+}
+
+#[tokio::test]
+async fn strict_non_pool_mode_keeps_a_stale_binding_claimable() {
+    // Strict mode without an embedded pool has no waitlist to re-mark a
+    // released job on. Clearing a stale binding there used to leave the job
+    // with neither a binding nor a mark, and strict claim_permitted requires
+    // one — the job stranded forever while its machine had died. The stale
+    // record must survive so a verified replacement runner can take over.
+    let temp = tempfile::tempdir().unwrap();
+    let state = pool_managed_state(&temp).await;
+    state.inner.lock().await.require_job_assignments = true;
+    state.inner.lock().await.pool_assignments_enabled = false;
+    let app = app(state.clone(), CancellationToken::new());
+
+    // A pre-registered idle runner gets the queue-time binding.
+    let (runner_a, token_a) =
+        register_runner_with_token(&app, "machine-a", &["self-hosted"], None).await;
+    let (_, session) = create_disttask_session(&app, &token_a, runner_a).await;
+    let session_id = session["sessionId"].as_str().unwrap();
+
+    let accepted = submit_simple_run(&app).await;
+    assert_eq!(accepted["queued_jobs"], 1);
+    {
+        let inner = state.inner.lock().await;
+        let key = inner.job_assignments.keys().next().cloned().unwrap();
+        assert_eq!(
+            inner.job_assignments.get(&key).map(|r| r.runner_id),
+            Some(runner_a),
+            "queue-time binding assigned the job to the idle runner"
+        );
+    }
+
+    // machine-a dies without claiming; the binding goes stale.
+    {
+        let mut inner = state.inner.lock().await;
+        for record in inner.job_assignments.values_mut() {
+            record.at = std::time::SystemTime::now()
+                - crate::runtime_scheduling::CLAIM_BINDING_TTL
+                - std::time::Duration::from_secs(1);
+            record.first_at = record.at;
+        }
+    }
+
+    // A fresh pool-authorized runner registers (provision token, so the
+    // pairing path runs): the stale binding must survive and still let it
+    // claim (kept, not cleared-and-stranded).
+    stage_provision_token(&state, "token-b");
+    let (runner_b, token_b) =
+        register_runner_with_token(&app, "machine-b", &["self-hosted"], Some("token-b")).await;
+    let (_, session_b) = create_disttask_session(&app, &token_b, runner_b).await;
+    let session_b_id = session_b["sessionId"].as_str().unwrap();
+    let delivered = poll_message(&app, &token_b, session_b_id).await;
+    assert!(
+        !delivered.is_null(),
+        "a verified runner must be able to take over the stale binding: {delivered}"
+    );
+
+    // The original runner's session is not the beneficiary.
+    let original = poll_message(&app, &token_a, session_id).await;
+    assert!(
+        original.is_null(),
+        "the dead machine's session must not receive the job"
     );
 }
 
