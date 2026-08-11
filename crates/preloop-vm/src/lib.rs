@@ -228,6 +228,18 @@ pub enum VmError {
         /// Bounded diagnostic.
         message: String,
     },
+    /// A plain-fork golden already has a live copy-on-write clone.
+    ///
+    /// SmolVM 1.7.4's `machine fork` does not retain a checkpoint for reuse.
+    /// Invoking it again against the paused base can invalidate storage still
+    /// used by the first clone, so callers must use an independent image.
+    #[error("fork base `{golden}` already has live clone `{clone}`")]
+    ForkBaseBusy {
+        /// Forkable base that cannot safely serve another clone yet.
+        golden: String,
+        /// Existing clone whose storage still depends on the base.
+        clone: String,
+    },
     /// Invalid SmolVM JSON output.
     #[error("invalid smolvm response: {0}")]
     Protocol(String),
@@ -359,6 +371,11 @@ pub struct SmolVmProvider {
     /// environment; unit tests substitute a pure lookup so the policy can be
     /// exercised without mutating global state.
     env_lookup: EnvLookup,
+    /// Whether this SmolVM retains a reusable RAM checkpoint after a plain
+    /// fork. Enabled by default while Preloop uses its patched SmolVM fork;
+    /// set `PRELOOP_SMOLVM_RETAINED_FORKS=false` to fall back to the safe
+    /// single-live-clone behavior.
+    retained_fork_checkpoints: bool,
 }
 
 impl Default for SmolVmProvider {
@@ -373,16 +390,18 @@ impl SmolVmProvider {
     /// Preloop-specific variables take precedence over the conventional proxy
     /// variables inherited by the process.
     pub fn from_environment(binary: impl Into<PathBuf>) -> Self {
-        Self::new(binary).with_pack_network(
-            first_nonempty_env(&[
-                "PRELOOP_RUNNER_PACK_PROXY",
-                "HTTPS_PROXY",
-                "https_proxy",
-                "HTTP_PROXY",
-                "http_proxy",
-            ]),
-            first_nonempty_env(&["PRELOOP_RUNNER_PACK_NO_PROXY", "NO_PROXY", "no_proxy"]),
-        )
+        Self::new(binary)
+            .with_retained_fork_checkpoints(env_flag_default_true("PRELOOP_SMOLVM_RETAINED_FORKS"))
+            .with_pack_network(
+                first_nonempty_env(&[
+                    "PRELOOP_RUNNER_PACK_PROXY",
+                    "HTTPS_PROXY",
+                    "https_proxy",
+                    "HTTP_PROXY",
+                    "http_proxy",
+                ]),
+                first_nonempty_env(&["PRELOOP_RUNNER_PACK_NO_PROXY", "NO_PROXY", "no_proxy"]),
+            )
     }
 }
 
@@ -392,6 +411,13 @@ fn first_nonempty_env(names: &[&str]) -> Option<String> {
             .ok()
             .filter(|value| !value.trim().is_empty())
     })
+}
+
+fn env_flag_default_true(name: &str) -> bool {
+    !matches!(
+        std::env::var(name).as_deref(),
+        Ok("0") | Ok("false") | Ok("FALSE") | Ok("no") | Ok("NO")
+    )
 }
 
 impl SmolVmProvider {
@@ -407,7 +433,18 @@ impl SmolVmProvider {
             forked_machines: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             socket_mount_supported: Arc::new(tokio::sync::OnceCell::new()),
             env_lookup: process_env,
+            retained_fork_checkpoints: true,
         }
+    }
+
+    /// Allow multiple live plain forks from one golden.
+    ///
+    /// Disable this only when the resolved SmolVM predates the retained-
+    /// checkpoint fix. Older releases leave the golden paused after the first
+    /// fork and cannot safely serve another clone.
+    pub fn with_retained_fork_checkpoints(mut self, enabled: bool) -> Self {
+        self.retained_fork_checkpoints = enabled;
+        self
     }
 
     /// Override the maximum bytes retained from each process stream.
@@ -868,23 +905,31 @@ impl VmProvider for SmolVmProvider {
 
     /// Fork one clone from a golden, one fork per golden at a time.
     ///
-    /// SmolVM holds exactly one RAM checkpoint per golden: the first fork
-    /// freezes the base and publishes a retained checkpoint, and later forks
-    /// restore from that checkpoint instead of re-freezing. Two forks racing
-    /// the same golden break the invariant — the loser issues a second FORK
-    /// against an already-paused VM, and that failure's rollback resumes the
-    /// base and deletes the retained checkpoint. Every later fork then fails
-    /// with `golden '<name>' is already paused; a valid retained checkpoint is
-    /// required`, so the pool cannot produce another runner until the golden is
-    /// rebuilt from scratch: queued jobs stall indefinitely, in exchange for
-    /// the few hundred milliseconds a concurrent refill saves. SmolVM's own
-    /// fork-pool controller serializes on the golden for the same reason.
+    /// Released SmolVM versions before the retained-checkpoint fix freeze the
+    /// base for one live clone but do not persist a checkpoint for later plain
+    /// forks. For those versions, track live clones under the same per-golden
+    /// lock and reject a second call before invoking SmolVM. Patched builds may
+    /// opt into checkpoint reuse with `PRELOOP_SMOLVM_RETAINED_FORKS=true`.
     ///
     /// Different goldens still fork concurrently, and forks remain excluded
     /// from base construction, so a golden cannot be replaced underneath one.
     async fn fork(&self, golden: &MachineName, clone: &MachineName) -> Result<(), VmError> {
         let fork_lock = self.fork_lock(golden).await;
         let _fork_guard = fork_lock.lock().await;
+        if !self.retained_fork_checkpoints {
+            if let Some(live_clone) = self
+                .forked_machines
+                .lock()
+                .await
+                .iter()
+                .find_map(|(clone, owner)| (owner == golden.as_str()).then(|| clone.clone()))
+            {
+                return Err(VmError::ForkBaseBusy {
+                    golden: golden.as_str().to_owned(),
+                    clone: live_clone,
+                });
+            }
+        }
         let result = self
             .concurrent(
                 "fork",

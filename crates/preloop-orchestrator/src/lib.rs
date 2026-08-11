@@ -2569,18 +2569,7 @@ async fn provision_slot<P: VmProvider + 'static>(
     environment: RunnerEnvironment,
 ) -> Result<ReadyRunner, OrchestratorError> {
     let name = MachineName::new(format!("{}-{slot}-{generation}", config.name_prefix))?;
-    match provision_runner(
-        provider,
-        config,
-        &name,
-        golden,
-        keys,
-        &environment.base,
-        &environment.toolchains,
-        environment.curated,
-    )
-    .await
-    {
+    match provision_runner(provider, config, &name, golden, keys, &environment).await {
         Ok(run) => Ok(ReadyRunner {
             name,
             run,
@@ -2940,13 +2929,30 @@ async fn provision_runner<P: VmProvider + 'static>(
     name: &MachineName,
     golden: Option<&MachineName>,
     keys: &Arc<KeyPool>,
-    environment_base: &str,
-    toolchains: &[ToolchainLayer],
-    curated: bool,
+    environment: &RunnerEnvironment,
 ) -> Result<Vec<String>, OrchestratorError> {
+    let mut direct_create_from_packed = config.use_packed_artifact;
     let forked_golden = match golden {
         Some(golden) => match provider.fork(golden, name).await {
             Ok(()) => Some(golden),
+            Err(error @ VmError::ForkBaseBusy { .. })
+                if config.use_packed_artifact
+                    && golden.as_str() == format!("{}-golden", config.name_prefix) =>
+            {
+                // A live plain-fork clone still depends on the golden's frozen
+                // storage. Do not touch the base and do not create another VM
+                // from that same packed payload: SmolVM's mixed fork/create
+                // path has returned ESTALE in both machines. Boot this slot
+                // independently from the job's OCI environment instead.
+                warn!(
+                    machine = name.as_str(),
+                    golden = golden.as_str(),
+                    %error,
+                    "fork base busy; creating runner independently from the OCI image"
+                );
+                direct_create_from_packed = false;
+                None
+            }
             Err(error)
                 if config.use_packed_artifact
                     && golden.as_str() == format!("{}-golden", config.name_prefix) =>
@@ -2987,18 +2993,20 @@ async fn provision_runner<P: VmProvider + 'static>(
                                 golden = golden.as_str(),
                                 "fork base spent and cannot be re-armed (a live clone still \
                                  depends on it, or the partial clone could not be removed); \
-                                 falling back to direct creation"
+                                 falling back to independent OCI creation"
                             );
                             let _ = provider.delete(name).await;
+                            direct_create_from_packed = false;
                             None
                         }
                         Err(rearm_error) => {
                             error!(
                                 golden = golden.as_str(),
                                 %rearm_error,
-                                "failed to re-arm spent fork base; falling back to direct \
-                                 creation"
+                                "failed to re-arm spent fork base; falling back to independent \
+                                 OCI creation"
                             );
+                            direct_create_from_packed = false;
                             None
                         }
                     }
@@ -3046,7 +3054,7 @@ async fn provision_runner<P: VmProvider + 'static>(
             // The pack carries the apt baseline, but not necessarily apt's
             // indices — restore them before any workflow apt-installs. A
             // custom base is used as-is: no apt assumptions.
-            if curated {
+            if environment.curated {
                 if let Err(error) = provider.exec(name, &apt_lists_refresh_command()).await {
                     warn!(
                     machine = name.as_str(),
@@ -3062,7 +3070,7 @@ async fn provision_runner<P: VmProvider + 'static>(
             // cargo-dist dies with "you don't appear to have cargo installed",
             // blaming the workflow for a broken machine. A fully baked pack
             // pays one `command -v` per layer.
-            for layer in toolchains {
+            for layer in &environment.toolchains {
                 if verify_toolchain_installed(provider.as_ref(), name, layer)
                     .await
                     .is_ok()
@@ -3081,9 +3089,9 @@ async fn provision_runner<P: VmProvider + 'static>(
                 }
                 verify_toolchain_installed(provider.as_ref(), name, layer).await?;
             }
-        } else if curated {
+        } else if environment.curated {
             install_base_dependencies(provider.as_ref(), name).await?;
-            for layer in toolchains {
+            for layer in &environment.toolchains {
                 for command in layer.install_commands() {
                     if let Err(error) = provider.exec(name, &command).await {
                         return Err(error.into());
@@ -3095,16 +3103,18 @@ async fn provision_runner<P: VmProvider + 'static>(
             // Custom base image: used as-is, no apt bake, no toolchains.
             debug!(
                 machine = name.as_str(),
-                base = %environment_base,
+                base = %environment.base,
                 "custom base image — skipping the curated bake"
             );
         }
     } else {
-        let uses_packed_artifact = config.use_packed_artifact;
+        let uses_packed_artifact = direct_create_from_packed;
         let spec = MachineSpec {
             name: name.clone(),
             image: if uses_packed_artifact {
                 config.artifact_payload().display().to_string()
+            } else if config.use_packed_artifact {
+                environment.base.clone()
             } else {
                 config.base_image.clone()
             },
@@ -3135,9 +3145,9 @@ async fn provision_runner<P: VmProvider + 'static>(
         // installs are idempotent, so a fully baked artifact only pays the
         // presence checks. A custom base is the operator's contract: no apt
         // baseline, no toolchain curation.
-        if curated {
+        if environment.curated {
             install_base_dependencies(provider.as_ref(), name).await?;
-            for layer in toolchains {
+            for layer in &environment.toolchains {
                 for command in layer.install_commands() {
                     if let Err(error) = provider.exec(name, &command).await {
                         return Err(error.into());
@@ -3150,7 +3160,7 @@ async fn provision_runner<P: VmProvider + 'static>(
 
     let runner = format!("/opt/preloop/bin/{}", config.runner_binary_name);
     let mut labels = config.labels.clone();
-    for label in runner_environment_labels(environment_base) {
+    for label in runner_environment_labels(&environment.base) {
         if !labels
             .iter()
             .any(|existing| existing.eq_ignore_ascii_case(&label))
@@ -3424,7 +3434,9 @@ mod lifecycle_tests {
     struct TestProvider {
         machines: Mutex<HashMap<String, MachineState>>,
         events: Mutex<Vec<String>>,
+        created_images: Mutex<Vec<(String, String)>>,
         fail_fork: bool,
+        fork_base_busy: bool,
         /// Fail the next fork with the "spent fork base" signature, then
         /// succeed. Mirrors a golden whose retained checkpoint vanished.
         fail_fork_once_spent: Mutex<bool>,
@@ -3458,7 +3470,9 @@ mod lifecycle_tests {
             Self {
                 machines: Mutex::new(HashMap::new()),
                 events: Mutex::new(Vec::new()),
+                created_images: Mutex::new(Vec::new()),
                 fail_fork: false,
+                fork_base_busy: false,
                 fail_fork_once_spent: Mutex::new(false),
                 live_forks: Mutex::new(true),
                 fail_start,
@@ -3480,6 +3494,11 @@ mod lifecycle_tests {
 
         fn failing_fork(mut self) -> Self {
             self.fail_fork = true;
+            self
+        }
+
+        fn with_busy_fork_base(mut self) -> Self {
+            self.fork_base_busy = true;
             self
         }
 
@@ -3510,6 +3529,14 @@ mod lifecycle_tests {
 
         async fn events(&self) -> Vec<String> {
             self.events.lock().await.clone()
+        }
+
+        async fn created_image(&self, name: &MachineName) -> Option<String> {
+            self.created_images
+                .lock()
+                .await
+                .iter()
+                .find_map(|(created, image)| (created == name.as_str()).then(|| image.clone()))
         }
     }
 
@@ -3983,6 +4010,10 @@ chmod +x "$destination/bin/node"
                 .lock()
                 .await
                 .insert(spec.name.as_str().to_owned(), MachineState::Stopped);
+            self.created_images
+                .lock()
+                .await
+                .push((spec.name.as_str().to_owned(), spec.image.clone()));
             self.events
                 .lock()
                 .await
@@ -4014,6 +4045,12 @@ chmod +x "$destination/bin/node"
                 .lock()
                 .await
                 .push(format!("fork:{}:{}", golden.as_str(), clone.as_str()));
+            if self.fork_base_busy {
+                return Err(VmError::ForkBaseBusy {
+                    golden: golden.as_str().to_owned(),
+                    clone: "lifecycle-test-0-live".to_owned(),
+                });
+            }
             {
                 let mut spent = self.fail_fork_once_spent.lock().await;
                 if *spent {
@@ -4279,6 +4316,19 @@ chmod +x "$destination/bin/node"
         config
     }
 
+    fn test_runner_environment(
+        base: impl Into<String>,
+        toolchains: Vec<ToolchainLayer>,
+        curated: bool,
+    ) -> RunnerEnvironment {
+        RunnerEnvironment {
+            fingerprint: None,
+            base: base.into(),
+            toolchains,
+            curated,
+        }
+    }
+
     /// A retained SmolVM checkpoint can become unusable after the packed
     /// golden has been prepared. Retrying the same fork forever starves every
     /// queued job, while creating a runner directly from the same packed
@@ -4315,9 +4365,7 @@ chmod +x "$destination/bin/node"
             &name,
             Some(&golden),
             &Arc::new(KeyPool::new()),
-            &config.base_image,
-            &[],
-            true,
+            &test_runner_environment(config.base_image.clone(), Vec::new(), true),
         )
         .await
         .expect("a broken packed-golden fork falls back to direct creation");
@@ -4370,9 +4418,7 @@ chmod +x "$destination/bin/node"
             &name,
             Some(&golden),
             &Arc::new(KeyPool::new()),
-            &config.base_image,
-            &[],
-            true,
+            &test_runner_environment(config.base_image.clone(), Vec::new(), true),
         )
         .await
         .expect("the re-armed golden serves the fork");
@@ -4420,9 +4466,7 @@ chmod +x "$destination/bin/node"
             &name,
             Some(&golden),
             &Arc::new(KeyPool::new()),
-            &config.base_image,
-            &[],
-            true,
+            &test_runner_environment(config.base_image.clone(), Vec::new(), true),
         )
         .await
         .expect("falls back to direct creation");
@@ -4435,6 +4479,46 @@ chmod +x "$destination/bin/node"
         assert!(
             events.contains(&format!("delete:{}", name.as_str())),
             "the partial clone is cleaned up: {events:?}"
+        );
+        assert_eq!(
+            provider.created_image(&name).await.as_deref(),
+            Some(config.base_image.as_str()),
+            "a live clone makes the shared packed payload unsafe; fallback must use OCI"
+        );
+    }
+
+    /// The provider reports a live clone before invoking SmolVM for another
+    /// plain fork. The orchestrator must neither re-arm the shared golden nor
+    /// instantiate the packed payload beside that clone.
+    #[tokio::test]
+    async fn busy_packed_fork_base_uses_independent_environment_image() {
+        let provider =
+            Arc::new(TestProvider::new(false, false, false, false, false).with_busy_fork_base());
+        let config = packed_fork_config();
+        let golden = MachineName::new("lifecycle-test-golden").unwrap();
+        let name = MachineName::new("lifecycle-test-0-9").unwrap();
+        let environment_base = "mirror.gcr.io/library/ubuntu:22.04";
+
+        provision_runner(
+            &provider,
+            &config,
+            &name,
+            Some(&golden),
+            &Arc::new(KeyPool::new()),
+            &test_runner_environment(environment_base, Vec::new(), true),
+        )
+        .await
+        .expect("a busy plain-fork base falls back to an independent OCI machine");
+
+        let events = provider.events().await;
+        assert!(
+            !events.iter().any(|event| event.starts_with("rearm:")),
+            "a golden with a live clone must not be re-armed: {events:?}"
+        );
+        assert_eq!(
+            provider.created_image(&name).await.as_deref(),
+            Some(environment_base),
+            "fallback must use the job's resolved environment, not the shared packed payload"
         );
     }
 
@@ -4457,9 +4541,7 @@ chmod +x "$destination/bin/node"
             &name,
             Some(&golden),
             &Arc::new(KeyPool::new()),
-            &config.base_image,
-            &[],
-            true,
+            &test_runner_environment(config.base_image.clone(), Vec::new(), true),
         )
         .await
         .expect("falls back to direct creation");
@@ -4489,9 +4571,7 @@ chmod +x "$destination/bin/node"
             &name,
             Some(&golden),
             &Arc::new(KeyPool::new()),
-            "mirror.gcr.io/library/ubuntu:22.04",
-            &[],
-            true,
+            &test_runner_environment("mirror.gcr.io/library/ubuntu:22.04", Vec::new(), true),
         )
         .await
         .expect_err("an environment-golden fork failure must propagate");
@@ -4523,9 +4603,11 @@ chmod +x "$destination/bin/node"
             &name,
             Some(&golden),
             &Arc::new(KeyPool::new()),
-            &config.base_image.clone(),
-            &[ToolchainLayer::Rust("1.97".to_owned())],
-            true,
+            &test_runner_environment(
+                config.base_image.clone(),
+                vec![ToolchainLayer::Rust("1.97".to_owned())],
+                true,
+            ),
         )
         .await
         .expect("the fork installs the toolchain its pack lacks");
@@ -4565,9 +4647,7 @@ chmod +x "$destination/bin/node"
             &name,
             Some(&golden),
             &Arc::new(KeyPool::new()),
-            &config.base_image.clone(),
-            &[],
-            true,
+            &test_runner_environment(config.base_image.clone(), Vec::new(), true),
         )
         .await
         .expect("provisioning succeeds");
@@ -4596,9 +4676,11 @@ chmod +x "$destination/bin/node"
             &name,
             Some(&golden),
             &Arc::new(KeyPool::new()),
-            &config.base_image.clone(),
-            &[ToolchainLayer::Rust("1.97".to_owned())],
-            true,
+            &test_runner_environment(
+                config.base_image.clone(),
+                vec![ToolchainLayer::Rust("1.97".to_owned())],
+                true,
+            ),
         )
         .await
         .expect("provisioning succeeds");
@@ -4790,9 +4872,7 @@ chmod +x "$destination/bin/node"
             &name,
             None,
             &Arc::new(KeyPool::new()),
-            "ghcr.io/acme/runner:latest",
-            &[],
-            false,
+            &test_runner_environment("ghcr.io/acme/runner:latest", Vec::new(), false),
         )
         .await
         .expect("custom base provisioning succeeds");

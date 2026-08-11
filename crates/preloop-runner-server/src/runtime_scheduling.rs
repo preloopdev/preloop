@@ -1296,10 +1296,39 @@ pub(crate) fn take_matching_job(
         job_matches_runner_capabilities(job, runner)
             && claim_permitted(inner, job, verified_runner_id)
     };
+    // A registration is paired to one concrete job before it begins polling.
+    // Prefer that fresh binding over takeover candidates whose original owner
+    // missed the claim window. Otherwise an old FIFO job can consume the new
+    // runner, leaving the job it was provisioned for queued and causing stale
+    // restored runs to advance ahead of the run the user just submitted.
+    let assigned_to_this_runner = |job: &QueuedJob| {
+        let Some(runner_id) = verified_runner_id else {
+            return false;
+        };
+        inner
+            .job_assignments
+            .get(&(job.run_id, job.job_id.clone()))
+            .is_some_and(|record| record.runner_id == runner_id && binding_fresh(record.at, now))
+    };
     let pos = inner
         .queue
         .iter()
-        .position(|job| job_labels_covered_exactly(&job.runs_on, &runner.labels) && claimable(job))
+        .position(|job| {
+            assigned_to_this_runner(job)
+                && job_labels_covered_exactly(&job.runs_on, &runner.labels)
+                && claimable(job)
+        })
+        .or_else(|| {
+            inner
+                .queue
+                .iter()
+                .position(|job| assigned_to_this_runner(job) && claimable(job))
+        })
+        .or_else(|| {
+            inner.queue.iter().position(|job| {
+                job_labels_covered_exactly(&job.runs_on, &runner.labels) && claimable(job)
+            })
+        })
         .or_else(|| inner.queue.iter().position(claimable))?;
     let job = inner.queue.remove(pos)?;
     let key = (job.run_id, job.job_id.clone());
@@ -2770,6 +2799,48 @@ mod assignment_tests {
         assert!(
             claimed.is_some(),
             "verified runner must take over the expired strict-mode assignment"
+        );
+    }
+
+    #[test]
+    fn freshly_paired_runner_prefers_its_assignment_over_stale_fifo_work() {
+        let mut inner = InnerState {
+            pool_assignments_enabled: true,
+            require_job_assignments: true,
+            ..Default::default()
+        };
+        let stale_job = test_queued_job("stale");
+        let stale_key = (stale_job.run_id, stale_job.job_id.clone());
+        let assigned_job = test_queued_job("assigned");
+        let assigned_key = (assigned_job.run_id, assigned_job.job_id.clone());
+        inner.queue.push_back(stale_job);
+        inner.queue.push_back(assigned_job);
+
+        let now = std::time::SystemTime::now();
+        inner.job_assignments.insert(
+            stale_key.clone(),
+            AssignmentRecord {
+                runner_id: 40,
+                at: now,
+                first_at: now - CLAIM_BINDING_TTL - std::time::Duration::from_secs(1),
+            },
+        );
+        inner.pool_pending.insert(stale_key, now);
+        inner.job_assignments.insert(
+            assigned_key,
+            AssignmentRecord {
+                runner_id: 41,
+                at: now,
+                first_at: now,
+            },
+        );
+
+        let claimed = take_matching_job(&mut inner, &self_hosted_caps(), Some(41))
+            .expect("the freshly paired runner has a claimable job");
+
+        assert_eq!(
+            claimed.job_id.0, "assigned",
+            "a stale takeover candidate must not displace the runner's fresh assignment"
         );
     }
 
