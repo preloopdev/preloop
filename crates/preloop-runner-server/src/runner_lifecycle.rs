@@ -104,6 +104,33 @@ pub(crate) async fn register_runner_native(
     Ok(Json(runner))
 }
 
+/// GET /api/v1/runners — list the runners currently registered with the
+/// control plane.
+///
+/// Read-only operator surface (native bearer). The CLI uses it to tell a
+/// queued run apart from a dead one: zero runners means no job will ever be
+/// picked up, however long `still waiting` prints.
+pub(crate) async fn list_runners_native(
+    State(shared): State<Arc<SharedState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let inner = shared.state.inner.lock().await;
+    let runners: Vec<serde_json::Value> = inner
+        .runners
+        .values()
+        .map(|runner| {
+            json!({
+                "id": runner.id,
+                "name": runner.name,
+                "labels": runner.labels,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "count": runners.len(),
+        "runners": runners,
+    })))
+}
+
 pub(crate) async fn create_session(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<RunnerSessionRequest>,

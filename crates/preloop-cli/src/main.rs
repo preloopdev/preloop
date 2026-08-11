@@ -1633,7 +1633,9 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     if let Some(token) = api_token() {
         request = request.bearer_auth(token);
     }
-    let response = request.send().await?;
+    let response = request.send().await.with_context(|| {
+        format!("cannot reach control plane at {url}; is `preloop serve` running?")
+    })?;
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
@@ -1663,6 +1665,10 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     // explanation, so the first poll failure is reported instead of being
     // folded into "no session".
     let mut poll_warned = false;
+    // Warn once (not every backpressure tick) when the control plane is
+    // unreachable or has no registered runners, so a queued run does not
+    // stream `still waiting` forever without the one fact that explains it.
+    let mut runner_warned = false;
     // Set when the run loop leaves through the debug prompt (abort, detach,
     // or a session error). The run is not terminal in those cases — the job
     // is paused and reattachable — so the generic conclusion below must not
@@ -1681,7 +1687,9 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         if let Some(token) = api_token() {
             events_request = events_request.bearer_auth(token);
         }
-        let events_response = events_request.send().await?;
+        let events_response = events_request.send().await.with_context(|| {
+            format!("cannot reach control plane at {url}; is `preloop serve` still running?")
+        })?;
         if !events_response.status().is_success() {
             let status = events_response.status();
             let body = events_response.text().await.unwrap_or_default();
@@ -1756,6 +1764,24 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                                          {paused_total} debug session(s) paused on the server \
                                          (preloop debug <id> to inspect)"
                                     );
+                                    if !runner_warned {
+                                        runner_warned = true;
+                                        match registered_runner_count(&client, &url).await {
+                                            Ok(0) => eprintln!(
+                                                "[preloop] warning: no runners are registered \
+                                                 on {url}; queued jobs will never start unless \
+                                                 one appears. Is `preloop serve` running with \
+                                                 its runner pool?"
+                                            ),
+                                            Ok(_) => {}
+                                            Err(error) => eprintln!(
+                                                "[preloop] warning: cannot check for runners on \
+                                                 {url} ({error:#}); queued jobs will not start \
+                                                 unless the control plane is back. Is \
+                                                 `preloop serve` still running?"
+                                            ),
+                                        }
+                                    }
                                     last_backpressure = std::time::Instant::now();
                                 }
                             }
@@ -1884,6 +1910,28 @@ fn same_file_path(left: &std::path::Path, right: &std::path::Path) -> bool {
         (Ok(left), Ok(right)) => left == right,
         _ => left == right,
     }
+}
+
+/// Number of runners currently registered with the control plane.
+///
+/// The `preloop run` watcher uses this to distinguish "waiting for pool
+/// capacity" from "nothing will ever pick the job up": zero registered
+/// runners means the queued jobs are stuck no matter how long the stream is
+/// held open.
+async fn registered_runner_count(client: &reqwest::Client, url: &str) -> anyhow::Result<usize> {
+    let mut request = client.get(format!("{url}/api/v1/runners"));
+    if let Some(token) = api_token() {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await?;
+    if !response.status().is_success() {
+        anyhow::bail!("server returned {}", response.status());
+    }
+    let body: serde_json::Value = response.json().await?;
+    Ok(body
+        .get("count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as usize)
 }
 
 fn update_run_status(current: &mut Option<ExecutionStatus>, next: Option<ExecutionStatus>) {

@@ -554,10 +554,12 @@ pub(crate) fn build_app(
         )
         .route(
             "/api/v1/runners",
-            post(register_runner_native).route_layer(middleware::from_fn_with_state(
-                shared.clone(),
-                require_native_bearer,
-            )),
+            post(register_runner_native)
+                .get(list_runners_native)
+                .route_layer(middleware::from_fn_with_state(
+                    shared.clone(),
+                    require_native_bearer,
+                )),
         )
         .route(
             "/api/v1/runners/purge",

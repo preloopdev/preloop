@@ -174,7 +174,8 @@ pub(crate) struct RunResponse {
         artifact,
         github_webhook,
         github_register,
-        github_callback
+        github_callback,
+        list_runners
     ),
     components(
         schemas(
@@ -592,3 +593,13 @@ fn github_register() {}
     responses((status = 200, content_type = "text/html", description = "App credentials page", body = String))
 )]
 fn github_callback() {}
+
+/// Registered runners (read-only; used by the CLI to detect a dead pool).
+#[utoipa::path(
+    get, path = "/api/v1/runners", tag = "Runners",
+    responses(
+        (status = 200, description = "Registered runners with labels", body = JsonValue)
+    ),
+    security(("native_bearer" = []))
+)]
+fn list_runners() {}

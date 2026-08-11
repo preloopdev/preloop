@@ -749,7 +749,17 @@ async fn openapi_document_lists_native_surface_and_excludes_runner_protocol() {
     assert!(!paths.keys().any(|path| path.starts_with("/_apis/")));
     assert!(!paths.keys().any(|path| path.starts_with("/broker/")));
     assert!(!paths.contains_key("/api/v1/scheduler/history"));
-    assert!(!paths.contains_key("/api/v1/runners"));
+    // The read-only runner listing is native operator surface (the CLI uses
+    // it to diagnose a dead pool); registration itself stays undocumented.
+    assert!(paths.contains_key("/api/v1/runners"));
+    assert_eq!(
+        paths["/api/v1/runners"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["get"]
+    );
 }
 
 #[tokio::test]
@@ -2609,6 +2619,59 @@ async fn registration_persists_runner_public_key_material() {
     let inner = state.inner.lock().await;
     assert_eq!(inner.runner_public_keys.get(&runner_id), Some(&public_key));
     assert!(inner.runner_rsa_public_keys.contains_key(&runner_id));
+}
+
+#[tokio::test]
+async fn native_runner_list_reports_registered_runners() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    // No runners yet: the CLI must be able to distinguish this from a
+    // healthy pool before it prints `still waiting` forever.
+    let empty = request_json(&app, Method::GET, "/api/v1/runners", Value::Null).await;
+    assert_eq!(empty["count"].as_u64(), Some(0));
+    assert_eq!(empty["runners"].as_array().map(Vec::len), Some(0));
+
+    let runner = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runners",
+        json!({
+            "name": "local",
+            "labels": ["self-hosted", "linux", "x64"]
+        }),
+    )
+    .await;
+    let runner_id = runner["id"].as_i64().unwrap();
+
+    let listed = request_json(&app, Method::GET, "/api/v1/runners", Value::Null).await;
+    assert_eq!(listed["count"].as_u64(), Some(1));
+    let runners = listed["runners"].as_array().unwrap();
+    assert_eq!(runners.len(), 1);
+    assert_eq!(runners[0]["id"].as_i64(), Some(runner_id));
+    assert_eq!(runners[0]["name"].as_str(), Some("local"));
+    let labels: Vec<&str> = runners[0]["labels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|label| label.as_str())
+        .collect();
+    assert_eq!(labels, vec!["self-hosted", "linux", "x64"]);
+
+    // The endpoint is native-bearer gated.
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/runners")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
