@@ -659,7 +659,20 @@ fn node_externals_at(runner_root: &str) -> Vec<Vec<String>> {
 /// on the engine's start-up critical path. Exposed for the fidelity tests.
 pub fn base_install_script() -> String {
     format!(
-        "apt-get update -qq && \
+        "(find /usr/bin /usr/sbin /bin /sbin /etc -type f 2>/dev/null | \
+            while IFS= read -r f; do chown 0:0 \"$f\" 2>/dev/null; done) || true; \
+         chown 0:0 /etc/sudo.conf /etc/sudoers 2>/dev/null; \
+         for f in /etc/sudoers.d/*; do [ -f \"$f\" ] && chown 0:0 \"$f\" 2>/dev/null; done; \
+         chmod 0440 /etc/sudoers /etc/sudoers.d/* 2>/dev/null; \
+         (for b in sudo su mount umount passwd chsh chfn newgrp gpasswd expiry chage wall write pkexec ping fusermount fusermount3; do \
+            for p in /usr/bin/$b /bin/$b /usr/sbin/$b; do \
+              if [ -f \"$p\" ]; then chown 0:0 \"$p\" 2>/dev/null; chmod u+s \"$p\" 2>/dev/null; fi; \
+            done; \
+          done; \
+          for p in /usr/lib/openssh/ssh-keysign /usr/lib/dbus-1.0/dbus-daemon-launch-helper; do \
+            if [ -f \"$p\" ]; then chown 0:0 \"$p\" 2>/dev/null; chmod u+s \"$p\" 2>/dev/null; fi; \
+          done) && \
+         apt-get update -qq && \
          (echo \"### install hosted apt baseline\" >&2 && \
           if DEBIAN_FRONTEND=noninteractive \
              apt-get -s install -qq --no-install-recommends {base_packages_pinned} >/dev/null 2>&1; then \
@@ -733,12 +746,19 @@ pub fn base_install_script() -> String {
           curl -fsSL \"https://nodejs.org/dist/v{BASE_NODE_VERSION}/node-v{BASE_NODE_VERSION}-linux-$NODE_ARCH.tar.gz\" \
             | tar -xz --strip-components=1 -C /usr/local) && \
          (install -m 0755 -d /etc/apt/keyrings && \
-          echo \"### fetch docker gpg\" >&2 && \
+         (echo \"### fetch docker gpg\" >&2 && \
           curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc && \
           echo \"deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable\" > /etc/apt/sources.list.d/docker.list && \
           apt-get update -qq && \
           DEBIAN_FRONTEND=noninteractive \
           apt-get install -y -qq {docker_packages} && \
+          (echo \"### install gh cli\" >&2 && \
+           curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+           echo \"deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\" > /etc/apt/sources.list.d/github-cli.list && \
+          apt-get update -qq && \
+          DEBIAN_FRONTEND=noninteractive \
+           apt-get install -y -qq gh && \
+           gh --version | head -1) && \
           echo \"### overlay docker v{DOCKER_VERSION}\" >&2 && \
           rm -rf /tmp/docker-static && mkdir -p /tmp/docker-static && \
           curl -fsSL \"https://download.docker.com/linux/static/stable/$DOCKER_STATIC_ARCH/docker-{DOCKER_VERSION}.tgz\" \
@@ -756,7 +776,7 @@ pub fn base_install_script() -> String {
           docker buildx version | grep -F 'v{DOCKER_BUILDX_VERSION}' && \
           docker compose version --short | grep -F '{DOCKER_COMPOSE_VERSION}' && \
           mkdir -p {DOCKER_DATA_ROOT} /etc/docker && \
-          printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\"}}\\n' > /etc/docker/daemon.json) && \
+          printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\"}}\\n' > /etc/docker/daemon.json)) && \
          (echo \"### fetch cargo-shear\" >&2 && \
           curl -sSL https://github.com/Boshen/cargo-shear/releases/download/v{CARGO_SHEAR_VERSION}/cargo-shear-$(uname -m)-unknown-linux-musl.tar.gz 2>/dev/null | tar -xz -C /usr/local/bin 2>/dev/null || true) && \
          (echo \"### bake git v{GIT_VERSION}\" >&2 && \
@@ -1277,7 +1297,16 @@ impl RunnerPoolConfig {
     }
 
     fn artifact_payload(&self) -> PathBuf {
-        self.artifact_stem.clone()
+        // The packed artifact is keyed by the resolved base image AND the
+        // environment fingerprint (toolchains + curated bake content). A
+        // stem-only key would let a golden keep the previous bake forever:
+        // bake-content changes (package pins, the ownership repair, new
+        // toolchains) must invalidate the pack or the fork base silently
+        // serves jobs the old toolchain.
+        let fingerprint = EnvironmentSpec::for_base(self.base_image.clone()).fingerprint;
+        let mut path = self.artifact_stem.clone().into_os_string();
+        path.push(format!("-{fingerprint}"));
+        PathBuf::from(path)
     }
 }
 
@@ -2912,6 +2941,7 @@ async fn run_until_exit<P: VmProvider + 'static>(
 /// Create, boot, and register one ephemeral runner; return its `run` argv.
 ///
 /// The caller owns cleanup: on any error the machine may already exist.
+#[allow(clippy::too_many_arguments)]
 async fn provision_runner<P: VmProvider + 'static>(
     provider: &Arc<P>,
     config: &RunnerPoolConfig,
@@ -3329,9 +3359,16 @@ async fn hold_for_debugging(name: &MachineName, debug_dir: &Path, shutdown: &Can
     let _ = std::fs::remove_file(&marker);
 }
 
-/// Return the runner artifact payload generated for an output stem.
-pub fn artifact_payload(stem: &Path) -> PathBuf {
-    stem.to_path_buf()
+/// Return the runner artifact payload generated for an output stem and base
+/// image.
+pub fn artifact_payload(stem: &Path, base_image: &str) -> PathBuf {
+    // Keep in sync with `RunnerPoolConfig::artifact_payload`: the packed
+    // artifact is keyed by the resolved base image AND the environment
+    // fingerprint, so bake-content changes invalidate the pack.
+    let fingerprint = EnvironmentSpec::for_base(base_image.to_owned()).fingerprint;
+    let mut path = stem.as_os_str().to_owned();
+    path.push(format!("-{fingerprint}"));
+    PathBuf::from(path)
 }
 
 #[cfg(test)]

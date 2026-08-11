@@ -349,7 +349,11 @@ impl Fixture {
         fs::create_dir(&bundle).unwrap();
         let artifact_stem = root.join("runner-image");
         if payload_exists {
-            fs::write(artifact_payload(&artifact_stem), b"existing-artifact").unwrap();
+            fs::write(
+                artifact_payload(&artifact_stem, "ghcr.io/preloop/base:latest"),
+                b"existing-artifact",
+            )
+            .unwrap();
         }
         let control_socket = root.join("engine.sock");
         fs::write(&control_socket, b"test-control-socket").unwrap();
@@ -531,7 +535,7 @@ async fn artifact_preparation_runs_once_and_reuses_payload_on_next_run() {
     task_shutdown.cancel();
     task.await.unwrap().unwrap();
 
-    assert!(artifact_payload(&fixture.config.artifact_stem).is_file());
+    assert!(artifact_payload(&fixture.config.artifact_stem, &fixture.config.base_image).is_file());
     let first = provider.snapshot().await;
     assert_eq!(first.pack_calls, 1);
     assert_eq!(

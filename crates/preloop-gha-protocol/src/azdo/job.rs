@@ -311,6 +311,10 @@ pub struct TaskStep {
     pub inputs: BTreeMap<String, String>,
     pub env: BTreeMap<String, String>,
     pub continue_on_error: Option<bool>,
+    /// Shell override for script steps (`shell:`), carried in the step
+    /// inputs exactly like the official runner's ScriptHandler expects
+    /// (`Inputs["shell"]`, falling back to the job's `defaults.run.shell`).
+    pub shell: Option<String>,
     pub working_directory: Option<String>,
     pub timeout_in_minutes: Option<u32>,
 }
@@ -325,6 +329,9 @@ impl Serialize for TaskStep {
         let mut inputs = self.inputs.clone();
         if let Some(script) = &self.script {
             inputs.insert("script".to_owned(), script.clone());
+            if let Some(shell) = &self.shell {
+                inputs.insert("shell".to_owned(), shell.clone());
+            }
             if let Some(wd) = &self.working_directory {
                 inputs.insert("workingDirectory".to_owned(), wd.clone());
             }
@@ -393,6 +400,7 @@ impl<'de> Deserialize<'de> for TaskStep {
         let env = extract_template_map(obj.get("environment").or_else(|| obj.get("env")))
             .unwrap_or_default();
         let inputs = extract_template_map(obj.get("inputs")).unwrap_or_default();
+        let shell = inputs.get("shell").cloned();
 
         // In the new serialization format, `script` lives inside the `inputs`
         // TemplateToken map instead of as a top-level field.
@@ -427,6 +435,7 @@ impl<'de> Deserialize<'de> for TaskStep {
                 .and_then(|v| serde_json::from_value(v.clone()).ok()),
             env,
             inputs,
+            shell,
             continue_on_error: obj.get("continueOnError").and_then(|v| {
                 v.as_bool()
                     .or_else(|| v.get("bool").and_then(serde_json::Value::as_bool))
@@ -473,6 +482,12 @@ fn extract_template_map(value: Option<&serde_json::Value>) -> Option<BTreeMap<St
                     v.as_str()
                         .map(str::to_owned)
                         .or_else(|| v.get("lit").and_then(|l| l.as_str()).map(str::to_owned))
+                        // Type-3 expression tokens carry the value in `expr`
+                        // (e.g. `format('...', ...)` for values containing
+                        // `${{ }}`). The runner evaluates them at step time,
+                        // so the raw expression string must survive the
+                        // extraction instead of collapsing to empty.
+                        .or_else(|| v.get("expr").and_then(|e| e.as_str()).map(str::to_owned))
                 })
                 .unwrap_or_default();
             map.insert(key, val);
@@ -753,6 +768,7 @@ mod tests {
             inputs: BTreeMap::new(),
             env: BTreeMap::new(),
             continue_on_error: None,
+            shell: None,
             working_directory: None,
             timeout_in_minutes: None,
         };
