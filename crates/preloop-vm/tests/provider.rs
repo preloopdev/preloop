@@ -775,15 +775,15 @@ printf 'exit %s\n' "$6" >> "$0.forklog"
         false
     }
 
-    /// SmolVM keeps one RAM checkpoint per golden: the first fork freezes the
-    /// base and later forks restore from the retained checkpoint. A second fork
-    /// racing the first FORKs an already-paused VM, and that failure's rollback
-    /// resumes the base and drops the checkpoint — after which every fork from
-    /// that golden fails and queued jobs stall until the golden is rebuilt.
+    /// Plain `machine fork` in SmolVM 1.7.4 does not persist a reusable
+    /// checkpoint. Once one live clone exists, invoking SmolVM for a second
+    /// clone fails against the paused base and can invalidate the first clone's
+    /// storage. The provider must reject that second clone before spawning the
+    /// command.
     #[tokio::test]
-    async fn forks_from_one_golden_never_overlap() {
+    async fn second_live_clone_from_one_golden_is_rejected_without_spawning_smolvm() {
         let (_directory, executable) = fake_blocking_fork_smolvm();
-        let provider = SmolVmProvider::new(&executable);
+        let provider = SmolVmProvider::new(&executable).with_retained_fork_checkpoints(false);
         let golden = MachineName::new("runner-golden").unwrap();
         let first = MachineName::new("runner-0-1").unwrap();
         let second = MachineName::new("runner-1-1").unwrap();
@@ -818,14 +818,70 @@ printf 'exit %s\n' "$6" >> "$0.forklog"
 
         fs::write(executable.with_extension("release"), "").unwrap();
         one.await.unwrap().unwrap();
-        two.await.unwrap().unwrap();
+        let error = two
+            .await
+            .unwrap()
+            .expect_err("a second live clone from one plain-fork golden must be rejected");
+        assert!(matches!(
+            error,
+            VmError::ForkBaseBusy {
+                ref golden,
+                ref clone,
+            } if golden == "runner-golden" && clone == "runner-0-1"
+        ));
 
         let log = fork_log(&executable);
-        let order: Vec<&str> = log.iter().map(|line| &line[..5]).collect();
         assert_eq!(
-            order,
-            ["enter", "exit ", "enter", "exit "],
-            "strictly one fork at a time: {log:?}"
+            log,
+            ["enter runner-0-1", "exit runner-0-1"],
+            "the rejected clone must never invoke SmolVM: {log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_checkpoint_mode_allows_multiple_live_clones() {
+        let (_directory, executable) = fake_blocking_fork_smolvm();
+        // This test intentionally uses the default: the patched SmolVM
+        // release is the normal runtime path now.
+        let provider = SmolVmProvider::new(&executable);
+        let golden = MachineName::new("runner-golden").unwrap();
+        let first = MachineName::new("runner-0-1").unwrap();
+        let second = MachineName::new("runner-1-1").unwrap();
+
+        let one = {
+            let provider = provider.clone();
+            let (golden, first) = (golden.clone(), first.clone());
+            tokio::spawn(async move { provider.fork(&golden, &first).await })
+        };
+        let two = {
+            let provider = provider.clone();
+            let (golden, second) = (golden.clone(), second.clone());
+            tokio::spawn(async move { provider.fork(&golden, &second).await })
+        };
+
+        assert!(wait_for_entries(&executable, 1).await);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            fork_log(&executable)
+                .iter()
+                .filter(|line| line.starts_with("enter"))
+                .count(),
+            1,
+            "the provider still serializes fork commands: {:?}",
+            fork_log(&executable)
+        );
+        fs::write(executable.with_extension("release"), "").unwrap();
+        one.await.unwrap().unwrap();
+        two.await.unwrap().unwrap();
+
+        assert_eq!(
+            fork_log(&executable),
+            [
+                "enter runner-0-1",
+                "exit runner-0-1",
+                "enter runner-1-1",
+                "exit runner-1-1"
+            ]
         );
     }
 

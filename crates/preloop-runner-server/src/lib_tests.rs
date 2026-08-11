@@ -13493,7 +13493,7 @@ jobs:
                     .and_then(Value::as_str)
             })
     }
-    let claimed_token = acquired_input(&checkout, "token").expect("claimed pinned token");
+    let claimed_token = acquired_input(checkout, "token").expect("claimed pinned token");
     assert_ne!(
         claimed_token, pinned_token,
         "claim must replace the submission-time token with a fresh one"
