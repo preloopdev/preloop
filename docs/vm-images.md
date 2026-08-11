@@ -207,14 +207,16 @@ You can point Preloop at the snapshot directly, with no golden:
 ```sh
 PRELOOP_RUNNER_BASE_IMAGE='ghcr.io/<your-org>/runner-images:ubuntu24-runner-large-latest-arm64' \
 PRELOOP_USE_PACKED_GOLDEN=false \
+PRELOOP_RUNNER_STORAGE_GB=80 \
 preloop serve
 ```
 
 Cold provisioning pulls the OCI image and bakes the runner baseline into each
-new VM. That works, but the official snapshots are large (about 20 GB
-compressed, 60 GB extracted), so every new runner pays a multi-GB pull and
-bake before its first job. For the official image we recommend packing a
-golden once instead:
+new VM (`PRELOOP_RUNNER_STORAGE_GB=80` covers the ~60 GB extracted snapshot).
+That works, but the official snapshots are large (about 20 GB compressed,
+60 GB extracted), so every new runner pays a multi-GB pull and bake before
+its first job. For the official image we recommend packing a golden once
+instead:
 
 ```sh
 OFFICIAL_IMAGE='ghcr.io/<your-org>/runner-images:ubuntu24-runner-large-latest-arm64'
