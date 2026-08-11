@@ -9,6 +9,116 @@ Releases before v0.27.0 predate the changelog.
 
 ## [Unreleased]
 
+### Added
+
+- `docs/internal/threatmodel.md`: threat model overview — attacker
+  assumptions, deployment topologies, defenses enforced for each attack
+  class (VM escape, hostile egress, secret theft, control-plane
+  impersonation, resource sabotage, supply chain), and candid current
+  limitations (internal doc).
+
+### Security
+
+- Harden standalone SmolVM execution for hostile workflow code: every Linux
+  operation that can boot or restart a machine (create, start, start_forkable,
+  fork, exec, pack) and every direct `smolvm machine exec`/`cp`/`shell` call
+  in the CLI (which connect to a machine, starting it when stopped) now run
+  `smolvm` with `SMOLVM_SECCOMP=enforce` and `SMOLVM_LANDLOCK=enforce` — the
+  hardening `smolvm serve` applies — so each `_boot-vm` is confined by
+  the syscall allowlist and filesystem Landlock rules instead of only
+  `harden_self`. A pre-set operator value wins (upstream precedence) but is
+  validated: modes SmolVM does not recognize fail the operation rather than
+  silently booting unconfined. macOS is unchanged (both controls are no-ops
+  upstream there). The policy is one exported function shared by the
+  provider and the CLI, with per-path command-environment tests.
+  Note that Landlock matches upstream exactly, while seccomp does not:
+  upstream `serve` defaults it on Linux/x86_64 only, though the boot
+  subprocess honours it on aarch64 too, so on Linux/aarch64 Preloop enables a
+  filter upstream leaves off. `docs/setup.md` documents the `Seccomp: 2`
+  check to confirm it on a new aarch64 host.
+- Per-VM host resource containment on Linux: the systemd service delegates
+  its cgroup subtree (`Delegate=cpu memory pids`) so every `_boot-vm` places
+  itself in a `vm-<pid>` leaf capped on CPU, PIDs, and memory. `Delegate=`
+  alone is insufficient — systemd chowns the subtree to the service user but
+  leaves `cgroup.subtree_control` empty, so child leaves get no limit files —
+  so the **server** performs the same one-time setup `smolvm serve` does
+  (vacate into a `preloop-supervisor` leaf, then enable the controllers on the
+  now-empty unit cgroup) via an explicit `init_vm_cgroup_delegation()` at
+  startup. The CLI never calls it: `preloop shell` and the debug session use a
+  read-only check and never mutate the cgroup hierarchy. No usable delegation,
+  no variable; the standalone path never claims per-VM UID isolation, which
+  requires a privileged supervisor.
+- The generated systemd service now runs under a dedicated `preloop` system
+  account (created at install, `kvm` group when `/dev/kvm` exists) instead of
+  root: a guest→VMM escape inherits the service identity, so root would hand
+  it the host. The unit adds an empty capability bounding set,
+  `ProtectKernelModules`/`ProtectKernelLogs`/`ProtectClock`,
+  `LockPersonality`, `RestrictRealtime`, and — critically — no longer grants
+  the serving unit write access to its own executable (only the root update
+  oneshot can replace the binary). State paths, socket activation, networking,
+  and `/dev/kvm` access are preserved; SmolVM data is pinned under
+  `PRELOOP_HOME/smolvm` and the installer bootstraps a service-visible
+  smolvm when only a root-home install exists — copied to
+  `/usr/local/lib/preloop/smolvm-prefix` and refreshed on re-install when the
+  source is newer, never shadowing an independently installed system binary.
+  The refresh is atomic: the new prefix is fully assembled in a sibling
+  staging directory and swapped into place with a rename, so a running service
+  never observes a mixed prefix; staging and backup are cleaned up on success
+  and failure alike.
+- **Keep privileged install artifacts out of the service-writable state dir.**
+  `PRELOOP_HOME` must be writable by the service, and on Unix the *directory*
+  write bit governs unlink and rename, so anything inside it can be replaced
+  by the service whatever the file's own owner and mode are. Three artifacts
+  therefore moved out, each closing a reproduced escalation:
+  - the bootstrapped smolvm prefix now lives at
+    `/usr/local/lib/preloop/smolvm-prefix`, root-owned and `a+rX` (never
+    chowned to the service). `/usr/local/bin/smolvm` points into it and root
+    executes that path when `preloop update` probes smolvm, so the previous
+    service-owned copy was a direct service-user → root escalation. Re-install
+    also repairs an already-chowned prefix.
+  - the systemd environment file now lives at `/etc/preloop/environment`,
+    `root:root` 0600. It previously ended up service-owned after any
+    re-install (the state-dir chown preceded the rewrite, and the rewrite
+    truncates in place rather than replacing the inode), and because
+    `EnvironmentFile=` overrides the unit's `Environment=`, a compromised VMM
+    could persist `SMOLVM_SECCOMP=off` and return unconfined via
+    `Restart=on-failure`.
+  - the staged GitHub App key now lives at
+    `/etc/preloop/github-app-key.pem`, `root:preloop` 0640 in a
+    `root:preloop` 0750 directory — readable by the service, writable only by
+    root, and no longer replaceable by it.
+  `preloop server uninstall` removes all three, so secrets no longer outlive
+  an uninstall that only purges the state dir.
+
+### Changed
+
+- `preloop server install` (Linux, system scope) creates the `preloop` service
+  account, chowns the state dir to it, stages a `root:preloop` 0640 copy of
+  `--github-app-key` into `/etc/preloop` (the caller's original is never
+  modified — chowning a key under `/root` would be useless because the service
+  user cannot traverse the parent), preparing the directories first so the very
+  install with a key works against a not-yet-existing (default or nested)
+  `--home`, and prints the `sudo -u preloop env PRELOOP_HOME=… preloop setup
+  github --save` flow for writing `config.toml`; see `docs/setup.md` "VM
+  sandbox (Linux)" for the verification procedure and the macOS limitation.
+- `preloop server install` now rejects a system-scope `--home` under `/home`,
+  `/root`, or `/run/user`: the `preloop` account cannot traverse those
+  whatever the state dir's own mode is, so the previous `ReadWritePaths`
+  carve-out produced a unit that looked correct and failed at first start.
+
+### Fixed
+
+- `preloop-cli` and `preloop-vm` did not compile for Linux at all (a
+  use-after-move in `add_to_kvm_group`, a `format!` arity bug that also
+  silently dropped the webhook hint from the install summary, and two test
+  errors). Every one of these lives behind `#[cfg(target_os = "linux")]`, so a
+  macOS development host never parsed them, and the work had not yet been
+  pushed for CI — which does build on Linux — to see.
+  Also fixed the pre-existing `clippy::needless_return` in
+  `preloop-socket-activation`, and the swapped `dir`/timer arguments that made
+  the install summary print
+  `units:  + preloop-update.{service,timer}/preloop.{service,socket}/etc/...`.
+
 ## [0.29.9-rc] - 2026-08-11
 
 ### Fixed
@@ -66,7 +176,6 @@ Releases before v0.27.0 predate the changelog.
 - `macos`/`windows` jobs wait for a registered external host instead of being
   failed by the Linux-only starvation sweep.
 - macOS BSD `tar` missing `--verbatim-files-from` is handled in sync.
-
 ## [0.29.8] - 2026-08-09
 
 ### Fixed

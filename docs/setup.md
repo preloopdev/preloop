@@ -388,9 +388,59 @@ What it does:
   from an encrypted, host-bound blob instead of the config file; see
   "Where secrets live" in the Secrets section.
 - Configuration is written to a mode-0600 environment file
-  (`/var/lib/preloop/environment` on Linux) the webhook secret never lands
-  in a world-readable unit.
+  (`/etc/preloop/environment` on a Linux system install, `<home>/environment`
+  for `--user`) — the webhook secret never lands in a world-readable unit.
 - State lives in `/var/lib/preloop` (mode 0700; `--home` overrides).
+- **Linux only — dedicated service identity.** The systemd service runs under
+  a `preloop` system account (created automatically; `kvm` group membership
+  added when `/dev/kvm` exists) instead of root. This is the load-bearing
+  hardening for the VM pool: a guest→VMM escape lands in the SmolVM boot
+  subprocess, which inherits the service identity, so root would hand an
+  escape the whole host. The installer chowns the **state dir** to that
+  account, because the engine writes its database, `config.toml`, and keys
+  there.
+
+  Everything the service must *not* be able to rewrite deliberately lives
+  outside `PRELOOP_HOME`. On Unix the *directory* write bit governs unlink and
+  rename, so any file inside a directory the service owns can be replaced by
+  the service regardless of that file's own owner and mode. Accordingly:
+
+  | Artifact | Location | Ownership |
+  |---|---|---|
+  | environment file | `/etc/preloop/environment` | `root:root` 0600 |
+  | staged App key | `/etc/preloop/github-app-key.pem` | `root:preloop` 0640 |
+  | bootstrapped smolvm | `/usr/local/lib/preloop/smolvm-prefix` | `root:root`, `a+rX` |
+  | engine state | `/var/lib/preloop` | `preloop:preloop` 0700 |
+
+  `/etc/preloop` itself is `root:preloop` 0750: the service can traverse in to
+  read its key and nothing more. The environment file matters because
+  `EnvironmentFile=` overrides the unit's own `Environment=` — a
+  service-writable copy would let a compromised VMM persist
+  `SMOLVM_SECCOMP=off` across the next `Restart=on-failure` and come back
+  unconfined. The smolvm prefix matters because `/usr/local/bin/smolvm` points
+  into it and **root executes that path** (`preloop update` probes `smolvm`
+  before deciding to reinstall), so a service-writable prefix would be a
+  direct service-user → root escalation.
+
+  The key is staged rather than chowned in place because a key left in the
+  caller's tree (e.g. under `/root`) is unreachable no matter how it is
+  owned — the service user cannot traverse the parent. The caller's original
+  file is never modified. If smolvm is only installed under
+  `/root/.local/bin` (the `preloop update` / official-installer location), the
+  installer copies it into the prefix above and links `/usr/local/bin/smolvm`
+  so the service can resolve it; that copy is refreshed on every re-install
+  when the source is newer — re-run `sudo preloop server install` after
+  `sudo preloop update` — atomically (the new prefix is assembled in a
+  staging directory and swapped into place, so a running service never
+  observes a half-copied prefix), and an independently installed system
+  smolvm is never shadowed. The unit also delegates its cgroup subtree
+  (`Delegate=cpu memory pids`) so each VM gets its own capped cgroup, and
+  denies the service the ability to rewrite its own binary.
+
+  A system install requires a `--home` the service account can reach:
+  `/home/...`, `/root...`, and `/run/user/...` are rejected up front, because
+  `preloop` cannot traverse them whatever the state dir's own mode is. Use the
+  default `/var/lib/preloop`, another root-reachable path, or `--user`.
 
 The `--github-app-*` / `--webhook-secret` flags are optional at install time,
 but **you must define these secrets** for the service to be useful: without a
@@ -398,12 +448,79 @@ webhook secret the engine rejects every GitHub webhook delivery, and without
 an App key it cannot mint `GITHUB_TOKEN`. They land in the mode-0600
 environment file (never in the world-readable units); alternatively install
 first, then configure credentials with
-`PRELOOP_HOME=/var/lib/preloop preloop setup github --save` (writes the
-mode-0600 `config.toml` — see above). `preloop server install --dry-run`
-prints the full plan without touching the system, and
+`sudo -u preloop env PRELOOP_HOME=/var/lib/preloop preloop setup github --save`
+(writes the mode-0600 `config.toml` owned by the service account — see
+above; running it as root instead would write a file the service cannot
+read). `preloop server install --dry-run` prints the full plan without
+touching the system, and
 `sudo preloop server uninstall` removes the units while keeping
 `/var/lib/preloop` data; pass `--purge-data` to delete it. Manual copies of
 the units live in `contrib/systemd/`.
+
+### VM sandbox (Linux): seccomp, Landlock, per-VM cgroups
+
+Every Linux operation that can boot or restart a SmolVM machine runs
+`smolvm` with the hardening `smolvm serve` applies, inherited by the
+`_boot-vm` subprocess — the VM provider's create/start/fork/pack/exec paths
+and the CLI's direct `machine exec`/`cp`/`shell` calls (which connect to a
+machine, starting it when it is stopped) all go through the same policy:
+
+- `SMOLVM_SECCOMP=enforce` — a syscall allowlist kills the VMM on any
+  disallowed syscall (ptrace, `mount`, `bpf`, `unshare`, …).
+  **Arch note:** upstream `smolvm serve` only defaults this on
+  Linux/x86\_64 (`src/cli/serve.rs` is gated
+  `#[cfg(all(target_os = "linux", target_arch = "x86_64"))]`), while the boot
+  subprocess honours the variable on both x86\_64 and aarch64
+  (`src/cli/internal_boot.rs`). Preloop sets it on every Linux arch, so on
+  Linux/aarch64 it enables a filter upstream leaves off by default. Verify it
+  on a new aarch64 host with the `Seccomp: 2` check below before relying on
+  it.
+- `SMOLVM_LANDLOCK=enforce` — the VMM's filesystem view is restricted to its
+  own rootfs/disks/devices; the rest of the host is denied. (Fork clones skip
+  Landlock upstream because they must map the golden's memfd — they stay
+  confined by seccomp and the cgroup.) Upstream gates this on Linux only,
+  with no arch restriction, so Preloop matches it exactly.
+- `SMOLVM_CGROUP_ROOT` — when the service unit delegates its cgroup subtree
+  (it does by default), each `_boot-vm` places itself in a per-VM
+  `vm-<pid>` leaf capped on CPU, PIDs, and memory. Note that `Delegate=` alone
+  is not enough: systemd chowns the unit's cgroup subtree to the service user
+  but leaves `cgroup.subtree_control` **empty**, so a child leaf created there
+  has no `cpu.max`/`memory.max`/`pids.max`. The server therefore performs the
+  same one-time setup `smolvm serve` does at startup — move itself into a
+  `preloop-supervisor` leaf, then enable `cpu`/`memory`/`pids` on the now-empty
+  unit cgroup — and only then advertises the root. That write happens once,
+  explicitly, in the server; the CLI never mutates the cgroup hierarchy and
+  falls back to a read-only check, so `preloop shell` and the debug session
+  leave it untouched. No usable delegation, no variable.
+
+Both controls fail closed: if the operator has already set
+`SMOLVM_SECCOMP`/`SMOLVM_LANDLOCK` in the service environment, the pre-set
+value wins (the same precedence `smolvm serve` documents), but only modes
+SmolVM actually honors (`enforce`/`audit`/`off` for seccomp, `enforce`/`off`
+for Landlock) — an unrecognized value is a hard error rather than the silent
+"off" upstream would treat it as. Setting `SMOLVM_SECCOMP=off` /
+`SMOLVM_LANDLOCK=off` is the deliberate, visible escape hatch for a
+self-hosted single-tenant box that cannot tolerate the filters.
+
+**Verifying activation on Linux.** After the first machine exists, find the
+VMM and check the kernel's own record:
+
+```sh
+pgrep -af "_boot-vm"            # -> <pid> smolvm _boot-vm <config>
+sudo grep Seccomp /proc/<pid>/status        # -> Seccomp: 2 (filter active)
+sudo tr '\0' '\n' < /proc/<pid>/environ | grep -E '^SMOLVM_(SECCOMP|LANDLOCK|CGROUP_ROOT)='
+```
+
+`Seccomp: 2` is the kernel's confirmation that the allowlist is enforced.
+Landlock has no status field in `/proc`, so its activation is verified by the
+boot subprocess's environment (`SMOLVM_LANDLOCK=enforce` above) plus
+SmolVM's own fail-closed behavior: with the variable set, a Landlock
+restriction that fails to install aborts the boot rather than running
+unconfined. `SMOLVM_CGROUP_ROOT` should name the service's own cgroup
+(`/sys/fs/cgroup/system.slice/preloop.service`); the per-VM leaves appear as
+`vm-<pid>` subdirectories with `cpu.max`/`pids.max`/`memory.max` set.
+
+
 
 ### Rootless option: `--user`
 
