@@ -15,20 +15,14 @@ use tokio::io::AsyncWriteExt;
 
 const DEFAULT_REPOSITORY: &str = "preloopdev/preloop";
 const USER_AGENT: &str = concat!("preloop/", env!("CARGO_PKG_VERSION"));
-/// Temporary Preloop fork carrying the retained-checkpoint fix until SmolVM
-/// publishes the next official release.
-const SMOLVM_REPOSITORY: &str = "preloopdev/smolvm";
+const SMOLVM_REPOSITORY: &str = "smol-machines/smolvm";
 
-/// SmolVM version `preloop update` installs from the temporary Preloop fork
-/// when the resolved binary cannot mount sockets.
+/// SmolVM version `preloop update` installs when the resolved binary cannot
+/// mount sockets.
 ///
-/// Pinned to the last release whose macOS artifact ships a NET=1 libkrun and
-/// used as the temporary fork's compatibility version:
-/// 1.7.5's `lib/libkrun.dylib` does not export `krun_add_net_unixstream`,
-/// so `--net-backend virtio-net` (the egress-floor backend preloop-vm
-/// selects) cannot boot a machine on macOS with it. Revisit when upstream
-/// ships a release with the symbol again.
-const SMOLVM_VERSION: &str = "1.7.4";
+/// Pinned to the first official release carrying reusable retained fork
+/// checkpoints and the macOS network symbol required by preloop-vm.
+const SMOLVM_VERSION: &str = "1.7.7";
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct UpdateArgs {
@@ -301,30 +295,15 @@ async fn probe_smolvm_version(binary: &Path) -> Option<String> {
         .map(|version| version.trim_start_matches('v').to_owned())
 }
 
-fn smolvm_release_repository() -> String {
-    std::env::var("PRELOOP_SMOLVM_RELEASE_REPOSITORY")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| SMOLVM_REPOSITORY.to_owned())
-}
-
-fn smolvm_release_version() -> String {
-    std::env::var("PRELOOP_SMOLVM_RELEASE_VERSION")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| SMOLVM_VERSION.to_owned())
-}
-
-async fn smolvm_is_compatible(binary: &Path, expected_version: &str) -> bool {
+async fn smolvm_is_compatible(binary: &Path) -> bool {
     probe_mount_socket(binary).await
-        && probe_smolvm_version(binary).await.as_deref() == Some(expected_version)
+        && probe_smolvm_version(binary).await.as_deref() == Some(SMOLVM_VERSION)
 }
 
 /// Probe the resolved smolvm and install the exact verified release when its
 /// version or required socket-mount capability differs.
 async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
-    let expected_version = smolvm_release_version();
-    if smolvm_is_compatible(Path::new("smolvm"), &expected_version).await {
+    if smolvm_is_compatible(Path::new("smolvm")).await {
         return Ok(());
     }
     let platform = smolvm_platform().ok_or_else(|| {
@@ -334,11 +313,10 @@ async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
             std::env::consts::ARCH
         )
     })?;
-    let repository = smolvm_release_repository();
     let release = fetch_release(
         client,
-        &format!("https://api.github.com/repos/{repository}/releases"),
-        Some(&expected_version),
+        &format!("https://api.github.com/repos/{SMOLVM_REPOSITORY}/releases"),
+        Some(SMOLVM_VERSION),
     )
     .await?;
     let version = release
@@ -365,7 +343,7 @@ async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
     // The install lands in `~/.local/bin`; if PATH still resolves another
     // binary, the engine keeps failing and the user is left confused about
     // why the update did not help. Say so explicitly.
-    if !smolvm_is_compatible(Path::new("smolvm"), &expected_version).await {
+    if !smolvm_is_compatible(Path::new("smolvm")).await {
         bail!(
             "installed smolvm {version} to {}, but `smolvm` on PATH still resolves \
              to an incompatible version or lacks --mount-socket; make sure {} comes first",
@@ -408,6 +386,8 @@ fn install_smolvm_from_archive(
         "smolvm-bin",
         "storage-template.ext4",
         "overlay-template.ext4",
+        "storage-template.ext4.zst",
+        "overlay-template.ext4.zst",
     ] {
         let source = top.join(name);
         if source.is_file() {
@@ -885,7 +865,7 @@ mod tests {
             std::fs::set_permissions(&executable, permissions).unwrap();
 
             assert_eq!(
-                smolvm_is_compatible(&executable, SMOLVM_VERSION).await,
+                smolvm_is_compatible(&executable).await,
                 expected,
                 "version={version}, flag={flag}"
             );
@@ -918,6 +898,16 @@ mod tests {
         std::fs::write(source.join("smolvm"), "#!/bin/sh\n").unwrap();
         std::fs::write(source.join("smolvm-bin"), "#!/bin/sh\n").unwrap();
         std::fs::write(source.join("storage-template.ext4"), b"template").unwrap();
+        std::fs::write(
+            source.join("storage-template.ext4.zst"),
+            b"compressed-template",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("overlay-template.ext4.zst"),
+            b"compressed-overlay",
+        )
+        .unwrap();
         let rootfs = source.join("agent-rootfs");
         std::fs::create_dir_all(&rootfs).unwrap();
         std::fs::write(rootfs.join("rootfs.txt"), b"rootfs").unwrap();
@@ -976,6 +966,14 @@ mod tests {
         assert_eq!(
             std::fs::read(install.prefix.join("storage-template.ext4")).unwrap(),
             b"template"
+        );
+        assert_eq!(
+            std::fs::read(install.prefix.join("storage-template.ext4.zst")).unwrap(),
+            b"compressed-template"
+        );
+        assert_eq!(
+            std::fs::read(install.prefix.join("overlay-template.ext4.zst")).unwrap(),
+            b"compressed-overlay"
         );
         assert_eq!(
             std::fs::read(install.data_dir.join("agent-rootfs/rootfs.txt")).unwrap(),

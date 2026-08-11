@@ -78,15 +78,15 @@ ensure_runtime() {
     [ -x "$smolvm_bin" ] || die "smolvm was not installed at $smolvm_bin"
     local smolvm_version
     smolvm_version="$("$smolvm_bin" --version 2>/dev/null | awk '{print $NF}')"
-    [ "$smolvm_version" = "1.7.4" ] \
-        || die "expected smolvm 1.7.4, found ${smolvm_version:-unknown}"
+    [ "$smolvm_version" = "1.7.7" ] \
+        || die "expected smolvm 1.7.7, found ${smolvm_version:-unknown}"
 
     # Keep custom-prefix installs self-contained and ahead of any incompatible
     # system smolvm already on PATH.
     if [ "$BIN_DIR" != "$HOME/.local/bin" ]; then
         ln -sfn "$smolvm_bin" "$BIN_DIR/smolvm"
     fi
-    say "installed smolvm 1.7.4"
+    say "installed smolvm 1.7.7"
 }
 
 install_from_release() {

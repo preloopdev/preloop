@@ -258,8 +258,6 @@ steps.
 | `PRELOOP_RUNNER_POOL_ENABLED` | Enable the local microVM runner pool (default off) |
 | `PRELOOP_RUNNER_POOL_SIZE` | Pool size (warm forks/VMs) |
 | `PRELOOP_USE_FORK` | Run the pool as forked microVMs (default true with a packed golden) |
-| `PRELOOP_SMOLVM_RETAINED_FORKS` | `true` by default; set `false` only for an older official SmolVM build |
-| `PRELOOP_SMOLVM_RELEASE_REPOSITORY` / `PRELOOP_SMOLVM_RELEASE_VERSION` | Temporary SmolVM release source and tag overrides for `preloop update --ensure-runtime` (defaults to `preloopdev/smolvm` / `1.7.4`) |
 | `PRELOOP_USE_PACKED_GOLDEN` | Use a release or locally cached packed golden (default on; set `false` for cold OCI provisioning) |
 | `PRELOOP_GOLDEN_URL` | Override the packed golden URL; checksum URL is this value plus `.sha256` |
 | `PRELOOP_RUNNER_BASE_IMAGE` | Override the digest-pinned Ubuntu base identity at serve time; set it with `PRELOOP_GOLDEN_URL` for a custom packed golden |
