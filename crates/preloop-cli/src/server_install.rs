@@ -18,11 +18,46 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 
+#[cfg(any(target_os = "linux", test))]
+use crate::set_private_file_permissions;
 use crate::{set_private_directory_permissions, write_private_file};
 
 /// Default state directory for the service.
 pub(crate) const DEFAULT_HOME: &str = "/var/lib/preloop";
 
+/// Root-owned configuration directory for system-scope installs.
+///
+/// `PRELOOP_HOME` must be writable by the service (the engine creates its DB,
+/// `config.toml`, and key material there), and on Unix the *directory* write
+/// bit governs unlink and rename — so any file inside it can be replaced by
+/// the service no matter what that file's own owner and mode are. Install
+/// artifacts the service must not be able to rewrite therefore live here
+/// instead of under `PRELOOP_HOME`: the systemd `EnvironmentFile` (which
+/// overrides the unit's own `Environment=`, so a writable copy would let a
+/// compromised service turn its sandbox off across a restart) and the staged
+/// GitHub App key.
+const SYSTEM_CONFIG_DIR: &str = "/etc/preloop";
+
+/// Root-owned parent for the bootstrapped smolvm copy.
+///
+/// Never under `PRELOOP_HOME`: `/usr/local/bin/smolvm` points into this prefix
+/// and **root** executes that path (`preloop update` probes `smolvm` before
+/// deciding to reinstall), so a service-writable prefix is a direct
+/// service-user → root escalation.
+#[cfg(any(target_os = "linux", test))]
+const SMOLVM_PREFIX_PARENT: &str = "/usr/local/lib/preloop";
+
+/// Dedicated system account the hardened system-scope service runs under.
+///
+/// A guest→VMM escape lands in the SmolVM boot subprocess, which inherits the
+/// service identity: running the whole control plane as root would hand an
+/// escape the host. The installer creates the account (and kvm group
+/// membership for /dev/kvm) at install time; user-scope units keep the
+/// installing user's identity.
+#[cfg(any(target_os = "linux", test))]
+const SERVICE_USER: &str = "preloop";
+
+#[cfg(any(target_os = "macos", test))]
 const LAUNCHD_LABEL: &str = "dev.preloop.server";
 #[cfg(any(target_os = "macos", test))]
 const LAUNCHD_PLIST: &str = "/Library/LaunchDaemons/dev.preloop.server.plist";
@@ -43,7 +78,7 @@ pub(crate) enum ServerCommand {
     Uninstall(UninstallArgs),
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 pub(crate) struct InstallArgs {
     /// Address to bind. Defaults to the engine default (127.0.0.1:9090); on
     /// Linux the port is published through socket activation.
@@ -142,7 +177,54 @@ fn install(args: InstallArgs) -> Result<()> {
             exe.display()
         );
     }
-    let env_lines = config_env_lines(&args)?;
+    if let Some(key) = &args.github_app_key {
+        anyhow::ensure!(
+            key.exists(),
+            "--github-app-key {} does not exist",
+            key.display()
+        );
+    }
+    // A system install runs as the dedicated `preloop` account, which cannot
+    // traverse a 0700 /home/<user> or /root. Such a --home would produce an
+    // install that looks fine and then fails at first start, so reject it
+    // here rather than shipping a broken unit.
+    #[cfg(any(target_os = "linux", test))]
+    if !args.user && home_blocked_by_protect_home(&home) {
+        bail!(
+            "--home {} is unusable for a system install: the `{SERVICE_USER}` service \
+             account cannot traverse /home, /root, or /run/user. Use {DEFAULT_HOME} \
+             (the default) or another root-reachable path, or install with --user.",
+            home.display()
+        );
+    }
+    // The state dir must exist before anything is staged into it: the very
+    // first system install with --github-app-key targets a not-yet-created
+    // (default or nested) directory, and staging the key copy would fail
+    // without it. prepare_home is idempotent and dry-run prints only.
+    prepare_home(&home, args.dry_run)?;
+    // The service account and the root-owned config dir must both exist
+    // before the key is staged into the latter and chowned to the former.
+    #[cfg(target_os = "linux")]
+    if !args.user {
+        ensure_service_user(&home, args.dry_run)?;
+        prepare_system_config_dir(args.dry_run)?;
+    }
+    let config_dir = if args.user {
+        home.clone()
+    } else {
+        PathBuf::from(SYSTEM_CONFIG_DIR)
+    };
+    let staged_key = staged_app_key(&args, &config_dir)?;
+    // The staged copy is root-owned 0600 until here; the service still has to
+    // read it, so widen it to root:preloop 0640 now that the account exists.
+    #[cfg(target_os = "linux")]
+    if !args.user && !args.dry_run {
+        if let Some(key) = &staged_key {
+            grant_service_read(key)
+                .with_context(|| format!("grant the service read access to {}", key.display()))?;
+        }
+    }
+    let env_lines = config_env_lines(&args, staged_key.as_deref())?;
     if let Some(path) = &args.systemd_credential {
         #[cfg(not(target_os = "linux"))]
         {
@@ -227,8 +309,14 @@ fn install_systemd(
     let update_service = render_systemd_update_service(exe, home, args.user)?;
     let timer = render_systemd_update_timer();
 
-    prepare_home(home, dry)?;
-    write_env_file(home, env_lines, dry)?;
+    if !args.user {
+        bootstrap_system_smolvm(dry)?;
+        chown_state_dir(home, dry)?;
+    }
+    // Written after chown_state_dir, and deliberately outside it for a system
+    // install: the env file lives in the root-owned config dir, so the
+    // recursive chown of the state dir never reaches it.
+    write_env_file(&env_file_path(home, args.user), env_lines, dry)?;
 
     // A rootless install cannot assume `~/.config/systemd/user` exists on a
     // fresh machine — create the unit directory before the first write.
@@ -268,33 +356,54 @@ fn install_systemd(
         );
     }
 
+    let identity = if args.user {
+        String::new()
+    } else {
+        // Self-terminating block: the template supplies the leading indent,
+        // this supplies the trailing one for whatever follows.
+        format!(
+            "identity: dedicated `{SERVICE_USER}` system account (kvm group for /dev/kvm);\n\
+             \x20          state dir chowned to it — config.toml must be written as that user:\n\
+             \x20          sudo -u {SERVICE_USER} env PRELOOP_HOME={} preloop setup github --save\n\
+             \x20 ",
+            home.display()
+        )
+    };
     let secrets = format!(
-        "secrets:   --webhook-secret/--github-app-* flags land in {}/environment (0600);\n\
+        "secrets:   --webhook-secret/--github-app-* flags land in {} (0600);\n\
          \x20          `setup github --save` writes config.toml (0600). Define a webhook\n\
          \x20          secret or GitHub webhook delivery is rejected.",
-        home.display()
+        env_file_path(home, args.user).display()
     );
     eprintln!(
         "[preloop] installed Preloop control plane as a {} systemd service:\n\
          \x20 units:   {}/preloop.{{service,socket}}{}\n\
-         \x20 state:   {} (0700), service config {}/environment (0600)\n\
+         \x20 state:   {} (0700), service config {} (0600)\n\
          \x20 status:  systemctl {} status preloop\n\
          \x20 logs:    journalctl {} -u preloop -f\n\
          \x20 GitHub:  re-run with --github-app-* flags, or run\n\
-         \x20          PRELOOP_HOME={} preloop setup github --save\n\
-         \x20 {}{}{}",
+         \x20          {}preloop setup github --save\n\
+         \x20 {}{}{}{}",
         if args.user { "user-scope" } else { "system" },
+        dir.display(),
         if args.no_update_timer {
             ""
         } else {
             " + preloop-update.{service,timer}"
         },
-        dir.display(),
         home.display(),
-        home.display(),
+        env_file_path(home, args.user).display(),
         if args.user { "--user" } else { "" },
         if args.user { "--user" } else { "" },
-        home.display(),
+        if args.user {
+            format!("PRELOOP_HOME={} ", home.display())
+        } else {
+            format!(
+                "sudo -u {SERVICE_USER} env PRELOOP_HOME={} ",
+                home.display()
+            )
+        },
+        identity,
         secrets,
         if args.user {
             "\n\
@@ -306,6 +415,451 @@ fn install_systemd(
         webhook_hint(args.public_url.as_deref()),
     );
     Ok(())
+}
+
+/// Whether a system account exists.
+#[cfg(target_os = "linux")]
+fn account_exists(name: &str) -> bool {
+    Command::new("getent")
+        .args(["passwd", name])
+        // `.output()` not `.status()`: getent prints the matched passwd line,
+        // which would land in the middle of the install plan.
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+/// Create the dedicated service account (idempotent) and add it to the `kvm`
+/// group when the host exposes `/dev/kvm` — the VMM opens it as the service
+/// identity. An existing account is never modified beyond group membership.
+#[cfg(target_os = "linux")]
+fn ensure_service_user(home: &Path, dry_run: bool) -> Result<()> {
+    if !account_exists(SERVICE_USER) {
+        let home_str = home.to_string_lossy();
+        let args = [
+            "--system",
+            "--home-dir",
+            &home_str,
+            "--shell",
+            "/usr/sbin/nologin",
+            "--comment",
+            "Preloop service account",
+            SERVICE_USER,
+        ];
+        if dry_run {
+            eprintln!(
+                "[preloop] would create system user {SERVICE_USER} (useradd {})",
+                args.join(" ")
+            );
+        } else {
+            match Command::new("useradd").args(args).status() {
+                Ok(status) if status.success() => {}
+                Ok(status) => bail!("useradd {SERVICE_USER} failed ({status})"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => bail!(
+                    "`useradd` not found; create the service account manually and re-run: \
+                     useradd --system --home-dir {} --shell /usr/sbin/nologin {SERVICE_USER}",
+                    home.display()
+                ),
+                Err(error) => {
+                    return Err(error).with_context(|| format!("run useradd {SERVICE_USER}"))
+                }
+            }
+        }
+    }
+    add_to_kvm_group(dry_run)?;
+    Ok(())
+}
+
+/// The VMM opens `/dev/kvm` (root:kvm, 0660) under the service identity.
+/// Only meaningful when the host actually exposes KVM.
+#[cfg(target_os = "linux")]
+fn add_to_kvm_group(dry_run: bool) -> Result<()> {
+    if !Path::new("/dev/kvm").exists() {
+        return Ok(());
+    }
+    let group_exists = Command::new("getent")
+        .args(["group", "kvm"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !group_exists {
+        eprintln!(
+            "[preloop] warning: /dev/kvm exists but there is no `kvm` group; \
+             the service user cannot open /dev/kvm"
+        );
+        return Ok(());
+    }
+    if dry_run {
+        eprintln!(
+            "[preloop] would add {SERVICE_USER} to the kvm group \
+             (usermod -aG kvm {SERVICE_USER})"
+        );
+        return Ok(());
+    }
+    let status = Command::new("usermod")
+        .args(["-aG", "kvm", SERVICE_USER])
+        .status();
+    if !status.as_ref().is_ok_and(|status| status.success()) {
+        eprintln!(
+            "[preloop] warning: adding {SERVICE_USER} to the kvm group failed ({status:?}); \
+             the VM pool cannot open /dev/kvm"
+        );
+    }
+    Ok(())
+}
+
+/// Ensure the service can resolve `smolvm` on its PATH.
+///
+/// The unit runs with the stock systemd service PATH and a HOME under the
+/// state dir, so an install under `/root/.local/bin` (where `preloop update`
+/// and the official installer put it) is invisible and untraversable to the
+/// service account. When no system-wide smolvm exists, copy root's prefix
+/// into [`SMOLVM_PREFIX_PARENT`] and link it onto the PATH: the wrapper script
+/// resolves its own location, so the copy is self-contained (binary, libs,
+/// bundled agent rootfs).
+///
+/// The copy stays **root-owned and read-only to the service** (`a+rX`, never
+/// chowned), and lives outside `PRELOOP_HOME`. `/usr/local/bin/smolvm` points
+/// into it and root executes that path — `preloop update` probes `smolvm` for
+/// its version and `--mount-socket` support before deciding to reinstall — so
+/// a prefix the service could write, or a prefix inside a directory the
+/// service could unlink entries from, would hand a guest→VMM escape a root
+/// shell on the next `sudo preloop update`. The service needs read and execute
+/// on this tree, nothing more; its mutable data lives in `SMOLVM_DATA_DIR`
+/// under the state dir.
+///
+/// Lifecycle: the copy is refreshed on every re-install when the source
+/// install is newer (after `sudo preloop update`, re-running
+/// `sudo preloop server install` picks the new version up), and the managed
+/// `/usr/local/bin/smolvm` symlink is always re-pointed. An independently
+/// installed system smolvm (not our symlink) is left alone — the installer
+/// never shadows an operator-managed binary. Refreshes are atomic: the new
+/// prefix is fully assembled (copied, pruned, made world-readable) in a
+/// sibling staging directory and swapped into place with a rename, so a
+/// running service never observes a half-copied prefix; running VMMs hold
+/// open inodes and are unaffected. Root's machine database is never imported
+/// (it describes VMs the service cannot see).
+#[cfg(target_os = "linux")]
+fn bootstrap_system_smolvm(dry_run: bool) -> Result<()> {
+    let managed_link = Path::new("/usr/local/bin/smolvm");
+    let parent = Path::new(SMOLVM_PREFIX_PARENT);
+    let destination = parent.join("smolvm-prefix");
+    // `smolvm` is the wrapper script; `smolvm-bin` is the real binary the
+    // freshness check must compare (the copied prefix mirrors the source
+    // layout exactly).
+    let destination_bin = destination.join("smolvm");
+    let destination_binary = destination.join("smolvm-bin");
+    if independent_system_smolvm(managed_link, &destination_bin) {
+        return Ok(());
+    }
+    let source_link = Path::new("/root/.local/bin/smolvm");
+    let source_prefix = Path::new("/root/.smolvm");
+    if !source_link.exists() || !source_prefix.is_dir() {
+        eprintln!(
+            "[preloop] note: no smolvm on the service PATH and none installed for root; \
+             the VM pool needs `sudo preloop update` (or smolvm in /usr/local/bin) \
+             before it can launch machines"
+        );
+        return Ok(());
+    }
+    let stale = smolvm_copy_stale(&source_prefix.join("smolvm-bin"), &destination_binary);
+    if dry_run {
+        if stale {
+            eprintln!(
+                "[preloop] would copy {} into {} (root-owned, read-only to the service)",
+                source_prefix.display(),
+                destination.display()
+            );
+        }
+        eprintln!(
+            "[preloop] would symlink /usr/local/bin/smolvm -> {}",
+            destination_bin.display()
+        );
+        return Ok(());
+    }
+    std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    set_world_readable_directory(parent)?;
+    if stale {
+        let staging = parent.join(format!("smolvm-prefix.staging-{}", std::process::id()));
+        let backup = parent.join(format!("smolvm-prefix.backup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&staging);
+        let _ = std::fs::remove_dir_all(&backup);
+        let assembled = (|| -> Result<()> {
+            std::fs::create_dir_all(&staging)
+                .with_context(|| format!("create {}", staging.display()))?;
+            let status = Command::new("cp")
+                .arg("-a")
+                .arg(format!("{}/.", source_prefix.display()))
+                .arg(format!("{}/", staging.display()))
+                .status()
+                .with_context(|| {
+                    format!(
+                        "copy {} into {}",
+                        source_prefix.display(),
+                        staging.display()
+                    )
+                })?;
+            if !status.success() {
+                bail!(
+                    "copying {} into {} failed ({status})",
+                    source_prefix.display(),
+                    staging.display()
+                );
+            }
+            // The copied database describes the root user's VMs — the service
+            // starts from a clean record instead of importing invisible
+            // machines.
+            for stale_db in ["smolvm.db", "smolvm.db-wal", "smolvm.db-shm"] {
+                let _ = std::fs::remove_file(staging.join(stale_db));
+            }
+            // Root's ~/.smolvm is typically 0700; the service must be able to
+            // read and execute the copy without being able to write it. Files
+            // stay root-owned — `a+rX` adds read (and execute where already
+            // executable), never write.
+            let status = Command::new("chmod")
+                .args(["-R", "a+rX"])
+                .arg(&staging)
+                .status()
+                .with_context(|| format!("chmod {}", staging.display()))?;
+            if !status.success() {
+                bail!("chmod {} failed ({status})", staging.display());
+            }
+            Ok(())
+        })();
+        if let Err(error) = assembled {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+        atomic_directory_swap(&destination, &staging, &backup)?;
+    }
+    // Idempotent repair: an earlier release chowned this prefix to the service
+    // account, which is exactly the escalation path above. Take it back.
+    let status = Command::new("chown")
+        .args(["-R", "root:root"])
+        .arg(&destination)
+        .status()
+        .with_context(|| format!("chown {}", destination.display()))?;
+    if !status.success() {
+        bail!("chown {} failed ({status})", destination.display());
+    }
+    let status = Command::new("chmod")
+        .args(["-R", "a+rX"])
+        .arg(&destination)
+        .status()
+        .with_context(|| format!("chmod {}", destination.display()))?;
+    if !status.success() {
+        bail!("chmod {} failed ({status})", destination.display());
+    }
+    // The symlink lands in the standard system bin dir; make sure it exists
+    // (some minimal systems ship without it).
+    std::fs::create_dir_all("/usr/local/bin").context("create /usr/local/bin")?;
+    let status = Command::new("ln")
+        .args(["-sfn"])
+        .arg(&destination_bin)
+        .arg("/usr/local/bin/smolvm")
+        .status()
+        .with_context(|| "symlink /usr/local/bin/smolvm".to_string())?;
+    if !status.success() {
+        bail!("symlinking /usr/local/bin/smolvm failed ({status})");
+    }
+    Ok(())
+}
+
+/// Atomically replace `destination` with a fully-assembled `staging`
+/// directory: rename the current prefix aside, rename staging into place,
+/// then drop the backup. If the swap fails the previous prefix is restored.
+/// Staging and backup are always cleaned up, on success and failure alike.
+#[cfg(any(target_os = "linux", test))]
+fn atomic_directory_swap(destination: &Path, staging: &Path, backup: &Path) -> Result<()> {
+    let had_previous = destination.exists();
+    if had_previous {
+        std::fs::rename(destination, backup).with_context(|| {
+            format!(
+                "set aside old {} to {}",
+                destination.display(),
+                backup.display()
+            )
+        })?;
+    }
+    if let Err(error) = std::fs::rename(staging, destination) {
+        if had_previous {
+            let _ = std::fs::rename(backup, destination);
+        }
+        let _ = std::fs::remove_dir_all(staging);
+        return Err(error)
+            .with_context(|| format!("swap {} into {}", staging.display(), destination.display()));
+    }
+    if had_previous {
+        let _ = std::fs::remove_dir_all(backup);
+    }
+    Ok(())
+}
+
+/// Whether an independently managed smolvm already exists on the service
+/// PATH. The installer's own `/usr/local/bin/smolvm` symlink into the service
+/// prefix is NOT independent: it may be stale relative to a newer source
+/// install and must be refreshed, never mistaken for a current binary.
+#[cfg(any(target_os = "linux", test))]
+fn independent_system_smolvm(managed_link: &Path, destination_bin: &Path) -> bool {
+    let is_managed = std::fs::read_link(managed_link).is_ok_and(|target| target == destination_bin);
+    !is_managed
+        && [
+            managed_link,
+            Path::new("/usr/bin/smolvm"),
+            Path::new("/bin/smolvm"),
+        ]
+        .iter()
+        .any(|candidate| candidate.exists())
+}
+
+/// Whether the service copy of smolvm is stale relative to the source
+/// install: missing entirely (first install), or older than the source
+/// binary (refresh after an update).
+#[cfg(any(target_os = "linux", test))]
+fn smolvm_copy_stale(source_bin: &Path, destination_bin: &Path) -> bool {
+    !destination_bin.exists() || newer_than(source_bin, destination_bin)
+}
+
+/// Whether `source`'s mtime is newer than `destination`'s; unknown metadata
+/// counts as stale so the copy is made.
+#[cfg(any(target_os = "linux", test))]
+fn newer_than(source: &Path, destination: &Path) -> bool {
+    match (
+        std::fs::metadata(source).and_then(|meta| meta.modified()),
+        std::fs::metadata(destination).and_then(|meta| meta.modified()),
+    ) {
+        (Ok(source), Ok(destination)) => source > destination,
+        _ => true,
+    }
+}
+
+/// Hand the state directory to the service account so the non-root service
+/// can initialize and own its state (config.toml, DB, smolvm data, copied
+/// smolvm prefix). Runs as root at install; a no-op for user-scope installs.
+#[cfg(target_os = "linux")]
+fn chown_state_dir(home: &Path, dry_run: bool) -> Result<()> {
+    if dry_run {
+        eprintln!(
+            "[preloop] would chown -R {} to {SERVICE_USER}:{SERVICE_USER}",
+            home.display()
+        );
+        return Ok(());
+    }
+    let status = Command::new("chown")
+        .arg("-R")
+        .arg(format!("{SERVICE_USER}:{SERVICE_USER}"))
+        .arg(home)
+        .status()
+        .with_context(|| format!("chown {}", home.display()))?;
+    if !status.success() {
+        bail!("chown {} failed ({status})", home.display());
+    }
+    Ok(())
+}
+
+/// Resolve the GitHub App key path the environment file will reference.
+///
+/// Linux system scope: the service reads the key under its dedicated
+/// non-root account, and a key left in the caller's tree — e.g. under
+/// `/root` — is unreachable no matter how it is chowned, because the service
+/// user cannot traverse the parent directory. The installer therefore stages
+/// a copy in the root-owned [`SYSTEM_CONFIG_DIR`], which [`grant_service_read`]
+/// then hands to the service as `root:preloop` mode `0640`: readable by the
+/// service and nothing more. It deliberately does not
+/// live under `PRELOOP_HOME`, because the service can unlink and recreate any
+/// entry in a directory it owns, which would let it swap its own App key.
+/// The caller's original is never modified. Every other scope keeps the
+/// original path.
+#[cfg(any(target_os = "linux", test))]
+fn staged_app_key(args: &InstallArgs, config_dir: &Path) -> Result<Option<PathBuf>> {
+    let Some(source) = args.github_app_key.clone() else {
+        return Ok(None);
+    };
+    if args.user {
+        return Ok(Some(source));
+    }
+    let destination = config_dir.join("github-app-key.pem");
+    if std::fs::canonicalize(&source).is_ok_and(|resolved| resolved == destination) {
+        // Already the staged file (re-install with the staged path).
+        return Ok(Some(destination));
+    }
+    if args.dry_run {
+        eprintln!(
+            "[preloop] would copy {} to {} (0640 root:{SERVICE_USER}, read-only to the service)",
+            source.display(),
+            destination.display()
+        );
+        return Ok(Some(destination));
+    }
+    std::fs::copy(&source, &destination)
+        .with_context(|| format!("copy {} to {}", source.display(), destination.display()))?;
+    // Staged private by default; `grant_service_read` widens it to the service
+    // group once the account is known to exist. Ownership is an install-time
+    // concern, kept out of the staging logic so this stays testable without
+    // root or a `preloop` account.
+    set_private_file_permissions(&destination)
+        .with_context(|| format!("chmod 0600 {}", destination.display()))?;
+    Ok(Some(destination))
+}
+
+/// Create the root-owned system config directory: `0750 root:{SERVICE_USER}`
+/// so the service can traverse in to read its key, but cannot create, rename,
+/// or unlink anything inside it.
+#[cfg(target_os = "linux")]
+fn prepare_system_config_dir(dry_run: bool) -> Result<()> {
+    let dir = Path::new(SYSTEM_CONFIG_DIR);
+    if dry_run {
+        eprintln!(
+            "[preloop] would create {} (0750 root:{SERVICE_USER})",
+            dir.display()
+        );
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o750))
+        .with_context(|| format!("chmod 0750 {}", dir.display()))?;
+    let status = Command::new("chown")
+        .arg(format!("root:{SERVICE_USER}"))
+        .arg(dir)
+        .status()
+        .with_context(|| format!("chown {}", dir.display()))?;
+    if !status.success() {
+        bail!("chown {} failed ({status})", dir.display());
+    }
+    Ok(())
+}
+
+/// Hand a root-owned file to the service for reading only: `root:{SERVICE_USER}`
+/// mode `0640`. Requires the service account to exist, so it runs after
+/// [`ensure_service_user`].
+#[cfg(target_os = "linux")]
+fn grant_service_read(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640))
+        .with_context(|| format!("chmod 0640 {}", path.display()))?;
+    let status = Command::new("chown")
+        .arg(format!("root:{SERVICE_USER}"))
+        .arg(path)
+        .status()
+        .with_context(|| format!("chown {}", path.display()))?;
+    if !status.success() {
+        bail!("chown {} failed ({status})", path.display());
+    }
+    Ok(())
+}
+
+/// `0755` — traversable and readable by every account, writable only by root.
+#[cfg(target_os = "linux")]
+fn set_world_readable_directory(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("chmod 0755 {}", path.display()))
+}
+
+/// Non-Linux installs keep the caller's key path (launchd runs as root, so
+/// traversal is not an issue).
+#[cfg(all(not(target_os = "linux"), not(test)))]
+fn staged_app_key(args: &InstallArgs, _config_dir: &Path) -> Result<Option<PathBuf>> {
+    Ok(args.github_app_key.clone())
 }
 
 #[cfg(target_os = "linux")]
@@ -359,6 +913,31 @@ fn uninstall_systemd(args: &UninstallArgs, home: &Path) -> Result<()> {
         dry,
         "reload systemd",
     );
+    // Secrets outlive --purge-data otherwise: for a system install the
+    // environment file and the staged App key live in the root-owned config
+    // dir, not under the state dir that --purge-data removes.
+    if !args.user {
+        for artifact in ["environment", "github-app-key.pem"] {
+            let path = Path::new(SYSTEM_CONFIG_DIR).join(artifact);
+            if path.exists() || dry {
+                remove_path(&path, dry)?;
+            }
+        }
+        // Only our own managed symlink, never an operator-installed binary.
+        let managed_link = Path::new("/usr/local/bin/smolvm");
+        let prefix = Path::new(SMOLVM_PREFIX_PARENT).join("smolvm-prefix");
+        if std::fs::read_link(managed_link).is_ok_and(|target| target.starts_with(&prefix)) {
+            remove_path(managed_link, dry)?;
+        }
+        if prefix.is_dir() {
+            if dry {
+                eprintln!("[preloop] would remove {}", prefix.display());
+            } else {
+                std::fs::remove_dir_all(&prefix)
+                    .with_context(|| format!("remove {}", prefix.display()))?;
+            }
+        }
+    }
     eprintln!(
         "[preloop] removed Preloop {} systemd units",
         if args.user { "user" } else { "system" }
@@ -374,6 +953,34 @@ fn render_systemd_service(
     credential: Option<&Path>,
 ) -> Result<String> {
     let exe_display = systemd_path(exe);
+    let identity = if user {
+        String::new()
+    } else {
+        // Dedicated service identity: an escape from the guest cannot reach
+        // root. The account (plus kvm group membership) is created by the
+        // installer; the state dir is chowned to it.
+        format!("User={SERVICE_USER}\nGroup={SERVICE_USER}\n")
+    };
+    let data_root = if user {
+        String::new()
+    } else {
+        // Pin SmolVM's data (machine records, VM disks, agent rootfs) under
+        // the state dir so it follows --home and stays owned by the service
+        // user — never the operator's or root's XDG tree.
+        format!(
+            "Environment=HOME={}\nEnvironment=SMOLVM_DATA_DIR={}/smolvm\n",
+            systemd_path(home),
+            systemd_path(home)
+        )
+    };
+    let delegation = if user {
+        String::new()
+    } else {
+        // Delegate this unit's cgroup subtree so `_boot-vm` can place each VM
+        // in its own capped `vm-<pid>` leaf (cpu/pids/memory). The provider
+        // only passes SMOLVM_CGROUP_ROOT when it observes this delegation.
+        "Delegate=cpu memory pids\n".to_owned()
+    };
     Ok(format!(
         r#"[Unit]
 Description=Preloop self-hosted GitHub Actions control plane
@@ -384,17 +991,25 @@ After=preloop.socket network-online.target
 Type=simple
 ExecStart={exe_display} serve
 Environment=PRELOOP_HOME={home}
-EnvironmentFile=-{home}/environment
-{credential}Restart=on-failure
+EnvironmentFile=-{env_file}
+{credential}{identity}{data_root}Restart=on-failure
 RestartSec=5s
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
-{readwrite}[Install]
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+LockPersonality=true
+RestrictRealtime=true
+CapabilityBoundingSet=
+{delegation}{state_directory}{readwrite}[Install]
 WantedBy={wanted_by}
 "#,
         home = home.display(),
+        env_file = systemd_path(&env_file_path(home, user)),
+        state_directory = state_directory_line(home, user),
         wanted_by = if user {
             "default.target"
         } else {
@@ -408,7 +1023,7 @@ WantedBy={wanted_by}
                 )
             })
             .unwrap_or_default(),
-        readwrite = readwrite_paths(exe, home, user),
+        readwrite = readwrite_paths(exe, home, user, false),
     ))
 }
 
@@ -450,28 +1065,38 @@ Wants=network-online.target
 Type=oneshot
 ExecStart={exe_display} update
 Environment=PRELOOP_HOME={home}
-EnvironmentFile=-{home}/environment
+EnvironmentFile=-{env_file}
 NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=read-only
 {readwrite}"#,
         home = home.display(),
-        readwrite = readwrite_paths(exe, home, user),
+        env_file = systemd_path(&env_file_path(home, user)),
+        readwrite = readwrite_paths(exe, home, user, true),
     ))
 }
 
-/// `ReadWritePaths=` line: the executable's directory (so the self-update
-/// timer can replace the binary under `ProtectSystem=full`) and, for
-/// user-scoped units, `PRELOOP_HOME` (which `ProtectHome=read-only` would
-/// otherwise make unwritable — the service cannot initialize its state).
-/// Paths are quoted per systemd's path-list syntax when they contain
-/// whitespace; an unquoted path with a space would split the list and the
-/// whitelist would silently miss the real directory.
+/// `ReadWritePaths=` line for a unit.
+///
+/// Only the update unit may rewrite the executable's directory
+/// (`replaceable_exe`): the self-update timer replaces the binary under
+/// `ProtectSystem=full`. The serving unit must NOT be able to write its own
+/// binary — a VMM escape under the service identity planting a new
+/// `ExecStart` target for the next root start to execute is an escalation
+/// path. The state dir is carved out only for user scope, where
+/// `ProtectHome=read-only` would otherwise block `~`; a system install under
+/// one of those roots is rejected outright by [`install`], and the default
+/// /var/lib/preloop needs no carve-out. Paths are quoted per
+/// systemd's path-list syntax when they contain whitespace; an unquoted path
+/// with a space would split the list and the whitelist would silently miss
+/// the real directory.
 #[cfg(any(target_os = "linux", test))]
-fn readwrite_paths(exe: &Path, home: &Path, user: bool) -> String {
+fn readwrite_paths(exe: &Path, home: &Path, user: bool, replaceable_exe: bool) -> String {
     let mut paths = Vec::new();
-    if let Some(dir) = readwrite_dir(exe) {
-        paths.push(systemd_path(&dir));
+    if replaceable_exe {
+        if let Some(dir) = readwrite_dir(exe) {
+            paths.push(systemd_path(&dir));
+        }
     }
     if user {
         paths.push(systemd_path(home));
@@ -481,6 +1106,46 @@ fn readwrite_paths(exe: &Path, home: &Path, user: bool) -> String {
     } else {
         format!("ReadWritePaths={}\n", paths.join(" "))
     }
+}
+
+/// `StateDirectory=` line for the default state directory: systemd then
+/// creates and chowns `/var/lib/preloop` for the service identity at every
+/// start. Custom `--home` paths cannot be expressed as a StateDirectory name,
+/// so those rely on the installer's chown instead.
+#[cfg(any(target_os = "linux", test))]
+fn state_directory_line(home: &Path, user: bool) -> String {
+    if !user && home == Path::new(DEFAULT_HOME) {
+        "StateDirectory=preloop\nStateDirectoryMode=0700\n".to_owned()
+    } else {
+        String::new()
+    }
+}
+
+/// Where the unit's `EnvironmentFile=` lives.
+///
+/// System scope puts it in the root-owned [`SYSTEM_CONFIG_DIR`] so the service
+/// identity cannot rewrite (or unlink and recreate) the file systemd feeds it;
+/// `EnvironmentFile=` overrides the unit's `Environment=`, so a service-owned
+/// copy would let a compromised VMM persist `SMOLVM_SECCOMP=off` across the
+/// next `Restart=on-failure`. User scope has no privilege boundary to defend,
+/// so it keeps the file beside the rest of the state.
+#[cfg(any(target_os = "linux", test))]
+fn env_file_path(home: &Path, user: bool) -> PathBuf {
+    if user {
+        home.join("environment")
+    } else {
+        Path::new(SYSTEM_CONFIG_DIR).join("environment")
+    }
+}
+
+/// `ProtectHome=read-only` makes these roots unwritable; a state dir under
+/// one of them needs an explicit `ReadWritePaths` carve-out (user scope), and
+/// is unusable altogether for a system install: the dedicated service account
+/// cannot traverse a `0700` `/home/<someone>` or `/root` no matter how the
+/// state dir itself is owned. [`install`] rejects those up front.
+#[cfg(any(target_os = "linux", test))]
+fn home_blocked_by_protect_home(home: &Path) -> bool {
+    home.starts_with("/home/") || home.starts_with("/root") || home.starts_with("/run/user")
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -524,7 +1189,7 @@ WantedBy=timers.target
 // launchd (macOS)
 // ---------------------------------------------------------------------------
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 fn install_launchd(
     args: &InstallArgs,
     home: &Path,
@@ -534,8 +1199,6 @@ fn install_launchd(
     let dry = args.dry_run;
     let (plist_path, domain) = launchd_target(args.user);
     let plist = render_launchd_plist(exe, home, env_lines)?;
-
-    prepare_home(home, dry)?;
 
     if dry {
         eprintln!(
@@ -626,7 +1289,7 @@ fn webhook_hint(public_url: Option<&str>) -> String {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 fn uninstall_launchd(args: &UninstallArgs, home: &Path) -> Result<()> {
     let _ = home;
     let dry = args.dry_run;
@@ -723,7 +1386,10 @@ fn render_launchd_plist(exe: &Path, home: &Path, env_lines: &[String]) -> Result
 /// Environment-file lines for the config the operator supplied. Keys are the
 /// names `preloop serve` / the server already read (`PRELOOP_LISTEN`,
 /// `PRELOOP_PUBLIC_URL`, `PRELOOP_GITHUB_APP_*`, `PRELOOP_WEBHOOK_SECRET`).
-fn config_env_lines(args: &InstallArgs) -> Result<Vec<String>> {
+/// `app_key` is the path the environment file should reference — the staged
+/// service-owned copy on Linux system installs, the caller's original
+/// elsewhere; `None` falls back to `args.github_app_key`.
+fn config_env_lines(args: &InstallArgs, app_key: Option<&Path>) -> Result<Vec<String>> {
     let mut lines = Vec::new();
     if let Some(listen) = args.listen {
         lines.push(env_line("PRELOOP_LISTEN", &listen.to_string())?);
@@ -734,9 +1400,22 @@ fn config_env_lines(args: &InstallArgs) -> Result<Vec<String>> {
     if let Some(id) = &args.github_app_id {
         lines.push(env_line("PRELOOP_GITHUB_APP_ID", id)?);
     }
-    if let Some(key) = &args.github_app_key {
-        let key = std::fs::canonicalize(key)
-            .with_context(|| format!("resolve --github-app-key {}", key.display()))?;
+    if let Some(key) = app_key.or(args.github_app_key.as_deref()) {
+        let key = match std::fs::canonicalize(key) {
+            Ok(resolved) => resolved,
+            // A --dry-run stages the key copy without creating it; the
+            // absolute staged path still renders the correct environment
+            // file. Real installs resolve, because `install` validated that
+            // the original exists and the staged copy was just made.
+            Err(_) => {
+                anyhow::ensure!(
+                    key.is_absolute(),
+                    "--github-app-key must be an absolute path (got {})",
+                    key.display()
+                );
+                key.to_path_buf()
+            }
+        };
         lines.push(env_line(
             "PRELOOP_GITHUB_APP_PEM_FILE",
             &key.display().to_string(),
@@ -808,16 +1487,25 @@ fn prepare_home(home: &Path, dry_run: bool) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn write_env_file(home: &Path, env_lines: &[String], dry_run: bool) -> Result<()> {
+fn write_env_file(path: &Path, env_lines: &[String], dry_run: bool) -> Result<()> {
     if env_lines.is_empty() {
         return Ok(());
     }
-    let path = home.join("environment");
     if dry_run {
         eprintln!("[preloop] would write {} (0600)", path.display());
         return Ok(());
     }
-    write_private_file(&path, env_lines.join("\n").as_bytes())
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    // write_private_file uses O_CREAT|O_TRUNC without unlinking, so a rewrite
+    // preserves the existing inode — and with it the existing owner. For a
+    // system install the file sits in the root-owned config dir and is never
+    // reached by the state-dir chown, so it stays root-owned across
+    // re-installs. (Before this was true, a second `server install` handed the
+    // service write access to its own EnvironmentFile, which overrides the
+    // unit's Environment= and could disable the VM sandbox on restart.)
+    write_private_file(path, env_lines.join("\n").as_bytes())
         .with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
@@ -906,6 +1594,7 @@ fn xml_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn env_lines() -> Vec<String> {
         vec![
@@ -925,12 +1614,219 @@ mod tests {
         .unwrap();
         assert!(unit.contains("ExecStart=/usr/local/bin/preloop serve"));
         assert!(unit.contains("Environment=PRELOOP_HOME=/var/lib/preloop"));
-        assert!(unit.contains("EnvironmentFile=-/var/lib/preloop/environment"));
-        assert!(unit.contains("ReadWritePaths=/usr/local/bin"));
+        // Root-owned config dir, not the service-writable state dir.
+        assert!(unit.contains("EnvironmentFile=-/etc/preloop/environment"));
         assert!(unit.contains("Requires=preloop.socket"));
         assert!(unit.contains("NoNewPrivileges=true"));
         assert!(unit.contains("ProtectSystem=full"));
+        assert!(unit.contains("ProtectHome=read-only"));
         assert!(unit.contains("WantedBy=multi-user.target"));
+    }
+
+    /// The full default system-scope unit, byte for byte — the renderer is
+    /// the observable output, and contrib/systemd/preloop.service mirrors it.
+    #[test]
+    fn systemd_service_default_system_scope_renders_exactly() {
+        let unit = render_systemd_service(
+            Path::new("/usr/local/bin/preloop"),
+            Path::new(DEFAULT_HOME),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            unit,
+            r#"[Unit]
+Description=Preloop self-hosted GitHub Actions control plane
+Requires=preloop.socket
+After=preloop.socket network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/preloop serve
+Environment=PRELOOP_HOME=/var/lib/preloop
+EnvironmentFile=-/etc/preloop/environment
+User=preloop
+Group=preloop
+Environment=HOME=/var/lib/preloop
+Environment=SMOLVM_DATA_DIR=/var/lib/preloop/smolvm
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+LockPersonality=true
+RestrictRealtime=true
+CapabilityBoundingSet=
+Delegate=cpu memory pids
+StateDirectory=preloop
+StateDirectoryMode=0700
+[Install]
+WantedBy=multi-user.target
+"#
+        );
+    }
+
+    /// The system-scope service must run under a dedicated non-root account:
+    /// a guest→VMM escape lands in the VMM process, which inherits the
+    /// service identity — root would hand the escape the host. The identity
+    /// is not applied to user-scope units (those already run as the
+    /// installing user, and systemd rejects User= there).
+    #[test]
+    fn systemd_service_runs_as_dedicated_non_root_identity() {
+        let unit = render_systemd_service(
+            Path::new("/usr/local/bin/preloop"),
+            Path::new(DEFAULT_HOME),
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(unit.contains("User=preloop\nGroup=preloop\n"));
+        assert!(unit.contains("CapabilityBoundingSet=\n"));
+        assert!(unit.contains("StateDirectory=preloop"));
+        assert!(unit.contains("StateDirectoryMode=0700"));
+        assert!(unit.contains("Delegate=cpu memory pids"));
+        assert!(unit.contains("ProtectKernelModules=true"));
+        assert!(unit.contains("ProtectKernelLogs=true"));
+        assert!(unit.contains("ProtectClock=true"));
+        assert!(unit.contains("LockPersonality=true"));
+        assert!(unit.contains("RestrictRealtime=true"));
+        // The serving unit must not be able to rewrite its own binary, and
+        // the default state dir is owned via StateDirectory, so no
+        // ReadWritePaths at all.
+        assert!(!unit.contains("ReadWritePaths="));
+        // SmolVM data is pinned under the state dir, not the operator's or
+        // root's XDG tree, and HOME follows so the service identity never
+        // resolves a foreign home.
+        assert!(unit.contains("Environment=HOME=/var/lib/preloop"));
+        assert!(unit.contains("Environment=SMOLVM_DATA_DIR=/var/lib/preloop/smolvm"));
+
+        let user_unit = render_systemd_service(
+            Path::new("/usr/local/bin/preloop"),
+            Path::new("/Users/me/.preloop"),
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(!user_unit.contains("User=preloop"));
+        assert!(!user_unit.contains("StateDirectory="));
+        assert!(!user_unit.contains("Delegate="));
+        assert!(!user_unit.contains("SMOLVM_DATA_DIR="));
+    }
+
+    /// Only the update unit may write the executable's directory: a VMM
+    /// escape (or any service-user code) planting a new binary for the next
+    /// root start to execute would be an escalation path.
+    #[test]
+    fn serving_unit_cannot_rewrite_its_own_binary() {
+        let service = render_systemd_service(
+            Path::new("/usr/local/bin/preloop"),
+            Path::new(DEFAULT_HOME),
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(!service.contains("ReadWritePaths=/usr/local/bin"));
+        let update = render_systemd_update_service(
+            Path::new("/usr/local/bin/preloop"),
+            Path::new(DEFAULT_HOME),
+            false,
+        )
+        .unwrap();
+        assert!(update.contains("ReadWritePaths=/usr/local/bin"));
+    }
+
+    /// A system install under a `ProtectHome=read-only` root is rejected, not
+    /// papered over with a `ReadWritePaths` carve-out: the `preloop` account
+    /// cannot traverse a 0700 `/home/<user>` or `/root` however the state dir
+    /// itself is owned, so the carve-out produced a unit that looked correct
+    /// and failed at first start. A root-reachable custom home is fine and
+    /// needs no carve-out at all.
+    #[test]
+    fn system_install_rejects_a_home_the_service_account_cannot_traverse() {
+        for blocked in [
+            "/home/me/preloop-data",
+            "/root/preloop",
+            "/run/user/1000/preloop",
+        ] {
+            assert!(
+                home_blocked_by_protect_home(Path::new(blocked)),
+                "{blocked} must be rejected for a system install"
+            );
+            let error = install(InstallArgs {
+                home: Some(PathBuf::from(blocked)),
+                user: false,
+                dry_run: true,
+                listen: None,
+                public_url: None,
+                github_app_id: None,
+                github_app_key: None,
+                github_app_installation_id: None,
+                webhook_secret: None,
+                no_update_timer: false,
+                systemd_credential: None,
+            })
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("unusable for a system install"),
+                "{blocked}: {error}"
+            );
+        }
+        // Root-reachable custom home: allowed, no carve-out, no StateDirectory.
+        assert!(!home_blocked_by_protect_home(Path::new("/srv/preloop")));
+        let open = render_systemd_service(
+            Path::new("/usr/local/bin/preloop"),
+            Path::new("/srv/preloop"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(!open.contains("ReadWritePaths="));
+        assert!(!open.contains("StateDirectory="));
+        // User scope still carves out its home, which ProtectHome would block.
+        let user_unit = render_systemd_service(
+            Path::new("/usr/local/bin/preloop"),
+            Path::new("/home/me/.preloop"),
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(user_unit.contains("ReadWritePaths=/home/me/.preloop"));
+    }
+
+    /// The whole point of the ownership split: nothing the service must not be
+    /// able to rewrite may live inside `PRELOOP_HOME`. The service owns that
+    /// directory, and on Unix the directory write bit governs unlink/rename,
+    /// so any entry in it can be replaced regardless of the entry's own mode.
+    #[test]
+    fn install_artifacts_live_outside_the_service_writable_state_dir() {
+        let home = Path::new(DEFAULT_HOME);
+        assert!(
+            !Path::new(SYSTEM_CONFIG_DIR).starts_with(home),
+            "the EnvironmentFile/App-key dir must not be under {}",
+            home.display()
+        );
+        assert!(
+            !Path::new(SMOLVM_PREFIX_PARENT).starts_with(home),
+            "the smolvm prefix (which /usr/local/bin/smolvm points into, and \
+             root executes) must not be under {}",
+            home.display()
+        );
+        // System scope: env file in the root-owned config dir. User scope: no
+        // privilege boundary, so it stays with the rest of the state.
+        assert_eq!(
+            env_file_path(home, false),
+            PathBuf::from("/etc/preloop/environment")
+        );
+        let user_home = Path::new("/home/me/.preloop");
+        assert_eq!(
+            env_file_path(user_home, true),
+            user_home.join("environment")
+        );
     }
 
     #[test]
@@ -968,7 +1864,16 @@ mod tests {
         )
         .unwrap();
         assert!(unit.contains("ExecStart=\"/opt/pre loop/preloop\" serve"));
-        assert!(unit.contains("ReadWritePaths=\"/opt/pre loop\""));
+        // The serving unit never gets the executable's directory, so no
+        // quoting is needed here; the update unit does carry it.
+        assert!(!unit.contains("ReadWritePaths="));
+        let update = render_systemd_update_service(
+            Path::new("/opt/pre loop/preloop"),
+            Path::new("/var/lib/preloop"),
+            false,
+        )
+        .unwrap();
+        assert!(update.contains("ReadWritePaths=\"/opt/pre loop\""));
     }
 
     #[test]
@@ -983,7 +1888,7 @@ mod tests {
         // ProtectHome=read-only would block ~/.preloop state; the unit must
         // carve out a writable exception.
         assert!(unit.contains("ProtectHome=read-only"));
-        assert!(unit.contains("ReadWritePaths=/usr/local/bin /Users/me/.preloop"));
+        assert!(unit.contains("ReadWritePaths=/Users/me/.preloop"));
         let system = render_systemd_service(
             Path::new("/usr/local/bin/preloop"),
             Path::new(DEFAULT_HOME),
@@ -991,15 +1896,37 @@ mod tests {
             None,
         )
         .unwrap();
-        // System scope grants only the executable's directory, never home.
-        assert!(system.contains("ReadWritePaths=/usr/local/bin\n"));
-        assert!(!system.contains("/var/lib/preloop\""));
+        // System scope relies on StateDirectory for the default home and
+        // grants no extra paths at all.
+        assert!(!system.contains("ReadWritePaths="));
     }
 
     #[test]
     fn readwrite_paths_quote_whitespace_dirs() {
-        let line = readwrite_paths(Path::new("/opt/pre loop/preloop"), Path::new("/h/p"), true);
-        assert_eq!(line, "ReadWritePaths=\"/opt/pre loop\" /h/p\n",);
+        // Update unit: executable dir + (user-scope) home, quoted.
+        let line = readwrite_paths(
+            Path::new("/opt/pre loop/preloop"),
+            Path::new("/h/p"),
+            true,
+            true,
+        );
+        assert_eq!(line, "ReadWritePaths=\"/opt/pre loop\" /h/p\n");
+        // Serving unit: only the state dir, never the executable's.
+        let serving = readwrite_paths(
+            Path::new("/opt/pre loop/preloop"),
+            Path::new("/h/p"),
+            true,
+            false,
+        );
+        assert_eq!(serving, "ReadWritePaths=/h/p\n");
+        // System scope with the default home: nothing at all.
+        let system = readwrite_paths(
+            Path::new("/usr/local/bin/preloop"),
+            Path::new(DEFAULT_HOME),
+            false,
+            false,
+        );
+        assert_eq!(system, "");
     }
 
     #[test]
@@ -1139,7 +2066,7 @@ mod tests {
             user: false,
             dry_run: false,
         };
-        let lines = config_env_lines(&args).unwrap();
+        let lines = config_env_lines(&args, None).unwrap();
         assert_eq!(
             lines,
             vec![
@@ -1178,6 +2105,401 @@ mod tests {
             readwrite_dir(Path::new("/usr/local/bin/preloop")).unwrap(),
             PathBuf::from("/usr/local/bin")
         );
+    }
+
+    /// The GitHub App key must be copied into service-owned state, never
+    /// chowned in place: the service user cannot traverse a `/root`-like
+    /// parent no matter how the file itself is owned. The caller's original
+    /// stays byte-for-byte and mode-for-mode untouched.
+    #[test]
+    fn staged_app_key_copies_into_state_without_touching_the_source() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("app.pem");
+        std::fs::write(&source, b"-----BEGIN PRIVATE KEY-----\nsecret\n").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let args = InstallArgs {
+            listen: None,
+            public_url: None,
+            github_app_id: None,
+            github_app_key: Some(source.clone()),
+            github_app_installation_id: None,
+            webhook_secret: None,
+            home: None,
+            no_update_timer: false,
+            systemd_credential: None,
+            user: false,
+            dry_run: false,
+        };
+
+        let staged = staged_app_key(&args, home.path()).unwrap().unwrap();
+
+        let expected = home.path().join("github-app-key.pem");
+        assert_eq!(staged, expected);
+        assert_eq!(
+            std::fs::read(&expected).unwrap(),
+            b"-----BEGIN PRIVATE KEY-----\nsecret\n"
+        );
+        assert_eq!(
+            std::fs::metadata(&expected).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "staged copy starts private; grant_service_read widens it to 0640 \
+             root:preloop once the service account exists"
+        );
+        // The caller's original is untouched.
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            b"-----BEGIN PRIVATE KEY-----\nsecret\n"
+        );
+        assert_eq!(
+            std::fs::metadata(&source).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // The environment file references the staged path, and dry-run
+        // renders the same line without creating the copy.
+        let env_args = InstallArgs {
+            github_app_key: Some(staged.clone()),
+            dry_run: false,
+            ..args.clone()
+        };
+        let lines = config_env_lines(&env_args, None).unwrap();
+        let canonical_staged = std::fs::canonicalize(&staged).unwrap();
+        assert!(
+            lines.iter().any(|line| line
+                == &format!("PRELOOP_GITHUB_APP_PEM_FILE={}", canonical_staged.display())),
+            "{lines:?}"
+        );
+        let dry_args = InstallArgs {
+            dry_run: true,
+            ..args
+        };
+        // A fresh home: dry-run must not create the staged copy anywhere.
+        let dry_home = tempfile::tempdir().unwrap();
+        let dry_staged = staged_app_key(&dry_args, dry_home.path()).unwrap().unwrap();
+        let dry_expected = dry_home.path().join("github-app-key.pem");
+        assert_eq!(dry_staged, dry_expected);
+        assert!(
+            !dry_expected.exists(),
+            "dry-run must not create the staged copy"
+        );
+        // Dry-run renders the staged path without a canonicalize round-trip.
+        let dry_lines = config_env_lines(&dry_args, Some(&dry_staged)).unwrap();
+        assert!(
+            dry_lines
+                .iter()
+                .any(|line| line
+                    == &format!("PRELOOP_GITHUB_APP_PEM_FILE={}", dry_expected.display()))
+        );
+    }
+
+    /// User-scope installs keep the caller's key path — the service runs as
+    /// the installing user, who can already reach it.
+    #[test]
+    fn staged_app_key_keeps_the_original_path_for_user_scope() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("app.pem");
+        std::fs::write(&source, b"key").unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let args = InstallArgs {
+            github_app_key: Some(source.clone()),
+            user: true,
+            dry_run: false,
+            listen: None,
+            public_url: None,
+            github_app_id: None,
+            github_app_installation_id: None,
+            webhook_secret: None,
+            home: None,
+            no_update_timer: false,
+            systemd_credential: None,
+        };
+        assert_eq!(
+            staged_app_key(&args, home.path()).unwrap(),
+            Some(source.clone())
+        );
+        assert!(!home.path().join("github-app-key.pem").exists());
+    }
+
+    /// The very first system install with `--github-app-key` targets a state
+    /// dir that does not exist yet (default or nested). `install()` must
+    /// prepare the directory before staging the key — this test pins that
+    /// ordering by reproducing the exact sequence against a nonexistent
+    /// nested path.
+    #[test]
+    fn first_install_stages_key_into_a_prepared_nested_state_dir() {
+        let base = tempfile::tempdir().unwrap();
+        let home = base.path().join("nested/preloop");
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("app.pem");
+        std::fs::write(&source, b"-----BEGIN PRIVATE KEY-----\nsecret\n").unwrap();
+        let args = InstallArgs {
+            github_app_key: Some(source.clone()),
+            dry_run: false,
+            user: false,
+            listen: None,
+            public_url: None,
+            github_app_id: None,
+            github_app_installation_id: None,
+            webhook_secret: None,
+            home: None,
+            no_update_timer: false,
+            systemd_credential: None,
+        };
+
+        // install()'s order: state dir first, then the staged key copy.
+        prepare_home(&home, false).unwrap();
+        let staged = staged_app_key(&args, &home).unwrap().unwrap();
+
+        assert_eq!(staged, home.join("github-app-key.pem"));
+        assert_eq!(
+            std::fs::read(&staged).unwrap(),
+            b"-----BEGIN PRIVATE KEY-----\nsecret\n"
+        );
+        assert_eq!(
+            std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "staged copy starts private; grant_service_read widens it to 0640 \
+             root:preloop once the service account exists"
+        );
+        assert_eq!(
+            std::fs::metadata(&home).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "state dir must stay 0700"
+        );
+        // The source is never modified.
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            b"-----BEGIN PRIVATE KEY-----\nsecret\n"
+        );
+        // Without the prepared state dir the staging copy fails — the
+        // ordering is the contract.
+        let unprepared = base.path().join("other-nested/preloop");
+        assert!(
+            staged_app_key(&args, &unprepared).is_err(),
+            "staging into a nonexistent state dir must fail loudly"
+        );
+        assert!(!unprepared.exists());
+    }
+
+    /// The full `install()` pre-flight, dry-run, against a nonexistent
+    /// nested state dir with `--github-app-key`: it must succeed and leave
+    /// nothing behind.
+    #[test]
+    fn dry_run_install_handles_nonexistent_nested_home_with_key() {
+        let base = tempfile::tempdir().unwrap();
+        let home = base.path().join("nested/preloop");
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("app.pem");
+        std::fs::write(&source, b"key").unwrap();
+        let args = InstallArgs {
+            home: Some(home.clone()),
+            github_app_key: Some(source),
+            dry_run: true,
+            user: false,
+            listen: Some("127.0.0.1:9090".parse().unwrap()),
+            public_url: None,
+            github_app_id: None,
+            github_app_installation_id: None,
+            webhook_secret: None,
+            no_update_timer: false,
+            systemd_credential: None,
+        };
+
+        install(args).unwrap();
+
+        assert!(!home.exists(), "dry-run must not create the state dir");
+    }
+
+    /// First install: no service copy yet, so the copy is stale and must be
+    /// made; the managed symlink is not an independent binary.
+    #[test]
+    fn smolvm_bootstrap_first_install_needs_a_copy() {
+        let home = tempfile::tempdir().unwrap();
+        let destination_bin = home.path().join("smolvm-prefix/smolvm");
+        let bin_dir = tempfile::tempdir().unwrap();
+        let managed_link = bin_dir.path().join("smolvm");
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("smolvm-bin");
+        std::fs::write(&source, b"binary").unwrap();
+        assert!(smolvm_copy_stale(&source, &destination_bin));
+        assert!(!independent_system_smolvm(&managed_link, &destination_bin));
+    }
+
+    /// Pin a file's mtime relative to now. `smolvm_copy_stale` compares
+    /// modification times, and two consecutive `fs::write`s can land in the
+    /// same filesystem timestamp tick (they do on the ext4/overlayfs used by
+    /// Linux CI, though not on APFS), which made ordering-by-write-order
+    /// flaky. Set the times explicitly instead.
+    #[cfg(any(target_os = "linux", test))]
+    fn set_mtime_secs_ago(path: &Path, secs_ago: u64) {
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(secs_ago);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
+    /// Refresh: after `preloop update` the source is newer and the copy must
+    /// be re-made; an up-to-date copy stays put.
+    #[test]
+    fn smolvm_bootstrap_refreshes_a_stale_copy_and_keeps_a_current_one() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source_bin = source_dir.path().join("smolvm-bin");
+        let destination_dir = tempfile::tempdir().unwrap();
+        let destination_bin = destination_dir.path().join("smolvm-bin");
+        std::fs::write(&destination_bin, b"old").unwrap();
+        std::fs::write(&source_bin, b"new").unwrap();
+        set_mtime_secs_ago(&destination_bin, 120);
+        set_mtime_secs_ago(&source_bin, 60);
+        assert!(smolvm_copy_stale(&source_bin, &destination_bin));
+
+        set_mtime_secs_ago(&source_bin, 120);
+        set_mtime_secs_ago(&destination_bin, 60);
+        assert!(!smolvm_copy_stale(&source_bin, &destination_bin));
+
+        // Identical mtimes (a same-tick copy) must NOT count as stale, or
+        // every re-install would rebuild the prefix.
+        let when = std::time::SystemTime::now();
+        for path in [&source_bin, &destination_bin] {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(when)
+                .unwrap();
+        }
+        assert!(!smolvm_copy_stale(&source_bin, &destination_bin));
+    }
+
+    /// The freshness check compares source `smolvm-bin` against destination
+    /// `smolvm-bin` — the wrapper file `smolvm` sits beside the real binary
+    /// and must not be used as a directory to look under.
+    #[test]
+    fn smolvm_bootstrap_compares_the_real_copied_binary_path() {
+        let home = tempfile::tempdir().unwrap();
+        let destination = home.path().join("smolvm-prefix");
+        let source_dir = tempfile::tempdir().unwrap();
+        let source_prefix = source_dir.path();
+        std::fs::create_dir_all(&destination).unwrap();
+
+        // Up to date: the destination binary is newer than the source.
+        std::fs::write(source_prefix.join("smolvm-bin"), b"old").unwrap();
+        std::fs::write(destination.join("smolvm-bin"), b"new").unwrap();
+        set_mtime_secs_ago(&source_prefix.join("smolvm-bin"), 120);
+        set_mtime_secs_ago(&destination.join("smolvm-bin"), 60);
+        assert!(!smolvm_copy_stale(
+            &source_prefix.join("smolvm-bin"),
+            &destination.join("smolvm-bin")
+        ));
+
+        // Stale: the source binary is newer — refresh needed.
+        std::fs::write(source_prefix.join("smolvm-bin"), b"newest").unwrap();
+        set_mtime_secs_ago(&source_prefix.join("smolvm-bin"), 10);
+        assert!(smolvm_copy_stale(
+            &source_prefix.join("smolvm-bin"),
+            &destination.join("smolvm-bin")
+        ));
+    }
+
+    #[test]
+    fn atomic_swap_first_install_moves_the_staging_dir_into_place() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("smolvm-prefix");
+        let staging = directory.path().join("smolvm-prefix.staging-1");
+        let backup = directory.path().join("smolvm-prefix.backup-1");
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::write(staging.join("smolvm-bin"), b"binary").unwrap();
+
+        atomic_directory_swap(&destination, &staging, &backup).unwrap();
+
+        assert_eq!(
+            std::fs::read(destination.join("smolvm-bin")).unwrap(),
+            b"binary"
+        );
+        assert!(!staging.exists());
+        assert!(!backup.exists());
+    }
+
+    /// A refresh must atomically replace the previous prefix: no reader can
+    /// observe a mix of old and new files, and no staging/backup debris
+    /// remains.
+    #[test]
+    fn atomic_swap_refresh_replaces_the_previous_prefix_without_leftovers() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("smolvm-prefix");
+        let staging = directory.path().join("smolvm-prefix.staging-2");
+        let backup = directory.path().join("smolvm-prefix.backup-2");
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(destination.join("smolvm-bin"), b"old-binary").unwrap();
+        std::fs::write(destination.join("lib"), b"old-lib").unwrap();
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::write(staging.join("smolvm-bin"), b"new-binary").unwrap();
+        std::fs::write(staging.join("lib"), b"new-lib").unwrap();
+
+        atomic_directory_swap(&destination, &staging, &backup).unwrap();
+
+        assert_eq!(
+            std::fs::read(destination.join("smolvm-bin")).unwrap(),
+            b"new-binary"
+        );
+        assert_eq!(std::fs::read(destination.join("lib")).unwrap(), b"new-lib");
+        assert!(!staging.exists());
+        assert!(!backup.exists());
+    }
+
+    /// A failed swap must restore the previous prefix and leave no staging
+    /// or backup debris.
+    #[test]
+    fn atomic_swap_failure_restores_the_previous_prefix_and_cleans_up() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("smolvm-prefix");
+        let staging = directory.path().join("smolvm-prefix.staging-3");
+        let backup = directory.path().join("smolvm-prefix.backup-3");
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(destination.join("smolvm-bin"), b"old-binary").unwrap();
+        // staging is missing: the swap rename fails.
+
+        let error = atomic_directory_swap(&destination, &staging, &backup).unwrap_err();
+
+        assert!(error.to_string().contains("swap"));
+        assert_eq!(
+            std::fs::read(destination.join("smolvm-bin")).unwrap(),
+            b"old-binary",
+            "the previous prefix must be restored"
+        );
+        assert!(!staging.exists());
+        assert!(!backup.exists());
+    }
+
+    /// The installer's own symlink into the service prefix must not be
+    /// mistaken for an independently current binary — that is exactly the
+    /// permanently-stale-shadow failure mode. An unrelated system binary is
+    /// respected and never shadowed.
+    #[test]
+    fn smolvm_bootstrap_managed_symlink_is_not_an_independent_binary() {
+        let home = tempfile::tempdir().unwrap();
+        let destination_bin = home.path().join("smolvm-prefix/smolvm");
+        let bin_dir = tempfile::tempdir().unwrap();
+        let managed_link = bin_dir.path().join("smolvm");
+
+        // Managed symlink (our own): not independent.
+        std::os::unix::fs::symlink(&destination_bin, &managed_link).unwrap();
+        assert!(!independent_system_smolvm(&managed_link, &destination_bin));
+        // A symlink to something else: independent.
+        std::fs::remove_file(&managed_link).unwrap();
+        let other = bin_dir.path().join("other");
+        std::fs::write(&other, b"other-binary").unwrap();
+        std::os::unix::fs::symlink(&other, &managed_link).unwrap();
+        assert!(independent_system_smolvm(&managed_link, &destination_bin));
+        // A regular file: independent.
+        std::fs::remove_file(&managed_link).unwrap();
+        std::fs::write(&managed_link, b"#! /bin/sh\n").unwrap();
+        assert!(independent_system_smolvm(&managed_link, &destination_bin));
+        // Nothing at the link: not independent (bootstrap proceeds).
+        std::fs::remove_file(&managed_link).unwrap();
+        assert!(!independent_system_smolvm(&managed_link, &destination_bin));
     }
 
     /// The rendered plist must be accepted by launchd's own parser.

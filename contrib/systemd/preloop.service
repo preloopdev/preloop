@@ -8,15 +8,39 @@ After=preloop.socket network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/preloop serve
+Environment=PRELOOP_HOME=/var/lib/preloop
+Environment=HOME=/var/lib/preloop
+Environment=SMOLVM_DATA_DIR=/var/lib/preloop/smolvm
+# Root-owned (0600 root:root in a 0750 root:preloop directory), deliberately
+# NOT under /var/lib/preloop: the service owns the state dir, and the
+# directory write bit governs unlink/rename, so an env file there could be
+# replaced by a compromised service. EnvironmentFile= overrides Environment=,
+# so that would let it persist SMOLVM_SECCOMP=off across Restart=on-failure.
+EnvironmentFile=-/etc/preloop/environment
+# Dedicated service identity: a guest->VMM escape lands in the VMM process,
+# which inherits this identity. The installer creates the account and adds it
+# to the kvm group (for /dev/kvm). State files must be written as this user
+# (e.g. `sudo -u preloop env PRELOOP_HOME=/var/lib/preloop preloop setup
+# github --save`).
+User=preloop
+Group=preloop
 Restart=on-failure
 RestartSec=5s
-Environment=PRELOOP_HOME=/var/lib/preloop
-StateDirectory=preloop
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
-ReadWritePaths=/usr/local/bin
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+LockPersonality=true
+RestrictRealtime=true
+CapabilityBoundingSet=
+# Delegate the cgroup subtree so each SmolVM `_boot-vm` can place itself in a
+# per-VM capped leaf (cpu/pids/memory) via SMOLVM_CGROUP_ROOT.
+Delegate=cpu memory pids
+StateDirectory=preloop
+StateDirectoryMode=0700
 
 [Install]
 WantedBy=multi-user.target

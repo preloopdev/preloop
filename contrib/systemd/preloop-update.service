@@ -9,7 +9,7 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=/usr/local/bin/preloop update
 Environment=PRELOOP_HOME=/var/lib/preloop
-StateDirectory=preloop
+EnvironmentFile=-/etc/preloop/environment
 NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=read-only
