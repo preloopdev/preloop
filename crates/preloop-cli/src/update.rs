@@ -295,13 +295,6 @@ async fn probe_smolvm_version(binary: &Path) -> Option<String> {
         .map(|version| version.trim_start_matches('v').to_owned())
 }
 
-fn smolvm_release_repository() -> String {
-    std::env::var("PRELOOP_SMOLVM_RELEASE_REPOSITORY")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| SMOLVM_REPOSITORY.to_owned())
-}
-
 fn smolvm_release_version() -> String {
     std::env::var("PRELOOP_SMOLVM_RELEASE_VERSION")
         .ok()
@@ -328,7 +321,6 @@ async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
             std::env::consts::ARCH
         )
     })?;
-    let repository = smolvm_release_repository();
     let release = fetch_release(
         client,
         &format!("https://api.github.com/repos/{SMOLVM_REPOSITORY}/releases"),
@@ -396,6 +388,19 @@ fn install_smolvm_from_archive(
         let target = install.prefix.join("lib");
         let _ = fs::remove_dir_all(&target);
         copy_dir_all(&lib, &target)?;
+    }
+    // 1.7.7 ships its disk templates as `.zst`; older installs keep the
+    // uncompressed variants. SmolVM's lazy extraction treats an existing
+    // uncompressed file as already prepared, so every template variant is
+    // removed before the archive's payload is copied — otherwise an upgraded
+    // installation silently keeps using the previous release's templates.
+    for stale in [
+        "storage-template.ext4",
+        "overlay-template.ext4",
+        "storage-template.ext4.zst",
+        "overlay-template.ext4.zst",
+    ] {
+        let _ = fs::remove_file(install.prefix.join(stale));
     }
     for name in [
         "smolvm",
@@ -1028,6 +1033,67 @@ mod tests {
         assert_eq!(
             std::fs::read_link(install.bin_dir.join("smolvm")).unwrap(),
             install.prefix.join("smolvm")
+        );
+    }
+
+    #[test]
+    fn upgrade_removes_stale_uncompressed_templates() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("smolvm-9.9.9-darwin-arm64");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("smolvm"), "#!/bin/sh\n").unwrap();
+        std::fs::write(source.join("smolvm-bin"), "#!/bin/sh\n").unwrap();
+        std::fs::write(
+            source.join("storage-template.ext4.zst"),
+            b"compressed-template",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("overlay-template.ext4.zst"),
+            b"compressed-overlay",
+        )
+        .unwrap();
+
+        let archive_path = directory.path().join("smolvm-9.9.9-darwin-arm64.tar.gz");
+        let file = std::fs::File::create(&archive_path).unwrap();
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        builder
+            .append_dir_all("smolvm-9.9.9-darwin-arm64", &source)
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+
+        let install = SmolvmInstall {
+            prefix: directory.path().join("prefix"),
+            data_dir: directory.path().join("data"),
+            bin_dir: directory.path().join("bin"),
+        };
+        // A pre-1.7.7 installation left uncompressed templates behind; the
+        // upgrade must not keep serving them.
+        std::fs::create_dir_all(&install.prefix).unwrap();
+        std::fs::write(install.prefix.join("storage-template.ext4"), b"stale").unwrap();
+        std::fs::write(install.prefix.join("overlay-template.ext4"), b"stale").unwrap();
+
+        install_smolvm_from_archive(&archive_path, "9.9.9", &install).unwrap();
+
+        assert!(
+            !install.prefix.join("storage-template.ext4").exists(),
+            "stale uncompressed storage template must be removed"
+        );
+        assert!(
+            !install.prefix.join("overlay-template.ext4").exists(),
+            "stale uncompressed overlay template must be removed"
+        );
+        assert_eq!(
+            std::fs::read(install.prefix.join("storage-template.ext4.zst")).unwrap(),
+            b"compressed-template"
+        );
+        assert_eq!(
+            std::fs::read(install.prefix.join("overlay-template.ext4.zst")).unwrap(),
+            b"compressed-overlay"
         );
     }
 

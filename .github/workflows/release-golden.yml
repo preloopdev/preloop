@@ -275,6 +275,12 @@ jobs:
           mkdir -p "$HOME/.smolvm"
           rm -rf "$HOME/.smolvm/lib"
           cp -R "$SRC/lib" "$HOME/.smolvm/lib"
+          # Drop every template variant before copying the archive's payload:
+          # smolvm's lazy extraction treats an existing uncompressed template
+          # as already prepared, so a stale file from a previous install
+          # would silently win over the new release's.
+          rm -f "$HOME/.smolvm"/storage-template.ext4 "$HOME/.smolvm"/overlay-template.ext4 \
+            "$HOME/.smolvm"/storage-template.ext4.zst "$HOME/.smolvm"/overlay-template.ext4.zst
           # Copy whichever storage/overlay template format the archive
           # carries (mirrors the update installer, which copies only files
           # that exist).

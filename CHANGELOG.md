@@ -119,6 +119,27 @@ Releases before v0.27.0 predate the changelog.
   the install summary print
   `units:  + preloop-update.{service,timer}/preloop.{service,socket}/etc/...`.
 
+## [0.30.1] - 2026-08-11
+
+### Added
+
+- Sign and attest golden packs, and verify base image provenance when
+  building goldens.
+
+### Fixed
+
+- Switch runtime acquisition from the temporary preloopdev/smolvm fork to
+  the official smol-machines/smolvm v1.7.7 release, which carries reusable
+  retained-fork checkpoints and the macOS network symbol preloop-vm needs
+  (#117, #118). `preloop update` and the golden-release workflow now install
+  the compressed `.zst` disk templates 1.7.7 ships.
+- Upgrading smolvm now removes a previous install's uncompressed
+  storage/overlay templates before copying the archive's variants, so an
+  upgraded installation can no longer keep silently using the old 1.7.4
+  payload.
+- Webhook ingestion: explicit body limit above GitHub's payload ceiling
+  (#116).
+
 ## [0.30.0] - 2026-08-11
 
 ### Security
