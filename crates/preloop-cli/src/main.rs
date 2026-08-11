@@ -515,6 +515,16 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
     } else {
         std::env::current_dir()?.join(args.output)
     };
+    // Enterprise option: verify the base image's provenance before baking.
+    // Dump-style base images carry a GitHub-signed SLSA attestation and a
+    // cosign keyless signature from the publishing workflow; a golden should
+    // only be built from an attested base. Opt in with:
+    //   PRELOOP_VERIFY_BASE_IMAGE=1 PRELOOP_VERIFY_BASE_IMAGE_REPO=<owner/repo>
+    if std::env::var_os("PRELOOP_VERIFY_BASE_IMAGE")
+        .is_some_and(|value| value != "0" && value != "false")
+    {
+        verify_base_image(&args.base_image).await?;
+    }
     let config = RunnerPoolConfig {
         size: 1,
         use_fork: false,
@@ -565,6 +575,64 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         output.display()
     );
     println!("{}", output.display());
+    Ok(())
+}
+
+/// Verify a registry base image's provenance before baking a golden from it.
+///
+/// Runs two independent checks, both keyless (no long-lived keys on the build
+/// host):
+///
+/// 1. `gh attestation verify` — the GitHub-signed SLSA provenance stored in
+///    GHCR, pinned to the publishing repository.
+/// 2. `cosign verify` — the Sigstore keyless signature, pinned to the
+///    publishing workflow's OIDC identity on the default branch.
+///
+/// Both tools must be installed on the build host. `PRELOOP_VERIFY_BASE_IMAGE`
+/// enables the check; `PRELOOP_VERIFY_BASE_IMAGE_REPO` names the repository
+/// that publishes the base image; `PRELOOP_BASE_IMAGE_IDENTITY_REGEXP`
+/// overrides the default certificate identity match.
+async fn verify_base_image(base_image: &str) -> anyhow::Result<()> {
+    let repo = std::env::var("PRELOOP_VERIFY_BASE_IMAGE_REPO").context(
+        "PRELOOP_VERIFY_BASE_IMAGE=1 requires PRELOOP_VERIFY_BASE_IMAGE_REPO=<owner/repo>",
+    )?;
+    if !base_image.contains('/') || base_image.starts_with('.') || base_image.starts_with('/') {
+        anyhow::bail!("base image `{base_image}` is not a registry reference; nothing to verify");
+    }
+    verify_base_image_with(&repo, base_image)
+}
+
+fn verify_base_image_with(repo: &str, base_image: &str) -> anyhow::Result<()> {
+    run_verifier(
+        "gh",
+        &["attestation", "verify", base_image, "--repo", repo],
+        "GitHub attestation",
+    )?;
+    let identity = std::env::var("PRELOOP_BASE_IMAGE_IDENTITY_REGEXP").unwrap_or_else(|_| {
+        format!("^https://github.com/{repo}/.github/workflows/dump.yml@refs/heads/")
+    });
+    run_verifier(
+        "cosign",
+        &[
+            "verify",
+            base_image,
+            "--certificate-identity-regexp",
+            &identity,
+            "--certificate-oidc-issuer",
+            "https://token.actions.githubusercontent.com",
+        ],
+        "cosign signature",
+    )
+}
+
+fn run_verifier(binary: &str, args: &[&str], what: &str) -> anyhow::Result<()> {
+    let status = std::process::Command::new(binary)
+        .args(args)
+        .status()
+        .with_context(|| format!("failed to run `{binary}`; is it installed?"))?;
+    if !status.success() {
+        anyhow::bail!("{what} verification failed for the base image (exit {status})");
+    }
     Ok(())
 }
 

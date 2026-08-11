@@ -2931,9 +2931,28 @@ async fn provision_runner<P: VmProvider + 'static>(
     keys: &Arc<KeyPool>,
     environment: &RunnerEnvironment,
 ) -> Result<Vec<String>, OrchestratorError> {
+    let mut direct_create_from_packed = config.use_packed_artifact;
     let forked_golden = match golden {
         Some(golden) => match provider.fork(golden, name).await {
             Ok(()) => Some(golden),
+            Err(error @ VmError::ForkBaseBusy { .. })
+                if config.use_packed_artifact
+                    && golden.as_str() == format!("{}-golden", config.name_prefix) =>
+            {
+                // A live plain-fork clone still depends on the golden's frozen
+                // storage. Do not touch the base and do not create another VM
+                // from that same packed payload: SmolVM's mixed fork/create
+                // path has returned ESTALE in both machines. Boot this slot
+                // independently from the job's OCI environment instead.
+                warn!(
+                    machine = name.as_str(),
+                    golden = golden.as_str(),
+                    %error,
+                    "fork base busy; creating runner independently from the OCI image"
+                );
+                direct_create_from_packed = false;
+                None
+            }
             Err(error)
                 if config.use_packed_artifact
                     && golden.as_str() == format!("{}-golden", config.name_prefix) =>
@@ -2974,18 +2993,20 @@ async fn provision_runner<P: VmProvider + 'static>(
                                 golden = golden.as_str(),
                                 "fork base spent and cannot be re-armed (a live clone still \
                                  depends on it, or the partial clone could not be removed); \
-                                 falling back to direct creation"
+                                 falling back to independent OCI creation"
                             );
                             let _ = provider.delete(name).await;
+                            direct_create_from_packed = false;
                             None
                         }
                         Err(rearm_error) => {
                             error!(
                                 golden = golden.as_str(),
                                 %rearm_error,
-                                "failed to re-arm spent fork base; falling back to direct \
-                                 creation"
+                                "failed to re-arm spent fork base; falling back to independent \
+                                 OCI creation"
                             );
+                            direct_create_from_packed = false;
                             None
                         }
                     }
@@ -3087,11 +3108,13 @@ async fn provision_runner<P: VmProvider + 'static>(
             );
         }
     } else {
-        let uses_packed_artifact = config.use_packed_artifact;
+        let uses_packed_artifact = direct_create_from_packed;
         let spec = MachineSpec {
             name: name.clone(),
             image: if uses_packed_artifact {
                 config.artifact_payload().display().to_string()
+            } else if config.use_packed_artifact {
+                environment.base.clone()
             } else {
                 config.base_image.clone()
             },
@@ -3411,7 +3434,9 @@ mod lifecycle_tests {
     struct TestProvider {
         machines: Mutex<HashMap<String, MachineState>>,
         events: Mutex<Vec<String>>,
+        created_images: Mutex<Vec<(String, String)>>,
         fail_fork: bool,
+        fork_base_busy: bool,
         /// Fail the next fork with the "spent fork base" signature, then
         /// succeed. Mirrors a golden whose retained checkpoint vanished.
         fail_fork_once_spent: Mutex<bool>,
@@ -3445,7 +3470,9 @@ mod lifecycle_tests {
             Self {
                 machines: Mutex::new(HashMap::new()),
                 events: Mutex::new(Vec::new()),
+                created_images: Mutex::new(Vec::new()),
                 fail_fork: false,
+                fork_base_busy: false,
                 fail_fork_once_spent: Mutex::new(false),
                 live_forks: Mutex::new(true),
                 fail_start,
@@ -3467,6 +3494,11 @@ mod lifecycle_tests {
 
         fn failing_fork(mut self) -> Self {
             self.fail_fork = true;
+            self
+        }
+
+        fn with_busy_fork_base(mut self) -> Self {
+            self.fork_base_busy = true;
             self
         }
 
@@ -3497,6 +3529,14 @@ mod lifecycle_tests {
 
         async fn events(&self) -> Vec<String> {
             self.events.lock().await.clone()
+        }
+
+        async fn created_image(&self, name: &MachineName) -> Option<String> {
+            self.created_images
+                .lock()
+                .await
+                .iter()
+                .find_map(|(created, image)| (created == name.as_str()).then(|| image.clone()))
         }
     }
 
@@ -3970,6 +4010,10 @@ chmod +x "$destination/bin/node"
                 .lock()
                 .await
                 .insert(spec.name.as_str().to_owned(), MachineState::Stopped);
+            self.created_images
+                .lock()
+                .await
+                .push((spec.name.as_str().to_owned(), spec.image.clone()));
             self.events
                 .lock()
                 .await
@@ -4001,6 +4045,12 @@ chmod +x "$destination/bin/node"
                 .lock()
                 .await
                 .push(format!("fork:{}:{}", golden.as_str(), clone.as_str()));
+            if self.fork_base_busy {
+                return Err(VmError::ForkBaseBusy {
+                    golden: golden.as_str().to_owned(),
+                    clone: "lifecycle-test-0-live".to_owned(),
+                });
+            }
             {
                 let mut spent = self.fail_fork_once_spent.lock().await;
                 if *spent {
@@ -4429,6 +4479,46 @@ chmod +x "$destination/bin/node"
         assert!(
             events.contains(&format!("delete:{}", name.as_str())),
             "the partial clone is cleaned up: {events:?}"
+        );
+        assert_eq!(
+            provider.created_image(&name).await.as_deref(),
+            Some(config.base_image.as_str()),
+            "a live clone makes the shared packed payload unsafe; fallback must use OCI"
+        );
+    }
+
+    /// The provider reports a live clone before invoking SmolVM for another
+    /// plain fork. The orchestrator must neither re-arm the shared golden nor
+    /// instantiate the packed payload beside that clone.
+    #[tokio::test]
+    async fn busy_packed_fork_base_uses_independent_environment_image() {
+        let provider =
+            Arc::new(TestProvider::new(false, false, false, false, false).with_busy_fork_base());
+        let config = packed_fork_config();
+        let golden = MachineName::new("lifecycle-test-golden").unwrap();
+        let name = MachineName::new("lifecycle-test-0-9").unwrap();
+        let environment_base = "mirror.gcr.io/library/ubuntu:22.04";
+
+        provision_runner(
+            &provider,
+            &config,
+            &name,
+            Some(&golden),
+            &Arc::new(KeyPool::new()),
+            &test_runner_environment(environment_base, Vec::new(), true),
+        )
+        .await
+        .expect("a busy plain-fork base falls back to an independent OCI machine");
+
+        let events = provider.events().await;
+        assert!(
+            !events.iter().any(|event| event.starts_with("rearm:")),
+            "a golden with a live clone must not be re-armed: {events:?}"
+        );
+        assert_eq!(
+            provider.created_image(&name).await.as_deref(),
+            Some(environment_base),
+            "fallback must use the job's resolved environment, not the shared packed payload"
         );
     }
 

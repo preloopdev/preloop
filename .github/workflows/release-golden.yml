@@ -128,6 +128,8 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - name: Check out repository
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
@@ -159,6 +161,32 @@ jobs:
           test -s "dist/$GOLDEN_NAME"
           sha256sum "dist/$GOLDEN_NAME" > "dist/$GOLDEN_NAME.sha256"
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # Keyless signature (Fulcio + Rekor) on the pack blob, verified against
+      # this workflow's own OIDC identity before upload. Consumers verify
+      # with: cosign verify-blob --bundle <pack>.bundle <pack>
+      - name: Sign golden (cosign keyless)
+        env:
+          GOLDEN_NAME: preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes --bundle "dist/$GOLDEN_NAME.bundle" "dist/$GOLDEN_NAME"
+          cosign verify-blob \
+            --bundle "dist/$GOLDEN_NAME.bundle" \
+            --certificate-identity-regexp \
+              "^https://github.com/$GITHUB_REPOSITORY/.github/workflows/release-golden.yml@refs/(heads/main|tags/)" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "dist/$GOLDEN_NAME"
+
+      # GitHub-signed SLSA provenance for the pack; consumers verify with:
+      # gh attestation verify <pack> --repo preloopdev/preloop
+      - name: Attest golden (GitHub provenance)
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
+
       - name: Upload Golden Artifact to Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -171,7 +199,8 @@ jobs:
             TARGET_TAG="$(gh release view --json tagName --jq .tagName)"
           fi
           gh release upload "$TARGET_TAG" \
-            "dist/$GOLDEN_NAME" "dist/$GOLDEN_NAME.sha256" --clobber
+            "dist/$GOLDEN_NAME" "dist/$GOLDEN_NAME.sha256" \
+            "dist/$GOLDEN_NAME.bundle" --clobber
 
       # A dispatched build has no release to upload to; without this the
       # golden would sit only on the runner's workspace and be lost. Keep it
@@ -185,6 +214,7 @@ jobs:
           path: |
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.sha256
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.bundle
           retention-days: 90
           if-no-files-found: error
 
@@ -198,6 +228,8 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64]
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - name: Check out repository
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
@@ -275,6 +307,32 @@ jobs:
           test -s "dist/$GOLDEN_NAME"
           shasum -a 256 "dist/$GOLDEN_NAME" > "dist/$GOLDEN_NAME.sha256"
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # Keyless signature (Fulcio + Rekor) on the pack blob, verified against
+      # this workflow's own OIDC identity before upload. Consumers verify
+      # with: cosign verify-blob --bundle <pack>.bundle <pack>
+      - name: Sign golden (cosign keyless)
+        env:
+          GOLDEN_NAME: preloop-ubuntu-24.04-aarch64
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes --bundle "dist/$GOLDEN_NAME.bundle" "dist/$GOLDEN_NAME"
+          cosign verify-blob \
+            --bundle "dist/$GOLDEN_NAME.bundle" \
+            --certificate-identity-regexp \
+              "^https://github.com/$GITHUB_REPOSITORY/.github/workflows/release-golden.yml@refs/(heads/main|tags/)" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "dist/$GOLDEN_NAME"
+
+      # GitHub-signed SLSA provenance for the pack; consumers verify with:
+      # gh attestation verify <pack> --repo preloopdev/preloop
+      - name: Attest golden (GitHub provenance)
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: dist/preloop-ubuntu-24.04-aarch64
+
       - name: Upload Golden Artifact to Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -287,7 +345,8 @@ jobs:
             TARGET_TAG="$(gh release view --json tagName --jq .tagName)"
           fi
           gh release upload "$TARGET_TAG" \
-            "dist/$GOLDEN_NAME" "dist/$GOLDEN_NAME.sha256" --clobber
+            "dist/$GOLDEN_NAME" "dist/$GOLDEN_NAME.sha256" \
+            "dist/$GOLDEN_NAME.bundle" --clobber
 
       - name: Retain Golden Artifact for non-release builds
         if: github.event_name != 'release'
@@ -297,5 +356,6 @@ jobs:
           path: |
             dist/preloop-ubuntu-24.04-aarch64
             dist/preloop-ubuntu-24.04-aarch64.sha256
+            dist/preloop-ubuntu-24.04-aarch64.bundle
           retention-days: 90
           if-no-files-found: error

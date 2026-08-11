@@ -134,6 +134,9 @@ Client-side (`preloop` CLI): `PRELOOP_URL` (default `http://127.0.0.1:9090`) and
 | `PRELOOP_RUNNER_OVERLAY_GB` | — | Per-VM writable overlay size |
 | `PRELOOP_RUNNER_USER` / `PRELOOP_RUNNER_UID` | `runner` / `1001` | Guest account steps run as, for GitHub-hosted parity. `root` restores root; empty disables switching |
 | `PRELOOP_USE_FORK` | — | Fork machines from a prepared golden instead of building each |
+| `PRELOOP_SMOLVM_RETAINED_FORKS` | `true` | Enable multiple live forks from one golden; set `false` only for an older official SmolVM build |
+| `PRELOOP_SMOLVM_RELEASE_REPOSITORY` | `preloopdev/smolvm` | Temporary GitHub `OWNER/NAME` override for `preloop update --ensure-runtime` |
+| `PRELOOP_SMOLVM_RELEASE_VERSION` | `1.7.4` | Temporary SmolVM release/tag override for `preloop update --ensure-runtime` |
 | `PRELOOP_USE_PACKED_GOLDEN` | `true` | Use a release or locally cached packed golden for on-demand and pooled runners |
 | `PRELOOP_GOLDEN_URL` | release asset | Packed golden URL; the optional checksum is fetched from the same URL plus `.sha256` |
 | `PRELOOP_RUNNER_BUNDLE` | — | Directory of runner binaries mounted into guests |

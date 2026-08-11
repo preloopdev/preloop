@@ -188,6 +188,25 @@ preloop serve
 Provisioning currently assumes an Ubuntu 24.04 or 22.04 userspace and uses
 `apt-get`. Use a workflow `container:` image for another distribution.
 
+### Verifying a base image's provenance
+
+For enterprise use, `build-golden` can refuse to bake from a base image whose
+provenance does not check out. The dump-style images published by the
+snapshot pipeline carry a GitHub-signed SLSA attestation (stored in GHCR) and
+a Sigstore keyless signature from the publishing workflow; both are verified
+before the golden is built:
+
+```sh
+PRELOOP_VERIFY_BASE_IMAGE=1 \
+PRELOOP_VERIFY_BASE_IMAGE_REPO=acme/runner-image-blobs \
+preloop build-golden --base-image 'ghcr.io/acme/runner-images:ubuntu24-runner-large-latest-arm64' ...
+```
+
+`gh` and `cosign` must be installed on the build host. The signature identity
+is pinned to the publishing repository's `dump.yml` workflow on the default
+branch; override with `PRELOOP_BASE_IMAGE_IDENTITY_REGEXP` if the publishing
+workflow differs.
+
 ### Using a snapshot of the official hosted image
 
 GitHub's hosted runner images are not published as OCI images, but the
