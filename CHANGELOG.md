@@ -9,22 +9,33 @@ Releases before v0.27.0 predate the changelog.
 
 ## [Unreleased]
 
+## [0.29.9-rc] - 2026-08-11
+
 ### Fixed
 
-- Serialize `machine fork` per golden VM. SmolVM keeps one RAM checkpoint per
-  golden; concurrent forks raced the freeze, and the loser's rollback resumed
-  the base and dropped the checkpoint, after which every fork failed with
-  `golden '<name>' is already paused; a valid retained checkpoint is required`
-  and queued jobs stalled until the engine restarted. Forks from different
-  goldens still run in parallel.
-- Re-arm a spent fork base (stop + restart forkable) and retry the fork once
-  when no clone still depends on it, instead of degrading every runner to a
-  full VM create. A base with live clones is never restarted — it falls back
-  to direct creation with an error explaining why.
+- Serialize `machine fork` per golden VM (#112). SmolVM keeps one RAM
+  checkpoint per golden; concurrent forks raced the freeze, and the loser's
+  rollback resumed the base and dropped the checkpoint, after which every
+  fork failed with `golden '<name>' is already paused; a valid retained
+  checkpoint is required` and queued jobs stalled until the engine restarted.
+  Forks from different goldens still run in parallel.
+- Re-arm a spent fork base atomically and retry the fork once (#112): partial
+  clone cleanup, the live-clone check, and the stop/restart run under the
+  provider's per-golden fork lock, and cleanup must succeed before the base
+  is touched. A base with live clones is never restarted — it falls back to
+  direct creation with an error explaining why.
 - `preloop debug <reference>` now resolves a run id that has several paused
   jobs: it lists them (with their run ids) instead of answering
-  `no paused job matching`. When nothing matches but other sessions are
-  paused, the reply says what is paused instead of a bare 404.
+  `no paused job matching`; non-404 failures propagate their real cause.
+  When nothing matches but other sessions are paused, the reply says what is
+  paused instead of a bare 404 (#112).
+- Persist GitHub check-run ids at creation so a server restart mid-queue no
+  longer orphans checks in "queued" forever while the jobs run and complete
+  (#113).
+- Dead-bound job requeue: stale bindings stay claimable in strict non-pool
+  mode (no more stranded jobs), and the original first-bound stamp survives
+  the requeue so repeated provisioning failures cannot extend the bounded
+  claim window (#113).
 
 ## [0.29.8] - 2026-08-09
 
