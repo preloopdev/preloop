@@ -431,6 +431,45 @@ async fn create_workspace_snapshot_inner(
     }
     run_git(&mut add, "stage local workspace state").await?;
 
+    // A local workspace can carry gitlink entries for submodules that were
+    // never registered in `.gitmodules` — a nested clone added by hand, or a
+    // half-removed submodule. Served faithfully, the gitlink makes
+    // `git submodule` operations in the VM (which actions/checkout runs when
+    // a workflow asks for submodules) die with `fatal: No url found for
+    // submodule path '…' in .gitmodules` even though the repository itself
+    // is intact. GitHub-hosted workspaces cannot have this state; local ones
+    // routinely do. Drop gitlinks no `.gitmodules` url resolves so the
+    // checkout behaves as if the path were an ordinary directory.
+    let staged = run_snapshot_git(
+        workspace,
+        staging_repository,
+        staging_index,
+        &cached_objects,
+        ["ls-files", "--stage", "-z"],
+        "list staged paths",
+    )
+    .await?;
+    let gitlinks = gitlink_paths(&staged.stdout);
+    if !gitlinks.is_empty() {
+        let configured = configured_submodule_urls(workspace);
+        let unresolvable: Vec<&str> = gitlinks
+            .iter()
+            .filter(|path| !configured.contains(*path))
+            .map(String::as_str)
+            .collect();
+        if !unresolvable.is_empty() {
+            let mut remove = snapshot_git_command(
+                workspace,
+                staging_repository,
+                staging_index,
+                &cached_objects,
+            );
+            remove.args(["update-index", "--force-remove", "--"]);
+            remove.args(&unresolvable);
+            run_git(&mut remove, "drop unresolvable submodule gitlinks").await?;
+        }
+    }
+
     let tree_output = run_snapshot_git(
         workspace,
         staging_repository,
@@ -845,6 +884,66 @@ fn snapshot_git_command(
         .env("GIT_INDEX_FILE", index)
         .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", source_objects);
     command
+}
+
+/// Paths of gitlink (mode `160000`) entries in a `git ls-files --stage -z`
+/// listing.
+///
+/// Records are NUL-terminated with a TAB between the `mode sha stage` header
+/// and the path; `-z` leaves paths unquoted.
+fn gitlink_paths(staged: &[u8]) -> Vec<String> {
+    let mut paths = Vec::new();
+    for record in staged.split(|byte| *byte == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
+            continue;
+        };
+        if record[..tab].starts_with(b"160000 ") {
+            if let Ok(path) = std::str::from_utf8(&record[tab + 1..]) {
+                paths.push(path.to_owned());
+            }
+        }
+    }
+    paths
+}
+
+/// Names of submodules that have a `url` configured in the workspace's
+/// `.gitmodules`, or an empty set when the file is absent or unparsable.
+///
+/// Submodule names conventionally equal the gitlink path (that is how
+/// `git submodule add` registers them), and `git submodule` resolves a
+/// gitlink by looking up `submodule.<path>.url` — so a gitlink whose path is
+/// not in this set is exactly the state that dies with `fatal: No url found
+/// for submodule path '…' in .gitmodules`.
+fn configured_submodule_urls(workspace: &FsPath) -> BTreeSet<String> {
+    let Ok(text) = std::fs::read_to_string(workspace.join(".gitmodules")) else {
+        return BTreeSet::new();
+    };
+    let mut configured = BTreeSet::new();
+    let mut current: Option<String> = None;
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            let inner = &line[1..line.len() - 1];
+            current = inner
+                .trim()
+                .strip_prefix("submodule")
+                .map(str::trim)
+                .and_then(|rest| rest.strip_prefix('"'))
+                .and_then(|rest| rest.strip_suffix('"'))
+                .map(str::to_owned);
+            continue;
+        }
+        if let (Some(name), Some(rest)) = (current.as_ref(), line.strip_prefix("url")) {
+            let value = rest.trim_start().strip_prefix('=').map(str::trim);
+            if value.is_some_and(|value| !value.is_empty()) {
+                configured.insert(name.clone());
+            }
+        }
+    }
+    configured
 }
 
 /// Whether the workspace's own `.gitignore` rules already exclude `relative`.
