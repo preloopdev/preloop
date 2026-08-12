@@ -485,6 +485,9 @@ fn pb_string_field(field: u64, value: &str) -> Vec<u8> {
 type CachePbFields = (String, String, Vec<String>, Option<String>, Option<String>);
 
 fn pb_cache_request(body: &[u8]) -> Result<CachePbFields, ApiError> {
+    // ghac 0.2.0 field numbers: metadata=1 (message), key=2,
+    // restore_keys=3, version=4 (GetCacheEntryDownloadURL /
+    // FinalizeCacheEntryUpload) or 3 (CreateCacheEntry).
     let one = |v: Option<Vec<String>>| {
         v.and_then(|mut s| {
             if s.is_empty() {
@@ -494,12 +497,48 @@ fn pb_cache_request(body: &[u8]) -> Result<CachePbFields, ApiError> {
             }
         })
     };
-    let key = one(pb_strings(body, 1)).unwrap_or_default();
-    let version = one(pb_strings(body, 2)).unwrap_or_default();
+    let key = one(pb_strings(body, 2)).unwrap_or_default();
+    let version = one(pb_strings(body, 4))
+        .or_else(|| one(pb_strings(body, 3)))
+        .unwrap_or_default();
     let restore_keys = pb_strings(body, 3).ok_or_else(|| ApiError::bad_request("bad protobuf"))?;
-    let scope = one(pb_strings(body, 4));
-    let repository = one(pb_strings(body, 5));
+    // Scope lives inside the CacheMetadata message: metadata(1) ->
+    // CacheMetadata.scope(2) -> CacheScope.scope(1).
+    let scope = pb_strings(body, 1)
+        .and_then(|mut v| {
+            if v.is_empty() {
+                None
+            } else {
+                Some(v.remove(0))
+            }
+        })
+        .and_then(|meta| {
+            pb_strings(meta.as_bytes(), 2).and_then(|mut v| {
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v.remove(0))
+                }
+            })
+        })
+        .and_then(|entry| {
+            pb_strings(entry.as_bytes(), 1).and_then(|mut v| {
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v.remove(0))
+                }
+            })
+        });
+    let repository = None;
     Ok((key, version, restore_keys, scope, repository))
+}
+
+/// Protobuf varint field (wire type 0), for the `ok` / `entry_id` fields.
+fn pb_uint_field(field: u64, value: u64) -> Vec<u8> {
+    let mut out = pb_varint_bytes(field << 3);
+    out.extend(pb_varint_bytes(value));
+    out
 }
 
 fn pb_or_json(
@@ -565,10 +604,7 @@ pub(crate) async fn twirp_cache_v2_create(
     {
         return Ok(pb_or_json(
             &headers,
-            vec![
-                pb_string_field(1, ""),
-                pb_string_field(2, "cache already exists"),
-            ],
+            vec![pb_uint_field(1, 0), pb_string_field(2, "")],
             json!({
                 "ok": false,
                 "signed_upload_url": "",
@@ -613,10 +649,7 @@ pub(crate) async fn twirp_cache_v2_create(
         let _ = tokio::fs::remove_dir_all(&stage_dir).await;
         return Ok(pb_or_json(
             &headers,
-            vec![
-                pb_string_field(1, ""),
-                pb_string_field(2, "cache upload already reserved"),
-            ],
+            vec![pb_uint_field(1, 0), pb_string_field(2, "")],
             json!({
                 "ok": false,
                 "signed_upload_url": "",
@@ -628,7 +661,7 @@ pub(crate) async fn twirp_cache_v2_create(
     info!(token, "cache v2 create entry");
     Ok(pb_or_json(
         &headers,
-        vec![pb_string_field(1, &upload_url), pb_string_field(2, "")],
+        vec![pb_uint_field(1, 1), pb_string_field(2, &upload_url)],
         json!({ "ok": true, "signed_upload_url": upload_url, "message": "" }),
     ))
 }
@@ -663,7 +696,7 @@ pub(crate) async fn twirp_cache_v2_finalize(
         {
             return Ok(pb_or_json(
                 &headers,
-                vec![pb_string_field(1, "1"), pb_string_field(2, "")],
+                vec![pb_uint_field(1, 1), pb_uint_field(2, 1)],
                 json!({ "ok": true, "entry_id": "1", "message": "" }),
             ));
         }
@@ -732,7 +765,7 @@ pub(crate) async fn twirp_cache_v2_finalize(
     );
     Ok(pb_or_json(
         &headers,
-        vec![pb_string_field(1, "1"), pb_string_field(2, "")],
+        vec![pb_uint_field(1, 1), pb_uint_field(2, 1)],
         json!({ "ok": true, "entry_id": "1", "message": "" }),
     ))
 }
@@ -770,7 +803,11 @@ pub(crate) async fn twirp_cache_v2_get_dl_url(
             );
             return Ok(pb_or_json(
                 &headers,
-                vec![pb_string_field(1, ""), pb_string_field(2, "")],
+                vec![
+                    pb_uint_field(1, 0),
+                    pb_string_field(2, ""),
+                    pb_string_field(3, ""),
+                ],
                 json!({ "ok": false, "signed_download_url": "", "matched_key": "" }),
             ));
         }
@@ -802,8 +839,9 @@ pub(crate) async fn twirp_cache_v2_get_dl_url(
     Ok(pb_or_json(
         &headers,
         vec![
-            pb_string_field(1, &download_url),
-            pb_string_field(2, &matched_key),
+            pb_uint_field(1, 1),
+            pb_string_field(2, &download_url),
+            pb_string_field(3, &matched_key),
         ],
         json!({
             "ok": true,
@@ -819,16 +857,20 @@ mod cache_pb_tests {
 
     #[test]
     fn pb_roundtrip_decodes_sccache_style_request() {
-        // GetCacheEntryDownloadURLRequest: key=1 version=2 restore_keys=3 scope=4
-        let mut body = pb_string_field(1, ".sccache_check");
-        body.extend(pb_string_field(2, "abc123"));
+        // ghac GetCacheEntryDownloadURLRequest: metadata=1 key=2
+        // restore_keys=3 version=4; scope nested in metadata.
+        let mut body = pb_string_field(2, ".sccache_check");
         body.extend(pb_string_field(3, "restore-a"));
-        body.extend(pb_string_field(4, "scope"));
+        body.extend(pb_string_field(4, "abc123"));
+        // metadata(1) -> CacheMetadata.scope(2) -> CacheScope.scope(1)
+        let scope_entry = pb_string_field(1, "refs/heads/main");
+        let meta = pb_string_field(2, &String::from_utf8(scope_entry).unwrap());
+        body.extend(pb_string_field(1, &String::from_utf8(meta).unwrap()));
         let (key, version, restore, scope, repository) = pb_cache_request(&body).unwrap();
         assert_eq!(key, ".sccache_check");
         assert_eq!(version, "abc123");
         assert_eq!(restore, vec!["restore-a"]);
-        assert_eq!(scope.as_deref(), Some("scope"));
+        assert_eq!(scope.as_deref(), Some("refs/heads/main"));
         assert_eq!(repository, None);
     }
 
