@@ -12675,6 +12675,179 @@ async fn workspace_snapshot_survives_refs_with_missing_objects() {
 }
 
 #[tokio::test]
+async fn snapshot_drops_unresolvable_gitlinks_but_keeps_registered_submodules() {
+    let temp = tempfile::tempdir().unwrap();
+    let (state_dir, workspace) = create_snapshot_fixture(temp.path());
+
+    // A nested repo added by hand: the parent index gets a gitlink entry
+    // but no `.gitmodules` registers it — the state that makes
+    // `git submodule foreach` inside the VM fail with `fatal: No url found
+    // for submodule path 'stream-docker-output' in .gitmodules`.
+    let nested = workspace.join("stream-docker-output");
+    fs::create_dir_all(&nested).unwrap();
+    git_fixture_command(&nested, &["init", "-q", "-b", "main"]);
+    git_fixture_command(&nested, &["config", "user.email", "nested@example.test"]);
+    fs::write(nested.join("payload.txt"), "nested\n").unwrap();
+    git_fixture_command(&nested, &["add", "payload.txt"]);
+    git_fixture_command(&nested, &["commit", "-qm", "nested"]);
+    let nested_tip = String::from_utf8(git_fixture_output(&nested, &["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let cacheinfo = format!("160000,{nested_tip},stream-docker-output");
+    git_fixture_command(
+        &workspace,
+        &["update-index", "--add", "--cacheinfo", cacheinfo.as_str()],
+    );
+
+    fs::create_dir_all(&state_dir).unwrap();
+    let first_run: RunId = "44444444-4444-4444-8444-444444444444".parse().unwrap();
+    let first = create_workspace_snapshot(&state_dir, &workspace, first_run, None)
+        .await
+        .expect("snapshot with an unresolvable gitlink should succeed");
+    let first_repository = state_dir.join(&first.repository);
+    let output = git_fixture_output(
+        &first_repository,
+        &[
+            "ls-tree",
+            first.commit_sha.as_str(),
+            "--",
+            "stream-docker-output",
+        ],
+    );
+    assert!(
+        output.is_empty(),
+        "unresolvable gitlink must be dropped from the snapshot: {}",
+        String::from_utf8_lossy(&output)
+    );
+
+    // Register the submodule properly: the gitlink must then survive so a
+    // workflow asking for submodules gets the real structure.
+    fs::write(
+        workspace.join(".gitmodules"),
+        "[submodule \"stream-docker-output\"]\n\tpath = stream-docker-output\n\turl = https://example.test/stream-docker-output.git\n",
+    )
+    .unwrap();
+    let second_run: RunId = "55555555-5555-4555-8555-555555555555".parse().unwrap();
+    let second = create_workspace_snapshot(&state_dir, &workspace, second_run, None)
+        .await
+        .expect("snapshot with a registered submodule should succeed");
+    let second_repository = state_dir.join(&second.repository);
+    let listed = String::from_utf8(git_fixture_output(
+        &second_repository,
+        &[
+            "ls-tree",
+            second.commit_sha.as_str(),
+            "--",
+            "stream-docker-output",
+        ],
+    ))
+    .unwrap();
+    assert!(
+        listed.starts_with("160000"),
+        "a registered submodule gitlink must survive the snapshot: {listed}"
+    );
+
+    // A logical submodule name that differs from the checkout path is valid
+    // (`git submodule add --name`): the gitlink must still survive, since git
+    // resolves it by the `path` key, not the section name.
+    fs::write(
+        workspace.join(".gitmodules"),
+        "[submodule \"logical-stream\"]\n\tpath = stream-docker-output\n\turl = https://example.test/stream-docker-output.git\n",
+    )
+    .unwrap();
+    let third_run: RunId = "66666666-6666-4666-8666-666666666666".parse().unwrap();
+    let third = create_workspace_snapshot(&state_dir, &workspace, third_run, None)
+        .await
+        .expect("snapshot with a logically-named submodule should succeed");
+    let third_repository = state_dir.join(&third.repository);
+    let listed = String::from_utf8(git_fixture_output(
+        &third_repository,
+        &[
+            "ls-tree",
+            third.commit_sha.as_str(),
+            "--",
+            "stream-docker-output",
+        ],
+    ))
+    .unwrap();
+    assert!(
+        listed.starts_with("160000"),
+        "a logically-named registered submodule gitlink must survive the snapshot: {listed}"
+    );
+}
+
+#[tokio::test]
+async fn snapshot_gitlink_resolution_matches_git() {
+    let temp = tempfile::tempdir().unwrap();
+    let (state_dir, workspace) = create_snapshot_fixture(temp.path());
+
+    // The keep/drop decision must mirror git's own resolution: git resolves a
+    // gitlink by the section whose `path` matches it. Three registration
+    // shapes git handles but a naive parser gets wrong:
+    //   `a#b`         git writes and decodes this path QUOTED in .gitmodules
+    //   `mixed`       [SUBMODULE]/Path/URL: config sections and keys are
+    //                 case-insensitive for git
+    //   `logical-only` section name only; its `path` points elsewhere, so a
+    //                 gitlink at the name itself is NOT resolvable
+    for path in ["a#b", "mixed", "logical-only"] {
+        let nested = workspace.join(path);
+        fs::create_dir_all(&nested).unwrap();
+        git_fixture_command(&nested, &["init", "-q", "-b", "main"]);
+        git_fixture_command(&nested, &["config", "user.email", "nested@example.test"]);
+        fs::write(nested.join("payload.txt"), format!("{path}\n")).unwrap();
+        git_fixture_command(&nested, &["add", "payload.txt"]);
+        git_fixture_command(&nested, &["commit", "-qm", path]);
+        let tip = String::from_utf8(git_fixture_output(&nested, &["rev-parse", "HEAD"]))
+            .unwrap()
+            .trim()
+            .to_owned();
+        let cacheinfo = format!("160000,{tip},{path}");
+        git_fixture_command(
+            &workspace,
+            &["update-index", "--add", "--cacheinfo", cacheinfo.as_str()],
+        );
+    }
+    fs::write(
+        workspace.join(".gitmodules"),
+        "[submodule \"a#b\"]\n\tpath = \"a#b\"\n\turl = https://example.test/a-b.git\n\
+         [SUBMODULE \"mixed\"]\n\tPath = mixed\n\tURL = https://example.test/mixed.git\n\
+         [submodule \"logical-only\"]\n\tpath = elsewhere\n\turl = https://example.test/elsewhere.git\n",
+    )
+    .unwrap();
+
+    fs::create_dir_all(&state_dir).unwrap();
+    let run_id: RunId = "77777777-7777-4777-8777-777777777777".parse().unwrap();
+    let snapshot = create_workspace_snapshot(&state_dir, &workspace, run_id, None)
+        .await
+        .expect("snapshot with mixed gitlink registrations should succeed");
+    let repository = state_dir.join(&snapshot.repository);
+    let tree_of = |path: &str| {
+        String::from_utf8(git_fixture_output(
+            &repository,
+            &["ls-tree", snapshot.commit_sha.as_str(), "--", path],
+        ))
+        .unwrap()
+    };
+
+    let quoted = tree_of("a#b");
+    assert!(
+        quoted.starts_with("160000"),
+        "quoted registered path must survive the snapshot: {quoted}"
+    );
+    let mixed = tree_of("mixed");
+    assert!(
+        mixed.starts_with("160000"),
+        "mixed-case registered section must survive the snapshot: {mixed}"
+    );
+    let name_only = tree_of("logical-only");
+    assert!(
+        name_only.is_empty(),
+        "name-only gitlink must be dropped from the snapshot: {name_only}"
+    );
+}
+
+#[tokio::test]
 async fn workspace_snapshot_captures_git_state_without_mutating_source() {
     let temp = tempfile::tempdir().unwrap();
     let (state_dir, workspace) = create_snapshot_fixture(temp.path());
