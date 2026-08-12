@@ -12706,11 +12706,13 @@ async fn snapshot_drops_unresolvable_gitlinks_but_keeps_registered_submodules() 
         .await
         .expect("snapshot with an unresolvable gitlink should succeed");
     let first_repository = state_dir.join(&first.repository);
-    let (_, output) = git_fixture_output_allow_failure(
+    let output = git_fixture_output(
         &first_repository,
         &[
             "ls-tree",
-            &format!("{}:stream-docker-output", first.commit_sha),
+            first.commit_sha.as_str(),
+            "--",
+            "stream-docker-output",
         ],
     );
     assert!(
@@ -12744,6 +12746,34 @@ async fn snapshot_drops_unresolvable_gitlinks_but_keeps_registered_submodules() 
     assert!(
         listed.starts_with("160000"),
         "a registered submodule gitlink must survive the snapshot: {listed}"
+    );
+
+    // A logical submodule name that differs from the checkout path is valid
+    // (`git submodule add --name`): the gitlink must still survive, since git
+    // resolves it by the `path` key, not the section name.
+    fs::write(
+        workspace.join(".gitmodules"),
+        "[submodule \"logical-stream\"]\n\tpath = stream-docker-output\n\turl = https://example.test/stream-docker-output.git\n",
+    )
+    .unwrap();
+    let third_run: RunId = "66666666-6666-4666-8666-666666666666".parse().unwrap();
+    let third = create_workspace_snapshot(&state_dir, &workspace, third_run, None)
+        .await
+        .expect("snapshot with a logically-named submodule should succeed");
+    let third_repository = state_dir.join(&third.repository);
+    let listed = String::from_utf8(git_fixture_output(
+        &third_repository,
+        &[
+            "ls-tree",
+            third.commit_sha.as_str(),
+            "--",
+            "stream-docker-output",
+        ],
+    ))
+    .unwrap();
+    assert!(
+        listed.starts_with("160000"),
+        "a logically-named registered submodule gitlink must survive the snapshot: {listed}"
     );
 }
 
