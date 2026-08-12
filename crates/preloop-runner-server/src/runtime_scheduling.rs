@@ -2320,12 +2320,39 @@ fn register_expanded_jobs(
     jobs: Vec<BuiltJob>,
 ) -> Vec<QueuedJob> {
     let mut queued = Vec::with_capacity(jobs.len());
+    // The submit path concludes `runs-on: windows-*`/`macos-*` jobs when no
+    // runner of that platform is registered, but a reusable caller defers its
+    // callee: those jobs are built here, after the submit-time check ran. A
+    // callee job on an unhostable platform must conclude the same way —
+    // otherwise it sits queued forever (a Linux VM is not allowed to claim
+    // it), and if its caller's own placeholder was claimed in the meantime,
+    // the foreign-OS steps run on Linux and the job wedges in cleanup.
+    let platforms = registered_runner_platforms(inner);
+    let mut unhostable: Vec<(JobId, String)> = Vec::new();
     for BuiltJob {
         plan,
         condition_context,
         artifacts,
     } in jobs
     {
+        if let Some(platform) = unhostable_platform(&plan.runs_on, platforms.clone()) {
+            unhostable.push((
+                plan.id.clone(),
+                format!(
+                    "no {platform} runner is registered with this server, so `runs-on: {}` \
+                     cannot be scheduled",
+                    plan.runs_on.join(", ")
+                ),
+            ));
+            if let Some(run) = inner.runs.get_mut(&run_id) {
+                run.jobs.insert(plan.id.clone(), ExecutionStatus::Failure);
+                run.job_base_ids
+                    .insert(plan.id.clone(), plan.base_id.clone());
+                run.job_needs.insert(plan.id.clone(), plan.needs.clone());
+                run.job_names.insert(plan.id.clone(), plan.name.clone());
+            }
+            continue;
+        }
         let job_request = artifacts.job_request;
         inner
             .id_token_grants
@@ -2415,6 +2442,14 @@ fn register_expanded_jobs(
             deferred_matrix: plan.deferred_matrix.clone(),
             reusable_call: plan.reusable_call.clone(),
         });
+    }
+    for (job_id, reason) in unhostable {
+        tracing::warn!(
+            run_id = %run_id.0,
+            job = %job_id.0,
+            %reason,
+            "materialized callee job is unhostable; failing it"
+        );
     }
     queued
 }
