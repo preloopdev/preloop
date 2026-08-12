@@ -5042,7 +5042,15 @@ jobs:
 
 #[tokio::test]
 async fn cancel_run_completes_github_checks_and_terminal_metadata() {
-    let check_completions = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+    // Keyed by check-run id: `PRELOOP_GITHUB_API_URL` is process-global, and
+    // `owner/repo` is the suite's default repository, so a co-scheduled test
+    // that submits a run lands its own check-run PATCH on this stub. Counting
+    // every request would make the assertion depend on the rest of the suite;
+    // this test's contract is about the check run it pinned below.
+    const CHECK_RUN_ID: u64 = 7;
+    let check_completions = Arc::new(parking_lot::Mutex::new(
+        Vec::<(u64, serde_json::Value)>::new(),
+    ));
     let mock_app = Router::new().route(
         "/repos/owner/repo/check-runs/:id",
         axum::routing::patch({
@@ -5050,7 +5058,7 @@ async fn cancel_run_completes_github_checks_and_terminal_metadata() {
             move |Path(id): Path<u64>, body: axum::extract::Json<Value>| {
                 let check_completions = check_completions.clone();
                 async move {
-                    check_completions.lock().unwrap().push(body.0);
+                    check_completions.lock().push((id, body.0));
                     Json(json!({"id": id}))
                 }
             }
@@ -5062,9 +5070,12 @@ async fn cancel_run_completes_github_checks_and_terminal_metadata() {
         axum::serve(listener, mock_app).await.unwrap();
     });
 
+    // `TestEnvVar` restores both on drop, so a panicking assertion below
+    // cannot leak this stub's address (or its token) onto the rest of the run.
     let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    std::env::set_var("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}"));
-    std::env::set_var("PRELOOP_GITHUB_TOKEN", "cancel-test-token");
+    let _api_url =
+        crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}"));
+    let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "cancel-test-token");
 
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -5084,7 +5095,8 @@ async fn cancel_run_completes_github_checks_and_terminal_metadata() {
     {
         let mut inner = state.inner.lock().await;
         let run = inner.runs.get_mut(&run_id).unwrap();
-        run.job_check_run_ids.insert(JobId("build".into()), 7);
+        run.job_check_run_ids
+            .insert(JobId("build".into()), CHECK_RUN_ID);
     }
 
     let cancelled = request_json(
@@ -5095,19 +5107,21 @@ async fn cancel_run_completes_github_checks_and_terminal_metadata() {
     )
     .await;
 
-    std::env::remove_var("PRELOOP_GITHUB_API_URL");
-    std::env::remove_var("PRELOOP_GITHUB_TOKEN");
-
     assert_eq!(cancelled["status"], "cancelled");
     assert_eq!(cancelled["conclusion"], "cancelled");
     assert!(
         cancelled["completed_at"].is_string(),
         "cancelled run must carry terminal completion metadata"
     );
-    let completions = check_completions.lock().unwrap();
-    assert_eq!(completions.len(), 1);
-    assert_eq!(completions[0]["status"], "completed");
-    assert_eq!(completions[0]["conclusion"], "cancelled");
+    let completions = check_completions.lock();
+    let mine: Vec<&serde_json::Value> = completions
+        .iter()
+        .filter(|(id, _)| *id == CHECK_RUN_ID)
+        .map(|(_, body)| body)
+        .collect();
+    assert_eq!(mine.len(), 1, "one cancel, one check-run completion");
+    assert_eq!(mine[0]["status"], "completed");
+    assert_eq!(mine[0]["conclusion"], "cancelled");
 }
 
 #[tokio::test]
@@ -5638,6 +5652,1060 @@ async fn the_wire_token_permissions_match_the_declared_policy() {
             "wire permissions for {declaration:?}"
         );
     }
+}
+
+/// GitHub's fork profile is the single effective job-authorization policy for
+/// fork-restricted tiers. A fork PR declaring `checks: write` and
+/// `id-token: write` must come out read-only on the runner-visible wire
+/// variable, read-only in the App installation-token request, with no OIDC
+/// request URL and no OIDC grant — while a trusted push and a
+/// `pull_request_target` keep the declared writes and OIDC untouched.
+#[tokio::test]
+async fn fork_pr_jobs_are_downgraded_to_read_only_and_oidc_denied() {
+    use crate::github_app::{GitHubAppCredentials, MintFailurePolicy};
+
+    let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.github_app = Some(GitHubAppCredentials::for_tests(
+        "424",
+        private_key,
+        MintFailurePolicy::LocalJwt,
+    ));
+    let app = app(state.clone(), CancellationToken::new());
+
+    let yaml = "on: pull_request\npermissions:\n  checks: write\n  id-token: write\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+    let payload = json!({
+        "action": "opened",
+        "number": 7,
+        "pull_request": {
+            "head": {"ref": "feature", "sha": "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3"},
+            "base": {"ref": "main", "sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"}
+        },
+        "repository": {"full_name": "owner/repo", "default_branch": "main"}
+    });
+    let submit = |tier: Option<&str>| {
+        request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": yaml,
+                "event": "pull_request",
+                "repository": "owner/repo",
+                "payload": payload,
+                "trust_tier": tier,
+            }),
+        )
+    };
+
+    // Fork PR: declared writes must not survive, OIDC must not be granted.
+    let fork = submit(Some("untrusted-fork-pull-request")).await;
+    let fork_run_id = fork["run_id"].as_str().unwrap();
+    let trusted = submit(None).await;
+    let trusted_run_id = trusted["run_id"].as_str().unwrap();
+    let target = submit(Some("pull-request-target")).await;
+    let target_run_id = target["run_id"].as_str().unwrap();
+
+    let inner = state.inner.lock().await;
+    let fork_message = queued_message_for(&inner, fork_run_id);
+    assert_eq!(
+        variable_value(&fork_message, "system.github.token.permissions"),
+        Some(r#"{"Checks":"read"}"#),
+        "fork PR: declared checks write must be clamped to read, and id-token \
+         must not be advertised as a read permission"
+    );
+    assert!(
+        !variable_value(&fork_message, "system.github.token.permissions")
+            .is_some_and(|wire| wire.contains("IdToken")),
+        "fork PR: the wire permissions must carry no IdToken metadata"
+    );
+    let fork_endpoint = fork_message
+        .resources
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.name.eq_ignore_ascii_case("SystemVssConnection"))
+        .expect("SystemVssConnection endpoint present");
+    assert!(
+        !fork_endpoint
+            .data
+            .get("GenerateIdTokenUrl")
+            .is_some_and(|url| !url.is_empty()),
+        "fork PR: no OIDC request URL may be emitted"
+    );
+    let fork_request = inner
+        .github_token_requests
+        .get(&fork_message.request_id)
+        .expect("fork PR job defers an App token request");
+    assert_eq!(
+        fork_request.permissions,
+        BTreeMap::from([("checks".to_owned(), "read".to_owned())]),
+        "fork PR: App token request carries only the read-only fork profile"
+    );
+    assert!(
+        !fork_request.permissions.contains_key("id-token"),
+        "fork PR: the App token request must not name the non-App id-token scope"
+    );
+    assert!(
+        fork_request.untrusted,
+        "fork PR: token request must be marked untrusted so no fallback widens it"
+    );
+    let fork_job_record = inner
+        .job_requests
+        .get(&fork_message.request_id)
+        .expect("fork job request record present");
+    assert_eq!(
+        inner
+            .id_token_grants
+            .get(&(fork_job_record.run_id, fork_job_record.job_id.clone())),
+        Some(&false),
+        "fork PR: no OIDC grant may be recorded"
+    );
+
+    // Trusted push: declared writes and OIDC survive verbatim.
+    let trusted_message = queued_message_for(&inner, trusted_run_id);
+    assert_eq!(
+        variable_value(&trusted_message, "system.github.token.permissions"),
+        Some(r#"{"Checks":"write","IdToken":"write"}"#),
+        "trusted job keeps the declared write profile"
+    );
+    let trusted_endpoint = trusted_message
+        .resources
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.name.eq_ignore_ascii_case("SystemVssConnection"))
+        .expect("SystemVssConnection endpoint present");
+    assert!(
+        trusted_endpoint
+            .data
+            .get("GenerateIdTokenUrl")
+            .is_some_and(|url| !url.is_empty()),
+        "trusted job keeps the OIDC request URL"
+    );
+    let trusted_request = inner
+        .github_token_requests
+        .get(&trusted_message.request_id)
+        .expect("trusted job defers an App token request");
+    assert_eq!(
+        trusted_request.permissions,
+        BTreeMap::from([("checks".to_owned(), "write".to_owned())]),
+        "trusted job's App token request carries only real App repository permissions"
+    );
+    assert!(
+        !trusted_request.permissions.contains_key("id-token"),
+        "the App installation-token request must exclude the non-App id-token scope"
+    );
+    assert!(
+        !trusted_request.untrusted,
+        "trusted job is not marked untrusted"
+    );
+
+    // pull_request_target: base-repo trust, declared writes untouched.
+    let target_message = queued_message_for(&inner, target_run_id);
+    assert_eq!(
+        variable_value(&target_message, "system.github.token.permissions"),
+        Some(r#"{"Checks":"write","IdToken":"write"}"#),
+        "pull_request_target keeps base-repo trust"
+    );
+    drop(inner);
+
+    // The OIDC endpoint enforces the same grant: refused for the fork,
+    // minted for the trusted job.
+    let fork_uri = format!(
+        "/runner/server/_apis/distributedtask/hubs/actions/plans/{}/jobs/{}/oidctoken?audience=api://test",
+        fork_message.plan.plan_id, fork_message.job_id
+    );
+    let (status, _) = try_req(&app, Method::GET, &fork_uri, Value::Null).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "fork PR: OIDC token request must be refused"
+    );
+    let trusted_uri = format!(
+        "/runner/server/_apis/distributedtask/hubs/actions/plans/{}/jobs/{}/oidctoken?audience=api://test",
+        trusted_message.plan.plan_id, trusted_message.job_id
+    );
+    let token = request_json(&app, Method::GET, &trusted_uri, Value::Null).await;
+    assert!(
+        token["value"]
+            .as_str()
+            .is_some_and(|jwt| jwt.split('.').count() == 3),
+        "trusted job still mints an OIDC JWT"
+    );
+}
+
+/// A mint failure for an untrusted fork job must never reach the configured
+/// `PRELOOP_GITHUB_TOKEN` PAT fallback: the PAT is repository-unscoped and
+/// ignores `permissions:`, so handing it to fork PR code would grant
+/// authority GitHub's read-only fork profile never allowed. The job keeps the
+/// local runtime token instead — while a trusted job under the same `pat`
+/// policy still receives the PAT.
+#[tokio::test]
+async fn untrusted_job_mint_failure_never_falls_back_to_the_pat() {
+    use crate::github_app::{GitHubAppCredentials, MintFailurePolicy};
+
+    let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut creds = GitHubAppCredentials::for_tests("424", private_key, MintFailurePolicy::Pat);
+    creds.pat_fallback = Some("github_pat_broad".to_owned());
+    state.github_app = Some(creds);
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+
+    // `local-workspace-only` carries no `owner/repo` slug, so the mint fails
+    // before it signs anything or opens a socket — exactly like
+    // `app_token_mint_failure_follows_the_configured_policy`.
+    let yaml = "on: push\npermissions:\n  checks: write\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+    let fork = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": yaml,
+            "event": "push",
+            "repository": "local-workspace-only",
+            "trust_tier": "untrusted-fork-pull-request",
+        }),
+    )
+    .await;
+    let trusted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": yaml,
+            "event": "push",
+            "repository": "local-workspace-only",
+        }),
+    )
+    .await;
+
+    {
+        let inner = state.inner.lock().await;
+        let fork_message = queued_message_for(&inner, fork["run_id"].as_str().unwrap());
+        let fork_request = inner
+            .github_token_requests
+            .get(&fork_message.request_id)
+            .cloned()
+            .expect("fork job defers a token request");
+        let trusted_message = queued_message_for(&inner, trusted["run_id"].as_str().unwrap());
+        let trusted_request = inner
+            .github_token_requests
+            .get(&trusted_message.request_id)
+            .cloned()
+            .expect("trusted job defers a token request");
+        assert!(fork_request.untrusted);
+        assert!(!trusted_request.untrusted);
+        let shared = Arc::new(SharedState {
+            state: state.clone(),
+            shutdown: shutdown.clone(),
+        });
+        let fork_mint = crate::broker::mint_dispatch_github_token(&shared, &fork_request).await;
+        assert!(
+            matches!(fork_mint, Ok(None)),
+            "fork job must not receive the PAT fallback under the `pat` policy"
+        );
+        let trusted_mint =
+            crate::broker::mint_dispatch_github_token(&shared, &trusted_request).await;
+        assert_eq!(
+            trusted_mint
+                .expect("trusted job's mint failure is not a dispatch error")
+                .expect("pat policy hands the PAT to a trusted job")
+                .token,
+            "github_pat_broad",
+            "the PAT fallback still applies to trusted jobs"
+        );
+    }
+}
+
+/// The broker claim swaps the build-time token for the minted App token.
+/// Every runner-visible alias must follow coherently — `system.github.token`
+/// (the `${{ github.token }}` variable), `github_token`, the
+/// `${{ secrets.GITHUB_TOKEN }}` alias, and the `github` context's `token`
+/// entry — or workflow code would read a stale local runtime token from one
+/// alias while the others carry the scoped mint.
+#[tokio::test]
+async fn broker_claim_patches_every_token_alias_with_the_minted_token() {
+    use crate::github_app::{GitHubAppCredentials, MintFailurePolicy};
+    use axum::routing::{get, post};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", listener.local_addr().unwrap());
+    let stub = Router::new()
+        .route(
+            "/app/installations",
+            get(|| async { Json(json!([{"id": 4242, "account": {"login": "owner"}}])) }),
+        )
+        .route(
+            "/app/installations/:installation_id/access_tokens",
+            post(
+                |Path(installation_id): Path<u64>, body: Json<Value>| async move {
+                    assert_eq!(installation_id, 4242);
+                    assert_eq!(body.0["permissions"], json!({"checks": "write"}));
+                    assert!(
+                        body.0["permissions"].get("id-token").is_none(),
+                        "id-token is not an installation-token scope and must not be requested"
+                    );
+                    Json(json!({
+                        "token": "ghs_minted_alias_token",
+                        "expires_at": "2999-01-01T00:00:00Z"
+                    }))
+                },
+            ),
+        );
+    tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+
+    // Held for the whole test: `PRELOOP_GITHUB_API_URL` is process-global.
+    // `TestEnvVar` restores it even if an assertion below panics — a bare
+    // `remove_var` at the end of the body leaks this stub's address to every
+    // later test when the test fails, which turns one failure into a cascade.
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", api_base);
+
+    let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.github_app = Some(GitHubAppCredentials::for_tests(
+        "424",
+        private_key,
+        MintFailurePolicy::LocalJwt,
+    ));
+    let app = app(state.clone(), CancellationToken::new());
+
+    let registered = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/Agent/1/0",
+        json!({"name": "alias-runner", "version": "2.335.1"}),
+    )
+    .await;
+    let runner_id = registered["id"].as_i64().unwrap();
+    let runner_token = state
+        .local_jwt(json!({
+            "sub": format!("preloop-runner-listen-{runner_id}"),
+            "scp": "ActionsRuntime.RunnerListen",
+        }))
+        .unwrap();
+
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\npermissions:\n  checks: write\n  id-token: write\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "payload": {"ref": "refs/heads/main", "commits": []},
+            "repository": "owner/repo",
+            "git_ref": "refs/heads/main",
+        }),
+    )
+    .await;
+
+    let session = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/runner/server/session",
+        json!({}),
+        &runner_token,
+    )
+    .await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    let job_ref = request_json_with_bearer(
+        &app,
+        Method::GET,
+        &format!("/runner/server/message?sessionId={session_id}&status=Online&waitSeconds=0"),
+        Value::Null,
+        &runner_token,
+    )
+    .await;
+    let body: Value = serde_json::from_str(job_ref["body"].as_str().unwrap()).unwrap();
+    let runner_request_id = body["runner_request_id"].as_str().unwrap();
+
+    let acquired = request_json_with_bearer(
+        &app,
+        Method::POST,
+        &format!("/broker/{runner_id}/acquirejob"),
+        json!({"jobMessageId": runner_request_id, "billingOwnerId": "local", "runnerOS": "Linux"}),
+        &runner_token,
+    )
+    .await;
+    for name in ["system.github.token", "github_token", "GITHUB_TOKEN"] {
+        assert_eq!(
+            acquired["variables"][name]["value"], "ghs_minted_alias_token",
+            "{name} must carry the minted App token after the claim"
+        );
+        assert_eq!(
+            acquired["variables"][name]["isSecret"], true,
+            "{name} must stay marked secret"
+        );
+    }
+    // `${{ github.token }}` in the workflow context must see the same mint.
+    let context_pairs = acquired["contextData"]["github"]["d"].as_array().unwrap();
+    let context_token = context_pairs
+        .iter()
+        .find(|pair| pair["k"] == "token")
+        .expect("github context carries a token entry")
+        .clone();
+    assert_eq!(
+        context_token["v"], "ghs_minted_alias_token",
+        "the github context token must be the minted App token"
+    );
+    // No narrowing occurred, so the wire permissions keep the declared set
+    // (including the OIDC metadata for this trusted job).
+    assert_eq!(
+        acquired["variables"]["system.github.token.permissions"]["value"],
+        r#"{"Checks":"write","IdToken":"write"}"#,
+        "an un-narrowed mint leaves the declared wire permissions intact"
+    );
+}
+
+/// When the App installation grants fewer repository permissions than the
+/// job requested, the broker narrows the mint and must restate the wire
+/// permissions: App-scoped entries come from the effective grant (a scope
+/// the installation lacks disappears), while a trusted job's Actions-only
+/// metadata (`IdToken: write`, whose OIDC grant is still live) survives.
+/// A fork-restricted job's wire set has no IdToken and must not gain one.
+#[tokio::test]
+async fn broker_claim_merges_narrowed_grants_with_actions_only_metadata() {
+    use crate::github_app::{GitHubAppCredentials, MintFailurePolicy};
+    use axum::routing::{get, post};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", listener.local_addr().unwrap());
+    // The installation grants `contents`, `metadata` and `pull-requests` at
+    // read — but NOT `checks`. The first mint for each claim therefore 422s
+    // (checks is ungranted), the grants are fetched, the request is clamped,
+    // and the second mint succeeds with only the granted scope.
+    let access_token_calls = Arc::new(AtomicUsize::new(0));
+    let stub = Router::new()
+        .route(
+            "/app/installations",
+            get(|| async { Json(json!([{"id": 4242, "account": {"login": "owner"}}])) }),
+        )
+        .route(
+            "/app/installations/:installation_id",
+            get(|Path(installation_id): Path<u64>| async move {
+                assert_eq!(installation_id, 4242);
+                Json(json!({
+                    "permissions": {
+                        "contents": "read",
+                        "metadata": "read",
+                        "pull_requests": "read"
+                    }
+                }))
+            }),
+        )
+        .route(
+            "/app/installations/:installation_id/access_tokens",
+            post({
+                let access_token_calls = access_token_calls.clone();
+                move |Path(installation_id): Path<u64>, body: Json<Value>| {
+                    let access_token_calls = access_token_calls.clone();
+                    async move {
+                        assert_eq!(installation_id, 4242);
+                        let call = access_token_calls.fetch_add(1, Ordering::SeqCst);
+                        match call {
+                            // First attempt per claim: the ungranted `checks`
+                            // scope makes GitHub reject the whole request.
+                            0 | 2 => axum::response::Response::builder()
+                                .status(StatusCode::UNPROCESSABLE_ENTITY)
+                                .body(Body::from(
+                                    json!({"message": "checks is not granted"}).to_string(),
+                                ))
+                                .unwrap(),
+                            _ => {
+                                // The clamped request names only the granted
+                                // scope, and never the Actions-only id-token.
+                                assert_eq!(body.0["permissions"], json!({"pull_requests": "read"}));
+                                assert!(body.0["permissions"].get("id-token").is_none());
+                                axum::Json(json!({
+                                    "token": format!("ghs_narrowed_{call}"),
+                                    "expires_at": "2999-01-01T00:00:00Z"
+                                }))
+                                .into_response()
+                            }
+                        }
+                    }
+                }
+            }),
+        );
+    tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+
+    // Held for the whole test: `PRELOOP_GITHUB_API_URL` is process-global, and
+    // `TestEnvVar` restores it through a panicking assertion.
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", api_base);
+
+    let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.github_app = Some(GitHubAppCredentials::for_tests(
+        "424",
+        private_key,
+        MintFailurePolicy::LocalJwt,
+    ));
+    let app = app(state.clone(), CancellationToken::new());
+    let registered = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/Agent/1/0",
+        json!({"name": "narrow-runner", "version": "2.335.1"}),
+    )
+    .await;
+    let runner_id = registered["id"].as_i64().unwrap();
+    let runner_token = state
+        .local_jwt(json!({
+            "sub": format!("preloop-runner-listen-{runner_id}"),
+            "scp": "ActionsRuntime.RunnerListen",
+        }))
+        .unwrap();
+
+    let yaml = "on: push\npermissions:\n  checks: write\n  pull-requests: write\n  id-token: write\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+    let submit = |tier: Option<&'static str>| {
+        let app = app.clone();
+        async move {
+            request_json(
+                &app,
+                Method::POST,
+                "/api/v1/runs",
+                json!({
+                    "workflow_yaml": yaml,
+                    "event": "push",
+                    "payload": {"ref": "refs/heads/main", "commits": []},
+                    "repository": "owner/repo",
+                    "git_ref": "refs/heads/main",
+                    "trust_tier": tier,
+                }),
+            )
+            .await
+        }
+    };
+
+    async fn claim_and_return(app: &Router, runner_id: i64, runner_token: &str) -> Value {
+        let session = request_json_with_bearer(
+            app,
+            Method::POST,
+            "/runner/server/session",
+            json!({}),
+            runner_token,
+        )
+        .await;
+        let session_id = session["sessionId"].as_str().unwrap();
+        let job_ref = request_json_with_bearer(
+            app,
+            Method::GET,
+            &format!("/runner/server/message?sessionId={session_id}&status=Online&waitSeconds=0"),
+            Value::Null,
+            runner_token,
+        )
+        .await;
+        let body: Value = serde_json::from_str(job_ref["body"].as_str().unwrap()).unwrap();
+        let runner_request_id = body["runner_request_id"].as_str().unwrap();
+        request_json_with_bearer(
+            app,
+            Method::POST,
+            &format!("/broker/{runner_id}/acquirejob"),
+            json!({"jobMessageId": runner_request_id, "billingOwnerId": "local", "runnerOS": "Linux"}),
+            runner_token,
+        )
+        .await
+    }
+
+    // Trusted job first (claim 1): declared writes are clamped to the
+    // installation's grant, `checks` disappears entirely, and `IdToken: write`
+    // survives because the OIDC grant is still live.
+    submit(None).await;
+    let trusted = claim_and_return(&app, runner_id, &runner_token).await;
+    assert_eq!(
+        trusted["variables"]["system.github.token.permissions"]["value"],
+        r#"{"IdToken":"write","PullRequests":"read"}"#,
+        "trusted wire keeps the OIDC metadata and reflects the narrowed App grant"
+    );
+    let trusted_endpoint = trusted["resources"]["endpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|endpoint| {
+            endpoint["name"]
+                .as_str()
+                .is_some_and(|name| name.eq_ignore_ascii_case("SystemVssConnection"))
+        })
+        .expect("SystemVssConnection endpoint present");
+    assert!(
+        trusted_endpoint["data"]["GenerateIdTokenUrl"]
+            .as_str()
+            .is_some_and(|url| !url.is_empty()),
+        "trusted job's OIDC grant survives the narrowing"
+    );
+    assert_eq!(
+        trusted["variables"]["system.github.token"]["value"], "ghs_narrowed_1",
+        "trusted job carries the minted token"
+    );
+
+    // Fork job (claim 3): same declared workflow, but the fork profile never
+    // carried IdToken — the narrowed restatement must not invent one.
+    submit(Some("untrusted-fork-pull-request")).await;
+    let fork = claim_and_return(&app, runner_id, &runner_token).await;
+    assert_eq!(
+        fork["variables"]["system.github.token.permissions"]["value"], r#"{"PullRequests":"read"}"#,
+        "fork wire reflects the narrowed grant with no IdToken metadata"
+    );
+    assert!(
+        !fork["variables"]["system.github.token.permissions"]["value"]
+            .as_str()
+            .is_some_and(|wire| wire.contains("IdToken")),
+        "fork wire must not advertise IdToken"
+    );
+    let fork_endpoint = fork["resources"]["endpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|endpoint| {
+            endpoint["name"]
+                .as_str()
+                .is_some_and(|name| name.eq_ignore_ascii_case("SystemVssConnection"))
+        })
+        .expect("SystemVssConnection endpoint present");
+    assert!(
+        !fork_endpoint["data"]["GenerateIdTokenUrl"]
+            .as_str()
+            .is_some_and(|url| !url.is_empty()),
+        "fork job gets no OIDC request URL"
+    );
+    assert_eq!(
+        fork["variables"]["system.github.token"]["value"], "ghs_narrowed_3",
+        "fork job carries the minted token"
+    );
+}
+
+/// The deferred App-token request is deliberately kept past the first claim so
+/// a re-claim after a runner disconnect re-mints under the build-time
+/// conditions (the original permission set and its fallback restrictions).
+/// It must not outlive the *job*, though: the record pins a repository and a
+/// permission set, it is persisted into the store snapshot, and a stale entry
+/// would let a re-claim mint fresh GitHub authority for work that is over.
+///
+/// Clearing it inside the broker's own `completejob` handler is not enough —
+/// the legacy `/_apis` completion endpoints and the lease-expiry reaper never
+/// run that handler. Every completion path does funnel through
+/// `complete_job_inner`, so that is where the record is dropped, and this test
+/// completes through the non-broker compat route to prove it.
+#[tokio::test]
+async fn a_completed_job_drops_its_deferred_token_request() {
+    use crate::github_app::{GitHubAppCredentials, MintFailurePolicy};
+
+    // A port nothing listens on: the mint fails on connect, so the claim
+    // exercises the retention path without any network round trip. Under
+    // `LocalJwt` the job simply keeps its local runtime token.
+    let closed_port = {
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        probe.local_addr().unwrap().port()
+    };
+
+    // Held for the whole test: `PRELOOP_GITHUB_API_URL` is process-global.
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _api_url = crate::state::TestEnvVar::set(
+        "PRELOOP_GITHUB_API_URL",
+        format!("http://127.0.0.1:{closed_port}"),
+    );
+
+    let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.github_app = Some(GitHubAppCredentials::for_tests(
+        "424",
+        private_key,
+        MintFailurePolicy::LocalJwt,
+    ));
+    let app = app(state.clone(), CancellationToken::new());
+
+    let registered = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/Agent/1/0",
+        json!({"name": "lifetime-runner", "version": "2.335.1"}),
+    )
+    .await;
+    let runner_id = registered["id"].as_i64().unwrap();
+    let runner_token = state
+        .local_jwt(json!({
+            "sub": format!("preloop-runner-listen-{runner_id}"),
+            "scp": "ActionsRuntime.RunnerListen",
+        }))
+        .unwrap();
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "payload": {"ref": "refs/heads/main", "commits": []},
+            "repository": "owner/repo",
+            "git_ref": "refs/heads/main",
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    let session = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/runner/server/session",
+        json!({}),
+        &runner_token,
+    )
+    .await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    let job_ref = request_json_with_bearer(
+        &app,
+        Method::GET,
+        &format!("/runner/server/message?sessionId={session_id}&status=Online&waitSeconds=0"),
+        Value::Null,
+        &runner_token,
+    )
+    .await;
+    let body: Value = serde_json::from_str(job_ref["body"].as_str().unwrap()).unwrap();
+    let runner_request_id = body["runner_request_id"].as_str().unwrap();
+
+    let _acquired = request_json_with_bearer(
+        &app,
+        Method::POST,
+        &format!("/broker/{runner_id}/acquirejob"),
+        json!({"jobMessageId": runner_request_id, "billingOwnerId": "local", "runnerOS": "Linux"}),
+        &runner_token,
+    )
+    .await;
+
+    // The internal request id is deliberately not on the wire (the broker
+    // zeroes `requestId` because run-service payloads use the DTO default),
+    // so read it from the correlation table the submit path populates.
+    let request_id = {
+        let inner = state.inner.lock().await;
+        let ids: Vec<i64> = inner.job_requests.keys().copied().collect();
+        assert_eq!(ids.len(), 1, "one job means one request record: {ids:?}");
+        // Half one: the claim must NOT consume the record, or a re-claim after
+        // a disconnect would rebuild it from defaults and lose both the
+        // declared permission set and the fork profile.
+        assert!(
+            inner.github_token_requests.contains_key(&ids[0]),
+            "the token request must survive the claim so a re-claim re-mints \
+             under the build-time permission set and fallback restrictions"
+        );
+        ids[0]
+    };
+
+    // Half two: complete through the legacy compat route — the broker's own
+    // `completejob` handler never runs here, exactly as for a lease-expiry
+    // reap or an `/_apis` finish callback.
+    request_json(
+        &app,
+        Method::PATCH,
+        &format!("/runner/server/_apis/distributedtask/hubs/actions/plans/{run_id}/jobs/build"),
+        json!({"status": "succeeded"}),
+    )
+    .await;
+
+    let inner = state.inner.lock().await;
+    assert!(
+        !inner.github_token_requests.contains_key(&request_id),
+        "a terminal job must not leave its App-token request registered: \
+         {:?}",
+        inner.github_token_requests
+    );
+    assert!(
+        inner
+            .job_requests
+            .get(&request_id)
+            .is_some_and(|record| record.result.is_some()),
+        "the completion must have settled the job request"
+    );
+}
+
+/// A `GitHubTokenRequest` persisted by a pre-upgrade server has no
+/// `untrusted` field. Deserializing it as trusted would silently re-enable
+/// the PAT fallback after a restart, so missing trust metadata must fail
+/// closed — and the mint path must then refuse the PAT for such a request.
+#[tokio::test]
+async fn persisted_token_request_without_trust_metadata_fails_closed() {
+    use crate::github_app::{GitHubAppCredentials, MintFailurePolicy};
+
+    // The exact shape a pre-upgrade store snapshot would carry: no
+    // `untrusted` key at all.
+    let old: crate::models::GitHubTokenRequest = serde_json::from_str(
+        r#"{"repository":"owner/repo","permissions":{"checks":"write"},"declared":true}"#,
+    )
+    .unwrap();
+    assert!(
+        old.untrusted,
+        "missing persisted trust metadata must deserialize as untrusted"
+    );
+
+    // Newly created trusted requests serialize the field explicitly, so the
+    // fail-closed default only ever applies to genuinely old state.
+    let trusted = crate::models::GitHubTokenRequest {
+        repository: "owner/repo".to_owned(),
+        permissions: BTreeMap::from([("checks".to_owned(), "write".to_owned())]),
+        declared: true,
+        untrusted: false,
+    };
+    let wire = serde_json::to_string(&trusted).unwrap();
+    assert!(
+        wire.contains("\"untrusted\":false"),
+        "trusted requests must persist their trust metadata explicitly: {wire}"
+    );
+    let round_tripped: crate::models::GitHubTokenRequest = serde_json::from_str(&wire).unwrap();
+    assert!(!round_tripped.untrusted);
+
+    // Broker/mint assertion: an old request (untrusted by fail-closed
+    // default) under the `pat` policy must not receive the PAT when the mint
+    // fails — `local-workspace-only` fails before any network I/O.
+    let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut creds = GitHubAppCredentials::for_tests("424", private_key, MintFailurePolicy::Pat);
+    creds.pat_fallback = Some("github_pat_broad".to_owned());
+    state.github_app = Some(creds);
+    let shared = Arc::new(SharedState {
+        state,
+        shutdown: CancellationToken::new(),
+    });
+    let old_request = crate::models::GitHubTokenRequest {
+        repository: "local-workspace-only".to_owned(),
+        permissions: old.permissions.clone(),
+        declared: true,
+        untrusted: old.untrusted,
+    };
+    let mint = crate::broker::mint_dispatch_github_token(&shared, &old_request).await;
+    assert!(
+        matches!(mint, Ok(None)),
+        "a request whose trust metadata was never recorded must not receive the PAT fallback"
+    );
+}
+
+/// A PAT-only deployment embeds the static PAT into job messages at build
+/// time. That override must never reach a fork-restricted job: the job keeps
+/// the local job-scoped runtime token, which authenticates only against this
+/// control plane.
+#[tokio::test]
+async fn fork_job_never_receives_the_configured_pat_override() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    std::fs::write(&config_path, "[github]\npat = \"github_pat_testvalue\"\n").unwrap();
+    let state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
+        .await
+        .unwrap();
+    assert!(
+        state.github_app.is_none(),
+        "config declares no app id or pem"
+    );
+    // The effective PAT is env-then-config (state.rs), and other tests mutate
+    // `PRELOOP_GITHUB_TOKEN` without the env lock — so assert against the
+    // effective value rather than the config literal to stay race-proof.
+    let pat = state
+        .static_github_pat()
+        .expect("config declares a PAT")
+        .to_owned();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let yaml =
+        "on: push\njobs:\n  probe:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+    let fork = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": yaml,
+            "event": "push",
+            "repository": "owner/repo",
+            "trust_tier": "untrusted-fork-pull-request",
+        }),
+    )
+    .await;
+    let trusted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": yaml,
+            "event": "push",
+            "repository": "owner/repo",
+        }),
+    )
+    .await;
+
+    let inner = state.inner.lock().await;
+    let fork_message = queued_message_for(&inner, fork["run_id"].as_str().unwrap());
+    let runtime_token = state.mint_runtime_token(&fork_message.plan.plan_id, &fork_message.job_id);
+    for name in ["system.github.token", "github_token", "GITHUB_TOKEN"] {
+        assert_eq!(
+            variable_value(&fork_message, name),
+            Some(runtime_token.as_str()),
+            "fork job must carry the local runtime token, not the PAT ({name})"
+        );
+    }
+    assert_ne!(
+        variable_value(&fork_message, "system.github.token"),
+        Some(pat.as_str()),
+        "the static PAT must not reach a fork-restricted job"
+    );
+
+    let trusted_message = queued_message_for(&inner, trusted["run_id"].as_str().unwrap());
+    assert_eq!(
+        variable_value(&trusted_message, "system.github.token"),
+        Some(pat.as_str()),
+        "trusted jobs still receive the configured PAT"
+    );
+}
+
+/// End-to-end through the webhook adapter: a fork `pull_request` delivery is
+/// stamped `UntrustedForkPullRequest` and the queued job must show the
+/// downgraded profile and no OIDC URL, and stored secrets stay denied.
+#[tokio::test]
+async fn fork_pull_request_webhook_jobs_are_downgraded_and_secrets_denied() {
+    // The webhook path creates check runs, and it only takes its mock branch
+    // while no GitHub credential is visible. `PRELOOP_GITHUB_TOKEN` and
+    // `PRELOOP_GITHUB_API_URL` are process-global, so a co-scheduled test that
+    // points them at its own stub would send this run's check-run POST there
+    // and turn the webhook 200 into a 502. Serialize on the same lock those
+    // tests hold, and guarantee the mock branch for this body.
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+    let _no_api_url = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_API_URL");
+
+    let temp = tempfile::tempdir().unwrap();
+    let ws_dir = temp.path().join("workspace");
+    tokio::fs::create_dir_all(ws_dir.join(".github/workflows"))
+        .await
+        .unwrap();
+    tokio::fs::write(
+        ws_dir.join(".github/workflows/test.yml"),
+        "on: pull_request\npermissions:\n  checks: write\n  id-token: write\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+    )
+    .await
+    .unwrap();
+
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.webhook_secret = Some("super-secret".to_owned());
+    state.local_workspace = Some(ws_dir);
+    {
+        let mut secrets = state.secrets.write();
+        secrets.repo.insert(
+            "owner/repo".to_owned(),
+            BTreeMap::from([("REPO_TOKEN".to_owned(), "repo-value".to_owned())]),
+        );
+    }
+    let app = app(state.clone(), CancellationToken::new());
+
+    // `head.repo.fork` absent defaults to fork — the same shape the existing
+    // webhook test delivers, now asserting the downgrade.
+    let payload = serde_json::json!({
+        "action": "opened",
+        "number": 42,
+        "pull_request": {
+            "head": {
+                "ref": "feature-branch",
+                "sha": "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3"
+            },
+            "base": {
+                "ref": "main",
+                "sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+            }
+        },
+        "repository": {
+            "full_name": "owner/repo",
+            "default_branch": "main"
+        }
+    });
+    let payload_bytes = serde_json::to_vec(&payload).unwrap();
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = HmacSha256::new_from_slice(b"super-secret").unwrap();
+    mac.update(&payload_bytes);
+    let sig_bytes = mac.finalize().into_bytes();
+    let sig_hex = sig_bytes
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<String>();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/github/webhooks")
+                .header("x-github-event", "pull_request")
+                .header("x-hub-signature-256", format!("sha256={sig_hex}"))
+                .header("content-type", "application/json")
+                .body(Body::from(payload_bytes))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let inner = state.inner.lock().await;
+    let (_, run_record) = inner.runs.iter().next().unwrap();
+    assert_eq!(
+        run_record.submission.trust_tier.as_deref(),
+        Some("untrusted-fork-pull-request"),
+        "the webhook adapter must stamp the fork tier"
+    );
+    let run_id = run_record.run_id.to_string();
+    let message = queued_message_for(&inner, &run_id);
+    assert_eq!(
+        variable_value(&message, "system.github.token.permissions"),
+        Some(r#"{"Checks":"read"}"#),
+        "webhook-delivered fork PR job is downgraded to read-only with no IdToken metadata"
+    );
+    let endpoint = message
+        .resources
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.name.eq_ignore_ascii_case("SystemVssConnection"))
+        .expect("SystemVssConnection endpoint present");
+    assert!(
+        !endpoint
+            .data
+            .get("GenerateIdTokenUrl")
+            .is_some_and(|url| !url.is_empty()),
+        "webhook-delivered fork PR job gets no OIDC request URL"
+    );
+    assert_eq!(
+        variable_value(&message, "REPO_TOKEN"),
+        None,
+        "stored secrets stay denied for the fork PR job"
+    );
+    drop(inner);
+
+    // Trusted control through the same build path: the same stored secret is
+    // injected and the declared writes survive.
+    let trusted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\npermissions:\n  checks: write\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo",
+        }),
+    )
+    .await;
+    let inner = state.inner.lock().await;
+    let trusted_message = queued_message_for(&inner, trusted["run_id"].as_str().unwrap());
+    assert_eq!(
+        variable_value(&trusted_message, "REPO_TOKEN"),
+        Some("repo-value"),
+        "trusted jobs still receive stored secrets"
+    );
+    assert_eq!(
+        variable_value(&trusted_message, "system.github.token.permissions"),
+        Some(r#"{"Checks":"write"}"#),
+        "trusted jobs keep declared writes"
+    );
 }
 
 /// A failed installation-token mint must never silently reach for the broad
@@ -7576,6 +8644,13 @@ async fn runner_lease_expiration_disconnect_reaper() {
 
 #[tokio::test]
 async fn github_webhook_flows_with_signature_and_check_runs() {
+    // This test asserts the mock check-run path (`check_run_id > 0` with no
+    // GitHub server involved). A co-scheduled test's `PRELOOP_GITHUB_TOKEN`
+    // would flip it to a live API call that fails, leaving zero check runs.
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+    let _no_api_url = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_API_URL");
+
     let temp = tempfile::tempdir().unwrap();
 
     // 1. Create a dummy workflow file in a local workspace
@@ -7701,24 +8776,8 @@ async fn check_run_ids_survive_a_restart_before_any_job_event() {
     // parallel test's token would flip the check-run path from mock to a real
     // GitHub API call. The mock path is the contract under test.
     let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let saved_token = std::env::var_os("PRELOOP_GITHUB_TOKEN");
-    let saved_api_url = std::env::var_os("PRELOOP_GITHUB_API_URL");
-    std::env::remove_var("PRELOOP_GITHUB_TOKEN");
-    std::env::remove_var("PRELOOP_GITHUB_API_URL");
-    struct RestoreGitHubEnv(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
-    impl Drop for RestoreGitHubEnv {
-        fn drop(&mut self) {
-            match &self.0 {
-                Some(value) => std::env::set_var("PRELOOP_GITHUB_TOKEN", value),
-                None => std::env::remove_var("PRELOOP_GITHUB_TOKEN"),
-            }
-            match &self.1 {
-                Some(value) => std::env::set_var("PRELOOP_GITHUB_API_URL", value),
-                None => std::env::remove_var("PRELOOP_GITHUB_API_URL"),
-            }
-        }
-    }
-    let _restore = RestoreGitHubEnv(saved_token, saved_api_url);
+    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+    let _no_api_url = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_API_URL");
 
     let temp = tempfile::tempdir().unwrap();
     let ws_dir = temp.path().join("workspace");
@@ -8065,6 +9124,11 @@ async fn github_webhook_concurrent_duplicate_delivery_creates_one_run() {
 
 #[tokio::test]
 async fn github_webhook_pull_request_event() {
+    // The webhook path reads `PRELOOP_GITHUB_TOKEN` / `PRELOOP_GITHUB_API_URL`
+    // live for check-run reporting. Hold the env lock so a concurrent
+    // env-mutating test cannot point those at a foreign credential or stub
+    // and turn this 200 into a 502.
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
     let temp = tempfile::tempdir().unwrap();
 
     // Create a dummy workflow file in a local workspace
@@ -13891,6 +14955,12 @@ async fn snapshot_401_advertises_a_bearer_challenge() {
 
 #[tokio::test]
 async fn local_workspace_checkout_acquires_synthetic_repository_and_serves_git_http() {
+    // `AppState::new` captures `PRELOOP_GITHUB_TOKEN` / `PRELOOP_GITHUB_APP_*`
+    // from the process env, and the claim path reads `PRELOOP_GITHUB_API_URL`
+    // live. Hold the env lock so a concurrent env-mutating test cannot make
+    // this job carry a foreign PAT (which would 401 the snapshot Git auth
+    // instead of 403 on the wrong-run probe).
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
     let temp = tempfile::tempdir().unwrap();
     let (state_dir, workspace) = create_snapshot_fixture(temp.path());
     let mut state = AppState::new(state_dir.clone()).await.unwrap();

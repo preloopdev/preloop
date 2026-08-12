@@ -666,6 +666,12 @@ pub(crate) async fn complete_job_inner(
             .session_active_requests
             .retain(|_, &mut rid| rid != *request_id);
         inner.inflight_requests.remove(request_id);
+        // The job is terminal, so its deferred App-token request must not
+        // outlive it: a re-claim re-mints from this record, and every
+        // completion path funnels through here (broker `completejob`, the
+        // legacy `/_apis` finish endpoints, `agent_request_patch`, and the
+        // lease-expiry reaper), so this is the one place that sees them all.
+        inner.github_token_requests.remove(request_id);
     }
     // Evict live-log state for this job to prevent unbounded memory growth.
     // The durable step-log blob has already been uploaded by the runner.
