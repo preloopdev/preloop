@@ -295,13 +295,6 @@ async fn probe_smolvm_version(binary: &Path) -> Option<String> {
         .map(|version| version.trim_start_matches('v').to_owned())
 }
 
-fn smolvm_release_repository() -> String {
-    std::env::var("PRELOOP_SMOLVM_RELEASE_REPOSITORY")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| SMOLVM_REPOSITORY.to_owned())
-}
-
 fn smolvm_release_version() -> String {
     std::env::var("PRELOOP_SMOLVM_RELEASE_VERSION")
         .ok()
@@ -328,7 +321,6 @@ async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
             std::env::consts::ARCH
         )
     })?;
-    let repository = smolvm_release_repository();
     let release = fetch_release(
         client,
         &format!("https://api.github.com/repos/{SMOLVM_REPOSITORY}/releases"),
