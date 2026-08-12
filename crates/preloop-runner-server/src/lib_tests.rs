@@ -12778,6 +12778,76 @@ async fn snapshot_drops_unresolvable_gitlinks_but_keeps_registered_submodules() 
 }
 
 #[tokio::test]
+async fn snapshot_gitlink_resolution_matches_git() {
+    let temp = tempfile::tempdir().unwrap();
+    let (state_dir, workspace) = create_snapshot_fixture(temp.path());
+
+    // The keep/drop decision must mirror git's own resolution: git resolves a
+    // gitlink by the section whose `path` matches it. Three registration
+    // shapes git handles but a naive parser gets wrong:
+    //   `a#b`         git writes and decodes this path QUOTED in .gitmodules
+    //   `mixed`       [SUBMODULE]/Path/URL: config sections and keys are
+    //                 case-insensitive for git
+    //   `logical-only` section name only; its `path` points elsewhere, so a
+    //                 gitlink at the name itself is NOT resolvable
+    for path in ["a#b", "mixed", "logical-only"] {
+        let nested = workspace.join(path);
+        fs::create_dir_all(&nested).unwrap();
+        git_fixture_command(&nested, &["init", "-q", "-b", "main"]);
+        git_fixture_command(&nested, &["config", "user.email", "nested@example.test"]);
+        fs::write(nested.join("payload.txt"), format!("{path}\n")).unwrap();
+        git_fixture_command(&nested, &["add", "payload.txt"]);
+        git_fixture_command(&nested, &["commit", "-qm", path]);
+        let tip = String::from_utf8(git_fixture_output(&nested, &["rev-parse", "HEAD"]))
+            .unwrap()
+            .trim()
+            .to_owned();
+        let cacheinfo = format!("160000,{tip},{path}");
+        git_fixture_command(
+            &workspace,
+            &["update-index", "--add", "--cacheinfo", cacheinfo.as_str()],
+        );
+    }
+    fs::write(
+        workspace.join(".gitmodules"),
+        "[submodule \"a#b\"]\n\tpath = \"a#b\"\n\turl = https://example.test/a-b.git\n\
+         [SUBMODULE \"mixed\"]\n\tPath = mixed\n\tURL = https://example.test/mixed.git\n\
+         [submodule \"logical-only\"]\n\tpath = elsewhere\n\turl = https://example.test/elsewhere.git\n",
+    )
+    .unwrap();
+
+    fs::create_dir_all(&state_dir).unwrap();
+    let run_id: RunId = "77777777-7777-4777-8777-777777777777".parse().unwrap();
+    let snapshot = create_workspace_snapshot(&state_dir, &workspace, run_id, None)
+        .await
+        .expect("snapshot with mixed gitlink registrations should succeed");
+    let repository = state_dir.join(&snapshot.repository);
+    let tree_of = |path: &str| {
+        String::from_utf8(git_fixture_output(
+            &repository,
+            &["ls-tree", snapshot.commit_sha.as_str(), "--", path],
+        ))
+        .unwrap()
+    };
+
+    let quoted = tree_of("a#b");
+    assert!(
+        quoted.starts_with("160000"),
+        "quoted registered path must survive the snapshot: {quoted}"
+    );
+    let mixed = tree_of("mixed");
+    assert!(
+        mixed.starts_with("160000"),
+        "mixed-case registered section must survive the snapshot: {mixed}"
+    );
+    let name_only = tree_of("logical-only");
+    assert!(
+        name_only.is_empty(),
+        "name-only gitlink must be dropped from the snapshot: {name_only}"
+    );
+}
+
+#[tokio::test]
 async fn workspace_snapshot_captures_git_state_without_mutating_source() {
     let temp = tempfile::tempdir().unwrap();
     let (state_dir, workspace) = create_snapshot_fixture(temp.path());

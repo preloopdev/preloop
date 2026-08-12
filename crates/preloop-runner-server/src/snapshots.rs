@@ -451,7 +451,7 @@ async fn create_workspace_snapshot_inner(
     .await?;
     let gitlinks = gitlink_paths(&staged.stdout);
     if !gitlinks.is_empty() {
-        let configured = configured_submodule_urls(workspace);
+        let configured = configured_submodule_urls(workspace).await;
         let unresolvable: Vec<&str> = gitlinks
             .iter()
             .filter(|path| !configured.contains(*path))
@@ -910,67 +910,76 @@ fn gitlink_paths(staged: &[u8]) -> Vec<String> {
 }
 
 /// Paths `git submodule` can resolve in the workspace's `.gitmodules`: the
-/// `path` value of every section that also carries a non-empty `url`, plus the
-/// section names themselves. Empty set when the file is absent or unparsable.
+/// `path` value of every section that also carries a non-empty `url`.
 ///
-/// Git resolves a gitlink by path: it finds the section whose `path` matches
-/// and uses that section's `url`; when no section names the path it falls back
-/// to `submodule.<path>.url`, which is how `git submodule add` registers
-/// submodules (name == path). A gitlink whose path is in neither set is
-/// exactly the state that dies with `fatal: No url found for submodule path
-/// '…' in .gitmodules`.
-///
-/// Matching of `submodule`/`url` is deliberately case-sensitive: git's own
-/// submodule machinery rejects `[SUBMODULE …]` and `URL =` entries, so a file
-/// git cannot parse must not be treated as configuring anything.
-fn configured_submodule_urls(workspace: &FsPath) -> BTreeSet<String> {
-    let Ok(text) = std::fs::read_to_string(workspace.join(".gitmodules")) else {
+/// Parsing is delegated to git itself (`git config -f .gitmodules -z
+/// --get-regexp '^submodule\..*\.(path|url)$'`) so quoting, escapes, line
+/// continuations, and case-insensitive section/key names are decoded exactly
+/// as git's submodule machinery decodes them. Git resolves a gitlink by
+/// path: it finds the section whose `path` matches and uses that section's
+/// `url`. A gitlink whose path only equals a section *name* is not
+/// resolvable — it dies with `fatal: No url found for submodule path '…' in
+/// .gitmodules` (verified against git 2.x) — so section names are
+/// deliberately excluded from the set. Empty set when the file is absent or
+/// git cannot parse it, matching git's own treatment of such a file.
+async fn configured_submodule_urls(workspace: &FsPath) -> BTreeSet<String> {
+    let output = Command::new("git")
+        .current_dir(workspace)
+        .args([
+            "config",
+            "-f",
+            ".gitmodules",
+            "-z",
+            "--get-regexp",
+            "^submodule\\..*\\.(path|url)$",
+        ])
+        .output()
+        .await;
+    let Ok(output) = output else {
         return BTreeSet::new();
     };
+    if !output.status.success() {
+        return BTreeSet::new();
+    }
+    // `-z` output is NUL-terminated records of the form `key\nvalue`. Keys
+    // are `submodule.<name>.path|url`; the name itself may contain dots and
+    // spaces, so only the trailing `.path`/`.url` suffix is stripped.
+    let mut path_by_name: std::collections::HashMap<&[u8], &[u8]> =
+        std::collections::HashMap::new();
+    let mut url_names: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+    for record in output.stdout.split(|byte| *byte == 0) {
+        let Some(nl) = record.iter().position(|byte| *byte == b'\n') else {
+            continue;
+        };
+        let key = &record[..nl];
+        let value = &record[nl + 1..];
+        let is_url = key.ends_with(b".url");
+        let suffix_len = if is_url {
+            b".url".len()
+        } else {
+            b".path".len()
+        };
+        if !is_url && !key.ends_with(b".path") {
+            continue;
+        }
+        let Some(name) = key.strip_prefix(b"submodule.") else {
+            continue;
+        };
+        let name = &name[..name.len() - suffix_len];
+        if value.is_empty() {
+            continue;
+        }
+        if is_url {
+            url_names.insert(name);
+        } else {
+            path_by_name.insert(name, value);
+        }
+    }
     let mut configured = BTreeSet::new();
-    let mut name: Option<&str> = None;
-    let mut path: Option<&str> = None;
-    let mut has_url = false;
-    // A `[]` header matches no real section, so chaining it after the file's
-    // lines flushes the trailing section.
-    for raw_line in text.lines().chain(std::iter::once("[]")) {
-        let line = raw_line.trim();
-        if line.starts_with('[') && line.ends_with(']') {
-            if has_url {
-                if let Some(name) = name {
-                    configured.insert(name.to_owned());
-                }
-                if let Some(path) = path {
-                    configured.insert(path.to_owned());
-                }
-            }
-            let inner = &line[1..line.len() - 1];
-            name = inner
-                .trim()
-                .strip_prefix("submodule")
-                .map(str::trim)
-                .and_then(|rest| rest.strip_prefix('"'))
-                .and_then(|rest| rest.strip_suffix('"'));
-            path = None;
-            has_url = false;
-            continue;
-        }
-        if name.is_none() {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("path") {
-            if let Some(value) = rest
-                .trim_start()
-                .strip_prefix('=')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                path = Some(value);
-            }
-        } else if let Some(rest) = line.strip_prefix("url") {
-            let value = rest.trim_start().strip_prefix('=').map(str::trim);
-            if value.is_some_and(|value| !value.is_empty()) {
-                has_url = true;
+    for (name, path) in path_by_name {
+        if url_names.contains(name) {
+            if let Ok(path) = std::str::from_utf8(path) {
+                configured.insert(path.to_owned());
             }
         }
     }
