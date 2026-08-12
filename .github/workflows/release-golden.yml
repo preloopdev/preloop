@@ -126,6 +126,12 @@ jobs:
     # `preloop:skip-golden` marker to the release notes for those releases.
     if: (github.event_name == 'workflow_dispatch' && !inputs.reuse_previous_goldens) || (github.event_name == 'release' && !contains(github.event.release.body, '<!-- preloop:skip-golden -->'))
     runs-on: [self-hosted, Linux, X64]
+    env:
+      # Release rustc peaks far past the pool's 4.5 GiB VM ceiling when the
+      # workspace compiles several crates at once; the golden job's release
+      # build must stay serial or the guest OOM-kills rustc (SIGKILL). The
+      # bake step dominates the job's wall time anyway, so this costs little.
+      CARGO_BUILD_JOBS: "1"
     permissions:
       contents: write
       id-token: write
