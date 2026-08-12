@@ -380,6 +380,80 @@ divergence a workflow could observe.
 
 ---
 
+## 1c. Large-repo conformance campaign (2026-08-12)
+
+Five large public repositories run unmodified against the local engine
+(aarch64 macOS host, packed golden + smolvm forks), with one x86 leg on the
+remote x86_64 control plane (`aksh.preloop.dev`). Workflows: moby/moby
+`ci.yml` (docker buildx/bake), neovim/neovim `test.yml` (zig/cmake matrix),
+microsoft/TypeScript `ci.yml` (node matrix), astral-sh/ruff `ci.yaml`
+(cargo/nextest matrix), nodejs/node `test-linux.yml` (x86 build+test).
+
+### 1c.1 Bugs found and fixed
+
+Every item below broke a real workflow step and was fixed in preloop:
+
+| Gap | Symptom | Fix |
+| --- | --- | --- |
+| SmolVM's pack extraction strips ownership **and setuid/setgid** from every file in the flattened rootfs | the unprivileged host-side virtiofs server cannot create guest-root-owned files, so all 31k files land owned by the host user (502 on macOS, 1000 on Linux) with setuid cleared — `/usr/bin/sudo` arrives `0755` and the first `sudo` step of every workflow fails (`sudo: /etc/sudo.conf is owned by uid 502, should be 0`) | the orchestrator repairs each fork before the runner configures: chown pass + tar-roundtrip rebuild for the chown-resistant residue, then setuid/setgid modes re-derived from the pack's own layer tar (the only surviving record of the original modes) and re-applied (`repair_leaked_rootfs_ownership`) |
+| SmolVM's non-streaming `machine exec` drops the connection after ~30s with no output | every provisioning exec that ran quietly for more than half a minute (the ownership repair, toolchain installs) was killed mid-flight, leaving half-repaired machines | provider execs pass an explicit `--timeout 30m` |
+| Job/workflow-level `env:` never reached action processes | moby's `docker buildx bake` resolved `${DESTDIR}` to `""` because the hcl default took over — the `govulncheck` target's `output = ["${DESTDIR}"]` collapsed to an empty output list, the report was never exported, and the bake action failed on the missing path. The server put job env in the message `variables` map and left the wire `environmentVariables` (the field the official runner materializes into step environments) empty | the job message builder now populates `environmentVariables` from the job env |
+| A server restart left every queued run permanently wedged | jobs restored from the store sat "pending" forever: the on-demand pool only forks while its shared `queue_depth` atomic is non-zero, and after a restart no runner exists to refresh it from a broker poll | `serve` re-arms the atomic with the recovered ready-queue length and re-syncs `next_job_runs_on` |
+| A run stuck on unclaimable jobs permanently parks its concurrency group | neovim's `test.yml` pins `concurrency:` on the workflow; a run whose remaining jobs were `windows-*` cells (held queued indefinitely by the starvation sweep, which deliberately waits for an external host) never went terminal, so its run-level concurrency holder never released and every later submission in the group parked forever ("pending") | the restore-time group reconciliation now also releases holders whose remaining jobs all need an external host with none registered; the run itself stays queued and re-acquires if a host ever appears |
+| The golden lacked the Chromium/playwright runtime libraries | vite's tests died in playwright's host-requirements check (`Failed to launch browser`, missing `libnss3` etc.); GitHub's ubuntu-24.04 image ships these | 21 browser runtime libs pinned in `versions.toml` and added to the golden bake. Caveat: the *packed* artifact cache is keyed only by the base-image digest, so package-list changes reach a packed golden only after the artifact is rebuilt (`prepare_artifact` rebuilds when the payload file is missing) — the pins take effect immediately for non-packed goldens and for the next artifact build |
+| The golden lacked RubyGems and Perl's cpanminus | neovim's functionaltest setup runs `gem install … neovim` and `sudo cpanm -n Neovim::Ext`; `gem: command not found` killed every posix cell | `ruby`, `ruby-rubygems`, `perl`, `cpanminus` pinned in `versions.toml` and baked (artifact rebuilt for the campaign) |
+| The golden lacked the rest of the hosted image's apt baseline | neovim's LLVM install script died on `lsb_release: command not found`; each missing utility (`xvfb`, `telnet`, `sshpass`, …) was a separate workflow-killing gap | the remaining packages from the official ubuntu-24.04 image's apt list (image readme 20260720.247.2) pinned and baked: `lsb-release`, `fonts-noto-color-emoji`, `haveged`, `mediainfo`, `p7zip-rar`, `pollinate`, `sshpass`, `telnet`, `tk`, `xvfb`, `zsync`, `ftp`, `sphinxsearch`, `systemd-coredump`, `libnss3-tools` |
+| The runner VMs had 4 GiB of RAM against workflows that assume the hosted 7 GiB | TypeScript's `ci.yml` sets `NODE_OPTIONS=--max-old-space-size=6144` ("7 GiB by default on GitHub"); the jake test workers died with a silent exit-2 crash | local pool raised to `PRELOOP_RUNNER_MEMORY_MIB=8192` (the remote already runs 6144) |
+| The runner account could not `sudo` | after the ownership repair, `sudo` demanded a password — the GitHub image grants the runner user passwordless sudo | the provisioning wrapper writes `/etc/sudoers.d/preloop-runner` (`NOPASSWD: ALL`) when it creates the account |
+| The packed artifact cache ignores bake-content changes | package pins added to the bake never reach a packed golden — the artifact cache key is the base-image digest only — so a parity fix requires deleting the artifact to force a rebuild | campaign practice: delete `~/.preloop/vms/preloop-…-aarch64` and restart; noted for a follow-up (key the artifact by the bake fingerprint) |
+| Multi-arch docker builds degrade to the host arch | moby's `cross` job resolves `linux/arm64` only — the golden lacks qemu-user-static/binfmt, so the ppc64le/s390x/amd64 cells GitHub builds are skipped rather than emulated | documented; `docker/setup-qemu-action` would need binfmt support in the golden to match GitHub |
+
+### 1c.2 Environmental findings
+
+- **The local server wedges and stops provisioning** (machines churn in
+  `created`, no exec processes, SIGTERM ignored). Restart with log capture
+  clears it; the restart wedge itself is the queue-depth bug above. The
+  pre-restart runs must be re-submitted.
+- **Shallow workspace clones break the snapshot's changed-files story**:
+  a depth-1 clone has no parent commit, the synthetic push's `before` is the
+  null SHA, and changed-files fetches die with `upload-pack: not our ref
+  00000000…`. The campaign re-clones unshallowed; `snapshots.rs` handles
+  shallow edges for the committed history it can see, but a truly rootless
+  tree has nothing to diff against.
+- **macOS/Windows cells fail via the 120s starvation sweep** with empty
+  logs (no runner declares that OS). This is the designed
+  fail-not-queue-forever divergence; GitHub would leave the job queued.
+- **The remote x86 server's pool runners lost their control bridge**
+  (broker poll connection refused inside the guests); a service restart
+  recreates them. Queued GitHub PR checks had been stalling.
+- **Cross-repo checkout auth**: the remote server's GitHub App installation
+  cannot mint tokens for repositories outside its installation, so
+  `actions/checkout` of a foreign public repo fails (`could not read
+  Username for 'https://github.com'`) when no workspace snapshot redirects
+  the checkout to the local snapshot server.
+
+### 1c.3 Results
+
+| Repo | Workflow | Result |
+| --- | --- | --- |
+| `moby/moby` | `ci.yml` | build (binary/dynbinary, amd64+arm64 cells) ✅, validate-dco ✅, cross/build-dind/prepare-cross/success ✅, govulncheck ✅ after the env fix |
+| `neovim/neovim` | `test.yml` | lintc/lint/clang-analyzer/zig-build ✅; posix ubuntu cells ✅; macos/windows cells fail via the starvation sweep (no such runners) |
+| `microsoft/TypeScript` | `ci.yml` | ubuntu test cells ✅; windows/macos cells fail via the starvation sweep |
+| `astral-sh/ruff` | `ci.yaml` | determine-changes gated matrix: unchanged-path jobs skip ✅ (32 skipped is the correct gate outcome); cargo jobs ✅ |
+| `nodejs/node` | `test-linux.yml` | runs on the remote x86_64 fleet; blocked by the App-token checkout issue, re-run pending |
+
+### 1c.4 Still open
+
+- **Held runs are not persisted.** A run parked in a concurrency group has
+  its jobs only in memory; after a restart the group is reconciled (above)
+  but the parked run itself is stuck pending and must be cancelled and
+  re-submitted.
+- **Remote deployment**: the ownership-repair and env fixes need a rebuild
+  and deploy to `main` (the x86 control plane) before foreign-repo runs
+  there behave like the local ones.
+
+---
+
 ## 2. Upstream surface we must emulate
 
 The 23 controllers in `runner.server/src/Runner.Server/Controllers/` define the contract.

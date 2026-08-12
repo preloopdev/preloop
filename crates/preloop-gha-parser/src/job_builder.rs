@@ -420,6 +420,22 @@ pub fn build_agent_job_message_with_normalized_context(
     }
     populate_runner_variables(&mut variables, plan);
 
+    // The official runner materializes job/workflow-level `env:` into the
+    // step environment from `AgentJobRequestMessage.EnvironmentVariables`,
+    // not from `variables` (which it treats as internal/bookkeeping plus
+    // secrets). Without this wire field, workflows that rely on job env
+    // reaching action processes — moby's `DESTDIR` driving `docker buildx
+    // bake` HCL variables is the canonical case — silently see empty values:
+    // bake resolves `${DESTDIR}` to `""` and drops the target's output.
+    // Emit one plain object per variable; the runner's template-map reader
+    // accepts that shape (and the `{map: [{Key, Value}]}` form upstream
+    // sends).
+    let environment_variables: Vec<serde_json::Value> = plan
+        .env
+        .iter()
+        .map(|(k, v)| serde_json::json!({ k: v }))
+        .collect();
+
     // GitHub supplies baseline regexes in addition to value-derived secret masks.
     let mut mask_hints = default_mask_hints();
     mask_hints.extend(
@@ -573,7 +589,7 @@ pub fn build_agent_job_message_with_normalized_context(
         billing_owner_id: None,
         file_table: Vec::new(),
         defaults: Vec::new(),
-        environment_variables: Vec::new(),
+        environment_variables,
         snapshot: None,
         condition: plan.if_condition.as_deref().map(runner_condition),
         variables,
@@ -964,6 +980,58 @@ jobs:
         assert_eq!(
             step["reference"],
             serde_json::json!({"type": "containerRegistry", "image": "alpine:3.20"})
+        );
+    }
+
+    /// Job/workflow-level `env:` must reach the wire as
+    /// `environmentVariables` (the field the official runner materializes
+    /// into step environments), not only as `variables`.
+    #[test]
+    fn job_env_is_exposed_on_environment_variables() {
+        let workflow = parse_workflow(
+            r#"
+on: push
+env:
+  GLOBAL_VAR: gv
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      DESTDIR: ./build
+    steps:
+      - run: echo hi
+"#,
+        )
+        .unwrap();
+        let plan = &crate::expand_jobs(&workflow).unwrap()[0];
+        let message = build_agent_job_message(
+            plan,
+            &serde_json::json!({"event_name": "push"}),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        let env: std::collections::BTreeMap<String, String> = message
+            .environment_variables
+            .iter()
+            .flat_map(|value| {
+                value.as_object().into_iter().flat_map(|obj| {
+                    obj.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
+                })
+            })
+            .collect();
+        assert_eq!(env.get("DESTDIR").map(String::as_str), Some("./build"));
+        assert_eq!(env.get("GLOBAL_VAR").map(String::as_str), Some("gv"));
+        assert_eq!(
+            message
+                .variables
+                .get("DESTDIR")
+                .and_then(|v| v.value.clone()),
+            Some("./build".to_owned()),
+            "the variable projection must stay intact for expression contexts"
         );
     }
 

@@ -399,9 +399,22 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     .await?;
     if let Some(queue_depth) = config.queue_depth.clone() {
         state.queue_depth = queue_depth;
+        // The pool shares this same atomic and only forks a runner while it
+        // is non-zero; a freshly restarted server has no runners yet, so
+        // nothing will refresh it from a broker poll. Re-arm it with the
+        // ready-queue size recovered from the store, or every job queued
+        // before the restart sits forever with the pool asleep.
+        state.queue_depth.store(
+            state.inner.lock().await.queue.len(),
+            std::sync::atomic::Ordering::Release,
+        );
     }
     if let Some(next_job_runs_on) = config.next_job_runs_on.clone() {
         state.next_job_runs_on = next_job_runs_on;
+    }
+    {
+        let inner = state.inner.lock().await;
+        crate::runtime_scheduling::sync_next_job_labels(&inner, &state.next_job_runs_on);
     }
     {
         let pool_managed = config.pending_registrations.is_some();

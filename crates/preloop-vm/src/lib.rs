@@ -341,6 +341,15 @@ pub trait VmProvider: Send + Sync {
 }
 
 /// CLI-backed SmolVM provider.
+///
+/// SmolVM's `machine exec` (non-streaming) drops the connection after a
+/// short client-side read timeout unless an explicit `--timeout` extends
+/// it, and it buffers all output until the command exits. Provisioning
+/// steps (ownership repair, toolchain installs, `configure`) routinely run
+/// minutes with little output, so a generous timeout is mandatory there;
+/// streaming execs (the runner itself) are unaffected.
+const EXEC_TIMEOUT: &str = "30m";
+
 #[derive(Debug, Clone)]
 pub struct SmolVmProvider {
     binary: PathBuf,
@@ -1038,6 +1047,8 @@ impl VmProvider for SmolVmProvider {
             "exec".into(),
             "--name".into(),
             name.as_str().into(),
+            "--timeout".into(),
+            EXEC_TIMEOUT.into(),
             "--".into(),
         ];
         args.extend_from_slice(argv);
@@ -1058,6 +1069,8 @@ impl VmProvider for SmolVmProvider {
             "exec".into(),
             "--name".into(),
             name.as_str().into(),
+            "--timeout".into(),
+            EXEC_TIMEOUT.into(),
         ];
         for (guest, source) in secrets {
             if !is_env_identifier(guest) {

@@ -527,6 +527,46 @@ fn base_packages_pinned() -> String {
         gnupg2={APT_GNUPG2} \
         sudo={APT_SUDO} \
         openssh-client={APT_OPENSSH_CLIENT} \
+        libnspr4={APT_LIBNSPR4} \
+        libnss3={APT_LIBNSS3} \
+        libatk1.0-0t64={APT_LIBATK1} \
+        libatk-bridge2.0-0t64={APT_LIBATK_BRIDGE} \
+        libatspi2.0-0t64={APT_LIBATSPI} \
+        libcairo2={APT_LIBCAIRO2} \
+        libcups2t64={APT_LIBCUPS2T64} \
+        libdbus-1-3={APT_LIBDBUS_1_3} \
+        libdrm2={APT_LIBDRM2} \
+        libgbm1={APT_LIBGBM1} \
+        libglib2.0-0t64={APT_LIBGLIB2} \
+        libpango-1.0-0={APT_LIBPANGO} \
+        libx11-6={APT_LIBX11_6} \
+        libxcb1={APT_LIBXCB1} \
+        libxcomposite1={APT_LIBXCOMPOSITE1} \
+        libxdamage1={APT_LIBXDAMAGE1} \
+        libxext6={APT_LIBXEXT6} \
+        libxfixes3={APT_LIBXFIXES3} \
+        libxkbcommon0={APT_LIBXKBCOMMON0} \
+        libxrandr2={APT_LIBXRANDR2} \
+        libasound2t64={APT_LIBASOUND2T64} \
+        ruby={APT_RUBY} \
+        ruby-rubygems={APT_RUBY_RUBYGEMS} \
+        perl={APT_PERL} \
+        cpanminus={APT_CPANMINUS} \
+        lsb-release={APT_LSB_RELEASE} \
+        fonts-noto-color-emoji={APT_FONTS_NOTO_COLOR_EMOJI} \
+        haveged={APT_HAVEGED} \
+        mediainfo={APT_MEDIAINFO} \
+        p7zip-rar={APT_P7ZIP_RAR} \
+        pollinate={APT_POLLINATE} \
+        sshpass={APT_SSHPASS} \
+        telnet={APT_TELNET} \
+        tk={APT_TK} \
+        xvfb={APT_XVFB} \
+        zsync={APT_ZSYNC} \
+        ftp={APT_FTP} \
+        sphinxsearch={APT_SPHINXSEARCH} \
+        systemd-coredump={APT_SYSTEMD_COREDUMP} \
+        libnss3-tools={APT_LIBNSS3_TOOLS} \
         build-essential={APT_BUILD_ESSENTIAL} \
         pkg-config={APT_PKG_CONFIG} \
         libssl-dev={APT_LIBSSL_DEV} \
@@ -3158,6 +3198,20 @@ async fn provision_runner<P: VmProvider + 'static>(
         }
     }
 
+    // smolvm's pack extraction unpacks the flattened rootfs through the
+    // host-side virtiofs server, which runs as the invoking (unprivileged)
+    // user. The server cannot create guest-root-owned files, so every file
+    // on the baked layer lands owned by the host user (502 on macOS, 1000
+    // on a Linux host) — modes intact, ownership meaningless to the guest.
+    // That breaks sudo(8) (which validates its own files), sshd, and any
+    // other tool that checks file ownership, so real workflows die at the
+    // first `sudo` step. Remap the leaked uid to root before the runner
+    // configures, restoring the setuid/setgid bits chown clears.
+    let artifact = config
+        .use_packed_artifact
+        .then(|| config.artifact_payload().to_path_buf());
+    repair_leaked_rootfs_ownership(provider.as_ref(), name, artifact.as_deref()).await?;
+
     let runner = format!("/opt/preloop/bin/{}", config.runner_binary_name);
     let mut labels = config.labels.clone();
     for label in runner_environment_labels(&environment.base) {
@@ -3299,6 +3353,8 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
         .join(" ");
     let script = format!(
         "getent passwd {user} >/dev/null 2>&1 || useradd -m -u {uid} {user} 2>/dev/null; \
+         printf '%s\\n' '{user} ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/preloop-{user} \
+           && chmod 0440 /etc/sudoers.d/preloop-{user}; \
          mkdir -p /run/user/{uid}; chown {uid}:{uid} /run/user/{uid} /var/lib/preloop-runner 2>/dev/null; \
          chmod 777 /run/preloop-control 2>/dev/null; \
          getent group docker >/dev/null 2>&1 && usermod -aG docker {user} 2>/dev/null; \
@@ -3331,6 +3387,228 @@ async fn verify_toolchain_installed<P: VmProvider>(
         return Err(OrchestratorError::Vm(error));
     }
     Ok(())
+}
+
+/// Remap rootfs files leaked to the host user back to root.
+///
+/// SmolVM's `pack` flattens a machine through an unprivileged host-side
+/// virtiofs server: every file on the baked layer ends up owned by the
+/// process that ran the server (the host user), because that process cannot
+/// set arbitrary guest ownership on the files it creates. The leak is
+/// wholesale — base-image files like `/usr/bin/sudo` and `/etc/passwd`
+/// included — and the guest has no account with the leaked uid, so the
+/// ownership is never legitimate. It only shows up when a tool validates
+/// ownership (`sudo` is the classic: `sudo: /etc/sudo.conf is owned by uid
+/// 502, should be 0`), which makes the first `sudo` step of any real
+/// workflow fail.
+///
+/// The repair walks the root filesystem and chowns every leaked file to
+/// root. A minority of leaked files sit on the packed-layer lowerdir in a
+/// state where the overlay reports the chown as applied while the file
+/// keeps its leaked owner (the `packed_layers` lower is itself a
+/// virtiofs-backed tree the host wrote, and its metacopy diverges from the
+/// stored inode); those are rebuilt with a tar roundtrip, which replaces
+/// the lower entry outright instead of copying it up. `chown` clears
+/// setuid/setgid bits, so the tar pass runs with `-p` and the archive's
+/// modes — including setuid — are reapplied verbatim. `/home/*` is left
+/// alone: on a Linux host the leaked uid is 1000, which is also the
+/// guest's real `ubuntu` user, and that home directory is legitimately
+/// theirs. The step is best-effort — a machine whose pack was produced
+/// without the leak (or a future smolvm that fixes it) simply has no files
+/// with the leaked uid and pays one cheap `find`.
+async fn repair_leaked_rootfs_ownership<P: VmProvider>(
+    provider: &P,
+    name: &MachineName,
+    artifact: Option<&Path>,
+) -> Result<(), OrchestratorError> {
+    let Some(uid) = leaked_host_uid() else {
+        return Ok(());
+    };
+    let setuid = artifact
+        .and_then(setuid_entries_from_pack)
+        .unwrap_or_default();
+    if !setuid.is_empty() {
+        info!(
+            machine = name.as_str(),
+            entries = setuid.len(),
+            "restoring setuid/setgid modes from the packed artifact"
+        );
+    }
+    let script = rootfs_repair_script(uid, &setuid);
+    let result = provider
+        .exec(name, &["sh".to_owned(), "-c".to_owned(), script])
+        .await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            // Never fail provisioning over the repair: a machine without the
+            // leak (or one where the leak is benign) still works, and the
+            // warning keeps the divergence visible.
+            warn!(
+                machine = name.as_str(),
+                %error,
+                "rootfs ownership repair failed; sudo and ownership-checking tools may misbehave"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// The guest shell script that repairs the leaked ownership for one uid.
+fn rootfs_repair_script(uid: u32, setuid: &[(String, String)]) -> String {
+    let restore = if setuid.is_empty() {
+        String::new()
+    } else {
+        let entries = setuid
+            .iter()
+            .map(|(mode, path)| format!("'{mode} {path}'"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            "echo \"repair: restoring setuid/setgid modes\"; \
+             for e in {entries}; do set -- $e; chmod \"$1\" \"$2\" 2>/dev/null || true; done;"
+        )
+    };
+    format!(
+        "uid={uid}; \
+         echo \"repair: remapping uid {uid} to root\"; \
+         find / -xdev -uid \"$uid\" ! -path '/home/*' \
+           -exec chown root:root {{}} + -print 2>/dev/null; \
+         echo \"repair: chown pass complete, rebuilding residue\"; \
+         find / -xdev -uid \"$uid\" ! -path '/home/*' -print0 2>/dev/null \
+           | tar --null --files-from=- --owner=root --group=root \
+               --checkpoint=1000 --checkpoint-action=echo \
+               -cf /tmp/.preloop-leaked.tar; \
+         tar --same-owner -p --checkpoint=1000 --checkpoint-action=echo \
+           -xf /tmp/.preloop-leaked.tar -C /; \
+         {restore} \
+         echo \"repair: complete\"; \
+         rm -f /tmp/.preloop-leaked.tar; true"
+    )
+}
+
+/// The uid the pack-extraction virtiofs server runs as: the uid of the
+/// process invoking smolvm. `None` when the caller is root, which can
+/// create arbitrary guest ownership and therefore never leaks.
+fn leaked_host_uid() -> Option<u32> {
+    let uid = unsafe { libc::geteuid() };
+    (uid != 0).then_some(uid)
+}
+
+/// `(octal mode, guest path)` pairs for every setuid/setgid file in the
+/// packed artifact's rootfs layer.
+///
+/// SmolVM's pack extraction strips the setuid/setgid bits along with the
+/// ownership (the unprivileged virtiofs server cannot reproduce either), so
+/// a leaked machine has *no* suid files at all — `/usr/bin/sudo` lands
+/// `0755` and `sudo` refuses to run. The only surviving record of the
+/// correct modes is the layer tar inside the pack artifact (which is also
+/// what every fork is extracted from), so the repair re-derives the suid
+/// list from that same archive.
+///
+/// The pack is a zstd-compressed outer tar whose members include
+/// `layers/<sha>.tar` — the flattened rootfs, a plain GNU tar. Listing it
+/// through `zstd | tar -xOf - | tar -tvf -` costs one streaming pass
+/// (~10–20s for the 3.8 GB layer); the result is cached per artifact so a
+/// fleet of forks pays it once per server process.
+fn setuid_entries_from_pack(pack: &Path) -> Option<Vec<(String, String)>> {
+    type CacheEntry = (PathBuf, u64, Vec<(String, String)>);
+    static CACHE: std::sync::LazyLock<std::sync::Mutex<Vec<CacheEntry>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+    let cache = &*CACHE;
+    let fingerprint = (pack.to_path_buf(), std::fs::metadata(pack).ok()?.len());
+    if let Ok(guard) = cache.lock() {
+        if let Some((_, _, entries)) = guard
+            .iter()
+            .find(|(path, len, _)| *path == fingerprint.0 && *len == fingerprint.1)
+        {
+            return Some(entries.clone());
+        }
+    }
+
+    let layer = pack_layer_member(pack)?;
+    let entries = list_setuid_entries(pack, &layer)?;
+    if let Ok(mut guard) = cache.lock() {
+        guard.push((fingerprint.0, fingerprint.1, entries.clone()));
+    }
+    Some(entries)
+}
+
+/// Name of the rootfs layer member inside the pack's outer tar.
+fn pack_layer_member(pack: &Path) -> Option<String> {
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "zstd -dc '{}' 2>/dev/null | tar -tf - 2>/dev/null | grep '^layers/.*\\.tar$' | head -1",
+            pack.display()
+        ))
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let name = String::from_utf8(output.stdout).ok()?;
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// Stream the pack's rootfs layer and collect setuid/setgid entries.
+fn list_setuid_entries(pack: &Path, layer: &str) -> Option<Vec<(String, String)>> {
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "zstd -dc '{}' 2>/dev/null | tar -xOf - '{}' 2>/dev/null | tar -tvf - 2>/dev/null",
+            pack.display(),
+            layer
+        ))
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let mut entries = Vec::new();
+    for line in stdout.lines() {
+        // GNU tar: `-rwsr-xr-x root/root 335120 2026-03-02 07:56 ./usr/bin/sudo`
+        // bsdtar:  `-rwsr-xr-x  0 root  wheel  335120 Mar  2 07:56 ./usr/bin/sudo`
+        let Some(mode) = parse_tar_mode(line) else {
+            continue;
+        };
+        let Some(path) = line.split_whitespace().next_back() else {
+            continue;
+        };
+        let path = path.strip_prefix("./").unwrap_or(path).to_owned();
+        entries.push((mode, path));
+    }
+    entries.sort();
+    entries.dedup();
+    Some(entries)
+}
+
+/// Parse a `tar -tvf` line's permission column into an octal mode, or
+/// `None` when the line has no setuid/setgid bit.
+fn parse_tar_mode(line: &str) -> Option<String> {
+    let perms = line.get(..10)?;
+    let setuid = matches!(perms.as_bytes().get(3), Some(b's' | b'S'));
+    let setgid = matches!(perms.as_bytes().get(6), Some(b's' | b'S'));
+    if !setuid && !setgid {
+        return None;
+    }
+    let mut bits = 0;
+    let groups = [
+        perms.as_bytes().get(1..4)?,  // user rwx
+        perms.as_bytes().get(4..7)?,  // group rwx
+        perms.as_bytes().get(7..10)?, // other rwx
+    ];
+    for group in groups {
+        bits = (bits << 3)
+            | (u32::from(group.contains(&b'r')) * 4)
+            | (u32::from(group.contains(&b'w')) * 2)
+            | u32::from(group.contains(&b'x') | group.contains(&b's') | group.contains(&b't'));
+    }
+    bits |= if setuid { 0o4000 } else { 0 };
+    bits |= if setgid { 0o2000 } else { 0 };
+    Some(format!("{bits:o}"))
 }
 
 /// Stage a pre-generated keypair for one `configure` call, if one is ready.
@@ -3888,6 +4166,11 @@ chmod +x "$destination/bin/node"
         assert!(
             script.contains("PRELOOP_RUNNER_USER=runner PRELOOP_RUNNER_UID=1001"),
             "{script}"
+        );
+        assert!(
+            script.contains("NOPASSWD: ALL"),
+            "the runner account must be able to sudo non-interactively, \
+             like the GitHub-hosted runner user: {script}"
         );
         assert!(
             script.ends_with("'/opt/preloop/bin/preloop-runner' 'run' '--once'"),
@@ -4695,6 +4978,102 @@ chmod +x "$destination/bin/node"
         assert!(
             !events.iter().any(|event| event.contains("rustup-init")),
             "a baked toolchain must not be reinstalled: {events:?}"
+        );
+    }
+
+    /// The pack-extraction ownership leak is repaired before the runner
+    /// configures, and only for a leaked (non-root) host uid.
+    #[tokio::test]
+    async fn provision_runs_rootfs_ownership_repair_before_configure() {
+        let Some(uid) = leaked_host_uid() else {
+            // Running as root, smolvm's virtiofs server can create guest
+            // root-owned files and nothing leaks; skipping is the correct
+            // production behavior, so the test has nothing to assert.
+            return;
+        };
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let config = packed_fork_config();
+        let golden = MachineName::new("lifecycle-test-golden").unwrap();
+        let name = MachineName::new("lifecycle-test-0-10").unwrap();
+
+        provision_runner(
+            &provider,
+            &config,
+            &name,
+            Some(&golden),
+            &Arc::new(KeyPool::new()),
+            &test_runner_environment(config.base_image.clone(), Vec::new(), true),
+        )
+        .await
+        .expect("provisioning succeeds with the repair step");
+
+        let events = provider.events().await;
+        let repair = events
+            .iter()
+            .position(|event| {
+                event.starts_with(&format!("exec:{}:", name.as_str()))
+                    && event.contains(&format!("uid={uid};"))
+            })
+            .expect("the ownership repair exec must run");
+        let configure = events
+            .iter()
+            .position(|event| event.starts_with(&format!("configure:{}", name.as_str())))
+            .expect("configure must run");
+        assert!(
+            repair < configure,
+            "ownership repair must precede configure: {events:?}"
+        );
+    }
+
+    /// The repair script targets exactly the leaked uid, skips `/home`,
+    /// rebuilds the chown-resistant residue with a mode-preserving tar
+    /// roundtrip, and re-applies the packed artifact's setuid/setgid modes.
+    #[test]
+    fn rootfs_repair_script_is_targeted_and_restores_setuid() {
+        let script = rootfs_repair_script(
+            502,
+            &[
+                ("4755".to_owned(), "/usr/bin/sudo".to_owned()),
+                ("2755".to_owned(), "/usr/bin/wall".to_owned()),
+            ],
+        );
+        assert!(script.contains("uid=502;"));
+        assert!(script.contains(r#"find / -xdev -uid "$uid" ! -path '/home/*'"#));
+        assert!(script.contains("exec chown root:root {} +"));
+        assert!(script.contains("tar --null --files-from=- --owner=root --group=root"));
+        assert!(script.contains("tar --same-owner -p --checkpoint=1000"));
+        assert!(script.contains("'4755 /usr/bin/sudo'"));
+        assert!(script.contains("'2755 /usr/bin/wall'"));
+        assert!(script.contains("chmod \"$1\" \"$2\""));
+        assert!(script.contains("rm -f /tmp/.preloop-leaked.tar"));
+    }
+
+    /// Without a packed artifact the repair still runs, just without the
+    /// setuid restore.
+    #[test]
+    fn rootfs_repair_script_skips_restore_without_setuid_list() {
+        let script = rootfs_repair_script(502, &[]);
+        assert!(!script.contains("restoring setuid/setgid"));
+        assert!(script.contains("repair: complete"));
+    }
+
+    /// `tar -tvf` mode parsing: GNU and BSD listings both carry the
+    /// permission column at the start of the line.
+    #[test]
+    fn tar_mode_parsing_handles_setuid_and_setgid() {
+        assert_eq!(
+            parse_tar_mode("-rwsr-xr-x root/root 335120 2026-03-02 07:56 ./usr/bin/sudo")
+                .as_deref(),
+            Some("4755")
+        );
+        assert_eq!(
+            parse_tar_mode("-rwxr-sr-x  0 root  shadow  1234 Mar  2 07:56 ./usr/bin/wall")
+                .as_deref(),
+            Some("2755")
+        );
+        assert_eq!(
+            parse_tar_mode("-rwxr-xr-x root/root 335120 2026-03-02 07:56 ./usr/bin/env"),
+            None
         );
     }
 
