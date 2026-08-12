@@ -407,6 +407,7 @@ Every item below broke a real workflow step and was fixed in preloop:
 | The runner account could not `sudo` | after the ownership repair, `sudo` demanded a password — the GitHub image grants the runner user passwordless sudo | the provisioning wrapper writes `/etc/sudoers.d/preloop-runner` (`NOPASSWD: ALL`) when it creates the account |
 | The packed artifact cache ignores bake-content changes | package pins added to the bake never reach a packed golden — the artifact cache key is the base-image digest only — so a parity fix requires deleting the artifact to force a rebuild | campaign practice: delete `~/.preloop/vms/preloop-…-aarch64` and restart; noted for a follow-up (key the artifact by the bake fingerprint) |
 | Multi-arch docker builds degrade to the host arch | moby's `cross` job resolves `linux/arm64` only — the golden lacks qemu-user-static/binfmt, so the ppc64le/s390x/amd64 cells GitHub builds are skipped rather than emulated | documented; `docker/setup-qemu-action` would need binfmt support in the golden to match GitHub |
+| Code-scanning SARIF uploads cannot complete without GitHub | moby's govulncheck scan, SARIF validation and fingerprinting all pass; the final `codeql-action/upload-sarif` POST to `api.github.com` fails (`Not Found`) because there is no GitHub backend behind the job's token | environmental — the scan itself is faithful; the upload needs a real GitHub token with `security-events: write` |
 
 ### 1c.2 Environmental findings
 

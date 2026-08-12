@@ -567,6 +567,7 @@ fn base_packages_pinned() -> String {
         sphinxsearch={APT_SPHINXSEARCH} \
         systemd-coredump={APT_SYSTEMD_COREDUMP} \
         libnss3-tools={APT_LIBNSS3_TOOLS} \
+        software-properties-common={APT_SOFTWARE_PROPERTIES_COMMON} \
         build-essential={APT_BUILD_ESSENTIAL} \
         pkg-config={APT_PKG_CONFIG} \
         libssl-dev={APT_LIBSSL_DEV} \
@@ -713,6 +714,7 @@ pub fn base_install_script() -> String {
          && printf '{LOOPBACK_HOSTS}' > /etc/hosts && \
          printf '127.0.0.1 %s\\n' \"$(hostname)\" >> /etc/hosts && \
          printf 'APT::Get::Assume-Yes \"true\";\\n' > /etc/apt/apt.conf.d/90assumeyes && \
+         rm -f /usr/lib/python3*/EXTERNALLY-MANAGED && \
          arch=$(uname -m); \
          case \"$arch\" in x86_64) NODE_ARCH=x64 ;; aarch64|arm64) NODE_ARCH=arm64 ;; *) NODE_ARCH=x64 ;; esac; \
          case \"$NODE_ARCH\" in \

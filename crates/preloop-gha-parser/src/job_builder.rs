@@ -395,9 +395,25 @@ pub fn build_agent_job_message_with_normalized_context(
         steps.push(task_step);
     }
 
-    // Materialize variables
+    // Materialize variables. Job/workflow `env:` values may carry `${{ }}`
+    // expressions (the canonical case is a boolean built from the github
+    // context: `SCCACHE_GHA_ENABLED: ${{ github.ref_name == 'main' }}`).
+    // GitHub resolves these server-side with the job context; preloop must
+    // too, or the raw template string lands in the step environment and
+    // tools that validate their inputs (sccache rejects anything that is not
+    // a boolean literal) fail on first use.
+    let resolved_env: BTreeMap<String, String> = plan
+        .env
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                resolve_string(v, &job_expr_context).unwrap_or_else(|_| v.clone()),
+            )
+        })
+        .collect();
     let mut variables = BTreeMap::new();
-    for (k, v) in &plan.env {
+    for (k, v) in &resolved_env {
         variables.insert(k.clone(), VariableValue::new(v));
     }
     for (k, v) in global_env {
@@ -430,8 +446,7 @@ pub fn build_agent_job_message_with_normalized_context(
     // Emit one plain object per variable; the runner's template-map reader
     // accepts that shape (and the `{map: [{Key, Value}]}` form upstream
     // sends).
-    let environment_variables: Vec<serde_json::Value> = plan
-        .env
+    let environment_variables: Vec<serde_json::Value> = resolved_env
         .iter()
         .map(|(k, v)| serde_json::json!({ k: v }))
         .collect();
@@ -1033,6 +1048,63 @@ jobs:
             Some("./build".to_owned()),
             "the variable projection must stay intact for expression contexts"
         );
+    }
+
+    /// `${{ }}` expressions inside `env:` values are resolved with the job
+    /// context before they reach the wire (GitHub resolves them server-side;
+    /// passing the raw template breaks tools that validate their inputs).
+    #[test]
+    fn env_values_resolve_expressions_with_the_job_context() {
+        let workflow = parse_workflow(
+            r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      ENABLED: ${{ github.ref_name == 'main' }}
+      PLAIN: hello
+    steps:
+      - run: echo hi
+"#,
+        )
+        .unwrap();
+        let plan = &crate::expand_jobs(&workflow).unwrap()[0];
+        let github = serde_json::json!({
+            "event_name": "push",
+            "ref": "refs/heads/main",
+            "ref_name": "main",
+            "base_ref": "",
+        });
+        let message = build_agent_job_message(
+            plan,
+            &github,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        let env: std::collections::BTreeMap<String, String> = message
+            .environment_variables
+            .iter()
+            .flat_map(|value| {
+                value
+                    .as_object()
+                    .into_iter()
+                    .flat_map(|obj| {
+                        obj.iter().filter_map(|(k, v)| {
+                            v.as_str().map(|s| (k.clone(), s.to_owned()))
+                        })
+                    })
+            })
+            .collect();
+        assert_eq!(
+            env.get("ENABLED").map(String::as_str),
+            Some("true"),
+            "the ref_name comparison must resolve to a boolean literal"
+        );
+        assert_eq!(env.get("PLAIN").map(String::as_str), Some("hello"));
     }
 
     #[test]

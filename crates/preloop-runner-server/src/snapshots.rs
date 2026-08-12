@@ -1061,6 +1061,39 @@ async fn ensure_object_cache(
     // remote while the lock is held; once complete it stays complete and
     // later runs skip the fetch entirely.
     let mut ancestry_complete = !repository.join("shallow").is_file();
+    if ancestry_complete {
+        // A cache cloned from a `--filter=blob:none` workspace inherits the
+        // promisor pack contents (commits and trees but no blobs) without
+        // carrying the partial-clone markers, so the shallow-file check
+        // above cannot see the hole. `rev-list --missing=print` enumerates
+        // every object reachable from the refs and prints the absent ones
+        // as bare SHAs (present objects print "sha path"). Any hole means
+        // the cache advertises refs it cannot serve — every workflow
+        // `git fetch --unshallow origin` against the snapshot then dies
+        // with `Could not read <sha>` / "revision walk setup failed" — so
+        // recover the full ancestry from the workspace's remote, the same
+        // deepen the shallow path uses.
+        let mut verify = Command::new("git");
+        verify
+            .env("GIT_DIR", &repository)
+            .args(["rev-list", "--objects", "--all", "--missing=print"]);
+        let missing = match run_git(&mut verify, "verify snapshot object cache completeness").await
+        {
+            Ok(output) => String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter(|line| !line.contains(' '))
+                .count(),
+            Err(_) => 0,
+        };
+        if missing > 0 {
+            warn!(
+                cache = %repository.display(),
+                %missing,
+                "snapshot object cache is missing objects (partial-clone workspace?); deepening from the remote"
+            );
+            ancestry_complete = false;
+        }
+    }
     if !ancestry_complete {
         ancestry_complete =
             deepen_object_cache_from_remote(&repository, workspace, github_pat).await;
