@@ -116,9 +116,10 @@ pub(crate) async fn next_message(
                 endpoint
                     .data
                     .insert("PipelinesServiceUrl".to_owned(), runner_server_url());
-                endpoint
-                    .data
-                    .insert("CacheServerUrl".to_owned(), runner_base_url());
+                endpoint.data.insert(
+                    "CacheServerUrl".to_owned(),
+                    format!("{}/", runner_base_url()),
+                );
             }
         }
         debug!(

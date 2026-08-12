@@ -1074,14 +1074,23 @@ async fn ensure_object_cache(
         // recover the full ancestry from the workspace's remote, the same
         // deepen the shallow path uses.
         let mut verify = Command::new("git");
-        verify
-            .env("GIT_DIR", &repository)
-            .args(["rev-list", "--objects", "--all", "--missing=print"]);
+        verify.env("GIT_DIR", &repository).args([
+            "rev-list",
+            "--objects",
+            "--all",
+            "--missing=print",
+        ]);
         let missing = match run_git(&mut verify, "verify snapshot object cache completeness").await
         {
             Ok(output) => String::from_utf8_lossy(&output.stdout)
                 .lines()
-                .filter(|line| !line.contains(' '))
+                .filter(|line| {
+                    // Present objects print "sha path"; missing ones print a
+                    // bare sha. Shallow-boundary roots are reported with the
+                    // null-ish `0000…` shas — they are graft markers, not
+                    // missing objects, and the shallow rewrite serves them.
+                    !line.contains(' ') && !line.starts_with("0000")
+                })
                 .count(),
             Err(_) => 0,
         };

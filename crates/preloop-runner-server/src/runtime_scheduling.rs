@@ -238,25 +238,7 @@ pub(crate) fn reconcile_concurrency_groups(inner: &mut InnerState) {
         if external_host_available {
             return false;
         }
-        let Some(run) = inner.runs.get(run_id) else {
-            return true;
-        };
-        run.jobs.iter().all(|(job_id, status)| {
-            matches!(
-                status,
-                ExecutionStatus::Success
-                    | ExecutionStatus::Failure
-                    | ExecutionStatus::Cancelled
-                    | ExecutionStatus::Skipped
-            ) || inner.queue.iter().any(|queued| {
-                queued.run_id == *run_id
-                    && queued.job_id == *job_id
-                    && queued.runs_on.iter().any(|label| {
-                        let label = label.to_ascii_lowercase();
-                        label.starts_with("macos") || label.starts_with("windows")
-                    })
-            })
-        })
+        run_stuck_on_external_hosts(inner, run_id)
     };
     let dead_running: Vec<(String, String)> = inner
         .concurrency_groups
@@ -304,6 +286,34 @@ pub(crate) fn reconcile_concurrency_groups(inner: &mut InnerState) {
     for run_id in dead_keys {
         inner.holder_keys.remove(&run_id);
     }
+}
+
+/// Whether every non-terminal job of `run_id` is queued behind an external
+/// host label (macos/windows) with none registered.
+///
+/// The starvation sweep deliberately keeps such jobs queued forever (the
+/// host may appear), so the run never goes terminal on its own. Used to
+/// identify concurrency holders that would otherwise park the group forever.
+pub(crate) fn run_stuck_on_external_hosts(inner: &InnerState, run_id: &RunId) -> bool {
+    let Some(run) = inner.runs.get(run_id) else {
+        return true;
+    };
+    run.jobs.iter().all(|(job_id, status)| {
+        matches!(
+            status,
+            ExecutionStatus::Success
+                | ExecutionStatus::Failure
+                | ExecutionStatus::Cancelled
+                | ExecutionStatus::Skipped
+        ) || inner.queue.iter().any(|queued| {
+            queued.run_id == *run_id
+                && queued.job_id == *job_id
+                && queued.runs_on.iter().any(|label| {
+                    let label = label.to_ascii_lowercase();
+                    label.starts_with("macos") || label.starts_with("windows")
+                })
+        })
+    })
 }
 
 /// Cancel a single job (job-level concurrency / fail-fast style).
@@ -795,6 +805,17 @@ pub(crate) fn try_acquire_concurrency(
     cancel_in_progress: bool,
     queue: preloop_gha_parser::ConcurrencyQueue,
 ) -> Result<bool, String> {
+    // A run whose *remaining* jobs all need an external host (macos/windows)
+    // with none registered never goes terminal — the starvation sweep keeps
+    // those jobs queued on purpose — so its run-level holder would park every
+    // later submission in this group forever. Check before the mutable borrow
+    // so the dead slot can be released and taken by the arriving run; the
+    // stuck run's jobs stay queued and re-acquire if a host appears.
+    let running_stuck = inner
+        .concurrency_groups
+        .get(&key)
+        .and_then(|group| group.running.as_ref())
+        .is_some_and(|running| run_stuck_on_external_hosts(inner, &running.run_id()));
     let group = inner
         .concurrency_groups
         .entry(key.clone())
@@ -808,6 +829,13 @@ pub(crate) fn try_acquire_concurrency(
     }
 
     if group.running.is_none() {
+        group.running = Some(holder.clone());
+        let _ = group;
+        track_holder_key(inner, &holder, key);
+        return Ok(true);
+    }
+    if running_stuck {
+        group.running = None;
         group.running = Some(holder.clone());
         let _ = group;
         track_holder_key(inner, &holder, key);

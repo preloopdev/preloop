@@ -406,10 +406,21 @@ pub fn build_agent_job_message_with_normalized_context(
         .env
         .iter()
         .map(|(k, v)| {
-            (
-                k.clone(),
-                resolve_string(v, &job_expr_context).unwrap_or_else(|_| v.clone()),
-            )
+            // Runtime-only context keys must survive job-build resolution:
+            // `github.workspace` is filled in by the runner at execution
+            // time (the server has no runner work directory), and the
+            // expression resolver turns a missing property into "" — so
+            // neovim's `BIN_DIR: ${{ github.workspace }}/bin` would silently
+            // collapse to `/bin` here. Leave those values untouched for the
+            // runner's step-time evaluation.
+            if v.contains("github.workspace") {
+                (k.clone(), v.clone())
+            } else {
+                (
+                    k.clone(),
+                    resolve_string(v, &job_expr_context).unwrap_or_else(|_| v.clone()),
+                )
+            }
         })
         .collect();
     let mut variables = BTreeMap::new();
@@ -1089,14 +1100,10 @@ jobs:
             .environment_variables
             .iter()
             .flat_map(|value| {
-                value
-                    .as_object()
-                    .into_iter()
-                    .flat_map(|obj| {
-                        obj.iter().filter_map(|(k, v)| {
-                            v.as_str().map(|s| (k.clone(), s.to_owned()))
-                        })
-                    })
+                value.as_object().into_iter().flat_map(|obj| {
+                    obj.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
+                })
             })
             .collect();
         assert_eq!(

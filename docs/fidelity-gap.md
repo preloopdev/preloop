@@ -408,6 +408,9 @@ Every item below broke a real workflow step and was fixed in preloop:
 | The packed artifact cache ignores bake-content changes | package pins added to the bake never reach a packed golden — the artifact cache key is the base-image digest only — so a parity fix requires deleting the artifact to force a rebuild | campaign practice: delete `~/.preloop/vms/preloop-…-aarch64` and restart; noted for a follow-up (key the artifact by the bake fingerprint) |
 | Multi-arch docker builds degrade to the host arch | moby's `cross` job resolves `linux/arm64` only — the golden lacks qemu-user-static/binfmt, so the ppc64le/s390x/amd64 cells GitHub builds are skipped rather than emulated | documented; `docker/setup-qemu-action` would need binfmt support in the golden to match GitHub |
 | Code-scanning SARIF uploads cannot complete without GitHub | moby's govulncheck scan, SARIF validation and fingerprinting all pass; the final `codeql-action/upload-sarif` POST to `api.github.com` fails (`Not Found`) because there is no GitHub backend behind the job's token | environmental — the scan itself is faithful; the upload needs a real GitHub token with `security-events: write` |
+| Job/workflow `env:` entries containing `${{ }}` were emitted verbatim | ruff's `sccache` step resolves `SCCACHE_GHA_ENABLED:${{ github.ref_name == 'main' }}` — the raw template string reached the step env and the sccache action died (`${{` is not valid in an env value for the official runner) | the job message builder now resolves env expressions server-side against the job context before emitting `environmentVariables` |
+| The snapshot object cache was trusted without verification | partial-clone workspaces (cloned with `--filter=blob:none`) produce object caches with commits and trees but no blobs and no shallow marker, so fetches from the cache silently returned incomplete packs (a `--unshallow` fetch would fail later in the workflow); the cache completeness was assumed | the snapshot path now runs `git rev-list --objects --all --missing=print` and deepens from the workspace remote when real holes exist; `--refetch` is used when the cache is not marked shallow (a plain fetch only transfers what new refs need, which is nothing when refs are unchanged). Shallow-boundary graft entries (`0000…` shas) are excluded from the missing count |
+| `ACTIONS_CACHE_URL` lacked the trailing slash | sccache's GHA storage backend concatenates its twirp path directly, producing `http://host:9090twirp/…` → `invalid port number` → storage probe failed → sccache's compiler shim emitted nothing → node's configure reported "Could not determine compiler version info" | `CacheServerUrl` is emitted with a trailing slash (both acquire paths) and the worker no longer trims it, matching the official results-receiver URL shape |
 
 ### 1c.2 Environmental findings
 
@@ -438,10 +441,10 @@ Every item below broke a real workflow step and was fixed in preloop:
 | Repo | Workflow | Result |
 | --- | --- | --- |
 | `moby/moby` | `ci.yml` | build (binary/dynbinary, amd64+arm64 cells) ✅, validate-dco ✅, cross/build-dind/prepare-cross/success ✅, govulncheck ✅ after the env fix |
-| `neovim/neovim` | `test.yml` | lintc/lint/clang-analyzer/zig-build ✅; posix ubuntu cells ✅; macos/windows cells fail via the starvation sweep (no such runners) |
-| `microsoft/TypeScript` | `ci.yml` | ubuntu test cells ✅; windows/macos cells fail via the starvation sweep |
-| `astral-sh/ruff` | `ci.yaml` | determine-changes gated matrix: unchanged-path jobs skip ✅ (32 skipped is the correct gate outcome); cargo jobs ✅ |
-| `nodejs/node` | `test-linux.yml` | runs on the remote x86_64 fleet; blocked by the App-token checkout issue, re-run pending |
+| `neovim/neovim` | `test.yml` | lintc/lint/clang-analyzer/zig-build ✅; posix ubuntu cells ✅; macos/windows cells fail via the starvation sweep (no such runners). The run-level `concurrency:` group deadlock found through this workflow is fixed (1c.1) |
+| `microsoft/TypeScript` | `ci.yml` | 15 ubuntu cells ✅ (node 14→lts/* matrix + baselines/format/knip/lint/misc/self-check/smoke/typecheck, package-size gated off, `required` gate ✅); windows/macos cells fail via the starvation sweep; one coverage cell hit a transient virtiofs mount race |
+| `astral-sh/ruff` | `ci.yaml` | determine-changes gated matrix: unchanged-path jobs skip ✅; fmt/shellcheck/clippy/prek/mkdocs/formatter/ruff-lsp/instrumented-benchmarks/16 cargo+test cells ✅; remaining failures are environmental: x86_64-binaries-in-arm64-guest (release/wasm test cells), `/tmp` tmpfs EXDEV (python-package), one cargo-package verification quirk |
+| `nodejs/node` | `test-linux.yml` | remote x86_64 leg: checkout/sudo/rustup/setup-python/apt all work (App-token checkout fixed via PAT + real payload SHA); remote builds keep flaking on apt under I/O contention. Local leg: runs end-to-end after the `ACTIONS_CACHE_URL` slash fix (1c.1) |
 
 ### 1c.4 Still open
 
@@ -449,9 +452,26 @@ Every item below broke a real workflow step and was fixed in preloop:
   its jobs only in memory; after a restart the group is reconciled (above)
   but the parked run itself is stuck pending and must be cancelled and
   re-submitted.
-- **Remote deployment**: the ownership-repair and env fixes need a rebuild
-  and deploy to `main` (the x86 control plane) before foreign-repo runs
-  there behave like the local ones.
+- **Remote deployment lags the local tree**: `main` runs the
+  ownership-repair-era binary; the env-expression, snapshot-cache and
+  `ACTIONS_CACHE_URL` fixes need a rebuild + deploy there for remote runs
+  to match local behavior.
+- **sccache's GHA cache backend** only exercises the cache on `main`-ref
+  jobs (the workflow gates `SCCACHE_GHA_ENABLED` to `main`); the URL-shape
+  bug that broke it is fixed (1c.1), but a full sccache GHA-storage
+  conformance pass on a `main`-ref build remains a follow-up.
+- **No x86_64-in-arm64-guest execution.** The aarch64 guests lack the
+  Rosetta loader mount (`/lib64/ld-linux-x86-64.so.2`) and binfmt
+  registration, so anything that runs an x86_64 binary inside the arm64
+  guest fails (`rosetta error: failed to open elf`). setup-python on the
+  arm64 guest downloads the correct arm64 build; the earlier x64 downloads
+  were a stale-golden-era artifact. GitHub's arm64 runners cannot run
+  x86_64 either, so this is only hit when a workflow insists on executing
+  foreign-arch binaries.
+- **`/tmp` is tmpfs**, so third-party actions that `rename()` across
+  `/tmp` → toolcache die with `EXDEV` (setup-wasm-pack does exactly this).
+  GitHub's image keeps `/tmp` on disk; the golden could mask
+  `tmp.mount` for parity.
 
 ---
 

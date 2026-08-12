@@ -793,9 +793,10 @@ pub(crate) async fn broker_acquire_job(
             endpoint
                 .data
                 .insert("PipelinesServiceUrl".to_owned(), runner_server_url());
-            endpoint
-                .data
-                .insert("CacheServerUrl".to_owned(), runner_base_url());
+            endpoint.data.insert(
+                "CacheServerUrl".to_owned(),
+                format!("{}/", runner_base_url()),
+            );
             endpoint.data.insert(
                 "FeedStreamUrl".to_owned(),
                 format!("{}/ws/live-logs/{}", websocket_base_url(), message.job_id),

@@ -526,6 +526,19 @@ pub async fn run_steps(
                     .unwrap_or_else(|_| v.clone());
                 step_ctx.env.insert(k.clone(), evaluated);
             }
+            // Workflow/job-level `env:` is pre-resolved by the server except
+            // for runtime-only context keys (`github.workspace` — the server
+            // has no runner work directory, and its resolver would zero the
+            // property to ""). Evaluate any leftover templates now against
+            // the full runtime context, like the official runner's
+            // step-time env evaluation. Step env still overrides.
+            for (k, v) in &step_ctx.job.env {
+                if v.contains("${{") {
+                    let evaluated = crate::worker::template::evaluate_template(v, &expr_ctx)
+                        .unwrap_or_else(|_| v.clone());
+                    step_ctx.env.entry(k.clone()).or_insert(evaluated);
+                }
+            }
         }
 
         // Snapshot the runner-managed state this step is allowed to mutate, so
