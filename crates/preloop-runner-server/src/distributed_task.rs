@@ -110,9 +110,10 @@ pub(crate) async fn next_message(
                         .state
                         .mint_runtime_token(&msg.plan.plan_id, &msg.job_id),
                 );
-                endpoint
-                    .data
-                    .insert("ResultsServiceUrl".to_owned(), runner_base_url());
+                endpoint.data.insert(
+                    "ResultsServiceUrl".to_owned(),
+                    format!("{}/", runner_base_url()),
+                );
                 endpoint
                     .data
                     .insert("PipelinesServiceUrl".to_owned(), runner_server_url());

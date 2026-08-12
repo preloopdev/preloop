@@ -787,9 +787,10 @@ pub(crate) async fn broker_acquire_job(
                     .state
                     .mint_runtime_token(&message.plan.plan_id, &message.job_id),
             );
-            endpoint
-                .data
-                .insert("ResultsServiceUrl".to_owned(), runner_base_url());
+            endpoint.data.insert(
+                "ResultsServiceUrl".to_owned(),
+                format!("{}/", runner_base_url()),
+            );
             endpoint
                 .data
                 .insert("PipelinesServiceUrl".to_owned(), runner_server_url());
