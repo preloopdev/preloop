@@ -3474,6 +3474,8 @@ fn rootfs_repair_script(uid: u32, setuid: &[(String, String)]) -> String {
     format!(
         "uid={uid}; \
          echo \"repair: remapping uid {uid} to root\"; \
+         chown root:root /etc/passwd /etc/group /etc/shadow /etc/gshadow \
+           /etc/sudoers /etc/sudoers.d 2>/dev/null || true; \
          find / -xdev -uid \"$uid\" ! -path '/home/*' \
            -exec chown root:root {{}} + -print 2>/dev/null; \
          echo \"repair: chown pass complete, rebuilding residue\"; \
