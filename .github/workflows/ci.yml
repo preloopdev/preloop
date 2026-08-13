@@ -76,7 +76,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
-          toolchain: "1.86"
+          toolchain: "1.97"
           components: rustfmt,clippy
 
       # inline run steps work against preloop
@@ -93,19 +93,21 @@ jobs:
           cargo clippy --locked -p preloop-gha-protocol -p preloop-gha-parser -p preloop-gha-expressions -p preloop-cache -p preloop-artifacts -p runner-watch -p preloop-conformance --all-targets -- -D warnings
           # Run clippy on crates with pre-existing warnings without -D warnings
           cargo clippy --locked -p preloop-runner -p preloop-runner-server -p preloop-runner-client -p preloop-dap --all-targets
-      # E2: cranelift codegen backend. Compiles fast and uses far less
-      # memory than LLVM (so JOBS=4), but generates unoptimized code the
-      # tests then run on — this job is test-dominated, expect a net loss.
-      - name: Install cranelift backend
-        run: rustup toolchain install nightly --profile minimal --component rustc-codegen-cranelift-preview
+      # nextest: runs test binaries in parallel (2 at a time, 2 threads
+      # each — same 4-thread ceiling as libtest). The workspace is
+      # test-execution-dominated (~13.4 min of a 15-min cargo test), so
+      # parallel binaries beat serial libtest runs. RUST_TEST_THREADS=2
+      # supplies the per-process thread count (nextest reads the env).
+      - name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-$HOME/.cargo}/bin
 
-      - run: |
-          BACKEND=$(find "$(rustc +nightly --print sysroot)" -name 'librustc_codegen_cranelift*.so' | head -1)
-          echo "cranelift backend: $BACKEND"
-          RUSTFLAGS="-Zunstable-options -Zcodegen-backend=$BACKEND -A warnings" \
-            cargo +nightly test --locked --workspace
+      - run: cargo nextest run --locked --workspace --no-fail-fast -j 2
         env:
-          CARGO_BUILD_JOBS: "4"
+          RUSTFLAGS: "-A warnings -C link-arg=-fuse-ld=lld"
+          # Host has 6 vCPUs for 2 VMs (8 requested): 4 threads oversubscribe
+          # and measured SLOWER than libtest's 2 (17.5 vs 13.4 min exec).
+          # 1 thread per process, 2 binaries in parallel = 2 threads total.
+          RUST_TEST_THREADS: "1"
 
   # Bounded property-test profile
   property-tests-fast:
@@ -120,7 +122,7 @@ jobs:
           lfs: true
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
-          toolchain: "1.86"
+          toolchain: "1.97"
 
       # Zero-filter guard so just fail if no properties match the filter
       - name: Verify concurrency_properties filter matches at least one test
@@ -229,7 +231,7 @@ jobs:
           lfs: true
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
-          toolchain: "1.86"
+          toolchain: "1.97"
 
       # Zero-filter guard
       - name: Verify concurrency_properties filter matches at least one test
