@@ -424,15 +424,17 @@ pub async fn start_job_container(
 
     let result = docker_cmd(&args.iter().map(|s| s.as_str()).collect::<Vec<_>>(), log).await?;
 
-    let container_id = result
-        .first()
-        .cloned()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
+    // `docker create` prints the container ID on stdout, but stderr is merged
+    // into the same line stream and pipe scheduling can surface a warning
+    // (e.g. a platform mismatch) before the ID. Never trust stream order:
+    // take the first line that is actually a 64-hex-char container ID.
+    let container_id = parse_container_id(&result).unwrap_or_default();
 
     if container_id.is_empty() {
-        anyhow::bail!("Failed to create job container — no ID returned");
+        anyhow::bail!(
+            "Failed to create job container — no ID returned (output: {})",
+            result.join(" | ")
+        );
     }
 
     // Start the container
@@ -536,17 +538,13 @@ pub async fn start_service_container(
 
     let result = docker_cmd(&args.iter().map(|s| s.as_str()).collect::<Vec<_>>(), log).await?;
 
-    let container_id = result
-        .first()
-        .cloned()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
+    let container_id = parse_container_id(&result).unwrap_or_default();
 
     if container_id.is_empty() {
         anyhow::bail!(
-            "Failed to create service container '{}' — no ID returned",
-            service.alias
+            "Failed to create service container '{}' — no ID returned (output: {})",
+            service.alias,
+            result.join(" | ")
         );
     }
 
@@ -914,6 +912,19 @@ fn push_docker_inherited_env(args: &mut Vec<String>, key: &str) {
     args.push(key.to_string());
 }
 
+/// Extract the container ID from `docker create` output.
+///
+/// Stdout and stderr are merged into one line stream, and the platform warning
+/// can precede the ID depending on pipe scheduling. The ID is the only 64-hex-
+/// character line; scan for it rather than trusting order.
+fn parse_container_id(lines: &[String]) -> Option<String> {
+    lines.iter().find_map(|line| {
+        let trimmed = line.trim();
+        (trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()))
+            .then(|| trimmed.to_owned())
+    })
+}
+
 /// F049: Inject web proxy env vars into container if configured on the host.
 ///
 /// Matches official runner `ContainerInfo.UpdateWebProxyEnv()`:
@@ -1041,6 +1052,29 @@ mod tests {
         let name = container_name("node:20-bookworm", label);
         assert!(name.ends_with("_node20bookworm_abc123"));
         assert_eq!(name.len(), 32 + 1 + "node20bookworm".len() + 1 + 6);
+    }
+
+    #[test]
+    fn create_output_parses_container_id_regardless_of_warning_position() {
+        let id = "8c69592e2dd96c1c92c6c6bcbf0a3c52ed9ad69fd054aeea54f40a8a8580e44d";
+        // The observed failure: docker's platform warning landed first in the
+        // merged stdout+stderr stream, and the old first-line parse fed the
+        // warning to `docker start`.
+        let warning_first = vec![
+            "WARNING: The requested image's platform (linux/amd64) does not match the detected host platform (linux/arm64/v8) and no specific platform was requested".to_owned(),
+            id.to_owned(),
+        ];
+        assert_eq!(parse_container_id(&warning_first).as_deref(), Some(id));
+
+        let id_first = vec![id.to_owned(), "WARNING: something".to_owned()];
+        assert_eq!(parse_container_id(&id_first).as_deref(), Some(id));
+
+        // No hex ID anywhere: must return None so the caller reports the
+        // actual docker output instead of misusing a message line.
+        assert_eq!(
+            parse_container_id(&["no id here".to_owned(), "another line".to_owned()]),
+            None
+        );
     }
 
     #[test]
