@@ -222,6 +222,7 @@ pub(crate) async fn next_message_broker_ref(
 
     loop {
         let mut inner = shared.state.inner.lock().await;
+        inner.mark_session_seen(&session_id);
         let runner_id = inner
             .runner_id_for_session(&session_id)
             .ok_or_else(|| ApiError::forbidden("broker session has no runner owner"))?;
@@ -344,6 +345,10 @@ pub(crate) async fn next_message_disttask(
         .get("sessionId")
         .cloned()
         .unwrap_or_else(|| "default".to_owned());
+    {
+        let mut inner = shared.state.inner.lock().await;
+        inner.mark_session_seen(&session_id);
+    }
     let is_azdo = {
         let inner = shared.state.inner.lock().await;
         inner.azdo_sessions.contains(&session_id)
@@ -507,7 +512,8 @@ pub(crate) async fn next_message_broker_ref_root(
         .cloned()
         .ok_or_else(|| ApiError::bad_request("broker sessionId is required"))?;
     {
-        let inner = shared.state.inner.lock().await;
+        let mut inner = shared.state.inner.lock().await;
+        inner.mark_session_seen(&session_id);
         if inner.broker_session_runners.get(&session_id) != Some(&runner_id) {
             return Err(ApiError::forbidden(
                 "broker session belongs to another runner",

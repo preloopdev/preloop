@@ -6180,6 +6180,84 @@ async fn queued_job_with_no_runner_is_failed_after_the_grace_window() {
 }
 
 #[tokio::test]
+async fn liveness_sweep_requeues_job_of_deaf_runner() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+
+    // Register a runner, open a session, and claim a submitted job through
+    // the real poll path.
+    let (runner_id, token) =
+        register_runner_with_token(&app, "deaf-runner", &["self-hosted"], None).await;
+    let (status, session) = create_disttask_session(&app, &token, runner_id).await;
+    assert!(
+        status == StatusCode::OK || status == StatusCode::CREATED,
+        "session creation must succeed (got {status})"
+    );
+    let session_id = session["sessionId"].as_str().unwrap().to_owned();
+
+    let accepted = submit_simple_run(&app).await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let job_id = JobId("build".to_owned());
+    let message = poll_message(&app, &token, &session_id).await;
+    assert!(!message.is_null(), "poll must claim the queued job");
+    {
+        let inner = state.inner.lock().await;
+        assert!(
+            inner.claimed_jobs.contains_key(&(run_id, job_id.clone())),
+            "poll must record the claim in claimed_jobs"
+        );
+        assert!(
+            inner.session_active_requests.contains_key(&session_id),
+            "poll must pin the claim to the session"
+        );
+    }
+
+    // The runner goes deaf: backdate its last poll and shrink the timeout.
+    {
+        let mut inner = state.inner.lock().await;
+        inner.runner_liveness_timeout = Duration::from_secs(600);
+        inner.session_last_seen.insert(
+            session_id.clone(),
+            std::time::Instant::now() - Duration::from_secs(3600),
+        );
+    }
+    reap_once(&shared).await;
+
+    {
+        let inner = state.inner.lock().await;
+        assert!(
+            !inner.runners.contains_key(&runner_id),
+            "deaf runner must be purged"
+        );
+        assert!(
+            !inner.sessions.contains_key(&session_id),
+            "deaf session must be purged"
+        );
+        assert!(
+            !inner.session_active_requests.contains_key(&session_id),
+            "deaf session claim must be released"
+        );
+        assert!(
+            !inner.claimed_jobs.contains_key(&(run_id, job_id.clone())),
+            "deaf claim must leave claimed_jobs"
+        );
+        assert!(
+            inner
+                .queue
+                .iter()
+                .any(|job| job.run_id == run_id && job.job_id == job_id),
+            "unfinished job must be requeued for a fresh machine"
+        );
+    }
+}
+
+#[tokio::test]
 async fn queued_job_survives_the_grace_window_while_the_pool_is_preparing() {
     let temp = tempfile::tempdir().unwrap();
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();

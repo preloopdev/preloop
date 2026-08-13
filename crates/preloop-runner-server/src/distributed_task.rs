@@ -17,6 +17,7 @@ pub(crate) async fn next_message(
 
     loop {
         let mut inner = shared.state.inner.lock().await;
+        inner.mark_session_seen(&session_id);
         if let Some(message) = inner
             .inflight_messages
             .get(&session_id)

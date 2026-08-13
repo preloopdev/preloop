@@ -140,6 +140,7 @@ pub(crate) async fn create_session(
                 runner_id: request.runner_id,
             },
         );
+        inner.mark_session_seen(&session_id.to_string());
         inner
             .broker_session_runners
             .insert(session_id.to_string(), request.runner_id);
@@ -235,6 +236,7 @@ pub(crate) async fn create_session_disttask(
                     runner_id,
                 },
             );
+            inner.mark_session_seen(&session_id.to_string());
         }
         // Only mark as AzDO if the client explicitly opts in.
         // This preserves backward compat: test and broker-hybrid sessions do NOT
