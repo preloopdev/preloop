@@ -47,10 +47,10 @@ jobs:
     runs-on: self-hosted
     timeout-minutes: 60
     env:
-      # 2 parallel debug rustc jobs peak around 3 GiB, inside the pool's
-      # 4.5 GiB VM ceiling. Unbounded parallelism OOM-killed the host once
-      # (4 jobs in a VM plus an oversized pool); the pool memory ceiling
-      # must stay above this or the guest OOM-kills rustc (SIGKILL).
+      # 2 parallel debug rustc + GNU ld links peak ~4.6 GiB in the guest
+      # (measured on the pool, 2026-08-13); the 5 GiB VM ceiling is the
+      # floor. Unbounded parallelism OOM-killed the host once; the ceiling
+      # must stay above the build peak or the guest OOM-kills rustc.
       CARGO_BUILD_JOBS: "2"
       # The dedicated property job carries the 256-case profile. Keep this
       # workspace gate aligned with `just test-ci` and bound libtest
@@ -92,9 +92,6 @@ jobs:
           s3-secret-access-key: ${{ secrets.KACHE_R2_SECRET_ACCESS_KEY }}
           manifest-key: ci-rust
           pr-comment: false
-
-      # inline run steps work against preloop
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
 
       - run: cargo fmt --all --check
       - run: |
