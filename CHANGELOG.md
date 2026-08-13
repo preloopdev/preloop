@@ -9,6 +9,8 @@ Releases before v0.27.0 predate the changelog.
 
 ## [Unreleased]
 
+## [0.30.2] - 2026-08-13
+
 ### Added
 
 - `docs/internal/threatmodel.md`: threat model overview — attacker
@@ -108,6 +110,19 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- The runner's in-guest control bridge no longer deafens the runner on a
+  transient upstream outage. The bridge previously exited after 10
+  consecutive upstream connect failures; when the guest network was not yet
+  up at VM fork, the runner's first polls burned that budget and the bridge
+  died permanently — the runner kept polling a dead loopback address
+  ("Connection refused") while its job sat in_progress with no logs. The
+  bridge now stays up and retries forever, matching the runner's own poll
+  loop, so a brief boot-window outage self-heals.
+- The control plane now sweeps runner sessions that stop polling and reaps
+  the deaf runner: the unfinished job is requeued for a fresh machine and
+  the dead VM is recycled, bounding the stall to
+  `PRELOOP_RUNNER_LIVENESS_TIMEOUT_SECS` (default 30 minutes) instead of
+  the 45-minute job lease (which failed the job rather than requeueing it).
 - `preloop-cli` and `preloop-vm` did not compile for Linux at all (a
   use-after-move in `add_to_kvm_group`, a `format!` arity bug that also
   silently dropped the webhook hint from the install summary, and two test
