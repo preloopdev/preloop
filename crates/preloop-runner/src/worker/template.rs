@@ -51,6 +51,26 @@ pub fn evaluate_template(input: &str, ctx: &preloop_gha_expressions::Context) ->
     Ok(result)
 }
 
+/// Evaluate a template, failing when any embedded expression cannot be
+/// evaluated.
+///
+/// [`evaluate_template`] preserves a failed `${{ }}` token verbatim so run
+/// scripts can degrade gracefully; the official runner does the opposite for
+/// step environments and action inputs — `PipelineTemplateConverter.
+/// ConvertToStepEnvironment` throws on a value that reaches it unevaluated,
+/// and the step is marked failed. This strict variant surfaces the same
+/// failure.
+pub fn evaluate_template_strict(
+    input: &str,
+    ctx: &preloop_gha_expressions::Context,
+) -> Result<String> {
+    let evaluated = evaluate_template(input, ctx)?;
+    if evaluated.contains("${{") {
+        anyhow::bail!("failed to evaluate expression in template: {input}");
+    }
+    Ok(evaluated)
+}
+
 /// Evaluate an `if:` condition expression as a boolean.
 ///
 /// GitHub Actions `if:` conditions are implicitly wrapped in `${{ }}` if they

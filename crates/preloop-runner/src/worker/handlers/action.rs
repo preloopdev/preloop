@@ -150,13 +150,46 @@ pub(crate) async fn ensure_remote_action_staged(
         .parent()
         .unwrap_or(std::path::Path::new("."));
     let actions_dir = base.join("_actions");
+    // Resolve ref → SHA through the server's runnerresolve endpoint first,
+    // like job-start preparation does (and like the official ActionManager):
+    // the download is then SHA-pinned via the server-minted URL. When the
+    // launch endpoint is unavailable, fall back to the api.github.com
+    // tarball, matching the official manager's own fallback.
+    let launch_url = ctx
+        .job
+        .get_variable("system.github.launch_endpoint")
+        .map(str::to_owned);
+    let mut resolved = None;
+    if let Some(launch_url) = launch_url {
+        let http = crate::client::http::HttpClient::new(None)?;
+        let resolver =
+            crate::client::actions_download::ActionsResolveClient::new(http, Some(launch_url));
+        let key = format!("{owner}/{repo}@{git_ref}");
+        let batch = resolver
+            .resolve_batch("", "", "", &[(owner, git_ref)])
+            .await
+            .unwrap_or_default();
+        resolved = batch.get(&key).cloned();
+    }
+    let dir_ref = resolved
+        .as_ref()
+        .map(|meta| meta.resolved_sha.as_str())
+        .filter(|sha| !sha.is_empty())
+        .unwrap_or(git_ref);
+    let download_url = resolved
+        .as_ref()
+        .map(|meta| meta.tar_url.as_str())
+        .filter(|url| !url.is_empty());
+    let auth_token = resolved
+        .as_ref()
+        .and_then(|meta| meta.auth_token.as_deref());
     let action_root = crate::worker::actions::manager::download_action(
         owner,
         repo,
-        git_ref,
+        dir_ref,
         &actions_dir,
-        None,
-        None,
+        download_url,
+        auth_token,
     )
     .await?;
     let action_dir = if subpath.is_empty() {

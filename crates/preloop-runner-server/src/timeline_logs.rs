@@ -375,6 +375,7 @@ pub(crate) async fn finish_job(
                 status,
                 outputs,
                 annotations: Vec::new(),
+                step_results: Vec::new(),
             })
         } else {
             None
@@ -541,6 +542,7 @@ pub(crate) async fn finish_job_plan(
                 status,
                 outputs,
                 annotations: Vec::new(),
+                step_results: Vec::new(),
             })
         } else {
             warn!(plan_id, "finish_job_plan: could not resolve run/job");

@@ -402,27 +402,31 @@ pub fn build_agent_job_message_with_normalized_context(
     // too, or the raw template string lands in the step environment and
     // tools that validate their inputs (sccache rejects anything that is not
     // a boolean literal) fail on first use.
-    let resolved_env: BTreeMap<String, String> = plan
-        .env
-        .iter()
-        .map(|(k, v)| {
-            // Runtime-only context keys must survive job-build resolution:
-            // `github.workspace` is filled in by the runner at execution
-            // time (the server has no runner work directory), and the
-            // expression resolver turns a missing property into "" — so
-            // neovim's `BIN_DIR: ${{ github.workspace }}/bin` would silently
-            // collapse to `/bin` here. Leave those values untouched for the
-            // runner's step-time evaluation.
-            if v.contains("github.workspace") {
-                (k.clone(), v.clone())
-            } else {
-                (
-                    k.clone(),
-                    resolve_string(v, &job_expr_context).unwrap_or_else(|_| v.clone()),
-                )
-            }
-        })
-        .collect();
+    let mut resolved_env: BTreeMap<String, String> = BTreeMap::new();
+    for (k, v) in &plan.env {
+        // Runtime-only context keys must survive job-build resolution:
+        // `github.workspace` is filled in by the runner at execution
+        // time (the server has no runner work directory), and the
+        // expression resolver turns a missing property into "" — so
+        // neovim's `BIN_DIR: ${{ github.workspace }}/bin` would silently
+        // collapse to `/bin` here. Leave those values untouched for the
+        // runner's step-time evaluation.
+        if v.contains("github.workspace") {
+            resolved_env.insert(k.clone(), v.clone());
+            continue;
+        }
+        // GitHub's server fails the workflow when an env expression cannot be
+        // evaluated (a parse error or unknown function); it never ships the
+        // raw template to the runner. Missing *properties* still coalesce to
+        // "" per the resolver.
+        let resolved = resolve_string(v, &job_expr_context).map_err(|error| {
+            format!(
+                "job `{}` env `{}` failed to evaluate: {error}",
+                plan.name, k
+            )
+        })?;
+        resolved_env.insert(k.clone(), resolved);
+    }
     let mut variables = BTreeMap::new();
     for (k, v) in &resolved_env {
         variables.insert(k.clone(), VariableValue::new(v));

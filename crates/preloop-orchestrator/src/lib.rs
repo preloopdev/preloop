@@ -816,7 +816,8 @@ pub fn base_install_script() -> String {
           printf 'export NVM_DIR=/usr/local/share/nvm\\n[ -s \"$NVM_DIR/nvm.sh\" ] && \\. \"$NVM_DIR/nvm.sh\"\\n' > /etc/profile.d/nvm.sh) && \
          echo \"### bake yarn v{YARN_VERSION}\" >&2 && \
          npm install -g yarn@{YARN_VERSION} && \
-         install -d -m 0775 -o 1001 -g 1001 /opt/hostedtoolcache && \
+         install -d -m 0777 /opt/hostedtoolcache && \
+         printf 'AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\\nRUNNER_TOOL_CACHE=/opt/hostedtoolcache\\n' >> /etc/environment && \
          (useradd -m -u 1000 -s /bin/bash ubuntu 2>/dev/null || true) && \
          apt-get clean && \
          rm -rf /usr/share/doc/* /usr/share/man/* /usr/share/info/*",
@@ -3358,7 +3359,10 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
          printf '%s\\n' '{user} ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/preloop-{user} \
            && chmod 0440 /etc/sudoers.d/preloop-{user}; \
          mkdir -p /run/user/{uid} /opt/hostedtoolcache; \
-         chown {uid}:{uid} /run/user/{uid} /var/lib/preloop-runner /opt/hostedtoolcache 2>/dev/null; \
+         chown {uid}:{uid} /run/user/{uid} /var/lib/preloop-runner 2>/dev/null; \
+         chmod -R 777 /opt/hostedtoolcache 2>/dev/null; \
+         grep -q AGENT_TOOLSDIRECTORY /etc/environment 2>/dev/null || \
+           printf 'AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\\nRUNNER_TOOL_CACHE=/opt/hostedtoolcache\\n' >> /etc/environment; \
          chmod 777 /run/preloop-control 2>/dev/null; \
          getent group docker >/dev/null 2>&1 && usermod -aG docker {user} 2>/dev/null; \
          exec setpriv --reuid {uid} --regid {uid} --init-groups env \

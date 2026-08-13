@@ -74,23 +74,24 @@ fn composite_inner_context(
 fn resolve_inner_with(
     with: &serde_json::Value,
     expr_ctx: &preloop_gha_expressions::Context,
-) -> serde_json::Value {
+) -> anyhow::Result<serde_json::Value> {
     let serde_json::Value::Object(map) = with else {
-        return with.clone();
+        return Ok(with.clone());
     };
-    serde_json::Value::Object(
-        map.iter()
-            .map(|(key, value)| {
-                let raw = value
-                    .as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| value.to_string());
-                let evaluated = crate::worker::template::evaluate_template(&raw, expr_ctx)
-                    .unwrap_or_else(|_| raw.clone());
-                (key.clone(), serde_json::json!(evaluated))
-            })
-            .collect(),
-    )
+    let mut resolved = serde_json::Map::new();
+    for (key, value) in map {
+        let raw = value
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| value.to_string());
+        // Strict, like the official runner's input conversion: an unevaluable
+        // expression fails the nested action instead of passing `${{ }}`
+        // through.
+        let evaluated = crate::worker::template::evaluate_template_strict(&raw, expr_ctx)
+            .with_context(|| format!("composite inner input '{key}'"))?;
+        resolved.insert(key.clone(), serde_json::json!(evaluated));
+    }
+    Ok(serde_json::Value::Object(resolved))
 }
 
 /// Run a composite action.
@@ -182,6 +183,12 @@ fn run_composite_action_inner<'a>(
             String,
             crate::worker::contexts::StepResult,
         > = indexmap::IndexMap::new();
+        // GitHub merges every inner-step failure into the composite result but
+        // keeps running the remaining steps (`CompositeActionHandler`:
+        // "Composite StepRunner should never throw exception out" — failures
+        // are recorded, later steps still execute, and only the final
+        // composite result reflects the failure).
+        let mut composite_failed: Option<anyhow::Error> = None;
 
         // Execute each composite step
         for (i, step) in steps.iter().enumerate() {
@@ -248,7 +255,22 @@ fn run_composite_action_inner<'a>(
                         continue;
                     }
                     Err(e) => {
-                        warn!("  Failed to evaluate if condition for '{step_name}': {e:#}. Running step.");
+                        // The official runner treats a condition-evaluation
+                        // error as a failed step and stops the composite
+                        // (CompositeActionHandler breaks after the error).
+                        warn!("  Failed to evaluate if condition for '{step_name}': {e:#}");
+                        composite_failed = Some(anyhow::anyhow!(
+                            "composite step '{step_name}' condition evaluation failed: {e:#}"
+                        ));
+                        nested_step_results.insert(
+                            step_id.clone(),
+                            crate::worker::contexts::StepResult {
+                                outcome: "Failure".to_string(),
+                                conclusion: "Failure".to_string(),
+                                outputs: Default::default(),
+                            },
+                        );
+                        break;
                     }
                 }
             }
@@ -329,95 +351,105 @@ fn run_composite_action_inner<'a>(
                 // outputs (`steps.<id>.outputs.*`) and composite inputs;
                 // resolve them against the composite context before dispatch.
                 let expr_ctx = composite_inner_context(ctx, &input_env, &nested_step_results);
-                let inner_with = resolve_inner_with(&inner_with, &expr_ctx);
-
-                // Recursively run nested composite actions with depth tracking
-                if uses.starts_with("$/") {
-                    // Official ResolveSelfRepositoryReferences at composite depth:
-                    // $/path → parent action repo root + path (already extracted).
-                    let subpath = uses.strip_prefix("$/").unwrap_or("").trim_start_matches('/');
-                    let inner_action_dir = match actions_tarball_root(action_dir) {
-                        Some(root) => root.join(subpath),
-                        None => {
-                            return Err(anyhow::anyhow!(
-                                "Unable to resolve self-reference '$/{subpath}'. Parent action directory is not under _actions/."
-                            ));
+                // An unevaluable input fails this inner step (official
+                // AssertString semantics); the composite keeps running the
+                // remaining steps.
+                match resolve_inner_with(&inner_with, &expr_ctx) {
+                    Err(error) => Err(error),
+                    Ok(inner_with) => {
+                        // Recursively run nested composite actions with depth tracking
+                        if uses.starts_with("$/") {
+                            // Official ResolveSelfRepositoryReferences at composite depth:
+                            // $/path → parent action repo root + path (already extracted).
+                            let subpath = uses
+                                .strip_prefix("$/")
+                                .unwrap_or("")
+                                .trim_start_matches('/');
+                            let inner_action_dir = match actions_tarball_root(action_dir) {
+                                Some(root) => root.join(subpath),
+                                None => {
+                                    return Err(anyhow::anyhow!(
+                                        "Unable to resolve self-reference '$/{subpath}'. Parent action directory is not under _actions/."
+                                    ));
+                                }
+                            };
+                            match super::factory::load_action_manifest(&inner_action_dir) {
+                                Ok(inner_manifest) if inner_manifest.runs_using == "composite" => {
+                                    run_composite_action_inner(
+                                        &inner_manifest,
+                                        &inner_action_dir,
+                                        &inner_with,
+                                        workspace,
+                                        ctx,
+                                        depth + 1,
+                                        cancel_rx.clone(),
+                                    )
+                                    .await
+                                    .map(|_| "Success".to_string())
+                                }
+                                Ok(_) => super::action::run_action_from_dir(
+                                    &inner_action_dir,
+                                    &inner_with,
+                                    workspace,
+                                    ctx,
+                                    cancel_rx.clone(),
+                                    Some(uses),
+                                )
+                                .await
+                                .map(|_| "Success".to_string()),
+                                Err(e) => Err(e).context(format!(
+                                    "loading self-repository action at {}",
+                                    inner_action_dir.display()
+                                )),
+                            }
+                        } else if uses.starts_with("./") || uses.starts_with("../") {
+                            let inner_action_dir = action_dir.join(uses);
+                            match super::factory::load_action_manifest(&inner_action_dir) {
+                                Ok(inner_manifest)
+                                    if inner_manifest.runs_using == "composite" =>
+                                {
+                                    run_composite_action_inner(
+                                        &inner_manifest,
+                                        &inner_action_dir,
+                                        &inner_with,
+                                        workspace,
+                                        ctx,
+                                        depth + 1,
+                                        cancel_rx.clone(),
+                                    )
+                                    .await
+                                    .map(|_| "Success".to_string())
+                                }
+                                _ => super::action::run_action(
+                                    uses,
+                                    &inner_with,
+                                    workspace,
+                                    ctx,
+                                    cancel_rx.clone(),
+                                )
+                                .await
+                                .map(|_| "Success".to_string()),
+                            }
+                        } else {
+                            // Nested remote action: job-start preparation stages only
+                            // the message's own steps, so download it on demand.
+                            let staged =
+                                super::action::ensure_remote_action_staged(uses, workspace, ctx)
+                                    .await;
+                            match staged {
+                                Ok(action_dir) => super::action::run_action_from_dir(
+                                    &action_dir,
+                                    &inner_with,
+                                    workspace,
+                                    ctx,
+                                    cancel_rx.clone(),
+                                    Some(uses),
+                                )
+                                .await
+                                .map(|_| "Success".to_string()),
+                                Err(error) => Err(error),
+                            }
                         }
-                    };
-                    match super::factory::load_action_manifest(&inner_action_dir) {
-                        Ok(inner_manifest) if inner_manifest.runs_using == "composite" => {
-                            run_composite_action_inner(
-                                &inner_manifest,
-                                &inner_action_dir,
-                                &inner_with,
-                                workspace,
-                                ctx,
-                                depth + 1,
-                                cancel_rx.clone(),
-                            )
-                            .await
-                            .map(|_| "Success".to_string())
-                        }
-                        Ok(_) => super::action::run_action_from_dir(
-                            &inner_action_dir,
-                            &inner_with,
-                            workspace,
-                            ctx,
-                            cancel_rx.clone(),
-                            Some(uses),
-                        )
-                        .await
-                        .map(|_| "Success".to_string()),
-                        Err(e) => Err(e).context(format!(
-                            "loading self-repository action at {}",
-                            inner_action_dir.display()
-                        )),
-                    }
-                } else if uses.starts_with("./") || uses.starts_with("../") {
-                    let inner_action_dir = action_dir.join(uses);
-                    match super::factory::load_action_manifest(&inner_action_dir) {
-                        Ok(inner_manifest) if inner_manifest.runs_using == "composite" => {
-                            run_composite_action_inner(
-                                &inner_manifest,
-                                &inner_action_dir,
-                                &inner_with,
-                                workspace,
-                                ctx,
-                                depth + 1,
-                                cancel_rx.clone(),
-                            )
-                            .await
-                            .map(|_| "Success".to_string())
-                        }
-                        _ => super::action::run_action(
-                            uses,
-                            &inner_with,
-                            workspace,
-                            ctx,
-                            cancel_rx.clone(),
-                        )
-                        .await
-                        .map(|_| "Success".to_string()),
-                    }
-                } else {
-                    // Nested remote action: job-start preparation stages only
-                    // the message's own steps, so download it on demand (the
-                    // official runner resolves nested refs when the composite
-                    // is first invoked).
-                    let staged =
-                        super::action::ensure_remote_action_staged(uses, workspace, ctx).await;
-                    match staged {
-                        Ok(action_dir) => super::action::run_action_from_dir(
-                            &action_dir,
-                            &inner_with,
-                            workspace,
-                            ctx,
-                            cancel_rx.clone(),
-                            Some(uses),
-                        )
-                        .await
-                        .map(|_| "Success".to_string()),
-                        Err(error) => Err(error),
                     }
                 }
             } else {
@@ -468,14 +500,13 @@ fn run_composite_action_inner<'a>(
                 },
             );
 
-            if outcome.is_err() && !continue_on_error {
-                // GitHub fails the composite (and therefore the outer step)
-                // when any inner step fails. Swallowing the failure here made
-                // the outer step report success while the environment was left
-                // half-configured — mastodon's setup-ruby composite passed
-                // even though its ruby/setup-ruby step never ran, and the
-                // workflow died later with a Ruby version mismatch.
-                return outcome.map(|_| ());
+            if outcome.is_err() && !continue_on_error && composite_failed.is_none() {
+                // Record the failure and keep going: the official runner
+                // continues executing later inner steps after a failure and
+                // only the merged composite result reflects it. (An earlier
+                // version returned immediately, which stopped later steps
+                // from running at all.)
+                composite_failed = outcome.err();
             }
         }
 
@@ -555,6 +586,11 @@ fn run_composite_action_inner<'a>(
         }
             ctx.job
                 .set_github_context_value("action_status", previous_action_status);
+            if let Some(error) = composite_failed {
+                // The composite ran every step; its merged result is a
+                // failure, so the outer step fails too (official semantics).
+                return Err(error);
+            }
             Ok(())
         }
         .await;
@@ -746,7 +782,10 @@ mod tests {
             result.is_err(),
             "a failed composite inner step must fail the composite (GitHub semantics)"
         );
-        assert!(!ctx.log_content().contains("should-not-run"));
+        assert!(
+            ctx.log_content().contains("should-not-run"),
+            "the official runner continues executing later inner steps after a failure"
+        );
     }
 
     #[tokio::test]

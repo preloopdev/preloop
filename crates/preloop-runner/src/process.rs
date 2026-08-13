@@ -59,6 +59,15 @@ pub struct ProcessOutput {
     pub exit_code: i32,
     /// Collected stdout + stderr lines (only when keep_lines is true).
     pub lines: Vec<String>,
+    /// Collected stdout-only lines (only when keep_lines is true).
+    ///
+    /// The official runner keeps the two streams separate
+    /// (`OutputDataReceived` vs `ErrorDataReceived`); the merged `lines` above
+    /// is for log display, but callers that must parse stdout (e.g. the
+    /// container ID from `docker create`) need the stdout-only view —
+    /// docker's platform warning on stderr can otherwise interleave ahead of
+    /// the ID.
+    pub stdout_lines: Vec<String>,
 }
 
 // ── Callback types ──────────────────────────────────────────────────────
@@ -116,11 +125,12 @@ pub async fn invoke<'a>(
     let stdout = child.inner().stdout.take();
     let stderr = child.inner().stderr.take();
 
-    let (chunk_tx, mut chunk_rx) = mpsc::channel::<Bytes>(CHUNK_CHANNEL_CAPACITY);
+    let (chunk_tx, mut chunk_rx) = mpsc::channel::<(bool, Bytes)>(CHUNK_CHANNEL_CAPACITY);
 
-    let stdout_handle = stdout.map(|s| spawn_chunk_reader(s, chunk_tx.clone()));
-    let stderr_handle = stderr.map(|s| spawn_chunk_reader(s, chunk_tx));
+    let stdout_handle = stdout.map(|s| spawn_chunk_reader(s, chunk_tx.clone(), true));
+    let stderr_handle = stderr.map(|s| spawn_chunk_reader(s, chunk_tx, false));
     let mut lines = Vec::new();
+    let mut stdout_lines = Vec::new();
 
     // Wait for process, racing against cancellation while draining chunks.
     let mut status_opt: Option<std::process::ExitStatus> = None;
@@ -148,7 +158,14 @@ pub async fn invoke<'a>(
         if let Some(rx) = cancel_rx.as_mut() {
             tokio::select! {
                 chunk = chunk_rx.recv() => match chunk {
-                    Some(bytes) => push_chunk(bytes, &mut lines, &mut on_chunk, keep_lines),
+                    Some((is_stdout, bytes)) => push_chunk(
+                        bytes,
+                        &mut lines,
+                        &mut stdout_lines,
+                        &mut on_chunk,
+                        keep_lines,
+                        is_stdout,
+                    ),
                     None => continue,
                 },
                 res = rx.changed() => {
@@ -171,7 +188,14 @@ pub async fn invoke<'a>(
         } else {
             tokio::select! {
                 chunk = chunk_rx.recv() => match chunk {
-                    Some(bytes) => push_chunk(bytes, &mut lines, &mut on_chunk, keep_lines),
+                    Some((is_stdout, bytes)) => push_chunk(
+                        bytes,
+                        &mut lines,
+                        &mut stdout_lines,
+                        &mut on_chunk,
+                        keep_lines,
+                        is_stdout,
+                    ),
                     None => continue,
                 },
                 _ = tokio::time::sleep_until(stream_deadline.unwrap_or_else(tokio::time::Instant::now)), if stream_deadline.is_some() => {
@@ -194,6 +218,7 @@ pub async fn invoke<'a>(
             stderr_handle,
             &mut chunk_rx,
             &mut lines,
+            &mut stdout_lines,
             &mut on_chunk,
             keep_lines,
             false,
@@ -212,13 +237,18 @@ pub async fn invoke<'a>(
         stderr_handle,
         &mut chunk_rx,
         &mut lines,
+        &mut stdout_lines,
         &mut on_chunk,
         keep_lines,
         !forced_stream_close,
     )
     .await;
 
-    Ok(ProcessOutput { exit_code, lines })
+    Ok(ProcessOutput {
+        exit_code,
+        lines,
+        stdout_lines,
+    })
 }
 
 // ── Signal timeouts ─────────────────────────────────────────────────────
@@ -242,7 +272,11 @@ const SIGTERM_GRACE: Duration = Duration::from_millis(250);
 /// read whatever the kernel gives us, send it as-is.
 ///
 /// The bounded channel backpressures the producer when the consumer is slow.
-fn spawn_chunk_reader<R>(mut stream: R, tx: mpsc::Sender<Bytes>) -> JoinHandle<()>
+fn spawn_chunk_reader<R>(
+    mut stream: R,
+    tx: mpsc::Sender<(bool, Bytes)>,
+    is_stdout: bool,
+) -> JoinHandle<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -254,7 +288,7 @@ where
                 Ok(0) => break,
                 Ok(n) => {
                     let chunk = Bytes::copy_from_slice(&buf[..n]);
-                    if tx.send(chunk).await.is_err() {
+                    if tx.send((is_stdout, chunk)).await.is_err() {
                         break;
                     }
                 }
@@ -274,19 +308,34 @@ where
 fn push_chunk(
     bytes: Bytes,
     lines: &mut Vec<String>,
+    stdout_lines: &mut Vec<String>,
     on_chunk: &mut Option<ChunkCallback<'_>>,
     keep_lines: bool,
+    is_stdout: bool,
 ) {
     if let Some(cb) = on_chunk.as_mut() {
         cb(&bytes);
     }
     if keep_lines {
+        let target: &mut Vec<String> = if is_stdout { stdout_lines } else { lines };
         for segment in bytes.split(|&b| b == b'\n') {
             if !segment.is_empty() {
                 match std::str::from_utf8(segment) {
-                    Ok(s) => lines.push(s.to_string()),
+                    Ok(s) => target.push(s.to_string()),
                     Err(_) => {
-                        lines.push(String::from_utf8_lossy(segment).into_owned());
+                        target.push(String::from_utf8_lossy(segment).into_owned());
+                    }
+                }
+            }
+        }
+        if is_stdout {
+            for segment in bytes.split(|&b| b == b'\n') {
+                if !segment.is_empty() {
+                    match std::str::from_utf8(segment) {
+                        Ok(s) => lines.push(s.to_string()),
+                        Err(_) => {
+                            lines.push(String::from_utf8_lossy(segment).into_owned());
+                        }
                     }
                 }
             }
@@ -295,11 +344,13 @@ fn push_chunk(
 }
 
 /// Drain remaining chunks after the process has exited or been cancelled.
+#[allow(clippy::too_many_arguments)]
 async fn drain_chunks(
     mut stdout_handle: Option<JoinHandle<()>>,
     mut stderr_handle: Option<JoinHandle<()>>,
-    chunk_rx: &mut mpsc::Receiver<Bytes>,
+    chunk_rx: &mut mpsc::Receiver<(bool, Bytes)>,
     lines: &mut Vec<String>,
+    stdout_lines: &mut Vec<String>,
     on_chunk: &mut Option<ChunkCallback<'_>>,
     keep_lines: bool,
     wait_for_eof: bool,
@@ -309,8 +360,8 @@ async fn drain_chunks(
         // redirected stdout/stderr streams reach EOF. A background descendant
         // that inherited either pipe therefore keeps the step active and
         // remains cancellable through the process group.
-        while let Some(bytes) = chunk_rx.recv().await {
-            push_chunk(bytes, lines, on_chunk, keep_lines);
+        while let Some((is_stdout, bytes)) = chunk_rx.recv().await {
+            push_chunk(bytes, lines, stdout_lines, on_chunk, keep_lines, is_stdout);
         }
         if let Some(handle) = stdout_handle.take() {
             let _ = handle.await;
@@ -331,8 +382,8 @@ async fn drain_chunks(
     if let Some(handle) = stderr_handle.take() {
         handle.abort();
     }
-    while let Ok(bytes) = chunk_rx.try_recv() {
-        push_chunk(bytes, lines, on_chunk, keep_lines);
+    while let Ok((is_stdout, bytes)) = chunk_rx.try_recv() {
+        push_chunk(bytes, lines, stdout_lines, on_chunk, keep_lines, is_stdout);
     }
 }
 
@@ -611,6 +662,12 @@ mod tests {
 
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.lines, vec!["out-1", "err-1", "out-2", "err-2"]);
+        assert_eq!(
+            result.stdout_lines,
+            vec!["out-1", "out-2"],
+            "stdout-only view must exclude stderr regardless of interleaving \
+             (the official runner parses container IDs from stdout alone)"
+        );
     }
 
     #[tokio::test]

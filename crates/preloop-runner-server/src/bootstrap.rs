@@ -305,6 +305,7 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
                         status: ExecutionStatus::Failure,
                         outputs: Default::default(),
                         annotations: Vec::new(),
+                        step_results: Vec::new(),
                     },
                 ));
             }

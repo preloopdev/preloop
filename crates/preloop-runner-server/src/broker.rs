@@ -23,6 +23,8 @@ pub(crate) struct BrokerRenewJobRequest {
     pub(crate) outputs: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub(crate) annotations: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub(crate) step_results: Vec<preloop_gha_protocol::CompletionStepResult>,
 }
 
 pub(crate) fn execution_status_from_runner_result(result: &str) -> Option<ExecutionStatus> {
@@ -898,6 +900,7 @@ async fn fail_unclaimable_request(shared: &Arc<SharedState>, request_id: i64) {
             status: ExecutionStatus::Failure,
             outputs: preloop_gha_protocol::OutputMap::new(),
             annotations: Vec::new(),
+            step_results: Vec::new(),
         };
         // The caller is already returning the mint failure to the runner, so a
         // secondary bookkeeping error must not mask it.
@@ -1086,6 +1089,7 @@ pub(crate) async fn broker_complete_job(
                     status,
                     outputs,
                     annotations: request.annotations.clone(),
+                    step_results: request.step_results.clone(),
                 })
             }
             None => {
