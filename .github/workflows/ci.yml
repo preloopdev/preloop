@@ -104,6 +104,10 @@ jobs:
       - run: cargo nextest run --locked --workspace --no-fail-fast -j 2
         env:
           RUSTFLAGS: "-A warnings -C link-arg=-fuse-ld=lld"
+          # Host has 6 vCPUs for 2 VMs (8 requested): 4 threads oversubscribe
+          # and measured SLOWER than libtest's 2 (17.5 vs 13.4 min exec).
+          # 1 thread per process, 2 binaries in parallel = 2 threads total.
+          RUST_TEST_THREADS: "1"
 
   # Bounded property-test profile
   property-tests-fast:
