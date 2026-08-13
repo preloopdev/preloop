@@ -973,18 +973,37 @@ impl VmProvider for SmolVmProvider {
     }
 
     async fn delete(&self, name: &MachineName) -> Result<(), VmError> {
-        let result = self
-            .recovery(
-                "delete",
-                &[
-                    "machine".into(),
-                    "delete".into(),
-                    "--name".into(),
-                    name.as_str().into(),
-                    "-f".into(),
-                ],
-            )
-            .await;
+        let args = [
+            "machine".into(),
+            "delete".into(),
+            "--name".into(),
+            name.as_str().into(),
+            "-f".into(),
+        ];
+        let mut attempts = 0;
+        let result = loop {
+            attempts += 1;
+            match self.recovery("delete", &args).await {
+                Ok(_) => break Ok(()),
+                // Delete is idempotent. SmolVM may remove its registry entry
+                // before a retry observes the partially cleaned directory.
+                Err(VmError::Command { message, .. })
+                    if message.to_ascii_lowercase().contains("not found") =>
+                {
+                    break Ok(());
+                }
+                // SmolVM 1.7.7 can race its final agent/log writes with the
+                // recursive data-directory removal. The same force-delete
+                // succeeds once those writers exit.
+                Err(VmError::Command { ref message, .. })
+                    if attempts < 3
+                        && message.to_ascii_lowercase().contains("directory not empty") =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(error) => break Err(error),
+            }
+        };
         if result.is_ok() {
             let mut forked = self.forked_machines.lock().await;
             forked.remove(name.as_str());
@@ -993,7 +1012,7 @@ impl VmProvider for SmolVmProvider {
             // clones forever, silently disabling the re-arm recovery.
             forked.retain(|_, owner| owner != name.as_str());
         }
-        result.map(|_| ())
+        result
     }
 
     async fn status(&self, name: &MachineName) -> Result<MachineState, VmError> {
@@ -1955,6 +1974,41 @@ mod tests {
             .delete(&MachineName::new("runner").unwrap())
             .await
             .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_retries_transient_nonempty_directory_and_is_idempotent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("smolvm");
+        let marker = directory.path().join("delete-attempted");
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\nif [ ! -f '{}' ]; then\n  touch '{}'\n  echo 'failed to remove machine data: Directory not empty (os error 66)' >&2\n  exit 1\nfi\n",
+                marker.display(),
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let provider = SmolVmProvider::new(&binary);
+        provider
+            .delete(&MachineName::new("runner").unwrap())
+            .await
+            .expect("transient nonempty-directory cleanup must be retried");
+        assert!(marker.exists());
+
+        // A missing machine is already deleted and must satisfy the same
+        // idempotent provider contract.
+        std::fs::write(&binary, "#!/bin/sh\necho 'machine not found' >&2\nexit 1\n").unwrap();
+        provider
+            .delete(&MachineName::new("runner").unwrap())
+            .await
+            .expect("deleting an absent machine must succeed");
     }
 
     /// A rejected sandbox override must surface as

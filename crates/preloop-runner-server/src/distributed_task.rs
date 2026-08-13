@@ -566,6 +566,15 @@ pub(crate) async fn complete_job_inner(
         let job_name = completion.job_id.0.clone();
         if let Some(pos) = run.jobs_list.iter().position(|j| j.name == job_name) {
             run.jobs_list[pos].conclusion = format!("{:?}", effective).to_lowercase();
+            // A worker can terminate through ForceFailJob before it sends the
+            // final WorkflowStepsUpdate. Do not leave the last reported step
+            // in_progress after its job is terminal.
+            let step_conclusion = status_string(effective);
+            for step in &mut run.jobs_list[pos].steps {
+                if step.conclusion == "in_progress" {
+                    step.conclusion = step_conclusion.clone();
+                }
+            }
             if !completion.annotations.is_empty() {
                 run.jobs_list[pos].annotations = mask_completion_annotations(run, &completion);
             }

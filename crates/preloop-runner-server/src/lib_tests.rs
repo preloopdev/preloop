@@ -2518,6 +2518,59 @@ results-second
 }
 
 #[tokio::test]
+async fn log_get_run_logs_falls_back_to_uploaded_step_logs() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let accepted = submit_yaml(
+        &app,
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 1\n",
+        "owner/repo",
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let (plan_id, agent_job_id) = {
+        let inner = state.inner.lock().await;
+        let request = inner
+            .job_requests
+            .values()
+            .find(|request| request.run_id == run_id)
+            .unwrap();
+        (request.plan_id.clone(), request.agent_job_id.to_string())
+    };
+    let results_dir = temp
+        .path()
+        .join("replay")
+        .join("results")
+        .join(plan_id)
+        .join(agent_job_id);
+    tokio::fs::create_dir_all(&results_dir).await.unwrap();
+    tokio::fs::write(results_dir.join("step-first.txt"), b"first step\n")
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    tokio::fs::write(results_dir.join("step-second.txt"), b"failed step\n")
+        .await
+        .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/v1/runs/{run_id}/logs"))
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(body.as_ref(), b"first step\nfailed step\n");
+}
+
+#[tokio::test]
 async fn log_get_run_logs_returns_404_for_unknown_run() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -9609,6 +9662,67 @@ fn secret_store_debug_redacts_values() {
     let pretty = format!("{store:#?}");
     assert!(!pretty.contains("global-plaintext"), "{pretty}");
     assert!(!pretty.contains("repo-plaintext"), "{pretty}");
+}
+
+#[tokio::test]
+async fn terminal_job_completion_terminalizes_an_active_step() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let accepted = submit_yaml(
+        &app,
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 1\n",
+        "local/preloop",
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+    let (plan_id, agent_job_id) = {
+        let inner = state.inner.lock().await;
+        let request = inner
+            .job_requests
+            .values()
+            .find(|request| request.run_id.0.to_string() == run_id)
+            .unwrap();
+        (request.plan_id.clone(), request.agent_job_id.to_string())
+    };
+    request_json(
+        &app,
+        Method::POST,
+        "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",
+        json!({
+            "workflow_run_backend_id": plan_id,
+            "workflow_job_run_backend_id": agent_job_id,
+            "steps": [{
+                "external_id": uuid::Uuid::new_v4().to_string(),
+                "number": 2,
+                "name": "Test",
+                "status": 3,
+                "conclusion": 0
+            }]
+        }),
+    )
+    .await;
+    request_json(
+        &app,
+        Method::POST,
+        "/internal/test/jobs/complete",
+        json!({
+            "run_id": run_id,
+            "job_id": "build",
+            "status": "failure",
+            "outputs": {}
+        }),
+    )
+    .await;
+
+    let run = get_run_json(&app, &run_id).await;
+    assert_eq!(run["status"], "failure");
+    assert_eq!(run["jobs_list"][0]["conclusion"], "failure");
+    assert_eq!(run["jobs_list"][0]["steps"][0]["name"], "Test");
+    assert_eq!(
+        run["jobs_list"][0]["steps"][0]["conclusion"], "failure",
+        "a terminal job must not retain an in-progress step"
+    );
 }
 
 #[tokio::test]
