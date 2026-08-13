@@ -93,9 +93,19 @@ jobs:
           cargo clippy --locked -p preloop-gha-protocol -p preloop-gha-parser -p preloop-gha-expressions -p preloop-cache -p preloop-artifacts -p runner-watch -p preloop-conformance --all-targets -- -D warnings
           # Run clippy on crates with pre-existing warnings without -D warnings
           cargo clippy --locked -p preloop-runner -p preloop-runner-server -p preloop-runner-client -p preloop-dap --all-targets
-      - run: cargo test --locked --workspace
+      # E2: cranelift codegen backend. Compiles fast and uses far less
+      # memory than LLVM (so JOBS=4), but generates unoptimized code the
+      # tests then run on — this job is test-dominated, expect a net loss.
+      - name: Install cranelift backend
+        run: rustup toolchain install nightly --profile minimal --component rustc-codegen-cranelift-preview
+
+      - run: |
+          BACKEND=$(find "$(rustc +nightly --print sysroot)" -name 'librustc_codegen_cranelift*.so' | head -1)
+          echo "cranelift backend: $BACKEND"
+          RUSTFLAGS="-Zunstable-options -Zcodegen-backend=$BACKEND -A warnings" \
+            cargo +nightly test --locked --workspace
         env:
-          RUSTFLAGS: "-A warnings -C link-arg=-fuse-ld=lld"
+          CARGO_BUILD_JOBS: "4"
 
   # Bounded property-test profile
   property-tests-fast:
