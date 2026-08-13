@@ -667,10 +667,14 @@ pub(crate) async fn complete_job_inner(
             .retain(|_, &mut rid| rid != *request_id);
         inner.inflight_requests.remove(request_id);
         // The job is terminal, so its deferred App-token request must not
-        // outlive it: a re-claim re-mints from this record, and every
-        // completion path funnels through here (broker `completejob`, the
-        // legacy `/_apis` finish endpoints, `agent_request_patch`, and the
-        // lease-expiry reaper), so this is the one place that sees them all.
+        // outlive it: a re-claim re-mints from this record. Claimed-job
+        // completions funnel through here (broker `completejob`, the legacy
+        // `/_apis` finish endpoints, `agent_request_patch`, and the
+        // lease-expiry reaper), and the scheduler's node retirement covers
+        // cancelled, skipped, and expansion-failed nodes. Known gap: the
+        // starvation sweep and the cancel of a never-claimed queued job turn
+        // terminal without reaching either site; the record leaks but is
+        // unreachable — the job is out of every dispatchable collection.
         inner.github_token_requests.remove(request_id);
     }
     // Evict live-log state for this job to prevent unbounded memory growth.

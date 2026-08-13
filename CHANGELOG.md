@@ -113,6 +113,12 @@ Releases before v0.27.0 predate the changelog.
   persisted token requests that predate the `untrusted` field as untrusted
   so a restart can never re-enable the PAT fallback for them.
 
+- Fork PR runs also get GitHub's read-only cache access: cache writes (the
+  `/_apis/artifactcache` reserve/upload/commit routes and the Twirp
+  `CreateCacheEntry`/`FinalizeCacheEntryUpload` handlers) are refused with
+  403 for fork-restricted jobs while restores stay open — a fork can no
+  longer poison cache entries that a trusted run later restores.
+
 - A deferred GitHub App token request no longer outlives the job it was built
   for. It is deliberately retained past the first claim so a re-claim after a
   runner disconnect re-mints under the build-time permission set instead of
@@ -285,6 +291,22 @@ Releases before v0.27.0 predate the changelog.
 - `macos`/`windows` jobs wait for a registered external host instead of being
   failed by the Linux-only starvation sweep.
 - macOS BSD `tar` missing `--verbatim-files-from` is handled in sync.
+
+## [0.29.8] - 2026-08-09
+
+### Fixed
+
+- Preserve remote action references across job restarts: the job wire format
+  now uses the canonical `ref` field and still accepts the legacy `version`
+  name when reading.
+- Recover golden runner provisioning when the exact hosted package pins are
+  unavailable by falling back to archive versions.
+- Complete cancellation bookkeeping so cancelled runs settle terminal state
+  and next-job label scheduling stays in sync.
+- Expose the worker half of live debugging (token exchange, session verdict,
+  and close) through the runner control socket.
+- Fall back to direct VM creation when forking the default packed golden
+  fails, without changing the job image for environment-specific goldens.
 
 ## [0.29.7] - 2026-08-09
 

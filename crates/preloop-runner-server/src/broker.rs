@@ -768,8 +768,9 @@ pub(crate) async fn broker_acquire_job(
         // The token request stays registered for the job's lifetime so a
         // re-claim re-mints under the build-time conditions (permission set
         // and fallback restrictions). `fail_unclaimable_request`,
-        // `complete_job_inner` (every completion path funnels there) and
-        // `retire_node_requests` remove it once the job is terminal.
+        // `complete_job_inner` (claimed-job completion paths funnel there)
+        // and `retire_node_requests` remove it once the job is terminal;
+        // see the `distributed_task.rs` completion path for the known gap.
         let mut inner = shared.state.inner.lock().await;
         inner.broker_messages.insert(request_id, message.clone());
     } else {

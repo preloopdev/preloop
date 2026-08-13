@@ -657,7 +657,7 @@ behave like GitHub's: read-only `GITHUB_TOKEN`, no secrets, no OIDC, and no
 fallback that can widen the credential. Two per-repository features remain to
 be compared with GitHub:
 
-**Cache access — conformant (resolved 2026-08-12).** GitHub gives fork PR runs
+**Cache access — conformant (resolved 2026-08-13).** GitHub gives fork PR runs
 read-only cache access: they can restore from the base repository's cache but
 cannot save to it (actions/cache README: "Some workflow runs only have
 read-only access to the cache. A common case is a workflow triggered by a pull
