@@ -410,7 +410,10 @@ Every item below broke a real workflow step and was fixed in preloop:
 | Code-scanning SARIF uploads cannot complete without GitHub | moby's govulncheck scan, SARIF validation and fingerprinting all pass; the final `codeql-action/upload-sarif` POST to `api.github.com` fails (`Not Found`) because there is no GitHub backend behind the job's token | environmental — the scan itself is faithful; the upload needs a real GitHub token with `security-events: write` |
 | Job/workflow `env:` entries containing `${{ }}` were emitted verbatim | ruff's `sccache` step resolves `SCCACHE_GHA_ENABLED:${{ github.ref_name == 'main' }}` — the raw template string reached the step env and the sccache action died (`${{` is not valid in an env value for the official runner) | the job message builder now resolves env expressions server-side against the job context before emitting `environmentVariables` |
 | The snapshot object cache was trusted without verification | partial-clone workspaces (cloned with `--filter=blob:none`) produce object caches with commits and trees but no blobs and no shallow marker, so fetches from the cache silently returned incomplete packs (a `--unshallow` fetch would fail later in the workflow); the cache completeness was assumed | the snapshot path now runs `git rev-list --objects --all --missing=print` and deepens from the workspace remote when real holes exist; `--refetch` is used when the cache is not marked shallow (a plain fetch only transfers what new refs need, which is nothing when refs are unchanged). Shallow-boundary graft entries (`0000…` shas) are excluded from the missing count |
-| `ACTIONS_CACHE_URL` lacked the trailing slash | sccache's GHA storage backend concatenates its twirp path directly, producing `http://host:9090twirp/…` → `invalid port number` → storage probe failed → sccache's compiler shim emitted nothing → node's configure reported "Could not determine compiler version info" | `CacheServerUrl` is emitted with a trailing slash (both acquire paths) and the worker no longer trims it, matching the official results-receiver URL shape |
+| `ACTIONS_CACHE_URL`/`ACTIONS_RESULTS_URL` lacked the trailing slash | sccache's GHA storage backend concatenates its twirp path directly onto the base URL, producing `http://host:9090twirp/…` → `invalid port number` → storage probe failed → sccache's compiler shim emitted nothing → node's configure reported "Could not determine compiler version info" | `ResultsServiceUrl` and `CacheServerUrl` are emitted with trailing slashes (both acquire paths) and the worker no longer trims them, matching the official results-receiver URL shape |
+| The cache twirp routes only accepted JSON bodies | actions/cache@v4 speaks twirp JSON, but sccache's GHA storage backend (the `ghac` crate) sends twirp **protobuf** (`content-type: application/protobuf`); the axum `Json` extractor answered 415 and sccache's storage probe failed (→ compiler shim → configure failure, same cascade as the URL bug). The protobuf field numbers also differ from the JSON shape: `metadata=1` (nested `CacheMetadata`→`CacheScope`), `key=2`, `restore_keys=3`, `version=4` (3 for create), and responses carry `ok=1` as a bool varint | the cache v2 create/finalize/get-download-url routes now decode protobuf requests and encode protobuf responses (field numbers verified against ghac 0.2.0's `cache.proto`) when the content-type says protobuf, falling back to JSON otherwise. This is what lets node's `main`-ref build (`CC: sccache clang-19`) run at all |
+| Reusable-callee jobs on unhostable platforms were only checked at submit time | a reusable caller defers its callee subtree to materialization, so the submit-time "no `windows` runner is registered" check never saw the callee's `runs-on: windows-2025`; the job sat queued forever (Linux VMs are label-excluded), while the caller's placeholder (empty `runs_on`) could be claimed by a Linux VM, run the foreign-OS steps, and wedge in cleanup — keeping the run `in_progress` forever and parking its concurrency group | `register_expanded_jobs` now concludes unhostable callee jobs as failures with the submit-path reason string |
+| The rootfs ownership repair missed the account database | the repair walked every uid-502 file but `/etc/passwd` stayed host-owned; `useradd` then wedged in uninterruptible sleep on the 502-owned file, so every forked runner died at account creation (and the smolvm exec layer flaked under the stalled I/O) | the repair script explicitly chowns `/etc/passwd /etc/group /etc/shadow /etc/gshadow` + the sudoers paths before the find pass |
 
 ### 1c.2 Environmental findings
 
@@ -444,7 +447,7 @@ Every item below broke a real workflow step and was fixed in preloop:
 | `neovim/neovim` | `test.yml` | lintc/lint/clang-analyzer/zig-build ✅; posix ubuntu cells ✅; macos/windows cells fail via the starvation sweep (no such runners). The run-level `concurrency:` group deadlock found through this workflow is fixed (1c.1) |
 | `microsoft/TypeScript` | `ci.yml` | 15 ubuntu cells ✅ (node 14→lts/* matrix + baselines/format/knip/lint/misc/self-check/smoke/typecheck, package-size gated off, `required` gate ✅); windows/macos cells fail via the starvation sweep; one coverage cell hit a transient virtiofs mount race |
 | `astral-sh/ruff` | `ci.yaml` | determine-changes gated matrix: unchanged-path jobs skip ✅; fmt/shellcheck/clippy/prek/mkdocs/formatter/ruff-lsp/instrumented-benchmarks/16 cargo+test cells ✅; remaining failures are environmental: x86_64-binaries-in-arm64-guest (release/wasm test cells), `/tmp` tmpfs EXDEV (python-package), one cargo-package verification quirk |
-| `nodejs/node` | `test-linux.yml` | remote x86_64 leg: checkout/sudo/rustup/setup-python/apt all work (App-token checkout fixed via PAT + real payload SHA); remote builds keep flaking on apt under I/O contention. Local leg: runs end-to-end after the `ACTIONS_CACHE_URL` slash fix (1c.1) |
+| `nodejs/node` | `test-linux.yml` | remote x86_64 leg: checkout/sudo/rustup/setup-python/apt all work (App-token checkout fixed via PAT + real payload SHA); remote builds keep flaking on apt under I/O contention. Local leg: the full toolchain chain works (clang-19 apt install, rustup, setup-python, sccache) after the URL-slash + protobuf-cache fixes (1c.1); the ~1h build itself is the final verification |
 
 ### 1c.4 Still open
 
@@ -453,13 +456,17 @@ Every item below broke a real workflow step and was fixed in preloop:
   but the parked run itself is stuck pending and must be cancelled and
   re-submitted.
 - **Remote deployment lags the local tree**: `main` runs the
-  ownership-repair-era binary; the env-expression, snapshot-cache and
-  `ACTIONS_CACHE_URL` fixes need a rebuild + deploy there for remote runs
-  to match local behavior.
-- **sccache's GHA cache backend** only exercises the cache on `main`-ref
-  jobs (the workflow gates `SCCACHE_GHA_ENABLED` to `main`); the URL-shape
-  bug that broke it is fixed (1c.1), but a full sccache GHA-storage
-  conformance pass on a `main`-ref build remains a follow-up.
+  ownership-repair-era binary; the env-expression, snapshot-cache,
+  URL-slash and protobuf-cache fixes need a rebuild + deploy there for
+  remote runs to match local behavior.
+- **The local smolvm fleet is flaky under I/O load**: rootfs ownership
+  repair walks take 20+ minutes, `useradd` wedges in D-state on
+  host-owned account files (fixed in 1c.1), and `smolvm machine exec`
+  intermittently fails with `Resource temporarily unavailable` — queued
+  jobs starve past the grace window while forks repair, which turns into
+  run failures that are fleet-caused, not workflow-caused. A re-run after
+  the fleet settles is the practical mitigation; baking the runner user
+  into the golden would remove the useradd write from the fork path.
 - **No x86_64-in-arm64-guest execution.** The aarch64 guests lack the
   Rosetta loader mount (`/lib64/ld-linux-x86-64.so.2`) and binfmt
   registration, so anything that runs an x86_64 binary inside the arm64
