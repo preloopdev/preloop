@@ -473,6 +473,17 @@ fn extract_template_map(value: Option<&serde_json::Value>) -> Option<BTreeMap<St
                     v.as_str()
                         .map(str::to_owned)
                         .or_else(|| v.get("lit").and_then(|l| l.as_str()).map(str::to_owned))
+                        .or_else(|| {
+                            // Type-3 expression tokens carry `expr`, not `lit`.
+                            // A persist → restore round-trip (server restart)
+                            // must keep the evaluable template: collapsing it
+                            // to "" silently empties every expression-valued
+                            // step input (a cache `key:` then fails with
+                            // "Input required and not supplied: key").
+                            v.get("expr")
+                                .and_then(|e| e.as_str())
+                                .map(|expr| format!("${{{{{expr}}}}}"))
+                        })
                 })
                 .unwrap_or_default();
             map.insert(key, val);
