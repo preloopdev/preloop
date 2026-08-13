@@ -100,7 +100,7 @@ jobs:
       - name: Install cargo-nextest
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-$HOME/.cargo}/bin
 
-      - run: cargo nextest run --locked --workspace --no-fail-fast -j 2 --test-threads 2 --doc
+      - run: cargo nextest run --locked --workspace --no-fail-fast -j 2 --test-threads 2
         env:
           RUSTFLAGS: "-A warnings -C link-arg=-fuse-ld=lld"
 
