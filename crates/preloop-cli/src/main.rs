@@ -634,7 +634,10 @@ fn require_digest_pinned_base(base_image: &str) -> anyhow::Result<()> {
     // policy applies to registry references only. Release workflows enable
     // this before baking so a mutable tag cannot silently become the golden's
     // input after the provenance sidecars were captured.
-    if base_image.starts_with('.') || base_image.starts_with('/') {
+    if base_image.starts_with('.')
+        || base_image.starts_with('/')
+        || std::path::Path::new(base_image).exists()
+    {
         return Ok(());
     }
     let digest = base_image

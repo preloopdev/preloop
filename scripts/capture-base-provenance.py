@@ -80,6 +80,13 @@ def blob_url(registry: str, repository: str, digest: str) -> str:
     )
 
 
+def referrers_url(registry: str, repository: str, subject_digest: str) -> str:
+    return (
+        f"https://{registry}/v2/{quote(repository, safe='/')}/referrers/"
+        f"{quote(subject_digest, safe=':')}"
+    )
+
+
 def fetch(url: str, accept: str) -> bytes:
     try:
         result = subprocess.run(
@@ -164,6 +171,34 @@ def fetch_attestation(
     return fetch_manifest(registry, repository, digest)
 
 
+def is_attestation_descriptor(descriptor: dict, subject_digest: str) -> bool:
+    annotations = descriptor.get("annotations") or {}
+    return (
+        annotations.get("vnd.docker.reference.type") == "attestation-manifest"
+        and annotations.get("vnd.docker.reference.digest") == subject_digest
+    )
+
+
+def fetch_referrers(
+    registry: str, repository: str, subject_digest: str
+) -> list[dict]:
+    body = fetch(
+        referrers_url(registry, repository, subject_digest), ACCEPT_MANIFEST
+    )
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as error:
+        fail(f"referrers response for {subject_digest} is not valid JSON: {error}")
+    manifests = payload.get("manifests", [])
+    if not isinstance(manifests, list):
+        fail(f"referrers response for {subject_digest} has no manifests list")
+    return [
+        descriptor
+        for descriptor in manifests
+        if is_attestation_descriptor(descriptor, subject_digest)
+    ]
+
+
 def copy_spdx_blob(
     registry: str,
     repository: str,
@@ -178,14 +213,31 @@ def copy_spdx_blob(
     if actual != digest:
         fail(f"registry returned {actual} for SPDX blob {digest}")
     try:
-        json.loads(body)
+        parsed = json.loads(body)
     except json.JSONDecodeError as error:
         fail(f"SPDX blob {digest} is not valid JSON: {error}")
+    # BuildKit attaches the SPDX document as the predicate of an in-toto
+    # statement; consumers of the sidecar expect a bare SPDX JSON document,
+    # so unwrap the predicate before publishing it.
+    if isinstance(parsed, dict) and isinstance(parsed.get("predicate"), dict):
+        statement_type = parsed.get("_type")
+        if not isinstance(statement_type, str) or not statement_type.startswith(
+            "https://in-toto.io/Statement/"
+        ):
+            fail(
+                f"SPDX blob {digest} has a predicate but is not an in-toto "
+                "statement; refusing to guess its structure"
+            )
+        parsed = parsed["predicate"]
+    body = json.dumps(parsed, indent=2, sort_keys=True).encode("utf-8")
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_bytes(body)
     return {
         "path": output.name,
-        "digest": digest,
+        # The digest of the published sidecar (post-unwrap); the registry
+        # blob digest is kept as `source_digest` for the integrity check.
+        "digest": digest_bytes(body),
+        "source_digest": digest,
         "size": len(body),
         "media_type": layer.get("mediaType"),
         "predicate_type": (layer.get("annotations") or {}).get(
@@ -223,26 +275,31 @@ def main() -> None:
 
     source_annotations = platform_descriptor.get("annotations") or {}
     source = source_annotations.get("org.opencontainers.image.source")
-    if args.require_source_prefix and (
-        not isinstance(source, str) or not source.startswith(args.require_source_prefix)
-    ):
-        fail(
-            "base source annotation does not match the required prefix: "
-            f"{source!r} (expected {args.require_source_prefix!r})"
+    if args.require_source_prefix:
+        prefix = args.require_source_prefix
+        # Match the prefix itself or a path below it (`/` boundary) so a
+        # lookalike URL sharing the prefix string is not accepted.
+        matches = isinstance(source, str) and (
+            source == prefix or source.startswith(prefix + "/")
         )
+        if not matches:
+            fail(
+                "base source annotation does not match the required prefix: "
+                f"{source!r} (expected {prefix!r})"
+            )
 
-    attestation_descriptors = [
-        descriptor
-        for descriptor in index.get("manifests", [])
-        if (descriptor.get("annotations") or {}).get(
-            "vnd.docker.reference.type"
-        )
-        == "attestation-manifest"
-        and (descriptor.get("annotations") or {}).get(
-            "vnd.docker.reference.digest"
-        )
-        == platform_digest
-    ]
+    # Prefer the OCI referrers API: cosign-attached attestations (SBOMs,
+    # signatures) are registered as referrers of the platform manifest and
+    # are not necessarily listed in the (unmodified) index. Fall back to
+    # index-listed attestation descriptors for registries without referrers
+    # support.
+    attestation_descriptors = fetch_referrers(registry, repository, platform_digest)
+    if not attestation_descriptors:
+        attestation_descriptors = [
+            descriptor
+            for descriptor in index.get("manifests", [])
+            if is_attestation_descriptor(descriptor, platform_digest)
+        ]
 
     attestations = []
     sbom = None

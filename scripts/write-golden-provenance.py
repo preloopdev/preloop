@@ -35,6 +35,18 @@ def main() -> None:
     args = parser.parse_args()
 
     evidence = json.loads(args.base_evidence.read_text(encoding="utf-8"))
+    sbom_evidence = evidence.get("sbom")
+    if not isinstance(sbom_evidence, dict) or not sbom_evidence.get("digest"):
+        fail(
+            "base evidence has no SBOM record; refusing to bind an unrelated "
+            "SBOM to the golden"
+        )
+    sbom_sha = sha256(args.base_sbom)
+    if sbom_sha != sbom_evidence["digest"]:
+        fail(
+            f"base SBOM {args.base_sbom} sha256 {sbom_sha} does not match "
+            f"the base evidence digest {sbom_evidence['digest']}"
+        )
     platform = evidence["platform"]
     image = evidence["image"]
     predicate = {
