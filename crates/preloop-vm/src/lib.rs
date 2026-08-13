@@ -117,6 +117,27 @@ fn public_only_net_backend(lookup: impl Fn(&str) -> Option<String>) -> &'static 
     }
 }
 
+/// Whether a `major.minor.patch` version string is at least the given
+/// version. Unparseable versions answer `false`: callers use this to decide
+/// whether a runtime is safe to fork from, and failing closed is the safe
+/// direction.
+fn smolvm_version_at_least(version: &str, major: u64, minor: u64, patch: u64) -> bool {
+    let mut parts = version.trim_start_matches('v').split('.');
+    let (Some(actual_major), Some(actual_minor), Some(actual_patch)) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let (Ok(actual_major), Ok(actual_minor), Ok(actual_patch)) = (
+        actual_major.parse::<u64>(),
+        actual_minor.parse::<u64>(),
+        actual_patch.parse::<u64>(),
+    ) else {
+        return false;
+    };
+    (actual_major, actual_minor, actual_patch) >= (major, minor, patch)
+}
+
 /// Where a guest environment value is resolved from, at launch time.
 ///
 /// SmolVM never persists the value itself, only this reference, so a secret
@@ -369,10 +390,13 @@ pub struct SmolVmProvider {
     /// exercised without mutating global state.
     env_lookup: EnvLookup,
     /// Whether this SmolVM retains a reusable RAM checkpoint after a plain
-    /// fork. Enabled by default while Preloop uses its patched SmolVM fork;
-    /// set `PRELOOP_SMOLVM_RETAINED_FORKS=false` to fall back to the safe
-    /// single-live-clone behavior.
-    retained_fork_checkpoints: bool,
+    /// fork, probed once per provider from the resolved binary's `--version`.
+    ///
+    /// Official SmolVM releases keep the checkpoint from 1.7.7; anything
+    /// older — or a probe that fails — must fall back to the safe
+    /// single-live-clone behavior, so the guard matches the actual binary
+    /// rather than assuming every install is current.
+    retained_fork_checkpoints: Arc<tokio::sync::OnceCell<bool>>,
 }
 
 impl Default for SmolVmProvider {
@@ -387,18 +411,16 @@ impl SmolVmProvider {
     /// Preloop-specific variables take precedence over the conventional proxy
     /// variables inherited by the process.
     pub fn from_environment(binary: impl Into<PathBuf>) -> Self {
-        Self::new(binary)
-            .with_retained_fork_checkpoints(env_flag_default_true("PRELOOP_SMOLVM_RETAINED_FORKS"))
-            .with_pack_network(
-                first_nonempty_env(&[
-                    "PRELOOP_RUNNER_PACK_PROXY",
-                    "HTTPS_PROXY",
-                    "https_proxy",
-                    "HTTP_PROXY",
-                    "http_proxy",
-                ]),
-                first_nonempty_env(&["PRELOOP_RUNNER_PACK_NO_PROXY", "NO_PROXY", "no_proxy"]),
-            )
+        Self::new(binary).with_pack_network(
+            first_nonempty_env(&[
+                "PRELOOP_RUNNER_PACK_PROXY",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "HTTP_PROXY",
+                "http_proxy",
+            ]),
+            first_nonempty_env(&["PRELOOP_RUNNER_PACK_NO_PROXY", "NO_PROXY", "no_proxy"]),
+        )
     }
 }
 
@@ -408,13 +430,6 @@ fn first_nonempty_env(names: &[&str]) -> Option<String> {
             .ok()
             .filter(|value| !value.trim().is_empty())
     })
-}
-
-fn env_flag_default_true(name: &str) -> bool {
-    !matches!(
-        std::env::var(name).as_deref(),
-        Ok("0") | Ok("false") | Ok("FALSE") | Ok("no") | Ok("NO")
-    )
 }
 
 impl SmolVmProvider {
@@ -430,18 +445,8 @@ impl SmolVmProvider {
             forked_machines: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             socket_mount_supported: Arc::new(tokio::sync::OnceCell::new()),
             env_lookup: process_env,
-            retained_fork_checkpoints: true,
+            retained_fork_checkpoints: Arc::new(tokio::sync::OnceCell::new()),
         }
-    }
-
-    /// Allow multiple live plain forks from one golden.
-    ///
-    /// Disable this only when the resolved SmolVM predates the retained-
-    /// checkpoint fix. Older releases leave the golden paused after the first
-    /// fork and cannot safely serve another clone.
-    pub fn with_retained_fork_checkpoints(mut self, enabled: bool) -> Self {
-        self.retained_fork_checkpoints = enabled;
-        self
     }
 
     /// Override the maximum bytes retained from each process stream.
@@ -605,6 +610,52 @@ impl SmolVmProvider {
             return Ok(false);
         };
         Ok(status.success() && String::from_utf8_lossy(&stdout).contains("--mount-socket"))
+    }
+
+    /// Whether the resolved binary retains a reusable RAM checkpoint after a
+    /// plain fork, probed from `--version` and cached for the provider's
+    /// lifetime.
+    ///
+    /// Official SmolVM keeps the checkpoint from 1.7.7. The version gate is
+    /// the reliable check here: `preloop serve` resolves whatever `smolvm`
+    /// is on PATH and does not run the upgrader, so the provider must not
+    /// assume every install is current. A probe that fails (missing binary,
+    /// unparseable version) is treated as not retaining checkpoints — the
+    /// fail-closed answer keeps the single-live-clone guard, which is always
+    /// safe, instead of re-exposing the fork corruption older releases cause.
+    async fn supports_retained_fork_checkpoints(&self) -> bool {
+        let mut command = self.command();
+        command
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let Ok(mut child) = command.spawn() else {
+            return false;
+        };
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let (stdout, stderr, status) = tokio::join!(
+            read_bounded(stdout, self.capture_limit),
+            read_bounded(stderr, self.capture_limit),
+            child.wait(),
+        );
+        let (Ok((stdout, _)), Ok(_), Ok(status)) = (stdout, stderr, status) else {
+            return false;
+        };
+        if !status.success() {
+            return false;
+        }
+        let output = String::from_utf8_lossy(&stdout);
+        let version = output
+            .split_whitespace()
+            .last()
+            .map(|version| version.trim_start_matches('v'));
+        match version {
+            Some(version) => smolvm_version_at_least(version, 1, 7, 7),
+            None => false,
+        }
     }
 
     async fn checked(
@@ -902,18 +953,36 @@ impl VmProvider for SmolVmProvider {
 
     /// Fork one clone from a golden, one fork per golden at a time.
     ///
-    /// Released SmolVM versions before the retained-checkpoint fix freeze the
-    /// base for one live clone but do not persist a checkpoint for later plain
-    /// forks. For those versions, track live clones under the same per-golden
-    /// lock and reject a second call before invoking SmolVM. Patched builds may
-    /// opt into checkpoint reuse with `PRELOOP_SMOLVM_RETAINED_FORKS=true`.
+    /// SmolVM holds exactly one RAM checkpoint per golden: the first fork
+    /// freezes the base and publishes a retained checkpoint, and later forks
+    /// restore from that checkpoint instead of re-freezing. Two forks racing
+    /// the same golden break the invariant — the loser issues a second FORK
+    /// against an already-paused VM, and that failure's rollback resumes the
+    /// base and deletes the retained checkpoint. Every later fork then fails
+    /// with `golden '<name>' is already paused; a valid retained checkpoint is
+    /// required`, so the pool cannot produce another runner until the golden is
+    /// rebuilt from scratch: queued jobs stall indefinitely, in exchange for
+    /// the few hundred milliseconds a concurrent refill saves. SmolVM's own
+    /// fork-pool controller serializes on the golden for the same reason.
+    ///
+    /// Releases before 1.7.7 (or an unprobeable runtime) additionally lack
+    /// retained checkpoints entirely: the first fork leaves the base paused
+    /// with no checkpoint to restore from, so a second live clone would be
+    /// served from storage that must outlive the first. For those runtimes,
+    /// track live clones under the same per-golden lock and reject a second
+    /// call before invoking SmolVM. The capability is probed once from the
+    /// resolved binary's `--version`, not assumed from the pinned install.
     ///
     /// Different goldens still fork concurrently, and forks remain excluded
     /// from base construction, so a golden cannot be replaced underneath one.
     async fn fork(&self, golden: &MachineName, clone: &MachineName) -> Result<(), VmError> {
         let fork_lock = self.fork_lock(golden).await;
         let _fork_guard = fork_lock.lock().await;
-        if !self.retained_fork_checkpoints {
+        let retains_checkpoints = *self
+            .retained_fork_checkpoints
+            .get_or_init(|| self.supports_retained_fork_checkpoints())
+            .await;
+        if !retains_checkpoints {
             if let Some(live_clone) = self
                 .forked_machines
                 .lock()
@@ -1721,6 +1790,21 @@ async fn forward(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_checkpoint_version_gate_answers_at_least_1_7_7() {
+        assert!(smolvm_version_at_least("1.7.7", 1, 7, 7));
+        assert!(smolvm_version_at_least("1.8.0", 1, 7, 7));
+        assert!(smolvm_version_at_least("2.0.0", 1, 7, 7));
+        assert!(smolvm_version_at_least("v1.7.7", 1, 7, 7));
+        assert!(!smolvm_version_at_least("1.7.6", 1, 7, 7));
+        assert!(!smolvm_version_at_least("1.7.4", 1, 7, 7));
+        assert!(!smolvm_version_at_least("1.6.9", 1, 7, 7));
+        // Unparseable versions fail closed: the guard stays active.
+        assert!(!smolvm_version_at_least("", 1, 7, 7));
+        assert!(!smolvm_version_at_least("latest", 1, 7, 7));
+        assert!(!smolvm_version_at_least("1.7", 1, 7, 7));
+    }
 
     #[test]
     fn cgroup_root_dir_trims_the_leading_slash_of_proc_self_cgroup_paths() {

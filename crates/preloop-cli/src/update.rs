@@ -236,10 +236,13 @@ fn default_smolvm_install() -> Option<SmolvmInstall> {
 }
 
 /// Host triple naming used by the smolvm release assets.
+///
+/// Intel macOS is deliberately absent: official SmolVM releases ship no
+/// `darwin-x86_64` artifact, so advertising the platform would install
+/// nothing and leave the engine without a usable runtime.
 fn smolvm_platform() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => Some("darwin-arm64"),
-        ("macos", "x86_64") => Some("darwin-x86_64"),
         ("linux", "aarch64") => Some("linux-arm64"),
         ("linux", "x86_64") => Some("linux-x86_64"),
         _ => None,
@@ -295,23 +298,15 @@ async fn probe_smolvm_version(binary: &Path) -> Option<String> {
         .map(|version| version.trim_start_matches('v').to_owned())
 }
 
-fn smolvm_release_version() -> String {
-    std::env::var("PRELOOP_SMOLVM_RELEASE_VERSION")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| SMOLVM_VERSION.to_owned())
-}
-
-async fn smolvm_is_compatible(binary: &Path, expected_version: &str) -> bool {
+async fn smolvm_is_compatible(binary: &Path) -> bool {
     probe_mount_socket(binary).await
-        && probe_smolvm_version(binary).await.as_deref() == Some(expected_version)
+        && probe_smolvm_version(binary).await.as_deref() == Some(SMOLVM_VERSION)
 }
 
 /// Probe the resolved smolvm and install the exact verified release when its
 /// version or required socket-mount capability differs.
 async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
-    let expected_version = smolvm_release_version();
-    if smolvm_is_compatible(Path::new("smolvm"), &expected_version).await {
+    if smolvm_is_compatible(Path::new("smolvm")).await {
         return Ok(());
     }
     let platform = smolvm_platform().ok_or_else(|| {
@@ -351,7 +346,7 @@ async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
     // The install lands in `~/.local/bin`; if PATH still resolves another
     // binary, the engine keeps failing and the user is left confused about
     // why the update did not help. Say so explicitly.
-    if !smolvm_is_compatible(Path::new("smolvm"), &expected_version).await {
+    if !smolvm_is_compatible(Path::new("smolvm")).await {
         bail!(
             "installed smolvm {version} to {}, but `smolvm` on PATH still resolves \
              to an incompatible version or lacks --mount-socket; make sure {} comes first",
@@ -886,7 +881,7 @@ mod tests {
             std::fs::set_permissions(&executable, permissions).unwrap();
 
             assert_eq!(
-                smolvm_is_compatible(&executable, SMOLVM_VERSION).await,
+                smolvm_is_compatible(&executable).await,
                 expected,
                 "version={version}, flag={flag}"
             );
@@ -897,7 +892,10 @@ mod tests {
     fn platform_naming_covers_apple_silicon_and_linux() {
         match (std::env::consts::OS, std::env::consts::ARCH) {
             ("macos", "aarch64") => assert_eq!(smolvm_platform(), Some("darwin-arm64")),
-            ("macos", "x86_64") => assert_eq!(smolvm_platform(), Some("darwin-x86_64")),
+            // Official SmolVM ships no Intel macOS artifact; the platform must
+            // not be advertised (otherwise `preloop update` would claim a
+            // runtime it cannot install).
+            ("macos", "x86_64") => assert_eq!(smolvm_platform(), None),
             ("linux", "aarch64") => assert_eq!(smolvm_platform(), Some("linux-arm64")),
             ("linux", "x86_64") => assert_eq!(smolvm_platform(), Some("linux-x86_64")),
             other => assert_eq!(smolvm_platform(), None, "unexpected host {other:?}"),
