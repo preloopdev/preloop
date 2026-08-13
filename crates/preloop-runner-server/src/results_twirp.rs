@@ -409,8 +409,10 @@ pub(crate) struct CacheV2GetDlUrlRequest {
 
 pub(crate) async fn twirp_cache_v2_create(
     State(shared): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<CacheV2CreateRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    crate::events::trust_tier::ensure_cache_write_allowed(&shared.state, &headers).await?;
     let storage_key = scoped_cache_key(
         &request.key,
         request.scope.as_deref(),
@@ -480,8 +482,10 @@ pub(crate) async fn twirp_cache_v2_create(
 
 pub(crate) async fn twirp_cache_v2_finalize(
     State(shared): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<CacheV2FinalizeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    crate::events::trust_tier::ensure_cache_write_allowed(&shared.state, &headers).await?;
     let t0 = std::time::Instant::now();
     let storage_key = scoped_cache_key(
         &request.key,

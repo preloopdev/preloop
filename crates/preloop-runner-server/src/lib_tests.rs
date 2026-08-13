@@ -6486,6 +6486,173 @@ async fn persisted_token_request_without_trust_metadata_fails_closed() {
     );
 }
 
+/// GitHub gives fork PR runs read-only cache access: they can restore from
+/// the base repository's cache but cannot save to it, so a fork cannot poison
+/// entries a trusted run later restores. Every cache write surface must deny
+/// fork-restricted jobs while reads stay open.
+#[tokio::test]
+async fn fork_pr_runs_get_read_only_cache_access() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let submit = |tier: Option<&'static str>| {
+        let app = app.clone();
+        async move {
+            request_json(
+                &app,
+                Method::POST,
+                "/api/v1/runs",
+                json!({
+                    "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+                    "event": "push",
+                    "payload": {"ref": "refs/heads/main", "commits": []},
+                    "repository": "owner/repo",
+                    "git_ref": "refs/heads/main",
+                    "trust_tier": tier,
+                }),
+            )
+            .await
+        }
+    };
+
+    let fork = submit(Some("untrusted-fork-pull-request")).await;
+    let trusted = submit(None).await;
+
+    let (fork_token, fork_plan, fork_job) = {
+        let inner = state.inner.lock().await;
+        let message = queued_message_for(&inner, fork["run_id"].as_str().unwrap());
+        (
+            state.mint_runtime_token(&message.plan.plan_id, &message.job_id),
+            message.plan.plan_id.clone(),
+            message.job_id,
+        )
+    };
+    let trusted_token = {
+        let inner = state.inner.lock().await;
+        let message = queued_message_for(&inner, trusted["run_id"].as_str().unwrap());
+        state.mint_runtime_token(&message.plan.plan_id, &message.job_id)
+    };
+
+    async fn status_with_bearer(
+        app: &Router,
+        bearer: &str,
+        method: Method,
+        uri: &str,
+        body: Value,
+    ) -> StatusCode {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        response.status()
+    }
+
+    let create_uri = "/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry";
+    let finalize_uri = "/twirp/github.actions.results.api.v1.CacheService/FinalizeCacheEntryUpload";
+    let restore_uri = "/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL";
+    let cache_body = json!({"key": "shared-key", "version": "v1"});
+
+    // Fork: writes refused on both the reserve (create) and finalize paths.
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &fork_token,
+            Method::POST,
+            create_uri,
+            cache_body.clone()
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "fork PR run must not reserve a cache entry"
+    );
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &fork_token,
+            Method::POST,
+            finalize_uri,
+            cache_body.clone()
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "fork PR run must not finalize a cache upload"
+    );
+    // Fork: restore stays open (a miss is a normal 200 `ok: false`).
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &fork_token,
+            Method::POST,
+            restore_uri,
+            cache_body.clone()
+        )
+        .await,
+        StatusCode::OK,
+        "fork PR run may still restore from the shared cache"
+    );
+    // Trusted control: the same write succeeds and returns an upload URL.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(create_uri)
+                .header(header::AUTHORIZATION, format!("Bearer {trusted_token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(cache_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["ok"], true);
+    assert!(
+        body["signed_upload_url"]
+            .as_str()
+            .is_some_and(|url| !url.is_empty()),
+        "trusted job still gets a cache upload URL"
+    );
+
+    // Legacy v1 surface (`actions/cache@v3`): the reserve write is denied too.
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &fork_token,
+            Method::POST,
+            "/_apis/artifactcache/cache",
+            json!({"key": "legacy-key", "version": "v1"}),
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "fork PR run must not reserve through the v1 cache API"
+    );
+
+    // The runtime token genuinely names the fork job (not a blanket reject):
+    // the OIDC surface proves it by refusing this token's job.
+    let oidc_uri = format!(
+        "/runner/server/_apis/distributedtask/hubs/actions/plans/{fork_plan}/jobs/{fork_job}/oidctoken"
+    );
+    assert_eq!(
+        status_with_bearer(&app, &fork_token, Method::GET, &oidc_uri, Value::Null).await,
+        StatusCode::FORBIDDEN,
+        "the fork job's runtime token is real and its OIDC grant is denied"
+    );
+}
+
 /// A PAT-only deployment embeds the static PAT into job messages at build
 /// time. That override must never reach a fork-restricted job: the job keeps
 /// the local job-scoped runtime token, which authenticates only against this

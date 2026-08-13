@@ -119,6 +119,50 @@ pub(crate) fn tier_of(submission: &preloop_gha_protocol::WorkflowSubmission) -> 
         .and_then(|value| serde_json::from_value::<TrustTier>(serde_json::json!(value)).ok())
 }
 
+/// Whether the job a results/cache request authenticates as is
+/// fork-restricted, resolved from its bearer runtime token.
+///
+/// `Some(true)`/`Some(false)` when the token names a live job; `None` when it
+/// is the system token or no job resolves (the control plane's own calls) —
+/// those are never fork-restricted. This is what lets the cache write
+/// handlers deny fork PR runs the same read-only cache access GitHub gives
+/// them (restore allowed, save refused) without touching the read path.
+pub(crate) async fn fork_restricted_from_token(
+    state: &crate::state::AppState,
+    token: &str,
+) -> Option<bool> {
+    let job = state.job_uuid_from_token(token)?;
+    let inner = state.inner.lock().await;
+    let request_id = inner.agent_job_requests.get(&job).copied()?;
+    let record = inner.job_requests.get(&request_id)?;
+    let run = inner.runs.get(&record.run_id)?;
+    let tier = tier_of(&run.submission)?;
+    Some(tier.is_fork_restricted())
+}
+
+/// Reject a cache write when the calling job is a fork-restricted run.
+///
+/// GitHub gives fork PR runs read-only cache access (restore allowed, save
+/// refused) so a fork cannot poison cache entries that trusted runs later
+/// restore. Mirroring that here applies to every cache write surface (the
+/// cache v2 Twirp handlers and the legacy `/_apis/artifactcache` ones alike);
+/// the read handlers never call this. The system token and unresolvable
+/// tokens are the control plane's own calls and always pass.
+pub(crate) async fn ensure_cache_write_allowed(
+    state: &crate::state::AppState,
+    headers: &axum::http::HeaderMap,
+) -> Result<(), crate::ApiError> {
+    let Some(token) = crate::auth::bearer_from_headers(headers) else {
+        return Ok(());
+    };
+    if fork_restricted_from_token(state, token).await == Some(true) {
+        return Err(crate::ApiError::forbidden(
+            "cache writes are read-only for fork pull request runs",
+        ));
+    }
+    Ok(())
+}
+
 /// The effective job-authorization policy for a submission tier and a job's
 /// resolved permission declarations.
 ///
