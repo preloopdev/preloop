@@ -475,7 +475,7 @@ fn run_composite_action_inner<'a>(
                 // half-configured — mastodon's setup-ruby composite passed
                 // even though its ruby/setup-ruby step never ran, and the
                 // workflow died later with a Ruby version mismatch.
-                return Err(outcome.unwrap_err());
+                return outcome.map(|_| ());
             }
         }
 

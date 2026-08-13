@@ -150,9 +150,15 @@ pub(crate) async fn ensure_remote_action_staged(
         .parent()
         .unwrap_or(std::path::Path::new("."));
     let actions_dir = base.join("_actions");
-    let action_root =
-        crate::worker::actions::manager::download_action(owner, repo, git_ref, &actions_dir, None, None)
-            .await?;
+    let action_root = crate::worker::actions::manager::download_action(
+        owner,
+        repo,
+        git_ref,
+        &actions_dir,
+        None,
+        None,
+    )
+    .await?;
     let action_dir = if subpath.is_empty() {
         action_root
     } else {

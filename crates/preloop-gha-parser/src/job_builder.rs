@@ -1210,6 +1210,65 @@ jobs:
     }
 
     #[test]
+    fn with_input_templates_survive_to_the_wire() {
+        // Mastodon's cache step keys on
+        // `${{ matrix.mode }}-assets-${{ github.head_ref || github.ref_name }}-${{ github.sha }}`.
+        // The step's with-value must reach the job message as a template the
+        // runner can evaluate — a resolved-literal collapse to "" made
+        // actions/cache fail with "Input required and not supplied: key".
+        let yaml = r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        mode: [production]
+    steps:
+      - uses: actions/cache@v5
+        with:
+          path: public/assets
+          key: ${{ matrix.mode }}-assets-${{ github.head_ref || github.ref_name }}-${{ github.sha }}
+"#;
+        let workflow = parse_workflow(yaml).unwrap();
+        let plans = crate::expand_jobs(&workflow).unwrap();
+        assert_eq!(plans.len(), 1);
+        let github = serde_json::json!({
+            "event_name": "push",
+            "ref": "refs/heads/main",
+            "ref_name": "main",
+            "sha": "0123456789abcdef0123456789abcdef01234567",
+            "repository": "mastodon/mastodon",
+        });
+        let msg = build_agent_job_message(
+            &plans[0],
+            &github,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let cache = msg
+            .steps
+            .iter()
+            .find(|s| s.context_name.as_deref() == Some("__actions_cache"));
+        let Some(cache) = cache else {
+            panic!(
+                "cache step must be present; steps: {:?}",
+                msg.steps
+                    .iter()
+                    .map(|s| (s.context_name.clone(), s.name.clone()))
+                    .collect::<Vec<_>>()
+            );
+        };
+        let key = cache.inputs.get("key").cloned().unwrap_or_default();
+        assert!(
+            key.contains("assets") && key.contains("matrix.mode"),
+            "cache key must reach the runner as an evaluable template, got {key:?}"
+        );
+    }
+
+    #[test]
     fn container_specs_use_official_template_tokens() {
         let literal = template_token(&serde_json::json!("node:20"));
         assert_eq!(literal["type"], 0);

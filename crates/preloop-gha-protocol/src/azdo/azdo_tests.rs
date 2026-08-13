@@ -1154,7 +1154,10 @@ fn task_step_input_expression_tokens_survive_persist_restore() {
         key.contains("${{") && key.contains("matrix.mode"),
         "expression input must survive decode as an evaluable template, got {key:?}"
     );
-    assert_eq!(decoded.inputs.get("path").map(String::as_str), Some("public/assets"));
+    assert_eq!(
+        decoded.inputs.get("path").map(String::as_str),
+        Some("public/assets")
+    );
 
     // And the re-serialized message keeps the expression token (no collapse
     // to a literal empty string).

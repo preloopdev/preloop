@@ -39,6 +39,29 @@ fn short_circuits() {
 }
 
 #[test]
+fn undefined_context_keys_coalesce_to_empty_like_github() {
+    // GitHub expressions treat an undefined context key as an empty string
+    // (with a warning), so a missing `head_ref` must coalesce through `||` to
+    // the present `ref_name`. Mastodon's cache `key:` uses exactly this
+    // pattern; the empty-input failure was a job-message round-trip bug that
+    // dropped the template, not an evaluator bug.
+    let mut context = Context::default();
+    context.insert(
+        "github",
+        json!({"ref": "refs/heads/main", "ref_name": "main"}),
+    );
+    assert_eq!(
+        eval_expression("github.head_ref || github.ref_name", &context).unwrap(),
+        Value::String("main".to_owned())
+    );
+    // An undefined key on its own is null (renders as the empty string).
+    assert_eq!(
+        eval_expression("github.head_ref", &context).unwrap(),
+        Value::Null
+    );
+}
+
+#[test]
 fn evaluates_json_join_and_comparisons() {
     let context = Context::default();
 
