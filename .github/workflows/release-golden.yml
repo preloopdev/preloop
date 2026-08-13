@@ -145,7 +145,7 @@ jobs:
 
       # Release builds are the slowest compiles on the pool; cache them
       # through the shared R2 bucket so golden re-bakes skip them entirely.
-      - uses: kunobi-ninja/kache-action@49398d37113c616fdb61be434cb497e3c2c8f3e6 # v1
+      - uses: kunobi-ninja/kache-action@v1
         with:
           s3-bucket: preloop-kache
           s3-endpoint: https://da4b337a84d48ad45633a546cd97dbff.r2.cloudflarestorage.com
