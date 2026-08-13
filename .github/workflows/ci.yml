@@ -57,6 +57,7 @@ jobs:
       # concurrency so the dogfood VM survives preloop-runner's suite.
       PROPTEST_CASES: "8"
       RUST_TEST_THREADS: "2"
+      RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
@@ -81,6 +82,9 @@ jobs:
       # inline run steps work against preloop
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
 
+      - name: Install lld linker
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends lld
+
       - run: cargo fmt --all --check
       - run: |
           # Run clippy on warning-free crates with strict -D warnings
@@ -89,7 +93,7 @@ jobs:
           cargo clippy --locked -p preloop-runner -p preloop-runner-server -p preloop-runner-client -p preloop-dap --all-targets
       - run: cargo test --locked --workspace
         env:
-          RUSTFLAGS: "-A warnings"
+          RUSTFLAGS: "-A warnings -C link-arg=-fuse-ld=lld"
 
   # Bounded property-test profile
   property-tests-fast:
