@@ -261,6 +261,8 @@ steps.
 | `PRELOOP_USE_PACKED_GOLDEN` | Use a release or locally cached packed golden (default on; set `false` for cold OCI provisioning) |
 | `PRELOOP_GOLDEN_URL` | Override the packed golden URL; checksum URL is this value plus `.sha256` |
 | `PRELOOP_RUNNER_BASE_IMAGE` | Override the digest-pinned Ubuntu base identity at serve time; set it with `PRELOOP_GOLDEN_URL` for a custom packed golden |
+| `PRELOOP_VERIFY_BASE_IMAGE` / `PRELOOP_VERIFY_BASE_IMAGE_REPO` | Require a digest-pinned OCI base's GitHub attestation and Cosign signature before `build-golden` |
+| `PRELOOP_REQUIRE_BASE_DIGEST` | Reject mutable registry tags during `build-golden` (used by release provenance builds) |
 | `PRELOOP_RUNNER_STORAGE_GB` | Persistent guest storage per runner and golden build (default 20 GiB; use 80 or more for full hosted-image snapshots) |
 | `PRELOOP_RUNNER_PACK_PROXY` | HTTP proxy for smolvm's separate registry export VM during golden packing; standard HTTP(S) proxy variables are fallbacks |
 | `PRELOOP_RUNNER_PACK_NO_PROXY` | Proxy bypass list for golden packing; `NO_PROXY` and `no_proxy` are fallbacks |

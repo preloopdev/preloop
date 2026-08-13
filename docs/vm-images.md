@@ -199,13 +199,53 @@ before the golden is built:
 ```sh
 PRELOOP_VERIFY_BASE_IMAGE=1 \
 PRELOOP_VERIFY_BASE_IMAGE_REPO=acme/runner-image-blobs \
-preloop build-golden --base-image 'ghcr.io/acme/runner-images:ubuntu24-runner-large-latest-arm64' ...
+preloop build-golden --base-image 'ghcr.io/acme/runner-images@sha256:<digest>' ...
 ```
 
 `gh` and `cosign` must be installed on the build host. The signature identity
 is pinned to the publishing repository's `dump.yml` workflow on the default
 branch; override with `PRELOOP_BASE_IMAGE_IDENTITY_REGEXP` if the publishing
 workflow differs.
+
+### Golden provenance
+
+The stock base in `versions.toml` is served from `mirror.gcr.io`, Google's
+cache of the Docker Official Ubuntu image. It is not a Google-built Ubuntu
+image. The release workflow resolves the pinned digest, records the selected
+platform manifest and its OCI attestation descriptors, and preserves the
+upstream SPDX SBOM beside the golden. The cache is useful for availability and
+rate-limit avoidance; the digest and the upstream image metadata are the
+provenance inputs.
+
+Each release golden then receives:
+
+1. a SHA-256 checksum;
+2. a Cosign keyless blob signature (`<golden>.bundle`);
+3. a GitHub SLSA provenance attestation over the golden, the base evidence,
+   the upstream SBOM, and a signed provenance manifest;
+4. a `<golden>.provenance.json` record binding the golden hash to the exact
+   base index/platform digest and release workflow.
+
+Verify the golden's two independent signatures from an online build host:
+
+```sh
+cosign verify-blob \
+  --bundle preloop-ubuntu-24.04-aarch64.bundle \
+  --certificate-identity-regexp \
+    '^https://github.com/preloopdev/preloop/.github/workflows/release-golden.yml@refs/(heads/main|tags/)' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  preloop-ubuntu-24.04-aarch64
+
+gh attestation verify \
+  preloop-ubuntu-24.04-aarch64 \
+  --repo preloopdev/preloop
+```
+
+Release builds require the base to be digest-pinned with
+`PRELOOP_REQUIRE_BASE_DIGEST=1`. This protects the golden cache and the
+provenance record from mutable image tags. The stock image's attached SPDX
+SBOM is evidence about the upstream input; it is not treated as a Google
+signature or as a substitute for the Preloop golden attestation.
 
 ### Using a snapshot of the official hosted image
 
