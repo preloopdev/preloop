@@ -1,0 +1,18 @@
+name: Repository Dispatch Dogfood
+
+on:
+  repository_dispatch:
+    types: [dogfood]
+
+# Exercises the github.com-compatible dispatch surface: POST /repos/{owner}/{repo}/dispatches
+# with event_type=dogfood. The event payload (action + client_payload) must arrive
+# verbatim in github.event.
+
+jobs:
+  dispatch-echo:
+    runs-on: self-hosted
+    steps:
+      - name: Echo event type
+        run: echo "event_type=${{ github.event.action }}"
+      - name: Echo client payload
+        run: echo "client_payload=${{ toJSON(github.event.client_payload) }}"

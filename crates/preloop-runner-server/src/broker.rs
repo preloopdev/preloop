@@ -963,11 +963,12 @@ pub(crate) async fn mint_dispatch_github_token(
     shared: &Arc<SharedState>,
     request: &GitHubTokenRequest,
 ) -> Result<Option<MintedGitHubToken>, ApiError> {
-    let Some(app) = &shared.state.github_app else {
+    let Some(app) = crate::github_app::select_app_for_repo(shared, &request.repository).await
+    else {
         return Ok(None);
     };
     match crate::github_app::get_or_mint_token_declared(
-        app,
+        &app,
         &request.repository,
         &request.permissions,
         request.declared,

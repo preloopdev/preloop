@@ -48,6 +48,8 @@ mod distributed_task;
 use distributed_task::*;
 mod auth;
 use auth::*;
+mod dispatch;
+mod dispatch_auth;
 mod oauth;
 use oauth::*;
 mod oidc_handlers;
@@ -88,6 +90,8 @@ pub mod scheduling;
 mod concurrency_http_properties;
 #[cfg(test)]
 mod concurrency_properties;
+#[cfg(test)]
+mod dispatch_tests;
 /// GitHub-compatible OIDC id-token provider.
 pub mod oidc;
 

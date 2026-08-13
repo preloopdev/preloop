@@ -57,6 +57,31 @@ pub struct GitHubConfig {
     /// Env: `PRELOOP_GITHUB_GRAPHQL_URL`.
     #[serde(default)]
     pub graphql_url: Option<String>,
+    /// Additional registered GitHub Apps beyond the legacy single-App env
+    /// vars (which remain the default first entry). Lets several Apps
+    /// coexist: each gets its own webhook secret in the receiver and its own
+    /// installation tokens for minting. Env override: `PRELOOP_GITHUB_APPS_JSON`
+    /// (a JSON array of the same shape).
+    #[serde(default)]
+    pub apps: Vec<AppConfig>,
+}
+
+/// One additional GitHub App in the multi-App registry (`github.apps`).
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct AppConfig {
+    /// Numeric App id, used as the `iss` claim of the App JWT.
+    pub app_id: String,
+    /// App private key PEM (inline).
+    pub pem: String,
+    /// Webhook secret for `X-Hub-Signature-256` verification, when the App
+    /// has its own (the legacy `PRELOOP_WEBHOOK_SECRET` covers the default
+    /// App).
+    #[serde(default)]
+    pub webhook_secret: Option<String>,
+    /// Explicit installation id, bypassing installation discovery for
+    /// single-installation deployments of this App.
+    #[serde(default)]
+    pub installation_id: Option<u64>,
 }
 
 /// Renders as `<redacted>` / `None` without quoting, for credential fields.
@@ -81,6 +106,7 @@ impl std::fmt::Debug for GitHubConfig {
             .field("mint_failure", &self.mint_failure)
             .field("pat", &redacted(self.pat.is_some()))
             .field("webhook_secret", &redacted(self.webhook_secret.is_some()))
+            .field("apps", &self.apps.len())
             .finish()
     }
 }
@@ -357,6 +383,7 @@ mod tests {
                 server_url: None,
                 api_url: None,
                 graphql_url: None,
+                apps: vec![],
             },
             secrets: BTreeMap::from([("DOCKERHUB_TOKEN".into(), "abc123".into())]),
             repo_secrets: BTreeMap::from([(

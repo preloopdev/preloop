@@ -173,6 +173,10 @@ pub(crate) struct RunResponse {
         artifacts,
         artifact,
         github_webhook,
+        workflow_dispatch_trigger,
+        repository_dispatch_trigger,
+        list_dispatch_workflows,
+        list_dispatch_runs,
         github_register,
         github_callback
     ),
@@ -201,6 +205,20 @@ impl Modify for SecuritySchemes {
                     .description(Some(
                         "System token (`PRELOOP_SYSTEM_TOKEN` or default `preloop-system-token`). \
                          Used by CLI clients, agents, and operators.",
+                    ))
+                    .build(),
+            ),
+        );
+        components.add_security_scheme(
+            "github_dispatch_bearer",
+            SecurityScheme::Http(
+                Http::builder()
+                    .scheme(HttpAuthScheme::Bearer)
+                    .description(Some(
+                        "GitHub-compatible dispatch credential: a GitHub App installation \
+                         token (own App offline via mint ledger, any App online via GitHub \
+                         round-trip), an own-App JWT, a PAT (`PRELOOP_GITHUB_TOKEN`), or the \
+                         system token. Requires `actions: write` on the repository.",
                     ))
                     .build(),
             ),
@@ -561,6 +579,98 @@ fn artifacts() {}
 fn artifact() {}
 
 // ── GitHub ──────────────────────────────────────────────────────────────────
+
+/// Trigger a `workflow_dispatch` run (github.com-compatible).
+///
+/// `POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches` —
+/// authenticated through the dispatch credential chain and validated against
+/// the workflow's declared triggers and inputs before any run is created.
+/// `workflow_id` is the workflow file name (`ci.yml`, `ci`, or
+/// `.github/workflows/ci.yml`); preloop does not track numeric workflow ids.
+#[utoipa::path(
+    post, path = "/repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches",
+    tag = "GitHub",
+    security(("github_dispatch_bearer" = [])),
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("workflow_id" = String, Path, description = "Workflow file name (e.g. `ci.yml`)")
+    ),
+    request_body = JsonValue,
+    responses(
+        (status = 204, description = "Run dispatched"),
+        (status = 401, description = "Missing or invalid credential", body = ApiErrorResponse),
+        (status = 403, description = "No `actions: write` on the repository", body = ApiErrorResponse),
+        (status = 404, description = "Unknown repository or workflow", body = ApiErrorResponse),
+        (status = 409, description = "Workflow is not `workflow_dispatch`-triggered", body = ApiErrorResponse),
+        (status = 422, description = "Input validation failed", body = ApiErrorResponse)
+    )
+)]
+fn workflow_dispatch_trigger() {}
+
+/// Trigger a `repository_dispatch` event (github.com-compatible).
+///
+/// `POST /repos/{owner}/{repo}/dispatches` — a broadcast: every workflow whose
+/// `on.repository_dispatch.types` matches `event_type` runs (an absent `types`
+/// matches every event type). Returns `204` even when no workflow matches.
+#[utoipa::path(
+    post, path = "/repos/{owner}/{repo}/dispatches",
+    tag = "GitHub",
+    security(("github_dispatch_bearer" = [])),
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name")
+    ),
+    request_body = JsonValue,
+    responses(
+        (status = 204, description = "Event dispatched"),
+        (status = 401, description = "Missing or invalid credential", body = ApiErrorResponse),
+        (status = 403, description = "No dispatch permission on the repository", body = ApiErrorResponse),
+        (status = 404, description = "Unknown repository", body = ApiErrorResponse),
+        (status = 422, description = "Missing or invalid `event_type`", body = ApiErrorResponse)
+    )
+)]
+fn repository_dispatch_trigger() {}
+
+/// List workflows for a repository (github.com-compatible shape).
+///
+/// `GET /repos/{owner}/{repo}/actions/workflows` — convenience for Apps that
+/// poll. `id` is a deterministic hash of the workflow path (preloop does not
+/// track github.com numeric workflow ids).
+#[utoipa::path(
+    get, path = "/repos/{owner}/{repo}/actions/workflows", tag = "GitHub",
+    security(("github_dispatch_bearer" = [])),
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name")
+    ),
+    responses(
+        (status = 200, description = "Workflow list", body = JsonValue),
+        (status = 401, description = "Missing or invalid credential", body = ApiErrorResponse),
+        (status = 404, description = "Unknown repository", body = ApiErrorResponse)
+    )
+)]
+fn list_dispatch_workflows() {}
+
+/// List recent runs for a repository (github.com-compatible shape).
+///
+/// `GET /repos/{owner}/{repo}/actions/runs` — convenience for Apps that poll.
+/// `id` is a deterministic hash of the preloop run UUID; the native `run_id`
+/// field is included for preloop-native consumers.
+#[utoipa::path(
+    get, path = "/repos/{owner}/{repo}/actions/runs", tag = "GitHub",
+    security(("github_dispatch_bearer" = [])),
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name")
+    ),
+    responses(
+        (status = 200, description = "Run list", body = JsonValue),
+        (status = 401, description = "Missing or invalid credential", body = ApiErrorResponse),
+        (status = 404, description = "Unknown repository", body = ApiErrorResponse)
+    )
+)]
+fn list_dispatch_runs() {}
 
 /// Receive a GitHub webhook event.
 ///

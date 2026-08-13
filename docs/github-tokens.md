@@ -294,3 +294,24 @@ and local-workspace checkout behave identically in all three cases.
 
 - [GitHub App Webhook Integration](./github-app-webhook.md) — webhook delivery, Checks API reporting, App registration walkthrough
 - [Fidelity Gap](./fidelity-gap.md) — what Preloop deliberately does not replicate
+
+## 7. Dispatch API authentication (GitHub App API compatibility)
+
+The github.com-compatible dispatch endpoints
+(`POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches`,
+`POST /repos/{owner}/{repo}/dispatches`) authenticate through a credential
+chain rather than the native bearer alone:
+
+| Credential | Verification | Works offline? |
+|---|---|---|
+| System token | Native bearer comparison | yes |
+| PAT (`PRELOOP_GITHUB_TOKEN`) | Constant-time compare | yes |
+| Own-App JWT | RS256 verified against the registered App PEM | yes |
+| Own-App installation token | In-memory mint ledger (hash → installation, repo, permissions, expiry) | yes |
+| Third-party App installation token | github.com round-trip: `GET /installation` + `GET /installation/repositories`; requires `actions: write`; 60s cache; **fails closed** on network error | no |
+
+Third-party App JWTs are never accepted — there is no PEM to verify them with.
+The `sender` for a dispatched run is the App bot identity (`{slug}[bot]`) for
+installation tokens, or the resolved PAT owner. Dispatched runs carry the
+`AppDispatch` trust tier, which allows repository secrets (the caller has
+proven `actions: write`, matching github.com).

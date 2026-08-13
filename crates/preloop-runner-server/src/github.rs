@@ -161,7 +161,7 @@ pub(crate) fn github_api_base() -> String {
 }
 
 async fn resolve_check_run_token(shared: &Arc<SharedState>, repo: &str) -> Option<String> {
-    if let Some(app_creds) = &shared.state.github_app {
+    if let Some(app_creds) = crate::github_app::select_app_for_repo(shared, repo).await {
         let mut permissions = std::collections::BTreeMap::new();
         permissions.insert("checks".to_owned(), "write".to_owned());
         // The App mint intermittently 422s while the installation grants are
@@ -169,7 +169,7 @@ async fn resolve_check_run_token(shared: &Arc<SharedState>, repo: &str) -> Optio
         // stranding the check run in `queued` (the fallback JWT cannot
         // PATCH check runs and GitHub keeps showing them pending).
         for attempt in 0..2 {
-            match crate::github_app::get_or_mint_token(app_creds, repo, &permissions).await {
+            match crate::github_app::get_or_mint_token(&app_creds, repo, &permissions).await {
                 Ok(token) => return Some(token),
                 Err(error) if attempt == 0 => {
                     tracing::warn!(
@@ -591,9 +591,9 @@ pub(crate) async fn fetch_workflows_at(
         }
         Ok(workflows)
     } else {
-        let token = if let Some(app) = &shared.state.github_app {
+        let token = if let Some(app) = crate::github_app::select_app_for_repo(shared, repo).await {
             let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
-            Some(crate::github_app::get_or_mint_token_at(api_base, app, repo, &permissions).await?)
+            Some(crate::github_app::get_or_mint_token_at(api_base, &app, repo, &permissions).await?)
         } else {
             std::env::var("PRELOOP_GITHUB_TOKEN").ok()
         };
@@ -681,12 +681,18 @@ async fn fetch_remote_workflows(
     Ok(workflows)
 }
 
-async fn resolve_ref_sha(
-    local_workspace: &Option<PathBuf>,
+/// Resolve `git_ref` to a commit SHA, using the same credential ladder as
+/// [`fetch_workflows`]: a local workspace is answered by `git rev-parse`,
+/// otherwise the PAT or an App-minted `contents: read` installation token
+/// queries the GitHub commits API. Returns `Ok(None)` when the ref does not
+/// resolve (unknown ref, offline without a workspace) — the caller decides
+/// what that means.
+pub(crate) async fn resolve_ref_sha(
+    shared: &Arc<SharedState>,
     repository: &str,
     git_ref: &str,
 ) -> anyhow::Result<Option<String>> {
-    if let Some(workspace) = local_workspace {
+    if let Some(workspace) = &shared.state.local_workspace {
         let output = tokio::process::Command::new("git")
             .arg("-C")
             .arg(workspace)
@@ -703,7 +709,18 @@ async fn resolve_ref_sha(
         }
         return Ok(None);
     }
-    let Some(token) = std::env::var("PRELOOP_GITHUB_TOKEN").ok() else {
+    let api_base = github_api_base();
+    let token = if let Some(app) = crate::github_app::select_app_for_repo(shared, repository).await
+    {
+        let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
+        Some(
+            crate::github_app::get_or_mint_token_at(&api_base, &app, repository, &permissions)
+                .await?,
+        )
+    } else {
+        std::env::var("PRELOOP_GITHUB_TOKEN").ok()
+    };
+    let Some(token) = token else {
         return Ok(None);
     };
     let commit_ref = git_ref
@@ -713,7 +730,7 @@ async fn resolve_ref_sha(
     let response = crate::shared_http::CLIENT
         .clone()
         .get(format!(
-            "https://api.github.com/repos/{repository}/commits/{commit_ref}"
+            "{api_base}/repos/{repository}/commits/{commit_ref}"
         ))
         .header("User-Agent", "preloop")
         .header("Authorization", format!("Bearer {token}"))
@@ -795,9 +812,9 @@ pub(crate) async fn resolve_pr_changed_files_at(
     pr_number: u64,
     api_base: &str,
 ) -> anyhow::Result<Option<Vec<String>>> {
-    let token = if let Some(app) = &shared.state.github_app {
+    let token = if let Some(app) = crate::github_app::select_app_for_repo(shared, repo).await {
         let permissions = BTreeMap::from([("pull_requests".to_owned(), "read".to_owned())]);
-        Some(crate::github_app::get_or_mint_token_at(api_base, app, repo, &permissions).await?)
+        Some(crate::github_app::get_or_mint_token_at(api_base, &app, repo, &permissions).await?)
     } else {
         std::env::var("PRELOOP_GITHUB_TOKEN").ok()
     };
@@ -816,17 +833,24 @@ pub(crate) async fn handle_github_webhook(
     body: bytes::Bytes,
 ) -> Result<impl IntoResponse, StatusCode> {
     // 1. Verify Signature
-    let secret = shared.state.webhook_secret.as_ref().ok_or_else(|| {
-        warn!("Webhook secret not configured on server, rejecting request");
-        StatusCode::UNAUTHORIZED
-    })?;
-
     let sig_header = headers
         .get("x-hub-signature-256")
         .and_then(|h| h.to_str().ok())
         .ok_or(StatusCode::UNAUTHORIZED)?;
-
-    if !verify_signature(secret, &body, sig_header) {
+    // Every registered App's secret is a candidate (D6): a payload signed by
+    // any App preloop fronts is accepted, one signed by none is rejected.
+    let secrets: Vec<String> = match &shared.state.github_apps {
+        Some(apps) => apps.webhook_secrets(shared.state.webhook_secret.as_deref()),
+        None => shared.state.webhook_secret.clone().into_iter().collect(),
+    };
+    if secrets.is_empty() {
+        warn!("No webhook secret is configured on the server, rejecting request");
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    if !secrets
+        .iter()
+        .any(|secret| verify_signature(secret, &body, sig_header))
+    {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
@@ -1191,13 +1215,7 @@ async fn process_github_webhook(
             })?;
         let resolved_sha = match &effective.sha {
             Some(sha) => sha.clone(),
-            None => match resolve_ref_sha(
-                &shared.state.local_workspace,
-                &repo_full_name,
-                &effective.git_ref,
-            )
-            .await
-            {
+            None => match resolve_ref_sha(shared, &repo_full_name, &effective.git_ref).await {
                 Ok(Some(sha)) => sha,
                 Ok(None) => {
                     error!(
@@ -1427,6 +1445,37 @@ async fn process_github_webhook(
     Ok((StatusCode::OK, Json(serde_json::json!(triggered_runs))))
 }
 
+/// Webhook events the App-manifest flow asks GitHub to subscribe a new App to.
+///
+/// Defaults to every webhook event preloop has an adapter for — the full
+/// [`crate::events::all_event_names`] set minus `schedule`, which is a
+/// workflow *trigger*, not a webhook event GitHub can subscribe an App to —
+/// so a newly created App can drive every trigger preloop supports. Operators
+/// who want a narrower, single-purpose App can override the set with
+/// `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` (comma-separated).
+pub(crate) fn manifest_default_events() -> Vec<String> {
+    if let Some(raw) = std::env::var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    {
+        let events: Vec<String> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|event| !event.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if !events.is_empty() {
+            return events;
+        }
+    }
+    crate::events::all_event_names()
+        .iter()
+        .filter(|event| **event != "schedule")
+        .map(|event| (*event).to_owned())
+        .collect()
+}
+
 /// Serve registration page for GitHub App Manifest flow.
 pub(crate) async fn github_register(headers: HeaderMap) -> impl IntoResponse {
     let host = headers
@@ -1451,16 +1500,22 @@ pub(crate) async fn github_register(headers: HeaderMap) -> impl IntoResponse {
         "default_permissions": {
             "checks": "write",
             "contents": "read",
+            "actions": "read",
+            "issues": "read",
+            "discussions": "read",
+            "deployments": "read",
+            "members": "read",
+            "pages": "read",
             "metadata": "read",
             "pull_requests": "read"
-    }
+        }
     });
 
     if !is_local {
         manifest_json["hook_attributes"] = serde_json::json!({
                 "url": format!("{}/api/v1/github/webhooks", base_url)
         });
-        manifest_json["default_events"] = serde_json::json!(["push", "pull_request"]);
+        manifest_json["default_events"] = serde_json::json!(manifest_default_events());
     }
 
     let html = format!(
@@ -1626,6 +1681,44 @@ mod tests {
             &configured
         ));
         assert!(!is_github_owned_workflow("ci.yml", &configured));
+    }
+
+    #[test]
+    fn manifest_default_events_cover_every_adapter_event_except_schedule() {
+        // `schedule` is a workflow trigger, not a webhook event GitHub can
+        // subscribe an App to; every other supported event must be in the
+        // manifest default so a newly created App can drive every trigger
+        // preloop supports without a settings visit.
+        let defaults = manifest_default_events();
+        for event in crate::events::all_event_names() {
+            if *event == "schedule" {
+                continue;
+            }
+            assert!(
+                defaults.iter().any(|have| have == event),
+                "manifest default events must include {event}"
+            );
+        }
+        assert!(
+            !defaults.iter().any(|event| event == "schedule"),
+            "schedule is a workflow trigger, not a subscribable webhook event"
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_default_events_override_is_used_when_set() {
+        // Held for the whole test: `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` is
+        // process-global and other tests build apps concurrently.
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        std::env::set_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS", "push, pull_request");
+        let events = manifest_default_events();
+        assert_eq!(events, vec!["push".to_owned(), "pull_request".to_owned()]);
+        std::env::remove_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS");
+
+        // A blank override falls back to the expanded default.
+        std::env::set_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS", "  ");
+        assert!(manifest_default_events().len() > 2);
+        std::env::remove_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS");
     }
 
     /// The signed push payload GitHub would deliver for `owner/repo`.

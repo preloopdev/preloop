@@ -27,7 +27,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde_json::json;
 use tokio::sync::RwLock;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::shared_http::CLIENT;
 
@@ -234,6 +234,110 @@ pub(crate) struct GitHubAppCredentials {
     /// mid-job or outlive a revoked installation. Discovery is the expensive
     /// call, so caching it leaves one API request per job in steady state.
     installation_cache: Arc<RwLock<HashMap<String, u64>>>,
+    /// Every installation token this App has minted, keyed by token hash.
+    /// The GitHub-compatible dispatch API consults it to validate a token
+    /// offline — without a github.com round-trip — when github.com is
+    /// unreachable (D2.4).
+    pub(crate) mint_ledger: Arc<MintLedger>,
+    /// Webhook secret for `X-Hub-Signature-256` verification, when this App
+    /// has its own (the legacy single-App secret lives in
+    /// `AppState::webhook_secret` and covers the default App).
+    pub(crate) webhook_secret: Option<String>,
+    /// Explicit installation id for single-installation deployments of this
+    /// App, bypassing installation discovery.
+    pub(crate) installation_id: Option<u64>,
+}
+
+/// Registry of every configured GitHub App.
+///
+/// The legacy single-App env vars (`PRELOOP_GITHUB_APP_ID` + PEM) are always
+/// the first entry — the default for minting fallback and the App `AppState`
+/// reports as `github_app`. Additional Apps come from `github.apps` in the
+/// config file or the `PRELOOP_GITHUB_APPS_JSON` environment variable.
+#[derive(Clone)]
+pub(crate) struct GitHubApps {
+    pub(crate) apps: Vec<GitHubAppCredentials>,
+    /// Index of the legacy env-var App within `apps`.
+    pub(crate) default_index: usize,
+}
+
+impl GitHubApps {
+    /// The default App — the legacy env-var one.
+    pub(crate) fn default_app(&self) -> &GitHubAppCredentials {
+        &self.apps[self.default_index]
+    }
+
+    /// Every webhook secret registered across the registry, plus the legacy
+    /// `AppState::webhook_secret`, deduplicated.
+    pub(crate) fn webhook_secrets(&self, legacy: Option<&str>) -> Vec<String> {
+        let mut secrets: Vec<String> = Vec::new();
+        if let Some(legacy) = legacy {
+            secrets.push(legacy.to_owned());
+        }
+        for app in &self.apps {
+            if let Some(secret) = &app.webhook_secret {
+                if !secrets.iter().any(|have| have == secret) {
+                    secrets.push(secret.clone());
+                }
+            }
+        }
+        secrets
+    }
+}
+
+/// One minted installation token, as recorded in [`MintLedger`].
+#[derive(Debug, Clone)]
+pub(crate) struct MintLedgerEntry {
+    pub(crate) installation_id: u64,
+    /// `owner/repo` slug the token is scoped to.
+    pub(crate) repository: String,
+    /// Permission scopes the token carries (post-clamp).
+    pub(crate) permissions: BTreeMap<String, String>,
+    pub(crate) expires_at: std::time::SystemTime,
+    pub(crate) app_id: String,
+    /// Account login the installation belongs to — the token's bot identity.
+    pub(crate) account_login: String,
+}
+
+/// In-memory record of every installation token preloop itself minted, keyed
+/// by SHA-256 of the token (never the raw token). Populated at mint time in
+/// [`mint_for_repository`]; entries are dropped once they expire, so the map
+/// stays bounded by the 10-minute token lifetime.
+#[derive(Debug, Default)]
+pub(crate) struct MintLedger {
+    entries: parking_lot::Mutex<HashMap<String, MintLedgerEntry>>,
+}
+
+impl MintLedger {
+    /// Record a freshly minted token. Expired entries are swept at the same
+    /// time so a busy server never accumulates dead tokens.
+    pub(crate) fn record(&self, token: &str, entry: MintLedgerEntry) {
+        let mut entries = self.entries.lock();
+        entries.insert(sha256_hex(token), entry);
+        let now = SystemTime::now();
+        entries.retain(|_, entry| entry.expires_at > now);
+    }
+
+    /// Look a token up. Returns `None` when unknown or expired.
+    pub(crate) fn lookup(&self, token: &str) -> Option<MintLedgerEntry> {
+        let entries = self.entries.lock();
+        entries
+            .get(&sha256_hex(token))
+            .cloned()
+            .filter(|entry| entry.expires_at > SystemTime::now())
+    }
+}
+
+/// Hex SHA-256 of `value` — the key form the mint ledger stores tokens under.
+fn sha256_hex(value: &str) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(value.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -251,19 +355,32 @@ impl GitHubAppCredentials {
             mint_failure,
             pat_fallback: None,
             installation_cache: Arc::new(RwLock::new(HashMap::new())),
+            mint_ledger: Arc::new(MintLedger::default()),
+            webhook_secret: None,
+            installation_id: None,
         }
     }
 }
 
-/// Read GitHub App credentials from the config file, overlaid by the
+impl GitHubAppCredentials {
+    /// Read the App's subscribed webhook events from GitHub (`GET /app`).
+    ///
+    /// Authenticates with the App JWT, the only credential `/app` accepts.
+    pub(crate) async fn read_app_events(&self) -> anyhow::Result<Vec<String>> {
+        read_app_events_at(&api_base(), &self.app_id, &self.private_key).await
+    }
+}
+
+/// Read the GitHub App registry from the config file, overlaid by the
 /// environment (`PRELOOP_GITHUB_*` wins over `~/.preloop/config.toml`).
 ///
-/// Returns `Ok(None)` when the App is not configured — including partial
-/// configuration, which is logged rather than fatal so a server with a stale
-/// half-set environment still boots. A private key that is present but
-/// unreadable or malformed *is* fatal: the operator plainly meant to configure
-/// an App, and starting without one would silently downgrade every job token.
-pub(crate) fn load_from_env() -> anyhow::Result<Option<GitHubAppCredentials>> {
+/// Returns `Ok(None)` when no App is configured — including partial
+/// configuration of the legacy single-App vars, which is logged rather than
+/// fatal so a server with a stale half-set environment still boots. A private
+/// key that is present but unreadable or malformed *is* fatal: the operator
+/// plainly meant to configure an App, and starting without one would silently
+/// downgrade every job token.
+pub(crate) fn load_from_env() -> anyhow::Result<Option<GitHubApps>> {
     load_from(&crate::config::load_config()?)
 }
 
@@ -274,10 +391,20 @@ pub(crate) fn load_from_env() -> anyhow::Result<Option<GitHubAppCredentials>> {
 /// which file that was.
 pub(crate) fn load_from(
     file_config: &crate::config::ConfigFile,
-) -> anyhow::Result<Option<GitHubAppCredentials>> {
+) -> anyhow::Result<Option<GitHubApps>> {
     // Parsed before the not-configured early return so a typo is a startup
     // error rather than a surprise the first time a mint fails in production.
     let mint_failure = MintFailurePolicy::from_env_or_config(&file_config.github)?;
+    let pat_fallback = std::env::var("PRELOOP_GITHUB_TOKEN")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| file_config.github.pat.clone());
+
+    let mut apps: Vec<GitHubAppCredentials> = Vec::new();
+    let default_index = 0usize;
+
+    // Legacy single-App env/config first — always the default entry (D6
+    // back-compat).
     let app_id =
         env_non_empty("PRELOOP_GITHUB_APP_ID").or_else(|| file_config.github.app_id.clone());
     let key_source = PRIVATE_KEY_ENV
@@ -290,51 +417,124 @@ pub(crate) fn load_from(
                 .as_ref()
                 .map(|pem| ("config github.app_pem", false, pem.clone()))
         });
-    let pat_fallback = std::env::var("PRELOOP_GITHUB_TOKEN")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .or_else(|| file_config.github.pat.clone());
-
-    let (app_id, source, is_path, value) = match (app_id, key_source) {
-        (Some(app_id), Some((source, is_path, value))) => (app_id, source, is_path, value),
-        (None, None) => return Ok(None),
+    match (app_id, key_source) {
+        (Some(app_id), Some((source, is_path, value))) => {
+            let pem = if is_path {
+                std::fs::read_to_string(&value).with_context(|| {
+                    format!("reading the GitHub App private key from {source}={value}")
+                })?
+            } else {
+                value
+            };
+            let private_key = parse_private_key(&pem)
+                .with_context(|| format!("parsing the GitHub App private key from {source}"))?;
+            debug!(
+                app_id,
+                source,
+                mint_failure = ?mint_failure,
+                "GitHub App token minting enabled"
+            );
+            apps.push(GitHubAppCredentials {
+                app_id,
+                private_key,
+                mint_failure,
+                pat_fallback: pat_fallback.clone(),
+                installation_cache: Arc::new(RwLock::new(HashMap::new())),
+                mint_ledger: Arc::new(MintLedger::default()),
+                // The legacy App's webhook secret is `AppState::webhook_secret`
+                // (`PRELOOP_WEBHOOK_SECRET`); the receiver dedups.
+                webhook_secret: None,
+                installation_id: installation_id_override()?,
+            });
+        }
+        (None, None) => {}
         (Some(_), None) => {
             warn!(
                 "PRELOOP_GITHUB_APP_ID is set but no App private key is; \
-                 GitHub App token minting is disabled"
+                 GitHub App token minting is disabled for it"
             );
-            return Ok(None);
         }
         (None, Some((source, ..))) => {
             warn!(
                 "{source} is set but PRELOOP_GITHUB_APP_ID is not; \
-                 GitHub App token minting is disabled"
+                 GitHub App token minting is disabled for it"
             );
-            return Ok(None);
         }
-    };
+    }
 
-    let pem = if is_path {
-        std::fs::read_to_string(&value)
-            .with_context(|| format!("reading the GitHub App private key from {source}={value}"))?
-    } else {
-        value
+    // Additional registered Apps: `PRELOOP_GITHUB_APPS_JSON` (env) wins over
+    // the config file's `github.apps`.
+    let extra: Vec<crate::config::AppConfig> = match std::env::var("PRELOOP_GITHUB_APPS_JSON")
+        .ok()
+        .map(|raw| raw.trim().to_owned())
+        .filter(|raw| !raw.is_empty())
+    {
+        Some(raw) => {
+            serde_json::from_str(&raw).with_context(|| "parsing PRELOOP_GITHUB_APPS_JSON")?
+        }
+        None => file_config.github.apps.clone(),
     };
-    let private_key = parse_private_key(&pem)
-        .with_context(|| format!("parsing the GitHub App private key from {source}"))?;
-    debug!(
-        app_id,
-        source,
-        mint_failure = ?mint_failure,
-        "GitHub App token minting enabled"
-    );
-    Ok(Some(GitHubAppCredentials {
-        app_id,
-        private_key,
-        mint_failure,
-        pat_fallback,
-        installation_cache: Arc::new(RwLock::new(HashMap::new())),
+    for app in extra {
+        let private_key = parse_private_key(&app.pem)
+            .with_context(|| format!("parsing the private key for GitHub App {}", app.app_id))?;
+        info!(
+            app_id = %app.app_id,
+            "registered additional GitHub App"
+        );
+        apps.push(GitHubAppCredentials {
+            app_id: app.app_id,
+            private_key,
+            mint_failure,
+            pat_fallback: pat_fallback.clone(),
+            installation_cache: Arc::new(RwLock::new(HashMap::new())),
+            mint_ledger: Arc::new(MintLedger::default()),
+            webhook_secret: app.webhook_secret,
+            installation_id: app.installation_id,
+        });
+    }
+
+    if apps.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(GitHubApps {
+        apps,
+        default_index,
     }))
+}
+
+/// Select the App whose installation covers `repository`'s owner (D6).
+///
+/// Installation discovery is cached per App, so steady state is one cached
+/// lookup per App. When no App's installation resolves — including transient
+/// discovery failures — the default (legacy) App is returned so the mint
+/// itself surfaces the real error rather than silently downgrading the job
+/// token.
+pub(crate) async fn select_app_for_repo(
+    shared: &crate::state::SharedState,
+    repository: &str,
+) -> Option<GitHubAppCredentials> {
+    let Some(registry) = shared.state.github_apps.as_ref() else {
+        // No registry — the legacy field (tests, older callers) is the App.
+        return shared.state.github_app.clone();
+    };
+    let owner = match split_repository(repository) {
+        Ok((owner, _)) => owner.to_owned(),
+        Err(_) => return Some(registry.default_app().clone()),
+    };
+    let api_base = api_base();
+    for app in &registry.apps {
+        let app_jwt = match sign_app_jwt(&app.app_id, &app.private_key) {
+            Ok(jwt) => jwt,
+            Err(_) => continue,
+        };
+        if installation_id_for(&api_base, app, &app_jwt, &owner)
+            .await
+            .is_ok()
+        {
+            return Some(app.clone());
+        }
+    }
+    Some(registry.default_app().clone())
 }
 
 /// Mint an installation token for `repository`, scoped to `permissions`.
@@ -448,6 +648,21 @@ async fn mint_for_repository(
     } else {
         attempt?
     };
+    // Every token preloop mints is recorded in the ledger so the dispatch API
+    // can validate it offline (github.com unreachable) without a round-trip.
+    // The recorded permission set is the one the token actually carries —
+    // the clamped set when narrowing occurred.
+    creds.mint_ledger.record(
+        &token,
+        MintLedgerEntry {
+            installation_id,
+            repository: format!("{owner}/{repo}"),
+            permissions: narrowed.clone().unwrap_or_else(|| permissions.clone()),
+            expires_at,
+            app_id: creds.app_id.clone(),
+            account_login: owner.to_owned(),
+        },
+    );
     debug!(
         repository,
         installation_id,
@@ -656,6 +871,11 @@ async fn installation_id_for(
     app_jwt: &str,
     owner: &str,
 ) -> anyhow::Result<u64> {
+    // Per-App override first (D6 `AppConfig.installation_id`), then the
+    // legacy global env override, then discovery (cached).
+    if let Some(installation_id) = creds.installation_id {
+        return Ok(installation_id);
+    }
     if let Some(installation_id) = installation_id_override()? {
         return Ok(installation_id);
     }
@@ -947,6 +1167,20 @@ async fn set_app_webhook_config_at(
         .context("calling GitHub to update the App webhook configuration")?;
     let status = response.status();
     if status.is_success() {
+        // GitHub cannot change an App's event subscription through the API
+        // (only `url`, `content_type`, and `secret` are mutable here), so
+        // read the subscription back and warn when the trigger events preloop
+        // turns into runs are missing — the operator has to tick them in the
+        // App settings UI.
+        match read_app_events_at(api_base, app_id, &creds.private_key).await {
+            Ok(events) => warn_missing_trigger_events(app_id, &events),
+            Err(error) => warn!(
+                app_id,
+                ?error,
+                "could not read back the App's event subscription after updating \
+                 the webhook configuration"
+            ),
+        }
         return Ok(());
     }
     let body = response.text().await.unwrap_or_default();
@@ -954,6 +1188,102 @@ async fn set_app_webhook_config_at(
         "GitHub refused the webhook update ({status}): {}",
         body.trim()
     )
+}
+
+/// Webhook events a preloop GitHub App must subscribe to for the full CI
+/// surface to work (D7). These are the Tier A + trigger events the adapters
+/// turn into runs; an App not subscribed to one of them will never deliver
+/// that webhook to preloop no matter how the workflow YAML is written.
+pub(crate) fn required_trigger_events() -> &'static [&'static str] {
+    &[
+        "push",
+        "pull_request",
+        "pull_request_target",
+        "pull_request_review",
+        "workflow_dispatch",
+        "workflow_run",
+        "repository_dispatch",
+        "issue_comment",
+        "issues",
+        "check_run",
+        "check_suite",
+        "create",
+        "delete",
+        "release",
+    ]
+}
+
+/// The required trigger events `subscribed` is missing, in canonical order.
+pub(crate) fn missing_trigger_events(subscribed: &[String]) -> Vec<String> {
+    required_trigger_events()
+        .iter()
+        .filter(|event| !subscribed.iter().any(|have| have == *event))
+        .map(|event| (*event).to_owned())
+        .collect()
+}
+
+/// Loudly warn when an App's subscribed events do not cover the trigger set.
+///
+/// GitHub cannot change an App's event subscription through the API — only
+/// the App settings UI can — so this is a warning with exact instructions,
+/// not an attempt to fix the App.
+pub(crate) fn warn_missing_trigger_events(app_id: &str, subscribed: &[String]) {
+    let missing = missing_trigger_events(subscribed);
+    if missing.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        app_id,
+        missing = %missing.join(", "),
+        "GitHub App {app_id} is not subscribed to webhook events preloop needs \
+         (missing: {}). GitHub will never deliver those events to preloop. Open \
+         the App's settings (https://github.com/settings/apps/{app_id}) → Webhooks \
+         → Edit → and tick the missing events.",
+        missing.join(", ")
+    );
+}
+
+/// Read the webhook events an App is subscribed to via `GET /app`.
+///
+/// Authenticates with the App JWT — the only credential `/app` accepts.
+/// Returns the `events` array; a transport or auth failure is an error so
+/// the caller decides how loudly to fail (fail closed, never pretend the
+/// subscription is fine when it could not be read).
+pub(crate) async fn read_app_events_at(
+    api_base: &str,
+    app_id: &str,
+    private_key: &rsa::RsaPrivateKey,
+) -> anyhow::Result<Vec<String>> {
+    let app_jwt = sign_app_jwt(app_id, private_key)?;
+    let response = CLIENT
+        .get(format!("{api_base}/app"))
+        .header("User-Agent", "preloop")
+        .header("Authorization", format!("Bearer {app_jwt}"))
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .with_context(|| format!("GET {api_base}/app"))?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!(
+            "GET /app failed with {status}: {}",
+            body.chars().take(1024).collect::<String>()
+        );
+    }
+    let payload: serde_json::Value =
+        serde_json::from_str(&body).with_context(|| "GET /app returned a non-JSON body")?;
+    let events = payload
+        .get("events")
+        .and_then(serde_json::Value::as_array)
+        .map(|events| {
+            events
+                .iter()
+                .filter_map(|event| event.as_str().map(str::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Ok(events)
 }
 
 /// Build credentials from raw config pieces (no environment involved).
@@ -965,6 +1295,9 @@ fn credentials_for(app_id: &str, pem: &str) -> anyhow::Result<GitHubAppCredentia
         mint_failure: MintFailurePolicy::LocalJwt,
         pat_fallback: None,
         installation_cache: Arc::new(RwLock::new(HashMap::new())),
+        mint_ledger: Arc::new(MintLedger::default()),
+        webhook_secret: None,
+        installation_id: None,
     })
 }
 
@@ -1241,6 +1574,9 @@ mod tests {
             mint_failure: MintFailurePolicy::LocalJwt,
             pat_fallback: None,
             installation_cache: Arc::new(RwLock::new(HashMap::new())),
+            mint_ledger: Arc::new(MintLedger::default()),
+            webhook_secret: None,
+            installation_id: None,
         };
         let permissions = BTreeMap::from([
             ("contents".to_owned(), "read".to_owned()),
@@ -1736,6 +2072,118 @@ mod tests {
                 ("issues".to_owned(), "read".to_owned()),
             ],
             "401/403 probes are skipped; successes are still reported"
+        );
+    }
+
+    #[test]
+    fn missing_trigger_events_reports_only_absent_required_events() {
+        let complete = required_trigger_events()
+            .iter()
+            .map(|event| (*event).to_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            missing_trigger_events(&complete).is_empty(),
+            "a full subscription has nothing missing"
+        );
+
+        let partial = vec![
+            "push".to_owned(),
+            "pull_request".to_owned(),
+            "repository_dispatch".to_owned(),
+        ];
+        let missing = missing_trigger_events(&partial);
+        assert!(missing.contains(&"workflow_dispatch".to_owned()));
+        assert!(missing.contains(&"issue_comment".to_owned()));
+        assert!(!missing.contains(&"push".to_owned()));
+        // Canonical order (the order of `required_trigger_events`), no
+        // duplicates.
+        let canonical: Vec<String> = required_trigger_events()
+            .iter()
+            .filter(|event| missing.iter().any(|missing| missing == *event))
+            .map(|event| (*event).to_owned())
+            .collect();
+        assert_eq!(missing, canonical);
+    }
+
+    #[tokio::test]
+    async fn read_app_events_parses_the_subscription_from_github() {
+        use axum::routing::get;
+        use axum::Json;
+        use axum::Router;
+
+        let seen_auth: Arc<std::sync::Mutex<Option<String>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let stub = Router::new().route(
+            "/app",
+            get({
+                let seen_auth = Arc::clone(&seen_auth);
+                move |headers: axum::http::HeaderMap| {
+                    let seen_auth = Arc::clone(&seen_auth);
+                    async move {
+                        *seen_auth.lock().expect("stub state") = headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned);
+                        Json(json!({
+                            "id": 424,
+                            "slug": "preloop-local-app",
+                            "events": ["push", "pull_request", "workflow_dispatch"]
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub API");
+        let api_base = format!("http://{}", listener.local_addr().expect("stub address"));
+        tokio::spawn(async move { axum::serve(listener, stub).await.expect("serve stub API") });
+
+        let key = test_key();
+        let events = read_app_events_at(&api_base, "424", &key)
+            .await
+            .expect("the stub serves the App's subscription");
+        assert_eq!(
+            events,
+            vec![
+                "push".to_owned(),
+                "pull_request".to_owned(),
+                "workflow_dispatch".to_owned(),
+            ]
+        );
+        let auth = seen_auth.lock().expect("stub state");
+        let token = auth
+            .as_deref()
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .expect("the read-back must authenticate with the App JWT");
+        assert!(
+            !token.starts_with("ghs_"),
+            "an App JWT, not an installation token, authenticates GET /app"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_app_events_fails_closed_when_github_refuses() {
+        use axum::http::StatusCode;
+        use axum::routing::get;
+        use axum::Router;
+
+        let stub = Router::new().route(
+            "/app",
+            get(|| async { (StatusCode::UNAUTHORIZED, "bad credentials") }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub API");
+        let api_base = format!("http://{}", listener.local_addr().expect("stub address"));
+        tokio::spawn(async move { axum::serve(listener, stub).await.expect("serve stub API") });
+
+        let error = read_app_events_at(&api_base, "424", &test_key())
+            .await
+            .expect_err("a refused read-back must be an error, never an empty subscription");
+        assert!(
+            error.to_string().contains("401"),
+            "the error must surface the status: {error:#}"
         );
     }
 }

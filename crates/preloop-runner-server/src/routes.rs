@@ -317,6 +317,38 @@ pub(crate) fn build_app(
             "/api/v3/repos/:owner/:repo/actions/runners/registration-token",
             post(github_registration_token),
         )
+        // GitHub-compatible dispatch API (surface 2): authenticated through
+        // the D2 chain (system bearer, PAT, own-App JWT, installation
+        // tokens) — see `dispatch_auth.rs`. Auth is mandatory; github.com
+        // returns 401 without a token.
+        .route(
+            "/repos/:owner/:repo/actions/workflows/:workflow_id/dispatches",
+            post(crate::dispatch::workflow_dispatch).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                crate::dispatch_auth::require_dispatch_auth,
+            )),
+        )
+        .route(
+            "/repos/:owner/:repo/dispatches",
+            post(crate::dispatch::repository_dispatch).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                crate::dispatch_auth::require_dispatch_auth,
+            )),
+        )
+        .route(
+            "/repos/:owner/:repo/actions/workflows",
+            get(crate::dispatch::list_workflows).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                crate::dispatch_auth::require_dispatch_auth,
+            )),
+        )
+        .route(
+            "/repos/:owner/:repo/actions/runs",
+            get(crate::dispatch::list_actions_runs).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                crate::dispatch_auth::require_dispatch_auth,
+            )),
+        )
         .route("/runner/server/_apis/connectionData", get(connection_data))
         .route("/runner/server/_apis/v1/oauth2/token", post(oauth2_token))
         .route("/runner/server/_apis/v1/AgentPools", get(runner_pools))

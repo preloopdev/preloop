@@ -6,7 +6,37 @@ This document records the design, build log, and interaction guide for the end-t
 
 ## 1. Webhook Architecture Overview
 
-The webhook system enables `preloop` to receive push and pull_request notifications directly from GitHub, fetch matching workflow files, and queue jobs for self-hosted runners. It also integrates with the GitHub Checks API to report status back to the repository.
+The webhook system enables `preloop` to receive GitHub App webhook events
+directly from GitHub, fetch matching workflow files, and queue jobs for
+self-hosted runners. It also integrates with the GitHub Checks API to report
+status back to the repository.
+
+### Supported events
+
+The webhook receiver understands every event the `EventAdapter` registry
+supports (`src/events/mod.rs`, `all_event_names()`):
+
+| Tier | Events |
+|---|---|
+| A — CI-critical | `push`, `pull_request`, `pull_request_target`, `pull_request_review`, `workflow_dispatch`, `workflow_run`, `check_run`, `check_suite`, `repository_dispatch`, `create`, `delete`, `release` |
+| B — issue/PR/social | `issues`, `issue_comment`, `discussion`, `discussion_comment`, `label`, `milestone` |
+| C — release/admin/fork/wiki | `watch`, `fork`, `deployment`, `deployment_status`, `member`, `public`, `gollum`, `page_build` |
+| Internal | `schedule` (synthesized by the cron scheduler, never delivered as a webhook) |
+
+The App-manifest flow (`GET /api/v1/github/register`) pre-subscribes a new App
+to every webhook event above except `schedule` (which is a workflow *trigger*,
+not a webhook event GitHub can subscribe an App to). Override the manifest's
+event list with `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` (comma-separated) when a
+narrower, single-purpose App is wanted.
+
+At startup preloop reads an existing App's subscription back from GitHub
+(`GET /app`, App-JWT auth) and **warns loudly** when the trigger events it
+turns into runs are missing (`push`, `pull_request`, `pull_request_target`,
+`pull_request_review`, `workflow_dispatch`, `workflow_run`,
+`repository_dispatch`, `issue_comment`, `issues`, `check_run`, `check_suite`,
+`create`, `delete`, `release`). GitHub cannot change an App's event
+subscription through the API — tick the missing events under the App's
+settings → Webhooks → Edit.
 
 ### Data Flow diagram:
 
@@ -50,14 +80,19 @@ The system is configured using the following environment variables:
 
 `preloop` verifies that incoming webhooks are authentic:
 - When `PRELOOP_WEBHOOK_SECRET` is set, `preloop` computes the HMAC-SHA256 signature of the raw request body and verifies it against the `x-hub-signature-256` header.
-- If verification fails or the header is missing, the endpoint returns `401 Unauthorized`.
-- If `PRELOOP_WEBHOOK_SECRET` is not configured, signature checking is skipped, enabling easier local testing.
+- If verification fails, the header is missing, or no secret is configured at
+  all, the endpoint returns `401 Unauthorized` — signature verification is
+  mandatory, never skipped.
+- With multiple registered Apps (`github.apps`, see
+  [GitHub Tokens](./github-tokens.md)), the signature is verified against
+  **each** App's webhook secret; a payload signed by any registered App is
+  accepted, and one signed by none is rejected.
 
 ---
 
 ## 4. Workflow Fetching Strategies
 
-When a push or PR webhook is received, `preloop` retrieves the workflow definitions:
+When a webhook event is received, `preloop` retrieves the workflow definitions:
 1. **Local Filesystem (Offline/Dev Mode)**:
    If `PRELOOP_LOCAL_WORKSPACE` is configured, `preloop` reads the `.github/workflows/`
    directory directly from that local path. For a default
@@ -90,11 +125,17 @@ If `PRELOOP_GITHUB_TOKEN` is not configured, these requests are simulated in-mem
 ## 6. How Users Interact with it
 
 ### Step 1: Set up Webhook in GitHub
-1. Go to your GitHub App or Repository settings.
+1. Go to your GitHub App settings.
 2. Set the payload URL to `http://<your-preloop-url>/api/v1/github/webhooks`.
 3. Set the content type to `application/json`.
 4. Enter a secure Webhook Secret (e.g. `super-secret`).
-5. Select the **Push** and **Pull Request** events.
+5. Select the events preloop should turn into runs. For the full surface,
+   tick every event in the table above; the manifest flow
+   (`GET /api/v1/github/register`) does this automatically for new Apps.
+   At minimum, tick the trigger events: `push`, `pull_request`,
+   `pull_request_target`, `pull_request_review`, `workflow_dispatch`,
+   `workflow_run`, `repository_dispatch`, `issue_comment`, `issues`,
+   `check_run`, `check_suite`, `create`, `delete`, `release`.
 
 ### Step 2: Start `preloop-runner-server`
 Run the server with the environment variables set:
@@ -107,7 +148,8 @@ just serve
 ```
 
 ### Step 3: Trigger workflows
-Push a commit or open a pull request. `preloop` will:
+Push a commit, open a pull request, dispatch a workflow through the REST API,
+or trigger any other subscribed event. `preloop` will:
 - Receive the webhook event.
 - Fetch the workflows.
 - Match filters (branches, tags, paths).

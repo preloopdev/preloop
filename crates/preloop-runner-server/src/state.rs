@@ -386,6 +386,15 @@ pub struct AppState {
     /// `None` when no App is configured, in which case job tokens fall back to
     /// `PRELOOP_GITHUB_TOKEN` and then to the local HMAC JWT.
     pub(crate) github_app: Option<crate::github_app::GitHubAppCredentials>,
+    /// The full registered GitHub App registry (D6). The legacy env-var App
+    /// is always the first entry and mirrors `github_app`.
+    pub(crate) github_apps: Option<crate::github_app::GitHubApps>,
+    /// Short-TTL cache of installation tokens validated against github.com
+    /// for the GitHub-compatible dispatch API (D2.4).
+    pub(crate) dispatch_token_cache: Arc<crate::dispatch_auth::InstallationTokenCache>,
+    /// Short-TTL cache of actor logins resolved for dispatch authentication
+    /// (PAT `GET /user`, App `GET /app`).
+    pub(crate) dispatch_actor_cache: Arc<crate::dispatch_auth::DispatchActorCache>,
     /// Static PAT used for job tokens when no GitHub App is configured.
     ///
     /// Sourced from `PRELOOP_GITHUB_TOKEN` (which wins) or, failing that, the
@@ -642,7 +651,10 @@ impl AppState {
         // durable base set.
         let credential = crate::config::load_credential_secrets()?;
         crate::config::merge_secret_stores(&mut config, credential);
-        let github_app = crate::github_app::load_from(&config)?;
+        let github_apps = crate::github_app::load_from(&config)?;
+        let github_app = github_apps
+            .as_ref()
+            .map(|registry| registry.default_app().clone());
         // Env wins over the config file, matching every other credential
         // here. An empty value in either source counts as unset: a blank
         // export must not disable signature verification silently.
@@ -729,6 +741,9 @@ impl AppState {
             secrets,
             secret_mutation: Arc::new(Mutex::new(())),
             github_app,
+            github_apps,
+            dispatch_token_cache: Arc::new(crate::dispatch_auth::InstallationTokenCache::default()),
+            dispatch_actor_cache: Arc::new(crate::dispatch_auth::DispatchActorCache::default()),
             github_pat,
             github_urls,
             action_sha_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
