@@ -448,7 +448,7 @@ Every item below broke a real workflow step and was fixed in preloop:
 | `moby/moby` | `ci.yml` | build (binary/dynbinary, amd64+arm64 cells) ✅, validate-dco ✅, cross/build-dind/prepare-cross/success ✅, govulncheck ✅ after the env fix |
 | `neovim/neovim` | `test.yml` | lintc/lint/clang-analyzer/zig-build ✅; posix ubuntu cells ✅; macos/windows cells fail via the starvation sweep (no such runners). The run-level `concurrency:` group deadlock found through this workflow is fixed (1c.1) |
 | `microsoft/TypeScript` | `ci.yml` | 15 ubuntu cells ✅ (node 14→lts/* matrix + baselines/format/knip/lint/misc/self-check/smoke/typecheck, package-size gated off, `required` gate ✅); windows/macos cells fail via the starvation sweep; one coverage cell hit a transient virtiofs mount race |
-| `astral-sh/ruff` | `ci.yaml` | determine-changes gated matrix: unchanged-path jobs skip ✅; fmt/shellcheck/clippy/prek/mkdocs/formatter/ruff-lsp/instrumented-benchmarks/16 cargo+test cells ✅; remaining failures are environmental: x86_64-binaries-in-arm64-guest (release/wasm test cells), `/tmp` tmpfs EXDEV (python-package), one cargo-package verification quirk |
+| `astral-sh/ruff` | `ci.yaml` | determine-changes gated matrix: unchanged-path jobs skip ✅; fmt/shellcheck/clippy/prek/mkdocs/formatter/ruff-lsp/instrumented-benchmarks/16 cargo+test cells ✅; remaining failures: Preloop does not register SmolVM's mounted Rosetta translator in the aarch64 guest (release/wasm test cells), `/tmp` tmpfs EXDEV (python-package), one cargo-package verification quirk |
 | `nodejs/node` | `test-linux.yml` | remote x86_64 leg: checkout/sudo/rustup/setup-python/apt all work (App-token checkout fixed via PAT + real payload SHA); remote builds keep flaking on apt under I/O contention. Local ubuntu + arm jobs both pass checkout, clang-19, rustup, setup-python, sccache and the full `make build-ci`; both workers then fail during `Test`. Their final test output was not uploaded, so the underlying assertion is unknown. The resulting terminal-step/log-recovery diagnostic gap is fixed in 1c.1 |
 
 ### 1c.4 Still open
@@ -469,14 +469,13 @@ Every item below broke a real workflow step and was fixed in preloop:
   run failures that are fleet-caused, not workflow-caused. A re-run after
   the fleet settles is the practical mitigation; baking the runner user
   into the golden would remove the useradd write from the fork path.
-- **No x86_64-in-arm64-guest execution.** The aarch64 guests lack the
-  Rosetta loader mount (`/lib64/ld-linux-x86-64.so.2`) and binfmt
-  registration, so anything that runs an x86_64 binary inside the arm64
-  guest fails (`rosetta error: failed to open elf`). setup-python on the
-  arm64 guest downloads the correct arm64 build; the earlier x64 downloads
-  were a stale-golden-era artifact. GitHub's arm64 runners cannot run
-  x86_64 either, so this is only hit when a workflow insists on executing
-  foreign-arch binaries.
+- **Rosetta is mounted but not registered inside aarch64 guests.** Preloop
+  already requests `smolvm machine update --rosetta` on Apple Silicon, and
+  the campaign VMs expose SmolVM's translator at `/mnt/rosetta`. The guest
+  has no corresponding binfmt registration, however, so directly executing
+  an x86_64 binary still fails. This is a Preloop guest-bootstrap gap, not a
+  SmolVM capability gap. Docker actions additionally need the Rosetta mount
+  propagated into containers.
 - **`/tmp` is tmpfs**, so third-party actions that `rename()` across
   `/tmp` → toolcache die with `EXDEV` (setup-wasm-pack does exactly this).
   GitHub's image keeps `/tmp` on disk; the golden could mask
