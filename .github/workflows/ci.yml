@@ -57,6 +57,7 @@ jobs:
       # concurrency so the dogfood VM survives preloop-runner's suite.
       PROPTEST_CASES: "8"
       RUST_TEST_THREADS: "2"
+      RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
@@ -81,15 +82,30 @@ jobs:
       # inline run steps work against preloop
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
 
+      # Runner executes as root in the pool VM; sudo's audit plugin fails on
+      # the mis-owned /etc/sudoers in the golden, so call apt directly.
+      - name: Install lld linker
+        run: apt-get update && apt-get install -y --no-install-recommends lld
+
       - run: cargo fmt --all --check
       - run: |
           # Run clippy on warning-free crates with strict -D warnings
           cargo clippy --locked -p preloop-gha-protocol -p preloop-gha-parser -p preloop-gha-expressions -p preloop-cache -p preloop-artifacts -p runner-watch -p preloop-conformance --all-targets -- -D warnings
           # Run clippy on crates with pre-existing warnings without -D warnings
           cargo clippy --locked -p preloop-runner -p preloop-runner-server -p preloop-runner-client -p preloop-dap --all-targets
-      - run: cargo test --locked --workspace
+      # E2: cranelift codegen backend. Compiles fast and uses far less
+      # memory than LLVM (so JOBS=4), but generates unoptimized code the
+      # tests then run on — this job is test-dominated, expect a net loss.
+      - name: Install cranelift backend
+        run: rustup toolchain install nightly --profile minimal --component rustc-codegen-cranelift-preview
+
+      - run: |
+          BACKEND=$(find "$(rustc +nightly --print sysroot)" -name 'librustc_codegen_cranelift*.so' | head -1)
+          echo "cranelift backend: $BACKEND"
+          RUSTFLAGS="-Zunstable-options -Zcodegen-backend=$BACKEND -A warnings" \
+            cargo +nightly test --locked --workspace
         env:
-          RUSTFLAGS: "-A warnings"
+          CARGO_BUILD_JOBS: "4"
 
   # Bounded property-test profile
   property-tests-fast:
