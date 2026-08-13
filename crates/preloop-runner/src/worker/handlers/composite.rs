@@ -356,9 +356,25 @@ fn run_composite_action_inner<'a>(
                         .map(|_| "Success".to_string()),
                     }
                 } else {
-                    super::action::run_action(uses, &inner_with, workspace, ctx, cancel_rx.clone())
+                    // Nested remote action: job-start preparation stages only
+                    // the message's own steps, so download it on demand (the
+                    // official runner resolves nested refs when the composite
+                    // is first invoked).
+                    let staged =
+                        super::action::ensure_remote_action_staged(uses, workspace, ctx).await;
+                    match staged {
+                        Ok(action_dir) => super::action::run_action_from_dir(
+                            &action_dir,
+                            &inner_with,
+                            workspace,
+                            ctx,
+                            cancel_rx.clone(),
+                            Some(uses),
+                        )
                         .await
-                        .map(|_| "Success".to_string())
+                        .map(|_| "Success".to_string()),
+                        Err(error) => Err(error),
+                    }
                 }
             } else {
                 Ok("Skipped".to_string())
@@ -409,7 +425,13 @@ fn run_composite_action_inner<'a>(
             );
 
             if outcome.is_err() && !continue_on_error {
-                break;
+                // GitHub fails the composite (and therefore the outer step)
+                // when any inner step fails. Swallowing the failure here made
+                // the outer step report success while the environment was left
+                // half-configured — mastodon's setup-ruby composite passed
+                // even though its ruby/setup-ruby step never ran, and the
+                // workflow died later with a Ruby version mismatch.
+                return Err(outcome.unwrap_err());
             }
         }
 
@@ -667,7 +689,7 @@ mod tests {
         let mut ctx = StepContext::new(&mut job, "composite".into(), "Composite".into());
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
-        run_composite_action(
+        let result = run_composite_action(
             &manifest,
             workspace.path(),
             &serde_json::json!({}),
@@ -675,9 +697,11 @@ mod tests {
             &mut ctx,
             cancel_rx,
         )
-        .await
-        .unwrap();
-
+        .await;
+        assert!(
+            result.is_err(),
+            "a failed composite inner step must fail the composite (GitHub semantics)"
+        );
         assert!(!ctx.log_content().contains("should-not-run"));
     }
 

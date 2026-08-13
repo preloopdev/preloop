@@ -120,6 +120,50 @@ fn resolve_remote_action(
     }
 }
 
+/// Stage a remote action on demand and return its resolved directory.
+///
+/// Job-start preparation only stages the actions named by the message's own
+/// steps, so a `uses:` nested inside a composite action (e.g.
+/// `ruby/setup-ruby@v1` in a local `.github/actions/*`) is never downloaded
+/// there. GitHub downloads nested actions when the composite is first
+/// invoked; this replicates that. Cached under `_actions/` like the
+/// prepared ones, and remembered in `action_paths` for later steps.
+pub(crate) async fn ensure_remote_action_staged(
+    uses: &str,
+    workspace: &str,
+    ctx: &mut StepContext<'_>,
+) -> Result<std::path::PathBuf> {
+    if let Some(path) = ctx.job.action_paths.get(uses) {
+        return Ok(std::path::PathBuf::from(path));
+    }
+    let (repo_part, git_ref) = uses
+        .split_once('@')
+        .context("action reference must contain @ref")?;
+    let parts: Vec<&str> = repo_part.splitn(3, '/').collect();
+    if parts.len() < 2 {
+        anyhow::bail!("invalid action reference: {uses}");
+    }
+    let (owner, repo) = (parts[0], parts[1]);
+    let subpath = if parts.len() > 2 { parts[2] } else { "" };
+
+    let base = std::path::Path::new(workspace)
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    let actions_dir = base.join("_actions");
+    let action_root =
+        crate::worker::actions::manager::download_action(owner, repo, git_ref, &actions_dir, None, None)
+            .await?;
+    let action_dir = if subpath.is_empty() {
+        action_root
+    } else {
+        action_root.join(subpath)
+    };
+    ctx.job
+        .action_paths
+        .insert(uses.to_owned(), action_dir.to_string_lossy().into_owned());
+    Ok(action_dir)
+}
+
 fn set_action_repository_context(ctx: &mut StepContext<'_>, uses: &str) {
     // Set github.action to the step's context name (matches official runner behavior)
     ctx.job.set_github_context_value(
@@ -168,6 +212,36 @@ mod tests {
             action_repository_context("actions/checkout/path@v4"),
             Some(("actions/checkout".to_string(), "v4".to_string()))
         );
+    }
+
+    #[tokio::test]
+    async fn ensure_remote_action_staged_returns_prepared_path_without_download() {
+        // A nested action already staged (by a previous composite invocation
+        // or by job preparation) must resolve from `action_paths` without
+        // touching the network.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let mut job = crate::worker::contexts::JobContext::new(
+            "j1".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({"github": {"workspace": workspace.path()}}),
+        );
+        job.workspace = Some(workspace.path().to_string_lossy().to_string());
+        let staged = workspace.path().join("_actions/ruby/setup-ruby/sha");
+        std::fs::create_dir_all(&staged).unwrap();
+        job.action_paths.insert(
+            "ruby/setup-ruby@6e5d382445ae5590b7449d8b3bc8cb1c2c27f617".to_owned(),
+            staged.to_string_lossy().into_owned(),
+        );
+        let mut ctx = StepContext::new(&mut job, "composite".into(), "Composite".into());
+        let resolved = crate::worker::handlers::action::ensure_remote_action_staged(
+            "ruby/setup-ruby@6e5d382445ae5590b7449d8b3bc8cb1c2c27f617",
+            workspace.path().to_str().unwrap(),
+            &mut ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved, staged);
     }
 
     #[test]
