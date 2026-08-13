@@ -393,6 +393,7 @@ impl ProdState {
             event: "push".to_owned(),
             conclusion: None,
             push_state: None,
+            snapshot_timing: None,
         };
         self.inner.runs.insert(run_id, record);
     }

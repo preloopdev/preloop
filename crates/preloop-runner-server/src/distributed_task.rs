@@ -630,6 +630,7 @@ pub(crate) async fn complete_job_inner(
             for step in &mut run.jobs_list[pos].steps {
                 if step.conclusion == "in_progress" {
                     step.conclusion = step_conclusion.clone();
+                    step.finished_at = step.finished_at.or(Some(chrono::Utc::now()));
                 }
             }
             if !completion.annotations.is_empty() {

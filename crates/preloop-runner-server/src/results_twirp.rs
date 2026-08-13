@@ -112,13 +112,20 @@ pub(crate) async fn twirp_workflow_steps_update(
                         } else {
                             "in_progress"
                         };
+                        let terminal = status_num == 6;
+                        let observed = chrono::Utc::now();
 
                         if let Some(pos) = job_detail.steps.iter().position(|s| s.name == name) {
                             job_detail.steps[pos].conclusion = conclusion_str.to_owned();
+                            if terminal && job_detail.steps[pos].finished_at.is_none() {
+                                job_detail.steps[pos].finished_at = Some(observed);
+                            }
                         } else {
                             job_detail.steps.push(StepRecord {
                                 name,
                                 conclusion: conclusion_str.to_owned(),
+                                started_at: Some(observed),
+                                finished_at: terminal.then_some(observed),
                             });
                         }
                     }

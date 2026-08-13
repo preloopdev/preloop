@@ -901,6 +901,7 @@ pub(crate) async fn submit_run_inner(
                     event: event.clone(),
                     conclusion: Some("failure".to_owned()),
                     push_state: None,
+                    snapshot_timing: None,
                 },
             );
             drop(inner);
@@ -1061,6 +1062,7 @@ pub(crate) async fn submit_run_inner(
                             event: event.clone(),
                             conclusion: Some("cancelled".to_owned()),
                             push_state: None,
+                            snapshot_timing: None,
                         },
                     );
                     drop(inner);
@@ -1128,6 +1130,7 @@ pub(crate) async fn submit_run_inner(
                     event: event.clone(),
                     conclusion: None,
                     push_state: None,
+                    snapshot_timing: None,
                 },
             );
             drop(inner);
@@ -1187,6 +1190,9 @@ pub(crate) async fn submit_run_inner(
                 event: event.clone(),
                 conclusion: None,
                 push_state: None,
+                snapshot_timing: workspace_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.snapshot_timing),
             },
         );
 
@@ -1294,6 +1300,9 @@ pub(crate) async fn submit_run_inner(
                 s
             }
         };
+        let snapshot_timing = workspace_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.snapshot_timing);
         inner.runs.insert(
             run_id,
             RunRecord {
@@ -1325,6 +1334,7 @@ pub(crate) async fn submit_run_inner(
                 event: event.clone(),
                 conclusion: None,
                 push_state: None,
+                snapshot_timing,
             },
         );
         // Deferred reusable-caller nodes whose needs are already satisfied

@@ -2948,6 +2948,7 @@ mod assignment_tests {
                 event: "push".to_owned(),
                 conclusion: None,
                 push_state: None,
+                snapshot_timing: None,
                 status: ExecutionStatus::Queued,
             },
         );

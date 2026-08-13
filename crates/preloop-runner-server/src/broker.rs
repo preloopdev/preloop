@@ -289,6 +289,7 @@ pub(crate) async fn next_message_broker_ref(
 
         if let Some(run) = inner.runs.get_mut(&queued.run_id) {
             run.status = ExecutionStatus::InProgress;
+            run.started_at.get_or_insert_with(chrono::Utc::now);
             run.jobs
                 .insert(queued.job_id.clone(), ExecutionStatus::InProgress);
         }
@@ -576,6 +577,7 @@ pub(crate) async fn next_message_broker_ref_root(
                 if let Some(queued) = claimed {
                     if let Some(run) = inner.runs.get_mut(&queued.run_id) {
                         run.status = ExecutionStatus::InProgress;
+                        run.started_at.get_or_insert_with(chrono::Utc::now);
                         run.jobs
                             .insert(queued.job_id.clone(), ExecutionStatus::InProgress);
                     }
@@ -962,10 +964,11 @@ pub(crate) async fn mint_dispatch_github_token(
     shared: &Arc<SharedState>,
     request: &GitHubTokenRequest,
 ) -> Result<Option<MintedGitHubToken>, ApiError> {
+    let started = std::time::Instant::now();
     let Some(app) = &shared.state.github_app else {
         return Ok(None);
     };
-    match crate::github_app::get_or_mint_token_declared(
+    let minted = match crate::github_app::get_or_mint_token_declared(
         app,
         &request.repository,
         &request.permissions,
@@ -973,10 +976,10 @@ pub(crate) async fn mint_dispatch_github_token(
     )
     .await
     {
-        Ok((token, effective_permissions)) => Ok(Some(MintedGitHubToken {
+        Ok((token, effective_permissions)) => Some(MintedGitHubToken {
             token,
             effective_permissions,
-        })),
+        }),
         Err(error) => {
             let fallback =
                 crate::github_app::fallback_token(app.mint_failure, app.pat_fallback.clone())
@@ -986,6 +989,11 @@ pub(crate) async fn mint_dispatch_github_token(
                             request.repository
                         ))
                     })?;
+            info!(
+                    repository = %request.repository,
+                duration_ms = started.elapsed().as_millis() as u64,
+                "GitHub token minted at claim (fallback path)"
+            );
             if fallback.is_some() {
                 warn!(
                     repository = %request.repository,
@@ -997,12 +1005,18 @@ pub(crate) async fn mint_dispatch_github_token(
                     "GitHub App token minting failed; job retains local runtime token: {error:#}"
                 );
             }
-            Ok(fallback.map(|token| MintedGitHubToken {
+            fallback.map(|token| MintedGitHubToken {
                 token,
                 effective_permissions: None,
-            }))
+            })
         }
-    }
+    };
+    info!(
+        repository = %request.repository,
+        duration_ms = started.elapsed().as_millis() as u64,
+        "GitHub token minted at claim"
+    );
+    Ok(minted)
 }
 
 pub(crate) async fn broker_renew_job(

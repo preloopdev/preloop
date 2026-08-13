@@ -42,6 +42,10 @@ pub(crate) struct WorkspaceSnapshot {
     /// covers the last commit the user wants tested). `None` on an unborn or
     /// initial-commit clean tree yields the null-SHA "initial push" base.
     pub(crate) before_sha: Option<String>,
+    /// Server-side cost of capturing this snapshot; present on snapshots
+    /// created after the timing instrumentation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) snapshot_timing: Option<crate::models::SnapshotTiming>,
 }
 
 /// Capture `workspace` as an immutable cache-backed bare repository for `run_id`.
@@ -57,6 +61,7 @@ pub(crate) async fn create_workspace_snapshot(
     run_id: RunId,
     github_pat: Option<&str>,
 ) -> Result<WorkspaceSnapshot, ApiError> {
+    let started = std::time::Instant::now();
     let workspace = std::fs::canonicalize(workspace).map_err(|error| {
         ApiError::bad_request(format!(
             "failed to resolve local workspace {}: {error}",
@@ -124,9 +129,26 @@ pub(crate) async fn create_workspace_snapshot(
         default_branch,
         before_sha,
     } = result?;
+    let timing = match snapshot_repo_timing(&final_repository) {
+        Ok(mut stats) => {
+            stats.duration_ms = started.elapsed().as_millis() as u64;
+            Some(stats)
+        }
+        Err(error) => {
+            warn!(
+                %run_id,
+                %error,
+                "Failed to collect snapshot repository stats"
+            );
+            None
+        }
+    };
     info!(
         %run_id,
         %commit_sha,
+        duration_ms = timing.map(|t| t.duration_ms).unwrap_or_default(),
+        object_count = timing.map(|t| t.object_count).unwrap_or_default(),
+        pack_bytes = timing.map(|t| t.pack_bytes).unwrap_or_default(),
         repository = %final_repository.display(),
         "Created immutable workspace snapshot"
     );
@@ -136,6 +158,47 @@ pub(crate) async fn create_workspace_snapshot(
         repository,
         default_branch,
         before_sha,
+        snapshot_timing: timing,
+    })
+}
+
+/// Object-count and stored-size statistics for a snapshot repository.
+///
+/// The snapshot's own objects live in a pack inside the repo directory, but
+/// the bulk of a real tree is shared through the alternate object cache —
+/// `git count-objects -v` never sees alternates. The number a checkout's
+/// fetch would transfer is the reachable set, so count it with
+/// `rev-list --objects --all` (includes alternates). Stored bytes are the
+/// run-owned repository directory (`du`), the incremental storage the run
+/// added to the state directory.
+fn snapshot_repo_timing(repository: &FsPath) -> anyhow::Result<crate::models::SnapshotTiming> {
+    use std::process::Command;
+    let count = Command::new("git")
+        .arg("--git-dir")
+        .arg(repository)
+        .args(["rev-list", "--objects", "--all"])
+        .output()?;
+    if !count.status.success() {
+        anyhow::bail!(
+            "git rev-list failed: {}",
+            String::from_utf8_lossy(&count.stderr).trim()
+        );
+    }
+    let object_count = count.stdout.iter().filter(|byte| **byte == b'\n').count() as u64;
+    let du = Command::new("du").arg("-sk").arg(repository).output()?;
+    let size_kib = if du.status.success() {
+        String::from_utf8_lossy(&du.stdout)
+            .split_whitespace()
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    Ok(crate::models::SnapshotTiming {
+        duration_ms: 0, // filled by the caller
+        object_count,
+        pack_bytes: size_kib,
     })
 }
 
@@ -1335,9 +1398,14 @@ struct CacheLock(PathBuf);
 /// with HTTP 500. The persistent object cache is untouched: it is shared and
 /// is what makes the next snapshot cheap.
 pub(crate) async fn discard_workspace_snapshot(state_dir: &FsPath, run_id: RunId) {
+    let started = std::time::Instant::now();
     let repository = state_dir.join("snapshots").join(run_id.to_string());
     match tokio::fs::remove_dir_all(&repository).await {
-        Ok(()) => debug!(%run_id, "Discarded finished run's workspace snapshot"),
+        Ok(()) => debug!(
+            %run_id,
+            duration_ms = started.elapsed().as_millis() as u64,
+            "Discarded finished run's workspace snapshot"
+        ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => warn!(
             %run_id,
@@ -1960,6 +2028,7 @@ mod deepen_and_redirect_tests {
             repository: "snapshots/11111111-1111-4111-8111-111111111111".to_owned(),
             default_branch: Some("main".to_owned()),
             before_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+            snapshot_timing: None,
         }
     }
 
