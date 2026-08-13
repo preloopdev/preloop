@@ -103,8 +103,8 @@ codegen-units = 1
 strip = true
 
 [profile.dev.build-override]
-# Proc macros and build scripts are executed, not shipped; optimize them
-# so the compiler spends less time inside them during dev/test builds.
+# Proc macros and build scripts are executed at compile time; verify against the
+# measured baseline whether opt-level 3 actually reduces test-build time before keeping it.
 opt-level = 3
 
 [profile.test]
