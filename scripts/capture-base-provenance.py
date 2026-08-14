@@ -11,8 +11,10 @@ SBOM blob is copied locally as well.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import NoReturn
@@ -87,7 +89,40 @@ def referrers_url(registry: str, repository: str, subject_digest: str) -> str:
     )
 
 
-def fetch(url: str, accept: str) -> bytes:
+def fetch(url: str, accept: str, allow_404: bool = False) -> bytes:
+    auth_args: list[str] = []
+    token = os.environ.get("GHCR_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if token:
+        # GHCR requires a registry-scoped token, not the raw credential:
+        # exchange it against the token endpoint first (anonymous for
+        # public packages; Basic auth for private ones).
+        try:
+            registry = url.split("/")[2]
+            repo = url.split("/v2/", 1)[1].rsplit("/", 1)[0]
+            exchange = subprocess.run(
+                [
+                    "curl",
+                    "--fail",
+                    "--silent",
+                    "--show-error",
+                    "--location",
+                    "--user",
+                    f"x-access-token:{token}",
+                    (
+                        f"https://{registry}/token?service={registry}"
+                        f"&scope=repository:{repo}:pull"
+                    ),
+                ],
+                check=True,
+                capture_output=True,
+            )
+            registry_token = json.loads(exchange.stdout).get("token")
+            if registry_token:
+                auth_args = ["--header", f"Authorization: Bearer {registry_token}"]
+        except (subprocess.CalledProcessError, json.JSONDecodeError):
+            # Fall through to anonymous; the manifest fetch will report the
+            # registry's real answer.
+            pass
     try:
         result = subprocess.run(
             [
@@ -105,6 +140,7 @@ def fetch(url: str, accept: str) -> bytes:
                 "120",
                 "--header",
                 f"Accept: {accept}",
+                *auth_args,
                 "--user-agent",
                 USER_AGENT,
                 url,
@@ -115,6 +151,8 @@ def fetch(url: str, accept: str) -> bytes:
     except FileNotFoundError:
         fail("curl is required to capture OCI base provenance")
     except subprocess.CalledProcessError as error:
+        if allow_404 and b"404" in error.stderr:
+            return b""
         detail = error.stderr.decode("utf-8", "replace").strip()
         fail(f"registry request failed for {url}: {detail}")
     return result.stdout
@@ -183,8 +221,14 @@ def fetch_referrers(
     registry: str, repository: str, subject_digest: str
 ) -> list[dict]:
     body = fetch(
-        referrers_url(registry, repository, subject_digest), ACCEPT_MANIFEST
+        referrers_url(registry, repository, subject_digest),
+        ACCEPT_MANIFEST,
+        allow_404=True,
     )
+    if not body:
+        # Registries return 404 for subjects without referrers (or without
+        # referrers support); that means "none", not an error.
+        return []
     try:
         payload = json.loads(body)
     except json.JSONDecodeError as error:
@@ -197,6 +241,24 @@ def fetch_referrers(
         for descriptor in manifests
         if is_attestation_descriptor(descriptor, subject_digest)
     ]
+
+
+def fetch_cosign_attestation(
+    registry: str, repository: str, subject_digest: str
+) -> list[dict]:
+    # cosign stores attestations in the tag schema (`sha256-<digest>.att`)
+    # rather than the OCI referrers API; GHCR does not index those as
+    # referrers, so discover the tag directly.
+    tag = "sha256-" + subject_digest.removeprefix("sha256:") + ".att"
+    body = fetch(
+        manifest_url(registry, repository, tag), ACCEPT_MANIFEST, allow_404=True
+    )
+    if not body:
+        return []
+    try:
+        return [json.loads(body)]
+    except json.JSONDecodeError:
+        return []
 
 
 def copy_spdx_blob(
@@ -216,6 +278,17 @@ def copy_spdx_blob(
         parsed = json.loads(body)
     except json.JSONDecodeError as error:
         fail(f"SPDX blob {digest} is not valid JSON: {error}")
+    # cosign wraps the statement in a DSSE envelope: the payload is the
+    # base64-encoded in-toto statement.
+    if isinstance(parsed, dict) and isinstance(parsed.get("payload"), str):
+        try:
+            payload = base64.b64decode(parsed["payload"])
+        except (ValueError, TypeError) as error:
+            fail(f"SPDX blob {digest} has an undecodable DSSE payload: {error}")
+        try:
+            parsed = json.loads(payload)
+        except json.JSONDecodeError as error:
+            fail(f"SPDX blob {digest} has a non-JSON DSSE payload: {error}")
     # BuildKit attaches the SPDX document as the predicate of an in-toto
     # statement; consumers of the sidecar expect a bare SPDX JSON document,
     # so unwrap the predicate before publishing it.
@@ -229,6 +302,12 @@ def copy_spdx_blob(
                 "statement; refusing to guess its structure"
             )
         parsed = parsed["predicate"]
+    elif isinstance(parsed, dict) and isinstance(parsed.get("predicate"), str):
+        # cosign embeds the SPDX document as a JSON string predicate.
+        try:
+            parsed = json.loads(parsed["predicate"])
+        except json.JSONDecodeError as error:
+            fail(f"SPDX blob {digest} has a non-JSON string predicate: {error}")
     body = json.dumps(parsed, indent=2, sort_keys=True).encode("utf-8")
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_bytes(body)
@@ -242,7 +321,8 @@ def copy_spdx_blob(
         "media_type": layer.get("mediaType"),
         "predicate_type": (layer.get("annotations") or {}).get(
             "in-toto.io/predicate-type"
-        ),
+        )
+        or (layer.get("annotations") or {}).get("predicateType"),
     }
 
 
@@ -274,6 +354,10 @@ def main() -> None:
     )
 
     source_annotations = platform_descriptor.get("annotations") or {}
+    # Composite descriptors often drop annotations; the platform manifest
+    # itself carries them (org.opencontainers.image.source/revision/...).
+    if not source_annotations:
+        source_annotations = platform_manifest.get("annotations") or {}
     source = source_annotations.get("org.opencontainers.image.source")
     if args.require_source_prefix:
         prefix = args.require_source_prefix
@@ -288,29 +372,43 @@ def main() -> None:
                 f"{source!r} (expected {prefix!r})"
             )
 
-    # Prefer the OCI referrers API: cosign-attached attestations (SBOMs,
-    # signatures) are registered as referrers of the platform manifest and
-    # are not necessarily listed in the (unmodified) index. Fall back to
-    # index-listed attestation descriptors for registries without referrers
-    # support.
-    attestation_descriptors = fetch_referrers(registry, repository, platform_digest)
-    if not attestation_descriptors:
-        attestation_descriptors = [
+    # Collect attestation manifests from every discovery mechanism: the OCI
+    # referrers API, attestation descriptors listed in the index, and
+    # cosign's tag-schema attestation (sha256-<digest>.att).
+    attestation_manifests: list[tuple[dict, str | None]] = []
+    seen: set[str] = set()
+    for descriptor in [
+        *fetch_referrers(registry, repository, platform_digest),
+        *[
             descriptor
             for descriptor in index.get("manifests", [])
             if is_attestation_descriptor(descriptor, platform_digest)
-        ]
+        ],
+    ]:
+        digest = descriptor.get("digest")
+        if not isinstance(digest, str) or digest in seen:
+            continue
+        seen.add(digest)
+        manifest, manifest_hash = fetch_attestation(registry, repository, descriptor)
+        attestation_manifests.append((manifest, manifest_hash))
+    for manifest in fetch_cosign_attestation(registry, repository, platform_digest):
+        key = digest_bytes(json.dumps(manifest, sort_keys=True).encode("utf-8"))
+        if key in seen:
+            continue
+        seen.add(key)
+        attestation_manifests.append((manifest, None))
 
     attestations = []
     sbom = None
-    for descriptor in attestation_descriptors:
-        manifest, manifest_hash = fetch_attestation(
-            registry, repository, descriptor
-        )
+    for manifest, manifest_hash in attestation_manifests:
         layers = []
         for layer in manifest.get("layers", []):
             annotations = layer.get("annotations") or {}
-            predicate_type = annotations.get("in-toto.io/predicate-type")
+            # cosign uses a bare `predicateType` annotation; BuildKit and
+            # GitHub's attestation API use the in-toto namespaced key.
+            predicate_type = annotations.get("in-toto.io/predicate-type") or (
+                annotations.get("predicateType")
+            )
             summary = {
                 key: value
                 for key, value in {
@@ -335,8 +433,16 @@ def main() -> None:
                 )
         attestations.append(
             {
-                "descriptor": descriptor_summary(descriptor),
-                "manifest_digest": descriptor.get("digest"),
+                "descriptor": descriptor_summary(
+                    {
+                        "mediaType": manifest.get("mediaType"),
+                        "size": None,
+                        "digest": manifest_hash,
+                        "platform": None,
+                        "annotations": manifest.get("annotations"),
+                    }
+                ),
+                "manifest_digest": manifest_hash,
                 "manifest_sha256": manifest_hash,
                 "layers": layers,
             }

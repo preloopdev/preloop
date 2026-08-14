@@ -135,6 +135,8 @@ jobs:
       contents: write
       id-token: write
       attestations: write
+      # The provenance capture exchanges the token against the registry.
+      packages: read
     steps:
       - name: Check out repository
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
@@ -145,7 +147,7 @@ jobs:
           echo "RUNNER_TARGET=x86_64-unknown-linux-gnu" >> "$GITHUB_ENV"
           echo "GOLDEN_ARCH=x86_64" >> "$GITHUB_ENV"
           echo "GOLDEN_PLATFORM=linux/amd64" >> "$GITHUB_ENV"
-          BASE_IMAGE="$(awk -F'"' '/^ubuntu_24_04_base = / { print $2; exit }' versions.toml)"
+          BASE_IMAGE="$(awk -F'"' '/^official_runner_image_base_amd64 = / { print $2; exit }' versions.toml)"
           test -n "$BASE_IMAGE"
           echo "BASE_IMAGE=$BASE_IMAGE" >> "$GITHUB_ENV"
 
@@ -169,7 +171,7 @@ jobs:
             --sbom-output "dist/$GOLDEN_NAME.base-sbom.spdx.json" \
             --require-sbom \
             --require-source-prefix \
-              "https://git.launchpad.net/cloud-images/+oci/ubuntu-base"
+              "https://github.com/preloopdev/runner-image-blobs/tree"
 
       - name: Pack Golden MicroVM Artifact
         env:
@@ -179,6 +181,9 @@ jobs:
           rm -f "dist/$GOLDEN_NAME"
           export PRELOOP_REQUIRE_BASE_DIGEST=1
           export PRELOOP_RUNNER_BASE_IMAGE="$BASE_IMAGE"
+          # The official runner snapshot extracts to ~60 GB; the bake VM must
+          # be larger than the stock 20 GiB default.
+          export PRELOOP_RUNNER_STORAGE_GB=80
           ./target/release/preloop build-golden \
             --runner-bundle "target/$RUNNER_TARGET/release" \
             --output "dist/$GOLDEN_NAME"
@@ -277,6 +282,8 @@ jobs:
       contents: write
       id-token: write
       attestations: write
+      # The provenance capture exchanges the token against the registry.
+      packages: read
     steps:
       - name: Check out repository
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
@@ -287,7 +294,7 @@ jobs:
           echo "RUNNER_TARGET=aarch64-unknown-linux-gnu" >> "$GITHUB_ENV"
           echo "GOLDEN_ARCH=aarch64" >> "$GITHUB_ENV"
           echo "GOLDEN_PLATFORM=linux/arm64" >> "$GITHUB_ENV"
-          BASE_IMAGE="$(awk -F'"' '/^ubuntu_24_04_base = / { print $2; exit }' versions.toml)"
+          BASE_IMAGE="$(awk -F'"' '/^official_runner_image_base_arm64 = / { print $2; exit }' versions.toml)"
           test -n "$BASE_IMAGE"
           echo "BASE_IMAGE=$BASE_IMAGE" >> "$GITHUB_ENV"
 
@@ -376,7 +383,7 @@ jobs:
             --sbom-output "dist/$GOLDEN_NAME.base-sbom.spdx.json" \
             --require-sbom \
             --require-source-prefix \
-              "https://git.launchpad.net/cloud-images/+oci/ubuntu-base"
+              "https://github.com/preloopdev/runner-image-blobs/tree"
 
       - name: Pack Golden MicroVM Artifact
         env:
@@ -386,6 +393,9 @@ jobs:
           rm -f "dist/$GOLDEN_NAME"
           export PRELOOP_REQUIRE_BASE_DIGEST=1
           export PRELOOP_RUNNER_BASE_IMAGE="$BASE_IMAGE"
+          # The official runner snapshot extracts to ~60 GB; the bake VM must
+          # be larger than the stock 20 GiB default.
+          export PRELOOP_RUNNER_STORAGE_GB=80
           ./target/release/preloop build-golden \
             --runner-bundle "target/$RUNNER_TARGET/release" \
             --output "dist/$GOLDEN_NAME"

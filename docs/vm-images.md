@@ -192,9 +192,10 @@ Provisioning currently assumes an Ubuntu 24.04 or 22.04 userspace and uses
 
 For enterprise use, `build-golden` can refuse to bake from a base image whose
 provenance does not check out. The dump-style images published by the
-snapshot pipeline carry a GitHub-signed SLSA attestation (stored in GHCR) and
-a Sigstore keyless signature from the publishing workflow; both are verified
-before the golden is built:
+snapshot pipeline carry Sigstore keyless signatures plus in-toto attestations
+(SLSA provenance and an SPDX SBOM), all signed by the publishing workflow's
+GitHub Actions OIDC identity and stored as OCI referrers in GHCR; they are
+verified before the golden is built:
 
 ```sh
 PRELOOP_VERIFY_BASE_IMAGE=1 \
@@ -202,10 +203,12 @@ PRELOOP_VERIFY_BASE_IMAGE_REPO=acme/runner-image-blobs \
 preloop build-golden --base-image 'ghcr.io/acme/runner-images@sha256:<digest>' ...
 ```
 
-`gh` and `cosign` must be installed on the build host. The signature identity
+`cosign` must be installed on the build host. The signature identity
 is pinned to the publishing repository's `dump.yml` workflow on the default
 branch; override with `PRELOOP_BASE_IMAGE_IDENTITY_REGEXP` if the publishing
-workflow differs.
+workflow differs. A mirror that signs with a long-lived key instead of
+keyless OIDC can set `PRELOOP_BASE_IMAGE_PUBKEY` to the public key file;
+verification then uses `cosign verify --key` rather than the identity check.
 
 ### Golden provenance
 
@@ -248,6 +251,15 @@ SBOM is evidence about the upstream input; it is not treated as a Google
 signature or as a substitute for the Preloop golden attestation.
 
 ### Using a snapshot of the official hosted image
+
+Since v0.30.3 the release golden is baked directly from the official
+GitHub-hosted runner image snapshot (republished as OCI by the
+[preloopdev/runner-image-blobs](https://github.com/preloopdev/runner-image-blobs)
+dump pipeline, then scanned, signed, and SLSA-attested before the floating tag
+advances). The release assets (`preloop-ubuntu-24.04-x86_64` and its
+`.provenance.json` / `.base-sbom.spdx.json` / `.bundle` sidecars) are therefore
+the official runner image with the Preloop runner baked in — no extra
+provisioning needed.
 
 GitHub's hosted runner images are not published as OCI images, but the
 community [runner-image-blobs](https://github.com/ChristopherHX/runner-image-blobs)
