@@ -650,6 +650,42 @@ adopts the shared `build_job_artifacts` helper.
 
 ---
 
+### 3c. Fork trust isolation (2026-08-12)
+
+The fork-PR token hardening (commit `47278c2b`) makes untrusted fork runs
+behave like GitHub's: read-only `GITHUB_TOKEN`, no secrets, no OIDC, and no
+fallback that can widen the credential. Two per-repository features remain to
+be compared with GitHub:
+
+**Cache access — conformant (resolved 2026-08-13).** GitHub gives fork PR runs
+read-only cache access: they can restore from the base repository's cache but
+cannot save to it (actions/cache README: "Some workflow runs only have
+read-only access to the cache. A common case is a workflow triggered by a pull
+request from a fork"), so a fork cannot poison entries a trusted run later
+restores. Preloop previously allowed fork writes on both the cache v2 Twirp
+surface (`CacheService/CreateCacheEntry`, `FinalizeCacheEntryUpload`) and the
+legacy `/_apis/artifactcache` surface. All cache *write* handlers now reject
+fork-restricted jobs (403, resolved via the job runtime token →
+`events::trust_tier::fork_restricted_from_token`); restore handlers are
+unchanged. Reads stay open for everyone.
+
+**Concurrency groups — at parity, suggested divergence (not implemented).**
+Concurrency groups are keyed `(lowercased repo, lowercased group name)`
+(`concurrency::concurrency_key`, no trust tier), matching GitHub's documented
+per-repository model ("using the same concurrency group in the repository").
+GitHub documents no fork isolation for concurrency, so a fork PR can declare a
+static group name (e.g. `prod-deploy`) with `cancel-in-progress: true` and
+cancel a trusted run — on GitHub and preloop alike. Suggested divergence,
+strictly safer than GitHub: key groups by `(repo, fork_restricted, group)` so
+fork runs contend only with fork runs and can never cancel a trusted holder.
+Tradeoffs: breaks cross-trust serialization for deliberately shared groups
+(use distinct group names per trust domain); the persisted key shape in
+`store.rs` needs a migration; and it does not bound resource abuse (a fork can
+still flood the pool with runs — that needs queue/run limits, separate from
+concurrency). Not implemented; documented here for parity tracking.
+
+---
+
 ## 4. Pluggable backends &amp; deployment modes
 
 The official runner protocol already decouples execution from the control plane: the runner

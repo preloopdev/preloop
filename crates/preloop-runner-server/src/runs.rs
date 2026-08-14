@@ -110,12 +110,7 @@ fn validate_schedule_crons(workflow: &preloop_gha_parser::Workflow) -> Result<()
 /// (repo/global/environment tiers). Native submissions carry no trust tier —
 /// `None` is therefore trusted.
 fn submission_allows_secrets(submission: &WorkflowSubmission) -> bool {
-    submission
-        .trust_tier
-        .as_deref()
-        .and_then(|value| {
-            serde_json::from_value::<crate::events::trust_tier::TrustTier>(json!(value)).ok()
-        })
+    crate::events::trust_tier::tier_of(submission)
         .map(|tier| tier.allows_secrets())
         .unwrap_or(true)
 }
@@ -1563,6 +1558,19 @@ pub(crate) fn build_job_artifacts(
     job: &preloop_gha_protocol::JobPlan,
     github_token_override: Option<String>,
 ) -> Result<BuiltJobArtifacts, ApiError> {
+    // One policy drives every job-facing authority decision for this tier:
+    // stored secrets, the runner-visible `system.github.token.permissions`
+    // variable, the GitHub App installation-token request, the OIDC grant,
+    // and which external token (if any) the job may receive. Fork-restricted
+    // tiers (fork PRs, fail-closed unknown events) get GitHub's read-only
+    // fork profile no matter what the workflow declared.
+    let tier = crate::events::trust_tier::tier_of(submission);
+    let policy = crate::events::trust_tier::job_authorization(
+        tier,
+        job.permissions.as_ref(),
+        job.oidc_id_token_granted,
+    );
+
     // Environment secrets are per-job: a job's `environment:` selects the
     // tier, so the overlay happens here, not in the submission-level merge.
     // Precedence per name: submission-provided > environment > repo > global,
@@ -1572,7 +1580,7 @@ pub(crate) fn build_job_artifacts(
     // map can be large — copying it per job would be pure allocation cost.
     // The original map is borrowed directly in that case.
     let mut env_overlay: Option<BTreeMap<String, String>> = None;
-    if submission_allows_secrets(submission) {
+    if policy.allows_secrets {
         if let Some(env_name) = job.oidc_environment.as_deref() {
             let env_secrets = shared
                 .state
@@ -1606,6 +1614,22 @@ pub(crate) fn build_job_artifacts(
         .map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
 
     agent_msg.preloop_preserve_on_failure = submission.preserve_on_failure.then_some(true);
+
+    // The message builder already wrote the declared permission set into the
+    // wire variable; for a fork-restricted job that set must be restated as
+    // the downgraded fork profile, because the runner prints this variable
+    // as its `GITHUB_TOKEN Permissions` group and it must not claim write
+    // authority the job's token will not carry.
+    if policy.fork_restricted {
+        agent_msg.variables.insert(
+            "system.github.token.permissions".to_owned(),
+            preloop_gha_protocol::azdo::VariableValue::new(
+                preloop_gha_parser::job_builder::token_permissions_wire_json(
+                    &policy.token_permissions,
+                ),
+            ),
+        );
+    }
 
     // Pre-allocate request ID atomically (no lock needed).
     let request_id = shared
@@ -1652,7 +1676,10 @@ pub(crate) fn build_job_artifacts(
         }
     }
 
-    let id_token_granted = job.oidc_id_token_granted;
+    // Fork-restricted jobs never receive an OIDC grant: no request URL is
+    // emitted here (and the broker restates it only for granted jobs), and
+    // the `oidctoken` endpoint refuses via `id_token_grants`.
+    let id_token_granted = policy.id_token_granted;
     if id_token_granted {
         let oidc_url = format!(
             "{}/runner/server/_apis/distributedtask/hubs/actions/plans/{}/jobs/{}/oidctoken?api-version=2.0",
@@ -1669,7 +1696,16 @@ pub(crate) fn build_job_artifacts(
         }
     }
 
-    let github_token = github_token_override.unwrap_or_else(|| runtime_token.clone());
+    // The PAT override (used when no GitHub App is configured) is a static,
+    // repository-unscoped credential: embedding it in a fork-restricted job's
+    // message would hand hostile code authority GitHub would never grant the
+    // fork. Such jobs keep the local job-scoped runtime token, which
+    // authenticates only against this control plane.
+    let github_token = if policy.fork_restricted {
+        runtime_token.clone()
+    } else {
+        github_token_override.unwrap_or_else(|| runtime_token.clone())
+    };
     agent_msg.variables.insert(
         "system.github.token".to_owned(),
         preloop_gha_protocol::azdo::VariableValue::secret(github_token.clone()),
@@ -1811,9 +1847,9 @@ pub(crate) fn build_job_artifacts(
         .as_ref()
         .map(|_| GitHubTokenRequest {
             repository: submission.repository.clone(),
-            permissions: preloop_gha_parser::effective_token_permissions(job.permissions.as_ref())
-                .into_owned(),
+            permissions: policy.app_permissions,
             declared: job.permissions.is_some(),
+            untrusted: policy.fork_restricted,
         });
 
     Ok(BuiltJobArtifacts {

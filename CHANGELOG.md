@@ -92,6 +92,42 @@ Releases before v0.27.0 predate the changelog.
   `preloop server uninstall` removes all three, so secrets no longer outlive
   an uninstall that only purges the state dir.
 
+- Enforce GitHub's read-only fork profile for untrusted fork pull requests:
+  fork PR jobs (and fail-closed unknown events) now receive a
+  `GITHUB_TOKEN` permission set clamped to read regardless of the workflow's
+  declared `permissions:` block, never get an OIDC request URL or token
+  grant, and can no longer receive the configured PAT — neither as a
+  mint-failure fallback nor as the build-time PAT override. The special
+  `id-token` permission is excluded rather than advertised as a read scope,
+  and the App installation-token request carries only real App repository
+  permissions (never `id-token`) for trusted jobs too. The trust tier is
+  applied as a single job-authorization policy shared by the runner wire
+  variable, the App installation-token request, the OIDC grant, and the
+  token fallback path, so a fork PR declaring `checks: write` and
+  `id-token: write` is downgraded end to end while `pull_request_target`,
+  internal PRs, push, schedule, and deployment runs keep their declared
+  permissions. Broker claims now keep every runner-visible token alias
+  (`system.github.token`, `github_token`, `GITHUB_TOKEN`, and the `github`
+  context token) on the minted App token, restate narrowed installation
+  grants without erasing a trusted job's `IdToken` metadata, and treat
+  persisted token requests that predate the `untrusted` field as untrusted
+  so a restart can never re-enable the PAT fallback for them.
+
+- Fork PR runs also get GitHub's read-only cache access: cache writes (the
+  `/_apis/artifactcache` reserve/upload/commit routes and the Twirp
+  `CreateCacheEntry`/`FinalizeCacheEntryUpload` handlers) are refused with
+  403 for fork-restricted jobs while restores stay open — a fork can no
+  longer poison cache entries that a trusted run later restores.
+
+- A deferred GitHub App token request no longer outlives the job it was built
+  for. It is deliberately retained past the first claim so a re-claim after a
+  runner disconnect re-mints under the build-time permission set instead of
+  rebuilding from the broader defaults, and it is now dropped wherever a job
+  request becomes terminal — the shared completion path (broker `completejob`,
+  the legacy `/_apis` finish endpoints, and the lease-expiry reaper alike) and
+  the scheduler's node retirement for cancelled, skipped, and
+  expansion-failed nodes.
+
 ### Changed
 
 - `preloop server install` (Linux, system scope) creates the `preloop` service
@@ -255,6 +291,7 @@ Releases before v0.27.0 predate the changelog.
 - `macos`/`windows` jobs wait for a registered external host instead of being
   failed by the Linux-only starvation sweep.
 - macOS BSD `tar` missing `--verbatim-files-from` is handled in sync.
+
 ## [0.29.8] - 2026-08-09
 
 ### Fixed

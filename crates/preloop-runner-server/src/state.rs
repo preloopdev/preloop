@@ -327,6 +327,20 @@ impl TestEnvVar {
         std::env::set_var(key, value);
         Self { key, previous }
     }
+
+    /// Clear a variable for the duration of a test.
+    ///
+    /// The counterpart to [`TestEnvVar::set`] for tests whose contract is the
+    /// *absence* of a value — a configured `PRELOOP_GITHUB_TOKEN` flips the
+    /// check-run path from its mock to a live GitHub call, so a test asserting
+    /// the mock path has to guarantee no token is visible. Restores on drop,
+    /// so a panicking test cannot leak the cleared state onto the rest of the
+    /// suite.
+    pub(crate) fn unset(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::remove_var(key);
+        Self { key, previous }
+    }
 }
 
 #[cfg(test)]
