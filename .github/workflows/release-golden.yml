@@ -183,7 +183,7 @@ jobs:
           export PRELOOP_RUNNER_BASE_IMAGE="$BASE_IMAGE"
           # The official runner snapshot extracts to ~60 GB; the bake VM must
           # be larger than the stock 20 GiB default.
-          export PRELOOP_RUNNER_STORAGE_GB=80
+          export PRELOOP_RUNNER_STORAGE_GB=120
           ./target/release/preloop build-golden \
             --runner-bundle "target/$RUNNER_TARGET/release" \
             --output "dist/$GOLDEN_NAME"
@@ -389,7 +389,7 @@ jobs:
           export PRELOOP_RUNNER_BASE_IMAGE="$BASE_IMAGE"
           # The official runner snapshot extracts to ~60 GB; the bake VM must
           # be larger than the stock 20 GiB default.
-          export PRELOOP_RUNNER_STORAGE_GB=80
+          export PRELOOP_RUNNER_STORAGE_GB=120
           ./target/release/preloop build-golden \
             --runner-bundle "target/$RUNNER_TARGET/release" \
             --output "dist/$GOLDEN_NAME"
