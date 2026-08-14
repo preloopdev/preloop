@@ -1750,8 +1750,13 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         building: Arc<AtomicUsize>,
     ) -> Result<(), OrchestratorError> {
         let max_concurrent = {
+            // Leave one runner's CPU share for the golden fork base and the
+            // host itself: filling every core with runner VMs starves the
+            // clone agents on fork readiness probes (EAGAIN), which rolls
+            // the fork back and spends the golden's retained checkpoint.
             let parallelism = std::thread::available_parallelism().map_or(2, |value| value.get());
-            (parallelism / usize::from(self.config.cpus.max(1))).max(1)
+            let per_runner = usize::from(self.config.cpus.max(1));
+            (parallelism / per_runner).saturating_sub(1).max(1)
         };
         info!(max_concurrent, "on-demand runner pool (size=0)");
 
