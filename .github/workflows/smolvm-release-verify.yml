@@ -1,0 +1,114 @@
+name: smolvm-release-verify
+
+# Verifies a SmolVM release on the real-VM host before preloop adopts it.
+#
+# Renovate opens PRs bumping `smolvm_golden_version` in versions.toml (see
+# renovate.json); this workflow installs the candidate exactly as
+# release-golden.yml and the updater do, probes the capabilities preloop
+# depends on, and gates the bump on the dogfood E2E. A green run is also the
+# signal that the updater's latest-stable adoption of that release is safe.
+#
+# Host-only, opt-in via SMOLVM_VERIFY_HOST_WORKSPACE (mirroring
+# runner-conformance.yml): webhook CI runs inside disposable Linux guests
+# and must not launch nested host smolVMs. The job mutates ~/.smolvm on the
+# shared host, so runs are serialized through a concurrency group. The E2E
+# needs the official runner cache at ~/.cache/actions-runner/current (same
+# prerequisite as `just dogfood`).
+
+on:
+  pull_request:
+    paths:
+      - versions.toml
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "SmolVM release to verify (default: smolvm_golden_version in versions.toml)"
+        required: false
+        type: string
+
+concurrency:
+  group: smolvm-host
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify smolvm release on smolvm-host
+    if: vars.SMOLVM_VERIFY_HOST_WORKSPACE != ''
+    runs-on: [self-hosted, macOS, ARM64, smolvm-host]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Detect golden-pin movement
+        id: changed
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          CHANGED=false
+          if ! git diff --quiet "${{ github.event.pull_request.base.sha }}" -- versions.toml \
+              && git diff "${{ github.event.pull_request.base.sha }}" -- versions.toml \
+                 | grep -q '^[+-]smolvm_golden_version'; then
+            CHANGED=true
+          fi
+          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve candidate version
+        id: resolve
+        run: |
+          set -euo pipefail
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="$(grep '^smolvm_golden_version' versions.toml | cut -d'"' -f2)"
+          fi
+          [ -n "$VERSION" ] || { echo "no smolvm version resolved" >&2; exit 1; }
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Install candidate smolvm (mirrors release-golden.yml)
+        if: github.event_name == 'workflow_dispatch' || steps.changed.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          SMOLVM_VERSION="${{ steps.resolve.outputs.version }}"
+          ARCHIVE="smolvm-${SMOLVM_VERSION}-darwin-arm64.tar.gz"
+          BASE="https://github.com/smol-machines/smolvm/releases/download/v${SMOLVM_VERSION}"
+          WORK="$(mktemp -d "${TMPDIR:-/tmp}/smolvm-verify.XXXXXX")"
+          curl -fsSL -o "$WORK/$ARCHIVE" "$BASE/$ARCHIVE"
+          curl -fsSL -o "$WORK/checksums.sha256" "$BASE/checksums.sha256"
+          grep -F "$ARCHIVE" "$WORK/checksums.sha256" | shasum -a 256 -c -
+          tar -xzf "$WORK/$ARCHIVE" -C "$WORK"
+          SRC="$WORK/smolvm-${SMOLVM_VERSION}-darwin-arm64"
+          mkdir -p "$HOME/.smolvm"
+          rm -rf "$HOME/.smolvm/lib"
+          cp -R "$SRC/lib" "$HOME/.smolvm/lib"
+          # Clear stale template variants from previous layouts so the
+          # candidate's format wins (same cleanup the updater runs).
+          rm -f "$HOME/.smolvm/storage-template.ext4" \
+              "$HOME/.smolvm/overlay-template.ext4" \
+              "$HOME/.smolvm/storage-template.ext4.zst" \
+              "$HOME/.smolvm/overlay-template.ext4.zst"
+          for f in smolvm smolvm-bin storage-template.ext4 overlay-template.ext4 \
+              storage-template.ext4.zst overlay-template.ext4.zst; do
+            [ -f "$SRC/$f" ] && cp "$SRC/$f" "$HOME/.smolvm/"
+          done
+          echo "$SMOLVM_VERSION" > "$HOME/.smolvm/.version"
+          mkdir -p "$HOME/Library/Application Support/smolvm"
+          rm -rf "$HOME/Library/Application Support/smolvm/agent-rootfs"
+          cp -R "$SRC/agent-rootfs" "$HOME/Library/Application Support/smolvm/agent-rootfs"
+          mkdir -p "$HOME/.local/bin"
+          ln -sfn "$HOME/.smolvm/smolvm" "$HOME/.local/bin/smolvm"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Probe capabilities
+        if: github.event_name == 'workflow_dispatch' || steps.changed.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          smolvm --version
+          smolvm machine create --help | grep -q -- --mount-socket \
+            || { echo "candidate lacks --mount-socket" >&2; exit 1; }
+
+      - name: Build server and run dogfood E2E
+        if: github.event_name == 'workflow_dispatch' || steps.changed.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          cargo build --locked --release -p preloop-runner-server
+          PRELOOP_PORT=19090 just dogfood

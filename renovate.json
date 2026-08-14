@@ -1,0 +1,34 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "dependencyDashboard": true,
+  "regexManagers": [
+    {
+      "description": "Official actions/runner release pin in versions.toml. The bump PR opens the runner-watch pipeline: conformance fails against the new version until goldens are re-recorded (see docs/conformance.md).",
+      "fileMatch": ["^versions\\.toml$"],
+      "matchStrings": ["runner_version\\s*=\\s*\"(?<currentValue>[^\"]+)\""],
+      "depNameTemplate": "actions/runner",
+      "datasourceTemplate": "github-releases",
+      "extractVersion": "^v(?<version>.*)$",
+      "versioningTemplate": "semver"
+    },
+    {
+      "description": "SmolVM release the golden workflow builds with. The bump PR is gated by .github/workflows/smolvm-release-verify.yml, which installs the candidate and runs the real-VM E2E on the smolvm-host; merge = verified.",
+      "fileMatch": ["^versions\\.toml$"],
+      "matchStrings": ["smolvm_golden_version\\s*=\\s*\"(?<currentValue>[^\"]+)\""],
+      "depNameTemplate": "smol-machines/smolvm",
+      "datasourceTemplate": "github-releases",
+      "extractVersion": "^v(?<version>.*)$",
+      "versioningTemplate": "semver"
+    }
+  ],
+  "packageRules": [
+    {
+      "matchDatasources": ["github-releases"],
+      "matchDepNames": ["actions/runner", "smol-machines/smolvm"],
+      "labels": ["dependencies"],
+      "commitMessageAction": "Bump",
+      "commitMessageTopic": "{{depName}}"
+    }
+  ]
+}

@@ -317,11 +317,13 @@ jobs:
             --target "$RUNNER_TARGET" \
             -p preloop-runner
 
-      - name: Install pinned smolvm
-        env:
-          SMOLVM_VERSION: "1.7.7"
+      - name: Install smolvm
         run: |
           set -euo pipefail
+          # The verified golden release, pinned in versions.toml and bumped
+          # by Renovate; smolvm-release-verify.yml gates the bump.
+          SMOLVM_VERSION="$(grep '^smolvm_golden_version' versions.toml | cut -d'"' -f2)"
+          [ -n "$SMOLVM_VERSION" ] || { echo "smolvm_golden_version missing from versions.toml" >&2; exit 1; }
           ARCHIVE="smolvm-${SMOLVM_VERSION}-darwin-arm64.tar.gz"
           BASE="https://github.com/smol-machines/smolvm/releases/download/v${SMOLVM_VERSION}"
           curl -fsSL -o "$ARCHIVE" "$BASE/$ARCHIVE"

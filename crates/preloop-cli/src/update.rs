@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::LazyLock;
 use tar::Archive;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -16,8 +17,11 @@ use tokio::io::AsyncWriteExt;
 const DEFAULT_REPOSITORY: &str = "preloopdev/preloop";
 const USER_AGENT: &str = concat!("preloop/", env!("CARGO_PKG_VERSION"));
 const SMOLVM_REPOSITORY: &str = "smol-machines/smolvm";
+include!(concat!(env!("OUT_DIR"), "/pins.rs"));
 
-/// Minimum SmolVM release `preloop update` accepts as already compatible.
+/// Minimum SmolVM release `preloop update` accepts as already compatible,
+/// compiled from `smolvm_min_version` in the workspace `versions.toml` (see
+/// `build.rs`; keep the two in sync).
 ///
 /// 1.7.7 is the first official release carrying reusable retained fork
 /// checkpoints and the macOS network symbol required by preloop-vm. 1.7.5
@@ -25,7 +29,10 @@ const SMOLVM_REPOSITORY: &str = "smol-machines/smolvm";
 /// the floor is the first fully-capable release rather than the whole 1.7
 /// line; any newer stable release (1.8.0, …) satisfies it without
 /// maintenance.
-const SMOLVM_MIN_COMPATIBLE_VERSION: Version = Version::new(1, 7, 7);
+static SMOLVM_MIN_COMPATIBLE_VERSION: LazyLock<Version> = LazyLock::new(|| {
+    Version::parse(SMOLVM_MIN_VERSION)
+        .expect("smolvm_min_version in versions.toml must be a semver version")
+});
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct UpdateArgs {
@@ -307,7 +314,7 @@ async fn smolvm_is_compatible(binary: &Path) -> bool {
         && probe_smolvm_version(binary)
             .await
             .and_then(|version| Version::parse(&version).ok())
-            .is_some_and(|version| version >= SMOLVM_MIN_COMPATIBLE_VERSION)
+            .is_some_and(|version| version >= *SMOLVM_MIN_COMPATIBLE_VERSION)
 }
 
 /// Probe the resolved smolvm and install the latest stable release when its

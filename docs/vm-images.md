@@ -343,6 +343,8 @@ by the build:
 | Key                                                     | What it pins                                                                     | Bump when                                                               |
 | ------------------------------------------------------- | -------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
 | `runner_version`                                        | Official `actions/runner` protocol target (currently `2.336.0`)                  | Upstream runner changes protocol surface                                |
+| `smolvm_min_version`                                    | SmolVM runtime floor `preloop update --ensure-runtime` accepts and upgrades from | A future SmolVM drops a capability preloop needs (rare, human-driven)   |
+| `smolvm_golden_version`                                 | SmolVM release the golden workflow builds with                                    | Upstream ships a newer stable (Renovate opens a bump PR, `smolvm-release-verify` gates it) |
 | `github_runner_image_version`                           | Official `actions/runner-images` Ubuntu 24.04 snapshot used as the parity source | Refreshing the hosted-image parity bake list                            |
 | `ubuntu_24_04_base`                                     | Base image by digest (`ubuntu:24.04@sha256:…`)                                   | You want a newer OS snapshot — always bump the digest, never a bare tag |
 | `ubuntu_22_04_base`                                     | Second pinned base                                                               | Same                                                                    |
@@ -355,6 +357,17 @@ by the build:
 The protocol target (`runner_version`) and the VM image are independent:
 the image always runs *our* runner; `runner_version` is the fidelity oracle
 that `runner-watch` compares against.
+
+The SmolVM pins are independent the same way and tracked with the same
+tooling: Renovate (`renovate.json`) watches the `actions/runner` and
+`smol-machines/smolvm` releases via the `github-releases` datasource and
+opens bump PRs against `versions.toml`. Runner bumps enter the
+watch → diff → triage → conform pipeline (`docs/conformance.md`). SmolVM
+golden bumps are gated by `.github/workflows/smolvm-release-verify.yml`,
+which installs the candidate on the `smolvm-host` and runs the dogfood E2E
+before merge — a green run also blesses the updater's automatic
+latest-stable adoption of that release. `smolvm_min_version` is deliberately
+not auto-bumped: it is a capability floor, not a tracked release.
 
 `versions.toml` defines Preloop's compiled distribution defaults. It is not a
 per-install user configuration file. Operators select custom OCI bases and
