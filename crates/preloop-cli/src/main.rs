@@ -607,25 +607,43 @@ async fn verify_base_image(base_image: &str) -> anyhow::Result<()> {
 }
 
 fn verify_base_image_with(repo: &str, base_image: &str) -> anyhow::Result<()> {
-    run_verifier(
-        "gh",
-        &["attestation", "verify", base_image, "--repo", repo],
-        "GitHub attestation",
-    )?;
     let identity = std::env::var("PRELOOP_BASE_IMAGE_IDENTITY_REGEXP").unwrap_or_else(|_| {
-        format!("^https://github.com/{repo}/.github/workflows/dump.yml@refs/heads/")
+        format!(
+            "^https://github.com/{repo}/.github/workflows/(dump|attest-local)\\.yml@refs/heads/"
+        )
     });
-    run_verifier(
-        "cosign",
-        &[
-            "verify",
-            base_image,
+    // The dump pipeline's images carry cosign signatures and in-toto
+    // attestations (SLSA provenance + SPDX SBOM). They are keyless-signed by
+    // the publishing workflow's OIDC identity; a mirror can instead publish
+    // signatures under a long-lived key and point PRELOOP_BASE_IMAGE_PUBKEY
+    // at the public key file. `gh attestation verify` only understands
+    // GitHub-API attestations (attest-build-provenance), which the dump does
+    // not produce, so verification is cosign-based.
+    let key = std::env::var("PRELOOP_BASE_IMAGE_PUBKEY").ok();
+    let identity_args: Vec<&str> = match &key {
+        Some(_) => vec![],
+        None => vec![
             "--certificate-identity-regexp",
             &identity,
             "--certificate-oidc-issuer",
             "https://token.actions.githubusercontent.com",
         ],
-        "cosign signature",
+    };
+    let mut verify_args: Vec<&str> = vec!["verify", base_image];
+    if let Some(key) = &key {
+        verify_args.extend(["--key", key]);
+    }
+    verify_args.extend(identity_args.iter().copied());
+    run_verifier("cosign", &verify_args, "cosign signature")?;
+    let mut attest_args: Vec<&str> = vec!["verify-attestation", base_image, "--type", "spdx"];
+    if let Some(key) = &key {
+        attest_args.extend(["--key", key]);
+    }
+    attest_args.extend(identity_args.iter().copied());
+    run_verifier(
+        "cosign",
+        &attest_args,
+        "cosign SPDX SBOM attestation",
     )
 }
 

@@ -9,6 +9,8 @@ Releases before v0.27.0 predate the changelog.
 
 ## [Unreleased]
 
+## [0.30.3] - 2026-08-13
+
 ## [0.30.2] - 2026-08-13
 
 ### Added
