@@ -378,8 +378,10 @@ async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
 
 /// Remove template variants from a previous SmolVM layout so the release's
 /// files are the only ones present. The archive carries either the
-/// uncompressed `.ext4` or compressed `.ext4.zst` variants; a leftover from
-/// an older installer would otherwise shadow the freshly copied format.
+/// uncompressed `.ext4` or compressed `.ext4.zst` variants; SmolVM's lazy
+/// extraction treats an existing uncompressed file as already prepared, so
+/// a leftover from an older installer would otherwise keep being used in
+/// place of the freshly copied format.
 /// Only `NotFound` is tolerated — any other failure is propagated so an
 /// update cannot report success while retaining stale state.
 fn remove_stale_smolvm_templates(prefix: &Path) -> anyhow::Result<()> {
@@ -1138,6 +1140,10 @@ mod tests {
         assert_eq!(
             std::fs::read(install.prefix.join("overlay-template.ext4.zst")).unwrap(),
             b"compressed-overlay"
+        );
+    }
+
+    #[test]
     fn remove_stale_smolvm_templates_clears_old_layouts() {
         let directory = tempfile::tempdir().unwrap();
         let prefix = directory.path().join("prefix");

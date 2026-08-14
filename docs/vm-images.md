@@ -364,10 +364,20 @@ tooling: Renovate (`renovate.json`) watches the `actions/runner` and
 opens bump PRs against `versions.toml`. Runner bumps enter the
 watch → diff → triage → conform pipeline (`docs/conformance.md`). SmolVM
 golden bumps are gated by `.github/workflows/smolvm-release-verify.yml`,
-which installs the candidate on the `smolvm-host` and runs the dogfood E2E
-before merge — a green run also blesses the updater's automatic
+which installs the candidate on the `smolvm-host` and boots a real microVM
+with it (create → start → exec → delete, including a `--mount-socket`
+mount) before merge — a green run also blesses the updater's automatic
 latest-stable adoption of that release. `smolvm_min_version` is deliberately
 not auto-bumped: it is a capability floor, not a tracked release.
+
+The verify gate is a required check on `main`, but the job is skipped (and
+merges unblocked) except on Renovate's `smolvm_golden_version` bump PRs
+(head branches `renovate/**`) and manual dispatches; a skipped required
+check passes. The job also needs a `smolvm-host`-labeled self-hosted runner
+(KVM on Linux or Hypervisor.framework on macOS) and
+`SMOLVM_VERIFY_HOST_WORKSPACE` set on the repo; the host needs registry
+access for the pinned Ubuntu base. Renovate auto-merges smolvm golden bumps
+once the verify check and `ci.yml` pass.
 
 `versions.toml` defines Preloop's compiled distribution defaults. It is not a
 per-install user configuration file. Operators select custom OCI bases and
