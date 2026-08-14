@@ -6534,29 +6534,6 @@ async fn fork_pr_runs_get_read_only_cache_access() {
         state.mint_runtime_token(&message.plan.plan_id, &message.job_id)
     };
 
-    async fn status_with_bearer(
-        app: &Router,
-        bearer: &str,
-        method: Method,
-        uri: &str,
-        body: Value,
-    ) -> StatusCode {
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(method)
-                    .uri(uri)
-                    .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        response.status()
-    }
-
     let create_uri = "/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry";
     let finalize_uri = "/twirp/github.actions.results.api.v1.CacheService/FinalizeCacheEntryUpload";
     let restore_uri = "/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL";
@@ -6750,29 +6727,6 @@ async fn fork_cache_writes_fail_closed_when_the_job_no_longer_resolves() {
     {
         let mut inner = state.inner.lock().await;
         inner.agent_job_requests.remove(&fork_job);
-    }
-
-    async fn status_with_bearer(
-        app: &Router,
-        bearer: &str,
-        method: Method,
-        uri: &str,
-        body: Value,
-    ) -> StatusCode {
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(method)
-                    .uri(uri)
-                    .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        response.status()
     }
 
     // Both write surfaces reject the now-unresolvable fork token.
@@ -10623,6 +10577,32 @@ async fn repo_scoped_secrets_override_global_and_stay_scoped() {
         Some("submitted-value"),
         "submission-provided secrets outrank both stored tiers"
     );
+}
+
+/// Send a request carrying a specific bearer token and return just the status
+/// code — the shared counterpart the cache-gating tests use, so a
+/// request-shape change lands in one place.
+async fn status_with_bearer(
+    app: &Router,
+    bearer: &str,
+    method: Method,
+    uri: &str,
+    body: Value,
+) -> StatusCode {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    response.status()
 }
 
 /// Like `request_json` but returns the status instead of asserting success.
