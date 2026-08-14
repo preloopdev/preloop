@@ -122,22 +122,55 @@ pub(crate) fn tier_of(submission: &preloop_gha_protocol::WorkflowSubmission) -> 
 /// Whether the job a results/cache request authenticates as is
 /// fork-restricted, resolved from its bearer runtime token.
 ///
-/// `Some(true)`/`Some(false)` when the token names a live job; `None` when it
-/// is the system token or no job resolves (the control plane's own calls) —
-/// those are never fork-restricted. This is what lets the cache write
-/// handlers deny fork PR runs the same read-only cache access GitHub gives
-/// them (restore allowed, save refused) without touching the read path.
+/// `Some(true)`/`Some(false)` when the token names a job that still resolves
+/// to a run. `None` when the token does not identify a job at all (system
+/// token or another control-plane surface) — those are never fork-restricted.
+/// This is what lets the cache write handlers deny fork PR runs the same
+/// read-only cache access GitHub gives them (restore allowed, save refused)
+/// without touching the read path.
+///
+/// A job-shaped token whose job no longer resolves — the request was retired
+/// or purged while the worker still holds the runtime JWT — fails closed to
+/// `Some(true)`: the tier can no longer be proven, so the write is refused
+/// rather than granted on the strength of a bookkeeping gap.
 pub(crate) async fn fork_restricted_from_token(
     state: &crate::state::AppState,
     token: &str,
 ) -> Option<bool> {
-    let job = state.job_uuid_from_token(token)?;
+    let payload = state.verify_local_jwt_claims(token)?;
+    // Only job runtime tokens carry the fork restriction. Anything not shaped
+    // like one (system token, runner-listen, debug-worker surfaces) belongs
+    // to the control plane and keeps its existing access.
+    let job_shaped = payload
+        .get("sub")
+        .and_then(|value| value.as_str())
+        .is_some_and(|sub| sub.starts_with("preloop-job-"))
+        && payload
+            .get("scp")
+            .and_then(|value| value.as_str())
+            .is_some_and(|scope| scope.starts_with("Actions.Results:"));
+    let Some(job) = state.job_uuid_from_token(token) else {
+        // Signed like a job token but its subject/scope no longer parse to a
+        // job: nothing left to prove it trusted, so refuse.
+        return job_shaped.then_some(true);
+    };
     let inner = state.inner.lock().await;
-    let request_id = inner.agent_job_requests.get(&job).copied()?;
-    let record = inner.job_requests.get(&request_id)?;
-    let run = inner.runs.get(&record.run_id)?;
-    let tier = tier_of(&run.submission)?;
-    Some(tier.is_fork_restricted())
+    // Every hop of the correlation must survive. When the job is retired or
+    // purged mid-flight the worker still holds a valid JWT, and the missing
+    // record must widen the denial, not the access.
+    let Some(request_id) = inner.agent_job_requests.get(&job).copied() else {
+        return Some(true);
+    };
+    let Some(record) = inner.job_requests.get(&request_id) else {
+        return Some(true);
+    };
+    let Some(run) = inner.runs.get(&record.run_id) else {
+        return Some(true);
+    };
+    // A submission without a tier field is a native (trusted) submission and
+    // stays allowed; `tier_of`'s parse-failure-is-trusted convention matches
+    // the secret policy.
+    Some(tier_of(&run.submission).is_some_and(|tier| tier.is_fork_restricted()))
 }
 
 /// Reject a cache write when the calling job is a fork-restricted run.
@@ -146,8 +179,9 @@ pub(crate) async fn fork_restricted_from_token(
 /// refused) so a fork cannot poison cache entries that trusted runs later
 /// restore. Mirroring that here applies to every cache write surface (the
 /// cache v2 Twirp handlers and the legacy `/_apis/artifactcache` ones alike);
-/// the read handlers never call this. The system token and unresolvable
-/// tokens are the control plane's own calls and always pass.
+/// the read handlers never call this. The system token and other
+/// non-job-shaped bearers are the control plane's own calls and always pass;
+/// a job-shaped token that no longer resolves fails closed instead.
 pub(crate) async fn ensure_cache_write_allowed(
     state: &crate::state::AppState,
     headers: &axum::http::HeaderMap,

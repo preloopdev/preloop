@@ -6627,7 +6627,9 @@ async fn fork_pr_runs_get_read_only_cache_access() {
         "trusted job still gets a cache upload URL"
     );
 
-    // Legacy v1 surface (`actions/cache@v3`): the reserve write is denied too.
+    // Legacy v1 surface (`actions/cache@v3`): every write endpoint is denied,
+    // not just the reserve. Reserve a trusted entry first so the upload and
+    // commit guards run against a real cache id.
     assert_eq!(
         status_with_bearer(
             &app,
@@ -6640,6 +6642,46 @@ async fn fork_pr_runs_get_read_only_cache_access() {
         StatusCode::FORBIDDEN,
         "fork PR run must not reserve through the v1 cache API"
     );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/_apis/artifactcache/cache")
+                .header(header::AUTHORIZATION, format!("Bearer {trusted_token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"key": "legacy-key", "version": "v1"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let cache_id = serde_json::from_slice::<Value>(&bytes).unwrap()["cacheId"]
+        .as_i64()
+        .expect("trusted legacy reserve returns a cache id");
+    let legacy_uri = format!("/_apis/artifactcache/cache/{cache_id}");
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &fork_token,
+            Method::PATCH,
+            &legacy_uri,
+            json!("fork upload payload"),
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "fork PR run must not upload through the v1 cache API"
+    );
+    assert_eq!(
+        status_with_bearer(&app, &fork_token, Method::POST, &legacy_uri, json!({})).await,
+        StatusCode::FORBIDDEN,
+        "fork PR run must not commit through the v1 cache API"
+    );
 
     // The runtime token genuinely names the fork job (not a blanket reject):
     // the OIDC surface proves it by refusing this token's job.
@@ -6650,6 +6692,127 @@ async fn fork_pr_runs_get_read_only_cache_access() {
         status_with_bearer(&app, &fork_token, Method::GET, &oidc_uri, Value::Null).await,
         StatusCode::FORBIDDEN,
         "the fork job's runtime token is real and its OIDC grant is denied"
+    );
+}
+
+/// A fork job's runtime JWT must not smuggle a cache write in after the
+/// job's request was retired. Retirement (`RequestRetirement::Purge` in
+/// `retire_node_requests`) removes the correlation records
+/// `fork_restricted_from_token` walks, and treating an unresolvable job
+/// token as a control-plane caller would let a fork worker poison cache
+/// entries with a leaked token. Unresolvable job tokens fail closed instead.
+#[tokio::test]
+async fn fork_cache_writes_fail_closed_when_the_job_no_longer_resolves() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let submit = |tier: Option<&'static str>| {
+        let app = app.clone();
+        async move {
+            request_json(
+                &app,
+                Method::POST,
+                "/api/v1/runs",
+                json!({
+                    "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+                    "event": "push",
+                    "payload": {"ref": "refs/heads/main", "commits": []},
+                    "repository": "owner/repo",
+                    "git_ref": "refs/heads/main",
+                    "trust_tier": tier,
+                }),
+            )
+            .await
+        }
+    };
+
+    let fork = submit(Some("untrusted-fork-pull-request")).await;
+    let trusted = submit(None).await;
+
+    let (fork_token, fork_job) = {
+        let inner = state.inner.lock().await;
+        let message = queued_message_for(&inner, fork["run_id"].as_str().unwrap());
+        (
+            state.mint_runtime_token(&message.plan.plan_id, &message.job_id),
+            message.job_id,
+        )
+    };
+    let trusted_token = {
+        let inner = state.inner.lock().await;
+        let message = queued_message_for(&inner, trusted["run_id"].as_str().unwrap());
+        state.mint_runtime_token(&message.plan.plan_id, &message.job_id)
+    };
+
+    // The same surgery `RequestRetirement::Purge` performs: drop the
+    // job-to-request correlation while the worker still holds the runtime
+    // JWT.
+    {
+        let mut inner = state.inner.lock().await;
+        inner.agent_job_requests.remove(&fork_job);
+    }
+
+    async fn status_with_bearer(
+        app: &Router,
+        bearer: &str,
+        method: Method,
+        uri: &str,
+        body: Value,
+    ) -> StatusCode {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        response.status()
+    }
+
+    // Both write surfaces reject the now-unresolvable fork token.
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &fork_token,
+            Method::POST,
+            "/_apis/artifactcache/cache",
+            json!({"key": "poison-key", "version": "v1"}),
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "an unresolvable job token must not reserve through the v1 cache API"
+    );
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &fork_token,
+            Method::POST,
+            "/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry",
+            json!({"key": "poison-key", "version": "v1"}),
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "an unresolvable job token must not create through the cache v2 API"
+    );
+    // The fail-closed rule fires for job tokens only: a live trusted job's
+    // token still reserves without trouble.
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &trusted_token,
+            Method::POST,
+            "/_apis/artifactcache/cache",
+            json!({"key": "trusted-key", "version": "v1"}),
+        )
+        .await,
+        StatusCode::OK,
+        "a resolvable trusted job token keeps write access"
     );
 }
 
