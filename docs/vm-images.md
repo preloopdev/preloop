@@ -370,14 +370,13 @@ mount) before merge — a green run also blesses the updater's automatic
 latest-stable adoption of that release. `smolvm_min_version` is deliberately
 not auto-bumped: it is a capability floor, not a tracked release.
 
-The verify gate is a required check on `main`, but the job is skipped (and
-merges unblocked) except on Renovate's `smolvm_golden_version` bump PRs
-(head branches `renovate/**`) and manual dispatches; a skipped required
-check passes. The job also needs a `smolvm-host`-labeled self-hosted runner
-(KVM on Linux or Hypervisor.framework on macOS) and
+The job runs on Renovate's `smolvm_golden_version` bump PRs (head branches
+`renovate/**`) and manual dispatches, and needs a `smolvm-host`-labeled
+self-hosted runner (KVM on Linux or Hypervisor.framework on macOS) with
 `SMOLVM_VERIFY_HOST_WORKSPACE` set on the repo; the host needs registry
 access for the pinned Ubuntu base. Renovate auto-merges smolvm golden bumps
-once the verify check and `ci.yml` pass.
+once the verify check and `ci.yml` pass — the merge gate is Renovate's
+auto-merge, not branch protection.
 
 `versions.toml` defines Preloop's compiled distribution defaults. It is not a
 per-install user configuration file. Operators select custom OCI bases and

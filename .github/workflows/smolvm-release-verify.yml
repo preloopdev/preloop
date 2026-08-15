@@ -13,9 +13,9 @@ name: smolvm-release-verify
 # candidate's templates, libkrun, and KVM/Hypervisor boot path — the surface
 # that broke at 1.7.5.
 #
-# Required-check semantics: on non-Renovate PRs the job is skipped, which a
-# required status check treats as passing (GitHub docs: a skipped job reports
-# success), so unrelated PRs are not blocked. The job additionally requires a
+# On non-Renovate PRs the job is skipped entirely, so unrelated PRs are
+# unaffected; the gate for smolvm bumps is Renovate auto-merge, which waits
+# for this check and ci.yml on its own PRs. The job additionally requires a
 # smolvm-capable self-hosted runner (any OS/arch with /dev/kvm or
 # Hypervisor.framework — the repo's aksh-golden-x64 KVM host, or a Mac)
 # labeled smolvm-host AND SMOLVM_VERIFY_HOST_WORKSPACE set (the same opt-in
