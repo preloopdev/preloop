@@ -1542,9 +1542,23 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
     if provider.status(golden).await? != MachineState::Missing {
         provider.delete(golden).await?;
     }
+    // smolvm's `machine create --from` consumes the SMOLPACK sidecar
+    // (`<payload>.smolmachine`), not the ELF launcher stub written at the
+    // payload path itself. Passing the stub fails with "invalid magic:
+    // expected SMOLPACK" and the pool silently falls back to a slow
+    // create-per-runner rebuild.
+    let payload = config.artifact_payload();
+    let pack = if payload.extension().is_some_and(|ext| ext == "smolmachine") {
+        payload
+    } else {
+        // Append, not `with_extension`: artifact names embed dots (the
+        // normalized `ghcr.io/...` base), so `with_extension` would replace
+        // everything after the last dot and produce a truncated path.
+        PathBuf::from(format!("{}.smolmachine", payload.display()))
+    };
     let spec = MachineSpec {
         name: golden.clone(),
-        image: config.artifact_payload().display().to_string(),
+        image: pack.display().to_string(),
         cpus: config.cpus,
         memory_mib: config.memory_mib,
         storage_gib: config.storage_gib,
@@ -3109,10 +3123,16 @@ async fn provision_runner<P: VmProvider + 'static>(
         }
     } else {
         let uses_packed_artifact = direct_create_from_packed;
+        let payload = config.artifact_payload();
+        let pack = if payload.extension().is_some_and(|ext| ext == "smolmachine") {
+            payload.clone()
+        } else {
+            PathBuf::from(format!("{}.smolmachine", payload.display()))
+        };
         let spec = MachineSpec {
             name: name.clone(),
             image: if uses_packed_artifact {
-                config.artifact_payload().display().to_string()
+                pack.display().to_string()
             } else if config.use_packed_artifact {
                 environment.base.clone()
             } else {

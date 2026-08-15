@@ -673,6 +673,9 @@ impl SmolVmProvider {
         network: Option<&NetworkPolicy>,
         staging_dir: Option<&Path>,
     ) -> Result<ExecOutput, VmError> {
+        if operation == "create" {
+            eprintln!("[preloop-vm:create] {:?}", args);
+        }
         let mut command = self.sandboxed_command()?;
         match network {
             Some(NetworkPolicy::PublicOnly) => {
@@ -689,6 +692,9 @@ impl SmolVmProvider {
             // archive. Keep that scratch space beside the output instead of
             // falling back to a small host /tmp tmpfs.
             command.env("TMPDIR", staging_dir);
+            // Pack export streams multi-GiB flattened layers; the general 4 GiB
+            // file-transfer cap would abort a large golden pack.
+            command.env("SMOLVM_FILE_TRANSFER_MAX_BYTES", "64GiB");
         }
         command
             .args(args)
@@ -823,30 +829,17 @@ impl VmProvider for SmolVmProvider {
             args.extend(["--from".into(), spec.image.clone()]);
         } else {
             args.extend(["--image".into(), spec.image.clone()]);
-            // A bare rootfs directory carries no OCI metadata, so the image
-            // defines no entrypoint/CMD and `machine start` refuses to run a
-            // detached workload. Everything this provider does runs through
-            // `machine exec` anyway, so pin a harmless keep-alive workload
-            // for directory images. Registry images keep their own CMD.
-            if Path::new(&spec.image).is_dir() {
-                args.extend([
-                    "--".into(),
-                    "/bin/sh".into(),
-                    "-c".into(),
-                    "sleep infinity".into(),
-                ]);
+            args.extend([
+                "--cpus".into(),
+                spec.cpus.to_string(),
+                "--mem".into(),
+                spec.memory_mib.to_string(),
+                "--storage".into(),
+                spec.storage_gib.to_string(),
+            ]);
+            if let Some(overlay_gib) = spec.overlay_gib {
+                args.extend(["--overlay".into(), overlay_gib.to_string()]);
             }
-        }
-        args.extend([
-            "--cpus".into(),
-            spec.cpus.to_string(),
-            "--mem".into(),
-            spec.memory_mib.to_string(),
-            "--storage".into(),
-            spec.storage_gib.to_string(),
-        ]);
-        if let Some(overlay_gib) = spec.overlay_gib {
-            args.extend(["--overlay".into(), overlay_gib.to_string()]);
         }
         match &spec.network {
             NetworkPolicy::Disabled => {}
@@ -891,6 +884,22 @@ impl VmProvider for SmolVmProvider {
             args.extend([
                 "--mount-socket".into(),
                 format!("{}:{}", mount.host.display(), mount.guest.display()),
+            ]);
+        }
+        if !is_pack {
+            // Everything this provider does runs through `machine exec`, so
+            // pin a harmless keep-alive workload for every image. Without it,
+            // machines whose record carries no entrypoint/cmd (local
+            // archives, the official runner image's bare `bash` CMD) fail to
+            // start with libkrun's EINVAL once the memory ceiling is raised.
+            // The workload must be the LAST positional block: `machine create`
+            // treats everything after `--` as the workload, so any flags
+            // appended later would be swallowed into it.
+            args.extend([
+                "--".into(),
+                "/bin/sh".into(),
+                "-c".into(),
+                "sleep infinity".into(),
             ]);
         }
         self.exclusive_with_network("create", &args, &spec.network)
@@ -1107,6 +1116,8 @@ impl VmProvider for SmolVmProvider {
             "exec".into(),
             "--name".into(),
             name.as_str().into(),
+            "--user".into(),
+            "root".into(),
             "--".into(),
         ];
         args.extend_from_slice(argv);
@@ -1127,6 +1138,8 @@ impl VmProvider for SmolVmProvider {
             "exec".into(),
             "--name".into(),
             name.as_str().into(),
+            "--user".into(),
+            "root".into(),
         ];
         for (guest, source) in secrets {
             if !is_env_identifier(guest) {
@@ -1174,7 +1187,7 @@ impl VmProvider for SmolVmProvider {
         }
         let mut command = self.sandboxed_command()?;
         command
-            .args(["machine", "exec", "--stream", "--name", name.as_str(), "--"])
+            .args(["machine", "exec", "--stream", "--name", name.as_str(), "--user", "root", "--"])
             .args(argv)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

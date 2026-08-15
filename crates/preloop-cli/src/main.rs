@@ -563,7 +563,13 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         runner_key_dir: None,
         pending_jobs: None,
         preload_images: Vec::new(),
-        runner_user: None,
+        // The golden bake provisions the image (runner install, apt, service
+        // files); it must run as root. The official runner image declares
+        // USER=runner, so the machine's default exec user is not root.
+        runner_user: std::env::var("PRELOOP_RUNNER_USER")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .or_else(|| Some("root".to_owned())),
         runner_uid: None,
         next_job_runs_on: None,
         pending_registrations: None,
