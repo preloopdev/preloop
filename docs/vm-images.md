@@ -549,3 +549,72 @@ fetches `index.docker.io` means the running CLI has an older compiled pin or
   `mirror.gcr.io/library/ubuntu:24.04@sha256:...`, not a bare
   `ubuntu:24.04@sha256:...`.
 
+### Building the official-runner-image golden on Apple Silicon
+
+The official GitHub-hosted runner image (`ubuntu24-runner-large`, published
+per-arch to `ghcr.io/preloopdev/runner-images` by the runner-image-blobs
+fork) is tens of GiB and declares `USER=runner`. Building a golden from it
+locally exercises several smolvm/praeloop sharp edges that a stock Ubuntu
+base never hits. All were fixed in smolvm's `src/cli/internal_boot.rs`,
+`src/cli/machine.rs`, `src/pack_export.rs`, `crates/smolvm-agent/src/…`, and
+`crates/preloop-cli`/`preloop-vm`; the notes below describe the failure each
+one produced so a regression is recognizable.
+
+- **`krun_start_enter returned: -22 (EINVAL)` — `Building the microVM failed:
+  Internal(Vm(VmSetup(VmCreate)))`**: the `smolvm` binary was re-signed with
+  an ad-hoc identity that dropped the `com.apple.security.hypervisor`
+  entitlement, so `hv_vm_create` returns `HV_UNSUPPORTED`. Re-sign with the
+  entitlement:
+  ```sh
+  cat > /tmp/hv.entitlements <<'EOF'
+  <?xml version="1.0" encoding="UTF-8"?>
+  <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+  <plist version="1.0"><dict>
+    <key>com.apple.security.hypervisor</key><true/>
+  </dict></plist>
+  EOF
+  codesign --force --sign - --entitlements /tmp/hv.entitlements ~/.smolvm/smolvm-bin
+  ```
+  Sanity-check with a tiny C probe calling `hv_vm_create` (returns 0 only
+  when the entitlement is present).
+- **Disk stays 20 GiB while the record says 120 GiB**: smolvm's
+  `open_or_create_at` never resizes an existing raw disk, and a machine
+  recreated under the same name reuses the same hash dir. A large flatten
+  then fills the small disk, and the guest surfaces the failure as
+  `io operation failed: Resource temporarily unavailable (os error 35)`.
+  `internal_boot.rs::open_boot_disk` now grows the raw disk to the requested
+  size (`set_len`; the guest `resize2fs` expands the ext4 at boot).
+- **Machine created with default resources despite `--mem/--storage`**:
+  `machine create` treats everything after `--` as the workload, so any flag
+  appended after the keep-alive workload (`-- /bin/sh -c sleep infinity`) is
+  silently swallowed — the machine boots with 8192 MiB / 20 GiB and no
+  network. The workload must be the *last* positional: praeloop now emits
+  every flag before `--`.
+- **`unknown variant \`flatten_layers\`` during pack**: the pack binary and
+  the guest agent's protocol disagree. The agent in
+  `~/.smolvm/agent-rootfs/usr/local/bin/` must be rebuilt from the *same*
+  checkout as the CLI (`cargo zigbuild --profile release-small -p smolvm-agent
+  --target aarch64-unknown-linux-musl`) and copied into the rootfs.
+- **`read file: guest streamed N bytes, exceeding the 4294967296 byte cap`**:
+  pack export streams multi-GiB flattened layers, but the general 4 GiB
+  file-transfer cap applies unless raised. praeloop sets
+  `SMOLVM_FILE_TRANSFER_MAX_BYTES=64GiB` on the pack command.
+- **`mkdir: cannot create directory '/var/lib/preloop-runner': Permission
+  denied` during the bake**: the official image declares `USER=runner`, and
+  `machine exec` runs as the image's declared user. The exec path now
+  accepts `--user` (added to smolvm's `ExecCmd`) and praeloop passes
+  `--user root` for bake commands.
+- **Packed layer contains `archive.tar`, not a rootfs (no `/bin/sh`)**:
+  a `local:<hash>` machine's cache dir holds the *archive*, not the
+  flattened rootfs. The pack export must flatten from the machine's own
+  storage (`image-archives/packed_layers/0000_rootfs`), not the cache dir;
+  `pack_export.rs` now sources the base that way for archive machines.
+- **`crun create` hangs then fails with EAGAIN**: never pipe crun's stderr
+  in the agent (`crun.rs` keeps `Stdio::null()`); capturing it for debugging
+  makes the two-step `crun create` deadlock.
+- **Disk fills from stale machine dirs**: a failed create can leak
+  `~/Library/Caches/smolvm/vms/<hash>/storage.raw` sparse files that a later
+  `machine delete` does not reclaim. When the host reports "No space left on
+  device" or flaky EAGAINs appear, prune the vms cache and verify free space
+  with `df -h /System/Volumes/Data`.
+

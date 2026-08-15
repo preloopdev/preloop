@@ -161,7 +161,7 @@ impl ToolchainLayer {
                          esac\n\
                          curl -fsSL \"https://static.rust-lang.org/rustup/archive/{}/$RUST_ARCH-unknown-linux-gnu/rustup-init\" -o /tmp/rustup-init\n\
                          chmod +x /tmp/rustup-init\n\
-                         /tmp/rustup-init -y --profile minimal --default-toolchain {}\n\
+                         /tmp/rustup-init -y --profile minimal --default-toolchain {} --component rustfmt,clippy\n\
                          rm -f /tmp/rustup-init",
                         crate::RUSTUP_VERSION,
                         safe_component(channel)
@@ -250,7 +250,14 @@ impl ToolchainLayer {
 /// so it is baked for everyone. `setup-*` actions download any other version
 /// a job asks for at job time — the same model GitHub-hosted runners use.
 pub fn curated_toolchains() -> Vec<ToolchainLayer> {
-    vec![ToolchainLayer::Rust("stable".into())]
+    // CI-Bench pins its corpus toolchains: Rust 1.88.0 (the version every
+    // task was authored and validated against) and Go 1.26.x. Baking them
+    // into every golden keeps the per-job VMs identical instead of
+    // re-installing per job.
+    vec![
+        ToolchainLayer::Rust("1.88.0".into()),
+        ToolchainLayer::Go("1.26".into()),
+    ]
 }
 
 /// Digest-pinned Ubuntu base images.
