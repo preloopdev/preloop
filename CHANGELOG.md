@@ -9,6 +9,18 @@ Releases before v0.27.0 predate the changelog.
 
 ## [Unreleased]
 
+### Security
+
+- Fail closed on cache writes when the calling job no longer resolves. A
+  fork PR job's runtime JWT survives the job's retirement
+  (`RequestRetirement::Purge` drops the correlation records the fork-tier
+  lookup walks); treating that unresolvable token as a control-plane caller
+  let a fork worker smuggle a cache write past the read-only guard with a
+  leaked token. `fork_restricted_from_token` now denies any job-shaped
+  token whose subject/scope no longer resolves to a live job, instead of
+  only when it positively resolves to a fork-restricted tier. Non-job
+  bearers (system token, runner-listen, debug-worker) are unaffected.
+
 ## [0.30.2] - 2026-08-13
 
 ### Added
