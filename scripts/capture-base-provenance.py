@@ -91,38 +91,48 @@ def referrers_url(registry: str, repository: str, subject_digest: str) -> str:
 
 def fetch(url: str, accept: str, allow_404: bool = False) -> bytes:
     auth_args: list[str] = []
+    # GHCR requires a registry-scoped token (not the raw credential): exchange
+    # it against the token endpoint. Try the configured credential first, then
+    # the anonymous exchange — public packages serve anonymous tokens, and a
+    # workflow token may legitimately lack access to a package linked to a
+    # different repository.
+    registry = url.split("/")[2]
+    path = url.split("/v2/", 1)[1]
+    for marker in ("/manifests/", "/blobs/", "/referrers/"):
+        if marker in path:
+            path = path.split(marker, 1)[0]
+            break
+    repo = path
+    exchange_url = (
+        f"https://{registry}/token?service={registry}"
+        f"&scope=repository:{repo}:pull"
+    )
     token = os.environ.get("GHCR_TOKEN") or os.environ.get("GITHUB_TOKEN")
-    if token:
-        # GHCR requires a registry-scoped token, not the raw credential:
-        # exchange it against the token endpoint first (anonymous for
-        # public packages; Basic auth for private ones).
+    credentials = ([("x-access-token", token)] if token else []) + [None]
+    registry_token = None
+    for credential in credentials:
+        cmd = [
+            "curl",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--location",
+        ]
+        if credential:
+            cmd += ["--user", f"{credential[0]}:{credential[1]}"]
+        cmd += [exchange_url]
         try:
-            registry = url.split("/")[2]
-            repo = url.split("/v2/", 1)[1].rsplit("/", 1)[0]
-            exchange = subprocess.run(
-                [
-                    "curl",
-                    "--fail",
-                    "--silent",
-                    "--show-error",
-                    "--location",
-                    "--user",
-                    f"x-access-token:{token}",
-                    (
-                        f"https://{registry}/token?service={registry}"
-                        f"&scope=repository:{repo}:pull"
-                    ),
-                ],
-                check=True,
-                capture_output=True,
-            )
+            exchange = subprocess.run(cmd, check=True, capture_output=True)
             registry_token = json.loads(exchange.stdout).get("token")
-            if registry_token:
-                auth_args = ["--header", f"Authorization: Bearer {registry_token}"]
         except (subprocess.CalledProcessError, json.JSONDecodeError):
-            # Fall through to anonymous; the manifest fetch will report the
-            # registry's real answer.
-            pass
+            registry_token = None
+        if registry_token:
+            break
+    auth_args = (
+        ["--header", f"Authorization: Bearer {registry_token}"]
+        if registry_token
+        else []
+    )
     try:
         result = subprocess.run(
             [
