@@ -139,19 +139,66 @@ pub(crate) async fn run(args: UpdateArgs) -> anyhow::Result<()> {
         }
     }
 
-    if remote_version <= current_version {
+    if remote_version < current_version {
         println!("preloop {} is already up to date", current_version);
         return Ok(());
     }
     let target = target_triple();
-    let selected = select_asset(&release.assets, &remote_version, target)
-        .with_context(|| format!("release {} has no asset for {target}", release.tag_name))?;
-    println!(
-        "preloop {} -> {} ({target})",
-        current_version, remote_version
-    );
-    if args.check {
-        return Ok(());
+    let selected = match select_asset(&release.assets, &remote_version, target) {
+        Some(selected) => selected,
+        // Same version with no asset for this target: nothing to compare
+        // against, so keep the installed binary (the version gate above
+        // already ruled out a downgrade).
+        None if remote_version == current_version => {
+            println!("preloop {} is already up to date", current_version);
+            return Ok(());
+        }
+        None => bail!("release {} has no asset for {target}", release.tag_name),
+    };
+    if remote_version == current_version {
+        // The version string is self-reported and can lie: a source build or
+        // a tampered binary claims the release version while its bytes
+        // differ, and a version-only gate then declares it up to date
+        // forever (this is how the v0.30.2 deaf-runner fix never reached
+        // production). Verify the installed binary against the checksummed
+        // release asset and reinstall on mismatch.
+        match installed_matches_release(&client, &selected).await {
+            Ok(true) => {
+                println!("preloop {} is already up to date", current_version);
+                return Ok(());
+            }
+            Ok(false) => println!(
+                "preloop {} does not match release {}; {} ({target})",
+                current_version,
+                release.tag_name,
+                if args.check {
+                    "would reinstall"
+                } else {
+                    "reinstalling"
+                }
+            ),
+            Err(error) => {
+                // A transient failure to fetch or verify the asset must not
+                // fail the hourly update timer; the next run retries.
+                println!(
+                    "warning: could not verify the installed binary against release {}: {error:#}",
+                    release.tag_name
+                );
+                println!("preloop {} is already up to date", current_version);
+                return Ok(());
+            }
+        }
+        if args.check {
+            return Ok(());
+        }
+    } else {
+        println!(
+            "preloop {} -> {} ({target})",
+            current_version, remote_version
+        );
+        if args.check {
+            return Ok(());
+        }
     }
 
     let lock_path = update_lock_path()?;
@@ -593,7 +640,18 @@ async fn verify_checksum(
     }
     .ok_or_else(|| anyhow::anyhow!("release asset {} has no SHA-256 checksum", archive.name))?;
 
-    let mut file = std::fs::File::open(archive_path)?;
+    let actual = sha256_file(archive_path)?;
+    if !actual.eq_ignore_ascii_case(&expected) {
+        bail!(
+            "checksum mismatch for {}: expected {expected}, got {actual}",
+            archive.name
+        );
+    }
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> anyhow::Result<String> {
+    let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 128 * 1024];
     loop {
@@ -603,14 +661,47 @@ async fn verify_checksum(
         }
         hasher.update(&buffer[..read]);
     }
-    let actual = format!("{:x}", hasher.finalize());
-    if !actual.eq_ignore_ascii_case(&expected) {
-        bail!(
-            "checksum mismatch for {}: expected {expected}, got {actual}",
-            archive.name
-        );
-    }
-    Ok(())
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Compare the installed binary against the checksummed release asset.
+///
+/// `Ok(true)` only when every byte of the installed executable matches the
+/// binary extracted from the release archive (whose own SHA-256 was already
+/// verified against the release checksum). Any fetch, checksum, or extract
+/// failure is an `Err` so the caller can distinguish "unknown" from
+/// "definitely equal".
+async fn installed_matches_release(
+    client: &Client,
+    selected: &SelectedAsset<'_>,
+) -> anyhow::Result<bool> {
+    let staging = tempfile::tempdir().context("create content-check staging directory")?;
+    let archive_path = staging.path().join(&selected.archive.name);
+    download(
+        client,
+        &selected.archive.browser_download_url,
+        &archive_path,
+    )
+    .await?;
+    verify_checksum(client, selected.archive, selected.checksum, &archive_path).await?;
+    let staged_binary = staging.path().join(binary_name());
+    extract_binary(&archive_path, &staged_binary)?;
+
+    let installed = std::env::current_exe().context("locate running preloop executable")?;
+    // macOS installs are launched through the `preloop` symlink into
+    // `<prefix>/bin/preloop`; canonicalize so a future compare of paths
+    // (and anyone reading this) sees the real file.
+    let installed =
+        fs::canonicalize(&installed).with_context(|| format!("resolve {}", installed.display()))?;
+    installed_binary_matches(&installed, &staged_binary)
+}
+
+/// Content comparison behind the same-version check: `true` only when the
+/// installed binary is byte-identical to the release binary. A missing or
+/// unreadable file is an `Err`, never a silent `true` — the caller treats
+/// "unknown" as "keep what is installed and retry later", not "matches".
+fn installed_binary_matches(installed: &Path, release_binary: &Path) -> anyhow::Result<bool> {
+    Ok(sha256_file(installed)? == sha256_file(release_binary)?)
 }
 
 fn extract_binary(archive_path: &Path, destination: &Path) -> anyhow::Result<()> {
@@ -1215,5 +1306,73 @@ mod tests {
 
         extract_binary(&archive_path, &output_path).expect("extract binary");
         assert_eq!(std::fs::read(output_path).expect("binary"), contents);
+    }
+
+    #[test]
+    fn content_check_detects_same_version_drift() {
+        // The v0.30.2 incident: a locally built binary claimed the release
+        // version string, so the version-only gate declared it up to date
+        // and the shipped fix never installed. The same-version check must
+        // compare bytes, not versions: identical content matches, drifted
+        // content (same claimed version) does not, and an unreadable file is
+        // an error rather than a silent match.
+        let temp = tempfile::tempdir().expect("staging directory");
+        let installed = temp.path().join("installed");
+        let release = temp.path().join("release");
+        std::fs::write(&installed, b"installed-build").unwrap();
+        std::fs::write(&release, b"installed-build").unwrap();
+        assert!(
+            installed_binary_matches(&installed, &release).expect("both files readable"),
+            "byte-identical binaries must match"
+        );
+        std::fs::write(&release, b"release-build").unwrap();
+        assert!(
+            !installed_binary_matches(&installed, &release).expect("both files readable"),
+            "drifted content at the same version must be detected"
+        );
+        assert!(
+            installed_binary_matches(&installed, &temp.path().join("missing")).is_err(),
+            "an unreadable binary must not be reported as matching"
+        );
+    }
+
+    #[test]
+    fn extract_then_content_check_rejects_a_tampered_archive_payload() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let temp = tempfile::tempdir().expect("staging directory");
+        let archive_path = temp.path().join("preloop-cli-aarch64-apple-darwin.tar.gz");
+        let file = std::fs::File::create(&archive_path).expect("archive");
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        // Same archive layout, different payload bytes than the "installed"
+        // binary that claims the same version.
+        let payload = b"drifted-release-payload";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder
+            .append_data(
+                &mut header,
+                "preloop-cli-aarch64-apple-darwin/preloop",
+                &payload[..],
+            )
+            .expect("binary entry");
+        builder
+            .into_inner()
+            .expect("gzip stream")
+            .finish()
+            .expect("archive");
+
+        let installed = temp.path().join("installed");
+        std::fs::write(&installed, b"local-build-claiming-same-version").unwrap();
+        let extracted = temp.path().join(binary_name());
+        extract_binary(&archive_path, &extracted).expect("extract binary");
+        assert!(
+            !installed_binary_matches(&installed, &extracted).expect("both files readable"),
+            "a drifted payload at the same version must trigger reinstall"
+        );
     }
 }
