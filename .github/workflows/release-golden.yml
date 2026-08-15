@@ -233,6 +233,25 @@ jobs:
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.base-sbom.spdx.json
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.provenance.json
 
+      # The packed golden routinely exceeds GitHub's 2 GiB release-asset
+      # limit (the official-image golden is ~10-15 GiB), so the golden is
+      # always retained as a workflow artifact BEFORE the (failing) upload:
+      # download from the run page for pool installs, or point
+      # PRELOOP_GOLDEN_URL at a custom host.
+      - name: Retain Golden Artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: golden-${{ env.GOLDEN_ARCH }}
+          path: |
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.sha256
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.bundle
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.base-provenance.json
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.base-sbom.spdx.json
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.provenance.json
+          retention-days: 90
+          if-no-files-found: error
+
       - name: Upload Golden Artifact to Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -255,25 +274,6 @@ jobs:
       # golden would sit only on the runner's workspace and be lost. Keep it
       # as a downloadable workflow artifact so the pool can be updated from
       # the run page.
-      # The packed golden routinely exceeds GitHub's 2 GiB release-asset
-      # limit (the official-image golden is ~10-15 GiB), so the golden is
-      # always retained as a workflow artifact: release builds can no longer
-      # rely on the release asset alone. Download from the run page and
-      # install into the pool, or point PRELOOP_GOLDEN_URL at a custom host.
-      - name: Retain Golden Artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: golden-${{ env.GOLDEN_ARCH }}
-          path: |
-            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
-            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.sha256
-            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.bundle
-            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.base-provenance.json
-            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.base-sbom.spdx.json
-            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.provenance.json
-          retention-days: 90
-          if-no-files-found: error
-
   # The aarch64 golden can only be built on an arm64 host (the guest VM runs
   # on the host's own architecture). GitHub-hosted Apple Silicon runners do
   # not support nested virtualization, so this must run on a bare-metal
@@ -449,6 +449,25 @@ jobs:
             dist/preloop-ubuntu-24.04-aarch64.base-sbom.spdx.json
             dist/preloop-ubuntu-24.04-aarch64.provenance.json
 
+      # The packed golden routinely exceeds GitHub's 2 GiB release-asset
+      # limit (the official-image golden is ~10-15 GiB), so the golden is
+      # always retained as a workflow artifact BEFORE the (failing) upload:
+      # download from the run page for pool installs, or point
+      # PRELOOP_GOLDEN_URL at a custom host.
+      - name: Retain Golden Artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: golden-${{ env.GOLDEN_ARCH }}
+          path: |
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.sha256
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.bundle
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.base-provenance.json
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.base-sbom.spdx.json
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.provenance.json
+          retention-days: 90
+          if-no-files-found: error
+
       - name: Upload Golden Artifact to Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -466,22 +485,3 @@ jobs:
             "dist/$GOLDEN_NAME.base-provenance.json" \
             "dist/$GOLDEN_NAME.base-sbom.spdx.json" \
             "dist/$GOLDEN_NAME.provenance.json" --clobber
-
-      # The packed golden routinely exceeds GitHub's 2 GiB release-asset
-      # limit (the official-image golden is ~10-15 GiB), so the golden is
-      # always retained as a workflow artifact: release builds can no longer
-      # rely on the release asset alone. Download from the run page and
-      # install into the pool, or point PRELOOP_GOLDEN_URL at a custom host.
-      - name: Retain Golden Artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: golden-aarch64
-          path: |
-            dist/preloop-ubuntu-24.04-aarch64
-            dist/preloop-ubuntu-24.04-aarch64.sha256
-            dist/preloop-ubuntu-24.04-aarch64.bundle
-            dist/preloop-ubuntu-24.04-aarch64.base-provenance.json
-            dist/preloop-ubuntu-24.04-aarch64.base-sbom.spdx.json
-            dist/preloop-ubuntu-24.04-aarch64.provenance.json
-          retention-days: 90
-          if-no-files-found: error
