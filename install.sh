@@ -68,25 +68,42 @@ release_json() { # tag or latest
     return 1
 }
 
+# --- smolvm runtime --------------------------------------------------------
+
+# `preloop update --ensure-runtime` installs the latest stable smolvm
+# release. 1.7.7 is the first release with the retained-fork checkpoints and
+# macOS network symbol preloop needs; anything newer (1.8.0, ...) is fine.
+# Keep in sync with `smolvm_min_version` in versions.toml, the source of
+# truth (this script cannot read it: it runs before the repo is checked out).
+SMOLVM_MIN_VERSION="1.7.7"
+
+smolvm_at_least() { # installed required
+    local installed required
+    installed="$(printf '%s' "$1" | awk -F. '{printf "%d%03d%03d\n", $1, $2, $3}')" || return 1
+    required="$(printf '%s' "$2" | awk -F. '{printf "%d%03d%03d\n", $1, $2, $3}')" || return 1
+    [ -n "$installed" ] && [ -n "$required" ] && [ "$installed" -ge "$required" ] 2>/dev/null
+}
+
 ensure_runtime() {
-    say "installing pinned smolvm runtime..."
+    say "installing smolvm runtime..."
     PATH="$BIN_DIR:$HOME/.local/bin:$PATH" \
         "$BIN_DIR/preloop" update --ensure-runtime \
-        || die "could not install the pinned smolvm runtime"
+        || die "could not install the smolvm runtime"
 
     local smolvm_bin="$HOME/.local/bin/smolvm"
     [ -x "$smolvm_bin" ] || die "smolvm was not installed at $smolvm_bin"
     local smolvm_version
     smolvm_version="$("$smolvm_bin" --version 2>/dev/null | awk '{print $NF}')"
-    [ "$smolvm_version" = "1.7.7" ] \
-        || die "expected smolvm 1.7.7, found ${smolvm_version:-unknown}"
+    if ! smolvm_at_least "$smolvm_version" "$SMOLVM_MIN_VERSION"; then
+        die "expected smolvm >= $SMOLVM_MIN_VERSION, found ${smolvm_version:-unknown}"
+    fi
 
     # Keep custom-prefix installs self-contained and ahead of any incompatible
     # system smolvm already on PATH.
     if [ "$BIN_DIR" != "$HOME/.local/bin" ]; then
         ln -sfn "$smolvm_bin" "$BIN_DIR/smolvm"
     fi
-    say "installed smolvm 1.7.7"
+    say "installed smolvm $smolvm_version"
 }
 
 install_from_release() {

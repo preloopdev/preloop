@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::LazyLock;
 use tar::Archive;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -16,13 +17,22 @@ use tokio::io::AsyncWriteExt;
 const DEFAULT_REPOSITORY: &str = "preloopdev/preloop";
 const USER_AGENT: &str = concat!("preloop/", env!("CARGO_PKG_VERSION"));
 const SMOLVM_REPOSITORY: &str = "smol-machines/smolvm";
+include!(concat!(env!("OUT_DIR"), "/pins.rs"));
 
-/// SmolVM version `preloop update` installs when the resolved binary cannot
-/// mount sockets.
+/// Minimum SmolVM release `preloop update` accepts as already compatible,
+/// compiled from `smolvm_min_version` in the workspace `versions.toml` (see
+/// `build.rs`; keep the two in sync).
 ///
-/// Pinned to the first official release carrying reusable retained fork
-/// checkpoints and the macOS network symbol required by preloop-vm.
-const SMOLVM_VERSION: &str = "1.7.7";
+/// 1.7.7 is the first official release carrying reusable retained fork
+/// checkpoints and the macOS network symbol required by preloop-vm. 1.7.5
+/// passes the `--mount-socket` probe yet its libkrun omits the symbol, so
+/// the floor is the first fully-capable release rather than the whole 1.7
+/// line; any newer stable release (1.8.0, …) satisfies it without
+/// maintenance.
+static SMOLVM_MIN_COMPATIBLE_VERSION: LazyLock<Version> = LazyLock::new(|| {
+    Version::parse(SMOLVM_MIN_VERSION)
+        .expect("smolvm_min_version in versions.toml must be a semver version")
+});
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct UpdateArgs {
@@ -113,10 +123,11 @@ pub(crate) async fn run(args: UpdateArgs) -> anyhow::Result<()> {
         Err(error) => println!("warning: Linux runner bundle not updated: {error:#}"),
     }
 
-    // The engine cannot provision VMs without the pinned compatible smolvm.
-    // Checking only `--mount-socket` accepted 1.7.5 on macOS even though its
-    // libkrun omitted krun_add_net_unixstream, so require both the capability
-    // and the exact release whose packaged runtime was verified.
+    // The engine cannot provision VMs without a compatible smolvm. Checking
+    // only `--mount-socket` accepted 1.7.5 on macOS even though its libkrun
+    // omitted krun_add_net_unixstream, so require the capability and at
+    // least the first release whose packaged runtime was verified; newer
+    // stable releases are adopted automatically.
     #[cfg(unix)]
     if !args.check {
         match ensure_smolvm(&client).await {
@@ -300,12 +311,21 @@ async fn probe_smolvm_version(binary: &Path) -> Option<String> {
 
 async fn smolvm_is_compatible(binary: &Path) -> bool {
     probe_mount_socket(binary).await
-        && probe_smolvm_version(binary).await.as_deref() == Some(SMOLVM_VERSION)
+        && probe_smolvm_version(binary)
+            .await
+            .and_then(|version| Version::parse(&version).ok())
+            .is_some_and(|version| version >= *SMOLVM_MIN_COMPATIBLE_VERSION)
 }
 
-/// Probe the resolved smolvm and install the exact verified release when its
+/// Probe the resolved smolvm and install the latest stable release when its
 /// version or required socket-mount capability differs.
 async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
+    let install = default_smolvm_install().context("HOME is not set")?;
+    // Clear stale templates from older layouts even when the pinned runtime
+    // is already installed: a compatible binary skips the install below, so
+    // this is the only chance to drop leftover variants that would otherwise
+    // keep being selected by SmolVM.
+    remove_stale_smolvm_templates(&install.prefix)?;
     if smolvm_is_compatible(Path::new("smolvm")).await {
         return Ok(());
     }
@@ -319,7 +339,7 @@ async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
     let release = fetch_release(
         client,
         &format!("https://api.github.com/repos/{SMOLVM_REPOSITORY}/releases"),
-        Some(SMOLVM_VERSION),
+        None,
     )
     .await?;
     let version = release
@@ -336,7 +356,6 @@ async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
         .assets
         .iter()
         .find(|asset| asset.name == "checksums.sha256");
-    let install = default_smolvm_install().context("HOME is not set")?;
     let staging = tempfile::tempdir().context("create smolvm download directory")?;
     let archive_path = staging.path().join(&archive_name);
     download(client, &archive_asset.browser_download_url, &archive_path).await?;
@@ -353,6 +372,34 @@ async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
             install.prefix.display(),
             install.bin_dir.display()
         );
+    }
+    Ok(())
+}
+
+/// Remove template variants from a previous SmolVM layout so the release's
+/// files are the only ones present. The archive carries either the
+/// uncompressed `.ext4` or compressed `.ext4.zst` variants; SmolVM's lazy
+/// extraction treats an existing uncompressed file as already prepared, so
+/// a leftover from an older installer would otherwise keep being used in
+/// place of the freshly copied format.
+/// Only `NotFound` is tolerated — any other failure is propagated so an
+/// update cannot report success while retaining stale state.
+fn remove_stale_smolvm_templates(prefix: &Path) -> anyhow::Result<()> {
+    for name in [
+        "storage-template.ext4",
+        "overlay-template.ext4",
+        "storage-template.ext4.zst",
+        "overlay-template.ext4.zst",
+    ] {
+        let path = prefix.join(name);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("remove stale smolvm template {}", path.display()));
+            }
+        }
     }
     Ok(())
 }
@@ -384,19 +431,7 @@ fn install_smolvm_from_archive(
         let _ = fs::remove_dir_all(&target);
         copy_dir_all(&lib, &target)?;
     }
-    // 1.7.7 ships its disk templates as `.zst`; older installs keep the
-    // uncompressed variants. SmolVM's lazy extraction treats an existing
-    // uncompressed file as already prepared, so every template variant is
-    // removed before the archive's payload is copied — otherwise an upgraded
-    // installation silently keeps using the previous release's templates.
-    for stale in [
-        "storage-template.ext4",
-        "overlay-template.ext4",
-        "storage-template.ext4.zst",
-        "overlay-template.ext4.zst",
-    ] {
-        let _ = fs::remove_file(install.prefix.join(stale));
-    }
+    remove_stale_smolvm_templates(&install.prefix)?;
     for name in [
         "smolvm",
         "smolvm-bin",
@@ -849,12 +884,15 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn compatibility_requires_pinned_version_and_mount_socket() {
+    async fn compatibility_requires_minimum_version_and_mount_socket() {
         let directory = tempfile::tempdir().unwrap();
         for (version, flag, expected) in [
-            (SMOLVM_VERSION, "--mount-socket <HOST:GUEST>", true),
+            ("1.7.7", "--mount-socket <HOST:GUEST>", true),
+            ("1.8.0", "--mount-socket <HOST:GUEST>", true),
             ("1.7.5", "--mount-socket <HOST:GUEST>", false),
-            (SMOLVM_VERSION, "--docker-socket", false),
+            ("1.7.6", "--mount-socket <HOST:GUEST>", false),
+            ("1.8.0", "--docker-socket", false),
+            ("1.7.7", "--docker-socket", false),
         ] {
             let executable = directory
                 .path()
@@ -916,7 +954,6 @@ mod tests {
         std::fs::write(lib.join("nested").join("libfile"), b"lib").unwrap();
         std::fs::write(source.join("smolvm"), "#!/bin/sh\n").unwrap();
         std::fs::write(source.join("smolvm-bin"), "#!/bin/sh\n").unwrap();
-        std::fs::write(source.join("storage-template.ext4"), b"template").unwrap();
         std::fs::write(
             source.join("storage-template.ext4.zst"),
             b"compressed-template",
@@ -967,6 +1004,19 @@ mod tests {
             data_dir: directory.path().join("data"),
             bin_dir: directory.path().join("bin"),
         };
+        std::fs::create_dir_all(&install.prefix).unwrap();
+        std::fs::write(install.prefix.join("storage-template.ext4"), b"stale").unwrap();
+        std::fs::write(install.prefix.join("overlay-template.ext4"), b"stale").unwrap();
+        std::fs::write(
+            install.prefix.join("storage-template.ext4.zst"),
+            b"stale-compressed",
+        )
+        .unwrap();
+        std::fs::write(
+            install.prefix.join("overlay-template.ext4.zst"),
+            b"stale-compressed",
+        )
+        .unwrap();
         if let Err(error) = install_smolvm_from_archive(&archive_path, "9.9.9", &install) {
             eprintln!("install error: {error:?}");
             panic!("install failed: {error}");
@@ -982,10 +1032,8 @@ mod tests {
         );
         assert!(install.prefix.join("smolvm").is_file());
         assert!(install.prefix.join("smolvm-bin").is_file());
-        assert_eq!(
-            std::fs::read(install.prefix.join("storage-template.ext4")).unwrap(),
-            b"template"
-        );
+        assert!(!install.prefix.join("storage-template.ext4").exists());
+        assert!(!install.prefix.join("overlay-template.ext4").exists());
         assert_eq!(
             std::fs::read(install.prefix.join("storage-template.ext4.zst")).unwrap(),
             b"compressed-template"
@@ -1092,6 +1140,50 @@ mod tests {
         assert_eq!(
             std::fs::read(install.prefix.join("overlay-template.ext4.zst")).unwrap(),
             b"compressed-overlay"
+        );
+    }
+
+    #[test]
+    fn remove_stale_smolvm_templates_clears_old_layouts() {
+        let directory = tempfile::tempdir().unwrap();
+        let prefix = directory.path().join("prefix");
+        std::fs::create_dir_all(&prefix).unwrap();
+        for name in [
+            "storage-template.ext4",
+            "overlay-template.ext4",
+            "storage-template.ext4.zst",
+            "overlay-template.ext4.zst",
+        ] {
+            std::fs::write(prefix.join(name), b"stale").unwrap();
+        }
+
+        remove_stale_smolvm_templates(&prefix).unwrap();
+
+        for name in [
+            "storage-template.ext4",
+            "overlay-template.ext4",
+            "storage-template.ext4.zst",
+            "overlay-template.ext4.zst",
+        ] {
+            assert!(!prefix.join(name).exists(), "{name} must be removed");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_stale_smolvm_templates_propagates_removal_failures() {
+        let directory = tempfile::tempdir().unwrap();
+        let prefix = directory.path().join("prefix");
+        // A directory at the template path makes `remove_file` fail with
+        // IsADirectory; the cleanup must surface that instead of silently
+        // proceeding and reporting a successful install.
+        std::fs::create_dir_all(prefix.join("storage-template.ext4")).unwrap();
+
+        let error = remove_stale_smolvm_templates(&prefix).unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("remove stale smolvm template"),
+            "unexpected error: {error:#}"
         );
     }
 
