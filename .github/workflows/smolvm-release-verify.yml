@@ -27,6 +27,11 @@ name: smolvm-release-verify
 
 on:
   pull_request:
+    # Renovate's smolvm bump PRs touch versions.toml; anything else does not
+    # need the upgrade-path verification. Keeps the preloop CI pool free on
+    # ordinary PRs (the server honors paths filters).
+    paths:
+      - versions.toml
   workflow_dispatch:
     inputs:
       version:
@@ -42,7 +47,8 @@ jobs:
   verify:
     name: Verify smolvm release on smolvm-host
     # Renovate bump PRs only (head branches renovate/**), plus manual
-    # dispatch; anything else skips so the required check passes cheaply.
+    # dispatch; anything else skips entirely (the preloop server evaluates
+    # root-job if conditions at submission, so nothing queues).
     if: (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'renovate/')) && vars.SMOLVM_VERIFY_HOST_WORKSPACE != ''
     runs-on: [self-hosted, smolvm-host]
     timeout-minutes: 120

@@ -23,6 +23,13 @@ name: runner-sync
 
 on:
   pull_request:
+    # Only Renovate's bump PRs (and the rare human versions.toml change)
+    # need the pipeline; running on every PR wastes pool slots on the
+    # preloop CI host, where the needs-gated sync job queues until prep
+    # completes. The preloop server honors paths filters (unevaluable ->
+    # rejected, not queued).
+    paths:
+      - versions.toml
   workflow_dispatch:
     inputs:
       from:
