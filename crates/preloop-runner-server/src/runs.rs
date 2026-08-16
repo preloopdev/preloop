@@ -885,6 +885,8 @@ pub(crate) async fn submit_run_inner(
                     job_continue_on_error: BTreeMap::new(),
                     status: ExecutionStatus::Failure,
                     job_check_run_ids: BTreeMap::new(),
+                    check_suite_id: None,
+                    check_head_sha: None,
                     reusable_calls,
                     jobs_list: Vec::new(),
                     created_at,
@@ -1045,6 +1047,8 @@ pub(crate) async fn submit_run_inner(
                             job_continue_on_error,
                             status: ExecutionStatus::Cancelled,
                             job_check_run_ids: BTreeMap::new(),
+                            check_suite_id: None,
+                            check_head_sha: None,
                             reusable_calls,
                             jobs_list: Vec::new(),
                             created_at,
@@ -1112,6 +1116,8 @@ pub(crate) async fn submit_run_inner(
                     job_continue_on_error,
                     status: ExecutionStatus::Pending,
                     job_check_run_ids: BTreeMap::new(),
+                    check_suite_id: None,
+                    check_head_sha: None,
                     reusable_calls,
                     jobs_list: Vec::new(),
                     created_at,
@@ -1171,6 +1177,8 @@ pub(crate) async fn submit_run_inner(
                 job_continue_on_error: job_continue_on_error.clone(),
                 status: ExecutionStatus::Queued,
                 job_check_run_ids: BTreeMap::new(),
+                check_suite_id: None,
+                check_head_sha: None,
                 reusable_calls: reusable_calls.clone(),
                 jobs_list: Vec::new(),
                 created_at,
@@ -1309,6 +1317,8 @@ pub(crate) async fn submit_run_inner(
                 job_continue_on_error,
                 status: initial_status,
                 job_check_run_ids: BTreeMap::new(),
+                check_suite_id: None,
+                check_head_sha: None,
                 reusable_calls,
                 jobs_list: Vec::new(),
                 created_at,
@@ -2169,49 +2179,18 @@ pub(crate) async fn cancel_run(
         .await;
     Ok(Json(record))
 }
-pub(crate) async fn rerun_run_inner(
-    shared: &Arc<SharedState>,
-    run_id: RunId,
-    reused_check_run: Option<(JobId, u64)>,
-) -> Result<RunAccepted, ApiError> {
-    let submission = {
-        let inner = shared.state.inner.lock().await;
-        inner
-            .runs
-            .get(&run_id)
-            .map(|run| (*run.submission).clone())
-            .ok_or_else(|| ApiError::not_found("run not found"))?
-    };
-    let accepted = submit_run_inner(shared, submission).await?;
-
-    if let Some((job_id, check_run_id)) = reused_check_run.as_ref() {
-        {
-            let mut inner = shared.state.inner.lock().await;
-            if let Some(run) = inner.runs.get_mut(&accepted.run_id) {
-                if run.jobs.contains_key(job_id) {
-                    run.job_check_run_ids.insert(job_id.clone(), *check_run_id);
-                }
-            }
-        }
-        // Same persistence obligation as `report_check_run_queued`: the
-        // reused check id must survive a restart before the job's first
-        // status event.
-        shared
-            .state
-            .emit(preloop_gha_protocol::NdjsonEvent::CheckRunCreated {
-                run_id: accepted.run_id,
-            })
-            .await;
-    }
-    crate::github::report_check_runs_for_run(shared, accepted.run_id, reused_check_run).await;
-    Ok(accepted)
-}
 
 pub(crate) async fn rerun_run(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
 ) -> Result<Json<RunAccepted>, ApiError> {
-    rerun_run_inner(&shared, run_id, None).await.map(Json)
+    // Reproduces the run as submitted (`None` keeps its job selection). A run
+    // that published checks republishes them — a fresh check run per job,
+    // GitHub's documented re-request flow; a run that never published checks
+    // just re-submits.
+    crate::github::rerun_run_inner(&shared, run_id, None)
+        .await
+        .map(Json)
 }
 
 /// Upper bound on how long an event stream waits for the next event.

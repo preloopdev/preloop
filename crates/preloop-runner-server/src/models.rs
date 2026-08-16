@@ -96,6 +96,18 @@ pub(crate) struct RunRecord {
     pub(crate) job_continue_on_error: BTreeMap<String, bool>,
     #[serde(default)]
     pub(crate) job_check_run_ids: BTreeMap<JobId, u64>,
+    /// GitHub check suite id reported by the check-runs API when the first
+    /// check run of this run was created. Lets `check_suite.rerequested` and
+    /// the recursion guard target exactly the runs whose checks live in the
+    /// suite; `None` for mock/offline runs that never talked to the API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) check_suite_id: Option<u64>,
+    /// Commit the check runs of this run were published on. This is the
+    /// status-check SHA, which for `pull_request` events is the PR head and
+    /// therefore differs from `submission.sha` (the base/checkout target).
+    /// Used to match a check suite to its runs when no suite id was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) check_head_sha: Option<String>,
     #[serde(default)]
     pub(crate) reusable_calls: BTreeMap<String, preloop_gha_parser::ReusableCallMetadata>,
     #[serde(default)]

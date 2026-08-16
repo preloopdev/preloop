@@ -16,10 +16,12 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::{
-    changed_paths_from_payload, submit_run_inner, ExecutionStatus, SharedState,
+    changed_paths_from_payload, submit_run_inner, ApiError, ExecutionStatus, SharedState,
     WebhookDeliveryState,
 };
-use preloop_gha_protocol::{AnnotationLevel, JobId, NdjsonEvent, RunId, WorkflowSubmission};
+use preloop_gha_protocol::{
+    AnnotationLevel, JobId, NdjsonEvent, RunAccepted, RunId, WorkflowSubmission,
+};
 
 /// Comma-separated workflow filenames or `.github/workflows/...` paths that
 /// GitHub, rather than Preloop, owns. This keeps release and artifact-publish
@@ -225,6 +227,21 @@ pub(crate) fn run_details_url(run_id: RunId) -> Option<String> {
 }
 
 /// Report a queued check run to GitHub or simulate it locally.
+///
+/// Always a `POST /repos/{owner}/{repo}/check-runs`, including for reruns.
+/// GitHub's Checks protocol has no "reset a finished check run" operation:
+/// its reference app answers both `check_suite.rerequested` and
+/// `check_run.rerequested` by creating a *new* check run in the re-requested
+/// suite ("When a check run is `rerequested`, you'll start the process all
+/// over and create a new check run" — Building CI checks with a GitHub App,
+/// Step 1.3). Re-using a finished check-run id via `PATCH … {"status":
+/// "queued"}` is undocumented and would leave the previous attempt's
+/// `conclusion` attached to a queued check.
+///
+/// The creation response also carries the check suite the run joined, and
+/// `sha` is the commit the checks live on (the PR head, not necessarily
+/// `submission.sha`). Both are recorded so `check_suite.rerequested` and the
+/// recursion guard can target this run exactly.
 pub(crate) async fn report_check_run_queued(
     shared: &Arc<SharedState>,
     repo: &str,
@@ -234,6 +251,7 @@ pub(crate) async fn report_check_run_queued(
 ) {
     let token = resolve_check_run_token(shared, repo).await;
     let mut check_run_id = None;
+    let mut suite_id = None;
 
     if let Some(token) = &token {
         let details_url = run_details_url(run_id);
@@ -260,6 +278,10 @@ pub(crate) async fn report_check_run_queued(
                         "GitHub check run created successfully"
                     );
                 }
+                suite_id = res
+                    .get("check_suite")
+                    .and_then(|suite| suite.get("id"))
+                    .and_then(|id| id.as_u64());
             }
             Err(e) => {
                 warn!(%run_id, %job_id, error = %e, "Failed to create GitHub check run");
@@ -271,107 +293,15 @@ pub(crate) async fn report_check_run_queued(
     }
 
     if let Some(check_id) = check_run_id {
-        {
-            let mut inner = shared.state.inner.lock().await;
-            if let Some(run) = inner.runs.get_mut(&run_id) {
-                run.job_check_run_ids.insert(job_id.clone(), check_id);
+        let mut inner = shared.state.inner.lock().await;
+        if let Some(run) = inner.runs.get_mut(&run_id) {
+            run.job_check_run_ids.insert(job_id.clone(), check_id);
+            if let Some(sid) = suite_id {
+                run.check_suite_id.get_or_insert(sid);
             }
-        }
-        // Persist the record now. The mapping is only meaningful while the
-        // run lives, and the next status event may be hours away (a long
-        // queue); a restart in that window used to restore the run with an
-        // empty mapping, silently orphaning the GitHub check in "queued"
-        // forever even though the job ran and completed.
-        shared
-            .state
-            .emit(preloop_gha_protocol::NdjsonEvent::CheckRunCreated { run_id })
-            .await;
-    }
-}
-
-/// Move an existing GitHub check run back to the queue after a rerequest.
-pub(crate) async fn report_existing_check_run_queued(
-    shared: &Arc<SharedState>,
-    repo: &str,
-    job_id: &JobId,
-    run_id: RunId,
-    check_run_id: u64,
-) {
-    let token = resolve_check_run_token(shared, repo).await;
-    if let Some(token) = &token {
-        let mut body = serde_json::json!({
-            "status": "queued",
-        });
-        if let Some(url) = run_details_url(run_id) {
-            body["details_url"] = serde_json::json!(url);
-        }
-        let path = format!("check-runs/{check_run_id}");
-        if let Err(error) =
-            send_github_check_request(token, repo, reqwest::Method::PATCH, &path, body).await
-        {
-            warn!(
-                %run_id,
-                %job_id,
-                check_run_id,
-                %error,
-                "Failed to requeue GitHub check run"
-            );
-        }
-    } else {
-        info!(
-            %run_id,
-            %job_id,
-            check_run_id,
-            "Mock requeued GitHub check run"
-        );
-    }
-}
-
-/// Publish queued/completed checks for a native rerun.
-pub(crate) async fn report_check_runs_for_run(
-    shared: &Arc<SharedState>,
-    run_id: RunId,
-    reused_check_run: Option<(JobId, u64)>,
-) {
-    let (repository, sha, jobs) = {
-        let inner = shared.state.inner.lock().await;
-        let Some(run) = inner.runs.get(&run_id) else {
-            return;
-        };
-        (
-            run.submission.repository.clone(),
-            run.submission.sha.clone(),
-            run.jobs.keys().cloned().collect::<Vec<_>>(),
-        )
-    };
-
-    for job_id in jobs {
-        if let Some((reused_job_id, check_run_id)) = &reused_check_run {
-            if reused_job_id == &job_id {
-                report_existing_check_run_queued(
-                    shared,
-                    &repository,
-                    &job_id,
-                    run_id,
-                    *check_run_id,
-                )
-                .await;
-            } else {
-                report_check_run_queued(shared, &repository, &sha, &job_id, run_id).await;
+            if run.check_head_sha.is_none() {
+                run.check_head_sha = Some(sha.to_owned());
             }
-        } else {
-            report_check_run_queued(shared, &repository, &sha, &job_id, run_id).await;
-        }
-
-        let status = {
-            let inner = shared.state.inner.lock().await;
-            inner
-                .runs
-                .get(&run_id)
-                .and_then(|run| run.jobs.get(&job_id).copied())
-        };
-        if let Some(status) = status.filter(|status| status.is_terminal()) {
-            report_check_run_completed(shared, run_id, &job_id, status).await;
         }
     }
 }
@@ -552,6 +482,300 @@ pub(crate) async fn report_check_run_completed(
             "Mock updated check run to completed"
         );
     }
+}
+
+/// Re-run a run: a fresh run record, and — when the source run had published
+/// checks — a fresh set of check runs on the same commit those checks live
+/// on. This is GitHub's documented app flow for a re-request; see
+/// [`report_check_run_queued`] for why the previous attempt's check-run ids
+/// are *not* reused.
+///
+/// `selected_jobs` overrides which jobs run:
+/// - `None` keeps the source submission's selection, so the native
+///   `/rerun` endpoint reproduces the run it was given.
+/// - `Some(jobs)` replaces it. `check_run.rerequested` passes the owning job;
+///   `check_suite.rerequested` passes an empty vector, which *clears* any
+///   narrowing — otherwise "Re-run all" on a suite whose newest attempt was
+///   itself a single-check rerun would silently re-run only that one job.
+///
+/// Note: `selected_jobs` resolves against a job's base id
+/// (`runs.rs::submit_run_inner`), so re-requesting one leg of a matrix
+/// re-runs every leg of that job.
+pub(crate) async fn rerun_run_inner(
+    shared: &Arc<SharedState>,
+    source_run_id: RunId,
+    selected_jobs: Option<Vec<String>>,
+) -> Result<RunAccepted, ApiError> {
+    let (mut submission, source_published_checks, check_sha) = {
+        let inner = shared.state.inner.lock().await;
+        let run = inner
+            .runs
+            .get(&source_run_id)
+            .ok_or_else(|| ApiError::not_found("run not found"))?;
+        (
+            (*run.submission).clone(),
+            !run.job_check_run_ids.is_empty(),
+            run.check_head_sha
+                .clone()
+                .unwrap_or_else(|| run.submission.sha.clone()),
+        )
+    };
+    if let Some(selected_jobs) = selected_jobs {
+        submission.selected_jobs = selected_jobs;
+    }
+    let accepted = submit_run_inner(shared, submission).await?;
+    let run_id = accepted.run_id;
+    // A run that never published checks (native submission) must not grow
+    // them on rerun — that would invent checks GitHub never asked for.
+    if !source_published_checks {
+        return Ok(accepted);
+    }
+    let (repository, jobs) = {
+        let inner = shared.state.inner.lock().await;
+        let Some(run) = inner.runs.get(&run_id) else {
+            return Ok(accepted);
+        };
+        (
+            run.submission.repository.clone(),
+            run.jobs.keys().cloned().collect::<Vec<_>>(),
+        )
+    };
+    for job_id in &jobs {
+        report_check_run_queued(shared, &repository, &check_sha, job_id, run_id).await;
+        // Jobs resolved terminal at submission (skipped, unsatisfiable
+        // needs) get their completion immediately, like the webhook path.
+        let status = {
+            let inner = shared.state.inner.lock().await;
+            inner
+                .runs
+                .get(&run_id)
+                .and_then(|run| run.jobs.get(job_id).copied())
+        };
+        if let Some(status) = status.filter(|status| status.is_terminal()) {
+            report_check_run_completed(shared, run_id, job_id, status).await;
+        }
+    }
+    Ok(accepted)
+}
+
+/// Whether `run` published the checks the payload's check suite describes.
+///
+/// GitHub keys its own recursion guard on the *suite*, not the individual
+/// check run: check-driven workflows do not fire "if the check suite was
+/// created by GitHub Actions **or if the check suite's head SHA is
+/// associated with GitHub Actions**" (Events that trigger workflows,
+/// `check_run` / `check_suite`). Both clauses matter here: the suite id is
+/// only known once the check-runs API answered, so offline runs and the
+/// window between `POST check-runs` and recording its id are covered by the
+/// head SHA instead.
+fn run_owns_suite(run: &crate::models::RunRecord, suite_id: Option<u64>, head_sha: &str) -> bool {
+    if let (Some(recorded), Some(suite_id)) = (run.check_suite_id, suite_id) {
+        if recorded == suite_id {
+            return true;
+        }
+    }
+    !head_sha.is_empty() && run.check_head_sha.as_deref() == Some(head_sha)
+}
+
+/// Whether the check_run/check_suite event refers to checks Preloop itself
+/// reported.
+///
+/// GitHub does not trigger check-driven workflows for check suites GitHub
+/// Actions created — otherwise a completed check would re-trigger the very
+/// workflow that created it, forever. Preloop's own check runs are the local
+/// equivalent of Actions-owned checks, so events about them get the same
+/// guard, keyed the same way GitHub keys it: the suite, or the suite's head
+/// SHA (see [`run_owns_suite`]). The individual check-run id is accepted too,
+/// since it is the most precise signal when we have it.
+async fn preloop_owns_check_event(
+    shared: &Arc<SharedState>,
+    event_name: &str,
+    payload: &Value,
+) -> bool {
+    let repository = payload
+        .get("repository")
+        .and_then(|r| r.get("full_name"))
+        .and_then(Value::as_str)
+        .unwrap_or("local/repo");
+    // A `check_run` payload describes its suite inline; a `check_suite`
+    // payload is the suite.
+    let subject = match event_name {
+        "check_run" => payload.get("check_run"),
+        _ => payload.get("check_suite"),
+    };
+    let Some(subject) = subject else {
+        return false;
+    };
+    let check_id = (event_name == "check_run")
+        .then(|| subject.get("id").and_then(Value::as_u64))
+        .flatten();
+    let suite = match event_name {
+        "check_run" => subject.get("check_suite"),
+        _ => Some(subject),
+    };
+    let suite_id = suite
+        .and_then(|suite| suite.get("id"))
+        .and_then(Value::as_u64);
+    let head_sha = suite
+        .and_then(|suite| suite.get("head_sha"))
+        .or_else(|| subject.get("head_sha"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    let inner = shared.state.inner.lock().await;
+    inner.runs.values().any(|run| {
+        run.submission.repository == repository
+            && (check_id
+                .is_some_and(|check_id| run.job_check_run_ids.values().any(|&id| id == check_id))
+                || run_owns_suite(run, suite_id, head_sha))
+    })
+}
+
+/// Handle `check_suite.rerequested` and `check_run.rerequested` — the Checks
+/// UI's "Re-run" buttons ask the app that owns the checks to re-run them.
+/// Preloop owns the runs that reported those checks, so it re-runs the exact
+/// runs: repository full name plus check-suite id (falling back to head sha
+/// for runs that never recorded a suite id — mock/legacy runs) for suites,
+/// or the exact check-run id for individual runs.
+///
+/// Idempotent under redelivery, per target: a workflow whose newest matching
+/// attempt is still running already has a re-run in flight, so a duplicate
+/// `rerequested` must not start a second one. The guard is scoped to that
+/// workflow — one busy workflow must not veto re-running the finished ones,
+/// and a run that never reaches a conclusion (abandoned lease, restart
+/// mid-run) must not wedge the button for the whole suite.
+///
+/// Failures are logged, not delivery failures: a redelivery cannot fix a
+/// rerun (the in-flight guard would skip it), so failing the delivery would
+/// only churn GitHub's retry loop.
+async fn rerun_for_rerequested(
+    shared: &Arc<SharedState>,
+    event_name: &str,
+    payload: &Value,
+) -> Vec<RunAccepted> {
+    let repository = payload
+        .get("repository")
+        .and_then(|r| r.get("full_name"))
+        .and_then(Value::as_str)
+        .unwrap_or("local/repo");
+    let mut accepted = Vec::new();
+
+    if event_name == "check_suite" {
+        let Some(suite) = payload.get("check_suite") else {
+            return accepted;
+        };
+        let Some(suite_id) = suite.get("id").and_then(Value::as_u64) else {
+            info!(
+                %repository,
+                "check_suite.rerequested without a suite id — nothing to re-run"
+            );
+            return accepted;
+        };
+        let head_sha = suite
+            .get("head_sha")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        let mut candidates = {
+            let inner = shared.state.inner.lock().await;
+            let mut candidates = Vec::new();
+            for (run_id, run) in &inner.runs {
+                if run.submission.repository != repository
+                    || !run_owns_suite(run, Some(suite_id), head_sha)
+                {
+                    continue;
+                }
+                candidates.push((
+                    run_id.clone(),
+                    run.submission.workflow_path.clone().unwrap_or_default(),
+                    run.created_at,
+                    run.conclusion.is_none(),
+                ));
+            }
+            candidates
+        };
+        // Newest run per workflow file: the current attempt of each workflow
+        // in the suite. The in-flight check applies to that attempt only.
+        candidates.sort_by(|a, b| b.2.cmp(&a.2));
+        let mut seen_paths = std::collections::BTreeSet::new();
+        for (run_id, path, _, running) in candidates {
+            if !seen_paths.insert(path) {
+                continue;
+            }
+            if running {
+                info!(
+                    %repository,
+                    suite_id,
+                    %run_id,
+                    "check_suite.rerequested while this workflow's newest attempt is still active — idempotent skip"
+                );
+                continue;
+            }
+            match rerun_run_inner(shared, run_id.clone(), Some(vec![])).await {
+                Ok(rerun) => accepted.push(rerun),
+                Err(error) => {
+                    warn!(%run_id, ?error, "check_suite rerun failed");
+                }
+            }
+        }
+    } else {
+        let Some(check_run) = payload.get("check_run") else {
+            return accepted;
+        };
+        let Some(check_id) = check_run.get("id").and_then(Value::as_u64) else {
+            info!(
+                %repository,
+                "check_run.rerequested without a check-run id — nothing to re-run"
+            );
+            return accepted;
+        };
+
+        let mut candidates = {
+            let inner = shared.state.inner.lock().await;
+            let mut candidates = Vec::new();
+            for (run_id, run) in &inner.runs {
+                if run.submission.repository != repository {
+                    continue;
+                }
+                for (job_id, &id) in &run.job_check_run_ids {
+                    if id != check_id {
+                        continue;
+                    }
+                    let base_id = run
+                        .job_base_ids
+                        .get(job_id)
+                        .cloned()
+                        .unwrap_or_else(|| job_id.0.clone());
+                    candidates.push((
+                        run_id.clone(),
+                        base_id,
+                        run.created_at,
+                        run.conclusion.is_none(),
+                    ));
+                }
+            }
+            candidates
+        };
+        candidates.sort_by(|a, b| b.2.cmp(&a.2));
+        if let Some((run_id, base_id, _, running)) = candidates.into_iter().next() {
+            if running {
+                info!(
+                    %repository,
+                    check_id,
+                    %run_id,
+                    "check_run.rerequested while the newest attempt is still active — idempotent skip"
+                );
+                return accepted;
+            }
+            match rerun_run_inner(shared, run_id.clone(), Some(vec![base_id])).await {
+                Ok(rerun) => accepted.push(rerun),
+                Err(error) => {
+                    warn!(%run_id, ?error, "check_run rerun failed");
+                }
+            }
+        }
+    }
+    accepted
 }
 
 /// Fetch workflows helper.
@@ -1048,7 +1272,7 @@ async fn process_check_run_rerequest(
         return Ok((StatusCode::OK, Json(serde_json::json!([]))));
     };
 
-    let accepted = crate::rerun_run_inner(shared, run_id, Some((job_id.clone(), check_run_id)))
+    let accepted = crate::github::rerun_run_inner(shared, run_id, Some(vec![job_id.0.clone()]))
         .await
         .map_err(|error| {
             error!(
@@ -1086,8 +1310,40 @@ async fn process_github_webhook(
     // 3. Parse the event payload
     let payload_val: Value = serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    if event_name == "check_run" {
-        return process_check_run_rerequest(shared, &payload_val).await;
+    let mut triggered_runs = Vec::new();
+
+    // Check-event semantics beyond workflow triggering, resolved before the
+    // trigger projection because they are independent of it:
+    // - `check_suite.rerequested` / `check_run.rerequested` are the Checks
+    //   UI's "Re-run" — they ask the app that owns the checks to re-run
+    //   them. Preloop owns the runs that reported those checks, so it
+    //   re-runs the exact runs. `rerequested` is *not* a workflow-trigger
+    //   activity type for `check_suite`, so this must not sit behind the
+    //   adapter's projection.
+    // - Recursion guard: GitHub does not trigger check-driven workflows for
+    //   suites GitHub Actions created; Preloop's own check runs are the
+    //   local equivalent, so events about them do not re-trigger
+    //   check-driven workflows either.
+    if matches!(event_name, "check_run" | "check_suite") {
+        let owned = preloop_owns_check_event(shared, event_name, &payload_val).await;
+        if payload_val.get("action").and_then(Value::as_str) == Some("rerequested") {
+            let reruns = rerun_for_rerequested(shared, event_name, &payload_val).await;
+            if !reruns.is_empty() {
+                info!(
+                    event = event_name,
+                    rerun_count = reruns.len(),
+                    "check rerun requested — re-ran matching runs"
+                );
+            }
+            triggered_runs.extend(reruns);
+        }
+        if owned {
+            info!(
+                event = event_name,
+                "check event belongs to a preloop-run check — recursion guard: not re-triggering check-driven workflows"
+            );
+            return Ok((StatusCode::OK, Json(serde_json::json!(triggered_runs))));
+        }
     }
 
     // 4. Look up the event adapter
@@ -1095,7 +1351,7 @@ async fn process_github_webhook(
         Some(a) => a,
         None => {
             info!("No adapter for event: {}", event_name);
-            return Ok((StatusCode::OK, Json(serde_json::json!([]))));
+            return Ok((StatusCode::OK, Json(serde_json::json!(triggered_runs))));
         }
     };
 
@@ -1107,7 +1363,7 @@ async fn process_github_webhook(
             "Event {} produced no effective events (e.g. [skip ci] or fork-gated)",
             event_name
         );
-        return Ok((StatusCode::OK, Json(serde_json::json!([]))));
+        return Ok((StatusCode::OK, Json(serde_json::json!(triggered_runs))));
     }
 
     let repo_full_name = payload_val
@@ -1152,7 +1408,6 @@ async fn process_github_webhook(
         (changed_paths_from_payload(&payload_val), true)
     };
 
-    let mut triggered_runs = Vec::new();
     let github_owned_workflows = configured_github_owned_workflows();
 
     // 5. For each effective event, fetch workflows and submit runs
@@ -1172,9 +1427,14 @@ async fn process_github_webhook(
         // Log filter validity warnings (non-fatal — GitHub only warns)
         // This is done per-workflow later, but we log at the event level too
 
-        // `workflow_run` is privileged: downstream workflow YAML must always
-        // come from the repository default branch, never the upstream head.
-        let workflow_ref = if effective.event == "workflow_run" {
+        // `workflow_run`, `check_run`, and `check_suite` are privileged:
+        // downstream workflow YAML must always come from the repository
+        // default branch (these events only fire when the workflow file
+        // exists there), never from the event's own ref.
+        let workflow_ref = if matches!(
+            effective.event.as_str(),
+            "workflow_run" | "check_run" | "check_suite"
+        ) {
             &ref_default
         } else {
             &effective.git_ref
@@ -1962,6 +2222,907 @@ mod tests {
             inner.runs.len(),
             1,
             "a redelivery after cancellation must be processed"
+        );
+    }
+
+    // ── check_suite / check_run events ────────────────────────────────
+
+    /// A real git repository whose `refs/heads/main` resolves: check-driven
+    /// webhooks resolve the run SHA to the default-branch head, exactly like
+    /// GitHub does for these events.
+    async fn git_workspace(temp: &tempfile::TempDir) -> std::path::PathBuf {
+        let ws_dir = temp.path().join("ws");
+        std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
+        let init = tokio::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&ws_dir)
+            .output()
+            .await
+            .unwrap();
+        assert!(init.status.success(), "git init failed: {init:?}");
+        let commit = tokio::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=preloop-test",
+                "-c",
+                "user.email=preloop@test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+            ])
+            .current_dir(&ws_dir)
+            .output()
+            .await
+            .unwrap();
+        assert!(commit.status.success(), "git commit failed: {commit:?}");
+        ws_dir
+    }
+
+    /// Head SHA of `main` in `ws_dir`.
+    async fn git_head(ws_dir: &std::path::Path) -> String {
+        let output = tokio::process::Command::new("git")
+            .args(["rev-parse", "refs/heads/main"])
+            .current_dir(ws_dir)
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn check_suite_payload(action: &str, suite_id: u64, head_sha: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "action": action,
+            "check_suite": {
+                "id": suite_id,
+                "head_branch": "changes",
+                "head_sha": head_sha,
+                "status": "completed",
+                "conclusion": "success",
+            },
+            "repository": {"full_name": "owner/repo", "default_branch": "main"},
+            "sender": {"login": "octocat"},
+        }))
+        .unwrap()
+    }
+
+    fn check_run_payload(action: &str, check_id: u64, head_sha: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "action": action,
+            "check_run": {
+                "id": check_id,
+                "name": "build",
+                "head_sha": head_sha,
+                "status": "completed",
+                "conclusion": "success",
+                "check_suite": {"id": 7, "head_branch": "changes"},
+            },
+            "repository": {"full_name": "owner/repo", "default_branch": "main"},
+            "sender": {"login": "octocat"},
+        }))
+        .unwrap()
+    }
+
+    /// `check_suite.completed` must trigger workflows whose `types` include
+    /// `completed` (and `on: check_suite` without `types`, whose default is
+    /// "all activity types"), and must not trigger a `types: [requested]`
+    /// workflow.
+    #[tokio::test]
+    async fn check_suite_completed_triggers_matching_workflows() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = git_workspace(&temp).await;
+        std::fs::write(
+            ws_dir.join(".github/workflows/suite-completed.yml"),
+            "on:\n  check_suite:\n    types: [completed]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo suite\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ws_dir.join(".github/workflows/suite-requested.yml"),
+            "on:\n  check_suite:\n    types: [requested]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo suite\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ws_dir.join(".github/workflows/suite-default.yml"),
+            "on: check_suite\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo suite\n",
+        )
+        .unwrap();
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        // Held for the whole test: these assertions depend on the
+        // GitHub env being unset (offline check runs), and
+        // `PRELOOP_GITHUB_*` is process-global.
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let head = git_head(&ws_dir).await;
+
+        let payload =
+            check_suite_payload("completed", 7, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+        assert_eq!(
+            fixture
+                .post_body("delivery-suite", Some("check_suite"), &payload)
+                .await,
+            StatusCode::OK
+        );
+
+        let inner = fixture.state.inner.lock().await;
+        assert_eq!(
+            inner.runs.len(),
+            2,
+            "completed must trigger the types:[completed] and the default workflow, not types:[requested]"
+        );
+        for run in inner.runs.values() {
+            assert_eq!(run.submission.event, "check_suite");
+            assert_eq!(run.submission.activity_type.as_deref(), Some("completed"));
+            assert_eq!(
+                run.submission.sha, head,
+                "check-driven runs check out the default-branch head"
+            );
+            assert_eq!(run.submission.git_ref, "refs/heads/main");
+        }
+    }
+
+    /// `check_run.created` must trigger an `on: check_run` workflow.
+    #[tokio::test]
+    async fn check_run_created_triggers_check_run_workflow() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = git_workspace(&temp).await;
+        std::fs::write(
+            ws_dir.join(".github/workflows/checkrun.yml"),
+            "on:\n  check_run:\n    types: [created, completed]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo check\n",
+        )
+        .unwrap();
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        // Held for the whole test: these assertions depend on the
+        // GitHub env being unset (offline check runs), and
+        // `PRELOOP_GITHUB_*` is process-global.
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let head = git_head(&ws_dir).await;
+
+        let payload = check_run_payload("created", 4, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+        assert_eq!(
+            fixture
+                .post_body("delivery-checkrun", Some("check_run"), &payload)
+                .await,
+            StatusCode::OK
+        );
+
+        let inner = fixture.state.inner.lock().await;
+        assert_eq!(inner.runs.len(), 1);
+        let run = inner.runs.values().next().unwrap();
+        assert_eq!(run.submission.event, "check_run");
+        assert_eq!(run.submission.activity_type.as_deref(), Some("created"));
+        assert_eq!(run.submission.sha, head);
+    }
+
+    /// Malformed check payloads are a completed, no-op delivery — never a
+    /// panic, never a run, never a delivery failure.
+    #[tokio::test]
+    async fn malformed_check_payloads_are_safe_noops() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = git_workspace(&temp).await;
+        std::fs::write(
+            ws_dir.join(".github/workflows/suite.yml"),
+            "on:\n  check_suite:\n    types: [completed]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo suite\n",
+        )
+        .unwrap();
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+
+        let mut unknown_action = serde_json::from_slice::<serde_json::Value>(&check_suite_payload(
+            "completed",
+            7,
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        ))
+        .unwrap();
+        unknown_action["action"] = serde_json::json!("labeled");
+        assert_eq!(
+            fixture
+                .post_body(
+                    "delivery-bad-action",
+                    Some("check_suite"),
+                    &serde_json::to_vec(&unknown_action).unwrap()
+                )
+                .await,
+            StatusCode::OK
+        );
+
+        let mut missing_suite = serde_json::from_slice::<serde_json::Value>(&check_suite_payload(
+            "completed",
+            7,
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        ))
+        .unwrap();
+        missing_suite.as_object_mut().unwrap().remove("check_suite");
+        assert_eq!(
+            fixture
+                .post_body(
+                    "delivery-missing-suite",
+                    Some("check_suite"),
+                    &serde_json::to_vec(&missing_suite).unwrap()
+                )
+                .await,
+            StatusCode::OK
+        );
+
+        let inner = fixture.state.inner.lock().await;
+        assert!(
+            inner.runs.is_empty(),
+            "malformed payloads must not run anything"
+        );
+        for delivery in ["delivery-bad-action", "delivery-missing-suite"] {
+            assert!(
+                inner.webhook_deliveries.iter().any(|(id, state)| {
+                    id == delivery && matches!(state, WebhookDeliveryState::Completed(_))
+                }),
+                "{delivery} must be a completed delivery"
+            );
+        }
+    }
+
+    /// Terminal state for every job of `run_id`, as the reaper would leave it.
+    async fn finish_run(fixture: &WebhookFixture, run_id: &RunId, conclusion: &str) {
+        let mut inner = fixture.state.inner.lock().await;
+        let run = inner.runs.get_mut(run_id).unwrap();
+        run.conclusion = Some(conclusion.to_owned());
+        run.status = ExecutionStatus::Failure;
+        for status in run.jobs.values_mut() {
+            *status = ExecutionStatus::Failure;
+        }
+    }
+
+    /// `check_suite.rerequested` (Checks UI "Re-run all") re-runs the runs of
+    /// the suite. Per GitHub's documented app flow the rerun publishes a
+    /// *fresh* check run per job rather than reviving the finished ones, and
+    /// a redelivered `rerequested` while the rerun is active is a no-op.
+    #[tokio::test]
+    async fn check_suite_rerequested_reruns_suite_with_fresh_checks() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = WebhookFixture::new(&temp).await;
+        // Held for the whole test: these assertions depend on the
+        // GitHub env being unset (offline check runs), and
+        // `PRELOOP_GITHUB_*` is process-global.
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+
+        assert_eq!(
+            fixture.post("delivery-1", Some("push")).await,
+            StatusCode::OK
+        );
+        let (run_a, check_ids_a) = {
+            let inner = fixture.state.inner.lock().await;
+            let run = inner.runs.values().next().unwrap();
+            assert_eq!(
+                run.check_head_sha.as_deref(),
+                Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+                "the commit the checks were published on is recorded"
+            );
+            (run.run_id.clone(), run.job_check_run_ids.clone())
+        };
+        assert!(!check_ids_a.is_empty(), "the push run must have check ids");
+        // Part of suite 7, as if its checks were created through the GitHub
+        // API (which is what records the suite id).
+        {
+            let mut inner = fixture.state.inner.lock().await;
+            inner.runs.get_mut(&run_a).unwrap().check_suite_id = Some(7);
+        }
+        finish_run(&fixture, &run_a, "success").await;
+
+        let payload =
+            check_suite_payload("rerequested", 7, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+        assert_eq!(
+            fixture
+                .post_body("delivery-rerun-1", Some("check_suite"), &payload)
+                .await,
+            StatusCode::OK
+        );
+
+        let rerun_id = {
+            let inner = fixture.state.inner.lock().await;
+            assert_eq!(inner.runs.len(), 2, "the rerequest must create one rerun");
+            let rerun = inner.runs.values().find(|run| run.run_id != run_a).unwrap();
+            assert_eq!(
+                rerun.job_check_run_ids.keys().collect::<Vec<_>>(),
+                check_ids_a.keys().collect::<Vec<_>>(),
+                "the rerun publishes a check run for the same jobs"
+            );
+            assert!(
+                rerun
+                    .job_check_run_ids
+                    .iter()
+                    .all(|(job, id)| check_ids_a.get(job) != Some(id)),
+                "each rerun check run is newly created, not the previous attempt's id"
+            );
+            assert_eq!(
+                rerun.check_head_sha, // same commit, new checks
+                Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned())
+            );
+            rerun.run_id.clone()
+        };
+
+        // Redelivery (new delivery id) while the rerun is active: no-op.
+        assert_eq!(
+            fixture
+                .post_body("delivery-rerun-2", Some("check_suite"), &payload)
+                .await,
+            StatusCode::OK
+        );
+        let inner = fixture.state.inner.lock().await;
+        assert_eq!(
+            inner.runs.len(),
+            2,
+            "a redelivered rerequest must not start a second rerun while one is in flight"
+        );
+        assert!(inner.runs.contains_key(&rerun_id));
+    }
+
+    /// Runs whose suite id was never recorded (offline mode) are matched by
+    /// the commit their checks were published on — which is the status-check
+    /// SHA, not `submission.sha`.
+    #[tokio::test]
+    async fn check_suite_rerequested_matches_on_published_check_sha() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = WebhookFixture::new(&temp).await;
+        // Held for the whole test: these assertions depend on the
+        // GitHub env being unset (offline check runs), and
+        // `PRELOOP_GITHUB_*` is process-global.
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        assert_eq!(
+            fixture.post("delivery-1", Some("push")).await,
+            StatusCode::OK
+        );
+        let run_a = {
+            let inner = fixture.state.inner.lock().await;
+            let run = inner.runs.values().next().unwrap();
+            assert_eq!(run.check_suite_id, None, "offline runs record no suite id");
+            run.run_id.clone()
+        };
+        // A base/head split, as `pull_request` produces: the suite's head sha
+        // is the published check sha, never the checkout target.
+        {
+            let mut inner = fixture.state.inner.lock().await;
+            let run = inner.runs.get_mut(&run_a).unwrap();
+            let mut submission = (*run.submission).clone();
+            submission.sha = "1111111111111111111111111111111111111111".to_owned();
+            run.submission = std::sync::Arc::new(submission);
+        }
+        finish_run(&fixture, &run_a, "success").await;
+
+        let payload = check_suite_payload(
+            "rerequested",
+            99,
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        );
+        assert_eq!(
+            fixture
+                .post_body("delivery-rerun", Some("check_suite"), &payload)
+                .await,
+            StatusCode::OK
+        );
+        let inner = fixture.state.inner.lock().await;
+        assert_eq!(
+            inner.runs.len(),
+            2,
+            "a suite id we never recorded must still match via the published check sha"
+        );
+    }
+
+    /// One busy workflow must not veto re-running the finished ones: all
+    /// preloop checks for a commit share a suite, and a run that never
+    /// reaches a conclusion would otherwise wedge "Re-run all" forever.
+    #[tokio::test]
+    async fn check_suite_rerequested_skips_only_the_busy_workflow() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = git_workspace(&temp).await;
+        for name in ["a", "b"] {
+            std::fs::write(
+                ws_dir.join(format!(".github/workflows/{name}.yml")),
+                "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            )
+            .unwrap();
+        }
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        // Held for the whole test: these assertions depend on the
+        // GitHub env being unset (offline check runs), and
+        // `PRELOOP_GITHUB_*` is process-global.
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        assert_eq!(
+            fixture.post("delivery-1", Some("push")).await,
+            StatusCode::OK
+        );
+
+        let (finished, busy) = {
+            let inner = fixture.state.inner.lock().await;
+            assert_eq!(inner.runs.len(), 2, "both workflows ran on the push");
+            let mut ids = inner
+                .runs
+                .values()
+                .map(|run| {
+                    (
+                        run.submission.workflow_path.clone().unwrap(),
+                        run.run_id.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            ids.sort();
+            (ids[0].1.clone(), ids[1].1.clone())
+        };
+        // `busy` never reaches a conclusion — an abandoned lease.
+        finish_run(&fixture, &finished, "failure").await;
+
+        let payload =
+            check_suite_payload("rerequested", 7, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+        assert_eq!(
+            fixture
+                .post_body("delivery-rerun", Some("check_suite"), &payload)
+                .await,
+            StatusCode::OK
+        );
+
+        let inner = fixture.state.inner.lock().await;
+        assert_eq!(
+            inner.runs.len(),
+            3,
+            "the finished workflow re-runs even though a sibling is still active"
+        );
+        let reruns: Vec<_> = inner
+            .runs
+            .values()
+            .filter(|run| run.run_id != finished && run.run_id != busy)
+            .collect();
+        assert_eq!(reruns.len(), 1);
+        assert_eq!(
+            reruns[0].submission.workflow_path,
+            inner.runs.get(&finished).unwrap().submission.workflow_path,
+            "the rerun belongs to the finished workflow, not the busy one"
+        );
+    }
+
+    /// `check_run.rerequested` (Checks UI "Re-run" on one check) re-runs the
+    /// exact run and job whose check-run id matches — other runs are
+    /// untouched — and a later suite-wide "Re-run all" is not narrowed by the
+    /// selection that rerun inherited.
+    #[tokio::test]
+    async fn check_run_rerequested_reruns_exact_check_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = git_workspace(&temp).await;
+        std::fs::write(
+            ws_dir.join(".github/workflows/build.yml"),
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo b\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo t\n",
+        )
+        .unwrap();
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        // Held for the whole test: these assertions depend on the
+        // GitHub env being unset (offline check runs), and
+        // `PRELOOP_GITHUB_*` is process-global.
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+
+        assert_eq!(
+            fixture.post("delivery-1", Some("push")).await,
+            StatusCode::OK
+        );
+        let (run_a, build_check_id) = {
+            let inner = fixture.state.inner.lock().await;
+            let run = inner.runs.values().next().unwrap();
+            assert_eq!(run.job_check_run_ids.len(), 2, "both jobs published checks");
+            (
+                run.run_id.clone(),
+                *run.job_check_run_ids
+                    .get(&JobId("build".to_owned()))
+                    .unwrap(),
+            )
+        };
+        finish_run(&fixture, &run_a, "failure").await;
+
+        let payload = check_run_payload(
+            "rerequested",
+            build_check_id,
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        );
+        assert_eq!(
+            fixture
+                .post_body("delivery-rerun", Some("check_run"), &payload)
+                .await,
+            StatusCode::OK
+        );
+
+        let narrowed = {
+            let inner = fixture.state.inner.lock().await;
+            assert_eq!(inner.runs.len(), 2);
+            let rerun = inner.runs.values().find(|run| run.run_id != run_a).unwrap();
+            assert_eq!(
+                rerun.submission.selected_jobs,
+                vec!["build".to_owned()],
+                "a check-run rerun narrows the rerun to the owning job"
+            );
+            assert_eq!(rerun.jobs.len(), 1, "only the owning job re-runs");
+            assert_eq!(
+                rerun.job_check_run_ids.len(),
+                1,
+                "and only that job publishes a check"
+            );
+            assert_ne!(
+                *rerun
+                    .job_check_run_ids
+                    .get(&JobId("build".to_owned()))
+                    .unwrap(),
+                build_check_id,
+                "the rerun's check run is newly created"
+            );
+            rerun.run_id.clone()
+        };
+        finish_run(&fixture, &narrowed, "failure").await;
+
+        // "Re-run all" on the suite must not inherit the narrowing above.
+        let suite =
+            check_suite_payload("rerequested", 7, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+        assert_eq!(
+            fixture
+                .post_body("delivery-suite-rerun", Some("check_suite"), &suite)
+                .await,
+            StatusCode::OK
+        );
+        let inner = fixture.state.inner.lock().await;
+        let full = inner
+            .runs
+            .values()
+            .find(|run| run.run_id != run_a && run.run_id != narrowed)
+            .expect("the suite rerequest must produce a rerun");
+        assert!(
+            full.submission.selected_jobs.is_empty(),
+            "a suite-wide re-run clears the inherited job selection"
+        );
+        assert_eq!(full.jobs.len(), 2, "\"Re-run all\" re-runs every job");
+    }
+
+    /// Recursion guard: events about Preloop's own checks do not re-trigger
+    /// check-driven workflows. GitHub keys this on the suite (or its head
+    /// SHA), not the individual check-run id, so a *sibling* check run in a
+    /// suite we own is guarded too.
+    #[tokio::test]
+    async fn check_events_about_own_checks_do_not_retrigger_workflows() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = git_workspace(&temp).await;
+        std::fs::write(
+            ws_dir.join(".github/workflows/push.yml"),
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo push\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ws_dir.join(".github/workflows/checkrun.yml"),
+            "on:\n  check_run:\n    types: [created]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo check\n",
+        )
+        .unwrap();
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        // Held for the whole test: these assertions depend on the
+        // GitHub env being unset (offline check runs), and
+        // `PRELOOP_GITHUB_*` is process-global.
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let head = git_head(&ws_dir).await;
+
+        assert_eq!(
+            fixture.post("delivery-1", Some("push")).await,
+            StatusCode::OK
+        );
+        let own_check_id = {
+            let inner = fixture.state.inner.lock().await;
+            assert_eq!(
+                inner.runs.len(),
+                1,
+                "only the push workflow matched the push"
+            );
+            *inner
+                .runs
+                .values()
+                .next()
+                .unwrap()
+                .job_check_run_ids
+                .values()
+                .next()
+                .unwrap()
+        };
+
+        // A `check_run.created` about that exact check: guarded.
+        let payload = check_run_payload("created", own_check_id, &head);
+        assert_eq!(
+            fixture
+                .post_body("delivery-own", Some("check_run"), &payload)
+                .await,
+            StatusCode::OK
+        );
+        assert_eq!(fixture.state.inner.lock().await.runs.len(), 1);
+
+        // A sibling check run we have never seen the id of, but whose suite
+        // head SHA is one we published on: guarded the way GitHub guards it.
+        let mut sibling = serde_json::from_slice::<serde_json::Value>(&check_run_payload(
+            "created",
+            555_555,
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        ))
+        .unwrap();
+        sibling["check_run"]["check_suite"]["head_sha"] =
+            serde_json::json!("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+        assert_eq!(
+            fixture
+                .post_body(
+                    "delivery-sibling",
+                    Some("check_run"),
+                    &serde_json::to_vec(&sibling).unwrap()
+                )
+                .await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            fixture.state.inner.lock().await.runs.len(),
+            1,
+            "a sibling check in a suite we own must not re-trigger check workflows"
+        );
+
+        // A foreign check on an unrelated commit: not guarded.
+        let payload = check_run_payload("created", 424_242, &head);
+        assert_eq!(
+            fixture
+                .post_body("delivery-foreign", Some("check_run"), &payload)
+                .await,
+            StatusCode::OK
+        );
+        let inner = fixture.state.inner.lock().await;
+        assert_eq!(inner.runs.len(), 2);
+        let run = inner
+            .runs
+            .values()
+            .find(|run| run.submission.event == "check_run")
+            .unwrap();
+        assert_eq!(run.submission.sha, head);
+    }
+
+    /// `check_suite.rerequested` re-runs the suite but must not *also* be
+    /// treated as a workflow trigger: `completed` is the only activity type
+    /// that starts an `on: check_suite` workflow.
+    #[tokio::test]
+    async fn check_suite_rerequested_is_not_a_workflow_trigger() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = git_workspace(&temp).await;
+        std::fs::write(
+            ws_dir.join(".github/workflows/suite.yml"),
+            "on: check_suite\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo suite\n",
+        )
+        .unwrap();
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        // Held for the whole test: these assertions depend on the
+        // GitHub env being unset (offline check runs), and
+        // `PRELOOP_GITHUB_*` is process-global.
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+
+        for (delivery, action) in [("d-req", "requested"), ("d-rereq", "rerequested")] {
+            let payload =
+                check_suite_payload(action, 7, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+            assert_eq!(
+                fixture
+                    .post_body(delivery, Some("check_suite"), &payload)
+                    .await,
+                StatusCode::OK
+            );
+        }
+        assert!(
+            fixture.state.inner.lock().await.runs.is_empty(),
+            "only check_suite.completed triggers an on: check_suite workflow"
+        );
+
+        // …and `completed` still does.
+        let payload =
+            check_suite_payload("completed", 7, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+        assert_eq!(
+            fixture
+                .post_body("d-done", Some("check_suite"), &payload)
+                .await,
+            StatusCode::OK
+        );
+        assert_eq!(fixture.state.inner.lock().await.runs.len(), 1);
+    }
+
+    /// The native rerun endpoint republishes checks for a run that had them.
+    #[tokio::test]
+    async fn native_rerun_publishes_fresh_check_runs() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = WebhookFixture::new(&temp).await;
+        // Held for the whole test: these assertions depend on the
+        // GitHub env being unset (offline check runs), and
+        // `PRELOOP_GITHUB_*` is process-global.
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        assert_eq!(
+            fixture.post("delivery-1", Some("push")).await,
+            StatusCode::OK
+        );
+        let (run_a, check_ids_a) = {
+            let inner = fixture.state.inner.lock().await;
+            let run = inner.runs.values().next().unwrap();
+            (run.run_id.clone(), run.job_check_run_ids.clone())
+        };
+        finish_run(&fixture, &run_a, "failure").await;
+
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/v1/runs/{run_a}/rerun"))
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {}", fixture.state.system_token),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success(), "rerun must be accepted");
+
+        let inner = fixture.state.inner.lock().await;
+        assert_eq!(inner.runs.len(), 2);
+        let rerun = inner.runs.values().find(|run| run.run_id != run_a).unwrap();
+        assert_eq!(
+            rerun.job_check_run_ids.keys().collect::<Vec<_>>(),
+            check_ids_a.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            rerun
+                .job_check_run_ids
+                .iter()
+                .all(|(job, id)| check_ids_a.get(job) != Some(id)),
+            "the rerun publishes new check runs rather than reviving finished ones"
+        );
+        assert_eq!(rerun.conclusion, None, "the rerun starts fresh");
+    }
+
+    /// Wire evidence for the rerun path: against a stub check-runs API, a
+    /// rerun issues `POST /repos/{owner}/{repo}/check-runs` for each job and
+    /// never a `PATCH check-runs/{id}` that pushes a finished check back to
+    /// `queued`. GitHub's Checks protocol has no reset operation — its
+    /// reference app answers `rerequested` by creating a new check run — and
+    /// a `PATCH {"status":"queued"}` on a completed run has no documented
+    /// effect on the stale `conclusion`.
+    #[tokio::test]
+    async fn rerun_creates_check_runs_and_never_requeues_a_finished_one() {
+        use parking_lot::Mutex;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let creates: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let patches: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let next_id = Arc::new(AtomicU64::new(1000));
+
+        let mock = axum::Router::new()
+            .route(
+                "/repos/owner/repo/check-runs",
+                axum::routing::post({
+                    let creates = creates.clone();
+                    let next_id = next_id.clone();
+                    move |body: axum::extract::Json<Value>| {
+                        let creates = creates.clone();
+                        let next_id = next_id.clone();
+                        async move {
+                            creates.lock().push(body.0);
+                            let id = next_id.fetch_add(1, Ordering::SeqCst);
+                            axum::Json(serde_json::json!({
+                                "id": id,
+                                "check_suite": {"id": 4242},
+                            }))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/repos/owner/repo/check-runs/:id",
+                axum::routing::patch({
+                    let patches = patches.clone();
+                    move |axum::extract::Path(id): axum::extract::Path<u64>,
+                          body: axum::extract::Json<Value>| {
+                        let patches = patches.clone();
+                        async move {
+                            patches.lock().push(body.0);
+                            axum::Json(serde_json::json!({"id": id}))
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, mock).await.unwrap();
+        });
+
+        // Held for the whole test: the GitHub env vars are process-global.
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        std::env::set_var("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}"));
+        std::env::set_var("PRELOOP_GITHUB_TOKEN", "rerun-wire-token");
+
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = WebhookFixture::new(&temp).await;
+        assert_eq!(
+            fixture.post("delivery-1", Some("push")).await,
+            StatusCode::OK
+        );
+
+        let (run_a, suite_id, first_ids) = {
+            let inner = fixture.state.inner.lock().await;
+            let run = inner.runs.values().next().unwrap();
+            (
+                run.run_id.clone(),
+                run.check_suite_id,
+                run.job_check_run_ids.clone(),
+            )
+        };
+        assert_eq!(
+            suite_id,
+            Some(4242),
+            "the create response's check_suite.id is recorded for suite targeting"
+        );
+        assert!(
+            !first_ids.is_empty(),
+            "the push run published check runs through the stub API"
+        );
+        // Terminal, so the rerequest is not skipped as in-flight.
+        let run_ids: Vec<RunId> = fixture
+            .state
+            .inner
+            .lock()
+            .await
+            .runs
+            .keys()
+            .cloned()
+            .collect();
+        for run_id in &run_ids {
+            finish_run(&fixture, run_id, "failure").await;
+        }
+        let creates_before = creates.lock().len();
+        let patches_before = patches.lock().len();
+
+        let payload = check_suite_payload(
+            "rerequested",
+            4242,
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        );
+        assert_eq!(
+            fixture
+                .post_body("delivery-rerun", Some("check_suite"), &payload)
+                .await,
+            StatusCode::OK
+        );
+
+        std::env::remove_var("PRELOOP_GITHUB_API_URL");
+        std::env::remove_var("PRELOOP_GITHUB_TOKEN");
+
+        let creates = creates.lock();
+        let rerun_creates = &creates[creates_before..];
+        assert!(
+            !rerun_creates.is_empty(),
+            "the rerun creates check runs rather than reviving the finished ones"
+        );
+        for body in rerun_creates {
+            assert_eq!(body["status"], "queued");
+            assert_eq!(body["name"], "build");
+            assert_eq!(
+                body["head_sha"], "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                "the new check run lands on the commit the previous checks were published on"
+            );
+        }
+        let patches = patches.lock();
+        let rerun_patches = &patches[patches_before..];
+        assert!(
+            rerun_patches.iter().all(|body| body["status"] != "queued"),
+            "no PATCH may push a finished check run back to queued: {rerun_patches:?}"
+        );
+
+        let inner = fixture.state.inner.lock().await;
+        let rerun = inner
+            .runs
+            .values()
+            .find(|run| !run_ids.contains(&run.run_id))
+            .expect("the rerequest produced a rerun");
+        assert_ne!(rerun.run_id, run_a);
+        assert!(
+            rerun
+                .job_check_run_ids
+                .iter()
+                .all(|(job, id)| first_ids.get(job) != Some(id)),
+            "the rerun tracks the newly created check-run ids"
         );
     }
 }

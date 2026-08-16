@@ -85,6 +85,57 @@ The system maps the lifecycle of each job to a GitHub Check Run:
 
 If `PRELOOP_GITHUB_TOKEN` is not configured, these requests are simulated in-memory and logged to the console, allowing fully offline execution.
 
+### Reruns
+
+Reruns — the native `POST /api/v1/runs/{run_id}/rerun` endpoint, a
+`check_suite.rerequested` webhook (Checks UI "Re-run all"), or a
+`check_run.rerequested` webhook (Checks UI "Re-run" on one check) — submit a
+new run and publish a **new** check run per job, exactly like the first
+attempt. This is GitHub's documented app flow: its reference CI app answers
+both `check_suite.rerequested` and `check_run.rerequested` with
+`create_check_run` ("When a check run is `rerequested`, you'll start the
+process all over and create a new check run" — [Building CI checks with a
+GitHub App](https://docs.github.com/en/apps/creating-github-apps/writing-code-for-a-github-app/building-ci-checks-with-a-github-app),
+Step 1.3). There is no Checks API operation that resets a finished check run,
+and `PATCH check-runs/{id}` with `{"status":"queued"}` has no documented
+effect on the previous attempt's `conclusion`.
+
+A run that never published check runs (a native submission) does not grow
+them on rerun.
+
+**Targeting.** `check_suite.rerequested` matches runs by repository plus the
+suite ID recorded from the check-runs creation response, or — for runs that
+never recorded one (offline mode) — by the commit those checks were published
+on (`RunRecord.check_head_sha`, the status-check SHA, which for a
+`pull_request` is the PR head and *not* `submission.sha`). It re-runs the
+newest attempt per workflow file, and clears any job selection the previous
+attempt carried, so "Re-run all" always means all. `check_run.rerequested`
+targets the newest run holding that check-run ID and narrows the rerun to the
+owning job and its `needs` closure; because `selected_jobs` resolves against a
+job's base ID, re-requesting one leg of a matrix re-runs every leg of that
+job. The native `POST /api/v1/runs/{run_id}/rerun` keeps the source run's job
+selection — it reproduces the run it was given.
+
+**Idempotency** is per target, not global: if a workflow's newest attempt is
+still running, a duplicate `rerequested` skips *that workflow* and still
+re-runs the finished ones. A single stuck run therefore cannot wedge "Re-run
+all" for the whole suite.
+
+### Check events as workflow triggers
+
+`on: check_run` accepts `created`, `rerequested`, `completed`, and
+`requested_action`. `on: check_suite` accepts **only** `completed` — GitHub
+delivers `requested` and `rerequested` as webhooks but does not treat them as
+workflow triggers, and `check_suite.requested` fires on every push, so
+projecting it would start a spurious run per push. For both events the
+workflow file must live on the default branch and the run checks out the
+default-branch head.
+
+A recursion guard keeps events about Preloop's own checks from re-triggering
+check-driven workflows, keyed the way GitHub keys it — the check suite, or the
+suite's head SHA — rather than only the individual check-run ID, so a sibling
+check inside a suite Preloop published is guarded too.
+
 ---
 
 ## 6. How Users Interact with it
