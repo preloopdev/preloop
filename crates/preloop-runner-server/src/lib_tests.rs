@@ -14829,6 +14829,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
         &WorkspaceSnapshot {
             head_sha: Some("f000000000000000000000000000000000000000".to_owned()),
             commit_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            tree_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
             repository: "snapshots/11111111-1111-4111-8111-111111111111".to_owned(),
             default_branch: Some("main".to_owned()),
             before_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
@@ -14874,6 +14875,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
             &WorkspaceSnapshot {
                 head_sha: Some("f000000000000000000000000000000000000000".to_owned()),
                 commit_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                tree_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
                 repository: "snapshots/22222222-2222-4222-8222-222222222222".to_owned(),
                 default_branch: Some("main".to_owned()),
                 before_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
@@ -14894,6 +14896,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
             &WorkspaceSnapshot {
             head_sha: Some("f000000000000000000000000000000000000000".to_owned()),
                 commit_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                tree_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
                 repository: "snapshots/33333333-3333-4333-8333-333333333333".to_owned(),
                 default_branch: Some("main".to_owned()),
                 before_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
@@ -14914,6 +14917,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
             &WorkspaceSnapshot {
                 head_sha: Some("f000000000000000000000000000000000000000".to_owned()),
                 commit_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                tree_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
                 repository: "snapshots/44444444-4444-4444-8444-444444444444".to_owned(),
                 default_branch: Some("main".to_owned()),
                 before_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),

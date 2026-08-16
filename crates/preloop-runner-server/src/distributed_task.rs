@@ -530,6 +530,10 @@ pub(crate) async fn complete_job_inner(
     }
     let mut inner = shared.state.inner.lock().await;
     let finalized_callers: Vec<JobId>;
+    // Set when this completion finalizes the whole run with a success
+    // conclusion — the auto-PR trigger fires exactly once per run because
+    // the block below runs only while `completed_at` is still `None`.
+    let mut newly_terminal_success = false;
     inner
         .claimed_jobs
         .remove(&(completion.run_id, completion.job_id.clone()));
@@ -602,6 +606,7 @@ pub(crate) async fn complete_job_inner(
         {
             run.completed_at = Some(chrono::Utc::now());
             run.conclusion = Some(status_string(run.status));
+            newly_terminal_success = run.status == ExecutionStatus::Success;
         }
     }
     // Use the status actually stored (may differ from completion if terminal-locked).
@@ -691,6 +696,17 @@ pub(crate) async fn complete_job_inner(
     inner.dap_ports.remove(&completion.run_id);
     let queue_nonempty = !inner.queue.is_empty() || !inner.cancellation_queue.is_empty();
     drop(inner);
+
+    // Webhook-driven auto-PR: a successful push run may open a PR per
+    // policy. Best-effort and detached — a GitHub outage must never affect
+    // the run's own result.
+    if newly_terminal_success {
+        let shared = shared.clone();
+        let run_id = completion.run_id;
+        tokio::spawn(async move {
+            crate::github_pr::maybe_open_pr(shared, run_id).await;
+        });
+    }
 
     // Any reusable-caller or dynamic-matrix node the sweep above unblocked was
     // deferred rather than expanded under the lock. Build those subtrees now

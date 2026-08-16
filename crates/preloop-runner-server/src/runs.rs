@@ -544,6 +544,16 @@ pub(crate) async fn submit_run_inner(
         None
     };
 
+    // A push-requested submission from a dirty tree carries no explicit
+    // tested tree (the client cannot know the snapshot tree in advance).
+    // Record the snapshot's tree so push-back can verify the client's
+    // materialized commit is byte-identical to what CI tested.
+    if submission.push.is_some() && submission.push_tree.is_none() {
+        if let Some(snapshot) = &workspace_snapshot {
+            submission.push_tree = Some(snapshot.tree_sha.clone());
+        }
+    }
+
     // A local submission is a synthetic push/PR against the snapshot. Present
     // the same event shape GitHub would: changed-file actions
     // (`dorny/paths-filter`, `tj-actions/changed-files`) and `actions/checkout`
@@ -1419,6 +1429,11 @@ pub(crate) async fn submit_run(
             &submission.sha,
             &submission.git_ref,
             submission.push_tree.as_deref().unwrap_or_default(),
+            // A dirty-tree submission cannot know the tested tree up front:
+            // the server snapshots the workspace inside submit_run_inner and
+            // records the snapshot tree below. The client materializes its
+            // commit from that recorded tree after CI passes.
+            submission.local_workspace.is_some(),
         )?;
     }
 

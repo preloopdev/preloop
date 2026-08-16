@@ -1525,19 +1525,18 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         }
     }
 
-    // Push-back requires the tested commit to be exactly what lands on
-    // GitHub: a dirty tree would run CI on commit + local edits, then push
-    // the commit alone — untested code. Refuse loudly instead of lying.
     let push_requested = args.push || args.create_pr;
-    let tested_head = if push_requested {
-        let dirty = git_porcelain().context("failed to check the working tree for --push")?;
-        if !dirty.is_empty() {
-            anyhow::bail!(
-                "--push requires a clean working tree so the pushed commit is exactly what \
-                 was tested. Uncommitted changes:\n  {}\n\nCommit or stash them first.",
-                dirty.join("\n  ")
-            );
-        }
+    // A dirty working tree is allowed with --push: CI runs on the server's
+    // snapshot of the uncommitted state, and after it passes the CLI
+    // materializes a commit whose tree is exactly what CI tested (see
+    // `decide_dirty_push_opts`). A clean tree pins the push to HEAD directly.
+    let dirty = if push_requested {
+        git_porcelain().context("failed to check the working tree for --push")?
+    } else {
+        Vec::new()
+    };
+    let dirty_push = push_requested && !dirty.is_empty();
+    let tested_head = if push_requested && !dirty_push {
         Some((git_rev_parse("HEAD")?, git_rev_parse("HEAD^{tree}")?))
     } else {
         None
@@ -1585,8 +1584,10 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     }
     // Overridden rather than set in the literal so a plain run keeps the
     // protocol's own defaults for `sha` and `actor`.
-    if let Some((head_sha, head_tree)) = tested_head {
-        submission.sha = head_sha;
+    if push_requested {
+        // The base commit: for a clean tree this IS the tested commit; for a
+        // dirty tree it is the parent of the materialized CI-verified commit.
+        submission.sha = git_rev_parse("HEAD")?;
         // The server names the requester in the PR body it opens.
         if let Some(name) = git_config_user_name() {
             submission.actor = name;
@@ -1595,7 +1596,9 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
             create_pr: args.create_pr,
             draft_pr: args.pr_draft,
         });
-        submission.push_tree = Some(head_tree);
+        if let Some((_, head_tree)) = tested_head {
+            submission.push_tree = Some(head_tree);
+        }
     }
 
     let client = build_client();
@@ -1835,9 +1838,40 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         // the reviewable state. Sync progress goes to stderr so piped
         // stdout stays clean.
         let push_error = if push_requested {
-            push::push_run(&client, &url, api_token(), &accepted.run_id.to_string())
+            if dirty_push {
+                // The PR decision happens after CI for a dirty tree: the
+                // user saw the result and chooses y/N/d now (or a label /
+                // explicit flag decides in non-interactive runs).
+                match decide_dirty_push_opts(&dirty, args.create_pr, args.pr_draft)? {
+                    Some(opts) => push::push_run(
+                        &client,
+                        &url,
+                        api_token(),
+                        &accepted.run_id.to_string(),
+                        Some(opts),
+                    )
+                    .await
+                    .err(),
+                    None => {
+                        eprintln!(
+                            "not pushing (declined) — CI result was informational. \
+                             Re-run `preloop push {}` to push later.",
+                            accepted.run_id
+                        );
+                        None
+                    }
+                }
+            } else {
+                push::push_run(
+                    &client,
+                    &url,
+                    api_token(),
+                    &accepted.run_id.to_string(),
+                    None,
+                )
                 .await
                 .err()
+            }
         } else {
             None
         };
@@ -2014,6 +2048,89 @@ fn git_porcelain() -> anyhow::Result<Vec<String>> {
         .collect())
 }
 
+/// Decide, after CI passes on a dirty tree, whether to materialize the
+/// tested tree, push it, and open a PR. Precedence: explicit `--create-pr`
+/// flag > head-commit labels (`[pr]` / `[draft]` / `[no-pr]`) > interactive
+/// prompt > safe default (skip). Returns `None` when the push should not
+/// happen at all.
+fn decide_dirty_push_opts(
+    dirty: &[String],
+    explicit_pr: bool,
+    pr_draft: bool,
+) -> anyhow::Result<Option<push::PushOpts>> {
+    if explicit_pr {
+        return Ok(Some(push::PushOpts {
+            create_pr: true,
+            draft: pr_draft,
+        }));
+    }
+
+    let head_message = git_rev_parse("HEAD")
+        .ok()
+        .and_then(|sha| {
+            std::process::Command::new("git")
+                .args(["log", "-1", "--format=%B", &sha])
+                .output()
+                .ok()
+        })
+        .and_then(|output| {
+            output
+                .status
+                .success()
+                .then(|| String::from_utf8_lossy(&output.stdout).to_lowercase())
+        })
+        .unwrap_or_default();
+    if head_message.contains("[no-pr]") {
+        return Ok(Some(push::PushOpts {
+            create_pr: false,
+            draft: pr_draft,
+        }));
+    }
+    if head_message.contains("[pr]") || head_message.contains("[draft]") {
+        return Ok(Some(push::PushOpts {
+            create_pr: true,
+            draft: head_message.contains("[draft]") || pr_draft,
+        }));
+    }
+
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        // Non-interactive and no label: the safest default is to leave the
+        // working tree alone — CI was informational.
+        return Ok(None);
+    }
+
+    eprintln!(
+        "CI passed on your working tree ({} change(s) included):",
+        dirty.len()
+    );
+    for line in dirty {
+        eprintln!("  {line}");
+    }
+    loop {
+        eprint!("Commit the tested tree and open a PR? [y/N/d] ");
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .context("reading prompt answer")?;
+        match input.trim().to_ascii_lowercase().as_str() {
+            "" | "n" => return Ok(None),
+            "y" => {
+                return Ok(Some(push::PushOpts {
+                    create_pr: true,
+                    draft: pr_draft,
+                }))
+            }
+            "d" => {
+                return Ok(Some(push::PushOpts {
+                    create_pr: true,
+                    draft: true,
+                }))
+            }
+            _ => eprintln!("answer y, N, or d"),
+        }
+    }
+}
+
 fn git_rev_parse(rev: &str) -> anyhow::Result<String> {
     let output = std::process::Command::new("git")
         .args(["rev-parse", rev])
@@ -2049,7 +2166,7 @@ async fn cmd_push(args: PushArgs) -> anyhow::Result<()> {
             anyhow::anyhow!("no runs found; pass a run id: `preloop push <run_id>`")
         })?,
     };
-    push::push_run(&client, &url, api_token(), &run_id).await
+    push::push_run(&client, &url, api_token(), &run_id, None).await
 }
 
 async fn cmd_plan(args: PlanArgs) -> anyhow::Result<()> {

@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# pre-push hook: soft CI gate for preloop.
+#
+# Install per checkout:
+#   cp contrib/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+#
+# What it does, on `git push origin <branch>`:
+#   1. Skips the gate entirely when any pushed commit message carries [skip ci].
+#   2. Otherwise runs `preloop run --push --create-pr` (CI on preloop, then the
+#      tested commit is pushed and a PR is opened), holding the push open while
+#      CI runs.
+#   3. CI green  -> exit 0. preloop already pushed the tested commit, so git's
+#      own push no-ops ("Everything up-to-date").
+#   4. CI red    -> exit 1. The push is aborted; the branch never reaches GitHub.
+#   5. Fail-open -> if preloop is unreachable the push proceeds with a loud
+#      warning (a CI gate must not brick `git push` when the server restarts).
+#
+# This is a SOFT gate: it is advisory per-machine. Anyone can push without the
+# hook (web UI, another machine). Server-side enforcement is a separate concern.
+#
+# On a dirty working tree, `preloop run --push` runs CI on the uncommitted
+# state and prompts [y/N/d] to materialize + push + open a PR after CI passes.
+
+set -euo pipefail
+
+preloop_bin="${PRELOOP_BIN:-preloop}"
+cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/preloop-push"
+mkdir -p "$cache_dir"
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  case "$local_ref" in
+    refs/heads/*) ;;
+    *) continue ;; # tags, deletions: not gated
+  esac
+  [[ "$local_sha" != 0000000000000000000000000000000000000000 ]] || continue # deletion
+
+  branch="${local_ref#refs/heads/}"
+
+  # 1. [skip ci] in any pushed commit bypasses the gate (mirrors preloop's
+  #    server-side skip-label handling).
+  if git log --format=%B "${remote_sha:-HEAD}..$local_sha" 2>/dev/null \
+      | grep -qi '\[skip *ci\]'; then
+    echo "preloop: [skip ci] found — pushing branch ${branch} without the CI gate"
+    continue
+  fi
+
+  # Resumable: a completed verdict for this exact HEAD is reused.
+  cache="$cache_dir/${local_sha}"
+  if [[ -f "$cache" ]]; then
+    verdict="$(cat "$cache")"
+    echo "preloop: cached CI verdict for ${local_sha:0:12}: ${verdict}"
+    if [[ "$verdict" == "success" ]]; then
+      continue
+    fi
+    echo "preloop: cached CI verdict is ${verdict} — fix and re-push (or rm $cache)" >&2
+    exit 1
+  fi
+
+  log="${TMPDIR:-/tmp}/preloop-push-${local_sha:0:12}.log"
+  echo "preloop: running CI on preloop before pushing ${branch} (this holds the push)..."
+  if ! "$preloop_bin" run --push --create-pr >"$log" 2>&1; then
+    if grep -qiE 'connection refused|unable to access|could not resolve host|temporary failure' "$log"; then
+      echo "preloop: unreachable — pushing ${branch} WITHOUT the CI gate (fail-open)" >&2
+      rm -f "$log"
+      continue
+    fi
+    echo "preloop: CI failed for ${branch} — push aborted. Details:" >&2
+    tail -n 30 "$log" >&2
+    exit 1
+  fi
+  echo "success" >"$cache"
+  rm -f "$log"
+done

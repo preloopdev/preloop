@@ -27,6 +27,15 @@ enum PushOutcome {
     FastForwarded,
 }
 
+/// Per-sync override of the server's PR intent, decided after CI (the
+/// dirty-tree prompt flow). `None` means "use the submission's recorded
+/// `push` request".
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PushOpts {
+    pub(crate) create_pr: bool,
+    pub(crate) draft: bool,
+}
+
 /// Push the tested commit to `refs/heads/<branch>` on `origin`.
 ///
 /// The remote branch must not exist, equal the tested commit, or be an
@@ -177,10 +186,11 @@ pub(crate) async fn push_run(
     url: &str,
     token: Option<String>,
     run_id: &str,
+    opts: Option<PushOpts>,
 ) -> anyhow::Result<()> {
     let mut attempt = 0;
     loop {
-        match push_run_once(client, url, token.as_deref(), run_id).await {
+        match push_run_once(client, url, token.as_deref(), run_id, opts).await {
             Ok(()) => return Ok(()),
             Err(error) if is_transient(&error) && attempt < RETRY_DELAYS_SECS.len() => {
                 let delay = RETRY_DELAYS_SECS[attempt];
@@ -203,6 +213,7 @@ async fn push_run_once(
     url: &str,
     token: Option<&str>,
     run_id: &str,
+    opts: Option<PushOpts>,
 ) -> anyhow::Result<()> {
     let mut request = client.get(format!("{url}/api/v1/runs/{run_id}"));
     if let Some(token) = token {
@@ -230,7 +241,7 @@ async fn push_run_once(
         .push
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("run {run_id} was not submitted with --push"))?;
-    let _push_tree = submission
+    let push_tree = submission
         .push_tree
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("run {run_id} has no recorded tested tree"))?;
@@ -245,12 +256,36 @@ async fn push_run_once(
             )
         })?;
 
-    // 1. Pin the push to the tested commit.
-    let outcome = push_tested_commit(sha, branch)?;
+    // 1. Pin the push to the tested commit. A dirty-tree run recorded the
+    //    snapshot tree but its submission sha is the *base* commit — its
+    //    tree differs from what CI tested. Materialize a real commit whose
+    //    tree is exactly the tested tree (parented on the base commit, using
+    //    the developer's git identity), so the pushed commit is byte-identical
+    //    to what CI validated. If the user committed the dirty state since
+    //    (tree now matches), push it directly.
+    let push_sha = {
+        let head_tree = git_output(
+            &std::env::current_dir().context("current directory")?,
+            ["rev-parse", &format!("{sha}^{{tree}}")],
+        )?;
+        if head_tree == push_tree {
+            sha.to_owned()
+        } else {
+            let materialized = materialize_tested_commit(push_tree, sha)?;
+            eprintln!(
+                "materialized CI-verified commit {materialized} (tree {push_tree}) from \
+                 the tested snapshot"
+            );
+            materialized
+        }
+    };
+    let outcome = push_tested_commit(&push_sha, branch)?;
     match outcome {
-        PushOutcome::Created => eprintln!("pushed {sha} to origin/{branch} (branch created)"),
-        PushOutcome::AlreadyThere => eprintln!("origin/{branch} already at {sha}"),
-        PushOutcome::FastForwarded => eprintln!("pushed {sha} to origin/{branch} (fast-forward)"),
+        PushOutcome::Created => eprintln!("pushed {push_sha} to origin/{branch} (branch created)"),
+        PushOutcome::AlreadyThere => eprintln!("origin/{branch} already at {push_sha}"),
+        PushOutcome::FastForwarded => {
+            eprintln!("pushed {push_sha} to origin/{branch} (fast-forward)")
+        }
     }
 
     // 2. The server verifies the pushed tree, reuses or creates the PR, and
@@ -258,6 +293,12 @@ async fn push_run_once(
     let mut request = client.post(format!("{url}/api/v1/runs/{run_id}/push"));
     if let Some(token) = token {
         request = request.bearer_auth(token);
+    }
+    if let Some(opts) = opts {
+        request = request.json(&serde_json::json!({
+            "create_pr": opts.create_pr,
+            "draft": opts.draft,
+        }));
     }
     let response = request
         .send()
@@ -285,6 +326,36 @@ async fn push_run_once(
         ),
     }
     Ok(())
+}
+
+/// Create a real commit whose tree is exactly the tested tree, parented on
+/// the run's base commit. The author/committer come from the checkout's git
+/// identity (`user.name` / `user.email`), so the materialized commit is
+/// attributed to the developer, not to a bot.
+fn materialize_tested_commit(tested_tree: &str, parent: &str) -> anyhow::Result<String> {
+    materialize_tested_commit_in(
+        &std::env::current_dir().context("current directory")?,
+        tested_tree,
+        parent,
+    )
+}
+
+fn materialize_tested_commit_in(
+    cwd: &std::path::Path,
+    tested_tree: &str,
+    parent: &str,
+) -> anyhow::Result<String> {
+    let head_message = git_output(cwd, ["log", "-1", "--format=%B", parent])
+        .unwrap_or_else(|_| "CI-verified snapshot".to_owned());
+    let message = format!(
+        "{head_message}\n\n[preloop] CI-verified snapshot of the working tree \
+         (tree {tested_tree})"
+    );
+    let commit = git_output(
+        cwd,
+        ["commit-tree", tested_tree, "-p", parent, "-m", &message],
+    )?;
+    Ok(commit)
 }
 
 #[cfg(test)]
@@ -343,6 +414,38 @@ mod tests {
         assert!(remote_sha.starts_with(&head), "branch created at {head}");
     }
 
+    #[test]
+    fn materialize_tested_commit_pins_the_exact_tree() {
+        let (work, _remote, head) = repo_with_remote();
+
+        // Dirty the tree and capture the staged tree — what CI would test.
+        fs::write(work.path().join("f.txt"), "two\n").unwrap();
+        git(work.path(), &["add", "f.txt"]);
+        let dirty_tree = git(work.path(), &["write-tree"]);
+        let head_tree = git(work.path(), &["rev-parse", "HEAD^{tree}"]);
+        assert_ne!(
+            dirty_tree, head_tree,
+            "the dirty tree must differ from HEAD"
+        );
+
+        let commit = materialize_tested_commit_in(work.path(), &dirty_tree, &head).unwrap();
+        // The materialized commit's tree is exactly the tested tree…
+        assert_eq!(
+            git(work.path(), &["rev-parse", &format!("{commit}^{{tree}}")]),
+            dirty_tree
+        );
+        // …parented on the base commit…
+        assert_eq!(
+            git(work.path(), &["rev-parse", &format!("{commit}^")]),
+            head
+        );
+        // …and attributed to the developer's git identity, not a bot.
+        let author = git(
+            work.path(),
+            &["log", "-1", "--format=%an <%ae>", commit.as_str()],
+        );
+        assert_eq!(author, "Test <test@example.com>");
+    }
     #[test]
     fn push_skips_when_remote_already_equal() {
         let (work, _remote, head) = repo_with_remote();
