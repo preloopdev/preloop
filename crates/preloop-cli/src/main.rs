@@ -4,7 +4,7 @@ use anyhow::Context;
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
-use preloop_gha_protocol::{ExecutionStatus, NdjsonEvent, RunAccepted, WorkflowSubmission};
+use preloop_gha_protocol::{ExecutionStatus, NdjsonEvent, RunAccepted, RunId, WorkflowSubmission};
 use preloop_orchestrator::environment::{is_stock_base_image, DEFAULT_BASE_IMAGE};
 use preloop_orchestrator::{RunnerPool, RunnerPoolConfig};
 use preloop_vm::SmolVmProvider;
@@ -1633,7 +1633,9 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     if let Some(token) = api_token() {
         request = request.bearer_auth(token);
     }
-    let response = request.send().await?;
+    let response = request.send().await.with_context(|| {
+        format!("cannot reach control plane at {url}; is `preloop serve` running?")
+    })?;
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
@@ -1663,6 +1665,13 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     // explanation, so the first poll failure is reported instead of being
     // folded into "no session".
     let mut poll_warned = false;
+    // Warn once (not every backpressure tick) when the control plane is
+    // unreachable or no registered runner can claim the queued jobs, so a
+    // queued run does not stream `still waiting` forever without the one
+    // fact that explains it. The check is repeated while a claimable runner
+    // exists (one can die between ticks) and latches only once a warning
+    // actually prints.
+    let mut runner_warned = false;
     // Set when the run loop leaves through the debug prompt (abort, detach,
     // or a session error). The run is not terminal in those cases — the job
     // is paused and reattachable — so the generic conclusion below must not
@@ -1681,7 +1690,9 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         if let Some(token) = api_token() {
             events_request = events_request.bearer_auth(token);
         }
-        let events_response = events_request.send().await?;
+        let events_response = events_request.send().await.with_context(|| {
+            format!("cannot reach control plane at {url}; is `preloop serve` still running?")
+        })?;
         if !events_response.status().is_success() {
             let status = events_response.status();
             let body = events_response.text().await.unwrap_or_default();
@@ -1756,6 +1767,40 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                                          {paused_total} debug session(s) paused on the server \
                                          (preloop debug <id> to inspect)"
                                     );
+                                    if !runner_warned {
+                                        match runner_capacity(&client, &url, accepted.run_id).await
+                                        {
+                                            Ok(Some((queued, claimable)))
+                                                if queued > 0 && claimable == 0 =>
+                                            {
+                                                runner_warned = true;
+                                                eprintln!(
+                                                    "[preloop] warning: no registered runner on \
+                                                     {url} can claim the queued jobs (their \
+                                                     `runs-on:` labels match no runner). If \
+                                                     `preloop serve` is still provisioning its \
+                                                     runner pool this is expected; otherwise the \
+                                                     jobs will never start — register a runner \
+                                                     with matching labels."
+                                                );
+                                            }
+                                            // A claimable runner exists (or nothing
+                                            // runner-bound is queued): keep checking on
+                                            // later ticks instead of latching a premature
+                                            // "all quiet" state.
+                                            Ok(_) => {}
+                                            Err(error) => {
+                                                runner_warned = true;
+                                                eprintln!(
+                                                    "[preloop] warning: cannot determine runner \
+                                                     availability on {url} ({error:#}); older \
+                                                     control plane without /api/v1/runners or a \
+                                                     transient error. Queued jobs may still \
+                                                     start if a runner is registered."
+                                                );
+                                            }
+                                        }
+                                    }
                                     last_backpressure = std::time::Instant::now();
                                 }
                             }
@@ -1883,6 +1928,52 @@ fn same_file_path(left: &std::path::Path, right: &std::path::Path) -> bool {
     match (left.canonicalize(), right.canonicalize()) {
         (Ok(left), Ok(right)) => left == right,
         _ => left == right,
+    }
+}
+
+/// Registered-runner capacity for a run's queued jobs, when the control
+/// plane supports the run-scoped runners query.
+///
+/// Returns `(queued, claimable)`: the run's ready-queue job count, and how
+/// many registered runners could claim at least one of them (the same
+/// `job_matches_runner` predicate the scheduler dispatches with). `None`
+/// when the server ignores `run_id` and returns the plain list — the caller
+/// then falls back to the raw count so a zero-runner control plane still
+/// gets the warning.
+async fn runner_capacity(
+    client: &reqwest::Client,
+    url: &str,
+    run_id: RunId,
+) -> anyhow::Result<Option<(usize, usize)>> {
+    let mut request = client.get(format!("{url}/api/v1/runners?run_id={run_id}"));
+    if let Some(token) = api_token() {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await?;
+    if !response.status().is_success() {
+        anyhow::bail!("server returned {}", response.status());
+    }
+    let body: serde_json::Value = response.json().await?;
+    match (
+        body.get("queued").and_then(serde_json::Value::as_u64),
+        body.get("claimable").and_then(serde_json::Value::as_u64),
+    ) {
+        (Some(queued), Some(claimable)) => Ok(Some((queued as usize, claimable as usize))),
+        // Older server (or one ignoring the query): only the raw count is
+        // available. When count is zero, represent that as 0 claimable runners
+        // for the queued jobs so the dead-pool warning fires. When count > 0,
+        // treat runners as claimable (optimistic fallback).
+        _ => {
+            let count = body
+                .get("count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            if count == 0 {
+                Ok(Some((1, 0)))
+            } else {
+                Ok(Some((count, count)))
+            }
+        }
     }
 }
 
