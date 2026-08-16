@@ -208,6 +208,7 @@ jobs:
         env:
           GOLDEN_NAME: preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
         run: |
+          set -euo pipefail
           mkdir -p dist
           rm -f "dist/$GOLDEN_NAME"
           export PRELOOP_REQUIRE_BASE_DIGEST=1
@@ -215,9 +216,47 @@ jobs:
           # The official runner snapshot extracts to ~60 GB; the bake VM must
           # be larger than the stock 20 GiB default.
           export PRELOOP_RUNNER_STORAGE_GB=120
-          ./target/release/preloop build-golden \
-            --runner-bundle "target/$RUNNER_TARGET/release" \
-            --output "dist/$GOLDEN_NAME"
+          # This runner is also the production smolvm-host: the CI pool runs
+          # several 5 GiB runner VMs on the same 22 GiB box. The builder guest
+          # needs 4 GiB of *committable* RAM, and smolvm boots it only AFTER
+          # the ~20 minute, 60 GB base-image pull — so a pool burst turns the
+          # whole pull into a wasted `EAGAIN` ("Resource temporarily
+          # unavailable"). Gate every attempt on measured headroom and retry,
+          # so a job landing mid-pull costs one retry instead of the run.
+          need_mib=6144
+          attempts=3
+          headroom() { awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo; }
+          for attempt in $(seq 1 "$attempts"); do
+            for _ in $(seq 1 45); do
+              waiting="$(headroom)"
+              if [ "$waiting" -ge "$need_mib" ]; then break; fi
+              echo "waiting for host headroom: ${waiting} MiB < ${need_mib} MiB"
+              sleep 60
+            done
+            available="$(headroom)"
+            if [ "$available" -lt "$need_mib" ]; then
+              echo "host never freed ${need_mib} MiB (last ${available} MiB);" \
+                "the CI pool is saturating this runner" >&2
+              exit 1
+            fi
+            echo "attempt ${attempt}/${attempts} with ${available} MiB available"
+            # A failed boot leaves the builder machine registered; drop it so
+            # the retry cannot collide with the previous attempt's disks.
+            smolvm machine delete --name preloop-release-golden-builder \
+              --force --cascade >/dev/null 2>&1 || true
+            if ./target/release/preloop build-golden \
+                --runner-bundle "target/$RUNNER_TARGET/release" \
+                --output "dist/$GOLDEN_NAME"; then
+              break
+            fi
+            if [ "$attempt" -eq "$attempts" ]; then
+              echo "build-golden failed after ${attempts} attempts" >&2
+              exit 1
+            fi
+            echo "build-golden failed; backing off before retry"
+            rm -f "dist/$GOLDEN_NAME"
+            sleep $((attempt * 120))
+          done
           test -s "dist/$GOLDEN_NAME"
           sha256sum "dist/$GOLDEN_NAME" > "dist/$GOLDEN_NAME.sha256"
 
