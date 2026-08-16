@@ -9,6 +9,18 @@ Releases before v0.27.0 predate the changelog.
 
 ## [Unreleased]
 
+### Fixed
+
+- `preloop update` is now content-aware when the remote release version
+  equals the installed version: it downloads the checksummed release asset,
+  verifies its SHA-256, and byte-compares the extracted binary against the
+  installed executable, reinstalling on mismatch. A version string is
+  self-reported and can lie (a source build or tampered binary claiming a
+  release version), so the old version-only gate declared such installs up
+  to date forever — this is how the v0.30.2 deaf-runner fix never reached
+  production. Lower versions still never downgrade; a failed content check
+  (fetch/checksum error) keeps the installed binary and retries next run.
+
 ### Security
 
 - Fail closed on cache writes when the calling job no longer resolves. A
