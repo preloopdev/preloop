@@ -247,8 +247,10 @@ impl ToolchainLayer {
 /// the GitHub-hosted parity toolset (node/python/go toolcaches, git, git-lfs,
 /// docker, nvm, yarn — see `base_install_script`), so per-project version
 /// files add nothing there. Rust is the one toolchain the base bake lacks,
-/// so it is baked for everyone. `setup-*` actions download any other version
-/// a job asks for at job time — the same model GitHub-hosted runners use.
+/// so it is baked for everyone — pinned for CI-Bench reproducibility — and Go
+/// rides along at the corpus-pinned version so per-job VMs stay identical.
+/// `setup-*` actions download any other version a job asks for at job time —
+/// the same model GitHub-hosted runners use.
 pub fn curated_toolchains() -> Vec<ToolchainLayer> {
     // CI-Bench pins its corpus toolchains: Rust 1.88.0 (the version every
     // task was authored and validated against) and Go 1.26.x. Baking them

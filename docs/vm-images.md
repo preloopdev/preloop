@@ -554,7 +554,7 @@ fetches `index.docker.io` means the running CLI has an older compiled pin or
 The official GitHub-hosted runner image (`ubuntu24-runner-large`, published
 per-arch to `ghcr.io/preloopdev/runner-images` by the runner-image-blobs
 fork) is tens of GiB and declares `USER=runner`. Building a golden from it
-locally exercises several smolvm/praeloop sharp edges that a stock Ubuntu
+locally exercises several smolvm/preloop sharp edges that a stock Ubuntu
 base never hits. All were fixed in smolvm's `src/cli/internal_boot.rs`,
 `src/cli/machine.rs`, `src/pack_export.rs`, `crates/smolvm-agent/src/…`, and
 `crates/preloop-cli`/`preloop-vm`; the notes below describe the failure each
@@ -588,7 +588,7 @@ one produced so a regression is recognizable.
   `machine create` treats everything after `--` as the workload, so any flag
   appended after the keep-alive workload (`-- /bin/sh -c sleep infinity`) is
   silently swallowed — the machine boots with 8192 MiB / 20 GiB and no
-  network. The workload must be the *last* positional: praeloop now emits
+  network. The workload must be the *last* positional: preloop now emits
   every flag before `--`.
 - **`unknown variant \`flatten_layers\`` during pack**: the pack binary and
   the guest agent's protocol disagree. The agent in
@@ -597,12 +597,12 @@ one produced so a regression is recognizable.
   --target aarch64-unknown-linux-musl`) and copied into the rootfs.
 - **`read file: guest streamed N bytes, exceeding the 4294967296 byte cap`**:
   pack export streams multi-GiB flattened layers, but the general 4 GiB
-  file-transfer cap applies unless raised. praeloop sets
+  file-transfer cap applies unless raised. preloop sets
   `SMOLVM_FILE_TRANSFER_MAX_BYTES=64GiB` on the pack command.
 - **`mkdir: cannot create directory '/var/lib/preloop-runner': Permission
   denied` during the bake**: the official image declares `USER=runner`, and
   `machine exec` runs as the image's declared user. The exec path now
-  accepts `--user` (added to smolvm's `ExecCmd`) and praeloop passes
+  accepts `--user` (added to smolvm's `ExecCmd`) and preloop passes
   `--user root` for bake commands.
 - **Packed layer contains `archive.tar`, not a rootfs (no `/bin/sh`)**:
   a `local:<hash>` machine's cache dir holds the *archive*, not the

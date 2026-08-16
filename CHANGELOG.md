@@ -425,7 +425,8 @@ live-logs (8), and golden (8).
 Bootstrap the cargo-dist release pipeline for `preloop-cli` (binary
 installers for macOS and Linux).
 
-[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.29.8...HEAD
+[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.30.3...HEAD
+[0.30.3]: https://github.com/preloopdev/preloop/compare/v0.30.2...v0.30.3
 [0.29.8]: https://github.com/preloopdev/preloop/compare/v0.29.7...v0.29.8
 [0.29.7]: https://github.com/preloopdev/preloop/compare/v0.29.6...v0.29.7
 [0.29.6]: https://github.com/preloopdev/preloop/compare/v0.29.5...v0.29.6

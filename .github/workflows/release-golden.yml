@@ -213,10 +213,15 @@ jobs:
           # with NotFound — leaving /storage at its initial unresized 512 MiB
           # template size and causing guest ENOSPC on large layer extractions.
           # Symlink e2fsprogs into standard binary paths.
-          ln -sf ../usr/sbin/resize2fs "$DATA_DIR/agent-rootfs/bin/resize2fs" || true
-          ln -sf ../sbin/e2fsck "$DATA_DIR/agent-rootfs/bin/e2fsck" || true
-          ln -sf ../usr/sbin/resize2fs "$DATA_DIR/agent-rootfs/usr/bin/resize2fs" || true
-          ln -sf ../sbin/e2fsck "$DATA_DIR/agent-rootfs/usr/bin/e2fsck" || true
+          # Absolute targets: on Alpine's merged-/usr, /bin and /usr/bin are
+          # the same directory, so a relative "../usr/sbin/resize2fs" from
+          # /usr/bin resolves to /usr/usr/sbin/resize2fs and the tool is
+          # still missing — the 120 GiB template then never expands and the
+          # guest ENOSPCs on large layer extractions.
+          ln -sf /usr/sbin/resize2fs "$DATA_DIR/agent-rootfs/bin/resize2fs" || true
+          ln -sf /sbin/e2fsck "$DATA_DIR/agent-rootfs/bin/e2fsck" || true
+          ln -sf /usr/sbin/resize2fs "$DATA_DIR/agent-rootfs/usr/bin/resize2fs" || true
+          ln -sf /sbin/e2fsck "$DATA_DIR/agent-rootfs/usr/bin/e2fsck" || true
           [ -f "$SRC/init.krun" ] && cp "$SRC/init.krun" "$DATA_DIR/init.krun"
           mkdir -p "$HOME/.local/bin"
           ln -sf "$HOME/.smolvm/smolvm" "$HOME/.local/bin/smolvm"
@@ -237,9 +242,21 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           rm -f "dist/$GOLDEN_NAME"
+          # Pull the base image via the host Docker daemon (which runs as root,
+          # downloads layers in parallel with chunked resume, and caches them),
+          # then export to a local tarball. This eliminates in-guest vsock socket
+          # read timeouts (IMAGE_PULL_TIMEOUT_SECS = 600) completely.
+          IMAGE_TAR="$(pwd)/base-image.tar"
+          if [ ! -s "$IMAGE_TAR" ]; then
+            echo "Pulling base image via host Docker daemon..."
+            docker pull "$BASE_IMAGE"
+            echo "Saving base image to $IMAGE_TAR..."
+            docker save "$BASE_IMAGE" -o "$IMAGE_TAR"
+          fi
+          test -s "$IMAGE_TAR"
 
           export PRELOOP_REQUIRE_BASE_DIGEST=1
-          export PRELOOP_RUNNER_BASE_IMAGE="$BASE_IMAGE"
+          export PRELOOP_RUNNER_BASE_IMAGE="$IMAGE_TAR"
           # The official runner snapshot extracts to ~60 GB; the bake VM must
           # be larger than the stock 20 GiB default.
           export PRELOOP_RUNNER_STORAGE_GB=120
@@ -348,7 +365,8 @@ jobs:
         with:
           name: golden-${{ env.GOLDEN_ARCH }}
           path: |
-            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.part.*
+            dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.parts.sha256
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.sha256
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.bundle
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.base-provenance.json
@@ -364,16 +382,36 @@ jobs:
           REQUESTED_TAG: ${{ inputs.release_tag }}
           EVENT_TAG: ${{ github.event.release.tag_name }}
         run: |
+          set -euo pipefail
           TARGET_TAG="${EVENT_TAG:-$REQUESTED_TAG}"
           if [ -z "$TARGET_TAG" ]; then
             TARGET_TAG="$(gh release view --json tagName --jq .tagName)"
           fi
+          # The golden routinely exceeds GitHub's 2 GiB per-asset limit and
+          # cannot be a release asset; publish only the signed pointers and
+          # provenance sidecars. The pack itself is retained as a workflow
+          # artifact (above) and is served to pools via PRELOOP_GOLDEN_URL
+          # pointing at OCI/object storage.
           gh release upload "$TARGET_TAG" \
-            "dist/$GOLDEN_NAME" "dist/$GOLDEN_NAME.sha256" \
+            "dist/$GOLDEN_NAME.sha256" \
             "dist/$GOLDEN_NAME.bundle" \
             "dist/$GOLDEN_NAME.base-provenance.json" \
             "dist/$GOLDEN_NAME.base-sbom.spdx.json" \
             "dist/$GOLDEN_NAME.provenance.json" --clobber
+
+      - name: Split golden for artifact retention
+        env:
+          GOLDEN_NAME: preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
+        run: |
+          set -euo pipefail
+          # upload-artifact caps a single artifact at 10 GB; the official-image
+          # golden is ~10-15 GB. Split it into <4 GB parts so the retention
+          # step below cannot fail late. Reassemble with
+          # `cat preloop-ubuntu-24.04-<arch>.part.* > preloop-ubuntu-24.04-<arch>`
+          # and verify against the .sha256 sidecar.
+          rm -f "dist/$GOLDEN_NAME.part."*
+          split -b 4G -d "dist/$GOLDEN_NAME" "dist/$GOLDEN_NAME.part."
+          sha256sum "dist/$GOLDEN_NAME.part."* > "dist/$GOLDEN_NAME.parts.sha256"
 
       # A dispatched build has no release to upload to; without this the
       # golden would sit only on the runner's workspace and be lost. Keep it
