@@ -360,6 +360,8 @@ by the build:
 | `github_runner_image_version`                           | Official `actions/runner-images` Ubuntu 24.04 snapshot used as the parity source | Refreshing the hosted-image parity bake list                            |
 | `ubuntu_24_04_base`                                     | Base image by digest (`ubuntu:24.04@sha256:…`)                                   | You want a newer OS snapshot — always bump the digest, never a bare tag |
 | `ubuntu_22_04_base`                                     | Second pinned base                                                               | Same                                                                    |
+| `official_runner_image_base_amd64`                      | Official GitHub-hosted runner image OCI reference for the x86_64 golden         | Bump the digest after re-running `runner-image-blobs` attestation and verifying the new digest |
+| `official_runner_image_base_arm64`                      | Official GitHub-hosted runner image OCI reference for the aarch64 golden         | Same as above                                                           |
 | `node_version`                                          | Node baked as the runner's externals                                             | A workflow needs a newer default Node                                   |
 | `node20_externals_version` / `node24_externals_version` | Additional Node externals                                                        | Same                                                                    |
 | `rustup_version`                                        | Rustup used to install baked Rust toolchains                                     | Toolchain bootstrap changes                                             |

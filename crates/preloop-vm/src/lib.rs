@@ -1752,7 +1752,7 @@ fn read_tar_json_member(tar_path: &Path, member: &str) -> Option<serde_json::Val
         return None;
     };
     let mut archive = tar::Archive::new(file);
-    let Ok(mut entries) = archive.entries() else {
+    let Ok(entries) = archive.entries() else {
         return None;
     };
     let member = member.trim_start_matches("./");

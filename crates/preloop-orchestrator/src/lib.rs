@@ -3013,8 +3013,7 @@ async fn provision_runner<P: VmProvider + 'static>(
                                     Ok(true) => {
                                         info!(
                                             golden = golden.as_str(),
-                                            attempt,
-                                            "golden fork base re-armed after clone drain"
+                                            attempt, "golden fork base re-armed after clone drain"
                                         );
                                         rearmed = true;
                                         break;
