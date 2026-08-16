@@ -646,11 +646,7 @@ fn verify_base_image_with(repo: &str, base_image: &str) -> anyhow::Result<()> {
         attest_args.extend(["--key", key]);
     }
     attest_args.extend(identity_args.iter().copied());
-    run_verifier(
-        "cosign",
-        &attest_args,
-        "cosign SPDX SBOM attestation",
-    )
+    run_verifier("cosign", &attest_args, "cosign SPDX SBOM attestation")
 }
 
 fn require_digest_pinned_base(base_image: &str) -> anyhow::Result<()> {
