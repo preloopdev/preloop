@@ -597,6 +597,9 @@ fn github_callback() {}
 /// Registered runners (read-only; used by the CLI to detect a dead pool).
 #[utoipa::path(
     get, path = "/api/v1/runners", tag = "Runners",
+    params(
+        ("run_id" = Option<String>, Query, description = "Run UUID; when present, `queued` and `claimable` report how many of the run's queued jobs no registered runner could claim")
+    ),
     responses(
         (status = 200, description = "Registered runners with labels", body = JsonValue)
     ),

@@ -2675,6 +2675,74 @@ async fn native_runner_list_reports_registered_runners() {
 }
 
 #[tokio::test]
+async fn native_runner_list_run_scoped_claimable() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    // A Linux pool runner is registered, so the raw runner count is positive.
+    // The CLI's dead-pool warning must key off runners that can actually
+    // claim the queued work, not the count.
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runners",
+        json!({"name": "pool-linux", "labels": ["self-hosted", "linux"]}),
+    )
+    .await;
+
+    // Claimable: a `runs-on: linux` job matches the registered runner.
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: linux\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo",
+        }),
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+    let listed = request_json(
+        &app,
+        Method::GET,
+        &format!("/api/v1/runners?run_id={run_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(listed["count"].as_u64(), Some(1));
+    assert_eq!(listed["queued"].as_u64(), Some(1));
+    assert_eq!(listed["claimable"].as_u64(), Some(1));
+
+    // Unclaimable: a job whose `runs-on` labels no registered runner carries
+    // (here a custom label) stays queued — the scheduler only fails jobs with
+    // no OS runner — so the raw count alone would hide the dead end.
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: custom-runs-on\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo",
+        }),
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+    let listed = request_json(
+        &app,
+        Method::GET,
+        &format!("/api/v1/runners?run_id={run_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(listed["count"].as_u64(), Some(1));
+    assert_eq!(listed["queued"].as_u64(), Some(1));
+    assert_eq!(listed["claimable"].as_u64(), Some(0));
+}
+
+#[tokio::test]
 async fn session_key_uses_registered_runner_public_key() {
     let temp = tempfile::tempdir().unwrap();
     let runner_keypair = AgentRsaKeypair::generate().unwrap();
