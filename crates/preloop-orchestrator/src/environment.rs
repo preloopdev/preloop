@@ -586,8 +586,10 @@ mod tests {
             "no duplicate toolchains"
         );
         // Rust is the one toolchain the base bake does not cover, so it is
-        // the deliberate member of the curated set.
-        assert!(first.contains(&ToolchainLayer::Rust("stable".into())));
+        // the deliberate member of the curated set (pinned for CI-Bench
+        // reproducibility; Go rides along).
+        assert!(first.contains(&ToolchainLayer::Rust("1.88.0".into())));
+        assert!(first.contains(&ToolchainLayer::Go("1.26".into())));
     }
 
     #[test]

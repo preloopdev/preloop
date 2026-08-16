@@ -9,7 +9,8 @@ Releases before v0.27.0 predate the changelog.
 
 ## [Unreleased]
 
-<<<<<<< HEAD
+## [0.30.3] - 2026-08-13
+
 ### Fixed
 
 - `preloop update` is now content-aware when the remote release version
@@ -21,9 +22,6 @@ Releases before v0.27.0 predate the changelog.
   to date forever — this is how the v0.30.2 deaf-runner fix never reached
   production. Lower versions still never downgrade; a failed content check
   (fetch/checksum error) keeps the installed binary and retries next run.
-=======
-## [0.30.3] - 2026-08-13
->>>>>>> 759b5243 (chore: release prep v0.30.3 — official runner image golden)
 
 ### Security
 

@@ -125,7 +125,7 @@ case "${1-}:${2-}" in
     if [ "${3-}" = "--stream" ]; then
       printf 'stream-out\n'
       printf 'stream-err\n' >&2
-    elif [ "${6-}" = "large-output" ]; then
+    elif [ "${8-}" = "large-output" ]; then
       printf '%200000s' ''
       printf '%200000s' '' >&2
     else
@@ -290,6 +290,10 @@ exit 0
                 format!("{}:/cache:ro", host_ro.display()),
                 "--mount-socket".to_owned(),
                 format!("{}:/run/preloop-engine.sock", host_socket.display()),
+                "--".to_owned(),
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "sleep infinity".to_owned(),
             ]
         );
     }
@@ -646,6 +650,8 @@ exit 0
                 "exec".to_owned(),
                 "--name".to_owned(),
                 "runner".to_owned(),
+                "--user".to_owned(),
+                "root".to_owned(),
                 "--".to_owned(),
                 "echo".to_owned(),
                 hostile,
