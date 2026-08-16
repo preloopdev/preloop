@@ -4,6 +4,39 @@ use serde_json::json;
 use super::*;
 
 #[test]
+fn format_output_cap_rejects_amplification_bomb() {
+    // Nested format() triples its argument per level: 20 levels around a
+    // 1 KB literal demands ~3 GB. Uncapped this was killed at 6.2 GB
+    // resident; the cap must trip as an ordinary error instead.
+    let mut expr = format!("'{}'", "A".repeat(1024));
+    for _ in 0..20 {
+        expr = format!("format('{{0}}{{0}}{{0}}', {expr})");
+    }
+    assert!(matches!(
+        eval_expression(&expr, &Context::default()),
+        Err(ExpressionError::FormatOutputTooLarge(_))
+    ));
+}
+
+#[test]
+fn format_output_cap_allows_normal_formatting() {
+    assert_eq!(
+        eval_expression("format('{0} {1}', 'hello', 'world')", &Context::default()).unwrap(),
+        Value::String("hello world".to_owned())
+    );
+    // Just under the cap passes through untouched.
+    let value = "A".repeat(500_000);
+    assert_eq!(
+        eval_expression(
+            &format!("format('{{0}}{{0}}', '{value}')",),
+            &Context::default()
+        )
+        .unwrap(),
+        Value::String(format!("{value}{value}"))
+    );
+}
+
+#[test]
 fn evaluates_context_and_functions() {
     let mut context = Context::default();
     context.insert("github", json!({"event_name": "push"}));

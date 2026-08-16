@@ -344,6 +344,25 @@ fn string_value(value: &Value) -> String {
     }
 }
 
+/// Cap on the output of `format()`.
+///
+/// Nested `format()` calls multiply output per level — each `{0}{0}{0}`
+/// triples its argument — so a ~1.5 KB expression could otherwise demand
+/// gigabytes (reproduced: 6.2 GB resident, process killed) without ever
+/// tripping an input-size limit. One megabyte is far above any real workflow
+/// usage.
+const MAX_FORMAT_OUTPUT_BYTES: usize = 1024 * 1024;
+
+fn push_capped(output: &mut String, segment: &str) -> Result<(), ExpressionError> {
+    if output.len() + segment.len() > MAX_FORMAT_OUTPUT_BYTES {
+        return Err(ExpressionError::FormatOutputTooLarge(
+            MAX_FORMAT_OUTPUT_BYTES,
+        ));
+    }
+    output.push_str(segment);
+    Ok(())
+}
+
 fn format_args(values: &[Value]) -> Result<String, ExpressionError> {
     let format = string_arg(values, 0);
     let bytes = format.as_bytes();
@@ -354,9 +373,9 @@ fn format_args(values: &[Value]) -> Result<String, ExpressionError> {
     while index < bytes.len() {
         match bytes[index] {
             b'{' => {
-                output.push_str(&format[segment_start..index]);
+                push_capped(&mut output, &format[segment_start..index])?;
                 if bytes.get(index + 1) == Some(&b'{') {
-                    output.push('{');
+                    push_capped(&mut output, "{")?;
                     index += 2;
                     segment_start = index;
                     continue;
@@ -384,23 +403,24 @@ fn format_args(values: &[Value]) -> Result<String, ExpressionError> {
                 let value = values
                     .get(argument_index + 1)
                     .ok_or_else(|| ExpressionError::InvalidFormat(format.clone()))?;
-                output.push_str(&string_value(value));
+                let rendered = string_value(value);
+                push_capped(&mut output, &rendered)?;
                 index = cursor + 1;
                 segment_start = index;
             }
             b'}' => {
-                output.push_str(&format[segment_start..index]);
+                push_capped(&mut output, &format[segment_start..index])?;
                 if bytes.get(index + 1) != Some(&b'}') {
                     return Err(ExpressionError::InvalidFormat(format));
                 }
-                output.push('}');
+                push_capped(&mut output, "}")?;
                 index += 2;
                 segment_start = index;
             }
             _ => index += 1,
         }
     }
-    output.push_str(&format[segment_start..]);
+    push_capped(&mut output, &format[segment_start..])?;
     Ok(output)
 }
 

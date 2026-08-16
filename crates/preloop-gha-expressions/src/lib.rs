@@ -95,6 +95,9 @@ pub enum ExpressionError {
     /// Invalid leading option passed to `hashFiles()`.
     #[error("invalid hashFiles option `{0}`")]
     InvalidHashFilesOption(String),
+    /// `format()` output exceeded the maximum length.
+    #[error("format() output exceeds the maximum of {0} bytes")]
+    FormatOutputTooLarge(usize),
 }
 
 /// Parse an expression without evaluating it.
