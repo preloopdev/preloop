@@ -532,7 +532,16 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         size: 1,
         use_fork: false,
         use_packed_artifact: false,
-        name_prefix: "preloop-release-golden".into(),
+        // Unique per bake: smolvm keys a machine's data dir by a hash of its
+        // name and reuses a dir left behind by a failed/interrupted run at its
+        // old on-disk size (smolvm#956). A stale dir then boots with the
+        // previous, smaller storage disk, so a large bake runs out of space
+        // mid-extraction with a confusing "Resource temporarily unavailable".
+        // A fresh name per run forces a fresh disk at the requested size.
+        name_prefix: std::env::var("PRELOOP_GOLDEN_NAME_PREFIX")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "preloop-release-golden".into()),
         base_image: args.base_image,
         workspace: args.workspace.or_else(|| std::env::current_dir().ok()),
         artifact_stem: output.clone(),
