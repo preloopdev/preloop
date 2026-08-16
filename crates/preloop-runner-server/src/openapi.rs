@@ -598,7 +598,7 @@ fn github_callback() {}
 #[utoipa::path(
     get, path = "/api/v1/runners", tag = "Runners",
     params(
-        ("run_id" = Option<String>, Query, description = "Run UUID; when present, `queued` and `claimable` report how many of the run's queued jobs no registered runner could claim")
+        ("run_id" = Option<String>, Query, description = "Run UUID; when present, `queued` is the number of the run's jobs awaiting a runner and `claimable` is the number of registered runners matching at least one of those queued jobs")
     ),
     responses(
         (status = 200, description = "Registered runners with labels", body = JsonValue)

@@ -153,12 +153,10 @@ pub(crate) async fn list_runners_native(
             .runners
             .values()
             .filter(|runner| {
+                let caps = crate::runtime_scheduling::capabilities_of(runner);
                 inner.queue.iter().any(|job| {
                     job.run_id == run_id
-                        && crate::runtime_scheduling::job_matches_runner(
-                            &job.runs_on,
-                            &runner.labels,
-                        )
+                        && crate::runtime_scheduling::job_matches_runner_capabilities(job, &caps)
                 })
             })
             .count();

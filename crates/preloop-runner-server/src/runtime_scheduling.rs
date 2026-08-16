@@ -1585,7 +1585,7 @@ pub(crate) fn clear_assignment(inner: &mut InnerState, run_id: RunId, job_id: &J
         .any(|job| job.run_id == run_id && job.job_id == *job_id)
 }
 
-fn capabilities_of(runner: &RegisteredRunner) -> RunnerCapabilities {
+pub(crate) fn capabilities_of(runner: &RegisteredRunner) -> RunnerCapabilities {
     RunnerCapabilities {
         known: true,
         labels: runner.labels.clone(),

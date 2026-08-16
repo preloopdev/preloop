@@ -1960,14 +1960,19 @@ async fn runner_capacity(
     ) {
         (Some(queued), Some(claimable)) => Ok(Some((queued as usize, claimable as usize))),
         // Older server (or one ignoring the query): only the raw count is
-        // available; treat every registered runner as claimable so the
-        // check degrades to the pre-run-scoped behavior.
+        // available. When count is zero, represent that as 0 claimable runners
+        // for the queued jobs so the dead-pool warning fires. When count > 0,
+        // treat runners as claimable (optimistic fallback).
         _ => {
             let count = body
                 .get("count")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0) as usize;
-            Ok(Some((count, count)))
+            if count == 0 {
+                Ok(Some((1, 0)))
+            } else {
+                Ok(Some((count, count)))
+            }
         }
     }
 }

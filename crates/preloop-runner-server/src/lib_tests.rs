@@ -2740,6 +2740,31 @@ async fn native_runner_list_run_scoped_claimable() {
     assert_eq!(listed["count"].as_u64(), Some(1));
     assert_eq!(listed["queued"].as_u64(), Some(1));
     assert_eq!(listed["claimable"].as_u64(), Some(0));
+
+    // Unclaimable: a job requiring a specific runner group when the registered
+    // runner belongs to a different group (here, default group) is unclaimable.
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on:\n      group: specialized-group\n      labels: [linux]\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo",
+        }),
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+    let listed = request_json(
+        &app,
+        Method::GET,
+        &format!("/api/v1/runners?run_id={run_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(listed["count"].as_u64(), Some(1));
+    assert_eq!(listed["queued"].as_u64(), Some(1));
+    assert_eq!(listed["claimable"].as_u64(), Some(0));
 }
 
 #[tokio::test]
