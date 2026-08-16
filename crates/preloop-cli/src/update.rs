@@ -162,21 +162,35 @@ pub(crate) async fn run(args: UpdateArgs) -> anyhow::Result<()> {
         // forever (this is how the v0.30.2 deaf-runner fix never reached
         // production). Verify the installed binary against the checksummed
         // release asset and reinstall on mismatch.
-        match installed_matches_release(&client, &selected).await {
-            Ok(true) => {
+        match check_same_version_content(&client, &selected).await {
+            Ok(ContentCheck::Matches) => {
                 println!("preloop {} is already up to date", current_version);
                 return Ok(());
             }
-            Ok(false) => println!(
-                "preloop {} does not match release {}; {} ({target})",
-                current_version,
-                release.tag_name,
+            Ok(ContentCheck::Drift(staged)) => {
+                println!(
+                    "preloop {} does not match release {}; {} ({target})",
+                    current_version,
+                    release.tag_name,
+                    if args.check {
+                        "would reinstall"
+                    } else {
+                        "reinstalling"
+                    }
+                );
                 if args.check {
-                    "would reinstall"
-                } else {
-                    "reinstalling"
+                    return Ok(());
                 }
-            ),
+                let lock_path = update_lock_path()?;
+                let _lock = UpdateLock::acquire(&lock_path)?;
+                let executable =
+                    std::env::current_exe().context("locate running preloop executable")?;
+                self_replace::self_replace(&staged.binary_path)
+                    .with_context(|| format!("atomically replace {}", executable.display()))?;
+                println!("installed preloop {}", remote_version);
+                restart_systemd_service().await?;
+                return Ok(());
+            }
             Err(error) => {
                 // A transient failure to fetch or verify the asset must not
                 // fail the hourly update timer; the next run retries.
@@ -187,9 +201,6 @@ pub(crate) async fn run(args: UpdateArgs) -> anyhow::Result<()> {
                 println!("preloop {} is already up to date", current_version);
                 return Ok(());
             }
-        }
-        if args.check {
-            return Ok(());
         }
     } else {
         println!(
@@ -203,20 +214,9 @@ pub(crate) async fn run(args: UpdateArgs) -> anyhow::Result<()> {
 
     let lock_path = update_lock_path()?;
     let _lock = UpdateLock::acquire(&lock_path)?;
-    let temp_dir = tempfile::tempdir().context("create update staging directory")?;
-    let archive_path = temp_dir.path().join(&selected.archive.name);
-    download(
-        &client,
-        &selected.archive.browser_download_url,
-        &archive_path,
-    )
-    .await?;
-    verify_checksum(&client, selected.archive, selected.checksum, &archive_path).await?;
-
-    let staged_binary = temp_dir.path().join(binary_name());
-    extract_binary(&archive_path, &staged_binary)?;
+    let staged = stage_release(&client, &selected).await?;
     let executable = std::env::current_exe().context("locate running preloop executable")?;
-    self_replace::self_replace(&staged_binary)
+    self_replace::self_replace(&staged.binary_path)
         .with_context(|| format!("atomically replace {}", executable.display()))?;
 
     println!("installed preloop {}", remote_version);
@@ -241,7 +241,8 @@ async fn update_linux_runner_bundle(client: &Client, release: &Release) -> anyho
         .iter()
         .find(|asset| asset.name == format!("{asset_name}.sha256"));
     let staging = tempfile::tempdir().context("create runner bundle staging directory")?;
-    let bundle_path = staging.path().join(&asset.name);
+    let file_name = safe_asset_filename(&asset.name)?;
+    let bundle_path = staging.path().join(file_name);
     download(client, &asset.browser_download_url, &bundle_path).await?;
     verify_checksum(client, asset, checksum, &bundle_path).await?;
 
@@ -664,19 +665,35 @@ fn sha256_file(path: &Path) -> anyhow::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Compare the installed binary against the checksummed release asset.
-///
-/// `Ok(true)` only when every byte of the installed executable matches the
-/// binary extracted from the release archive (whose own SHA-256 was already
-/// verified against the release checksum). Any fetch, checksum, or extract
-/// failure is an `Err` so the caller can distinguish "unknown" from
-/// "definitely equal".
-async fn installed_matches_release(
+/// Validate that an asset name is a single, safe relative filename without
+/// traversal components (`..`) or absolute path prefixes.
+fn safe_asset_filename(name: &str) -> anyhow::Result<&Path> {
+    let path = Path::new(name);
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("release asset name {name:?} has no valid filename"))?;
+    if file_name != path.as_os_str() {
+        bail!("release asset name {name:?} contains path separators or traversal");
+    }
+    Ok(Path::new(file_name))
+}
+
+/// A downloaded, verified, and extracted release ready for `self_replace`.
+/// Retains the temporary directory so the extracted binary remains valid on
+/// disk until dropped.
+struct StagedRelease {
+    _temp_dir: tempfile::TempDir,
+    binary_path: PathBuf,
+}
+
+/// Download a release asset, verify its checksum, and extract the binary.
+async fn stage_release(
     client: &Client,
     selected: &SelectedAsset<'_>,
-) -> anyhow::Result<bool> {
-    let staging = tempfile::tempdir().context("create content-check staging directory")?;
-    let archive_path = staging.path().join(&selected.archive.name);
+) -> anyhow::Result<StagedRelease> {
+    let temp_dir = tempfile::tempdir().context("create update staging directory")?;
+    let file_name = safe_asset_filename(&selected.archive.name)?;
+    let archive_path = temp_dir.path().join(file_name);
     download(
         client,
         &selected.archive.browser_download_url,
@@ -684,8 +701,25 @@ async fn installed_matches_release(
     )
     .await?;
     verify_checksum(client, selected.archive, selected.checksum, &archive_path).await?;
-    let staged_binary = staging.path().join(binary_name());
+    let staged_binary = temp_dir.path().join(binary_name());
     extract_binary(&archive_path, &staged_binary)?;
+    Ok(StagedRelease {
+        _temp_dir: temp_dir,
+        binary_path: staged_binary,
+    })
+}
+
+enum ContentCheck {
+    Matches,
+    Drift(StagedRelease),
+}
+
+/// Compare the installed binary against the checksummed release asset.
+async fn check_same_version_content(
+    client: &Client,
+    selected: &SelectedAsset<'_>,
+) -> anyhow::Result<ContentCheck> {
+    let staged = stage_release(client, selected).await?;
 
     let installed = std::env::current_exe().context("locate running preloop executable")?;
     // macOS installs are launched through the `preloop` symlink into
@@ -693,7 +727,11 @@ async fn installed_matches_release(
     // (and anyone reading this) sees the real file.
     let installed =
         fs::canonicalize(&installed).with_context(|| format!("resolve {}", installed.display()))?;
-    installed_binary_matches(&installed, &staged_binary)
+    if installed_binary_matches(&installed, &staged.binary_path)? {
+        Ok(ContentCheck::Matches)
+    } else {
+        Ok(ContentCheck::Drift(staged))
+    }
 }
 
 /// Content comparison behind the same-version check: `true` only when the
@@ -1374,5 +1412,13 @@ mod tests {
             !installed_binary_matches(&installed, &extracted).expect("both files readable"),
             "a drifted payload at the same version must trigger reinstall"
         );
+    }
+
+    #[test]
+    fn safe_asset_filename_rejects_traversal_and_absolute_paths() {
+        assert!(safe_asset_filename("preloop-v0.30.2-aarch64-apple-darwin.tar.gz").is_ok());
+        assert!(safe_asset_filename("../evil.tar.gz").is_err());
+        assert!(safe_asset_filename("/etc/passwd").is_err());
+        assert!(safe_asset_filename("").is_err());
     }
 }
