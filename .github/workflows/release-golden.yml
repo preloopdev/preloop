@@ -207,6 +207,14 @@ jobs:
       - name: Pack Golden MicroVM Artifact
         env:
           GOLDEN_NAME: preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
+          # smolvm's Go agent pulls the base image with Go's HTTP/2 client,
+          # whose flow-control window throttles the multi-GB layers to a few
+          # MB/s and then desyncs into "stream error: ... PROTOCOL_ERROR;
+          # received from peer" mid-transfer (the CDN and host are both
+          # healthy; a plain curl pulls the same blob at ~57 MB/s). Force the
+          # agent's transport down to HTTP/1.1, where each request is one
+          # connection with no multiplexed streams to corrupt.
+          GODEBUG: http2client=0
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -462,6 +470,7 @@ jobs:
       - name: Pack Golden MicroVM Artifact
         env:
           GOLDEN_NAME: preloop-ubuntu-24.04-aarch64
+          GODEBUG: http2client=0
         run: |
           mkdir -p dist
           rm -f "dist/$GOLDEN_NAME"
