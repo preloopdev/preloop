@@ -33,6 +33,38 @@ pub struct MatrixCombination {
     pub include_only: bool,
 }
 
+/// GitHub's documented ceiling on jobs a single matrix job may generate.
+pub const MAX_MATRIX_COMBINATIONS: usize = 256;
+
+/// Expand a concrete matrix, refusing inputs whose fan-out exceeds
+/// [`MAX_MATRIX_COMBINATIONS`].
+///
+/// The cross-product is fully materialized, so an uncapped spec is a
+/// memory-exhaustion vector from a tiny workflow payload; GitHub rejects the
+/// same input server-side, and the official runner surfaces that error, so
+/// refusing here also preserves wire compatibility.
+pub fn try_expand_matrix_spec(
+    job_id: &str,
+    spec: &MatrixSpec,
+) -> Result<Vec<MatrixCombination>, crate::ParserError> {
+    if cartesian_count(spec) > MAX_MATRIX_COMBINATIONS {
+        return Err(crate::ParserError::MatrixTooLarge {
+            job_id: job_id.to_owned(),
+            limit: MAX_MATRIX_COMBINATIONS,
+        });
+    }
+    let expanded = expand_matrix_spec(spec);
+    // Include-only rows append past the cross product and can push the total
+    // over the limit even when the cartesian count is under it.
+    if expanded.len() > MAX_MATRIX_COMBINATIONS {
+        return Err(crate::ParserError::MatrixTooLarge {
+            job_id: job_id.to_owned(),
+            limit: MAX_MATRIX_COMBINATIONS,
+        });
+    }
+    Ok(expanded)
+}
+
 /// Expand a concrete matrix according to GitHub's `MatrixBuilder` semantics.
 pub fn expand_matrix_spec(spec: &MatrixSpec) -> Vec<MatrixCombination> {
     let mut combinations = Vec::with_capacity(cartesian_count(spec));
@@ -812,6 +844,98 @@ jobs:
         assert!(matches!(
             value_to_matrix_spec("test", &json_arr),
             Err(crate::ParserError::InvalidExpression(_))
+        ));
+    }
+
+    /// A matrix whose cross-product exceeds the limit must be refused before
+    /// the cartesian product is materialized. Ten axes of ten values expand
+    /// to 10^10 combinations — uncapped, this exhausts memory at expansion
+    /// time from a ~450 byte workflow.
+    #[test]
+    fn try_expand_matrix_spec_rejects_cross_product_over_limit() {
+        let mut axes = IndexMap::new();
+        for i in 0..10 {
+            axes.insert(
+                format!("a{i}"),
+                (0..10).map(Value::from).collect::<Vec<_>>(),
+            );
+        }
+        let spec = MatrixSpec {
+            axes,
+            exclude: vec![],
+            include: vec![],
+        };
+        assert!(matches!(
+            try_expand_matrix_spec("bomb", &spec),
+            Err(crate::ParserError::MatrixTooLarge { .. })
+        ));
+    }
+
+    /// Include-only rows append past the cross product and must count toward
+    /// the same ceiling.
+    #[test]
+    fn try_expand_matrix_spec_rejects_include_overflow() {
+        let mut axes = IndexMap::new();
+        axes.insert("a".to_owned(), (0..16).map(Value::from).collect::<Vec<_>>());
+        let include = (0..241)
+            .map(|i| {
+                let mut row = IndexMap::new();
+                // Non-matching axis value forces each include to become its
+                // own row instead of merging into the cartesian rows.
+                row.insert("a".to_owned(), Value::String(format!("only{i}")));
+                row.insert(format!("extra{i}"), Value::from(i));
+                row
+            })
+            .collect::<Vec<_>>();
+        let spec = MatrixSpec {
+            axes,
+            exclude: vec![],
+            include,
+        };
+        // 16 cartesian rows + 241 include-only rows = 257 > 256.
+        assert!(matches!(
+            try_expand_matrix_spec("bomb", &spec),
+            Err(crate::ParserError::MatrixTooLarge { .. })
+        ));
+    }
+
+    /// The limit itself must pass through untouched — a matrix exactly at the
+    /// ceiling is legitimate on GitHub and must expand here too.
+    #[test]
+    fn try_expand_matrix_spec_allows_exact_limit() {
+        let mut axes = IndexMap::new();
+        axes.insert(
+            "a".to_owned(),
+            (0..MAX_MATRIX_COMBINATIONS)
+                .map(Value::from)
+                .collect::<Vec<_>>(),
+        );
+        let spec = MatrixSpec {
+            axes,
+            exclude: vec![],
+            include: vec![],
+        };
+        assert_eq!(
+            try_expand_matrix_spec("edge", &spec).unwrap().len(),
+            MAX_MATRIX_COMBINATIONS
+        );
+    }
+
+    /// End-to-end through the public API: the workflow bomb must fail with
+    /// `MatrixTooLarge`, not OOM the process.
+    #[test]
+    fn expand_jobs_rejects_matrix_bomb_workflow() {
+        let mut yaml = String::from(
+            "on: push\njobs:\n  bomb:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n",
+        );
+        for i in 0..10 {
+            yaml.push_str(&format!("        a{i}: [0,1,2,3,4,5,6,7,8,9]\n"));
+        }
+        yaml.push_str("    steps:\n      - run: echo hi\n");
+        let workflow = crate::parse_workflow(&yaml).unwrap();
+        assert!(matches!(
+            crate::expand_jobs(&workflow),
+            Err(crate::ParserError::MatrixTooLarge { .. })
         ));
     }
 
