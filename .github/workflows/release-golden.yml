@@ -199,6 +199,15 @@ jobs:
           mkdir -p "$DATA_DIR"
           rm -rf "$DATA_DIR/agent-rootfs"
           cp -R "$SRC/agent-rootfs" "$DATA_DIR/agent-rootfs"
+          # Alpine's default guest init PATH (/bin:/usr/bin) omits /usr/sbin,
+          # so `Command::new("resize2fs")` during `mount_storage_disk` failed
+          # with NotFound — leaving /storage at its initial unresized 512 MiB
+          # template size and causing guest ENOSPC on large layer extractions.
+          # Symlink e2fsprogs into standard binary paths.
+          ln -sf ../usr/sbin/resize2fs "$DATA_DIR/agent-rootfs/bin/resize2fs" || true
+          ln -sf ../sbin/e2fsck "$DATA_DIR/agent-rootfs/bin/e2fsck" || true
+          ln -sf ../usr/sbin/resize2fs "$DATA_DIR/agent-rootfs/usr/bin/resize2fs" || true
+          ln -sf ../sbin/e2fsck "$DATA_DIR/agent-rootfs/usr/bin/e2fsck" || true
           [ -f "$SRC/init.krun" ] && cp "$SRC/init.krun" "$DATA_DIR/init.krun"
           mkdir -p "$HOME/.local/bin"
           ln -sf "$HOME/.smolvm/smolvm" "$HOME/.local/bin/smolvm"
