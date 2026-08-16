@@ -13,7 +13,7 @@ smolvm_min_version = "1.7.7"
 # .github/workflows/smolvm-release-verify.yml gates the merge with the real-VM
 # E2E on the smolvm-host. Deliberately separate from smolvm_min_version:
 # goldens track the last *verified* release, the runtime floor rarely moves.
-smolvm_golden_version = "1.7.7"
+smolvm_golden_version = "1.8.2"
 
 # Image inputs for the runner golden. The OCI bases are immutable filesystem
 # inputs. `github_runner_image_version` is the actions/runner-images snapshot
