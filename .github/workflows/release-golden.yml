@@ -199,16 +199,15 @@ jobs:
           mkdir -p "$DATA_DIR"
           rm -rf "$DATA_DIR/agent-rootfs"
           cp -R "$SRC/agent-rootfs" "$DATA_DIR/agent-rootfs"
-          # Pre-resize template ext4 filesystems to 120 GiB directly on the host
-          # so smolvm's guest mounts them as full 120 GiB filesystems at boot.
-          if [ -f "$HOME/.smolvm/storage-template.ext4" ]; then
-            truncate -s 120G "$HOME/.smolvm/storage-template.ext4"
-            resize2fs "$HOME/.smolvm/storage-template.ext4" || true
-          fi
-          if [ -f "$HOME/.smolvm/overlay-template.ext4" ]; then
-            truncate -s 120G "$HOME/.smolvm/overlay-template.ext4"
-            resize2fs "$HOME/.smolvm/overlay-template.ext4" || true
-          fi
+          # The stock template from smolvm ships with only 32,768 inodes (designed
+          # for minimal containers). The official runner image carries >200,000 files
+          # across 18 layers, so extraction ran out of inodes on the dotnet SDK layer.
+          # Format fresh 120 GiB sparse templates with 7.8 million inodes directly on the host.
+          rm -f "$HOME/.smolvm/storage-template.ext4" "$HOME/.smolvm/overlay-template.ext4"
+          truncate -s 120G "$HOME/.smolvm/storage-template.ext4"
+          mkfs.ext4 -F -q -O ^has_journal -b 4096 "$HOME/.smolvm/storage-template.ext4"
+          truncate -s 120G "$HOME/.smolvm/overlay-template.ext4"
+          mkfs.ext4 -F -q -O ^has_journal -b 4096 -L smolvm-overlay "$HOME/.smolvm/overlay-template.ext4"
           # Alpine's default guest init PATH (/bin:/usr/bin) omits /usr/sbin,
           # so `Command::new("resize2fs")` during `mount_storage_disk` failed
           # with NotFound — leaving /storage at its initial unresized 512 MiB
