@@ -3,6 +3,8 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -673,9 +675,6 @@ impl SmolVmProvider {
         network: Option<&NetworkPolicy>,
         staging_dir: Option<&Path>,
     ) -> Result<ExecOutput, VmError> {
-        if operation == "create" {
-            eprintln!("[preloop-vm:create] {:?}", args);
-        }
         let mut command = self.sandboxed_command()?;
         match network {
             Some(NetworkPolicy::PublicOnly) => {
@@ -888,19 +887,23 @@ impl VmProvider for SmolVmProvider {
         }
         if !is_pack {
             // Everything this provider does runs through `machine exec`, so
-            // pin a harmless keep-alive workload for every image. Without it,
-            // machines whose record carries no entrypoint/cmd (local
-            // archives, the official runner image's bare `bash` CMD) fail to
-            // start with libkrun's EINVAL once the memory ceiling is raised.
-            // The workload must be the LAST positional block: `machine create`
-            // treats everything after `--` as the workload, so any flags
-            // appended later would be swallowed into it.
-            args.extend([
-                "--".into(),
-                "/bin/sh".into(),
-                "-c".into(),
-                "sleep infinity".into(),
-            ]);
+            // pin a harmless keep-alive workload when the image declares no
+            // usable startup command. Without it, machines whose record
+            // carries no entrypoint/cmd (bare archives, the official runner
+            // image's `bash` CMD) fail to start with libkrun's EINVAL once
+            // the memory ceiling is raised. Images that declare a real
+            // CMD/entrypoint keep their own workload — overriding it changes
+            // runtime behavior. The workload must be the LAST positional
+            // block: `machine create` treats everything after `--` as the
+            // workload, so any flags appended later would be swallowed.
+            if !image_has_startup_command(&spec.image) {
+                args.extend([
+                    "--".into(),
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "sleep infinity".into(),
+                ]);
+            }
         }
         self.exclusive_with_network("create", &args, &spec.network)
             .await?;
@@ -1700,6 +1703,72 @@ fn cgroup_controllers_enabled(dir: &Path) -> bool {
 #[cfg(any(target_os = "linux", test))]
 fn cgroup_root_dir(rel: &str) -> PathBuf {
     Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/'))
+}
+
+/// Whether an image declares a usable startup command (entrypoint or cmd).
+///
+/// Registry references and packs carry their own entrypoint/cmd in the image
+/// or pack metadata, so the provider assumes they have one and never overrides
+/// it with the keep-alive workload. A local OCI archive (docker-save `.tar`)
+/// is inspected from its `manifest.json` + config: if the config names neither
+/// an entrypoint nor a cmd, the machine would boot with an empty record and
+/// can fail to start (libkrun EINVAL) once the memory ceiling is raised.
+fn image_has_startup_command(image: &str) -> bool {
+    let path = Path::new(image);
+    if !path.is_file() || image.ends_with(".smolmachine") {
+        return true;
+    }
+    // Docker-save archive: read manifest.json, then the config file it names.
+    let manifest = read_tar_json_member(path, "manifest.json").and_then(|value| {
+        value
+            .get(0)
+            .and_then(|entry| entry.get("Config"))
+            .and_then(|config| config.as_str())
+            .map(str::to_owned)
+    });
+    let Some(config_name) = manifest else {
+        return true;
+    };
+    let Some(config) = read_tar_json_member(path, &config_name) else {
+        return true;
+    };
+    // docker-save nests the image config under `config`; the OCI layout keeps
+    // it at the top level.
+    let config = config.get("config").unwrap_or(&config);
+    let has_entrypoint = config
+        .get("Entrypoint")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|v| !v.is_empty());
+    let has_cmd = config
+        .get("Cmd")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|v| !v.is_empty());
+    has_entrypoint || has_cmd
+}
+
+/// Read and parse one member of a docker-save tar by name (prefix-stripped).
+fn read_tar_json_member(tar_path: &Path, member: &str) -> Option<serde_json::Value> {
+    let Ok(file) = File::open(tar_path) else {
+        return None;
+    };
+    let mut archive = tar::Archive::new(file);
+    let Ok(mut entries) = archive.entries() else {
+        return None;
+    };
+    let member = member.trim_start_matches("./");
+    for mut entry in entries.flatten() {
+        let Ok(entry_path) = entry.path() else {
+            continue;
+        };
+        if entry_path.to_string_lossy().trim_start_matches("./") == member {
+            let mut raw = Vec::new();
+            if entry.read_to_end(&mut raw).is_err() {
+                return None;
+            }
+            return serde_json::from_slice(&raw).ok();
+        }
+    }
+    None
 }
 
 fn validate_spec(spec: &MachineSpec) -> Result<(), VmError> {

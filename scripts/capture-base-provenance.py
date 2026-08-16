@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import NoReturn
 from urllib.parse import quote
@@ -111,21 +112,43 @@ def fetch(url: str, accept: str, allow_404: bool = False) -> bytes:
     credentials = ([("x-access-token", token)] if token else []) + [None]
     registry_token = None
     for credential in credentials:
+        # Keep the credential out of argv (visible in `ps`): pass it through
+        # a 0600 curl config file that is removed immediately after use.
+        auth_cfg = None
+        if credential:
+            fd, auth_cfg = tempfile.mkstemp(prefix="ghcr-token-")
+            try:
+                os.write(
+                    fd,
+                    f"--user {credential[0]}:{credential[1]}\n".encode(),
+                )
+            finally:
+                os.close(fd)
         cmd = [
             "curl",
             "--fail",
             "--silent",
             "--show-error",
             "--location",
+            "--connect-timeout",
+            "15",
+            "--max-time",
+            "60",
         ]
-        if credential:
-            cmd += ["--user", f"{credential[0]}:{credential[1]}"]
+        if auth_cfg:
+            cmd += ["--config", auth_cfg]
         cmd += [exchange_url]
         try:
             exchange = subprocess.run(cmd, check=True, capture_output=True)
             registry_token = json.loads(exchange.stdout).get("token")
         except (subprocess.CalledProcessError, json.JSONDecodeError):
             registry_token = None
+        finally:
+            if auth_cfg:
+                try:
+                    os.unlink(auth_cfg)
+                except OSError:
+                    pass
         if registry_token:
             break
     auth_args = (
@@ -366,9 +389,13 @@ def main() -> None:
     source_annotations = platform_descriptor.get("annotations") or {}
     # Composite descriptors often drop annotations; the platform manifest
     # itself carries them (org.opencontainers.image.source/revision/...).
-    if not source_annotations:
-        source_annotations = platform_manifest.get("annotations") or {}
+    # Check the source key specifically: a descriptor may carry unrelated
+    # annotations while the manifest holds the source, and vice versa.
     source = source_annotations.get("org.opencontainers.image.source")
+    if not source:
+        source = (platform_manifest.get("annotations") or {}).get(
+            "org.opencontainers.image.source"
+        )
     if args.require_source_prefix:
         prefix = args.require_source_prefix
         # Match the prefix itself or a path below it (`/` boundary) so a
@@ -402,11 +429,15 @@ def main() -> None:
         manifest, manifest_hash = fetch_attestation(registry, repository, descriptor)
         attestation_manifests.append((manifest, manifest_hash))
     for manifest in fetch_cosign_attestation(registry, repository, platform_digest):
+        # The canonical-JSON digest is the manifest's content hash — the same
+        # identity the referrers path records — so a manifest discovered both
+        # ways deduplicates, and the evidence is pinned (a null digest would
+        # leave the attestation unverifiable).
         key = digest_bytes(json.dumps(manifest, sort_keys=True).encode("utf-8"))
         if key in seen:
             continue
         seen.add(key)
-        attestation_manifests.append((manifest, None))
+        attestation_manifests.append((manifest, key))
 
     attestations = []
     sbom = None

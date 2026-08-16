@@ -541,7 +541,12 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         name_prefix: std::env::var("PRELOOP_GOLDEN_NAME_PREFIX")
             .ok()
             .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "preloop-release-golden".into()),
+            .unwrap_or_else(|| {
+                // A constant fallback would make repeated local bakes reuse
+                // the same machine name (and its hash dir), defeating the
+                // fresh-disk guarantee above. Per-invocation suffix instead.
+                format!("preloop-release-golden-{}", std::process::id())
+            }),
         base_image: args.base_image,
         workspace: args.workspace.or_else(|| std::env::current_dir().ok()),
         artifact_stem: output.clone(),
@@ -598,15 +603,15 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
 
 /// Verify a registry base image's provenance before baking a golden from it.
 ///
-/// Runs two independent checks, both keyless (no long-lived keys on the build
-/// host):
+/// The dump pipeline's images carry cosign keyless signatures and in-toto
+/// attestations (SLSA provenance + SPDX SBOM), signed by the publishing
+/// workflow's OIDC identity. A mirror can instead publish signatures under a
+/// long-lived key and point `PRELOOP_BASE_IMAGE_PUBKEY` at the public key
+/// file; `gh attestation verify` only understands GitHub-API attestations
+/// (attest-build-provenance), which the dump does not produce, so verification
+/// is cosign-based.
 ///
-/// 1. `gh attestation verify` — the GitHub-signed SLSA provenance stored in
-///    GHCR, pinned to the publishing repository.
-/// 2. `cosign verify` — the Sigstore keyless signature, pinned to the
-///    publishing workflow's OIDC identity on the default branch.
-///
-/// Both tools must be installed on the build host. `PRELOOP_VERIFY_BASE_IMAGE`
+/// `cosign` must be installed on the build host. `PRELOOP_VERIFY_BASE_IMAGE`
 /// enables the check; `PRELOOP_VERIFY_BASE_IMAGE_REPO` names the repository
 /// that publishes the base image; `PRELOOP_BASE_IMAGE_IDENTITY_REGEXP`
 /// overrides the default certificate identity match.

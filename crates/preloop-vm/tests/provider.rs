@@ -290,10 +290,6 @@ exit 0
                 format!("{}:/cache:ro", host_ro.display()),
                 "--mount-socket".to_owned(),
                 format!("{}:/run/preloop-engine.sock", host_socket.display()),
-                "--".to_owned(),
-                "/bin/sh".to_owned(),
-                "-c".to_owned(),
-                "sleep infinity".to_owned(),
             ]
         );
     }

@@ -12,7 +12,7 @@
 > **Revised at**: commit `d7f495d5`, 2026-08-02 — scope widened from local-only to
 > local + self-hosted production grade; ecosystem download payload cache added as the
 > primary toolchain acceleration mechanism (replacing resolver-gated golden baking).
-> **Drift check before implementation**: `git diff --stat d7f495d5..HEAD -- crates/aksh-cache crates/aksh-runner-server crates/aksh-runner crates/preloop-orchestrator crates/preloop-vm docs`
+> **Drift check before implementation**: `git diff --stat d7f495d5..HEAD -- crates/preloop-cache crates/preloop-runner-server crates/preloop-runner crates/preloop-orchestrator crates/preloop-vm docs`
 
 ## Executive decision
 
@@ -87,7 +87,7 @@ Revised priority order:
 
 ### Actions cache store
 
-`crates/aksh-cache/src/lib.rs` implements a local file-backed `CacheStore`:
+`crates/preloop-cache/src/lib.rs` implements a local file-backed `CacheStore`:
 
 - cache identity is a SHA-256-derived directory;
 - original key, version, and creation time are stored as metadata;
@@ -97,15 +97,15 @@ Revised priority order:
 - complete archives are read into `Vec<u8>` on restore;
 - there is no quota, expiration, eviction policy, or indexed lookup.
 
-`crates/aksh-runner-server/src/models.rs` stores v1 uploads in `PendingCache.bytes`.
+`crates/preloop-runner-server/src/models.rs` stores v1 uploads in `PendingCache.bytes`.
 
-`crates/aksh-runner-server/src/blob_store.rs` stages v2 blocks on disk, then:
+`crates/preloop-runner-server/src/blob_store.rs` stages v2 blocks on disk, then:
 
 - assembles all blocks in a single `Vec<u8>`;
 - writes a second complete copy;
 - reads complete blobs to return downloads.
 
-`crates/aksh-runner-server/src/results_twirp.rs` reads the complete staged blob during finalize and passes complete bytes to `CacheStore::put`. This is acceptable for small local caches but cannot be the self-hosted data path under multi-gigabyte transfers.
+`crates/preloop-runner-server/src/results_twirp.rs` reads the complete staged blob during finalize and passes complete bytes to `CacheStore::put`. This is acceptable for small local caches but cannot be the self-hosted data path under multi-gigabyte transfers.
 
 ### Cache scoping and authorization
 
@@ -150,8 +150,8 @@ Toolchain baking status (2026-08-02): `prepare_artifact` installs workspace-reso
 
 ### Other useful caches
 
-- `crates/aksh-runner-server/src/actions.rs` streams action tarballs into an atomic on-disk cache keyed by owner/repository/ref. Mutable tags are cached indefinitely; resolve tags to commit SHA and store immutable content by digest.
-- `crates/aksh-runner-server/src/snapshots.rs` maintains a lock-protected Git object cache per local Git common-directory identity and persists stat data. Its documented `git add` result improves from `156 ms` to `16 ms` for a 6,000-file workspace. This is the right pattern: immutable objects, narrow identity, atomic refresh, and no workspace reuse.
+- `crates/preloop-runner-server/src/actions.rs` streams action tarballs into an atomic on-disk cache keyed by owner/repository/ref. Mutable tags are cached indefinitely; resolve tags to commit SHA and store immutable content by digest.
+- `crates/preloop-runner-server/src/snapshots.rs` maintains a lock-protected Git object cache per local Git common-directory identity and persists stat data. Its documented `git add` result improves from `156 ms` to `16 ms` for a 6,000-file workspace. This is the right pattern: immutable objects, narrow identity, atomic refresh, and no workspace reuse.
 - `crates/preloop-orchestrator/src/keys.rs` deliberately gives every runner a unique RSA key. Runner private keys, credentials, and secret-bearing state must never enter a shared cache or golden image.
 
 ### No payload cache today
@@ -212,8 +212,8 @@ One row per origin class, in one config file. Adding an ecosystem is one row + t
 | rustup | `static.rust-lang.org` | `/dist/**`, `/rustup/**` | immutable ∞ (versioned); channel manifests TTL 10 min | `RUSTUP_DIST_SERVER`, `RUSTUP_UPDATE_ROOT` |
 | cargo | `index.crates.io`, `static.crates.io` | sparse index files; `/crates/**` | index TTL 5 min; `.crate` ∞ | `[source.crates-io]` replacement in `$CARGO_HOME/config.toml` |
 | npm | `registry.npmjs.org` | `/{pkg}` metadata; `/{pkg}/-/*.tgz` | metadata TTL 5 min + ETag revalidate; tarballs ∞ | global `registry=` npmrc |
-| Go modules | `proxy.golang.org` | `/{mod}/@v/{ver}.*` (immutable); `@v/list`, `@latest` (TTL 15 min) | `GOPROXY` (keep `,direct` fallback) | |
-| pip | `files.pythonhosted.org`, `pypi.org/simple` | wheel/sdist URLs are hash-laden ∞; simple index TTL 5 min + revalidate | `/etc/pip.conf` / `PIP_INDEX_URL` | |
+| Go modules | `proxy.golang.org` | `/{mod}/@v/{ver}.*` (immutable); `@v/list`, `@latest` (TTL 15 min) | module files ∞; list/latest TTL 15 min | `GOPROXY` (keep `,direct` fallback) |
+| pip | `files.pythonhosted.org`, `pypi.org/simple` | wheel/sdist URLs are hash-laden ∞; simple index TTL 5 min + revalidate | wheels ∞; simple index TTL 5 min | `/etc/pip.conf` / `PIP_INDEX_URL` |
 | apt | distro mirrors | `pool/**.deb` immutable; `dists/**` TTL 1 h | optional row; guests use golden-baked baselines first |
 | Node runtime | `nodejs.org` | `/dist/v*/**` immutable | only when using payload downloads directly; `$RUNNER_TOOL_CACHE` materialization preferred |
 | GitHub release assets | `github.com`, `objects.githubusercontent.com` | release download URLs | tag resolution records TTL 1 h; versioned archives ∞ | optional |
@@ -231,7 +231,7 @@ Guests reach the cache over the same NAT TCP path as the control plane (smolvm �
 
 - **Same daemon as the control plane.** Cache liveness must equal control-plane liveness, because some tools cannot fall back (npm, cargo, rustup hard-fail if their configured endpoint is down; Go falls back only via `GOPROXY=…,direct`).
 - **Self-hosted profile: dedicated interface + TLS.** Bind `PRELOOP_CACHE_LISTEN` (default: control-upstream interface, port `9091`) and serve TLS with a per-deployment CA generated at first start under `$PRELOOP_HOME/cache/ca/`. The CA is injected into the golden's system trust store and per-tool stores (`NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `CARGO_HTTP_CAINFO`). This is a *pinned, single-endpoint* CA — not general egress MITM. Plain-HTTP would require per-tool insecure flags (`GOINSECURE`, cargo registry HTTP rules) and gives no integrity for metadata rows, so it is rejected.
-- **Local profile: loopback HTTP is acceptable** (`http://127.0.0.1:9091`); the same CA path is recommended to keep guest images identical across profiles.
+- **Local profile: plain HTTP to the host cache listener is acceptable**; the guest reaches it over the control-plane NAT path (e.g. the virtio-net gateway address), never the guest's own loopback — `127.0.0.1` inside the guest points at the guest, not the host. The same CA path is recommended to keep guest images identical across profiles.
 - CA rotation requires golden rebuild; the fingerprint includes the deployment CA digest so goldens invalidate deliberately.
 - **Auth**: on a non-loopback listener, `/cache/*` requires the runtime/job capability (Phase 3); loopback local profile requires none. The public tunnel address must never expose cache routes.
 
@@ -754,7 +754,7 @@ Keep the existing five-repository slices and add controlled synthetic cases:
 - 8 simultaneous forks cold-fetching the same rustup dist;
 - cold node-local tier with warm object storage;
 - warm node-local tier;
-- upstream-error and upstream-slowmoon cases with latency budgeting.
+- upstream-error and upstream-slowdown cases with latency budgeting.
 
 Success criteria for the first campaign:
 
@@ -773,7 +773,7 @@ Success criteria for the first campaign:
 
 Target areas:
 
-- cache handlers in `aksh-runner-server`;
+- cache handlers in `preloop-runner-server`;
 - `CacheStore` operations;
 - orchestrator golden/tool/image phases;
 - runner setup/post action timing.
