@@ -1187,7 +1187,16 @@ impl VmProvider for SmolVmProvider {
         }
         let mut command = self.sandboxed_command()?;
         command
-            .args(["machine", "exec", "--stream", "--name", name.as_str(), "--user", "root", "--"])
+            .args([
+                "machine",
+                "exec",
+                "--stream",
+                "--name",
+                name.as_str(),
+                "--user",
+                "root",
+                "--",
+            ])
             .args(argv)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
