@@ -95,6 +95,9 @@ pub enum ExpressionError {
     /// Invalid leading option passed to `hashFiles()`.
     #[error("invalid hashFiles option `{0}`")]
     InvalidHashFilesOption(String),
+    /// Expression nesting exceeded the parser's depth ceiling.
+    #[error("expression nesting exceeds the maximum depth of {0}")]
+    TooDeep(usize),
 }
 
 /// Parse an expression without evaluating it.

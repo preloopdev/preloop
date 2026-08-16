@@ -588,4 +588,39 @@ mod official_semantics {
         let _ = std::fs::remove_dir_all(&workspace);
         assert!(result.is_err(), "unknown hashFiles flags must fail");
     }
+
+    /// Deeply nested parens overflow the parser's stack instead of returning
+    /// an error: 100k `(` from a 200 KB expression aborted the process before
+    /// the depth guard existed. The guard must reject, not crash.
+    #[test]
+    fn deeply_nested_parens_error_instead_of_overflowing() {
+        let n = 100_000;
+        let expr = format!("{}1{}", "(".repeat(n), ")".repeat(n));
+        assert!(matches!(
+            validate_expression(&expr),
+            Err(ExpressionError::TooDeep(_))
+        ));
+    }
+
+    /// `!` recurses through a different parse function than parens; it needs
+    /// the same ceiling.
+    #[test]
+    fn deeply_nested_negations_error_instead_of_overflowing() {
+        let expr = format!("{}true", "!".repeat(100_000));
+        assert!(matches!(
+            validate_expression(&expr),
+            Err(ExpressionError::TooDeep(_))
+        ));
+    }
+
+    /// Expressions within the ceiling must keep working unchanged.
+    #[test]
+    fn expressions_within_depth_limit_still_parse() {
+        let n = 200;
+        let expr = format!("{}true{}", "(".repeat(n), ")".repeat(n));
+        assert!(eval_bool(&expr, &Context::default()).unwrap());
+
+        let negated = format!("{}true", "!".repeat(200));
+        assert!(eval_bool(&negated, &Context::default()).unwrap());
+    }
 }
