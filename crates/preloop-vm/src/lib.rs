@@ -829,17 +829,17 @@ impl VmProvider for SmolVmProvider {
             args.extend(["--from".into(), spec.image.clone()]);
         } else {
             args.extend(["--image".into(), spec.image.clone()]);
-            args.extend([
-                "--cpus".into(),
-                spec.cpus.to_string(),
-                "--mem".into(),
-                spec.memory_mib.to_string(),
-                "--storage".into(),
-                spec.storage_gib.to_string(),
-            ]);
-            if let Some(overlay_gib) = spec.overlay_gib {
-                args.extend(["--overlay".into(), overlay_gib.to_string()]);
-            }
+        }
+        args.extend([
+            "--cpus".into(),
+            spec.cpus.to_string(),
+            "--mem".into(),
+            spec.memory_mib.to_string(),
+            "--storage".into(),
+            spec.storage_gib.to_string(),
+        ]);
+        if let Some(overlay_gib) = spec.overlay_gib {
+            args.extend(["--overlay".into(), overlay_gib.to_string()]);
         }
         match &spec.network {
             NetworkPolicy::Disabled => {}
