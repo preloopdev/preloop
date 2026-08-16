@@ -57,6 +57,119 @@ fn mounted_control_origin(public_url: &str) -> Option<String> {
     loopback.then(|| public_url.trim_end_matches('/').to_owned())
 }
 
+// ── Pre-push hook ──────────────────────────────────────────────────────────
+const HOOK_MARKER: &str = "# pre-push hook: soft CI gate for preloop";
+
+const PRE_PUSH_HOOK: &str = r#"#!/usr/bin/env bash
+# pre-push hook: soft CI gate for preloop.
+set -euo pipefail
+preloop_bin="${PRELOOP_BIN:-preloop}"
+cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/preloop-push"
+mkdir -p "$cache_dir"
+while read -r local_ref local_sha _remote_ref remote_sha; do
+  case "$local_ref" in refs/heads/*) ;; *) continue ;; esac
+  [[ "$local_sha" != 0000000000000000000000000000000000000000 ]] || continue
+  branch="${local_ref#refs/heads/}"
+  if git log --format=%B "${remote_sha:-HEAD}..$local_sha" 2>/dev/null \
+      | grep -qi '\[skip *ci\]'; then
+    echo "preloop: [skip ci] found — pushing ${branch} without the CI gate"
+    continue
+  fi
+  cache="$cache_dir/${local_sha}"
+  if [[ -f "$cache" ]]; then
+    verdict="$(cat "$cache")"
+    echo "preloop: cached CI verdict for ${local_sha:0:12}: ${verdict}"
+    if [[ "$verdict" == "success" ]]; then continue; fi
+    echo "preloop: cached verdict is ${verdict} — fix and re-push (or rm $cache)" >&2
+    exit 1
+  fi
+  log="${TMPDIR:-/tmp}/preloop-push-${local_sha:0:12}.log"
+  echo "preloop: running CI on preloop before pushing ${branch} (this holds the push)..."
+  if ! "$preloop_bin" run --push --create-pr >"$log" 2>&1; then
+    if grep -qiE 'connection refused|unable to access|could not resolve host|temporary failure' "$log"; then
+      echo "preloop: unreachable — pushing ${branch} WITHOUT the CI gate (fail-open)" >&2
+      rm -f "$log"; continue
+    fi
+    echo "preloop: CI failed for ${branch} — push aborted. Details:" >&2
+    tail -n 30 "$log" >&2; exit 1
+  fi
+  echo "success" >"$cache"; rm -f "$log"
+done
+"#;
+
+fn hook_installed() -> bool {
+    std::fs::read_to_string(".git/hooks/pre-push")
+        .map(|c| c.contains(HOOK_MARKER))
+        .unwrap_or(false)
+}
+
+fn hook_decided() -> bool {
+    std::fs::read_to_string(".git/config")
+        .map(|c| c.contains("hook-installed = true") || c.contains("hook-declined = true"))
+        .unwrap_or(false)
+}
+
+fn mark_hook_installed() {
+    let config_path = std::path::Path::new(".git/config");
+    let mut content = std::fs::read_to_string(config_path).unwrap_or_default();
+    if !content.contains("hook-installed = true") {
+        content.push_str("\n[preloop]\n\thook-installed = true\n");
+        let _ = std::fs::write(config_path, content);
+    }
+}
+
+fn mark_hook_declined() {
+    let config_path = std::path::Path::new(".git/config");
+    let mut content = std::fs::read_to_string(config_path).unwrap_or_default();
+    if !content.contains("hook-declined = true") {
+        content.push_str("\n[preloop]\n\thook-declined = true\n");
+        let _ = std::fs::write(config_path, content);
+    }
+}
+
+fn install_hook() -> anyhow::Result<()> {
+    let hooks_dir = std::path::Path::new(".git/hooks");
+    std::fs::create_dir_all(hooks_dir).context("create .git/hooks")?;
+    let hook_path = hooks_dir.join("pre-push");
+    std::fs::write(&hook_path, PRE_PUSH_HOOK).context("write pre-push hook")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&hook_path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&hook_path, perms)?;
+    }
+    mark_hook_installed();
+    Ok(())
+}
+
+fn maybe_offer_hook() -> anyhow::Result<()> {
+    if hook_installed() || hook_decided() {
+        return Ok(());
+    }
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return Ok(());
+    }
+    eprintln!(
+        "preloop: add preloop CI as a pre-push hook to run CI on your working tree before\n\
+         \x20 committing? This will run CI on preloop before every `git push`."
+    );
+    eprint!("         [y/N] ");
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => {
+            install_hook()?;
+            eprintln!("preloop: installed .git/hooks/pre-push");
+        }
+        _ => {
+            mark_hook_declined();
+            eprintln!("preloop: not installing (won't ask again for this repo)");
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn api_token() -> Option<String> {
     std::env::var("PRELOOP_TOKEN")
         .or_else(|_| std::env::var("PRELOOP_SYSTEM_TOKEN"))
@@ -1470,6 +1583,7 @@ fn default_local_activity_type(event: &str, payload: &serde_json::Value) -> Opti
 }
 
 async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
+    let _ = maybe_offer_hook();
     let workflow_path = resolve_workflow_path(args.file.as_deref())?;
     let workflow_yaml = std::fs::read_to_string(&workflow_path)
         .with_context(|| format!("failed to read workflow: {}", workflow_path.display()))?;
@@ -3103,6 +3217,34 @@ mod tests {
     fn status_parses() {
         let cli = parse(&["status"]).unwrap();
         assert!(matches!(cli.command, Command::Status));
+    }
+
+    #[test]
+    fn hook_lifecycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::env::set_current_dir(repo).unwrap();
+
+        // Create a minimal git repo manually. `git init` inside a subdirectory
+        // of the workspace would use the parent checkout's `.git/`.
+        std::fs::create_dir_all(".git/hooks").unwrap();
+        std::fs::write(".git/config", "[core]\n\trepositoryformatversion = 0\n").unwrap();
+        std::fs::write(".git/HEAD", "ref: refs/heads/main\n").unwrap();
+
+        assert!(!hook_installed(), "should not be installed yet");
+        assert!(!hook_decided(), "should not be decided yet");
+
+        install_hook().unwrap();
+        assert!(hook_installed(), "should be installed after install_hook");
+
+        // Install is idempotent — no error on second call.
+        install_hook().unwrap();
+        assert!(hook_installed());
+
+        // Uninstall and verify decline mark persists.
+        std::fs::remove_file(".git/hooks/pre-push").unwrap();
+        mark_hook_declined();
+        assert!(hook_decided(), "should be decided after declining");
     }
 
     #[test]
