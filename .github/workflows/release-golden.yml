@@ -199,6 +199,16 @@ jobs:
           mkdir -p "$DATA_DIR"
           rm -rf "$DATA_DIR/agent-rootfs"
           cp -R "$SRC/agent-rootfs" "$DATA_DIR/agent-rootfs"
+          # Pre-resize template ext4 filesystems to 120 GiB directly on the host
+          # so smolvm's guest mounts them as full 120 GiB filesystems at boot.
+          if [ -f "$HOME/.smolvm/storage-template.ext4" ]; then
+            truncate -s 120G "$HOME/.smolvm/storage-template.ext4"
+            resize2fs "$HOME/.smolvm/storage-template.ext4" || true
+          fi
+          if [ -f "$HOME/.smolvm/overlay-template.ext4" ]; then
+            truncate -s 120G "$HOME/.smolvm/overlay-template.ext4"
+            resize2fs "$HOME/.smolvm/overlay-template.ext4" || true
+          fi
           # Alpine's default guest init PATH (/bin:/usr/bin) omits /usr/sbin,
           # so `Command::new("resize2fs")` during `mount_storage_disk` failed
           # with NotFound — leaving /storage at its initial unresized 512 MiB
