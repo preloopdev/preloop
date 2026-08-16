@@ -3003,15 +3003,55 @@ async fn provision_runner<P: VmProvider + 'static>(
                             }
                         }
                         Ok(false) => {
-                            error!(
-                                golden = golden.as_str(),
-                                "fork base spent and cannot be re-armed (a live clone still \
-                                 depends on it, or the partial clone could not be removed); \
-                                 falling back to independent OCI creation"
-                            );
-                            let _ = provider.delete(name).await;
-                            direct_create_from_packed = false;
-                            None
+                            // A live clone (another runner forked from the
+                            // golden) blocks the re-freeze; those clones are
+                            // ephemeral and exit after their job. Wait for
+                            // them to drain, then retry the re-arm a bounded
+                            // number of times before falling back to direct
+                            // creation (whose socket mount cannot serve the
+                            // control transport, so the fallback usually
+                            // fails registration anyway).
+                            let mut rearmed = false;
+                            for attempt in 0..12 {
+                                tokio::time::sleep(Duration::from_secs(10)).await;
+                                match provider.rearm_fork_base(golden, Some(name)).await {
+                                    Ok(true) => {
+                                        info!(
+                                            golden = golden.as_str(),
+                                            attempt,
+                                            "golden fork base re-armed after clone drain"
+                                        );
+                                        rearmed = true;
+                                        break;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if rearmed {
+                                match provider.fork(golden, name).await {
+                                    Ok(()) => Some(golden),
+                                    Err(retry_error) => {
+                                        error!(
+                                            machine = name.as_str(),
+                                            golden = golden.as_str(),
+                                            %retry_error,
+                                            "re-armed golden still cannot fork; falling back to \
+                                             direct creation"
+                                        );
+                                        let _ = provider.delete(name).await;
+                                        None
+                                    }
+                                }
+                            } else {
+                                error!(
+                                    golden = golden.as_str(),
+                                    "fork base spent and could not be re-armed after waiting for \
+                                     clone drain; falling back to independent OCI creation"
+                                );
+                                let _ = provider.delete(name).await;
+                                direct_create_from_packed = false;
+                                None
+                            }
                         }
                         Err(rearm_error) => {
                             error!(

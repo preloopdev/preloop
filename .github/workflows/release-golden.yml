@@ -224,6 +224,7 @@ jobs:
           # The official runner snapshot extracts to ~60 GB; the bake VM must
           # be larger than the stock 20 GiB default.
           export PRELOOP_RUNNER_STORAGE_GB=120
+          export PRELOOP_RUNNER_OVERLAY_GB=120
           # smolvm keys a machine's data dir by a hash of its name and reuses
           # a dir left by a failed run at its old size (smolvm#956): a stale
           # dir boots with the previous, smaller storage disk and a large bake
@@ -486,6 +487,7 @@ jobs:
           # The official runner snapshot extracts to ~60 GB; the bake VM must
           # be larger than the stock 20 GiB default.
           export PRELOOP_RUNNER_STORAGE_GB=120
+          export PRELOOP_RUNNER_OVERLAY_GB=120
           ./target/release/preloop build-golden \
             --runner-bundle "target/$RUNNER_TARGET/release" \
             --output "dist/$GOLDEN_NAME"
