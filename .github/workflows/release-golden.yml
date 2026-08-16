@@ -237,8 +237,20 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           rm -f "dist/$GOLDEN_NAME"
+          # Flatten and export the verified base image into a local rootfs directory
+          # on the host. This extracts all layers natively with high-speed host Go
+          # tooling directly onto the physical disk, eliminating in-guest vsock socket
+          # read timeouts and in-guest layer extraction failures entirely.
+          if ! command -v crane >/dev/null 2>&1; then
+            curl -fsSL https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz | tar -xz -C "$HOME/.local/bin" crane
+          fi
+          ROOTFS_DIR="$(pwd)/base-rootfs"
+          rm -rf "$ROOTFS_DIR" && mkdir -p "$ROOTFS_DIR"
+          echo "Exporting base image to local rootfs on host..."
+          crane export "$BASE_IMAGE" - | tar -x -C "$ROOTFS_DIR"
+
           export PRELOOP_REQUIRE_BASE_DIGEST=1
-          export PRELOOP_RUNNER_BASE_IMAGE="$BASE_IMAGE"
+          export PRELOOP_RUNNER_BASE_IMAGE="$ROOTFS_DIR"
           # The official runner snapshot extracts to ~60 GB; the bake VM must
           # be larger than the stock 20 GiB default.
           export PRELOOP_RUNNER_STORAGE_GB=120
@@ -500,8 +512,16 @@ jobs:
         run: |
           mkdir -p dist
           rm -f "dist/$GOLDEN_NAME"
+          if ! command -v crane >/dev/null 2>&1; then
+            curl -fsSL https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Darwin_arm64.tar.gz | tar -xz -C "$HOME/.local/bin" crane
+          fi
+          ROOTFS_DIR="$(pwd)/base-rootfs"
+          rm -rf "$ROOTFS_DIR" && mkdir -p "$ROOTFS_DIR"
+          echo "Exporting base image to local rootfs on host..."
+          crane export "$BASE_IMAGE" - | tar -x -C "$ROOTFS_DIR"
+
           export PRELOOP_REQUIRE_BASE_DIGEST=1
-          export PRELOOP_RUNNER_BASE_IMAGE="$BASE_IMAGE"
+          export PRELOOP_RUNNER_BASE_IMAGE="$ROOTFS_DIR"
           # The official runner snapshot extracts to ~60 GB; the bake VM must
           # be larger than the stock 20 GiB default.
           export PRELOOP_RUNNER_STORAGE_GB=120
