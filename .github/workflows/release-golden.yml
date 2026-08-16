@@ -224,6 +224,13 @@ jobs:
           # The official runner snapshot extracts to ~60 GB; the bake VM must
           # be larger than the stock 20 GiB default.
           export PRELOOP_RUNNER_STORAGE_GB=120
+          # smolvm keys a machine's data dir by a hash of its name and reuses
+          # a dir left by a failed run at its old size (smolvm#956): a stale
+          # dir boots with the previous, smaller storage disk and a large bake
+          # dies mid-extraction with "Resource temporarily unavailable". A
+          # unique name per run forces a fresh disk at the requested size.
+          export PRELOOP_GOLDEN_NAME_PREFIX="preloop-release-golden-${GITHUB_RUN_ID}"
+          builder="preloop-release-golden-${GITHUB_RUN_ID}-builder"
           # This runner is also the production smolvm-host: the CI pool runs
           # several 5 GiB runner VMs on the same 22 GiB box. The builder guest
           # needs 4 GiB of *committable* RAM, and smolvm boots it only AFTER
@@ -250,7 +257,7 @@ jobs:
             echo "attempt ${attempt}/${attempts} with ${available} MiB available"
             # A failed boot leaves the builder machine registered; drop it so
             # the retry cannot collide with the previous attempt's disks.
-            smolvm machine delete --name preloop-release-golden-builder \
+            smolvm machine delete --name "$builder" \
               --force --cascade >/dev/null 2>&1 || true
             if ./target/release/preloop build-golden \
                 --runner-bundle "target/$RUNNER_TARGET/release" \
