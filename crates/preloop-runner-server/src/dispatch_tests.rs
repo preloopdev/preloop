@@ -436,6 +436,19 @@ jobs:
     steps:
       - run: echo any
 "#;
+const RD_BROKEN: &str = r#"
+name: broken
+on:
+  repository_dispatch:
+    types: [deploy]
+  schedule:
+    - cron: "not a cron"
+jobs:
+  b:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo broken
+"#;
 
 #[tokio::test]
 async fn repository_dispatch_broadcasts_to_matching_and_untyped_workflows() {
@@ -487,6 +500,36 @@ async fn repository_dispatch_with_no_matching_workflow_is_still_204() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert!(recorded_runs(&state).await.is_empty());
+}
+
+#[tokio::test]
+async fn repository_dispatch_keeps_broadcasting_after_workflow_validation_failure() {
+    let (state, app, _temp) =
+        dispatch_fixture(&[("deploy.yml", RD_DEPLOY), ("broken.yml", RD_BROKEN)]).await;
+
+    let (status, body) = post_json(
+        &app,
+        "/repos/octocat/repo/dispatches",
+        r#"{"event_type": "deploy"}"#,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "a per-workflow validation failure must not stop unrelated broadcasts: {body}"
+    );
+
+    let runs = recorded_runs(&state).await;
+    assert_eq!(
+        runs.len(),
+        1,
+        "the valid matching workflow runs; the invalid workflow is rejected"
+    );
+    assert_eq!(
+        runs[0].1.submission.workflow_file.as_deref(),
+        Some("deploy.yml")
+    );
 }
 
 #[tokio::test]
@@ -642,8 +685,8 @@ async fn dispatch_with_pat_authenticates() {
     let runs = recorded_runs(&state).await;
     assert_eq!(runs.len(), 1);
     // github.com is unreachable in this test, so the PAT's actor falls back
-    // to the operator placeholder instead of failing the dispatch.
-    assert_eq!(runs[0].1.github["actor"], "preloop-system");
+    // to `preloop-pat` (not the system-bearer identity) instead of failing.
+    assert_eq!(runs[0].1.github["actor"], "preloop-pat");
 }
 
 #[tokio::test]
@@ -996,11 +1039,12 @@ async fn select_app_for_repo_picks_the_app_installed_on_the_owner() {
         .expect("an App is installed on org-a");
     assert_eq!(for_org_a.app_id, "424");
 
-    // A repo neither App covers falls back to the default App.
-    let fallback = crate::github_app::select_app_for_repo(&shared, "nowhere/repo")
-        .await
-        .expect("the default App is the fallback");
-    assert_eq!(fallback.app_id, "424");
+    // In multi-App setups, a repo neither App covers returns None (no guessing).
+    let unmapped = crate::github_app::select_app_for_repo(&shared, "nowhere/repo").await;
+    assert!(
+        unmapped.is_none(),
+        "a repo neither App covers must return None, not guess"
+    );
     handle.abort();
 }
 

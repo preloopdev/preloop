@@ -1447,13 +1447,12 @@ async fn process_github_webhook(
 
 /// Webhook events the App-manifest flow asks GitHub to subscribe a new App to.
 ///
-/// Defaults to every webhook event preloop has an adapter for — the full
-/// [`crate::events::all_event_names`] set minus `schedule`, which is a
-/// workflow *trigger*, not a webhook event GitHub can subscribe an App to —
-/// so a newly created App can drive every trigger preloop supports. Operators
-/// who want a narrower, single-purpose App can override the set with
-/// `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` (comma-separated).
-pub(crate) fn manifest_default_events() -> Vec<String> {
+/// Defaults to the minimal CI event set (`push`, `pull_request`). GitHub
+/// cannot change an App's event subscriptions through its API after creation,
+/// so operators who need additional triggers must add them manually in the
+/// App settings UI. Operators who want a different creation-time set can
+/// override it with `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` (comma-separated).
+pub fn manifest_default_events() -> Vec<String> {
     if let Some(raw) = std::env::var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS")
         .ok()
         .map(|value| value.trim().to_owned())
@@ -1469,11 +1468,7 @@ pub(crate) fn manifest_default_events() -> Vec<String> {
             return events;
         }
     }
-    crate::events::all_event_names()
-        .iter()
-        .filter(|event| **event != "schedule")
-        .map(|event| (*event).to_owned())
-        .collect()
+    vec!["push".to_owned(), "pull_request".to_owned()]
 }
 
 /// Serve registration page for GitHub App Manifest flow.
@@ -1684,25 +1679,9 @@ mod tests {
     }
 
     #[test]
-    fn manifest_default_events_cover_every_adapter_event_except_schedule() {
-        // `schedule` is a workflow trigger, not a webhook event GitHub can
-        // subscribe an App to; every other supported event must be in the
-        // manifest default so a newly created App can drive every trigger
-        // preloop supports without a settings visit.
+    fn manifest_default_events_use_minimal_ci_defaults() {
         let defaults = manifest_default_events();
-        for event in crate::events::all_event_names() {
-            if *event == "schedule" {
-                continue;
-            }
-            assert!(
-                defaults.iter().any(|have| have == event),
-                "manifest default events must include {event}"
-            );
-        }
-        assert!(
-            !defaults.iter().any(|event| event == "schedule"),
-            "schedule is a workflow trigger, not a subscribable webhook event"
-        );
+        assert_eq!(defaults, vec!["push", "pull_request"]);
     }
 
     #[tokio::test]
@@ -1715,9 +1694,9 @@ mod tests {
         assert_eq!(events, vec!["push".to_owned(), "pull_request".to_owned()]);
         std::env::remove_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS");
 
-        // A blank override falls back to the expanded default.
+        // A blank override falls back to the minimal default.
         std::env::set_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS", "  ");
-        assert!(manifest_default_events().len() > 2);
+        assert_eq!(manifest_default_events(), vec!["push", "pull_request"]);
         std::env::remove_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS");
     }
 

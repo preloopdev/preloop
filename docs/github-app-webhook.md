@@ -23,11 +23,12 @@ supports (`src/events/mod.rs`, `all_event_names()`):
 | C — release/admin/fork/wiki | `watch`, `fork`, `deployment`, `deployment_status`, `member`, `public`, `gollum`, `page_build` |
 | Internal | `schedule` (synthesized by the cron scheduler, never delivered as a webhook) |
 
-The App-manifest flow (`GET /api/v1/github/register`) pre-subscribes a new App
-to every webhook event above except `schedule` (which is a workflow *trigger*,
-not a webhook event GitHub can subscribe an App to). Override the manifest's
-event list with `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` (comma-separated) when a
-narrower, single-purpose App is wanted.
+The App-manifest flow (`GET /api/v1/github/register`) defaults to the minimal
+CI event set: `push` and `pull_request`. Override the creation-time event list
+with `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` (comma-separated) when the App needs
+additional or different events. GitHub cannot change an App's event
+subscriptions through its API after creation; add later events manually under
+the App's settings → Webhooks → Edit.
 
 At startup preloop reads an existing App's subscription back from GitHub
 (`GET /app`, App-JWT auth) and **warns loudly** when the trigger events it

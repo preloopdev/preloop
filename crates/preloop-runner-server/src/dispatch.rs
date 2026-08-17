@@ -23,7 +23,7 @@ use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde_json::{json, Value};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::dispatch_auth::DispatchIdentity;
 use crate::events::trust_tier::TrustTier;
@@ -198,14 +198,28 @@ pub(crate) async fn repository_dispatch(
         );
         match submit_and_report(&shared, submission, &repository, &sha).await {
             Ok(_) => {}
-            // A 4xx outcome means this workflow is not triggered by the
-            // event_type — broadcast semantics say the others still run.
-            Err(error) if error.status().is_client_error() => {
+            // A trigger mismatch is expected in a broadcast: the adapter
+            // submits every workflow, and submit_run_inner is authoritative
+            // about the workflow's `on.repository_dispatch` filter.
+            Err(error) if is_trigger_mismatch(&error) => {
                 info!(
                     workflow = %filename,
                     event_type,
                     detail = %error.message(),
                     "workflow not triggered by repository_dispatch"
+                );
+            }
+            // Other client errors are real per-workflow failures (for
+            // example, invalid workflow configuration). Keep broadcasting so
+            // unrelated workflows can still run, but make the partial
+            // failure visible instead of mislabeling it as a non-match.
+            Err(error) if error.status().is_client_error() => {
+                warn!(
+                    workflow = %filename,
+                    event_type,
+                    status = %error.status(),
+                    detail = %error.message(),
+                    "repository_dispatch workflow submission failed; other workflows will continue"
                 );
             }
             Err(error) => return Err(error),
@@ -419,6 +433,16 @@ fn workflow_has_trigger(workflow: &preloop_gha_parser::Workflow, event: &str) ->
         Trigger::Many(names) => names.iter().any(|name| name == event),
         Trigger::Map(triggers) => triggers.contains_key(event),
     }
+}
+
+/// `submit_run_inner` uses this exact error for a workflow whose trigger
+/// filters do not match the broadcast event. Other 4xx errors must remain
+/// visible as per-workflow failures.
+fn is_trigger_mismatch(error: &ApiError) -> bool {
+    error.status() == StatusCode::BAD_REQUEST
+        && error
+            .message()
+            .starts_with("workflow does not match event `")
 }
 
 /// Build the `WorkflowSubmission` for a dispatched effective event, carrying

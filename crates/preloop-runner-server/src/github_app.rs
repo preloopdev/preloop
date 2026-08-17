@@ -301,8 +301,9 @@ pub(crate) struct MintLedgerEntry {
 
 /// In-memory record of every installation token preloop itself minted, keyed
 /// by SHA-256 of the token (never the raw token). Populated at mint time in
-/// [`mint_for_repository`]; entries are dropped once they expire, so the map
-/// stays bounded by the 10-minute token lifetime.
+/// [`mint_for_repository`]; entries are dropped once GitHub's `expires_at`
+/// elapses (typically ~1h for installation tokens — distinct from the 10-minute
+/// App JWT used only to mint them), so the map stays bounded by live tokens.
 #[derive(Debug, Default)]
 pub(crate) struct MintLedger {
     entries: parking_lot::Mutex<HashMap<String, MintLedgerEntry>>,
@@ -505,10 +506,10 @@ pub(crate) fn load_from(
 /// Select the App whose installation covers `repository`'s owner (D6).
 ///
 /// Installation discovery is cached per App, so steady state is one cached
-/// lookup per App. When no App's installation resolves — including transient
-/// discovery failures — the default (legacy) App is returned so the mint
-/// itself surfaces the real error rather than silently downgrading the job
-/// token.
+/// lookup per App. For single-App setups, the single configured App is
+/// returned directly. For multi-App setups, returns `None` when no registered
+/// App covers the target repository's owner, avoiding silent mis-attribution
+/// or minting from the wrong App.
 pub(crate) async fn select_app_for_repo(
     shared: &crate::state::SharedState,
     repository: &str,
@@ -519,7 +520,12 @@ pub(crate) async fn select_app_for_repo(
     };
     let owner = match split_repository(repository) {
         Ok((owner, _)) => owner.to_owned(),
-        Err(_) => return Some(registry.default_app().clone()),
+        Err(_) => {
+            if registry.apps.len() == 1 {
+                return Some(registry.default_app().clone());
+            }
+            return None;
+        }
     };
     let api_base = api_base();
     for app in &registry.apps {
@@ -534,7 +540,16 @@ pub(crate) async fn select_app_for_repo(
             return Some(app.clone());
         }
     }
-    Some(registry.default_app().clone())
+    if registry.apps.len() == 1 {
+        Some(registry.default_app().clone())
+    } else {
+        debug!(
+            repository,
+            apps_checked = registry.apps.len(),
+            "no registered GitHub App is installed on repository owner"
+        );
+        None
+    }
 }
 
 /// Mint an installation token for `repository`, scoped to `permissions`.

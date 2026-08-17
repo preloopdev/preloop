@@ -48,6 +48,11 @@ const TOKEN_CACHE_TTL: Duration = Duration::from_secs(60);
 /// How long a PAT's `GET /user` login and an App JWT's slug stay cached.
 const ACTOR_CACHE_TTL: Duration = Duration::from_secs(60);
 
+/// Offline / unresolvable PAT actor. Distinct from the system-bearer identity
+/// (`preloop-system`) so audit logs and `github.actor` checks never conflate a
+/// PAT dispatch with native system auth when github.com cannot name the user.
+const PRELOOP_PAT_ACTOR: &str = "preloop-pat";
+
 /// The identity a dispatch request authenticated as (D2).
 #[derive(Debug, Clone)]
 pub(crate) struct DispatchIdentity {
@@ -477,30 +482,39 @@ fn verify_app_jwt(
 }
 
 /// The login a PAT maps to, from `GET /user` (cached). Falls back to the
-/// operator placeholder when github.com cannot be reached — a PAT dispatch
-/// must not fail on actor resolution.
+/// dedicated [`PRELOOP_PAT_ACTOR`] placeholder when github.com cannot be
+/// reached — auth already succeeded offline, so the dispatch must not fail on
+/// actor resolution, but the label must not pretend to be the system bearer.
+/// Failed lookups are **not** cached: a transient outage must not pin the
+/// placeholder for the full actor TTL after github.com recovers.
 async fn resolve_pat_actor(shared: &Arc<SharedState>, pat: &str) -> String {
     let key = format!("pat:{}", sha256_hex(pat));
     if let Some(actor) = shared.state.dispatch_actor_cache.get(&key) {
         return actor;
     }
     let api_base = crate::github::github_api_base();
-    let actor = match fetch_json(&format!("{api_base}/user"), pat).await {
-        Ok(user) => user
-            .get("login")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_else(|| "preloop-system".to_owned()),
+    match fetch_json(&format!("{api_base}/user"), pat).await {
+        Ok(user) => {
+            let Some(actor) = user
+                .get("login")
+                .and_then(serde_json::Value::as_str)
+                .filter(|login| !login.is_empty())
+                .map(str::to_owned)
+            else {
+                warn!("PAT GET /user response had no login; using {PRELOOP_PAT_ACTOR}");
+                return PRELOOP_PAT_ACTOR.to_owned();
+            };
+            shared.state.dispatch_actor_cache.put(key, actor.clone());
+            actor
+        }
         Err(error) => {
             warn!(
                 ?error,
-                "could not resolve the PAT's actor from github.com; using preloop-system"
+                "could not resolve the PAT's actor from github.com; using {PRELOOP_PAT_ACTOR}"
             );
-            "preloop-system".to_owned()
+            PRELOOP_PAT_ACTOR.to_owned()
         }
-    };
-    shared.state.dispatch_actor_cache.put(key, actor.clone());
-    actor
+    }
 }
 
 /// The bot login of a registered App (`{slug}[bot]`), from `GET /app`

@@ -311,7 +311,15 @@ chain rather than the native bearer alone:
 | Third-party App installation token | github.com round-trip: `GET /installation` + `GET /installation/repositories`; requires `actions: write`; 60s cache; **fails closed** on network error | no |
 
 Third-party App JWTs are never accepted — there is no PEM to verify them with.
-The `sender` for a dispatched run is the App bot identity (`{slug}[bot]`) for
-installation tokens, or the resolved PAT owner. Dispatched runs carry the
-`AppDispatch` trust tier, which allows repository secrets (the caller has
-proven `actions: write`, matching github.com).
+The `sender` / `github.actor` for a dispatched run is:
+- installation token → App bot identity (`{slug}[bot]`, or ledger `account_login`)
+- own-App JWT → `{slug}[bot]` (or `{app_id}[bot]` offline)
+- PAT → `GET /user` login when github.com is reachable; otherwise the dedicated
+  placeholder `preloop-pat` (never the system-bearer identity `preloop-system`).
+  Failed PAT actor lookups are not cached, so a transient outage does not pin
+  the placeholder after github.com recovers.
+- system token → `preloop-system`
+
+Installation-token dispatches carry the `AppDispatch` trust tier, which allows
+repository secrets (the caller has proven `actions: write`, matching github.com).
+System / PAT / own-App JWT dispatches stay on `AdminManual`.

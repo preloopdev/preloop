@@ -151,16 +151,20 @@ is created. Missing input validation must not reject a *webhook*-delivered dispa
   register Apps at runtime (nice-to-have; config-first is fine).
 
 ### D7. Event subscription
-- Manifest `default_events` (currently `["push","pull_request"]`) becomes
-  configurable, defaulting to the full supported set: Tier A + the trigger events
-  Apps need — `push`, `pull_request`, `pull_request_target`, `pull_request_review`,
-  `workflow_dispatch`, `workflow_run`, `repository_dispatch`, `issue_comment`,
-  `issues`, `check_run`, `check_suite`, `create`, `delete`, `release`, plus the
-  Tier B/C events the adapters already handle (match `events/mod.rs::all_event_names()`).
+- Manifest `default_events` is configurable and defaults to the minimal CI set:
+  `push`, `pull_request`. Operators who need additional events must add them
+  manually in the App settings UI because GitHub's API cannot change event
+  subscriptions after App creation. The trigger events Apps may need include
+  `pull_request_target`, `pull_request_review`, `workflow_dispatch`,
+  `workflow_run`, `repository_dispatch`, `issue_comment`, `issues`, `check_run`,
+  `check_suite`, `create`, `delete`, `release`, plus the Tier B/C events the
+  adapters already handle.
 - **Caveat**: GitHub's `PATCH /app/hook/config` cannot change an App's event
   subscription (only url/content_type/secret). Event subscriptions are set at App
   creation (manifest) or in the App settings UI. So:
-  - New Apps (manifest flow): expanded `default_events` applies automatically.
+  - New Apps (manifest flow): only the minimal defaults apply automatically;
+    add additional events manually in the App settings UI or set the override
+    before creating the App.
   - Existing Apps: `GET /app` (App JWT auth) returns `events` — read it back at
     startup, and **warn loudly** if the required trigger events are missing, with
     instructions to tick them in App settings.
@@ -256,7 +260,8 @@ docs/
 
 ### M1 — Docs fix + event subscription
 - [ ] `docs/github-app-webhook.md` corrected (full event list from `all_event_names()`)
-- [ ] Manifest `default_events` configurable, expanded default (D7)
+- [ ] Manifest `default_events` configurable, minimal `push`/`pull_request`
+      default with manual GitHub settings guidance for additional events (D7)
 - [ ] Startup read-back of `GET /app` events; loud warning when trigger events missing
 - [ ] Tests: manifest generation includes events; read-back warning path
 - **Exit**: existing deployments unchanged (no new required config); docs match code.
@@ -327,9 +332,8 @@ Milestone status and open-question decisions, updated as the work lands.
   is mandatory (doc previously claimed it is skipped without a secret — the
   code 401s); webhook setup steps list the trigger events; multi-secret
   verification noted.
-- `src/github.rs`: `manifest_default_events()` — expanded default (every
-  `all_event_names()` event except `schedule`, which is a workflow trigger,
-  not a subscribable webhook event), overridable via
+- `src/github.rs`: `manifest_default_events()` — minimal `push` and
+  `pull_request` default, overridable via
   `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` (comma-separated). Manifest
   `default_permissions` expanded (read-level: actions/issues/discussions/
   deployments/members/pages) so the expanded event list is deliverable.
@@ -339,14 +343,15 @@ Milestone status and open-question decisions, updated as the work lands.
   subscription back after a successful PATCH and warns on missing triggers.
 - `src/bootstrap.rs`: `serve()` spawns a startup read-back of the App's event
   subscription and warns loudly when trigger events are missing.
-- Tests: manifest defaults cover every adapter event except `schedule`;
-  env override respected; `read_app_events_at` parses a stubbed `/app` and
+- Tests: manifest defaults use the minimal CI set; env override respected;
+  `read_app_events_at` parses a stubbed `/app` and
   fails closed on refusal; missing-trigger computation is canonical.
 
 **Open-question decisions so far:**
-- D7 manifest default: `all_event_names()` minus `schedule` (schedule is not a
-  webhook event GitHub can subscribe an App to; the read-back warning covers
-  the real trigger set). Narrowing is possible via `PRELOOP_GITHUB_APP_DEFAULT_EVENTS`.
+- D7 manifest default: `push` and `pull_request`. Additional events can be
+  selected at creation time with `PRELOOP_GITHUB_APP_DEFAULT_EVENTS`; after
+  creation, operators must add subscriptions manually in GitHub's App
+  settings because the API cannot change them.
 
 ### M2 — Dispatch shim (done)
 

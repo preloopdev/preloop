@@ -43,12 +43,15 @@ use tokio::sync::{oneshot, Mutex};
 const DEFAULT_PERMISSIONS: &[(&str, &str)] = &[
     ("checks", "write"),
     ("contents", "read"),
+    ("actions", "read"),
+    ("issues", "read"),
+    ("discussions", "read"),
+    ("deployments", "read"),
+    ("members", "read"),
+    ("pages", "read"),
     ("metadata", "read"),
     ("pull_requests", "read"),
 ];
-
-/// Events the App subscribes to when webhooks are configured.
-const DEFAULT_EVENTS: &[&str] = &["push", "pull_request"];
 
 /// How long to wait for the operator to finish in the browser.
 const BROWSER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
@@ -164,7 +167,8 @@ pub(crate) fn manifest(
             "url": format!("{}/api/v1/github/webhooks", public.trim_end_matches('/')),
             "active": true,
         });
-        manifest["default_events"] = serde_json::json!(DEFAULT_EVENTS);
+        manifest["default_events"] =
+            serde_json::json!(preloop_runner_server::github::manifest_default_events());
     }
     // With no public URL there is no webhook at all: GitHub validates hook URL
     // reachability even for inactive hooks and rejects loopback addresses.
@@ -719,7 +723,9 @@ mod tests {
             "https://ci.example.com/api/v1/github/webhooks"
         );
         assert_eq!(manifest["hook_attributes"]["active"], true);
-        assert_eq!(manifest["default_events"][0], "push");
+        let events = manifest["default_events"].as_array().unwrap();
+        assert!(events.iter().any(|e| e == "push"));
+        assert!(events.iter().any(|e| e == "pull_request"));
     }
 
     #[test]
