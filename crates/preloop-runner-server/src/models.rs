@@ -21,6 +21,11 @@ pub(crate) struct PushState {
     /// Pull request number, when the branch has an open PR (created or
     /// pre-existing).
     pub(crate) pr_number: Option<u64>,
+    /// The commit the sync actually published (`submission.sha` for a clean
+    /// submission; the materialized branch head for a dirty one). Webhook
+    /// dedup matches the echo of our own push against this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) effective_sha: Option<String>,
 }
 
 #[derive(Debug, Clone)]

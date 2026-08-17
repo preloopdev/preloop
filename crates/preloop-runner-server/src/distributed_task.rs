@@ -697,17 +697,6 @@ pub(crate) async fn complete_job_inner(
     let queue_nonempty = !inner.queue.is_empty() || !inner.cancellation_queue.is_empty();
     drop(inner);
 
-    // Webhook-driven auto-PR: a successful push run may open a PR per
-    // policy. Best-effort and detached — a GitHub outage must never affect
-    // the run's own result.
-    if newly_terminal_success {
-        let shared = shared.clone();
-        let run_id = completion.run_id;
-        tokio::spawn(async move {
-            crate::github_pr::maybe_open_pr(shared, run_id).await;
-        });
-    }
-
     // Any reusable-caller or dynamic-matrix node the sweep above unblocked was
     // deferred rather than expanded under the lock. Build those subtrees now
     // that the guard is released, and fold the result into the outcome the
@@ -729,6 +718,23 @@ pub(crate) async fn complete_job_inner(
             .cloned()
             .ok_or_else(|| ApiError::not_found("run not found"))?
     };
+
+    // Webhook-driven auto-PR: a successful push run may open a PR per
+    // policy. Fires only after deferred expansions have settled: an
+    // expansion can add work or conclude a subtree, and the pre-expansion
+    // "success" snapshot is not the final truth (the record above is
+    // re-read post-expansion). Best-effort and detached — a GitHub outage
+    // must never affect the run's own result.
+    if newly_terminal_success
+        && record.status == ExecutionStatus::Success
+        && record.conclusion.as_deref() == Some("success")
+    {
+        let shared = shared.clone();
+        let run_id = completion.run_id;
+        tokio::spawn(async move {
+            crate::github_pr::maybe_open_pr(shared, run_id).await;
+        });
+    }
 
     github::report_check_run_completed(
         &shared,

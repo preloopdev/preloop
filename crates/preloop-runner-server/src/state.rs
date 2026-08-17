@@ -729,12 +729,11 @@ impl AppState {
             if !value.trim().is_empty() {
                 pr_config.auto = match value.trim().to_ascii_lowercase().as_str() {
                     "feature" => crate::config::PrAuto::Feature,
-                    "always" => crate::config::PrAuto::Always,
                     "never" => crate::config::PrAuto::Never,
                     other => {
                         tracing::warn!(
                             value = other,
-                            "unknown PRELOOP_GITHUB_PR_AUTO; expected feature|always|never"
+                            "unknown PRELOOP_GITHUB_PR_AUTO; expected feature|never"
                         );
                         pr_config.auto
                     }
@@ -743,10 +742,20 @@ impl AppState {
         }
         if let Ok(value) = env::var("PRELOOP_GITHUB_PR_DRAFT") {
             if !value.trim().is_empty() {
-                pr_config.draft = matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes"
-                );
+                // A typo (`ture`) must not silently flip the configured
+                // draft policy: unknown values keep the configured default
+                // and warn, mirroring PRELOOP_GITHUB_PR_AUTO.
+                pr_config.draft = match value.trim().to_ascii_lowercase().as_str() {
+                    "1" | "true" | "yes" => true,
+                    "0" | "false" | "no" => false,
+                    other => {
+                        tracing::warn!(
+                            value = other,
+                            "unknown PRELOOP_GITHUB_PR_DRAFT; expected 1|true|yes|0|false|no"
+                        );
+                        pr_config.draft
+                    }
+                };
             }
         }
         if let Ok(value) = env::var("PRELOOP_GITHUB_PR_EXCLUDE") {

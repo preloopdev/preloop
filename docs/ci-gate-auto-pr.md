@@ -1,143 +1,113 @@
-# CI Gate + Auto-PR — Implementation Plan
+# CI Gate + Auto-PR
 
-Status: Plan (implementation start)
-Branch: `Bnjoroge/ci-gate-auto-pr`
+How preloop gates pushes with CI and opens pull requests after a green run.
+Three complementary flows, all ending in "the tested commit is on GitHub with
+a pull request when CI passed":
 
-## 1. Goal
+1. **Committed flow — push-back**: `preloop run --push [--create-pr]` runs CI,
+   then the client pushes the tested commit and the server verifies
+   `pushed tree == tested tree`, reuses/creates the branch's pull request, and
+   reports check runs. `github_push.rs` + `preloop-cli/src/push.rs`.
+2. **Seamless webhook flow — auto-PR**: a plain `git push origin feature/x`
+   delivers a push webhook; when the run succeeds, the server opens the pull
+   request itself per policy. No CLI step. `github_pr.rs`.
+3. **Dirty-tree flow**: `preloop run --push` on uncommitted changes runs CI on
+   the server's snapshot of the working tree, then on green materializes a
+   real commit from the exact tested tree, pushes it, and (per the prompt or
+   flags) opens the PR. The commit's author is the developer's git identity.
 
-Three complementary flows, all ending in "PR opened on GitHub after CI passes":
+Plus a **pre-push hook** (`contrib/pre-push`, auto-offered by the CLI) that
+makes flow 1's gate automatic for plain `git push`.
 
-1. **Committed flow (exists)**: `preloop run --push --create-pr [--pr-draft]` — CI on a
-   clean tree, client pushes the tested commit, server verifies tree == tested tree,
-   creates/reuses the PR, reports check runs. `github_push.rs` + `preloop-cli/src/push.rs`.
-   Missing: a **pre-push hook** so plain `git push` runs this instead of a CLI step.
-2. **Seamless webhook flow (new — M1)**: plain `git push origin feature/x` → push webhook →
-   CI on preloop → **server opens the PR automatically** when the run succeeds, per policy.
-   No hook, no CLI step. Soft gate (branch exists on GitHub before CI — accepted).
-3. **Dirty-tree flow (new — M2)**: CI on uncommitted changes (server snapshot), then on
-   green the client **materializes a real commit from the tested snapshot**, pushes it,
-   and opens the PR. Interactive `[y/N/d]` prompt; author = developer's git identity.
+## Config
 
-Decisions from design review (all accepted):
-- The gate is **soft** (hooks are advisory; web UI / other machines bypass). No server-side
-  enforcement in this milestone.
-- **Author identity** = the developer's local git config (`user.name`/`user.email`), passed
-  through `submission.actor` and used by `git commit-tree` for the materialized commit.
-- **Retroactive check runs**: already handled — push-back reports check runs for the pushed
-  SHA (github_push.rs step 4); `already_published` suppresses the webhook re-run.
-- **Resumable gate**: the hook caches the run id per HEAD SHA; a re-push reuses a completed
-  run instead of re-running CI.
-- **Fail-open**: hook exits 0 with a loud warning when preloop is unreachable (configurable).
+Server auto-PR policy (`config.toml` `[github.pr]` or environment):
 
-## 2. Current state (verified)
+| Key | Env | Default | Meaning |
+|---|---|---|---|
+| `auto` | `PRELOOP_GITHUB_PR_AUTO` | `feature` | `feature`: open PRs for non-default, non-excluded branches with no open PR. `never`: never open automatically; a `[pr]` head-commit label still opens one. |
+| `draft` | `PRELOOP_GITHUB_PR_DRAFT` | `true` | Open newly-created PRs as drafts. Unknown env values warn and keep the configured value. |
+| `exclude` | `PRELOOP_GITHUB_PR_EXCLUDE` | — | Comma-separated gitignore-style branch patterns never to open a PR for (`*` matches any run of characters; a trailing `/` matches everything below a prefix). |
 
-- `github_push.rs`: `POST /api/v1/runs/:run_id/push` — verifies tested tree == pushed tree,
-  resolves default base, refuses default branch (feature-only backstop), reuses open PR by
-  `head=owner:branch`, creates PR when `submission.push.create_pr` (with `draft_pr`), reports
-  missing check runs, marks `PushState::Synced`. Idempotent. Helpers: `push_token`,
-  `github_json`, `classify`, `validate_push_target`.
-- `preloop-cli/src/main.rs` run command: `--push`, `--create-pr`, `--pr-draft`; **refuses a
-  dirty tree** ("--push requires a clean working tree so the pushed commit is exactly what
-  was tested"). Sets `submission.sha`, `.push_tree`, `.actor` (from `git_config_user_name`).
-- `preloop-cli/src/push.rs`: `push_tested_commit` (with merge-base safety, refuses diverged
-  branch, refuses default branch), `push_run` retry loop.
-- Server snapshot: `runs.rs` `create_workspace_snapshot` builds a synthetic commit from the
-  local workspace (respects .gitignore, includes untracked non-ignored); snapshot
-  `commit_sha` exists; checkout served via preloop git smart-HTTP.
-- Run completion: `broker.rs::broker_complete_job` (jobs); run reaches terminal conclusion
-  when the last job completes.
-- Skip labels: `[skip ci]`-family parsed from push payload commit messages
-  (`events/push.rs`).
+Head-commit message labels override policy: `[no-pr]` skips (always), `[draft]`
+opens as draft, `[pr]` forces an open even under `auto = never`. Labels are
+read from the **head** commit only — an older commit in the same push cannot
+suppress or force the current head's PR.
 
-## 3. M1 — Server: webhook-driven auto-PR (new module `github_pr.rs`)
+Only webhook-delivered runs trigger auto-PR: native `/api/v1/runs`
+submissions carry no trust tier and are never auto-PR'd, and push-back runs
+(`submission.push` set) are client-managed — `github_push.rs` owns their PR.
+The server needs the GitHub App `pull_requests: write` permission (or a PAT)
+to create PRs; without credentials the run still succeeds and the PR is
+simply not opened.
 
-### Config (`config.rs::GithubConfig`)
-```rust
-pub struct PrConfig {
-    pub auto: PrAuto,          // feature (default) | always | never   env PRELOOP_GITHUB_PR_AUTO
-    pub draft: bool,           // default true                        env PRELOOP_GITHUB_PR_DRAFT
-    pub exclude: Vec<String>,  // branch patterns (gitignore-style)   env PRELOOP_GITHUB_PR_EXCLUDE
-}
-```
-Keep push-back's explicit `--create-pr` behavior unchanged (client-managed).
+## Push-back verification (`POST /api/v1/runs/:run_id/push`)
 
-### Policy (`github_pr.rs`)
-`pr_decision(shared, run, payload) -> PrDecision { Open { draft }, Skip(&'static str) }`:
-- Only runs with `event == "push"` delivered by webhook (not `submission.push` set — those
-  are client-managed; not local-only synthetic submissions with no real owner/repo slug —
-  `validate_push_target` rules).
-- Only `conclusion == success`.
-- Branch = payload ref (`refs/heads/...`), not the default branch, not a tag, not excluded
-  by patterns.
-- No existing open PR (`GET pulls?head={owner}:{branch}&state=open`) — dedup.
-- Head-commit message labels override: `[no-pr]` → Skip; `[draft]` → Open draft;
-  `[pr]` → Open (even if `auto = never`). Precedence: label > prompt-equivalent > config.
-- `auto = never` + no `[pr]` → Skip.
+Every step is idempotent (`preloop push <run_id>` replays freely):
 
-### Completion hook
-In the run-completion path (where the last job's conclusion finalizes the run): if the run
-matches the webhook-push criteria and succeeds → spawn a **best-effort async task** that runs
-`pr_decision` then `POST pulls` with the minted token (`pull_requests: write`). PR body
-mirrors push-back's (CI run details + details URL). Errors are logged, never fail the run.
-Skip if no App/PAT configured.
+1. **Tree verification** — the pushed commit's tree must equal the tested
+   tree. A clean submission pins `commits/{sha}` directly (no branch-tip
+   fallback: a tree-only match on a different commit must not publish checks
+   for untested work). A dirty submission recorded the snapshot tree at
+   accept time; the client materializes its commit *after* the run, so the
+   server verifies the **branch head**, which is the authoritative commit the
+   client pushed.
+2. **PR** — reuse an open PR for `owner:branch`, else create one when
+   requested (`--create-pr`, or a `{create_pr, draft}` body override —
+   non-boolean override values are rejected with a 400, never silently
+   dropped).
+3. **Checks** — jobs that lack a check run get queued + completed check runs
+   against the *effective* head commit (the materialized commit for dirty
+   runs; submit-time checks are only created for clean runs, where the head
+   is known up front).
+4. The published commit is recorded (`push_state.effective_sha`) so the push
+   webhook echo of the materialized commit is recognized by
+   `already_published` and does not re-run CI.
 
-### Tests
-- `pr_decision` unit tests: feature/main/tag/excluded/`[no-pr]`/`[draft]`/`[pr]`/dedup.
-- Router-level: webhook push → run completes → PR created (stubbed api.github.com, pattern
-  from `dispatch_tests.rs`); 403 without `pull_requests: write`; no PR when policy skips.
+## Dirty-tree flow
 
-## 4. M2 — CLI: dirty-tree interactive prompt flow
+`preloop run --push` on a dirty tree:
 
-### Server: expose the tested snapshot tree
-`submit_run_inner`: when a push-requested submission has a dirty tree (no explicit
-`push_tree`) but the local-workspace snapshot exists, record the snapshot commit's tree as
-`push_tree` (server knows it — snapshot is built before submit completes). Then
-`POST /api/v1/runs/:run_id/push` tree-verification works for dirty runs.
+- The server snapshots the workspace at accept time and records the snapshot
+  tree as the tested tree. If the snapshot fails, the submission is rejected
+  loudly — a push-requested run without a tested tree can never be pushed.
+- After CI, the CLI materializes a commit whose tree is exactly the tested
+  tree (`git commit-tree`, parented on the base commit, authored by the local
+  git identity). The tested tree's objects are reproduced from the working
+  tree with a private index (the user's staging area is untouched); if the
+  working tree changed since submission so the tested tree can no longer be
+  reproduced, the push fails with a re-submit hint instead of pushing
+  something untested.
+- The PR decision comes after CI: explicit `--create-pr` > head-commit labels
+  > interactive `[y/N/d]` prompt > safe default. A non-interactive explicit
+  `--push` (without `--create-pr`) still pushes the tested tree, leaving
+  `create_pr` false.
 
-### CLI (`preloop-cli/src/main.rs` run command)
-- Replace the hard dirty-tree bail: when `--push`/`--create-pr` and the tree is dirty,
-  proceed (CI runs on the snapshot; server records `push_tree`). Keep the clean-tree fast
-  path unchanged.
-- After the run reaches success:
-  - Interactive (`stdin` is a TTY) and not `--create-pr`-explicit: prompt
-    `Commit these changes and open a PR? [y/N/d]` (after printing the snapshot summary:
-    modified/untracked counts — reuse `git_porcelain`).
-  - Non-interactive: honor head-commit labels `[pr]`/`[draft]`/`[no-pr]`; else skip
-    (safe default) unless `--create-pr`.
-- Materialize (new fn in `preloop-cli/src/push.rs` or `commit.rs`): `git commit-tree
-  <tested_tree> -p <local HEAD> -m <msg>` where `<tested_tree>` comes from the run record
-  (`push_tree`), msg from policy (latest commit message + CI marker) or a flag; author from
-  local git config (`git_config_user_name`/`user.email` — the developer's identity).
-- Then the existing path: `push_tested_commit(new_commit, branch)` + `push_run` (POST push
-  endpoint → verifies tree == tested tree, opens PR with `draft` per answer).
-- Local tree stays untouched; commit exists only on the pushed branch.
+## Pre-push hook
 
-### Tests
-- Unit: materialize fn (bare-repo fixtures like `push.rs` tests), prompt decision table
-  (label precedence), dirty-tree submission carries `push_tree` from the snapshot.
+`contrib/pre-push` (or let `preloop run` install it) is a **soft, advisory
+gate**: on `git push` of the checked-out branch's current commit it holds the
+push open while CI runs and aborts the push when CI fails. Other refs
+(non-`HEAD` branches, tags, deletions) pass with a warning — the tree CI
+would test is not the tree being pushed. The hook never pushes anything
+itself.
 
-## 5. M3 — Pre-push hook (soft gate, committed flow)
+- `[skip ci]` in any pushed commit bypasses the gate (all-zero remote SHAs on
+  new branches are handled so the check works there too).
+- Verdicts are cached per `(remote, server endpoint, commit sha)`, recording
+  the run id; a re-push validates the recorded run's live terminal status
+  (success → skip, failure → block, in progress → wait, unknown → re-run).
+  An interrupted hook resumes the run it already started instead of
+  duplicating CI.
+- **Fail-open**: when preloop itself is unreachable the push proceeds with a
+  loud warning. Unreachability is detected from the CLI's machine-readable
+  `PRELOOP_UNREACHABLE` marker — never from CI step output that happens to
+  mention a network error, and never from Git push errors (auth, permissions)
+  that would otherwise bypass the gate.
+- Install preserves an existing pre-push hook: the previous hook is backed up
+  to `pre-push.preloop-prev` and chained (run first, verdict authoritative),
+  and `core.hooksPath` is respected.
 
-`contrib/pre-push` (shell, documented): on `git push origin <branch>`:
-- Skip entirely when the pushed commits' messages contain `[skip ci]`.
-- Run `preloop run --push --create-pr [--pr-draft per config/label]`.
-- Resumable: cache run id per HEAD SHA in `$HOME/.cache/preloop-push-<sha>`; if a cached
-  terminal run exists, reuse instead of re-running.
-- Fail-open: preloop unreachable → warn loudly, exit 0 (push proceeds without gate).
-- CI failure → exit 1 (push aborted, branch never reaches GitHub).
-- On success exit 0 — preloop already pushed the commit; git's own push no-ops
-  ("Everything up-to-date").
-
-## 6. M4 — Docs, gate, dogfood, PR
-
-- `docs/github-tokens.md` / `docs/github-app-webhook.md`: the three flows + hook install.
-- `fixtures/workflows/`: a push-PR dogfood workflow (if needed).
-- `just test-ci` green in the worktree.
-- Dogfood: local E2E — serve, submit dirty-tree run through the new flow against a local
-  bare "origin", verify commit == tested tree and PR-open call shape.
-- Open the feature PR on GitHub (this branch).
-
-## 7. Non-goals
-- Server-side enforcement of the CI-first gate (hook is advisory by decision).
-- GitHub branch protection / status-check wiring for the gate.
-- Webhook auto-PR for non-push events (PRs, reviews) — push only this milestone.
+This is a soft gate by design: it is advisory per machine. Anyone can push
+without the hook (web UI, another machine); server-side enforcement is a
+separate concern.

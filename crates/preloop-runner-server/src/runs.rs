@@ -553,6 +553,17 @@ pub(crate) async fn submit_run_inner(
             submission.push_tree = Some(snapshot.tree_sha.clone());
         }
     }
+    // A push-requested run whose tree could not be captured can never be
+    // pushed: the push endpoint refuses runs without a recorded tested tree.
+    // Reject loudly at accept time instead of running CI on a submission
+    // that is permanently unpushable (the later `/push` would fail with a
+    // misleading "not submitted with --push").
+    if submission.push.is_some() && submission.push_tree.is_none() {
+        return Err(ApiError::bad_request(
+            "push-requested run needs a tested tree, but the workspace snapshot could not be \
+             created; commit or stash your changes and re-submit (or run without --push)",
+        ));
+    }
 
     // A local submission is a synthetic push/PR against the snapshot. Present
     // the same event shape GitHub would: changed-file actions
@@ -1433,40 +1444,53 @@ pub(crate) async fn submit_run(
             // the server snapshots the workspace inside submit_run_inner and
             // records the snapshot tree below. The client materializes its
             // commit from that recorded tree after CI passes.
-            submission.local_workspace.is_some(),
+            // The snapshot uses either the client's workspace header or the
+            // server-side configured workspace, so both count here.
+            submission.local_workspace.is_some() || shared.state.local_workspace.is_some(),
         )?;
     }
 
+    // A dirty-tree push has no known head commit at submit time: check runs
+    // would attach to the base commit and stay pending forever. The push
+    // endpoint reports them against the materialized branch head instead
+    // (`github_push.rs` step 4). Clean-tree pushes know their commit up
+    // front and get queued checks immediately.
+    let dirty_push = submission.push.as_ref().is_some_and(|push| push.dirty);
+    let clean_push_checks = push_requested && !dirty_push;
     let accepted = submit_run_inner(&shared, submission).await?;
     if push_requested {
-        // Report queued check runs for every job, exactly like the webhook
-        // adapter does for delivered events, so GitHub shows the run from
-        // the moment it is accepted. Jobs resolved terminal at submission
-        // (skipped, unsatisfiable needs) get their completion immediately.
         let run_id = accepted.run_id;
-        let (repository, sha, jobs) = {
-            let inner = shared.state.inner.lock().await;
-            let Some(run) = inner.runs.get(&run_id) else {
-                return Ok(Json(accepted));
-            };
-            (
-                run.submission.repository.clone(),
-                run.submission.sha.clone(),
-                run.jobs.keys().cloned().collect::<Vec<_>>(),
-            )
-        };
-        for job_id in &jobs {
-            crate::github::report_check_run_queued(&shared, &repository, &sha, job_id, run_id)
-                .await;
-            let status = {
+        if clean_push_checks {
+            // Report queued check runs for every job, exactly like the
+            // webhook adapter does for delivered events, so GitHub shows the
+            // run from the moment it is accepted. Jobs resolved terminal at
+            // submission (skipped, unsatisfiable needs) get their completion
+            // immediately.
+            let (repository, sha, jobs) = {
                 let inner = shared.state.inner.lock().await;
-                inner
-                    .runs
-                    .get(&run_id)
-                    .and_then(|run| run.jobs.get(job_id).copied())
+                let Some(run) = inner.runs.get(&run_id) else {
+                    return Ok(Json(accepted));
+                };
+                (
+                    run.submission.repository.clone(),
+                    run.submission.sha.clone(),
+                    run.jobs.keys().cloned().collect::<Vec<_>>(),
+                )
             };
-            if let Some(status) = status.filter(|status| status.is_terminal()) {
-                crate::github::report_check_run_completed(&shared, run_id, job_id, status).await;
+            for job_id in &jobs {
+                crate::github::report_check_run_queued(&shared, &repository, &sha, job_id, run_id)
+                    .await;
+                let status = {
+                    let inner = shared.state.inner.lock().await;
+                    inner
+                        .runs
+                        .get(&run_id)
+                        .and_then(|run| run.jobs.get(job_id).copied())
+                };
+                if let Some(status) = status.filter(|status| status.is_terminal()) {
+                    crate::github::report_check_run_completed(&shared, run_id, job_id, status)
+                        .await;
+                }
             }
         }
         let mut inner = shared.state.inner.lock().await;
@@ -1475,6 +1499,7 @@ pub(crate) async fn submit_run(
                 status: PushStatus::Pending,
                 error: None,
                 pr_number: None,
+                effective_sha: None,
             });
         }
     }

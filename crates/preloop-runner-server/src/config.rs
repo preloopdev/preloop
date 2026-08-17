@@ -67,32 +67,28 @@ pub struct GitHubConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PrAuto {
-    /// Open a PR for any branch that is not the repository's default branch
-    /// and has no open PR yet (the default).
+    /// Open a PR for any branch that is not the repository's default branch,
+    /// is not excluded by pattern, and has no open PR yet (the default).
     #[default]
     Feature,
-    /// Open a PR for every successful push run on a branch (still dedup'd
-    /// against an existing open PR, and still skipped by `[no-pr]`).
-    Always,
-    /// Never open PRs automatically; an explicit `[pr]` label in the head
-    /// commit message still opens one.
+    /// Never open PRs automatically; `[pr]` bypasses only the auto policy.
+    /// Default-branch, exclusion, deduplication, and credential checks still
+    /// apply.
     Never,
 }
 
 /// Auto-PR policy: which successful push runs get a pull request opened on
 /// GitHub, and how the PR is created.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PrConfig {
-    /// When to open PRs. Env: `PRELOOP_GITHUB_PR_AUTO` (`feature|always|never`).
-    #[serde(default)]
+    /// When to open PRs. Env: `PRELOOP_GITHUB_PR_AUTO` (`feature|never`).
     pub auto: PrAuto,
     /// Open newly-created PRs as drafts. Drafts keep reviewers out until the
     /// author marks them ready. Env: `PRELOOP_GITHUB_PR_DRAFT`.
-    #[serde(default = "pr_draft_default")]
     pub draft: bool,
     /// Branch patterns (gitignore-style) never to open a PR for.
     /// Env: `PRELOOP_GITHUB_PR_EXCLUDE` (comma-separated).
-    #[serde(default)]
     pub exclude: Vec<String>,
 }
 
@@ -106,10 +102,6 @@ impl Default for PrConfig {
             exclude: Vec::new(),
         }
     }
-}
-
-fn pr_draft_default() -> bool {
-    true
 }
 
 /// Renders as `<redacted>` / `None` without quoting, for credential fields.

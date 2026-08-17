@@ -36,7 +36,7 @@ pub(crate) async fn maybe_open_pr(shared: Arc<SharedState>, run_id: RunId) {
 async fn maybe_open_pr_inner(shared: &Arc<SharedState>, run_id: RunId) -> anyhow::Result<bool> {
     // Snapshot the fields we need under the lock, then drop it before any
     // network I/O.
-    let (repository, git_ref, payload, push_requested) = {
+    let (repository, git_ref, payload) = {
         let inner = shared.state.inner.lock().await;
         let run = inner
             .runs
@@ -48,17 +48,22 @@ async fn maybe_open_pr_inner(shared: &Arc<SharedState>, run_id: RunId) -> anyhow
         if run.event != "push" {
             return Ok(false);
         }
+        // Only webhook-delivered runs carry a trust tier (the dispatcher
+        // stamps it). A native `/api/v1/runs` caller setting `event = "push"`
+        // is a local submission, not a GitHub push, and must not trigger
+        // auto-PR.
+        if crate::events::trust_tier::tier_of(&run.submission).is_none() {
+            return Ok(false);
+        }
         // Push-back runs are client-managed: `github_push.rs` owns their PR.
         if run.submission.push.is_some() {
             return Ok(false);
         }
         // A local-only submission (no real `owner/repo` slug) can never have
         // a PR opened for it.
-        let (owner, repo) = run
-            .submission
-            .repository
-            .split_once('/')
-            .ok_or_else(|| anyhow::anyhow!("not a GitHub repository"))?;
+        let Some((owner, repo)) = run.submission.repository.split_once('/') else {
+            return Ok(false);
+        };
         if owner.is_empty() || repo.is_empty() || repo.contains('/') {
             return Ok(false);
         }
@@ -66,10 +71,8 @@ async fn maybe_open_pr_inner(shared: &Arc<SharedState>, run_id: RunId) -> anyhow
             run.submission.repository.clone(),
             run.submission.git_ref.clone(),
             run.submission.payload.clone(),
-            run.submission.push.is_some(),
         )
     };
-    let _ = push_requested;
 
     let Some(branch) = git_ref.strip_prefix("refs/heads/") else {
         return Ok(false);
@@ -113,11 +116,13 @@ async fn maybe_open_pr_inner(shared: &Arc<SharedState>, run_id: RunId) -> anyhow
     // second one.
     let (owner, _) = repository.split_once('/').expect("checked above");
     let head = format!("{owner}:{branch}");
+    let query = serde_urlencoded::to_string([("head", head.as_str()), ("state", "open")])
+        .expect("url-encoding cannot fail for str pairs");
     let existing = crate::github_push::github_json(
         &token,
         &repository,
         "GET",
-        &format!("pulls?head={head}&state=open"),
+        &format!("pulls?{query}"),
         None,
     )
     .await?;
@@ -161,7 +166,7 @@ async fn maybe_open_pr_inner(shared: &Arc<SharedState>, run_id: RunId) -> anyhow
     Ok(true)
 }
 
-/// Head-commit labels parsed from the push payload's commit messages.
+/// Head-commit labels parsed from the push payload's head commit message.
 #[derive(Debug, Clone, Copy, Default)]
 struct PrLabels {
     no_pr: bool,
@@ -169,29 +174,26 @@ struct PrLabels {
     force: bool,
 }
 
-/// Scan the push payload's commit messages (all commits, falling back to
-/// `head_commit`) for `[no-pr]`, `[draft]`, and `[pr]` labels, mirroring how
-/// the `[skip ci]` family is parsed for push events.
+/// Scan the push payload's **head** commit message for `[no-pr]`, `[draft]`,
+/// and `[pr]` labels. GitHub push payloads carry the head commit explicitly
+/// and also as the last element of `commits`; labels in *older* commits of
+/// the same push must not override the head's intent (an earlier `[no-pr]`
+/// must not suppress the PR for the current head).
 fn pr_labels_from_payload(payload: &Value) -> PrLabels {
     let mut labels = PrLabels::default();
-    let mut messages: Vec<&str> = Vec::new();
-    if let Some(commits) = payload.get("commits").and_then(Value::as_array) {
-        for commit in commits {
-            if let Some(message) = commit.get("message").and_then(Value::as_str) {
-                messages.push(message);
-            }
-        }
-    }
-    if messages.is_empty() {
-        if let Some(message) = payload
-            .get("head_commit")
-            .and_then(|c| c.get("message"))
-            .and_then(Value::as_str)
-        {
-            messages.push(message);
-        }
-    }
-    for message in messages {
+    let message = payload
+        .get("head_commit")
+        .and_then(|c| c.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            payload
+                .get("commits")
+                .and_then(Value::as_array)
+                .and_then(|commits| commits.last())
+                .and_then(|commit| commit.get("message"))
+                .and_then(Value::as_str)
+        });
+    if let Some(message) = message {
         let lower = message.to_ascii_lowercase();
         if lower.contains("[no-pr]") {
             labels.no_pr = true;
@@ -223,22 +225,35 @@ fn branch_matches(pattern: &str, branch: &str) -> bool {
     if parts.len() == 1 {
         return pattern == branch;
     }
-    let mut rest = branch;
-    for (i, part) in parts.iter().enumerate() {
+    // Anchor the first literal as a prefix and the last as a suffix; scan
+    // the middle literals in order between them. Matching the last literal
+    // at its first occurrence (as the old code did) let trailing bytes make
+    // `x*y` miss `xyy` and `*-wip` miss `feat-wip-wip`.
+    let first = parts[0];
+    if !first.is_empty() && !branch.starts_with(first) {
+        return false;
+    }
+    let last = parts[parts.len() - 1];
+    if !last.is_empty() && !branch.ends_with(last) {
+        return false;
+    }
+    let mut rest = if first.is_empty() {
+        branch
+    } else {
+        &branch[first.len()..]
+    };
+    if !last.is_empty() {
+        // `ends_with` matched at the end, so this is a byte boundary.
+        rest = &rest[..rest.len() - last.len()];
+    }
+    for part in &parts[1..parts.len() - 1] {
         if part.is_empty() {
             continue;
         }
         let Some(pos) = rest.find(part) else {
             return false;
         };
-        // The first literal must be a prefix; the last a suffix.
-        if i == 0 && pos != 0 {
-            return false;
-        }
         rest = &rest[pos + part.len()..];
-        if i == parts.len() - 1 && !rest.is_empty() {
-            return false;
-        }
     }
     true
 }
@@ -270,6 +285,22 @@ mod tests {
     }
 
     #[test]
+    fn labels_only_read_the_head_commit() {
+        // GitHub lists the most recent commit last; an older `[no-pr]` in the
+        // same push must not suppress the PR for the current head.
+        let labels =
+            pr_labels_from_payload(&payload_with_messages(&["chore: a [no-pr]", "feat: b"]));
+        assert!(!labels.no_pr, "an older [no-pr] must not apply to the head");
+
+        // An explicit `head_commit` wins over the `commits` array.
+        let mut payload = payload_with_messages(&["chore: c [no-pr]"]);
+        payload["head_commit"] = serde_json::json!({"message": "feat: d [pr]"});
+        let labels = pr_labels_from_payload(&payload);
+        assert!(labels.force);
+        assert!(!labels.no_pr);
+    }
+
+    #[test]
     fn labels_fallback_to_head_commit_when_commits_absent() {
         let payload = serde_json::json!({
             "head_commit": { "message": "fix: z [draft]" },
@@ -289,6 +320,14 @@ mod tests {
         assert!(branch_matches("*-experiment", "foo-experiment"));
         assert!(!branch_matches("*-experiment", "foo-experimental"));
         assert!(branch_matches("*", "anything"));
+        // The final literal is a suffix, not a first occurrence: trailing
+        // bytes must not make a matching pattern miss.
+        assert!(branch_matches("*-wip", "feat-wip-wip"));
+        assert!(branch_matches("*ab", "abab"));
+        assert!(!branch_matches("*-wip", "feat-wip-x"));
+        assert!(branch_matches("foo*bar", "foobar"));
+        assert!(branch_matches("foo*bar*", "foobar"));
+        assert!(!branch_matches("foo*bar", "foobarbaz"));
     }
 
     #[test]
@@ -409,6 +448,9 @@ mod tests {
                     let mut inner = state.inner.lock().await;
                     let run = inner.runs.get_mut(&run_id).expect("run recorded");
                     run.conclusion = Some("success".to_owned());
+                    // The webhook dispatcher stamps the trust tier; native
+                    // submissions carry none and are never auto-PR'd.
+                    Arc::make_mut(&mut run.submission).trust_tier = Some("internal".to_owned());
                 }
                 run_id
             }
@@ -431,8 +473,7 @@ mod tests {
         assert_eq!(created["base"], "main");
         assert_eq!(created["draft"], serde_json::Value::Bool(true));
 
-        // 2. [no-pr] label skips even under auto = always.
-        state.pr_config.auto = crate::config::PrAuto::Always;
+        // 2. [no-pr] label skips under the default policy.
         let run_id = submit_successful(&state, "chore: y [no-pr]").await;
         let opened = maybe_open_pr_inner(&shared, run_id).await.unwrap();
         assert!(!opened, "[no-pr] must suppress the PR");
@@ -447,6 +488,64 @@ mod tests {
             "an existing open PR must be reused, not duplicated"
         );
         assert_eq!(created_count.load(Ordering::SeqCst), 1, "no new PR create");
+    }
+
+    #[tokio::test]
+    async fn native_push_submission_never_auto_opens_a_pr() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{header, Method, Request, StatusCode};
+        use tokio_util::sync::CancellationToken;
+        use tower::ServiceExt;
+
+        // A native `/api/v1/runs` caller may set `event = "push"`; without a
+        // webhook-stamped trust tier the run must never auto-open a PR.
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = crate::AppState::new(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        state.github_pat = Some(preloop_gha_protocol::SecretString::new(String::from(
+            "test-pat",
+        )));
+        let app = crate::app(state.clone(), CancellationToken::new());
+        let body = serde_json::json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: self-hosted\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "acme/web",
+            "git_ref": "refs/heads/feature/x",
+            "payload": { "repository": { "default_branch": "main" } },
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/runs")
+                    .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let accepted: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let run_id =
+            crate::RunId(uuid::Uuid::parse_str(accepted["run_id"].as_str().unwrap()).unwrap());
+        {
+            let mut inner = state.inner.lock().await;
+            let run = inner.runs.get_mut(&run_id).expect("run recorded");
+            run.conclusion = Some("success".to_owned());
+        }
+        let shared = Arc::new(crate::SharedState {
+            state: state.clone(),
+            shutdown: CancellationToken::new(),
+        });
+        let opened = maybe_open_pr_inner(&shared, run_id).await.unwrap();
+        assert!(
+            !opened,
+            "a native submission must never auto-open a PR (no webhook provenance)"
+        );
     }
 
     #[tokio::test]
@@ -502,7 +601,7 @@ mod tests {
             "repository": "acme/web",
             "git_ref": "refs/heads/feature/x",
             "sha": head,
-            "push": { "create_pr": true, "draft_pr": true },
+            "push": { "create_pr": true, "draft_pr": true, "dirty": true },
             "payload": { "repository": { "default_branch": "main" } },
         });
         let response = app

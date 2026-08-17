@@ -188,9 +188,15 @@ pub(crate) async fn push_run(
     run_id: &str,
     opts: Option<PushOpts>,
 ) -> anyhow::Result<()> {
+    // Resolve the exact commit to push once, before the retry loop. Every
+    // attempt must push the SAME commit: materialization stamps the current
+    // time into the commit dates, so re-materializing per attempt yields a
+    // divergent commit, and a transient server failure after the branch push
+    // would then be misreported as "branch diverged".
+    let push_sha = prepare_push_sha(client, url, token.as_deref(), run_id).await?;
     let mut attempt = 0;
     loop {
-        match push_run_once(client, url, token.as_deref(), run_id, opts).await {
+        match push_run_once(client, url, token.as_deref(), run_id, &push_sha, opts).await {
             Ok(()) => return Ok(()),
             Err(error) if is_transient(&error) && attempt < RETRY_DELAYS_SECS.len() => {
                 let delay = RETRY_DELAYS_SECS[attempt];
@@ -208,11 +214,74 @@ pub(crate) async fn push_run(
     }
 }
 
+/// Fetch the run and decide the exact commit to push: for a clean submission
+/// that is `submission.sha` (the tested commit); for a dirty one it is a
+/// materialized commit whose tree is exactly the tested snapshot tree.
+async fn prepare_push_sha(
+    client: &reqwest::Client,
+    url: &str,
+    token: Option<&str>,
+    run_id: &str,
+) -> anyhow::Result<String> {
+    let mut request = client.get(format!("{url}/api/v1/runs/{run_id}"));
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let response = request
+        .send()
+        .await
+        .with_context(|| format!("fetching run {run_id}"))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("server returned {status} fetching run {run_id}: {body}");
+    }
+    let run: serde_json::Value = response.json().await?;
+    let submission: WorkflowSubmission = serde_json::from_value(
+        run.get("submission")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("run {run_id} has no submission record"))?,
+    )
+    .context("parsing run submission")?;
+
+    submission
+        .push
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("run {run_id} was not submitted with --push"))?;
+    let push_tree = submission
+        .push_tree
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("run {run_id} has no recorded tested tree"))?;
+    let sha = &submission.sha;
+
+    // Pin the push to the tested commit. A dirty-tree run recorded the
+    // snapshot tree but its submission sha is the *base* commit — its
+    // tree differs from what CI tested. Materialize a real commit whose
+    // tree is exactly the tested tree (parented on the base commit, using
+    // the developer's git identity), so the pushed commit is byte-identical
+    // to what CI validated. If the user committed the dirty state since
+    // (tree now matches), push it directly.
+    let head_tree = git_output(
+        &std::env::current_dir().context("current directory")?,
+        ["rev-parse", &format!("{sha}^{{tree}}")],
+    )?;
+    if head_tree == push_tree {
+        return Ok(sha.to_owned());
+    }
+    let materialized = materialize_tested_commit(push_tree, sha)?;
+    eprintln!(
+        "materialized CI-verified commit {materialized} (tree {push_tree}) from \
+         the tested snapshot"
+    );
+    Ok(materialized)
+}
+
 async fn push_run_once(
     client: &reqwest::Client,
     url: &str,
     token: Option<&str>,
     run_id: &str,
+    push_sha: &str,
     opts: Option<PushOpts>,
 ) -> anyhow::Result<()> {
     let mut request = client.get(format!("{url}/api/v1/runs/{run_id}"));
@@ -241,11 +310,6 @@ async fn push_run_once(
         .push
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("run {run_id} was not submitted with --push"))?;
-    let push_tree = submission
-        .push_tree
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("run {run_id} has no recorded tested tree"))?;
-    let sha = &submission.sha;
     let branch = submission
         .git_ref
         .strip_prefix("refs/heads/")
@@ -256,30 +320,7 @@ async fn push_run_once(
             )
         })?;
 
-    // 1. Pin the push to the tested commit. A dirty-tree run recorded the
-    //    snapshot tree but its submission sha is the *base* commit — its
-    //    tree differs from what CI tested. Materialize a real commit whose
-    //    tree is exactly the tested tree (parented on the base commit, using
-    //    the developer's git identity), so the pushed commit is byte-identical
-    //    to what CI validated. If the user committed the dirty state since
-    //    (tree now matches), push it directly.
-    let push_sha = {
-        let head_tree = git_output(
-            &std::env::current_dir().context("current directory")?,
-            ["rev-parse", &format!("{sha}^{{tree}}")],
-        )?;
-        if head_tree == push_tree {
-            sha.to_owned()
-        } else {
-            let materialized = materialize_tested_commit(push_tree, sha)?;
-            eprintln!(
-                "materialized CI-verified commit {materialized} (tree {push_tree}) from \
-                 the tested snapshot"
-            );
-            materialized
-        }
-    };
-    let outcome = push_tested_commit(&push_sha, branch)?;
+    let outcome = push_tested_commit(push_sha, branch)?;
     match outcome {
         PushOutcome::Created => eprintln!("pushed {push_sha} to origin/{branch} (branch created)"),
         PushOutcome::AlreadyThere => eprintln!("origin/{branch} already at {push_sha}"),
@@ -345,6 +386,16 @@ fn materialize_tested_commit_in(
     tested_tree: &str,
     parent: &str,
 ) -> anyhow::Result<String> {
+    // The tested tree is a server-computed sha (the snapshot repository's
+    // tree), whose objects may not exist in this checkout. Reproduce the
+    // tree from the working tree with a private index — the same inclusion
+    // rules the server's snapshot applies (tracked modifications + untracked
+    // non-ignored files) — so `commit-tree` can resolve it. Content
+    // addressing makes a sha match proof that the exact tested objects are
+    // now present. A mismatch means the working tree changed since the run
+    // was submitted; materializing a *different* tree would violate
+    // pushed == tested, so fail with a re-submit hint.
+    ensure_tested_tree_resolvable(cwd, tested_tree)?;
     let head_message = git_output(cwd, ["log", "-1", "--format=%B", parent])
         .unwrap_or_else(|_| "CI-verified snapshot".to_owned());
     let message = format!(
@@ -356,6 +407,62 @@ fn materialize_tested_commit_in(
         ["commit-tree", tested_tree, "-p", parent, "-m", &message],
     )?;
     Ok(commit)
+}
+
+/// Make `tested_tree` resolvable in `cwd`'s object store.
+///
+/// Fast path: the tree object already exists locally. Otherwise stage the
+/// working tree into a private index (never touching the user's index) and
+/// write the resulting tree — this materializes every blob the tree
+/// references. The private index keeps the user's staging area untouched.
+fn ensure_tested_tree_resolvable(cwd: &std::path::Path, tested_tree: &str) -> anyhow::Result<()> {
+    if git_output(cwd, ["cat-file", "-e", tested_tree]).is_ok() {
+        return Ok(());
+    }
+    // A private index under the repo's git dir: unique per invocation, and
+    // git cleans up nothing, so remove it afterwards.
+    let git_dir = git_output(cwd, ["rev-parse", "--git-dir"])?;
+    let index =
+        std::path::Path::new(&git_dir).join(format!("preloop-index-{}", std::process::id()));
+    let _ = std::fs::remove_file(&index);
+    let stage = || -> anyhow::Result<String> {
+        let add = Command::new("git")
+            .current_dir(cwd)
+            .env("GIT_INDEX_FILE", &index)
+            .args(["add", "-A"])
+            .output()
+            .context("git add -A (private index)")?;
+        if !add.status.success() {
+            anyhow::bail!(
+                "git add -A: {}",
+                String::from_utf8_lossy(&add.stderr).trim()
+            );
+        }
+        let write = Command::new("git")
+            .current_dir(cwd)
+            .env("GIT_INDEX_FILE", &index)
+            .args(["write-tree"])
+            .output()
+            .context("git write-tree (private index)")?;
+        if !write.status.success() {
+            anyhow::bail!(
+                "git write-tree: {}",
+                String::from_utf8_lossy(&write.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&write.stdout).trim().to_owned())
+    };
+    let reproduced = stage();
+    let _ = std::fs::remove_file(&index);
+    let reproduced = reproduced?;
+    if reproduced != tested_tree {
+        anyhow::bail!(
+            "tested tree {tested_tree} does not match the working tree {reproduced}; \
+             the working tree changed since the run was submitted. Re-submit after \
+             committing or stashing your changes so the pushed commit is exactly what CI tested"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -446,6 +553,66 @@ mod tests {
         );
         assert_eq!(author, "Test <test@example.com>");
     }
+
+    #[test]
+    fn materialize_imports_tree_from_another_repository() {
+        // The tested tree is created in repo A (its object store holds the
+        // blobs); the push runs from repo B, whose object store never saw
+        // that tree. Materialization must reproduce the tree from B's
+        // working files — content-addressed, so a sha match proves the
+        // exact tested objects are now local — and commit-tree must resolve.
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        git(a.path(), &["init", "-q", "-b", "main"]);
+        git(a.path(), &["config", "user.email", "test@example.com"]);
+        git(a.path(), &["config", "user.name", "Test"]);
+        fs::write(a.path().join("f.txt"), "one\n").unwrap();
+        git(a.path(), &["add", "f.txt"]);
+        git(a.path(), &["commit", "-q", "-m", "one"]);
+        let head = git(a.path(), &["rev-parse", "HEAD"]);
+
+        // B is a clone of A at the same base commit.
+        git(
+            a.path(),
+            &[
+                "clone",
+                "-q",
+                a.path().to_str().unwrap(),
+                b.path().to_str().unwrap(),
+            ],
+        );
+        assert_eq!(
+            git(b.path(), &["rev-parse", "HEAD"]),
+            head,
+            "B starts at the same base commit"
+        );
+
+        // A's dirty tree is the "tested" tree; its objects only exist in A.
+        fs::write(a.path().join("f.txt"), "two\n").unwrap();
+        git(a.path(), &["add", "f.txt"]);
+        let tested_tree = git(a.path(), &["write-tree"]);
+        let probe = Command::new("git")
+            .current_dir(b.path())
+            .args(["cat-file", "-e", &tested_tree])
+            .status()
+            .unwrap();
+        assert!(
+            !probe.success(),
+            "B must not know the tested tree object before materialization"
+        );
+
+        // B has the same working-file content, unstaged.
+        fs::write(b.path().join("f.txt"), "two\n").unwrap();
+
+        let commit = materialize_tested_commit_in(b.path(), &tested_tree, &head).unwrap();
+        assert_eq!(
+            git(b.path(), &["rev-parse", &format!("{commit}^{{tree}}")]),
+            tested_tree,
+            "the materialized commit carries the exact tested tree"
+        );
+        assert_eq!(git(b.path(), &["rev-parse", &format!("{commit}^")]), head);
+    }
+
     #[test]
     fn push_skips_when_remote_already_equal() {
         let (work, _remote, head) = repo_with_remote();

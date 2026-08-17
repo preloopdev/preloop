@@ -6776,6 +6776,11 @@ async fn fork_cache_writes_fail_closed_when_the_job_no_longer_resolves() {
 /// control plane.
 #[tokio::test]
 async fn fork_job_never_receives_the_configured_pat_override() {
+    // The effective PAT is env-then-config; writers of `PRELOOP_GITHUB_TOKEN`
+    // serialize on the env lock, so this reader must take it too or the
+    // asserted token flips under parallelism.
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
     let temp = tempfile::tempdir().unwrap();
     let config_path = temp.path().join("config.toml");
     std::fs::write(&config_path, "[github]\npat = \"github_pat_testvalue\"\n").unwrap();
@@ -6786,9 +6791,6 @@ async fn fork_job_never_receives_the_configured_pat_override() {
         state.github_app.is_none(),
         "config declares no app id or pem"
     );
-    // The effective PAT is env-then-config (state.rs), and other tests mutate
-    // `PRELOOP_GITHUB_TOKEN` without the env lock — so assert against the
-    // effective value rather than the config literal to stay race-proof.
     let pat = state
         .static_github_pat()
         .expect("config declares a PAT")
@@ -10365,6 +10367,10 @@ fn variable_value<'a>(message: &'a AgentJobRequestMessage, name: &str) -> Option
 /// success while every job silently ran on the local runtime token instead.
 #[tokio::test]
 async fn pat_only_config_supplies_job_github_token() {
+    // Same env-lock discipline: `PRELOOP_GITHUB_TOKEN` writers serialize on
+    // it, and a leaked value would win env-then-config and break the assert.
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
     let temp = tempfile::tempdir().unwrap();
     let config_path = temp.path().join("config.toml");
     std::fs::write(&config_path, "[github]\npat = \"github_pat_testvalue\"\n").unwrap();
@@ -18538,6 +18544,209 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
         None,
         "a different commit is different work"
     );
+
+    // A dirty-tree run's submission sha is the *base* commit; the webhook
+    // echo carries the materialized commit recorded in push_state.
+    // already_published must recognise that commit too, or every dirty-tree
+    // push would re-run CI.
+    const BASE_SHA: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    const MATERIALIZED_SHA: &str = "ffffffffffffffffffffffffffffffffffffffff";
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "git_ref": "refs/heads/feat/y",
+            "sha": BASE_SHA,
+            "push": {"create_pr": true, "draft_pr": true, "dirty": true},
+            "push_tree": TREE,
+            "workflow_path": PUBLISHED_WORKFLOW,
+        }),
+    )
+    .await;
+    let dirty_id = accepted["run_id"]
+        .as_str()
+        .unwrap()
+        .parse::<RunId>()
+        .unwrap();
+    {
+        let mut inner = state.inner.lock().await;
+        let run = inner.runs.get_mut(&dirty_id).unwrap();
+        run.conclusion = Some("success".to_owned());
+        run.push_state = Some(crate::models::PushState {
+            status: crate::models::PushStatus::Synced,
+            error: None,
+            pr_number: Some(7),
+            effective_sha: Some(MATERIALIZED_SHA.to_owned()),
+        });
+    }
+    assert_eq!(
+        crate::github_push::already_published(
+            &shared,
+            "owner/repo",
+            MATERIALIZED_SHA,
+            PUBLISHED_WORKFLOW
+        )
+        .await,
+        Some(dirty_id),
+        "the webhook echo of a materialized dirty-tree commit must be recognised"
+    );
+    assert_eq!(
+        crate::github_push::already_published(&shared, "owner/repo", BASE_SHA, PUBLISHED_WORKFLOW)
+            .await,
+        Some(dirty_id),
+        "the recorded submission sha (the base commit) still matches, as for any push-back run"
+    );
+
+    std::env::remove_var("PRELOOP_GITHUB_TOKEN");
+    std::env::remove_var("PRELOOP_GITHUB_API_URL");
+}
+
+#[tokio::test]
+async fn dirty_push_sync_verifies_the_branch_head_and_reports_checks_on_the_materialized_commit() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const BASE_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const TREE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const MATERIALIZED: &str = "cccccccccccccccccccccccccccccccccccccccc";
+
+    // A dirty-tree submission records the base commit as `sha`; the tested
+    // commit is materialized after the run and pushed to the branch head, so
+    // the sync must verify the BRANCH (not the base sha) and report checks
+    // against the materialized head.
+    let pr_creates = Arc::new(AtomicUsize::new(0));
+    let check_creates = Arc::new(parking_lot::Mutex::new(Vec::<Value>::new()));
+    let mock_app = Router::new()
+        .route(
+            "/repos/owner/repo",
+            get(|| async { Json(json!({"default_branch": "main"})) }),
+        )
+        .route(
+            // Branch names may contain slashes; GitHub's commits/{ref}
+            // endpoint matches the whole remaining path.
+            "/repos/owner/repo/commits/*ref",
+            get(|Path(r#ref): Path<String>| async move {
+                assert_eq!(r#ref, "feat/x", "dirty sync must verify the branch head");
+                Json(json!({
+                    "sha": MATERIALIZED,
+                    "commit": {"tree": {"sha": TREE}},
+                }))
+            }),
+        )
+        .route(
+            "/repos/owner/repo/pulls",
+            get(|| async { Json(json!([])) }).post({
+                let pr_creates = pr_creates.clone();
+                move |_body: axum::extract::Json<Value>| {
+                    let pr_creates = pr_creates.clone();
+                    async move {
+                        pr_creates.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({"number": 42}))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/repos/owner/repo/check-runs",
+            post({
+                let check_creates = check_creates.clone();
+                move |body: axum::extract::Json<Value>| {
+                    let check_creates = check_creates.clone();
+                    async move {
+                        check_creates.lock().push(body.0);
+                        Json(json!({"id": 7}))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/repos/owner/repo/check-runs/:id",
+            axum::routing::patch(|| async { Json(json!({"id": 7})) }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, mock_app).await.unwrap();
+    });
+
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    std::env::set_var("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}"));
+    std::env::set_var("PRELOOP_GITHUB_TOKEN", "sync-test-token");
+
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "git_ref": "refs/heads/feat/x",
+            "sha": BASE_SHA,
+            "push_tree": TREE,
+            "push": {"create_pr": true, "draft_pr": true, "dirty": true},
+        }),
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+    {
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&run_id.parse::<RunId>().unwrap()).unwrap();
+        assert_eq!(
+            run.job_check_run_ids.len(),
+            0,
+            "dirty pushes get no submit-time check runs (the head is unknown)"
+        );
+        assert_eq!(run.push_state.as_ref().unwrap().status, PushStatus::Pending);
+    }
+    {
+        let mut inner = state.inner.lock().await;
+        let run = inner
+            .runs
+            .get_mut(&run_id.parse::<RunId>().unwrap())
+            .unwrap();
+        run.conclusion = Some("success".to_owned());
+        run.jobs
+            .insert(JobId("build".to_owned()), ExecutionStatus::Success);
+    }
+
+    let (status, body) = request_json_status(
+        &app,
+        Method::POST,
+        &format!("/api/v1/runs/{run_id}/push"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "dirty sync must succeed: {body}");
+    assert_eq!(pr_creates.load(Ordering::SeqCst), 1, "PR created");
+    let check = check_creates
+        .lock()
+        .first()
+        .cloned()
+        .expect("queued check run");
+    assert_eq!(
+        check["head_sha"], MATERIALIZED,
+        "checks attach to the materialized head commit, not the base"
+    );
+    {
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&run_id.parse::<RunId>().unwrap()).unwrap();
+        let push_state = run.push_state.as_ref().unwrap();
+        assert_eq!(push_state.status, PushStatus::Synced);
+        assert_eq!(
+            push_state.effective_sha.as_deref(),
+            Some(MATERIALIZED),
+            "the published commit is recorded for webhook dedup"
+        );
+    }
 
     std::env::remove_var("PRELOOP_GITHUB_TOKEN");
     std::env::remove_var("PRELOOP_GITHUB_API_URL");
