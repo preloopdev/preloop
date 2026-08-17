@@ -10,8 +10,8 @@
 //! come to roughly 90 GB and are the job of setup actions and containers.
 
 use preloop_orchestrator::{
-    base_install_script, base_packages, compiler_packages, docker_data_root, docker_packages,
-    loopback_hosts, BASE_NODE_VERSION,
+    base_install_script, base_packages, compiler_packages, crun_rosetta_shim, docker_data_root,
+    docker_packages, loopback_hosts, BASE_NODE_VERSION, CRUN_VERSION,
 };
 
 /// Commands a workflow may reasonably assume exist, because `ubuntu-latest`
@@ -394,4 +394,137 @@ fn loopback_resolves_by_name() {
             "missing standard entry `{entry}` present on a stock Ubuntu host"
         );
     }
+}
+
+/// Docker-in-VM containers on Apple Silicon need `/mnt/rosetta` in their mount
+/// namespace or every amd64 binary dies with `rosetta-wrapper: unexpected
+/// initial stop: 32512`. The VM agent only injects that mount into specs it
+/// assembles itself; containers an in-guest dockerd creates (every `container:`
+/// job, every `services:` sidecar, every `docker run` in a workflow) bypass it.
+/// The golden therefore runs dockerd with the `crun-rosetta` shim as its
+/// default runtime: the shim rewrites each bundle's config.json (drop the
+/// empty `blockIO` section the libkrunfw kernel has no cgroup files for, add
+/// the read-only `/mnt/rosetta` bind when Rosetta is enabled) and execs crun.
+/// This wiring is the image-side counterpart of the smolvm agent fix and is
+/// byte-identical to the version proven live against the failing workload.
+#[test]
+fn golden_wires_crun_rosetta_as_docker_default_runtime() {
+    let script = base_install_script();
+
+    // daemon.json: the runtime is merged into the config the bake already owns
+    // (data-root keeps container storage on the forkable ext4 volume).
+    let daemon_json = format!(
+        "{{\"data-root\":\"{}\",\"runtimes\":{{\"crun-rosetta\":{{\"path\":\"/usr/local/bin/crun-rosetta\"}}}},\"default-runtime\":\"crun-rosetta\"}}",
+        docker_data_root()
+    );
+    assert!(
+        script.contains(&daemon_json),
+        "daemon.json must name crun-rosetta the default runtime without \
+         clobbering the container data-root; missing: {daemon_json}"
+    );
+
+    // The shim and its pinned static backend both land in the image. crun must
+    // be >= 1.14: buildx's embedded executor invokes `runc run --keep`.
+    for fragment in [
+        format!("crun-{CRUN_VERSION}-linux-$LFS_ARCH"),
+        "https://github.com/containers/crun/releases/download/".to_owned(),
+        "chmod 0755 /usr/bin/crun".to_owned(),
+        format!("/usr/bin/crun --version | grep -F '{CRUN_VERSION}'"),
+        "chmod 0755 /usr/local/bin/crun-rosetta".to_owned(),
+        "ln -sf crun-rosetta /usr/local/bin/runc".to_owned(),
+    ] {
+        assert!(script.contains(&fragment), "bake lost {fragment:?}");
+    }
+
+    // The shim rides into the image as one shell word; without it dockerd has
+    // a default-runtime pointing at nothing and every container create fails.
+    assert!(
+        script.contains("> /usr/local/bin/crun-rosetta"),
+        "the crun-rosetta shim itself must be installed by the bake"
+    );
+    // buildx execs `runc` by PATH lookup and ignores daemon.json, which is why
+    // the symlink exists ahead of /usr/bin. Docker's own runc there must stay
+    // untouched, both for non-shim inspection and as the escape hatch.
+    assert!(
+        !script.contains("-o /usr/bin/runc"),
+        "the bake must not shadow docker's real /usr/bin/runc"
+    );
+    // The shim's config.json rewrite uses jq; it rides in the apt baseline.
+    assert!(
+        base_packages().split_whitespace().any(|p| p == "jq"),
+        "the crun-rosetta shim requires jq in the golden"
+    );
+}
+
+#[test]
+fn crun_rosetta_shim_is_byte_identical_to_the_live_proven_version() {
+    let shim = crun_rosetta_shim();
+
+    // sha256 of scripts/rosetta/crun-rosetta in the smolvm rosetta worktree at
+    // the live-proven commit (07b5449). The exact bytes that ran green against
+    // `docker build thekevjames/coveralls:4.0.0` on an amd64 image are the
+    // contract here; any edit must be re-proven, not merged silently.
+    use sha2::Digest as _;
+    let digest: String = sha2::Sha256::digest(shim.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(
+        digest, "dec932252ddf7d1766e9fbbb4700e6fb7b890ac0d259a4ffa0b365f7b9884935",
+        "crun-rosetta drifted from the live-proven bytes"
+    );
+
+    // Defense in depth against a wholesale replacement: pin the load-bearing
+    // behaviors a rewrite could quietly lose.
+    for fragment in [
+        // dockerd emits "blockIO": {} on every container; crun writes io.max
+        // for it and the libkrunfw kernel lacks CONFIG_BLK_DEV_THROTTLING, so
+        // without this strip EVERY docker container fails to create.
+        "del(.linux.resources.blockIO)",
+        // Enablement gates: the boot sentinel env var, or the translator
+        // already visible from the shim's namespace (exec'd containers don't
+        // inherit PID 1's env).
+        "${SMOLVM_ROSETTA:-}",
+        "$ROSETTA_PATH/rosetta",
+        "ROSETTA_PATH=${CRUN_ROSETTA_PATH:-/mnt/rosetta}",
+        // The injected mount itself: bind, read-only, and never over a
+        // destination a user already claimed.
+        ".destination == $dst",
+        "options: [\"bind\", \"ro\"]",
+        // The real runtime the golden installs and the shim must hand off to.
+        "REAL_CRUN=${CRUN_ROSETTA_CRUN:-/usr/bin/crun}",
+        "exec \"$REAL_CRUN\" \"$@\"",
+    ] {
+        assert!(
+            shim.contains(fragment),
+            "crun-rosetta lost its {fragment:?} behavior"
+        );
+    }
+}
+
+/// The bake embeds the shim as one single-quoted word in the install script.
+/// A quoting slip would corrupt the file dockerd execs for every container, so
+/// reconstruct the fragment independently (the POSIX `'\''` idiom) and demand
+/// a real shell hands the exact bytes back.
+#[cfg(unix)]
+#[test]
+fn baked_shim_reconstructs_verbatim_through_the_shell() {
+    let quoted = format!("'{}'", crun_rosetta_shim().replace('\'', "'\\''"));
+    let install_fragment = format!("printf '%s' {quoted} > /usr/local/bin/crun-rosetta");
+    assert!(
+        base_install_script().contains(&install_fragment),
+        "the bake must embed the shim with the POSIX single-quote idiom"
+    );
+
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("printf '%s' {quoted}"))
+        .output()
+        .expect("a POSIX sh is present on every dev and CI platform");
+    assert!(output.status.success());
+    assert_eq!(
+        output.stdout,
+        crun_rosetta_shim().as_bytes(),
+        "shell-quoted shim must round-trip byte-exact"
+    );
 }

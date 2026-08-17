@@ -52,6 +52,12 @@ git_lfs_version = "3.7.1"
 docker_version = "28.0.4"
 docker_buildx_version = "0.35.0"
 docker_compose_version = "2.38.2"
+# Static upstream crun backing the golden's docker default-runtime shim
+# (assets/crun-rosetta in preloop-orchestrator). Must be >= 1.14: buildx's
+# embedded executor invokes `runc run --keep`, which older crun predates. The
+# GitHub release asset is statically linked, so it carries no glibc coupling
+# to the Ubuntu base.
+crun_version = "1.23.1"
 clang_versions = "16 17 18"
 clang_default_version = "18"
 clang_16_version = "16.0.6"
