@@ -1742,7 +1742,23 @@ fn image_has_startup_command(image: &str) -> bool {
     let has_cmd = config
         .get("Cmd")
         .and_then(serde_json::Value::as_array)
-        .is_some_and(|v| !v.is_empty());
+        .is_some_and(|v| {
+            let cmd_strings: Vec<&str> = v.iter().filter_map(|s| s.as_str()).collect();
+            !cmd_strings.is_empty()
+                && !matches!(
+                    cmd_strings.as_slice(),
+                    ["/bin/bash"]
+                        | ["/bin/sh"]
+                        | ["bash"]
+                        | ["sh"]
+                        | ["/usr/bin/bash"]
+                        | ["/usr/bin/sh"]
+                        | ["/bin/ash"]
+                        | ["ash"]
+                        | ["/bin/zsh"]
+                        | ["zsh"]
+                )
+        });
     has_entrypoint || has_cmd
 }
 
