@@ -37,6 +37,23 @@ fn format_output_cap_allows_normal_formatting() {
 }
 
 #[test]
+fn format_argument_evaluation_has_an_expression_wide_budget() {
+    let value = "A".repeat(500_000);
+    let mut expr = "format('{0}', 'ok'".to_owned();
+    for _ in 0..20 {
+        expr.push_str(", '");
+        expr.push_str(&value);
+        expr.push('\'');
+    }
+    expr.push(')');
+
+    assert!(matches!(
+        eval_expression(&expr, &Context::default()),
+        Err(ExpressionError::EvaluationTooLarge(_))
+    ));
+}
+
+#[test]
 fn evaluates_context_and_functions() {
     let mut context = Context::default();
     context.insert("github", json!({"event_name": "push"}));

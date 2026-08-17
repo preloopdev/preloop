@@ -36,6 +36,13 @@ pub fn evaluate_template(input: &str, ctx: &preloop_gha_expressions::Context) ->
                 Err(e) => {
                     // On expression error, preserve the original token
                     debug!("Expression evaluation failed: {e}");
+                    if matches!(
+                        e,
+                        preloop_gha_expressions::ExpressionError::FormatOutputTooLarge(_)
+                            | preloop_gha_expressions::ExpressionError::EvaluationTooLarge(_)
+                    ) {
+                        return Err(e.into());
+                    }
                     result.push_str(&rest[start..expr_start + end + 2]);
                 }
             }
@@ -356,5 +363,14 @@ mod tests {
             result,
             "echo \"only runs for ubuntu-latest \u{2014} os=ubuntu-latest\""
         );
+    }
+
+    #[test]
+    fn format_resource_errors_propagate_from_templates_and_conditions() {
+        let mut ctx = make_ctx();
+        ctx.insert("env", serde_json::json!({"BIG": "A".repeat(600_000)}));
+
+        assert!(evaluate_template("${{ format('{0}{0}', env.BIG) }}", &ctx).is_err());
+        assert!(evaluate_condition("format('{0}{0}', env.BIG)", &ctx).is_err());
     }
 }

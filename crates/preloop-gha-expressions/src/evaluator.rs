@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::borrow::Cow;
 
 use super::{
     ast::{BinaryOp, Expr},
@@ -69,63 +70,104 @@ pub(super) fn collect_contexts_from_expr(expr: &Expr, out: &mut std::collections
     }
 }
 
-pub(super) fn eval(expr: &Expr, context: &Context) -> Result<Value, ExpressionError> {
-    match expr {
+pub(super) const MAX_EVALUATED_VALUE_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Default)]
+pub(super) struct EvalBudget {
+    used_bytes: usize,
+}
+
+impl EvalBudget {
+    fn charge(&mut self, value: &Value) -> Result<(), ExpressionError> {
+        self.used_bytes = self.used_bytes.checked_add(value_size(value)).ok_or(
+            ExpressionError::EvaluationTooLarge(MAX_EVALUATED_VALUE_BYTES),
+        )?;
+        if self.used_bytes > MAX_EVALUATED_VALUE_BYTES {
+            return Err(ExpressionError::EvaluationTooLarge(
+                MAX_EVALUATED_VALUE_BYTES,
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn value_size(value: &Value) -> usize {
+    match value {
+        Value::Null => 0,
+        Value::Bool(_) => 1,
+        Value::Number(_) => 16,
+        Value::String(value) => value.len(),
+        Value::Array(values) => values.iter().map(value_size).sum(),
+        Value::Object(values) => values
+            .iter()
+            .map(|(key, value)| key.len() + value_size(value))
+            .sum(),
+    }
+}
+
+pub(super) fn eval(
+    expr: &Expr,
+    context: &Context,
+    budget: &mut EvalBudget,
+) -> Result<Value, ExpressionError> {
+    let value = match expr {
         Expr::Literal(value) => Ok(value.clone()),
         Expr::Path(path) => Ok(context.resolve(path)),
-        Expr::UnaryNot(expr) => Ok(Value::Bool(!is_truthy(&eval(expr, context)?))),
+        Expr::UnaryNot(expr) => Ok(Value::Bool(!is_truthy(&eval(expr, context, budget)?))),
         Expr::Binary { op, left, right } => match op {
             BinaryOp::Or => {
-                let left = eval(left, context)?;
+                let left = eval(left, context, budget)?;
                 if is_truthy(&left) {
                     Ok(left)
                 } else {
-                    eval(right, context)
+                    eval(right, context, budget)
                 }
             }
             BinaryOp::And => {
-                let left = eval(left, context)?;
+                let left = eval(left, context, budget)?;
                 if is_truthy(&left) {
-                    eval(right, context)
+                    eval(right, context, budget)
                 } else {
                     Ok(left)
                 }
             }
             BinaryOp::Eq => Ok(Value::Bool(abstract_equal(
-                &eval(left, context)?,
-                &eval(right, context)?,
+                &eval(left, context, budget)?,
+                &eval(right, context, budget)?,
             ))),
             BinaryOp::Ne => Ok(Value::Bool(!abstract_equal(
-                &eval(left, context)?,
-                &eval(right, context)?,
+                &eval(left, context, budget)?,
+                &eval(right, context, budget)?,
             ))),
             BinaryOp::Gt => Ok(Value::Bool(compare_values(
-                &eval(left, context)?,
-                &eval(right, context)?,
+                &eval(left, context, budget)?,
+                &eval(right, context, budget)?,
                 |ordering| ordering.is_gt(),
             ))),
             BinaryOp::Ge => Ok(Value::Bool(compare_values(
-                &eval(left, context)?,
-                &eval(right, context)?,
+                &eval(left, context, budget)?,
+                &eval(right, context, budget)?,
                 |ordering| ordering.is_ge(),
             ))),
             BinaryOp::Lt => Ok(Value::Bool(compare_values(
-                &eval(left, context)?,
-                &eval(right, context)?,
+                &eval(left, context, budget)?,
+                &eval(right, context, budget)?,
                 |ordering| ordering.is_lt(),
             ))),
             BinaryOp::Le => Ok(Value::Bool(compare_values(
-                &eval(left, context)?,
-                &eval(right, context)?,
+                &eval(left, context, budget)?,
+                &eval(right, context, budget)?,
                 |ordering| ordering.is_le(),
             ))),
         },
-        Expr::Call { name, args } => eval_call(name, args, context),
+        Expr::Call { name, args } => eval_call(name, args, context, budget),
         Expr::MemberAccess { expr, path } => {
-            let base = eval(expr, context)?;
+            let base = eval(expr, context, budget)?;
             Ok(Context::resolve_value(base, path))
         }
-    }
+    }?;
+    budget.charge(&value)?;
+    Ok(value)
 }
 
 fn abstract_equal(left: &Value, right: &Value) -> bool {
@@ -244,7 +286,12 @@ fn is_decimal_number(value: &str) -> bool {
     index == bytes.len()
 }
 
-fn eval_call(name: &str, args: &[Expr], context: &Context) -> Result<Value, ExpressionError> {
+fn eval_call(
+    name: &str,
+    args: &[Expr],
+    context: &Context,
+    budget: &mut EvalBudget,
+) -> Result<Value, ExpressionError> {
     let lower = name.to_ascii_lowercase();
     // case() uses lazy evaluation — handle before eager collect
     if lower == "case" {
@@ -253,21 +300,21 @@ fn eval_call(name: &str, args: &[Expr], context: &Context) -> Result<Value, Expr
         }
         // Evaluate predicate-result pairs lazily
         for i in (0..args.len() - 1).step_by(2) {
-            let predicate = eval(&args[i], context)?;
+            let predicate = eval(&args[i], context, budget)?;
             if !predicate.is_boolean() {
                 return Err(ExpressionError::NonBooleanCasePredicate);
             }
             if predicate.as_bool().unwrap_or(false) {
-                return eval(&args[i + 1], context);
+                return eval(&args[i + 1], context, budget);
             }
         }
         // No predicate matched — return default (last arg)
-        return eval(&args[args.len() - 1], context);
+        return eval(&args[args.len() - 1], context, budget);
     }
-    let values = args
-        .iter()
-        .map(|arg| eval(arg, context))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut values = Vec::with_capacity(args.len());
+    for arg in args {
+        values.push(eval(arg, context, budget)?);
+    }
 
     match lower.as_str() {
         "always" => Ok(Value::Bool(true)),
@@ -344,6 +391,13 @@ fn string_value(value: &Value) -> String {
     }
 }
 
+fn string_value_cow(value: &Value) -> Cow<'_, str> {
+    match value {
+        Value::String(value) => Cow::Borrowed(value),
+        _ => Cow::Owned(string_value(value)),
+    }
+}
+
 /// Cap on the output of `format()`.
 ///
 /// Nested `format()` calls multiply output per level — each `{0}{0}{0}`
@@ -354,7 +408,7 @@ fn string_value(value: &Value) -> String {
 const MAX_FORMAT_OUTPUT_BYTES: usize = 1024 * 1024;
 
 fn push_capped(output: &mut String, segment: &str) -> Result<(), ExpressionError> {
-    if output.len() + segment.len() > MAX_FORMAT_OUTPUT_BYTES {
+    if segment.len() > MAX_FORMAT_OUTPUT_BYTES - output.len() {
         return Err(ExpressionError::FormatOutputTooLarge(
             MAX_FORMAT_OUTPUT_BYTES,
         ));
@@ -364,9 +418,14 @@ fn push_capped(output: &mut String, segment: &str) -> Result<(), ExpressionError
 }
 
 fn format_args(values: &[Value]) -> Result<String, ExpressionError> {
-    let format = string_arg(values, 0);
+    let format = string_value_cow(values.first().unwrap_or(&Value::Null));
+    if format.len() > MAX_FORMAT_OUTPUT_BYTES {
+        return Err(ExpressionError::FormatOutputTooLarge(
+            MAX_FORMAT_OUTPUT_BYTES,
+        ));
+    }
     let bytes = format.as_bytes();
-    let mut output = String::with_capacity(format.len());
+    let mut output = String::with_capacity(format.len().min(MAX_FORMAT_OUTPUT_BYTES));
     let mut segment_start = 0;
     let mut index = 0;
 
@@ -387,31 +446,31 @@ fn format_args(values: &[Value]) -> Result<String, ExpressionError> {
                     cursor += 1;
                 }
                 if cursor == digit_start {
-                    return Err(ExpressionError::InvalidFormat(format));
+                    return Err(ExpressionError::InvalidFormat(format.into_owned()));
                 }
                 let argument_index = format[digit_start..cursor]
                     .parse::<u8>()
-                    .map_err(|_| ExpressionError::InvalidFormat(format.clone()))?
+                    .map_err(|_| ExpressionError::InvalidFormat(format.to_string()))?
                     as usize;
                 match bytes.get(cursor) {
                     Some(b'}') => {}
                     Some(b':') => {
-                        return Err(ExpressionError::InvalidFormat(format));
+                        return Err(ExpressionError::InvalidFormat(format.into_owned()));
                     }
-                    _ => return Err(ExpressionError::InvalidFormat(format)),
+                    _ => return Err(ExpressionError::InvalidFormat(format.into_owned())),
                 }
                 let value = values
                     .get(argument_index + 1)
-                    .ok_or_else(|| ExpressionError::InvalidFormat(format.clone()))?;
-                let rendered = string_value(value);
-                push_capped(&mut output, &rendered)?;
+                    .ok_or_else(|| ExpressionError::InvalidFormat(format.to_string()))?;
+                let rendered = string_value_cow(value);
+                push_capped(&mut output, rendered.as_ref())?;
                 index = cursor + 1;
                 segment_start = index;
             }
             b'}' => {
                 push_capped(&mut output, &format[segment_start..index])?;
                 if bytes.get(index + 1) != Some(&b'}') {
-                    return Err(ExpressionError::InvalidFormat(format));
+                    return Err(ExpressionError::InvalidFormat(format.into_owned()));
                 }
                 push_capped(&mut output, "}")?;
                 index += 2;
