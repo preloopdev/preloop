@@ -9,6 +9,40 @@ Releases before v0.27.0 predate the changelog.
 
 ## [Unreleased]
 
+## [0.30.4] - 2026-08-17
+
+### Added
+
+- The official-runner packed golden is now the arm64 default:
+  `download_prebaked_golden` pulls the digest-pinned OCI artifact
+  (`ghcr.io/preloopdev/preloop-golden@sha256:a2f7caf3…`, overridable with
+  `PRELOOP_GOLDEN_OCI_REF`) when no `PRELOOP_GOLDEN_URL` is configured, with
+  bearer-token registry auth, layer digest verification, and zstd decoding of
+  the packed VM layer. The release asset remains the fallback and
+  `PRELOOP_GOLDEN_URL` still selects it over the OCI default.
+- `PRELOOP_CLIENT_TIMEOUT_SECONDS` bounds runner-client requests; rejected
+  workflow submissions now surface the server status and body.
+- `benchmarks/real-world/conformance-5repos.sh` plus `just conform-5repos`:
+  five-repository campaign runner against the official runner golden.
+
+### Fixed
+
+- OCI golden download parsed the layer descriptor's `mediaType` as
+  `media_type` (every standard manifest failed to parse, silently falling
+  back to the release asset) and installed the compressed layer without
+  decoding it; the download now renames the field, logs parse failures, and
+  zstd-decodes the verified layer into the `.smolmachine` payload.
+- SmolVM runtime environment now applies to recovery commands (status, list,
+  stop, delete), so they target the same registry and macOS `HOME` as boot;
+  derived `SMOLVM_DATA_DIR` and macOS `HOME` directories are created before
+  spawn; macOS `HOME` isolation works without an explicit `PRELOOP_HOME`;
+  the agent rootfs is probed from the SmolVM data directory first.
+- Runner-client remote workflow fetches reuse the timeout-configured client
+  (`lint` can no longer hang on a stalled GitHub API request).
+- conformance campaign script: INT/TERM traps exit with the conventional
+  statuses instead of resuming, curl calls are bounded, and polling fails
+  fast when the local server dies.
+
 ## [0.30.3] - 2026-08-13
 
 ### Fixed
