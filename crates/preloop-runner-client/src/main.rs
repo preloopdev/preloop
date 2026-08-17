@@ -231,7 +231,7 @@ async fn main() -> anyhow::Result<()> {
             let reusable_workflows =
                 collect_reusable_workflows(workspace_root.as_deref(), &workflow).await?;
             let reusable_workflows =
-                resolve_remote_workflows(reusable_workflows, &workflow_yaml).await?;
+                resolve_remote_workflows(reusable_workflows, &workflow_yaml, &http).await?;
             let expanded =
                 preloop_gha_parser::expand_jobs_with_reusables(&parsed, &reusable_workflows)
                     .with_context(|| format!("expand workflow {}", workflow.display()))?;
@@ -328,10 +328,8 @@ fn same_file_path(left: &std::path::Path, right: &std::path::Path) -> bool {
 async fn resolve_remote_workflows(
     mut workflows: BTreeMap<String, String>,
     root_yaml: &str,
+    client: &reqwest::Client,
 ) -> anyhow::Result<BTreeMap<String, String>> {
-    let client = reqwest::Client::builder()
-        .user_agent("preloop-runner-client")
-        .build()?;
     let token = std::env::var("PRELOOP_GITHUB_TOKEN").ok();
     let mut queue = vec![(root_yaml.to_owned(), 0usize)];
     let mut visited = std::collections::BTreeSet::new();

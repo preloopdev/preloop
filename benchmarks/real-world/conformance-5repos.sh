@@ -190,7 +190,7 @@ start_server() {
   "$SERVER_BIN" serve --listen "127.0.0.1:$PORT" >"$log" 2>&1 &
   SERVER_PID=$!
   for _ in $(seq 1 120); do
-    if curl -fsS "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
+    if curl -fsS --max-time 5 "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
       echo "=== preloop server ready on :$PORT using $OFFICIAL_GOLDEN_ARTIFACT ==="
       return 0
     fi
@@ -210,10 +210,16 @@ cleanup() {
     wait "$SERVER_PID" 2>/dev/null || true
   fi
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+# Signal-specific handlers: the shared cleanup would otherwise resume the
+# script after the interrupt. Exit with the conventional statuses (130/143).
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 run_status() {
-  curl -fsS -H "Authorization: Bearer ${PRELOOP_SYSTEM_TOKEN:-preloop-system-token}" \
+  # --max-time keeps a stalled status request from masking the deadline; a
+  # dead server then surfaces as `unknown` and wait_run fails fast instead.
+  curl -fsS --max-time 15 -H "Authorization: Bearer ${PRELOOP_SYSTEM_TOKEN:-preloop-system-token}" \
     "http://127.0.0.1:$PORT/api/v1/runs/$1" 2>/dev/null \
     | python3 -c 'import json,sys; r=json.load(sys.stdin); print(r.get("status", "unknown"))' \
     || echo unknown
@@ -221,7 +227,7 @@ run_status() {
 
 run_snapshot() {
   local run_id="$1" output="$2"
-  curl -fsS -H "Authorization: Bearer ${PRELOOP_SYSTEM_TOKEN:-preloop-system-token}" \
+  curl -fsS --max-time 15 -H "Authorization: Bearer ${PRELOOP_SYSTEM_TOKEN:-preloop-system-token}" \
     "http://127.0.0.1:$PORT/api/v1/runs/$run_id" >"$output" 2>/dev/null || printf '%s\n' '{}' >"$output"
 }
 
@@ -271,6 +277,13 @@ wait_run() {
   local target="$1" run_id="$2" deadline status
   deadline=$(( $(date +%s) + TIMEOUT_SECONDS ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
+    # A crashed server would otherwise be retried as `unknown` until the
+    # campaign deadline; fail immediately instead.
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+      echo "[$target] preloop server exited; cannot poll run $run_id" >&2
+      printf '%s\n' server-crashed
+      return 0
+    fi
     status="$(run_status "$run_id")"
     echo "[$target] status=$status" >&2
     case "$status" in

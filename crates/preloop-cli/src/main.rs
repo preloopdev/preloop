@@ -102,14 +102,10 @@ pub(crate) fn smolvm_command() -> anyhow::Result<std::process::Command> {
     // (see crates/preloop-cli/src/server_install.rs), so the engine records
     // its machines in that registry. A separately invoked `preloop shell` /
     // `preloop debug` must consult the SAME registry or it cannot find the
-    // paused, service-owned machine — the caller's default data dir would
-    // resolve a different one. An operator value wins, so this only fills
-    // the gap, never overrides.
-    if std::env::var_os("SMOLVM_DATA_DIR").is_none() {
-        let data_dir = preloop_home().join("smolvm");
-        command.env("SMOLVM_DATA_DIR", data_dir);
-    }
-    preloop_vm::apply_smolvm_runtime_env(&mut command, None);
+    // paused, service-owned machine. `apply_smolvm_runtime_env` fills the
+    // same gap from the effective Preloop home (and isolates `HOME` on macOS,
+    // where SmolVM ignores `SMOLVM_DATA_DIR`); an operator value still wins.
+    preloop_vm::apply_smolvm_runtime_env(&mut command, None)?;
     preloop_vm::apply_smolvm_sandbox_env(&mut command)?;
     Ok(command)
 }
