@@ -91,8 +91,13 @@ async fn main() -> anyhow::Result<()> {
     let native_api_token =
         env::var("PRELOOP_SYSTEM_TOKEN").unwrap_or_else(|_| "preloop-system-token".to_owned());
     let cli = Cli::parse();
+    let timeout_seconds = env::var("PRELOOP_CLIENT_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(30);
     let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(timeout_seconds))
         .user_agent("preloop-runner-client")
         .build()?;
 
@@ -166,13 +171,13 @@ async fn main() -> anyhow::Result<()> {
                     .encode(canonical.as_os_str().to_string_lossy().as_bytes());
                 request = request.header("x-preloop-local-workspace", encoded);
             }
-            let response = request
-                .json(&submission)
-                .send()
-                .await?
-                .error_for_status()?
-                .text()
-                .await?;
+            let response = request.json(&submission).send().await?;
+            let status = response.status();
+            let body = response.text().await?;
+            if !status.is_success() {
+                anyhow::bail!("server rejected workflow submission ({status}): {body}");
+            }
+            let response = body;
             println!("{response}");
         }
         Command::Run { run_id } => {

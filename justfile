@@ -127,6 +127,11 @@ conform-server-deep:
     cargo zigbuild -p preloop-runner-server --release --target aarch64-unknown-linux-musl
     bash ./scripts/conform-server-deep.sh
 
+# Run the five-repository campaign against the pinned 9GB official runner
+# golden. Override PRELOOP_GOLDEN_ARTIFACT when the cache lives elsewhere.
+conform-5repos:
+    bash ./benchmarks/real-world/conformance-5repos.sh
+
 # Compare workflow/job status responses from the official and preloop runners.
 conform-runner-light:
     python3 benchmarks/real-world/runner-conformance.py --mode light

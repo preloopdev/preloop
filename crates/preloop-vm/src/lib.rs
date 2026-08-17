@@ -490,6 +490,7 @@ impl SmolVmProvider {
     /// pack — not just machine creation.
     fn sandboxed_command(&self) -> Result<Command, VmError> {
         let mut command = self.command();
+        apply_smolvm_runtime_env_async(&mut command, Some(&self.binary));
         apply_sandbox_env(&mut command, self.env_lookup)?;
         Ok(command)
     }
@@ -1522,6 +1523,99 @@ pub fn apply_smolvm_sandbox_env(command: &mut std::process::Command) -> Result<(
         command.env(key, value);
     }
     Ok(())
+}
+
+fn smolvm_runtime_env(binary: Option<&Path>) -> Vec<(String, std::ffi::OsString)> {
+    let host_home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut env = Vec::new();
+    if std::env::var_os("SMOLVM_DATA_DIR").is_none() {
+        if let Some(preloop_home) = std::env::var_os("PRELOOP_HOME") {
+            let preloop_home = PathBuf::from(preloop_home);
+            // SmolVM 1.8.x ignores SMOLVM_DATA_DIR on macOS and derives its
+            // registry from HOME. Keep each Preloop home isolated while still
+            // leaving an explicit operator registry untouched.
+            #[cfg(target_os = "macos")]
+            env.push((
+                "HOME".to_owned(),
+                preloop_home.join("smolvm-home").into_os_string(),
+            ));
+            env.push((
+                "SMOLVM_DATA_DIR".to_owned(),
+                preloop_home.join("smolvm").into_os_string(),
+            ));
+        }
+    }
+
+    // HOME may be isolated above, so preserve the host installation assets
+    // explicitly for the child SmolVM process.
+    if std::env::var_os("SMOLVM_AGENT_ROOTFS").is_none() {
+        if let Some(path) = host_home
+            .as_ref()
+            .map(|home| home.join(".smolvm/agent-rootfs"))
+            .filter(|path| path.is_dir())
+        {
+            env.push(("SMOLVM_AGENT_ROOTFS".to_owned(), path.into_os_string()));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut candidates = Vec::new();
+        if let Some(path) = std::env::var_os("SMOLVM_LIB_DIR") {
+            candidates.push(PathBuf::from(path));
+        }
+        if let Some(binary) = binary {
+            let resolved = binary
+                .canonicalize()
+                .ok()
+                .or_else(|| binary.is_absolute().then(|| binary.to_path_buf()));
+            if let Some(parent) = resolved.and_then(|path| path.parent().map(Path::to_path_buf)) {
+                candidates.push(parent.join("lib"));
+            }
+        }
+        if let Some(home) = host_home {
+            candidates.push(home.join(".smolvm/lib"));
+        }
+        let Some(lib_dir) = candidates
+            .into_iter()
+            .find(|path| path.join("libkrunfw.5.dylib").is_file())
+        else {
+            return env;
+        };
+        let mut paths = vec![lib_dir];
+        if let Some(existing) = std::env::var_os("DYLD_LIBRARY_PATH") {
+            paths.extend(std::env::split_paths(&existing));
+        }
+        if let Ok(loader_path) = std::env::join_paths(paths) {
+            env.push(("DYLD_LIBRARY_PATH".to_owned(), loader_path));
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = binary;
+    }
+    env
+}
+
+/// Add the bundled SmolVM libraries to boot-capable child commands on macOS.
+///
+/// The macOS release binary dynamically loads `libkrunfw.5.dylib` from the
+/// adjacent `.smolvm/lib` directory, but the binary has no rpath and the
+/// bootstrap process does not inherit a loader path from the installer.
+/// Without this, `machine create` succeeds and every subsequent VM start
+/// fails at the Hypervisor.framework boundary. An explicit `SMOLVM_LIB_DIR`
+/// wins; otherwise use the resolved binary's sibling directory or the
+/// standard per-user install location.
+pub fn apply_smolvm_runtime_env(command: &mut std::process::Command, binary: Option<&Path>) {
+    for (key, value) in smolvm_runtime_env(binary) {
+        command.env(key, value);
+    }
+}
+
+fn apply_smolvm_runtime_env_async(command: &mut Command, binary: Option<&Path>) {
+    for (key, value) in smolvm_runtime_env(binary) {
+        command.env(key, value);
+    }
 }
 
 /// Apply the sandbox policy to a provider command.

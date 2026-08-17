@@ -109,6 +109,7 @@ pub(crate) fn smolvm_command() -> anyhow::Result<std::process::Command> {
         let data_dir = preloop_home().join("smolvm");
         command.env("SMOLVM_DATA_DIR", data_dir);
     }
+    preloop_vm::apply_smolvm_runtime_env(&mut command, None);
     preloop_vm::apply_smolvm_sandbox_env(&mut command)?;
     Ok(command)
 }
