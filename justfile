@@ -48,7 +48,11 @@ test-properties-full:
     PROPTEST_CASES=10000 cargo test --locked -p preloop-runner-server --quiet
     PROPTEST_CASES=10000 cargo test --locked -p preloop-runner-server --quiet -- --ignored
 
-test-ci: fmt-check clippy
+# Security linter for GitHub Actions workflows
+zizmor:
+    uvx zizmor .github/workflows/
+
+test-ci: fmt-check clippy zizmor
     PROPTEST_CASES=8 cargo test --locked --workspace --quiet
     just conform
     @echo CI: all checks passed
