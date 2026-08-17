@@ -1585,7 +1585,7 @@ pub(crate) fn clear_assignment(inner: &mut InnerState, run_id: RunId, job_id: &J
         .any(|job| job.run_id == run_id && job.job_id == *job_id)
 }
 
-fn capabilities_of(runner: &RegisteredRunner) -> RunnerCapabilities {
+pub(crate) fn capabilities_of(runner: &RegisteredRunner) -> RunnerCapabilities {
     RunnerCapabilities {
         known: true,
         labels: runner.labels.clone(),
@@ -2348,6 +2348,10 @@ fn retire_node_requests(
             .session_active_requests
             .retain(|_, &mut rid| rid != request_id);
         inner.inflight_requests.remove(&request_id);
+        // Terminal either way: a settled node stays in the run as a finished
+        // job and a purged one no longer exists, and neither can be claimed
+        // again. The deferred App-token request must not survive either.
+        inner.github_token_requests.remove(&request_id);
         match retirement {
             RequestRetirement::Settle(status) => {
                 if let Some(record) = inner.job_requests.get_mut(&request_id) {
@@ -2357,7 +2361,6 @@ fn retire_node_requests(
                 }
             }
             RequestRetirement::Purge => {
-                inner.github_token_requests.remove(&request_id);
                 let Some(record) = inner.job_requests.remove(&request_id) else {
                     continue;
                 };

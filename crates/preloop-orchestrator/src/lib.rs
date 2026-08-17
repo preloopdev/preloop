@@ -830,6 +830,10 @@ fn docker_start_command() -> Vec<String> {
 
 /// How long to wait for a freshly started guest to accept commands.
 const GUEST_READY_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long to wait between live-clone drain probes before re-arming a spent
+/// golden fork base. Bounded retries; the probe loop is exercised by tests
+/// under paused Tokio time, so this is the only knob the delay is tied to.
+const GOLDEN_DRAIN_PROBE_DELAY: Duration = Duration::from_secs(10);
 /// Gap between guest readiness probes.
 const GUEST_READY_POLL: Duration = Duration::from_millis(25);
 
@@ -1542,9 +1546,14 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
     if provider.status(golden).await? != MachineState::Missing {
         provider.delete(golden).await?;
     }
+    // smolvm's `machine create --from` consumes the SMOLPACK, not the ELF
+    // launcher stub written at the payload stem. A downloaded release asset
+    // IS the pack at the stem; a locally built golden leaves the pack in the
+    // `.smolmachine` sidecar. Centralized in [`packed_golden_path`].
+    let pack = packed_golden_path(&config.artifact_payload());
     let spec = MachineSpec {
         name: golden.clone(),
-        image: config.artifact_payload().display().to_string(),
+        image: pack.display().to_string(),
         cpus: config.cpus,
         memory_mib: config.memory_mib,
         storage_gib: config.storage_gib,
@@ -2989,15 +2998,67 @@ async fn provision_runner<P: VmProvider + 'static>(
                             }
                         }
                         Ok(false) => {
-                            error!(
-                                golden = golden.as_str(),
-                                "fork base spent and cannot be re-armed (a live clone still \
-                                 depends on it, or the partial clone could not be removed); \
-                                 falling back to independent OCI creation"
-                            );
-                            let _ = provider.delete(name).await;
-                            direct_create_from_packed = false;
-                            None
+                            // A live clone (another runner forked from the
+                            // golden) blocks the re-freeze; those clones are
+                            // ephemeral and exit after their job. Wait for
+                            // them to drain, then retry the re-arm a bounded
+                            // number of times before falling back to direct
+                            // creation (whose socket mount cannot serve the
+                            // control transport, so the fallback usually
+                            // fails registration anyway).
+                            let mut rearmed = false;
+                            for attempt in 0..12 {
+                                tokio::time::sleep(GOLDEN_DRAIN_PROBE_DELAY).await;
+                                match provider.rearm_fork_base(golden, Some(name)).await {
+                                    Ok(true) => {
+                                        info!(
+                                            golden = golden.as_str(),
+                                            attempt, "golden fork base re-armed after clone drain"
+                                        );
+                                        rearmed = true;
+                                        break;
+                                    }
+                                    Ok(false) => {
+                                        // Live clones still hold the golden;
+                                        // keep probing until the bounded
+                                        // retries are exhausted.
+                                    }
+                                    Err(drain_error) => {
+                                        error!(
+                                            golden = golden.as_str(),
+                                            %drain_error,
+                                            "re-arm failed while draining clones; falling back \
+                                             without further waiting"
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                            if rearmed {
+                                match provider.fork(golden, name).await {
+                                    Ok(()) => Some(golden),
+                                    Err(retry_error) => {
+                                        error!(
+                                            machine = name.as_str(),
+                                            golden = golden.as_str(),
+                                            %retry_error,
+                                            "re-armed golden still cannot fork; falling back to \
+                                             direct creation"
+                                        );
+                                        let _ = provider.delete(name).await;
+                                        None
+                                    }
+                                }
+                            } else {
+                                error!(
+                                    golden = golden.as_str(),
+                                    "fork base spent and could not be re-armed after waiting for \
+                                     clone drain; falling back to independent OCI creation"
+                                );
+                                let _ = provider.delete(name).await;
+                                direct_create_from_packed = false;
+                                None
+                            }
                         }
                         Err(rearm_error) => {
                             error!(
@@ -3109,10 +3170,11 @@ async fn provision_runner<P: VmProvider + 'static>(
         }
     } else {
         let uses_packed_artifact = direct_create_from_packed;
+        let pack = packed_golden_path(&config.artifact_payload());
         let spec = MachineSpec {
             name: name.clone(),
             image: if uses_packed_artifact {
-                config.artifact_payload().display().to_string()
+                pack.display().to_string()
             } else if config.use_packed_artifact {
                 environment.base.clone()
             } else {
@@ -3418,6 +3480,21 @@ async fn hold_for_debugging(name: &MachineName, debug_dir: &Path, shutdown: &Can
 /// Return the runner artifact payload generated for an output stem.
 pub fn artifact_payload(stem: &Path) -> PathBuf {
     stem.to_path_buf()
+}
+
+/// Resolve the actual packed-golden file for smolvm's `machine create
+/// --from`. The artifact stem names the payload: a downloaded release asset
+/// IS the SMOLPACK at the stem, while a locally built golden leaves an ELF
+/// launcher stub at the stem with the pack in the `<stem>.smolmachine`
+/// sidecar. Prefer the sidecar when present, else the stem itself — never
+/// invent a path that may not exist.
+fn packed_golden_path(payload: &Path) -> PathBuf {
+    let sidecar = PathBuf::from(format!("{}.smolmachine", payload.display()));
+    if sidecar.is_file() {
+        sidecar
+    } else {
+        payload.to_path_buf()
+    }
 }
 
 #[cfg(test)]
@@ -4449,7 +4526,10 @@ chmod +x "$destination/bin/node"
     /// A spent base that still has live clones must NOT be re-armed: resuming
     /// it would corrupt the copy-on-write clones. The pool falls back to a
     /// full create instead.
-    #[tokio::test]
+    // Paused time: the drain loop sleeps GOLDEN_DRAIN_PROBE_DELAY between
+    // probes; without this the 12-probe worst case would stall the test for
+    // two minutes of real time.
+    #[tokio::test(start_paused = true)]
     async fn spent_fork_base_with_live_clones_is_not_rearmed() {
         let provider = Arc::new(
             TestProvider::new(false, false, false, false, false)

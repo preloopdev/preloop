@@ -9,6 +9,32 @@ Releases before v0.27.0 predate the changelog.
 
 ## [Unreleased]
 
+## [0.30.3] - 2026-08-13
+
+### Fixed
+
+- `preloop update` is now content-aware when the remote release version
+  equals the installed version: it downloads the checksummed release asset,
+  verifies its SHA-256, and byte-compares the extracted binary against the
+  installed executable, reinstalling on mismatch. A version string is
+  self-reported and can lie (a source build or tampered binary claiming a
+  release version), so the old version-only gate declared such installs up
+  to date forever — this is how the v0.30.2 deaf-runner fix never reached
+  production. Lower versions still never downgrade; a failed content check
+  (fetch/checksum error) keeps the installed binary and retries next run.
+
+### Security
+
+- Fail closed on cache writes when the calling job no longer resolves. A
+  fork PR job's runtime JWT survives the job's retirement
+  (`RequestRetirement::Purge` drops the correlation records the fork-tier
+  lookup walks); treating that unresolvable token as a control-plane caller
+  let a fork worker smuggle a cache write past the read-only guard with a
+  leaked token. `fork_restricted_from_token` now denies any job-shaped
+  token whose subject/scope no longer resolves to a live job, instead of
+  only when it positively resolves to a fork-restricted tier. Non-job
+  bearers (system token, runner-listen, debug-worker) are unaffected.
+
 ## [0.30.2] - 2026-08-13
 
 ### Added
@@ -91,6 +117,42 @@ Releases before v0.27.0 predate the changelog.
     root, and no longer replaceable by it.
   `preloop server uninstall` removes all three, so secrets no longer outlive
   an uninstall that only purges the state dir.
+
+- Enforce GitHub's read-only fork profile for untrusted fork pull requests:
+  fork PR jobs (and fail-closed unknown events) now receive a
+  `GITHUB_TOKEN` permission set clamped to read regardless of the workflow's
+  declared `permissions:` block, never get an OIDC request URL or token
+  grant, and can no longer receive the configured PAT — neither as a
+  mint-failure fallback nor as the build-time PAT override. The special
+  `id-token` permission is excluded rather than advertised as a read scope,
+  and the App installation-token request carries only real App repository
+  permissions (never `id-token`) for trusted jobs too. The trust tier is
+  applied as a single job-authorization policy shared by the runner wire
+  variable, the App installation-token request, the OIDC grant, and the
+  token fallback path, so a fork PR declaring `checks: write` and
+  `id-token: write` is downgraded end to end while `pull_request_target`,
+  internal PRs, push, schedule, and deployment runs keep their declared
+  permissions. Broker claims now keep every runner-visible token alias
+  (`system.github.token`, `github_token`, `GITHUB_TOKEN`, and the `github`
+  context token) on the minted App token, restate narrowed installation
+  grants without erasing a trusted job's `IdToken` metadata, and treat
+  persisted token requests that predate the `untrusted` field as untrusted
+  so a restart can never re-enable the PAT fallback for them.
+
+- Fork PR runs also get GitHub's read-only cache access: cache writes (the
+  `/_apis/artifactcache` reserve/upload/commit routes and the Twirp
+  `CreateCacheEntry`/`FinalizeCacheEntryUpload` handlers) are refused with
+  403 for fork-restricted jobs while restores stay open — a fork can no
+  longer poison cache entries that a trusted run later restores.
+
+- A deferred GitHub App token request no longer outlives the job it was built
+  for. It is deliberately retained past the first claim so a re-claim after a
+  runner disconnect re-mints under the build-time permission set instead of
+  rebuilding from the broader defaults, and it is now dropped wherever a job
+  request becomes terminal — the shared completion path (broker `completejob`,
+  the legacy `/_apis` finish endpoints, and the lease-expiry reaper alike) and
+  the scheduler's node retirement for cancelled, skipped, and
+  expansion-failed nodes.
 
 ### Changed
 
@@ -255,6 +317,7 @@ Releases before v0.27.0 predate the changelog.
 - `macos`/`windows` jobs wait for a registered external host instead of being
   failed by the Linux-only starvation sweep.
 - macOS BSD `tar` missing `--verbatim-files-from` is handled in sync.
+
 ## [0.29.8] - 2026-08-09
 
 ### Fixed
@@ -362,7 +425,8 @@ live-logs (8), and golden (8).
 Bootstrap the cargo-dist release pipeline for `preloop-cli` (binary
 installers for macOS and Linux).
 
-[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.29.8...HEAD
+[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.30.3...HEAD
+[0.30.3]: https://github.com/preloopdev/preloop/compare/v0.30.2...v0.30.3
 [0.29.8]: https://github.com/preloopdev/preloop/compare/v0.29.7...v0.29.8
 [0.29.7]: https://github.com/preloopdev/preloop/compare/v0.29.6...v0.29.7
 [0.29.6]: https://github.com/preloopdev/preloop/compare/v0.29.5...v0.29.6

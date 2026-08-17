@@ -1,0 +1,182 @@
+name: smolvm-release-verify
+
+# SmolVM release verification — runs the upgrade path for a candidate release
+# on the real-VM host.
+#
+# Triggered specifically by Renovate's `smolvm_golden_version` bump PRs
+# (head branches `renovate/**`, see renovate.json) and manually via
+# `workflow_dispatch` with a version input. It installs the candidate exactly
+# as release-golden.yml and the updater do, probes the capabilities preloop
+# depends on, and boots a real microVM with the candidate (create -> start ->
+# exec -> delete) to gate the bump. A green run is also the signal that the
+# updater's latest-stable adoption of that release is safe: it exercises the
+# candidate's templates, libkrun, and KVM/Hypervisor boot path — the surface
+# that broke at 1.7.5.
+#
+# On non-Renovate PRs the job is skipped entirely, so unrelated PRs are
+# unaffected; the gate for smolvm bumps is Renovate auto-merge, which waits
+# for this check and ci.yml on its own PRs. The job additionally requires a
+# smolvm-capable self-hosted runner (any OS/arch with /dev/kvm or
+# Hypervisor.framework — the repo's aksh-golden-x64 KVM host, or a Mac)
+# labeled smolvm-host AND SMOLVM_VERIFY_HOST_WORKSPACE set (the same opt-in
+# pattern as runner-conformance.yml; webhook CI runs inside disposable Linux
+# guests and must not try to launch nested host smolVMs). Runs are serialized
+# through a concurrency group because the job mutates ~/.smolvm on the shared
+# host. The VM smoke needs the host's virtualization and registry access for
+# the pinned Ubuntu base.
+
+on:
+  pull_request:
+    # Renovate's smolvm bump PRs touch versions.toml; anything else does not
+    # need the upgrade-path verification. Keeps the preloop CI pool free on
+    # ordinary PRs (the server honors paths filters).
+    paths:
+      - versions.toml
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "SmolVM release to verify (default: smolvm_golden_version in versions.toml)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: smolvm-host
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify smolvm release on smolvm-host
+    # Renovate bump PRs only (head branches renovate/**), plus manual
+    # dispatch; anything else skips entirely (the preloop server evaluates
+    # root-job if conditions at submission, so nothing queues).
+    if: (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'renovate/')) && vars.SMOLVM_VERIFY_HOST_WORKSPACE != ''
+    runs-on: [self-hosted, smolvm-host]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
+      - name: Detect golden-pin movement
+        id: changed
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          CHANGED=false
+          if ! git diff --quiet "$BASE_SHA" -- versions.toml \
+              && git diff "$BASE_SHA" -- versions.toml \
+                 | grep -q '^[+-]smolvm_golden_version'; then
+            CHANGED=true
+          fi
+          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve candidate version
+        id: resolve
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
+          else
+            VERSION="$(grep '^smolvm_golden_version' versions.toml | cut -d'"' -f2)"
+          fi
+          [ -n "$VERSION" ] || { echo "no smolvm version resolved" >&2; exit 1; }
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Install candidate smolvm (mirrors release-golden.yml)
+        if: github.event_name == 'workflow_dispatch' || steps.changed.outputs.changed == 'true'
+        env:
+          SMOLVM_VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          case "$(uname -s)/$(uname -m)" in
+            Darwin/arm64) PLATFORM="darwin-arm64"; DATA_DIR="$HOME/Library/Application Support/smolvm" ;;
+            Darwin/x86_64) PLATFORM="darwin-x86_64"; DATA_DIR="$HOME/Library/Application Support/smolvm" ;;
+            Linux/x86_64) PLATFORM="linux-x86_64"; DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/smolvm" ;;
+            Linux/aarch64) PLATFORM="linux-arm64"; DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/smolvm" ;;
+            *) echo "unsupported host $(uname -s)/$(uname -m)" >&2; exit 1 ;;
+          esac
+          ARCHIVE="smolvm-${SMOLVM_VERSION}-${PLATFORM}.tar.gz"
+          BASE="https://github.com/smol-machines/smolvm/releases/download/v${SMOLVM_VERSION}"
+          WORK="$(mktemp -d "${TMPDIR:-/tmp}/smolvm-verify.XXXXXX")"
+          curl -fsSL -o "$WORK/$ARCHIVE" "$BASE/$ARCHIVE"
+          curl -fsSL -o "$WORK/checksums.sha256" "$BASE/checksums.sha256"
+          # shasum -c resolves names relative to the working directory, so
+          # verify from inside the download dir.
+          ( cd "$WORK" && grep -F "$ARCHIVE" checksums.sha256 | shasum -a 256 -c - )
+          tar -xzf "$WORK/$ARCHIVE" -C "$WORK"
+          SRC="$WORK/smolvm-${SMOLVM_VERSION}-${PLATFORM}"
+          mkdir -p "$HOME/.smolvm"
+          rm -rf "$HOME/.smolvm/lib"
+          cp -R "$SRC/lib" "$HOME/.smolvm/lib"
+          # Clear stale template variants from previous layouts so the
+          # candidate's format wins (same cleanup the updater runs).
+          rm -f "$HOME/.smolvm/storage-template.ext4" \
+              "$HOME/.smolvm/overlay-template.ext4" \
+              "$HOME/.smolvm/storage-template.ext4.zst" \
+              "$HOME/.smolvm/overlay-template.ext4.zst"
+          for f in smolvm smolvm-bin storage-template.ext4 overlay-template.ext4 \
+              storage-template.ext4.zst overlay-template.ext4.zst; do
+            [ -f "$SRC/$f" ] && cp "$SRC/$f" "$HOME/.smolvm/"
+          done
+          echo "$SMOLVM_VERSION" > "$HOME/.smolvm/.version"
+          mkdir -p "$DATA_DIR"
+          rm -rf "$DATA_DIR/agent-rootfs"
+          cp -R "$SRC/agent-rootfs" "$DATA_DIR/agent-rootfs"
+          mkdir -p "$HOME/.local/bin"
+          ln -sfn "$HOME/.smolvm/smolvm" "$HOME/.local/bin/smolvm"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Probe capabilities
+        if: github.event_name == 'workflow_dispatch' || steps.changed.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          smolvm --version
+          smolvm machine create --help | grep -q -- --mount-socket \
+            || { echo "candidate lacks --mount-socket" >&2; exit 1; }
+
+      - name: Boot a VM with the candidate (regression smoke)
+        if: github.event_name == 'workflow_dispatch' || steps.changed.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          NAME="preloop-verify-$(date +%s)"
+          SOCKET="$(mktemp -u "${TMPDIR:-/tmp}/preloop-verify.XXXXXX.sock")"
+          cleanup() {
+            smolvm machine stop --name "$NAME" >/dev/null 2>&1 || true
+            smolvm machine delete --name "$NAME" -f >/dev/null 2>&1 || true
+            rm -f "$SOCKET"
+          }
+          trap cleanup EXIT
+          # The exact base preloop provisions runners from (versions.toml),
+          # digest-pinned; pulls through smolvm's registry client.
+          IMAGE="$(grep '^ubuntu_24_04_base' versions.toml | cut -d'"' -f2)"
+          [ -n "$IMAGE" ] || { echo "ubuntu_24_04_base missing from versions.toml" >&2; exit 1; }
+          python3 -c "import socket; s = socket.socket(socket.AF_UNIX); s.bind('$SOCKET'); s.close()"
+          echo "creating machine from $IMAGE"
+          smolvm machine create --name "$NAME" \
+            --image "$IMAGE" \
+            --net \
+            --mount-socket "$SOCKET:/run/preloop-verify.sock"
+          smolvm machine start --name "$NAME"
+          echo "waiting for the guest to boot..."
+          BOOTED=""
+          for _ in $(seq 1 150); do
+            if smolvm machine exec --name "$NAME" -- sh -c 'echo smolvm-verify-ok' \
+                | grep -q smolvm-verify-ok; then
+              BOOTED=1
+              break
+            fi
+            sleep 2
+          done
+          if [ -z "$BOOTED" ]; then
+            echo "machine did not boot (or exec failed) with candidate smolvm" >&2
+            smolvm machine status --name "$NAME" 2>&1 || true
+            exit 1
+          fi
+          echo "candidate smolvm boots VMs: PASS"

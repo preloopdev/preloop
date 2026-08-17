@@ -404,6 +404,18 @@ steps; GitHub exports only the step's own `env:` block. Harmless so far —
 `install-action`'s `BASH_FUNC_` guard does not trip on them — but it is a
 divergence a workflow could observe.
 
+### 1b.5 Pool reliability findings (2026-08-13)
+
+Found while measuring build-speed configs on the pool. Operational/reliability
+gaps (not protocol-shape gaps); tracked for fix:
+
+| Issue | Gap | Observed |
+| ----- | --- | -------- |
+| [#131](https://github.com/preloopdev/preloop/issues/131) | Runner never enforces the job timeout against a **hung step** — the runner keeps polling + renewing the job lock, so neither the liveness sweep nor the 45-min lease reclaims it; `timeout-minutes` never fires mid-step (official runner cancels at the budget) | `property-tests-fast` wedged 60+ min in `actions/checkout`, then again in a compile step; cancelled manually (runs `6a6f842f`, `9b7437a1`) |
+| [#132](https://github.com/preloopdev/preloop/issues/132) | Golden bakes `/etc/sudoers` owned by uid 1000 → `sudo` broken in every pool VM (docs' `sudo apt-get` pattern fails) | `sudo: error initializing audit plugin sudoers_audit` on running VM `preloop-runner-1-7`; first lld CI attempt failed on it |
+| [#133](https://github.com/preloopdev/preloop/issues/133) | GitHub App ran the **stale workflow YAML** for a push (first job attempt used the previous commit's ci.yml, then restarted with the correct one) | push `2b4090c1`: stale nextest config log `34425e86...`, correct config restarted 22:05 |
+| [#134](https://github.com/preloopdev/preloop/issues/134) | `GET /api/v1/runs/<id>/logs` returns **truncated** logs while `replay/results/*/job-logs.txt` is complete on disk | endpoint cut at 16:34:47 for a run whose file ends 16:46:03 (run `684a20e0`) |
+
 ---
 
 ## 2. Upstream surface we must emulate
@@ -661,6 +673,42 @@ runner-correlation maps (`job_requests`, `inflight_requests`, …) the way
 runtime reusable expansion now does — jobs fanned out from
 `needs`-dependent matrices lack RenewJob/timeline correlation until that path
 adopts the shared `build_job_artifacts` helper.
+
+---
+
+### 3c. Fork trust isolation (2026-08-12)
+
+The fork-PR token hardening (commit `47278c2b`) makes untrusted fork runs
+behave like GitHub's: read-only `GITHUB_TOKEN`, no secrets, no OIDC, and no
+fallback that can widen the credential. Two per-repository features remain to
+be compared with GitHub:
+
+**Cache access — conformant (resolved 2026-08-13).** GitHub gives fork PR runs
+read-only cache access: they can restore from the base repository's cache but
+cannot save to it (actions/cache README: "Some workflow runs only have
+read-only access to the cache. A common case is a workflow triggered by a pull
+request from a fork"), so a fork cannot poison entries a trusted run later
+restores. Preloop previously allowed fork writes on both the cache v2 Twirp
+surface (`CacheService/CreateCacheEntry`, `FinalizeCacheEntryUpload`) and the
+legacy `/_apis/artifactcache` surface. All cache *write* handlers now reject
+fork-restricted jobs (403, resolved via the job runtime token →
+`events::trust_tier::fork_restricted_from_token`); restore handlers are
+unchanged. Reads stay open for everyone.
+
+**Concurrency groups — at parity, suggested divergence (not implemented).**
+Concurrency groups are keyed `(lowercased repo, lowercased group name)`
+(`concurrency::concurrency_key`, no trust tier), matching GitHub's documented
+per-repository model ("using the same concurrency group in the repository").
+GitHub documents no fork isolation for concurrency, so a fork PR can declare a
+static group name (e.g. `prod-deploy`) with `cancel-in-progress: true` and
+cancel a trusted run — on GitHub and preloop alike. Suggested divergence,
+strictly safer than GitHub: key groups by `(repo, fork_restricted, group)` so
+fork runs contend only with fork runs and can never cancel a trusted holder.
+Tradeoffs: breaks cross-trust serialization for deliberately shared groups
+(use distinct group names per trust domain); the persisted key shape in
+`store.rs` needs a migration; and it does not bound resource abuse (a fork can
+still flood the pool with runs — that needs queue/run limits, separate from
+concurrency). Not implemented; documented here for parity tracking.
 
 ---
 
