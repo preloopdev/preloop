@@ -238,6 +238,12 @@ pub enum VmError {
         /// Operating-system error.
         source: std::io::Error,
     },
+    /// Failed to prepare the SmolVM runtime directories.
+    #[error("failed to prepare SmolVM runtime directories: {source}")]
+    RuntimeIo {
+        /// Operating-system error.
+        source: std::io::Error,
+    },
     /// SmolVM rejected an operation.
     #[error("smolvm {operation} failed with exit code {exit_code}: {message}")]
     Command {
@@ -490,6 +496,7 @@ impl SmolVmProvider {
     /// pack — not just machine creation.
     fn sandboxed_command(&self) -> Result<Command, VmError> {
         let mut command = self.command();
+        apply_smolvm_runtime_env_async(&mut command, Some(&self.binary))?;
         apply_sandbox_env(&mut command, self.env_lookup)?;
         Ok(command)
     }
@@ -506,8 +513,9 @@ impl SmolVmProvider {
     /// forwarded unvalidated: on an invalid override they are removed, so a
     /// recovery command runs without sandbox variables (no VMM is spawned
     /// here, so nothing boots unconfined) rather than with garbage.
-    fn recovery_command(&self) -> Command {
+    fn recovery_command(&self) -> Result<Command, VmError> {
         let mut command = self.command();
+        apply_smolvm_runtime_env_async(&mut command, Some(&self.binary))?;
         match sandbox_env_with(self.env_lookup) {
             Ok(sandbox) => {
                 for key in sandbox.remove {
@@ -523,7 +531,7 @@ impl SmolVmProvider {
                 command.env_remove("SMOLVM_CGROUP_ROOT");
             }
         }
-        command
+        Ok(command)
     }
 
     /// Run an operation that can never boot or restart a VMM, using
@@ -534,7 +542,7 @@ impl SmolVmProvider {
         operation: &'static str,
         args: &[String],
     ) -> Result<ExecOutput, VmError> {
-        let mut command = self.recovery_command();
+        let mut command = self.recovery_command()?;
         command
             .args(args)
             .stdin(Stdio::null())
@@ -1519,6 +1527,155 @@ pub fn apply_smolvm_sandbox_env(command: &mut std::process::Command) -> Result<(
         command.env_remove(key);
     }
     for (key, value) in sandbox.set {
+        command.env(key, value);
+    }
+    Ok(())
+}
+
+/// Preloop home the helper isolates SmolVM into: the explicit `PRELOOP_HOME`,
+/// else `<HOME>/.preloop` (the CLI's `preloop_home()` default), else the
+/// bare `.preloop` relative directory.
+fn effective_preloop_home() -> Option<PathBuf> {
+    std::env::var_os("PRELOOP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".preloop")))
+}
+
+fn smolvm_runtime_env(binary: Option<&Path>) -> Vec<(String, std::ffi::OsString)> {
+    let host_home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut env = Vec::new();
+    let explicit_data_dir = std::env::var_os("SMOLVM_DATA_DIR").map(PathBuf::from);
+    let data_dir = explicit_data_dir
+        .clone()
+        .or_else(|| effective_preloop_home().map(|home| home.join("smolvm")));
+    if explicit_data_dir.is_none() {
+        if let Some(data_dir) = &data_dir {
+            // SmolVM 1.8.x ignores SMOLVM_DATA_DIR on macOS and derives its
+            // registry from HOME. Keep each Preloop home isolated while still
+            // leaving an explicit operator registry untouched.
+            #[cfg(target_os = "macos")]
+            if let Some(preloop_home) = effective_preloop_home() {
+                env.push((
+                    "HOME".to_owned(),
+                    preloop_home.join("smolvm-home").into_os_string(),
+                ));
+            }
+            env.push((
+                "SMOLVM_DATA_DIR".to_owned(),
+                data_dir.clone().into_os_string(),
+            ));
+        }
+    }
+
+    // HOME may be isolated above, so preserve the host installation assets
+    // explicitly for the child SmolVM process. Official installs keep the
+    // agent rootfs inside the SmolVM data directory, so probe that first,
+    // then the historical `~/.smolvm` location.
+    if std::env::var_os("SMOLVM_AGENT_ROOTFS").is_none() {
+        let mut candidates = Vec::new();
+        if let Some(data_dir) = &data_dir {
+            candidates.push(data_dir.join("agent-rootfs"));
+        }
+        if let Some(home) = host_home.as_ref() {
+            candidates.push(home.join(".smolvm/agent-rootfs"));
+        }
+        if let Some(path) = candidates.into_iter().find(|path| path.is_dir()) {
+            env.push(("SMOLVM_AGENT_ROOTFS".to_owned(), path.into_os_string()));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut candidates = Vec::new();
+        if let Some(path) = std::env::var_os("SMOLVM_LIB_DIR") {
+            candidates.push(PathBuf::from(path));
+        }
+        if let Some(binary) = binary {
+            let resolved = binary
+                .canonicalize()
+                .ok()
+                .or_else(|| binary.is_absolute().then(|| binary.to_path_buf()));
+            if let Some(parent) = resolved.and_then(|path| path.parent().map(Path::to_path_buf)) {
+                candidates.push(parent.join("lib"));
+            }
+        }
+        if let Some(home) = host_home {
+            candidates.push(home.join(".smolvm/lib"));
+        }
+        let Some(lib_dir) = candidates
+            .into_iter()
+            .find(|path| path.join("libkrunfw.5.dylib").is_file())
+        else {
+            return env;
+        };
+        let mut paths = vec![lib_dir];
+        if let Some(existing) = std::env::var_os("DYLD_LIBRARY_PATH") {
+            paths.extend(std::env::split_paths(&existing));
+        }
+        if let Ok(loader_path) = std::env::join_paths(paths) {
+            env.push(("DYLD_LIBRARY_PATH".to_owned(), loader_path));
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = binary;
+    }
+    env
+}
+
+/// Add the bundled SmolVM libraries to boot-capable child commands on macOS.
+///
+/// The macOS release binary dynamically loads `libkrunfw.5.dylib` from the
+/// adjacent `.smolvm/lib` directory, but the binary has no rpath and the
+/// bootstrap process does not inherit a loader path from the installer.
+/// Without this, `machine create` succeeds and every subsequent VM start
+/// fails at the Hypervisor.framework boundary. An explicit `SMOLVM_LIB_DIR`
+/// wins; otherwise use the resolved binary's sibling directory or the
+/// standard per-user install location.
+/// Directories derived from the effective Preloop home that must exist before
+/// SmolVM starts (it does not create a missing data dir itself).
+fn runtime_dirs_to_create() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if std::env::var_os("SMOLVM_DATA_DIR").is_none() {
+        if let Some(home) = effective_preloop_home() {
+            dirs.push(home.join("smolvm"));
+            #[cfg(target_os = "macos")]
+            dirs.push(home.join("smolvm-home"));
+        }
+    }
+    dirs
+}
+
+/// Add the bundled SmolVM libraries to boot-capable child commands on macOS.
+///
+/// The macOS release binary dynamically loads `libkrunfw.5.dylib` from the
+/// adjacent `.smolvm/lib` directory, but the binary has no rpath and the
+/// bootstrap process does not inherit a loader path from the installer.
+/// Without this, `machine create` succeeds and every subsequent VM start
+/// fails at the Hypervisor.framework boundary. An explicit `SMOLVM_LIB_DIR`
+/// wins; otherwise use the resolved binary's sibling directory or the
+/// standard per-user install location.
+pub fn apply_smolvm_runtime_env(
+    command: &mut std::process::Command,
+    binary: Option<&Path>,
+) -> Result<(), VmError> {
+    for dir in runtime_dirs_to_create() {
+        std::fs::create_dir_all(&dir).map_err(|source| VmError::RuntimeIo { source })?;
+    }
+    for (key, value) in smolvm_runtime_env(binary) {
+        command.env(key, value);
+    }
+    Ok(())
+}
+
+fn apply_smolvm_runtime_env_async(
+    command: &mut Command,
+    binary: Option<&Path>,
+) -> Result<(), VmError> {
+    for dir in runtime_dirs_to_create() {
+        std::fs::create_dir_all(&dir).map_err(|source| VmError::RuntimeIo { source })?;
+    }
+    for (key, value) in smolvm_runtime_env(binary) {
         command.env(key, value);
     }
     Ok(())

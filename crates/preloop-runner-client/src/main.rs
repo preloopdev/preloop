@@ -91,8 +91,13 @@ async fn main() -> anyhow::Result<()> {
     let native_api_token =
         env::var("PRELOOP_SYSTEM_TOKEN").unwrap_or_else(|_| "preloop-system-token".to_owned());
     let cli = Cli::parse();
+    let timeout_seconds = env::var("PRELOOP_CLIENT_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(30);
     let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(timeout_seconds))
         .user_agent("preloop-runner-client")
         .build()?;
 
@@ -166,13 +171,13 @@ async fn main() -> anyhow::Result<()> {
                     .encode(canonical.as_os_str().to_string_lossy().as_bytes());
                 request = request.header("x-preloop-local-workspace", encoded);
             }
-            let response = request
-                .json(&submission)
-                .send()
-                .await?
-                .error_for_status()?
-                .text()
-                .await?;
+            let response = request.json(&submission).send().await?;
+            let status = response.status();
+            let body = response.text().await?;
+            if !status.is_success() {
+                anyhow::bail!("server rejected workflow submission ({status}): {body}");
+            }
+            let response = body;
             println!("{response}");
         }
         Command::Run { run_id } => {
@@ -226,7 +231,7 @@ async fn main() -> anyhow::Result<()> {
             let reusable_workflows =
                 collect_reusable_workflows(workspace_root.as_deref(), &workflow).await?;
             let reusable_workflows =
-                resolve_remote_workflows(reusable_workflows, &workflow_yaml).await?;
+                resolve_remote_workflows(reusable_workflows, &workflow_yaml, &http).await?;
             let expanded =
                 preloop_gha_parser::expand_jobs_with_reusables(&parsed, &reusable_workflows)
                     .with_context(|| format!("expand workflow {}", workflow.display()))?;
@@ -323,10 +328,8 @@ fn same_file_path(left: &std::path::Path, right: &std::path::Path) -> bool {
 async fn resolve_remote_workflows(
     mut workflows: BTreeMap<String, String>,
     root_yaml: &str,
+    client: &reqwest::Client,
 ) -> anyhow::Result<BTreeMap<String, String>> {
-    let client = reqwest::Client::builder()
-        .user_agent("preloop-runner-client")
-        .build()?;
     let token = std::env::var("PRELOOP_GITHUB_TOKEN").ok();
     let mut queue = vec![(root_yaml.to_owned(), 0usize)];
     let mut visited = std::collections::BTreeSet::new();

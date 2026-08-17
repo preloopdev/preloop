@@ -20,6 +20,7 @@ use preloop_vm::{
     MachineName, MachineSpec, MachineState, NetworkPolicy, OutputChunk, SecretSource,
     SmolVmProvider, SocketMount, VmError, VmProvider, VolumeMount,
 };
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -270,16 +271,51 @@ fn default_golden_url(release_version: &str) -> String {
     )
 }
 
+/// Public OCI artifact carrying the official arm64 packed VM golden.
+///
+/// This is deliberately separate from the `runner-images` base-image package:
+/// the latter is an OCI rootfs image, while this package contains a
+/// `.smolmachine` payload ready for `machine create --from`.
+///
+/// Pinned to the immutable manifest digest of the mutable
+/// `ubuntu24-arm64-runner-large-latest` tag (verified reachable 2026-08-17):
+/// a mutable tag could be silently replaced between the manifest fetch and
+/// the blob pull, and moving the default stays a reviewed code change
+/// instead of a registry retag. The artifact is produced by the CI golden
+/// pipeline (pool-side bake of the official ubuntu24-arm64 runner image);
+/// the repo release flow additionally publishes the packed golden as a
+/// GitHub Release asset, which `PRELOOP_GOLDEN_URL` selects over this
+/// default.
+const DEFAULT_GOLDEN_OCI_REF: &str =
+    "ghcr.io/preloopdev/preloop-golden@sha256:a2f7caf367e19efa4cb2d6f32a7093db8fae79e1b1525b65ac1190c1d2b44361";
+
 fn should_download_prebaked_golden(base_image: &str, custom_golden_url: bool) -> bool {
     is_stock_base_image(base_image) || custom_golden_url
 }
 
 async fn download_prebaked_golden(payload: &Path, release_version: &str) -> bool {
-    let default_url = default_golden_url(release_version);
-    let url = std::env::var("PRELOOP_GOLDEN_URL")
+    // An exported-but-blank `PRELOOP_GOLDEN_URL` must behave like an unset
+    // one in both places below: the operator otherwise gets neither the OCI
+    // default nor their (empty) override.
+    let forced_url = std::env::var("PRELOOP_GOLDEN_URL")
         .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or(default_url);
+        .filter(|value| !value.trim().is_empty());
+    if std::env::consts::ARCH == "aarch64" && forced_url.is_none() {
+        let reference = std::env::var("PRELOOP_GOLDEN_OCI_REF")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_GOLDEN_OCI_REF.to_owned());
+        if download_oci_golden(payload, &reference).await {
+            return true;
+        }
+        warn!(
+            reference,
+            "default OCI golden unavailable; trying release asset"
+        );
+    }
+
+    let default_url = default_golden_url(release_version);
+    let url = forced_url.unwrap_or(default_url);
 
     info!(url = %url, target = %payload.display(), "Attempting to download pre-baked golden microVM image");
 
@@ -402,6 +438,237 @@ async fn download_prebaked_golden(payload: &Path, release_version: &str) -> bool
 
     info!(target = %payload.display(), "Downloaded pre-baked golden microVM image successfully");
     true
+}
+
+#[derive(Debug, Deserialize)]
+struct OciManifest {
+    #[serde(default)]
+    layers: Vec<OciLayer>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OciLayer {
+    digest: String,
+    /// OCI descriptors name this field `mediaType`; without the rename every
+    /// standard manifest fails to parse and the OCI path silently falls back
+    /// to the release asset.
+    #[serde(rename = "mediaType")]
+    media_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OciToken {
+    token: String,
+}
+
+/// Download the packed VM layer from a public OCI artifact without requiring
+/// `oras`, Docker, or any other host-side registry client.
+async fn download_oci_golden(payload: &Path, reference: &str) -> bool {
+    let Some((registry, repository, version)) = split_oci_reference(reference) else {
+        warn!(reference, "invalid OCI golden reference");
+        return false;
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(600))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return false,
+    };
+    let manifest_url = format!("https://{registry}/v2/{repository}/manifests/{version}");
+    let accept = "application/vnd.oci.image.manifest.v1+json, \
+                  application/vnd.docker.distribution.manifest.v2+json";
+    let Some(response) = registry_get(&client, &manifest_url, accept).await else {
+        info!(reference, "OCI golden manifest unavailable");
+        return false;
+    };
+    let manifest = match response.json::<OciManifest>().await {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            warn!(reference, %error, "OCI golden manifest parse failed");
+            return false;
+        }
+    };
+    let Some(layer) = manifest
+        .layers
+        .into_iter()
+        .find(|layer| layer.media_type == "application/vnd.preloop.smolmachine.v1+zstd")
+    else {
+        warn!(reference, "OCI golden has no packed VM layer");
+        return false;
+    };
+    let blob_url = format!("https://{registry}/v2/{repository}/blobs/{}", layer.digest);
+    let Some(response) = registry_get(&client, &blob_url, "*/*").await else {
+        return false;
+    };
+    let Some(parent) = payload.parent() else {
+        return false;
+    };
+    let tmp_payload = parent.join(format!(".tmp-golden-{}", uuid::Uuid::new_v4()));
+    if stream_golden_response(response, &tmp_payload, payload, Some(layer.digest)).await {
+        info!(
+            reference,
+            target = %payload.display(),
+            "Downloaded OCI pre-baked golden microVM image successfully"
+        );
+        return true;
+    }
+    let _ = tokio::fs::remove_file(&tmp_payload).await;
+    false
+}
+
+async fn registry_get(
+    client: &reqwest::Client,
+    url: &str,
+    accept: &str,
+) -> Option<reqwest::Response> {
+    let response = client
+        .get(url)
+        .header(reqwest::header::ACCEPT, accept)
+        .send()
+        .await
+        .ok()?;
+    if response.status().is_success() {
+        return Some(response);
+    }
+    if response.status() != reqwest::StatusCode::UNAUTHORIZED {
+        return None;
+    }
+    let challenge = response
+        .headers()
+        .get(reqwest::header::WWW_AUTHENTICATE)?
+        .to_str()
+        .ok()?;
+    let realm = auth_parameter(challenge, "realm")?;
+    let service = auth_parameter(challenge, "service")?;
+    let scope = auth_parameter(challenge, "scope")?;
+    let token = client
+        .get(realm)
+        .query(&[("service", service), ("scope", scope)])
+        .send()
+        .await
+        .ok()?
+        .json::<OciToken>()
+        .await
+        .ok()?;
+    client
+        .get(url)
+        .header(reqwest::header::ACCEPT, accept)
+        .bearer_auth(token.token)
+        .send()
+        .await
+        .ok()
+        .filter(|response| response.status().is_success())
+}
+
+fn auth_parameter(challenge: &str, name: &str) -> Option<String> {
+    challenge.split(',').find_map(|part| {
+        let (key, value) = part.trim().split_once('=')?;
+        (key.trim()
+            .trim_start_matches("Bearer ")
+            .eq_ignore_ascii_case(name))
+        .then(|| value.trim_matches('"').to_owned())
+    })
+}
+
+fn split_oci_reference(reference: &str) -> Option<(String, String, String)> {
+    let (registry, remainder) = reference.split_once('/')?;
+    let (repository, version) = remainder
+        .rsplit_once('@')
+        .or_else(|| remainder.rsplit_once(':'))?;
+    if registry.is_empty() || repository.is_empty() || version.is_empty() {
+        return None;
+    }
+    Some((
+        registry.to_owned(),
+        repository.to_owned(),
+        version.to_owned(),
+    ))
+}
+
+/// zstd-decode the bare `+zstd` layer frame `compressed` into `payload`.
+///
+/// The published `application/vnd.preloop.smolmachine.v1+zstd` layer is a
+/// zstd frame wrapping the `.smolmachine` sidecar; `machine create --from`
+/// reads the sidecar container (stub + compressed assets + manifest +
+/// footer) directly, so the layer must be decoded before it is installed.
+fn decompress_golden_layer(compressed: &Path, payload: &Path) -> std::io::Result<()> {
+    let input = std::fs::File::open(compressed)?;
+    let mut output = std::fs::File::create(payload)?;
+    zstd::stream::copy_decode(input, &mut output)
+}
+
+/// Stream the OCI layer to a temporary file, verify its digest against the
+/// manifest descriptor, then zstd-decode it into the final payload. The
+/// digest check runs against the compressed bytes the layer was published
+/// under; only a digest-verified layer is ever decompressed.
+async fn stream_golden_response(
+    response: reqwest::Response,
+    compressed_tmp: &Path,
+    payload: &Path,
+    expected_sha256: Option<String>,
+) -> bool {
+    let mut file = match tokio::fs::File::create(compressed_tmp).await {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else {
+            let _ = tokio::fs::remove_file(compressed_tmp).await;
+            return false;
+        };
+        if file.write_all(&chunk).await.is_err() {
+            let _ = tokio::fs::remove_file(compressed_tmp).await;
+            return false;
+        }
+    }
+    if file.flush().await.is_err() {
+        let _ = tokio::fs::remove_file(compressed_tmp).await;
+        return false;
+    }
+    drop(file);
+    if let Some(expected) = expected_sha256 {
+        let digest = match tokio::task::spawn_blocking({
+            let path = compressed_tmp.to_owned();
+            move || {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                let mut file = std::fs::File::open(path)?;
+                std::io::copy(&mut file, &mut hasher)?;
+                Ok::<String, std::io::Error>(format!("{:x}", hasher.finalize()))
+            }
+        })
+        .await
+        {
+            Ok(Ok(digest)) => digest,
+            _ => return false,
+        };
+        let expected = expected.strip_prefix("sha256:").unwrap_or(&expected);
+        if digest != expected {
+            warn!(expected, %digest, "OCI golden layer digest mismatch");
+            return false;
+        }
+    }
+    let decoded = tokio::task::spawn_blocking({
+        let compressed = compressed_tmp.to_owned();
+        let target = payload.to_owned();
+        move || decompress_golden_layer(&compressed, &target)
+    })
+    .await;
+    let _ = tokio::fs::remove_file(compressed_tmp).await;
+    match decoded {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            warn!(%error, target = %payload.display(), "OCI golden layer decompression failed");
+            let _ = tokio::fs::remove_file(payload).await;
+            false
+        }
+        Err(_) => {
+            let _ = tokio::fs::remove_file(payload).await;
+            false
+        }
+    }
 }
 
 /// First whitespace-separated token of a `sha256sum`-style checksum file
@@ -4009,6 +4276,62 @@ chmod +x "$destination/bin/node"
         let url = default_golden_url("9.8.7");
         assert!(url.contains("/releases/download/v9.8.7/"), "{url}");
         assert!(!url.contains(env!("CARGO_PKG_VERSION")), "{url}");
+    }
+
+    #[test]
+    fn default_oci_golden_reference_targets_arm64_pack() {
+        let (registry, repository, version) =
+            split_oci_reference(DEFAULT_GOLDEN_OCI_REF).expect("valid OCI reference");
+        assert_eq!(registry, "ghcr.io");
+        assert_eq!(repository, "preloopdev/preloop-golden");
+        // Immutable digest pin: changing the default must be a reviewed code
+        // change, not a registry retag.
+        assert!(
+            version.len() == "sha256:".len() + 64 && version.starts_with("sha256:"),
+            "expected a digest-pinned default, got `{version}`"
+        );
+    }
+
+    #[test]
+    fn oci_layer_deserializes_camel_case_media_type() {
+        let manifest: OciManifest = serde_json::from_str(
+            r#"{"layers":[{"digest":"sha256:00","mediaType":"application/vnd.preloop.smolmachine.v1+zstd"}]}"#,
+        )
+        .expect("standard OCI manifest must parse");
+        let layer = manifest
+            .layers
+            .into_iter()
+            .find(|layer| layer.media_type == "application/vnd.preloop.smolmachine.v1+zstd")
+            .expect("packed VM layer present");
+        assert_eq!(layer.digest, "sha256:00");
+    }
+
+    #[test]
+    fn golden_layer_decompression_roundtrip() {
+        let bytes: &[u8] = b"smolpack payload";
+        let compressed = zstd::stream::encode_all(bytes, 3).expect("compress");
+        let dir = std::env::temp_dir().join(format!("golden-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let compressed_path = dir.join("layer.zst");
+        let payload_path = dir.join("payload.smolmachine");
+        std::fs::write(&compressed_path, compressed).expect("write");
+        decompress_golden_layer(&compressed_path, &payload_path).expect("decode");
+        let decoded = std::fs::read(&payload_path).expect("read");
+        assert_eq!(decoded, bytes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oci_auth_challenge_parameters_parse() {
+        let challenge = r#"Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:preloopdev/preloop-golden:pull""#;
+        assert_eq!(
+            auth_parameter(challenge, "realm").as_deref(),
+            Some("https://ghcr.io/token")
+        );
+        assert_eq!(
+            auth_parameter(challenge, "scope").as_deref(),
+            Some("repository:preloopdev/preloop-golden:pull")
+        );
     }
 
     #[test]
