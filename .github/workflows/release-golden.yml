@@ -252,11 +252,13 @@ jobs:
             docker pull "$BASE_IMAGE"
             echo "Saving base image to $IMAGE_TAR..."
             docker save "$BASE_IMAGE" -o "$IMAGE_TAR"
+            docker rmi "$BASE_IMAGE" >/dev/null 2>&1 || true
           fi
           test -s "$IMAGE_TAR"
 
           export PRELOOP_REQUIRE_BASE_DIGEST=1
           export PRELOOP_RUNNER_BASE_IMAGE="$IMAGE_TAR"
+          export SMOLVM_MAX_IMAGE_BYTES=34359738368
           # The official runner snapshot extracts to ~60 GB; the bake VM must
           # be larger than the stock 20 GiB default.
           export PRELOOP_RUNNER_STORAGE_GB=120
