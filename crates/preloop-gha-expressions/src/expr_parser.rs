@@ -55,8 +55,11 @@ impl Parser {
 
     fn parse_or(&mut self) -> Result<Expr, ExpressionError> {
         let mut expr = self.parse_and()?;
+        let mut chain_depth = 0;
         while matches!(self.current(), Token::Or) {
             self.advance();
+            self.enter()?;
+            chain_depth += 1;
             let right = self.parse_and()?;
             expr = Expr::Binary {
                 op: BinaryOp::Or,
@@ -64,13 +67,17 @@ impl Parser {
                 right: Box::new(right),
             };
         }
+        self.depth -= chain_depth;
         Ok(expr)
     }
 
     fn parse_and(&mut self) -> Result<Expr, ExpressionError> {
         let mut expr = self.parse_eq()?;
+        let mut chain_depth = 0;
         while matches!(self.current(), Token::And) {
             self.advance();
+            self.enter()?;
+            chain_depth += 1;
             let right = self.parse_eq()?;
             expr = Expr::Binary {
                 op: BinaryOp::And,
@@ -78,11 +85,13 @@ impl Parser {
                 right: Box::new(right),
             };
         }
+        self.depth -= chain_depth;
         Ok(expr)
     }
 
     fn parse_eq(&mut self) -> Result<Expr, ExpressionError> {
         let mut expr = self.parse_unary()?;
+        let mut chain_depth = 0;
         loop {
             let op = match self.current() {
                 Token::Eq => BinaryOp::Eq,
@@ -94,6 +103,8 @@ impl Parser {
                 _ => break,
             };
             self.advance();
+            self.enter()?;
+            chain_depth += 1;
             let right = self.parse_unary()?;
             expr = Expr::Binary {
                 op,
@@ -101,6 +112,7 @@ impl Parser {
                 right: Box::new(right),
             };
         }
+        self.depth -= chain_depth;
         Ok(expr)
     }
 

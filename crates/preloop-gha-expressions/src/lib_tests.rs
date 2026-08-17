@@ -623,4 +623,19 @@ mod official_semantics {
         let negated = format!("{}true", "!".repeat(200));
         assert!(eval_bool(&negated, &Context::default()).unwrap());
     }
+
+    #[test]
+    fn deeply_nested_binary_chains_error_instead_of_overflowing() {
+        for operator in ["||", "&&", "=="] {
+            let mut expr = "true".to_owned();
+            for _ in 0..1_000 {
+                expr.push_str(operator);
+                expr.push_str("true");
+            }
+            assert!(
+                matches!(validate_expression(&expr), Err(ExpressionError::TooDeep(_))),
+                "operator chain should be depth-limited: {operator}"
+            );
+        }
+    }
 }
