@@ -47,7 +47,14 @@ pub fn try_expand_matrix_spec(
     job_id: &str,
     spec: &MatrixSpec,
 ) -> Result<Vec<MatrixCombination>, crate::ParserError> {
-    if cartesian_count(spec) > MAX_MATRIX_COMBINATIONS {
+    let cartesian = cartesian_count(spec);
+    // `expand_matrix_spec` preallocates the cartesian rows plus every
+    // include-only candidate. Reject the upper bound before it can allocate
+    // an attacker-sized vector, even when the cartesian product itself is
+    // small.
+    if cartesian > MAX_MATRIX_COMBINATIONS
+        || cartesian.saturating_add(spec.include.len()) > MAX_MATRIX_COMBINATIONS
+    {
         return Err(crate::ParserError::MatrixTooLarge {
             job_id: job_id.to_owned(),
             limit: MAX_MATRIX_COMBINATIONS,
