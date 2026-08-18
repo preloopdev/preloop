@@ -54,6 +54,17 @@ fn format_argument_evaluation_has_an_expression_wide_budget() {
 }
 
 #[test]
+fn evaluation_budget_counts_container_and_null_overhead() {
+    let mut context = Context::default();
+    context.insert("values", Value::Array(vec![Value::Null; 300_000]));
+
+    assert!(matches!(
+        eval_expression("values", &context),
+        Err(ExpressionError::EvaluationTooLarge(_))
+    ));
+}
+
+#[test]
 fn evaluates_context_and_functions() {
     let mut context = Context::default();
     context.insert("github", json!({"event_name": "push"}));

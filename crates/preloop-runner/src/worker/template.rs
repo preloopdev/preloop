@@ -370,7 +370,16 @@ mod tests {
         let mut ctx = make_ctx();
         ctx.insert("env", serde_json::json!({"BIG": "A".repeat(600_000)}));
 
-        assert!(evaluate_template("${{ format('{0}{0}', env.BIG) }}", &ctx).is_err());
-        assert!(evaluate_condition("format('{0}{0}', env.BIG)", &ctx).is_err());
+        let template_error =
+            evaluate_template("${{ format('{0}{0}', env.BIG) }}", &ctx).unwrap_err();
+        assert!(matches!(
+            template_error.downcast_ref::<preloop_gha_expressions::ExpressionError>(),
+            Some(preloop_gha_expressions::ExpressionError::FormatOutputTooLarge(_))
+        ));
+        let condition_error = evaluate_condition("format('{0}{0}', env.BIG)", &ctx).unwrap_err();
+        assert!(matches!(
+            condition_error.downcast_ref::<preloop_gha_expressions::ExpressionError>(),
+            Some(preloop_gha_expressions::ExpressionError::FormatOutputTooLarge(_))
+        ));
     }
 }

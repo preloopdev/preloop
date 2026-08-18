@@ -1,5 +1,6 @@
 use serde_json::Value;
 use std::borrow::Cow;
+use std::io::Write;
 
 use super::{
     ast::{BinaryOp, Expr},
@@ -78,6 +79,10 @@ pub(super) struct EvalBudget {
 }
 
 impl EvalBudget {
+    fn remaining(&self) -> usize {
+        MAX_EVALUATED_VALUE_BYTES.saturating_sub(self.used_bytes)
+    }
+
     fn charge(&mut self, value: &Value) -> Result<(), ExpressionError> {
         self.used_bytes = self.used_bytes.checked_add(value_size(value)).ok_or(
             ExpressionError::EvaluationTooLarge(MAX_EVALUATED_VALUE_BYTES),
@@ -101,7 +106,10 @@ fn value_size(value: &Value) -> usize {
         Value::Number(_) => 32,
         Value::String(value) => 24 + value.len(),
         Value::Array(values) => {
-            24 + values.iter().map(|value| 16 + value_size(value)).sum::<usize>()
+            24 + values
+                .iter()
+                .map(|value| 16 + value_size(value))
+                .sum::<usize>()
         }
         Value::Object(values) => values
             .iter()
@@ -116,8 +124,17 @@ pub(super) fn eval(
     budget: &mut EvalBudget,
 ) -> Result<Value, ExpressionError> {
     let value = match expr {
-        Expr::Literal(value) => Ok(value.clone()),
-        Expr::Path(path) => Ok(context.resolve(path)),
+        Expr::Literal(value) => {
+            budget.charge(value)?;
+            return Ok(value.clone());
+        }
+        Expr::Path(path) => {
+            if let Some(value) = context.resolve_ref(path) {
+                budget.charge(value)?;
+                return Ok(value.clone());
+            }
+            Ok(context.resolve(path))
+        }
         Expr::UnaryNot(expr) => Ok(Value::Bool(!is_truthy(&eval(expr, context, budget)?))),
         Expr::Binary { op, left, right } => match op {
             BinaryOp::Or => {
@@ -341,12 +358,12 @@ fn eval_call(
                 .to_ascii_lowercase()
                 .ends_with(&string_arg(&values, 1).to_ascii_lowercase()),
         )),
-        "format" => format_args(&values).map(Value::String),
+        "format" => format_args(&values, budget).map(Value::String),
         "fromjson" => Ok(values
             .first()
             .and_then(|value| serde_json::from_str(&string_value(value)).ok())
             .unwrap_or(Value::Null)),
-        "join" => join_args(&values).map(Value::String),
+        "join" => join_args(&values, budget).map(Value::String),
         "hashfiles" => hash_files(&values, context).map(Value::String),
         "tojson" => Ok(Value::String(
             serde_json::to_string(values.first().unwrap_or(&Value::Null)).unwrap_or_default(),
@@ -403,6 +420,52 @@ fn string_value_cow(value: &Value) -> Cow<'_, str> {
     }
 }
 
+struct CappedJsonWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl Write for CappedJsonWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let remaining = self.limit.saturating_sub(self.bytes.len());
+        if bytes.len() > remaining {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "serialized value exceeds evaluation budget",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn string_value_capped<'a>(
+    value: &'a Value,
+    limit: usize,
+) -> Result<Cow<'a, str>, ExpressionError> {
+    match value {
+        Value::String(value) => Ok(Cow::Borrowed(value)),
+        Value::Null => Ok(Cow::Borrowed("")),
+        Value::Bool(value) => Ok(Cow::Owned(value.to_string())),
+        Value::Number(value) => Ok(Cow::Owned(string_value(&Value::Number(value.clone())))),
+        other => {
+            let mut writer = CappedJsonWriter {
+                bytes: Vec::with_capacity(limit.min(256)),
+                limit,
+            };
+            serde_json::to_writer(&mut writer, other)
+                .map_err(|_| ExpressionError::EvaluationTooLarge(MAX_EVALUATED_VALUE_BYTES))?;
+            let value = String::from_utf8(writer.bytes)
+                .map_err(|_| ExpressionError::EvaluationTooLarge(MAX_EVALUATED_VALUE_BYTES))?;
+            Ok(Cow::Owned(value))
+        }
+    }
+}
+
 /// Cap on the output of `format()`.
 ///
 /// Nested `format()` calls multiply output per level — each `{0}{0}{0}`
@@ -412,17 +475,26 @@ fn string_value_cow(value: &Value) -> Cow<'_, str> {
 /// usage.
 const MAX_FORMAT_OUTPUT_BYTES: usize = 1024 * 1024;
 
-fn push_capped(output: &mut String, segment: &str) -> Result<(), ExpressionError> {
+fn push_format_capped(
+    output: &mut String,
+    segment: &str,
+    budget: &EvalBudget,
+) -> Result<(), ExpressionError> {
     if segment.len() > MAX_FORMAT_OUTPUT_BYTES - output.len() {
         return Err(ExpressionError::FormatOutputTooLarge(
             MAX_FORMAT_OUTPUT_BYTES,
+        ));
+    }
+    if segment.len() > budget.remaining().saturating_sub(output.len()) {
+        return Err(ExpressionError::EvaluationTooLarge(
+            MAX_EVALUATED_VALUE_BYTES,
         ));
     }
     output.push_str(segment);
     Ok(())
 }
 
-fn format_args(values: &[Value]) -> Result<String, ExpressionError> {
+fn format_args(values: &[Value], budget: &EvalBudget) -> Result<String, ExpressionError> {
     let format = string_value_cow(values.first().unwrap_or(&Value::Null));
     let bytes = format.as_bytes();
     let mut output = String::with_capacity(format.len().min(MAX_FORMAT_OUTPUT_BYTES));
@@ -432,9 +504,9 @@ fn format_args(values: &[Value]) -> Result<String, ExpressionError> {
     while index < bytes.len() {
         match bytes[index] {
             b'{' => {
-                push_capped(&mut output, &format[segment_start..index])?;
+                push_format_capped(&mut output, &format[segment_start..index], budget)?;
                 if bytes.get(index + 1) == Some(&b'{') {
-                    push_capped(&mut output, "{")?;
+                    push_format_capped(&mut output, "{", budget)?;
                     index += 2;
                     segment_start = index;
                     continue;
@@ -463,42 +535,44 @@ fn format_args(values: &[Value]) -> Result<String, ExpressionError> {
                     .get(argument_index + 1)
                     .ok_or_else(|| ExpressionError::InvalidFormat(format.to_string()))?;
                 let rendered = string_value_cow(value);
-                push_capped(&mut output, rendered.as_ref())?;
+                push_format_capped(&mut output, rendered.as_ref(), budget)?;
                 index = cursor + 1;
                 segment_start = index;
             }
             b'}' => {
-                push_capped(&mut output, &format[segment_start..index])?;
+                push_format_capped(&mut output, &format[segment_start..index], budget)?;
                 if bytes.get(index + 1) != Some(&b'}') {
                     return Err(ExpressionError::InvalidFormat(format.into_owned()));
                 }
-                push_capped(&mut output, "}")?;
+                push_format_capped(&mut output, "}", budget)?;
                 index += 2;
                 segment_start = index;
             }
             _ => index += 1,
         }
     }
-    push_capped(&mut output, &format[segment_start..])?;
+    push_format_capped(&mut output, &format[segment_start..], budget)?;
     Ok(output)
 }
 
-fn join_args(values: &[Value]) -> Result<String, ExpressionError> {
-    let separator = string_value_cow(values.get(1).unwrap_or(&Value::Null));
+fn join_args(values: &[Value], budget: &EvalBudget) -> Result<String, ExpressionError> {
+    let separator = string_value_capped(values.get(1).unwrap_or(&Value::Null), budget.remaining())?;
     let mut output = String::new();
     match values.first() {
         Some(Value::Array(values)) => {
             for (index, value) in values.iter().enumerate() {
                 if index > 0 {
-                    push_evaluation_capped(&mut output, separator.as_ref())?;
+                    push_evaluation_capped(&mut output, separator.as_ref(), budget)?;
                 }
-                let rendered = string_value_cow(value);
-                push_evaluation_capped(&mut output, rendered.as_ref())?;
+                let rendered =
+                    string_value_capped(value, budget.remaining().saturating_sub(output.len()))?;
+                push_evaluation_capped(&mut output, rendered.as_ref(), budget)?;
             }
         }
         Some(value) => {
-            let rendered = string_value_cow(value);
-            push_evaluation_capped(&mut output, rendered.as_ref())?;
+            let rendered =
+                string_value_capped(value, budget.remaining().saturating_sub(output.len()))?;
+            push_evaluation_capped(&mut output, rendered.as_ref(), budget)?;
         }
         None => {}
     }
@@ -508,8 +582,9 @@ fn join_args(values: &[Value]) -> Result<String, ExpressionError> {
 fn push_evaluation_capped(
     output: &mut String,
     segment: &str,
+    budget: &EvalBudget,
 ) -> Result<(), ExpressionError> {
-    if segment.len() > MAX_EVALUATED_VALUE_BYTES.saturating_sub(output.len()) {
+    if segment.len() > budget.remaining().saturating_sub(output.len()) {
         return Err(ExpressionError::EvaluationTooLarge(
             MAX_EVALUATED_VALUE_BYTES,
         ));
