@@ -1,5 +1,82 @@
 use super::*;
 
+/// Per-job live console feed buffer.
+///
+/// The ingestion paths (the live-log WebSocket and the `TimeLineWebConsoleLog`
+/// POST) are driven by authenticated runners, but a long-lived or hung job can
+/// stream output for hours, so the retained history is capped by byte size
+/// instead of growing without bound for the job's lifetime. Oldest wrappers
+/// are dropped past the cap — mid-job SSE viewers see the retained tail, and
+/// the durable step-log blob remains the source of truth for full logs. A
+/// single wrapper larger than the whole budget is dropped outright: storing it
+/// would evict the entire existing tail for one batch, and broadcasting it
+/// would amplify across every subscriber.
+#[derive(Clone)]
+pub(crate) struct LiveLogBuffer {
+    pub(crate) lines: VecDeque<LiveLogFeedLinesWrapper>,
+    bytes: usize,
+    max_bytes: usize,
+}
+
+impl LiveLogBuffer {
+    /// Default per-job cap on retained live feed bytes. The accounting covers
+    /// the wrapper struct, the step id, and every line string (header plus
+    /// bytes), so it bounds heap use regardless of wrapper shape.
+    pub(crate) const DEFAULT_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+    pub(crate) fn new(max_bytes: usize) -> Self {
+        Self {
+            lines: VecDeque::new(),
+            bytes: 0,
+            max_bytes,
+        }
+    }
+
+    pub(crate) fn total_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Append a wrapper, tail-dropping the oldest wrappers once the byte cap
+    /// is exceeded. Returns `false` (storing nothing) when a single wrapper
+    /// exceeds the whole budget.
+    pub(crate) fn push(&mut self, wrapper: LiveLogFeedLinesWrapper) -> bool {
+        let size = Self::wrapper_bytes(&wrapper);
+        if size > self.max_bytes {
+            return false;
+        }
+        self.bytes += size;
+        self.lines.push_back(wrapper);
+        while self.bytes > self.max_bytes {
+            if let Some(oldest) = self.lines.pop_front() {
+                self.bytes -= Self::wrapper_bytes(&oldest);
+            }
+        }
+        true
+    }
+
+    fn wrapper_bytes(wrapper: &LiveLogFeedLinesWrapper) -> usize {
+        std::mem::size_of::<LiveLogFeedLinesWrapper>()
+            + wrapper.step_id.len()
+            + wrapper.value.len() * std::mem::size_of::<String>()
+            + wrapper.value.iter().map(|line| line.len()).sum::<usize>()
+    }
+}
+
+impl Default for LiveLogBuffer {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_MAX_BYTES)
+    }
+}
+
+impl IntoIterator for LiveLogBuffer {
+    type Item = LiveLogFeedLinesWrapper;
+    type IntoIter = std::collections::vec_deque::IntoIter<LiveLogFeedLinesWrapper>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.lines.into_iter()
+    }
+}
+
 pub(crate) async fn live_logs_sse(
     State(shared): State<Arc<SharedState>>,
     Path((run_id, job_id)): Path<(RunId, String)>,
@@ -137,7 +214,90 @@ pub(crate) async fn record_live_log_wrapper(
         let tx = live_log_sender(&mut inner, job_id);
         (lines_arc, tx)
     };
-    // Push and broadcast under per-job lock only.
-    job_lines.lock().await.push(wrapper.clone());
-    let _ = tx.send(wrapper);
+    // Push and broadcast under per-job lock only. An oversized batch is
+    // dropped from both the retained buffer and the live fan-out, so one
+    // pathological frame cannot evict the tail or amplify across subscribers.
+    let stored = job_lines.lock().await.push(wrapper.clone());
+    if stored {
+        let _ = tx.send(wrapper);
+    } else {
+        warn!(%job_id, "dropping live log batch exceeding per-job buffer cap");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wrapper(step_id: &str, line: &str) -> LiveLogFeedLinesWrapper {
+        LiveLogFeedLinesWrapper {
+            step_id: step_id.to_string(),
+            start_line: 1,
+            count: 1,
+            value: vec![line.to_string()],
+        }
+    }
+
+    #[test]
+    fn buffer_tail_drops_oldest_wrappers_past_cap() {
+        // One wrapper's accounted size: struct (64) + step id + String header
+        // (24) + line bytes.
+        let one = wrapper("a", "hello");
+        let size = LiveLogBuffer::wrapper_bytes(&one);
+        assert_eq!(size, 64 + 1 + 24 + 5);
+
+        let mut buffer = LiveLogBuffer::new(size + 10);
+        assert!(buffer.push(wrapper("a", "hello")));
+        assert_eq!(buffer.lines.len(), 1);
+        assert_eq!(buffer.total_bytes(), size);
+
+        // Second wrapper pushes the total over the cap; the oldest is dropped.
+        assert!(buffer.push(wrapper("b", "hello")));
+        assert_eq!(buffer.lines.len(), 1);
+        assert_eq!(buffer.lines[0].step_id, "b");
+        assert_eq!(buffer.total_bytes(), size);
+
+        // Eviction continues until the buffer fits inside the cap.
+        let mut buffer = LiveLogBuffer::new(size * 2 + 5);
+        assert!(buffer.push(wrapper("a", "hello")));
+        assert!(buffer.push(wrapper("b", "hello")));
+        assert!(buffer.push(wrapper("c", "hello")));
+        assert_eq!(buffer.lines.len(), 2);
+        assert_eq!(buffer.lines[0].step_id, "b");
+        assert_eq!(buffer.lines[1].step_id, "c");
+        assert_eq!(buffer.total_bytes(), size * 2);
+    }
+
+    #[test]
+    fn buffer_rejects_wrapper_larger_than_whole_budget() {
+        let mut buffer = LiveLogBuffer::new(100);
+        assert!(buffer.push(wrapper("a", "hello")));
+
+        let oversized = LiveLogFeedLinesWrapper {
+            step_id: "huge".to_string(),
+            start_line: 1,
+            count: 1,
+            value: vec!["x".repeat(200)],
+        };
+        assert!(!buffer.push(oversized));
+        assert_eq!(buffer.lines.len(), 1);
+        assert_eq!(buffer.lines[0].step_id, "a");
+    }
+
+    #[test]
+    fn buffer_clones_preserve_retained_tail() {
+        let mut buffer =
+            LiveLogBuffer::new(LiveLogBuffer::wrapper_bytes(&wrapper("a", "hello")) + 10);
+        buffer.push(wrapper("a", "hello"));
+        buffer.push(wrapper("b", "hello"));
+        assert_eq!(buffer.lines.len(), 1);
+
+        let snapshot = buffer.clone();
+        assert_eq!(snapshot.lines.len(), 1);
+        assert_eq!(snapshot.lines[0].step_id, "b");
+        assert_eq!(snapshot.total_bytes(), buffer.total_bytes());
+
+        let replayed: Vec<String> = snapshot.into_iter().map(|w| w.step_id).collect();
+        assert_eq!(replayed, vec!["b".to_string()]);
+    }
 }

@@ -2276,11 +2276,11 @@ async fn live_log_websocket_accepts_bearer_and_stores_lines() {
                 let inner = state.inner.lock().await;
                 if let Some(job_lines) = inner.live_log_lines.get("job-live") {
                     let wrappers = job_lines.lock().await;
-                    if wrappers.len() == 1 {
-                        assert_eq!(wrappers[0].step_id, "step-1");
-                        assert_eq!(wrappers[0].start_line, 1);
-                        assert_eq!(wrappers[0].count, 2);
-                        assert_eq!(wrappers[0].value, vec!["hello", "world"]);
+                    if wrappers.lines.len() == 1 {
+                        assert_eq!(wrappers.lines[0].step_id, "step-1");
+                        assert_eq!(wrappers.lines[0].start_line, 1);
+                        assert_eq!(wrappers.lines[0].count, 2);
+                        assert_eq!(wrappers.lines[0].value, vec!["hello", "world"]);
                         break;
                     }
                 }
@@ -2361,8 +2361,8 @@ async fn live_log_websocket_survives_malformed_payload() {
             let inner = state.inner.lock().await;
             if let Some(job_lines) = inner.live_log_lines.get("job-malformed") {
                 let wrappers = job_lines.lock().await;
-                if wrappers.len() == 1 {
-                    assert_eq!(wrappers[0].value, vec!["survived"]);
+                if wrappers.lines.len() == 1 {
+                    assert_eq!(wrappers.lines[0].value, vec!["survived"]);
                     break;
                 }
             }

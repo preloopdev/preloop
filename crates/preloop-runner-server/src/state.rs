@@ -1099,8 +1099,7 @@ pub(crate) struct InnerState {
     /// Persisted timeline records keyed by `{plan_id}/{timeline_id}`.
     /// Upserted on each PATCH; returned by GET.
     pub(crate) timeline_records: BTreeMap<String, BTreeMap<uuid::Uuid, azdo::TimelineRecord>>,
-    pub(crate) live_log_lines:
-        BTreeMap<String, Arc<tokio::sync::Mutex<Vec<LiveLogFeedLinesWrapper>>>>,
+    pub(crate) live_log_lines: BTreeMap<String, Arc<tokio::sync::Mutex<LiveLogBuffer>>>,
     pub(crate) live_log_tx: BTreeMap<String, broadcast::Sender<LiveLogFeedLinesWrapper>>,
     pub(crate) inflight_requests: BTreeMap<i64, (RunId, JobId)>,
     pub(crate) job_requests: BTreeMap<i64, TaskAgentJobRequestRecord>,
