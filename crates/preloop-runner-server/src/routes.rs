@@ -389,7 +389,14 @@ pub(crate) fn build_app(
         .route("/api/v1/scheduler/history", get(get_scheduler_history))
         .route(
             "/api/v1/github/webhooks",
-            post(github::handle_github_webhook),
+            post(github::handle_github_webhook)
+                // GitHub's own webhook cap is 25 MiB; without an explicit
+                // limit axum's 2 MiB default aborts the connection mid-body,
+                // which the sender sees as a reset/broken pipe and retries
+                // blindly. Set the limit above GitHub's ceiling so real
+                // deliveries pass and oversized input gets a deterministic
+                // 413 instead of a severed connection.
+                .layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
         .route("/api/v1/github/register", get(github::github_register))
         .route("/api/v1/github/callback", get(github::github_callback))
@@ -547,10 +554,12 @@ pub(crate) fn build_app(
         )
         .route(
             "/api/v1/runners",
-            post(register_runner_native).route_layer(middleware::from_fn_with_state(
-                shared.clone(),
-                require_native_bearer,
-            )),
+            post(register_runner_native)
+                .get(list_runners_native)
+                .route_layer(middleware::from_fn_with_state(
+                    shared.clone(),
+                    require_native_bearer,
+                )),
         )
         .route(
             "/api/v1/runners/purge",

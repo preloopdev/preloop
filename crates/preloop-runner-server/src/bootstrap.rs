@@ -341,6 +341,32 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
 
     drop(inner);
 
+    // Liveness sweep: a session that stops polling is a deaf runner — its
+    // in-guest control bridge died (e.g. the guest network was not up at
+    // fork and the bridge gave up). Purge it so the unfinished job goes
+    // back on the queue for a fresh machine instead of sitting in_progress
+    // until the 45-minute job lease fails it, and so the pool stops handing
+    // the dead machine new jobs. Restored sessions from a restart have no
+    // last-seen entry and are deliberately skipped here (the runner
+    // re-registers and polls, or the lease reaper bounds them).
+    let stale_runners: std::collections::BTreeSet<i64> = {
+        let inner = shared.state.inner.lock().await;
+        let now = std::time::Instant::now();
+        inner
+            .session_last_seen
+            .iter()
+            .filter(|(_, seen)| now.duration_since(**seen) > inner.runner_liveness_timeout)
+            .filter_map(|(session_id, _)| inner.runner_id_for_session(session_id))
+            .collect()
+    };
+    for runner_id in stale_runners {
+        warn!(
+            runner_id,
+            "liveness sweep: reaping deaf runner (no poll within timeout)"
+        );
+        purge_runner_identity(shared, runner_id).await;
+    }
+
     // Notify if cancellations or starvation failures occurred
     if cancellation_count > 0 || !starved.is_empty() {
         shared.state.message_notify.notify_waiters();

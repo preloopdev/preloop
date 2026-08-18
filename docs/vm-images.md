@@ -188,7 +188,78 @@ preloop serve
 Provisioning currently assumes an Ubuntu 24.04 or 22.04 userspace and uses
 `apt-get`. Use a workflow `container:` image for another distribution.
 
+### Verifying a base image's provenance
+
+For enterprise use, `build-golden` can refuse to bake from a base image whose
+provenance does not check out. The dump-style images published by the
+snapshot pipeline carry Sigstore keyless signatures plus in-toto attestations
+(SLSA provenance and an SPDX SBOM), all signed by the publishing workflow's
+GitHub Actions OIDC identity and stored as OCI referrers in GHCR; they are
+verified before the golden is built:
+
+```sh
+PRELOOP_VERIFY_BASE_IMAGE=1 \
+PRELOOP_VERIFY_BASE_IMAGE_REPO=acme/runner-image-blobs \
+preloop build-golden --base-image 'ghcr.io/acme/runner-images@sha256:<digest>' ...
+```
+
+`cosign` must be installed on the build host. The signature identity
+is pinned to the publishing repository's `dump.yml` workflow on the default
+branch; override with `PRELOOP_BASE_IMAGE_IDENTITY_REGEXP` if the publishing
+workflow differs. A mirror that signs with a long-lived key instead of
+keyless OIDC can set `PRELOOP_BASE_IMAGE_PUBKEY` to the public key file;
+verification then uses `cosign verify --key` rather than the identity check.
+
+### Golden provenance
+
+The stock base in `versions.toml` is served from `mirror.gcr.io`, Google's
+cache of the Docker Official Ubuntu image. It is not a Google-built Ubuntu
+image. The release workflow resolves the pinned digest, records the selected
+platform manifest and its OCI attestation descriptors, and preserves the
+upstream SPDX SBOM beside the golden. The cache is useful for availability and
+rate-limit avoidance; the digest and the upstream image metadata are the
+provenance inputs.
+
+Each release golden then receives:
+
+1. a SHA-256 checksum;
+2. a Cosign keyless blob signature (`<golden>.bundle`);
+3. a GitHub SLSA provenance attestation over the golden, the base evidence,
+   the upstream SBOM, and a signed provenance manifest;
+4. a `<golden>.provenance.json` record binding the golden hash to the exact
+   base index/platform digest and release workflow.
+
+Verify the golden's two independent signatures from an online build host:
+
+```sh
+cosign verify-blob \
+  --bundle preloop-ubuntu-24.04-aarch64.bundle \
+  --certificate-identity-regexp \
+    '^https://github.com/preloopdev/preloop/.github/workflows/release-golden.yml@refs/(heads/main|tags/)' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  preloop-ubuntu-24.04-aarch64
+
+gh attestation verify \
+  preloop-ubuntu-24.04-aarch64 \
+  --repo preloopdev/preloop
+```
+
+Release builds require the base to be digest-pinned with
+`PRELOOP_REQUIRE_BASE_DIGEST=1`. This protects the golden cache and the
+provenance record from mutable image tags. The stock image's attached SPDX
+SBOM is evidence about the upstream input; it is not treated as a Google
+signature or as a substitute for the Preloop golden attestation.
+
 ### Using a snapshot of the official hosted image
+
+Since v0.30.3 the release golden is baked directly from the official
+GitHub-hosted runner image snapshot (republished as OCI by the
+[preloopdev/runner-image-blobs](https://github.com/preloopdev/runner-image-blobs)
+dump pipeline, then scanned, signed, and SLSA-attested before the floating tag
+advances). The release assets (`preloop-ubuntu-24.04-x86_64` and its
+`.provenance.json` / `.base-sbom.spdx.json` / `.bundle` sidecars) are therefore
+the official runner image with the Preloop runner baked in — no extra
+provisioning needed.
 
 GitHub's hosted runner images are not published as OCI images, but the
 community [runner-image-blobs](https://github.com/ChristopherHX/runner-image-blobs)
@@ -210,7 +281,6 @@ PRELOOP_USE_PACKED_GOLDEN=false \
 PRELOOP_RUNNER_STORAGE_GB=80 \
 preloop serve
 ```
-
 Cold provisioning pulls the OCI image and bakes the runner baseline into each
 new VM (`PRELOOP_RUNNER_STORAGE_GB=80` covers the ~60 GB extracted snapshot).
 That works, but the official snapshots are large (about 20 GB compressed,
@@ -284,9 +354,13 @@ by the build:
 | Key                                                     | What it pins                                                                     | Bump when                                                               |
 | ------------------------------------------------------- | -------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
 | `runner_version`                                        | Official `actions/runner` protocol target (currently `2.336.0`)                  | Upstream runner changes protocol surface                                |
+| `smolvm_min_version`                                    | SmolVM runtime floor `preloop update --ensure-runtime` accepts and upgrades from | A future SmolVM drops a capability preloop needs (rare, human-driven)   |
+| `smolvm_golden_version`                                 | SmolVM release the golden workflow builds with                                    | Upstream ships a newer stable (Renovate opens a bump PR, `smolvm-release-verify` gates it) |
 | `github_runner_image_version`                           | Official `actions/runner-images` Ubuntu 24.04 snapshot used as the parity source | Refreshing the hosted-image parity bake list                            |
 | `ubuntu_24_04_base`                                     | Base image by digest (`ubuntu:24.04@sha256:…`)                                   | You want a newer OS snapshot — always bump the digest, never a bare tag |
 | `ubuntu_22_04_base`                                     | Second pinned base                                                               | Same                                                                    |
+| `official_runner_image_base_amd64`                      | Official GitHub-hosted runner image OCI reference for the x86_64 golden         | Bump the digest after re-running `runner-image-blobs` attestation and verifying the new digest |
+| `official_runner_image_base_arm64`                      | Official GitHub-hosted runner image OCI reference for the aarch64 golden         | Same as above                                                           |
 | `node_version`                                          | Node baked as the runner's externals                                             | A workflow needs a newer default Node                                   |
 | `node20_externals_version` / `node24_externals_version` | Additional Node externals                                                        | Same                                                                    |
 | `rustup_version`                                        | Rustup used to install baked Rust toolchains                                     | Toolchain bootstrap changes                                             |
@@ -296,6 +370,26 @@ by the build:
 The protocol target (`runner_version`) and the VM image are independent:
 the image always runs *our* runner; `runner_version` is the fidelity oracle
 that `runner-watch` compares against.
+
+The SmolVM pins are independent the same way and tracked with the same
+tooling: Renovate (`renovate.json`) watches the `actions/runner` and
+`smol-machines/smolvm` releases via the `github-releases` datasource and
+opens bump PRs against `versions.toml`. Runner bumps enter the
+watch → diff → triage → conform pipeline (`docs/conformance.md`). SmolVM
+golden bumps are gated by `.github/workflows/smolvm-release-verify.yml`,
+which installs the candidate on the `smolvm-host` and boots a real microVM
+with it (create → start → exec → delete, including a `--mount-socket`
+mount) before merge — a green run also blesses the updater's automatic
+latest-stable adoption of that release. `smolvm_min_version` is deliberately
+not auto-bumped: it is a capability floor, not a tracked release.
+
+The job runs on Renovate's `smolvm_golden_version` bump PRs (head branches
+`renovate/**`) and manual dispatches, and needs a `smolvm-host`-labeled
+self-hosted runner (KVM on Linux or Hypervisor.framework on macOS) with
+`SMOLVM_VERIFY_HOST_WORKSPACE` set on the repo; the host needs registry
+access for the pinned Ubuntu base. Renovate auto-merges smolvm golden bumps
+once the verify check and `ci.yml` pass — the merge gate is Renovate's
+auto-merge, not branch protection.
 
 `versions.toml` defines Preloop's compiled distribution defaults. It is not a
 per-install user configuration file. Operators select custom OCI bases and
@@ -456,3 +550,71 @@ fetches `index.docker.io` means the running CLI has an older compiled pin or
   `mirror.gcr.io/library/ubuntu:24.04@sha256:...`, not a bare
   `ubuntu:24.04@sha256:...`.
 
+### Building the official-runner-image golden on Apple Silicon
+
+The official GitHub-hosted runner image (`ubuntu24-runner-large`, published
+per-arch to `ghcr.io/preloopdev/runner-images` by the runner-image-blobs
+fork) is tens of GiB and declares `USER=runner`. Building a golden from it
+locally exercises several smolvm/preloop sharp edges that a stock Ubuntu
+base never hits. All were fixed in smolvm's `src/cli/internal_boot.rs`,
+`src/cli/machine.rs`, `src/pack_export.rs`, `crates/smolvm-agent/src/…`, and
+`crates/preloop-cli`/`preloop-vm`; the notes below describe the failure each
+one produced so a regression is recognizable.
+
+- **`krun_start_enter returned: -22 (EINVAL)` — `Building the microVM failed:
+  Internal(Vm(VmSetup(VmCreate)))`**: the `smolvm` binary was re-signed with
+  an ad-hoc identity that dropped the `com.apple.security.hypervisor`
+  entitlement, so `hv_vm_create` returns `HV_UNSUPPORTED`. Re-sign with the
+  entitlement:
+  ```sh
+  cat > /tmp/hv.entitlements <<'EOF'
+  <?xml version="1.0" encoding="UTF-8"?>
+  <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+  <plist version="1.0"><dict>
+    <key>com.apple.security.hypervisor</key><true/>
+  </dict></plist>
+  EOF
+  codesign --force --sign - --entitlements /tmp/hv.entitlements ~/.smolvm/smolvm-bin
+  ```
+  Sanity-check with a tiny C probe calling `hv_vm_create` (returns 0 only
+  when the entitlement is present).
+- **Disk stays 20 GiB while the record says 120 GiB**: smolvm's
+  `open_or_create_at` never resizes an existing raw disk, and a machine
+  recreated under the same name reuses the same hash dir. A large flatten
+  then fills the small disk, and the guest surfaces the failure as
+  `io operation failed: Resource temporarily unavailable (os error 35)`.
+  `internal_boot.rs::open_boot_disk` now grows the raw disk to the requested
+  size (`set_len`; the guest `resize2fs` expands the ext4 at boot).
+- **Machine created with default resources despite `--mem/--storage`**:
+  `machine create` treats everything after `--` as the workload, so any flag
+  appended after the keep-alive workload (`-- /bin/sh -c sleep infinity`) is
+  silently swallowed — the machine boots with 8192 MiB / 20 GiB and no
+  network. The workload must be the *last* positional: preloop now emits
+  every flag before `--`.
+- **`unknown variant \`flatten_layers\`` during pack**: the pack binary and
+  the guest agent's protocol disagree. The agent in
+  `~/.smolvm/agent-rootfs/usr/local/bin/` must be rebuilt from the *same*
+  checkout as the CLI (`cargo zigbuild --profile release-small -p smolvm-agent
+  --target aarch64-unknown-linux-musl`) and copied into the rootfs.
+- **`read file: guest streamed N bytes, exceeding the 4294967296 byte cap`**:
+  pack export streams multi-GiB flattened layers, but the general 4 GiB
+  file-transfer cap applies unless raised. preloop sets
+  `SMOLVM_FILE_TRANSFER_MAX_BYTES=64GiB` on the pack command.
+- **`mkdir: cannot create directory '/var/lib/preloop-runner': Permission
+  denied` during the bake**: the official image declares `USER=runner`, and
+  `machine exec` runs as the image's declared user. The exec path now
+  accepts `--user` (added to smolvm's `ExecCmd`) and preloop passes
+  `--user root` for bake commands.
+- **Packed layer contains `archive.tar`, not a rootfs (no `/bin/sh`)**:
+  a `local:<hash>` machine's cache dir holds the *archive*, not the
+  flattened rootfs. The pack export must flatten from the machine's own
+  storage (`image-archives/packed_layers/0000_rootfs`), not the cache dir;
+  `pack_export.rs` now sources the base that way for archive machines.
+- **`crun create` hangs then fails with EAGAIN**: never pipe crun's stderr
+  in the agent (`crun.rs` keeps `Stdio::null()`); capturing it for debugging
+  makes the two-step `crun create` deadlock.
+- **Disk fills from stale machine dirs**: a failed create can leak
+  `~/Library/Caches/smolvm/vms/<hash>/storage.raw` sparse files that a later
+  `machine delete` does not reclaim. When the host reports "No space left on
+  device" or flaky EAGAINs appear, prune the vms cache and verify free space
+  with `df -h /System/Volumes/Data`.

@@ -4,7 +4,7 @@ use anyhow::Context;
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
-use preloop_gha_protocol::{ExecutionStatus, NdjsonEvent, RunAccepted, WorkflowSubmission};
+use preloop_gha_protocol::{ExecutionStatus, NdjsonEvent, RunAccepted, RunId, WorkflowSubmission};
 use preloop_orchestrator::environment::{is_stock_base_image, DEFAULT_BASE_IMAGE};
 use preloop_orchestrator::{artifact_payload, RunnerPool, RunnerPoolConfig};
 use preloop_vm::SmolVmProvider;
@@ -85,6 +85,81 @@ pub(crate) fn preloop_home() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".preloop")))
         .unwrap_or_else(|| PathBuf::from(".preloop"))
+}
+
+/// A `smolvm` command carrying Preloop's Linux VM-sandbox environment.
+///
+/// Direct `machine exec`/`cp`/`shell` calls can implicitly boot or restart a
+/// stopped machine — upstream's exec path connects to the machine, starting
+/// it when needed, and `machine shell` does the same — so these spawns must
+/// carry the exact seccomp/Landlock/cgroup environment the VM provider
+/// applies to its own boots. This is the single chokepoint for them; the
+/// policy lives in [`preloop_vm::smolvm_sandbox_env`] and is a no-op on
+/// macOS, matching the provider.
+pub(crate) fn smolvm_command() -> anyhow::Result<std::process::Command> {
+    let mut command = std::process::Command::new("smolvm");
+    // The service unit pins `SMOLVM_DATA_DIR=<PRELOOP_HOME>/smolvm`
+    // (see crates/preloop-cli/src/server_install.rs), so the engine records
+    // its machines in that registry. A separately invoked `preloop shell` /
+    // `preloop debug` must consult the SAME registry or it cannot find the
+    // paused, service-owned machine. `apply_smolvm_runtime_env` fills the
+    // same gap from the effective Preloop home (and isolates `HOME` on macOS,
+    // where SmolVM ignores `SMOLVM_DATA_DIR`); an operator value still wins.
+    preloop_vm::apply_smolvm_runtime_env(&mut command, None)?;
+    preloop_vm::apply_smolvm_sandbox_env(&mut command)?;
+    Ok(command)
+}
+
+#[cfg(test)]
+pub(crate) static SMOLVM_PATH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// A fake `smolvm` on PATH that records the sandbox environment it was given
+/// and answers the debug-session byte-count probe. Serialized with
+/// [`SMOLVM_PATH_LOCK`]: `PATH` is process-global and the debug-session and
+/// shell tests run in the same binary.
+#[cfg(test)]
+pub(crate) fn fake_smolvm_on_path() -> (tempfile::TempDir, PathBuf) {
+    let directory = tempfile::tempdir().unwrap();
+    let executable = directory.path().join("smolvm");
+    std::fs::write(
+        &executable,
+        r##"#!/bin/sh
+printf 'SMOLVM_SECCOMP=%s\n' "${SMOLVM_SECCOMP-}" > "$0.seccomp"
+printf 'SMOLVM_LANDLOCK=%s\n' "${SMOLVM_LANDLOCK-}" > "$0.landlock"
+printf 'SMOLVM_CGROUP_ROOT=%s\n' "${SMOLVM_CGROUP_ROOT-}" > "$0.cgroup"
+printf 'SMOLVM_DATA_DIR=%s\n' "${SMOLVM_DATA_DIR-}" > "$0.datadir"
+case "$*" in
+  *"wc -c"*) printf '12345\n' ;;
+esac
+exit 0
+"##,
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+    use std::os::unix::fs::PermissionsExt;
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&executable, permissions).unwrap();
+    (directory, executable)
+}
+
+/// Run `test` with a fake `smolvm` first on PATH, restoring PATH afterwards.
+#[cfg(test)]
+pub(crate) fn with_fake_smolvm_path<T>(test: impl FnOnce(&PathBuf) -> T) -> T {
+    let _guard = SMOLVM_PATH_LOCK.blocking_lock();
+    let (directory, executable) = fake_smolvm_on_path();
+    let previous = std::env::var_os("PATH");
+    let mut path = directory.path().as_os_str().to_owned();
+    path.push(":");
+    if let Some(previous) = &previous {
+        path.push(previous);
+    }
+    std::env::set_var("PATH", path);
+    let result = test(&executable);
+    match previous {
+        Some(previous) => std::env::set_var("PATH", previous),
+        None => std::env::remove_var("PATH"),
+    }
+    result
 }
 
 #[derive(Debug, Parser)]
@@ -437,11 +512,38 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
     } else {
         std::env::current_dir()?.join(args.output)
     };
+    // Enterprise option: verify the base image's provenance before baking.
+    // Dump-style base images carry a GitHub-signed SLSA attestation and a
+    // cosign keyless signature from the publishing workflow; a golden should
+    // only be built from an attested base. Opt in with:
+    //   PRELOOP_VERIFY_BASE_IMAGE=1 PRELOOP_VERIFY_BASE_IMAGE_REPO=<owner/repo>
+    if std::env::var_os("PRELOOP_VERIFY_BASE_IMAGE")
+        .is_some_and(|value| value != "0" && value != "false")
+    {
+        verify_base_image(&args.base_image).await?;
+    }
+    if env_flag("PRELOOP_REQUIRE_BASE_DIGEST", false) {
+        require_digest_pinned_base(&args.base_image)?;
+    }
     let config = RunnerPoolConfig {
         size: 1,
         use_fork: false,
         use_packed_artifact: false,
-        name_prefix: "preloop-release-golden".into(),
+        // Unique per bake: smolvm keys a machine's data dir by a hash of its
+        // name and reuses a dir left behind by a failed/interrupted run at its
+        // old on-disk size (smolvm#956). A stale dir then boots with the
+        // previous, smaller storage disk, so a large bake runs out of space
+        // mid-extraction with a confusing "Resource temporarily unavailable".
+        // A fresh name per run forces a fresh disk at the requested size.
+        name_prefix: std::env::var("PRELOOP_GOLDEN_NAME_PREFIX")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| {
+                // A constant fallback would make repeated local bakes reuse
+                // the same machine name (and its hash dir), defeating the
+                // fresh-disk guarantee above. Per-invocation suffix instead.
+                format!("preloop-release-golden-{}", std::process::id())
+            }),
         base_image: args.base_image,
         workspace: args.workspace.or_else(|| std::env::current_dir().ok()),
         artifact_stem: output.clone(),
@@ -472,7 +574,13 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         runner_key_dir: None,
         pending_jobs: None,
         preload_images: Vec::new(),
-        runner_user: None,
+        // The golden bake provisions the image (runner install, apt, service
+        // files); it must run as root. The official runner image declares
+        // USER=runner, so the machine's default exec user is not root.
+        runner_user: std::env::var("PRELOOP_RUNNER_USER")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .or_else(|| Some("root".to_owned())),
         runner_uid: None,
         next_job_runs_on: None,
         pending_registrations: None,
@@ -515,6 +623,105 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         output.display()
     );
     println!("{}", output.display());
+    Ok(())
+}
+
+/// Verify a registry base image's provenance before baking a golden from it.
+///
+/// The dump pipeline's images carry cosign keyless signatures and in-toto
+/// attestations (SLSA provenance + SPDX SBOM), signed by the publishing
+/// workflow's OIDC identity. A mirror can instead publish signatures under a
+/// long-lived key and point `PRELOOP_BASE_IMAGE_PUBKEY` at the public key
+/// file; `gh attestation verify` only understands GitHub-API attestations
+/// (attest-build-provenance), which the dump does not produce, so verification
+/// is cosign-based.
+///
+/// `cosign` must be installed on the build host. `PRELOOP_VERIFY_BASE_IMAGE`
+/// enables the check; `PRELOOP_VERIFY_BASE_IMAGE_REPO` names the repository
+/// that publishes the base image; `PRELOOP_BASE_IMAGE_IDENTITY_REGEXP`
+/// overrides the default certificate identity match.
+async fn verify_base_image(base_image: &str) -> anyhow::Result<()> {
+    let repo = std::env::var("PRELOOP_VERIFY_BASE_IMAGE_REPO").context(
+        "PRELOOP_VERIFY_BASE_IMAGE=1 requires PRELOOP_VERIFY_BASE_IMAGE_REPO=<owner/repo>",
+    )?;
+    if !base_image.contains('/') || base_image.starts_with('.') || base_image.starts_with('/') {
+        anyhow::bail!("base image `{base_image}` is not a registry reference; nothing to verify");
+    }
+    require_digest_pinned_base(base_image)?;
+    verify_base_image_with(&repo, base_image)
+}
+
+fn verify_base_image_with(repo: &str, base_image: &str) -> anyhow::Result<()> {
+    let identity = std::env::var("PRELOOP_BASE_IMAGE_IDENTITY_REGEXP").unwrap_or_else(|_| {
+        format!(
+            "^https://github.com/{repo}/.github/workflows/(dump|attest-local)\\.yml@refs/heads/"
+        )
+    });
+    // The dump pipeline's images carry cosign signatures and in-toto
+    // attestations (SLSA provenance + SPDX SBOM). They are keyless-signed by
+    // the publishing workflow's OIDC identity; a mirror can instead publish
+    // signatures under a long-lived key and point PRELOOP_BASE_IMAGE_PUBKEY
+    // at the public key file. `gh attestation verify` only understands
+    // GitHub-API attestations (attest-build-provenance), which the dump does
+    // not produce, so verification is cosign-based.
+    let key = std::env::var("PRELOOP_BASE_IMAGE_PUBKEY").ok();
+    let identity_args: Vec<&str> = match &key {
+        Some(_) => vec![],
+        None => vec![
+            "--certificate-identity-regexp",
+            &identity,
+            "--certificate-oidc-issuer",
+            "https://token.actions.githubusercontent.com",
+        ],
+    };
+    let mut verify_args: Vec<&str> = vec!["verify", base_image];
+    if let Some(key) = &key {
+        verify_args.extend(["--key", key]);
+    }
+    verify_args.extend(identity_args.iter().copied());
+    run_verifier("cosign", &verify_args, "cosign signature")?;
+    let mut attest_args: Vec<&str> = vec!["verify-attestation", base_image, "--type", "spdx"];
+    if let Some(key) = &key {
+        attest_args.extend(["--key", key]);
+    }
+    attest_args.extend(identity_args.iter().copied());
+    run_verifier("cosign", &attest_args, "cosign SPDX SBOM attestation")
+}
+
+fn require_digest_pinned_base(base_image: &str) -> anyhow::Result<()> {
+    // Packed artifacts and local paths are already immutable inputs; this
+    // policy applies to registry references only. Release workflows enable
+    // this before baking so a mutable tag cannot silently become the golden's
+    // input after the provenance sidecars were captured.
+    if base_image.starts_with('.')
+        || base_image.starts_with('/')
+        || std::path::Path::new(base_image).exists()
+    {
+        return Ok(());
+    }
+    let digest = base_image
+        .split_once("@sha256:")
+        .map(|(_, digest)| digest)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "base image `{base_image}` must use an immutable @sha256:<digest> reference"
+            )
+        })?;
+    anyhow::ensure!(
+        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "base image `{base_image}` has an invalid sha256 digest"
+    );
+    Ok(())
+}
+
+fn run_verifier(binary: &str, args: &[&str], what: &str) -> anyhow::Result<()> {
+    let status = std::process::Command::new(binary)
+        .args(args)
+        .status()
+        .with_context(|| format!("failed to run `{binary}`; is it installed?"))?;
+    if !status.success() {
+        anyhow::bail!("{what} verification failed for the base image (exit {status})");
+    }
     Ok(())
 }
 
@@ -872,6 +1079,15 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
                 }
             }
             let pool_shutdown = shutdown.clone();
+            // Supervisor-side, once, before any VM boots: systemd's
+            // `Delegate=cpu memory pids` chowns this unit's cgroup subtree but
+            // leaves `cgroup.subtree_control` empty, so a `vm-<pid>` leaf would
+            // get no cpu/memory/pids limit files. This performs the same
+            // vacate-then-enable dance `smolvm serve` does. It is the only
+            // place Preloop writes to the cgroup hierarchy — the CLI paths
+            // (`preloop shell`, debug-session `machine exec`/`cp`) resolve the
+            // root read-only and never mutate it.
+            preloop_vm::init_vm_cgroup_delegation();
             Some(tokio::spawn(async move {
                 RunnerPool::new(std::sync::Arc::new(SmolVmProvider::default()), config)?
                     .run(pool_shutdown)
@@ -1456,7 +1672,9 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     if let Some(token) = api_token() {
         request = request.bearer_auth(token);
     }
-    let response = request.send().await?;
+    let response = request.send().await.with_context(|| {
+        format!("cannot reach control plane at {url}; is `preloop serve` running?")
+    })?;
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
@@ -1486,6 +1704,13 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     // explanation, so the first poll failure is reported instead of being
     // folded into "no session".
     let mut poll_warned = false;
+    // Warn once (not every backpressure tick) when the control plane is
+    // unreachable or no registered runner can claim the queued jobs, so a
+    // queued run does not stream `still waiting` forever without the one
+    // fact that explains it. The check is repeated while a claimable runner
+    // exists (one can die between ticks) and latches only once a warning
+    // actually prints.
+    let mut runner_warned = false;
     // Set when the run loop leaves through the debug prompt (abort, detach,
     // or a session error). The run is not terminal in those cases — the job
     // is paused and reattachable — so the generic conclusion below must not
@@ -1504,7 +1729,9 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         if let Some(token) = api_token() {
             events_request = events_request.bearer_auth(token);
         }
-        let events_response = events_request.send().await?;
+        let events_response = events_request.send().await.with_context(|| {
+            format!("cannot reach control plane at {url}; is `preloop serve` still running?")
+        })?;
         if !events_response.status().is_success() {
             let status = events_response.status();
             let body = events_response.text().await.unwrap_or_default();
@@ -1579,6 +1806,40 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                                          {paused_total} debug session(s) paused on the server \
                                          (preloop debug <id> to inspect)"
                                     );
+                                    if !runner_warned {
+                                        match runner_capacity(&client, &url, accepted.run_id).await
+                                        {
+                                            Ok(Some((queued, claimable)))
+                                                if queued > 0 && claimable == 0 =>
+                                            {
+                                                runner_warned = true;
+                                                eprintln!(
+                                                    "[preloop] warning: no registered runner on \
+                                                     {url} can claim the queued jobs (their \
+                                                     `runs-on:` labels match no runner). If \
+                                                     `preloop serve` is still provisioning its \
+                                                     runner pool this is expected; otherwise the \
+                                                     jobs will never start — register a runner \
+                                                     with matching labels."
+                                                );
+                                            }
+                                            // A claimable runner exists (or nothing
+                                            // runner-bound is queued): keep checking on
+                                            // later ticks instead of latching a premature
+                                            // "all quiet" state.
+                                            Ok(_) => {}
+                                            Err(error) => {
+                                                runner_warned = true;
+                                                eprintln!(
+                                                    "[preloop] warning: cannot determine runner \
+                                                     availability on {url} ({error:#}); older \
+                                                     control plane without /api/v1/runners or a \
+                                                     transient error. Queued jobs may still \
+                                                     start if a runner is registered."
+                                                );
+                                            }
+                                        }
+                                    }
                                     last_backpressure = std::time::Instant::now();
                                 }
                             }
@@ -1706,6 +1967,52 @@ fn same_file_path(left: &std::path::Path, right: &std::path::Path) -> bool {
     match (left.canonicalize(), right.canonicalize()) {
         (Ok(left), Ok(right)) => left == right,
         _ => left == right,
+    }
+}
+
+/// Registered-runner capacity for a run's queued jobs, when the control
+/// plane supports the run-scoped runners query.
+///
+/// Returns `(queued, claimable)`: the run's ready-queue job count, and how
+/// many registered runners could claim at least one of them (the same
+/// `job_matches_runner` predicate the scheduler dispatches with). `None`
+/// when the server ignores `run_id` and returns the plain list — the caller
+/// then falls back to the raw count so a zero-runner control plane still
+/// gets the warning.
+async fn runner_capacity(
+    client: &reqwest::Client,
+    url: &str,
+    run_id: RunId,
+) -> anyhow::Result<Option<(usize, usize)>> {
+    let mut request = client.get(format!("{url}/api/v1/runners?run_id={run_id}"));
+    if let Some(token) = api_token() {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await?;
+    if !response.status().is_success() {
+        anyhow::bail!("server returned {}", response.status());
+    }
+    let body: serde_json::Value = response.json().await?;
+    match (
+        body.get("queued").and_then(serde_json::Value::as_u64),
+        body.get("claimable").and_then(serde_json::Value::as_u64),
+    ) {
+        (Some(queued), Some(claimable)) => Ok(Some((queued as usize, claimable as usize))),
+        // Older server (or one ignoring the query): only the raw count is
+        // available. When count is zero, represent that as 0 claimable runners
+        // for the queued jobs so the dead-pool warning fires. When count > 0,
+        // treat runners as claimable (optimistic fallback).
+        _ => {
+            let count = body
+                .get("count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            if count == 0 {
+                Ok(Some((1, 0)))
+            } else {
+                Ok(Some((count, count)))
+            }
+        }
     }
 }
 
@@ -2073,6 +2380,13 @@ async fn cmd_shell(args: ShellArgs) -> anyhow::Result<()> {
     eprintln!("[preloop] Connecting to preserved VM: {machine_name}");
     eprintln!("[preloop] Exit the shell to release the VM.");
 
+    // Build the smolvm command BEFORE claiming the marker: an invalid
+    // sandbox override makes this fail, and the marker claim + heartbeat
+    // below must not exist yet when it does — otherwise the preserved VM
+    // would stay marked ACTIVE (and the heartbeat would keep touching the
+    // marker) until the orchestrator's idle timeout, with nobody attached.
+    let mut command = crate::smolvm_command()?;
+
     // Claim the session before starting so the orchestrator stops counting down.
     let _ = std::fs::write(&marker, preloop_orchestrator::DEBUG_MARKER_ACTIVE);
 
@@ -2089,8 +2403,10 @@ async fn cmd_shell(args: ShellArgs) -> anyhow::Result<()> {
         }
     });
 
-    // Run smolvm machine shell interactively.
-    let status = std::process::Command::new("smolvm")
+    // Run smolvm machine shell interactively. The shell boots a stopped
+    // machine, so the sandbox environment applies exactly as for a provider
+    // spawn.
+    let status = command
         .args(["machine", "shell", "--name", &machine_name])
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
@@ -2215,6 +2531,17 @@ mod tests {
             "ghcr.io/acme/runner-images:ubuntu24-runner-large-latest-arm64"
         );
         assert_eq!(args.storage_gib, Some(80));
+    }
+
+    #[test]
+    fn base_digest_policy_rejects_mutable_registry_references() {
+        assert!(require_digest_pinned_base(
+            "mirror.gcr.io/library/ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90"
+        )
+        .is_ok());
+        assert!(require_digest_pinned_base("/tmp/preloop.smolmachine").is_ok());
+        assert!(require_digest_pinned_base("ghcr.io/acme/base:latest").is_err());
+        assert!(require_digest_pinned_base("ghcr.io/acme/base@sha256:not-a-digest").is_err());
     }
 
     #[test]
@@ -2723,11 +3050,75 @@ mod tests {
 
     #[test]
     fn shell_explicit_ref() {
-        let cli = parse(&["shell", "run-42"]).unwrap();
+        let cli = parse(&["shell", "0"]).unwrap();
         let Command::Shell(args) = cli.command else {
             panic!("expected Shell");
         };
-        assert_eq!(args.run_ref.unwrap(), "run-42");
+        assert_eq!(args.run_ref.as_deref(), Some("0"));
+    }
+
+    /// `preloop shell` spawns `smolvm machine shell`, which boots a stopped
+    /// machine — the sandbox environment must reach it exactly like a
+    /// provider spawn. The observable contract is the environment of the
+    /// spawned process.
+    #[tokio::test]
+    async fn shell_spawn_carries_the_sandbox_environment() {
+        let _guard = crate::SMOLVM_PATH_LOCK.lock().await;
+        let (directory, executable) = crate::fake_smolvm_on_path();
+        let previous_path = std::env::var_os("PATH");
+        let previous_home = std::env::var_os("PRELOOP_HOME");
+        let mut path = directory.path().as_os_str().to_owned();
+        path.push(":");
+        if let Some(previous) = &previous_path {
+            path.push(previous);
+        }
+        std::env::set_var("PATH", path);
+
+        let home = tempfile::tempdir().unwrap();
+        let debug_dir = home.path().join("state/debug");
+        std::fs::create_dir_all(&debug_dir).unwrap();
+        std::fs::write(debug_dir.join("preloop-runner-0-1"), "claimed").unwrap();
+        std::env::set_var("PRELOOP_HOME", home.path());
+
+        let result = cmd_shell(ShellArgs {
+            run_ref: Some("preloop-runner-0-1".to_owned()),
+        })
+        .await;
+
+        match previous_home {
+            Some(previous) => std::env::set_var("PRELOOP_HOME", previous),
+            None => std::env::remove_var("PRELOOP_HOME"),
+        }
+        match previous_path {
+            Some(previous) => std::env::set_var("PATH", previous),
+            None => std::env::remove_var("PATH"),
+        }
+        result.unwrap();
+
+        let read = |suffix: &str| {
+            std::fs::read_to_string(executable.with_extension(suffix))
+                .unwrap()
+                .trim()
+                .to_owned()
+        };
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(read("seccomp"), "SMOLVM_SECCOMP=enforce");
+            assert_eq!(read("landlock"), "SMOLVM_LANDLOCK=enforce");
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(read("seccomp"), "SMOLVM_SECCOMP=");
+            assert_eq!(read("landlock"), "SMOLVM_LANDLOCK=");
+        }
+        // The direct CLI spawn must consult the engine's registry, not the
+        // caller's: pinned to <PRELOOP_HOME>/smolvm, which the unit sets for
+        // the service and this test sets to a temp dir.
+        let data_dir = home.path().join("smolvm");
+        assert_eq!(
+            read("datadir"),
+            format!("SMOLVM_DATA_DIR={}", data_dir.display())
+        );
     }
 
     // -- top-level --

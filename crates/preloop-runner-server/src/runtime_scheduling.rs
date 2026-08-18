@@ -1296,10 +1296,39 @@ pub(crate) fn take_matching_job(
         job_matches_runner_capabilities(job, runner)
             && claim_permitted(inner, job, verified_runner_id)
     };
+    // A registration is paired to one concrete job before it begins polling.
+    // Prefer that fresh binding over takeover candidates whose original owner
+    // missed the claim window. Otherwise an old FIFO job can consume the new
+    // runner, leaving the job it was provisioned for queued and causing stale
+    // restored runs to advance ahead of the run the user just submitted.
+    let assigned_to_this_runner = |job: &QueuedJob| {
+        let Some(runner_id) = verified_runner_id else {
+            return false;
+        };
+        inner
+            .job_assignments
+            .get(&(job.run_id, job.job_id.clone()))
+            .is_some_and(|record| record.runner_id == runner_id && binding_fresh(record.at, now))
+    };
     let pos = inner
         .queue
         .iter()
-        .position(|job| job_labels_covered_exactly(&job.runs_on, &runner.labels) && claimable(job))
+        .position(|job| {
+            assigned_to_this_runner(job)
+                && job_labels_covered_exactly(&job.runs_on, &runner.labels)
+                && claimable(job)
+        })
+        .or_else(|| {
+            inner
+                .queue
+                .iter()
+                .position(|job| assigned_to_this_runner(job) && claimable(job))
+        })
+        .or_else(|| {
+            inner.queue.iter().position(|job| {
+                job_labels_covered_exactly(&job.runs_on, &runner.labels) && claimable(job)
+            })
+        })
         .or_else(|| inner.queue.iter().position(claimable))?;
     let job = inner.queue.remove(pos)?;
     let key = (job.run_id, job.job_id.clone());
@@ -1509,29 +1538,27 @@ pub(crate) fn pair_registered_runner(inner: &mut InnerState, runner_id: i64) {
     // back to the FIFO claim path), a stale mark means that provisioning died
     // before any machine registered — filtering those out is what left
     // long-waiting jobs invisible to the pool.
+    //
+    // Precompute matching queue positions in a single pass over the ready queue
+    // to avoid quadratic scanning under the global state mutex.
+    let queue_positions: std::collections::HashMap<(RunId, JobId), usize> = inner
+        .queue
+        .iter()
+        .enumerate()
+        .filter(|(_, job)| job_matches_runner_capabilities(job, &caps))
+        .map(|(idx, job)| ((job.run_id, job.job_id.clone()), idx))
+        .collect();
+
     let chosen = inner
         .pool_pending
         .iter()
-        .filter(|(key, _)| {
-            inner
-                .queue
-                .iter()
-                .find(|job| job.run_id == key.0 && job.job_id == key.1)
-                .map(|job| job_matches_runner_capabilities(job, &caps))
-                .unwrap_or(false)
+        .filter_map(|(key, at)| {
+            queue_positions
+                .get(key)
+                .map(|&pos| (key, *at, pos))
         })
-        .min_by_key(|(key, at)| {
-            // Several stale bindings can be re-marked with the same `now`.
-            // Use the actual queue position as the tie-breaker instead of
-            // letting BTreeMap key order reorder jobs during replacement.
-            let queue_position = inner
-                .queue
-                .iter()
-                .position(|job| job.run_id == key.0 && job.job_id == key.1)
-                .unwrap_or(usize::MAX);
-            (**at, queue_position)
-        })
-        .map(|(key, _)| key.clone());
+        .min_by_key(|(_, at, pos)| (*at, *pos))
+        .map(|(key, _, _)| key.clone());
     if let Some(key) = chosen {
         // Rebinding to a replacement machine keeps the original first-bound
         // stamp, so repeated provisioning failures cannot extend the window
@@ -1566,7 +1593,7 @@ pub(crate) fn clear_assignment(inner: &mut InnerState, run_id: RunId, job_id: &J
         .any(|job| job.run_id == run_id && job.job_id == *job_id)
 }
 
-fn capabilities_of(runner: &RegisteredRunner) -> RunnerCapabilities {
+pub(crate) fn capabilities_of(runner: &RegisteredRunner) -> RunnerCapabilities {
     RunnerCapabilities {
         known: true,
         labels: runner.labels.clone(),
@@ -2329,6 +2356,10 @@ fn retire_node_requests(
             .session_active_requests
             .retain(|_, &mut rid| rid != request_id);
         inner.inflight_requests.remove(&request_id);
+        // Terminal either way: a settled node stays in the run as a finished
+        // job and a purged one no longer exists, and neither can be claimed
+        // again. The deferred App-token request must not survive either.
+        inner.github_token_requests.remove(&request_id);
         match retirement {
             RequestRetirement::Settle(status) => {
                 if let Some(record) = inner.job_requests.get_mut(&request_id) {
@@ -2338,7 +2369,6 @@ fn retire_node_requests(
                 }
             }
             RequestRetirement::Purge => {
-                inner.github_token_requests.remove(&request_id);
                 let Some(record) = inner.job_requests.remove(&request_id) else {
                     continue;
                 };
@@ -2780,6 +2810,48 @@ mod assignment_tests {
         assert!(
             claimed.is_some(),
             "verified runner must take over the expired strict-mode assignment"
+        );
+    }
+
+    #[test]
+    fn freshly_paired_runner_prefers_its_assignment_over_stale_fifo_work() {
+        let mut inner = InnerState {
+            pool_assignments_enabled: true,
+            require_job_assignments: true,
+            ..Default::default()
+        };
+        let stale_job = test_queued_job("stale");
+        let stale_key = (stale_job.run_id, stale_job.job_id.clone());
+        let assigned_job = test_queued_job("assigned");
+        let assigned_key = (assigned_job.run_id, assigned_job.job_id.clone());
+        inner.queue.push_back(stale_job);
+        inner.queue.push_back(assigned_job);
+
+        let now = std::time::SystemTime::now();
+        inner.job_assignments.insert(
+            stale_key.clone(),
+            AssignmentRecord {
+                runner_id: 40,
+                at: now,
+                first_at: now - CLAIM_BINDING_TTL - std::time::Duration::from_secs(1),
+            },
+        );
+        inner.pool_pending.insert(stale_key, now);
+        inner.job_assignments.insert(
+            assigned_key,
+            AssignmentRecord {
+                runner_id: 41,
+                at: now,
+                first_at: now,
+            },
+        );
+
+        let claimed = take_matching_job(&mut inner, &self_hosted_caps(), Some(41))
+            .expect("the freshly paired runner has a claimable job");
+
+        assert_eq!(
+            claimed.job_id.0, "assigned",
+            "a stale takeover candidate must not displace the runner's fresh assignment"
         );
     }
 

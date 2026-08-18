@@ -34,7 +34,7 @@ Regarding official-image compatibility, we build a curated base image that inclu
 On Apple Silicon, x86_64 goldens also run through Rosetta 2 translation (enabled automatically for every VM). Performance is slightly slower than arm64 native, so prefer arm64 goldens on Apple Silicon when you can. Docker actions are not supported yet on this path: amd64 images inside the VM's Docker lack the Rosetta mount, so they fail with a cryptic `rosetta-wrapper` error.
 
 You can simulate most if not all Github events locally. For some events, you might need to add a payload.
-See [docs/cli_reference.md](docs/cli_reference.md) for more flags you can pass.
+See [docs/cli_reference.md](docs/cli_refernce.md) for more flags you can pass.
 
 To continue with the setup, see GitHub App and PAT credentials, secrets, config file, and the troubleshooting guide: [docs/setup.md](docs/setup.md)
 

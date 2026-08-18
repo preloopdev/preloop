@@ -327,6 +327,20 @@ impl TestEnvVar {
         std::env::set_var(key, value);
         Self { key, previous }
     }
+
+    /// Clear a variable for the duration of a test.
+    ///
+    /// The counterpart to [`TestEnvVar::set`] for tests whose contract is the
+    /// *absence* of a value — a configured `PRELOOP_GITHUB_TOKEN` flips the
+    /// check-run path from its mock to a live GitHub call, so a test asserting
+    /// the mock path has to guarantee no token is visible. Restores on drop,
+    /// so a panicking test cannot leak the cleared state onto the rest of the
+    /// suite.
+    pub(crate) fn unset(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::remove_var(key);
+        Self { key, previous }
+    }
 }
 
 #[cfg(test)]
@@ -599,6 +613,13 @@ impl AppState {
             artifact_v2_registry: registry,
             next_artifact_v2_id: next_id,
             oidc_keypair: Some(oidc_keypair),
+            session_last_seen: BTreeMap::new(),
+            runner_liveness_timeout: std::time::Duration::from_secs(
+                env::var("PRELOOP_RUNNER_LIVENESS_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|raw| raw.trim().parse().ok())
+                    .unwrap_or(1800),
+            ),
             ..Default::default()
         };
         let store = crate::store::open_store(store_url, &state_dir, &local_jwt_key).await?;
@@ -963,6 +984,18 @@ impl InnerState {
             })
             .unwrap_or_default()
     }
+
+    /// Record that a runner session just polled the control plane.
+    ///
+    /// The liveness sweep purges runners whose sessions have not polled
+    /// within [`InnerState::runner_liveness_timeout`]: a session that goes
+    /// silent is a deaf runner (its in-guest control bridge died), and its
+    /// unfinished job must be requeued to a fresh machine instead of sitting
+    /// in_progress until the job-lease reaper fails it 45 minutes later.
+    pub(crate) fn mark_session_seen(&mut self, session_id: &str) {
+        self.session_last_seen
+            .insert(session_id.to_owned(), std::time::Instant::now());
+    }
 }
 
 #[derive(Default)]
@@ -994,6 +1027,15 @@ pub(crate) struct InnerState {
     pub(crate) expanding: BTreeSet<(RunId, JobId)>,
     pub(crate) runners: BTreeMap<i64, RegisteredRunner>,
     pub(crate) sessions: BTreeMap<String, RunnerSession>,
+    /// When each runner session last polled. In-memory only: sessions are
+    /// ephemeral and re-created by runners, so nothing is persisted here.
+    /// Restored sessions from a restart have no entry and are left to the
+    /// job-lease reaper rather than being swept immediately.
+    pub(crate) session_last_seen: BTreeMap<String, std::time::Instant>,
+    /// How long a session may go without polling before the liveness sweep
+    /// purges its runner. Env: `PRELOOP_RUNNER_LIVENESS_TIMEOUT_SECS`
+    /// (default 1800).
+    pub(crate) runner_liveness_timeout: std::time::Duration,
     pub(crate) session_keys: BTreeMap<String, SessionEncryption>,
     // test-only: retained for session encryption integration coverage.
     #[allow(dead_code)]

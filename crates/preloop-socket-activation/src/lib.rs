@@ -46,7 +46,10 @@ pub fn take_tcp_listener() -> anyhow::Result<Option<tokio::net::TcpListener>> {
         listener
             .set_nonblocking(true)
             .context("set systemd listener nonblocking")?;
-        return Ok(Some(tokio::net::TcpListener::from_std(listener)?));
+        // Trailing expression, not `return`: exactly one of these two cfg
+        // blocks is compiled, so on Linux this is the function's tail and a
+        // `return` here trips clippy::needless_return.
+        Ok(Some(tokio::net::TcpListener::from_std(listener)?))
     }
 
     #[cfg(not(target_os = "linux"))]

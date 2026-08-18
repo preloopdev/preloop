@@ -20,6 +20,7 @@ use preloop_vm::{
     MachineName, MachineSpec, MachineState, NetworkPolicy, OutputChunk, SecretSource,
     SmolVmProvider, SocketMount, VmError, VmProvider, VolumeMount,
 };
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -31,7 +32,7 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 const GUEST_CONTROL_DIR: &str = "/run/preloop-control";
 const GUEST_CONTROL_SOCKET: &str = "/run/preloop-control/engine.sock";
@@ -270,16 +271,51 @@ fn default_golden_url(release_version: &str) -> String {
     )
 }
 
+/// Public OCI artifact carrying the official arm64 packed VM golden.
+///
+/// This is deliberately separate from the `runner-images` base-image package:
+/// the latter is an OCI rootfs image, while this package contains a
+/// `.smolmachine` payload ready for `machine create --from`.
+///
+/// Pinned to the immutable manifest digest of the mutable
+/// `ubuntu24-arm64-runner-large-latest` tag (verified reachable 2026-08-17):
+/// a mutable tag could be silently replaced between the manifest fetch and
+/// the blob pull, and moving the default stays a reviewed code change
+/// instead of a registry retag. The artifact is produced by the CI golden
+/// pipeline (pool-side bake of the official ubuntu24-arm64 runner image);
+/// the repo release flow additionally publishes the packed golden as a
+/// GitHub Release asset, which `PRELOOP_GOLDEN_URL` selects over this
+/// default.
+const DEFAULT_GOLDEN_OCI_REF: &str =
+    "ghcr.io/preloopdev/preloop-golden@sha256:a2f7caf367e19efa4cb2d6f32a7093db8fae79e1b1525b65ac1190c1d2b44361";
+
 fn should_download_prebaked_golden(base_image: &str, custom_golden_url: bool) -> bool {
     is_stock_base_image(base_image) || custom_golden_url
 }
 
 async fn download_prebaked_golden(payload: &Path, release_version: &str) -> bool {
-    let default_url = default_golden_url(release_version);
-    let url = std::env::var("PRELOOP_GOLDEN_URL")
+    // An exported-but-blank `PRELOOP_GOLDEN_URL` must behave like an unset
+    // one in both places below: the operator otherwise gets neither the OCI
+    // default nor their (empty) override.
+    let forced_url = std::env::var("PRELOOP_GOLDEN_URL")
         .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or(default_url);
+        .filter(|value| !value.trim().is_empty());
+    if std::env::consts::ARCH == "aarch64" && forced_url.is_none() {
+        let reference = std::env::var("PRELOOP_GOLDEN_OCI_REF")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_GOLDEN_OCI_REF.to_owned());
+        if download_oci_golden(payload, &reference).await {
+            return true;
+        }
+        warn!(
+            reference,
+            "default OCI golden unavailable; trying release asset"
+        );
+    }
+
+    let default_url = default_golden_url(release_version);
+    let url = forced_url.unwrap_or(default_url);
 
     info!(url = %url, target = %payload.display(), "Attempting to download pre-baked golden microVM image");
 
@@ -401,6 +437,214 @@ async fn download_prebaked_golden(payload: &Path, release_version: &str) -> bool
     }
 
     info!(target = %payload.display(), "Downloaded pre-baked golden microVM image successfully");
+    true
+}
+
+#[derive(Debug, Deserialize)]
+struct OciManifest {
+    #[serde(default)]
+    layers: Vec<OciLayer>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OciLayer {
+    digest: String,
+    /// OCI descriptors name this field `mediaType`; without the rename every
+    /// standard manifest fails to parse and the OCI path silently falls back
+    /// to the release asset.
+    #[serde(rename = "mediaType")]
+    media_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OciToken {
+    token: String,
+}
+
+/// Download the packed VM layer from a public OCI artifact without requiring
+/// `oras`, Docker, or any other host-side registry client.
+async fn download_oci_golden(payload: &Path, reference: &str) -> bool {
+    let Some((registry, repository, version)) = split_oci_reference(reference) else {
+        warn!(reference, "invalid OCI golden reference");
+        return false;
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(600))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return false,
+    };
+    let manifest_url = format!("https://{registry}/v2/{repository}/manifests/{version}");
+    let accept = "application/vnd.oci.image.manifest.v1+json, \
+                  application/vnd.docker.distribution.manifest.v2+json";
+    let Some(response) = registry_get(&client, &manifest_url, accept).await else {
+        info!(reference, "OCI golden manifest unavailable");
+        return false;
+    };
+    let manifest = match response.json::<OciManifest>().await {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            warn!(reference, %error, "OCI golden manifest parse failed");
+            return false;
+        }
+    };
+    let Some(layer) = manifest
+        .layers
+        .into_iter()
+        .find(|layer| layer.media_type == "application/vnd.preloop.smolmachine.v1+zstd")
+    else {
+        warn!(reference, "OCI golden has no packed VM layer");
+        return false;
+    };
+    let blob_url = format!("https://{registry}/v2/{repository}/blobs/{}", layer.digest);
+    let Some(response) = registry_get(&client, &blob_url, "*/*").await else {
+        return false;
+    };
+    let Some(parent) = payload.parent() else {
+        return false;
+    };
+    let tmp_payload = parent.join(format!(".tmp-golden-{}", uuid::Uuid::new_v4()));
+    if stream_golden_response(response, &tmp_payload, Some(layer.digest)).await
+        && tokio::fs::rename(&tmp_payload, payload).await.is_ok()
+    {
+        info!(
+            reference,
+            target = %payload.display(),
+            "Downloaded OCI pre-baked golden microVM image successfully"
+        );
+        return true;
+    }
+    let _ = tokio::fs::remove_file(&tmp_payload).await;
+    false
+}
+
+async fn registry_get(
+    client: &reqwest::Client,
+    url: &str,
+    accept: &str,
+) -> Option<reqwest::Response> {
+    let response = client
+        .get(url)
+        .header(reqwest::header::ACCEPT, accept)
+        .send()
+        .await
+        .ok()?;
+    if response.status().is_success() {
+        return Some(response);
+    }
+    if response.status() != reqwest::StatusCode::UNAUTHORIZED {
+        return None;
+    }
+    let challenge = response
+        .headers()
+        .get(reqwest::header::WWW_AUTHENTICATE)?
+        .to_str()
+        .ok()?;
+    let realm = auth_parameter(challenge, "realm")?;
+    let service = auth_parameter(challenge, "service")?;
+    let scope = auth_parameter(challenge, "scope")?;
+    let token = client
+        .get(realm)
+        .query(&[("service", service), ("scope", scope)])
+        .send()
+        .await
+        .ok()?
+        .json::<OciToken>()
+        .await
+        .ok()?;
+    client
+        .get(url)
+        .header(reqwest::header::ACCEPT, accept)
+        .bearer_auth(token.token)
+        .send()
+        .await
+        .ok()
+        .filter(|response| response.status().is_success())
+}
+
+fn auth_parameter(challenge: &str, name: &str) -> Option<String> {
+    challenge.split(',').find_map(|part| {
+        let (key, value) = part.trim().split_once('=')?;
+        (key.trim()
+            .trim_start_matches("Bearer ")
+            .eq_ignore_ascii_case(name))
+        .then(|| value.trim_matches('"').to_owned())
+    })
+}
+
+fn split_oci_reference(reference: &str) -> Option<(String, String, String)> {
+    let (registry, remainder) = reference.split_once('/')?;
+    let (repository, version) = remainder
+        .rsplit_once('@')
+        .or_else(|| remainder.rsplit_once(':'))?;
+    if registry.is_empty() || repository.is_empty() || version.is_empty() {
+        return None;
+    }
+    Some((
+        registry.to_owned(),
+        repository.to_owned(),
+        version.to_owned(),
+    ))
+}
+
+/// Stream the OCI layer to a temporary file, verify its digest against the
+/// manifest descriptor, then install it at the payload path.
+///
+/// The published `application/vnd.preloop.smolmachine.v1+zstd` layer is the
+/// raw `.smolmachine` sidecar: zstd-compressed asset frames followed by the
+/// uncompressed manifest and `SMOLPACK` footer. The media type's `+zstd`
+/// suffix describes the internal asset compression, not the layer itself —
+/// the layer bytes are NOT a bare zstd stream (verified: the blob ends with
+/// an uncompressed `SMOLPACK` trailer), and `machine create --from` reads
+/// the sidecar container directly. Do not decompress the layer.
+async fn stream_golden_response(
+    response: reqwest::Response,
+    tmp_payload: &Path,
+    expected_sha256: Option<String>,
+) -> bool {
+    let mut file = match tokio::fs::File::create(tmp_payload).await {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else {
+            let _ = tokio::fs::remove_file(tmp_payload).await;
+            return false;
+        };
+        if file.write_all(&chunk).await.is_err() {
+            let _ = tokio::fs::remove_file(tmp_payload).await;
+            return false;
+        }
+    }
+    if file.flush().await.is_err() {
+        let _ = tokio::fs::remove_file(tmp_payload).await;
+        return false;
+    }
+    drop(file);
+    if let Some(expected) = expected_sha256 {
+        let digest = match tokio::task::spawn_blocking({
+            let path = tmp_payload.to_owned();
+            move || {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                let mut file = std::fs::File::open(path)?;
+                std::io::copy(&mut file, &mut hasher)?;
+                Ok::<String, std::io::Error>(format!("{:x}", hasher.finalize()))
+            }
+        })
+        .await
+        {
+            Ok(Ok(digest)) => digest,
+            _ => return false,
+        };
+        let expected = expected.strip_prefix("sha256:").unwrap_or(&expected);
+        if digest != expected {
+            warn!(expected, %digest, "OCI golden layer digest mismatch");
+            return false;
+        }
+    }
     true
 }
 
@@ -850,6 +1094,10 @@ fn docker_start_command() -> Vec<String> {
 
 /// How long to wait for a freshly started guest to accept commands.
 const GUEST_READY_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long to wait between live-clone drain probes before re-arming a spent
+/// golden fork base. Bounded retries; the probe loop is exercised by tests
+/// under paused Tokio time, so this is the only knob the delay is tied to.
+const GOLDEN_DRAIN_PROBE_DELAY: Duration = Duration::from_secs(10);
 /// Gap between guest readiness probes.
 const GUEST_READY_POLL: Duration = Duration::from_millis(25);
 
@@ -1571,9 +1819,14 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
     if provider.status(golden).await? != MachineState::Missing {
         provider.delete(golden).await?;
     }
+    // smolvm's `machine create --from` consumes the SMOLPACK, not the ELF
+    // launcher stub written at the payload stem. A downloaded release asset
+    // IS the pack at the stem; a locally built golden leaves the pack in the
+    // `.smolmachine` sidecar. Centralized in [`packed_golden_path`].
+    let pack = packed_golden_path(&config.artifact_payload());
     let spec = MachineSpec {
         name: golden.clone(),
-        image: config.artifact_payload().display().to_string(),
+        image: pack.display().to_string(),
         cpus: config.cpus,
         memory_mib: config.memory_mib,
         storage_gib: config.storage_gib,
@@ -2598,18 +2851,7 @@ async fn provision_slot<P: VmProvider + 'static>(
     environment: RunnerEnvironment,
 ) -> Result<ReadyRunner, OrchestratorError> {
     let name = MachineName::new(format!("{}-{slot}-{generation}", config.name_prefix))?;
-    match provision_runner(
-        provider,
-        config,
-        &name,
-        golden,
-        keys,
-        &environment.base,
-        &environment.toolchains,
-        environment.curated,
-    )
-    .await
-    {
+    match provision_runner(provider, config, &name, golden, keys, &environment).await {
         Ok(run) => Ok(ReadyRunner {
             name,
             run,
@@ -2938,6 +3180,28 @@ async fn run_until_exit<P: VmProvider + 'static>(
     }
 }
 
+/// Whether a fork failure means this golden can never serve another fork.
+///
+/// A SmolVM fork base carries one RAM checkpoint. Lose it — a raced fork whose
+/// rollback resumed the base, a pruned snapshot directory, a golden restarted
+/// out from under the record — and the base is paused with nothing to restore
+/// from, so *every* later fork fails identically. The pool keeps working, but
+/// each runner now pays a full VM create, which reads as "jobs are queued and
+/// nothing is happening" rather than as a broken fork base. Matching SmolVM's
+/// wording is deliberate: these strings are the only signal the CLI gives, and
+/// a missed match costs a log line, not correctness.
+fn fork_base_unusable(error: &VmError) -> bool {
+    let message = error.to_string();
+    [
+        "is already paused",
+        "is not running forkable",
+        "control socket not responding",
+        "is not ready to fork",
+    ]
+    .iter()
+    .any(|signature| message.contains(signature))
+}
+
 /// Create, boot, and register one ephemeral runner; return its `run` argv.
 ///
 /// The caller owns cleanup: on any error the machine may already exist.
@@ -2948,35 +3212,160 @@ async fn provision_runner<P: VmProvider + 'static>(
     name: &MachineName,
     golden: Option<&MachineName>,
     keys: &Arc<KeyPool>,
-    environment_base: &str,
-    toolchains: &[ToolchainLayer],
-    curated: bool,
+    environment: &RunnerEnvironment,
 ) -> Result<Vec<String>, OrchestratorError> {
+    let mut direct_create_from_packed = config.use_packed_artifact;
     let forked_golden = match golden {
         Some(golden) => match provider.fork(golden, name).await {
             Ok(()) => Some(golden),
-            Err(error)
+            Err(error @ VmError::ForkBaseBusy { .. })
                 if config.use_packed_artifact
                     && golden.as_str() == format!("{}-golden", config.name_prefix) =>
             {
+                // A live plain-fork clone still depends on the golden's frozen
+                // storage. Do not touch the base and do not create another VM
+                // from that same packed payload: SmolVM's mixed fork/create
+                // path has returned ESTALE in both machines. Boot this slot
+                // independently from the job's OCI environment instead.
                 warn!(
                     machine = name.as_str(),
                     golden = golden.as_str(),
                     %error,
-                    "packed golden fork failed; creating runner directly from packed artifact"
+                    "fork base busy; creating runner independently from the OCI image"
                 );
-                // A failed fork can leave a partial clone behind. Best-effort
-                // cleanup makes the direct create safe; if cleanup itself is
-                // still racing SmolVM state, create returns the actionable
-                // error and the slot supervisor retries normally.
-                if let Err(cleanup) = provider.delete(name).await {
-                    debug!(
-                        machine = name.as_str(),
-                        %cleanup,
-                        "failed fork left no removable clone"
-                    );
-                }
+                direct_create_from_packed = false;
                 None
+            }
+            Err(error)
+                if config.use_packed_artifact
+                    && golden.as_str() == format!("{}-golden", config.name_prefix) =>
+            {
+                if fork_base_unusable(&error) {
+                    // The base is spent. Re-arm it atomically with forking:
+                    // partial-clone cleanup, the live-clone check, and the
+                    // stop/start happen under the provider's per-golden fork
+                    // lock, so a concurrent slot cannot create a clone mid
+                    // re-arm. A full engine restart and golden rebuild was
+                    // the only recovery before; a re-arm is a few seconds.
+                    warn!(
+                        machine = name.as_str(),
+                        golden = golden.as_str(),
+                        %error,
+                        "fork base spent; re-arming the golden once"
+                    );
+                    match provider.rearm_fork_base(golden, Some(name)).await {
+                        Ok(true) => {
+                            info!(golden = golden.as_str(), "golden fork base re-armed");
+                            match provider.fork(golden, name).await {
+                                Ok(()) => Some(golden),
+                                Err(retry_error) => {
+                                    error!(
+                                        machine = name.as_str(),
+                                        golden = golden.as_str(),
+                                        %retry_error,
+                                        "re-armed golden still cannot fork; falling back to \
+                                         direct creation"
+                                    );
+                                    let _ = provider.delete(name).await;
+                                    None
+                                }
+                            }
+                        }
+                        Ok(false) => {
+                            // A live clone (another runner forked from the
+                            // golden) blocks the re-freeze; those clones are
+                            // ephemeral and exit after their job. Wait for
+                            // them to drain, then retry the re-arm a bounded
+                            // number of times before falling back to direct
+                            // creation (whose socket mount cannot serve the
+                            // control transport, so the fallback usually
+                            // fails registration anyway).
+                            let mut rearmed = false;
+                            for attempt in 0..12 {
+                                tokio::time::sleep(GOLDEN_DRAIN_PROBE_DELAY).await;
+                                match provider.rearm_fork_base(golden, Some(name)).await {
+                                    Ok(true) => {
+                                        info!(
+                                            golden = golden.as_str(),
+                                            attempt, "golden fork base re-armed after clone drain"
+                                        );
+                                        rearmed = true;
+                                        break;
+                                    }
+                                    Ok(false) => {
+                                        // Live clones still hold the golden;
+                                        // keep probing until the bounded
+                                        // retries are exhausted.
+                                    }
+                                    Err(drain_error) => {
+                                        error!(
+                                            golden = golden.as_str(),
+                                            %drain_error,
+                                            "re-arm failed while draining clones; falling back \
+                                             without further waiting"
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                            if rearmed {
+                                match provider.fork(golden, name).await {
+                                    Ok(()) => Some(golden),
+                                    Err(retry_error) => {
+                                        error!(
+                                            machine = name.as_str(),
+                                            golden = golden.as_str(),
+                                            %retry_error,
+                                            "re-armed golden still cannot fork; falling back to \
+                                             direct creation"
+                                        );
+                                        let _ = provider.delete(name).await;
+                                        None
+                                    }
+                                }
+                            } else {
+                                error!(
+                                    golden = golden.as_str(),
+                                    "fork base spent and could not be re-armed after waiting for \
+                                     clone drain; falling back to independent OCI creation"
+                                );
+                                let _ = provider.delete(name).await;
+                                direct_create_from_packed = false;
+                                None
+                            }
+                        }
+                        Err(rearm_error) => {
+                            error!(
+                                golden = golden.as_str(),
+                                %rearm_error,
+                                "failed to re-arm spent fork base; falling back to independent \
+                                 OCI creation"
+                            );
+                            direct_create_from_packed = false;
+                            None
+                        }
+                    }
+                } else {
+                    // A failed fork can leave a partial clone behind.
+                    // Best-effort cleanup makes the direct create safe; if
+                    // cleanup itself is still racing SmolVM state, create
+                    // returns the actionable error and the slot supervisor
+                    // retries normally.
+                    warn!(
+                        machine = name.as_str(),
+                        golden = golden.as_str(),
+                        %error,
+                        "packed golden fork failed; creating runner directly from packed artifact"
+                    );
+                    if let Err(cleanup) = provider.delete(name).await {
+                        debug!(
+                            machine = name.as_str(),
+                            %cleanup,
+                            "failed fork left no removable clone"
+                        );
+                    }
+                    None
+                }
             }
             Err(error) => return Err(error.into()),
         },
@@ -3000,7 +3389,7 @@ async fn provision_runner<P: VmProvider + 'static>(
             // The pack carries the apt baseline, but not necessarily apt's
             // indices — restore them before any workflow apt-installs. A
             // custom base is used as-is: no apt assumptions.
-            if curated {
+            if environment.curated {
                 if let Err(error) = provider.exec(name, &apt_lists_refresh_command()).await {
                     warn!(
                     machine = name.as_str(),
@@ -3016,7 +3405,7 @@ async fn provision_runner<P: VmProvider + 'static>(
             // cargo-dist dies with "you don't appear to have cargo installed",
             // blaming the workflow for a broken machine. A fully baked pack
             // pays one `command -v` per layer.
-            for layer in toolchains {
+            for layer in &environment.toolchains {
                 if verify_toolchain_installed(provider.as_ref(), name, layer)
                     .await
                     .is_ok()
@@ -3035,9 +3424,9 @@ async fn provision_runner<P: VmProvider + 'static>(
                 }
                 verify_toolchain_installed(provider.as_ref(), name, layer).await?;
             }
-        } else if curated {
+        } else if environment.curated {
             install_base_dependencies(provider.as_ref(), name).await?;
-            for layer in toolchains {
+            for layer in &environment.toolchains {
                 for command in layer.install_commands() {
                     if let Err(error) = provider.exec(name, &command).await {
                         return Err(error.into());
@@ -3049,16 +3438,19 @@ async fn provision_runner<P: VmProvider + 'static>(
             // Custom base image: used as-is, no apt bake, no toolchains.
             debug!(
                 machine = name.as_str(),
-                base = %environment_base,
+                base = %environment.base,
                 "custom base image — skipping the curated bake"
             );
         }
     } else {
-        let uses_packed_artifact = config.use_packed_artifact;
+        let uses_packed_artifact = direct_create_from_packed;
+        let pack = packed_golden_path(&config.artifact_payload());
         let spec = MachineSpec {
             name: name.clone(),
             image: if uses_packed_artifact {
-                config.artifact_payload().display().to_string()
+                pack.display().to_string()
+            } else if config.use_packed_artifact {
+                environment.base.clone()
             } else {
                 config.base_image.clone()
             },
@@ -3089,9 +3481,9 @@ async fn provision_runner<P: VmProvider + 'static>(
         // installs are idempotent, so a fully baked artifact only pays the
         // presence checks. A custom base is the operator's contract: no apt
         // baseline, no toolchain curation.
-        if curated {
+        if environment.curated {
             install_base_dependencies(provider.as_ref(), name).await?;
-            for layer in toolchains {
+            for layer in &environment.toolchains {
                 for command in layer.install_commands() {
                     if let Err(error) = provider.exec(name, &command).await {
                         return Err(error.into());
@@ -3104,7 +3496,7 @@ async fn provision_runner<P: VmProvider + 'static>(
 
     let runner = format!("/opt/preloop/bin/{}", config.runner_binary_name);
     let mut labels = config.labels.clone();
-    for label in runner_environment_labels(environment_base) {
+    for label in runner_environment_labels(&environment.base) {
         if !labels
             .iter()
             .any(|existing| existing.eq_ignore_ascii_case(&label))
@@ -3371,6 +3763,21 @@ pub fn artifact_payload(stem: &Path, base_image: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// Resolve the actual packed-golden file for smolvm's `machine create
+/// --from`. The artifact stem names the payload: a downloaded release asset
+/// IS the SMOLPACK at the stem, while a locally built golden leaves an ELF
+/// launcher stub at the stem with the pack in the `<stem>.smolmachine`
+/// sidecar. Prefer the sidecar when present, else the stem itself — never
+/// invent a path that may not exist.
+fn packed_golden_path(payload: &Path) -> PathBuf {
+    let sidecar = PathBuf::from(format!("{}.smolmachine", payload.display()));
+    if sidecar.is_file() {
+        sidecar
+    } else {
+        payload.to_path_buf()
+    }
+}
+
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
@@ -3385,7 +3792,15 @@ mod lifecycle_tests {
     struct TestProvider {
         machines: Mutex<HashMap<String, MachineState>>,
         events: Mutex<Vec<String>>,
+        created_images: Mutex<Vec<(String, String)>>,
         fail_fork: bool,
+        fork_base_busy: bool,
+        /// Fail the next fork with the "spent fork base" signature, then
+        /// succeed. Mirrors a golden whose retained checkpoint vanished.
+        fail_fork_once_spent: Mutex<bool>,
+        /// Report live clones to `rearm_fork_base`; true by default so a spent
+        /// base with dependents is never re-armed in tests either.
+        live_forks: Mutex<bool>,
         fail_start: bool,
         fail_install: bool,
         fail_configure: bool,
@@ -3413,7 +3828,11 @@ mod lifecycle_tests {
             Self {
                 machines: Mutex::new(HashMap::new()),
                 events: Mutex::new(Vec::new()),
+                created_images: Mutex::new(Vec::new()),
                 fail_fork: false,
+                fork_base_busy: false,
+                fail_fork_once_spent: Mutex::new(false),
+                live_forks: Mutex::new(true),
                 fail_start,
                 fail_install,
                 fail_configure,
@@ -3436,6 +3855,23 @@ mod lifecycle_tests {
             self
         }
 
+        fn with_busy_fork_base(mut self) -> Self {
+            self.fork_base_busy = true;
+            self
+        }
+
+        /// Fail the next fork with the spent-fork-base signature, then succeed.
+        fn failing_fork_once_spent(mut self) -> Self {
+            *self.fail_fork_once_spent.get_mut() = true;
+            self
+        }
+
+        /// Report whether clones of the golden still exist.
+        fn with_live_forks(mut self, live: bool) -> Self {
+            *self.live_forks.get_mut() = live;
+            self
+        }
+
         /// A provider whose guests lack `binary` until an install command for
         /// it runs — a pack baked without the workspace's toolchain.
         fn without_binary(binary: &'static str) -> Self {
@@ -3451,6 +3887,14 @@ mod lifecycle_tests {
 
         async fn events(&self) -> Vec<String> {
             self.events.lock().await.clone()
+        }
+
+        async fn created_image(&self, name: &MachineName) -> Option<String> {
+            self.created_images
+                .lock()
+                .await
+                .iter()
+                .find_map(|(created, image)| (created == name.as_str()).then(|| image.clone()))
         }
     }
 
@@ -3849,6 +4293,47 @@ chmod +x "$destination/bin/node"
     }
 
     #[test]
+    fn default_oci_golden_reference_targets_arm64_pack() {
+        let (registry, repository, version) =
+            split_oci_reference(DEFAULT_GOLDEN_OCI_REF).expect("valid OCI reference");
+        assert_eq!(registry, "ghcr.io");
+        assert_eq!(repository, "preloopdev/preloop-golden");
+        // Immutable digest pin: changing the default must be a reviewed code
+        // change, not a registry retag.
+        assert!(
+            version.len() == "sha256:".len() + 64 && version.starts_with("sha256:"),
+            "expected a digest-pinned default, got `{version}`"
+        );
+    }
+
+    #[test]
+    fn oci_layer_deserializes_camel_case_media_type() {
+        let manifest: OciManifest = serde_json::from_str(
+            r#"{"layers":[{"digest":"sha256:00","mediaType":"application/vnd.preloop.smolmachine.v1+zstd"}]}"#,
+        )
+        .expect("standard OCI manifest must parse");
+        let layer = manifest
+            .layers
+            .into_iter()
+            .find(|layer| layer.media_type == "application/vnd.preloop.smolmachine.v1+zstd")
+            .expect("packed VM layer present");
+        assert_eq!(layer.digest, "sha256:00");
+    }
+
+    #[test]
+    fn oci_auth_challenge_parameters_parse() {
+        let challenge = r#"Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:preloopdev/preloop-golden:pull""#;
+        assert_eq!(
+            auth_parameter(challenge, "realm").as_deref(),
+            Some("https://ghcr.io/token")
+        );
+        assert_eq!(
+            auth_parameter(challenge, "scope").as_deref(),
+            Some("repository:preloopdev/preloop-golden:pull")
+        );
+    }
+
+    #[test]
     fn concurrent_on_demand_provisioning_keeps_preparing_signal_raised() {
         let active = Arc::new(AtomicUsize::new(0));
         let signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3924,6 +4409,10 @@ chmod +x "$destination/bin/node"
                 .lock()
                 .await
                 .insert(spec.name.as_str().to_owned(), MachineState::Stopped);
+            self.created_images
+                .lock()
+                .await
+                .push((spec.name.as_str().to_owned(), spec.image.clone()));
             self.events
                 .lock()
                 .await
@@ -3955,6 +4444,22 @@ chmod +x "$destination/bin/node"
                 .lock()
                 .await
                 .push(format!("fork:{}:{}", golden.as_str(), clone.as_str()));
+            if self.fork_base_busy {
+                return Err(VmError::ForkBaseBusy {
+                    golden: golden.as_str().to_owned(),
+                    clone: "lifecycle-test-0-live".to_owned(),
+                });
+            }
+            {
+                let mut spent = self.fail_fork_once_spent.lock().await;
+                if *spent {
+                    *spent = false;
+                    return Err(test_error(
+                        "smolvm fork failed with exit code 1: golden 'lifecycle-test-golden' \
+                         is already paused; a valid retained checkpoint is required",
+                    ));
+                }
+            }
             if self.fail_fork {
                 return Err(test_error("fork-failure"));
             }
@@ -3969,7 +4474,31 @@ chmod +x "$destination/bin/node"
             Ok(())
         }
 
+        async fn rearm_fork_base(
+            &self,
+            golden: &MachineName,
+            partial: Option<&MachineName>,
+        ) -> Result<bool, VmError> {
+            self.events
+                .lock()
+                .await
+                .push(format!("rearm:{}", golden.as_str()));
+            if let Some(partial) = partial {
+                self.delete(partial).await?;
+            }
+            if *self.live_forks.lock().await {
+                return Ok(false);
+            }
+            self.stop(golden).await?;
+            self.start(golden).await?;
+            Ok(true)
+        }
+
         async fn stop(&self, name: &MachineName) -> Result<(), VmError> {
+            self.events
+                .lock()
+                .await
+                .push(format!("stop:{}", name.as_str()));
             self.machines
                 .lock()
                 .await
@@ -4186,12 +4715,43 @@ chmod +x "$destination/bin/node"
         config
     }
 
+    fn test_runner_environment(
+        base: impl Into<String>,
+        toolchains: Vec<ToolchainLayer>,
+        curated: bool,
+    ) -> RunnerEnvironment {
+        RunnerEnvironment {
+            fingerprint: None,
+            base: base.into(),
+            toolchains,
+            curated,
+        }
+    }
+
     /// A retained SmolVM checkpoint can become unusable after the packed
     /// golden has been prepared. Retrying the same fork forever starves every
     /// queued job, while creating a runner directly from the same packed
     /// artifact remains valid.
     #[tokio::test]
     async fn packed_golden_fork_failure_falls_back_to_direct_creation() {
+        // Verbatim from SmolVM 1.7.x: a spent fork base is reported through the
+        // CLI's stderr, so the signature match is the only handle on it.
+        const SPENT_BASE: &str = "smolvm fork failed with exit code 1: Freezing golden \
+             'preloop-runner-golden' as fork base...\nError: agent operation failed: fork: \
+             golden 'preloop-runner-golden' is already paused; a valid retained checkpoint \
+             is required";
+
+        assert!(fork_base_unusable(&VmError::Command {
+            operation: "fork",
+            exit_code: 1,
+            message: SPENT_BASE.to_owned(),
+        }));
+        assert!(!fork_base_unusable(&VmError::Command {
+            operation: "fork",
+            exit_code: 1,
+            message: "host port 8080 is assigned to more than one clone".to_owned(),
+        }));
+
         let provider =
             Arc::new(TestProvider::new(false, false, false, false, false).failing_fork());
         let config = packed_fork_config();
@@ -4204,9 +4764,7 @@ chmod +x "$destination/bin/node"
             &name,
             Some(&golden),
             &Arc::new(KeyPool::new()),
-            &config.base_image,
-            &[],
-            true,
+            &test_runner_environment(config.base_image.clone(), Vec::new(), true),
         )
         .await
         .expect("a broken packed-golden fork falls back to direct creation");
@@ -4239,6 +4797,164 @@ chmod +x "$destination/bin/node"
         assert!(provider.has_machine(&name).await);
     }
 
+    /// A spent fork base with no surviving clones is re-armed (stop, start
+    /// forkable) and the fork retried — the queue recovers in seconds instead
+    /// of stalling until someone restarts the engine and rebuilds the golden.
+    #[tokio::test]
+    async fn spent_fork_base_with_no_live_clones_is_rearmed_and_retried() {
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, false)
+                .with_live_forks(false)
+                .failing_fork_once_spent(),
+        );
+        let config = packed_fork_config();
+        let golden = MachineName::new("lifecycle-test-golden").unwrap();
+        let name = MachineName::new("lifecycle-test-0-6").unwrap();
+
+        provision_runner(
+            &provider,
+            &config,
+            &name,
+            Some(&golden),
+            &Arc::new(KeyPool::new()),
+            &test_runner_environment(config.base_image.clone(), Vec::new(), true),
+        )
+        .await
+        .expect("the re-armed golden serves the fork");
+
+        let events = provider.events().await;
+        let expected = [
+            format!("fork:{}:{}", golden.as_str(), name.as_str()),
+            format!("rearm:{}", golden.as_str()),
+            format!("delete:{}", name.as_str()),
+            format!("stop:{}", golden.as_str()),
+            format!("start:{}", golden.as_str()),
+            format!("fork:{}:{}", golden.as_str(), name.as_str()),
+        ];
+        let mut cursor = 0;
+        for event in &expected {
+            let position = events[cursor..]
+                .iter()
+                .position(|seen| seen == event)
+                .expect("re-arm sequence must include every step");
+            cursor += position + 1;
+        }
+        assert!(
+            provider.has_machine(&name).await,
+            "the retried fork must leave the clone provisioned"
+        );
+    }
+
+    /// A spent base that still has live clones must NOT be re-armed: resuming
+    /// it would corrupt the copy-on-write clones. The pool falls back to a
+    /// full create instead.
+    // Paused time: the drain loop sleeps GOLDEN_DRAIN_PROBE_DELAY between
+    // probes; without this the 12-probe worst case would stall the test for
+    // two minutes of real time.
+    #[tokio::test(start_paused = true)]
+    async fn spent_fork_base_with_live_clones_is_not_rearmed() {
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, false)
+                .with_live_forks(true)
+                .failing_fork_once_spent(),
+        );
+        let config = packed_fork_config();
+        let golden = MachineName::new("lifecycle-test-golden").unwrap();
+        let name = MachineName::new("lifecycle-test-0-7").unwrap();
+
+        provision_runner(
+            &provider,
+            &config,
+            &name,
+            Some(&golden),
+            &Arc::new(KeyPool::new()),
+            &test_runner_environment(config.base_image.clone(), Vec::new(), true),
+        )
+        .await
+        .expect("falls back to direct creation");
+
+        let events = provider.events().await;
+        assert!(
+            !events.iter().any(|event| event.starts_with("stop:")),
+            "the golden must not be touched while clones exist: {events:?}"
+        );
+        assert!(
+            events.contains(&format!("delete:{}", name.as_str())),
+            "the partial clone is cleaned up: {events:?}"
+        );
+        assert_eq!(
+            provider.created_image(&name).await.as_deref(),
+            Some(config.base_image.as_str()),
+            "a live clone makes the shared packed payload unsafe; fallback must use OCI"
+        );
+    }
+
+    /// The provider reports a live clone before invoking SmolVM for another
+    /// plain fork. The orchestrator must neither re-arm the shared golden nor
+    /// instantiate the packed payload beside that clone.
+    #[tokio::test]
+    async fn busy_packed_fork_base_uses_independent_environment_image() {
+        let provider =
+            Arc::new(TestProvider::new(false, false, false, false, false).with_busy_fork_base());
+        let config = packed_fork_config();
+        let golden = MachineName::new("lifecycle-test-golden").unwrap();
+        let name = MachineName::new("lifecycle-test-0-9").unwrap();
+        let environment_base = "mirror.gcr.io/library/ubuntu:22.04";
+
+        provision_runner(
+            &provider,
+            &config,
+            &name,
+            Some(&golden),
+            &Arc::new(KeyPool::new()),
+            &test_runner_environment(environment_base, Vec::new(), true),
+        )
+        .await
+        .expect("a busy plain-fork base falls back to an independent OCI machine");
+
+        let events = provider.events().await;
+        assert!(
+            !events.iter().any(|event| event.starts_with("rearm:")),
+            "a golden with a live clone must not be re-armed: {events:?}"
+        );
+        assert_eq!(
+            provider.created_image(&name).await.as_deref(),
+            Some(environment_base),
+            "fallback must use the job's resolved environment, not the shared packed payload"
+        );
+    }
+
+    /// A partial clone that cannot be removed must block the re-arm: the
+    /// untracked clone would otherwise share the resumed base's disks.
+    #[tokio::test]
+    async fn spent_fork_base_with_failed_partial_cleanup_is_not_rearmed() {
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, true)
+                .with_live_forks(false)
+                .failing_fork_once_spent(),
+        );
+        let config = packed_fork_config();
+        let golden = MachineName::new("lifecycle-test-golden").unwrap();
+        let name = MachineName::new("lifecycle-test-0-8").unwrap();
+
+        provision_runner(
+            &provider,
+            &config,
+            &name,
+            Some(&golden),
+            &Arc::new(KeyPool::new()),
+            &test_runner_environment(config.base_image.clone(), Vec::new(), true),
+        )
+        .await
+        .expect("falls back to direct creation");
+
+        let events = provider.events().await;
+        assert!(
+            !events.iter().any(|event| event.starts_with("stop:")),
+            "the golden must not be touched when cleanup failed: {events:?}"
+        );
+    }
+
     /// An environment-specific golden may represent a different `runs-on`
     /// image from the packed artifact. Falling back there would run the job
     /// on the wrong operating system, so only the default packed golden may
@@ -4257,9 +4973,7 @@ chmod +x "$destination/bin/node"
             &name,
             Some(&golden),
             &Arc::new(KeyPool::new()),
-            "mirror.gcr.io/library/ubuntu:22.04",
-            &[],
-            true,
+            &test_runner_environment("mirror.gcr.io/library/ubuntu:22.04", Vec::new(), true),
         )
         .await
         .expect_err("an environment-golden fork failure must propagate");
@@ -4291,9 +5005,11 @@ chmod +x "$destination/bin/node"
             &name,
             Some(&golden),
             &Arc::new(KeyPool::new()),
-            &config.base_image.clone(),
-            &[ToolchainLayer::Rust("1.97".to_owned())],
-            true,
+            &test_runner_environment(
+                config.base_image.clone(),
+                vec![ToolchainLayer::Rust("1.97".to_owned())],
+                true,
+            ),
         )
         .await
         .expect("the fork installs the toolchain its pack lacks");
@@ -4333,9 +5049,7 @@ chmod +x "$destination/bin/node"
             &name,
             Some(&golden),
             &Arc::new(KeyPool::new()),
-            &config.base_image.clone(),
-            &[],
-            true,
+            &test_runner_environment(config.base_image.clone(), Vec::new(), true),
         )
         .await
         .expect("provisioning succeeds");
@@ -4364,9 +5078,11 @@ chmod +x "$destination/bin/node"
             &name,
             Some(&golden),
             &Arc::new(KeyPool::new()),
-            &config.base_image.clone(),
-            &[ToolchainLayer::Rust("1.97".to_owned())],
-            true,
+            &test_runner_environment(
+                config.base_image.clone(),
+                vec![ToolchainLayer::Rust("1.97".to_owned())],
+                true,
+            ),
         )
         .await
         .expect("provisioning succeeds");
@@ -4558,9 +5274,7 @@ chmod +x "$destination/bin/node"
             &name,
             None,
             &Arc::new(KeyPool::new()),
-            "ghcr.io/acme/runner:latest",
-            &[],
-            false,
+            &test_runner_environment("ghcr.io/acme/runner:latest", Vec::new(), false),
         )
         .await
         .expect("custom base provisioning succeeds");

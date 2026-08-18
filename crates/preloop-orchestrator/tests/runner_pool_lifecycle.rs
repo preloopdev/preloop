@@ -521,7 +521,6 @@ async fn artifact_preparation_runs_once_and_reuses_payload_on_next_run() {
     // only happens after the artifact is fully built, then cancel.
     let task_shutdown = CancellationToken::new();
     let task = tokio::spawn({
-        let pool = pool;
         let task_shutdown = task_shutdown.clone();
         async move { pool.run(task_shutdown).await }
     });

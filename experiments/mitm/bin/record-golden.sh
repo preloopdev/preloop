@@ -58,6 +58,16 @@ for sc in $SCENARIOS; do
             DEST="$GOLDEN_DIR/$sc"
             rm -rf "$DEST"
             cp -rL "$LATEST" "$DEST"
+            # Strip live credentials before the capture becomes a committed
+            # golden. capture.py already redacts flows.jsonl bodies, but the
+            # raw flows.mitm stream is untouched by the addon; scrub it here
+            # so the commit boundary is unconditionally clean.
+            python3 "$SCRIPT_DIR/scrub-goldens.py" "$DEST" || {
+                echo "WARNING: scrubbing $sc failed; capture not committed" >&2
+                rm -rf "$DEST"
+                FAIL=$((FAIL + 1))
+                continue
+            }
             echo "golden saved: $DEST"
             PASS=$((PASS + 1))
         else

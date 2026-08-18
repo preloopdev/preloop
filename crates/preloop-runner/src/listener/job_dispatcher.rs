@@ -481,7 +481,8 @@ fn kill_process_tree(root: u32) {
                     continue;
                 };
                 // /proc/<pid>/stat: pid (comm) state ppid ...
-                let Some(open) = stat.find('(') else { continue };
+                // `comm` may contain spaces and parentheses, so the fields
+                // after it are found from the LAST ')', not by splitting.
                 let Some(close) = stat.rfind(')') else {
                     continue;
                 };

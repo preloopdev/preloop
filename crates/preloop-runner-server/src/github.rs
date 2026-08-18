@@ -274,11 +274,11 @@ pub(crate) async fn report_check_run_queued(
         let mapping_changed = {
             let mut inner = shared.state.inner.lock().await;
             inner.runs.get_mut(&run_id).and_then(|run| {
-                run.jobs.contains_key(job_id).then(|| {
+                Some(
                     run.job_check_run_ids
                         .insert(job_id.clone(), check_id)
-                        .is_none_or(|previous| previous != check_id)
-                })
+                        .is_none_or(|previous| previous != check_id),
+                )
             })
         };
         if mapping_changed == Some(true) {
