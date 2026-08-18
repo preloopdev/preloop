@@ -1552,11 +1552,7 @@ pub(crate) fn pair_registered_runner(inner: &mut InnerState, runner_id: i64) {
     let chosen = inner
         .pool_pending
         .iter()
-        .filter_map(|(key, at)| {
-            queue_positions
-                .get(key)
-                .map(|&pos| (key, *at, pos))
-        })
+        .filter_map(|(key, at)| queue_positions.get(key).map(|&pos| (key, *at, pos)))
         .min_by_key(|(_, at, pos)| (*at, *pos))
         .map(|(key, _, _)| key.clone());
     if let Some(key) = chosen {
