@@ -25,7 +25,6 @@ serde_yaml = { workspace = true }
 sha2 = "0.10"
 uuid = { workspace = true }
 reqwest = { workspace = true }
-zstd = "0.13"
 
 [dev-dependencies]
 tempfile.workspace = true

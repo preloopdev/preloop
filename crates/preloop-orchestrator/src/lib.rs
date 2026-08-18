@@ -505,7 +505,9 @@ async fn download_oci_golden(payload: &Path, reference: &str) -> bool {
         return false;
     };
     let tmp_payload = parent.join(format!(".tmp-golden-{}", uuid::Uuid::new_v4()));
-    if stream_golden_response(response, &tmp_payload, payload, Some(layer.digest)).await {
+    if stream_golden_response(response, &tmp_payload, Some(layer.digest)).await
+        && tokio::fs::rename(&tmp_payload, payload).await.is_ok()
+    {
         info!(
             reference,
             target = %payload.display(),
@@ -586,51 +588,44 @@ fn split_oci_reference(reference: &str) -> Option<(String, String, String)> {
     ))
 }
 
-/// zstd-decode the bare `+zstd` layer frame `compressed` into `payload`.
-///
-/// The published `application/vnd.preloop.smolmachine.v1+zstd` layer is a
-/// zstd frame wrapping the `.smolmachine` sidecar; `machine create --from`
-/// reads the sidecar container (stub + compressed assets + manifest +
-/// footer) directly, so the layer must be decoded before it is installed.
-fn decompress_golden_layer(compressed: &Path, payload: &Path) -> std::io::Result<()> {
-    let input = std::fs::File::open(compressed)?;
-    let mut output = std::fs::File::create(payload)?;
-    zstd::stream::copy_decode(input, &mut output)
-}
-
 /// Stream the OCI layer to a temporary file, verify its digest against the
-/// manifest descriptor, then zstd-decode it into the final payload. The
-/// digest check runs against the compressed bytes the layer was published
-/// under; only a digest-verified layer is ever decompressed.
+/// manifest descriptor, then install it at the payload path.
+///
+/// The published `application/vnd.preloop.smolmachine.v1+zstd` layer is the
+/// raw `.smolmachine` sidecar: zstd-compressed asset frames followed by the
+/// uncompressed manifest and `SMOLPACK` footer. The media type's `+zstd`
+/// suffix describes the internal asset compression, not the layer itself —
+/// the layer bytes are NOT a bare zstd stream (verified: the blob ends with
+/// an uncompressed `SMOLPACK` trailer), and `machine create --from` reads
+/// the sidecar container directly. Do not decompress the layer.
 async fn stream_golden_response(
     response: reqwest::Response,
-    compressed_tmp: &Path,
-    payload: &Path,
+    tmp_payload: &Path,
     expected_sha256: Option<String>,
 ) -> bool {
-    let mut file = match tokio::fs::File::create(compressed_tmp).await {
+    let mut file = match tokio::fs::File::create(tmp_payload).await {
         Ok(file) => file,
         Err(_) => return false,
     };
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let Ok(chunk) = chunk else {
-            let _ = tokio::fs::remove_file(compressed_tmp).await;
+            let _ = tokio::fs::remove_file(tmp_payload).await;
             return false;
         };
         if file.write_all(&chunk).await.is_err() {
-            let _ = tokio::fs::remove_file(compressed_tmp).await;
+            let _ = tokio::fs::remove_file(tmp_payload).await;
             return false;
         }
     }
     if file.flush().await.is_err() {
-        let _ = tokio::fs::remove_file(compressed_tmp).await;
+        let _ = tokio::fs::remove_file(tmp_payload).await;
         return false;
     }
     drop(file);
     if let Some(expected) = expected_sha256 {
         let digest = match tokio::task::spawn_blocking({
-            let path = compressed_tmp.to_owned();
+            let path = tmp_payload.to_owned();
             move || {
                 use sha2::{Digest, Sha256};
                 let mut hasher = Sha256::new();
@@ -650,25 +645,7 @@ async fn stream_golden_response(
             return false;
         }
     }
-    let decoded = tokio::task::spawn_blocking({
-        let compressed = compressed_tmp.to_owned();
-        let target = payload.to_owned();
-        move || decompress_golden_layer(&compressed, &target)
-    })
-    .await;
-    let _ = tokio::fs::remove_file(compressed_tmp).await;
-    match decoded {
-        Ok(Ok(())) => true,
-        Ok(Err(error)) => {
-            warn!(%error, target = %payload.display(), "OCI golden layer decompression failed");
-            let _ = tokio::fs::remove_file(payload).await;
-            false
-        }
-        Err(_) => {
-            let _ = tokio::fs::remove_file(payload).await;
-            false
-        }
-    }
+    true
 }
 
 /// First whitespace-separated token of a `sha256sum`-style checksum file
@@ -4304,21 +4281,6 @@ chmod +x "$destination/bin/node"
             .find(|layer| layer.media_type == "application/vnd.preloop.smolmachine.v1+zstd")
             .expect("packed VM layer present");
         assert_eq!(layer.digest, "sha256:00");
-    }
-
-    #[test]
-    fn golden_layer_decompression_roundtrip() {
-        let bytes: &[u8] = b"smolpack payload";
-        let compressed = zstd::stream::encode_all(bytes, 3).expect("compress");
-        let dir = std::env::temp_dir().join(format!("golden-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let compressed_path = dir.join("layer.zst");
-        let payload_path = dir.join("payload.smolmachine");
-        std::fs::write(&compressed_path, compressed).expect("write");
-        decompress_golden_layer(&compressed_path, &payload_path).expect("decode");
-        let decoded = std::fs::read(&payload_path).expect("read");
-        assert_eq!(decoded, bytes);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
