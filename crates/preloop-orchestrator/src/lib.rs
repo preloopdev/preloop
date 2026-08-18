@@ -607,44 +607,57 @@ async fn registry_get(
     client: &reqwest::Client,
     url: &str,
     accept: &str,
-) -> Option<reqwest::Response> {
+) -> Result<reqwest::Response, String> {
     let response = client
         .get(url)
         .header(reqwest::header::ACCEPT, accept)
         .send()
         .await
-        .ok()?;
+        .map_err(|error| format!("request failed: {error}"))?;
     if response.status().is_success() {
-        return Some(response);
+        return Ok(response);
     }
     if response.status() != reqwest::StatusCode::UNAUTHORIZED {
-        return None;
+        return Err(format!("registry returned HTTP {}", response.status()));
     }
     let challenge = response
         .headers()
-        .get(reqwest::header::WWW_AUTHENTICATE)?
+        .get(reqwest::header::WWW_AUTHENTICATE)
+        .ok_or_else(|| "registry response has no auth challenge".to_owned())?
         .to_str()
-        .ok()?;
-    let realm = auth_parameter(challenge, "realm")?;
-    let service = auth_parameter(challenge, "service")?;
-    let scope = auth_parameter(challenge, "scope")?;
+        .map_err(|error| format!("invalid registry auth challenge: {error}"))?;
+    let realm = auth_parameter(challenge, "realm")
+        .ok_or_else(|| "registry auth challenge has no realm".to_owned())?;
+    let service = auth_parameter(challenge, "service")
+        .ok_or_else(|| "registry auth challenge has no service".to_owned())?;
+    let scope = auth_parameter(challenge, "scope")
+        .ok_or_else(|| "registry auth challenge has no scope".to_owned())?;
     let token = client
         .get(realm)
         .query(&[("service", service), ("scope", scope)])
         .send()
         .await
-        .ok()?
+        .map_err(|error| format!("registry token request failed: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("registry token request failed: {error}"))?
         .json::<OciToken>()
         .await
-        .ok()?;
-    client
+        .map_err(|error| format!("registry token response was invalid: {error}"))?;
+    let response = client
         .get(url)
         .header(reqwest::header::ACCEPT, accept)
         .bearer_auth(token.token)
         .send()
         .await
-        .ok()
-        .filter(|response| response.status().is_success())
+        .map_err(|error| format!("authenticated registry request failed: {error}"))?;
+    if response.status().is_success() {
+        Ok(response)
+    } else {
+        Err(format!(
+            "authenticated registry request returned HTTP {}",
+            response.status()
+        ))
+    }
 }
 
 fn auth_parameter(challenge: &str, name: &str) -> Option<String> {
@@ -686,25 +699,44 @@ async fn stream_golden_response(
     response: reqwest::Response,
     tmp_payload: &Path,
     expected_sha256: Option<String>,
-) -> bool {
+) -> Result<u64, String> {
     let mut file = match tokio::fs::File::create(tmp_payload).await {
         Ok(file) => file,
-        Err(_) => return false,
+        Err(error) => {
+            return Err(format!("could not create temporary OCI golden: {error}"));
+        }
     };
+    let total_bytes = response.content_length();
+    let mut downloaded_bytes = 0_u64;
+    let mut next_progress = GOLDEN_PROGRESS_INTERVAL;
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let Ok(chunk) = chunk else {
-            let _ = tokio::fs::remove_file(tmp_payload).await;
-            return false;
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                let _ = tokio::fs::remove_file(tmp_payload).await;
+                return Err(format!(
+                    "stream failed after {downloaded_bytes} bytes: {error}"
+                ));
+            }
         };
-        if file.write_all(&chunk).await.is_err() {
+        if let Err(error) = file.write_all(&chunk).await {
             let _ = tokio::fs::remove_file(tmp_payload).await;
-            return false;
+            return Err(format!(
+                "write failed after {downloaded_bytes} bytes: {error}"
+            ));
+        }
+        downloaded_bytes = downloaded_bytes.saturating_add(chunk.len() as u64);
+        if downloaded_bytes >= next_progress {
+            report_golden_download_progress("OCI", downloaded_bytes, total_bytes);
+            next_progress = next_progress.saturating_add(GOLDEN_PROGRESS_INTERVAL);
         }
     }
-    if file.flush().await.is_err() {
+    if let Err(error) = file.flush().await {
         let _ = tokio::fs::remove_file(tmp_payload).await;
-        return false;
+        return Err(format!(
+            "flush failed after {downloaded_bytes} bytes: {error}"
+        ));
     }
     drop(file);
     if let Some(expected) = expected_sha256 {
@@ -721,15 +753,25 @@ async fn stream_golden_response(
         .await
         {
             Ok(Ok(digest)) => digest,
-            _ => return false,
+            Ok(Err(error)) => {
+                let _ = tokio::fs::remove_file(tmp_payload).await;
+                return Err(format!("could not hash downloaded OCI golden: {error}"));
+            }
+            Err(error) => {
+                let _ = tokio::fs::remove_file(tmp_payload).await;
+                return Err(format!("could not join OCI golden hash task: {error}"));
+            }
         };
         let expected = expected.strip_prefix("sha256:").unwrap_or(&expected);
         if digest != expected {
-            warn!(expected, %digest, "OCI golden layer digest mismatch");
-            return false;
+            let _ = tokio::fs::remove_file(tmp_payload).await;
+            return Err(format!(
+                "digest mismatch: expected {expected}, received {digest}"
+            ));
         }
     }
-    true
+    report_golden_download_progress("OCI", downloaded_bytes, total_bytes);
+    Ok(downloaded_bytes)
 }
 
 /// First whitespace-separated token of a `sha256sum`-style checksum file
