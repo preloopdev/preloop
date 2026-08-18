@@ -458,7 +458,11 @@ pub(crate) fn with_fake_smolvm_path<T>(test: impl FnOnce(&PathBuf) -> T) -> T {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "preloop", about = "Local CI with hardware isolation")]
+#[command(
+    name = "preloop",
+    about = "Local CI with hardware isolation",
+    version = env!("CARGO_PKG_VERSION")
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -466,6 +470,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Print the installed Preloop version.
+    Version,
+
     Run(RunArgs),
 
     /// Show the expanded job DAG without executing.
@@ -756,6 +763,10 @@ async fn main() -> anyhow::Result<()> {
     // Both run the daemon in this process, so neither may bootstrap another
     // one underneath itself.
     match cli.command {
+        Command::Version => {
+            println!("preloop {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
         Command::Serve(args) => return cmd_engine(args).await,
         Command::Engine => return cmd_engine(ServeArgs::default()).await,
         Command::BuildGolden(args) => return cmd_build_golden(args).await,
@@ -788,6 +799,7 @@ async fn main() -> anyhow::Result<()> {
         | Command::Serve(_)
         | Command::Engine
         | Command::BuildGolden(_)
+        | Command::Version
         | Command::Setup(_)
         | Command::Doctor(_)
         | Command::Secret(_)
@@ -2696,6 +2708,47 @@ fn materialize_plan_jobs(
     Ok(materialized)
 }
 
+fn materialize_plan_jobs(
+    plans: Vec<preloop_gha_protocol::JobPlan>,
+    reusable_workflows: &BTreeMap<String, String>,
+) -> anyhow::Result<Vec<preloop_gha_protocol::JobPlan>> {
+    let mut materialized = Vec::new();
+    for plan in plans {
+        let Some(call) = plan.reusable_call.as_ref() else {
+            materialized.push(plan);
+            continue;
+        };
+        // Needs-driven matrices are runtime placeholders. Their concrete
+        // cells require completed needs outputs, so do not send the empty
+        // matrix to `expand_reusable_call` (which correctly rejects it).
+        // Keep the placeholder visible and report its deferred expression.
+        if plan.deferred_matrix.is_some() {
+            materialized.push(plan);
+            continue;
+        }
+        let Some(yaml) = reusable_workflows.get(&call.workflow_file) else {
+            // Remote and unresolved calls remain explicit placeholders. The
+            // plan must not invent callee jobs without the referenced YAML.
+            materialized.push(plan);
+            continue;
+        };
+        let called = preloop_gha_parser::parse_workflow(yaml)
+            .map_err(|error| anyhow::anyhow!("parse reusable {}: {error}", call.workflow_file))?;
+        let expanded = preloop_gha_parser::expand_reusable_call(
+            &called,
+            &plan,
+            reusable_workflows,
+            &BTreeMap::new(),
+        )
+        .map_err(|error| anyhow::anyhow!("expand reusable {}: {error}", call.workflow_file))?;
+        // Keep the caller boundary in the output for downstream `needs`
+        // references, then append the concrete callee jobs it gates.
+        materialized.push(plan);
+        materialized.extend(materialize_plan_jobs(expanded.jobs, reusable_workflows)?);
+    }
+    Ok(materialized)
+}
+
 async fn cmd_plan(args: PlanArgs) -> anyhow::Result<()> {
     let workflow_path = resolve_workflow_path(args.file.as_deref())?;
     let workflow_yaml = std::fs::read_to_string(&workflow_path)
@@ -2770,6 +2823,21 @@ async fn cmd_plan(args: PlanArgs) -> anyhow::Result<()> {
         );
     }
     Ok(())
+
+}
+
+fn plan_json(plan: &preloop_gha_protocol::JobPlan) -> serde_json::Value {
+    serde_json::json!({
+        "id": plan.id.0,
+        "base_id": plan.base_id,
+        "name": plan.name,
+        "runner_group": plan.runner_group,
+        "runs_on": plan.runs_on,
+        "needs": plan.needs.iter().map(|need| need.0.clone()).collect::<Vec<_>>(),
+        "matrix": plan.matrix,
+        "deferred_matrix": plan.deferred_matrix,
+        "steps": plan.steps.len(),
+    })
 }
 
 fn plan_json(plan: &preloop_gha_protocol::JobPlan) -> serde_json::Value {
@@ -3727,6 +3795,19 @@ mod tests {
             err.kind(),
             ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
         );
+    }
+
+    #[test]
+    fn version_subcommand_parses_without_starting_engine() {
+        let cli = parse(&["version"]).unwrap();
+        assert!(matches!(cli.command, Command::Version));
+    }
+
+    #[test]
+    fn version_flag_uses_package_version() {
+        let err = Cli::try_parse_from(["preloop", "--version"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayVersion);
+        assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
     }
 
     #[test]

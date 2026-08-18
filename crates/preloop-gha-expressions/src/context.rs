@@ -39,6 +39,23 @@ impl Context {
         self.roots.insert(key.into(), value);
     }
 
+    /// Merge the entries of `extra` into the object root at `key`, creating
+    /// the root if absent. Used to overlay step-level environment variables
+    /// onto the job `env` context while evaluating a step's own script.
+    pub fn merge_root(&mut self, key: &str, extra: Value) {
+        match self.roots.remove(key) {
+            Some(Value::Object(mut base)) => {
+                if let Value::Object(extra_map) = extra {
+                    base.extend(extra_map);
+                }
+                self.roots.insert(key.to_string(), Value::Object(base));
+            }
+            _ => {
+                self.roots.insert(key.to_string(), extra);
+            }
+        }
+    }
+
     /// Resolve a dotted path such as `github.event_name`.
     /// Resolve a path such as `github.event_name`, with bracket access and wildcard support.
     ///
@@ -80,6 +97,22 @@ impl Context {
             };
         }
         current
+    }
+
+    /// Borrow a simple dotted path without cloning the resolved value.
+    ///
+    /// Wildcards and array projections can construct new arrays, so callers
+    /// that need those forms should continue using [`Self::resolve`].
+    pub(crate) fn resolve_ref(&self, path: &[String]) -> Option<&Value> {
+        let (first, rest) = path.split_first()?;
+        let mut current = self.roots.get(first)?;
+        for segment in rest {
+            if segment == "*" {
+                return None;
+            }
+            current = current.as_object()?.get(segment)?;
+        }
+        Some(current)
     }
 
     /// Resolve a path against an existing value (used for member access on expression results).

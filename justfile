@@ -48,7 +48,11 @@ test-properties-full:
     PROPTEST_CASES=10000 cargo test --locked -p preloop-runner-server --quiet
     PROPTEST_CASES=10000 cargo test --locked -p preloop-runner-server --quiet -- --ignored
 
-test-ci: fmt-check clippy
+# Security linter for GitHub Actions workflows
+zizmor:
+    uvx zizmor .github/workflows/
+
+test-ci: fmt-check clippy zizmor
     PROPTEST_CASES=8 cargo test --locked --workspace --quiet
     just conform
     @echo CI: all checks passed
@@ -122,6 +126,11 @@ conform-server-light:
 conform-server-deep:
     cargo zigbuild -p preloop-runner-server --release --target aarch64-unknown-linux-musl
     bash ./scripts/conform-server-deep.sh
+
+# Run the five-repository campaign against the pinned 9GB official runner
+# golden. Override PRELOOP_GOLDEN_ARTIFACT when the cache lives elsewhere.
+conform-5repos:
+    bash ./benchmarks/real-world/conformance-5repos.sh
 
 # Compare workflow/job status responses from the official and preloop runners.
 conform-runner-light:

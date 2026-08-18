@@ -3,6 +3,8 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -117,27 +119,6 @@ fn public_only_net_backend(lookup: impl Fn(&str) -> Option<String>) -> &'static 
     }
 }
 
-/// Whether a `major.minor.patch` version string is at least the given
-/// version. Unparseable versions answer `false`: callers use this to decide
-/// whether a runtime is safe to fork from, and failing closed is the safe
-/// direction.
-fn smolvm_version_at_least(version: &str, major: u64, minor: u64, patch: u64) -> bool {
-    let mut parts = version.trim_start_matches('v').split('.');
-    let (Some(actual_major), Some(actual_minor), Some(actual_patch)) =
-        (parts.next(), parts.next(), parts.next())
-    else {
-        return false;
-    };
-    let (Ok(actual_major), Ok(actual_minor), Ok(actual_patch)) = (
-        actual_major.parse::<u64>(),
-        actual_minor.parse::<u64>(),
-        actual_patch.parse::<u64>(),
-    ) else {
-        return false;
-    };
-    (actual_major, actual_minor, actual_patch) >= (major, minor, patch)
-}
-
 /// Where a guest environment value is resolved from, at launch time.
 ///
 /// SmolVM never persists the value itself, only this reference, so a secret
@@ -233,6 +214,12 @@ pub enum VmError {
     Launch {
         /// Program path.
         program: String,
+        /// Operating-system error.
+        source: std::io::Error,
+    },
+    /// Failed to prepare the SmolVM runtime directories.
+    #[error("failed to prepare SmolVM runtime directories: {source}")]
+    RuntimeIo {
         /// Operating-system error.
         source: std::io::Error,
     },
@@ -389,14 +376,6 @@ pub struct SmolVmProvider {
     /// environment; unit tests substitute a pure lookup so the policy can be
     /// exercised without mutating global state.
     env_lookup: EnvLookup,
-    /// Whether this SmolVM retains a reusable RAM checkpoint after a plain
-    /// fork, probed once per provider from the resolved binary's `--version`.
-    ///
-    /// Official SmolVM releases keep the checkpoint from 1.7.7; anything
-    /// older — or a probe that fails — must fall back to the safe
-    /// single-live-clone behavior, so the guard matches the actual binary
-    /// rather than assuming every install is current.
-    retained_fork_checkpoints: Arc<tokio::sync::OnceCell<bool>>,
 }
 
 impl Default for SmolVmProvider {
@@ -445,7 +424,6 @@ impl SmolVmProvider {
             forked_machines: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             socket_mount_supported: Arc::new(tokio::sync::OnceCell::new()),
             env_lookup: process_env,
-            retained_fork_checkpoints: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -488,6 +466,7 @@ impl SmolVmProvider {
     /// pack — not just machine creation.
     fn sandboxed_command(&self) -> Result<Command, VmError> {
         let mut command = self.command();
+        apply_smolvm_runtime_env_async(&mut command, Some(&self.binary))?;
         apply_sandbox_env(&mut command, self.env_lookup)?;
         Ok(command)
     }
@@ -504,8 +483,9 @@ impl SmolVmProvider {
     /// forwarded unvalidated: on an invalid override they are removed, so a
     /// recovery command runs without sandbox variables (no VMM is spawned
     /// here, so nothing boots unconfined) rather than with garbage.
-    fn recovery_command(&self) -> Command {
+    fn recovery_command(&self) -> Result<Command, VmError> {
         let mut command = self.command();
+        apply_smolvm_runtime_env_async(&mut command, Some(&self.binary))?;
         match sandbox_env_with(self.env_lookup) {
             Ok(sandbox) => {
                 for key in sandbox.remove {
@@ -521,7 +501,7 @@ impl SmolVmProvider {
                 command.env_remove("SMOLVM_CGROUP_ROOT");
             }
         }
-        command
+        Ok(command)
     }
 
     /// Run an operation that can never boot or restart a VMM, using
@@ -532,7 +512,7 @@ impl SmolVmProvider {
         operation: &'static str,
         args: &[String],
     ) -> Result<ExecOutput, VmError> {
-        let mut command = self.recovery_command();
+        let mut command = self.recovery_command()?;
         command
             .args(args)
             .stdin(Stdio::null())
@@ -612,52 +592,6 @@ impl SmolVmProvider {
         Ok(status.success() && String::from_utf8_lossy(&stdout).contains("--mount-socket"))
     }
 
-    /// Whether the resolved binary retains a reusable RAM checkpoint after a
-    /// plain fork, probed from `--version` and cached for the provider's
-    /// lifetime.
-    ///
-    /// Official SmolVM keeps the checkpoint from 1.7.7. The version gate is
-    /// the reliable check here: `preloop serve` resolves whatever `smolvm`
-    /// is on PATH and does not run the upgrader, so the provider must not
-    /// assume every install is current. A probe that fails (missing binary,
-    /// unparseable version) is treated as not retaining checkpoints — the
-    /// fail-closed answer keeps the single-live-clone guard, which is always
-    /// safe, instead of re-exposing the fork corruption older releases cause.
-    async fn supports_retained_fork_checkpoints(&self) -> bool {
-        let mut command = self.command();
-        command
-            .arg("--version")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let Ok(mut child) = command.spawn() else {
-            return false;
-        };
-        let stdout = child.stdout.take().expect("piped stdout");
-        let stderr = child.stderr.take().expect("piped stderr");
-        let (stdout, stderr, status) = tokio::join!(
-            read_bounded(stdout, self.capture_limit),
-            read_bounded(stderr, self.capture_limit),
-            child.wait(),
-        );
-        let (Ok((stdout, _)), Ok(_), Ok(status)) = (stdout, stderr, status) else {
-            return false;
-        };
-        if !status.success() {
-            return false;
-        }
-        let output = String::from_utf8_lossy(&stdout);
-        let version = output
-            .split_whitespace()
-            .last()
-            .map(|version| version.trim_start_matches('v'));
-        match version {
-            Some(version) => smolvm_version_at_least(version, 1, 7, 7),
-            None => false,
-        }
-    }
-
     async fn checked(
         &self,
         operation: &'static str,
@@ -689,6 +623,9 @@ impl SmolVmProvider {
             // archive. Keep that scratch space beside the output instead of
             // falling back to a small host /tmp tmpfs.
             command.env("TMPDIR", staging_dir);
+            // Pack export streams multi-GiB flattened layers; the general 4 GiB
+            // file-transfer cap would abort a large golden pack.
+            command.env("SMOLVM_FILE_TRANSFER_MAX_BYTES", "64GiB");
         }
         command
             .args(args)
@@ -823,19 +760,6 @@ impl VmProvider for SmolVmProvider {
             args.extend(["--from".into(), spec.image.clone()]);
         } else {
             args.extend(["--image".into(), spec.image.clone()]);
-            // A bare rootfs directory carries no OCI metadata, so the image
-            // defines no entrypoint/CMD and `machine start` refuses to run a
-            // detached workload. Everything this provider does runs through
-            // `machine exec` anyway, so pin a harmless keep-alive workload
-            // for directory images. Registry images keep their own CMD.
-            if Path::new(&spec.image).is_dir() {
-                args.extend([
-                    "--".into(),
-                    "/bin/sh".into(),
-                    "-c".into(),
-                    "sleep infinity".into(),
-                ]);
-            }
         }
         args.extend([
             "--cpus".into(),
@@ -892,6 +816,26 @@ impl VmProvider for SmolVmProvider {
                 "--mount-socket".into(),
                 format!("{}:{}", mount.host.display(), mount.guest.display()),
             ]);
+        }
+        if !is_pack {
+            // Everything this provider does runs through `machine exec`, so
+            // pin a harmless keep-alive workload when the image declares no
+            // usable startup command. Without it, machines whose record
+            // carries no entrypoint/cmd (bare archives, the official runner
+            // image's `bash` CMD) fail to start with libkrun's EINVAL once
+            // the memory ceiling is raised. Images that declare a real
+            // CMD/entrypoint keep their own workload — overriding it changes
+            // runtime behavior. The workload must be the LAST positional
+            // block: `machine create` treats everything after `--` as the
+            // workload, so any flags appended later would be swallowed.
+            if !image_has_startup_command(&spec.image) {
+                args.extend([
+                    "--".into(),
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "sleep infinity".into(),
+                ]);
+            }
         }
         self.exclusive_with_network("create", &args, &spec.network)
             .await?;
@@ -965,37 +909,11 @@ impl VmProvider for SmolVmProvider {
     /// the few hundred milliseconds a concurrent refill saves. SmolVM's own
     /// fork-pool controller serializes on the golden for the same reason.
     ///
-    /// Releases before 1.7.7 (or an unprobeable runtime) additionally lack
-    /// retained checkpoints entirely: the first fork leaves the base paused
-    /// with no checkpoint to restore from, so a second live clone would be
-    /// served from storage that must outlive the first. For those runtimes,
-    /// track live clones under the same per-golden lock and reject a second
-    /// call before invoking SmolVM. The capability is probed once from the
-    /// resolved binary's `--version`, not assumed from the pinned install.
-    ///
     /// Different goldens still fork concurrently, and forks remain excluded
     /// from base construction, so a golden cannot be replaced underneath one.
     async fn fork(&self, golden: &MachineName, clone: &MachineName) -> Result<(), VmError> {
         let fork_lock = self.fork_lock(golden).await;
         let _fork_guard = fork_lock.lock().await;
-        let retains_checkpoints = *self
-            .retained_fork_checkpoints
-            .get_or_init(|| self.supports_retained_fork_checkpoints())
-            .await;
-        if !retains_checkpoints {
-            if let Some(live_clone) = self
-                .forked_machines
-                .lock()
-                .await
-                .iter()
-                .find_map(|(clone, owner)| (owner == golden.as_str()).then(|| clone.clone()))
-            {
-                return Err(VmError::ForkBaseBusy {
-                    golden: golden.as_str().to_owned(),
-                    clone: live_clone,
-                });
-            }
-        }
         let result = self
             .concurrent(
                 "fork",
@@ -1499,6 +1417,248 @@ pub fn apply_smolvm_sandbox_env(command: &mut std::process::Command) -> Result<(
     Ok(())
 }
 
+/// Preloop home the helper isolates SmolVM into: the explicit `PRELOOP_HOME`,
+/// else `<HOME>/.preloop` (the CLI's `preloop_home()` default), else the
+/// bare `.preloop` relative directory.
+fn effective_preloop_home() -> Option<PathBuf> {
+    std::env::var_os("PRELOOP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".preloop")))
+}
+
+/// Candidate locations for the SmolVM guest agent rootfs, in probe order.
+///
+/// SmolVM keeps its data directory — and the agent rootfs inside it — at the
+/// platform default (`~/Library/Application Support/smolvm` on macOS,
+/// `~/.local/share/smolvm` on Linux) or wherever `SMOLVM_DATA_DIR` points.
+/// Preloop derives its own registry dir from the effective Preloop home and
+/// may isolate the child's `HOME` on macOS, so the REAL host locations must
+/// be probed explicitly or a standard install's agent rootfs is never found
+/// (the isolated HOME sends smolvm to an empty directory).
+fn agent_rootfs_candidates(host_home: Option<&Path>, data_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(data_dir) = data_dir {
+        candidates.push(data_dir.join("agent-rootfs"));
+    }
+    if let Some(home) = host_home {
+        #[cfg(target_os = "macos")]
+        {
+            candidates.push(home.join("Library/Application Support/smolvm/agent-rootfs"));
+            candidates.push(home.join(".smolvm/agent-rootfs"));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            candidates.push(home.join(".local/share/smolvm/agent-rootfs"));
+            candidates.push(home.join(".smolvm/agent-rootfs"));
+        }
+    }
+    candidates
+}
+
+/// Kill any lingering SmolVM `_boot-vm` hypervisor processes whose machine
+/// state lives under this Preloop home.
+///
+/// A server death (crash, OOM, SIGKILL) orphans the detached `_boot-vm`
+/// processes: the CLI flow detaches them (the parent-death watchdog is
+/// off by design), and only the in-VM agent or an explicit `machine stop`
+/// can shut them down. If the machine's data directory is then removed out
+/// from under the live VM (a home cleanup), the smolvm database no longer
+/// knows the machine, so `machine delete` cannot reach it — the `_boot-vm`
+/// keeps the storage file descriptors open and the unlinked blocks leak
+/// until the process exits. The `_boot-vm` argv names its
+/// `boot-config.json` under the data dir, so orphaned processes are
+/// identifiable by path.
+///
+/// Called at pool startup (crash recovery) and shutdown (unresponsive
+/// agent belt-and-suspenders). Returns the number of processes killed.
+pub fn purge_orphaned_vms() -> Result<usize, VmError> {
+    let Some(preloop_home) = effective_preloop_home() else {
+        return Ok(0);
+    };
+    let markers: Vec<String> = [
+        preloop_home.join("smolvm"),
+        preloop_home.join("smolvm-home"),
+    ]
+    .iter()
+    .filter_map(|path| path.to_str().map(str::to_owned))
+    .collect();
+    if markers.is_empty() {
+        return Ok(0);
+    }
+    let output = std::process::Command::new("ps")
+        .args(["ax", "-o", "pid=,command="])
+        .output()
+        .map_err(|source| VmError::Launch {
+            program: "ps".to_owned(),
+            source,
+        })?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut killed = 0usize;
+    for line in text.lines() {
+        if !line.contains("_boot-vm") {
+            continue;
+        }
+        if !markers.iter().any(|marker| line.contains(marker.as_str())) {
+            continue;
+        }
+        let Some(pid) = line
+            .split_whitespace()
+            .next()
+            .and_then(|token| token.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if pid <= 0 {
+            continue;
+        }
+        // SIGKILL: the machine is unreachable through smolvm (no record, or
+        // an unresponsive agent) — the hypervisor process must die to
+        // release the storage fds.
+        let status = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+        if matches!(status, Ok(status) if status.success()) {
+            killed += 1;
+        }
+    }
+    Ok(killed)
+}
+
+fn smolvm_runtime_env(binary: Option<&Path>) -> Vec<(String, std::ffi::OsString)> {
+    let host_home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut env = Vec::new();
+    let explicit_data_dir = std::env::var_os("SMOLVM_DATA_DIR").map(PathBuf::from);
+    let data_dir = explicit_data_dir
+        .clone()
+        .or_else(|| effective_preloop_home().map(|home| home.join("smolvm")));
+    if explicit_data_dir.is_none() {
+        if let Some(data_dir) = &data_dir {
+            // SmolVM 1.8.x ignores SMOLVM_DATA_DIR on macOS and derives its
+            // registry from HOME. Keep each Preloop home isolated while still
+            // leaving an explicit operator registry untouched.
+            #[cfg(target_os = "macos")]
+            if let Some(preloop_home) = effective_preloop_home() {
+                env.push((
+                    "HOME".to_owned(),
+                    preloop_home.join("smolvm-home").into_os_string(),
+                ));
+            }
+            env.push((
+                "SMOLVM_DATA_DIR".to_owned(),
+                data_dir.clone().into_os_string(),
+            ));
+        }
+    }
+
+    // HOME may be isolated above, so preserve the host installation assets
+    // explicitly for the child SmolVM process: the agent rootfs lives in the
+    // REAL host's platform data dir, which the isolated HOME would miss.
+    if std::env::var_os("SMOLVM_AGENT_ROOTFS").is_none() {
+        if let Some(path) = agent_rootfs_candidates(host_home.as_deref(), data_dir.as_deref())
+            .into_iter()
+            .find(|path| path.is_dir())
+        {
+            env.push(("SMOLVM_AGENT_ROOTFS".to_owned(), path.into_os_string()));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut candidates = Vec::new();
+        if let Some(path) = std::env::var_os("SMOLVM_LIB_DIR") {
+            candidates.push(PathBuf::from(path));
+        }
+        if let Some(binary) = binary {
+            let resolved = binary
+                .canonicalize()
+                .ok()
+                .or_else(|| binary.is_absolute().then(|| binary.to_path_buf()));
+            if let Some(parent) = resolved.and_then(|path| path.parent().map(Path::to_path_buf)) {
+                candidates.push(parent.join("lib"));
+            }
+        }
+        if let Some(home) = host_home {
+            candidates.push(home.join(".smolvm/lib"));
+        }
+        let Some(lib_dir) = candidates
+            .into_iter()
+            .find(|path| path.join("libkrunfw.5.dylib").is_file())
+        else {
+            return env;
+        };
+        let mut paths = vec![lib_dir];
+        if let Some(existing) = std::env::var_os("DYLD_LIBRARY_PATH") {
+            paths.extend(std::env::split_paths(&existing));
+        }
+        if let Ok(loader_path) = std::env::join_paths(paths) {
+            env.push(("DYLD_LIBRARY_PATH".to_owned(), loader_path));
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = binary;
+    }
+    env
+}
+
+/// Add the bundled SmolVM libraries to boot-capable child commands on macOS.
+///
+/// The macOS release binary dynamically loads `libkrunfw.5.dylib` from the
+/// adjacent `.smolvm/lib` directory, but the binary has no rpath and the
+/// bootstrap process does not inherit a loader path from the installer.
+/// Without this, `machine create` succeeds and every subsequent VM start
+/// fails at the Hypervisor.framework boundary. An explicit `SMOLVM_LIB_DIR`
+/// wins; otherwise use the resolved binary's sibling directory or the
+/// standard per-user install location.
+/// Directories derived from the effective Preloop home that must exist before
+/// SmolVM starts (it does not create a missing data dir itself).
+fn runtime_dirs_to_create() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if std::env::var_os("SMOLVM_DATA_DIR").is_none() {
+        if let Some(home) = effective_preloop_home() {
+            dirs.push(home.join("smolvm"));
+            #[cfg(target_os = "macos")]
+            dirs.push(home.join("smolvm-home"));
+        }
+    }
+    dirs
+}
+
+/// Add the bundled SmolVM libraries to boot-capable child commands on macOS.
+///
+/// The macOS release binary dynamically loads `libkrunfw.5.dylib` from the
+/// adjacent `.smolvm/lib` directory, but the binary has no rpath and the
+/// bootstrap process does not inherit a loader path from the installer.
+/// Without this, `machine create` succeeds and every subsequent VM start
+/// fails at the Hypervisor.framework boundary. An explicit `SMOLVM_LIB_DIR`
+/// wins; otherwise use the resolved binary's sibling directory or the
+/// standard per-user install location.
+pub fn apply_smolvm_runtime_env(
+    command: &mut std::process::Command,
+    binary: Option<&Path>,
+) -> Result<(), VmError> {
+    for dir in runtime_dirs_to_create() {
+        std::fs::create_dir_all(&dir).map_err(|source| VmError::RuntimeIo { source })?;
+    }
+    for (key, value) in smolvm_runtime_env(binary) {
+        command.env(key, value);
+    }
+    Ok(())
+}
+
+fn apply_smolvm_runtime_env_async(
+    command: &mut Command,
+    binary: Option<&Path>,
+) -> Result<(), VmError> {
+    for dir in runtime_dirs_to_create() {
+        std::fs::create_dir_all(&dir).map_err(|source| VmError::RuntimeIo { source })?;
+    }
+    for (key, value) in smolvm_runtime_env(binary) {
+        command.env(key, value);
+    }
+    Ok(())
+}
+
 /// Apply the sandbox policy to a provider command.
 #[cfg(target_os = "linux")]
 fn apply_sandbox_env(command: &mut Command, lookup: EnvLookup) -> Result<(), VmError> {
@@ -1680,6 +1840,72 @@ fn cgroup_root_dir(rel: &str) -> PathBuf {
     Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/'))
 }
 
+/// Whether an image declares a usable startup command (entrypoint or cmd).
+///
+/// Registry references and packs carry their own entrypoint/cmd in the image
+/// or pack metadata, so the provider assumes they have one and never overrides
+/// it with the keep-alive workload. A local OCI archive (docker-save `.tar`)
+/// is inspected from its `manifest.json` + config: if the config names neither
+/// an entrypoint nor a cmd, the machine would boot with an empty record and
+/// can fail to start (libkrun EINVAL) once the memory ceiling is raised.
+fn image_has_startup_command(image: &str) -> bool {
+    let path = Path::new(image);
+    if !path.is_file() || image.ends_with(".smolmachine") {
+        return true;
+    }
+    // Docker-save archive: read manifest.json, then the config file it names.
+    let manifest = read_tar_json_member(path, "manifest.json").and_then(|value| {
+        value
+            .get(0)
+            .and_then(|entry| entry.get("Config"))
+            .and_then(|config| config.as_str())
+            .map(str::to_owned)
+    });
+    let Some(config_name) = manifest else {
+        return true;
+    };
+    let Some(config) = read_tar_json_member(path, &config_name) else {
+        return true;
+    };
+    // docker-save nests the image config under `config`; the OCI layout keeps
+    // it at the top level.
+    let config = config.get("config").unwrap_or(&config);
+    let has_entrypoint = config
+        .get("Entrypoint")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|v| !v.is_empty());
+    let has_cmd = config
+        .get("Cmd")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|v| !v.is_empty());
+    has_entrypoint || has_cmd
+}
+
+/// Read and parse one member of a docker-save tar by name (prefix-stripped).
+fn read_tar_json_member(tar_path: &Path, member: &str) -> Option<serde_json::Value> {
+    let Ok(file) = File::open(tar_path) else {
+        return None;
+    };
+    let mut archive = tar::Archive::new(file);
+    let Ok(entries) = archive.entries() else {
+        return None;
+    };
+    let member = member.trim_start_matches("./");
+    for mut entry in entries.flatten() {
+        let Ok(entry_path) = entry.path() else {
+            continue;
+        };
+        if entry_path.to_string_lossy().trim_start_matches("./") == member {
+            let mut raw = Vec::new();
+            if entry.read_to_end(&mut raw).is_err() {
+                return None;
+            }
+            return serde_json::from_slice(&raw).ok();
+        }
+    }
+    None
+}
+
 fn validate_spec(spec: &MachineSpec) -> Result<(), VmError> {
     if spec.image.trim().is_empty()
         || spec.cpus == 0
@@ -1789,22 +2015,76 @@ async fn forward(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[test]
-    fn retained_checkpoint_version_gate_answers_at_least_1_7_7() {
-        assert!(smolvm_version_at_least("1.7.7", 1, 7, 7));
-        assert!(smolvm_version_at_least("1.8.0", 1, 7, 7));
-        assert!(smolvm_version_at_least("2.0.0", 1, 7, 7));
-        assert!(smolvm_version_at_least("v1.7.7", 1, 7, 7));
-        assert!(!smolvm_version_at_least("1.7.6", 1, 7, 7));
-        assert!(!smolvm_version_at_least("1.7.4", 1, 7, 7));
-        assert!(!smolvm_version_at_least("1.6.9", 1, 7, 7));
-        // Unparseable versions fail closed: the guard stays active.
-        assert!(!smolvm_version_at_least("", 1, 7, 7));
-        assert!(!smolvm_version_at_least("latest", 1, 7, 7));
-        assert!(!smolvm_version_at_least("1.7", 1, 7, 7));
+    fn purge_orphaned_vms_kills_matching_boot_vm_processes() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!("preloop-purge-{}", uuid::Uuid::new_v4()));
+        let marker = home.join("smolvm-home/Library/Caches/smolvm/vms/deadbeef/boot-config.json");
+        // A process that looks like an orphaned _boot-vm for this home: the
+        // argv carries the marker path, so `ps` shows it in the command line.
+        // `sh -c '… & wait'` keeps the shell alive with the marker visible
+        // in its argv (a bare `sh -c cmd` execs cmd, dropping the args).
+        let mut child = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "sleep 60 & wait",
+                "_boot-vm",
+                marker.to_str().unwrap(),
+            ])
+            .spawn()
+            .expect("spawn dummy boot-vm");
+        let pid = child.id() as i32;
+        let previous = std::env::var_os("PRELOOP_HOME");
+        std::env::set_var("PRELOOP_HOME", &home);
+        let killed = purge_orphaned_vms().expect("purge");
+        match previous {
+            Some(value) => std::env::set_var("PRELOOP_HOME", value),
+            None => std::env::remove_var("PRELOOP_HOME"),
+        }
+        assert!(killed >= 1, "purge should have killed the matching process");
+        // Reap the SIGKILLed child so it is not a zombie (kill -0 on a
+        // zombie still succeeds until it is reaped).
+        let _ = child.wait();
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .expect("probe process");
+        assert!(!alive.success(), "matching _boot-vm must be dead");
     }
+
+    #[test]
+    fn agent_rootfs_candidates_probe_platform_then_legacy() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let home = dir.path();
+        #[cfg(target_os = "macos")]
+        let platform = home.join("Library/Application Support/smolvm/agent-rootfs");
+        #[cfg(not(target_os = "macos"))]
+        let platform = home.join(".local/share/smolvm/agent-rootfs");
+        let legacy = home.join(".smolvm/agent-rootfs");
+        std::fs::create_dir_all(&platform).expect("platform agent rootfs");
+        std::fs::create_dir_all(&legacy).expect("legacy agent rootfs");
+        let found = agent_rootfs_candidates(Some(home), None)
+            .into_iter()
+            .find(|path| path.is_dir())
+            .expect("a candidate exists");
+        assert_eq!(
+            found, platform,
+            "the platform default must be probed before the legacy location"
+        );
+
+        // An explicit SMOLVM_DATA_DIR wins over the platform defaults.
+        let explicit = home.join("custom/agent-rootfs");
+        std::fs::create_dir_all(&explicit).expect("explicit agent rootfs");
+        let found = agent_rootfs_candidates(Some(home), Some(home.join("custom").as_path()))
+            .into_iter()
+            .find(|path| path.is_dir())
+            .expect("explicit candidate exists");
+        assert_eq!(found, explicit);
+    }
+
+    use super::*;
 
     #[test]
     fn cgroup_root_dir_trims_the_leading_slash_of_proc_self_cgroup_paths() {

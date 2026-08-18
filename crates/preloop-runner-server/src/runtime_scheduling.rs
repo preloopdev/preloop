@@ -1538,19 +1538,23 @@ pub(crate) fn pair_registered_runner(inner: &mut InnerState, runner_id: i64) {
     // back to the FIFO claim path), a stale mark means that provisioning died
     // before any machine registered — filtering those out is what left
     // long-waiting jobs invisible to the pool.
+    //
+    // Precompute matching queue positions in a single pass over the ready queue
+    // to avoid quadratic scanning under the global state mutex.
+    let queue_positions: std::collections::HashMap<(RunId, JobId), usize> = inner
+        .queue
+        .iter()
+        .enumerate()
+        .filter(|(_, job)| job_matches_runner_capabilities(job, &caps))
+        .map(|(idx, job)| ((job.run_id, job.job_id.clone()), idx))
+        .collect();
+
     let chosen = inner
         .pool_pending
         .iter()
-        .filter(|(key, _)| {
-            inner
-                .queue
-                .iter()
-                .find(|job| job.run_id == key.0 && job.job_id == key.1)
-                .map(|job| job_matches_runner_capabilities(job, &caps))
-                .unwrap_or(false)
-        })
-        .min_by_key(|(_, at)| **at)
-        .map(|(key, _)| key.clone());
+        .filter_map(|(key, at)| queue_positions.get(key).map(|&pos| (key, *at, pos)))
+        .min_by_key(|(_, at, pos)| (*at, *pos))
+        .map(|(key, _, _)| key.clone());
     if let Some(key) = chosen {
         // Rebinding to a replacement machine keeps the original first-bound
         // stamp, so repeated provisioning failures cannot extend the window
@@ -1585,7 +1589,7 @@ pub(crate) fn clear_assignment(inner: &mut InnerState, run_id: RunId, job_id: &J
         .any(|job| job.run_id == run_id && job.job_id == *job_id)
 }
 
-fn capabilities_of(runner: &RegisteredRunner) -> RunnerCapabilities {
+pub(crate) fn capabilities_of(runner: &RegisteredRunner) -> RunnerCapabilities {
     RunnerCapabilities {
         known: true,
         labels: runner.labels.clone(),
