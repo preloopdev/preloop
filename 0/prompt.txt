@@ -15,3 +15,7 @@ Yeah, that's fine. What's that ensure runtime plug for exactly?
 ---
 
 That's fine. Do we have a preloop version of command?
+
+---
+
+Alright, sounds good. Implement it
