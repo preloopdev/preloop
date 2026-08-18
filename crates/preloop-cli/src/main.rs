@@ -3497,6 +3497,24 @@ mod tests {
             .then_some(())
             .expect("git init succeeds");
 
+        // A developer-configured global `core.hooksPath` (e.g.
+        // `~/.config/git/hooks`) would make `git rev-parse --git-path hooks`
+        // resolve outside this repository: `install_hook` would write into —
+        // and this test's assertions would miss — the shared location, and
+        // the "uninstall" step could clobber a real global hook. Pin the
+        // hooks directory to this repository's own `.git/hooks` via a local
+        // config so the whole lifecycle stays self-contained.
+        let local_hooks = std::fs::canonicalize(repo.join(".git/hooks")).expect("hooks dir");
+        assert!(
+            std::process::Command::new("git")
+                .args(["config", "--local", "core.hooksPath"])
+                .arg(&local_hooks)
+                .status()
+                .expect("git config core.hooksPath")
+                .success(),
+            "git config core.hooksPath succeeds"
+        );
+
         assert!(!hook_installed(), "should not be installed yet");
         assert!(!hook_decided(), "should not be decided yet");
 
