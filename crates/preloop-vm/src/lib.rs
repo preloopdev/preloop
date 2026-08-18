@@ -13,6 +13,8 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
+include!(concat!(env!("OUT_DIR"), "/pins.rs"));
+
 const DEFAULT_CAPTURE_LIMIT: usize = 1024 * 1024;
 
 /// A validated persistent SmolVM machine name.
@@ -123,21 +125,26 @@ fn public_only_net_backend(lookup: impl Fn(&str) -> Option<String>) -> &'static 
 /// version. Unparseable versions answer `false`: callers use this to decide
 /// whether a runtime is safe to fork from, and failing closed is the safe
 /// direction.
-fn smolvm_version_at_least(version: &str, major: u64, minor: u64, patch: u64) -> bool {
-    let mut parts = version.trim().trim_start_matches('v').split('.');
-    let (Some(actual_major), Some(actual_minor), Some(actual_patch)) =
-        (parts.next(), parts.next(), parts.next())
-    else {
+fn smolvm_version_at_least(version: &str, minimum: &str) -> bool {
+    let parse = |value: &str| {
+        let mut parts = value.trim().trim_start_matches('v').split('.');
+        let (Some(major), Some(minor), Some(patch)) = (parts.next(), parts.next(), parts.next())
+        else {
+            return None;
+        };
+        let (Ok(major), Ok(minor), Ok(patch)) = (
+            major.parse::<u64>(),
+            minor.parse::<u64>(),
+            patch.parse::<u64>(),
+        ) else {
+            return None;
+        };
+        Some((major, minor, patch))
+    };
+    let (Some(actual), Some(required)) = (parse(version), parse(minimum)) else {
         return false;
     };
-    let (Ok(actual_major), Ok(actual_minor), Ok(actual_patch)) = (
-        actual_major.parse::<u64>(),
-        actual_minor.parse::<u64>(),
-        actual_patch.parse::<u64>(),
-    ) else {
-        return false;
-    };
-    (actual_major, actual_minor, actual_patch) >= (major, minor, patch)
+    actual >= required
 }
 
 /// Where a guest environment value is resolved from, at launch time.
@@ -400,8 +407,8 @@ pub struct SmolVmProvider {
     /// Whether this SmolVM retains a reusable RAM checkpoint after a plain
     /// fork, probed once per provider from the resolved binary's `--version`.
     ///
-    /// Official SmolVM releases keep the checkpoint from 1.7.7; anything
-    /// older — or a probe that fails — must fall back to the safe
+    /// Official SmolVM releases keep the checkpoint from the configured
+    /// minimum; anything older — or a probe that fails — must fall back to the safe
     /// single-live-clone behavior, so the guard matches the actual binary
     /// rather than assuming every install is current.
     retained_fork_checkpoints: Arc<tokio::sync::OnceCell<bool>>,
@@ -626,7 +633,7 @@ impl SmolVmProvider {
     /// plain fork, probed from `--version` and cached for the provider's
     /// lifetime.
     ///
-    /// Official SmolVM keeps the checkpoint from 1.7.7. The version gate is
+    /// Official SmolVM keeps the checkpoint from the configured minimum. The version gate is
     /// the reliable check here: `preloop serve` resolves whatever `smolvm`
     /// is on PATH and does not run the upgrader, so the provider must not
     /// assume every install is current. A probe that fails (missing binary,
@@ -683,7 +690,7 @@ impl SmolVmProvider {
             .last()
             .map(|version| version.trim_start_matches('v'));
         match version {
-            Some(version) => smolvm_version_at_least(version, 1, 7, 7),
+            Some(version) => smolvm_version_at_least(version, SMOLVM_MIN_VERSION),
             None => false,
         }
     }
@@ -1005,7 +1012,7 @@ impl VmProvider for SmolVmProvider {
     /// the few hundred milliseconds a concurrent refill saves. SmolVM's own
     /// fork-pool controller serializes on the golden for the same reason.
     ///
-    /// Releases before 1.7.7 (or an unprobeable runtime) additionally lack
+    /// Releases before the configured minimum (or an unprobeable runtime) additionally lack
     /// retained checkpoints entirely: the first fork leaves the base paused
     /// with no checkpoint to restore from, so a second live clone would be
     /// served from storage that must outlive the first. For those runtimes,
@@ -2209,18 +2216,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn retained_checkpoint_version_gate_answers_at_least_1_7_7() {
-        assert!(smolvm_version_at_least("1.7.7", 1, 7, 7));
-        assert!(smolvm_version_at_least("1.8.0", 1, 7, 7));
-        assert!(smolvm_version_at_least("2.0.0", 1, 7, 7));
-        assert!(smolvm_version_at_least("v1.7.7", 1, 7, 7));
-        assert!(!smolvm_version_at_least("1.7.6", 1, 7, 7));
-        assert!(!smolvm_version_at_least("1.7.4", 1, 7, 7));
-        assert!(!smolvm_version_at_least("1.6.9", 1, 7, 7));
+    fn retained_checkpoint_version_gate_uses_central_minimum() {
+        assert!(smolvm_version_at_least(
+            SMOLVM_MIN_VERSION,
+            SMOLVM_MIN_VERSION
+        ));
+        assert!(smolvm_version_at_least("1.9.0", SMOLVM_MIN_VERSION));
+        assert!(smolvm_version_at_least("v1.8.1", SMOLVM_MIN_VERSION));
+        assert!(!smolvm_version_at_least("1.8.0", SMOLVM_MIN_VERSION));
+        assert!(!smolvm_version_at_least("1.7.7", SMOLVM_MIN_VERSION));
+        assert!(!smolvm_version_at_least("1.6.9", SMOLVM_MIN_VERSION));
         // Unparseable versions fail closed: the guard stays active.
-        assert!(!smolvm_version_at_least("", 1, 7, 7));
-        assert!(!smolvm_version_at_least("latest", 1, 7, 7));
-        assert!(!smolvm_version_at_least("1.7", 1, 7, 7));
+        assert!(!smolvm_version_at_least("", SMOLVM_MIN_VERSION));
+        assert!(!smolvm_version_at_least("latest", SMOLVM_MIN_VERSION));
+        assert!(!smolvm_version_at_least("1.7", SMOLVM_MIN_VERSION));
     }
 
     #[test]

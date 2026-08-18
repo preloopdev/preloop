@@ -180,3 +180,55 @@ jobs:
             exit 1
           fi
           echo "candidate smolvm boots VMs: PASS"
+
+      - name: Verify packed ownership preservation
+        if: github.event_name == 'workflow_dispatch' || steps.changed.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          BASE_NAME="preloop-ownership-base-$(date +%s)"
+          CLONE_NAME="${BASE_NAME}-clone"
+          WORK="$(mktemp -d "${TMPDIR:-/tmp}/preloop-ownership.XXXXXX")"
+          PACK="$WORK/ownership-pack"
+          cleanup() {
+            smolvm machine stop --name "$CLONE_NAME" >/dev/null 2>&1 || true
+            smolvm machine delete --name "$CLONE_NAME" -f --cascade >/dev/null 2>&1 || true
+            smolvm machine stop --name "$BASE_NAME" >/dev/null 2>&1 || true
+            smolvm machine delete --name "$BASE_NAME" -f --cascade >/dev/null 2>&1 || true
+            rm -rf "$WORK"
+          }
+          trap cleanup EXIT
+
+          # Create a file owned by a non-root guest account, pack the VM, then
+          # rehydrate it. SmolVM <1.8.1 leaked the host UID/GID here; the
+          # candidate must preserve the archived 2345:2345 ownership.
+          smolvm machine create --name "$BASE_NAME" \
+            --image alpine:3.20 \
+            --net \
+            --init 'addgroup -g 2345 repro && adduser -D -u 2345 -G repro repro && touch /opt/preloop-ownership && chown 2345:2345 /opt/preloop-ownership'
+          smolvm machine start --name "$BASE_NAME"
+          READY=""
+          for _ in $(seq 1 150); do
+            if smolvm machine exec --name "$BASE_NAME" -- \
+                sh -c 'test "$(stat -c %u:%g /opt/preloop-ownership)" = 2345:2345'; then
+              READY=1
+              break
+            fi
+            sleep 2
+          done
+          [ -n "$READY" ] || { echo "ownership fixture VM did not become ready" >&2; exit 1; }
+          smolvm machine stop --name "$BASE_NAME"
+          smolvm pack create --from-vm "$BASE_NAME" --output "$PACK" --no-sign
+          smolvm machine create --name "$CLONE_NAME" --from "$PACK"
+          smolvm machine start --name "$CLONE_NAME"
+          ACTUAL=""
+          for _ in $(seq 1 150); do
+            ACTUAL="$(smolvm machine exec --name "$CLONE_NAME" -- \
+              sh -c 'stat -c %u:%g /opt/preloop-ownership' 2>/dev/null || true)"
+            if [ "$ACTUAL" = "2345:2345" ]; then
+              break
+            fi
+            sleep 2
+          done
+          [ "$ACTUAL" = "2345:2345" ] \
+            || { echo "packed ownership mismatch: expected 2345:2345, got $ACTUAL" >&2; exit 1; }
+          echo "packed ownership preservation: PASS"

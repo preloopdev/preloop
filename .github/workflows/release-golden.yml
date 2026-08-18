@@ -182,11 +182,11 @@ jobs:
             --require-source-prefix \
               "https://github.com/preloopdev/runner-image-blobs/tree"
 
-      - name: Install pinned smolvm
-        env:
-          SMOLVM_VERSION: "1.8.2"
+      - name: Install configured smolvm
         run: |
           set -euo pipefail
+          SMOLVM_VERSION="$(grep '^smolvm_golden_version' versions.toml | cut -d'"' -f2)"
+          [ -n "$SMOLVM_VERSION" ] || { echo "smolvm_golden_version missing from versions.toml" >&2; exit 1; }
           ARCHIVE="smolvm-${SMOLVM_VERSION}-linux-x86_64.tar.gz"
           BASE="https://github.com/smol-machines/smolvm/releases/download/v${SMOLVM_VERSION}"
           curl -fsSL -o "$ARCHIVE" "$BASE/$ARCHIVE"

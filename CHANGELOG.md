@@ -9,6 +9,15 @@ Releases before v0.27.0 predate the changelog.
 
 ## [Unreleased]
 
+### Fixed
+
+- SmolVM compatibility now comes from the central `versions.toml`
+  `smolvm_min_version` pin. `preloop-cli` and `preloop-vm` compile the same
+  floor, and `preloop update --ensure-runtime` installs the latest stable
+  SmolVM when the local runtime is below it or lacks required capabilities.
+  Preloop relies on SmolVM's packed-ownership implementation instead of
+  rewriting guest rootfs ownership.
+
 ## [0.30.10] - 2026-08-18
 
 ### Fixed

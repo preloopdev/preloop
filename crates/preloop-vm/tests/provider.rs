@@ -760,7 +760,7 @@ printf 'exit %s\n' "$6" >> "$0.forklog"
 
     /// The current official runtime: retains reusable fork checkpoints.
     fn fake_blocking_fork_smolvm() -> (TempDir, PathBuf) {
-        fake_blocking_fork_smolvm_with_version("1.7.7")
+        fake_blocking_fork_smolvm_with_version(preloop_vm::SMOLVM_MIN_VERSION)
     }
 
     fn fork_log(executable: &Path) -> Vec<String> {

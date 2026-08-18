@@ -23,12 +23,9 @@ include!(concat!(env!("OUT_DIR"), "/pins.rs"));
 /// compiled from `smolvm_min_version` in the workspace `versions.toml` (see
 /// `build.rs`; keep the two in sync).
 ///
-/// 1.7.7 is the first official release carrying reusable retained fork
-/// checkpoints and the macOS network symbol required by preloop-vm. 1.7.5
-/// passes the `--mount-socket` probe yet its libkrun omits the symbol, so
-/// the floor is the first fully-capable release rather than the whole 1.7
-/// line; any newer stable release (1.8.0, …) satisfies it without
-/// maintenance.
+/// The configured floor is the first release that satisfies all runtime
+/// invariants, including packed-machine ownership preservation; newer stable
+/// releases satisfy it without another code change.
 static SMOLVM_MIN_COMPATIBLE_VERSION: LazyLock<Version> = LazyLock::new(|| {
     Version::parse(SMOLVM_MIN_VERSION)
         .expect("smolvm_min_version in versions.toml must be a semver version")
@@ -52,7 +49,7 @@ pub(crate) struct UpdateArgs {
     #[arg(long, env = "PRELOOP_RELEASES_API", hide = true)]
     pub api_url: Option<String>,
 
-    /// Install and verify Preloop's pinned VM runtime without updating Preloop.
+    /// Install and verify the latest compatible VM runtime without updating Preloop.
     #[arg(long, hide = true)]
     pub ensure_runtime: bool,
 }
@@ -376,7 +373,7 @@ fn configured_smolvm_version() -> Option<String> {
 /// version or required socket-mount capability differs.
 async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
     let install = default_smolvm_install().context("HOME is not set")?;
-    // Clear stale templates from older layouts even when the pinned runtime
+    // Clear stale templates from older layouts even when the compatible runtime
     // is already installed: a compatible binary skips the install below, so
     // this is the only chance to drop leftover variants that would otherwise
     // keep being selected by SmolVM.
@@ -402,6 +399,14 @@ async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
         .tag_name
         .strip_prefix('v')
         .unwrap_or(&release.tag_name);
+    let release_version = parse_release_version(version)?;
+    if release_version < *SMOLVM_MIN_COMPATIBLE_VERSION {
+        bail!(
+            "SmolVM release {} is below configured minimum {}",
+            release.tag_name,
+            SMOLVM_MIN_VERSION
+        );
+    }
     let archive_name = format!("smolvm-{version}-{platform}.tar.gz");
     let archive_asset = release
         .assets
@@ -1024,12 +1029,12 @@ mod tests {
     async fn compatibility_requires_minimum_version_and_mount_socket() {
         let directory = tempfile::tempdir().unwrap();
         for (version, flag, expected) in [
-            ("1.7.7", "--mount-socket <HOST:GUEST>", true),
-            ("1.8.0", "--mount-socket <HOST:GUEST>", true),
+            ("1.8.1", "--mount-socket <HOST:GUEST>", true),
+            ("1.8.2", "--mount-socket <HOST:GUEST>", true),
+            ("1.8.0", "--mount-socket <HOST:GUEST>", false),
             ("1.7.5", "--mount-socket <HOST:GUEST>", false),
             ("1.7.6", "--mount-socket <HOST:GUEST>", false),
-            ("1.8.0", "--docker-socket", false),
-            ("1.7.7", "--docker-socket", false),
+            ("1.8.1", "--docker-socket", false),
         ] {
             let executable = directory
                 .path()
