@@ -92,8 +92,6 @@ jobs:
           # Run clippy on crates with pre-existing warnings without -D warnings
           cargo clippy --locked -p preloop-runner -p preloop-runner-server -p preloop-runner-client -p preloop-dap --all-targets
       - run: cargo test --locked --workspace
-        env:
-          RUSTFLAGS: "-A warnings -C link-arg=-fuse-ld=lld"
 
   # Bounded property-test profile
   property-tests-fast:

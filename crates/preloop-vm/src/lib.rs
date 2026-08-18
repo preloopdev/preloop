@@ -122,7 +122,7 @@ fn public_only_net_backend(lookup: impl Fn(&str) -> Option<String>) -> &'static 
 /// whether a runtime is safe to fork from, and failing closed is the safe
 /// direction.
 fn smolvm_version_at_least(version: &str, major: u64, minor: u64, patch: u64) -> bool {
-    let mut parts = version.split('.');
+    let mut parts = version.trim().trim_start_matches('v').split('.');
     let (Some(actual_major), Some(actual_minor), Some(actual_patch)) =
         (parts.next(), parts.next(), parts.next())
     else {
