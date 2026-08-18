@@ -6,18 +6,44 @@ use super::{
     ExpressionError,
 };
 
+/// Maximum expression nesting depth.
+///
+/// The parser is recursive descent and the evaluator recurses over the same
+/// AST, so unbounded nesting (e.g. megabytes of `(((…` or `!!!…`) overflows
+/// the thread stack, which aborts the process instead of unwinding. Real
+/// workflow expressions are shallow; nothing legitimate nests near this.
+pub(crate) const MAX_EXPRESSION_DEPTH: usize = 256;
+
 pub(crate) struct Parser {
     tokens: Vec<Token>,
     index: usize,
+    depth: usize,
 }
 
 impl Parser {
     pub(crate) fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, index: 0 }
+        Self {
+            tokens,
+            index: 0,
+            depth: 0,
+        }
+    }
+
+    /// Enter one nesting level, refusing input past the depth ceiling. An
+    /// over-deep error aborts the whole parse, so the counter is not unwound.
+    fn enter(&mut self) -> Result<(), ExpressionError> {
+        self.depth += 1;
+        if self.depth > MAX_EXPRESSION_DEPTH {
+            return Err(ExpressionError::TooDeep(MAX_EXPRESSION_DEPTH));
+        }
+        Ok(())
     }
 
     pub(crate) fn parse_expr(&mut self) -> Result<Expr, ExpressionError> {
-        self.parse_or()
+        self.enter()?;
+        let expr = self.parse_or();
+        self.depth -= 1;
+        expr
     }
 
     pub(crate) fn expect_end(&self) -> Result<(), ExpressionError> {
@@ -29,8 +55,11 @@ impl Parser {
 
     fn parse_or(&mut self) -> Result<Expr, ExpressionError> {
         let mut expr = self.parse_and()?;
+        let mut chain_depth = 0;
         while matches!(self.current(), Token::Or) {
             self.advance();
+            self.enter()?;
+            chain_depth += 1;
             let right = self.parse_and()?;
             expr = Expr::Binary {
                 op: BinaryOp::Or,
@@ -38,13 +67,17 @@ impl Parser {
                 right: Box::new(right),
             };
         }
+        self.depth -= chain_depth;
         Ok(expr)
     }
 
     fn parse_and(&mut self) -> Result<Expr, ExpressionError> {
         let mut expr = self.parse_eq()?;
+        let mut chain_depth = 0;
         while matches!(self.current(), Token::And) {
             self.advance();
+            self.enter()?;
+            chain_depth += 1;
             let right = self.parse_eq()?;
             expr = Expr::Binary {
                 op: BinaryOp::And,
@@ -52,11 +85,13 @@ impl Parser {
                 right: Box::new(right),
             };
         }
+        self.depth -= chain_depth;
         Ok(expr)
     }
 
     fn parse_eq(&mut self) -> Result<Expr, ExpressionError> {
         let mut expr = self.parse_unary()?;
+        let mut chain_depth = 0;
         loop {
             let op = match self.current() {
                 Token::Eq => BinaryOp::Eq,
@@ -68,6 +103,8 @@ impl Parser {
                 _ => break,
             };
             self.advance();
+            self.enter()?;
+            chain_depth += 1;
             let right = self.parse_unary()?;
             expr = Expr::Binary {
                 op,
@@ -75,13 +112,17 @@ impl Parser {
                 right: Box::new(right),
             };
         }
+        self.depth -= chain_depth;
         Ok(expr)
     }
 
     fn parse_unary(&mut self) -> Result<Expr, ExpressionError> {
         if matches!(self.current(), Token::Bang) {
             self.advance();
-            Ok(Expr::UnaryNot(Box::new(self.parse_unary()?)))
+            self.enter()?;
+            let inner = self.parse_unary();
+            self.depth -= 1;
+            Ok(Expr::UnaryNot(Box::new(inner?)))
         } else {
             self.parse_primary()
         }

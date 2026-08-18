@@ -588,4 +588,75 @@ mod official_semantics {
         let _ = std::fs::remove_dir_all(&workspace);
         assert!(result.is_err(), "unknown hashFiles flags must fail");
     }
+
+    /// Deeply nested parens overflow the parser's stack instead of returning
+    /// an error: 100k `(` from a 200 KB expression aborted the process before
+    /// the depth guard existed. The guard must reject, not crash.
+    #[test]
+    fn deeply_nested_parens_error_instead_of_overflowing() {
+        let n = 100_000;
+        let expr = format!("{}1{}", "(".repeat(n), ")".repeat(n));
+        assert!(matches!(
+            validate_expression(&expr),
+            Err(ExpressionError::TooDeep(_))
+        ));
+    }
+
+    /// `!` recurses through a different parse function than parens; it needs
+    /// the same ceiling.
+    #[test]
+    fn deeply_nested_negations_error_instead_of_overflowing() {
+        let expr = format!("{}true", "!".repeat(100_000));
+        assert!(matches!(
+            validate_expression(&expr),
+            Err(ExpressionError::TooDeep(_))
+        ));
+    }
+
+    /// Expressions within the ceiling must keep working unchanged.
+    #[test]
+    fn expressions_within_depth_limit_still_parse() {
+        use super::expr_parser::MAX_EXPRESSION_DEPTH;
+
+        // `parse_expr` consumes one level for the root, so this is the
+        // largest accepted parenthesized/unary nesting.
+        let n = MAX_EXPRESSION_DEPTH - 1;
+        let expr = format!("{}true{}", "(".repeat(n), ")".repeat(n));
+        assert!(eval_bool(&expr, &Context::default()).unwrap());
+
+        let unary_n = n - (n % 2);
+        let negated = format!("{}true", "!".repeat(unary_n));
+        assert!(eval_bool(&negated, &Context::default()).unwrap());
+
+        let too_deep = format!(
+            "{}true{}",
+            "(".repeat(MAX_EXPRESSION_DEPTH),
+            ")".repeat(MAX_EXPRESSION_DEPTH)
+        );
+        assert!(matches!(
+            validate_expression(&too_deep),
+            Err(ExpressionError::TooDeep(_))
+        ));
+
+        let too_deep_negated = format!("{}true", "!".repeat(MAX_EXPRESSION_DEPTH));
+        assert!(matches!(
+            validate_expression(&too_deep_negated),
+            Err(ExpressionError::TooDeep(_))
+        ));
+    }
+
+    #[test]
+    fn deeply_nested_binary_chains_error_instead_of_overflowing() {
+        for operator in ["||", "&&", "=="] {
+            let mut expr = "true".to_owned();
+            for _ in 0..1_000 {
+                expr.push_str(operator);
+                expr.push_str("true");
+            }
+            assert!(
+                matches!(validate_expression(&expr), Err(ExpressionError::TooDeep(_))),
+                "operator chain should be depth-limited: {operator}"
+            );
+        }
+    }
 }
