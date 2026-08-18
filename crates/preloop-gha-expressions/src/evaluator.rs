@@ -422,12 +422,6 @@ fn string_value(value: &Value) -> String {
     }
 }
 
-fn string_value_cow(value: &Value) -> Cow<'_, str> {
-    match value {
-        Value::String(value) => Cow::Borrowed(value),
-        _ => Cow::Owned(string_value(value)),
-    }
-}
 
 struct CappedJsonWriter {
     bytes: Vec<u8>,

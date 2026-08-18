@@ -27,8 +27,47 @@ pub(crate) struct SyncResponse {
 pub(crate) async fn push_run(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
+    body: Bytes,
 ) -> Result<Json<SyncResponse>, ApiError> {
-    Ok(Json(push_run_to_github(&shared, run_id).await?))
+    // Optional per-sync override of the submission's PR intent, so a client
+    // can decide *after* CI whether to open a PR (dirty-tree prompt flow)
+    // without changing the recorded submission.
+    let override_pr = if body.is_empty() {
+        None
+    } else {
+        let parsed: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|_| ApiError::bad_request("push body, when present, must be JSON"))?;
+        if !parsed.is_null() && !parsed.is_object() {
+            return Err(ApiError::bad_request(
+                "push body must be a JSON object of {create_pr, draft} overrides",
+            ));
+        }
+        // A typo (`"create_pr": "no"`) must not be silently treated as
+        // omitted: the submission's recorded PR intent would win, opening a
+        // PR the client explicitly tried to suppress.
+        let bool_field = |name: &str| -> Result<Option<bool>, ApiError> {
+            match parsed.get(name) {
+                None => Ok(None),
+                Some(value) => value.as_bool().map(Some).ok_or_else(|| {
+                    ApiError::bad_request(format!("push field `{name}` must be boolean"))
+                }),
+            }
+        };
+        Some(PushOverride {
+            create_pr: bool_field("create_pr")?,
+            draft: bool_field("draft")?,
+        })
+    };
+    Ok(Json(
+        push_run_to_github(&shared, run_id, override_pr).await?,
+    ))
+}
+
+/// Per-sync override of the submission's PR intent (`POST /push` body).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PushOverride {
+    pub(crate) create_pr: Option<bool>,
+    pub(crate) draft: Option<bool>,
 }
 
 /// The run that already tested `sha` for `workflow_path` through push-back,
@@ -46,6 +85,10 @@ pub(crate) async fn push_run(
 /// a plain webhook run must never suppress a later one (redeliveries are a
 /// retry mechanism, not a duplicate), and workflows the user never submitted
 /// are genuinely new work that still has to run.
+///
+/// A dirty-tree run's submission sha is the *base* commit, not the commit
+/// the push webhook carries; once the sync ran, the published (materialized)
+/// commit is recorded in `push_state.effective_sha` and matched here too.
 pub(crate) async fn already_published(
     shared: &Arc<SharedState>,
     repository: &str,
@@ -63,7 +106,11 @@ pub(crate) async fn already_published(
                 // still be re-run by its own echo.
                 && run.conclusion.is_some()
                 && run.submission.repository == repository
-                && run.submission.sha == sha
+                && (run.submission.sha == sha
+                    || run.push_state
+                        .as_ref()
+                        .and_then(|state| state.effective_sha.as_deref())
+                        == Some(sha))
                 && run.submission.workflow_path.as_deref() == Some(workflow_path)
         })
         .map(|run| run.run_id)
@@ -72,10 +119,11 @@ pub(crate) async fn already_published(
 pub(crate) async fn push_run_to_github(
     shared: &Arc<SharedState>,
     run_id: RunId,
+    override_pr: Option<PushOverride>,
 ) -> Result<SyncResponse, ApiError> {
     // Snapshot everything the sync needs under one lock, then work outside
     // it: the GitHub calls are slow and must not hold the state mutex.
-    let (repository, git_ref, sha, push_tree, create_pr, draft_pr, actor, conclusion, jobs) = {
+    let (repository, git_ref, sha, push_tree, create_pr, draft_pr, actor, conclusion, jobs, dirty) = {
         let inner = shared.state.inner.lock().await;
         let run = inner
             .runs
@@ -116,11 +164,24 @@ pub(crate) async fn push_run_to_github(
         };
 
         let repository = run.submission.repository.clone();
+        let (create_pr, draft_pr) = match (override_pr, &run.submission.push) {
+            (Some(override_pr), Some(push)) => (
+                override_pr.create_pr.unwrap_or(push.create_pr),
+                override_pr.draft.unwrap_or(push.draft_pr),
+            ),
+            (Some(override_pr), None) => (
+                override_pr.create_pr.unwrap_or(false),
+                override_pr.draft.unwrap_or(false),
+            ),
+            (None, Some(push)) => (push.create_pr, push.draft_pr),
+            (None, None) => (false, false),
+        };
         validate_push_target(
             &repository,
             &run.submission.sha,
             &run.submission.git_ref,
             tree,
+            run.submission.local_workspace.is_some(),
         )?;
 
         (
@@ -128,11 +189,12 @@ pub(crate) async fn push_run_to_github(
             run.submission.git_ref.clone(),
             run.submission.sha.clone(),
             tree.clone(),
-            push.create_pr,
-            push.draft_pr,
+            create_pr,
+            draft_pr,
             run.submission.actor.clone(),
             conclusion.clone(),
             run.jobs.clone(),
+            push.dirty,
         )
     };
 
@@ -143,6 +205,7 @@ pub(crate) async fn push_run_to_github(
                 status: PushStatus::Blocked,
                 error: Some(error),
                 pr_number: None,
+                effective_sha: None,
             });
         }
     }
@@ -164,17 +227,53 @@ pub(crate) async fn push_run_to_github(
         }
     };
 
-    // 1. The tested tree must be the pushed tree. A 404 here means the
-    //    client never pushed the commit (or pushed something else).
-    let commit =
-        match github_json(&token, &repository, "GET", &format!("commits/{sha}"), None).await {
+    // 1. The tested tree must be the pushed tree. Which commit to verify
+    //    depends on how the run was submitted:
+    //    - Clean tree: `sha` is exactly the commit the client pushed. Look
+    //      it up directly and never fall back to the branch tip — a
+    //      tree-only match on a different commit must not publish checks for
+    //      work the run did not test.
+    //    - Dirty tree: the tested commit is materialized by the client
+    //      *after* the run, so its sha is unknown in advance. The branch
+    //      head IS the authoritative commit the client pushed (looking up
+    //      the base `sha` would succeed against the already-pushed base
+    //      commit and reject the materialized push with a tree mismatch).
+    let commit = if dirty {
+        match github_json(
+            &token,
+            &repository,
+            "GET",
+            &format!("commits/{branch}"),
+            None,
+        )
+        .await
+        {
             Ok(commit) => commit,
             Err(error) => {
-                let message = format!("commit {sha} not found on GitHub: {error}");
+                let message = format!(
+                    "branch {branch} not found on GitHub after a dirty-tree push; \
+                     did the client push the materialized commit? {error}"
+                );
                 mark_blocked(shared, run_id, message.clone()).await;
                 return Err(classify(&message));
             }
-        };
+        }
+    } else {
+        match github_json(&token, &repository, "GET", &format!("commits/{sha}"), None).await {
+            Ok(commit) => commit,
+            Err(error) => {
+                let message =
+                    format!("commit {sha} not found on GitHub; did the client push it? {error}");
+                mark_blocked(shared, run_id, message.clone()).await;
+                return Err(classify(&message));
+            }
+        }
+    };
+    let effective_sha = commit
+        .get("sha")
+        .and_then(|sha| sha.as_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| sha.clone());
     let pushed_tree = commit
         .get("commit")
         .and_then(|commit| commit.get("tree"))
@@ -237,32 +336,27 @@ pub(crate) async fn push_run_to_github(
 
     // 3. Reuse an open PR for the branch; create one only when asked.
     let head = format!("{owner}:{branch}");
-    let pr_number = match github_json(
-        &token,
-        &repository,
-        "GET",
-        &format!("pulls?head={head}&state=open"),
-        None,
-    )
-    .await
-    {
-        Ok(pulls) => pulls
-            .as_array()
-            .and_then(|list| list.first())
-            .and_then(|pr| pr.get("number"))
-            .and_then(|number| number.as_u64()),
-        Err(error) => {
-            let message = format!("could not look up pull requests: {error}");
-            mark_blocked(shared, run_id, message.clone()).await;
-            return Err(classify(&message));
-        }
-    };
+    let query = serde_urlencoded::to_string([("head", head.as_str()), ("state", "open")])
+        .expect("url-encoding cannot fail for str pairs");
+    let pr_number =
+        match github_json(&token, &repository, "GET", &format!("pulls?{query}"), None).await {
+            Ok(pulls) => pulls
+                .as_array()
+                .and_then(|list| list.first())
+                .and_then(|pr| pr.get("number"))
+                .and_then(|number| number.as_u64()),
+            Err(error) => {
+                let message = format!("could not look up pull requests: {error}");
+                mark_blocked(shared, run_id, message.clone()).await;
+                return Err(classify(&message));
+            }
+        };
     let pr_number = if let Some(number) = pr_number {
         Some(number)
     } else if create_pr {
         let body = format!(
             "CI run `{run_id}` completed with `{conclusion}`.\n\n\
-             - Head: `{sha}`\n\
+             - Head: `{effective_sha}`\n\
              - Tested tree: `{push_tree}`\n\
              - Actor: `{actor}`\n\
              - Details: {}",
@@ -314,7 +408,14 @@ pub(crate) async fn push_run_to_github(
                 .is_some_and(|run| run.job_check_run_ids.contains_key(job_id))
         };
         if !has_check_run {
-            crate::github::report_check_run_queued(shared, &repository, &sha, job_id, run_id).await;
+            crate::github::report_check_run_queued(
+                shared,
+                &repository,
+                &effective_sha,
+                job_id,
+                run_id,
+            )
+            .await;
             if jobs.get(job_id).is_some_and(|status| status.is_terminal()) {
                 crate::github::report_check_run_completed(shared, run_id, job_id, jobs[job_id])
                     .await;
@@ -328,6 +429,9 @@ pub(crate) async fn push_run_to_github(
             status: PushStatus::Synced,
             error: None,
             pr_number,
+            // The commit the push webhook echo will carry; `already_published`
+            // matches it so a dirty-tree push does not re-run CI.
+            effective_sha: Some(effective_sha),
         });
     }
     drop(inner);
@@ -347,6 +451,7 @@ pub(crate) fn validate_push_target(
     sha: &str,
     git_ref: &str,
     push_tree: &str,
+    allow_unset_tree: bool,
 ) -> Result<(), ApiError> {
     let (owner, repo) = repository.split_once('/').ok_or_else(|| {
         ApiError::bad_request(format!(
@@ -368,7 +473,10 @@ pub(crate) fn validate_push_target(
             "--push requires a committed HEAD (submit from a git checkout)",
         ));
     }
-    if push_tree.len() != 40 || !push_tree.chars().all(|c| c.is_ascii_hexdigit()) {
+    if push_tree.is_empty() && allow_unset_tree {
+        // Dirty-tree submission: the server records the snapshot tree when
+        // the run is accepted. Nothing to verify here.
+    } else if push_tree.len() != 40 || !push_tree.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(ApiError::bad_request("invalid tested tree recorded"));
     }
     Ok(())
@@ -384,7 +492,7 @@ const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
 /// `PRELOOP_GITHUB_TOKEN` directly instead would leave a server configured
 /// by `preloop setup github --via pat` able to run CI but never able to push
 /// its result back, because that flow only ever writes the config file.
-async fn push_token(shared: &Arc<SharedState>, repository: &str) -> Option<String> {
+pub(crate) async fn push_token(shared: &Arc<SharedState>, repository: &str) -> Option<String> {
     if let Some(app_creds) = &shared.state.github_app {
         let permissions = std::collections::BTreeMap::from([
             ("checks".to_owned(), "write".to_owned()),
@@ -401,7 +509,7 @@ async fn push_token(shared: &Arc<SharedState>, repository: &str) -> Option<Strin
 
 /// One GitHub REST call returning the parsed JSON body. Errors carry the
 /// HTTP status so [`classify`] can tell user mistakes from outages.
-async fn github_json(
+pub(crate) async fn github_json(
     token: &str,
     repository: &str,
     method: &str,

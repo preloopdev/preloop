@@ -23,6 +23,10 @@ const MAX_GIT_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct WorkspaceSnapshot {
     pub(crate) commit_sha: String,
+    /// Tree of the snapshot commit — the exact tree the run tests. A
+    /// push-back client materializes a real commit from this tree so the
+    /// pushed commit is byte-identical to what CI validated.
+    pub(crate) tree_sha: String,
     /// The workspace's real HEAD commit (the commit the submission is based
     /// on), when the workspace has one. This is the identity a workflow sees
     /// as `github.sha`: it is what a custom checkout that fetches from the
@@ -120,6 +124,7 @@ pub(crate) async fn create_workspace_snapshot(
 
     let SnapshotResult {
         commit_sha,
+        tree_sha,
         head_sha,
         default_branch,
         before_sha,
@@ -132,6 +137,7 @@ pub(crate) async fn create_workspace_snapshot(
     );
     Ok(WorkspaceSnapshot {
         commit_sha,
+        tree_sha,
         head_sha,
         repository,
         default_branch,
@@ -744,6 +750,10 @@ async fn create_workspace_snapshot_inner(
         })?;
     Ok(SnapshotResult {
         commit_sha,
+        // The snapshot commit's tree — the exact staged dirty tree CI tests,
+        // not the workspace HEAD's tree. Push-back clients materialize their
+        // commit from this so pushed == tested.
+        tree_sha: tree.clone(),
         head_sha: source_head,
         default_branch,
         before_sha,
@@ -754,6 +764,7 @@ async fn create_workspace_snapshot_inner(
 /// the submission as a coherent GitHub event to changed-file actions.
 struct SnapshotResult {
     commit_sha: String,
+    tree_sha: String,
     head_sha: Option<String>,
     default_branch: Option<String>,
     before_sha: Option<String>,
@@ -2054,6 +2065,7 @@ mod deepen_and_redirect_tests {
         WorkspaceSnapshot {
             head_sha: Some("f000000000000000000000000000000000000000".to_owned()),
             commit_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            tree_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
             repository: "snapshots/11111111-1111-4111-8111-111111111111".to_owned(),
             default_branch: Some("main".to_owned()),
             before_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),

@@ -57,6 +57,301 @@ fn mounted_control_origin(public_url: &str) -> Option<String> {
     loopback.then(|| public_url.trim_end_matches('/').to_owned())
 }
 
+// ── Pre-push hook ──────────────────────────────────────────────────────────
+const HOOK_MARKER: &str = "# pre-push hook: soft CI gate for preloop";
+
+/// Marker the pre-push hook greps for to decide fail-open. Emitted only when
+/// the engine itself cannot be reached (connection-level failure); a CI step
+/// that happens to print a network error must never look like an outage.
+pub(crate) const ENGINE_UNREACHABLE_MARKER: &str = "PRELOOP_UNREACHABLE";
+
+fn engine_unreachable_context() -> String {
+    format!("preloop engine unreachable ({ENGINE_UNREACHABLE_MARKER})")
+}
+
+const PRE_PUSH_HOOK: &str = r#"#!/usr/bin/env bash
+# pre-push hook: soft CI gate for preloop.
+set -euo pipefail
+
+# Chain a previously installed hook (another tool's), if any: run it first
+# with the same stdin refs; its verdict is authoritative.
+prev_hook="$(dirname "$0")/pre-push.preloop-prev"
+if [[ -x "$prev_hook" ]]; then
+  refs="$(cat)"
+  if printf '%s\n' "$refs" | "$prev_hook" "$@"; then
+    :
+  else
+    previous_status=$?
+    exit "$previous_status"
+  fi
+else
+  refs="$(cat)"
+fi
+
+preloop_bin="${PRELOOP_BIN:-preloop}"
+endpoint="${PRELOOP_URL:-http://127.0.0.1:9090}"
+remote_url="${2:-unknown-remote}"
+cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/preloop-push"
+mkdir -p "$cache_dir"
+zero_sha=0000000000000000000000000000000000000000
+
+# The gate only validates pushes of the checked-out branch's current commit:
+# for any other ref the tree CI would test is not the tree being pushed, and
+# a soft gate must not brick legitimate pushes it cannot verify — those pass
+# with a loud note. The gate itself never pushes anything (no push-back): it
+# holds `git push` open while CI runs and lets git proceed only when CI is
+# green. Cached verdicts are scoped to (remote, endpoint, sha) so a result
+# from another repository, server, or commit is never reused.
+head_branch="$(git symbolic-ref --short HEAD 2>/dev/null || true)"
+head_sha="$(git rev-parse HEAD 2>/dev/null || true)"
+
+run_ci_or_resume() {
+  local local_sha="$1" branch="$2" remote_sha="$3"
+  local log_range
+  # [skip ci] in any pushed commit bypasses the gate (mirrors preloop's
+  # server-side skip-label handling). A new branch carries an all-zero
+  # remote sha — log the single revision, not an invalid range.
+  if [[ "$remote_sha" == "$zero_sha" ]]; then
+    log_range="$local_sha"
+  else
+    log_range="${remote_sha}..$local_sha"
+  fi
+  if git log --format=%B "$log_range" 2>/dev/null | grep -qi '\[skip *ci\]'; then
+    echo "preloop: [skip ci] found — pushing ${branch} without the CI gate"
+    return 0
+  fi
+
+  # Scoped cache: keyed by (remote, endpoint, sha), recording the run id.
+  # Only a terminal-success verdict for this exact destination skips CI; a
+  # recorded run is validated live (and resumed) instead of trusting a bare
+  # "the hook exited 0" marker that an interruption could skip writing.
+  local cache_key cache run_id verdict
+  get_verdict() {
+    local status_err status_rc status_output
+    status_err="$(mktemp "${TMPDIR:-/tmp}/preloop-status-XXXXXX")"
+    set +e
+    status_output="$(PRELOOP_URL="$endpoint" "$preloop_bin" status "$1" 2>"$status_err")"
+    status_rc=$?
+    set -e
+    if [[ $status_rc -eq 0 ]]; then
+      printf '%s\n' "$status_output"
+    elif grep -q "$ENGINE_UNREACHABLE_MARKER" "$status_err"; then
+      printf 'unreachable\n'
+    else
+      printf 'error\n'
+    fi
+    rm -f "$status_err"
+  }
+  cache_key="$(printf '%s\n' "$remote_url" "$endpoint" "$local_sha" | git hash-object --stdin)"
+  cache="$cache_dir/$cache_key"
+  if [[ -f "$cache" ]]; then
+    IFS=$'\t' read -r run_id cached_remote cached_endpoint < "$cache" || true
+    if [[ "$cached_remote" == "$remote_url" && "$cached_endpoint" == "$endpoint" ]]; then
+      verdict="$(get_verdict "$run_id")"
+      case "$verdict" in
+        success)
+          echo "preloop: cached CI verdict for ${local_sha:0:12}: success"
+          return 0 ;;
+        failure|cancelled|skipped)
+          echo "preloop: cached CI verdict for ${local_sha:0:12}: ${verdict} — fix and re-push (or rm $cache)" >&2
+          return 1 ;;
+        in_progress|queued|pending)
+          echo "preloop: run ${run_id} still in progress — waiting for CI before pushing ${branch}..."
+          waited=0
+          timeout_secs="${PRELOOP_HOOK_TIMEOUT_SECS:-3600}"
+          while (( waited < timeout_secs )); do
+            sleep 15
+            waited=$(( waited + 15 ))
+            verdict="$(get_verdict "$run_id")"
+            case "$verdict" in
+              success)
+                echo "preloop: CI passed for ${branch}"
+                return 0 ;;
+              failure|cancelled|skipped)
+                echo "preloop: cached CI verdict for ${local_sha:0:12}: ${verdict} — fix and re-push (or rm $cache)" >&2
+                return 1 ;;
+              in_progress|queued|pending) ;;
+              unreachable)
+                echo "preloop: cannot reach the engine to resume run ${run_id} — pushing ${branch} WITHOUT the CI gate (fail-open)" >&2
+                return 0 ;;
+              error)
+                echo "preloop: cannot validate cached run ${run_id} — push aborted" >&2
+                return 1 ;;
+            esac
+          done
+          echo "preloop: CI did not finish within ${timeout_secs}s — push aborted" >&2
+          return 1 ;;
+        error)
+          echo "preloop: cannot resolve run ${run_id} — running CI fresh" >&2 ;;
+      esac
+    fi
+  fi
+
+  # Run CI. Fail open only on the machine-readable engine-unreachable marker
+  # emitted by preloop itself — never on CI step output that happens to
+  # mention a network error.
+  local log error_log run_pid run_status i
+  log="$(mktemp "${TMPDIR:-/tmp}/preloop-push-XXXXXX")"
+  error_log="$(mktemp "${TMPDIR:-/tmp}/preloop-push-error-XXXXXX")"
+  echo "preloop: running CI on preloop before pushing ${branch} (this holds the push)..."
+  set +e
+  "$preloop_bin" run >"$log" 2>"$error_log" &
+  run_pid=$!
+  # Record the run id as soon as the engine accepts it, so an interrupted
+  # hook (Ctrl-C, crash) resumes the same run on the next push instead of
+  # duplicating CI.
+  for i in $(seq 1 300); do
+    run_id="$(grep -oE 'Run [0-9a-fA-F-]{36} created' "$log" 2>/dev/null | head -1 | awk '{print $2}' || true)"
+    [[ -n "$run_id" ]] && break
+    sleep 0.2
+  done
+  if [[ -n "$run_id" ]]; then
+    printf '%s\t%s\t%s\n' "$run_id" "$remote_url" "$endpoint" > "$cache"
+  fi
+  wait "$run_pid"
+  run_status=$?
+  set -e
+  if grep -q "$ENGINE_UNREACHABLE_MARKER" "$error_log"; then
+    echo "preloop: engine unreachable — pushing ${branch} WITHOUT the CI gate (fail-open)" >&2
+    rm -f "$log" "$error_log"
+    return 0
+  fi
+  if [[ $run_status -ne 0 ]]; then
+    echo "preloop: CI failed for ${branch} — push aborted. Details:" >&2
+    tail -n 30 "$log" >&2
+    tail -n 30 "$error_log" >&2
+    rm -f "$log" "$error_log"
+    return 1
+  fi
+  rm -f "$log" "$error_log"
+  return 0
+}
+
+while read -r local_ref local_sha _remote_ref remote_sha; do
+  case "$local_ref" in refs/heads/*) ;; *) continue ;; esac
+  [[ "$local_sha" != "$zero_sha" ]] || continue
+  branch="${local_ref#refs/heads/}"
+  if [[ "$branch" != "$head_branch" || "$local_sha" != "$head_sha" ]]; then
+    echo "preloop: not gating push of ${branch} (only the checked-out branch is validated)" >&2
+    continue
+  fi
+  if ! run_ci_or_resume "$local_sha" "$branch" "$remote_sha"; then
+    exit 1
+  fi
+done <<< "$refs"
+exit 0
+"#;
+
+fn hook_installed() -> bool {
+    resolve_hooks_dir()
+        .ok()
+        .and_then(|dir| std::fs::read_to_string(dir.join("pre-push")).ok())
+        .is_some_and(|content| content.contains(HOOK_MARKER))
+}
+
+fn hook_decided() -> bool {
+    fn git_config_flag(key: &str) -> bool {
+        std::process::Command::new("git")
+            .args(["config", "--local", "--get", key])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .is_some_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "true")
+    }
+
+    git_config_flag("preloop.hook-installed") || git_config_flag("preloop.hook-declined")
+}
+
+fn set_hook_decision(key: &str) {
+    let _ = std::process::Command::new("git")
+        .args(["config", "--local", key, "true"])
+        .status();
+}
+
+fn mark_hook_installed() {
+    set_hook_decision("preloop.hook-installed");
+}
+
+fn mark_hook_declined() {
+    set_hook_decision("preloop.hook-declined");
+}
+
+fn install_hook() -> anyhow::Result<()> {
+    // `core.hooksPath` moves every hook out of `.git/hooks` (a global
+    // `core.hooksPath` like `~/.config/git/hooks` is common); writing to
+    // `.git/hooks` would leave the gate unused. Resolve the directory git
+    // actually consults, matching its own precedence.
+    let hooks_dir = resolve_hooks_dir()?;
+    std::fs::create_dir_all(&hooks_dir).context("create hooks directory")?;
+    let hook_path = hooks_dir.join("pre-push");
+    // Preserve a pre-existing hook (installed by another tool): chain it
+    // instead of clobbering repository checks. Reinstalling over our own
+    // hook backs nothing up (idempotent).
+    let existing_hook = std::fs::read(&hook_path).ok();
+    if existing_hook
+        .as_deref()
+        .is_some_and(|bytes| !String::from_utf8_lossy(bytes).contains(HOOK_MARKER))
+    {
+        let backup = hooks_dir.join("pre-push.preloop-prev");
+        std::fs::copy(&hook_path, &backup).context("back up previous pre-push hook")?;
+    }
+    std::fs::write(&hook_path, PRE_PUSH_HOOK).context("write pre-push hook")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&hook_path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&hook_path, perms)?;
+    }
+    mark_hook_installed();
+    Ok(())
+}
+
+/// The directory git runs hooks from, resolved by Git itself.
+fn resolve_hooks_dir() -> anyhow::Result<std::path::PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--git-path", "hooks"])
+        .output()
+        .context("resolve Git hooks directory")?;
+    if output.status.success() {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if !path.is_empty() {
+            return Ok(std::path::PathBuf::from(path));
+        }
+    }
+    anyhow::bail!(
+        "git rev-parse --git-path hooks failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
+}
+
+fn maybe_offer_hook() -> anyhow::Result<()> {
+    if hook_installed() || hook_decided() {
+        return Ok(());
+    }
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return Ok(());
+    }
+    eprintln!(
+        "preloop: add preloop CI as a pre-push hook to run CI on your working tree before\n\
+         \x20 committing? This will run CI on preloop before every `git push`."
+    );
+    eprint!("         [y/N] ");
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => {
+            install_hook()?;
+            eprintln!("preloop: installed .git/hooks/pre-push");
+        }
+        _ => {
+            mark_hook_declined();
+            eprintln!("preloop: not installing (won't ask again for this repo)");
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn api_token() -> Option<String> {
     std::env::var("PRELOOP_TOKEN")
         .or_else(|_| std::env::var("PRELOOP_SYSTEM_TOKEN"))
@@ -183,8 +478,12 @@ enum Command {
     /// Show the expanded job DAG without executing.
     Plan(PlanArgs),
 
-    /// Show active and recent runs.
-    Status,
+    /// Show active and recent runs, or the live status of one run (prints a
+    /// single machine-readable status word for scripting).
+    Status {
+        #[arg(value_name = "RUN_ID")]
+        run_id: Option<String>,
+    },
 
     Logs(LogsArgs),
 
@@ -366,8 +665,9 @@ struct RunArgs {
 
     /// After the run completes, push the tested commit to GitHub and
     /// publish the result: create or update the pull request for the branch
-    /// and report check runs for the commit. Requires a clean working tree
-    /// (the pushed commit must be exactly what was tested) and a GitHub
+    /// and report check runs for the commit. A dirty working tree is
+    /// allowed: CI runs on a snapshot of the uncommitted state, and the
+    /// pushed commit carries exactly that tested tree. Requires a GitHub
     /// origin.
     #[arg(long)]
     push: bool,
@@ -486,7 +786,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Run(args) => cmd_run(args).await,
         Command::Plan(_) => unreachable!("plan is handled before engine bootstrap"),
-        Command::Status => cmd_status().await,
+        Command::Status { run_id } => cmd_status(run_id).await,
         Command::Logs(args) => cmd_logs(args).await,
         Command::Cancel(args) => cmd_cancel(args).await,
         Command::Shell(args) => cmd_shell(args).await,
@@ -1572,6 +1872,9 @@ fn collect_local_reusable_workflows(
 }
 
 async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
+    // A hook that fails to install after the user accepted is a real
+    // failure: report it instead of silently running ungated.
+    maybe_offer_hook()?;
     let workflow_path = resolve_workflow_path(args.file.as_deref())?;
     let workflow_yaml = std::fs::read_to_string(&workflow_path)
         .with_context(|| format!("failed to read workflow: {}", workflow_path.display()))?;
@@ -1606,19 +1909,18 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         }
     }
 
-    // Push-back requires the tested commit to be exactly what lands on
-    // GitHub: a dirty tree would run CI on commit + local edits, then push
-    // the commit alone — untested code. Refuse loudly instead of lying.
     let push_requested = args.push || args.create_pr;
-    let tested_head = if push_requested {
-        let dirty = git_porcelain().context("failed to check the working tree for --push")?;
-        if !dirty.is_empty() {
-            anyhow::bail!(
-                "--push requires a clean working tree so the pushed commit is exactly what \
-                 was tested. Uncommitted changes:\n  {}\n\nCommit or stash them first.",
-                dirty.join("\n  ")
-            );
-        }
+    // A dirty working tree is allowed with --push: CI runs on the server's
+    // snapshot of the uncommitted state, and after it passes the CLI
+    // materializes a commit whose tree is exactly what CI tested (see
+    // `decide_dirty_push_opts`). A clean tree pins the push to HEAD directly.
+    let dirty = if push_requested {
+        git_porcelain().context("failed to check the working tree for --push")?
+    } else {
+        Vec::new()
+    };
+    let dirty_push = push_requested && !dirty.is_empty();
+    let tested_head = if push_requested && !dirty_push {
         Some((git_rev_parse("HEAD")?, git_rev_parse("HEAD^{tree}")?))
     } else {
         None
@@ -1666,8 +1968,10 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     }
     // Overridden rather than set in the literal so a plain run keeps the
     // protocol's own defaults for `sha` and `actor`.
-    if let Some((head_sha, head_tree)) = tested_head {
-        submission.sha = head_sha;
+    if push_requested {
+        // The base commit: for a clean tree this IS the tested commit; for a
+        // dirty tree it is the parent of the materialized CI-verified commit.
+        submission.sha = git_rev_parse("HEAD")?;
         // The server names the requester in the PR body it opens.
         if let Some(name) = git_config_user_name() {
             submission.actor = name;
@@ -1675,8 +1979,13 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         submission.push = Some(preloop_gha_protocol::PushRequest {
             create_pr: args.create_pr,
             draft_pr: args.pr_draft,
+            // The server verifies the branch head for a dirty-tree push (the
+            // materialized commit) instead of the base sha.
+            dirty: dirty_push,
         });
-        submission.push_tree = Some(head_tree);
+        if let Some((_, head_tree)) = tested_head {
+            submission.push_tree = Some(head_tree);
+        }
     }
 
     let client = build_client();
@@ -1694,9 +2003,10 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     if let Some(token) = api_token() {
         request = request.bearer_auth(token);
     }
-    let response = request.send().await.with_context(|| {
-        format!("cannot reach control plane at {url}; is `preloop serve` running?")
-    })?;
+    let response = request
+        .send()
+        .await
+        .with_context(engine_unreachable_context)?;
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
@@ -1751,9 +2061,10 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         if let Some(token) = api_token() {
             events_request = events_request.bearer_auth(token);
         }
-        let events_response = events_request.send().await.with_context(|| {
-            format!("cannot reach control plane at {url}; is `preloop serve` still running?")
-        })?;
+        let events_response = events_request
+            .send()
+            .await
+            .with_context(engine_unreachable_context)?;
         if !events_response.status().is_success() {
             let status = events_response.status();
             let body = events_response.text().await.unwrap_or_default();
@@ -1961,9 +2272,46 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         // the reviewable state. Sync progress goes to stderr so piped
         // stdout stays clean.
         let push_error = if push_requested {
-            push::push_run(&client, &url, api_token(), &accepted.run_id.to_string())
+            if dirty_push {
+                // The PR decision happens after CI for a dirty tree: the
+                // user saw the result and chooses y/N/d now (or a label /
+                // explicit flag decides in non-interactive runs).
+                match decide_dirty_push_opts(
+                    &dirty,
+                    args.push,
+                    args.create_pr,
+                    args.pr_draft,
+                    status == ExecutionStatus::Success,
+                )? {
+                    Some(opts) => push::push_run(
+                        &client,
+                        &url,
+                        api_token(),
+                        &accepted.run_id.to_string(),
+                        Some(opts),
+                    )
+                    .await
+                    .err(),
+                    None => {
+                        eprintln!(
+                            "not pushing (declined) — CI result was informational. \
+                             Re-run `preloop push {}` to push later.",
+                            accepted.run_id
+                        );
+                        None
+                    }
+                }
+            } else {
+                push::push_run(
+                    &client,
+                    &url,
+                    api_token(),
+                    &accepted.run_id.to_string(),
+                    None,
+                )
                 .await
                 .err()
+            }
         } else {
             None
         };
@@ -2186,6 +2534,101 @@ fn git_porcelain() -> anyhow::Result<Vec<String>> {
         .collect())
 }
 
+/// Decide, after CI on a dirty tree, whether to materialize the tested tree,
+/// push it, and open a PR. Precedence: explicit `--create-pr` flag >
+/// head-commit labels (`[pr]` / `[draft]` / `[no-pr]`) > interactive prompt >
+/// safe default. An explicit `--push` (without `--create-pr`) still pushes
+/// the tested tree non-interactively — the user asked to push; `create_pr`
+/// stays false. Returns `None` when the push should not happen at all.
+fn decide_dirty_push_opts(
+    dirty: &[String],
+    explicit_push: bool,
+    explicit_pr: bool,
+    pr_draft: bool,
+    ci_passed: bool,
+) -> anyhow::Result<Option<push::PushOpts>> {
+    if !ci_passed {
+        eprintln!("not pushing a dirty tree because CI failed");
+        return Ok(None);
+    }
+    if explicit_pr {
+        return Ok(Some(push::PushOpts {
+            create_pr: true,
+            draft: pr_draft,
+        }));
+    }
+
+    let head_message = git_rev_parse("HEAD")
+        .ok()
+        .and_then(|sha| {
+            std::process::Command::new("git")
+                .args(["log", "-1", "--format=%B", &sha])
+                .output()
+                .ok()
+        })
+        .and_then(|output| {
+            output
+                .status
+                .success()
+                .then(|| String::from_utf8_lossy(&output.stdout).to_lowercase())
+        })
+        .unwrap_or_default();
+    if head_message.contains("[no-pr]") {
+        return Ok(Some(push::PushOpts {
+            create_pr: false,
+            draft: pr_draft,
+        }));
+    }
+    if head_message.contains("[pr]") || head_message.contains("[draft]") {
+        return Ok(Some(push::PushOpts {
+            create_pr: true,
+            draft: head_message.contains("[draft]") || pr_draft,
+        }));
+    }
+
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        // Non-interactive and no label. An explicit `--push` is still an
+        // explicit request: push the tested tree without opening a PR. A
+        // plain `--create-pr`-less run with a dirty tree stays a no-op.
+        return Ok(explicit_push.then_some(push::PushOpts {
+            create_pr: false,
+            draft: pr_draft,
+        }));
+    }
+
+    eprintln!(
+        "CI {} on your working tree ({} change(s) included):",
+        if ci_passed { "passed" } else { "failed" },
+        dirty.len()
+    );
+    for line in dirty {
+        eprintln!("  {line}");
+    }
+    loop {
+        eprint!("Commit the tested tree and open a PR? [y/N/d] ");
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .context("reading prompt answer")?;
+        match input.trim().to_ascii_lowercase().as_str() {
+            "" | "n" => return Ok(None),
+            "y" => {
+                return Ok(Some(push::PushOpts {
+                    create_pr: true,
+                    draft: pr_draft,
+                }))
+            }
+            "d" => {
+                return Ok(Some(push::PushOpts {
+                    create_pr: true,
+                    draft: true,
+                }))
+            }
+            _ => eprintln!("answer y, N, or d"),
+        }
+    }
+}
+
 fn git_rev_parse(rev: &str) -> anyhow::Result<String> {
     let output = std::process::Command::new("git")
         .args(["rev-parse", rev])
@@ -2221,7 +2664,7 @@ async fn cmd_push(args: PushArgs) -> anyhow::Result<()> {
             anyhow::anyhow!("no runs found; pass a run id: `preloop push <run_id>`")
         })?,
     };
-    push::push_run(&client, &url, api_token(), &run_id).await
+    push::push_run(&client, &url, api_token(), &run_id, None).await
 }
 
 fn materialize_plan_jobs(
@@ -2355,9 +2798,36 @@ fn plan_json(plan: &preloop_gha_protocol::JobPlan) -> serde_json::Value {
     })
 }
 
-async fn cmd_status() -> anyhow::Result<()> {
+async fn cmd_status(run_id: Option<String>) -> anyhow::Result<()> {
     let client = build_client();
     let url = server_url();
+    if let Some(run_id) = run_id {
+        // Single-run mode: one machine-readable status word
+        // (success/failure/cancelled/skipped/in_progress/queued/pending) for
+        // scripts like the pre-push hook. Connection failures carry the
+        // engine-unreachable marker so the hook can fail open.
+        let mut request = client.get(format!("{url}/api/v1/runs/{run_id}"));
+        if let Some(token) = api_token() {
+            request = request.bearer_auth(token);
+        }
+        let response = request
+            .send()
+            .await
+            .with_context(engine_unreachable_context)?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("server returned {status}: {body}");
+        }
+        let run: serde_json::Value = response.json().await?;
+        println!(
+            "{}",
+            run.get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+        );
+        return Ok(());
+    }
     let mut request = client.get(format!("{url}/api/v1/runs?limit=20"));
     if let Some(token) = api_token() {
         request = request.bearer_auth(token);
@@ -3287,7 +3757,103 @@ mod tests {
     #[test]
     fn status_parses() {
         let cli = parse(&["status"]).unwrap();
-        assert!(matches!(cli.command, Command::Status));
+        assert!(matches!(cli.command, Command::Status { run_id: None }));
+        let cli = parse(&["status", "550e8400-e29b-41d4-a716-446655440000"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Status {
+                run_id: Some(ref id)
+            } if id == "550e8400-e29b-41d4-a716-446655440000"
+        ));
+    }
+
+    #[test]
+    fn hook_lifecycle() {
+        // All tests in this binary share one process working directory and
+        // run in parallel threads; restore the original cwd so the tempdir
+        // (and this test's `.git/`) cannot leak into other tests.
+        struct CwdGuard(std::path::PathBuf);
+        impl Drop for CwdGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let original = std::env::current_dir().expect("current dir");
+        std::env::set_current_dir(repo).unwrap();
+        let _guard = CwdGuard(original);
+
+        // `git init` inside this standalone tempdir cannot use the parent
+        // checkout's `.git/`, and exercises the same Git path resolution as
+        // the real installation flow.
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .status()
+            .expect("git init")
+            .success()
+            .then_some(())
+            .expect("git init succeeds");
+
+        // A developer-configured global `core.hooksPath` (e.g.
+        // `~/.config/git/hooks`) would make `git rev-parse --git-path hooks`
+        // resolve outside this repository: `install_hook` would write into —
+        // and this test's assertions would miss — the shared location, and
+        // the "uninstall" step could clobber a real global hook. Pin the
+        // hooks directory to this repository's own `.git/hooks` via a local
+        // config so the whole lifecycle stays self-contained.
+        let local_hooks = std::fs::canonicalize(repo.join(".git/hooks")).expect("hooks dir");
+        assert!(
+            std::process::Command::new("git")
+                .args(["config", "--local", "core.hooksPath"])
+                .arg(&local_hooks)
+                .status()
+                .expect("git config core.hooksPath")
+                .success(),
+            "git config core.hooksPath succeeds"
+        );
+
+        assert!(!hook_installed(), "should not be installed yet");
+        assert!(!hook_decided(), "should not be decided yet");
+
+        install_hook().unwrap();
+        assert!(hook_installed(), "should be installed after install_hook");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(".git/hooks/pre-push")
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_ne!(mode & 0o111, 0, "hook must be executable");
+        }
+
+        // Install is idempotent — no error on second call.
+        install_hook().unwrap();
+        assert!(hook_installed());
+        assert!(
+            !std::path::Path::new(".git/hooks/pre-push.preloop-prev").exists(),
+            "reinstall over our own hook must not create a backup"
+        );
+
+        // A pre-existing third-party hook is chained, not clobbered.
+        std::fs::write(".git/hooks/pre-push", "#!/bin/sh\necho 'third-party'\n").unwrap();
+        install_hook().unwrap();
+        let backed = std::fs::read_to_string(".git/hooks/pre-push.preloop-prev").unwrap();
+        assert_eq!(
+            backed, "#!/bin/sh\necho 'third-party'\n",
+            "the previous hook must be preserved for chaining"
+        );
+        let installed = std::fs::read_to_string(".git/hooks/pre-push").unwrap();
+        assert!(
+            installed.contains("pre-push.preloop-prev"),
+            "the installed hook must chain the previous one"
+        );
+
+        // Uninstall and verify decline mark persists.
+        std::fs::remove_file(".git/hooks/pre-push").unwrap();
+        mark_hook_declined();
+        assert!(hook_decided(), "should be decided after declining");
     }
 
     #[test]

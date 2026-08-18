@@ -57,6 +57,51 @@ pub struct GitHubConfig {
     /// Env: `PRELOOP_GITHUB_GRAPHQL_URL`.
     #[serde(default)]
     pub graphql_url: Option<String>,
+    /// Auto-PR policy for webhook-driven push runs (see [`PrConfig`]).
+    #[serde(default)]
+    pub pr: PrConfig,
+}
+
+/// When a webhook-driven push run succeeds, should the server open a pull
+/// request for its branch?
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PrAuto {
+    /// Open a PR for any branch that is not the repository's default branch,
+    /// is not excluded by pattern, and has no open PR yet (the default).
+    #[default]
+    Feature,
+    /// Never open PRs automatically; `[pr]` bypasses only the auto policy.
+    /// Default-branch, exclusion, deduplication, and credential checks still
+    /// apply.
+    Never,
+}
+
+/// Auto-PR policy: which successful push runs get a pull request opened on
+/// GitHub, and how the PR is created.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrConfig {
+    /// When to open PRs. Env: `PRELOOP_GITHUB_PR_AUTO` (`feature|never`).
+    pub auto: PrAuto,
+    /// Open newly-created PRs as drafts. Drafts keep reviewers out until the
+    /// author marks them ready. Env: `PRELOOP_GITHUB_PR_DRAFT`.
+    pub draft: bool,
+    /// Branch patterns (gitignore-style) never to open a PR for.
+    /// Env: `PRELOOP_GITHUB_PR_EXCLUDE` (comma-separated).
+    pub exclude: Vec<String>,
+}
+
+impl Default for PrConfig {
+    fn default() -> Self {
+        Self {
+            auto: PrAuto::default(),
+            // Draft by default: an auto-opened PR should not surprise
+            // reviewers before the author marks it ready.
+            draft: true,
+            exclude: Vec::new(),
+        }
+    }
 }
 
 /// Renders as `<redacted>` / `None` without quoting, for credential fields.
@@ -81,6 +126,7 @@ impl std::fmt::Debug for GitHubConfig {
             .field("mint_failure", &self.mint_failure)
             .field("pat", &redacted(self.pat.is_some()))
             .field("webhook_secret", &redacted(self.webhook_secret.is_some()))
+            .field("pr", &self.pr)
             .finish()
     }
 }
@@ -357,6 +403,7 @@ mod tests {
                 server_url: None,
                 api_url: None,
                 graphql_url: None,
+                pr: PrConfig::default(),
             },
             secrets: BTreeMap::from([("DOCKERHUB_TOKEN".into(), "abc123".into())]),
             repo_secrets: BTreeMap::from([(

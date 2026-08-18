@@ -155,6 +155,13 @@ pub struct PushRequest {
     /// Create newly-created pull requests as drafts so reviewers are not
     /// notified until the author marks them ready.
     pub draft_pr: bool,
+    /// The submission came from a dirty working tree: the client could not
+    /// know the tested tree up front, so the server records the snapshot
+    /// tree at accept time and the client materializes a commit from it
+    /// after CI passes. The push endpoint uses this to verify the branch
+    /// head (the materialized commit) instead of the submission's base sha.
+    #[serde(default)]
+    pub dirty: bool,
 }
 
 /// Complete workflow request submitted to the control plane.

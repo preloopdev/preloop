@@ -530,6 +530,10 @@ pub(crate) async fn complete_job_inner(
     }
     let mut inner = shared.state.inner.lock().await;
     let finalized_callers: Vec<JobId>;
+    // Set when this completion finalizes the whole run with a success
+    // conclusion — the auto-PR trigger fires exactly once per run because
+    // the block below runs only while `completed_at` is still `None`.
+    let mut newly_terminal_success = false;
     inner
         .claimed_jobs
         .remove(&(completion.run_id, completion.job_id.clone()));
@@ -602,6 +606,7 @@ pub(crate) async fn complete_job_inner(
         {
             run.completed_at = Some(chrono::Utc::now());
             run.conclusion = Some(status_string(run.status));
+            newly_terminal_success = run.status == ExecutionStatus::Success;
         }
     }
     // Use the status actually stored (may differ from completion if terminal-locked).
@@ -713,6 +718,23 @@ pub(crate) async fn complete_job_inner(
             .cloned()
             .ok_or_else(|| ApiError::not_found("run not found"))?
     };
+
+    // Webhook-driven auto-PR: a successful push run may open a PR per
+    // policy. Fires only after deferred expansions have settled: an
+    // expansion can add work or conclude a subtree, and the pre-expansion
+    // "success" snapshot is not the final truth (the record above is
+    // re-read post-expansion). Best-effort and detached — a GitHub outage
+    // must never affect the run's own result.
+    if newly_terminal_success
+        && record.status == ExecutionStatus::Success
+        && record.conclusion.as_deref() == Some("success")
+    {
+        let shared = shared.clone();
+        let run_id = completion.run_id;
+        tokio::spawn(async move {
+            crate::github_pr::maybe_open_pr(shared, run_id).await;
+        });
+    }
 
     github::report_check_run_completed(
         &shared,
