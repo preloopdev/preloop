@@ -443,9 +443,10 @@ impl Write for CappedJsonWriter {
     }
 }
 
-fn string_value_capped<'a>(
+fn string_value_bounded<'a>(
     value: &'a Value,
     limit: usize,
+    overflow: impl Fn() -> ExpressionError,
 ) -> Result<Cow<'a, str>, ExpressionError> {
     match value {
         Value::String(value) => Ok(Cow::Borrowed(value)),
@@ -457,13 +458,20 @@ fn string_value_capped<'a>(
                 bytes: Vec::with_capacity(limit.min(256)),
                 limit,
             };
-            serde_json::to_writer(&mut writer, other)
-                .map_err(|_| ExpressionError::EvaluationTooLarge(MAX_EVALUATED_VALUE_BYTES))?;
-            let value = String::from_utf8(writer.bytes)
-                .map_err(|_| ExpressionError::EvaluationTooLarge(MAX_EVALUATED_VALUE_BYTES))?;
+            serde_json::to_writer(&mut writer, other).map_err(|_| overflow())?;
+            let value = String::from_utf8(writer.bytes).map_err(|_| overflow())?;
             Ok(Cow::Owned(value))
         }
     }
+}
+
+fn string_value_capped<'a>(
+    value: &'a Value,
+    limit: usize,
+) -> Result<Cow<'a, str>, ExpressionError> {
+    string_value_bounded(value, limit, || {
+        ExpressionError::EvaluationTooLarge(MAX_EVALUATED_VALUE_BYTES)
+    })
 }
 
 /// Cap on the output of `format()`.
@@ -495,7 +503,15 @@ fn push_format_capped(
 }
 
 fn format_args(values: &[Value], budget: &EvalBudget) -> Result<String, ExpressionError> {
-    let format = string_value_capped(values.first().unwrap_or(&Value::Null), budget.remaining())?;
+    // Bound serialization by the format capacity, not the evaluation budget:
+    // a container argument must not allocate up to the full 8 MiB evaluation
+    // budget before the 1 MiB format cap rejects it.
+    let format_overflow = || ExpressionError::FormatOutputTooLarge(MAX_FORMAT_OUTPUT_BYTES);
+    let format = string_value_bounded(
+        values.first().unwrap_or(&Value::Null),
+        MAX_FORMAT_OUTPUT_BYTES,
+        format_overflow,
+    )?;
     let bytes = format.as_bytes();
     let mut output = String::with_capacity(format.len().min(MAX_FORMAT_OUTPUT_BYTES));
     let mut segment_start = 0;
@@ -534,8 +550,11 @@ fn format_args(values: &[Value], budget: &EvalBudget) -> Result<String, Expressi
                 let value = values
                     .get(argument_index + 1)
                     .ok_or_else(|| ExpressionError::InvalidFormat(format.to_string()))?;
-                let rendered =
-                    string_value_capped(value, budget.remaining().saturating_sub(output.len()))?;
+                let rendered = string_value_bounded(
+                    value,
+                    MAX_FORMAT_OUTPUT_BYTES.saturating_sub(output.len()),
+                    format_overflow,
+                )?;
                 push_format_capped(&mut output, rendered.as_ref(), budget)?;
                 index = cursor + 1;
                 segment_start = index;

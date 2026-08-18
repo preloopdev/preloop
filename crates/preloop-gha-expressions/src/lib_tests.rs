@@ -79,6 +79,30 @@ fn format_rejects_large_container_before_unbounded_render() {
 }
 
 #[test]
+fn format_bounds_container_serialization_by_format_capacity() {
+    // Container serialization is bounded by the remaining format capacity
+    // (1 MiB), not the evaluation budget: a render that exceeds the format
+    // cap must report FormatOutputTooLarge even when the evaluation budget
+    // is the tighter constraint. Without the format-capacity bound the
+    // serialization fails against the evaluation budget instead and reports
+    // EvaluationTooLarge.
+    let mut context = Context::default();
+    // Consume most of the evaluation budget with an unreferenced argument.
+    context.insert("bomb", Value::String("A".repeat(6_000_000)));
+    // JSON escaping doubles the render: 800_000 quotes render as ~1.6 MiB of
+    // JSON while the charged value size stays under the remaining budget.
+    context.insert(
+        "container",
+        Value::Array(vec![Value::String("\"".repeat(800_000))]),
+    );
+
+    assert!(matches!(
+        eval_expression("format('{1}', bomb, container)", &context),
+        Err(ExpressionError::FormatOutputTooLarge(_))
+    ));
+}
+
+#[test]
 fn evaluates_context_and_functions() {
     let mut context = Context::default();
     context.insert("github", json!({"event_name": "push"}));
