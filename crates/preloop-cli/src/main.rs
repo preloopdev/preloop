@@ -2042,6 +2042,14 @@ fn materialize_plan_jobs(
             materialized.push(plan);
             continue;
         };
+        // Needs-driven matrices are runtime placeholders. Their concrete
+        // cells require completed needs outputs, so do not send the empty
+        // matrix to `expand_reusable_call` (which correctly rejects it).
+        // Keep the placeholder visible and report its deferred expression.
+        if plan.deferred_matrix.is_some() {
+            materialized.push(plan);
+            continue;
+        }
         let Some(yaml) = reusable_workflows.get(&call.workflow_file) else {
             // Remote and unresolved calls remain explicit placeholders. The
             // plan must not invent callee jobs without the referenced YAML.
@@ -2122,13 +2130,19 @@ async fn cmd_plan(args: PlanArgs) -> anyhow::Result<()> {
             .as_deref()
             .map(|group| format!("  runner-group: {group}"))
             .unwrap_or_default();
+        let deferred_matrix = plan
+            .deferred_matrix
+            .as_deref()
+            .map(|expression| format!("  deferred-matrix: {expression}"))
+            .unwrap_or_default();
         println!(
-            "{}{}  runs-on: {}{}{}{}",
+            "{}{}  runs-on: {}{}{}{}{}",
             plan.id.0,
             matrix,
             plan.runs_on.join(", "),
             needs,
             runner_group,
+            deferred_matrix,
             format!("  steps: {}", plan.steps.len()),
         );
     }
@@ -2144,6 +2158,7 @@ fn plan_json(plan: &preloop_gha_protocol::JobPlan) -> serde_json::Value {
         "runs_on": plan.runs_on,
         "needs": plan.needs.iter().map(|need| need.0.clone()).collect::<Vec<_>>(),
         "matrix": plan.matrix,
+        "deferred_matrix": plan.deferred_matrix,
         "steps": plan.steps.len(),
     })
 }
