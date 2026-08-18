@@ -1,5 +1,20 @@
 runner_version = "2.336.0"
 
+# SmolVM runtime floor: the first official release with the reusable
+# retained-fork checkpoints and macOS network symbol preloop needs. `preloop
+# update --ensure-runtime` accepts any stable release >= this (1.7.5/1.7.6
+# pass the `--mount-socket` probe yet lack the macOS symbol) and installs
+# the latest stable. Compiled into preloop-cli by
+# crates/preloop-cli/build.rs; keep install.sh's SMOLVM_MIN_VERSION in sync.
+smolvm_min_version = "1.7.7"
+
+# SmolVM release the golden-image workflow (.github/workflows/release-golden.yml)
+# builds with. Renovate opens a bump PR when upstream ships a newer stable;
+# .github/workflows/smolvm-release-verify.yml gates the merge with the real-VM
+# E2E on the smolvm-host. Deliberately separate from smolvm_min_version:
+# goldens track the last *verified* release, the runtime floor rarely moves.
+smolvm_golden_version = "1.8.2"
+
 # Image inputs for the runner golden. The OCI bases are immutable filesystem
 # inputs. `github_runner_image_version` is the actions/runner-images snapshot
 # used as the parity source for the tool and package versions below.
@@ -12,6 +27,15 @@ github_runner_image_version = "20260720.247.2"
 # PRELOOP_RUNNER_BASE_IMAGE), not project defaults in this file.
 ubuntu_24_04_base = "mirror.gcr.io/library/ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90"
 ubuntu_22_04_base = "mirror.gcr.io/library/ubuntu:22.04@sha256:0e0a0fc6d18feda9db1590da249ac93e8d5abfea8f4c3c0c849ce512b5ef8982"
+
+# The official GitHub-hosted runner image snapshot, republished as OCI by the
+# preloopdev/runner-image-blobs dump pipeline and vetted (scanned, signed, and
+# SLSA-attested) before the floating tag advances. Release goldens are baked
+# from this instead of the plain Ubuntu base. The dump pipeline publishes
+# per-architecture tags (ubuntu24-* for amd64, ubuntu24-arm64-* for arm64);
+# each is digest-pinned at its own platform index.
+official_runner_image_base_amd64 = "ghcr.io/preloopdev/runner-images:ubuntu24-runner-large-latest@sha256:4f7e4be438e4eb9c0f23bebdec12cf1d25520876ad2052412ba18580919b7795"
+official_runner_image_base_arm64 = "ghcr.io/preloopdev/runner-images:ubuntu24-arm64-runner-large-latest@sha256:3884ef2266edee7ae2da8f70f54faba5340238e68ede5274d0e90fdec80faf9e"
 
 # Provisioning version pins baked into the runner golden.
 node_version = "22.23.1"
