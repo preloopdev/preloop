@@ -357,7 +357,7 @@ async fn probe_smolvm_version(binary: &Path) -> Option<String> {
         .map(|version| version.trim_start_matches('v').to_owned())
 }
 
-async fn smolvm_is_compatible(binary: &Path, expected_version: &str) -> bool {
+async fn smolvm_is_compatible(binary: &Path) -> bool {
     probe_mount_socket(binary).await
         && probe_smolvm_version(binary)
             .await
@@ -365,12 +365,11 @@ async fn smolvm_is_compatible(binary: &Path, expected_version: &str) -> bool {
             .is_some_and(|version| version >= *SMOLVM_MIN_COMPATIBLE_VERSION)
 }
 
-fn configured_smolvm_version() -> String {
+fn configured_smolvm_version() -> Option<String> {
     std::env::var("PRELOOP_SMOLVM_RELEASE_VERSION")
         .ok()
         .map(|version| version.trim().trim_start_matches('v').to_owned())
         .filter(|version| !version.is_empty())
-        .unwrap_or_else(|| SMOLVM_VERSION.to_owned())
 }
 
 /// Probe the resolved smolvm and install the exact verified release when its
@@ -382,8 +381,7 @@ async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
     // this is the only chance to drop leftover variants that would otherwise
     // keep being selected by SmolVM.
     remove_stale_smolvm_templates(&install.prefix)?;
-    let expected_version = configured_smolvm_version();
-    if smolvm_is_compatible(Path::new("smolvm"), &expected_version).await {
+    if smolvm_is_compatible(Path::new("smolvm")).await {
         return Ok(());
     }
     let platform = smolvm_platform().ok_or_else(|| {
@@ -393,10 +391,11 @@ async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
             std::env::consts::ARCH
         )
     })?;
+    let configured_version = configured_smolvm_version();
     let release = fetch_release(
         client,
         &format!("https://api.github.com/repos/{SMOLVM_REPOSITORY}/releases"),
-        Some(&expected_version),
+        configured_version.as_deref(),
     )
     .await?;
     let version = release

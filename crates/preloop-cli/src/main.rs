@@ -2323,7 +2323,7 @@ async fn cmd_plan(args: PlanArgs) -> anyhow::Result<()> {
             needs,
             runner_group,
             deferred_matrix,
-            format!("  steps: {}", plan.steps.len()),
+            format_args!("  steps: {}", plan.steps.len()),
         );
     }
     Ok(())
