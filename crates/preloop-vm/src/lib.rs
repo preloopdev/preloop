@@ -1577,6 +1577,75 @@ fn agent_rootfs_candidates(host_home: Option<&Path>, data_dir: Option<&Path>) ->
     candidates
 }
 
+/// Kill any lingering SmolVM `_boot-vm` hypervisor processes whose machine
+/// state lives under this Preloop home.
+///
+/// A server death (crash, OOM, SIGKILL) orphans the detached `_boot-vm`
+/// processes: the CLI flow detaches them (the parent-death watchdog is
+/// off by design), and only the in-VM agent or an explicit `machine stop`
+/// can shut them down. If the machine's data directory is then removed out
+/// from under the live VM (a home cleanup), the smolvm database no longer
+/// knows the machine, so `machine delete` cannot reach it — the `_boot-vm`
+/// keeps the storage file descriptors open and the unlinked blocks leak
+/// until the process exits. The `_boot-vm` argv names its
+/// `boot-config.json` under the data dir, so orphaned processes are
+/// identifiable by path.
+///
+/// Called at pool startup (crash recovery) and shutdown (unresponsive
+/// agent belt-and-suspenders). Returns the number of processes killed.
+pub fn purge_orphaned_vms() -> Result<usize, VmError> {
+    let Some(preloop_home) = effective_preloop_home() else {
+        return Ok(0);
+    };
+    let markers: Vec<String> = [
+        preloop_home.join("smolvm"),
+        preloop_home.join("smolvm-home"),
+    ]
+    .iter()
+    .filter_map(|path| path.to_str().map(str::to_owned))
+    .collect();
+    if markers.is_empty() {
+        return Ok(0);
+    }
+    let output = std::process::Command::new("ps")
+        .args(["ax", "-o", "pid=,command="])
+        .output()
+        .map_err(|source| VmError::Launch {
+            program: "ps".to_owned(),
+            source,
+        })?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut killed = 0usize;
+    for line in text.lines() {
+        if !line.contains("_boot-vm") {
+            continue;
+        }
+        if !markers.iter().any(|marker| line.contains(marker.as_str())) {
+            continue;
+        }
+        let Some(pid) = line
+            .split_whitespace()
+            .next()
+            .and_then(|token| token.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if pid <= 0 {
+            continue;
+        }
+        // SIGKILL: the machine is unreachable through smolvm (no record, or
+        // an unresponsive agent) — the hypervisor process must die to
+        // release the storage fds.
+        let status = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+        if matches!(status, Ok(status) if status.success()) {
+            killed += 1;
+        }
+    }
+    Ok(killed)
+}
+
 fn smolvm_runtime_env(binary: Option<&Path>) -> Vec<(String, std::ffi::OsString)> {
     let host_home = std::env::var_os("HOME").map(PathBuf::from);
     let mut env = Vec::new();
@@ -2068,6 +2137,44 @@ async fn forward(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn purge_orphaned_vms_kills_matching_boot_vm_processes() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!("preloop-purge-{}", uuid::Uuid::new_v4()));
+        let marker = home.join("smolvm-home/Library/Caches/smolvm/vms/deadbeef/boot-config.json");
+        // A process that looks like an orphaned _boot-vm for this home: the
+        // argv carries the marker path, so `ps` shows it in the command line.
+        // `sh -c '… & wait'` keeps the shell alive with the marker visible
+        // in its argv (a bare `sh -c cmd` execs cmd, dropping the args).
+        let mut child = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "sleep 60 & wait",
+                "_boot-vm",
+                marker.to_str().unwrap(),
+            ])
+            .spawn()
+            .expect("spawn dummy boot-vm");
+        let pid = child.id() as i32;
+        let previous = std::env::var_os("PRELOOP_HOME");
+        std::env::set_var("PRELOOP_HOME", &home);
+        let killed = purge_orphaned_vms().expect("purge");
+        match previous {
+            Some(value) => std::env::set_var("PRELOOP_HOME", value),
+            None => std::env::remove_var("PRELOOP_HOME"),
+        }
+        assert!(killed >= 1, "purge should have killed the matching process");
+        // Reap the SIGKILLed child so it is not a zombie (kill -0 on a
+        // zombie still succeeds until it is reaped).
+        let _ = child.wait();
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .expect("probe process");
+        assert!(!alive.success(), "matching _boot-vm must be dead");
+    }
 
     #[test]
     fn agent_rootfs_candidates_probe_platform_then_legacy() {

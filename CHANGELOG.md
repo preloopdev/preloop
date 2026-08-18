@@ -9,6 +9,19 @@ Releases before v0.27.0 predate the changelog.
 
 ## [Unreleased]
 
+## [0.30.10] - 2026-08-18
+
+### Fixed
+
+- A crashed server orphaned its detached `_boot-vm` hypervisor processes:
+  the pool never stopped them on death, and if the machine data dir was
+  cleaned out from under them (a home cleanup), the smolvm DB no longer
+  knew the machines — the `_boot-vm` kept the storage fds open and the
+  unlinked blocks leaked until the process exited (observed holding
+  hundreds of GB for 47 h). Pool startup and shutdown now purge orphaned
+  `_boot-vm` processes by their boot-config path under the Preloop home,
+  SIGKILLing whatever the smolvm delete could not reach.
+
 ## [0.30.9] - 2026-08-18
 
 ### Fixed
