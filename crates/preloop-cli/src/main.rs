@@ -163,7 +163,11 @@ pub(crate) fn with_fake_smolvm_path<T>(test: impl FnOnce(&PathBuf) -> T) -> T {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "preloop", about = "Local CI with hardware isolation")]
+#[command(
+    name = "preloop",
+    about = "Local CI with hardware isolation",
+    version = env!("CARGO_PKG_VERSION")
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -171,6 +175,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Print the installed Preloop version.
+    Version,
+
     Run(RunArgs),
 
     /// Show the expanded job DAG without executing.
@@ -456,6 +463,10 @@ async fn main() -> anyhow::Result<()> {
     // Both run the daemon in this process, so neither may bootstrap another
     // one underneath itself.
     match cli.command {
+        Command::Version => {
+            println!("preloop {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
         Command::Serve(args) => return cmd_engine(args).await,
         Command::Engine => return cmd_engine(ServeArgs::default()).await,
         Command::BuildGolden(args) => return cmd_build_golden(args).await,
@@ -488,6 +499,7 @@ async fn main() -> anyhow::Result<()> {
         | Command::Serve(_)
         | Command::Engine
         | Command::BuildGolden(_)
+        | Command::Version
         | Command::Setup(_)
         | Command::Doctor(_)
         | Command::Secret(_)
@@ -3257,6 +3269,19 @@ mod tests {
             err.kind(),
             ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
         );
+    }
+
+    #[test]
+    fn version_subcommand_parses_without_starting_engine() {
+        let cli = parse(&["version"]).unwrap();
+        assert!(matches!(cli.command, Command::Version));
+    }
+
+    #[test]
+    fn version_flag_uses_package_version() {
+        let err = Cli::try_parse_from(["preloop", "--version"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayVersion);
+        assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
     }
 
     #[test]

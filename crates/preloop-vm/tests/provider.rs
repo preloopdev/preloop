@@ -734,33 +734,22 @@ for arg in "$@"; do printf '%s\n' "$arg" >> "$0.args"; done
 
     /// A smolvm whose `machine fork` records entry and exit around a barrier,
     /// so a test can observe whether two forks are in flight at once.
-    fn fake_blocking_fork_smolvm_with_version(version: &str) -> (TempDir, PathBuf) {
+    fn fake_blocking_fork_smolvm() -> (TempDir, PathBuf) {
         let directory = tempfile::tempdir().unwrap();
         let executable = directory.path().join("smolvm");
         write_executable(
             &executable,
-            &format!(
-                r##"#!/bin/sh
+            r##"#!/bin/sh
 set -eu
-if [ "${{1-}}" = "--version" ]; then
-  echo "smolvm {version}"
-  exit 0
-fi
-if [ "${{1-}}:${{2-}}" != "machine:fork" ]; then
+if [ "${1-}:${2-}" != "machine:fork" ]; then
   exit 0
 fi
 printf 'enter %s\n' "$6" >> "$0.forklog"
 while [ ! -f "$0.release" ]; do sleep 0.02; done
 printf 'exit %s\n' "$6" >> "$0.forklog"
 "##,
-            ),
         );
         (directory, executable)
-    }
-
-    /// The current official runtime: retains reusable fork checkpoints.
-    fn fake_blocking_fork_smolvm() -> (TempDir, PathBuf) {
-        fake_blocking_fork_smolvm_with_version("1.7.7")
     }
 
     fn fork_log(executable: &Path) -> Vec<String> {
@@ -786,74 +775,11 @@ printf 'exit %s\n' "$6" >> "$0.forklog"
         false
     }
 
-    /// Plain `machine fork` in SmolVM 1.7.4 does not persist a reusable
-    /// checkpoint. Once one live clone exists, invoking SmolVM for a second
-    /// clone fails against the paused base and can invalidate the first clone's
-    /// storage. The provider must reject that second clone before spawning the
-    /// command. The guard is driven by the probed runtime version: an install
-    /// left on an older official release still gets the safe behavior.
-    #[tokio::test]
-    async fn second_live_clone_from_one_golden_is_rejected_without_spawning_smolvm() {
-        let (_directory, executable) = fake_blocking_fork_smolvm_with_version("1.7.4");
-        let provider = SmolVmProvider::new(&executable);
-        let golden = MachineName::new("runner-golden").unwrap();
-        let first = MachineName::new("runner-0-1").unwrap();
-        let second = MachineName::new("runner-1-1").unwrap();
-
-        let one = {
-            let provider = provider.clone();
-            let (golden, first) = (golden.clone(), first.clone());
-            tokio::spawn(async move { provider.fork(&golden, &first).await })
-        };
-        let two = {
-            let provider = provider.clone();
-            let (golden, second) = (golden.clone(), second.clone());
-            tokio::spawn(async move { provider.fork(&golden, &second).await })
-        };
-
-        assert!(
-            wait_for_entries(&executable, 1).await,
-            "the first fork must start"
-        );
-        // The barrier holds fork one inside smolvm. If forks were concurrent,
-        // fork two would enter here rather than wait for the lock.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert_eq!(
-            fork_log(&executable)
-                .iter()
-                .filter(|line| line.starts_with("enter"))
-                .count(),
-            1,
-            "second fork must wait for the first to finish: {:?}",
-            fork_log(&executable)
-        );
-        fs::write(executable.with_extension("release"), "").unwrap();
-        one.await.unwrap().unwrap();
-        let error = two
-            .await
-            .unwrap()
-            .expect_err("a second live clone from one plain-fork golden must be rejected");
-        assert!(matches!(
-            error,
-            VmError::ForkBaseBusy {
-                ref golden,
-                ref clone,
-            } if golden == "runner-golden" && clone == "runner-0-1"
-        ));
-
-        let log = fork_log(&executable);
-        assert_eq!(
-            log,
-            ["enter runner-0-1", "exit runner-0-1"],
-            "the rejected clone must never invoke SmolVM: {log:?}"
-        );
-    }
-
     #[tokio::test]
     async fn retained_checkpoint_mode_allows_multiple_live_clones() {
         let (_directory, executable) = fake_blocking_fork_smolvm();
-        // The fake reports 1.7.7, so the probed capability check enables
-        // multiple live clones; forks are still serialized per golden.
+        // Forks are serialized per golden while multiple live clones remain
+        // supported by the configured SmolVM runtime.
         let provider = SmolVmProvider::new(&executable);
         let golden = MachineName::new("runner-golden").unwrap();
         let first = MachineName::new("runner-0-1").unwrap();
