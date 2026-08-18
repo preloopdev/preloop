@@ -1,0 +1,17 @@
+huh why did it fail?
+
+---
+
+ok are tehre any other stuff we do to ensure compat with 1.7.7 or something we shouldnt need any of it. its extra stuff that makes everything complicated
+
+---
+
+Okay, so we confirmed that if a user has a lowest small VM version, we upgrade them automatically, right? When we're doing pre-loop update.
+
+---
+
+Yeah, that's fine. What's that ensure runtime plug for exactly?
+
+---
+
+That's fine. Do we have a preloop version of command?
