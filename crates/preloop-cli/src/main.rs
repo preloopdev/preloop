@@ -468,13 +468,16 @@ async fn main() -> anyhow::Result<()> {
         Command::Doctor(args) => return github_setup::cmd_doctor(args).await,
         Command::Secret(args) => return github_setup::cmd_secret(args).await,
         Command::Server(args) => return server_install::run(args),
+        // Planning parses local workflow files only; do not bootstrap the
+        // control-plane engine for a command that never contacts it.
+        Command::Plan(args) => return cmd_plan(args).await,
         _ => {}
     }
     ensure_engine_running().await?;
 
     match cli.command {
         Command::Run(args) => cmd_run(args).await,
-        Command::Plan(args) => cmd_plan(args).await,
+        Command::Plan(_) => unreachable!("plan is handled before engine bootstrap"),
         Command::Status => cmd_status().await,
         Command::Logs(args) => cmd_logs(args).await,
         Command::Cancel(args) => cmd_cancel(args).await,
@@ -2099,9 +2102,13 @@ async fn cmd_plan(args: PlanArgs) -> anyhow::Result<()> {
             format!("  needs: {}", ids.join(", "))
         };
         println!(
-            "{}{}  runs-on: {}{}{}",
+            "{}{}  runs-on: {}{}{}{}",
             plan.id.0,
             matrix,
+            plan.runner_group
+                .as_deref()
+                .map(|group| format!("group:{group} "))
+                .unwrap_or_default(),
             plan.runs_on.join(", "),
             needs,
             format!("  steps: {}", plan.steps.len())
@@ -2115,6 +2122,7 @@ fn plan_json(plan: &preloop_gha_protocol::JobPlan) -> serde_json::Value {
         "id": plan.id.0,
         "base_id": plan.base_id,
         "name": plan.name,
+        "runner_group": plan.runner_group,
         "runs_on": plan.runs_on,
         "needs": plan.needs.iter().map(|need| need.0.clone()).collect::<Vec<_>>(),
         "matrix": plan.matrix,
