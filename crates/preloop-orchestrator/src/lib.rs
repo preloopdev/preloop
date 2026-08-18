@@ -2278,6 +2278,17 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                 }
             }
         }
+        // A crashed server orphans its detached `_boot-vm` hypervisor
+        // processes; when the data dir was cleaned out from under them the
+        // smolvm DB no longer knows the machines, so the deletes above
+        // cannot reach them and they keep the storage fds open — the
+        // unlinked blocks leak until the process dies. Kill by config path.
+        match preloop_vm::purge_orphaned_vms() {
+            Ok(killed) if killed > 0 => {
+                info!(killed, "purged orphaned SmolVM hypervisor processes")
+            }
+            _ => {}
+        }
         Ok(())
     }
 }

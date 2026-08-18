@@ -1,6 +1,6 @@
 [package]
 name = "preloop-cli"
-version = "0.30.9"
+version = "0.30.10"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
