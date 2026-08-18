@@ -465,13 +465,16 @@ async fn main() -> anyhow::Result<()> {
         Command::Doctor(args) => return github_setup::cmd_doctor(args).await,
         Command::Secret(args) => return github_setup::cmd_secret(args).await,
         Command::Server(args) => return server_install::run(args),
+        // Planning parses local workflow files only; do not bootstrap the
+        // control-plane engine for a command that never contacts it.
+        Command::Plan(args) => return cmd_plan(args).await,
         _ => {}
     }
     ensure_engine_running().await?;
 
     match cli.command {
         Command::Run(args) => cmd_run(args).await,
-        Command::Plan(args) => cmd_plan(args).await,
+        Command::Plan(_) => unreachable!("plan is handled before engine bootstrap"),
         Command::Status => cmd_status().await,
         Command::Logs(args) => cmd_logs(args).await,
         Command::Cancel(args) => cmd_cancel(args).await,
@@ -1528,6 +1531,34 @@ fn default_local_activity_type(event: &str, payload: &serde_json::Value) -> Opti
     }
 }
 
+fn collect_local_reusable_workflows(
+    workflow_path: &std::path::Path,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let current_dir = std::env::current_dir()?;
+    let workflows_dir = current_dir.join(".github").join("workflows");
+    let mut reusable_workflows = BTreeMap::new();
+    let Ok(entries) = std::fs::read_dir(workflows_dir) else {
+        return Ok(reusable_workflows);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("yml" | "yaml")
+        ) || same_file_path(&path, workflow_path)
+        {
+            continue;
+        }
+        let Some(relative) = path.strip_prefix(&current_dir).ok() else {
+            continue;
+        };
+        let yaml = std::fs::read_to_string(&path)
+            .with_context(|| format!("read reusable workflow {}", path.display()))?;
+        reusable_workflows.insert(relative.to_string_lossy().into_owned(), yaml);
+    }
+    Ok(reusable_workflows)
+}
+
 async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     let workflow_path = resolve_workflow_path(args.file.as_deref())?;
     let workflow_yaml = std::fs::read_to_string(&workflow_path)
@@ -1538,28 +1569,7 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     // server the same way the native client does: everything under the
     // workspace `.github/workflows/`, keyed repository-relative, minus the
     // submitted workflow itself.
-    let mut reusable_workflows = BTreeMap::new();
-    if let Ok(current_dir) = std::env::current_dir() {
-        let workflows_dir = current_dir.join(".github").join("workflows");
-        if let Ok(entries) = std::fs::read_dir(&workflows_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !matches!(
-                    path.extension().and_then(|ext| ext.to_str()),
-                    Some("yml" | "yaml")
-                ) || same_file_path(&path, &workflow_path)
-                {
-                    continue;
-                }
-                let Some(relative) = path.strip_prefix(&current_dir).ok() else {
-                    continue;
-                };
-                let yaml = std::fs::read_to_string(&path)
-                    .with_context(|| format!("read reusable workflow {}", path.display()))?;
-                reusable_workflows.insert(relative.to_string_lossy().into_owned(), yaml);
-            }
-        }
-    }
+    let reusable_workflows = collect_local_reusable_workflows(&workflow_path)?;
 
     let payload = match args.payload.as_deref() {
         Some(path) => {
@@ -2202,18 +2212,135 @@ async fn cmd_push(args: PushArgs) -> anyhow::Result<()> {
     push::push_run(&client, &url, api_token(), &run_id).await
 }
 
-async fn cmd_plan(args: PlanArgs) -> anyhow::Result<()> {
-    let workflow = args
-        .file
-        .as_ref()
-        .map_or("all workflows".into(), |p| p.display().to_string());
+fn materialize_plan_jobs(
+    plans: Vec<preloop_gha_protocol::JobPlan>,
+    reusable_workflows: &BTreeMap<String, String>,
+) -> anyhow::Result<Vec<preloop_gha_protocol::JobPlan>> {
+    let mut materialized = Vec::new();
+    for plan in plans {
+        let Some(call) = plan.reusable_call.as_ref() else {
+            materialized.push(plan);
+            continue;
+        };
+        // Needs-driven matrices are runtime placeholders. Their concrete
+        // cells require completed needs outputs, so do not send the empty
+        // matrix to `expand_reusable_call` (which correctly rejects it).
+        // Keep the placeholder visible and report its deferred expression.
+        if plan.deferred_matrix.is_some() {
+            materialized.push(plan);
+            continue;
+        }
+        let Some(yaml) = reusable_workflows.get(&call.workflow_file) else {
+            // Remote and unresolved calls remain explicit placeholders. The
+            // plan must not invent callee jobs without the referenced YAML.
+            materialized.push(plan);
+            continue;
+        };
+        let called = preloop_gha_parser::parse_workflow(yaml)
+            .map_err(|error| anyhow::anyhow!("parse reusable {}: {error}", call.workflow_file))?;
+        let expanded = preloop_gha_parser::expand_reusable_call(
+            &called,
+            &plan,
+            reusable_workflows,
+            &BTreeMap::new(),
+        )
+        .map_err(|error| anyhow::anyhow!("expand reusable {}: {error}", call.workflow_file))?;
+        // Keep the caller boundary in the output for downstream `needs`
+        // references, then append the concrete callee jobs it gates.
+        materialized.push(plan);
+        materialized.extend(materialize_plan_jobs(expanded.jobs, reusable_workflows)?);
+    }
+    Ok(materialized)
+}
 
-    println!("preloop plan: {workflow}");
+async fn cmd_plan(args: PlanArgs) -> anyhow::Result<()> {
+    let workflow_path = resolve_workflow_path(args.file.as_deref())?;
+    let workflow_yaml = std::fs::read_to_string(&workflow_path)
+        .with_context(|| format!("failed to read workflow: {}", workflow_path.display()))?;
+
+    let reusable_workflows = collect_local_reusable_workflows(&workflow_path)?;
+
+    let workflow = preloop_gha_parser::parse_workflow(&workflow_yaml)
+        .map_err(|error| anyhow::anyhow!("parse {}: {error}", workflow_path.display()))?;
+    let expanded =
+        preloop_gha_parser::expand_jobs_with_reusables(&workflow, &reusable_workflows)
+            .map_err(|error| anyhow::anyhow!("expand {}: {error}", workflow_path.display()))?;
+    let plans = materialize_plan_jobs(expanded.jobs, &reusable_workflows)?;
+
     if args.json {
-        println!("  format: json");
+        let value = serde_json::json!({
+            "workflow": workflow_path.display().to_string(),
+            "jobs": plans.iter().map(plan_json).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
     }
 
-    anyhow::bail!("")
+    println!(
+        "workflow: {} ({} jobs expanded from {} declared)",
+        workflow_path.display(),
+        plans.len(),
+        workflow.jobs.len()
+    );
+    let name = workflow.name.as_deref().unwrap_or("(unnamed)");
+    println!("name:     {name}");
+    println!();
+    for plan in &plans {
+        let matrix = if plan.matrix.is_empty() {
+            String::new()
+        } else {
+            let cells: Vec<String> = plan
+                .matrix
+                .iter()
+                .map(|(key, value)| match value {
+                    serde_json::Value::String(value) => format!("{key}={value}"),
+                    other => format!("{key}={other}"),
+                })
+                .collect();
+            format!("  [{}]", cells.join(", "))
+        };
+        let needs = if plan.needs.is_empty() {
+            String::new()
+        } else {
+            let ids: Vec<&str> = plan.needs.iter().map(|need| need.0.as_str()).collect();
+            format!("  needs: {}", ids.join(", "))
+        };
+        let runner_group = plan
+            .runner_group
+            .as_deref()
+            .map(|group| format!("  runner-group: {group}"))
+            .unwrap_or_default();
+        let deferred_matrix = plan
+            .deferred_matrix
+            .as_deref()
+            .map(|expression| format!("  deferred-matrix: {expression}"))
+            .unwrap_or_default();
+        println!(
+            "{}{}  runs-on: {}{}{}{}{}",
+            plan.id.0,
+            matrix,
+            plan.runs_on.join(", "),
+            needs,
+            runner_group,
+            deferred_matrix,
+            format!("  steps: {}", plan.steps.len()),
+        );
+    }
+    Ok(())
+}
+
+fn plan_json(plan: &preloop_gha_protocol::JobPlan) -> serde_json::Value {
+    serde_json::json!({
+        "id": plan.id.0,
+        "base_id": plan.base_id,
+        "name": plan.name,
+        "runner_group": plan.runner_group,
+        "runs_on": plan.runs_on,
+        "needs": plan.needs.iter().map(|need| need.0.clone()).collect::<Vec<_>>(),
+        "matrix": plan.matrix,
+        "deferred_matrix": plan.deferred_matrix,
+        "steps": plan.steps.len(),
+    })
 }
 
 async fn cmd_status() -> anyhow::Result<()> {
