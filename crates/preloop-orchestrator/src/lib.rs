@@ -1816,6 +1816,20 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
     config: &RunnerPoolConfig,
     golden: &MachineName,
 ) -> Result<(), OrchestratorError> {
+    // Same adoption rule as the baked-golden path: an engine restart must not
+    // re-unpack a multi-GiB packed golden that is still sitting there forkable
+    // and fingerprint-matched. Without this every `serve` restart pays the
+    // full unpack (tens of GB of storage writes) before the first job.
+    let env_spec = EnvironmentSpec::for_base(config.base_image.clone());
+    if golden_is_reusable(provider, config, golden, &env_spec.fingerprint).await {
+        info!(
+            machine = golden.as_str(),
+            fingerprint = %env_spec.fingerprint,
+            "adopted the existing packed golden fork base"
+        );
+        return Ok(());
+    }
+    remove_golden_record(config, golden);
     if provider.status(golden).await? != MachineState::Missing {
         provider.delete(golden).await?;
     }
@@ -1858,6 +1872,7 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
     }
     provider.stop(golden).await?;
     provider.start_forkable(golden).await?;
+    write_golden_record(config, golden, &env_spec.fingerprint);
     info!(
         machine = golden.as_str(),
         artifact = %config.artifact_payload().display(),
@@ -3659,11 +3674,23 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
          chmod 777 /run/preloop-control 2>/dev/null; \
          getent group docker >/dev/null 2>&1 && usermod -aG docker {user} 2>/dev/null"
     );
+    // setpriv requires a groups mode: --init-groups (setgroups) only works
+    // as root, so the exec-as-image-user branch (official golden: USER
+    // runner, uid 1001) must use --keep-groups — the exec context already
+    // carries the right supplementary groups, and reuid/regid to self are
+    // permitted without privileges. The root branch keeps --init-groups.
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&provisioning);
     let script = format!(
-        "{root_or_sudo}\n\
-         exec setpriv --reuid {uid} --regid {uid} --init-groups env \
-           PRELOOP_RUNNER_USER={user} PRELOOP_RUNNER_UID={uid} HOME={home} {program} {args}",
-        root_or_sudo = run_as_root_or_sudo(&provisioning),
+        "if [ \"$(id -u)\" -eq 0 ]; then \
+           {provisioning}; \
+           exec setpriv --reuid {uid} --regid {uid} --init-groups env \
+             PRELOOP_RUNNER_USER={user} PRELOOP_RUNNER_UID={uid} HOME={home} {program} {args}; \
+         else \
+           printf %s '{b64}' | base64 -d | sudo -n sh 2>/dev/null || true; \
+           exec setpriv --reuid {uid} --regid {uid} --keep-groups env \
+             PRELOOP_RUNNER_USER={user} PRELOOP_RUNNER_UID={uid} HOME={home} {program} {args}; \
+         fi"
     );
     vec!["sh".to_owned(), "-c".to_owned(), script]
 }
@@ -4263,16 +4290,30 @@ chmod +x "$destination/bin/node"
             script.contains("chmod 777 /run/preloop-control"),
             "{script}"
         );
+        // Root branch (locally baked goldens) drops with --init-groups; the
+        // exec-as-image-user branch (official golden) provisions via sudo and
+        // self-drops with --keep-groups (setgroups needs root).
         assert!(
             script.contains("setpriv --reuid 1001 --regid 1001 --init-groups"),
             "{script}"
         );
         assert!(
-            script.contains("PRELOOP_RUNNER_USER=runner PRELOOP_RUNNER_UID=1001"),
+            script.contains("setpriv --reuid 1001 --regid 1001 --keep-groups"),
             "{script}"
         );
         assert!(
-            script.ends_with("'/opt/preloop/bin/preloop-runner' 'run' '--once'"),
+            script.contains("| base64 -d | sudo -n sh 2>/dev/null || true"),
+            "{script}"
+        );
+        assert_eq!(
+            script
+                .matches("'/opt/preloop/bin/preloop-runner' 'run' '--once'")
+                .count(),
+            2,
+            "the wrapped program must appear in both branches"
+        );
+        assert!(
+            script.contains("PRELOOP_RUNNER_USER=runner PRELOOP_RUNNER_UID=1001"),
             "{script}"
         );
     }

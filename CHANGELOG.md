@@ -9,6 +9,23 @@ Releases before v0.27.0 predate the changelog.
 
 ## [Unreleased]
 
+## [0.30.9] - 2026-08-18
+
+### Fixed
+
+- The exec-as-image-user branch of the runner wrapper used
+  `setpriv --init-groups`, which fails as a non-root user (setgroups needs
+  root) — so on the official golden (image USER runner) every configure/run
+  exec died with `initgroups failed: Operation not permitted`. The non-root
+  branch now self-drops with `--keep-groups` (verified on the official
+  smolvm: both the root and image-user branches land on uid 1001).
+- The packed-golden path now adopts an existing running, fingerprint-matched
+  golden instead of re-unpacking tens of GiB on every `serve` restart.
+- `conformance-5repos.sh` campaign fixes: golden symlink carries the
+  environment fingerprint, stale campaign home is cleaned between runs,
+  deno targets the generated `ci.generated.yml`, and the runner storage
+  default is 160 GiB (the runner-large golden unpacks past 80 GiB).
+
 ## [0.30.8] - 2026-08-18
 
 ### Changed

@@ -24,7 +24,7 @@ CAMPAIGN_HOME="${CONFORMANCE_HOME:-/tmp/preloop-5repos-home}"
 PORT="${CONFORMANCE_PORT:-9197}"
 POLL_SECONDS="${CONFORMANCE_POLL_SECONDS:-10}"
 TIMEOUT_SECONDS="${CONFORMANCE_TIMEOUT_SECONDS:-7200}"
-POOL_SIZE="${PRELOOP_RUNNER_POOL_SIZE:-2}"
+POOL_SIZE="${PRELOOP_RUNNER_POOL_SIZE:-1}"
 HOST_HOME="${HOME:-}"
 SMOLVM_PROCESS_HOME="${CONFORMANCE_SMOLVM_HOME:-$CAMPAIGN_HOME/smolvm-home}"
 export PRELOOP_SYSTEM_TOKEN="${PRELOOP_SYSTEM_TOKEN:-preloop-system-token}"
@@ -84,7 +84,7 @@ target_cfg() {
       # frontend-metrics.yml was renamed to frontend-lint.yml upstream.
       echo "grafana https://github.com/grafana/grafana.git main .github/workflows/frontend-lint.yml push refs/heads/main" ;;
     deno/ci)
-      echo "deno https://github.com/denoland/deno.git main .github/workflows/ci.yml push refs/heads/main" ;;
+      echo "deno https://github.com/denoland/deno.git main .github/workflows/ci.generated.yml push refs/heads/main" ;;
     pydantic/ci)
       echo "pydantic https://github.com/pydantic/pydantic.git main .github/workflows/ci.yml push refs/heads/main" ;;
     pydantic/test)
@@ -119,13 +119,30 @@ file_size() {
 }
 
 prepare_golden_home() {
+  # Dedicated temp home: a crashed run leaves VM disks (tens of GiB) that
+  # crowd out the next golden unpack. The golden artifact itself lives
+  # outside this home (~/.config/preloop/vms), so a clean slate is safe.
+  rm -rf "$CAMPAIGN_HOME"
   [ -f "$OFFICIAL_GOLDEN_ARTIFACT" ] || fail "missing 9GB official golden: $OFFICIAL_GOLDEN_ARTIFACT"
   local bytes expected
   bytes="$(file_size "$OFFICIAL_GOLDEN_ARTIFACT")"
   # Reject the small launcher stub or a partial download.  The packed payload
   # used by this campaign is the ~9GB .smolmachine sidecar.
   [ "$bytes" -ge 8589934592 ] || fail "golden is ${bytes} bytes, not the required ~9GB .smolmachine payload"
-  expected="$CAMPAIGN_HOME/vms/$OFFICIAL_GOLDEN_NAME"
+  # The server probes the packed artifact at
+  # <vms>/<stem>-<environment-fingerprint>: artifact_payload() appends the
+  # EnvironmentSpec fingerprint (sha256 of the normalized base/toolchains/
+  # curated/bake JSON) so bake-content changes invalidate stale packs. A
+  # stem-only symlink silently falls through to a base-image pull (tens of
+  # GiB) — replicate the fingerprint computation here (the base is custom,
+  # so nothing is curated and there are no toolchains).
+  fingerprint="$(python3 - "$OFFICIAL_GOLDEN_BASE" <<'INNERPY'
+import hashlib, json, sys
+normalized = {"base": sys.argv[1], "toolchains": [], "curated": False, "bake": ""}
+print(hashlib.sha256(json.dumps(normalized, separators=(",", ":")).encode()).hexdigest())
+INNERPY
+)"
+  expected="$CAMPAIGN_HOME/vms/$OFFICIAL_GOLDEN_NAME-$fingerprint"
   mkdir -p "$(dirname "$expected")"
   ln -sfn "$OFFICIAL_GOLDEN_ARTIFACT" "$expected"
   [ -f "$expected" ] || fail "failed to expose official golden at $expected"
@@ -183,7 +200,7 @@ start_server() {
   PRELOOP_RUNNER_POOL_SIZE="$POOL_SIZE" \
   PRELOOP_USE_FORK=1 \
   PRELOOP_RUNNER_MEMORY_MIB="${PRELOOP_RUNNER_MEMORY_MIB:-8192}" \
-  PRELOOP_RUNNER_STORAGE_GB="${PRELOOP_RUNNER_STORAGE_GB:-80}" \
+  PRELOOP_RUNNER_STORAGE_GB="${PRELOOP_RUNNER_STORAGE_GB:-160}" \
   PRELOOP_RUNNER_LABELS="${PRELOOP_RUNNER_LABELS:-X64,ubuntu-arm64-small,ubuntu-x64-small,ubuntu-x64}" \
   PRELOOP_PUBLIC_URL="http://127.0.0.1:$PORT" \
   RUST_LOG="${RUST_LOG:-info,preloop=info}" \
