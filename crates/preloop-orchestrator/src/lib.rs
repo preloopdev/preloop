@@ -572,7 +572,7 @@ async fn download_oci_golden(payload: &Path, reference: &str) -> bool {
         return false;
     };
     let tmp_payload = parent.join(format!(".tmp-golden-{}", uuid::Uuid::new_v4()));
-    match stream_golden_response(response, &tmp_payload, Some(layer_digest)).await {
+    match stream_golden_response(response, &tmp_payload, Some(layer_digest), layer_size).await {
         Ok(downloaded_bytes) => {
             if let Err(error) = tokio::fs::rename(&tmp_payload, payload).await {
                 warn!(
@@ -699,6 +699,7 @@ async fn stream_golden_response(
     response: reqwest::Response,
     tmp_payload: &Path,
     expected_sha256: Option<String>,
+    expected_total_bytes: Option<u64>,
 ) -> Result<u64, String> {
     let mut file = match tokio::fs::File::create(tmp_payload).await {
         Ok(file) => file,
@@ -706,7 +707,7 @@ async fn stream_golden_response(
             return Err(format!("could not create temporary OCI golden: {error}"));
         }
     };
-    let total_bytes = response.content_length();
+    let total_bytes = response.content_length().or(expected_total_bytes);
     let mut downloaded_bytes = 0_u64;
     let mut next_progress = GOLDEN_PROGRESS_INTERVAL;
     let mut stream = response.bytes_stream();
@@ -5648,7 +5649,7 @@ mod golden_download_tests {
         .await;
         let response = reqwest::get(url).await.unwrap();
 
-        let error = stream_golden_response(response, &payload, None)
+        let error = stream_golden_response(response, &payload, None, None)
             .await
             .expect_err("truncated OCI body must fail");
 
