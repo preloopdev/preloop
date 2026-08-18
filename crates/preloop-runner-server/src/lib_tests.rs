@@ -18357,8 +18357,9 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
 
     // Held for the whole test: the GitHub env vars are process-global.
     let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    std::env::set_var("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}"));
-    std::env::set_var("PRELOOP_GITHUB_TOKEN", "sync-test-token");
+    let _api_url =
+        crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}"));
+    let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "sync-test-token");
 
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -18600,9 +18601,6 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
         Some(dirty_id),
         "the recorded submission sha (the base commit) still matches, as for any push-back run"
     );
-
-    std::env::remove_var("PRELOOP_GITHUB_TOKEN");
-    std::env::remove_var("PRELOOP_GITHUB_API_URL");
 }
 
 #[tokio::test]

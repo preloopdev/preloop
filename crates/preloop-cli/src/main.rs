@@ -250,27 +250,30 @@ fn hook_installed() -> bool {
 }
 
 fn hook_decided() -> bool {
-    std::fs::read_to_string(".git/config")
-        .map(|c| c.contains("hook-installed = true") || c.contains("hook-declined = true"))
-        .unwrap_or(false)
+    fn git_config_flag(key: &str) -> bool {
+        std::process::Command::new("git")
+            .args(["config", "--local", "--get", key])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .is_some_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "true")
+    }
+
+    git_config_flag("preloop.hook-installed") || git_config_flag("preloop.hook-declined")
+}
+
+fn set_hook_decision(key: &str) {
+    let _ = std::process::Command::new("git")
+        .args(["config", "--local", key, "true"])
+        .status();
 }
 
 fn mark_hook_installed() {
-    let config_path = std::path::Path::new(".git/config");
-    let mut content = std::fs::read_to_string(config_path).unwrap_or_default();
-    if !content.contains("hook-installed = true") {
-        content.push_str("\n[preloop]\n\thook-installed = true\n");
-        let _ = std::fs::write(config_path, content);
-    }
+    set_hook_decision("preloop.hook-installed");
 }
 
 fn mark_hook_declined() {
-    let config_path = std::path::Path::new(".git/config");
-    let mut content = std::fs::read_to_string(config_path).unwrap_or_default();
-    if !content.contains("hook-declined = true") {
-        content.push_str("\n[preloop]\n\thook-declined = true\n");
-        let _ = std::fs::write(config_path, content);
-    }
+    set_hook_decision("preloop.hook-declined");
 }
 
 fn install_hook() -> anyhow::Result<()> {
@@ -284,9 +287,10 @@ fn install_hook() -> anyhow::Result<()> {
     // Preserve a pre-existing hook (installed by another tool): chain it
     // instead of clobbering repository checks. Reinstalling over our own
     // hook backs nothing up (idempotent).
-    if std::fs::read_to_string(&hook_path)
-        .ok()
-        .is_some_and(|content| !content.contains(HOOK_MARKER))
+    let existing_hook = std::fs::read(&hook_path).ok();
+    if existing_hook
+        .as_deref()
+        .is_some_and(|bytes| !String::from_utf8_lossy(bytes).contains(HOOK_MARKER))
     {
         let backup = hooks_dir.join("pre-push.preloop-prev");
         std::fs::copy(&hook_path, &backup).context("back up previous pre-push hook")?;
@@ -303,40 +307,22 @@ fn install_hook() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The directory git runs hooks from: `core.hooksPath` when set (resolved
-/// relative to the working directory, like git does), else `.git/hooks`.
+/// The directory git runs hooks from, resolved by Git itself.
 fn resolve_hooks_dir() -> anyhow::Result<std::path::PathBuf> {
-    let configured = std::process::Command::new("git")
-        .args(["config", "--get", "core.hooksPath"])
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--git-path", "hooks"])
         .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            (!path.is_empty()).then_some(path)
-        });
-    if let Some(path) = configured {
-        let path = std::path::PathBuf::from(path);
-        return Ok(if path.is_absolute() {
-            path
-        } else {
-            std::env::current_dir()
-                .context("current directory")?
-                .join(path)
-        });
+        .context("resolve Git hooks directory")?;
+    if output.status.success() {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if !path.is_empty() {
+            return Ok(std::path::PathBuf::from(path));
+        }
     }
-    let git_dir = std::process::Command::new("git")
-        .args(["rev-parse", "--git-dir"])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            (!path.is_empty()).then_some(std::path::PathBuf::from(path))
-        });
-    Ok(git_dir
-        .unwrap_or_else(|| std::path::PathBuf::from(".git"))
-        .join("hooks"))
+    anyhow::bail!(
+        "git rev-parse --git-path hooks failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
 }
 
 fn maybe_offer_hook() -> anyhow::Result<()> {
@@ -2393,6 +2379,10 @@ fn decide_dirty_push_opts(
     pr_draft: bool,
     ci_passed: bool,
 ) -> anyhow::Result<Option<push::PushOpts>> {
+    if !ci_passed {
+        eprintln!("not pushing a dirty tree because CI failed");
+        return Ok(None);
+    }
     if explicit_pr {
         return Ok(Some(push::PushOpts {
             create_pr: true,
@@ -3496,11 +3486,16 @@ mod tests {
         std::env::set_current_dir(repo).unwrap();
         let _guard = CwdGuard(original);
 
-        // Create a minimal git repo manually. `git init` inside a subdirectory
-        // of the workspace would use the parent checkout's `.git/`.
-        std::fs::create_dir_all(".git/hooks").unwrap();
-        std::fs::write(".git/config", "[core]\n\trepositoryformatversion = 0\n").unwrap();
-        std::fs::write(".git/HEAD", "ref: refs/heads/main\n").unwrap();
+        // `git init` inside this standalone tempdir cannot use the parent
+        // checkout's `.git/`, and exercises the same Git path resolution as
+        // the real installation flow.
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .status()
+            .expect("git init")
+            .success()
+            .then_some(())
+            .expect("git init succeeds");
 
         assert!(!hook_installed(), "should not be installed yet");
         assert!(!hook_decided(), "should not be decided yet");

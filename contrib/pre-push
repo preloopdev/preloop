@@ -33,8 +33,11 @@ set -euo pipefail
 prev_hook="$(dirname "$0")/pre-push.preloop-prev"
 if [[ -x "$prev_hook" ]]; then
   refs="$(cat)"
-  if ! printf '%s\n' "$refs" | "$prev_hook" "$@"; then
-    exit $?
+  if printf '%s\n' "$refs" | "$prev_hook" "$@"; then
+    :
+  else
+    previous_status=$?
+    exit "$previous_status"
   fi
 else
   refs="$(cat)"
@@ -70,12 +73,28 @@ run_ci_or_resume() {
   # recorded run is validated live (and resumed) rather than trusting a bare
   # "the hook exited 0" marker that an interruption could skip writing.
   local cache_key cache run_id verdict
+  get_verdict() {
+    local status_err status_rc status_output
+    status_err="$(mktemp "${TMPDIR:-/tmp}/preloop-status-XXXXXX")"
+    set +e
+    status_output="$(PRELOOP_URL="$endpoint" "$preloop_bin" status "$1" 2>"$status_err")"
+    status_rc=$?
+    set -e
+    if [[ $status_rc -eq 0 ]]; then
+      printf '%s\n' "$status_output"
+    elif grep -q 'PRELOOP_UNREACHABLE' "$status_err"; then
+      printf 'unreachable\n'
+    else
+      printf 'error\n'
+    fi
+    rm -f "$status_err"
+  }
   cache_key="$(printf '%s\n' "$remote_url" "$endpoint" "$local_sha" | git hash-object --stdin)"
   cache="$cache_dir/$cache_key"
   if [[ -f "$cache" ]]; then
     IFS=$'\t' read -r run_id cached_remote cached_endpoint < "$cache" || true
     if [[ "$cached_remote" == "$remote_url" && "$cached_endpoint" == "$endpoint" ]]; then
-      verdict="$(PRELOOP_URL="$endpoint" "$preloop_bin" status "$run_id" 2>/dev/null || echo unknown)"
+      verdict="$(get_verdict "$run_id")"
       case "$verdict" in
         success)
           echo "preloop: cached CI verdict for ${local_sha:0:12}: success"
@@ -87,7 +106,7 @@ run_ci_or_resume() {
           echo "preloop: run ${run_id} still in progress — waiting for CI before pushing ${branch}..."
           while :; do
             sleep 15
-            verdict="$(PRELOOP_URL="$endpoint" "$preloop_bin" status "$run_id" 2>/dev/null || echo unknown)"
+            verdict="$(get_verdict "$run_id")"
             case "$verdict" in
               success)
                 echo "preloop: CI passed for ${branch}"
@@ -96,12 +115,15 @@ run_ci_or_resume() {
                 echo "preloop: cached CI verdict for ${local_sha:0:12}: ${verdict} — fix and re-push (or rm $cache)" >&2
                 return 1 ;;
               in_progress|queued|pending) ;;
-              unknown)
+              unreachable)
                 echo "preloop: cannot reach the engine to resume run ${run_id} — pushing ${branch} WITHOUT the CI gate (fail-open)" >&2
                 return 0 ;;
+              error)
+                echo "preloop: cannot validate cached run ${run_id} — push aborted" >&2
+                return 1 ;;
             esac
           done ;;
-        unknown)
+        error)
           echo "preloop: cannot resolve run ${run_id} — running CI fresh" >&2 ;;
       esac
     fi
@@ -110,11 +132,12 @@ run_ci_or_resume() {
   # Run CI. Fail open only on the machine-readable engine-unreachable marker
   # emitted by preloop itself — never on CI step output that happens to
   # mention a network error.
-  local log="${TMPDIR:-/tmp}/preloop-push-${local_sha:0:12}.log"
-  local run_pid run_status i
+  local log error_log run_pid run_status i
+  log="$(mktemp "${TMPDIR:-/tmp}/preloop-push-XXXXXX")"
+  error_log="$(mktemp "${TMPDIR:-/tmp}/preloop-push-error-XXXXXX")"
   echo "preloop: running CI on preloop before pushing ${branch} (this holds the push)..."
   set +e
-  "$preloop_bin" run >"$log" 2>&1 &
+  "$preloop_bin" run >"$log" 2>"$error_log" &
   run_pid=$!
   # Record the run id as soon as the engine accepts it, so an interrupted
   # hook (Ctrl-C, crash) resumes the same run on the next push instead of
@@ -130,18 +153,19 @@ run_ci_or_resume() {
   wait "$run_pid"
   run_status=$?
   set -e
-  if grep -q 'PRELOOP_UNREACHABLE' "$log"; then
+  if grep -q 'PRELOOP_UNREACHABLE' "$error_log"; then
     echo "preloop: engine unreachable — pushing ${branch} WITHOUT the CI gate (fail-open)" >&2
-    rm -f "$log"
+    rm -f "$log" "$error_log"
     return 0
   fi
   if [[ $run_status -ne 0 ]]; then
     echo "preloop: CI failed for ${branch} — push aborted. Details:" >&2
     tail -n 30 "$log" >&2
-    rm -f "$log"
+    tail -n 30 "$error_log" >&2
+    rm -f "$log" "$error_log"
     return 1
   fi
-  rm -f "$log"
+  rm -f "$log" "$error_log"
   return 0
 }
 

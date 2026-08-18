@@ -244,6 +244,9 @@ fn branch_matches(pattern: &str, branch: &str) -> bool {
     };
     if !last.is_empty() {
         // `ends_with` matched at the end, so this is a byte boundary.
+        if rest.len() < last.len() {
+            return false;
+        }
         rest = &rest[..rest.len() - last.len()];
     }
     for part in &parts[1..parts.len() - 1] {
@@ -328,6 +331,8 @@ mod tests {
         assert!(branch_matches("foo*bar", "foobar"));
         assert!(branch_matches("foo*bar*", "foobar"));
         assert!(!branch_matches("foo*bar", "foobarbaz"));
+        assert!(!branch_matches("foo*foo", "foo"));
+        assert!(branch_matches("a*a", "aa"));
     }
 
     #[test]
