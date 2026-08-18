@@ -9,6 +9,134 @@ Releases before v0.27.0 predate the changelog.
 
 ## [Unreleased]
 
+## [0.30.10] - 2026-08-18
+
+### Fixed
+
+- A crashed server orphaned its detached `_boot-vm` hypervisor processes:
+  the pool never stopped them on death, and if the machine data dir was
+  cleaned out from under them (a home cleanup), the smolvm DB no longer
+  knew the machines — the `_boot-vm` kept the storage fds open and the
+  unlinked blocks leaked until the process exited (observed holding
+  hundreds of GB for 47 h). Pool startup and shutdown now purge orphaned
+  `_boot-vm` processes by their boot-config path under the Preloop home,
+  SIGKILLing whatever the smolvm delete could not reach.
+
+## [0.30.9] - 2026-08-18
+
+### Fixed
+
+- The exec-as-image-user branch of the runner wrapper used
+  `setpriv --init-groups`, which fails as a non-root user (setgroups needs
+  root) — so on the official golden (image USER runner) every configure/run
+  exec died with `initgroups failed: Operation not permitted`. The non-root
+  branch now self-drops with `--keep-groups` (verified on the official
+  smolvm: both the root and image-user branches land on uid 1001).
+- The packed-golden path now adopts an existing running, fingerprint-matched
+  golden instead of re-unpacking tens of GiB on every `serve` restart.
+- `conformance-5repos.sh` campaign fixes: golden symlink carries the
+  environment fingerprint, stale campaign home is cleaned between runs,
+  deno targets the generated `ci.generated.yml`, and the runner storage
+  default is 160 GiB (the runner-large golden unpacks past 80 GiB).
+
+## [0.30.8] - 2026-08-18
+
+### Changed
+
+- Guest commands no longer run through `smolvm machine exec --user root`
+  (a flag only the retained smolvm fork shipped). The wrapper now branches on
+  the uid it lands on: root runs the provisioning directly (locally baked
+  goldens), any other image user runs it via passwordless sudo (the official
+  runner image declares `USER runner`), then the runner still drops to uid
+  1001 via `setpriv`. This removes the fork dependency entirely: `preloop
+  update --ensure-runtime` installs the official smolvm again and v0.30.7's
+  fork-pointing is reverted.
+
+## [0.30.7] - 2026-08-18
+
+### Fixed
+
+- Every pool exec runs as root via `smolvm machine exec --user root`, a flag
+  that only exists in the retained fork's smolvm 1.8.2+ — but `preloop
+  update --ensure-runtime` installed the official smolvm, so on fresh
+  machines every golden/runner exec failed with `unexpected argument
+  '--user' found`. The runtime now comes from the retained fork
+  (`preloopdev/smolvm` v1.8.2 line), the compatibility probe also checks
+  `machine exec --user`, and `smolvm_min_version` is raised to 1.8.2.
+
+## [0.30.6] - 2026-08-17
+
+### Fixed
+
+- The SmolVM guest agent rootfs was never found on standard installs: it
+  lives in smolvm's platform data directory (`~/Library/Application
+  Support/smolvm` on macOS, `~/.local/share/smolvm` on Linux), but the
+  runtime environment only probed the derived Preloop data dir and the
+  legacy `~/.smolvm` layout. With the isolated macOS `HOME`, every golden
+  machine start failed with `verify rootfs: agent rootfs not found`. The
+  probe now checks the real host's platform data dir first, then the legacy
+  location, and an explicit `SMOLVM_DATA_DIR` still wins.
+
+## [0.30.5] - 2026-08-17
+
+### Fixed
+
+- OCI golden download decompressed the packed layer, but the published
+  `application/vnd.preloop.smolmachine.v1+zstd` layer is the raw
+  `.smolmachine` sidecar — zstd asset frames followed by the uncompressed
+  manifest and `SMOLPACK` footer — so every OCI pull failed and fell back to
+  the release asset or a slow local bake. The download now verifies the
+  layer digest and installs the sidecar as-is, which `machine create --from`
+  consumes directly.
+
+## [0.30.4] - 2026-08-17
+
+### Added
+
+- The official-runner packed golden is now the arm64 default:
+  `download_prebaked_golden` pulls the digest-pinned OCI artifact
+  (`ghcr.io/preloopdev/preloop-golden@sha256:a2f7caf3…`, overridable with
+  `PRELOOP_GOLDEN_OCI_REF`) when no `PRELOOP_GOLDEN_URL` is configured, with
+  bearer-token registry auth, layer digest verification, and zstd decoding of
+  the packed VM layer. The release asset remains the fallback and
+  `PRELOOP_GOLDEN_URL` still selects it over the OCI default.
+- `PRELOOP_CLIENT_TIMEOUT_SECONDS` bounds runner-client requests; rejected
+  workflow submissions now surface the server status and body.
+- `benchmarks/real-world/conformance-5repos.sh` plus `just conform-5repos`:
+  five-repository campaign runner against the official runner golden.
+
+### Fixed
+
+- OCI golden download parsed the layer descriptor's `mediaType` as
+  `media_type` (every standard manifest failed to parse, silently falling
+  back to the release asset) and installed the compressed layer without
+  decoding it; the download now renames the field, logs parse failures, and
+  zstd-decodes the verified layer into the `.smolmachine` payload.
+- SmolVM runtime environment now applies to recovery commands (status, list,
+  stop, delete), so they target the same registry and macOS `HOME` as boot;
+  derived `SMOLVM_DATA_DIR` and macOS `HOME` directories are created before
+  spawn; macOS `HOME` isolation works without an explicit `PRELOOP_HOME`;
+  the agent rootfs is probed from the SmolVM data directory first.
+- Runner-client remote workflow fetches reuse the timeout-configured client
+  (`lint` can no longer hang on a stalled GitHub API request).
+- conformance campaign script: INT/TERM traps exit with the conventional
+  statuses instead of resuming, curl calls are bounded, and polling fails
+  fast when the local server dies.
+
+## [0.30.3] - 2026-08-13
+
+### Fixed
+
+- `preloop update` is now content-aware when the remote release version
+  equals the installed version: it downloads the checksummed release asset,
+  verifies its SHA-256, and byte-compares the extracted binary against the
+  installed executable, reinstalling on mismatch. A version string is
+  self-reported and can lie (a source build or tampered binary claiming a
+  release version), so the old version-only gate declared such installs up
+  to date forever — this is how the v0.30.2 deaf-runner fix never reached
+  production. Lower versions still never downgrade; a failed content check
+  (fetch/checksum error) keeps the installed binary and retries next run.
+
 ### Security
 
 - Fail closed on cache writes when the calling job no longer resolves. A
@@ -411,7 +539,8 @@ live-logs (8), and golden (8).
 Bootstrap the cargo-dist release pipeline for `preloop-cli` (binary
 installers for macOS and Linux).
 
-[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.29.8...HEAD
+[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.30.3...HEAD
+[0.30.3]: https://github.com/preloopdev/preloop/compare/v0.30.2...v0.30.3
 [0.29.8]: https://github.com/preloopdev/preloop/compare/v0.29.7...v0.29.8
 [0.29.7]: https://github.com/preloopdev/preloop/compare/v0.29.6...v0.29.7
 [0.29.6]: https://github.com/preloopdev/preloop/compare/v0.29.5...v0.29.6

@@ -262,6 +262,13 @@ mod tests {
         assert_eq!(result, "plain text no expressions");
     }
 
+    #[test]
+    fn format_like_literal_is_not_evaluated() {
+        let ctx = make_ctx();
+        let literal = "format('literal {0}', github.repository)";
+        assert_eq!(evaluate_template(literal, &ctx).unwrap(), literal);
+    }
+
     // --- P1 expressions/templates gap coverage ---
 
     #[test]

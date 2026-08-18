@@ -20,6 +20,7 @@ use preloop_vm::{
     MachineName, MachineSpec, MachineState, NetworkPolicy, OutputChunk, SecretSource,
     SmolVmProvider, SocketMount, VmError, VmProvider, VolumeMount,
 };
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -270,16 +271,51 @@ fn default_golden_url(release_version: &str) -> String {
     )
 }
 
+/// Public OCI artifact carrying the official arm64 packed VM golden.
+///
+/// This is deliberately separate from the `runner-images` base-image package:
+/// the latter is an OCI rootfs image, while this package contains a
+/// `.smolmachine` payload ready for `machine create --from`.
+///
+/// Pinned to the immutable manifest digest of the mutable
+/// `ubuntu24-arm64-runner-large-latest` tag (verified reachable 2026-08-17):
+/// a mutable tag could be silently replaced between the manifest fetch and
+/// the blob pull, and moving the default stays a reviewed code change
+/// instead of a registry retag. The artifact is produced by the CI golden
+/// pipeline (pool-side bake of the official ubuntu24-arm64 runner image);
+/// the repo release flow additionally publishes the packed golden as a
+/// GitHub Release asset, which `PRELOOP_GOLDEN_URL` selects over this
+/// default.
+const DEFAULT_GOLDEN_OCI_REF: &str =
+    "ghcr.io/preloopdev/preloop-golden@sha256:a2f7caf367e19efa4cb2d6f32a7093db8fae79e1b1525b65ac1190c1d2b44361";
+
 fn should_download_prebaked_golden(base_image: &str, custom_golden_url: bool) -> bool {
     is_stock_base_image(base_image) || custom_golden_url
 }
 
 async fn download_prebaked_golden(payload: &Path, release_version: &str) -> bool {
-    let default_url = default_golden_url(release_version);
-    let url = std::env::var("PRELOOP_GOLDEN_URL")
+    // An exported-but-blank `PRELOOP_GOLDEN_URL` must behave like an unset
+    // one in both places below: the operator otherwise gets neither the OCI
+    // default nor their (empty) override.
+    let forced_url = std::env::var("PRELOOP_GOLDEN_URL")
         .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or(default_url);
+        .filter(|value| !value.trim().is_empty());
+    if std::env::consts::ARCH == "aarch64" && forced_url.is_none() {
+        let reference = std::env::var("PRELOOP_GOLDEN_OCI_REF")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_GOLDEN_OCI_REF.to_owned());
+        if download_oci_golden(payload, &reference).await {
+            return true;
+        }
+        warn!(
+            reference,
+            "default OCI golden unavailable; trying release asset"
+        );
+    }
+
+    let default_url = default_golden_url(release_version);
+    let url = forced_url.unwrap_or(default_url);
 
     info!(url = %url, target = %payload.display(), "Attempting to download pre-baked golden microVM image");
 
@@ -401,6 +437,214 @@ async fn download_prebaked_golden(payload: &Path, release_version: &str) -> bool
     }
 
     info!(target = %payload.display(), "Downloaded pre-baked golden microVM image successfully");
+    true
+}
+
+#[derive(Debug, Deserialize)]
+struct OciManifest {
+    #[serde(default)]
+    layers: Vec<OciLayer>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OciLayer {
+    digest: String,
+    /// OCI descriptors name this field `mediaType`; without the rename every
+    /// standard manifest fails to parse and the OCI path silently falls back
+    /// to the release asset.
+    #[serde(rename = "mediaType")]
+    media_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OciToken {
+    token: String,
+}
+
+/// Download the packed VM layer from a public OCI artifact without requiring
+/// `oras`, Docker, or any other host-side registry client.
+async fn download_oci_golden(payload: &Path, reference: &str) -> bool {
+    let Some((registry, repository, version)) = split_oci_reference(reference) else {
+        warn!(reference, "invalid OCI golden reference");
+        return false;
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(600))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return false,
+    };
+    let manifest_url = format!("https://{registry}/v2/{repository}/manifests/{version}");
+    let accept = "application/vnd.oci.image.manifest.v1+json, \
+                  application/vnd.docker.distribution.manifest.v2+json";
+    let Some(response) = registry_get(&client, &manifest_url, accept).await else {
+        info!(reference, "OCI golden manifest unavailable");
+        return false;
+    };
+    let manifest = match response.json::<OciManifest>().await {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            warn!(reference, %error, "OCI golden manifest parse failed");
+            return false;
+        }
+    };
+    let Some(layer) = manifest
+        .layers
+        .into_iter()
+        .find(|layer| layer.media_type == "application/vnd.preloop.smolmachine.v1+zstd")
+    else {
+        warn!(reference, "OCI golden has no packed VM layer");
+        return false;
+    };
+    let blob_url = format!("https://{registry}/v2/{repository}/blobs/{}", layer.digest);
+    let Some(response) = registry_get(&client, &blob_url, "*/*").await else {
+        return false;
+    };
+    let Some(parent) = payload.parent() else {
+        return false;
+    };
+    let tmp_payload = parent.join(format!(".tmp-golden-{}", uuid::Uuid::new_v4()));
+    if stream_golden_response(response, &tmp_payload, Some(layer.digest)).await
+        && tokio::fs::rename(&tmp_payload, payload).await.is_ok()
+    {
+        info!(
+            reference,
+            target = %payload.display(),
+            "Downloaded OCI pre-baked golden microVM image successfully"
+        );
+        return true;
+    }
+    let _ = tokio::fs::remove_file(&tmp_payload).await;
+    false
+}
+
+async fn registry_get(
+    client: &reqwest::Client,
+    url: &str,
+    accept: &str,
+) -> Option<reqwest::Response> {
+    let response = client
+        .get(url)
+        .header(reqwest::header::ACCEPT, accept)
+        .send()
+        .await
+        .ok()?;
+    if response.status().is_success() {
+        return Some(response);
+    }
+    if response.status() != reqwest::StatusCode::UNAUTHORIZED {
+        return None;
+    }
+    let challenge = response
+        .headers()
+        .get(reqwest::header::WWW_AUTHENTICATE)?
+        .to_str()
+        .ok()?;
+    let realm = auth_parameter(challenge, "realm")?;
+    let service = auth_parameter(challenge, "service")?;
+    let scope = auth_parameter(challenge, "scope")?;
+    let token = client
+        .get(realm)
+        .query(&[("service", service), ("scope", scope)])
+        .send()
+        .await
+        .ok()?
+        .json::<OciToken>()
+        .await
+        .ok()?;
+    client
+        .get(url)
+        .header(reqwest::header::ACCEPT, accept)
+        .bearer_auth(token.token)
+        .send()
+        .await
+        .ok()
+        .filter(|response| response.status().is_success())
+}
+
+fn auth_parameter(challenge: &str, name: &str) -> Option<String> {
+    challenge.split(',').find_map(|part| {
+        let (key, value) = part.trim().split_once('=')?;
+        (key.trim()
+            .trim_start_matches("Bearer ")
+            .eq_ignore_ascii_case(name))
+        .then(|| value.trim_matches('"').to_owned())
+    })
+}
+
+fn split_oci_reference(reference: &str) -> Option<(String, String, String)> {
+    let (registry, remainder) = reference.split_once('/')?;
+    let (repository, version) = remainder
+        .rsplit_once('@')
+        .or_else(|| remainder.rsplit_once(':'))?;
+    if registry.is_empty() || repository.is_empty() || version.is_empty() {
+        return None;
+    }
+    Some((
+        registry.to_owned(),
+        repository.to_owned(),
+        version.to_owned(),
+    ))
+}
+
+/// Stream the OCI layer to a temporary file, verify its digest against the
+/// manifest descriptor, then install it at the payload path.
+///
+/// The published `application/vnd.preloop.smolmachine.v1+zstd` layer is the
+/// raw `.smolmachine` sidecar: zstd-compressed asset frames followed by the
+/// uncompressed manifest and `SMOLPACK` footer. The media type's `+zstd`
+/// suffix describes the internal asset compression, not the layer itself —
+/// the layer bytes are NOT a bare zstd stream (verified: the blob ends with
+/// an uncompressed `SMOLPACK` trailer), and `machine create --from` reads
+/// the sidecar container directly. Do not decompress the layer.
+async fn stream_golden_response(
+    response: reqwest::Response,
+    tmp_payload: &Path,
+    expected_sha256: Option<String>,
+) -> bool {
+    let mut file = match tokio::fs::File::create(tmp_payload).await {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else {
+            let _ = tokio::fs::remove_file(tmp_payload).await;
+            return false;
+        };
+        if file.write_all(&chunk).await.is_err() {
+            let _ = tokio::fs::remove_file(tmp_payload).await;
+            return false;
+        }
+    }
+    if file.flush().await.is_err() {
+        let _ = tokio::fs::remove_file(tmp_payload).await;
+        return false;
+    }
+    drop(file);
+    if let Some(expected) = expected_sha256 {
+        let digest = match tokio::task::spawn_blocking({
+            let path = tmp_payload.to_owned();
+            move || {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                let mut file = std::fs::File::open(path)?;
+                std::io::copy(&mut file, &mut hasher)?;
+                Ok::<String, std::io::Error>(format!("{:x}", hasher.finalize()))
+            }
+        })
+        .await
+        {
+            Ok(Ok(digest)) => digest,
+            _ => return false,
+        };
+        let expected = expected.strip_prefix("sha256:").unwrap_or(&expected);
+        if digest != expected {
+            warn!(expected, %digest, "OCI golden layer digest mismatch");
+            return false;
+        }
+    }
     true
 }
 
@@ -659,7 +903,20 @@ fn node_externals_at(runner_root: &str) -> Vec<Vec<String>> {
 /// on the engine's start-up critical path. Exposed for the fidelity tests.
 pub fn base_install_script() -> String {
     format!(
-        "apt-get update -qq && \
+        "(find /usr/bin /usr/sbin /bin /sbin /etc -type f 2>/dev/null | \
+            while IFS= read -r f; do chown 0:0 \"$f\" 2>/dev/null; done) || true; \
+         chown 0:0 /etc/sudo.conf /etc/sudoers 2>/dev/null; \
+         for f in /etc/sudoers.d/*; do [ -f \"$f\" ] && chown 0:0 \"$f\" 2>/dev/null; done; \
+         chmod 0440 /etc/sudoers /etc/sudoers.d/* 2>/dev/null; \
+         (for b in sudo su mount umount passwd chsh chfn newgrp gpasswd expiry chage wall write pkexec ping fusermount fusermount3; do \
+            for p in /usr/bin/$b /bin/$b /usr/sbin/$b; do \
+              if [ -f \"$p\" ]; then chown 0:0 \"$p\" 2>/dev/null; chmod u+s \"$p\" 2>/dev/null; fi; \
+            done; \
+          done; \
+          for p in /usr/lib/openssh/ssh-keysign /usr/lib/dbus-1.0/dbus-daemon-launch-helper; do \
+            if [ -f \"$p\" ]; then chown 0:0 \"$p\" 2>/dev/null; chmod u+s \"$p\" 2>/dev/null; fi; \
+          done) && \
+         apt-get update -qq && \
          (echo \"### install hosted apt baseline\" >&2 && \
           if DEBIAN_FRONTEND=noninteractive \
              apt-get -s install -qq --no-install-recommends {base_packages_pinned} >/dev/null 2>&1; then \
@@ -733,12 +990,19 @@ pub fn base_install_script() -> String {
           curl -fsSL \"https://nodejs.org/dist/v{BASE_NODE_VERSION}/node-v{BASE_NODE_VERSION}-linux-$NODE_ARCH.tar.gz\" \
             | tar -xz --strip-components=1 -C /usr/local) && \
          (install -m 0755 -d /etc/apt/keyrings && \
-          echo \"### fetch docker gpg\" >&2 && \
+         (echo \"### fetch docker gpg\" >&2 && \
           curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc && \
           echo \"deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable\" > /etc/apt/sources.list.d/docker.list && \
           apt-get update -qq && \
           DEBIAN_FRONTEND=noninteractive \
           apt-get install -y -qq {docker_packages} && \
+          (echo \"### install gh cli\" >&2 && \
+           curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+           echo \"deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\" > /etc/apt/sources.list.d/github-cli.list && \
+          apt-get update -qq && \
+          DEBIAN_FRONTEND=noninteractive \
+           apt-get install -y -qq gh && \
+           gh --version | head -1) && \
           echo \"### overlay docker v{DOCKER_VERSION}\" >&2 && \
           rm -rf /tmp/docker-static && mkdir -p /tmp/docker-static && \
           curl -fsSL \"https://download.docker.com/linux/static/stable/$DOCKER_STATIC_ARCH/docker-{DOCKER_VERSION}.tgz\" \
@@ -756,7 +1020,7 @@ pub fn base_install_script() -> String {
           docker buildx version | grep -F 'v{DOCKER_BUILDX_VERSION}' && \
           docker compose version --short | grep -F '{DOCKER_COMPOSE_VERSION}' && \
           mkdir -p {DOCKER_DATA_ROOT} /etc/docker && \
-          printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\"}}\\n' > /etc/docker/daemon.json) && \
+          printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\"}}\\n' > /etc/docker/daemon.json)) && \
          (echo \"### fetch cargo-shear\" >&2 && \
           curl -sSL https://github.com/Boshen/cargo-shear/releases/download/v{CARGO_SHEAR_VERSION}/cargo-shear-$(uname -m)-unknown-linux-musl.tar.gz 2>/dev/null | tar -xz -C /usr/local/bin 2>/dev/null || true) && \
          (echo \"### bake git v{GIT_VERSION}\" >&2 && \
@@ -813,7 +1077,7 @@ fn docker_start_command() -> Vec<String> {
     vec![
         "sh".to_owned(),
         "-c".to_owned(),
-        format!(
+        run_as_root_or_sudo(&format!(
             "command -v dockerd >/dev/null 2>&1 || exit 0; \
              docker info >/dev/null 2>&1 && exit 0; \
              rm -f /var/run/docker.pid; \
@@ -824,12 +1088,16 @@ fn docker_start_command() -> Vec<String> {
                sleep 0.2; \
              done; \
              exit 0"
-        ),
+        )),
     ]
 }
 
 /// How long to wait for a freshly started guest to accept commands.
 const GUEST_READY_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long to wait between live-clone drain probes before re-arming a spent
+/// golden fork base. Bounded retries; the probe loop is exercised by tests
+/// under paused Tokio time, so this is the only knob the delay is tied to.
+const GOLDEN_DRAIN_PROBE_DELAY: Duration = Duration::from_secs(10);
 /// Gap between guest readiness probes.
 const GUEST_READY_POLL: Duration = Duration::from_millis(25);
 
@@ -1277,7 +1545,16 @@ impl RunnerPoolConfig {
     }
 
     fn artifact_payload(&self) -> PathBuf {
-        self.artifact_stem.clone()
+        // The packed artifact is keyed by the resolved base image AND the
+        // environment fingerprint (toolchains + curated bake content). A
+        // stem-only key would let a golden keep the previous bake forever:
+        // bake-content changes (package pins, the ownership repair, new
+        // toolchains) must invalidate the pack or the fork base silently
+        // serves jobs the old toolchain.
+        let fingerprint = EnvironmentSpec::for_base(self.base_image.clone()).fingerprint;
+        let mut path = self.artifact_stem.clone().into_os_string();
+        path.push(format!("-{fingerprint}"));
+        PathBuf::from(path)
     }
 }
 
@@ -1337,7 +1614,7 @@ async fn preload_images<P: VmProvider>(
         .map(|image| format!("'{}'", image.replace('\'', "'\\''")))
         .collect::<Vec<_>>()
         .join(" ");
-    let script = format!(
+    let script = run_as_root_or_sudo(&format!(
         "command -v dockerd >/dev/null 2>&1 || {{ echo 'no dockerd' >&2; exit 1; }}; \
          mkdir -p {DOCKER_DATA_ROOT}; \
          docker info >/dev/null 2>&1 || (dockerd >/var/log/dockerd-preload.log 2>&1 &); \
@@ -1350,7 +1627,7 @@ async fn preload_images<P: VmProvider>(
          done; \
          sync; \
          echo \"$pulled\""
-    );
+    ));
     let output = provider
         .exec(golden, &["sh".to_owned(), "-c".to_owned(), script])
         .await?;
@@ -1539,12 +1816,31 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
     config: &RunnerPoolConfig,
     golden: &MachineName,
 ) -> Result<(), OrchestratorError> {
+    // Same adoption rule as the baked-golden path: an engine restart must not
+    // re-unpack a multi-GiB packed golden that is still sitting there forkable
+    // and fingerprint-matched. Without this every `serve` restart pays the
+    // full unpack (tens of GB of storage writes) before the first job.
+    let env_spec = EnvironmentSpec::for_base(config.base_image.clone());
+    if golden_is_reusable(provider, config, golden, &env_spec.fingerprint).await {
+        info!(
+            machine = golden.as_str(),
+            fingerprint = %env_spec.fingerprint,
+            "adopted the existing packed golden fork base"
+        );
+        return Ok(());
+    }
+    remove_golden_record(config, golden);
     if provider.status(golden).await? != MachineState::Missing {
         provider.delete(golden).await?;
     }
+    // smolvm's `machine create --from` consumes the SMOLPACK, not the ELF
+    // launcher stub written at the payload stem. A downloaded release asset
+    // IS the pack at the stem; a locally built golden leaves the pack in the
+    // `.smolmachine` sidecar. Centralized in [`packed_golden_path`].
+    let pack = packed_golden_path(&config.artifact_payload());
     let spec = MachineSpec {
         name: golden.clone(),
-        image: config.artifact_payload().display().to_string(),
+        image: pack.display().to_string(),
         cpus: config.cpus,
         memory_mib: config.memory_mib,
         storage_gib: config.storage_gib,
@@ -1576,6 +1872,7 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
     }
     provider.stop(golden).await?;
     provider.start_forkable(golden).await?;
+    write_golden_record(config, golden, &env_spec.fingerprint);
     info!(
         machine = golden.as_str(),
         artifact = %config.artifact_payload().display(),
@@ -1980,6 +2277,17 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     warn!(machine = name.as_str(), %error, "failed to delete stale Preloop runner");
                 }
             }
+        }
+        // A crashed server orphans its detached `_boot-vm` hypervisor
+        // processes; when the data dir was cleaned out from under them the
+        // smolvm DB no longer knows the machines, so the deletes above
+        // cannot reach them and they keep the storage fds open — the
+        // unlinked blocks leak until the process dies. Kill by config path.
+        match preloop_vm::purge_orphaned_vms() {
+            Ok(killed) if killed > 0 => {
+                info!(killed, "purged orphaned SmolVM hypervisor processes")
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -2923,6 +3231,7 @@ fn fork_base_unusable(error: &VmError) -> bool {
 /// Create, boot, and register one ephemeral runner; return its `run` argv.
 ///
 /// The caller owns cleanup: on any error the machine may already exist.
+#[allow(clippy::too_many_arguments)]
 async fn provision_runner<P: VmProvider + 'static>(
     provider: &Arc<P>,
     config: &RunnerPoolConfig,
@@ -2989,15 +3298,67 @@ async fn provision_runner<P: VmProvider + 'static>(
                             }
                         }
                         Ok(false) => {
-                            error!(
-                                golden = golden.as_str(),
-                                "fork base spent and cannot be re-armed (a live clone still \
-                                 depends on it, or the partial clone could not be removed); \
-                                 falling back to independent OCI creation"
-                            );
-                            let _ = provider.delete(name).await;
-                            direct_create_from_packed = false;
-                            None
+                            // A live clone (another runner forked from the
+                            // golden) blocks the re-freeze; those clones are
+                            // ephemeral and exit after their job. Wait for
+                            // them to drain, then retry the re-arm a bounded
+                            // number of times before falling back to direct
+                            // creation (whose socket mount cannot serve the
+                            // control transport, so the fallback usually
+                            // fails registration anyway).
+                            let mut rearmed = false;
+                            for attempt in 0..12 {
+                                tokio::time::sleep(GOLDEN_DRAIN_PROBE_DELAY).await;
+                                match provider.rearm_fork_base(golden, Some(name)).await {
+                                    Ok(true) => {
+                                        info!(
+                                            golden = golden.as_str(),
+                                            attempt, "golden fork base re-armed after clone drain"
+                                        );
+                                        rearmed = true;
+                                        break;
+                                    }
+                                    Ok(false) => {
+                                        // Live clones still hold the golden;
+                                        // keep probing until the bounded
+                                        // retries are exhausted.
+                                    }
+                                    Err(drain_error) => {
+                                        error!(
+                                            golden = golden.as_str(),
+                                            %drain_error,
+                                            "re-arm failed while draining clones; falling back \
+                                             without further waiting"
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                            if rearmed {
+                                match provider.fork(golden, name).await {
+                                    Ok(()) => Some(golden),
+                                    Err(retry_error) => {
+                                        error!(
+                                            machine = name.as_str(),
+                                            golden = golden.as_str(),
+                                            %retry_error,
+                                            "re-armed golden still cannot fork; falling back to \
+                                             direct creation"
+                                        );
+                                        let _ = provider.delete(name).await;
+                                        None
+                                    }
+                                }
+                            } else {
+                                error!(
+                                    golden = golden.as_str(),
+                                    "fork base spent and could not be re-armed after waiting for \
+                                     clone drain; falling back to independent OCI creation"
+                                );
+                                let _ = provider.delete(name).await;
+                                direct_create_from_packed = false;
+                                None
+                            }
                         }
                         Err(rearm_error) => {
                             error!(
@@ -3109,10 +3470,11 @@ async fn provision_runner<P: VmProvider + 'static>(
         }
     } else {
         let uses_packed_artifact = direct_create_from_packed;
+        let pack = packed_golden_path(&config.artifact_payload());
         let spec = MachineSpec {
             name: name.clone(),
             image: if uses_packed_artifact {
-                config.artifact_payload().display().to_string()
+                pack.display().to_string()
             } else if config.use_packed_artifact {
                 environment.base.clone()
             } else {
@@ -3282,6 +3644,20 @@ async fn provision_runner<P: VmProvider + 'static>(
 /// `setpriv` and export the account identity for the step-environment
 /// contract (USER/LOGNAME/XDG_RUNTIME_DIR are derived from it by the
 /// worker). Purely a guest-side concern — never applied on the host.
+/// Carry a guest shell script so its root-only steps run either directly
+/// (the exec landed on root — locally baked goldens from plain bases declare
+/// no USER) or via passwordless sudo (the official runner image declares
+/// `USER runner`, and `machine exec` runs as that image user). The script is
+/// embedded base64 so every quoting form survives both shells.
+fn run_as_root_or_sudo(script: &str) -> String {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(script);
+    format!(
+        "if [ \"$(id -u)\" -eq 0 ]; then {script}; else \
+           printf %s '{b64}' | base64 -d | sudo -n sh 2>/dev/null || true; fi"
+    )
+}
+
 fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
     let Some(user) = &config.runner_user else {
         return argv.to_vec();
@@ -3297,13 +3673,35 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
         .map(|arg| shell_quote(arg))
         .collect::<Vec<_>>()
         .join(" ");
-    let script = format!(
+    // Root-only provisioning: create the runner account when missing, open
+    // its runtime and control-bridge paths, join the docker group. Runs
+    // directly when the exec landed on root, else via passwordless sudo —
+    // the official golden declares USER runner, so `machine exec` lands on
+    // runner and setpriv below self-drops to the same uid (no privilege
+    // change needed).
+    let provisioning = format!(
         "getent passwd {user} >/dev/null 2>&1 || useradd -m -u {uid} {user} 2>/dev/null; \
          mkdir -p /run/user/{uid}; chown {uid}:{uid} /run/user/{uid} /var/lib/preloop-runner 2>/dev/null; \
          chmod 777 /run/preloop-control 2>/dev/null; \
-         getent group docker >/dev/null 2>&1 && usermod -aG docker {user} 2>/dev/null; \
-         exec setpriv --reuid {uid} --regid {uid} --init-groups env \
-           PRELOOP_RUNNER_USER={user} PRELOOP_RUNNER_UID={uid} HOME={home} {program} {args}"
+         getent group docker >/dev/null 2>&1 && usermod -aG docker {user} 2>/dev/null"
+    );
+    // setpriv requires a groups mode: --init-groups (setgroups) only works
+    // as root, so the exec-as-image-user branch (official golden: USER
+    // runner, uid 1001) must use --keep-groups — the exec context already
+    // carries the right supplementary groups, and reuid/regid to self are
+    // permitted without privileges. The root branch keeps --init-groups.
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&provisioning);
+    let script = format!(
+        "if [ \"$(id -u)\" -eq 0 ]; then \
+           {provisioning}; \
+           exec setpriv --reuid {uid} --regid {uid} --init-groups env \
+             PRELOOP_RUNNER_USER={user} PRELOOP_RUNNER_UID={uid} HOME={home} {program} {args}; \
+         else \
+           printf %s '{b64}' | base64 -d | sudo -n sh 2>/dev/null || true; \
+           exec setpriv --reuid {uid} --regid {uid} --keep-groups env \
+             PRELOOP_RUNNER_USER={user} PRELOOP_RUNNER_UID={uid} HOME={home} {program} {args}; \
+         fi"
     );
     vec!["sh".to_owned(), "-c".to_owned(), script]
 }
@@ -3415,9 +3813,31 @@ async fn hold_for_debugging(name: &MachineName, debug_dir: &Path, shutdown: &Can
     let _ = std::fs::remove_file(&marker);
 }
 
-/// Return the runner artifact payload generated for an output stem.
-pub fn artifact_payload(stem: &Path) -> PathBuf {
-    stem.to_path_buf()
+/// Return the runner artifact payload generated for an output stem and base
+/// image.
+pub fn artifact_payload(stem: &Path, base_image: &str) -> PathBuf {
+    // Keep in sync with `RunnerPoolConfig::artifact_payload`: the packed
+    // artifact is keyed by the resolved base image AND the environment
+    // fingerprint, so bake-content changes invalidate the pack.
+    let fingerprint = EnvironmentSpec::for_base(base_image.to_owned()).fingerprint;
+    let mut path = stem.as_os_str().to_owned();
+    path.push(format!("-{fingerprint}"));
+    PathBuf::from(path)
+}
+
+/// Resolve the actual packed-golden file for smolvm's `machine create
+/// --from`. The artifact stem names the payload: a downloaded release asset
+/// IS the SMOLPACK at the stem, while a locally built golden leaves an ELF
+/// launcher stub at the stem with the pack in the `<stem>.smolmachine`
+/// sidecar. Prefer the sidecar when present, else the stem itself — never
+/// invent a path that may not exist.
+fn packed_golden_path(payload: &Path) -> PathBuf {
+    let sidecar = PathBuf::from(format!("{}.smolmachine", payload.display()));
+    if sidecar.is_file() {
+        sidecar
+    } else {
+        payload.to_path_buf()
+    }
 }
 
 #[cfg(test)]
@@ -3881,16 +4301,30 @@ chmod +x "$destination/bin/node"
             script.contains("chmod 777 /run/preloop-control"),
             "{script}"
         );
+        // Root branch (locally baked goldens) drops with --init-groups; the
+        // exec-as-image-user branch (official golden) provisions via sudo and
+        // self-drops with --keep-groups (setgroups needs root).
         assert!(
             script.contains("setpriv --reuid 1001 --regid 1001 --init-groups"),
             "{script}"
         );
         assert!(
-            script.contains("PRELOOP_RUNNER_USER=runner PRELOOP_RUNNER_UID=1001"),
+            script.contains("setpriv --reuid 1001 --regid 1001 --keep-groups"),
             "{script}"
         );
         assert!(
-            script.ends_with("'/opt/preloop/bin/preloop-runner' 'run' '--once'"),
+            script.contains("| base64 -d | sudo -n sh 2>/dev/null || true"),
+            "{script}"
+        );
+        assert_eq!(
+            script
+                .matches("'/opt/preloop/bin/preloop-runner' 'run' '--once'")
+                .count(),
+            2,
+            "the wrapped program must appear in both branches"
+        );
+        assert!(
+            script.contains("PRELOOP_RUNNER_USER=runner PRELOOP_RUNNER_UID=1001"),
             "{script}"
         );
     }
@@ -3932,6 +4366,47 @@ chmod +x "$destination/bin/node"
         let url = default_golden_url("9.8.7");
         assert!(url.contains("/releases/download/v9.8.7/"), "{url}");
         assert!(!url.contains(env!("CARGO_PKG_VERSION")), "{url}");
+    }
+
+    #[test]
+    fn default_oci_golden_reference_targets_arm64_pack() {
+        let (registry, repository, version) =
+            split_oci_reference(DEFAULT_GOLDEN_OCI_REF).expect("valid OCI reference");
+        assert_eq!(registry, "ghcr.io");
+        assert_eq!(repository, "preloopdev/preloop-golden");
+        // Immutable digest pin: changing the default must be a reviewed code
+        // change, not a registry retag.
+        assert!(
+            version.len() == "sha256:".len() + 64 && version.starts_with("sha256:"),
+            "expected a digest-pinned default, got `{version}`"
+        );
+    }
+
+    #[test]
+    fn oci_layer_deserializes_camel_case_media_type() {
+        let manifest: OciManifest = serde_json::from_str(
+            r#"{"layers":[{"digest":"sha256:00","mediaType":"application/vnd.preloop.smolmachine.v1+zstd"}]}"#,
+        )
+        .expect("standard OCI manifest must parse");
+        let layer = manifest
+            .layers
+            .into_iter()
+            .find(|layer| layer.media_type == "application/vnd.preloop.smolmachine.v1+zstd")
+            .expect("packed VM layer present");
+        assert_eq!(layer.digest, "sha256:00");
+    }
+
+    #[test]
+    fn oci_auth_challenge_parameters_parse() {
+        let challenge = r#"Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:preloopdev/preloop-golden:pull""#;
+        assert_eq!(
+            auth_parameter(challenge, "realm").as_deref(),
+            Some("https://ghcr.io/token")
+        );
+        assert_eq!(
+            auth_parameter(challenge, "scope").as_deref(),
+            Some("repository:preloopdev/preloop-golden:pull")
+        );
     }
 
     #[test]
@@ -4449,7 +4924,10 @@ chmod +x "$destination/bin/node"
     /// A spent base that still has live clones must NOT be re-armed: resuming
     /// it would corrupt the copy-on-write clones. The pool falls back to a
     /// full create instead.
-    #[tokio::test]
+    // Paused time: the drain loop sleeps GOLDEN_DRAIN_PROBE_DELAY between
+    // probes; without this the 12-probe worst case would stall the test for
+    // two minutes of real time.
+    #[tokio::test(start_paused = true)]
     async fn spent_fork_base_with_live_clones_is_not_rearmed() {
         let provider = Arc::new(
             TestProvider::new(false, false, false, false, false)

@@ -42,14 +42,16 @@ on:
         type: string
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 jobs:
   prep:
     name: Prep runner sync (diff + triage)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
     outputs:
       moved: ${{ steps.moved.outputs.moved }}
       from: ${{ steps.versions.outputs.from }}
@@ -57,27 +59,34 @@ jobs:
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
+          persist-credentials: false
           lfs: true
       - uses: dtolnay/rust-toolchain@52699249a776424c51ebc9ee197baf0f9dbf0d8a
       - name: Resolve versions
         id: versions
+        env:
+          INPUT_FROM: ${{ github.event.inputs.from }}
+          INPUT_TO: ${{ github.event.inputs.to }}
         run: |
           set -euo pipefail
           OUT="$(python3 scripts/resolve-runner-versions.py \
-            --from "${{ github.event.inputs.from }}" \
-            --to "${{ github.event.inputs.to }}")"
+            --from "$INPUT_FROM" \
+            --to "$INPUT_TO")"
           FROM="$(printf '%s\n' "$OUT" | sed -n 's/^from=//p')"
           TO="$(printf '%s\n' "$OUT" | sed -n 's/^to=//p')"
           echo "from=$FROM" >> "$GITHUB_OUTPUT"
           echo "to=$TO" >> "$GITHUB_OUTPUT"
       - name: Detect runner_version movement
         id: moved
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
           MOVED=true
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            if git diff --quiet "${{ github.event.pull_request.base.sha }}" -- versions.toml \
-                || ! git diff "${{ github.event.pull_request.base.sha }}" -- versions.toml \
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            if git diff --quiet "$BASE_SHA" -- versions.toml \
+                || ! git diff "$BASE_SHA" -- versions.toml \
                      | grep -q '^[+-]runner_version'; then
               MOVED=false
             fi
@@ -89,7 +98,10 @@ jobs:
           cargo run -q -p runner-watch -- init || true
       - name: Diff upstream tags
         if: steps.moved.outputs.moved == 'true'
-        run: cargo run -q -p runner-watch -- diff --from "${{ steps.versions.outputs.from }}" --to "${{ steps.versions.outputs.to }}"
+        env:
+          VER_FROM: ${{ steps.versions.outputs.from }}
+          VER_TO: ${{ steps.versions.outputs.to }}
+        run: cargo run -q -p runner-watch -- diff --from "$VER_FROM" --to "$VER_TO"
       - name: Triage delta into specs
         if: steps.moved.outputs.moved == 'true'
         run: cargo run -q -p runner-watch -- triage --no-agents
@@ -97,11 +109,17 @@ jobs:
         if: steps.moved.outputs.moved == 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VER_FROM: ${{ steps.versions.outputs.from }}
+          VER_TO: ${{ steps.versions.outputs.to }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SERVER_URL: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
           SPECS="$(python3 -c 'import json; print(json.load(open(".runner-watch/triage-summary.json")).get("specs", 0))')"
-          BODY="runner-sync: ${{ steps.versions.outputs.from }} -> ${{ steps.versions.outputs.to }} triaged into **$SPECS specs** (deterministic, no agents). See [the run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for delta.json and the spec set. The sync job then records goldens, conforms, and opens the tiered PRs once a runner-sync host is provisioned."
-          gh pr comment "${{ github.event.pull_request.number }}" --body "$BODY"
+          BODY="runner-sync: $VER_FROM -> $VER_TO triaged into **$SPECS specs** (deterministic, no agents). See [the run]($SERVER_URL/$REPO/actions/runs/$RUN_ID) for delta.json and the spec set. The sync job then records goldens, conforms, and opens the tiered PRs once a runner-sync host is provisioned."
+          gh pr comment "$PR_NUMBER" --body "$BODY"
       - name: Upload triage artifacts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -122,22 +140,29 @@ jobs:
     if: vars.RUNNER_SYNC_HOST_WORKSPACE != ''
     runs-on: [self-hosted, runner-sync]
     timeout-minutes: 180
+    permissions:
+      contents: write
+      pull-requests: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       HOST_WORKSPACE: ${{ vars.RUNNER_SYNC_HOST_WORKSPACE }}
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
+          persist-credentials: false
           lfs: true
       - uses: dtolnay/rust-toolchain@52699249a776424c51ebc9ee197baf0f9dbf0d8a
       - name: Detect runner_version movement
         id: moved
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
           MOVED=true
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            if git diff --quiet "${{ github.event.pull_request.base.sha }}" -- versions.toml \
-                || ! git diff "${{ github.event.pull_request.base.sha }}" -- versions.toml \
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            if git diff --quiet "$BASE_SHA" -- versions.toml \
+                || ! git diff "$BASE_SHA" -- versions.toml \
                      | grep -q '^[+-]runner_version'; then
               MOVED=false
             fi
@@ -146,11 +171,14 @@ jobs:
       - name: Resolve versions
         id: versions
         if: steps.moved.outputs.moved == 'true'
+        env:
+          INPUT_FROM: ${{ github.event.inputs.from }}
+          INPUT_TO: ${{ github.event.inputs.to }}
         run: |
           set -euo pipefail
           OUT="$(python3 scripts/resolve-runner-versions.py \
-            --from "${{ github.event.inputs.from }}" \
-            --to "${{ github.event.inputs.to }}")"
+            --from "$INPUT_FROM" \
+            --to "$INPUT_TO")"
           FROM="$(printf '%s\n' "$OUT" | sed -n 's/^from=//p')"
           TO="$(printf '%s\n' "$OUT" | sed -n 's/^to=//p')"
           echo "from=$FROM" >> "$GITHUB_OUTPUT"
@@ -160,7 +188,10 @@ jobs:
         run: cargo run -q -p runner-watch -- init || true
       - name: Diff upstream tags
         if: steps.moved.outputs.moved == 'true'
-        run: cargo run -q -p runner-watch -- diff --from "${{ steps.versions.outputs.from }}" --to "${{ steps.versions.outputs.to }}"
+        env:
+          VER_FROM: ${{ steps.versions.outputs.from }}
+          VER_TO: ${{ steps.versions.outputs.to }}
+        run: cargo run -q -p runner-watch -- diff --from "$VER_FROM" --to "$VER_TO"
       - name: Triage delta into specs
         if: steps.moved.outputs.moved == 'true'
         run: cargo run -q -p runner-watch -- triage --no-agents
@@ -172,9 +203,13 @@ jobs:
         run: cargo run -q -p runner-watch -- review
       - name: Record official goldens
         if: steps.moved.outputs.moved == 'true'
-        run: cargo run -q -p runner-watch -- record-golden --runner "${{ steps.versions.outputs.to }}" --non-interactive
+        env:
+          VER_TO: ${{ steps.versions.outputs.to }}
+        run: cargo run -q -p runner-watch -- record-golden --runner "$VER_TO" --non-interactive
       - name: Replay against the built server
         if: steps.moved.outputs.moved == 'true'
+        env:
+          VER_TO: ${{ steps.versions.outputs.to }}
         run: |
           set -euo pipefail
           python3 benchmarks/conformance/check_corpus.py || true
@@ -198,7 +233,7 @@ jobs:
             sleep .1
           done
           curl -fsS "$REPLAY_URL/healthz" >/dev/null || { cat "$SERVER_LOG" >&2; echo "replay server not ready" >&2; exit 1; }
-          cargo run -q -p runner-watch -- conform --runner "v${{ steps.versions.outputs.to }}" \
+          cargo run -q -p runner-watch -- conform --runner "v$VER_TO" \
             --preloop-url "$REPLAY_URL" --skip-cargo-test
           kill "$SERVER_PID" >/dev/null 2>&1 || true
           wait "$SERVER_PID" >/dev/null 2>&1 || true
@@ -207,18 +242,21 @@ jobs:
           echo "conform: PASS"
       - name: Open tiered sync PRs
         if: steps.moved.outputs.moved == 'true'
+        env:
+          VER_TO: ${{ steps.versions.outputs.to }}
         run: |
           set -euo pipefail
+          gh auth setup-git
           git config user.name "preloop-sync[bot]"
           git config user.email "preloop-sync[bot]@users.noreply.github.com"
-          BRANCH="runner-sync/v${{ steps.versions.outputs.to }}"
+          BRANCH="runner-sync/v$VER_TO"
           git checkout -b "$BRANCH"
           # Renders the tiered PR bodies and updates versions.toml / README /
           # fidelity-gap for the new version.
           cargo run -q -p runner-watch -- pr --dry-run
           git add -A
           if ! git diff --cached --quiet; then
-            git commit -m "chore(runner-sync): reconcile actions/runner v${{ steps.versions.outputs.to }}"
+            git commit -m "chore(runner-sync): reconcile actions/runner v$VER_TO"
             git push origin "$BRANCH"
           fi
           cargo run -q -p runner-watch -- pr --base main --head "$BRANCH"
