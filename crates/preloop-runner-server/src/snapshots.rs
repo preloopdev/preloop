@@ -198,8 +198,23 @@ fn snapshot_repo_timing(repository: &FsPath) -> anyhow::Result<crate::models::Sn
     Ok(crate::models::SnapshotTiming {
         duration_ms: 0, // filled by the caller
         object_count,
-        pack_bytes: size_kib,
+        pack_bytes: size_kib.saturating_mul(1024),
     })
+}
+
+/// Count objects that `rev-list` explicitly reports as missing. With
+/// `--missing=print`, missing objects are prefixed with `?`; ordinary commit
+/// lines are bare object IDs, while tree/blob lines may include a path.
+async fn missing_snapshot_objects(repository: &FsPath) -> Result<u64, ApiError> {
+    let mut verify = Command::new("git");
+    verify
+        .env("GIT_DIR", repository)
+        .args(["rev-list", "--objects", "--all", "--missing=print"]);
+    let output = run_git(&mut verify, "verify snapshot object cache completeness").await?;
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.starts_with('?'))
+        .count() as u64)
 }
 
 async fn create_workspace_snapshot_inner(
@@ -1136,27 +1151,7 @@ async fn ensure_object_cache(
         // with `Could not read <sha>` / "revision walk setup failed" — so
         // recover the full ancestry from the workspace's remote, the same
         // deepen the shallow path uses.
-        let mut verify = Command::new("git");
-        verify.env("GIT_DIR", &repository).args([
-            "rev-list",
-            "--objects",
-            "--all",
-            "--missing=print",
-        ]);
-        let missing = match run_git(&mut verify, "verify snapshot object cache completeness").await
-        {
-            Ok(output) => String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .filter(|line| {
-                    // Present objects print "sha path"; missing ones print a
-                    // bare sha. Shallow-boundary roots are reported with the
-                    // null-ish `0000…` shas — they are graft markers, not
-                    // missing objects, and the shallow rewrite serves them.
-                    !line.contains(' ') && !line.starts_with("0000")
-                })
-                .count(),
-            Err(_) => 0,
-        };
+        let missing = missing_snapshot_objects(&repository).await?;
         if missing > 0 {
             warn!(
                 cache = %repository.display(),
@@ -1169,6 +1164,9 @@ async fn ensure_object_cache(
     if !ancestry_complete {
         ancestry_complete =
             deepen_object_cache_from_remote(&repository, workspace, github_pat).await;
+        if ancestry_complete {
+            ancestry_complete = missing_snapshot_objects(&repository).await? == 0;
+        }
         refreshed = refreshed || ancestry_complete;
     }
     let mut index = repository.as_os_str().to_owned();
@@ -1271,6 +1269,10 @@ async fn deepen_object_cache_from_remote(
         .args(["fetch", "--quiet", "--force", "--no-tags"]);
     if shallow_marker.is_file() {
         fetch.arg("--unshallow");
+    } else {
+        // A filtered clone can have no shallow marker while omitting blobs.
+        // Refetch asks Git to transfer those promisor objects too.
+        fetch.arg("--refetch");
     }
     if let Some((key, value)) = github_pat.and_then(|pat| github_auth_header_for_remote(&url, pat))
     {
