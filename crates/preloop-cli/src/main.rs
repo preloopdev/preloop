@@ -4,9 +4,9 @@ use anyhow::Context;
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
-use preloop_gha_protocol::{ExecutionStatus, NdjsonEvent, RunAccepted, WorkflowSubmission};
+use preloop_gha_protocol::{ExecutionStatus, NdjsonEvent, RunAccepted, RunId, WorkflowSubmission};
 use preloop_orchestrator::environment::{is_stock_base_image, DEFAULT_BASE_IMAGE};
-use preloop_orchestrator::{RunnerPool, RunnerPoolConfig};
+use preloop_orchestrator::{artifact_payload, RunnerPool, RunnerPoolConfig};
 use preloop_vm::SmolVmProvider;
 use rand::RngCore;
 use std::collections::BTreeMap;
@@ -397,13 +397,10 @@ pub(crate) fn smolvm_command() -> anyhow::Result<std::process::Command> {
     // (see crates/preloop-cli/src/server_install.rs), so the engine records
     // its machines in that registry. A separately invoked `preloop shell` /
     // `preloop debug` must consult the SAME registry or it cannot find the
-    // paused, service-owned machine — the caller's default data dir would
-    // resolve a different one. An operator value wins, so this only fills
-    // the gap, never overrides.
-    if std::env::var_os("SMOLVM_DATA_DIR").is_none() {
-        let data_dir = preloop_home().join("smolvm");
-        command.env("SMOLVM_DATA_DIR", data_dir);
-    }
+    // paused, service-owned machine. `apply_smolvm_runtime_env` fills the
+    // same gap from the effective Preloop home (and isolates `HOME` on macOS,
+    // where SmolVM ignores `SMOLVM_DATA_DIR`); an operator value still wins.
+    preloop_vm::apply_smolvm_runtime_env(&mut command, None)?;
     preloop_vm::apply_smolvm_sandbox_env(&mut command)?;
     Ok(command)
 }
@@ -768,13 +765,16 @@ async fn main() -> anyhow::Result<()> {
         Command::Doctor(args) => return github_setup::cmd_doctor(args).await,
         Command::Secret(args) => return github_setup::cmd_secret(args).await,
         Command::Server(args) => return server_install::run(args),
+        // Planning parses local workflow files only; do not bootstrap the
+        // control-plane engine for a command that never contacts it.
+        Command::Plan(args) => return cmd_plan(args).await,
         _ => {}
     }
     ensure_engine_running().await?;
 
     match cli.command {
         Command::Run(args) => cmd_run(args).await,
-        Command::Plan(args) => cmd_plan(args).await,
+        Command::Plan(_) => unreachable!("plan is handled before engine bootstrap"),
         Command::Status { run_id } => cmd_status(run_id).await,
         Command::Logs(args) => cmd_logs(args).await,
         Command::Cancel(args) => cmd_cancel(args).await,
@@ -832,7 +832,21 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         size: 1,
         use_fork: false,
         use_packed_artifact: false,
-        name_prefix: "preloop-release-golden".into(),
+        // Unique per bake: smolvm keys a machine's data dir by a hash of its
+        // name and reuses a dir left behind by a failed/interrupted run at its
+        // old on-disk size (smolvm#956). A stale dir then boots with the
+        // previous, smaller storage disk, so a large bake runs out of space
+        // mid-extraction with a confusing "Resource temporarily unavailable".
+        // A fresh name per run forces a fresh disk at the requested size.
+        name_prefix: std::env::var("PRELOOP_GOLDEN_NAME_PREFIX")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| {
+                // A constant fallback would make repeated local bakes reuse
+                // the same machine name (and its hash dir), defeating the
+                // fresh-disk guarantee above. Per-invocation suffix instead.
+                format!("preloop-release-golden-{}", std::process::id())
+            }),
         base_image: args.base_image,
         workspace: args.workspace.or_else(|| std::env::current_dir().ok()),
         artifact_stem: output.clone(),
@@ -863,15 +877,49 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         runner_key_dir: None,
         pending_jobs: None,
         preload_images: Vec::new(),
-        runner_user: None,
+        // The golden bake provisions the image (runner install, apt, service
+        // files); it must run as root. The official runner image declares
+        // USER=runner, so the machine's default exec user is not root.
+        runner_user: std::env::var("PRELOOP_RUNNER_USER")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .or_else(|| Some("root".to_owned())),
         runner_uid: None,
         next_job_runs_on: None,
         pending_registrations: None,
         preparing_signal: None,
     };
+    let payload = artifact_payload(&output, &config.base_image);
     RunnerPool::new(std::sync::Arc::new(SmolVmProvider::default()), config)?
         .rebuild_artifact()
         .await?;
+    if payload != output {
+        let temporary = output.with_file_name(format!(
+            ".{}.tmp-{}",
+            output
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("golden"),
+            std::process::id()
+        ));
+        let copy_result = (|| -> anyhow::Result<()> {
+            std::fs::copy(&payload, &temporary).with_context(|| {
+                format!(
+                    "copy generated golden {} to temporary output {}",
+                    payload.display(),
+                    temporary.display()
+                )
+            })?;
+            std::fs::rename(&temporary, &output).with_context(|| {
+                format!("atomically replace requested output {}", output.display())
+            })?;
+            Ok(())
+        })();
+        if copy_result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        copy_result?;
+    }
     anyhow::ensure!(
         output.is_file(),
         "golden build did not create {}",
@@ -883,15 +931,15 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
 
 /// Verify a registry base image's provenance before baking a golden from it.
 ///
-/// Runs two independent checks, both keyless (no long-lived keys on the build
-/// host):
+/// The dump pipeline's images carry cosign keyless signatures and in-toto
+/// attestations (SLSA provenance + SPDX SBOM), signed by the publishing
+/// workflow's OIDC identity. A mirror can instead publish signatures under a
+/// long-lived key and point `PRELOOP_BASE_IMAGE_PUBKEY` at the public key
+/// file; `gh attestation verify` only understands GitHub-API attestations
+/// (attest-build-provenance), which the dump does not produce, so verification
+/// is cosign-based.
 ///
-/// 1. `gh attestation verify` — the GitHub-signed SLSA provenance stored in
-///    GHCR, pinned to the publishing repository.
-/// 2. `cosign verify` — the Sigstore keyless signature, pinned to the
-///    publishing workflow's OIDC identity on the default branch.
-///
-/// Both tools must be installed on the build host. `PRELOOP_VERIFY_BASE_IMAGE`
+/// `cosign` must be installed on the build host. `PRELOOP_VERIFY_BASE_IMAGE`
 /// enables the check; `PRELOOP_VERIFY_BASE_IMAGE_REPO` names the repository
 /// that publishes the base image; `PRELOOP_BASE_IMAGE_IDENTITY_REGEXP`
 /// overrides the default certificate identity match.
@@ -907,26 +955,40 @@ async fn verify_base_image(base_image: &str) -> anyhow::Result<()> {
 }
 
 fn verify_base_image_with(repo: &str, base_image: &str) -> anyhow::Result<()> {
-    run_verifier(
-        "gh",
-        &["attestation", "verify", base_image, "--repo", repo],
-        "GitHub attestation",
-    )?;
     let identity = std::env::var("PRELOOP_BASE_IMAGE_IDENTITY_REGEXP").unwrap_or_else(|_| {
-        format!("^https://github.com/{repo}/.github/workflows/dump.yml@refs/heads/")
+        format!(
+            "^https://github.com/{repo}/.github/workflows/(dump|attest-local)\\.yml@refs/heads/"
+        )
     });
-    run_verifier(
-        "cosign",
-        &[
-            "verify",
-            base_image,
+    // The dump pipeline's images carry cosign signatures and in-toto
+    // attestations (SLSA provenance + SPDX SBOM). They are keyless-signed by
+    // the publishing workflow's OIDC identity; a mirror can instead publish
+    // signatures under a long-lived key and point PRELOOP_BASE_IMAGE_PUBKEY
+    // at the public key file. `gh attestation verify` only understands
+    // GitHub-API attestations (attest-build-provenance), which the dump does
+    // not produce, so verification is cosign-based.
+    let key = std::env::var("PRELOOP_BASE_IMAGE_PUBKEY").ok();
+    let identity_args: Vec<&str> = match &key {
+        Some(_) => vec![],
+        None => vec![
             "--certificate-identity-regexp",
             &identity,
             "--certificate-oidc-issuer",
             "https://token.actions.githubusercontent.com",
         ],
-        "cosign signature",
-    )
+    };
+    let mut verify_args: Vec<&str> = vec!["verify", base_image];
+    if let Some(key) = &key {
+        verify_args.extend(["--key", key]);
+    }
+    verify_args.extend(identity_args.iter().copied());
+    run_verifier("cosign", &verify_args, "cosign signature")?;
+    let mut attest_args: Vec<&str> = vec!["verify-attestation", base_image, "--type", "spdx"];
+    if let Some(key) = &key {
+        attest_args.extend(["--key", key]);
+    }
+    attest_args.extend(identity_args.iter().copied());
+    run_verifier("cosign", &attest_args, "cosign SPDX SBOM attestation")
 }
 
 fn require_digest_pinned_base(base_image: &str) -> anyhow::Result<()> {
@@ -1769,6 +1831,34 @@ fn default_local_activity_type(event: &str, payload: &serde_json::Value) -> Opti
     }
 }
 
+fn collect_local_reusable_workflows(
+    workflow_path: &std::path::Path,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let current_dir = std::env::current_dir()?;
+    let workflows_dir = current_dir.join(".github").join("workflows");
+    let mut reusable_workflows = BTreeMap::new();
+    let Ok(entries) = std::fs::read_dir(workflows_dir) else {
+        return Ok(reusable_workflows);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("yml" | "yaml")
+        ) || same_file_path(&path, workflow_path)
+        {
+            continue;
+        }
+        let Some(relative) = path.strip_prefix(&current_dir).ok() else {
+            continue;
+        };
+        let yaml = std::fs::read_to_string(&path)
+            .with_context(|| format!("read reusable workflow {}", path.display()))?;
+        reusable_workflows.insert(relative.to_string_lossy().into_owned(), yaml);
+    }
+    Ok(reusable_workflows)
+}
+
 async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     // A hook that fails to install after the user accepted is a real
     // failure: report it instead of silently running ungated.
@@ -1782,28 +1872,7 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     // server the same way the native client does: everything under the
     // workspace `.github/workflows/`, keyed repository-relative, minus the
     // submitted workflow itself.
-    let mut reusable_workflows = BTreeMap::new();
-    if let Ok(current_dir) = std::env::current_dir() {
-        let workflows_dir = current_dir.join(".github").join("workflows");
-        if let Ok(entries) = std::fs::read_dir(&workflows_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !matches!(
-                    path.extension().and_then(|ext| ext.to_str()),
-                    Some("yml" | "yaml")
-                ) || same_file_path(&path, &workflow_path)
-                {
-                    continue;
-                }
-                let Some(relative) = path.strip_prefix(&current_dir).ok() else {
-                    continue;
-                };
-                let yaml = std::fs::read_to_string(&path)
-                    .with_context(|| format!("read reusable workflow {}", path.display()))?;
-                reusable_workflows.insert(relative.to_string_lossy().into_owned(), yaml);
-            }
-        }
-    }
+    let reusable_workflows = collect_local_reusable_workflows(&workflow_path)?;
 
     let payload = match args.payload.as_deref() {
         Some(path) => {
@@ -1955,6 +2024,13 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     // explanation, so the first poll failure is reported instead of being
     // folded into "no session".
     let mut poll_warned = false;
+    // Warn once (not every backpressure tick) when the control plane is
+    // unreachable or no registered runner can claim the queued jobs, so a
+    // queued run does not stream `still waiting` forever without the one
+    // fact that explains it. The check is repeated while a claimable runner
+    // exists (one can die between ticks) and latches only once a warning
+    // actually prints.
+    let mut runner_warned = false;
     // Set when the run loop leaves through the debug prompt (abort, detach,
     // or a session error). The run is not terminal in those cases — the job
     // is paused and reattachable — so the generic conclusion below must not
@@ -2051,6 +2127,40 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                                          {paused_total} debug session(s) paused on the server \
                                          (preloop debug <id> to inspect)"
                                     );
+                                    if !runner_warned {
+                                        match runner_capacity(&client, &url, accepted.run_id).await
+                                        {
+                                            Ok(Some((queued, claimable)))
+                                                if queued > 0 && claimable == 0 =>
+                                            {
+                                                runner_warned = true;
+                                                eprintln!(
+                                                    "[preloop] warning: no registered runner on \
+                                                     {url} can claim the queued jobs (their \
+                                                     `runs-on:` labels match no runner). If \
+                                                     `preloop serve` is still provisioning its \
+                                                     runner pool this is expected; otherwise the \
+                                                     jobs will never start — register a runner \
+                                                     with matching labels."
+                                                );
+                                            }
+                                            // A claimable runner exists (or nothing
+                                            // runner-bound is queued): keep checking on
+                                            // later ticks instead of latching a premature
+                                            // "all quiet" state.
+                                            Ok(_) => {}
+                                            Err(error) => {
+                                                runner_warned = true;
+                                                eprintln!(
+                                                    "[preloop] warning: cannot determine runner \
+                                                     availability on {url} ({error:#}); older \
+                                                     control plane without /api/v1/runners or a \
+                                                     transient error. Queued jobs may still \
+                                                     start if a runner is registered."
+                                                );
+                                            }
+                                        }
+                                    }
                                     last_backpressure = std::time::Instant::now();
                                 }
                             }
@@ -2215,6 +2325,52 @@ fn same_file_path(left: &std::path::Path, right: &std::path::Path) -> bool {
     match (left.canonicalize(), right.canonicalize()) {
         (Ok(left), Ok(right)) => left == right,
         _ => left == right,
+    }
+}
+
+/// Registered-runner capacity for a run's queued jobs, when the control
+/// plane supports the run-scoped runners query.
+///
+/// Returns `(queued, claimable)`: the run's ready-queue job count, and how
+/// many registered runners could claim at least one of them (the same
+/// `job_matches_runner` predicate the scheduler dispatches with). `None`
+/// when the server ignores `run_id` and returns the plain list — the caller
+/// then falls back to the raw count so a zero-runner control plane still
+/// gets the warning.
+async fn runner_capacity(
+    client: &reqwest::Client,
+    url: &str,
+    run_id: RunId,
+) -> anyhow::Result<Option<(usize, usize)>> {
+    let mut request = client.get(format!("{url}/api/v1/runners?run_id={run_id}"));
+    if let Some(token) = api_token() {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await?;
+    if !response.status().is_success() {
+        anyhow::bail!("server returned {}", response.status());
+    }
+    let body: serde_json::Value = response.json().await?;
+    match (
+        body.get("queued").and_then(serde_json::Value::as_u64),
+        body.get("claimable").and_then(serde_json::Value::as_u64),
+    ) {
+        (Some(queued), Some(claimable)) => Ok(Some((queued as usize, claimable as usize))),
+        // Older server (or one ignoring the query): only the raw count is
+        // available. When count is zero, represent that as 0 claimable runners
+        // for the queued jobs so the dead-pool warning fires. When count > 0,
+        // treat runners as claimable (optimistic fallback).
+        _ => {
+            let count = body
+                .get("count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            if count == 0 {
+                Ok(Some((1, 0)))
+            } else {
+                Ok(Some((count, count)))
+            }
+        }
     }
 }
 
@@ -2499,18 +2655,135 @@ async fn cmd_push(args: PushArgs) -> anyhow::Result<()> {
     push::push_run(&client, &url, api_token(), &run_id, None).await
 }
 
-async fn cmd_plan(args: PlanArgs) -> anyhow::Result<()> {
-    let workflow = args
-        .file
-        .as_ref()
-        .map_or("all workflows".into(), |p| p.display().to_string());
+fn materialize_plan_jobs(
+    plans: Vec<preloop_gha_protocol::JobPlan>,
+    reusable_workflows: &BTreeMap<String, String>,
+) -> anyhow::Result<Vec<preloop_gha_protocol::JobPlan>> {
+    let mut materialized = Vec::new();
+    for plan in plans {
+        let Some(call) = plan.reusable_call.as_ref() else {
+            materialized.push(plan);
+            continue;
+        };
+        // Needs-driven matrices are runtime placeholders. Their concrete
+        // cells require completed needs outputs, so do not send the empty
+        // matrix to `expand_reusable_call` (which correctly rejects it).
+        // Keep the placeholder visible and report its deferred expression.
+        if plan.deferred_matrix.is_some() {
+            materialized.push(plan);
+            continue;
+        }
+        let Some(yaml) = reusable_workflows.get(&call.workflow_file) else {
+            // Remote and unresolved calls remain explicit placeholders. The
+            // plan must not invent callee jobs without the referenced YAML.
+            materialized.push(plan);
+            continue;
+        };
+        let called = preloop_gha_parser::parse_workflow(yaml)
+            .map_err(|error| anyhow::anyhow!("parse reusable {}: {error}", call.workflow_file))?;
+        let expanded = preloop_gha_parser::expand_reusable_call(
+            &called,
+            &plan,
+            reusable_workflows,
+            &BTreeMap::new(),
+        )
+        .map_err(|error| anyhow::anyhow!("expand reusable {}: {error}", call.workflow_file))?;
+        // Keep the caller boundary in the output for downstream `needs`
+        // references, then append the concrete callee jobs it gates.
+        materialized.push(plan);
+        materialized.extend(materialize_plan_jobs(expanded.jobs, reusable_workflows)?);
+    }
+    Ok(materialized)
+}
 
-    println!("preloop plan: {workflow}");
+async fn cmd_plan(args: PlanArgs) -> anyhow::Result<()> {
+    let workflow_path = resolve_workflow_path(args.file.as_deref())?;
+    let workflow_yaml = std::fs::read_to_string(&workflow_path)
+        .with_context(|| format!("failed to read workflow: {}", workflow_path.display()))?;
+
+    let reusable_workflows = collect_local_reusable_workflows(&workflow_path)?;
+
+    let workflow = preloop_gha_parser::parse_workflow(&workflow_yaml)
+        .map_err(|error| anyhow::anyhow!("parse {}: {error}", workflow_path.display()))?;
+    let expanded =
+        preloop_gha_parser::expand_jobs_with_reusables(&workflow, &reusable_workflows)
+            .map_err(|error| anyhow::anyhow!("expand {}: {error}", workflow_path.display()))?;
+    let plans = materialize_plan_jobs(expanded.jobs, &reusable_workflows)?;
+
     if args.json {
-        println!("  format: json");
+        let value = serde_json::json!({
+            "workflow": workflow_path.display().to_string(),
+            "jobs": plans.iter().map(plan_json).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
     }
 
-    anyhow::bail!("")
+    println!(
+        "workflow: {} ({} jobs expanded from {} declared)",
+        workflow_path.display(),
+        plans.len(),
+        workflow.jobs.len()
+    );
+    let name = workflow.name.as_deref().unwrap_or("(unnamed)");
+    println!("name:     {name}");
+    println!();
+    for plan in &plans {
+        let matrix = if plan.matrix.is_empty() {
+            String::new()
+        } else {
+            let cells: Vec<String> = plan
+                .matrix
+                .iter()
+                .map(|(key, value)| match value {
+                    serde_json::Value::String(value) => format!("{key}={value}"),
+                    other => format!("{key}={other}"),
+                })
+                .collect();
+            format!("  [{}]", cells.join(", "))
+        };
+        let needs = if plan.needs.is_empty() {
+            String::new()
+        } else {
+            let ids: Vec<&str> = plan.needs.iter().map(|need| need.0.as_str()).collect();
+            format!("  needs: {}", ids.join(", "))
+        };
+        let runner_group = plan
+            .runner_group
+            .as_deref()
+            .map(|group| format!("  runner-group: {group}"))
+            .unwrap_or_default();
+        let deferred_matrix = plan
+            .deferred_matrix
+            .as_deref()
+            .map(|expression| format!("  deferred-matrix: {expression}"))
+            .unwrap_or_default();
+        println!(
+            "{}{}  runs-on: {}{}{}{}{}",
+            plan.id.0,
+            matrix,
+            plan.runs_on.join(", "),
+            needs,
+            runner_group,
+            deferred_matrix,
+            format_args!("  steps: {}", plan.steps.len()),
+        );
+    }
+    Ok(())
+}
+
+fn plan_json(plan: &preloop_gha_protocol::JobPlan) -> serde_json::Value {
+    serde_json::json!({
+        "id": plan.id.0,
+        "base_id": plan.base_id,
+        "name": plan.name,
+        "runner_group": plan.runner_group,
+        "runs_on": plan.runs_on,
+        "needs": plan.needs.iter().map(|need| need.0.clone()).collect::<Vec<_>>(),
+        "matrix": plan.matrix,
+        "deferred_matrix": plan.deferred_matrix,
+        "steps": plan.steps.len(),
+    })
 }
 
 async fn cmd_status(run_id: Option<String>) -> anyhow::Result<()> {

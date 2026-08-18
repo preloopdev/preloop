@@ -749,7 +749,17 @@ async fn openapi_document_lists_native_surface_and_excludes_runner_protocol() {
     assert!(!paths.keys().any(|path| path.starts_with("/_apis/")));
     assert!(!paths.keys().any(|path| path.starts_with("/broker/")));
     assert!(!paths.contains_key("/api/v1/scheduler/history"));
-    assert!(!paths.contains_key("/api/v1/runners"));
+    // The read-only runner listing is native operator surface (the CLI uses
+    // it to diagnose a dead pool); registration itself stays undocumented.
+    assert!(paths.contains_key("/api/v1/runners"));
+    assert_eq!(
+        paths["/api/v1/runners"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["get"]
+    );
 }
 
 #[tokio::test]
@@ -2609,6 +2619,152 @@ async fn registration_persists_runner_public_key_material() {
     let inner = state.inner.lock().await;
     assert_eq!(inner.runner_public_keys.get(&runner_id), Some(&public_key));
     assert!(inner.runner_rsa_public_keys.contains_key(&runner_id));
+}
+
+#[tokio::test]
+async fn native_runner_list_reports_registered_runners() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    // No runners yet: the CLI must be able to distinguish this from a
+    // healthy pool before it prints `still waiting` forever.
+    let empty = request_json(&app, Method::GET, "/api/v1/runners", Value::Null).await;
+    assert_eq!(empty["count"].as_u64(), Some(0));
+    assert_eq!(empty["runners"].as_array().map(Vec::len), Some(0));
+
+    let runner = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runners",
+        json!({
+            "name": "local",
+            "labels": ["self-hosted", "linux", "x64"]
+        }),
+    )
+    .await;
+    let runner_id = runner["id"].as_i64().unwrap();
+
+    let listed = request_json(&app, Method::GET, "/api/v1/runners", Value::Null).await;
+    assert_eq!(listed["count"].as_u64(), Some(1));
+    let runners = listed["runners"].as_array().unwrap();
+    assert_eq!(runners.len(), 1);
+    assert_eq!(runners[0]["id"].as_i64(), Some(runner_id));
+    assert_eq!(runners[0]["name"].as_str(), Some("local"));
+    let labels: Vec<&str> = runners[0]["labels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|label| label.as_str())
+        .collect();
+    assert_eq!(labels, vec!["self-hosted", "linux", "x64"]);
+
+    // The endpoint is native-bearer gated.
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/runners")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn native_runner_list_run_scoped_claimable() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    // A Linux pool runner is registered, so the raw runner count is positive.
+    // The CLI's dead-pool warning must key off runners that can actually
+    // claim the queued work, not the count.
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runners",
+        json!({"name": "pool-linux", "labels": ["self-hosted", "linux"]}),
+    )
+    .await;
+
+    // Claimable: a `runs-on: linux` job matches the registered runner.
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: linux\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo",
+        }),
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+    let listed = request_json(
+        &app,
+        Method::GET,
+        &format!("/api/v1/runners?run_id={run_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(listed["count"].as_u64(), Some(1));
+    assert_eq!(listed["queued"].as_u64(), Some(1));
+    assert_eq!(listed["claimable"].as_u64(), Some(1));
+
+    // Unclaimable: a job whose `runs-on` labels no registered runner carries
+    // (here a custom label) stays queued — the scheduler only fails jobs with
+    // no OS runner — so the raw count alone would hide the dead end.
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: custom-runs-on\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo",
+        }),
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+    let listed = request_json(
+        &app,
+        Method::GET,
+        &format!("/api/v1/runners?run_id={run_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(listed["count"].as_u64(), Some(1));
+    assert_eq!(listed["queued"].as_u64(), Some(1));
+    assert_eq!(listed["claimable"].as_u64(), Some(0));
+
+    // Unclaimable: a job requiring a specific runner group when the registered
+    // runner belongs to a different group (here, default group) is unclaimable.
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on:\n      group: specialized-group\n      labels: [linux]\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo",
+        }),
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+    let listed = request_json(
+        &app,
+        Method::GET,
+        &format!("/api/v1/runners?run_id={run_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(listed["count"].as_u64(), Some(1));
+    assert_eq!(listed["queued"].as_u64(), Some(1));
+    assert_eq!(listed["claimable"].as_u64(), Some(0));
 }
 
 #[tokio::test]
@@ -5673,6 +5829,14 @@ async fn fork_pr_jobs_are_downgraded_to_read_only_and_oidc_denied() {
         MintFailurePolicy::LocalJwt,
     ));
     let app = app(state.clone(), CancellationToken::new());
+    // Native `/api/v1/runs` clears client-supplied `trust_tier` (only the
+    // webhook adapters stamp provenance). Drive the fork downgrades through
+    // the same entry point the webhook path uses: `submit_run_inner` with an
+    // already-stamped submission.
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: CancellationToken::new(),
+    });
 
     let yaml = "on: pull_request\npermissions:\n  checks: write\n  id-token: write\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
     let payload = json!({
@@ -5684,31 +5848,36 @@ async fn fork_pr_jobs_are_downgraded_to_read_only_and_oidc_denied() {
         },
         "repository": {"full_name": "owner/repo", "default_branch": "main"}
     });
-    let submit = |tier: Option<&str>| {
-        request_json(
-            &app,
-            Method::POST,
-            "/api/v1/runs",
-            json!({
-                "workflow_yaml": yaml,
-                "event": "pull_request",
-                "repository": "owner/repo",
-                "payload": payload,
-                "trust_tier": tier,
-            }),
-        )
+    let submit = |tier: Option<&'static str>| {
+        let shared = shared.clone();
+        let payload = payload.clone();
+        async move {
+            crate::submit_run_inner(
+                &shared,
+                preloop_gha_protocol::WorkflowSubmission {
+                    workflow_yaml: yaml.to_owned(),
+                    event: "pull_request".to_owned(),
+                    repository: "owner/repo".to_owned(),
+                    payload,
+                    trust_tier: tier.map(str::to_owned),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("fork/trusted/target submission accepted")
+        }
     };
 
     // Fork PR: declared writes must not survive, OIDC must not be granted.
     let fork = submit(Some("untrusted-fork-pull-request")).await;
-    let fork_run_id = fork["run_id"].as_str().unwrap();
+    let fork_run_id = fork.run_id.to_string();
     let trusted = submit(None).await;
-    let trusted_run_id = trusted["run_id"].as_str().unwrap();
+    let trusted_run_id = trusted.run_id.to_string();
     let target = submit(Some("pull-request-target")).await;
-    let target_run_id = target["run_id"].as_str().unwrap();
+    let target_run_id = target.run_id.to_string();
 
     let inner = state.inner.lock().await;
-    let fork_message = queued_message_for(&inner, fork_run_id);
+    let fork_message = queued_message_for(&inner, &fork_run_id);
     assert_eq!(
         variable_value(&fork_message, "system.github.token.permissions"),
         Some(r#"{"Checks":"read"}"#),
@@ -5763,7 +5932,7 @@ async fn fork_pr_jobs_are_downgraded_to_read_only_and_oidc_denied() {
     );
 
     // Trusted push: declared writes and OIDC survive verbatim.
-    let trusted_message = queued_message_for(&inner, trusted_run_id);
+    let trusted_message = queued_message_for(&inner, &trusted_run_id);
     assert_eq!(
         variable_value(&trusted_message, "system.github.token.permissions"),
         Some(r#"{"Checks":"write","IdToken":"write"}"#),
@@ -5801,7 +5970,7 @@ async fn fork_pr_jobs_are_downgraded_to_read_only_and_oidc_denied() {
     );
 
     // pull_request_target: base-repo trust, declared writes untouched.
-    let target_message = queued_message_for(&inner, target_run_id);
+    let target_message = queued_message_for(&inner, &target_run_id);
     assert_eq!(
         variable_value(&target_message, "system.github.token.permissions"),
         Some(r#"{"Checks":"write","IdToken":"write"}"#),
@@ -5851,45 +6020,54 @@ async fn untrusted_job_mint_failure_never_falls_back_to_the_pat() {
     creds.pat_fallback = Some("github_pat_broad".to_owned());
     state.github_app = Some(creds);
     let shutdown = CancellationToken::new();
-    let app = app(state.clone(), shutdown.clone());
+    let _app = app(state.clone(), shutdown.clone());
+    // Native `/api/v1/runs` clears client-supplied `trust_tier` (only the
+    // webhook adapters stamp provenance); stamp it via `submit_run_inner`
+    // like the webhook path does.
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: shutdown.clone(),
+    });
 
     // `local-workspace-only` carries no `owner/repo` slug, so the mint fails
     // before it signs anything or opens a socket — exactly like
     // `app_token_mint_failure_follows_the_configured_policy`.
     let yaml = "on: push\npermissions:\n  checks: write\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
-    let fork = request_json(
-        &app,
-        Method::POST,
-        "/api/v1/runs",
-        json!({
-            "workflow_yaml": yaml,
-            "event": "push",
-            "repository": "local-workspace-only",
-            "trust_tier": "untrusted-fork-pull-request",
-        }),
+    let fork = crate::submit_run_inner(
+        &shared,
+        preloop_gha_protocol::WorkflowSubmission {
+            workflow_yaml: yaml.to_owned(),
+            event: "push".to_owned(),
+            repository: "local-workspace-only".to_owned(),
+            trust_tier: Some("untrusted-fork-pull-request".to_owned()),
+            ..Default::default()
+        },
     )
-    .await;
-    let trusted = request_json(
-        &app,
-        Method::POST,
-        "/api/v1/runs",
-        json!({
-            "workflow_yaml": yaml,
-            "event": "push",
-            "repository": "local-workspace-only",
-        }),
+    .await
+    .expect("fork submission accepted");
+    let fork_run_id = fork.run_id.to_string();
+    let trusted = crate::submit_run_inner(
+        &shared,
+        preloop_gha_protocol::WorkflowSubmission {
+            workflow_yaml: yaml.to_owned(),
+            event: "push".to_owned(),
+            repository: "local-workspace-only".to_owned(),
+            ..Default::default()
+        },
     )
-    .await;
+    .await
+    .expect("trusted submission accepted");
+    let trusted_run_id = trusted.run_id.to_string();
 
     {
         let inner = state.inner.lock().await;
-        let fork_message = queued_message_for(&inner, fork["run_id"].as_str().unwrap());
+        let fork_message = queued_message_for(&inner, &fork_run_id);
         let fork_request = inner
             .github_token_requests
             .get(&fork_message.request_id)
             .cloned()
             .expect("fork job defers a token request");
-        let trusted_message = queued_message_for(&inner, trusted["run_id"].as_str().unwrap());
+        let trusted_message = queued_message_for(&inner, &trusted_run_id);
         let trusted_request = inner
             .github_token_requests
             .get(&trusted_message.request_id)
@@ -5897,10 +6075,6 @@ async fn untrusted_job_mint_failure_never_falls_back_to_the_pat() {
             .expect("trusted job defers a token request");
         assert!(fork_request.untrusted);
         assert!(!trusted_request.untrusted);
-        let shared = Arc::new(SharedState {
-            state: state.clone(),
-            shutdown: shutdown.clone(),
-        });
         let fork_mint = crate::broker::mint_dispatch_github_token(&shared, &fork_request).await;
         assert!(
             matches!(fork_mint, Ok(None)),
@@ -6163,23 +6337,30 @@ async fn broker_claim_merges_narrowed_grants_with_actions_only_metadata() {
         .unwrap();
 
     let yaml = "on: push\npermissions:\n  checks: write\n  pull-requests: write\n  id-token: write\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+    // Native `/api/v1/runs` clears client-supplied `trust_tier` (only the
+    // webhook adapters stamp provenance); stamp it via `submit_run_inner`
+    // like the webhook path does.
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: CancellationToken::new(),
+    });
     let submit = |tier: Option<&'static str>| {
-        let app = app.clone();
+        let shared = shared.clone();
         async move {
-            request_json(
-                &app,
-                Method::POST,
-                "/api/v1/runs",
-                json!({
-                    "workflow_yaml": yaml,
-                    "event": "push",
-                    "payload": {"ref": "refs/heads/main", "commits": []},
-                    "repository": "owner/repo",
-                    "git_ref": "refs/heads/main",
-                    "trust_tier": tier,
-                }),
+            crate::submit_run_inner(
+                &shared,
+                preloop_gha_protocol::WorkflowSubmission {
+                    workflow_yaml: yaml.to_owned(),
+                    event: "push".to_owned(),
+                    payload: json!({"ref": "refs/heads/main", "commits": []}),
+                    repository: "owner/repo".to_owned(),
+                    git_ref: "refs/heads/main".to_owned(),
+                    trust_tier: tier.map(str::to_owned),
+                    ..Default::default()
+                },
             )
             .await
+            .expect("fork/trusted submission accepted")
         }
     };
 
@@ -6496,32 +6677,41 @@ async fn fork_pr_runs_get_read_only_cache_access() {
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
+    // Native `/api/v1/runs` clears client-supplied `trust_tier` (only the
+    // webhook adapters stamp provenance); stamp it via `submit_run_inner`
+    // like the webhook path does.
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: CancellationToken::new(),
+    });
     let submit = |tier: Option<&'static str>| {
-        let app = app.clone();
+        let shared = shared.clone();
         async move {
-            request_json(
-                &app,
-                Method::POST,
-                "/api/v1/runs",
-                json!({
-                    "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
-                    "event": "push",
-                    "payload": {"ref": "refs/heads/main", "commits": []},
-                    "repository": "owner/repo",
-                    "git_ref": "refs/heads/main",
-                    "trust_tier": tier,
-                }),
+            crate::submit_run_inner(
+                &shared,
+                preloop_gha_protocol::WorkflowSubmission {
+                    workflow_yaml: "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n".to_owned(),
+                    event: "push".to_owned(),
+                    payload: json!({"ref": "refs/heads/main", "commits": []}),
+                    repository: "owner/repo".to_owned(),
+                    git_ref: "refs/heads/main".to_owned(),
+                    trust_tier: tier.map(str::to_owned),
+                    ..Default::default()
+                },
             )
             .await
+            .expect("fork/trusted submission accepted")
         }
     };
 
     let fork = submit(Some("untrusted-fork-pull-request")).await;
+    let fork_run_id = fork.run_id.to_string();
     let trusted = submit(None).await;
+    let trusted_run_id = trusted.run_id.to_string();
 
     let (fork_token, fork_plan, fork_job) = {
         let inner = state.inner.lock().await;
-        let message = queued_message_for(&inner, fork["run_id"].as_str().unwrap());
+        let message = queued_message_for(&inner, &fork_run_id);
         (
             state.mint_runtime_token(&message.plan.plan_id, &message.job_id),
             message.plan.plan_id.clone(),
@@ -6530,7 +6720,7 @@ async fn fork_pr_runs_get_read_only_cache_access() {
     };
     let trusted_token = {
         let inner = state.inner.lock().await;
-        let message = queued_message_for(&inner, trusted["run_id"].as_str().unwrap());
+        let message = queued_message_for(&inner, &trusted_run_id);
         state.mint_runtime_token(&message.plan.plan_id, &message.job_id)
     };
 
@@ -6795,36 +6985,45 @@ async fn fork_job_never_receives_the_configured_pat_override() {
         .static_github_pat()
         .expect("config declares a PAT")
         .to_owned();
-    let app = app(state.clone(), CancellationToken::new());
+    let _app = app(state.clone(), CancellationToken::new());
+    // Native `/api/v1/runs` clears client-supplied `trust_tier` (only the
+    // webhook adapters stamp provenance); stamp it via `submit_run_inner`
+    // like the webhook path does.
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: CancellationToken::new(),
+    });
 
     let yaml =
         "on: push\njobs:\n  probe:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
-    let fork = request_json(
-        &app,
-        Method::POST,
-        "/api/v1/runs",
-        json!({
-            "workflow_yaml": yaml,
-            "event": "push",
-            "repository": "owner/repo",
-            "trust_tier": "untrusted-fork-pull-request",
-        }),
+    let fork = crate::submit_run_inner(
+        &shared,
+        preloop_gha_protocol::WorkflowSubmission {
+            workflow_yaml: yaml.to_owned(),
+            event: "push".to_owned(),
+            repository: "owner/repo".to_owned(),
+            trust_tier: Some("untrusted-fork-pull-request".to_owned()),
+            ..Default::default()
+        },
     )
-    .await;
-    let trusted = request_json(
-        &app,
-        Method::POST,
-        "/api/v1/runs",
-        json!({
-            "workflow_yaml": yaml,
-            "event": "push",
-            "repository": "owner/repo",
-        }),
+    .await
+    .expect("fork submission accepted");
+    let fork_run_id = fork.run_id.to_string();
+    let trusted = crate::submit_run_inner(
+        &shared,
+        preloop_gha_protocol::WorkflowSubmission {
+            workflow_yaml: yaml.to_owned(),
+            event: "push".to_owned(),
+            repository: "owner/repo".to_owned(),
+            ..Default::default()
+        },
     )
-    .await;
+    .await
+    .expect("trusted submission accepted");
+    let trusted_run_id = trusted.run_id.to_string();
 
     let inner = state.inner.lock().await;
-    let fork_message = queued_message_for(&inner, fork["run_id"].as_str().unwrap());
+    let fork_message = queued_message_for(&inner, &fork_run_id);
     let runtime_token = state.mint_runtime_token(&fork_message.plan.plan_id, &fork_message.job_id);
     for name in ["system.github.token", "github_token", "GITHUB_TOKEN"] {
         assert_eq!(
@@ -6839,7 +7038,7 @@ async fn fork_job_never_receives_the_configured_pat_override() {
         "the static PAT must not reach a fork-restricted job"
     );
 
-    let trusted_message = queued_message_for(&inner, trusted["run_id"].as_str().unwrap());
+    let trusted_message = queued_message_for(&inner, &trusted_run_id);
     assert_eq!(
         variable_value(&trusted_message, "system.github.token"),
         Some(pat.as_str()),
