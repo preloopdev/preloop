@@ -365,7 +365,14 @@ async fn smolvm_is_compatible(binary: &Path) -> bool {
             .is_some_and(|version| version >= *SMOLVM_MIN_COMPATIBLE_VERSION)
 }
 
-/// Probe the resolved smolvm and install the latest stable release when its
+fn configured_smolvm_version() -> Option<String> {
+    std::env::var("PRELOOP_SMOLVM_RELEASE_VERSION")
+        .ok()
+        .map(|version| version.trim().trim_start_matches('v').to_owned())
+        .filter(|version| !version.is_empty())
+}
+
+/// Probe the resolved smolvm and install the exact verified release when its
 /// version or required socket-mount capability differs.
 async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
     let install = default_smolvm_install().context("HOME is not set")?;
@@ -384,10 +391,11 @@ async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
             std::env::consts::ARCH
         )
     })?;
+    let configured_version = configured_smolvm_version();
     let release = fetch_release(
         client,
         &format!("https://api.github.com/repos/{SMOLVM_REPOSITORY}/releases"),
-        None,
+        configured_version.as_deref(),
     )
     .await?;
     let version = release

@@ -124,7 +124,7 @@ fn public_only_net_backend(lookup: impl Fn(&str) -> Option<String>) -> &'static 
 /// whether a runtime is safe to fork from, and failing closed is the safe
 /// direction.
 fn smolvm_version_at_least(version: &str, major: u64, minor: u64, patch: u64) -> bool {
-    let mut parts = version.trim_start_matches('v').split('.');
+    let mut parts = version.trim().trim_start_matches('v').split('.');
     let (Some(actual_major), Some(actual_minor), Some(actual_patch)) =
         (parts.next(), parts.next(), parts.next())
     else {
@@ -634,7 +634,27 @@ impl SmolVmProvider {
     /// fail-closed answer keeps the single-live-clone guard, which is always
     /// safe, instead of re-exposing the fork corruption older releases cause.
     async fn supports_retained_fork_checkpoints(&self) -> bool {
-        let mut command = self.command();
+        // Follow symlinks before probing. Package managers commonly install a
+        // versioned SmolVM binary behind a stable wrapper path; probing the
+        // wrapper's own banner can otherwise enable the gate for an older
+        // runtime it resolves at exec time.
+        let binary_path = self.binary.clone();
+        let binary = tokio::task::spawn_blocking(move || {
+            if binary_path.is_absolute() || binary_path.components().count() > 1 {
+                std::fs::canonicalize(&binary_path).unwrap_or(binary_path)
+            } else {
+                std::env::var_os("PATH")
+                    .into_iter()
+                    .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+                    .map(|directory| directory.join(&binary_path))
+                    .find(|candidate| candidate.is_file())
+                    .and_then(|candidate| std::fs::canonicalize(candidate).ok())
+                    .unwrap_or(binary_path)
+            }
+        })
+        .await
+        .unwrap_or_else(|_| self.binary.clone());
+        let mut command = Command::new(binary);
         command
             .arg("--version")
             .stdin(Stdio::null())
