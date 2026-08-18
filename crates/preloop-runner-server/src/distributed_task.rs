@@ -534,7 +534,7 @@ fn completion_step_conclusion(wire: &preloop_gha_protocol::CompletionStepResult)
     let terminal = match wire.status.as_ref()?.as_str() {
         Some("completed") => true,
         Some(_) => false,
-        None => wire.status.as_ref()?.as_u64() == Some(2),
+        None => matches!(wire.status.as_ref()?.as_u64(), Some(2 | 3)),
     };
     if !terminal {
         return None;

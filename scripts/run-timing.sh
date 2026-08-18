@@ -22,7 +22,6 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PRELOOP_URL="${PRELOOP_URL:-http://127.0.0.1:9090}"
 if [ -n "${PRELOOP_SYSTEM_TOKEN:-}" ]; then
     TOKEN="$PRELOOP_SYSTEM_TOKEN"
@@ -38,8 +37,13 @@ fetch() {
 }
 
 if [ -z "$RUN_ID" ]; then
-    RUN_ID=$(fetch /api/v1/runs | jq -r '.runs[0].run_id // empty' 2>/dev/null \
-        || fetch /api/v1/runs | jq -r '.[0].run_id // empty')
+    RUN_ID=$(fetch /api/v1/runs | jq -r '
+        if type == "array" then
+            (max_by(.created_at // "") // {}) | .run_id // empty
+        else
+            ((.runs // []) | (max_by(.created_at // "") // {}) | .run_id // empty)
+        end
+    ')
     [ -n "$RUN_ID" ] || { echo "ERROR: no runs found at $PRELOOP_URL/api/v1/runs" >&2; exit 1; }
 fi
 

@@ -107,6 +107,7 @@ fn resolve_remote_action(
     let owner = parts[0];
     let repo = parts[1];
     let subpath = if parts.len() > 2 { parts[2] } else { "" };
+    validate_remote_action_reference(owner, repo, git_ref, subpath)?;
 
     let base = std::path::Path::new(workspace)
         .parent()
@@ -145,6 +146,7 @@ pub(crate) async fn ensure_remote_action_staged(
     }
     let (owner, repo) = (parts[0], parts[1]);
     let subpath = if parts.len() > 2 { parts[2] } else { "" };
+    validate_remote_action_reference(owner, repo, git_ref, subpath)?;
 
     let base = std::path::Path::new(workspace)
         .parent()
@@ -201,6 +203,40 @@ pub(crate) async fn ensure_remote_action_staged(
         .action_paths
         .insert(uses.to_owned(), action_dir.to_string_lossy().into_owned());
     Ok(action_dir)
+}
+
+fn validate_remote_action_reference(
+    owner: &str,
+    repo: &str,
+    git_ref: &str,
+    subpath: &str,
+) -> Result<()> {
+    if owner.is_empty()
+        || repo.is_empty()
+        || owner.chars().any(|character| matches!(character, '/' | '\\'))
+        || repo.chars().any(|character| matches!(character, '/' | '\\'))
+        || git_ref.is_empty()
+        || git_ref.contains('\\')
+    {
+        anyhow::bail!("invalid action reference components");
+    }
+    let safe_path = |value: &str| {
+        let path = std::path::Path::new(value);
+        !path.is_absolute()
+            && path.components().all(|component| {
+                !matches!(
+                    component,
+                    std::path::Component::Prefix(_)
+                        | std::path::Component::RootDir
+                        | std::path::Component::CurDir
+                        | std::path::Component::ParentDir
+                )
+            })
+    };
+    if !safe_path(git_ref) || (!subpath.is_empty() && !safe_path(subpath)) {
+        anyhow::bail!("action reference contains an unsafe path component");
+    }
+    Ok(())
 }
 
 fn set_action_repository_context(ctx: &mut StepContext<'_>, uses: &str) {
