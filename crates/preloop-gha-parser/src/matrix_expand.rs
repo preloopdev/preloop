@@ -35,6 +35,7 @@ pub struct MatrixCombination {
 
 /// GitHub's documented ceiling on jobs a single matrix job may generate.
 pub const MAX_MATRIX_COMBINATIONS: usize = 256;
+const MAX_MATRIX_AXES: usize = 1024;
 const MAX_MATRIX_EXPANSION_WORK: usize = 1_000_000;
 const MAX_MATRIX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
@@ -53,6 +54,12 @@ pub fn try_expand_matrix_spec(
     // materialized. Matching includes do not add jobs, so counting every
     // include here would reject valid 256-row matrices.
     if spec.axes.is_empty() && spec.include.len() > MAX_MATRIX_COMBINATIONS {
+        return Err(crate::ParserError::MatrixTooLarge {
+            job_id: job_id.to_owned(),
+            limit: MAX_MATRIX_COMBINATIONS,
+        });
+    }
+    if spec.axes.len() > MAX_MATRIX_AXES {
         return Err(crate::ParserError::MatrixTooLarge {
             job_id: job_id.to_owned(),
             limit: MAX_MATRIX_COMBINATIONS,
@@ -108,7 +115,16 @@ fn expand_axis_rows(
     work: &mut usize,
 ) -> Result<(), ()> {
     if axis_index == axes.len() {
-        *work = work.checked_add(1).ok_or(())?;
+        // Matching filters is the expensive part of each leaf. Charge the
+        // leaf and every exclude/include comparison, not just the recursion
+        // visit, so large filter lists cannot bypass the work budget.
+        *work = work
+            .checked_add(
+                1usize
+                    .saturating_add(spec.exclude.len())
+                    .saturating_add(spec.include.len()),
+            )
+            .ok_or(())?;
         if *work > MAX_MATRIX_EXPANSION_WORK {
             return Err(());
         }
