@@ -48,10 +48,10 @@ The stock golden contains:
 
 1. **Base OS**: Ubuntu 24.04, pinned by **digest**. Ubuntu 22.04 is also pinned for workflows that select it. We dont support macos/windows runners yet.
 2. **The runner**: `preloop-runner` cross-built for `aarch64-unknown-linux-gnu`
-cargo-zigbuild), fidelity-tracked against the official `actions/runner`
-see `versions.toml`).
-3. **Curated toolchains**: a fixed toolchain set is baked into every golden, currently Rust stable, plus the GitHub-hosted parity toolset in  
-base_install_script`(node/python/go toolcaches, git, git-lfs, docker, vm, yarn).`setup-*` actions download any version a job asks for at job time, the same model GitHub-hosted runners use.
+(`cargo-zigbuild`), fidelity-tracked against the official `actions/runner`
+(see `versions.toml`).
+3. **Curated toolchains**: a fixed toolchain set is baked into every golden, currently Rust stable, plus the GitHub-hosted parity toolset in
+`base_install_script` (node/python/go toolcaches, git, git-lfs, docker, nvm, yarn). `setup-*` actions download any version a job asks for at job time, the same model GitHub-hosted runners use.
 4. **Base dependencies**: the apt set `install_base_dependencies` installs
 git, curl, build-essential, python3, jq, unzip/zip, locales, …).
 5. **Docker**: daemon + CLI, so `container:` / `services:` jobs work.
@@ -267,8 +267,8 @@ in order:
 
 1. `PRELOOP_RUNNER_BUNDLE` — a directory containing a Linux `preloop-runner`.
 2. `<prefix>/lib/preloop/runner/<triple>/` — where `install.sh` and
-preloop update` place the bundle on macOS releases (the host's Linux
-riple first, then any installed triple).
+`preloop update` place the bundle on macOS releases (the host's Linux
+`triple` first, then any installed triple).
 3. `target/<triple>/{debug,release}` under a development build.
 
 On Linux hosts the installed `preloop-runner` is already a Linux binary, so no
@@ -336,7 +336,7 @@ parity targets to bake (or pin) so CI results on Preloop match GitHub:
 | Docker stack         | **client 28.0.4, server 28.0.4, buildx 0.35.0, compose 2.38.2** | Container/service jobs are a whole workflow category; apt's older docker + missing buildx/compose changes `docker buildx` / `docker compose` behavior                                                  |
 | Clang family         | **clang/format/tidy 16.0.6, 17.0.6, 18.1.3**                    | There is no standard GitHub setup action; C/C++ workflows commonly invoke versioned binaries directly                                                                                                  |
 | GNU compiler family  | **gcc/g++/gfortran 12.4.0, 13.3.0, 14.2.0**                     | Same implicit system-tool contract; `build-essential` supplies only the default compiler                                                                                                               |
-| Runner user contract | `**runner` (uid 1001), `HOME=/home/runner`, `/run/user/1001`**  | Every `id -u` / `env_var('USER')` / `runtime_directory()` check drifts without it (implemented — see `docs/push.md`'s runner-user section)                                                             |
+| Runner user contract | **`runner` (uid 1001), `HOME=/home/runner`, `/run/user/1001`**  | Every `id -u` / `env_var('USER')` / `runtime_directory()` check drifts without it (implemented — see `docs/push.md`'s runner-user section)                                                             |
 
 
 ### Tier 2 — behavior parity (bake when size allows)

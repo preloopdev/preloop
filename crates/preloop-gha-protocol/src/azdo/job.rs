@@ -487,7 +487,16 @@ fn extract_template_map(value: Option<&serde_json::Value>) -> Option<BTreeMap<St
                         // `${{ }}`). The runner evaluates them at step time,
                         // so the raw expression string must survive the
                         // extraction instead of collapsing to empty.
-                        .or_else(|| v.get("expr").and_then(|e| e.as_str()).map(str::to_owned))
+                        .or_else(|| {
+                            v.get("expr")
+                                .and_then(|e| e.as_str())
+                                // Preserve type-3 provenance across the
+                                // TaskStep round-trip. The runner's template
+                                // evaluator intentionally only evaluates
+                                // marked expressions; literal values beginning
+                                // with `format(` must remain literal.
+                                .map(|expr| format!("${{{{ {expr} }}}}"))
+                        })
                 })
                 .unwrap_or_default();
             map.insert(key, val);
@@ -792,6 +801,25 @@ mod tests {
         let reserialized = serde_json::to_value(&decoded).unwrap();
         assert_eq!(reserialized["reference"]["ref"], "v4");
         assert!(reserialized["reference"].get("version").is_none());
+    }
+
+    #[test]
+    fn expression_template_tokens_keep_expression_provenance() {
+        let step: TaskStep = serde_json::from_value(serde_json::json!({
+            "inputs": {
+                "type": 2,
+                "map": [{
+                    "key": {"type": 0, "lit": "script"},
+                    "value": {"type": 3, "expr": "format('echo {0}', github.repository)"}
+                }]
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            step.inputs.get("script"),
+            Some(&"${{ format('echo {0}', github.repository) }}".to_owned())
+        );
     }
 
     /// The snapshot credential must never appear in Debug output of the job

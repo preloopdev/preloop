@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
 use preloop_gha_protocol::{ExecutionStatus, NdjsonEvent, RunAccepted, WorkflowSubmission};
 use preloop_orchestrator::environment::{is_stock_base_image, DEFAULT_BASE_IMAGE};
-use preloop_orchestrator::{RunnerPool, RunnerPoolConfig};
+use preloop_orchestrator::{artifact_payload, RunnerPool, RunnerPoolConfig};
 use preloop_vm::SmolVmProvider;
 use rand::RngCore;
 use std::collections::BTreeMap;
@@ -478,9 +478,19 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         pending_registrations: None,
         preparing_signal: None,
     };
+    let payload = artifact_payload(&output, &config.base_image);
     RunnerPool::new(std::sync::Arc::new(SmolVmProvider::default()), config)?
         .rebuild_artifact()
         .await?;
+    if payload != output {
+        std::fs::copy(&payload, &output).with_context(|| {
+            format!(
+                "copy generated golden {} to requested output {}",
+                payload.display(),
+                output.display()
+            )
+        })?;
+    }
     anyhow::ensure!(
         output.is_file(),
         "golden build did not create {}",

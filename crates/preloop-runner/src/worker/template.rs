@@ -8,18 +8,6 @@ use tracing::debug;
 
 /// Evaluate all `${{ }}` expressions in a string.
 pub fn evaluate_template(input: &str, ctx: &preloop_gha_expressions::Context) -> Result<String> {
-    // Values the server serialized as type-3 expression tokens (e.g. a
-    // `format('...', ...)` wrapping a string that contains `${{ }}` — the
-    // official wire format) arrive as a bare expression with no markers.
-    // Evaluate the whole thing as one expression so the script/env value
-    // resolves to its literal content.
-    if !input.contains("${{") && input.trim_start().starts_with("format('") {
-        if let Ok(value) = preloop_gha_expressions::eval_expression(input, ctx) {
-            if let Some(literal) = value.as_str() {
-                return Ok(literal.to_owned());
-            }
-        }
-    }
     if !input.contains("${{") {
         return Ok(input.to_string());
     }
@@ -272,6 +260,13 @@ mod tests {
         let ctx = make_ctx();
         let result = evaluate_template("plain text no expressions", &ctx).unwrap();
         assert_eq!(result, "plain text no expressions");
+    }
+
+    #[test]
+    fn format_like_literal_is_not_evaluated() {
+        let ctx = make_ctx();
+        let literal = "format('literal {0}', github.repository)";
+        assert_eq!(evaluate_template(literal, &ctx).unwrap(), literal);
     }
 
     // --- P1 expressions/templates gap coverage ---
