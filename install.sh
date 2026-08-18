@@ -71,11 +71,12 @@ release_json() { # tag or latest
 # --- smolvm runtime --------------------------------------------------------
 
 # `preloop update --ensure-runtime` installs the latest stable smolvm
-# release. 1.7.7 is the first release with the retained-fork checkpoints and
-# macOS network symbol preloop needs; anything newer (1.8.0, ...) is fine.
-# Keep in sync with `smolvm_min_version` in versions.toml, the source of
-# truth (this script cannot read it: it runs before the repo is checked out).
-SMOLVM_MIN_VERSION="1.7.7"
+# release. The retained fork's 1.8.2 line (preloopdev/smolvm) is the first
+# with `machine exec --user`, which the pool requires; anything newer is
+# fine. Keep in sync with `smolvm_min_version` in versions.toml, the source
+# of truth (this script cannot read it: it runs before the repo is checked
+# out).
+SMOLVM_MIN_VERSION="1.8.2"
 
 smolvm_at_least() { # installed required
     local installed required

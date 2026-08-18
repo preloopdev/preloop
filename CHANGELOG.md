@@ -9,6 +9,18 @@ Releases before v0.27.0 predate the changelog.
 
 ## [Unreleased]
 
+## [0.30.7] - 2026-08-18
+
+### Fixed
+
+- Every pool exec runs as root via `smolvm machine exec --user root`, a flag
+  that only exists in the retained fork's smolvm 1.8.2+ — but `preloop
+  update --ensure-runtime` installed the official smolvm, so on fresh
+  machines every golden/runner exec failed with `unexpected argument
+  '--user' found`. The runtime now comes from the retained fork
+  (`preloopdev/smolvm` v1.8.2 line), the compatibility probe also checks
+  `machine exec --user`, and `smolvm_min_version` is raised to 1.8.2.
+
 ## [0.30.6] - 2026-08-17
 
 ### Fixed
