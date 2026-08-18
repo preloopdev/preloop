@@ -628,7 +628,17 @@ impl SmolVmProvider {
         // versioned SmolVM binary behind a stable wrapper path; probing the
         // wrapper's own banner can otherwise enable the gate for an older
         // runtime it resolves at exec time.
-        let binary = std::fs::canonicalize(&self.binary).unwrap_or_else(|_| self.binary.clone());
+        let binary = if self.binary.is_absolute() || self.binary.components().count() > 1 {
+            std::fs::canonicalize(&self.binary).unwrap_or_else(|_| self.binary.clone())
+        } else {
+            std::env::var_os("PATH")
+                .into_iter()
+                .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+                .map(|directory| directory.join(&self.binary))
+                .find(|candidate| candidate.is_file())
+                .and_then(|candidate| std::fs::canonicalize(candidate).ok())
+                .unwrap_or_else(|| self.binary.clone())
+        };
         let mut command = Command::new(binary);
         command
             .arg("--version")

@@ -306,7 +306,8 @@ async fn smolvm_is_compatible(binary: &Path, expected_version: &str) -> bool {
 fn configured_smolvm_version() -> String {
     std::env::var("PRELOOP_SMOLVM_RELEASE_VERSION")
         .ok()
-        .filter(|version| !version.trim().is_empty())
+        .map(|version| version.trim().trim_start_matches('v').to_owned())
+        .filter(|version| !version.is_empty())
         .unwrap_or_else(|| SMOLVM_VERSION.to_owned())
 }
 
@@ -889,7 +890,7 @@ mod tests {
             std::fs::set_permissions(&executable, permissions).unwrap();
 
             assert_eq!(
-                smolvm_is_compatible(&executable, version).await,
+                smolvm_is_compatible(&executable, SMOLVM_VERSION).await,
                 expected,
                 "version={version}, flag={flag}"
             );
