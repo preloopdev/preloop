@@ -189,6 +189,9 @@ jobs:
           CLONE_NAME="${BASE_NAME}-clone"
           WORK="$(mktemp -d "${TMPDIR:-/tmp}/preloop-ownership.XXXXXX")"
           PACK="$WORK/ownership-pack"
+          echo "SMOLVM_VERIFY_BASE_NAME=$BASE_NAME" >> "$GITHUB_ENV"
+          echo "SMOLVM_VERIFY_CLONE_NAME=$CLONE_NAME" >> "$GITHUB_ENV"
+          echo "SMOLVM_VERIFY_WORK=$WORK" >> "$GITHUB_ENV"
           cleanup() {
             smolvm machine stop --name "$CLONE_NAME" >/dev/null 2>&1 || true
             smolvm machine delete --name "$CLONE_NAME" -f --cascade >/dev/null 2>&1 || true
@@ -218,17 +221,37 @@ jobs:
           [ -n "$READY" ] || { echo "ownership fixture VM did not become ready" >&2; exit 1; }
           smolvm machine stop --name "$BASE_NAME"
           smolvm pack create --from-vm "$BASE_NAME" --output "$PACK" --no-sign
-          smolvm machine create --name "$CLONE_NAME" --from "$PACK"
+          smolvm machine create --name "$CLONE_NAME" --from "${PACK}.smolmachine"
           smolvm machine start --name "$CLONE_NAME"
           ACTUAL=""
           for _ in $(seq 1 150); do
             ACTUAL="$(smolvm machine exec --name "$CLONE_NAME" -- \
-              sh -c 'stat -c %u:%g /opt/preloop-ownership' 2>/dev/null || true)"
+              sh -c 'stat -c %u:%g /opt/preloop-ownership' 2>/dev/null | tail -n 1 || true)"
             if [ "$ACTUAL" = "2345:2345" ]; then
               break
+            fi
+            if [ -n "$ACTUAL" ]; then
+              echo "packed ownership mismatch: expected 2345:2345, got $ACTUAL" >&2
+              exit 1
             fi
             sleep 2
           done
           [ "$ACTUAL" = "2345:2345" ] \
             || { echo "packed ownership mismatch: expected 2345:2345, got $ACTUAL" >&2; exit 1; }
           echo "packed ownership preservation: PASS"
+
+      - name: Cleanup ownership regression machines
+        if: always()
+        run: |
+          set +e
+          if [ -n "${SMOLVM_VERIFY_CLONE_NAME:-}" ]; then
+            smolvm machine stop --name "$SMOLVM_VERIFY_CLONE_NAME" >/dev/null 2>&1 || true
+            smolvm machine delete --name "$SMOLVM_VERIFY_CLONE_NAME" -f --cascade >/dev/null 2>&1 || true
+          fi
+          if [ -n "${SMOLVM_VERIFY_BASE_NAME:-}" ]; then
+            smolvm machine stop --name "$SMOLVM_VERIFY_BASE_NAME" >/dev/null 2>&1 || true
+            smolvm machine delete --name "$SMOLVM_VERIFY_BASE_NAME" -f --cascade >/dev/null 2>&1 || true
+          fi
+          if [ -n "${SMOLVM_VERIFY_WORK:-}" ]; then
+            rm -rf "$SMOLVM_VERIFY_WORK"
+          fi
