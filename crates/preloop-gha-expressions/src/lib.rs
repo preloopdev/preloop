@@ -15,7 +15,7 @@ mod lexer;
 pub use conditions::{contains_status_check_function, effective_condition, is_truthy};
 pub use context::Context;
 
-use evaluator::{collect_contexts_from_expr, eval, validate_function_calls};
+use evaluator::{collect_contexts_from_expr, eval, validate_function_calls, EvalBudget};
 use expr_parser::Parser;
 use lexer::Lexer;
 
@@ -95,6 +95,13 @@ pub enum ExpressionError {
     /// Invalid leading option passed to `hashFiles()`.
     #[error("invalid hashFiles option `{0}`")]
     InvalidHashFilesOption(String),
+    /// `format()` output exceeded the maximum length.
+    #[error("format() output exceeds the maximum of {0} bytes")]
+    FormatOutputTooLarge(usize),
+    /// Temporary values created while evaluating an expression exceeded the
+    /// memory budget.
+    #[error("expression evaluation exceeds the temporary value budget of {0} bytes")]
+    EvaluationTooLarge(usize),
     /// Expression nesting exceeded the parser's depth ceiling.
     #[error("expression nesting exceeds the maximum depth of {0}")]
     TooDeep(usize),
@@ -120,7 +127,8 @@ pub fn collect_contexts(input: &str) -> Result<std::collections::HashSet<String>
 pub fn eval_expression(input: &str, context: &Context) -> Result<Value, ExpressionError> {
     let trimmed = trim_expression_markers(input);
     let expr = parse_cached(trimmed)?;
-    eval(&expr, context)
+    let mut budget = EvalBudget::default();
+    eval(&expr, context, &mut budget)
 }
 
 /// Evaluate an expression as GitHub Actions truthiness.

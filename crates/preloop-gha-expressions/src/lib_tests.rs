@@ -4,6 +4,105 @@ use serde_json::json;
 use super::*;
 
 #[test]
+fn format_output_cap_rejects_amplification_bomb() {
+    // Nested format() triples its argument per level: 20 levels around a
+    // 1 KB literal demands ~3 GB. Uncapped this was killed at 6.2 GB
+    // resident; the cap must trip as an ordinary error instead.
+    let mut expr = format!("'{}'", "A".repeat(1024));
+    for _ in 0..20 {
+        expr = format!("format('{{0}}{{0}}{{0}}', {expr})");
+    }
+    assert!(matches!(
+        eval_expression(&expr, &Context::default()),
+        Err(ExpressionError::FormatOutputTooLarge(_))
+    ));
+}
+
+#[test]
+fn format_output_cap_allows_normal_formatting() {
+    assert_eq!(
+        eval_expression("format('{0} {1}', 'hello', 'world')", &Context::default()).unwrap(),
+        Value::String("hello world".to_owned())
+    );
+    // Just under the cap passes through untouched.
+    let value = "A".repeat(500_000);
+    assert_eq!(
+        eval_expression(
+            &format!("format('{{0}}{{0}}', '{value}')",),
+            &Context::default()
+        )
+        .unwrap(),
+        Value::String(format!("{value}{value}"))
+    );
+}
+
+#[test]
+fn format_argument_evaluation_has_an_expression_wide_budget() {
+    let value = "A".repeat(500_000);
+    let mut expr = "format('{0}', 'ok'".to_owned();
+    for _ in 0..20 {
+        expr.push_str(", '");
+        expr.push_str(&value);
+        expr.push('\'');
+    }
+    expr.push(')');
+
+    assert!(matches!(
+        eval_expression(&expr, &Context::default()),
+        Err(ExpressionError::EvaluationTooLarge(_))
+    ));
+}
+
+#[test]
+fn evaluation_budget_counts_container_and_null_overhead() {
+    let mut context = Context::default();
+    context.insert("values", Value::Array(vec![Value::Null; 300_000]));
+
+    assert!(matches!(
+        eval_expression("values", &context),
+        Err(ExpressionError::EvaluationTooLarge(_))
+    ));
+}
+
+#[test]
+fn format_rejects_large_container_before_unbounded_render() {
+    let mut context = Context::default();
+    context.insert(
+        "values",
+        Value::Array(vec![Value::String("A".repeat(2_000)); 1_000]),
+    );
+
+    assert!(matches!(
+        eval_expression("format('{0}', values)", &context),
+        Err(ExpressionError::FormatOutputTooLarge(_))
+    ));
+}
+
+#[test]
+fn format_bounds_container_serialization_by_format_capacity() {
+    // Container serialization is bounded by the remaining format capacity
+    // (1 MiB), not the evaluation budget: a render that exceeds the format
+    // cap must report FormatOutputTooLarge even when the evaluation budget
+    // is the tighter constraint. Without the format-capacity bound the
+    // serialization fails against the evaluation budget instead and reports
+    // EvaluationTooLarge.
+    let mut context = Context::default();
+    // Consume most of the evaluation budget with an unreferenced argument.
+    context.insert("bomb", Value::String("A".repeat(6_000_000)));
+    // JSON escaping doubles the render: 800_000 quotes render as ~1.6 MiB of
+    // JSON while the charged value size stays under the remaining budget.
+    context.insert(
+        "container",
+        Value::Array(vec![Value::String("\"".repeat(800_000))]),
+    );
+
+    assert!(matches!(
+        eval_expression("format('{1}', bomb, container)", &context),
+        Err(ExpressionError::FormatOutputTooLarge(_))
+    ));
+}
+
+#[test]
 fn evaluates_context_and_functions() {
     let mut context = Context::default();
     context.insert("github", json!({"event_name": "push"}));
