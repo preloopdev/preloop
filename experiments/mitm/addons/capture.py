@@ -10,17 +10,16 @@ from pathlib import Path
 
 from mitmproxy import http
 
-# Headers whose values are always redacted in the capture.
-REDACT_HEADERS = {
-    "authorization",
-    "cookie",
-    "set-cookie",
-    "x-vss-session",
-    "x-tfs-session",
-    "x-vss-e2eid",
-}
-# Headers that contain this substring -> redact value.
-REDACT_SUBSTRINGS = ("token",)
+# mitmdump -s executes the addon file directly; make the sibling redact
+# module importable regardless of the caller's working directory.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from redact import (
+    REDACTED,
+    redact_bytes,
+    redact_headers,
+    redact_json,
+)
 
 
 def _capture_dir() -> Path | None:
@@ -44,17 +43,6 @@ def _safe_json(data: bytes) -> object:
         return None
 
 
-def _redact_headers(headers) -> list[list[str]]:
-    out = []
-    for name, value in headers.items():
-        nl = name.lower()
-        if nl in REDACT_HEADERS or any(s in nl for s in REDACT_SUBSTRINGS):
-            out.append([name, "***REDACTED***"])
-        else:
-            out.append([name, value])
-    return out
-
-
 def _dump_flow(flow: http.HTTPFlow, index: int, cd: Path):
     request = flow.request
     response = flow.response
@@ -62,20 +50,23 @@ def _dump_flow(flow: http.HTTPFlow, index: int, cd: Path):
     content_type = request.headers.get("content-type", "")
     is_json = "json" in content_type
 
-    req_body = request.get_content(strict=False) or b""
+    # Redact live credentials from the body before anything is recorded:
+    # the b64/json/bin forms all derive from these bytes. Headers are
+    # redacted separately below.
+    req_body = redact_bytes(request.get_content(strict=False) or b"")
     req_b64 = _safe_b64(req_body)
-    req_json = _safe_json(req_body) if is_json else None
+    req_json = redact_json(_safe_json(req_body)) if is_json else None
     req_sha = hashlib.sha256(req_body).hexdigest()
 
     if response is not None:
         resp_content_type = response.headers.get("content-type", "")
         resp_is_json = "json" in resp_content_type
-        resp_body = response.get_content(strict=False) or b""
+        resp_body = redact_bytes(response.get_content(strict=False) or b"")
         resp_b64 = _safe_b64(resp_body)
-        resp_json = _safe_json(resp_body) if resp_is_json else None
+        resp_json = redact_json(_safe_json(resp_body)) if resp_is_json else None
         resp_sha = hashlib.sha256(resp_body).hexdigest()
         status = response.status_code
-        resp_headers = _redact_headers(response.headers)
+        resp_headers = redact_headers(response.headers)
         ts_resp = response.timestamp_end or response.timestamp_start
     else:
         resp_b64 = ""
@@ -98,7 +89,7 @@ def _dump_flow(flow: http.HTTPFlow, index: int, cd: Path):
         "scheme": request.scheme,
         "host": request.host,
         "path": request.path,
-        "request_headers": _redact_headers(request.headers),
+        "request_headers": redact_headers(request.headers),
         "request_body_b64": req_b64,
         "request_body_json": req_json,
         "request_body_sha256": req_sha,

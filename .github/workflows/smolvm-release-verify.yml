@@ -39,6 +39,9 @@ on:
         required: false
         type: string
 
+permissions:
+  contents: read
+
 concurrency:
   group: smolvm-host
   cancel-in-progress: false
@@ -54,15 +57,19 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
 
       - name: Detect golden-pin movement
         id: changed
         if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
           CHANGED=false
-          if ! git diff --quiet "${{ github.event.pull_request.base.sha }}" -- versions.toml \
-              && git diff "${{ github.event.pull_request.base.sha }}" -- versions.toml \
+          if ! git diff --quiet "$BASE_SHA" -- versions.toml \
+              && git diff "$BASE_SHA" -- versions.toml \
                  | grep -q '^[+-]smolvm_golden_version'; then
             CHANGED=true
           fi
@@ -70,10 +77,12 @@ jobs:
 
       - name: Resolve candidate version
         id: resolve
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
           set -euo pipefail
-          if [ -n "${{ github.event.inputs.version }}" ]; then
-            VERSION="${{ github.event.inputs.version }}"
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
           else
             VERSION="$(grep '^smolvm_golden_version' versions.toml | cut -d'"' -f2)"
           fi
@@ -82,9 +91,10 @@ jobs:
 
       - name: Install candidate smolvm (mirrors release-golden.yml)
         if: github.event_name == 'workflow_dispatch' || steps.changed.outputs.changed == 'true'
+        env:
+          SMOLVM_VERSION: ${{ steps.resolve.outputs.version }}
         run: |
           set -euo pipefail
-          SMOLVM_VERSION="${{ steps.resolve.outputs.version }}"
           case "$(uname -s)/$(uname -m)" in
             Darwin/arm64) PLATFORM="darwin-arm64"; DATA_DIR="$HOME/Library/Application Support/smolvm" ;;
             Darwin/x86_64) PLATFORM="darwin-x86_64"; DATA_DIR="$HOME/Library/Application Support/smolvm" ;;

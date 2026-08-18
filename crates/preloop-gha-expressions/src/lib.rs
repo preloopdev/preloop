@@ -102,6 +102,9 @@ pub enum ExpressionError {
     /// memory budget.
     #[error("expression evaluation exceeds the temporary value budget of {0} bytes")]
     EvaluationTooLarge(usize),
+    /// Expression nesting exceeded the parser's depth ceiling.
+    #[error("expression nesting exceeds the maximum depth of {0}")]
+    TooDeep(usize),
 }
 
 /// Parse an expression without evaluating it.

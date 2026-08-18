@@ -638,6 +638,7 @@ fn arb_literal_step() -> impl Strategy<Value = TaskStep> {
                     inputs,
                     env,
                     continue_on_error: Some(false),
+                    shell: None,
                     working_directory: None,
                     timeout_in_minutes: None,
                 }
@@ -774,6 +775,7 @@ fn task_step_serializes_as_runner_action_step() {
         display_name_token: None,
         condition: None,
         script: Some("echo hi".to_owned()),
+        shell: None,
         reference: None,
         inputs: BTreeMap::new(),
         env: BTreeMap::new(),
@@ -812,6 +814,7 @@ fn task_step_serializes_expression_as_format_token() {
         display_name_token: None,
         condition: None,
         script: None,
+        shell: None,
         reference: None,
         inputs,
         env: BTreeMap::new(),

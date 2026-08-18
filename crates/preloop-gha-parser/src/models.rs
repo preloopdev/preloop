@@ -59,6 +59,14 @@ pub enum ParserError {
         /// Matrix field.
         field: &'static str,
     },
+    /// Matrix cross-product exceeded the maximum number of generated jobs.
+    #[error("matrix for job `{job_id}` can not generate more than {limit} jobs")]
+    MatrixTooLarge {
+        /// Job id.
+        job_id: String,
+        /// Maximum allowed combinations.
+        limit: usize,
+    },
     /// Local reusable workflow was referenced but not supplied.
     #[error("local reusable workflow `{path}` was not found")]
     MissingReusableWorkflow {
