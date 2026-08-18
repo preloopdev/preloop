@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
 use preloop_gha_protocol::{ExecutionStatus, NdjsonEvent, RunAccepted, RunId, WorkflowSubmission};
 use preloop_orchestrator::environment::{is_stock_base_image, DEFAULT_BASE_IMAGE};
-use preloop_orchestrator::{RunnerPool, RunnerPoolConfig};
+use preloop_orchestrator::{artifact_payload, RunnerPool, RunnerPoolConfig};
 use preloop_vm::SmolVmProvider;
 use rand::RngCore;
 use std::collections::BTreeMap;
@@ -586,9 +586,37 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         pending_registrations: None,
         preparing_signal: None,
     };
+    let payload = artifact_payload(&output, &config.base_image);
     RunnerPool::new(std::sync::Arc::new(SmolVmProvider::default()), config)?
         .rebuild_artifact()
         .await?;
+    if payload != output {
+        let temporary = output.with_file_name(format!(
+            ".{}.tmp-{}",
+            output
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("golden"),
+            std::process::id()
+        ));
+        let copy_result = (|| -> anyhow::Result<()> {
+            std::fs::copy(&payload, &temporary).with_context(|| {
+                format!(
+                    "copy generated golden {} to temporary output {}",
+                    payload.display(),
+                    temporary.display()
+                )
+            })?;
+            std::fs::rename(&temporary, &output).with_context(|| {
+                format!("atomically replace requested output {}", output.display())
+            })?;
+            Ok(())
+        })();
+        if copy_result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        copy_result?;
+    }
     anyhow::ensure!(
         output.is_file(),
         "golden build did not create {}",
