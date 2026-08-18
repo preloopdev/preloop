@@ -23,17 +23,13 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
-- **SmolVM pack extraction strips ownership and setuid**: every file in the
-  flattened rootfs lands owned by the host user (502 on macOS, 1000 on
-  Linux) with setuid/setgid cleared — the first `sudo` step of any workflow
-  failed. Each fork is now repaired before the runner configures: a chown
-  pass, a tar-roundtrip rebuild of the chown-resistant residue, and the
-  setuid/setgid modes re-derived from the pack's own layer tar and
-  re-applied (`repair_leaked_rootfs_ownership`).
+- **Packed-machine ownership now comes from SmolVM**: the runtime updater
+  requires SmolVM 1.8.1 or newer and installs the latest stable release when
+  an older or incompatible runtime is detected. Preloop no longer rewrites
+  guest rootfs ownership or re-derives setuid modes itself.
 - **SmolVM non-streaming `machine exec` dropped after ~30s without
-  output**: provisioning steps that ran quietly (ownership repair,
-  toolchain installs) were killed mid-flight, leaving half-repaired
-  machines. Provider execs now pass an explicit `--timeout`.
+  output**: quiet provisioning commands such as toolchain installs were
+  killed mid-flight. Provider execs now pass an explicit `--timeout`.
 - **Job/workflow-level `env:` never reached action processes**: the server
   wrote job env only into the message `variables` map, leaving the wire
   `environmentVariables` (which the official runner materializes into step

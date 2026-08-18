@@ -260,9 +260,9 @@ jobs:
             --target aarch64-unknown-linux-gnu \
             -p preloop-runner
 
-      - name: Install pinned smolvm
+      - name: Install compatible smolvm
         env:
-          SMOLVM_VERSION: "1.7.7"
+          SMOLVM_VERSION: "1.8.2"
         run: |
           set -euo pipefail
           ARCHIVE="smolvm-${SMOLVM_VERSION}-darwin-arm64.tar.gz"

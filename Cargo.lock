@@ -2007,7 +2007,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "futures",
- "libc",
  "preloop-gha-parser",
  "preloop-gha-protocol",
  "preloop-runner-server",

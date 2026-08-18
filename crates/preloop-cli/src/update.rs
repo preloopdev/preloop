@@ -17,12 +17,9 @@ const DEFAULT_REPOSITORY: &str = "preloopdev/preloop";
 const USER_AGENT: &str = concat!("preloop/", env!("CARGO_PKG_VERSION"));
 const SMOLVM_REPOSITORY: &str = "smol-machines/smolvm";
 
-/// SmolVM version `preloop update` installs when the resolved binary cannot
-/// mount sockets.
-///
-/// Pinned to the first official release carrying reusable retained fork
-/// checkpoints and the macOS network symbol required by preloop-vm.
-const SMOLVM_VERSION: &str = "1.7.7";
+/// First SmolVM release that preserves archived UID/GID metadata when
+/// extracting packed machines. Newer stable releases are preferred.
+const SMOLVM_MIN_VERSION: &str = "1.8.1";
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct UpdateArgs {
@@ -42,7 +39,7 @@ pub(crate) struct UpdateArgs {
     #[arg(long, env = "PRELOOP_RELEASES_API", hide = true)]
     pub api_url: Option<String>,
 
-    /// Install and verify Preloop's pinned VM runtime without updating Preloop.
+    /// Install and verify the latest compatible VM runtime without updating Preloop.
     #[arg(long, hide = true)]
     pub ensure_runtime: bool,
 }
@@ -113,10 +110,9 @@ pub(crate) async fn run(args: UpdateArgs) -> anyhow::Result<()> {
         Err(error) => println!("warning: Linux runner bundle not updated: {error:#}"),
     }
 
-    // The engine cannot provision VMs without the pinned compatible smolvm.
-    // Checking only `--mount-socket` accepted 1.7.5 on macOS even though its
-    // libkrun omitted krun_add_net_unixstream, so require both the capability
-    // and the exact release whose packaged runtime was verified.
+    // The engine cannot provision VMs without a compatible smolvm. Checking
+    // only `--mount-socket` accepted releases with the CLI surface but missing
+    // runtime fixes, so require both the capability and the minimum release.
     #[cfg(unix)]
     if !args.check {
         match ensure_smolvm(&client).await {
@@ -295,23 +291,27 @@ async fn probe_smolvm_version(binary: &Path) -> Option<String> {
         .map(|version| version.trim_start_matches('v').to_owned())
 }
 
-fn smolvm_release_version() -> String {
+fn smolvm_release_override() -> Option<String> {
     std::env::var("PRELOOP_SMOLVM_RELEASE_VERSION")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| SMOLVM_VERSION.to_owned())
 }
 
-async fn smolvm_is_compatible(binary: &Path, expected_version: &str) -> bool {
-    probe_mount_socket(binary).await
-        && probe_smolvm_version(binary).await.as_deref() == Some(expected_version)
+async fn smolvm_is_compatible(binary: &Path, minimum_version: &Version) -> bool {
+    let Some(version) = probe_smolvm_version(binary).await else {
+        return false;
+    };
+    let Ok(version) = Version::parse(&version) else {
+        return false;
+    };
+    probe_mount_socket(binary).await && version >= *minimum_version
 }
 
-/// Probe the resolved smolvm and install the exact verified release when its
-/// version or required socket-mount capability differs.
+/// Probe the resolved smolvm and install the latest stable release when its
+/// version is below the minimum or it lacks the required socket capability.
 async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
-    let expected_version = smolvm_release_version();
-    if smolvm_is_compatible(Path::new("smolvm"), &expected_version).await {
+    let minimum_version = Version::parse(SMOLVM_MIN_VERSION)?;
+    if smolvm_is_compatible(Path::new("smolvm"), &minimum_version).await {
         return Ok(());
     }
     let platform = smolvm_platform().ok_or_else(|| {
@@ -324,13 +324,21 @@ async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
     let release = fetch_release(
         client,
         &format!("https://api.github.com/repos/{SMOLVM_REPOSITORY}/releases"),
-        Some(SMOLVM_VERSION),
+        smolvm_release_override().as_deref(),
     )
     .await?;
     let version = release
         .tag_name
         .strip_prefix('v')
         .unwrap_or(&release.tag_name);
+    let release_version = parse_release_version(version)?;
+    if release_version < minimum_version {
+        bail!(
+            "SmolVM release {} is below the required minimum {}",
+            release.tag_name,
+            minimum_version
+        );
+    }
     let archive_name = format!("smolvm-{version}-{platform}.tar.gz");
     let archive_asset = release
         .assets
@@ -351,7 +359,7 @@ async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
     // The install lands in `~/.local/bin`; if PATH still resolves another
     // binary, the engine keeps failing and the user is left confused about
     // why the update did not help. Say so explicitly.
-    if !smolvm_is_compatible(Path::new("smolvm"), &expected_version).await {
+    if !smolvm_is_compatible(Path::new("smolvm"), &minimum_version).await {
         bail!(
             "installed smolvm {version} to {}, but `smolvm` on PATH still resolves \
              to an incompatible version or lacks --mount-socket; make sure {} comes first",
@@ -854,12 +862,14 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn compatibility_requires_pinned_version_and_mount_socket() {
+    async fn compatibility_requires_minimum_version_and_mount_socket() {
         let directory = tempfile::tempdir().unwrap();
+        let minimum = Version::parse(SMOLVM_MIN_VERSION).unwrap();
         for (version, flag, expected) in [
-            (SMOLVM_VERSION, "--mount-socket <HOST:GUEST>", true),
-            ("1.7.5", "--mount-socket <HOST:GUEST>", false),
-            (SMOLVM_VERSION, "--docker-socket", false),
+            ("1.8.1", "--mount-socket <HOST:GUEST>", true),
+            ("1.8.2", "--mount-socket <HOST:GUEST>", true),
+            ("1.8.0", "--mount-socket <HOST:GUEST>", false),
+            ("1.8.1", "--docker-socket", false),
         ] {
             let executable = directory
                 .path()
@@ -886,7 +896,7 @@ mod tests {
             std::fs::set_permissions(&executable, permissions).unwrap();
 
             assert_eq!(
-                smolvm_is_compatible(&executable, SMOLVM_VERSION).await,
+                smolvm_is_compatible(&executable, &minimum).await,
                 expected,
                 "version={version}, flag={flag}"
             );

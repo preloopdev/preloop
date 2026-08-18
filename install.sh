@@ -69,24 +69,24 @@ release_json() { # tag or latest
 }
 
 ensure_runtime() {
-    say "installing pinned smolvm runtime..."
+    say "installing compatible smolvm runtime..."
     PATH="$BIN_DIR:$HOME/.local/bin:$PATH" \
         "$BIN_DIR/preloop" update --ensure-runtime \
-        || die "could not install the pinned smolvm runtime"
+        || die "could not install a compatible smolvm runtime"
 
     local smolvm_bin="$HOME/.local/bin/smolvm"
     [ -x "$smolvm_bin" ] || die "smolvm was not installed at $smolvm_bin"
     local smolvm_version
     smolvm_version="$("$smolvm_bin" --version 2>/dev/null | awk '{print $NF}')"
-    [ "$smolvm_version" = "1.7.7" ] \
-        || die "expected smolvm 1.7.7, found ${smolvm_version:-unknown}"
+    [ -n "$smolvm_version" ] \
+        || die "installed smolvm did not report a version"
 
     # Keep custom-prefix installs self-contained and ahead of any incompatible
     # system smolvm already on PATH.
     if [ "$BIN_DIR" != "$HOME/.local/bin" ]; then
         ln -sfn "$smolvm_bin" "$BIN_DIR/smolvm"
     fi
-    say "installed smolvm 1.7.7"
+    say "installed smolvm $smolvm_version"
 }
 
 install_from_release() {
