@@ -427,6 +427,13 @@ fn parse_sha256_checksum(text: &str) -> Option<String> {
 /// workflows portable. This list is ~350 MB.
 const BASE_PACKAGES: &str = "\
      git curl wget ca-certificates gnupg2 sudo openssh-client \
+     libnspr4 libnss3 libatk1.0-0t64 libatk-bridge2.0-0t64 \
+     libatspi2.0-0t64 libcairo2 libcups2t64 libdbus-1-3 libdrm2 libgbm1 \
+     libglib2.0-0t64 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 \
+     libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 libasound2t64 \
+     ruby ruby-rubygems perl cpanminus lsb-release fonts-noto-color-emoji \
+     haveged mediainfo p7zip-rar pollinate sshpass telnet tk xvfb zsync ftp \
+     sphinxsearch systemd-coredump libnss3-tools software-properties-common \
      build-essential pkg-config libssl-dev make autoconf automake libtool m4 \
      bison flex texinfo patchelf swig dpkg-dev fakeroot binutils \
      libicu-dev libsqlite3-dev libyaml-dev \
@@ -434,7 +441,8 @@ const BASE_PACKAGES: &str = "\
      unzip zip xz-utils zstd bzip2 brotli lz4 pigz p7zip-full tar \
      jq file tree shellcheck parallel time acl locales tzdata \
      rsync dnsutils iputils-ping net-tools iproute2 netcat-openbsd \
-     sqlite3 rpm aria2 mercurial";
+     sqlite3 rpm aria2 mercurial libcurl4-openssl-dev zlib1g-dev gettext \
+     libexpat1-dev";
 
 /// Node.js baked into the base image, pinned (via `versions.toml`) to the
 /// GitHub-hosted ubuntu-24.04 system Node. Ubuntu's apt `nodejs` (18.19) is
