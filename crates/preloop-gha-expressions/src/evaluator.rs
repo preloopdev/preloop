@@ -93,14 +93,19 @@ impl EvalBudget {
 
 fn value_size(value: &Value) -> usize {
     match value {
-        Value::Null => 0,
-        Value::Bool(_) => 1,
-        Value::Number(_) => 16,
-        Value::String(value) => value.len(),
-        Value::Array(values) => values.iter().map(value_size).sum(),
+        // Include conservative per-value/container overhead. Counting only
+        // payload bytes lets large arrays of nulls or empty strings evade the
+        // evaluation budget while still consuming substantial heap memory.
+        Value::Null => 16,
+        Value::Bool(_) => 16,
+        Value::Number(_) => 32,
+        Value::String(value) => 24 + value.len(),
+        Value::Array(values) => {
+            24 + values.iter().map(|value| 16 + value_size(value)).sum::<usize>()
+        }
         Value::Object(values) => values
             .iter()
-            .map(|(key, value)| key.len() + value_size(value))
+            .map(|(key, value)| 32 + key.len() + value_size(value))
             .sum(),
     }
 }
@@ -341,7 +346,7 @@ fn eval_call(
             .first()
             .and_then(|value| serde_json::from_str(&string_value(value)).ok())
             .unwrap_or(Value::Null)),
-        "join" => Ok(Value::String(join_args(&values))),
+        "join" => join_args(&values).map(Value::String),
         "hashfiles" => hash_files(&values, context).map(Value::String),
         "tojson" => Ok(Value::String(
             serde_json::to_string(values.first().unwrap_or(&Value::Null)).unwrap_or_default(),
@@ -419,11 +424,6 @@ fn push_capped(output: &mut String, segment: &str) -> Result<(), ExpressionError
 
 fn format_args(values: &[Value]) -> Result<String, ExpressionError> {
     let format = string_value_cow(values.first().unwrap_or(&Value::Null));
-    if format.len() > MAX_FORMAT_OUTPUT_BYTES {
-        return Err(ExpressionError::FormatOutputTooLarge(
-            MAX_FORMAT_OUTPUT_BYTES,
-        ));
-    }
     let bytes = format.as_bytes();
     let mut output = String::with_capacity(format.len().min(MAX_FORMAT_OUTPUT_BYTES));
     let mut segment_start = 0;
@@ -483,17 +483,39 @@ fn format_args(values: &[Value]) -> Result<String, ExpressionError> {
     Ok(output)
 }
 
-fn join_args(values: &[Value]) -> String {
-    let separator = string_arg(values, 1);
+fn join_args(values: &[Value]) -> Result<String, ExpressionError> {
+    let separator = string_value_cow(values.get(1).unwrap_or(&Value::Null));
+    let mut output = String::new();
     match values.first() {
-        Some(Value::Array(values)) => values
-            .iter()
-            .map(string_value)
-            .collect::<Vec<_>>()
-            .join(&separator),
-        Some(value) => string_value(value),
-        None => String::new(),
+        Some(Value::Array(values)) => {
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    push_evaluation_capped(&mut output, separator.as_ref())?;
+                }
+                let rendered = string_value_cow(value);
+                push_evaluation_capped(&mut output, rendered.as_ref())?;
+            }
+        }
+        Some(value) => {
+            let rendered = string_value_cow(value);
+            push_evaluation_capped(&mut output, rendered.as_ref())?;
+        }
+        None => {}
     }
+    Ok(output)
+}
+
+fn push_evaluation_capped(
+    output: &mut String,
+    segment: &str,
+) -> Result<(), ExpressionError> {
+    if segment.len() > MAX_EVALUATED_VALUE_BYTES.saturating_sub(output.len()) {
+        return Err(ExpressionError::EvaluationTooLarge(
+            MAX_EVALUATED_VALUE_BYTES,
+        ));
+    }
+    output.push_str(segment);
+    Ok(())
 }
 
 /// Implementation of `hashFiles(pattern, ...)` (F027).
