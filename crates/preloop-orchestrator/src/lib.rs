@@ -3223,10 +3223,14 @@ async fn provision_runner<P: VmProvider + 'static>(
     // other tool that checks file ownership, so real workflows die at the
     // first `sudo` step. Remap the leaked uid to root before the runner
     // configures, restoring the setuid/setgid bits chown clears.
-    let artifact = config
-        .use_packed_artifact
-        .then(|| config.artifact_payload().to_path_buf());
-    repair_leaked_rootfs_ownership(provider.as_ref(), name, artifact.as_deref()).await?;
+    // Only packed-artifact extraction can leak the host uid into the guest.
+    // Normal and operator-supplied images retain their guest ownership; do
+    // not rewrite legitimate files owned by a guest user whose numeric uid
+    // happens to equal the host uid.
+    if config.use_packed_artifact {
+        let artifact = config.artifact_payload();
+        repair_leaked_rootfs_ownership(provider.as_ref(), name, Some(&artifact)).await?;
+    }
 
     let runner = format!("/opt/preloop/bin/{}", config.runner_binary_name);
     let mut labels = config.labels.clone();
@@ -5047,6 +5051,36 @@ chmod +x "$destination/bin/node"
         );
     }
 
+    #[tokio::test]
+    async fn provision_skips_rootfs_ownership_repair_for_nonpacked_images() {
+        let Some(uid) = leaked_host_uid() else {
+            return;
+        };
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let config = test_config(false);
+        let name = MachineName::new("lifecycle-test-nonpacked-0-10").unwrap();
+
+        provision_runner(
+            &provider,
+            &config,
+            &name,
+            None,
+            &Arc::new(KeyPool::new()),
+            &test_runner_environment(config.base_image.clone(), Vec::new(), true),
+        )
+        .await
+        .expect("nonpacked provisioning succeeds without ownership repair");
+
+        let events = provider.events().await;
+        assert!(
+            !events.iter().any(|event| {
+                event.starts_with(&format!("exec:{}:", name.as_str()))
+                    && event.contains(&format!("uid={uid};"))
+            }),
+            "nonpacked images must not receive packed-rootfs ownership repair: {events:?}"
+        );
+    }
+
     /// The repair script targets exactly the leaked uid, skips `/home`,
     /// rebuilds the chown-resistant residue with a mode-preserving tar
     /// roundtrip, and re-applies the packed artifact's setuid/setgid modes.
@@ -5070,8 +5104,8 @@ chmod +x "$destination/bin/node"
         assert!(script.contains("rm -f /tmp/.preloop-leaked.tar"));
     }
 
-    /// Without a packed artifact the repair still runs, just without the
-    /// setuid restore.
+    /// The script itself remains valid without setuid entries; the caller
+    /// gates it to packed artifacts so normal images are never rewritten.
     #[test]
     fn rootfs_repair_script_skips_restore_without_setuid_list() {
         let script = rootfs_repair_script(502, &[]);
