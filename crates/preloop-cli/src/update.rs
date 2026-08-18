@@ -331,8 +331,8 @@ async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
     let repository = smolvm_release_repository();
     let release = fetch_release(
         client,
-        &format!("https://api.github.com/repos/{SMOLVM_REPOSITORY}/releases"),
-        Some(SMOLVM_VERSION),
+        &format!("https://api.github.com/repos/{repository}/releases"),
+        Some(&expected_version),
     )
     .await?;
     let version = release
