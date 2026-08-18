@@ -616,12 +616,33 @@ mod official_semantics {
     /// Expressions within the ceiling must keep working unchanged.
     #[test]
     fn expressions_within_depth_limit_still_parse() {
-        let n = 200;
+        use super::expr_parser::MAX_EXPRESSION_DEPTH;
+
+        // `parse_expr` consumes one level for the root, so this is the
+        // largest accepted parenthesized/unary nesting.
+        let n = MAX_EXPRESSION_DEPTH - 1;
         let expr = format!("{}true{}", "(".repeat(n), ")".repeat(n));
         assert!(eval_bool(&expr, &Context::default()).unwrap());
 
-        let negated = format!("{}true", "!".repeat(200));
+        let unary_n = n - (n % 2);
+        let negated = format!("{}true", "!".repeat(unary_n));
         assert!(eval_bool(&negated, &Context::default()).unwrap());
+
+        let too_deep = format!(
+            "{}true{}",
+            "(".repeat(MAX_EXPRESSION_DEPTH),
+            ")".repeat(MAX_EXPRESSION_DEPTH)
+        );
+        assert!(matches!(
+            validate_expression(&too_deep),
+            Err(ExpressionError::TooDeep(_))
+        ));
+
+        let too_deep_negated = format!("{}true", "!".repeat(MAX_EXPRESSION_DEPTH));
+        assert!(matches!(
+            validate_expression(&too_deep_negated),
+            Err(ExpressionError::TooDeep(_))
+        ));
     }
 
     #[test]
