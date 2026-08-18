@@ -16,7 +16,7 @@ use tokio::io::AsyncWriteExt;
 
 const DEFAULT_REPOSITORY: &str = "preloopdev/preloop";
 const USER_AGENT: &str = concat!("preloop/", env!("CARGO_PKG_VERSION"));
-const SMOLVM_REPOSITORY: &str = "preloopdev/smolvm";
+const SMOLVM_REPOSITORY: &str = "smol-machines/smolvm";
 include!(concat!(env!("OUT_DIR"), "/pins.rs"));
 
 /// Minimum SmolVM release `preloop update` accepts as already compatible,
@@ -359,44 +359,10 @@ async fn probe_smolvm_version(binary: &Path) -> Option<String> {
 
 async fn smolvm_is_compatible(binary: &Path) -> bool {
     probe_mount_socket(binary).await
-        && probe_exec_user(binary).await
         && probe_smolvm_version(binary)
             .await
             .and_then(|version| Version::parse(&version).ok())
             .is_some_and(|version| version >= *SMOLVM_MIN_COMPATIBLE_VERSION)
-}
-
-/// Whether a smolvm binary's `machine exec` accepts `--user`.
-///
-/// The pool runs every guest command with `machine exec --user root` (the
-/// image-declared USER would otherwise be the default, and the guest-side
-/// setpriv wrapper needs root to create the runner account and open the
-/// control bridge). The flag exists only in the retained fork's patched
-/// 1.8.2+ line (`preloopdev/smolvm`); official releases lack it and would
-/// fail every exec with an "unexpected argument" parse error.
-async fn probe_exec_user(binary: &Path) -> bool {
-    let mut command = tokio::process::Command::new(binary);
-    command
-        .args(["machine", "exec", "--help"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
-    let Ok(mut child) = command.spawn() else {
-        return false;
-    };
-    let stdout = child.stdout.take();
-    let Ok(status) = child.wait().await else {
-        return false;
-    };
-    if !status.success() {
-        return false;
-    }
-    let Some(mut stdout) = stdout else {
-        return false;
-    };
-    let mut output = String::new();
-    stdout.read_to_string(&mut output).await.is_ok() && output.contains("--user")
 }
 
 /// Probe the resolved smolvm and install the latest stable release when its

@@ -1077,7 +1077,7 @@ fn docker_start_command() -> Vec<String> {
     vec![
         "sh".to_owned(),
         "-c".to_owned(),
-        format!(
+        run_as_root_or_sudo(&format!(
             "command -v dockerd >/dev/null 2>&1 || exit 0; \
              docker info >/dev/null 2>&1 && exit 0; \
              rm -f /var/run/docker.pid; \
@@ -1088,7 +1088,7 @@ fn docker_start_command() -> Vec<String> {
                sleep 0.2; \
              done; \
              exit 0"
-        ),
+        )),
     ]
 }
 
@@ -1614,7 +1614,7 @@ async fn preload_images<P: VmProvider>(
         .map(|image| format!("'{}'", image.replace('\'', "'\\''")))
         .collect::<Vec<_>>()
         .join(" ");
-    let script = format!(
+    let script = run_as_root_or_sudo(&format!(
         "command -v dockerd >/dev/null 2>&1 || {{ echo 'no dockerd' >&2; exit 1; }}; \
          mkdir -p {DOCKER_DATA_ROOT}; \
          docker info >/dev/null 2>&1 || (dockerd >/var/log/dockerd-preload.log 2>&1 &); \
@@ -1627,7 +1627,7 @@ async fn preload_images<P: VmProvider>(
          done; \
          sync; \
          echo \"$pulled\""
-    );
+    ));
     let output = provider
         .exec(golden, &["sh".to_owned(), "-c".to_owned(), script])
         .await?;
@@ -3618,6 +3618,20 @@ async fn provision_runner<P: VmProvider + 'static>(
 /// `setpriv` and export the account identity for the step-environment
 /// contract (USER/LOGNAME/XDG_RUNTIME_DIR are derived from it by the
 /// worker). Purely a guest-side concern — never applied on the host.
+/// Carry a guest shell script so its root-only steps run either directly
+/// (the exec landed on root — locally baked goldens from plain bases declare
+/// no USER) or via passwordless sudo (the official runner image declares
+/// `USER runner`, and `machine exec` runs as that image user). The script is
+/// embedded base64 so every quoting form survives both shells.
+fn run_as_root_or_sudo(script: &str) -> String {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(script);
+    format!(
+        "if [ \"$(id -u)\" -eq 0 ]; then {script}; else \
+           printf %s '{b64}' | base64 -d | sudo -n sh 2>/dev/null || true; fi"
+    )
+}
+
 fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
     let Some(user) = &config.runner_user else {
         return argv.to_vec();
@@ -3633,13 +3647,23 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
         .map(|arg| shell_quote(arg))
         .collect::<Vec<_>>()
         .join(" ");
-    let script = format!(
+    // Root-only provisioning: create the runner account when missing, open
+    // its runtime and control-bridge paths, join the docker group. Runs
+    // directly when the exec landed on root, else via passwordless sudo —
+    // the official golden declares USER runner, so `machine exec` lands on
+    // runner and setpriv below self-drops to the same uid (no privilege
+    // change needed).
+    let provisioning = format!(
         "getent passwd {user} >/dev/null 2>&1 || useradd -m -u {uid} {user} 2>/dev/null; \
          mkdir -p /run/user/{uid}; chown {uid}:{uid} /run/user/{uid} /var/lib/preloop-runner 2>/dev/null; \
          chmod 777 /run/preloop-control 2>/dev/null; \
-         getent group docker >/dev/null 2>&1 && usermod -aG docker {user} 2>/dev/null; \
+         getent group docker >/dev/null 2>&1 && usermod -aG docker {user} 2>/dev/null"
+    );
+    let script = format!(
+        "{root_or_sudo}\n\
          exec setpriv --reuid {uid} --regid {uid} --init-groups env \
-           PRELOOP_RUNNER_USER={user} PRELOOP_RUNNER_UID={uid} HOME={home} {program} {args}"
+           PRELOOP_RUNNER_USER={user} PRELOOP_RUNNER_UID={uid} HOME={home} {program} {args}",
+        root_or_sudo = run_as_root_or_sudo(&provisioning),
     );
     vec!["sh".to_owned(), "-c".to_owned(), script]
 }

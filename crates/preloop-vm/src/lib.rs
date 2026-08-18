@@ -1127,8 +1127,6 @@ impl VmProvider for SmolVmProvider {
             "exec".into(),
             "--name".into(),
             name.as_str().into(),
-            "--user".into(),
-            "root".into(),
             "--".into(),
         ];
         args.extend_from_slice(argv);
@@ -1149,8 +1147,6 @@ impl VmProvider for SmolVmProvider {
             "exec".into(),
             "--name".into(),
             name.as_str().into(),
-            "--user".into(),
-            "root".into(),
         ];
         for (guest, source) in secrets {
             if !is_env_identifier(guest) {
@@ -1198,16 +1194,7 @@ impl VmProvider for SmolVmProvider {
         }
         let mut command = self.sandboxed_command()?;
         command
-            .args([
-                "machine",
-                "exec",
-                "--stream",
-                "--name",
-                name.as_str(),
-                "--user",
-                "root",
-                "--",
-            ])
+            .args(["machine", "exec", "--stream", "--name", name.as_str(), "--"])
             .args(argv)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

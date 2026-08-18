@@ -125,7 +125,7 @@ case "${1-}:${2-}" in
     if [ "${3-}" = "--stream" ]; then
       printf 'stream-out\n'
       printf 'stream-err\n' >&2
-    elif [ "${8-}" = "large-output" ]; then
+    elif [ "${6-}" = "large-output" ]; then
       printf '%200000s' ''
       printf '%200000s' '' >&2
     else
@@ -646,8 +646,6 @@ exit 0
                 "exec".to_owned(),
                 "--name".to_owned(),
                 "runner".to_owned(),
-                "--user".to_owned(),
-                "root".to_owned(),
                 "--".to_owned(),
                 "echo".to_owned(),
                 hostile,

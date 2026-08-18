@@ -1,13 +1,12 @@
 runner_version = "2.336.0"
 
-# SmolVM runtime floor: the retained fork's 1.8.2 line
-# (`preloopdev/smolvm`), the first release with `machine exec --user` —
-# the pool runs every guest command as root via that flag, and official
-# smolvm releases lack it. `preloop update --ensure-runtime` accepts any
-# release >= this and installs the latest from the fork. Compiled into
-# preloop-cli by crates/preloop-cli/build.rs; keep install.sh's
-# SMOLVM_MIN_VERSION in sync.
-smolvm_min_version = "1.8.2"
+# SmolVM runtime floor: the first official release with the reusable
+# retained-fork checkpoints and macOS network symbol preloop needs. `preloop
+# update --ensure-runtime` accepts any stable release >= this (1.7.5/1.7.6
+# pass the `--mount-socket` probe yet lack the macOS symbol) and installs
+# the latest stable. Compiled into preloop-cli by
+# crates/preloop-cli/build.rs; keep install.sh's SMOLVM_MIN_VERSION in sync.
+smolvm_min_version = "1.7.7"
 
 # SmolVM release the golden-image workflow (.github/workflows/release-golden.yml)
 # builds with. Renovate opens a bump PR when upstream ships a newer stable;

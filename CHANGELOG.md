@@ -9,6 +9,19 @@ Releases before v0.27.0 predate the changelog.
 
 ## [Unreleased]
 
+## [0.30.8] - 2026-08-18
+
+### Changed
+
+- Guest commands no longer run through `smolvm machine exec --user root`
+  (a flag only the retained smolvm fork shipped). The wrapper now branches on
+  the uid it lands on: root runs the provisioning directly (locally baked
+  goldens), any other image user runs it via passwordless sudo (the official
+  runner image declares `USER runner`), then the runner still drops to uid
+  1001 via `setpriv`. This removes the fork dependency entirely: `preloop
+  update --ensure-runtime` installs the official smolvm again and v0.30.7's
+  fork-pointing is reverted.
+
 ## [0.30.7] - 2026-08-18
 
 ### Fixed

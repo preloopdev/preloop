@@ -1849,7 +1849,7 @@ dependencies = [
 
 [[package]]
 name = "preloop-cli"
-version = "0.30.6"
+version = "0.30.8"
 dependencies = [
  "anyhow",
  "axum",
@@ -2006,6 +2006,7 @@ version = "0.21.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "futures",
  "preloop-gha-parser",
  "preloop-gha-protocol",
