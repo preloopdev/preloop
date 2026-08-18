@@ -9,6 +9,18 @@ Releases before v0.27.0 predate the changelog.
 
 ## [Unreleased]
 
+## [0.30.5] - 2026-08-17
+
+### Fixed
+
+- OCI golden download decompressed the packed layer, but the published
+  `application/vnd.preloop.smolmachine.v1+zstd` layer is the raw
+  `.smolmachine` sidecar — zstd asset frames followed by the uncompressed
+  manifest and `SMOLPACK` footer — so every OCI pull failed and fell back to
+  the release asset or a slow local bake. The download now verifies the
+  layer digest and installs the sidecar as-is, which `machine create --from`
+  consumes directly.
+
 ## [0.30.4] - 2026-08-17
 
 ### Added
