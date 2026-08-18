@@ -336,6 +336,7 @@ impl Drop for GoldenUrlGuard {
 
 impl Fixture {
     fn new(label: &str, payload_exists: bool) -> Self {
+        const BASE_IMAGE: &str = "ghcr.io/preloop/base:latest";
         let env_guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -350,7 +351,7 @@ impl Fixture {
         let artifact_stem = root.join("runner-image");
         if payload_exists {
             fs::write(
-                artifact_payload(&artifact_stem, "ghcr.io/preloop/base:latest"),
+                artifact_payload(&artifact_stem, BASE_IMAGE),
                 b"existing-artifact",
             )
             .unwrap();
@@ -367,7 +368,7 @@ impl Fixture {
             use_fork: false,
             use_packed_artifact: false,
             name_prefix: format!("pool-{label}-{id}"),
-            base_image: "ghcr.io/preloop/base:latest".to_owned(),
+            base_image: BASE_IMAGE.to_owned(),
             workspace: None,
             artifact_stem,
             release_version: "9.9.9".to_owned(),

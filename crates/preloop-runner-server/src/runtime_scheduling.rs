@@ -1520,7 +1520,17 @@ pub(crate) fn pair_registered_runner(inner: &mut InnerState, runner_id: i64) {
                 .map(|job| job_matches_runner_capabilities(job, &caps))
                 .unwrap_or(false)
         })
-        .min_by_key(|(_, at)| **at)
+        .min_by_key(|(key, at)| {
+            // Several stale bindings can be re-marked with the same `now`.
+            // Use the actual queue position as the tie-breaker instead of
+            // letting BTreeMap key order reorder jobs during replacement.
+            let queue_position = inner
+                .queue
+                .iter()
+                .position(|job| job.run_id == key.0 && job.job_id == key.1)
+                .unwrap_or(usize::MAX);
+            (**at, queue_position)
+        })
         .map(|(key, _)| key.clone());
     if let Some(key) = chosen {
         // Rebinding to a replacement machine keeps the original first-bound
