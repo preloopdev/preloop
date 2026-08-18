@@ -283,11 +283,37 @@ fn default_golden_url(release_version: &str) -> String {
 /// the blob pull, and moving the default stays a reviewed code change
 /// instead of a registry retag. The artifact is produced by the CI golden
 /// pipeline (pool-side bake of the official ubuntu24-arm64 runner image);
-/// the repo release flow additionally publishes the packed golden as a
-/// GitHub Release asset, which `PRELOOP_GOLDEN_URL` selects over this
-/// default.
+/// the release flow retains the packed golden as a workflow artifact because
+/// GitHub Release assets are capped at 2 GiB; `PRELOOP_GOLDEN_URL` selects a
+/// custom host when one is available.
 const DEFAULT_GOLDEN_OCI_REF: &str =
     "ghcr.io/preloopdev/preloop-golden@sha256:a2f7caf367e19efa4cb2d6f32a7093db8fae79e1b1525b65ac1190c1d2b44361";
+const GOLDEN_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+const GOLDEN_PROGRESS_INTERVAL: u64 = 1024 * 1024 * 1024;
+
+fn golden_download_percent(downloaded_bytes: u64, total_bytes: Option<u64>) -> Option<u8> {
+    let total_bytes = total_bytes.filter(|total| *total > 0)?;
+    Some(
+        downloaded_bytes
+            .min(total_bytes)
+            .saturating_mul(100)
+            .checked_div(total_bytes)
+            .unwrap_or_default() as u8,
+    )
+}
+
+fn report_golden_download_progress(source: &str, downloaded_bytes: u64, total_bytes: Option<u64>) {
+    match (
+        total_bytes,
+        golden_download_percent(downloaded_bytes, total_bytes),
+    ) {
+        (Some(total_bytes), Some(percent)) => info!(
+            source,
+            downloaded_bytes, total_bytes, percent, "Golden download progress"
+        ),
+        _ => info!(source, downloaded_bytes, "Golden download progress"),
+    }
+}
 
 fn should_download_prebaked_golden(base_image: &str, custom_golden_url: bool) -> bool {
     is_stock_base_image(base_image) || custom_golden_url
@@ -308,29 +334,41 @@ async fn download_prebaked_golden(payload: &Path, release_version: &str) -> bool
         if download_oci_golden(payload, &reference).await {
             return true;
         }
-        warn!(
-            reference,
-            "default OCI golden unavailable; trying release asset"
-        );
+        info!(reference, "OCI golden unavailable; trying release asset");
     }
 
     let default_url = default_golden_url(release_version);
     let url = forced_url.unwrap_or(default_url);
 
-    info!(url = %url, target = %payload.display(), "Attempting to download pre-baked golden microVM image");
+    info!(
+        url = %url,
+        target = %payload.display(),
+        "Downloading pre-baked golden from release asset (this may take several minutes)"
+    );
 
     let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(600))
+        .timeout(GOLDEN_DOWNLOAD_TIMEOUT)
         .build()
     {
-        Ok(c) => c,
-        Err(_) => return false,
+        Ok(client) => client,
+        Err(error) => {
+            warn!(%error, "Could not create golden download client");
+            return false;
+        }
     };
 
     let response = match client.get(&url).send().await {
         Ok(res) if res.status().is_success() => res,
-        _ => {
-            info!("Pre-baked golden image release not found; will build locally");
+        Ok(response) => {
+            info!(
+                status = %response.status(),
+                url = %url,
+                "Pre-baked golden release asset unavailable; will build locally"
+            );
+            return false;
+        }
+        Err(error) => {
+            warn!(%error, url = %url, "Pre-baked golden release download failed; will build locally");
             return false;
         }
     };
@@ -372,6 +410,9 @@ async fn download_prebaked_golden(payload: &Path, release_version: &str) -> bool
     // full image size on a host that has not yet built anything, and the OOM
     // killer arriving here takes out the very process that would otherwise fall
     // back to building locally.
+    let total_bytes = response.content_length();
+    let mut downloaded_bytes = 0_u64;
+    let mut next_progress = GOLDEN_PROGRESS_INTERVAL;
     let mut stream = response.bytes_stream();
     let mut streamed = true;
     while let Some(chunk) = stream.next().await {
@@ -382,6 +423,11 @@ async fn download_prebaked_golden(payload: &Path, release_version: &str) -> bool
         if file.write_all(&chunk).await.is_err() {
             streamed = false;
             break;
+        }
+        downloaded_bytes = downloaded_bytes.saturating_add(chunk.len() as u64);
+        if downloaded_bytes >= next_progress {
+            report_golden_download_progress("release", downloaded_bytes, total_bytes);
+            next_progress = next_progress.saturating_add(GOLDEN_PROGRESS_INTERVAL);
         }
     }
 
@@ -436,6 +482,7 @@ async fn download_prebaked_golden(payload: &Path, release_version: &str) -> bool
         return false;
     }
 
+    report_golden_download_progress("release", downloaded_bytes, total_bytes);
     info!(target = %payload.display(), "Downloaded pre-baked golden microVM image successfully");
     true
 }
@@ -449,6 +496,8 @@ struct OciManifest {
 #[derive(Debug, Deserialize)]
 struct OciLayer {
     digest: String,
+    #[serde(default)]
+    size: Option<u64>,
     /// OCI descriptors name this field `mediaType`; without the rename every
     /// standard manifest fails to parse and the OCI path silently falls back
     /// to the release asset.
@@ -469,18 +518,24 @@ async fn download_oci_golden(payload: &Path, reference: &str) -> bool {
         return false;
     };
     let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(600))
+        .timeout(GOLDEN_DOWNLOAD_TIMEOUT)
         .build()
     {
         Ok(client) => client,
-        Err(_) => return false,
+        Err(error) => {
+            warn!(%error, "Could not create OCI golden download client");
+            return false;
+        }
     };
     let manifest_url = format!("https://{registry}/v2/{repository}/manifests/{version}");
     let accept = "application/vnd.oci.image.manifest.v1+json, \
                   application/vnd.docker.distribution.manifest.v2+json";
-    let Some(response) = registry_get(&client, &manifest_url, accept).await else {
-        info!(reference, "OCI golden manifest unavailable");
-        return false;
+    let response = match registry_get(&client, &manifest_url, accept).await {
+        Ok(response) => response,
+        Err(error) => {
+            warn!(reference, %error, "OCI golden manifest unavailable");
+            return false;
+        }
     };
     let manifest = match response.json::<OciManifest>().await {
         Ok(manifest) => manifest,
@@ -497,23 +552,52 @@ async fn download_oci_golden(payload: &Path, reference: &str) -> bool {
         warn!(reference, "OCI golden has no packed VM layer");
         return false;
     };
-    let blob_url = format!("https://{registry}/v2/{repository}/blobs/{}", layer.digest);
-    let Some(response) = registry_get(&client, &blob_url, "*/*").await else {
-        return false;
+    let layer_size = layer.size;
+    let layer_digest = layer.digest;
+    let blob_url = format!("https://{registry}/v2/{repository}/blobs/{layer_digest}");
+    info!(
+        reference,
+        target = %payload.display(),
+        size_bytes = layer_size.unwrap_or_default(),
+        "Downloading pre-baked OCI golden (this may take several minutes)"
+    );
+    let response = match registry_get(&client, &blob_url, "*/*").await {
+        Ok(response) => response,
+        Err(error) => {
+            warn!(reference, %error, "OCI golden layer unavailable");
+            return false;
+        }
     };
     let Some(parent) = payload.parent() else {
         return false;
     };
     let tmp_payload = parent.join(format!(".tmp-golden-{}", uuid::Uuid::new_v4()));
-    if stream_golden_response(response, &tmp_payload, Some(layer.digest)).await
-        && tokio::fs::rename(&tmp_payload, payload).await.is_ok()
-    {
-        info!(
-            reference,
-            target = %payload.display(),
-            "Downloaded OCI pre-baked golden microVM image successfully"
-        );
-        return true;
+    match stream_golden_response(response, &tmp_payload, Some(layer_digest)).await {
+        Ok(downloaded_bytes) => {
+            if let Err(error) = tokio::fs::rename(&tmp_payload, payload).await {
+                warn!(
+                    reference,
+                    %error,
+                    target = %payload.display(),
+                    "Downloaded OCI golden but could not install it"
+                );
+            } else {
+                info!(
+                    reference,
+                    target = %payload.display(),
+                    downloaded_bytes,
+                    "Downloaded OCI pre-baked golden microVM image successfully"
+                );
+                return true;
+            }
+        }
+        Err(error) => {
+            warn!(
+                reference,
+                %error,
+                "OCI golden download failed; will try the release asset"
+            );
+        }
     }
     let _ = tokio::fs::remove_file(&tmp_payload).await;
     false
@@ -4369,6 +4453,15 @@ chmod +x "$destination/bin/node"
     }
 
     #[test]
+    fn golden_download_progress_reports_bounded_percentage() {
+        assert_eq!(golden_download_percent(0, Some(100)), Some(0));
+        assert_eq!(golden_download_percent(25, Some(100)), Some(25));
+        assert_eq!(golden_download_percent(150, Some(100)), Some(100));
+        assert_eq!(golden_download_percent(1, None), None);
+        assert_eq!(golden_download_percent(1, Some(0)), None);
+    }
+
+    #[test]
     fn default_oci_golden_reference_targets_arm64_pack() {
         let (registry, repository, version) =
             split_oci_reference(DEFAULT_GOLDEN_OCI_REF).expect("valid OCI reference");
@@ -4385,7 +4478,7 @@ chmod +x "$destination/bin/node"
     #[test]
     fn oci_layer_deserializes_camel_case_media_type() {
         let manifest: OciManifest = serde_json::from_str(
-            r#"{"layers":[{"digest":"sha256:00","mediaType":"application/vnd.preloop.smolmachine.v1+zstd"}]}"#,
+            r#"{"layers":[{"digest":"sha256:00","size":42,"mediaType":"application/vnd.preloop.smolmachine.v1+zstd"}]}"#,
         )
         .expect("standard OCI manifest must parse");
         let layer = manifest
@@ -4394,6 +4487,7 @@ chmod +x "$destination/bin/node"
             .find(|layer| layer.media_type == "application/vnd.preloop.smolmachine.v1+zstd")
             .expect("packed VM layer present");
         assert_eq!(layer.digest, "sha256:00");
+        assert_eq!(layer.size, Some(42));
     }
 
     #[test]
@@ -5495,6 +5589,29 @@ mod golden_download_tests {
         assert!(!downloaded);
         assert!(!payload.exists());
         assert!(leftovers(directory.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn truncated_oci_download_reports_progress_before_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let payload = directory.path().join("golden.smolmachine");
+        let body = vec![0xEF_u8; 64 * 1024];
+        let url = serve_once(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                body.len() + 4096
+            ),
+            body,
+        )
+        .await;
+        let response = reqwest::get(url).await.unwrap();
+
+        let error = stream_golden_response(response, &payload, None)
+            .await
+            .expect_err("truncated OCI body must fail");
+
+        assert!(error.contains("stream failed after"), "{error}");
+        assert!(!payload.exists());
     }
 
     #[tokio::test]

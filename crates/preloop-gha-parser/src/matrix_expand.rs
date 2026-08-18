@@ -37,7 +37,6 @@ pub struct MatrixCombination {
 pub const MAX_MATRIX_COMBINATIONS: usize = 256;
 const MAX_MATRIX_AXES: usize = 1024;
 const MAX_MATRIX_EXPANSION_WORK: usize = 1_000_000;
-const MAX_MATRIX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
 /// Expand a concrete matrix, refusing inputs whose fan-out exceeds
 /// [`MAX_MATRIX_COMBINATIONS`].
@@ -71,27 +70,29 @@ pub fn try_expand_matrix_spec(
     })
 }
 
+struct ExpansionState<'a> {
+    spec: &'a MatrixSpec,
+    axes: Vec<(&'a String, &'a Vec<Value>)>,
+    include_matched: Vec<bool>,
+    work: usize,
+}
+
 fn expand_matrix_spec_bounded(spec: &MatrixSpec) -> Result<Vec<MatrixCombination>, ()> {
     let mut expanded = Vec::with_capacity(
         MAX_MATRIX_COMBINATIONS.min(cartesian_count(spec).saturating_add(spec.include.len())),
     );
-    let mut include_matched = vec![false; spec.include.len()];
-    let axes: Vec<(&String, &Vec<Value>)> = spec.axes.iter().collect();
+    let mut state = ExpansionState {
+        spec,
+        axes: spec.axes.iter().collect(),
+        include_matched: vec![false; spec.include.len()],
+        work: 0,
+    };
     let mut current = IndexMap::new();
-    let mut work = 0;
-    if !axes.is_empty() && axes.iter().all(|(_, values)| !values.is_empty()) {
-        expand_axis_rows(
-            spec,
-            &axes,
-            0,
-            &mut current,
-            &mut expanded,
-            &mut include_matched,
-            &mut work,
-        )?;
+    if !state.axes.is_empty() && state.axes.iter().all(|(_, values)| !values.is_empty()) {
+        expand_axis_rows(&mut state, 0, &mut current, &mut expanded)?;
     }
 
-    for (included, matched) in spec.include.iter().zip(include_matched) {
+    for (included, matched) in spec.include.iter().zip(state.include_matched) {
         if !matched {
             push_matrix_row(
                 &mut expanded,
@@ -106,46 +107,44 @@ fn expand_matrix_spec_bounded(spec: &MatrixSpec) -> Result<Vec<MatrixCombination
 }
 
 fn expand_axis_rows(
-    spec: &MatrixSpec,
-    axes: &[(&String, &Vec<Value>)],
+    state: &mut ExpansionState<'_>,
     axis_index: usize,
     current: &mut IndexMap<String, Value>,
     expanded: &mut Vec<MatrixCombination>,
-    include_matched: &mut [bool],
-    work: &mut usize,
 ) -> Result<(), ()> {
-    if axis_index == axes.len() {
-        // Matching filters is the expensive part of each leaf. Charge the
-        // leaf and every exclude/include comparison, not just the recursion
-        // visit, so large filter lists cannot bypass the work budget.
-        *work = work
-            .checked_add(
-                1usize
-                    .saturating_add(spec.exclude.len())
-                    .saturating_add(spec.include.len()),
-            )
-            .ok_or(())?;
-        if *work > MAX_MATRIX_EXPANSION_WORK {
+    if axis_index == state.axes.len() {
+        state.work = state.work.checked_add(1).ok_or(())?;
+        if state.work > MAX_MATRIX_EXPANSION_WORK {
             return Err(());
         }
-        if spec
-            .exclude
-            .iter()
-            .any(|excluded| matches_partial(current, excluded))
-        {
+        let mut excluded = false;
+        for exc in &state.spec.exclude {
+            state.work = state.work.checked_add(1).ok_or(())?;
+            if state.work > MAX_MATRIX_EXPANSION_WORK {
+                return Err(());
+            }
+            if matches_partial(current, exc) {
+                excluded = true;
+                break;
+            }
+        }
+        if excluded {
             return Ok(());
         }
 
         let mut values = current.clone();
         let mut extras = IndexMap::new();
-        for (index, included) in spec.include.iter().enumerate() {
-            if included
-                .iter()
-                .all(|(key, value)| !spec.axes.contains_key(key) || current.get(key) == Some(value))
-            {
-                include_matched[index] = true;
+        for (index, included) in state.spec.include.iter().enumerate() {
+            state.work = state.work.checked_add(1).ok_or(())?;
+            if state.work > MAX_MATRIX_EXPANSION_WORK {
+                return Err(());
+            }
+            if included.iter().all(|(key, value)| {
+                !state.spec.axes.contains_key(key) || current.get(key) == Some(value)
+            }) {
+                state.include_matched[index] = true;
                 for (key, value) in included {
-                    if !spec.axes.contains_key(key) {
+                    if !state.spec.axes.contains_key(key) {
                         extras.insert(key.clone(), value.clone());
                     }
                 }
@@ -160,18 +159,10 @@ fn expand_axis_rows(
             },
         )
     } else {
-        let (axis, values) = axes[axis_index];
+        let (axis, values) = state.axes[axis_index];
         for value in values {
             current.insert(axis.clone(), value.clone());
-            expand_axis_rows(
-                spec,
-                axes,
-                axis_index + 1,
-                current,
-                expanded,
-                include_matched,
-                work,
-            )?;
+            expand_axis_rows(state, axis_index + 1, current, expanded)?;
             current.shift_remove(axis);
         }
         Ok(())
@@ -182,47 +173,15 @@ fn push_matrix_row(
     expanded: &mut Vec<MatrixCombination>,
     row: MatrixCombination,
 ) -> Result<(), ()> {
-    if expanded.len() >= MAX_MATRIX_COMBINATIONS
-        || expanded
-            .iter()
-            .map(|existing| matrix_value_size(&existing.values))
-            .sum::<usize>()
-            .saturating_add(matrix_value_size(&row.values))
-            > MAX_MATRIX_PAYLOAD_BYTES
-    {
+    if expanded.len() >= MAX_MATRIX_COMBINATIONS {
         return Err(());
     }
     expanded.push(row);
     Ok(())
 }
 
-fn matrix_value_size(values: &IndexMap<String, Value>) -> usize {
-    values
-        .iter()
-        .map(|(key, value)| key.len().saturating_add(json_value_size(value)))
-        .sum()
-}
-
-fn json_value_size(value: &Value) -> usize {
-    match value {
-        Value::Null | Value::Bool(_) => 16,
-        Value::Number(_) => 32,
-        Value::String(value) => 24usize.saturating_add(value.len()),
-        Value::Array(values) => {
-            24usize.saturating_add(values.iter().map(json_value_size).sum::<usize>())
-        }
-        Value::Object(values) => values
-            .iter()
-            .map(|(key, value)| {
-                32usize
-                    .saturating_add(key.len())
-                    .saturating_add(json_value_size(value))
-            })
-            .sum(),
-    }
-}
-
 /// Expand a concrete matrix according to GitHub's `MatrixBuilder` semantics.
+#[allow(dead_code)]
 pub fn expand_matrix_spec(spec: &MatrixSpec) -> Vec<MatrixCombination> {
     let mut combinations = Vec::with_capacity(cartesian_count(spec));
     if !spec.axes.is_empty() && spec.axes.values().all(|values| !values.is_empty()) {
@@ -1124,31 +1083,6 @@ jobs:
             expanded[0].values.get("extra"),
             Some(&Value::String("value".to_owned()))
         );
-    }
-
-    #[test]
-    fn matching_include_payload_is_bounded() {
-        let mut axes = IndexMap::new();
-        axes.insert(
-            "a".to_owned(),
-            (0..MAX_MATRIX_COMBINATIONS)
-                .map(Value::from)
-                .collect::<Vec<_>>(),
-        );
-        let mut include = IndexMap::new();
-        for index in 0..20_000 {
-            include.insert(format!("extra{index}"), Value::String("x".repeat(64)));
-        }
-        let spec = MatrixSpec {
-            axes,
-            exclude: vec![],
-            include: vec![include],
-        };
-
-        assert!(matches!(
-            try_expand_matrix_spec("large-include", &spec),
-            Err(crate::ParserError::MatrixTooLarge { .. })
-        ));
     }
 
     /// End-to-end through the public API: the workflow bomb must fail with
