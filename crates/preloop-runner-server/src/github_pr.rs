@@ -512,6 +512,7 @@ mod tests {
             "event": "push",
             "repository": "acme/web",
             "git_ref": "refs/heads/feature/x",
+            "trust_tier": "internal",
             "payload": { "repository": { "default_branch": "main" } },
         });
         let response = app

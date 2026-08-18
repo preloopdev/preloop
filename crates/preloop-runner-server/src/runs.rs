@@ -1416,6 +1416,10 @@ pub(crate) async fn submit_run(
     headers: axum::http::HeaderMap,
     Json(mut submission): Json<WorkflowSubmission>,
 ) -> Result<Json<RunAccepted>, ApiError> {
+    // Native callers cannot establish webhook provenance. Never allow a
+    // request body to select the trust tier used by auto-PR and secret policy;
+    // only the GitHub webhook adapters may stamp this field.
+    submission.trust_tier = None;
     if let Some(encoded) = headers
         .get("x-preloop-local-workspace")
         .and_then(|value| value.to_str().ok())
