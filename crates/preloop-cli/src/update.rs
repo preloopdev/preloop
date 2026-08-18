@@ -298,15 +298,23 @@ async fn probe_smolvm_version(binary: &Path) -> Option<String> {
         .map(|version| version.trim_start_matches('v').to_owned())
 }
 
-async fn smolvm_is_compatible(binary: &Path) -> bool {
+async fn smolvm_is_compatible(binary: &Path, expected_version: &str) -> bool {
     probe_mount_socket(binary).await
-        && probe_smolvm_version(binary).await.as_deref() == Some(SMOLVM_VERSION)
+        && probe_smolvm_version(binary).await.as_deref() == Some(expected_version)
+}
+
+fn configured_smolvm_version() -> String {
+    std::env::var("PRELOOP_SMOLVM_RELEASE_VERSION")
+        .ok()
+        .filter(|version| !version.trim().is_empty())
+        .unwrap_or_else(|| SMOLVM_VERSION.to_owned())
 }
 
 /// Probe the resolved smolvm and install the exact verified release when its
 /// version or required socket-mount capability differs.
 async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
-    if smolvm_is_compatible(Path::new("smolvm")).await {
+    let expected_version = configured_smolvm_version();
+    if smolvm_is_compatible(Path::new("smolvm"), &expected_version).await {
         return Ok(());
     }
     let platform = smolvm_platform().ok_or_else(|| {
@@ -319,7 +327,7 @@ async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
     let release = fetch_release(
         client,
         &format!("https://api.github.com/repos/{SMOLVM_REPOSITORY}/releases"),
-        Some(SMOLVM_VERSION),
+        Some(&expected_version),
     )
     .await?;
     let version = release
@@ -346,7 +354,7 @@ async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
     // The install lands in `~/.local/bin`; if PATH still resolves another
     // binary, the engine keeps failing and the user is left confused about
     // why the update did not help. Say so explicitly.
-    if !smolvm_is_compatible(Path::new("smolvm")).await {
+    if !smolvm_is_compatible(Path::new("smolvm"), &expected_version).await {
         bail!(
             "installed smolvm {version} to {}, but `smolvm` on PATH still resolves \
              to an incompatible version or lacks --mount-socket; make sure {} comes first",
@@ -881,7 +889,7 @@ mod tests {
             std::fs::set_permissions(&executable, permissions).unwrap();
 
             assert_eq!(
-                smolvm_is_compatible(&executable).await,
+                smolvm_is_compatible(&executable, version).await,
                 expected,
                 "version={version}, flag={flag}"
             );

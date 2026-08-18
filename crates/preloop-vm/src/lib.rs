@@ -624,7 +624,12 @@ impl SmolVmProvider {
     /// fail-closed answer keeps the single-live-clone guard, which is always
     /// safe, instead of re-exposing the fork corruption older releases cause.
     async fn supports_retained_fork_checkpoints(&self) -> bool {
-        let mut command = self.command();
+        // Follow symlinks before probing. Package managers commonly install a
+        // versioned SmolVM binary behind a stable wrapper path; probing the
+        // wrapper's own banner can otherwise enable the gate for an older
+        // runtime it resolves at exec time.
+        let binary = std::fs::canonicalize(&self.binary).unwrap_or_else(|_| self.binary.clone());
+        let mut command = Command::new(binary);
         command
             .arg("--version")
             .stdin(Stdio::null())
