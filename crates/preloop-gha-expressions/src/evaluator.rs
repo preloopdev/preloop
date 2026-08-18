@@ -123,6 +123,12 @@ pub(super) fn eval(
     context: &Context,
     budget: &mut EvalBudget,
 ) -> Result<Value, ExpressionError> {
+    // Keep this dispatcher thin: expressions nested up to the parser's depth
+    // ceiling recurse through it, and every frame on the recursion path is
+    // stack a within-ceiling expression may consume. Heavy per-op logic lives
+    // in non-recursive helpers so the frames pushed per nesting level stay
+    // small (a fat frame here made `!`×254 and `a==b==c` chains overflow the
+    // test thread's 2 MiB stack).
     let value = match expr {
         Expr::Literal(value) => {
             budget.charge(value)?;
@@ -135,61 +141,64 @@ pub(super) fn eval(
             }
             Ok(context.resolve(path))
         }
-        Expr::UnaryNot(expr) => Ok(Value::Bool(!is_truthy(&eval(expr, context, budget)?))),
-        Expr::Binary { op, left, right } => match op {
-            BinaryOp::Or => {
-                let left = eval(left, context, budget)?;
-                if is_truthy(&left) {
-                    Ok(left)
-                } else {
-                    eval(right, context, budget)
-                }
-            }
-            BinaryOp::And => {
-                let left = eval(left, context, budget)?;
-                if is_truthy(&left) {
-                    eval(right, context, budget)
-                } else {
-                    Ok(left)
-                }
-            }
-            BinaryOp::Eq => Ok(Value::Bool(abstract_equal(
-                &eval(left, context, budget)?,
-                &eval(right, context, budget)?,
-            ))),
-            BinaryOp::Ne => Ok(Value::Bool(!abstract_equal(
-                &eval(left, context, budget)?,
-                &eval(right, context, budget)?,
-            ))),
-            BinaryOp::Gt => Ok(Value::Bool(compare_values(
-                &eval(left, context, budget)?,
-                &eval(right, context, budget)?,
-                |ordering| ordering.is_gt(),
-            ))),
-            BinaryOp::Ge => Ok(Value::Bool(compare_values(
-                &eval(left, context, budget)?,
-                &eval(right, context, budget)?,
-                |ordering| ordering.is_ge(),
-            ))),
-            BinaryOp::Lt => Ok(Value::Bool(compare_values(
-                &eval(left, context, budget)?,
-                &eval(right, context, budget)?,
-                |ordering| ordering.is_lt(),
-            ))),
-            BinaryOp::Le => Ok(Value::Bool(compare_values(
-                &eval(left, context, budget)?,
-                &eval(right, context, budget)?,
-                |ordering| ordering.is_le(),
-            ))),
-        },
+        Expr::UnaryNot(expr) => eval_not(expr, context, budget),
+        Expr::Binary { .. } => eval_binary(expr, context, budget),
         Expr::Call { name, args } => eval_call(name, args, context, budget),
-        Expr::MemberAccess { expr, path } => {
-            let base = eval(expr, context, budget)?;
-            Ok(Context::resolve_value(base, path))
-        }
+        Expr::MemberAccess { expr, path } => eval_member(expr, path, context, budget),
     }?;
     budget.charge(&value)?;
     Ok(value)
+}
+
+fn eval_not(
+    expr: &Expr,
+    context: &Context,
+    budget: &mut EvalBudget,
+) -> Result<Value, ExpressionError> {
+    Ok(Value::Bool(!is_truthy(&eval(expr, context, budget)?)))
+}
+
+fn eval_member(
+    expr: &Expr,
+    path: &[String],
+    context: &Context,
+    budget: &mut EvalBudget,
+) -> Result<Value, ExpressionError> {
+    let base = eval(expr, context, budget)?;
+    Ok(Context::resolve_value(base, path))
+}
+
+fn eval_binary(
+    expr: &Expr,
+    context: &Context,
+    budget: &mut EvalBudget,
+) -> Result<Value, ExpressionError> {
+    let Expr::Binary { op, left, right } = expr else {
+        unreachable!("eval_binary requires a binary expression");
+    };
+    let left = eval(left, context, budget)?;
+    // Short-circuiting must not evaluate the right operand.
+    match op {
+        BinaryOp::Or if is_truthy(&left) => return Ok(left),
+        BinaryOp::And if !is_truthy(&left) => return Ok(left),
+        _ => {}
+    }
+    let right = eval(right, context, budget)?;
+    Ok(combine_binary(op, left, right))
+}
+
+fn combine_binary(op: &BinaryOp, left: Value, right: Value) -> Value {
+    match op {
+        // Short-circuiting already returned when `left` decides the result;
+        // `right` is only evaluated when it must be the value.
+        BinaryOp::Or | BinaryOp::And => right,
+        BinaryOp::Eq => Value::Bool(abstract_equal(&left, &right)),
+        BinaryOp::Ne => Value::Bool(!abstract_equal(&left, &right)),
+        BinaryOp::Gt => Value::Bool(compare_values(&left, &right, |ordering| ordering.is_gt())),
+        BinaryOp::Ge => Value::Bool(compare_values(&left, &right, |ordering| ordering.is_ge())),
+        BinaryOp::Lt => Value::Bool(compare_values(&left, &right, |ordering| ordering.is_lt())),
+        BinaryOp::Le => Value::Bool(compare_values(&left, &right, |ordering| ordering.is_le())),
+    }
 }
 
 fn abstract_equal(left: &Value, right: &Value) -> bool {
