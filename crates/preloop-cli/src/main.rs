@@ -2708,47 +2708,6 @@ fn materialize_plan_jobs(
     Ok(materialized)
 }
 
-fn materialize_plan_jobs(
-    plans: Vec<preloop_gha_protocol::JobPlan>,
-    reusable_workflows: &BTreeMap<String, String>,
-) -> anyhow::Result<Vec<preloop_gha_protocol::JobPlan>> {
-    let mut materialized = Vec::new();
-    for plan in plans {
-        let Some(call) = plan.reusable_call.as_ref() else {
-            materialized.push(plan);
-            continue;
-        };
-        // Needs-driven matrices are runtime placeholders. Their concrete
-        // cells require completed needs outputs, so do not send the empty
-        // matrix to `expand_reusable_call` (which correctly rejects it).
-        // Keep the placeholder visible and report its deferred expression.
-        if plan.deferred_matrix.is_some() {
-            materialized.push(plan);
-            continue;
-        }
-        let Some(yaml) = reusable_workflows.get(&call.workflow_file) else {
-            // Remote and unresolved calls remain explicit placeholders. The
-            // plan must not invent callee jobs without the referenced YAML.
-            materialized.push(plan);
-            continue;
-        };
-        let called = preloop_gha_parser::parse_workflow(yaml)
-            .map_err(|error| anyhow::anyhow!("parse reusable {}: {error}", call.workflow_file))?;
-        let expanded = preloop_gha_parser::expand_reusable_call(
-            &called,
-            &plan,
-            reusable_workflows,
-            &BTreeMap::new(),
-        )
-        .map_err(|error| anyhow::anyhow!("expand reusable {}: {error}", call.workflow_file))?;
-        // Keep the caller boundary in the output for downstream `needs`
-        // references, then append the concrete callee jobs it gates.
-        materialized.push(plan);
-        materialized.extend(materialize_plan_jobs(expanded.jobs, reusable_workflows)?);
-    }
-    Ok(materialized)
-}
-
 async fn cmd_plan(args: PlanArgs) -> anyhow::Result<()> {
     let workflow_path = resolve_workflow_path(args.file.as_deref())?;
     let workflow_yaml = std::fs::read_to_string(&workflow_path)
@@ -2823,21 +2782,6 @@ async fn cmd_plan(args: PlanArgs) -> anyhow::Result<()> {
         );
     }
     Ok(())
-
-}
-
-fn plan_json(plan: &preloop_gha_protocol::JobPlan) -> serde_json::Value {
-    serde_json::json!({
-        "id": plan.id.0,
-        "base_id": plan.base_id,
-        "name": plan.name,
-        "runner_group": plan.runner_group,
-        "runs_on": plan.runs_on,
-        "needs": plan.needs.iter().map(|need| need.0.clone()).collect::<Vec<_>>(),
-        "matrix": plan.matrix,
-        "deferred_matrix": plan.deferred_matrix,
-        "steps": plan.steps.len(),
-    })
 }
 
 fn plan_json(plan: &preloop_gha_protocol::JobPlan) -> serde_json::Value {
