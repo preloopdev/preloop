@@ -1,0 +1,30 @@
+{
+  "cli_version": "0.10.0",
+  "checkpoint_id": "01M0BAR9WKCNV72PAY3V6ND3FT",
+  "session_id": "01a0169f-6726-7000-8972-4a9019c2c76d",
+  "strategy": "manual-commit",
+  "created_at": "2026-08-18T20:59:39.627835Z",
+  "branch": "fix/security-format-output-cap",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "crates/preloop-gha-expressions/src/evaluator.rs"
+  ],
+  "agent": "Oh My Pi",
+  "model": "",
+  "turn_id": "4f20864f9316",
+  "checkpoint_transcript_start": 84,
+  "transcript_lines_at_start": 84,
+  "compact_transcript_start": 25,
+  "initial_attribution": {
+    "calculated_at": "2026-08-18T20:59:39.58532Z",
+    "agent_lines": 0,
+    "agent_removed": 0,
+    "human_added": 9,
+    "human_modified": 51,
+    "human_removed": 0,
+    "total_committed": 9,
+    "total_lines_changed": 60,
+    "agent_percentage": 0,
+    "metric_version": 2
+  }
+}
