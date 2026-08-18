@@ -495,7 +495,7 @@ fn push_format_capped(
 }
 
 fn format_args(values: &[Value], budget: &EvalBudget) -> Result<String, ExpressionError> {
-    let format = string_value_cow(values.first().unwrap_or(&Value::Null));
+    let format = string_value_capped(values.first().unwrap_or(&Value::Null), budget.remaining())?;
     let bytes = format.as_bytes();
     let mut output = String::with_capacity(format.len().min(MAX_FORMAT_OUTPUT_BYTES));
     let mut segment_start = 0;
@@ -534,7 +534,8 @@ fn format_args(values: &[Value], budget: &EvalBudget) -> Result<String, Expressi
                 let value = values
                     .get(argument_index + 1)
                     .ok_or_else(|| ExpressionError::InvalidFormat(format.to_string()))?;
-                let rendered = string_value_cow(value);
+                let rendered =
+                    string_value_capped(value, budget.remaining().saturating_sub(output.len()))?;
                 push_format_capped(&mut output, rendered.as_ref(), budget)?;
                 index = cursor + 1;
                 segment_start = index;

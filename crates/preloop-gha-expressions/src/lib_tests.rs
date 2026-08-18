@@ -65,6 +65,20 @@ fn evaluation_budget_counts_container_and_null_overhead() {
 }
 
 #[test]
+fn format_rejects_large_container_before_unbounded_render() {
+    let mut context = Context::default();
+    context.insert(
+        "values",
+        Value::Array(vec![Value::String("A".repeat(2_000)); 1_000]),
+    );
+
+    assert!(matches!(
+        eval_expression("format('{0}', values)", &context),
+        Err(ExpressionError::FormatOutputTooLarge(_))
+    ));
+}
+
+#[test]
 fn evaluates_context_and_functions() {
     let mut context = Context::default();
     context.insert("github", json!({"event_name": "push"}));
