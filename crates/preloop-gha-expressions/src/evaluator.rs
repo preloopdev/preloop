@@ -1,4 +1,6 @@
 use serde_json::Value;
+use std::borrow::Cow;
+use std::io::Write;
 
 use super::{
     ast::{BinaryOp, Expr},
@@ -69,62 +71,133 @@ pub(super) fn collect_contexts_from_expr(expr: &Expr, out: &mut std::collections
     }
 }
 
-pub(super) fn eval(expr: &Expr, context: &Context) -> Result<Value, ExpressionError> {
-    match expr {
-        Expr::Literal(value) => Ok(value.clone()),
-        Expr::Path(path) => Ok(context.resolve(path)),
-        Expr::UnaryNot(expr) => Ok(Value::Bool(!is_truthy(&eval(expr, context)?))),
-        Expr::Binary { op, left, right } => match op {
-            BinaryOp::Or => {
-                let left = eval(left, context)?;
-                if is_truthy(&left) {
-                    Ok(left)
-                } else {
-                    eval(right, context)
-                }
-            }
-            BinaryOp::And => {
-                let left = eval(left, context)?;
-                if is_truthy(&left) {
-                    eval(right, context)
-                } else {
-                    Ok(left)
-                }
-            }
-            BinaryOp::Eq => Ok(Value::Bool(abstract_equal(
-                &eval(left, context)?,
-                &eval(right, context)?,
-            ))),
-            BinaryOp::Ne => Ok(Value::Bool(!abstract_equal(
-                &eval(left, context)?,
-                &eval(right, context)?,
-            ))),
-            BinaryOp::Gt => Ok(Value::Bool(compare_values(
-                &eval(left, context)?,
-                &eval(right, context)?,
-                |ordering| ordering.is_gt(),
-            ))),
-            BinaryOp::Ge => Ok(Value::Bool(compare_values(
-                &eval(left, context)?,
-                &eval(right, context)?,
-                |ordering| ordering.is_ge(),
-            ))),
-            BinaryOp::Lt => Ok(Value::Bool(compare_values(
-                &eval(left, context)?,
-                &eval(right, context)?,
-                |ordering| ordering.is_lt(),
-            ))),
-            BinaryOp::Le => Ok(Value::Bool(compare_values(
-                &eval(left, context)?,
-                &eval(right, context)?,
-                |ordering| ordering.is_le(),
-            ))),
-        },
-        Expr::Call { name, args } => eval_call(name, args, context),
-        Expr::MemberAccess { expr, path } => {
-            let base = eval(expr, context)?;
-            Ok(Context::resolve_value(base, path))
+pub(super) const MAX_EVALUATED_VALUE_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Default)]
+pub(super) struct EvalBudget {
+    used_bytes: usize,
+}
+
+impl EvalBudget {
+    fn remaining(&self) -> usize {
+        MAX_EVALUATED_VALUE_BYTES.saturating_sub(self.used_bytes)
+    }
+
+    fn charge(&mut self, value: &Value) -> Result<(), ExpressionError> {
+        self.used_bytes = self.used_bytes.checked_add(value_size(value)).ok_or(
+            ExpressionError::EvaluationTooLarge(MAX_EVALUATED_VALUE_BYTES),
+        )?;
+        if self.used_bytes > MAX_EVALUATED_VALUE_BYTES {
+            return Err(ExpressionError::EvaluationTooLarge(
+                MAX_EVALUATED_VALUE_BYTES,
+            ));
         }
+        Ok(())
+    }
+}
+
+fn value_size(value: &Value) -> usize {
+    match value {
+        // Include conservative per-value/container overhead. Counting only
+        // payload bytes lets large arrays of nulls or empty strings evade the
+        // evaluation budget while still consuming substantial heap memory.
+        Value::Null => 16,
+        Value::Bool(_) => 16,
+        Value::Number(_) => 32,
+        Value::String(value) => 24 + value.len(),
+        Value::Array(values) => {
+            24 + values
+                .iter()
+                .map(|value| 16 + value_size(value))
+                .sum::<usize>()
+        }
+        Value::Object(values) => values
+            .iter()
+            .map(|(key, value)| 32 + key.len() + value_size(value))
+            .sum(),
+    }
+}
+
+pub(super) fn eval(
+    expr: &Expr,
+    context: &Context,
+    budget: &mut EvalBudget,
+) -> Result<Value, ExpressionError> {
+    // Keep this dispatcher thin: expressions nested up to the parser's depth
+    // ceiling recurse through it, and every frame on the recursion path is
+    // stack a within-ceiling expression may consume. Heavy per-op logic lives
+    // in non-recursive helpers so the frames pushed per nesting level stay
+    // small (a fat frame here made `!`×254 and `a==b==c` chains overflow the
+    // test thread's 2 MiB stack).
+    let value = match expr {
+        Expr::Literal(value) => {
+            budget.charge(value)?;
+            return Ok(value.clone());
+        }
+        Expr::Path(path) => {
+            if let Some(value) = context.resolve_ref(path) {
+                budget.charge(value)?;
+                return Ok(value.clone());
+            }
+            Ok(context.resolve(path))
+        }
+        Expr::UnaryNot(expr) => eval_not(expr, context, budget),
+        Expr::Binary { .. } => eval_binary(expr, context, budget),
+        Expr::Call { name, args } => eval_call(name, args, context, budget),
+        Expr::MemberAccess { expr, path } => eval_member(expr, path, context, budget),
+    }?;
+    budget.charge(&value)?;
+    Ok(value)
+}
+
+fn eval_not(
+    expr: &Expr,
+    context: &Context,
+    budget: &mut EvalBudget,
+) -> Result<Value, ExpressionError> {
+    Ok(Value::Bool(!is_truthy(&eval(expr, context, budget)?)))
+}
+
+fn eval_member(
+    expr: &Expr,
+    path: &[String],
+    context: &Context,
+    budget: &mut EvalBudget,
+) -> Result<Value, ExpressionError> {
+    let base = eval(expr, context, budget)?;
+    Ok(Context::resolve_value(base, path))
+}
+
+fn eval_binary(
+    expr: &Expr,
+    context: &Context,
+    budget: &mut EvalBudget,
+) -> Result<Value, ExpressionError> {
+    let Expr::Binary { op, left, right } = expr else {
+        unreachable!("eval_binary requires a binary expression");
+    };
+    let left = eval(left, context, budget)?;
+    // Short-circuiting must not evaluate the right operand.
+    match op {
+        BinaryOp::Or if is_truthy(&left) => return Ok(left),
+        BinaryOp::And if !is_truthy(&left) => return Ok(left),
+        _ => {}
+    }
+    let right = eval(right, context, budget)?;
+    Ok(combine_binary(op, left, right))
+}
+
+fn combine_binary(op: &BinaryOp, left: Value, right: Value) -> Value {
+    match op {
+        // Short-circuiting already returned when `left` decides the result;
+        // `right` is only evaluated when it must be the value.
+        BinaryOp::Or | BinaryOp::And => right,
+        BinaryOp::Eq => Value::Bool(abstract_equal(&left, &right)),
+        BinaryOp::Ne => Value::Bool(!abstract_equal(&left, &right)),
+        BinaryOp::Gt => Value::Bool(compare_values(&left, &right, |ordering| ordering.is_gt())),
+        BinaryOp::Ge => Value::Bool(compare_values(&left, &right, |ordering| ordering.is_ge())),
+        BinaryOp::Lt => Value::Bool(compare_values(&left, &right, |ordering| ordering.is_lt())),
+        BinaryOp::Le => Value::Bool(compare_values(&left, &right, |ordering| ordering.is_le())),
     }
 }
 
@@ -244,7 +317,12 @@ fn is_decimal_number(value: &str) -> bool {
     index == bytes.len()
 }
 
-fn eval_call(name: &str, args: &[Expr], context: &Context) -> Result<Value, ExpressionError> {
+fn eval_call(
+    name: &str,
+    args: &[Expr],
+    context: &Context,
+    budget: &mut EvalBudget,
+) -> Result<Value, ExpressionError> {
     let lower = name.to_ascii_lowercase();
     // case() uses lazy evaluation — handle before eager collect
     if lower == "case" {
@@ -253,21 +331,21 @@ fn eval_call(name: &str, args: &[Expr], context: &Context) -> Result<Value, Expr
         }
         // Evaluate predicate-result pairs lazily
         for i in (0..args.len() - 1).step_by(2) {
-            let predicate = eval(&args[i], context)?;
+            let predicate = eval(&args[i], context, budget)?;
             if !predicate.is_boolean() {
                 return Err(ExpressionError::NonBooleanCasePredicate);
             }
             if predicate.as_bool().unwrap_or(false) {
-                return eval(&args[i + 1], context);
+                return eval(&args[i + 1], context, budget);
             }
         }
         // No predicate matched — return default (last arg)
-        return eval(&args[args.len() - 1], context);
+        return eval(&args[args.len() - 1], context, budget);
     }
-    let values = args
-        .iter()
-        .map(|arg| eval(arg, context))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut values = Vec::with_capacity(args.len());
+    for arg in args {
+        values.push(eval(arg, context, budget)?);
+    }
 
     match lower.as_str() {
         "always" => Ok(Value::Bool(true)),
@@ -289,12 +367,12 @@ fn eval_call(name: &str, args: &[Expr], context: &Context) -> Result<Value, Expr
                 .to_ascii_lowercase()
                 .ends_with(&string_arg(&values, 1).to_ascii_lowercase()),
         )),
-        "format" => format_args(&values).map(Value::String),
+        "format" => format_args(&values, budget).map(Value::String),
         "fromjson" => Ok(values
             .first()
             .and_then(|value| serde_json::from_str(&string_value(value)).ok())
             .unwrap_or(Value::Null)),
-        "join" => Ok(Value::String(join_args(&values))),
+        "join" => join_args(&values, budget).map(Value::String),
         "hashfiles" => hash_files(&values, context).map(Value::String),
         "tojson" => Ok(Value::String(
             serde_json::to_string(values.first().unwrap_or(&Value::Null)).unwrap_or_default(),
@@ -344,19 +422,116 @@ fn string_value(value: &Value) -> String {
     }
 }
 
-fn format_args(values: &[Value]) -> Result<String, ExpressionError> {
-    let format = string_arg(values, 0);
+fn string_value_cow(value: &Value) -> Cow<'_, str> {
+    match value {
+        Value::String(value) => Cow::Borrowed(value),
+        _ => Cow::Owned(string_value(value)),
+    }
+}
+
+struct CappedJsonWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl Write for CappedJsonWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let remaining = self.limit.saturating_sub(self.bytes.len());
+        if bytes.len() > remaining {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "serialized value exceeds evaluation budget",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn string_value_bounded<'a>(
+    value: &'a Value,
+    limit: usize,
+    overflow: impl Fn() -> ExpressionError,
+) -> Result<Cow<'a, str>, ExpressionError> {
+    match value {
+        Value::String(value) => Ok(Cow::Borrowed(value)),
+        Value::Null => Ok(Cow::Borrowed("")),
+        Value::Bool(value) => Ok(Cow::Owned(value.to_string())),
+        Value::Number(value) => Ok(Cow::Owned(string_value(&Value::Number(value.clone())))),
+        other => {
+            let mut writer = CappedJsonWriter {
+                bytes: Vec::with_capacity(limit.min(256)),
+                limit,
+            };
+            serde_json::to_writer(&mut writer, other).map_err(|_| overflow())?;
+            let value = String::from_utf8(writer.bytes).map_err(|_| overflow())?;
+            Ok(Cow::Owned(value))
+        }
+    }
+}
+
+fn string_value_capped<'a>(
+    value: &'a Value,
+    limit: usize,
+) -> Result<Cow<'a, str>, ExpressionError> {
+    string_value_bounded(value, limit, || {
+        ExpressionError::EvaluationTooLarge(MAX_EVALUATED_VALUE_BYTES)
+    })
+}
+
+/// Cap on the output of `format()`.
+///
+/// Nested `format()` calls multiply output per level — each `{0}{0}{0}`
+/// triples its argument — so a ~1.5 KB expression could otherwise demand
+/// gigabytes (reproduced: 6.2 GB resident, process killed) without ever
+/// tripping an input-size limit. One megabyte is far above any real workflow
+/// usage.
+const MAX_FORMAT_OUTPUT_BYTES: usize = 1024 * 1024;
+
+fn push_format_capped(
+    output: &mut String,
+    segment: &str,
+    budget: &EvalBudget,
+) -> Result<(), ExpressionError> {
+    if segment.len() > MAX_FORMAT_OUTPUT_BYTES - output.len() {
+        return Err(ExpressionError::FormatOutputTooLarge(
+            MAX_FORMAT_OUTPUT_BYTES,
+        ));
+    }
+    if segment.len() > budget.remaining().saturating_sub(output.len()) {
+        return Err(ExpressionError::EvaluationTooLarge(
+            MAX_EVALUATED_VALUE_BYTES,
+        ));
+    }
+    output.push_str(segment);
+    Ok(())
+}
+
+fn format_args(values: &[Value], budget: &EvalBudget) -> Result<String, ExpressionError> {
+    // Bound serialization by the format capacity, not the evaluation budget:
+    // a container argument must not allocate up to the full 8 MiB evaluation
+    // budget before the 1 MiB format cap rejects it.
+    let format_overflow = || ExpressionError::FormatOutputTooLarge(MAX_FORMAT_OUTPUT_BYTES);
+    let format = string_value_bounded(
+        values.first().unwrap_or(&Value::Null),
+        MAX_FORMAT_OUTPUT_BYTES,
+        format_overflow,
+    )?;
     let bytes = format.as_bytes();
-    let mut output = String::with_capacity(format.len());
+    let mut output = String::with_capacity(format.len().min(MAX_FORMAT_OUTPUT_BYTES));
     let mut segment_start = 0;
     let mut index = 0;
 
     while index < bytes.len() {
         match bytes[index] {
             b'{' => {
-                output.push_str(&format[segment_start..index]);
+                push_format_capped(&mut output, &format[segment_start..index], budget)?;
                 if bytes.get(index + 1) == Some(&b'{') {
-                    output.push('{');
+                    push_format_capped(&mut output, "{", budget)?;
                     index += 2;
                     segment_start = index;
                     continue;
@@ -368,53 +543,83 @@ fn format_args(values: &[Value]) -> Result<String, ExpressionError> {
                     cursor += 1;
                 }
                 if cursor == digit_start {
-                    return Err(ExpressionError::InvalidFormat(format));
+                    return Err(ExpressionError::InvalidFormat(format.into_owned()));
                 }
                 let argument_index = format[digit_start..cursor]
                     .parse::<u8>()
-                    .map_err(|_| ExpressionError::InvalidFormat(format.clone()))?
+                    .map_err(|_| ExpressionError::InvalidFormat(format.to_string()))?
                     as usize;
                 match bytes.get(cursor) {
                     Some(b'}') => {}
                     Some(b':') => {
-                        return Err(ExpressionError::InvalidFormat(format));
+                        return Err(ExpressionError::InvalidFormat(format.into_owned()));
                     }
-                    _ => return Err(ExpressionError::InvalidFormat(format)),
+                    _ => return Err(ExpressionError::InvalidFormat(format.into_owned())),
                 }
                 let value = values
                     .get(argument_index + 1)
-                    .ok_or_else(|| ExpressionError::InvalidFormat(format.clone()))?;
-                output.push_str(&string_value(value));
+                    .ok_or_else(|| ExpressionError::InvalidFormat(format.to_string()))?;
+                let rendered = string_value_bounded(
+                    value,
+                    MAX_FORMAT_OUTPUT_BYTES.saturating_sub(output.len()),
+                    format_overflow,
+                )?;
+                push_format_capped(&mut output, rendered.as_ref(), budget)?;
                 index = cursor + 1;
                 segment_start = index;
             }
             b'}' => {
-                output.push_str(&format[segment_start..index]);
+                push_format_capped(&mut output, &format[segment_start..index], budget)?;
                 if bytes.get(index + 1) != Some(&b'}') {
-                    return Err(ExpressionError::InvalidFormat(format));
+                    return Err(ExpressionError::InvalidFormat(format.into_owned()));
                 }
-                output.push('}');
+                push_format_capped(&mut output, "}", budget)?;
                 index += 2;
                 segment_start = index;
             }
             _ => index += 1,
         }
     }
-    output.push_str(&format[segment_start..]);
+    push_format_capped(&mut output, &format[segment_start..], budget)?;
     Ok(output)
 }
 
-fn join_args(values: &[Value]) -> String {
-    let separator = string_arg(values, 1);
+fn join_args(values: &[Value], budget: &EvalBudget) -> Result<String, ExpressionError> {
+    let separator = string_value_capped(values.get(1).unwrap_or(&Value::Null), budget.remaining())?;
+    let mut output = String::new();
     match values.first() {
-        Some(Value::Array(values)) => values
-            .iter()
-            .map(string_value)
-            .collect::<Vec<_>>()
-            .join(&separator),
-        Some(value) => string_value(value),
-        None => String::new(),
+        Some(Value::Array(values)) => {
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    push_evaluation_capped(&mut output, separator.as_ref(), budget)?;
+                }
+                let rendered =
+                    string_value_capped(value, budget.remaining().saturating_sub(output.len()))?;
+                push_evaluation_capped(&mut output, rendered.as_ref(), budget)?;
+            }
+        }
+        Some(value) => {
+            let rendered =
+                string_value_capped(value, budget.remaining().saturating_sub(output.len()))?;
+            push_evaluation_capped(&mut output, rendered.as_ref(), budget)?;
+        }
+        None => {}
     }
+    Ok(output)
+}
+
+fn push_evaluation_capped(
+    output: &mut String,
+    segment: &str,
+    budget: &EvalBudget,
+) -> Result<(), ExpressionError> {
+    if segment.len() > budget.remaining().saturating_sub(output.len()) {
+        return Err(ExpressionError::EvaluationTooLarge(
+            MAX_EVALUATED_VALUE_BYTES,
+        ));
+    }
+    output.push_str(segment);
+    Ok(())
 }
 
 /// Implementation of `hashFiles(pattern, ...)` (F027).

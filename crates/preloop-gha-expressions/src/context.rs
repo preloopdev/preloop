@@ -99,6 +99,22 @@ impl Context {
         current
     }
 
+    /// Borrow a simple dotted path without cloning the resolved value.
+    ///
+    /// Wildcards and array projections can construct new arrays, so callers
+    /// that need those forms should continue using [`Self::resolve`].
+    pub(crate) fn resolve_ref(&self, path: &[String]) -> Option<&Value> {
+        let (first, rest) = path.split_first()?;
+        let mut current = self.roots.get(first)?;
+        for segment in rest {
+            if segment == "*" {
+                return None;
+            }
+            current = current.as_object()?.get(segment)?;
+        }
+        Some(current)
+    }
+
     /// Resolve a path against an existing value (used for member access on expression results).
     pub fn resolve_value(mut current: Value, path: &[String]) -> Value {
         for segment in path {
