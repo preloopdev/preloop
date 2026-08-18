@@ -13,8 +13,6 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
-include!(concat!(env!("OUT_DIR"), "/pins.rs"));
-
 const DEFAULT_CAPTURE_LIMIT: usize = 1024 * 1024;
 
 /// A validated persistent SmolVM machine name.
@@ -119,32 +117,6 @@ fn public_only_net_backend(lookup: impl Fn(&str) -> Option<String>) -> &'static 
         Some("tsi") => "tsi",
         _ => "virtio-net",
     }
-}
-
-/// Whether a `major.minor.patch` version string is at least the given
-/// version. Unparseable versions answer `false`: callers use this to decide
-/// whether a runtime is safe to fork from, and failing closed is the safe
-/// direction.
-fn smolvm_version_at_least(version: &str, minimum: &str) -> bool {
-    let parse = |value: &str| {
-        let mut parts = value.trim().trim_start_matches('v').split('.');
-        let (Some(major), Some(minor), Some(patch)) = (parts.next(), parts.next(), parts.next())
-        else {
-            return None;
-        };
-        let (Ok(major), Ok(minor), Ok(patch)) = (
-            major.parse::<u64>(),
-            minor.parse::<u64>(),
-            patch.parse::<u64>(),
-        ) else {
-            return None;
-        };
-        Some((major, minor, patch))
-    };
-    let (Some(actual), Some(required)) = (parse(version), parse(minimum)) else {
-        return false;
-    };
-    actual >= required
 }
 
 /// Where a guest environment value is resolved from, at launch time.
@@ -404,14 +376,6 @@ pub struct SmolVmProvider {
     /// environment; unit tests substitute a pure lookup so the policy can be
     /// exercised without mutating global state.
     env_lookup: EnvLookup,
-    /// Whether this SmolVM retains a reusable RAM checkpoint after a plain
-    /// fork, probed once per provider from the resolved binary's `--version`.
-    ///
-    /// Official SmolVM releases keep the checkpoint from the configured
-    /// minimum; anything older — or a probe that fails — must fall back to the safe
-    /// single-live-clone behavior, so the guard matches the actual binary
-    /// rather than assuming every install is current.
-    retained_fork_checkpoints: Arc<tokio::sync::OnceCell<bool>>,
 }
 
 impl Default for SmolVmProvider {
@@ -460,7 +424,6 @@ impl SmolVmProvider {
             forked_machines: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             socket_mount_supported: Arc::new(tokio::sync::OnceCell::new()),
             env_lookup: process_env,
-            retained_fork_checkpoints: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -627,72 +590,6 @@ impl SmolVmProvider {
             return Ok(false);
         };
         Ok(status.success() && String::from_utf8_lossy(&stdout).contains("--mount-socket"))
-    }
-
-    /// Whether the resolved binary retains a reusable RAM checkpoint after a
-    /// plain fork, probed from `--version` and cached for the provider's
-    /// lifetime.
-    ///
-    /// Official SmolVM keeps the checkpoint from the configured minimum. The version gate is
-    /// the reliable check here: `preloop serve` resolves whatever `smolvm`
-    /// is on PATH and does not run the upgrader, so the provider must not
-    /// assume every install is current. A probe that fails (missing binary,
-    /// unparseable version) is treated as not retaining checkpoints — the
-    /// fail-closed answer keeps the single-live-clone guard, which is always
-    /// safe, instead of re-exposing the fork corruption older releases cause.
-    async fn supports_retained_fork_checkpoints(&self) -> bool {
-        // Follow symlinks before probing. Package managers commonly install a
-        // versioned SmolVM binary behind a stable wrapper path; probing the
-        // wrapper's own banner can otherwise enable the gate for an older
-        // runtime it resolves at exec time.
-        let binary_path = self.binary.clone();
-        let binary = tokio::task::spawn_blocking(move || {
-            if binary_path.is_absolute() || binary_path.components().count() > 1 {
-                std::fs::canonicalize(&binary_path).unwrap_or(binary_path)
-            } else {
-                std::env::var_os("PATH")
-                    .into_iter()
-                    .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
-                    .map(|directory| directory.join(&binary_path))
-                    .find(|candidate| candidate.is_file())
-                    .and_then(|candidate| std::fs::canonicalize(candidate).ok())
-                    .unwrap_or(binary_path)
-            }
-        })
-        .await
-        .unwrap_or_else(|_| self.binary.clone());
-        let mut command = Command::new(binary);
-        command
-            .arg("--version")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let Ok(mut child) = command.spawn() else {
-            return false;
-        };
-        let stdout = child.stdout.take().expect("piped stdout");
-        let stderr = child.stderr.take().expect("piped stderr");
-        let (stdout, stderr, status) = tokio::join!(
-            read_bounded(stdout, self.capture_limit),
-            read_bounded(stderr, self.capture_limit),
-            child.wait(),
-        );
-        let (Ok((stdout, _)), Ok(_), Ok(status)) = (stdout, stderr, status) else {
-            return false;
-        };
-        if !status.success() {
-            return false;
-        }
-        let output = String::from_utf8_lossy(&stdout);
-        let version = output
-            .split_whitespace()
-            .last()
-            .map(|version| version.trim_start_matches('v'));
-        match version {
-            Some(version) => smolvm_version_at_least(version, SMOLVM_MIN_VERSION),
-            None => false,
-        }
     }
 
     async fn checked(
@@ -1012,37 +909,11 @@ impl VmProvider for SmolVmProvider {
     /// the few hundred milliseconds a concurrent refill saves. SmolVM's own
     /// fork-pool controller serializes on the golden for the same reason.
     ///
-    /// Releases before the configured minimum (or an unprobeable runtime) additionally lack
-    /// retained checkpoints entirely: the first fork leaves the base paused
-    /// with no checkpoint to restore from, so a second live clone would be
-    /// served from storage that must outlive the first. For those runtimes,
-    /// track live clones under the same per-golden lock and reject a second
-    /// call before invoking SmolVM. The capability is probed once from the
-    /// resolved binary's `--version`, not assumed from the pinned install.
-    ///
     /// Different goldens still fork concurrently, and forks remain excluded
     /// from base construction, so a golden cannot be replaced underneath one.
     async fn fork(&self, golden: &MachineName, clone: &MachineName) -> Result<(), VmError> {
         let fork_lock = self.fork_lock(golden).await;
         let _fork_guard = fork_lock.lock().await;
-        let retains_checkpoints = *self
-            .retained_fork_checkpoints
-            .get_or_init(|| self.supports_retained_fork_checkpoints())
-            .await;
-        if !retains_checkpoints {
-            if let Some(live_clone) = self
-                .forked_machines
-                .lock()
-                .await
-                .iter()
-                .find_map(|(clone, owner)| (owner == golden.as_str()).then(|| clone.clone()))
-            {
-                return Err(VmError::ForkBaseBusy {
-                    golden: golden.as_str().to_owned(),
-                    clone: live_clone,
-                });
-            }
-        }
         let result = self
             .concurrent(
                 "fork",
@@ -2214,23 +2085,6 @@ mod tests {
     }
 
     use super::*;
-
-    #[test]
-    fn retained_checkpoint_version_gate_uses_central_minimum() {
-        assert!(smolvm_version_at_least(
-            SMOLVM_MIN_VERSION,
-            SMOLVM_MIN_VERSION
-        ));
-        assert!(smolvm_version_at_least("1.9.0", SMOLVM_MIN_VERSION));
-        assert!(smolvm_version_at_least("v1.8.1", SMOLVM_MIN_VERSION));
-        assert!(!smolvm_version_at_least("1.8.0", SMOLVM_MIN_VERSION));
-        assert!(!smolvm_version_at_least("1.7.7", SMOLVM_MIN_VERSION));
-        assert!(!smolvm_version_at_least("1.6.9", SMOLVM_MIN_VERSION));
-        // Unparseable versions fail closed: the guard stays active.
-        assert!(!smolvm_version_at_least("", SMOLVM_MIN_VERSION));
-        assert!(!smolvm_version_at_least("latest", SMOLVM_MIN_VERSION));
-        assert!(!smolvm_version_at_least("1.7", SMOLVM_MIN_VERSION));
-    }
 
     #[test]
     fn cgroup_root_dir_trims_the_leading_slash_of_proc_self_cgroup_paths() {
