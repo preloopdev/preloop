@@ -483,13 +483,31 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         .rebuild_artifact()
         .await?;
     if payload != output {
-        std::fs::copy(&payload, &output).with_context(|| {
-            format!(
-                "copy generated golden {} to requested output {}",
-                payload.display(),
-                output.display()
-            )
-        })?;
+        let temporary = output.with_file_name(format!(
+            ".{}.tmp-{}",
+            output
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("golden"),
+            std::process::id()
+        ));
+        let copy_result = (|| -> anyhow::Result<()> {
+            std::fs::copy(&payload, &temporary).with_context(|| {
+                format!(
+                    "copy generated golden {} to temporary output {}",
+                    payload.display(),
+                    temporary.display()
+                )
+            })?;
+            std::fs::rename(&temporary, &output).with_context(|| {
+                format!("atomically replace requested output {}", output.display())
+            })?;
+            Ok(())
+        })();
+        if copy_result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        copy_result?;
     }
     anyhow::ensure!(
         output.is_file(),
