@@ -9,6 +9,19 @@ Releases before v0.27.0 predate the changelog.
 
 ## [Unreleased]
 
+## [0.30.6] - 2026-08-17
+
+### Fixed
+
+- The SmolVM guest agent rootfs was never found on standard installs: it
+  lives in smolvm's platform data directory (`~/Library/Application
+  Support/smolvm` on macOS, `~/.local/share/smolvm` on Linux), but the
+  runtime environment only probed the derived Preloop data dir and the
+  legacy `~/.smolvm` layout. With the isolated macOS `HOME`, every golden
+  machine start failed with `verify rootfs: agent rootfs not found`. The
+  probe now checks the real host's platform data dir first, then the legacy
+  location, and an explicit `SMOLVM_DATA_DIR` still wins.
+
 ## [0.30.5] - 2026-08-17
 
 ### Fixed
