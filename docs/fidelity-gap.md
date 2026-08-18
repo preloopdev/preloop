@@ -335,7 +335,7 @@ workflow. All are fixed:
 | A custom `shell:` command line was collapsed into one argv entry                       | `taiki-e/install-action` declares `shell: /usr/bin/env -u ENV … /bin/sh -eu {0}`; `env` unset one absurdly named variable, found no command, printed the environment, exited 0 — the step "succeeded" installing nothing and the next step died with `no such command: hack`                                 | `resolve_shell` splits every whitespace token; `{0}` substitution per token                                                                                                                                                                                     |
 | Toolchain bin directories were not on the runner's PATH                                | `dtolnay/rust-toolchain` only appends `$CARGO_HOME/bin` to `$GITHUB_PATH` when it installs rustup itself, so on an image that already has rustup (ours, and GitHub's) anything `cargo install`-ed was unreachable                                                                                            | the guest runner is launched with an explicit PATH covering `$HOME/.cargo/bin` and `/usr/local/go/bin`                                                                                                                                                          |
 | The baseline wiped `/var/lib/apt/lists`                                                | uv's musl cell runs `sudo apt-get install musl-tools` with no `apt-get update`: `E: Unable to locate package`                                                                                                                                                                                                | keep the lists; a fork of a pack that shipped without them refreshes on provision                                                                                                                                                                               |
-| Rosetta enable failure left a half-created machine                                     | an Apple Silicon host without Rosetta 2 (or a transient `smolvm machine update --rosetta` failure) left a broken VM the pool kept reusing; x86_64 golden jobs failed at start instead of surfacing the cause                                                                                                 | the provider propagates the `update --rosetta` error and deletes the partial machine (`rosetta_update_failure_is_returned_and_partial_machine_is_deleted`); x86_64 guests on Apple Silicon run under Rosetta 2 translation, with arm64 native preferred (see `docs/internal/smolvm-benchmarks.md`)                              |
+| Rosetta enable failure left a half-created machine                                     | an Apple Silicon host without Rosetta 2 (or a transient `smolvm machine update --rosetta` failure) left a broken VM the pool kept reusing; x86_64 golden jobs failed at start instead of surfacing the cause                                                                                                 | the provider propagates the `update --rosetta` error and deletes the partial machine (`rosetta_update_failure_is_returned_and_partial_machine_is_deleted`); x86_64 guests on Apple Silicon run under Rosetta 2 translation, with arm64 native preferred (see `docs/vm-images.md`) |
 | A fork of the packed golden trusted the pack's bake                                    | a published pack predating the workspace's toolchain pin boots without cargo, and cargo-dist dies on "you don't appear to have cargo installed" in 11s                                                                                                                                                       | probe each toolchain layer per fork and install only what the pack lacks; and `build-golden` now bakes the workspace's toolchains (`rust-toolchain.toml` etc.) into the artifact, so forks inherit them — the per-fork install is gone once the pack is rebuilt |
 | The guest hostname did not resolve                                                     | every `sudo` call printed `sudo: unable to resolve host <name>`, which appears in no hosted log                                                                                                                                                                                                              | the baseline adds the hostname to `/etc/hosts`                                                                                                                                                                                                                  |
 | `apt-get install` prompted, and a step's stdin never reached EOF                       | the hosted images ship `/etc/apt/apt.conf.d/90assumeyes`, so uv's `sudo apt-get install musl-tools` (no `-y`) installs three packages without a prompt; here it asked `Do you want to continue? [Y/n]` and, because the runner is a child of a guest `exec` whose stdin never closes, blocked for 45 minutes | ship the same apt config, and give every step `Stdio::null()` for stdin                                                                                                                                                                                         |
@@ -377,6 +377,18 @@ only match here because a self-hosted runner stands in for unknown labels.
 steps; GitHub exports only the step's own `env:` block. Harmless so far —
 `install-action`'s `BASH_FUNC_` guard does not trip on them — but it is a
 divergence a workflow could observe.
+
+### 1b.5 Pool reliability findings (2026-08-13)
+
+Found while measuring build-speed configs on the pool. Operational/reliability
+gaps (not protocol-shape gaps); tracked for fix:
+
+| Issue | Gap | Observed |
+| ----- | --- | -------- |
+| [#131](https://github.com/preloopdev/preloop/issues/131) | Runner never enforces the job timeout against a **hung step** — the runner keeps polling + renewing the job lock, so neither the liveness sweep nor the 45-min lease reclaims it; `timeout-minutes` never fires mid-step (official runner cancels at the budget) | `property-tests-fast` wedged 60+ min in `actions/checkout`, then again in a compile step; cancelled manually (runs `6a6f842f`, `9b7437a1`) |
+| [#132](https://github.com/preloopdev/preloop/issues/132) | Golden bakes `/etc/sudoers` owned by uid 1000 → `sudo` broken in every pool VM (docs' `sudo apt-get` pattern fails) | `sudo: error initializing audit plugin sudoers_audit` on running VM `preloop-runner-1-7`; first lld CI attempt failed on it |
+| [#133](https://github.com/preloopdev/preloop/issues/133) | GitHub App ran the **stale workflow YAML** for a push (first job attempt used the previous commit's ci.yml, then restarted with the correct one) | push `2b4090c1`: stale nextest config log `34425e86...`, correct config restarted 22:05 |
+| [#134](https://github.com/preloopdev/preloop/issues/134) | `GET /api/v1/runs/<id>/logs` returns **truncated** logs while `replay/results/*/job-logs.txt` is complete on disk | endpoint cut at 16:34:47 for a run whose file ends 16:46:03 (run `684a20e0`) |
 
 ---
 
@@ -635,6 +647,42 @@ runner-correlation maps (`job_requests`, `inflight_requests`, …) the way
 runtime reusable expansion now does — jobs fanned out from
 `needs`-dependent matrices lack RenewJob/timeline correlation until that path
 adopts the shared `build_job_artifacts` helper.
+
+---
+
+### 3c. Fork trust isolation (2026-08-12)
+
+The fork-PR token hardening (commit `47278c2b`) makes untrusted fork runs
+behave like GitHub's: read-only `GITHUB_TOKEN`, no secrets, no OIDC, and no
+fallback that can widen the credential. Two per-repository features remain to
+be compared with GitHub:
+
+**Cache access — conformant (resolved 2026-08-13).** GitHub gives fork PR runs
+read-only cache access: they can restore from the base repository's cache but
+cannot save to it (actions/cache README: "Some workflow runs only have
+read-only access to the cache. A common case is a workflow triggered by a pull
+request from a fork"), so a fork cannot poison entries a trusted run later
+restores. Preloop previously allowed fork writes on both the cache v2 Twirp
+surface (`CacheService/CreateCacheEntry`, `FinalizeCacheEntryUpload`) and the
+legacy `/_apis/artifactcache` surface. All cache *write* handlers now reject
+fork-restricted jobs (403, resolved via the job runtime token →
+`events::trust_tier::fork_restricted_from_token`); restore handlers are
+unchanged. Reads stay open for everyone.
+
+**Concurrency groups — at parity, suggested divergence (not implemented).**
+Concurrency groups are keyed `(lowercased repo, lowercased group name)`
+(`concurrency::concurrency_key`, no trust tier), matching GitHub's documented
+per-repository model ("using the same concurrency group in the repository").
+GitHub documents no fork isolation for concurrency, so a fork PR can declare a
+static group name (e.g. `prod-deploy`) with `cancel-in-progress: true` and
+cancel a trusted run — on GitHub and preloop alike. Suggested divergence,
+strictly safer than GitHub: key groups by `(repo, fork_restricted, group)` so
+fork runs contend only with fork runs and can never cancel a trusted holder.
+Tradeoffs: breaks cross-trust serialization for deliberately shared groups
+(use distinct group names per trust domain); the persisted key shape in
+`store.rs` needs a migration; and it does not bound resource abuse (a fork can
+still flood the pool with runs — that needs queue/run limits, separate from
+concurrency). Not implemented; documented here for parity tracking.
 
 ---
 

@@ -189,6 +189,27 @@ pub(crate) struct GitHubTokenRequest {
     /// A declared set must be minted verbatim or fail visibly; the implicit
     /// default may be narrowed to what the App installation actually grants.
     pub(crate) declared: bool,
+    /// Whether the job's trust tier restricts GitHub authority (fork PR or
+    /// fail-closed unknown event). Such jobs carry only the read-only fork
+    /// profile, and a mint failure never falls back to the broad
+    /// `PRELOOP_GITHUB_TOKEN` PAT: the job keeps the local runtime token
+    /// instead of receiving authority GitHub would not grant the fork.
+    ///
+    /// Missing persisted metadata fails closed: a request written by a
+    /// pre-upgrade server has no `untrusted` field, and deserializing it as
+    /// trusted would silently re-enable the PAT fallback after a restart for
+    /// a job whose tier was never recorded. Newly created requests always
+    /// serialize the field explicitly (`false` for trusted jobs), so only
+    /// genuinely old state hits the fail-closed default.
+    #[serde(default = "default_untrusted")]
+    pub(crate) untrusted: bool,
+}
+
+/// Fail-closed default for persisted [`GitHubTokenRequest`]s that predate
+/// the `untrusted` field: no recorded trust metadata means the request may
+/// have belonged to an untrusted job, so it is treated as untrusted.
+fn default_untrusted() -> bool {
+    true
 }
 
 /// Runner metadata used by dispatch matching.

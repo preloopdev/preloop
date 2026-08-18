@@ -431,6 +431,45 @@ async fn create_workspace_snapshot_inner(
     }
     run_git(&mut add, "stage local workspace state").await?;
 
+    // A local workspace can carry gitlink entries for submodules that were
+    // never registered in `.gitmodules` — a nested clone added by hand, or a
+    // half-removed submodule. Served faithfully, the gitlink makes
+    // `git submodule` operations in the VM (which actions/checkout runs when
+    // a workflow asks for submodules) die with `fatal: No url found for
+    // submodule path '…' in .gitmodules` even though the repository itself
+    // is intact. GitHub-hosted workspaces cannot have this state; local ones
+    // routinely do. Drop gitlinks no `.gitmodules` url resolves so the
+    // checkout behaves as if the path were an ordinary directory.
+    let staged = run_snapshot_git(
+        workspace,
+        staging_repository,
+        staging_index,
+        &cached_objects,
+        ["ls-files", "--stage", "-z"],
+        "list staged paths",
+    )
+    .await?;
+    let gitlinks = gitlink_paths(&staged.stdout);
+    if !gitlinks.is_empty() {
+        let configured = configured_submodule_urls(workspace).await;
+        let unresolvable: Vec<&str> = gitlinks
+            .iter()
+            .filter(|path| !configured.contains(*path))
+            .map(String::as_str)
+            .collect();
+        if !unresolvable.is_empty() {
+            let mut remove = snapshot_git_command(
+                workspace,
+                staging_repository,
+                staging_index,
+                &cached_objects,
+            );
+            remove.args(["update-index", "--force-remove", "--"]);
+            remove.args(&unresolvable);
+            run_git(&mut remove, "drop unresolvable submodule gitlinks").await?;
+        }
+    }
+
     let tree_output = run_snapshot_git(
         workspace,
         staging_repository,
@@ -845,6 +884,106 @@ fn snapshot_git_command(
         .env("GIT_INDEX_FILE", index)
         .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", source_objects);
     command
+}
+
+/// Paths of gitlink (mode `160000`) entries in a `git ls-files --stage -z`
+/// listing.
+///
+/// Records are NUL-terminated with a TAB between the `mode sha stage` header
+/// and the path; `-z` leaves paths unquoted.
+fn gitlink_paths(staged: &[u8]) -> Vec<String> {
+    let mut paths = Vec::new();
+    for record in staged.split(|byte| *byte == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
+            continue;
+        };
+        if record[..tab].starts_with(b"160000 ") {
+            if let Ok(path) = std::str::from_utf8(&record[tab + 1..]) {
+                paths.push(path.to_owned());
+            }
+        }
+    }
+    paths
+}
+
+/// Paths `git submodule` can resolve in the workspace's `.gitmodules`: the
+/// `path` value of every section that also carries a non-empty `url`.
+///
+/// Parsing is delegated to git itself (`git config -f .gitmodules -z
+/// --get-regexp '^submodule\..*\.(path|url)$'`) so quoting, escapes, line
+/// continuations, and case-insensitive section/key names are decoded exactly
+/// as git's submodule machinery decodes them. Git resolves a gitlink by
+/// path: it finds the section whose `path` matches and uses that section's
+/// `url`. A gitlink whose path only equals a section *name* is not
+/// resolvable — it dies with `fatal: No url found for submodule path '…' in
+/// .gitmodules` (verified against git 2.x) — so section names are
+/// deliberately excluded from the set. Empty set when the file is absent or
+/// git cannot parse it, matching git's own treatment of such a file.
+async fn configured_submodule_urls(workspace: &FsPath) -> BTreeSet<String> {
+    let output = Command::new("git")
+        .current_dir(workspace)
+        .args([
+            "config",
+            "-f",
+            ".gitmodules",
+            "-z",
+            "--get-regexp",
+            "^submodule\\..*\\.(path|url)$",
+        ])
+        .output()
+        .await;
+    let Ok(output) = output else {
+        return BTreeSet::new();
+    };
+    if !output.status.success() {
+        return BTreeSet::new();
+    }
+    // `-z` output is NUL-terminated records of the form `key\nvalue`. Keys
+    // are `submodule.<name>.path|url`; the name itself may contain dots and
+    // spaces, so only the trailing `.path`/`.url` suffix is stripped.
+    let mut path_by_name: std::collections::HashMap<&[u8], &[u8]> =
+        std::collections::HashMap::new();
+    let mut url_names: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+    for record in output.stdout.split(|byte| *byte == 0) {
+        let Some(nl) = record.iter().position(|byte| *byte == b'\n') else {
+            continue;
+        };
+        let key = &record[..nl];
+        let value = &record[nl + 1..];
+        let is_url = key.ends_with(b".url");
+        let suffix_len = if is_url {
+            b".url".len()
+        } else {
+            b".path".len()
+        };
+        if !is_url && !key.ends_with(b".path") {
+            continue;
+        }
+        let Some(name) = key.strip_prefix(b"submodule.") else {
+            continue;
+        };
+        let name = &name[..name.len() - suffix_len];
+        if value.is_empty() {
+            continue;
+        }
+        if is_url {
+            url_names.insert(name);
+        } else {
+            path_by_name.insert(name, value);
+        }
+    }
+    let mut configured = BTreeSet::new();
+    for (name, path) in path_by_name {
+        if url_names.contains(name) {
+            if let Ok(path) = std::str::from_utf8(path) {
+                configured.insert(path.to_owned());
+            }
+        }
+    }
+    configured
 }
 
 /// Whether the workspace's own `.gitignore` rules already exclude `relative`.
