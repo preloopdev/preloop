@@ -7,7 +7,39 @@ use anyhow::Result;
 use tracing::debug;
 
 /// Evaluate all `${{ }}` expressions in a string.
+///
+/// On expression evaluation failure the original `${{ }}` token is preserved
+/// so `run:` scripts can degrade gracefully. Prefer
+/// [`evaluate_template_strict`] for step env and action inputs, which match
+/// the official runner's fail-closed behavior.
 pub fn evaluate_template(input: &str, ctx: &preloop_gha_expressions::Context) -> Result<String> {
+    evaluate_template_inner(input, ctx, /* strict */ false)
+}
+
+/// Evaluate a template, failing when any embedded expression cannot be
+/// evaluated.
+///
+/// Failures are detected while evaluating each `${{ }}` token (parse/eval
+/// error, or an unclosed token). Successfully resolved values may still
+/// contain the characters `${{` — for example a secret or input whose payload
+/// is documentation that mentions GitHub Actions syntax — and those must not
+/// be rejected. Scanning the rendered string for `${{` would confuse data with
+/// leftover template tokens.
+///
+/// Matches the official runner: `PipelineTemplateConverter.ConvertToStepEnvironment`
+/// throws when an input/env expression cannot be evaluated, and the step fails.
+pub fn evaluate_template_strict(
+    input: &str,
+    ctx: &preloop_gha_expressions::Context,
+) -> Result<String> {
+    evaluate_template_inner(input, ctx, /* strict */ true)
+}
+
+fn evaluate_template_inner(
+    input: &str,
+    ctx: &preloop_gha_expressions::Context,
+    strict: bool,
+) -> Result<String> {
     if !input.contains("${{") {
         return Ok(input.to_string());
     }
@@ -34,12 +66,17 @@ pub fn evaluate_template(input: &str, ctx: &preloop_gha_expressions::Context) ->
                     result.push_str(&value_to_string(&value));
                 }
                 Err(e) => {
-                    // On expression error, preserve the original token
+                    if strict {
+                        anyhow::bail!("failed to evaluate expression `{expr}`: {e}");
+                    }
+                    // Lenient: preserve the original token so run scripts degrade.
                     debug!("Expression evaluation failed: {e}");
                     result.push_str(&rest[start..expr_start + end + 2]);
                 }
             }
             rest = &rest[start + 3 + end + 2..];
+        } else if strict {
+            anyhow::bail!("unclosed expression in template: {input}");
         } else {
             // No closing }}, copy the rest literally
             result.push_str(&rest[start..]);
@@ -49,26 +86,6 @@ pub fn evaluate_template(input: &str, ctx: &preloop_gha_expressions::Context) ->
 
     result.push_str(rest);
     Ok(result)
-}
-
-/// Evaluate a template, failing when any embedded expression cannot be
-/// evaluated.
-///
-/// [`evaluate_template`] preserves a failed `${{ }}` token verbatim so run
-/// scripts can degrade gracefully; the official runner does the opposite for
-/// step environments and action inputs — `PipelineTemplateConverter.
-/// ConvertToStepEnvironment` throws on a value that reaches it unevaluated,
-/// and the step is marked failed. This strict variant surfaces the same
-/// failure.
-pub fn evaluate_template_strict(
-    input: &str,
-    ctx: &preloop_gha_expressions::Context,
-) -> Result<String> {
-    let evaluated = evaluate_template(input, ctx)?;
-    if evaluated.contains("${{") {
-        anyhow::bail!("failed to evaluate expression in template: {input}");
-    }
-    Ok(evaluated)
 }
 
 /// Evaluate an `if:` condition expression as a boolean.
@@ -358,6 +375,55 @@ mod tests {
         .unwrap();
         assert_eq!(result, "echo Running on test/repo ref refs/heads/main done");
     }
+
+    /// Resolved values may contain the characters `${{` (docs, examples,
+    /// grep patterns). Strict mode must not treat that payload as a leftover
+    /// unevaluated template token.
+    #[test]
+    fn strict_allows_literal_dollar_brace_in_resolved_value() {
+        let mut ctx = make_ctx();
+        ctx.insert(
+            "inputs",
+            serde_json::json!({
+                "grep_pattern": "if (x) { return `${{foo}}`; }"
+            }),
+        );
+        let result =
+            evaluate_template_strict("${{ inputs.grep_pattern }}", &ctx).expect("resolved data");
+        assert_eq!(result, "if (x) { return `${{foo}}`; }");
+    }
+
+    #[test]
+    fn strict_fails_on_expression_eval_error() {
+        let ctx = make_ctx();
+        // Unknown function → ExpressionError, not a successful Null render.
+        let err = evaluate_template_strict("x=${{ not_a_real_function() }}", &ctx)
+            .expect_err("strict must fail closed on eval errors");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("failed to evaluate expression"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn strict_fails_on_unclosed_expression() {
+        let ctx = make_ctx();
+        let err = evaluate_template_strict("x=${{ github.repository", &ctx)
+            .expect_err("unclosed token must fail in strict mode");
+        assert!(
+            err.to_string().contains("unclosed expression"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn lenient_still_preserves_failed_expression_token() {
+        let ctx = make_ctx();
+        let result = evaluate_template("x=${{ not_a_real_function() }}", &ctx).unwrap();
+        assert_eq!(result, "x=${{ not_a_real_function() }}");
+    }
+
     /// Regression: format() expressions whose template literal contains multi-byte
     /// Unicode characters (e.g. em dash U+2014) previously caused find_expression_end
     /// to return a char index instead of a byte offset, silently truncating the

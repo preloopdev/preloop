@@ -136,7 +136,10 @@ pub(crate) async fn prepare_remote_actions(
     // the nested remote refs discovered in the previous wave's manifests.
     let mut pending: Vec<(String, ParsedUses)> = refs;
     let mut wave_resolved = resolved;
-    for _depth in 0..=composite_max_depth() {
+    // Exclusive upper bound: at most `composite_max_depth()` executable
+    // nesting levels (official Constants.CompositeActionsMaxDepth = 10).
+    // An inclusive range pre-downloads one extra level the runner will reject.
+    for _depth in 0..composite_max_depth() {
         if pending.is_empty() {
             break;
         }

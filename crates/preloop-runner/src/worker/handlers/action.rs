@@ -155,8 +155,9 @@ pub(crate) async fn ensure_remote_action_staged(
     // Resolve ref → SHA through the server's runnerresolve endpoint first,
     // like job-start preparation does (and like the official ActionManager):
     // the download is then SHA-pinned via the server-minted URL. When the
-    // launch endpoint is unavailable, fall back to the api.github.com
-    // tarball, matching the official manager's own fallback.
+    // launch endpoint is unavailable (None), fall back to the api.github.com
+    // tarball. Auth/protocol failures from a configured endpoint must
+    // propagate — never launder them into an unauthenticated download.
     let launch_url = ctx
         .job
         .get_variable("system.github.launch_endpoint")
@@ -166,11 +167,28 @@ pub(crate) async fn ensure_remote_action_staged(
         let http = crate::client::http::HttpClient::new(None)?;
         let resolver =
             crate::client::actions_download::ActionsResolveClient::new(http, Some(launch_url));
-        let key = format!("{owner}/{repo}@{git_ref}");
-        let batch = resolver
-            .resolve_batch("", "", "", &[(owner, git_ref)])
-            .await
+        let action_name = format!("{owner}/{repo}");
+        let key = format!("{action_name}@{git_ref}");
+        // Job-start preparation authenticates with the SystemVssConnection
+        // token and the plan/job identity. Nested on-demand staging must do
+        // the same; empty credentials make private/GHES actions fail and
+        // skip the server's SHA-pinned download path.
+        let access_token = ctx
+            .job
+            .env
+            .get("ACTIONS_RUNTIME_TOKEN")
+            .cloned()
             .unwrap_or_default();
+        let plan_id = ctx
+            .job
+            .get_variable("system.orchestrationId")
+            .or_else(|| ctx.job.get_variable("system.planId"))
+            .unwrap_or("");
+        let job_id = ctx.job.job_id.as_str();
+        let batch = resolver
+            .resolve_batch(&access_token, plan_id, job_id, &[(action_name.as_str(), git_ref)])
+            .await
+            .with_context(|| format!("runnerresolve nested action {uses}"))?;
         resolved = batch.get(&key).cloned();
     }
     let dir_ref = resolved
@@ -199,6 +217,8 @@ pub(crate) async fn ensure_remote_action_staged(
     } else {
         action_root.join(subpath)
     };
+    // Containment: resolved path must stay under `_actions/`.
+    ensure_under_actions_dir(&actions_dir, &action_dir)?;
     ctx.job
         .action_paths
         .insert(uses.to_owned(), action_dir.to_string_lossy().into_owned());
@@ -211,35 +231,63 @@ fn validate_remote_action_reference(
     git_ref: &str,
     subpath: &str,
 ) -> Result<()> {
-    if owner.is_empty()
-        || repo.is_empty()
-        || owner.chars().any(|character| matches!(character, '/' | '\\'))
-        || repo.chars().any(|character| matches!(character, '/' | '\\'))
-        || git_ref.is_empty()
-        || git_ref.contains('\\')
-    {
+    if owner.is_empty() || repo.is_empty() || git_ref.is_empty() {
         anyhow::bail!("invalid action reference components");
     }
-    let safe_path = |value: &str| {
-        let path = std::path::Path::new(value);
-        !path.is_absolute()
-            && path.components().all(|component| {
-                !matches!(
-                    component,
-                    std::path::Component::Prefix(_)
-                        | std::path::Component::RootDir
-                        | std::path::Component::CurDir
-                        | std::path::Component::ParentDir
-                )
-            })
-    };
-    if !safe_path(git_ref) || (!subpath.is_empty() && !safe_path(subpath)) {
+    // Reject absolute paths and `.` / `..` in every reference segment before
+    // any filesystem join. Owner/repo are single path components; ref and
+    // subpath may contain `/` but never traversal.
+    for (label, value) in [("owner", owner), ("repo", repo)] {
+        if !is_safe_single_component(value) {
+            anyhow::bail!("action reference {label} contains an unsafe path component");
+        }
+    }
+    if !is_safe_relative_path(git_ref) || (!subpath.is_empty() && !is_safe_relative_path(subpath)) {
         anyhow::bail!("action reference contains an unsafe path component");
     }
     Ok(())
 }
 
-fn set_action_repository_context(ctx: &mut StepContext<'_>, uses: &str) {
+fn is_safe_single_component(value: &str) -> bool {
+    !value.is_empty()
+        && !value.contains('/')
+        && !value.contains('\\')
+        && value != "."
+        && value != ".."
+}
+
+fn is_safe_relative_path(value: &str) -> bool {
+    let path = std::path::Path::new(value);
+    !value.is_empty()
+        && !path.is_absolute()
+        && !value.contains('\\')
+        && path.components().all(|component| {
+            matches!(component, std::path::Component::Normal(_))
+        })
+}
+
+fn ensure_under_actions_dir(actions_dir: &std::path::Path, action_dir: &std::path::Path) -> Result<()> {
+    let actions_canon = std::fs::canonicalize(actions_dir).unwrap_or_else(|_| actions_dir.to_path_buf());
+    // action_dir may not exist yet for path-only resolution; walk parents.
+    let mut probe = action_dir.to_path_buf();
+    let action_canon = loop {
+        if let Ok(canon) = std::fs::canonicalize(&probe) {
+            break canon;
+        }
+        if !probe.pop() {
+            break action_dir.to_path_buf();
+        }
+    };
+    if action_canon == actions_canon || action_canon.starts_with(&actions_canon) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "action path escapes _actions directory: {}",
+        action_dir.display()
+    );
+}
+
+pub(crate) fn set_action_repository_context(ctx: &mut StepContext<'_>, uses: &str) {
     // Set github.action to the step's context name (matches official runner behavior)
     ctx.job.set_github_context_value(
         "action",
@@ -317,6 +365,35 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resolved, staged);
+    }
+
+    #[test]
+    fn validate_remote_action_reference_rejects_traversal() {
+        assert!(validate_remote_action_reference("actions", "checkout", "v4", "").is_ok());
+        assert!(
+            validate_remote_action_reference("..", "checkout", "v4", "").is_err(),
+            "owner must not be .."
+        );
+        assert!(
+            validate_remote_action_reference("actions", ".", "v4", "").is_err(),
+            "repo must not be ."
+        );
+        assert!(
+            validate_remote_action_reference("actions", "checkout", "../v4", "").is_err(),
+            "ref must not traverse"
+        );
+        assert!(
+            validate_remote_action_reference("actions", "checkout", "v4", "../../etc").is_err(),
+            "subpath must not traverse"
+        );
+        assert!(
+            validate_remote_action_reference("/abs", "checkout", "v4", "").is_err(),
+            "owner must not be absolute"
+        );
+        assert!(
+            validate_remote_action_reference("actions", "checkout", "v4", "/abs").is_err(),
+            "subpath must not be absolute"
+        );
     }
 
     #[test]

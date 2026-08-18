@@ -9855,6 +9855,142 @@ async fn workflow_steps_update_prefers_runner_reported_step_names() {
     );
 }
 
+#[tokio::test]
+async fn workflow_steps_update_terminal_first_sighting_does_not_fake_zero_duration() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = submit_yaml(
+        &app,
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        "local/preloop",
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+    let (plan_id, agent_job_id) = {
+        let inner = state.inner.lock().await;
+        let request = inner
+            .job_requests
+            .values()
+            .find(|request| request.run_id.0.to_string() == run_id)
+            .expect("submitted run must have a job request");
+        (request.plan_id.clone(), request.agent_job_id.to_string())
+    };
+
+    // Fast built-in / quick steps often complete before any in-progress
+    // update is processed. First sighting is already terminal (status=6).
+    request_json(
+        &app,
+        Method::POST,
+        "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",
+        json!({
+            "workflow_run_backend_id": plan_id,
+            "workflow_job_run_backend_id": agent_job_id,
+            "steps": [{
+                "external_id": uuid::Uuid::new_v4().to_string(),
+                "number": 2,
+                "name": "Run echo hi",
+                "status": 6,
+                "conclusion": 2
+            }]
+        }),
+    )
+    .await;
+
+    let run = get_run_json(&app, &run_id).await;
+    let step = run["jobs_list"][0]["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["name"] == "Run echo hi")
+        .expect("step row");
+    assert!(
+        step.get("started_at").is_none() || step["started_at"].is_null(),
+        "terminal-first sighting must not invent started_at (got {step:?})"
+    );
+    assert!(
+        step.get("finished_at").and_then(|v| v.as_str()).is_some(),
+        "terminal-first sighting must still record finished_at (got {step:?})"
+    );
+}
+
+#[tokio::test]
+async fn workflow_steps_update_records_start_on_in_progress_then_finish() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = submit_yaml(
+        &app,
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        "local/preloop",
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+    let (plan_id, agent_job_id) = {
+        let inner = state.inner.lock().await;
+        let request = inner
+            .job_requests
+            .values()
+            .find(|request| request.run_id.0.to_string() == run_id)
+            .expect("submitted run must have a job request");
+        (request.plan_id.clone(), request.agent_job_id.to_string())
+    };
+
+    request_json(
+        &app,
+        Method::POST,
+        "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",
+        json!({
+            "workflow_run_backend_id": plan_id,
+            "workflow_job_run_backend_id": agent_job_id,
+            "steps": [{
+                "external_id": uuid::Uuid::new_v4().to_string(),
+                "number": 2,
+                "name": "Run echo hi",
+                "status": 3,
+                "conclusion": 0
+            }]
+        }),
+    )
+    .await;
+    request_json(
+        &app,
+        Method::POST,
+        "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",
+        json!({
+            "workflow_run_backend_id": plan_id,
+            "workflow_job_run_backend_id": agent_job_id,
+            "steps": [{
+                "external_id": uuid::Uuid::new_v4().to_string(),
+                "number": 2,
+                "name": "Run echo hi",
+                "status": 6,
+                "conclusion": 2
+            }]
+        }),
+    )
+    .await;
+
+    let run = get_run_json(&app, &run_id).await;
+    let step = run["jobs_list"][0]["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["name"] == "Run echo hi")
+        .expect("step row");
+    assert!(
+        step.get("started_at").and_then(|v| v.as_str()).is_some(),
+        "in_progress first sighting must set started_at (got {step:?})"
+    );
+    assert!(
+        step.get("finished_at").and_then(|v| v.as_str()).is_some(),
+        "terminal follow-up must set finished_at (got {step:?})"
+    );
+    assert!(step["conclusion"] == "success");
+}
+
 async fn get_run_json(app: &Router, run_id: &str) -> Value {
     request_json(
         app,

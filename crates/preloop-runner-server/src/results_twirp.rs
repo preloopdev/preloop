@@ -117,14 +117,24 @@ pub(crate) async fn twirp_workflow_steps_update(
 
                         if let Some(pos) = job_detail.steps.iter().position(|s| s.name == name) {
                             job_detail.steps[pos].conclusion = conclusion_str.to_owned();
+                            // First non-terminal sighting is the start signal.
+                            if !terminal && job_detail.steps[pos].started_at.is_none() {
+                                job_detail.steps[pos].started_at = Some(observed);
+                            }
                             if terminal && job_detail.steps[pos].finished_at.is_none() {
                                 job_detail.steps[pos].finished_at = Some(observed);
                             }
                         } else {
+                            // First time we hear about this step:
+                            // - in_progress → record started_at only
+                            // - already terminal → record finished_at only
+                            //   (do not invent started_at == finished_at, which
+                            //   forces duration 0 for fast steps that complete
+                            //   before any in-progress update is processed)
                             job_detail.steps.push(StepRecord {
                                 name,
                                 conclusion: conclusion_str.to_owned(),
-                                started_at: Some(observed),
+                                started_at: (!terminal).then_some(observed),
                                 finished_at: terminal.then_some(observed),
                             });
                         }
@@ -419,11 +429,18 @@ pub(crate) struct CacheV2GetDlUrlRequest {
 //
 // actions/cache@v4 speaks JSON, but sccache's GHA storage backend sends the
 // twirp protobuf encoding (content-type `application/protobuf`) and rejects
-// anything else with a 415. The GitHub results-api proto field numbers:
-//   CreateCacheEntryRequest:            key=1 version=2 size=3 scope=4 repository=5
-//   FinalizeCacheEntryUploadRequest:    key=1 version=2 scope=3 repository=4
-//   GetCacheEntryDownloadURLRequest:    key=1 version=2 restore_keys=3 scope=4 repository=5
-//   ...Response:                        signed_url=1 matched_key=2 / entry_id=1 message=2
+// anything else with a 415.
+//
+// Official ghac / @actions/cache CacheService field numbers (do not "fix"
+// the decoder to a flat key=1 layout — that breaks the wire format):
+//   CreateCacheEntryRequest:         metadata=1 key=2 version=3
+//   FinalizeCacheEntryUploadRequest: metadata=1 key=2 size_bytes=3 version=4
+//   GetCacheEntryDownloadURLRequest: metadata=1 key=2 restore_keys=3 version=4
+//   GetCacheEntryDownloadURLResponse: ok=1 signed_download_url=2 matched_key=3
+//   CreateCacheEntryResponse:        ok=1 signed_upload_url=2
+//   FinalizeCacheEntryUploadResponse: ok=1 entry_id=2
+// Scope / repository live inside CacheMetadata (field 1), not as top-level
+// key=1 style fields. See `pb_cache_request` below.
 
 fn pb_varint(buf: &[u8], pos: usize) -> Option<(u64, usize)> {
     let mut value: u64 = 0;
