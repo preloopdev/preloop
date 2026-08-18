@@ -1541,6 +1541,35 @@ fn effective_preloop_home() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".preloop")))
 }
 
+/// Candidate locations for the SmolVM guest agent rootfs, in probe order.
+///
+/// SmolVM keeps its data directory — and the agent rootfs inside it — at the
+/// platform default (`~/Library/Application Support/smolvm` on macOS,
+/// `~/.local/share/smolvm` on Linux) or wherever `SMOLVM_DATA_DIR` points.
+/// Preloop derives its own registry dir from the effective Preloop home and
+/// may isolate the child's `HOME` on macOS, so the REAL host locations must
+/// be probed explicitly or a standard install's agent rootfs is never found
+/// (the isolated HOME sends smolvm to an empty directory).
+fn agent_rootfs_candidates(host_home: Option<&Path>, data_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(data_dir) = data_dir {
+        candidates.push(data_dir.join("agent-rootfs"));
+    }
+    if let Some(home) = host_home {
+        #[cfg(target_os = "macos")]
+        {
+            candidates.push(home.join("Library/Application Support/smolvm/agent-rootfs"));
+            candidates.push(home.join(".smolvm/agent-rootfs"));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            candidates.push(home.join(".local/share/smolvm/agent-rootfs"));
+            candidates.push(home.join(".smolvm/agent-rootfs"));
+        }
+    }
+    candidates
+}
+
 fn smolvm_runtime_env(binary: Option<&Path>) -> Vec<(String, std::ffi::OsString)> {
     let host_home = std::env::var_os("HOME").map(PathBuf::from);
     let mut env = Vec::new();
@@ -1568,18 +1597,13 @@ fn smolvm_runtime_env(binary: Option<&Path>) -> Vec<(String, std::ffi::OsString)
     }
 
     // HOME may be isolated above, so preserve the host installation assets
-    // explicitly for the child SmolVM process. Official installs keep the
-    // agent rootfs inside the SmolVM data directory, so probe that first,
-    // then the historical `~/.smolvm` location.
+    // explicitly for the child SmolVM process: the agent rootfs lives in the
+    // REAL host's platform data dir, which the isolated HOME would miss.
     if std::env::var_os("SMOLVM_AGENT_ROOTFS").is_none() {
-        let mut candidates = Vec::new();
-        if let Some(data_dir) = &data_dir {
-            candidates.push(data_dir.join("agent-rootfs"));
-        }
-        if let Some(home) = host_home.as_ref() {
-            candidates.push(home.join(".smolvm/agent-rootfs"));
-        }
-        if let Some(path) = candidates.into_iter().find(|path| path.is_dir()) {
+        if let Some(path) = agent_rootfs_candidates(host_home.as_deref(), data_dir.as_deref())
+            .into_iter()
+            .find(|path| path.is_dir())
+        {
             env.push(("SMOLVM_AGENT_ROOTFS".to_owned(), path.into_os_string()));
         }
     }
@@ -2037,6 +2061,37 @@ async fn forward(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn agent_rootfs_candidates_probe_platform_then_legacy() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let home = dir.path();
+        #[cfg(target_os = "macos")]
+        let platform = home.join("Library/Application Support/smolvm/agent-rootfs");
+        #[cfg(not(target_os = "macos"))]
+        let platform = home.join(".local/share/smolvm/agent-rootfs");
+        let legacy = home.join(".smolvm/agent-rootfs");
+        std::fs::create_dir_all(&platform).expect("platform agent rootfs");
+        std::fs::create_dir_all(&legacy).expect("legacy agent rootfs");
+        let found = agent_rootfs_candidates(Some(home), None)
+            .into_iter()
+            .find(|path| path.is_dir())
+            .expect("a candidate exists");
+        assert_eq!(
+            found, platform,
+            "the platform default must be probed before the legacy location"
+        );
+
+        // An explicit SMOLVM_DATA_DIR wins over the platform defaults.
+        let explicit = home.join("custom/agent-rootfs");
+        std::fs::create_dir_all(&explicit).expect("explicit agent rootfs");
+        let found = agent_rootfs_candidates(Some(home), Some(home.join("custom").as_path()))
+            .into_iter()
+            .find(|path| path.is_dir())
+            .expect("explicit candidate exists");
+        assert_eq!(found, explicit);
+    }
+
     use super::*;
 
     #[test]
