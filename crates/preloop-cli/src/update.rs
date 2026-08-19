@@ -1028,7 +1028,9 @@ mod tests {
     #[tokio::test]
     async fn compatibility_requires_minimum_version_and_mount_socket() {
         let directory = tempfile::tempdir().unwrap();
-        let minimum = Version::parse(SMOLVM_MIN_VERSION).unwrap();
+        // Parse-check the floor constant; the loop below pins the concrete
+        // versions that must pass or fail against it.
+        let _minimum = Version::parse(SMOLVM_MIN_VERSION).unwrap();
         for (version, flag, expected) in [
             ("1.8.1", "--mount-socket <HOST:GUEST>", true),
             ("1.8.2", "--mount-socket <HOST:GUEST>", true),

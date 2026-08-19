@@ -42,6 +42,10 @@ pub struct GithubSetupArgs {
     #[arg(long)]
     pub pem_file: Option<PathBuf>,
 
+    /// Create an additional App in the registry via browser (with --via app).
+    #[arg(long)]
+    pub add: bool,
+
     /// Create the App under this organization instead of your personal
     /// account (with --via app, browser flow).
     #[arg(long)]
@@ -94,6 +98,7 @@ impl std::fmt::Debug for GithubSetupArgs {
             .field("via", &self.via)
             .field("app_id", &self.app_id)
             .field("pem_file", &self.pem_file)
+            .field("add", &self.add)
             .field("org", &self.org)
             .field("port", &self.port)
             .field("public_url", &self.public_url)
@@ -264,22 +269,39 @@ async fn setup_app(args: &GithubSetupArgs) -> anyhow::Result<()> {
             // the first installed and minting tokens, and the operator almost
             // certainly meant "point the one I have at this URL".
             let existing = preloop_runner_server::config::load_config()?.github;
-            if let (Some(app_id), Some(pem)) = (existing.app_id, existing.app_pem) {
-                return match args.public_url.as_deref() {
-                    Some(public_url) => {
-                        enable_webhooks(&app_id, &pem, public_url, existing.webhook_secret).await
-                    }
-                    None => {
-                        println!(
-                            "App {app_id} is already configured in {}.\n\
-                             \x20 --public-url <URL>  point its webhook at a reachable address\n\
-                             \x20 --app-id/--pem-file replace it with a different App\n\
-                             Delete the [github] keys from that file to start over.",
-                            preloop_runner_server::config::config_path().display()
-                        );
-                        Ok(())
-                    }
-                };
+            let has_configured_app = (existing.app_id.is_some() && existing.app_pem.is_some())
+                || !existing.apps.is_empty();
+            if has_configured_app && !args.add {
+                if let (Some(app_id), Some(pem)) = (&existing.app_id, &existing.app_pem) {
+                    return match args.public_url.as_deref() {
+                        Some(public_url) => {
+                            enable_webhooks(app_id, pem, public_url, existing.webhook_secret).await
+                        }
+                        None => {
+                            let primary_id = existing.app_id.as_deref().unwrap_or("configured");
+                            println!(
+                                "App {primary_id} is already configured in {}.\n\
+                                 \x20 --public-url <URL>  point its webhook at a reachable address\n\
+                                 \x20 --add              create an additional App via browser and add it to registry\n\
+                                 \x20 --app-id/--pem-file add or update an App with existing credentials\n\
+                                 Delete the [github] keys from that file to start over.",
+                                preloop_runner_server::config::config_path().display()
+                            );
+                            Ok(())
+                        }
+                    };
+                }
+                // Only registry Apps are configured — there is no legacy
+                // primary App to point at a URL, and launching the browser
+                // flow would create another App the operator did not ask
+                // for. Say how to proceed instead.
+                println!(
+                    "GitHub Apps are already configured in the `github.apps` registry in {}.\n\
+                     \x20 --add              create an additional App via browser and add it to registry\n\
+                     \x20 --app-id/--pem-file add or update an App with existing credentials",
+                    preloop_runner_server::config::config_path().display()
+                );
+                return Ok(());
             }
             return setup_app_via_browser(args).await;
         }
@@ -312,6 +334,12 @@ async fn setup_app(args: &GithubSetupArgs) -> anyhow::Result<()> {
 
 /// Persist App credentials to the engine's config file.
 ///
+/// Supports both the primary legacy App and additional Apps in `github.apps`:
+/// - If `app_id` matches `config.github.app_id`, updates the legacy fields in place.
+/// - If `app_id` matches an existing entry in `config.github.apps`, updates that entry in place.
+/// - If `config.github.app_id` is empty and `config.github.apps` is empty, writes to the legacy fields.
+/// - If `config.github.app_id` is set to a different App, appends a new `AppConfig` to `config.github.apps`.
+///
 /// The webhook secret only exists on the manifest path — GitHub generates it
 /// during creation — so it is written when present and left untouched
 /// otherwise, which keeps a manual re-run from clearing a working secret.
@@ -321,14 +349,46 @@ fn save_app_credentials(
     webhook_secret: Option<String>,
 ) -> anyhow::Result<PathBuf> {
     let mut config = preloop_runner_server::config::load_config()?;
-    config.github.app_id = Some(app_id.to_owned());
-    config.github.app_pem = Some(pem.to_owned());
     if config.github.mint_failure.is_none() {
         config.github.mint_failure = Some("local".into());
     }
-    if webhook_secret.is_some() {
-        config.github.webhook_secret = webhook_secret;
+
+    if let Some(existing_primary) = &config.github.app_id {
+        if existing_primary == app_id {
+            config.github.app_pem = Some(pem.to_owned());
+            if webhook_secret.is_some() {
+                config.github.webhook_secret = webhook_secret;
+            }
+            return write_config(&config);
+        }
     }
+
+    if let Some(existing) = config.github.apps.iter_mut().find(|a| a.app_id == app_id) {
+        existing.pem = pem.to_owned();
+        if webhook_secret.is_some() {
+            existing.webhook_secret = webhook_secret;
+        }
+        return write_config(&config);
+    }
+
+    if config.github.app_id.is_none() && config.github.apps.is_empty() {
+        config.github.app_id = Some(app_id.to_owned());
+        config.github.app_pem = Some(pem.to_owned());
+        if webhook_secret.is_some() {
+            config.github.webhook_secret = webhook_secret;
+        }
+        return write_config(&config);
+    }
+
+    config
+        .github
+        .apps
+        .push(preloop_runner_server::config::AppConfig {
+            app_id: app_id.to_owned(),
+            pem: pem.to_owned(),
+            webhook_secret,
+            installation_id: None,
+        });
     write_config(&config)
 }
 
@@ -394,7 +454,11 @@ async fn enable_webhooks(
     preloop_runner_server::github_app::set_app_webhook_config(app_id, pem, &hook_url, &secret)
         .await?;
     let mut config = preloop_runner_server::config::load_config()?;
-    config.github.webhook_secret = Some(secret);
+    if let Some(existing) = config.github.apps.iter_mut().find(|a| a.app_id == app_id) {
+        existing.webhook_secret = Some(secret.clone());
+    } else {
+        config.github.webhook_secret = Some(secret.clone());
+    }
     let path = write_config(&config)?;
     println!("App {app_id} webhook now delivers to {hook_url}");
     println!("Secret stored in {}", path.display());
@@ -668,25 +732,41 @@ pub(crate) async fn cmd_doctor(args: DoctorArgs) -> anyhow::Result<()> {
     println!("config: {}", path.display());
     let config = preloop_runner_server::config::load_config()?;
     let mut failed = false;
+    let mut app_found = false;
 
-    match (&config.github.app_id, &config.github.app_pem) {
-        (Some(app_id), Some(pem)) => {
-            println!(
-                "github app: configured (id {app_id}, mint failure = {})",
-                config.github.mint_failure.as_deref().unwrap_or("local")
-            );
-            if !args.repos.is_empty() {
-                if let Err(error) = doctor_app(app_id, pem, &args.repos).await {
-                    println!("{error:#}");
-                    failed = true;
-                }
-            } else {
-                println!("  (pass --repo owner/name to verify against GitHub)");
+    if let (Some(app_id), Some(pem)) = (&config.github.app_id, &config.github.app_pem) {
+        app_found = true;
+        println!(
+            "github app: configured (id {app_id}, mint failure = {})",
+            config.github.mint_failure.as_deref().unwrap_or("local")
+        );
+        if !args.repos.is_empty() {
+            if let Err(error) = doctor_app(app_id, pem, &args.repos).await {
+                println!("{error:#}");
+                failed = true;
             }
+        } else {
+            println!("  (pass --repo owner/name to verify against GitHub)");
         }
-        _ => {
-            println!("github app: not configured (jobs get no GitHub authority)");
+    }
+    for app in &config.github.apps {
+        app_found = true;
+        println!(
+            "github app: configured (id {}, mint failure = {})",
+            app.app_id,
+            config.github.mint_failure.as_deref().unwrap_or("local")
+        );
+        if !args.repos.is_empty() {
+            if let Err(error) = doctor_app(&app.app_id, &app.pem, &args.repos).await {
+                println!("{error:#}");
+                failed = true;
+            }
+        } else if config.github.app_id.is_none() {
+            println!("  (pass --repo owner/name to verify against GitHub)");
         }
+    }
+    if !app_found {
+        println!("github app: not configured (jobs get no GitHub authority)");
     }
     if let Some(pat) = &config.github.pat {
         println!(

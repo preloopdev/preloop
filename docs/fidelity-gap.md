@@ -32,6 +32,32 @@ runner.server reference: `ChristopherHX/runner.server` v3.14.0 (commit `06964614
 
 (overridable via `PRELOOP_UPSTREAM_RUNNER_SERVER_REF`). 
 
+## GitHub App dispatch API compatibility (REST surface)
+
+Preloop serves the Actions-relevant subset of the GitHub REST API so
+third-party GitHub Apps can trigger runs against it with no code changes:
+
+- `POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches` —
+  `workflow_dispatch` with `ref` + `inputs`, validated against the workflow's
+  declared trigger and input schema (422 on failure), 409 when the workflow is
+  not dispatch-triggered.
+- `POST /repos/{owner}/{repo}/dispatches` — `repository_dispatch` broadcast
+  (`event_type` + `client_payload`); every workflow with a matching
+  `on.repository_dispatch.types` entry runs.
+- `GET /repos/{owner}/{repo}/actions/workflows` and
+  `GET /repos/{owner}/{repo}/actions/runs` — polling convenience, github.com
+  response shape.
+
+Auth follows the github.com model: bearer installation tokens (own App offline
+via a mint ledger; any App online via a GitHub round-trip), own-App JWTs, a
+PAT, or the system token; `actions: write` is required for dispatch. See
+[`docs/github-tokens.md` §7](./github-tokens.md).
+
+Deliberately **not** implemented: numeric workflow/run ids (filenames only —
+the read endpoints expose deterministic hashes), the rest of the GitHub REST
+API beyond the Actions-facing subset, and GitHub Enterprise Server parity
+(GHE is the *model* for this surface, not a target).
+
 ---
 
 ## 0b. v2.336.0 delta (2026-07-20)

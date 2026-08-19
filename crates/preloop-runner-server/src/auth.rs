@@ -349,7 +349,7 @@ pub(crate) async fn runner_surface_only(
     mut request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    const DENIED_PREFIXES: &[&str] = &["/internal/", "/runs/"];
+    const DENIED_PREFIXES: &[&str] = &["/internal/", "/runs/", "/repos/"];
     let path = request.uri().path();
     let worker_debug_route = is_worker_debug_route(request.method(), path);
     let denied = DENIED_PREFIXES

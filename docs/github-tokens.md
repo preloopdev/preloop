@@ -288,6 +288,39 @@ Regardless of which branch is taken, `ACTIONS_RUNTIME_TOKEN` and the pinned
 `actions/checkout` token stay local HMAC JWTs, so cache, artifacts, logs, OIDC,
 and local-workspace checkout behave identically in all three cases.
 
+## 7. Dispatch API authentication (GitHub App API compatibility)
+
+The github.com-compatible dispatch endpoints
+(`POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches`,
+`POST /repos/{owner}/{repo}/dispatches`) authenticate through a credential
+chain rather than the native bearer alone:
+
+| Credential | Verification | Works offline? |
+|---|---|---|
+| System token | Native bearer comparison | yes |
+| PAT (`PRELOOP_GITHUB_TOKEN`) | Constant-time compare | yes |
+| Own-App JWT | RS256 verified against the registered App PEM | yes |
+| Own-App installation token | In-memory mint ledger (hash → installation, repo, permissions, expiry) | yes |
+| Third-party App installation token | github.com round-trip: `GET /installation` + `GET /installation/repositories`; requires `actions: write`; 60s cache; **fails closed** on network error | no |
+
+Third-party App JWTs are never accepted — there is no PEM to verify them with.
+The `sender` / `github.actor` for a dispatched run is:
+- own App installation token (offline mint ledger) → `{slug}[bot]` resolved via
+  `GET /app` (cached); `{app_id}[bot]` when github.com is unreachable
+- third-party installation token (online) → `{slug}[bot]`, falling back to
+  `{account.login}[bot]` when the slug is absent
+- own-App JWT → `{slug}[bot]` (or `{app_id}[bot]` offline)
+- PAT → `GET /user` login when github.com is reachable; otherwise the dedicated
+  placeholder `preloop-pat` (never the system-bearer identity `preloop-system`).
+  Failed PAT actor lookups are not cached, so a transient outage does not pin
+  the placeholder after github.com recovers.
+- system token → `preloop-system`
+
+Installation-token dispatches carry the `AppDispatch` trust tier, which allows
+repository secrets (the caller has proven the endpoint's write permission,
+matching github.com). System / PAT / own-App JWT dispatches stay on
+`AdminManual`.
+
 ---
 
 ## Related

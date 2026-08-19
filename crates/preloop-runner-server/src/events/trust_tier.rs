@@ -26,6 +26,13 @@ pub enum TrustTier {
     PullRequestTarget,
     /// Manually dispatched via `workflow_dispatch`.
     AdminManual,
+    /// Dispatched through the GitHub-compatible REST API by a validated
+    /// installation token (the caller proved `actions: write`). Same trust
+    /// posture as `AdminManual` — repo secrets are injected, matching
+    /// github.com, where an App holding `actions: write` dispatches runs
+    /// that receive secrets — but the provenance is distinct so runs from
+    /// third-party Apps are auditable.
+    AppDispatch,
     /// Fired by a release or deployment event.
     Deployment,
     /// Fired by the internal schedule executor.
@@ -44,6 +51,7 @@ impl TrustTier {
                 | TrustTier::Internal
                 | TrustTier::InternalPullRequest
                 | TrustTier::AdminManual
+                | TrustTier::AppDispatch
                 | TrustTier::Deployment
                 | TrustTier::Schedule
         )

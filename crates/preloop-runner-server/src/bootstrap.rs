@@ -487,6 +487,46 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             });
         }
     }
+    // Read back the App's webhook event subscription at startup (D7). A new
+    // App created from the manifest gets the expanded default events, but an
+    // App created earlier — or narrowed by hand — may miss trigger events,
+    // and GitHub cannot change a subscription through the API. Warn loudly
+    // so the operator ticks the missing events in App settings.
+    if let Some(app) = state.github_app.clone() {
+        let app_id = app.app_id.clone();
+        tokio::spawn(async move {
+            match app.read_app_events().await {
+                Ok(events) => crate::github_app::warn_missing_trigger_events(&app_id, &events),
+                Err(error) => warn!(
+                    app_id,
+                    ?error,
+                    "could not read back the GitHub App's event subscription at startup"
+                ),
+            }
+        });
+    }
+    // Additional registered Apps (`github.apps` / `PRELOOP_GITHUB_APPS_JSON`)
+    // get the same startup read-back. The legacy default App — always the
+    // registry's `default_index` — is already covered by the branch above.
+    if let Some(registry) = state.github_apps.as_ref() {
+        for (index, app) in registry.apps.iter().enumerate() {
+            if index == registry.default_index {
+                continue;
+            }
+            let app = app.clone();
+            tokio::spawn(async move {
+                let app_id = app.app_id.clone();
+                match app.read_app_events().await {
+                    Ok(events) => crate::github_app::warn_missing_trigger_events(&app_id, &events),
+                    Err(error) => warn!(
+                        app_id,
+                        ?error,
+                        "could not read back the GitHub App's event subscription at startup"
+                    ),
+                }
+            });
+        }
+    }
     if let Some(path) = &config.record_flows {
         let file = std::fs::OpenOptions::new()
             .create(true)

@@ -321,6 +321,100 @@ mod tests {
         }
     }
 
+    proptest! {
+        #[test]
+        fn workflow_dispatch_ref_resolution(
+            default_branch in branch_name(),
+            branch in branch_name(),
+            tag in tag_name(),
+        ) {
+            // An explicit refs/... ref passes through untouched.
+            let payload = serde_json::json!({
+                "ref": format!("refs/heads/{branch}"),
+                "repository": { "default_branch": &default_branch },
+            });
+            let events = crate::events::workflow_dispatch::Adapter.project(&payload);
+            prop_assert_eq!(events.len(), 1);
+            prop_assert_eq!(&events[0].git_ref, &format!("refs/heads/{branch}"));
+
+            // A bare ref is treated as a branch.
+            let payload = serde_json::json!({
+                "ref": &branch,
+                "repository": { "default_branch": &default_branch },
+            });
+            let events = crate::events::workflow_dispatch::Adapter.project(&payload);
+            prop_assert_eq!(&events[0].git_ref, &format!("refs/heads/{branch}"));
+
+            // A bare ref with ref_type=tag is treated as a tag.
+            let payload = serde_json::json!({
+                "ref": &tag,
+                "ref_type": "tag",
+                "repository": { "default_branch": &default_branch },
+            });
+            let events = crate::events::workflow_dispatch::Adapter.project(&payload);
+            prop_assert_eq!(&events[0].git_ref, &format!("refs/tags/{tag}"));
+
+            // An absent ref defaults to the repository default branch.
+            let payload = serde_json::json!({
+                "repository": { "default_branch": &default_branch },
+            });
+            let events = crate::events::workflow_dispatch::Adapter.project(&payload);
+            prop_assert_eq!(&events[0].git_ref, &format!("refs/heads/{default_branch}"));
+        }
+
+        #[test]
+        fn workflow_dispatch_inputs_passthrough(
+            default_branch in branch_name(),
+            input_keys in proptest::collection::vec("[a-z_]{1,12}", 0..8),
+            values in proptest::collection::vec("\\PC{0,20}", 0..8),
+        ) {
+            let mut inputs = serde_json::Map::new();
+            for (key, value) in input_keys.iter().zip(values.iter()) {
+                inputs.insert(key.clone(), serde_json::Value::String(value.clone()));
+            }
+            let payload = serde_json::json!({
+                "repository": { "default_branch": &default_branch },
+                "inputs": inputs,
+            });
+            let events = crate::events::workflow_dispatch::Adapter.project(&payload);
+            prop_assert_eq!(events.len(), 1);
+            prop_assert_eq!(
+                events[0].payload.get("inputs"),
+                Some(&serde_json::json!(inputs)),
+                "workflow_dispatch inputs must survive projection verbatim"
+            );
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn repository_dispatch_client_payload_passthrough(
+            default_branch in branch_name(),
+            event_type in "[a-z0-9_-]{1,40}",
+            payload_keys in proptest::collection::vec("[a-z_]{1,12}", 0..8),
+            values in proptest::collection::vec("\\PC{0,20}", 0..8),
+        ) {
+            let mut client_payload = serde_json::Map::new();
+            for (key, value) in payload_keys.iter().zip(values.iter()) {
+                client_payload.insert(key.clone(), serde_json::Value::String(value.clone()));
+            }
+            let payload = serde_json::json!({
+                "action": &event_type,
+                "client_payload": client_payload,
+                "repository": { "default_branch": &default_branch },
+            });
+            let events = crate::events::repository_dispatch::Adapter.project(&payload);
+            prop_assert_eq!(events.len(), 1);
+            prop_assert_eq!(&events[0].event, "repository_dispatch");
+            prop_assert_eq!(&events[0].activity_type, &Some(event_type.clone()));
+            prop_assert_eq!(
+                events[0].payload.get("client_payload"),
+                Some(&serde_json::json!(client_payload)),
+                "repository_dispatch client_payload must survive projection verbatim"
+            );
+        }
+    }
+
     // --- Non-proptest tests for parser filter validity ---
 
     #[test]

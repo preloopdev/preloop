@@ -57,9 +57,88 @@ pub struct GitHubConfig {
     /// Env: `PRELOOP_GITHUB_GRAPHQL_URL`.
     #[serde(default)]
     pub graphql_url: Option<String>,
+    /// Additional registered GitHub Apps beyond the legacy single-App env
+    /// vars (which remain the default first entry). Lets several Apps
+    /// coexist: each gets its own webhook secret in the receiver and its own
+    /// installation tokens for minting. Env override: `PRELOOP_GITHUB_APPS_JSON`
+    /// (a JSON array of the same shape).
+    #[serde(default)]
+    pub apps: Vec<AppConfig>,
     /// Auto-PR policy for webhook-driven push runs (see [`PrConfig`]).
     #[serde(default)]
     pub pr: PrConfig,
+}
+
+/// One additional GitHub App in the multi-App registry (`github.apps`).
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct AppConfig {
+    /// Numeric App id, used as the `iss` claim of the App JWT. Accepts a
+    /// string or integer on deserialize — GitHub App ids are numbers, and
+    /// `github.apps` / `PRELOOP_GITHUB_APPS_JSON` entries are written by
+    /// hand, so `app_id: 12345` and `app_id: "12345"` must both load.
+    #[serde(deserialize_with = "de_string_or_integer")]
+    pub app_id: String,
+    /// App private key PEM (inline).
+    pub pem: String,
+    /// Webhook secret for `X-Hub-Signature-256` verification, when the App
+    /// has its own (the legacy `PRELOOP_WEBHOOK_SECRET` covers the default
+    /// App).
+    #[serde(default)]
+    pub webhook_secret: Option<String>,
+    /// Explicit installation id, bypassing installation discovery for
+    /// single-installation deployments of this App.
+    #[serde(default)]
+    pub installation_id: Option<u64>,
+}
+
+/// Accept a string or integer for the numeric `app_id`, normalizing to a
+/// string. GitHub App ids are numbers; registry entries are written by hand,
+/// so both shapes must load. Anything else is a typo worth failing on.
+fn de_string_or_integer<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Visitor;
+
+    struct StringOrInteger;
+
+    impl<'de> Visitor<'de> for StringOrInteger {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a string or integer")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(value.to_owned())
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(value)
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(value.to_string())
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(value.to_string())
+        }
+    }
+
+    deserializer.deserialize_any(StringOrInteger)
 }
 
 /// When a webhook-driven push run succeeds, should the server open a pull
@@ -126,6 +205,7 @@ impl std::fmt::Debug for GitHubConfig {
             .field("mint_failure", &self.mint_failure)
             .field("pat", &redacted(self.pat.is_some()))
             .field("webhook_secret", &redacted(self.webhook_secret.is_some()))
+            .field("apps", &self.apps.len())
             .field("pr", &self.pr)
             .finish()
     }
@@ -403,6 +483,7 @@ mod tests {
                 server_url: None,
                 api_url: None,
                 graphql_url: None,
+                apps: vec![],
                 pr: PrConfig::default(),
             },
             secrets: BTreeMap::from([("DOCKERHUB_TOKEN".into(), "abc123".into())]),

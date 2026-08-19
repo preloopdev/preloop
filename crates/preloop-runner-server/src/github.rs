@@ -161,7 +161,7 @@ pub(crate) fn github_api_base() -> String {
 }
 
 async fn resolve_check_run_token(shared: &Arc<SharedState>, repo: &str) -> Option<String> {
-    if let Some(app_creds) = &shared.state.github_app {
+    if let Some(app_creds) = crate::github_app::select_app_for_repo(shared, repo).await {
         let mut permissions = std::collections::BTreeMap::new();
         permissions.insert("checks".to_owned(), "write".to_owned());
         // The App mint intermittently 422s while the installation grants are
@@ -169,7 +169,7 @@ async fn resolve_check_run_token(shared: &Arc<SharedState>, repo: &str) -> Optio
         // stranding the check run in `queued` (the fallback JWT cannot
         // PATCH check runs and GitHub keeps showing them pending).
         for attempt in 0..2 {
-            match crate::github_app::get_or_mint_token(app_creds, repo, &permissions).await {
+            match crate::github_app::get_or_mint_token(&app_creds, repo, &permissions).await {
                 Ok(token) => return Some(token),
                 Err(error) if attempt == 0 => {
                     tracing::warn!(
@@ -575,8 +575,85 @@ pub(crate) async fn fetch_workflows_at(
     api_base: &str,
 ) -> anyhow::Result<BTreeMap<String, String>> {
     if let Some(base_path) = &shared.state.local_workspace {
-        let workflows_dir = base_path.join(".github/workflows");
         let mut workflows = BTreeMap::new();
+        // A dispatch for a branch other than the checked-out tree must read
+        // the workflow definitions from that ref, not from the working tree.
+        if !git_ref.is_empty() {
+            // A ref beginning with '-' would be parsed by git as an option
+            // (e.g. `git rev-parse --verify -x^{commit}`); treat it as
+            // unresolvable and fall back to the checked-out tree.
+            if git_ref.starts_with('-') {
+                warn!(
+                    %git_ref,
+                    workspace = %base_path.display(),
+                    "git_ref starts with '-' and is not a valid ref; falling back to the checked-out tree",
+                );
+            } else {
+                let commitish: &str = &format!("{git_ref}^{{commit}}");
+                let resolved = tokio::process::Command::new("git")
+                    .arg("-C")
+                    .arg(base_path)
+                    .args(["rev-parse", "--verify", commitish])
+                    .output()
+                    .await?;
+                if resolved.status.success() {
+                    let listing = tokio::process::Command::new("git")
+                        .arg("-C")
+                        .arg(base_path)
+                        .args([
+                            "ls-tree",
+                            "-r",
+                            "--name-only",
+                            git_ref,
+                            "--",
+                            ".github/workflows",
+                        ])
+                        .output()
+                        .await?;
+                    if !listing.status.success() {
+                        anyhow::bail!(
+                            "git ls-tree for ref {git_ref:?} in {} failed: {}",
+                            base_path.display(),
+                            String::from_utf8_lossy(&listing.stderr),
+                        );
+                    }
+                    for line in String::from_utf8_lossy(&listing.stdout).lines() {
+                        let path = line.trim();
+                        if path.is_empty() {
+                            continue;
+                        }
+                        let name = path.rsplit('/').next().unwrap_or(path);
+                        if name.ends_with(".yml") || name.ends_with(".yaml") {
+                            let path_ref: &str = &format!("{git_ref}:{path}");
+                            let content = tokio::process::Command::new("git")
+                                .arg("-C")
+                                .arg(base_path)
+                                .args(["show", path_ref])
+                                .output()
+                                .await?;
+                            if !content.status.success() {
+                                anyhow::bail!(
+                                    "git show {path_ref:?} in {} failed: {}",
+                                    base_path.display(),
+                                    String::from_utf8_lossy(&content.stderr),
+                                );
+                            }
+                            workflows.insert(
+                                name.to_owned(),
+                                String::from_utf8_lossy(&content.stdout).into_owned(),
+                            );
+                        }
+                    }
+                    return Ok(workflows);
+                }
+                warn!(
+                    %git_ref,
+                    workspace = %base_path.display(),
+                    "git_ref does not resolve in the local workspace; falling back to the checked-out tree",
+                );
+            }
+        }
+        let workflows_dir = base_path.join(".github/workflows");
         if workflows_dir.exists() {
             let mut dir = tokio::fs::read_dir(workflows_dir).await?;
             while let Some(entry) = dir.next_entry().await? {
@@ -595,9 +672,9 @@ pub(crate) async fn fetch_workflows_at(
         }
         Ok(workflows)
     } else {
-        let token = if let Some(app) = &shared.state.github_app {
+        let token = if let Some(app) = crate::github_app::select_app_for_repo(shared, repo).await {
             let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
-            Some(crate::github_app::get_or_mint_token_at(api_base, app, repo, &permissions).await?)
+            Some(crate::github_app::get_or_mint_token_at(api_base, &app, repo, &permissions).await?)
         } else {
             std::env::var("PRELOOP_GITHUB_TOKEN").ok()
         };
@@ -685,12 +762,18 @@ async fn fetch_remote_workflows(
     Ok(workflows)
 }
 
-async fn resolve_ref_sha(
-    local_workspace: &Option<PathBuf>,
+/// Resolve `git_ref` to a commit SHA, using the same credential ladder as
+/// [`fetch_workflows`]: a local workspace is answered by `git rev-parse`,
+/// otherwise the PAT or an App-minted `contents: read` installation token
+/// queries the GitHub commits API. Returns `Ok(None)` when the ref does not
+/// resolve (unknown ref, offline without a workspace) — the caller decides
+/// what that means.
+pub(crate) async fn resolve_ref_sha(
+    shared: &Arc<SharedState>,
     repository: &str,
     git_ref: &str,
 ) -> anyhow::Result<Option<String>> {
-    if let Some(workspace) = local_workspace {
+    if let Some(workspace) = &shared.state.local_workspace {
         let output = tokio::process::Command::new("git")
             .arg("-C")
             .arg(workspace)
@@ -707,7 +790,18 @@ async fn resolve_ref_sha(
         }
         return Ok(None);
     }
-    let Some(token) = std::env::var("PRELOOP_GITHUB_TOKEN").ok() else {
+    let api_base = github_api_base();
+    let token = if let Some(app) = crate::github_app::select_app_for_repo(shared, repository).await
+    {
+        let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
+        Some(
+            crate::github_app::get_or_mint_token_at(&api_base, &app, repository, &permissions)
+                .await?,
+        )
+    } else {
+        std::env::var("PRELOOP_GITHUB_TOKEN").ok()
+    };
+    let Some(token) = token else {
         return Ok(None);
     };
     let commit_ref = git_ref
@@ -717,7 +811,7 @@ async fn resolve_ref_sha(
     let response = crate::shared_http::CLIENT
         .clone()
         .get(format!(
-            "https://api.github.com/repos/{repository}/commits/{commit_ref}"
+            "{api_base}/repos/{repository}/commits/{commit_ref}"
         ))
         .header("User-Agent", "preloop")
         .header("Authorization", format!("Bearer {token}"))
@@ -799,9 +893,9 @@ pub(crate) async fn resolve_pr_changed_files_at(
     pr_number: u64,
     api_base: &str,
 ) -> anyhow::Result<Option<Vec<String>>> {
-    let token = if let Some(app) = &shared.state.github_app {
+    let token = if let Some(app) = crate::github_app::select_app_for_repo(shared, repo).await {
         let permissions = BTreeMap::from([("pull_requests".to_owned(), "read".to_owned())]);
-        Some(crate::github_app::get_or_mint_token_at(api_base, app, repo, &permissions).await?)
+        Some(crate::github_app::get_or_mint_token_at(api_base, &app, repo, &permissions).await?)
     } else {
         std::env::var("PRELOOP_GITHUB_TOKEN").ok()
     };
@@ -820,17 +914,24 @@ pub(crate) async fn handle_github_webhook(
     body: bytes::Bytes,
 ) -> Result<impl IntoResponse, StatusCode> {
     // 1. Verify Signature
-    let secret = shared.state.webhook_secret.as_ref().ok_or_else(|| {
-        warn!("Webhook secret not configured on server, rejecting request");
-        StatusCode::UNAUTHORIZED
-    })?;
-
     let sig_header = headers
         .get("x-hub-signature-256")
         .and_then(|h| h.to_str().ok())
         .ok_or(StatusCode::UNAUTHORIZED)?;
-
-    if !verify_signature(secret, &body, sig_header) {
+    // Every registered App's secret is a candidate (D6): a payload signed by
+    // any App preloop fronts is accepted, one signed by none is rejected.
+    let secrets: Vec<String> = match &shared.state.github_apps {
+        Some(apps) => apps.webhook_secrets(shared.state.webhook_secret.as_deref()),
+        None => shared.state.webhook_secret.clone().into_iter().collect(),
+    };
+    if secrets.is_empty() {
+        warn!("No webhook secret is configured on the server, rejecting request");
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    if !secrets
+        .iter()
+        .any(|secret| verify_signature(secret, &body, sig_header))
+    {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
@@ -1195,13 +1296,7 @@ async fn process_github_webhook(
             })?;
         let resolved_sha = match &effective.sha {
             Some(sha) => sha.clone(),
-            None => match resolve_ref_sha(
-                &shared.state.local_workspace,
-                &repo_full_name,
-                &effective.git_ref,
-            )
-            .await
-            {
+            None => match resolve_ref_sha(shared, &repo_full_name, &effective.git_ref).await {
                 Ok(Some(sha)) => sha,
                 Ok(None) => {
                     error!(
@@ -1431,6 +1526,32 @@ async fn process_github_webhook(
     Ok((StatusCode::OK, Json(serde_json::json!(triggered_runs))))
 }
 
+/// Webhook events the App-manifest flow asks GitHub to subscribe a new App to.
+///
+/// Defaults to the minimal CI event set (`push`, `pull_request`). GitHub
+/// cannot change an App's event subscriptions through its API after creation,
+/// so operators who need additional triggers must add them manually in the
+/// App settings UI. Operators who want a different creation-time set can
+/// override it with `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` (comma-separated).
+pub fn manifest_default_events() -> Vec<String> {
+    if let Some(raw) = std::env::var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    {
+        let events: Vec<String> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|event| !event.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if !events.is_empty() {
+            return events;
+        }
+    }
+    vec!["push".to_owned(), "pull_request".to_owned()]
+}
+
 /// Serve registration page for GitHub App Manifest flow.
 pub(crate) async fn github_register(headers: HeaderMap) -> impl IntoResponse {
     let host = headers
@@ -1457,14 +1578,14 @@ pub(crate) async fn github_register(headers: HeaderMap) -> impl IntoResponse {
             "contents": "read",
             "metadata": "read",
             "pull_requests": "read"
-    }
+        }
     });
 
     if !is_local {
         manifest_json["hook_attributes"] = serde_json::json!({
                 "url": format!("{}/api/v1/github/webhooks", base_url)
         });
-        manifest_json["default_events"] = serde_json::json!(["push", "pull_request"]);
+        manifest_json["default_events"] = serde_json::json!(manifest_default_events());
     }
 
     let html = format!(
@@ -1630,6 +1751,33 @@ mod tests {
             &configured
         ));
         assert!(!is_github_owned_workflow("ci.yml", &configured));
+    }
+
+    #[tokio::test]
+    async fn manifest_default_events_use_minimal_ci_defaults() {
+        // Held for the whole test: `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` is
+        // process-global and other tests build apps concurrently; the
+        // fallback must be asserted with the override absent.
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        std::env::remove_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS");
+        let defaults = manifest_default_events();
+        assert_eq!(defaults, vec!["push", "pull_request"]);
+    }
+
+    #[tokio::test]
+    async fn manifest_default_events_override_is_used_when_set() {
+        // Held for the whole test: `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` is
+        // process-global and other tests build apps concurrently.
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        std::env::set_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS", "push, pull_request");
+        let events = manifest_default_events();
+        assert_eq!(events, vec!["push".to_owned(), "pull_request".to_owned()]);
+        std::env::remove_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS");
+
+        // A blank override falls back to the minimal default.
+        std::env::set_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS", "  ");
+        assert_eq!(manifest_default_events(), vec!["push", "pull_request"]);
+        std::env::remove_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS");
     }
 
     /// The signed push payload GitHub would deliver for `owner/repo`.

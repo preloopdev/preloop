@@ -258,7 +258,7 @@ pub(crate) async fn submit_run_inner(
         activity_type,
         &submission.workflow_run_upstream_names,
     ) {
-        return Err(ApiError::bad_request(format!(
+        return Err(ApiError::trigger_mismatch(format!(
             "workflow does not match event `{}`",
             submission.event
         )));
@@ -463,7 +463,7 @@ pub(crate) async fn submit_run_inner(
         "artifact_cache_size_limit": "10",
         "repository_visibility": "private",
         "actor_id": "0",
-        "actor": "preloop-system",
+        "actor": submission.actor.clone(),
         "workflow": workflow.name.clone().unwrap_or_default(),
         "head_ref": pr_head_ref,
         "base_ref": pr_base_ref,
@@ -479,7 +479,7 @@ pub(crate) async fn submit_run_inner(
         "workflow_ref": workflow_ref,
         "workflow_sha": sha,
         "repository_id": "0",
-        "triggering_actor": "preloop-system"
+        "triggering_actor": submission.actor
     });
 
     let run_name = workflow.run_name.as_deref().map(|raw| {
