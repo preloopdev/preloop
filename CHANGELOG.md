@@ -17,6 +17,21 @@ Releases before v0.27.0 predate the changelog.
   SmolVM when the local runtime is below it or lacks required capabilities.
   Preloop relies on SmolVM's packed-ownership implementation instead of
   rewriting guest rootfs ownership.
+- A golden download had 10 minutes to complete, body included. The packed
+  arm64 golden is ~9.6 GB, so that budget demanded 128 Mbps sustained and
+  was unreachable on an ordinary link (measured: 84 Mbps from ghcr.io, so
+  the pull needs ~15 minutes). The deadline killed the transfer around
+  two-thirds through, `preloop serve` reported the official golden as
+  "unavailable", and the run fell through to a local bake. The budget is
+  now one hour, which covers any link above ~21 Mbps.
+
+### Changed
+
+- Golden download progress now reads as a percentage and a completion bar
+  in megabytes — `golden download (OCI): [########------------] 40%
+  (3850 MB / 9630 MB)` — instead of raw byte counts, and reports every
+  256 MB rather than every 1 GiB (about one line per 25 s on a 100 Mbps
+  link).
 
 ## [0.30.10] - 2026-08-18
 

@@ -288,8 +288,19 @@ fn default_golden_url(release_version: &str) -> String {
 /// custom host when one is available.
 const DEFAULT_GOLDEN_OCI_REF: &str =
     "ghcr.io/preloopdev/preloop-golden@sha256:a2f7caf367e19efa4cb2d6f32a7093db8fae79e1b1525b65ac1190c1d2b44361";
-const GOLDEN_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
-const GOLDEN_PROGRESS_INTERVAL: u64 = 1024 * 1024 * 1024;
+/// Deadline for a whole golden download, response body included.
+///
+/// The packed golden runs to ~9.6 GB, so this budget is really a floor on
+/// link speed rather than a formality: finishing inside an hour needs ~21
+/// Mbps sustained. The original 10-minute budget demanded 128 Mbps, which
+/// an ordinary connection cannot serve — it killed the transfer around
+/// two-thirds through and fell back to a local bake that looked like the
+/// artifact was missing.
+const GOLDEN_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+/// How often a download reports progress. 256 MB puts a ~9.6 GB pull at
+/// roughly one line every 25 s on a 100 Mbps link: often enough to show
+/// movement, sparse enough not to bury the log.
+const GOLDEN_PROGRESS_INTERVAL: u64 = 256 * 1000 * 1000;
 
 fn golden_download_percent(downloaded_bytes: u64, total_bytes: Option<u64>) -> Option<u8> {
     let total_bytes = total_bytes.filter(|total| *total > 0)?;
@@ -302,16 +313,44 @@ fn golden_download_percent(downloaded_bytes: u64, total_bytes: Option<u64>) -> O
     )
 }
 
+/// Whole megabytes, the unit a multi-gigabyte download is legible in.
+fn megabytes(bytes: u64) -> u64 {
+    bytes / 1_000_000
+}
+
+/// Fixed-width completion bar, e.g. `[########------------]` at 40%.
+fn progress_bar(percent: u8) -> String {
+    const CELLS: usize = 20;
+    let filled = percent.min(100) as usize * CELLS / 100;
+    let mut bar = String::with_capacity(CELLS + 2);
+    bar.push('[');
+    for cell in 0..CELLS {
+        bar.push(if cell < filled { '#' } else { '-' });
+    }
+    bar.push(']');
+    bar
+}
+
 fn report_golden_download_progress(source: &str, downloaded_bytes: u64, total_bytes: Option<u64>) {
     match (
         total_bytes,
         golden_download_percent(downloaded_bytes, total_bytes),
     ) {
         (Some(total_bytes), Some(percent)) => info!(
+            "golden download ({}): {} {}% ({} MB / {} MB)",
             source,
-            downloaded_bytes, total_bytes, percent, "Golden download progress"
+            progress_bar(percent),
+            percent,
+            megabytes(downloaded_bytes),
+            megabytes(total_bytes)
         ),
-        _ => info!(source, downloaded_bytes, "Golden download progress"),
+        // No Content-Length and no manifest size: report the only honest
+        // number rather than a percentage of an unknown total.
+        _ => info!(
+            "golden download ({}): {} MB, total size unknown",
+            source,
+            megabytes(downloaded_bytes)
+        ),
     }
 }
 
@@ -556,10 +595,10 @@ async fn download_oci_golden(payload: &Path, reference: &str) -> bool {
     let layer_digest = layer.digest;
     let blob_url = format!("https://{registry}/v2/{repository}/blobs/{layer_digest}");
     info!(
+        "pulling pre-baked OCI golden ({} MB) from {} into {}",
+        layer_size.map(megabytes).unwrap_or_default(),
         reference,
-        target = %payload.display(),
-        size_bytes = layer_size.unwrap_or_default(),
-        "Downloading pre-baked OCI golden (this may take several minutes)"
+        payload.display()
     );
     let response = match registry_get(&client, &blob_url, "*/*").await {
         Ok(response) => response,
@@ -4502,6 +4541,24 @@ chmod +x "$destination/bin/node"
         assert_eq!(golden_download_percent(150, Some(100)), Some(100));
         assert_eq!(golden_download_percent(1, None), None);
         assert_eq!(golden_download_percent(1, Some(0)), None);
+    }
+
+    #[test]
+    fn golden_progress_bar_tracks_percentage_and_clamps() {
+        assert_eq!(progress_bar(0), "[--------------------]");
+        assert_eq!(progress_bar(40), "[########------------]");
+        assert_eq!(progress_bar(100), "[####################]");
+        // A percentage above 100 must not widen the bar past its cells.
+        assert_eq!(progress_bar(250), "[####################]");
+    }
+
+    #[test]
+    fn golden_progress_reports_megabytes_not_raw_bytes() {
+        // The packed arm64 golden, the size that made byte counts unreadable.
+        assert_eq!(megabytes(9_630_322_181), 9630);
+        assert_eq!(megabytes(0), 0);
+        // Sub-megabyte progress reads as 0 MB rather than a misleading 1.
+        assert_eq!(megabytes(999_999), 0);
     }
 
     #[test]
