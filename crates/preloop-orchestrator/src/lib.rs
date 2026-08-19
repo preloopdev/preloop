@@ -1304,15 +1304,30 @@ fn docker_start_command() -> Vec<String> {
              mkdir -p {DOCKER_DATA_ROOT}; \
              modprobe overlay >/dev/null 2>&1 || true; \
              modprobe fuse >/dev/null 2>&1 || true; \
+             # The krunfw guest kernel has fuse built in, but the VM boots
+             # /dev as a plain tmpfs with only the image's baked nodes, so
+             # /dev/fuse is missing and fuse-overlayfs (dockerd's fallback
+             # when its overlay probe fails) dies with 'fuse: device not
+             # found'). Create the node when the kernel supports fuse; dockerd
+             # then auto-picks fuse-overlayfs (CoW) on kernels whose overlay
+             # probe fails, and overlay2 on stock kernels where it succeeds.
+             if grep -q fuse /proc/filesystems; then \
+               [ -e /dev/fuse ] || mknod /dev/fuse c 10 229; \
+             fi; \
              mkdir -p /tmp/.preloop-ovprobe; \
              if mount -t overlay overlay -o lowerdir=/tmp:/usr /tmp/.preloop-ovprobe 2>/dev/null; then \
                umount /tmp/.preloop-ovprobe 2>/dev/null || true; \
-               DRIVER=overlay2; \
+               DRIVER=; \
              else \
-               DRIVER=vfs; \
+               # Overlay unusable (the krunfw kernel rejects the probe mount
+               # with EINVAL). Only force vfs when fuse is unavailable too —
+               # otherwise fuse-overlayfs auto-detects and works.
+               [ -e /dev/fuse ] || DRIVER=vfs; \
              fi; \
              rmdir /tmp/.preloop-ovprobe 2>/dev/null || true; \
-             printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\",\"storage-driver\":\"%s\"}}\\n' \"$DRIVER\" > /etc/docker/daemon.json; \
+             if [ -n \"$DRIVER\" ]; then \
+               printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\",\"storage-driver\":\"%s\"}}\\n' \"$DRIVER\" > /etc/docker/daemon.json; \
+             fi; \
              start_dockerd() {{ \
                rm -f /var/run/docker.pid; \
                dockerd >/var/log/dockerd.log 2>&1 & \
