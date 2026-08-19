@@ -139,6 +139,7 @@ where
     }
 
     deserializer.deserialize_any(StringOrInteger)
+}
 
 /// When a webhook-driven push run succeeds, should the server open a pull
 /// request for its branch?

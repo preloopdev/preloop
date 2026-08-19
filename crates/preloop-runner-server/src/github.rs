@@ -591,7 +591,12 @@ pub(crate) async fn fetch_workflows_at(
                     .arg("-C")
                     .arg(base_path)
                     .args([
-                        "ls-tree", "-r", "--name-only", git_ref, "--", ".github/workflows",
+                        "ls-tree",
+                        "-r",
+                        "--name-only",
+                        git_ref,
+                        "--",
+                        ".github/workflows",
                     ])
                     .output()
                     .await?;
