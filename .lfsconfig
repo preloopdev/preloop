@@ -1,0 +1,11 @@
+# Git LFS resolves its endpoint from `origin` by default. A clone whose
+# `origin` is a mirror (preloopdev/preloopde) therefore asks that mirror's
+# LFS store for the `.runner-watch/golden/**` captures, which only exist in
+# the canonical repository — every checkout then fails with
+# `Object does not exist on the server: [404]` and the golden-payload tests
+# parse LFS pointer files instead of captures.
+#
+# Pin the endpoint to the canonical repository, which is public: anonymous
+# download works, so this needs no credentials.
+[lfs]
+	url = https://github.com/preloopdev/preloop.git/info/lfs
