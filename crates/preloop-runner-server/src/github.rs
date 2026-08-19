@@ -1732,7 +1732,6 @@ mod tests {
         assert!(!is_github_owned_workflow("ci.yml", &configured));
     }
 
-    #[test]
     #[tokio::test]
     async fn manifest_default_events_use_minimal_ci_defaults() {
         // Held for the whole test: `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` is
