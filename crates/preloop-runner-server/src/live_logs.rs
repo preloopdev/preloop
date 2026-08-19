@@ -36,6 +36,13 @@ impl LiveLogBuffer {
         self.bytes
     }
 
+    /// Whether a single wrapper is small enough to be retained on its own,
+    /// regardless of any eviction it may trigger. Used to reject oversized
+    /// batches before they are cloned for the buffer.
+    pub(crate) fn fits(&self, wrapper: &LiveLogFeedLinesWrapper) -> bool {
+        Self::wrapper_bytes(wrapper) <= self.max_bytes
+    }
+
     /// Append a wrapper, tail-dropping the oldest wrappers once the byte cap
     /// is exceeded. Returns `false` (storing nothing) when a single wrapper
     /// exceeds the whole budget.
@@ -214,11 +221,14 @@ pub(crate) async fn record_live_log_wrapper(
         let tx = live_log_sender(&mut inner, job_id);
         (lines_arc, tx)
     };
-    // Push and broadcast under per-job lock only. An oversized batch is
-    // dropped from both the retained buffer and the live fan-out, so one
-    // pathological frame cannot evict the tail or amplify across subscribers.
-    let stored = job_lines.lock().await.push(wrapper.clone());
-    if stored {
+    // Hold the per-job lock across both the buffer push and the broadcast send
+    // so concurrent ingestion cannot reorder live fan-out relative to the
+    // retained tail. Reject oversized batches before cloning, then drop them
+    // from both the retained buffer and the live fan-out so one pathological
+    // frame cannot evict the tail or amplify across subscribers.
+    let mut lines = job_lines.lock().await;
+    if lines.fits(&wrapper) {
+        lines.push(wrapper.clone());
         let _ = tx.send(wrapper);
     } else {
         warn!(%job_id, "dropping live log batch exceeding per-job buffer cap");
