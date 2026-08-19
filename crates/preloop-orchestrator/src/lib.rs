@@ -1070,11 +1070,6 @@ pub fn loopback_hosts() -> &'static str {
     LOOPBACK_HOSTS
 }
 
-/// PATH exported to the guest runner. Exposed for the lifecycle tests.
-pub fn guest_runner_path() -> &'static str {
-    GUEST_RUNNER_PATH
-}
-
 fn node_externals_at(runner_root: &str) -> Vec<Vec<String>> {
     [vec![
         "sh".to_owned(),
@@ -1290,6 +1285,14 @@ fn base_install_commands() -> Vec<Vec<String>> {
 /// A stale `/var/run/docker.pid` naming that same pid blocks startup outright,
 /// and is only removed once `docker info` has failed  so it is stale by
 /// definition.
+///
+/// The storage driver is probed, never assumed: the golden's daemon auto-selects
+/// `fuse-overlayfs`, which cannot mount inside the smolvm kernel (no `/dev/fuse`,
+/// and the bundled fuse-overlayfs rejects the `lazytime` option), so every
+/// `docker run` in a container job dies with "fuse: device not found". We try a
+/// real overlay mount first and fall back to `vfs`; if the daemon then refuses
+/// the previous driver's data, the docker data-root is reset and dockerd is
+/// retried once (images re-pull from the registry).
 fn docker_start_command() -> Vec<String> {
     vec![
         "sh".to_owned(),
@@ -1299,6 +1302,23 @@ fn docker_start_command() -> Vec<String> {
              docker info >/dev/null 2>&1 && exit 0; \
              rm -f /var/run/docker.pid; \
              mkdir -p {DOCKER_DATA_ROOT}; \
+             modprobe overlay >/dev/null 2>&1 || true; \
+             modprobe fuse >/dev/null 2>&1 || true; \
+             mkdir -p /tmp/.preloop-ovprobe; \
+             if mount -t overlay overlay -o lowerdir=/tmp,/usr /tmp/.preloop-ovprobe 2>/dev/null; then \
+               umount /tmp/.preloop-ovprobe 2>/dev/null || true; \
+               DRIVER=overlay2; \
+             else \
+               DRIVER=vfs; \
+             fi; \
+             rmdir /tmp/.preloop-ovprobe 2>/dev/null || true; \
+             printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\",\"storage-driver\":\"%s\"}}\\n' \"$DRIVER\" > /etc/docker/daemon.json; \
+             (dockerd >/var/log/dockerd.log 2>&1 &) ; \
+             for _ in $(seq 1 50); do \
+               docker info >/dev/null 2>&1 && exit 0; \
+               sleep 0.2; \
+             done; \
+             rm -rf {DOCKER_DATA_ROOT}/*; \
              (dockerd >/var/log/dockerd.log 2>&1 &) ; \
              for _ in $(seq 1 50); do \
                docker info >/dev/null 2>&1 && exit 0; \
@@ -1457,11 +1477,24 @@ async fn write_bake_manifest<P: VmProvider>(
 /// dtolnay/rust-toolchain only appends that directory to `$GITHUB_PATH` when it
 /// has to install rustup itself, so on an image that already has rustup — ours,
 /// and GitHub's — the directory is on PATH or the tool is simply unreachable.
-/// Guests run as root, so `$HOME/.cargo` is `/root/.cargo`; the Go layer
-/// untars into `/usr/local/go`. Absent directories cost nothing.
-const GUEST_RUNNER_PATH: &str = "/root/.cargo/bin:/usr/local/go/bin:\
-                                 /usr/local/sbin:/usr/local/bin:\
-                                 /usr/sbin:/usr/bin:/sbin:/bin";
+///
+/// The cargo bin dir must match the user the runner executes steps as: a root
+/// runner (no switching) installs into `/root/.cargo`, a switched runner into
+/// `/home/<user>/.cargo`. The root-only path must never be exported to an
+/// unprivileged runner — `/root` is 0700, so every tool lookup stats it and
+/// gets EACCES (nodejs/ci: `EACCES: permission denied, stat
+/// '/root/.cargo/bin/git'`), and the Go layer untars into the world-readable
+/// `/usr/local/go`. Absent directories cost nothing.
+pub fn guest_runner_path(config: &RunnerPoolConfig) -> String {
+    let cargo_bin = match config.runner_user.as_deref() {
+        None | Some("root") => "/root/.cargo/bin".to_owned(),
+        Some(user) => format!("/home/{user}/.cargo/bin"),
+    };
+    format!(
+        "{cargo_bin}:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:\
+         /usr/sbin:/usr/bin:/sbin:/bin"
+    )
+}
 
 /// `env` prefix for guest runner invocations, empty when nothing needs setting.
 ///
@@ -1470,7 +1503,7 @@ const GUEST_RUNNER_PATH: &str = "/root/.cargo/bin:/usr/local/go/bin:\
 /// vice versa, so neither may gate the other.
 fn guest_env_prefix(config: &RunnerPoolConfig, name: &MachineName) -> Vec<String> {
     let mut env = Vec::new();
-    env.push(format!("PATH={GUEST_RUNNER_PATH}"));
+    env.push(format!("PATH={}", guest_runner_path(config)));
     // The guest needs its own VM name so a debug session can tell a controller
     // which machine to open a shell into. Nothing else in the guest knows it.
     env.push(format!("PRELOOP_MACHINE_NAME={}", name.as_str()));
@@ -1870,6 +1903,73 @@ async fn preload_images<P: VmProvider>(
     Ok(())
 }
 
+/// Install the amd64 loader + libc into an arm64 golden so dynamically
+/// linked x86_64 binaries can run under Rosetta translation.
+///
+/// Only Apple Silicon hosts have Rosetta, so everything else is a no-op; the
+/// script additionally self-guards on the guest arch (an x86_64 golden on a
+/// Mac already ships the amd64 rootfs natively). The trailing `sync` is
+/// load-bearing exactly as in [`preload_images`]: forking captures the disk,
+/// not the page cache, and the installed packages must reach the frozen base.
+/// The package set covers the loader, libc, C++ runtime, zlib, and systemd
+/// (valkey's official x86_64 tarballs link `libsystemd.so.0`); apt pulls the
+/// amd64 transitive deps.
+async fn prepare_rosetta_multiarch<P: VmProvider>(
+    provider: &P,
+    golden: &MachineName,
+) -> Result<(), OrchestratorError> {
+    if !(cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64") {
+        return Ok(());
+    }
+    // arm64 Ubuntu's deb822 sources (ubuntu.sources) point at
+    // ports.ubuntu.com, which does not carry amd64; once `dpkg
+    // --add-architecture amd64` runs, every source without an
+    // `Architectures:` line serves amd64 too and ports 404s. Scope the native
+    // stanzas to arm64 and add an explicit archive.ubuntu.com [arch=amd64]
+    // source across all four suites (the image carries security-update
+    // versions — noble main alone is older and the mutual glibc Breaks pins
+    // make the resolver fail). One suite per deb line: the one-line format
+    // takes a single suite and misparses extras as components. Without the
+    // scoping, every later apt-get update (including the per-fork
+    // hosted-baseline install) fails on the amd64 fetch.
+    let script = run_as_root_or_sudo(
+        "case \"$(uname -m)\" in \
+           aarch64|arm64) ;; \
+           *) echo 'guest is not arm64; rosetta multiarch install is a no-op' >&2; exit 0 ;; \
+         esac; \
+         dpkg --add-architecture amd64; \
+         sed -i '/^Types: deb$/a Architectures: arm64' /etc/apt/sources.list.d/ubuntu.sources; \
+         CODENAME=$(. /etc/os-release 2>/dev/null && echo \"$VERSION_CODENAME\"); \
+         [ -n \"$CODENAME\" ] || CODENAME=noble; \
+         for s in '' '-updates' '-backports' '-security'; do \
+           printf 'deb [arch=amd64] http://archive.ubuntu.com/ubuntu/ %s%s main restricted universe multiverse\\n' \"$CODENAME\" \"$s\" \
+             >> /etc/apt/sources.list.d/preloop-amd64.list; \
+         done; \
+         apt-get update -qq; \
+         DEBIAN_FRONTEND=noninteractive \
+         apt-get install -y -qq --no-install-recommends \
+           libc6:amd64 libgcc-s1:amd64 libstdc++6:amd64 zlib1g:amd64 \
+           libsystemd0:amd64; \
+         sync; \
+         test -f /lib64/ld-linux-x86-64.so.2",
+    );
+    let output = provider
+        .exec(golden, &["sh".to_owned(), "-c".to_owned(), script])
+        .await?;
+    if output.exit_code != 0 {
+        return Err(OrchestratorError::Config(format!(
+            "rosetta multiarch install failed (exit {}): {}",
+            output.exit_code,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    info!(
+        machine = golden.as_str(),
+        "installed amd64 multiarch libs into golden for Rosetta x86_64 translation"
+    );
+    Ok(())
+}
+
 /// Prepare a running forkable golden VM with the requested environment.
 ///
 /// SmolVM takes the forkable RAM/disk snapshot when `start --forkable` runs.
@@ -2081,6 +2181,10 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
         let _ = provider.delete(golden).await;
         return Err(error);
     }
+    // Fatal, not a warning: on Apple Silicon the multiarch shim is the
+    // golden's contract, and a failed install leaves a reusable base that is
+    // adoptable on later restarts (amd64 arch added, loader missing).
+    prepare_rosetta_multiarch(provider.as_ref(), golden).await?;
     if let Err(error) = preload_images(provider.as_ref(), golden, &config.preload_images).await {
         warn!(
             machine = golden.as_str(),
@@ -2192,9 +2296,18 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             result = slots.join_next() => {
                 shutdown.cancel();
                 match result {
-                    Some(Ok(Err(error))) => return Err(error),
-                    Some(Err(error)) => return Err(OrchestratorError::Pool(error.to_string())),
-                    Some(Ok(Ok(()))) => return Err(OrchestratorError::Pool("runner slot exited".into())),
+                    Some(Ok(Err(error))) => {
+                        error!(%error, "runner slot failed; tearing down pool");
+                        return Err(error);
+                    }
+                    Some(Err(error)) => {
+                        error!(%error, "runner slot task panicked; tearing down pool");
+                        return Err(OrchestratorError::Pool(error.to_string()));
+                    }
+                    Some(Ok(Ok(()))) => {
+                        error!("runner slot exited without shutdown; tearing down pool");
+                        return Err(OrchestratorError::Pool("runner slot exited".into()));
+                    }
                     None => return Err(OrchestratorError::Pool("runner pool had no slots".into())),
                 }
             }
@@ -3201,12 +3314,20 @@ async fn run_one_runner<P: VmProvider + 'static>(
     } = plan;
 
     let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+    // The runner's completion is observed through this oneshot, never by
+    // re-polling the JoinHandle: `tokio::join!(&mut run_task, successor)`
+    // panics with "JoinHandle polled after completion" when the runner exits
+    // before the successor finishes provisioning and `select!` re-polls the
+    // branch — a completed `&mut JoinHandle` cannot be polled again.
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     let claimed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let run_provider = provider.clone();
     let run_name = name.clone();
     idle.fetch_add(1, Ordering::AcqRel);
-    let mut run_task =
-        tokio::spawn(async move { run_until_exit(&run_provider, &run_name, &run, busy_tx).await });
+    let run_task = tokio::spawn(async move {
+        let result = run_until_exit(&run_provider, &run_name, &run, busy_tx).await;
+        let _ = done_tx.send(result);
+    });
 
     // Resolves once the runner reports a job and its replacement is ready. A
     // runner that exits without taking a job (shutdown, transient failure)
@@ -3276,12 +3397,18 @@ async fn run_one_runner<P: VmProvider + 'static>(
         },
         pair = async {
             // Concurrent on purpose: the successor is built while the job is
-            // still running, which is the whole point of the busy signal.
-            tokio::join!(&mut run_task, build_successor)
+            // still running, which is the whole point of the busy signal. The
+            // oneshot is polled once by value, so a runner that exits before
+            // the successor is ready cannot be re-polled into a panic.
+            tokio::join!(done_rx, build_successor)
         } => {
             let result = match pair.0 {
-                Ok(result) => result.map_err(OrchestratorError::from),
-                Err(error) => Err(OrchestratorError::Pool(error.to_string())),
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(OrchestratorError::Pool(error.to_string())),
+                // The runner task panicked (sender dropped without a value).
+                Err(_) => Err(OrchestratorError::Pool(
+                    "runner task ended without a result".into(),
+                )),
             };
             (result, pair.1)
         },
@@ -3920,15 +4047,29 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
     // permitted without privileges. The root branch keeps --init-groups.
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&provisioning);
+    // Raise RLIMIT_NOFILE before dropping privileges. GitHub-hosted runners
+    // allow many open files (valkey's test suite raises the soft limit to
+    // 10032), but the exec channel's defaults leave the hard limit below
+    // that, so the runner user gets EPERM on setrlimit. 524288 mirrors
+    // systemd's built-in hard default, which is what GitHub's runner service
+    // (no explicit LimitNOFILE) inherits. Raising the hard limit needs root
+    // (CAP_SYS_RESOURCE), hence the sudo in the exec-as-image-user branch;
+    // setpriv then runs as root there too, so --init-groups is correct in
+    // both branches (setgroups needs root — the --keep-groups variant was
+    // only a workaround for the self-drop).
+    let inner = format!(
+        "ulimit -Hn 524288; ulimit -Sn 524288; \
+         exec setpriv --reuid {uid} --regid {uid} --init-groups env \
+           PRELOOP_RUNNER_USER={user} PRELOOP_RUNNER_UID={uid} HOME={home} {program} {args}"
+    );
+    let inner_b64 = base64::engine::general_purpose::STANDARD.encode(&inner);
     let script = format!(
         "if [ \"$(id -u)\" -eq 0 ]; then \
            {provisioning}; \
-           exec setpriv --reuid {uid} --regid {uid} --init-groups env \
-             PRELOOP_RUNNER_USER={user} PRELOOP_RUNNER_UID={uid} HOME={home} {program} {args}; \
+           printf %s '{inner_b64}' | base64 -d | sh; \
          else \
            printf %s '{b64}' | base64 -d | sudo -n sh 2>/dev/null || true; \
-           exec setpriv --reuid {uid} --regid {uid} --keep-groups env \
-             PRELOOP_RUNNER_USER={user} PRELOOP_RUNNER_UID={uid} HOME={home} {program} {args}; \
+           printf %s '{inner_b64}' | base64 -d | sudo -n sh; \
          fi"
     );
     vec!["sh".to_owned(), "-c".to_owned(), script]
@@ -4072,6 +4213,7 @@ fn packed_golden_path(payload: &Path) -> PathBuf {
 mod lifecycle_tests {
     use super::*;
     use async_trait::async_trait;
+    use base64::Engine as _;
     use preloop_vm::{ExecOutput, OutputChunk};
     use std::collections::HashMap;
     use std::os::unix::fs::PermissionsExt as _;
@@ -4529,17 +4671,6 @@ chmod +x "$destination/bin/node"
             script.contains("chmod 777 /run/preloop-control"),
             "{script}"
         );
-        // Root branch (locally baked goldens) drops with --init-groups; the
-        // exec-as-image-user branch (official golden) provisions via sudo and
-        // self-drops with --keep-groups (setgroups needs root).
-        assert!(
-            script.contains("setpriv --reuid 1001 --regid 1001 --init-groups"),
-            "{script}"
-        );
-        assert!(
-            script.contains("setpriv --reuid 1001 --regid 1001 --keep-groups"),
-            "{script}"
-        );
         assert!(
             script.contains("NOPASSWD: ALL"),
             "the runner account must be able to sudo non-interactively, \
@@ -4549,16 +4680,44 @@ chmod +x "$destination/bin/node"
             script.contains("| base64 -d | sudo -n sh 2>/dev/null || true"),
             "{script}"
         );
-        assert_eq!(
-            script
-                .matches("'/opt/preloop/bin/preloop-runner' 'run' '--once'")
-                .count(),
-            2,
-            "the wrapped program must appear in both branches"
+        // Both branches run the launch (limit raise + setpriv drop) from a
+        // base64'd script; the image-user branch pipes it through sudo so the
+        // raise and the --init-groups setgroups run as root. Decode every
+        // blob and assert across them.
+        let blobs: Vec<String> = script
+            .split("| base64 -d")
+            .filter_map(|part| {
+                let close = part.rfind('\'')?;
+                let open = part[..close].rfind('\'')?;
+                Some(part[open + 1..close].to_owned())
+            })
+            .collect();
+        let all = blobs
+            .iter()
+            .map(|b| {
+                String::from_utf8(
+                    base64::engine::general_purpose::STANDARD.decode(b).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all.contains("ulimit -Hn 524288; ulimit -Sn 524288"),
+            "{all}"
         );
         assert!(
-            script.contains("PRELOOP_RUNNER_USER=runner PRELOOP_RUNNER_UID=1001"),
-            "{script}"
+            all.contains("setpriv --reuid 1001 --regid 1001 --init-groups"),
+            "{all}"
+        );
+        assert!(!all.contains("--keep-groups"), "{all}");
+        assert!(
+            all.contains("'/opt/preloop/bin/preloop-runner' 'run' '--once'"),
+            "{all}"
+        );
+        assert!(
+            all.contains("PRELOOP_RUNNER_USER=runner PRELOOP_RUNNER_UID=1001"),
+            "{all}"
         );
     }
 

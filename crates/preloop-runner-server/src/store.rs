@@ -1346,6 +1346,12 @@ impl SqliteStore {
         self.write_meta_tx(&tx, &snapshot.meta)?;
         tx.commit()
             .map_err(|error| anyhow::anyhow!("committing store snapshot: {error}"))?;
+        // The WAL grows with every runner event; an unbounded WAL (hundreds of
+        // MB) makes the next write's checkpoint sync stall the server for
+        // minutes. Keep it small so a commit is never a multi-hundred-MB sync.
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|error| anyhow::anyhow!("checkpointing WAL: {error}"))?;
         Ok(())
     }
 
@@ -1381,6 +1387,12 @@ impl SqliteStore {
         self.insert_event_tx(&tx, &projection.event)?;
         tx.commit()
             .map_err(|error| anyhow::anyhow!("committing run event: {error}"))?;
+        // Same rationale as the full-snapshot path: keep the WAL bounded so a
+        // runner-event burst cannot stall the next commit behind a giant
+        // checkpoint sync.
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|error| anyhow::anyhow!("checkpointing WAL: {error}"))?;
         Ok(())
     }
 
