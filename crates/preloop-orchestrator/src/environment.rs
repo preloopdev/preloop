@@ -253,12 +253,12 @@ impl ToolchainLayer {
 /// the same model GitHub-hosted runners use.
 pub fn curated_toolchains() -> Vec<ToolchainLayer> {
     // CI-Bench pins its corpus toolchains: Rust 1.88.0 (the version every
-    // task was authored and validated against) and Go 1.26.x. Baking them
+    // task was authored and validated against) and Go 1.24.x. Baking them
     // into every golden keeps the per-job VMs identical instead of
     // re-installing per job.
     vec![
         ToolchainLayer::Rust("1.88.0".into()),
-        ToolchainLayer::Go("1.26".into()),
+        ToolchainLayer::Go("1.24".into()),
     ]
 }
 
@@ -591,7 +591,7 @@ mod tests {
         // the deliberate member of the curated set (pinned for CI-Bench
         // reproducibility; Go rides along).
         assert!(first.contains(&ToolchainLayer::Rust("1.88.0".into())));
-        assert!(first.contains(&ToolchainLayer::Go("1.26".into())));
+        assert!(first.contains(&ToolchainLayer::Go("1.24".into())));
     }
 
     #[test]
