@@ -29,7 +29,7 @@ use crate::dispatch_auth::DispatchIdentity;
 use crate::events::trust_tier::TrustTier;
 use crate::events::EventAdapter;
 use crate::state::SharedState;
-use crate::{ApiError, RunAccepted, WorkflowSubmission};
+use crate::{errors::ApiErrorKind, ApiError, RunAccepted, WorkflowSubmission};
 
 /// POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches
 ///
@@ -461,10 +461,7 @@ fn workflow_has_trigger(workflow: &preloop_gha_parser::Workflow, event: &str) ->
 /// filters do not match the broadcast event. Other 4xx errors must remain
 /// visible as per-workflow failures.
 fn is_trigger_mismatch(error: &ApiError) -> bool {
-    error.status() == StatusCode::BAD_REQUEST
-        && error
-            .message()
-            .starts_with("workflow does not match event `")
+    error.kind() == ApiErrorKind::TriggerMismatch
 }
 
 /// Build the `WorkflowSubmission` for a dispatched effective event, carrying
@@ -669,13 +666,15 @@ async fn resolve_ref_sha(
 
 /// Deterministic 64-bit hash of `value` — the synthetic numeric id for
 /// workflows and runs (preloop tracks neither github.com workflow ids nor
-/// numeric run ids). `DefaultHasher::new()` uses fixed keys, so ids are
-/// stable across restarts.
+/// numeric run ids). SHA-256 truncated to 8 bytes is stable across restarts
+/// AND Rust toolchains (`DefaultHasher` makes no such guarantee, and these
+/// ids are returned to clients and persisted).
 fn stable_id(value: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    value.hash(&mut hasher);
-    hasher.finish()
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(value.as_bytes());
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    u64::from_le_bytes(bytes)
 }
 
 /// github.com run status from the internal execution status.

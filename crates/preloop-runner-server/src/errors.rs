@@ -137,11 +137,25 @@ fn twirp_error_payload(status: StatusCode, message: &str) -> Value {
     json!({ "code": code, "msg": message })
 }
 
+/// Programmatic classification of an [`ApiError`], independent of the
+/// rendered message text. Handlers that must branch on a specific failure
+/// (rather than parse a message string) match on this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ApiErrorKind {
+    /// Default classification for ordinary errors.
+    #[default]
+    BadRequest,
+    /// A submitted workflow's trigger filters rejected the event
+    /// (`workflow does not match event ...`).
+    TriggerMismatch,
+}
+
 /// API error.
 #[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
     message: String,
+    kind: ApiErrorKind,
 }
 
 impl ApiError {
@@ -155,10 +169,29 @@ impl ApiError {
         self.status
     }
 
+    /// Programmatic classification of this error.
+    pub(crate) fn kind(&self) -> ApiErrorKind {
+        self.kind
+    }
+
     pub(crate) fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
+            kind: ApiErrorKind::BadRequest,
+        }
+    }
+
+    /// A workflow whose trigger filters rejected the broadcast event.
+    ///
+    /// `submit_run_inner` returns this exact error; the dispatch adapter
+    /// recognizes it by [`ApiErrorKind::TriggerMismatch`] so per-workflow
+    /// trigger failures stay visible without message-text matching.
+    pub(crate) fn trigger_mismatch(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+            kind: ApiErrorKind::TriggerMismatch,
         }
     }
 
@@ -166,6 +199,7 @@ impl ApiError {
         Self {
             status: StatusCode::UNAUTHORIZED,
             message: message.into(),
+            kind: ApiErrorKind::BadRequest,
         }
     }
 
@@ -173,6 +207,7 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_FOUND,
             message: message.into(),
+            kind: ApiErrorKind::BadRequest,
         }
     }
 
@@ -180,6 +215,7 @@ impl ApiError {
         Self {
             status: StatusCode::FORBIDDEN,
             message: message.into(),
+            kind: ApiErrorKind::BadRequest,
         }
     }
 
@@ -187,6 +223,7 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             message: message.into(),
+            kind: ApiErrorKind::BadRequest,
         }
     }
 
@@ -194,6 +231,7 @@ impl ApiError {
         Self {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             message: message.into(),
+            kind: ApiErrorKind::BadRequest,
         }
     }
 
@@ -201,6 +239,7 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
+            kind: ApiErrorKind::BadRequest,
         }
     }
 
@@ -208,6 +247,7 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_GATEWAY,
             message: message.into(),
+            kind: ApiErrorKind::BadRequest,
         }
     }
 }

@@ -64,6 +64,8 @@ The system is configured using the following environment variables:
 | `PRELOOP_WEBHOOK_SECRET` | Secret key configured on the GitHub App to verify payload signatures. | `my-secure-webhook-secret` |
 | `PRELOOP_LOCAL_WORKSPACE` | Path to a local Git worktree used for offline workflow loading and immutable local-source checkouts. | `/path/to/my-repo` |
 | `PRELOOP_GITHUB_TOKEN` | GitHub Personal Access Token or App Installation Token to fetch workflows and update check runs. | `ghp_...` or `ghs_...` |
+| `PRELOOP_GITHUB_APPS_JSON` | JSON array of additional registered Apps overriding `github.apps`; each entry: `app_id`, `pem`, optional `webhook_secret`/`installation_id`. | `[{"app_id":12345,"pem":"-----BEGIN..."}]` |
+| `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` | Comma-separated creation-time event list for the App-manifest flow; defaults to `push,pull_request`. | `push,pull_request` |
 
 ### Security Best Practices
 

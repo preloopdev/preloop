@@ -305,7 +305,10 @@ chain rather than the native bearer alone:
 
 Third-party App JWTs are never accepted — there is no PEM to verify them with.
 The `sender` / `github.actor` for a dispatched run is:
-- installation token → App bot identity (`{slug}[bot]`, or ledger `account_login`)
+- own App installation token (offline mint ledger) → `{slug}[bot]` resolved via
+  `GET /app` (cached); `{app_id}[bot]` when github.com is unreachable
+- third-party installation token (online) → `{slug}[bot]`, falling back to
+  `{account.login}[bot]` when the slug is absent
 - own-App JWT → `{slug}[bot]` (or `{app_id}[bot]` offline)
 - PAT → `GET /user` login when github.com is reachable; otherwise the dedicated
   placeholder `preloop-pat` (never the system-bearer identity `preloop-system`).

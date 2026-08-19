@@ -264,19 +264,23 @@ pub(crate) struct GitHubAppCredentials {
 
 /// Registry of every configured GitHub App.
 ///
-/// The legacy single-App env vars (`PRELOOP_GITHUB_APP_ID` + PEM) are always
-/// the first entry — the default for minting fallback and the App `AppState`
-/// reports as `github_app`. Additional Apps come from `github.apps` in the
-/// config file or the `PRELOOP_GITHUB_APPS_JSON` environment variable.
+/// The entry at [`GitHubApps::default_index`] is the first registered App —
+/// the legacy single-App env vars (`PRELOOP_GITHUB_APP_ID` + PEM) when
+/// configured, otherwise the first `github.apps` entry (config file or
+/// `PRELOOP_GITHUB_APPS_JSON`). It is the default for minting fallback and
+/// the App `AppState` reports as `github_app`. Additional Apps come after it
+/// in registry order.
 #[derive(Clone)]
 pub(crate) struct GitHubApps {
     pub(crate) apps: Vec<GitHubAppCredentials>,
-    /// Index of the legacy env-var App within `apps`.
+    /// Index of the default App within `apps` — the legacy env-var App when
+    /// configured, otherwise the first `github.apps` entry.
     pub(crate) default_index: usize,
 }
 
 impl GitHubApps {
-    /// The default App — the legacy env-var one.
+    /// The default App — the first registered App (the legacy env-var App
+    /// when configured, otherwise the first `github.apps` entry).
     pub(crate) fn default_app(&self) -> &GitHubAppCredentials {
         &self.apps[self.default_index]
     }
@@ -410,6 +414,10 @@ pub(crate) fn load_from_env() -> anyhow::Result<Option<GitHubApps>> {
 /// A caller that resolved the config path once (the engine does, at startup)
 /// uses this so the file is read exactly once and every consumer agrees on
 /// which file that was.
+///
+/// The App at [`GitHubApps::default_index`] is the first registered App: the
+/// legacy env-var App when configured, otherwise the first `github.apps`
+/// entry.
 pub(crate) fn load_from(
     file_config: &crate::config::ConfigFile,
 ) -> anyhow::Result<Option<GitHubApps>> {
@@ -422,10 +430,13 @@ pub(crate) fn load_from(
         .or_else(|| file_config.github.pat.clone());
 
     let mut apps: Vec<GitHubAppCredentials> = Vec::new();
+    // The default entry is index 0 because the legacy App, when present, is
+    // pushed first below; with registry-only configs that slot is the first
+    // `github.apps` entry instead.
     let default_index = 0usize;
 
-    // Legacy single-App env/config first — always the default entry (D6
-    // back-compat).
+    // Legacy single-App env/config first — the default entry when configured
+    // (D6 back-compat).
     let app_id =
         env_non_empty("PRELOOP_GITHUB_APP_ID").or_else(|| file_config.github.app_id.clone());
     let key_source = PRIVATE_KEY_ENV

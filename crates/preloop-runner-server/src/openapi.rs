@@ -14,7 +14,7 @@ use utoipa::{
 #[derive(Debug, ToSchema)]
 pub(crate) struct ApiErrorResponse {
     /// Human-readable error message.
-    pub message: String,
+    pub error: String,
 }
 
 /// Result returned after accepting a workflow run.
@@ -608,7 +608,8 @@ fn artifact() {}
         (status = 403, description = "No `actions: write` on the repository", body = ApiErrorResponse),
         (status = 404, description = "Unknown repository or workflow", body = ApiErrorResponse),
         (status = 409, description = "Workflow is not `workflow_dispatch`-triggered", body = ApiErrorResponse),
-        (status = 422, description = "Input validation failed", body = ApiErrorResponse)
+        (status = 422, description = "Input validation failed", body = ApiErrorResponse),
+        (status = 502, description = "Failed to fetch workflows or resolve the ref", body = ApiErrorResponse)
     )
 )]
 fn workflow_dispatch_trigger() {}
@@ -633,7 +634,8 @@ fn workflow_dispatch_trigger() {}
         (status = 401, description = "Missing or invalid credential", body = ApiErrorResponse),
         (status = 403, description = "No dispatch permission on the repository", body = ApiErrorResponse),
         (status = 404, description = "Unknown repository", body = ApiErrorResponse),
-        (status = 422, description = "Missing or invalid `event_type`", body = ApiErrorResponse)
+        (status = 422, description = "Missing or invalid `event_type`", body = ApiErrorResponse),
+        (status = 502, description = "Failed to fetch workflows or resolve the ref", body = ApiErrorResponse)
     )
 )]
 fn repository_dispatch_trigger() {}
@@ -653,7 +655,9 @@ fn repository_dispatch_trigger() {}
     responses(
         (status = 200, description = "Workflow list", body = JsonValue),
         (status = 401, description = "Missing or invalid credential", body = ApiErrorResponse),
-        (status = 404, description = "Unknown repository", body = ApiErrorResponse)
+        (status = 403, description = "No repository access", body = ApiErrorResponse),
+        (status = 404, description = "Unknown repository", body = ApiErrorResponse),
+        (status = 502, description = "Failed to fetch workflows or resolve the ref", body = ApiErrorResponse)
     )
 )]
 fn list_dispatch_workflows() {}
@@ -673,7 +677,9 @@ fn list_dispatch_workflows() {}
     responses(
         (status = 200, description = "Run list", body = JsonValue),
         (status = 401, description = "Missing or invalid credential", body = ApiErrorResponse),
-        (status = 404, description = "Unknown repository", body = ApiErrorResponse)
+        (status = 403, description = "No repository access", body = ApiErrorResponse),
+        (status = 404, description = "Unknown repository", body = ApiErrorResponse),
+        (status = 502, description = "Failed to fetch workflows or resolve the ref", body = ApiErrorResponse)
     )
 )]
 fn list_dispatch_runs() {}

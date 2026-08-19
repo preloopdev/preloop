@@ -579,28 +579,44 @@ pub(crate) async fn fetch_workflows_at(
         // A dispatch for a branch other than the checked-out tree must read
         // the workflow definitions from that ref, not from the working tree.
         if !git_ref.is_empty() {
-            let commitish: &str = &format!("{git_ref}^{{commit}}");
-            let resolved = tokio::process::Command::new("git")
-                .arg("-C")
-                .arg(base_path)
-                .args(["rev-parse", "--verify", commitish])
-                .output()
-                .await?;
-            if resolved.status.success() {
-                let listing = tokio::process::Command::new("git")
+            // A ref beginning with '-' would be parsed by git as an option
+            // (e.g. `git rev-parse --verify -x^{commit}`); treat it as
+            // unresolvable and fall back to the checked-out tree.
+            if git_ref.starts_with('-') {
+                warn!(
+                    %git_ref,
+                    workspace = %base_path.display(),
+                    "git_ref starts with '-' and is not a valid ref; falling back to the checked-out tree",
+                );
+            } else {
+                let commitish: &str = &format!("{git_ref}^{{commit}}");
+                let resolved = tokio::process::Command::new("git")
                     .arg("-C")
                     .arg(base_path)
-                    .args([
-                        "ls-tree",
-                        "-r",
-                        "--name-only",
-                        git_ref,
-                        "--",
-                        ".github/workflows",
-                    ])
+                    .args(["rev-parse", "--verify", commitish])
                     .output()
                     .await?;
-                if listing.status.success() {
+                if resolved.status.success() {
+                    let listing = tokio::process::Command::new("git")
+                        .arg("-C")
+                        .arg(base_path)
+                        .args([
+                            "ls-tree",
+                            "-r",
+                            "--name-only",
+                            git_ref,
+                            "--",
+                            ".github/workflows",
+                        ])
+                        .output()
+                        .await?;
+                    if !listing.status.success() {
+                        anyhow::bail!(
+                            "git ls-tree for ref {git_ref:?} in {} failed: {}",
+                            base_path.display(),
+                            String::from_utf8_lossy(&listing.stderr),
+                        );
+                    }
                     for line in String::from_utf8_lossy(&listing.stdout).lines() {
                         let path = line.trim();
                         if path.is_empty() {
@@ -615,22 +631,27 @@ pub(crate) async fn fetch_workflows_at(
                                 .args(["show", path_ref])
                                 .output()
                                 .await?;
-                            if content.status.success() {
-                                workflows.insert(
-                                    name.to_owned(),
-                                    String::from_utf8_lossy(&content.stdout).into_owned(),
+                            if !content.status.success() {
+                                anyhow::bail!(
+                                    "git show {path_ref:?} in {} failed: {}",
+                                    base_path.display(),
+                                    String::from_utf8_lossy(&content.stderr),
                                 );
                             }
+                            workflows.insert(
+                                name.to_owned(),
+                                String::from_utf8_lossy(&content.stdout).into_owned(),
+                            );
                         }
                     }
+                    return Ok(workflows);
                 }
-                return Ok(workflows);
+                warn!(
+                    %git_ref,
+                    workspace = %base_path.display(),
+                    "git_ref does not resolve in the local workspace; falling back to the checked-out tree",
+                );
             }
-            warn!(
-                %git_ref,
-                workspace = %base_path.display(),
-                "git_ref does not resolve in the local workspace; falling back to the checked-out tree",
-            );
         }
         let workflows_dir = base_path.join(".github/workflows");
         if workflows_dir.exists() {

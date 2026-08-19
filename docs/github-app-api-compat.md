@@ -453,10 +453,10 @@ Not done (budget cut): the optional native admin endpoints
 `GET/POST /api/v1/github/apps` (D6 nice-to-have), and the M4 minting-selection
 test proving a job's `GITHUB_TOKEN` comes from the installed App end to end.
 
-### M5 — Fidelity hardening + gate (NOT done)
+### M5 — Fidelity hardening + gate (done except the final gate)
 
-Pending: dispatch-payload property tests (`events/property_tests.rs` style),
+Shipped: dispatch-payload property tests (`events/property_tests.rs` style),
 `openapi.rs` docs for the new endpoints, `docs/github-tokens.md` +
-`docs/fidelity-gap.md` updates, the `repository_dispatch` dogfood fixture,
-and `just test-ci` (fmt-check + clippy + workspace tests). The crate's lib
+`docs/fidelity-gap.md` updates, and the `repository_dispatch` dogfood fixture.
+Pending: `just test-ci` (fmt-check + clippy + workspace tests). The crate's lib
 test suite is green (535 tests) but the full gate has not run.

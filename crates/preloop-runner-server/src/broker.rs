@@ -991,7 +991,56 @@ pub(crate) async fn mint_dispatch_github_token(
     let started = std::time::Instant::now();
     let Some(app) = crate::github_app::select_app_for_repo(shared, &request.repository).await
     else {
-        return Ok(None);
+        // No registered GitHub App covers this repository. The legacy
+        // single-App path always had an App, so mint failures flowed through
+        // the configured mint-failure policy; apply the default App's policy
+        // rather than silently bypassing it. An untrusted fork job must never
+        // fall back to the PAT (it is repository-unscoped and ignores
+        // `permissions:`), so it keeps the local runtime token instead.
+        if request.untrusted {
+            return Ok(None);
+        }
+        let Some(default_app) = &shared.state.github_app else {
+            return Ok(None);
+        };
+        warn!(
+            repository = %request.repository,
+            "No registered GitHub App covers the repository; applying the default App's mint-failure policy"
+        );
+        let fallback = crate::github_app::fallback_token(
+            default_app.mint_failure,
+            default_app.pat_fallback.clone(),
+        )
+        .map_err(|refusal| {
+            ApiError::bad_gateway(format!(
+                "GitHub App token minting failed for {}: {refusal}",
+                request.repository
+            ))
+        })?;
+        return Ok(match fallback {
+            Some(token) => {
+                info!(
+                    repository = %request.repository,
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    "GitHub token minted at claim (fallback path)"
+                );
+                warn!(
+                    repository = %request.repository,
+                    "No registered GitHub App covers the repository; using configured PAT fallback"
+                );
+                Some(MintedGitHubToken {
+                    token,
+                    effective_permissions: None,
+                })
+            }
+            None => {
+                warn!(
+                    repository = %request.repository,
+                    "No registered GitHub App covers the repository; job retains local runtime token"
+                );
+                None
+            }
+        });
     };
     let minted = match crate::github_app::get_or_mint_token_declared(
         &app,

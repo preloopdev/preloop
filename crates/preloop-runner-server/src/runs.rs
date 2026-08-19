@@ -258,7 +258,7 @@ pub(crate) async fn submit_run_inner(
         activity_type,
         &submission.workflow_run_upstream_names,
     ) {
-        return Err(ApiError::bad_request(format!(
+        return Err(ApiError::trigger_mismatch(format!(
             "workflow does not match event `{}`",
             submission.event
         )));

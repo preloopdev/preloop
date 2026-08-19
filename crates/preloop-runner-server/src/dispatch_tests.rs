@@ -370,6 +370,56 @@ async fn workflow_dispatch_unknown_ref_is_404() {
 }
 
 #[tokio::test]
+async fn workflow_dispatch_to_explicit_tag_ref_is_204() {
+    let (state, app, temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    git_ok(&temp.path().join("ws"), &["tag", "v1.0"]);
+
+    let (status, body) = post_json(
+        &app,
+        "/repos/octocat/repo/actions/workflows/dispatch.yml/dispatches",
+        r#"{"ref": "refs/tags/v1.0", "inputs": {"greeting": "hi"}}"#,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "body={body}");
+
+    let runs = recorded_runs(&state).await;
+    assert_eq!(runs.len(), 1);
+    let (_, run) = &runs[0];
+    assert_eq!(run.submission.git_ref, "refs/tags/v1.0");
+    // `github.event` keeps the webhook shape: ref/ref_type for a tag match a
+    // github.com-delivered `create`/`workflow_dispatch` payload.
+    assert_eq!(run.github["event"]["ref"], "refs/tags/v1.0");
+    assert_eq!(run.github["event"]["ref_type"], "tag");
+    assert_eq!(run.head_sha.len(), 40);
+}
+
+#[tokio::test]
+async fn workflow_dispatch_bare_tag_name_is_204() {
+    let (state, app, temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    git_ok(&temp.path().join("ws"), &["tag", "v1.0"]);
+
+    // A bare tag name is tried as a branch first, then a tag, matching
+    // github.com's resolution.
+    let (status, body) = post_json(
+        &app,
+        "/repos/octocat/repo/actions/workflows/dispatch.yml/dispatches",
+        r#"{"ref": "v1.0", "inputs": {"greeting": "hi"}}"#,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "body={body}");
+
+    let runs = recorded_runs(&state).await;
+    assert_eq!(runs.len(), 1);
+    let (_, run) = &runs[0];
+    assert_eq!(run.submission.git_ref, "refs/tags/v1.0");
+    assert_eq!(run.github["event"]["ref"], "refs/tags/v1.0");
+    assert_eq!(run.github["event"]["ref_type"], "tag");
+    assert_eq!(run.head_sha.len(), 40);
+}
+
+#[tokio::test]
 async fn workflow_dispatch_without_dispatch_trigger_is_409() {
     let (state, app, _temp) = dispatch_fixture(&[(
         "push-only.yml",
@@ -883,6 +933,39 @@ async fn ledger_token_scoped_to_another_repo_is_403() {
 }
 
 #[tokio::test]
+async fn read_endpoints_reject_ledger_token_scoped_to_another_repo() {
+    // Pin the API base to a closed port so the ledger actor fallback
+    // (`{app_id}[bot]`) is deterministic regardless of ambient network.
+    let (_env, _env_lock) = pin_api_base("http://127.0.0.1:1").await;
+    let (state, app, _key, _temp) =
+        dispatch_fixture_with_app(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    record_ledger_token(
+        &state,
+        "ghs_other_repo_read_token",
+        "other/repo",
+        &[("actions", "write")],
+    );
+
+    // authorize_read covers both read endpoints; a token scoped to a
+    // different repository must be refused before any run/workflow data.
+    let (status, _) = get_json(
+        &app,
+        "/repos/octocat/repo/actions/workflows",
+        Some("ghs_other_repo_read_token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, _) = get_json(
+        &app,
+        "/repos/octocat/repo/actions/runs",
+        Some("ghs_other_repo_read_token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn unknown_token_fails_closed_when_github_is_unreachable() {
     let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
 
@@ -902,8 +985,6 @@ async fn unknown_token_fails_closed_when_github_is_unreachable() {
     );
     assert!(recorded_runs(&state).await.is_empty());
 }
-
-// ─── M3: third-party installation tokens (stubbed github.com) ──────────────
 
 // ─── M4: multi-App registry ────────────────────────────────────────────────
 
@@ -1115,6 +1196,8 @@ fn installation_stub(
             get(|| async { Json(json!({ "slug": "preloop-local-app" })) }),
         )
 }
+
+// ─── M3: third-party installation tokens (stubbed github.com) ──────────────
 
 #[tokio::test]
 async fn third_party_installation_token_dispatches_when_it_holds_actions_write() {
