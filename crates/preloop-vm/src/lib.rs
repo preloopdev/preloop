@@ -12,6 +12,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
+use tracing::warn;
 
 const DEFAULT_CAPTURE_LIMIT: usize = 1024 * 1024;
 
@@ -349,6 +350,15 @@ pub trait VmProvider: Send + Sync {
 }
 
 /// CLI-backed SmolVM provider.
+///
+/// SmolVM's `machine exec` (non-streaming) drops the connection after a
+/// short client-side read timeout unless an explicit `--timeout` extends
+/// it, and it buffers all output until the command exits. Provisioning
+/// steps (toolchain installs, `configure`) routinely run
+/// minutes with little output, so a generous timeout is mandatory there;
+/// streaming execs (the runner itself) are unaffected.
+const EXEC_TIMEOUT: &str = "30m";
+
 #[derive(Debug, Clone)]
 pub struct SmolVmProvider {
     binary: PathBuf,
@@ -951,18 +961,49 @@ impl VmProvider for SmolVmProvider {
     }
 
     async fn delete(&self, name: &MachineName) -> Result<(), VmError> {
-        let result = self
-            .recovery(
-                "delete",
-                &[
-                    "machine".into(),
-                    "delete".into(),
-                    "--name".into(),
-                    name.as_str().into(),
-                    "-f".into(),
-                ],
-            )
-            .await;
+        let args = [
+            "machine".into(),
+            "delete".into(),
+            "--name".into(),
+            name.as_str().into(),
+            "-f".into(),
+        ];
+        let mut attempts = 0;
+        let result = loop {
+            attempts += 1;
+            match self.recovery("delete", &args).await {
+                Ok(_) => break Ok(()),
+                // Delete is idempotent. SmolVM may remove its registry entry
+                // before a retry observes the partially cleaned directory.
+                Err(VmError::Command { message, .. })
+                    if message.to_ascii_lowercase().contains("not found") =>
+                {
+                    break Ok(());
+                }
+                // SmolVM 1.7.7 can race its final agent/log writes with the
+                // recursive data-directory removal. The same force-delete
+                // succeeds once those writers exit.
+                Err(VmError::Command { ref message, .. })
+                    if attempts < 3
+                        && message.to_ascii_lowercase().contains("directory not empty") =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                // The machine registry is a single SQLite database; concurrent
+                // create/fork/delete from the pool contends on it. A delete
+                // that hits the lock leaves the machine leaked — and a leaked
+                // clone is what blocks the golden's re-arm. Retry the same
+                // bounded way; the lock clears once the competing operation
+                // commits.
+                Err(VmError::Command { ref message, .. })
+                    if attempts < 3
+                        && message.to_ascii_lowercase().contains("database is locked") =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                Err(error) => break Err(error),
+            }
+        };
         if result.is_ok() {
             let mut forked = self.forked_machines.lock().await;
             forked.remove(name.as_str());
@@ -971,7 +1012,7 @@ impl VmProvider for SmolVmProvider {
             // clones forever, silently disabling the re-arm recovery.
             forked.retain(|_, owner| owner != name.as_str());
         }
-        result.map(|_| ())
+        result
     }
 
     async fn status(&self, name: &MachineName) -> Result<MachineState, VmError> {
@@ -1025,6 +1066,8 @@ impl VmProvider for SmolVmProvider {
             "exec".into(),
             "--name".into(),
             name.as_str().into(),
+            "--timeout".into(),
+            EXEC_TIMEOUT.into(),
             "--".into(),
         ];
         args.extend_from_slice(argv);
@@ -1045,6 +1088,8 @@ impl VmProvider for SmolVmProvider {
             "exec".into(),
             "--name".into(),
             name.as_str().into(),
+            "--timeout".into(),
+            EXEC_TIMEOUT.into(),
         ];
         for (guest, source) in secrets {
             if !is_env_identifier(guest) {
@@ -1200,16 +1245,50 @@ impl VmProvider for SmolVmProvider {
                 return Ok(false);
             }
         }
-        self.concurrent(
-            "stop",
-            &[
-                "machine".into(),
-                "stop".into(),
-                "--name".into(),
-                golden.as_str().into(),
-            ],
-        )
-        .await?;
+        match self
+            .concurrent(
+                "stop",
+                &[
+                    "machine".into(),
+                    "stop".into(),
+                    "--name".into(),
+                    golden.as_str().into(),
+                ],
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(VmError::Command { message, .. })
+                if message.contains("stop or delete the clones first") =>
+            {
+                // SmolVM's registry knows live clones this process's
+                // in-memory map does not (the map is rebuilt per engine
+                // start, so clones leaked by an earlier session are
+                // invisible here). Delete them so the golden can re-freeze;
+                // `delete` retries transient registry-lock contention.
+                warn!(
+                    golden = golden.as_str(),
+                    clones = extract_dependent_clones(&message).join(", "),
+                    "re-arm blocked by clones unknown to this session; removing them"
+                );
+                for clone in extract_dependent_clones(&message) {
+                    if let Ok(name) = MachineName::new(clone) {
+                        let _ = self.delete(&name).await;
+                    }
+                }
+                self.concurrent(
+                    "stop",
+                    &[
+                        "machine".into(),
+                        "stop".into(),
+                        "--name".into(),
+                        golden.as_str().into(),
+                    ],
+                )
+                .await?;
+            }
+            Err(error) => return Err(error),
+        }
         self.concurrent(
             "start",
             &[
@@ -1223,6 +1302,28 @@ impl VmProvider for SmolVmProvider {
         .await?;
         Ok(true)
     }
+}
+
+/// Clone machine names SmolVM names in its "stop or delete the clones first"
+/// refusal, e.g. `is the fork base for 2 live clone(s) (clone-a, clone-b)`.
+///
+/// The names are the only authoritative list of what still depends on the
+/// frozen base — the pool's own map can be empty after a restart even though
+/// SmolVM's registry kept the clones.
+fn extract_dependent_clones(message: &str) -> Vec<String> {
+    let Some(open) = message.find("live clone(s) (") else {
+        return Vec::new();
+    };
+    let rest = &message[open + "live clone(s) (".len()..];
+    let Some(close) = rest.find(')') else {
+        return Vec::new();
+    };
+    rest[..close]
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Whether a name is usable as a shell environment variable identifier.
@@ -2115,6 +2216,33 @@ mod tests {
         );
     }
 
+    /// The exact refusal SmolVM emits when a re-arm tries to stop a golden
+    /// that still has live clones — names parsed from the message are the
+    /// authoritative dependency list when the pool's in-memory clone map is
+    /// empty (fresh engine start after a session that leaked machines).
+    #[test]
+    fn extract_dependent_clones_parses_smolvm_refusal() {
+        assert_eq!(
+            extract_dependent_clones(
+                "Error: agent operation failed: stop: machine 'preloop-runner-golden' is the \
+                 fork base for 2 live clone(s) (preloop-runner-535-1, preloop-runner-642-1); \
+                 stop or delete the clones first"
+            ),
+            vec!["preloop-runner-535-1", "preloop-runner-642-1"]
+        );
+        assert_eq!(
+            extract_dependent_clones("is the fork base for 1 live clone(s) (preloop-runner-9-1)"),
+            vec!["preloop-runner-9-1"]
+        );
+    }
+
+    #[test]
+    fn extract_dependent_clones_ignores_unrelated_errors() {
+        assert!(extract_dependent_clones("vm not found: preloop-runner-golden").is_empty());
+        assert!(extract_dependent_clones("").is_empty());
+        assert!(extract_dependent_clones("database is locked").is_empty());
+    }
+
     #[test]
     fn cgroup_controllers_enabled_requires_all_three_controllers() {
         let directory = tempfile::tempdir().unwrap();
@@ -2306,6 +2434,41 @@ mod tests {
             .delete(&MachineName::new("runner").unwrap())
             .await
             .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_retries_transient_nonempty_directory_and_is_idempotent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("smolvm");
+        let marker = directory.path().join("delete-attempted");
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\nif [ ! -f '{}' ]; then\n  touch '{}'\n  echo 'failed to remove machine data: Directory not empty (os error 66)' >&2\n  exit 1\nfi\n",
+                marker.display(),
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let provider = SmolVmProvider::new(&binary);
+        provider
+            .delete(&MachineName::new("runner").unwrap())
+            .await
+            .expect("transient nonempty-directory cleanup must be retried");
+        assert!(marker.exists());
+
+        // A missing machine is already deleted and must satisfy the same
+        // idempotent provider contract.
+        std::fs::write(&binary, "#!/bin/sh\necho 'machine not found' >&2\nexit 1\n").unwrap();
+        provider
+            .delete(&MachineName::new("runner").unwrap())
+            .await
+            .expect("deleting an absent machine must succeed");
     }
 
     /// A rejected sandbox override must surface as

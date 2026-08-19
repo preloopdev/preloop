@@ -266,7 +266,10 @@ fn evaluate_template_value(
     value: &str,
     expr_ctx: &preloop_gha_expressions::Context,
 ) -> Result<String> {
-    crate::worker::template::evaluate_template(value, expr_ctx)
+    // Strict: the official runner fails the action step when an input
+    // expression cannot be evaluated (AssertString), instead of passing the
+    // raw `${{ }}` through to the action.
+    crate::worker::template::evaluate_template_strict(value, expr_ctx)
         .with_context(|| format!("evaluating container manifest value {value:?}"))
 }
 

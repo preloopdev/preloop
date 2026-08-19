@@ -182,6 +182,38 @@ Releases before v0.27.0 predate the changelog.
   class (VM escape, hostile egress, secret theft, control-plane
   impersonation, resource sabotage, supply chain), and candid current
   limitations (internal doc).
+- Real-world large-repo conformance campaign (moby, neovim, TypeScript,
+  ruff, node): five unmodified workflows run end to end; campaign writeup
+  in `.runner-watch/repos-conformance-20260812.md` and `docs/fidelity-gap.md`
+  §1c.
+
+### Fixed
+
+- **Packed-machine ownership now comes from SmolVM**: the runtime updater
+  requires SmolVM 1.8.1 or newer and installs the latest stable release when
+  an older or incompatible runtime is detected. Preloop no longer rewrites
+  guest rootfs ownership or re-derives setuid modes itself.
+- **SmolVM non-streaming `machine exec` dropped after ~30s without
+  output**: quiet provisioning commands such as toolchain installs were
+  killed mid-flight. Provider execs now pass an explicit `--timeout`.
+- **Job/workflow-level `env:` never reached action processes**: the server
+  wrote job env only into the message `variables` map, leaving the wire
+  `environmentVariables` (which the official runner materializes into step
+  environments) empty — `docker buildx bake` HCL variables like moby's
+  `DESTDIR` silently resolved to their defaults and targets lost their
+  outputs. The job message builder now populates `environmentVariables`.
+- **Queued runs wedged across a server restart**: the on-demand pool only
+  forks while its shared `queue_depth` atomic is non-zero, and after a
+  restart no runner exists to refresh it; recovered queues sat "pending"
+  forever. `serve` re-arms the atomic from the recovered queue.
+- **Concurrency-group deadlock on unclaimable jobs**: a run whose remaining
+  jobs all need an external host (macos/windows) never goes terminal, so its
+  run-level concurrency holder parked every later submission in the same
+  group forever. Restore-time group reconciliation now releases holders
+  stuck that way (the run stays queued and re-acquires if a host appears).
+- **Golden missing Chromium/playwright runtime libraries**: 21 browser
+  runtime libs pinned in `versions.toml` and added to the golden bake
+  (fingerprint-invalidating, so the pool rebuilds).
 
 ### Security
 

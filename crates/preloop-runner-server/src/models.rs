@@ -38,6 +38,25 @@ pub(crate) struct DapPortRegistration {
 pub(crate) struct StepRecord {
     pub(crate) name: String,
     pub(crate) conclusion: String,
+    /// Server-side observation of when the step first appeared (started) and
+    /// when it turned terminal (finished). Stamped at projection time, so
+    /// durations are authoritative even when the runner omits wire
+    /// timestamps (preloop-runner) or when a worker dies mid-step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) started_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) finished_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Server-side timing for the workspace snapshot created at submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SnapshotTiming {
+    /// Wall time spent capturing the tree, including the git operations.
+    pub(crate) duration_ms: u64,
+    /// Objects (loose + packed) in the snapshot repository.
+    pub(crate) object_count: u64,
+    /// Packed size in bytes (loose objects are negligible after repacking).
+    pub(crate) pack_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +134,10 @@ pub(crate) struct RunRecord {
     pub(crate) conclusion: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) push_state: Option<PushState>,
+    /// Submission-time workspace snapshot cost; present only for local
+    /// submissions that snapshot a workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) snapshot_timing: Option<SnapshotTiming>,
 }
 
 #[derive(Debug, Clone)]

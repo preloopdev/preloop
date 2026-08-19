@@ -837,6 +837,13 @@ fn parse_sha256_checksum(text: &str) -> Option<String> {
 /// workflows portable. This list is ~350 MB.
 const BASE_PACKAGES: &str = "\
      git curl wget ca-certificates gnupg2 sudo openssh-client \
+     libnspr4 libnss3 libatk1.0-0t64 libatk-bridge2.0-0t64 \
+     libatspi2.0-0t64 libcairo2 libcups2t64 libdbus-1-3 libdrm2 libgbm1 \
+     libglib2.0-0t64 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 \
+     libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 libasound2t64 \
+     ruby ruby-rubygems perl cpanminus lsb-release fonts-noto-color-emoji \
+     haveged mediainfo p7zip-rar pollinate sshpass telnet tk xvfb zsync ftp \
+     sphinxsearch systemd-coredump libnss3-tools software-properties-common \
      build-essential pkg-config libssl-dev make autoconf automake libtool m4 \
      bison flex texinfo patchelf swig dpkg-dev fakeroot binutils \
      libicu-dev libsqlite3-dev libyaml-dev \
@@ -844,7 +851,8 @@ const BASE_PACKAGES: &str = "\
      unzip zip xz-utils zstd bzip2 brotli lz4 pigz p7zip-full tar \
      jq file tree shellcheck parallel time acl locales tzdata \
      rsync dnsutils iputils-ping net-tools iproute2 netcat-openbsd \
-     sqlite3 rpm aria2 mercurial";
+     sqlite3 rpm aria2 mercurial libcurl4-openssl-dev zlib1g-dev gettext \
+     libexpat1-dev";
 
 /// Node.js baked into the base image, pinned (via `versions.toml`) to the
 /// GitHub-hosted ubuntu-24.04 system Node. Ubuntu's apt `nodejs` (18.19) is
@@ -937,6 +945,47 @@ fn base_packages_pinned() -> String {
         gnupg2={APT_GNUPG2} \
         sudo={APT_SUDO} \
         openssh-client={APT_OPENSSH_CLIENT} \
+        libnspr4={APT_LIBNSPR4} \
+        libnss3={APT_LIBNSS3} \
+        libatk1.0-0t64={APT_LIBATK1} \
+        libatk-bridge2.0-0t64={APT_LIBATK_BRIDGE} \
+        libatspi2.0-0t64={APT_LIBATSPI} \
+        libcairo2={APT_LIBCAIRO2} \
+        libcups2t64={APT_LIBCUPS2T64} \
+        libdbus-1-3={APT_LIBDBUS_1_3} \
+        libdrm2={APT_LIBDRM2} \
+        libgbm1={APT_LIBGBM1} \
+        libglib2.0-0t64={APT_LIBGLIB2} \
+        libpango-1.0-0={APT_LIBPANGO} \
+        libx11-6={APT_LIBX11_6} \
+        libxcb1={APT_LIBXCB1} \
+        libxcomposite1={APT_LIBXCOMPOSITE1} \
+        libxdamage1={APT_LIBXDAMAGE1} \
+        libxext6={APT_LIBXEXT6} \
+        libxfixes3={APT_LIBXFIXES3} \
+        libxkbcommon0={APT_LIBXKBCOMMON0} \
+        libxrandr2={APT_LIBXRANDR2} \
+        libasound2t64={APT_LIBASOUND2T64} \
+        ruby={APT_RUBY} \
+        ruby-rubygems={APT_RUBY_RUBYGEMS} \
+        perl={APT_PERL} \
+        cpanminus={APT_CPANMINUS} \
+        lsb-release={APT_LSB_RELEASE} \
+        fonts-noto-color-emoji={APT_FONTS_NOTO_COLOR_EMOJI} \
+        haveged={APT_HAVEGED} \
+        mediainfo={APT_MEDIAINFO} \
+        p7zip-rar={APT_P7ZIP_RAR} \
+        pollinate={APT_POLLINATE} \
+        sshpass={APT_SSHPASS} \
+        telnet={APT_TELNET} \
+        tk={APT_TK} \
+        xvfb={APT_XVFB} \
+        zsync={APT_ZSYNC} \
+        ftp={APT_FTP} \
+        sphinxsearch={APT_SPHINXSEARCH} \
+        systemd-coredump={APT_SYSTEMD_COREDUMP} \
+        libnss3-tools={APT_LIBNSS3_TOOLS} \
+        software-properties-common={APT_SOFTWARE_PROPERTIES_COMMON} \
         build-essential={APT_BUILD_ESSENTIAL} \
         pkg-config={APT_PKG_CONFIG} \
         libssl-dev={APT_LIBSSL_DEV} \
@@ -1096,6 +1145,7 @@ pub fn base_install_script() -> String {
          && printf '{LOOPBACK_HOSTS}' > /etc/hosts && \
          printf '127.0.0.1 %s\\n' \"$(hostname)\" >> /etc/hosts && \
          printf 'APT::Get::Assume-Yes \"true\";\\n' > /etc/apt/apt.conf.d/90assumeyes && \
+         rm -f /usr/lib/python3*/EXTERNALLY-MANAGED && \
          arch=$(uname -m); \
          case \"$arch\" in x86_64) NODE_ARCH=x64 ;; aarch64|arm64) NODE_ARCH=arm64 ;; *) NODE_ARCH=x64 ;; esac; \
          case \"$NODE_ARCH\" in \
@@ -1204,7 +1254,8 @@ pub fn base_install_script() -> String {
           printf 'export NVM_DIR=/usr/local/share/nvm\\n[ -s \"$NVM_DIR/nvm.sh\" ] && \\. \"$NVM_DIR/nvm.sh\"\\n' > /etc/profile.d/nvm.sh) && \
          echo \"### bake yarn v{YARN_VERSION}\" >&2 && \
          npm install -g yarn@{YARN_VERSION} && \
-         install -d -m 0775 -o 1001 -g 1001 /opt/hostedtoolcache && \
+         install -d -m 0777 /opt/hostedtoolcache && \
+         printf 'AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\\nRUNNER_TOOL_CACHE=/opt/hostedtoolcache\\n' >> /etc/environment && \
          (useradd -m -u 1000 -s /bin/bash ubuntu 2>/dev/null || true) && \
          apt-get clean && \
          rm -rf /usr/share/doc/* /usr/share/man/* /usr/share/info/*",
@@ -2170,8 +2221,13 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         building: Arc<AtomicUsize>,
     ) -> Result<(), OrchestratorError> {
         let max_concurrent = {
+            // Leave one runner's CPU share for the golden fork base and the
+            // host itself: filling every core with runner VMs starves the
+            // clone agents on fork readiness probes (EAGAIN), which rolls
+            // the fork back and spends the golden's retained checkpoint.
             let parallelism = std::thread::available_parallelism().map_or(2, |value| value.get());
-            (parallelism / usize::from(self.config.cpus.max(1))).max(1)
+            let per_runner = usize::from(self.config.cpus.max(1));
+            (parallelism / per_runner).saturating_sub(1).max(1)
         };
         info!(max_concurrent, "on-demand runner pool (size=0)");
 
@@ -3847,7 +3903,13 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
     // change needed).
     let provisioning = format!(
         "getent passwd {user} >/dev/null 2>&1 || useradd -m -u {uid} {user} 2>/dev/null; \
-         mkdir -p /run/user/{uid}; chown {uid}:{uid} /run/user/{uid} /var/lib/preloop-runner 2>/dev/null; \
+         printf '%s\\n' '{user} ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/preloop-{user} \
+           && chmod 0440 /etc/sudoers.d/preloop-{user}; \
+         mkdir -p /run/user/{uid} /opt/hostedtoolcache; \
+         chown {uid}:{uid} /run/user/{uid} /var/lib/preloop-runner 2>/dev/null; \
+         chmod -R 777 /opt/hostedtoolcache 2>/dev/null; \
+         grep -q AGENT_TOOLSDIRECTORY /etc/environment 2>/dev/null || \
+           printf 'AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\\nRUNNER_TOOL_CACHE=/opt/hostedtoolcache\\n' >> /etc/environment; \
          chmod 777 /run/preloop-control 2>/dev/null; \
          getent group docker >/dev/null 2>&1 && usermod -aG docker {user} 2>/dev/null"
     );
@@ -4477,6 +4539,11 @@ chmod +x "$destination/bin/node"
         assert!(
             script.contains("setpriv --reuid 1001 --regid 1001 --keep-groups"),
             "{script}"
+        );
+        assert!(
+            script.contains("NOPASSWD: ALL"),
+            "the runner account must be able to sudo non-interactively, \
+             like the GitHub-hosted runner user: {script}"
         );
         assert!(
             script.contains("| base64 -d | sudo -n sh 2>/dev/null || true"),

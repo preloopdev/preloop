@@ -116,8 +116,18 @@ fn setup_actions_own_versioned_runtime_toolcaches() {
         );
     }
     assert!(
-        script.contains("install -d -m 0775 -o 1001 -g 1001 /opt/hostedtoolcache"),
-        "setup actions need a runner-writable toolcache"
+        script.contains("install -d -m 0777 /opt/hostedtoolcache"),
+        "the hosted image creates /opt/hostedtoolcache root-owned, mode 777 \
+         (runner-images configure-environment.sh); setup actions need a \
+         world-writable toolcache"
+    );
+    assert!(
+        script.contains("AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache"),
+        "the hosted image sets AGENT_TOOLSDIRECTORY in /etc/environment"
+    );
+    assert!(
+        script.contains("RUNNER_TOOL_CACHE=/opt/hostedtoolcache"),
+        "the hosted image sets RUNNER_TOOL_CACHE in /etc/environment"
     );
 }
 

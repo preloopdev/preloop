@@ -111,15 +111,17 @@ pub(crate) async fn next_message(
                         .state
                         .mint_runtime_token(&msg.plan.plan_id, &msg.job_id),
                 );
-                endpoint
-                    .data
-                    .insert("ResultsServiceUrl".to_owned(), runner_base_url());
+                endpoint.data.insert(
+                    "ResultsServiceUrl".to_owned(),
+                    format!("{}/", runner_base_url()),
+                );
                 endpoint
                     .data
                     .insert("PipelinesServiceUrl".to_owned(), runner_server_url());
-                endpoint
-                    .data
-                    .insert("CacheServerUrl".to_owned(), runner_base_url());
+                endpoint.data.insert(
+                    "CacheServerUrl".to_owned(),
+                    format!("{}/", runner_base_url()),
+                );
             }
         }
         debug!(
@@ -285,6 +287,7 @@ pub(crate) async fn complete_job_compat(
             status,
             outputs: Default::default(),
             annotations: Vec::new(),
+            step_results: Vec::new(),
         },
     )
     .await
@@ -360,6 +363,7 @@ pub(crate) async fn agent_request_patch(
                     status: new_status,
                     outputs: Default::default(),
                     annotations: Vec::new(),
+                    step_results: Vec::new(),
                 })
             } else {
                 info!(
@@ -519,6 +523,42 @@ fn mask_completion_annotations(
     )
 }
 
+/// Map a `completejob` stepResult's status + conclusion to the run record's
+/// step-conclusion string, when the step is terminally reported.
+///
+/// Status is the official TimelineRecordState (`completed` or 2); only a
+/// terminal status makes the conclusion authoritative — in-progress/pending
+/// steps stay for the reconciliation pass. Conclusion is the official
+/// TaskResult (`succeeded`/`succeededwithissues`/`failed`/`canceled`/
+/// `skipped`/`abandoned`, or the numeric 0..5 forms).
+fn completion_step_conclusion(wire: &preloop_gha_protocol::CompletionStepResult) -> Option<String> {
+    let terminal = match wire.status.as_ref()?.as_str() {
+        Some("completed") => true,
+        Some(_) => false,
+        None => matches!(wire.status.as_ref()?.as_u64(), Some(2 | 3)),
+    };
+    if !terminal {
+        return None;
+    }
+    let conclusion = match wire.conclusion.as_ref()?.as_str() {
+        Some(text) => match text.to_ascii_lowercase().as_str() {
+            "succeeded" | "succeededwithissues" => "success",
+            "failed" | "abandoned" => "failure",
+            "canceled" | "cancelled" => "cancelled",
+            "skipped" => "skipped",
+            _ => return None,
+        },
+        None => match wire.conclusion.as_ref()?.as_u64() {
+            Some(0 | 1) => "success",
+            Some(2 | 5) => "failure",
+            Some(3) => "cancelled",
+            Some(4) => "skipped",
+            _ => return None,
+        },
+    };
+    Some(conclusion.to_owned())
+}
+
 pub(crate) async fn complete_job_inner(
     shared: Arc<SharedState>,
     completion: JobCompletion,
@@ -569,6 +609,35 @@ pub(crate) async fn complete_job_inner(
         let job_name = completion.job_id.0.clone();
         if let Some(pos) = run.jobs_list.iter().position(|j| j.name == job_name) {
             run.jobs_list[pos].conclusion = format!("{:?}", effective).to_lowercase();
+            // A worker can terminate through ForceFailJob before it sends the
+            // final WorkflowStepsUpdate. Do not leave the last reported step
+            // in_progress after its job is terminal.
+            //
+            // The official runner carries the authoritative per-step
+            // conclusions in CompleteJob.stepResults (status=TimelineRecordState,
+            // conclusion=TaskResult); apply them first. A crashed worker sends
+            // none, and any step still in_progress after that is reconciled to
+            // the job's effective status — the same view GitHub's server
+            // presents for orphaned steps.
+            for step in &mut run.jobs_list[pos].steps {
+                let Some(wire) = completion
+                    .step_results
+                    .iter()
+                    .find(|result| result.name.as_deref() == Some(step.name.as_str()))
+                else {
+                    continue;
+                };
+                if let Some(conclusion) = completion_step_conclusion(wire) {
+                    step.conclusion = conclusion;
+                }
+            }
+            let step_conclusion = status_string(effective);
+            for step in &mut run.jobs_list[pos].steps {
+                if step.conclusion == "in_progress" {
+                    step.conclusion = step_conclusion.clone();
+                    step.finished_at = step.finished_at.or(Some(chrono::Utc::now()));
+                }
+            }
             if !completion.annotations.is_empty() {
                 run.jobs_list[pos].annotations = mask_completion_annotations(run, &completion);
             }

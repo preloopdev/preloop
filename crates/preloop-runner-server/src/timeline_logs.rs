@@ -153,13 +153,32 @@ pub(crate) async fn patch_timeline_records(
                         }
                         _ => "success",
                     };
+                    let started_at = record
+                        .start_time
+                        .as_deref()
+                        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                        .map(|t| t.with_timezone(&chrono::Utc));
+                    let finished_at = record
+                        .finish_time
+                        .as_deref()
+                        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                        .map(|t| t.with_timezone(&chrono::Utc));
+                    let observed = chrono::Utc::now();
 
                     if let Some(pos) = job_detail.steps.iter().position(|s| s.name == *name) {
                         job_detail.steps[pos].conclusion = conclusion_str.to_owned();
+                        if let Some(started_at) = started_at {
+                            job_detail.steps[pos].started_at = Some(started_at);
+                        }
+                        if let Some(finished_at) = finished_at {
+                            job_detail.steps[pos].finished_at = Some(finished_at);
+                        }
                     } else {
                         job_detail.steps.push(StepRecord {
                             name: name.clone(),
                             conclusion: conclusion_str.to_owned(),
+                            started_at: started_at.or(Some(observed)),
+                            finished_at,
                         });
                     }
                 }
@@ -375,6 +394,7 @@ pub(crate) async fn finish_job(
                 status,
                 outputs,
                 annotations: Vec::new(),
+                step_results: Vec::new(),
             })
         } else {
             None
@@ -541,6 +561,7 @@ pub(crate) async fn finish_job_plan(
                 status,
                 outputs,
                 annotations: Vec::new(),
+                step_results: Vec::new(),
             })
         } else {
             warn!(plan_id, "finish_job_plan: could not resolve run/job");
@@ -619,6 +640,7 @@ mod tests {
                     event: "push".to_owned(),
                     conclusion: None,
                     push_state: None,
+                    snapshot_timing: None,
                 },
             );
             inner.plan_requests.insert(plan_id.clone(), request_id);

@@ -519,12 +519,42 @@ pub async fn run_steps(
             step.context_name.clone(),
             resolved_display_name.clone(),
         );
+        // The official runner fails the step when a step-env expression
+        // cannot be evaluated (AssertString throws; StepsRunner marks the
+        // step failed). Never silently keep a literal `${{ }}` in the
+        // environment.
+        let mut step_env_error: Option<anyhow::Error> = None;
         {
             let expr_ctx = step_ctx.job.build_expression_context();
             for (k, v) in &step.env {
-                let evaluated = crate::worker::template::evaluate_template(v, &expr_ctx)
-                    .unwrap_or_else(|_| v.clone());
-                step_ctx.env.insert(k.clone(), evaluated);
+                match crate::worker::template::evaluate_template_strict(v, &expr_ctx) {
+                    Ok(evaluated) => {
+                        step_ctx.env.insert(k.clone(), evaluated);
+                    }
+                    Err(error) => {
+                        step_env_error
+                            .get_or_insert_with(|| anyhow::anyhow!("step env '{k}' {error:#}"));
+                    }
+                }
+            }
+            // Workflow/job-level `env:` is pre-resolved by the server except
+            // for runtime-only context keys (`github.workspace` — the server
+            // has no runner work directory, and its resolver would zero the
+            // property to ""). Evaluate any leftover templates now against
+            // the full runtime context, like the official runner's
+            // step-time env evaluation. Step env still overrides.
+            for (k, v) in &step_ctx.job.env {
+                if v.contains("${{") {
+                    match crate::worker::template::evaluate_template_strict(v, &expr_ctx) {
+                        Ok(evaluated) => {
+                            step_ctx.env.entry(k.clone()).or_insert(evaluated);
+                        }
+                        Err(error) => {
+                            step_env_error
+                                .get_or_insert_with(|| anyhow::anyhow!("job env '{k}' {error:#}"));
+                        }
+                    }
+                }
             }
         }
 
@@ -727,9 +757,10 @@ pub async fn run_steps(
                 step_cancel_rx
             };
 
-            let mut outcome = match file_command_init_error {
-                Some(error) => Err(error),
-                None => {
+            let mut outcome = match (file_command_init_error, step_env_error.take()) {
+                (_, Some(error)) => Err(error),
+                (Some(error), _) => Err(error),
+                (None, None) => {
                     execute_step(&step.step_type, &mut step_ctx, workspace, exec_cancel_rx).await
                 }
             };

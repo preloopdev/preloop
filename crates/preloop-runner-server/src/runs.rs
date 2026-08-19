@@ -917,6 +917,7 @@ pub(crate) async fn submit_run_inner(
                     event: event.clone(),
                     conclusion: Some("failure".to_owned()),
                     push_state: None,
+                    snapshot_timing: None,
                 },
             );
             drop(inner);
@@ -1077,6 +1078,7 @@ pub(crate) async fn submit_run_inner(
                             event: event.clone(),
                             conclusion: Some("cancelled".to_owned()),
                             push_state: None,
+                            snapshot_timing: None,
                         },
                     );
                     drop(inner);
@@ -1144,6 +1146,7 @@ pub(crate) async fn submit_run_inner(
                     event: event.clone(),
                     conclusion: None,
                     push_state: None,
+                    snapshot_timing: None,
                 },
             );
             drop(inner);
@@ -1203,6 +1206,9 @@ pub(crate) async fn submit_run_inner(
                 event: event.clone(),
                 conclusion: None,
                 push_state: None,
+                snapshot_timing: workspace_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.snapshot_timing),
             },
         );
 
@@ -1310,6 +1316,9 @@ pub(crate) async fn submit_run_inner(
                 s
             }
         };
+        let snapshot_timing = workspace_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.snapshot_timing);
         inner.runs.insert(
             run_id,
             RunRecord {
@@ -1341,6 +1350,7 @@ pub(crate) async fn submit_run_inner(
                 event: event.clone(),
                 conclusion: None,
                 push_state: None,
+                snapshot_timing,
             },
         );
         // Deferred reusable-caller nodes whose needs are already satisfied
@@ -2130,17 +2140,66 @@ pub(crate) async fn get_run_logs(
 
     let mut merged = Vec::new();
     for (plan_id, agent_job_id, fallback_blocks) in sources {
-        let results_log = state_dir
+        let results_dir = state_dir
             .join("replay")
             .join("results")
             .join(plan_id)
-            .join(agent_job_id)
-            .join("job-logs.txt");
+            .join(agent_job_id);
+        let results_log = results_dir.join("job-logs.txt");
         match tokio::fs::read(&results_log).await {
             Ok(contents) => merged.extend_from_slice(&contents),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                for block in fallback_blocks {
-                    merged.extend_from_slice(&block);
+                let mut step_logs = Vec::new();
+                match tokio::fs::read_dir(&results_dir).await {
+                    Ok(mut entries) => {
+                        while let Some(entry) = entries.next_entry().await.map_err(|error| {
+                            ApiError::internal(format!(
+                                "failed to enumerate result logs `{}`: {error}",
+                                results_dir.display()
+                            ))
+                        })? {
+                            let name = entry.file_name();
+                            let name = name.to_string_lossy();
+                            if !name.starts_with("step-") || !name.ends_with(".txt") {
+                                continue;
+                            }
+                            let metadata = entry.metadata().await.map_err(|error| {
+                                ApiError::internal(format!(
+                                    "failed to inspect result log `{}`: {error}",
+                                    entry.path().display()
+                                ))
+                            })?;
+                            if !metadata.is_file() {
+                                continue;
+                            }
+                            let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+                            step_logs.push((modified, name.into_owned(), entry.path()));
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(ApiError::internal(format!(
+                            "failed to enumerate result logs `{}`: {error}",
+                            results_dir.display()
+                        )));
+                    }
+                }
+                step_logs
+                    .sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+                if step_logs.is_empty() {
+                    for block in fallback_blocks {
+                        merged.extend_from_slice(&block);
+                    }
+                } else {
+                    for (_, _, path) in step_logs {
+                        let contents = tokio::fs::read(&path).await.map_err(|error| {
+                            ApiError::internal(format!(
+                                "failed to read result log `{}`: {error}",
+                                path.display()
+                            ))
+                        })?;
+                        merged.extend_from_slice(&contents);
+                    }
                 }
             }
             Err(error) => {

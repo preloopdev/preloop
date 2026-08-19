@@ -23,6 +23,8 @@ pub(crate) struct BrokerRenewJobRequest {
     pub(crate) outputs: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub(crate) annotations: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub(crate) step_results: Vec<preloop_gha_protocol::CompletionStepResult>,
 }
 
 pub(crate) fn execution_status_from_runner_result(result: &str) -> Option<ExecutionStatus> {
@@ -288,6 +290,7 @@ pub(crate) async fn next_message_broker_ref(
 
         if let Some(run) = inner.runs.get_mut(&queued.run_id) {
             run.status = ExecutionStatus::InProgress;
+            run.started_at.get_or_insert_with(chrono::Utc::now);
             run.jobs
                 .insert(queued.job_id.clone(), ExecutionStatus::InProgress);
         }
@@ -580,6 +583,7 @@ pub(crate) async fn next_message_broker_ref_root(
                 if let Some(queued) = claimed {
                     if let Some(run) = inner.runs.get_mut(&queued.run_id) {
                         run.status = ExecutionStatus::InProgress;
+                        run.started_at.get_or_insert_with(chrono::Utc::now);
                         run.jobs
                             .insert(queued.job_id.clone(), ExecutionStatus::InProgress);
                     }
@@ -804,15 +808,17 @@ pub(crate) async fn broker_acquire_job(
                     .state
                     .mint_runtime_token(&message.plan.plan_id, &message.job_id),
             );
-            endpoint
-                .data
-                .insert("ResultsServiceUrl".to_owned(), runner_base_url());
+            endpoint.data.insert(
+                "ResultsServiceUrl".to_owned(),
+                format!("{}/", runner_base_url()),
+            );
             endpoint
                 .data
                 .insert("PipelinesServiceUrl".to_owned(), runner_server_url());
-            endpoint
-                .data
-                .insert("CacheServerUrl".to_owned(), runner_base_url());
+            endpoint.data.insert(
+                "CacheServerUrl".to_owned(),
+                format!("{}/", runner_base_url()),
+            );
             endpoint.data.insert(
                 "FeedStreamUrl".to_owned(),
                 format!("{}/ws/live-logs/{}", websocket_base_url(), message.job_id),
@@ -920,6 +926,7 @@ async fn fail_unclaimable_request(shared: &Arc<SharedState>, request_id: i64) {
             status: ExecutionStatus::Failure,
             outputs: preloop_gha_protocol::OutputMap::new(),
             annotations: Vec::new(),
+            step_results: Vec::new(),
         };
         // The caller is already returning the mint failure to the runner, so a
         // secondary bookkeeping error must not mask it.
@@ -981,10 +988,11 @@ pub(crate) async fn mint_dispatch_github_token(
     shared: &Arc<SharedState>,
     request: &GitHubTokenRequest,
 ) -> Result<Option<MintedGitHubToken>, ApiError> {
+    let started = std::time::Instant::now();
     let Some(app) = &shared.state.github_app else {
         return Ok(None);
     };
-    match crate::github_app::get_or_mint_token_declared(
+    let minted = match crate::github_app::get_or_mint_token_declared(
         app,
         &request.repository,
         &request.permissions,
@@ -992,10 +1000,10 @@ pub(crate) async fn mint_dispatch_github_token(
     )
     .await
     {
-        Ok((token, effective_permissions)) => Ok(Some(MintedGitHubToken {
+        Ok((token, effective_permissions)) => Some(MintedGitHubToken {
             token,
             effective_permissions,
-        })),
+        }),
         Err(error) => {
             // An untrusted fork job must never fall back to the PAT: the
             // PAT is repository-unscoped and ignores `permissions:`, so
@@ -1019,6 +1027,11 @@ pub(crate) async fn mint_dispatch_github_token(
                             request.repository
                         ))
                     })?;
+            info!(
+                    repository = %request.repository,
+                duration_ms = started.elapsed().as_millis() as u64,
+                "GitHub token minted at claim (fallback path)"
+            );
             if fallback.is_some() {
                 warn!(
                     repository = %request.repository,
@@ -1030,12 +1043,18 @@ pub(crate) async fn mint_dispatch_github_token(
                     "GitHub App token minting failed; job retains local runtime token: {error:#}"
                 );
             }
-            Ok(fallback.map(|token| MintedGitHubToken {
+            fallback.map(|token| MintedGitHubToken {
                 token,
                 effective_permissions: None,
-            }))
+            })
         }
-    }
+    };
+    info!(
+        repository = %request.repository,
+        duration_ms = started.elapsed().as_millis() as u64,
+        "GitHub token minted at claim"
+    );
+    Ok(minted)
 }
 
 /// Merge a minted token's effective (App-scoped) permission set into the
@@ -1181,6 +1200,7 @@ pub(crate) async fn broker_complete_job(
                     status,
                     outputs,
                     annotations: request.annotations.clone(),
+                    step_results: request.step_results.clone(),
                 })
             }
             None => {

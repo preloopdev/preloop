@@ -482,7 +482,9 @@ jobs:
             --target "$RUNNER_TARGET" \
             -p preloop-runner
 
-      - name: Install smolvm
+      - name: Install compatible smolvm
+        env:
+          SMOLVM_VERSION: "1.8.2"
         run: |
           set -euo pipefail
           # The verified golden release, pinned in versions.toml and bumped

@@ -2528,6 +2528,59 @@ results-second
 }
 
 #[tokio::test]
+async fn log_get_run_logs_falls_back_to_uploaded_step_logs() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let accepted = submit_yaml(
+        &app,
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 1\n",
+        "owner/repo",
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let (plan_id, agent_job_id) = {
+        let inner = state.inner.lock().await;
+        let request = inner
+            .job_requests
+            .values()
+            .find(|request| request.run_id == run_id)
+            .unwrap();
+        (request.plan_id.clone(), request.agent_job_id.to_string())
+    };
+    let results_dir = temp
+        .path()
+        .join("replay")
+        .join("results")
+        .join(plan_id)
+        .join(agent_job_id);
+    tokio::fs::create_dir_all(&results_dir).await.unwrap();
+    tokio::fs::write(results_dir.join("step-first.txt"), b"first step\n")
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    tokio::fs::write(results_dir.join("step-second.txt"), b"failed step\n")
+        .await
+        .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/v1/runs/{run_id}/logs"))
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(body.as_ref(), b"first step\nfailed step\n");
+}
+
+#[tokio::test]
 async fn log_get_run_logs_returns_404_for_unknown_run() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -11269,6 +11322,136 @@ fn secret_store_debug_redacts_values() {
 }
 
 #[tokio::test]
+async fn completion_step_results_are_authoritative_over_inference() {
+    // The official runner carries final step conclusions in
+    // CompleteJob.stepResults (TaskResult strings). A step the worker reports
+    // as "skipped" must not be blanket-terminalized to the job's failure
+    // status: the completion's own stepResults win.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let accepted = submit_yaml(
+        &app,
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 1\n",
+        "local/preloop",
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+    let (plan_id, agent_job_id) = {
+        let inner = state.inner.lock().await;
+        let request = inner
+            .job_requests
+            .values()
+            .find(|request| request.run_id.0.to_string() == run_id)
+            .unwrap();
+        (request.plan_id.clone(), request.agent_job_id.to_string())
+    };
+    request_json(
+        &app,
+        Method::POST,
+        "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",
+        json!({
+            "workflow_run_backend_id": plan_id,
+            "workflow_job_run_backend_id": agent_job_id,
+            "steps": [{
+                "external_id": uuid::Uuid::new_v4().to_string(),
+                "number": 2,
+                "name": "Test",
+                "status": 3,
+                "conclusion": 0
+            }]
+        }),
+    )
+    .await;
+    request_json(
+        &app,
+        Method::POST,
+        "/internal/test/jobs/complete",
+        json!({
+            "run_id": run_id,
+            "job_id": "build",
+            "status": "failure",
+            "outputs": {},
+            "step_results": [{
+                "external_id": uuid::Uuid::new_v4().to_string(),
+                "number": 2,
+                "name": "Test",
+                "status": "completed",
+                "conclusion": "skipped"
+            }]
+        }),
+    )
+    .await;
+
+    let run = get_run_json(&app, &run_id).await;
+    assert_eq!(run["status"], "failure");
+    assert_eq!(
+        run["jobs_list"][0]["steps"][0]["conclusion"], "skipped",
+        "the completion's stepResults must override job-status inference"
+    );
+}
+
+async fn terminal_job_completion_terminalizes_an_active_step() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let accepted = submit_yaml(
+        &app,
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 1\n",
+        "local/preloop",
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+    let (plan_id, agent_job_id) = {
+        let inner = state.inner.lock().await;
+        let request = inner
+            .job_requests
+            .values()
+            .find(|request| request.run_id.0.to_string() == run_id)
+            .unwrap();
+        (request.plan_id.clone(), request.agent_job_id.to_string())
+    };
+    request_json(
+        &app,
+        Method::POST,
+        "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",
+        json!({
+            "workflow_run_backend_id": plan_id,
+            "workflow_job_run_backend_id": agent_job_id,
+            "steps": [{
+                "external_id": uuid::Uuid::new_v4().to_string(),
+                "number": 2,
+                "name": "Test",
+                "status": 3,
+                "conclusion": 0
+            }]
+        }),
+    )
+    .await;
+    request_json(
+        &app,
+        Method::POST,
+        "/internal/test/jobs/complete",
+        json!({
+            "run_id": run_id,
+            "job_id": "build",
+            "status": "failure",
+            "outputs": {}
+        }),
+    )
+    .await;
+
+    let run = get_run_json(&app, &run_id).await;
+    assert_eq!(run["status"], "failure");
+    assert_eq!(run["jobs_list"][0]["conclusion"], "failure");
+    assert_eq!(run["jobs_list"][0]["steps"][0]["name"], "Test");
+    assert_eq!(
+        run["jobs_list"][0]["steps"][0]["conclusion"], "failure",
+        "a terminal job must not retain an in-progress step"
+    );
+}
+
+#[tokio::test]
 async fn workflow_steps_update_prefers_runner_reported_step_names() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -11327,6 +11510,142 @@ async fn workflow_steps_update_prefers_runner_reported_step_names() {
             .all(|step| !step["name"].as_str().unwrap_or("").is_empty()),
         "no step may have an empty name in the run record: {steps:?}"
     );
+}
+
+#[tokio::test]
+async fn workflow_steps_update_terminal_first_sighting_does_not_fake_zero_duration() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = submit_yaml(
+        &app,
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        "local/preloop",
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+    let (plan_id, agent_job_id) = {
+        let inner = state.inner.lock().await;
+        let request = inner
+            .job_requests
+            .values()
+            .find(|request| request.run_id.0.to_string() == run_id)
+            .expect("submitted run must have a job request");
+        (request.plan_id.clone(), request.agent_job_id.to_string())
+    };
+
+    // Fast built-in / quick steps often complete before any in-progress
+    // update is processed. First sighting is already terminal (status=6).
+    request_json(
+        &app,
+        Method::POST,
+        "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",
+        json!({
+            "workflow_run_backend_id": plan_id,
+            "workflow_job_run_backend_id": agent_job_id,
+            "steps": [{
+                "external_id": uuid::Uuid::new_v4().to_string(),
+                "number": 2,
+                "name": "Run echo hi",
+                "status": 6,
+                "conclusion": 2
+            }]
+        }),
+    )
+    .await;
+
+    let run = get_run_json(&app, &run_id).await;
+    let step = run["jobs_list"][0]["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["name"] == "Run echo hi")
+        .expect("step row");
+    assert!(
+        step.get("started_at").is_none() || step["started_at"].is_null(),
+        "terminal-first sighting must not invent started_at (got {step:?})"
+    );
+    assert!(
+        step.get("finished_at").and_then(|v| v.as_str()).is_some(),
+        "terminal-first sighting must still record finished_at (got {step:?})"
+    );
+}
+
+#[tokio::test]
+async fn workflow_steps_update_records_start_on_in_progress_then_finish() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = submit_yaml(
+        &app,
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        "local/preloop",
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+    let (plan_id, agent_job_id) = {
+        let inner = state.inner.lock().await;
+        let request = inner
+            .job_requests
+            .values()
+            .find(|request| request.run_id.0.to_string() == run_id)
+            .expect("submitted run must have a job request");
+        (request.plan_id.clone(), request.agent_job_id.to_string())
+    };
+
+    request_json(
+        &app,
+        Method::POST,
+        "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",
+        json!({
+            "workflow_run_backend_id": plan_id,
+            "workflow_job_run_backend_id": agent_job_id,
+            "steps": [{
+                "external_id": uuid::Uuid::new_v4().to_string(),
+                "number": 2,
+                "name": "Run echo hi",
+                "status": 3,
+                "conclusion": 0
+            }]
+        }),
+    )
+    .await;
+    request_json(
+        &app,
+        Method::POST,
+        "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",
+        json!({
+            "workflow_run_backend_id": plan_id,
+            "workflow_job_run_backend_id": agent_job_id,
+            "steps": [{
+                "external_id": uuid::Uuid::new_v4().to_string(),
+                "number": 2,
+                "name": "Run echo hi",
+                "status": 6,
+                "conclusion": 2
+            }]
+        }),
+    )
+    .await;
+
+    let run = get_run_json(&app, &run_id).await;
+    let step = run["jobs_list"][0]["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["name"] == "Run echo hi")
+        .expect("step row");
+    assert!(
+        step.get("started_at").and_then(|v| v.as_str()).is_some(),
+        "in_progress first sighting must set started_at (got {step:?})"
+    );
+    assert!(
+        step.get("finished_at").and_then(|v| v.as_str()).is_some(),
+        "terminal follow-up must set finished_at (got {step:?})"
+    );
+    assert!(step["conclusion"] == "success");
 }
 
 async fn get_run_json(app: &Router, run_id: &str) -> Value {
@@ -15038,6 +15357,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
             repository: "snapshots/11111111-1111-4111-8111-111111111111".to_owned(),
             default_branch: Some("main".to_owned()),
             before_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+            snapshot_timing: None,
         },
         "http://127.0.0.1:9090",
         "local-runtime-jwt",
@@ -15084,6 +15404,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
                 repository: "snapshots/22222222-2222-4222-8222-222222222222".to_owned(),
                 default_branch: Some("main".to_owned()),
                 before_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+                snapshot_timing: None,
             },
             "http://127.0.0.1:9090",
             "local-runtime-jwt",
@@ -15105,6 +15426,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
                 repository: "snapshots/33333333-3333-4333-8333-333333333333".to_owned(),
                 default_branch: Some("main".to_owned()),
                 before_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+                snapshot_timing: None,
             },
             "http://127.0.0.1:9090",
             "local-runtime-jwt",
@@ -15126,6 +15448,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
                 repository: "snapshots/44444444-4444-4444-8444-444444444444".to_owned(),
                 default_branch: Some("main".to_owned()),
                 before_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+                snapshot_timing: None,
             },
             "http://127.0.0.1:9090",
             "local-runtime-jwt",

@@ -740,6 +740,13 @@ pub(crate) fn apply_meta_snapshot(inner: &mut InnerState, meta: MetaSnapshot) {
         .map(|(run_id, job_id, granted)| ((run_id, job_id), granted))
         .collect();
     inner.concurrency_groups = meta.concurrency_groups.into_iter().collect();
+    // A restored group may name a holder whose run is already terminal (the
+    // snapshot predates the completion) or missing entirely; leaving it in
+    // place parks every later submission in that group forever. Reconcile
+    // before anything dispatches, and re-promote whatever the freed slots
+    // unblock.
+    crate::runtime_scheduling::reconcile_concurrency_groups(inner);
+    crate::runtime_scheduling::promote_ready_jobs(inner);
     inner.jobset_admissions = meta.jobset_admissions.into_iter().collect();
     inner.run_concurrency = meta.run_concurrency.into_iter().collect();
     inner.holder_keys = meta.holder_keys.into_iter().collect();

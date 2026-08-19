@@ -129,37 +129,107 @@ pub(crate) async fn prepare_remote_actions(
         .join("_actions");
     let mut action_paths = std::collections::HashMap::new();
 
-    for (uses, parsed) in refs {
-        let key = format!("{}@{}", parsed.action_name, parsed.git_ref);
-        let meta = resolved.get(&key);
-        let dir_ref = meta
-            .map(|m| m.resolved_sha.as_str())
-            .filter(|sha| !sha.is_empty())
-            .unwrap_or(parsed.git_ref.as_str());
-        let download_url = meta
-            .map(|m| m.tar_url.as_str())
-            .filter(|url| !url.is_empty());
-        let auth_token = meta.and_then(|m| m.auth_token.as_deref());
+    // The official ActionManager.PrepareActionsRecursiveAsync resolves and
+    // downloads nested actions recursively at prepare time (depth-limited,
+    // batched per level). A composite manifest is only readable after its own
+    // download, so walk the manifest tree level by level: each wave resolves
+    // the nested remote refs discovered in the previous wave's manifests.
+    let mut pending: Vec<(String, ParsedUses)> = refs;
+    let mut wave_resolved = resolved;
+    // Exclusive upper bound: at most `composite_max_depth()` executable
+    // nesting levels (official Constants.CompositeActionsMaxDepth = 10).
+    // An inclusive range pre-downloads one extra level the runner will reject.
+    for _depth in 0..composite_max_depth() {
+        if pending.is_empty() {
+            break;
+        }
+        let mut nested: Vec<(String, ParsedUses)> = Vec::new();
+        for (uses, parsed) in pending {
+            if action_paths.contains_key(&uses) {
+                continue;
+            }
+            let key = format!("{}@{}", parsed.action_name, parsed.git_ref);
+            let meta = wave_resolved.get(&key);
+            let dir_ref = meta
+                .map(|m| m.resolved_sha.as_str())
+                .filter(|sha| !sha.is_empty())
+                .unwrap_or(parsed.git_ref.as_str());
+            let download_url = meta
+                .map(|m| m.tar_url.as_str())
+                .filter(|url| !url.is_empty());
+            let auth_token = meta.and_then(|m| m.auth_token.as_deref());
 
-        let action_root = super::actions::manager::download_action(
-            &parsed.owner,
-            &parsed.repo,
-            dir_ref,
-            &actions_dir,
-            download_url,
-            auth_token,
-        )
-        .await?;
+            let action_root = super::actions::manager::download_action(
+                &parsed.owner,
+                &parsed.repo,
+                dir_ref,
+                &actions_dir,
+                download_url,
+                auth_token,
+            )
+            .await?;
 
-        let action_dir = if parsed.subpath.is_empty() {
-            action_root
-        } else {
-            action_root.join(&parsed.subpath)
-        };
-        action_paths.insert(uses, action_dir.to_string_lossy().to_string());
+            let action_dir = if parsed.subpath.is_empty() {
+                action_root
+            } else {
+                action_root.join(&parsed.subpath)
+            };
+            action_paths.insert(uses, action_dir.to_string_lossy().to_string());
+
+            // A composite's nested `uses:` refs are collected for the next
+            // wave, mirroring PrepareActionsRecursiveAsync.
+            let Ok(manifest) = super::handlers::factory::load_action_manifest(&action_dir) else {
+                continue;
+            };
+            if manifest.runs_using != "composite" {
+                continue;
+            }
+            if let Some(steps) = &manifest.runs_steps {
+                for step in steps {
+                    let Some(nested_uses) = step.get("uses").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    if nested_uses.starts_with("./")
+                        || nested_uses.starts_with("../")
+                        || nested_uses.starts_with("docker://")
+                        || nested_uses.starts_with("$/")
+                    {
+                        continue;
+                    }
+                    if action_paths.contains_key(nested_uses) {
+                        continue;
+                    }
+                    if let Some(parsed) = parse_remote_uses(nested_uses) {
+                        if !nested.iter().any(|(u, _)| u == nested_uses) {
+                            nested.push((nested_uses.to_owned(), parsed));
+                        }
+                    }
+                }
+            }
+        }
+        if nested.is_empty() {
+            break;
+        }
+        // Resolve the next wave's refs against the server (batched, like the
+        // official manager), tolerating a failed resolve so preparation still
+        // downloads what it can; execution-time staging covers the rest.
+        let action_pairs: Vec<(&str, &str)> = nested
+            .iter()
+            .map(|(_, parsed)| (parsed.action_name.as_str(), parsed.git_ref.as_str()))
+            .collect();
+        wave_resolved = resolver
+            .resolve_batch(&access_token, plan_id, job_id, &action_pairs)
+            .await
+            .unwrap_or_default();
+        pending = nested;
     }
 
     Ok(action_paths)
+}
+
+/// Official `Constants.CompositeActionsMaxDepth` (10).
+fn composite_max_depth() -> usize {
+    10
 }
 
 pub(crate) struct ParsedUses {

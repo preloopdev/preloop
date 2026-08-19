@@ -369,8 +369,8 @@ fn configured_smolvm_version() -> Option<String> {
         .filter(|version| !version.is_empty())
 }
 
-/// Probe the resolved smolvm and install the exact verified release when its
-/// version or required socket-mount capability differs.
+/// Probe the resolved smolvm and install the latest stable release when its
+/// version is below the minimum or it lacks the required socket capability.
 async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
     let install = default_smolvm_install().context("HOME is not set")?;
     // Clear stale templates from older layouts even when the compatible runtime
@@ -1028,6 +1028,7 @@ mod tests {
     #[tokio::test]
     async fn compatibility_requires_minimum_version_and_mount_socket() {
         let directory = tempfile::tempdir().unwrap();
+        let minimum = Version::parse(SMOLVM_MIN_VERSION).unwrap();
         for (version, flag, expected) in [
             ("1.8.1", "--mount-socket <HOST:GUEST>", true),
             ("1.8.2", "--mount-socket <HOST:GUEST>", true),
