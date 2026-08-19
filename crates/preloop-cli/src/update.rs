@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::LazyLock;
 use tar::Archive;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -16,10 +17,19 @@ use tokio::io::AsyncWriteExt;
 const DEFAULT_REPOSITORY: &str = "preloopdev/preloop";
 const USER_AGENT: &str = concat!("preloop/", env!("CARGO_PKG_VERSION"));
 const SMOLVM_REPOSITORY: &str = "smol-machines/smolvm";
+include!(concat!(env!("OUT_DIR"), "/pins.rs"));
 
-/// First SmolVM release that preserves archived UID/GID metadata when
-/// extracting packed machines. Newer stable releases are preferred.
-const SMOLVM_MIN_VERSION: &str = "1.8.1";
+/// Minimum SmolVM release `preloop update` accepts as already compatible,
+/// compiled from `smolvm_min_version` in the workspace `versions.toml` (see
+/// `build.rs`; keep the two in sync).
+///
+/// The configured floor is the first release that satisfies all runtime
+/// invariants, including packed-machine ownership preservation; newer stable
+/// releases satisfy it without another code change.
+static SMOLVM_MIN_COMPATIBLE_VERSION: LazyLock<Version> = LazyLock::new(|| {
+    Version::parse(SMOLVM_MIN_VERSION)
+        .expect("smolvm_min_version in versions.toml must be a semver version")
+});
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct UpdateArgs {
@@ -111,8 +121,10 @@ pub(crate) async fn run(args: UpdateArgs) -> anyhow::Result<()> {
     }
 
     // The engine cannot provision VMs without a compatible smolvm. Checking
-    // only `--mount-socket` accepted releases with the CLI surface but missing
-    // runtime fixes, so require both the capability and the minimum release.
+    // only `--mount-socket` accepted 1.7.5 on macOS even though its libkrun
+    // omitted krun_add_net_unixstream, so require the capability and at
+    // least the first release whose packaged runtime was verified; newer
+    // stable releases are adopted automatically.
     #[cfg(unix)]
     if !args.check {
         match ensure_smolvm(&client).await {
@@ -124,37 +136,84 @@ pub(crate) async fn run(args: UpdateArgs) -> anyhow::Result<()> {
         }
     }
 
-    if remote_version <= current_version {
+    if remote_version < current_version {
         println!("preloop {} is already up to date", current_version);
         return Ok(());
     }
     let target = target_triple();
-    let selected = select_asset(&release.assets, &remote_version, target)
-        .with_context(|| format!("release {} has no asset for {target}", release.tag_name))?;
-    println!(
-        "preloop {} -> {} ({target})",
-        current_version, remote_version
-    );
-    if args.check {
-        return Ok(());
+    let selected = match select_asset(&release.assets, &remote_version, target) {
+        Some(selected) => selected,
+        // Same version with no asset for this target: nothing to compare
+        // against, so keep the installed binary (the version gate above
+        // already ruled out a downgrade).
+        None if remote_version == current_version => {
+            println!("preloop {} is already up to date", current_version);
+            return Ok(());
+        }
+        None => bail!("release {} has no asset for {target}", release.tag_name),
+    };
+    if remote_version == current_version {
+        // The version string is self-reported and can lie: a source build or
+        // a tampered binary claims the release version while its bytes
+        // differ, and a version-only gate then declares it up to date
+        // forever (this is how the v0.30.2 deaf-runner fix never reached
+        // production). Verify the installed binary against the checksummed
+        // release asset and reinstall on mismatch.
+        match check_same_version_content(&client, &selected).await {
+            Ok(ContentCheck::Matches) => {
+                println!("preloop {} is already up to date", current_version);
+                return Ok(());
+            }
+            Ok(ContentCheck::Drift(staged)) => {
+                println!(
+                    "preloop {} does not match release {}; {} ({target})",
+                    current_version,
+                    release.tag_name,
+                    if args.check {
+                        "would reinstall"
+                    } else {
+                        "reinstalling"
+                    }
+                );
+                if args.check {
+                    return Ok(());
+                }
+                let lock_path = update_lock_path()?;
+                let _lock = UpdateLock::acquire(&lock_path)?;
+                let executable =
+                    std::env::current_exe().context("locate running preloop executable")?;
+                self_replace::self_replace(&staged.binary_path)
+                    .with_context(|| format!("atomically replace {}", executable.display()))?;
+                println!("installed preloop {}", remote_version);
+                restart_systemd_service().await?;
+                return Ok(());
+            }
+            Err(error) => {
+                // A transient failure to fetch or verify the asset must not
+                // fail the hourly update timer; the next run retries.
+                println!(
+                    "warning: could not verify the installed binary against release {}: {error:#}",
+                    release.tag_name
+                );
+                println!("preloop {} is already up to date", current_version);
+                return Ok(());
+            }
+        }
+    } else {
+        println!(
+            "preloop {} -> {} ({target})",
+            current_version, remote_version
+        );
+        if args.check {
+            return Ok(());
+        }
     }
 
     let lock_path = update_lock_path()?;
     let _lock = UpdateLock::acquire(&lock_path)?;
-    let temp_dir = tempfile::tempdir().context("create update staging directory")?;
-    let archive_path = temp_dir.path().join(&selected.archive.name);
-    download(
-        &client,
-        &selected.archive.browser_download_url,
-        &archive_path,
-    )
-    .await?;
-    verify_checksum(&client, selected.archive, selected.checksum, &archive_path).await?;
-
-    let staged_binary = temp_dir.path().join(binary_name());
-    extract_binary(&archive_path, &staged_binary)?;
+    let staged = stage_release(&client, &selected).await?;
     let executable = std::env::current_exe().context("locate running preloop executable")?;
-    self_replace::self_replace(&staged_binary)
+    self_replace::self_replace(&staged.binary_path)
         .with_context(|| format!("atomically replace {}", executable.display()))?;
 
     println!("installed preloop {}", remote_version);
@@ -179,7 +238,8 @@ async fn update_linux_runner_bundle(client: &Client, release: &Release) -> anyho
         .iter()
         .find(|asset| asset.name == format!("{asset_name}.sha256"));
     let staging = tempfile::tempdir().context("create runner bundle staging directory")?;
-    let bundle_path = staging.path().join(&asset.name);
+    let file_name = safe_asset_filename(&asset.name)?;
+    let bundle_path = staging.path().join(file_name);
     download(client, &asset.browser_download_url, &bundle_path).await?;
     verify_checksum(client, asset, checksum, &bundle_path).await?;
 
@@ -232,10 +292,13 @@ fn default_smolvm_install() -> Option<SmolvmInstall> {
 }
 
 /// Host triple naming used by the smolvm release assets.
+///
+/// Intel macOS is deliberately absent: official SmolVM releases ship no
+/// `darwin-x86_64` artifact, so advertising the platform would install
+/// nothing and leave the engine without a usable runtime.
 fn smolvm_platform() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => Some("darwin-arm64"),
-        ("macos", "x86_64") => Some("darwin-x86_64"),
         ("linux", "aarch64") => Some("linux-arm64"),
         ("linux", "x86_64") => Some("linux-x86_64"),
         _ => None,
@@ -291,27 +354,31 @@ async fn probe_smolvm_version(binary: &Path) -> Option<String> {
         .map(|version| version.trim_start_matches('v').to_owned())
 }
 
-fn smolvm_release_override() -> Option<String> {
-    std::env::var("PRELOOP_SMOLVM_RELEASE_VERSION")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+async fn smolvm_is_compatible(binary: &Path) -> bool {
+    probe_mount_socket(binary).await
+        && probe_smolvm_version(binary)
+            .await
+            .and_then(|version| Version::parse(&version).ok())
+            .is_some_and(|version| version >= *SMOLVM_MIN_COMPATIBLE_VERSION)
 }
 
-async fn smolvm_is_compatible(binary: &Path, minimum_version: &Version) -> bool {
-    let Some(version) = probe_smolvm_version(binary).await else {
-        return false;
-    };
-    let Ok(version) = Version::parse(&version) else {
-        return false;
-    };
-    probe_mount_socket(binary).await && version >= *minimum_version
+fn configured_smolvm_version() -> Option<String> {
+    std::env::var("PRELOOP_SMOLVM_RELEASE_VERSION")
+        .ok()
+        .map(|version| version.trim().trim_start_matches('v').to_owned())
+        .filter(|version| !version.is_empty())
 }
 
 /// Probe the resolved smolvm and install the latest stable release when its
 /// version is below the minimum or it lacks the required socket capability.
 async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
-    let minimum_version = Version::parse(SMOLVM_MIN_VERSION)?;
-    if smolvm_is_compatible(Path::new("smolvm"), &minimum_version).await {
+    let install = default_smolvm_install().context("HOME is not set")?;
+    // Clear stale templates from older layouts even when the compatible runtime
+    // is already installed: a compatible binary skips the install below, so
+    // this is the only chance to drop leftover variants that would otherwise
+    // keep being selected by SmolVM.
+    remove_stale_smolvm_templates(&install.prefix)?;
+    if smolvm_is_compatible(Path::new("smolvm")).await {
         return Ok(());
     }
     let platform = smolvm_platform().ok_or_else(|| {
@@ -321,10 +388,11 @@ async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
             std::env::consts::ARCH
         )
     })?;
+    let configured_version = configured_smolvm_version();
     let release = fetch_release(
         client,
         &format!("https://api.github.com/repos/{SMOLVM_REPOSITORY}/releases"),
-        smolvm_release_override().as_deref(),
+        configured_version.as_deref(),
     )
     .await?;
     let version = release
@@ -332,11 +400,11 @@ async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
         .strip_prefix('v')
         .unwrap_or(&release.tag_name);
     let release_version = parse_release_version(version)?;
-    if release_version < minimum_version {
+    if release_version < *SMOLVM_MIN_COMPATIBLE_VERSION {
         bail!(
-            "SmolVM release {} is below the required minimum {}",
+            "SmolVM release {} is below configured minimum {}",
             release.tag_name,
-            minimum_version
+            SMOLVM_MIN_VERSION
         );
     }
     let archive_name = format!("smolvm-{version}-{platform}.tar.gz");
@@ -349,7 +417,6 @@ async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
         .assets
         .iter()
         .find(|asset| asset.name == "checksums.sha256");
-    let install = default_smolvm_install().context("HOME is not set")?;
     let staging = tempfile::tempdir().context("create smolvm download directory")?;
     let archive_path = staging.path().join(&archive_name);
     download(client, &archive_asset.browser_download_url, &archive_path).await?;
@@ -359,13 +426,41 @@ async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
     // The install lands in `~/.local/bin`; if PATH still resolves another
     // binary, the engine keeps failing and the user is left confused about
     // why the update did not help. Say so explicitly.
-    if !smolvm_is_compatible(Path::new("smolvm"), &minimum_version).await {
+    if !smolvm_is_compatible(Path::new("smolvm")).await {
         bail!(
             "installed smolvm {version} to {}, but `smolvm` on PATH still resolves \
              to an incompatible version or lacks --mount-socket; make sure {} comes first",
             install.prefix.display(),
             install.bin_dir.display()
         );
+    }
+    Ok(())
+}
+
+/// Remove template variants from a previous SmolVM layout so the release's
+/// files are the only ones present. The archive carries either the
+/// uncompressed `.ext4` or compressed `.ext4.zst` variants; SmolVM's lazy
+/// extraction treats an existing uncompressed file as already prepared, so
+/// a leftover from an older installer would otherwise keep being used in
+/// place of the freshly copied format.
+/// Only `NotFound` is tolerated — any other failure is propagated so an
+/// update cannot report success while retaining stale state.
+fn remove_stale_smolvm_templates(prefix: &Path) -> anyhow::Result<()> {
+    for name in [
+        "storage-template.ext4",
+        "overlay-template.ext4",
+        "storage-template.ext4.zst",
+        "overlay-template.ext4.zst",
+    ] {
+        let path = prefix.join(name);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("remove stale smolvm template {}", path.display()));
+            }
+        }
     }
     Ok(())
 }
@@ -397,19 +492,7 @@ fn install_smolvm_from_archive(
         let _ = fs::remove_dir_all(&target);
         copy_dir_all(&lib, &target)?;
     }
-    // 1.7.7 ships its disk templates as `.zst`; older installs keep the
-    // uncompressed variants. SmolVM's lazy extraction treats an existing
-    // uncompressed file as already prepared, so every template variant is
-    // removed before the archive's payload is copied — otherwise an upgraded
-    // installation silently keeps using the previous release's templates.
-    for stale in [
-        "storage-template.ext4",
-        "overlay-template.ext4",
-        "storage-template.ext4.zst",
-        "overlay-template.ext4.zst",
-    ] {
-        let _ = fs::remove_file(install.prefix.join(stale));
-    }
+    remove_stale_smolvm_templates(&install.prefix)?;
     for name in [
         "smolvm",
         "smolvm-bin",
@@ -571,7 +654,18 @@ async fn verify_checksum(
     }
     .ok_or_else(|| anyhow::anyhow!("release asset {} has no SHA-256 checksum", archive.name))?;
 
-    let mut file = std::fs::File::open(archive_path)?;
+    let actual = sha256_file(archive_path)?;
+    if !actual.eq_ignore_ascii_case(&expected) {
+        bail!(
+            "checksum mismatch for {}: expected {expected}, got {actual}",
+            archive.name
+        );
+    }
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> anyhow::Result<String> {
+    let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 128 * 1024];
     loop {
@@ -581,14 +675,84 @@ async fn verify_checksum(
         }
         hasher.update(&buffer[..read]);
     }
-    let actual = format!("{:x}", hasher.finalize());
-    if !actual.eq_ignore_ascii_case(&expected) {
-        bail!(
-            "checksum mismatch for {}: expected {expected}, got {actual}",
-            archive.name
-        );
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Validate that an asset name is a single, safe relative filename without
+/// traversal components (`..`) or absolute path prefixes.
+fn safe_asset_filename(name: &str) -> anyhow::Result<&Path> {
+    let path = Path::new(name);
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("release asset name {name:?} has no valid filename"))?;
+    if file_name != path.as_os_str() {
+        bail!("release asset name {name:?} contains path separators or traversal");
     }
-    Ok(())
+    Ok(Path::new(file_name))
+}
+
+/// A downloaded, verified, and extracted release ready for `self_replace`.
+/// Retains the temporary directory so the extracted binary remains valid on
+/// disk until dropped.
+struct StagedRelease {
+    _temp_dir: tempfile::TempDir,
+    binary_path: PathBuf,
+}
+
+/// Download a release asset, verify its checksum, and extract the binary.
+async fn stage_release(
+    client: &Client,
+    selected: &SelectedAsset<'_>,
+) -> anyhow::Result<StagedRelease> {
+    let temp_dir = tempfile::tempdir().context("create update staging directory")?;
+    let file_name = safe_asset_filename(&selected.archive.name)?;
+    let archive_path = temp_dir.path().join(file_name);
+    download(
+        client,
+        &selected.archive.browser_download_url,
+        &archive_path,
+    )
+    .await?;
+    verify_checksum(client, selected.archive, selected.checksum, &archive_path).await?;
+    let staged_binary = temp_dir.path().join(binary_name());
+    extract_binary(&archive_path, &staged_binary)?;
+    Ok(StagedRelease {
+        _temp_dir: temp_dir,
+        binary_path: staged_binary,
+    })
+}
+
+enum ContentCheck {
+    Matches,
+    Drift(StagedRelease),
+}
+
+/// Compare the installed binary against the checksummed release asset.
+async fn check_same_version_content(
+    client: &Client,
+    selected: &SelectedAsset<'_>,
+) -> anyhow::Result<ContentCheck> {
+    let staged = stage_release(client, selected).await?;
+
+    let installed = std::env::current_exe().context("locate running preloop executable")?;
+    // macOS installs are launched through the `preloop` symlink into
+    // `<prefix>/bin/preloop`; canonicalize so a future compare of paths
+    // (and anyone reading this) sees the real file.
+    let installed =
+        fs::canonicalize(&installed).with_context(|| format!("resolve {}", installed.display()))?;
+    if installed_binary_matches(&installed, &staged.binary_path)? {
+        Ok(ContentCheck::Matches)
+    } else {
+        Ok(ContentCheck::Drift(staged))
+    }
+}
+
+/// Content comparison behind the same-version check: `true` only when the
+/// installed binary is byte-identical to the release binary. A missing or
+/// unreadable file is an `Err`, never a silent `true` — the caller treats
+/// "unknown" as "keep what is installed and retry later", not "matches".
+fn installed_binary_matches(installed: &Path, release_binary: &Path) -> anyhow::Result<bool> {
+    Ok(sha256_file(installed)? == sha256_file(release_binary)?)
 }
 
 fn extract_binary(archive_path: &Path, destination: &Path) -> anyhow::Result<()> {
@@ -869,6 +1033,8 @@ mod tests {
             ("1.8.1", "--mount-socket <HOST:GUEST>", true),
             ("1.8.2", "--mount-socket <HOST:GUEST>", true),
             ("1.8.0", "--mount-socket <HOST:GUEST>", false),
+            ("1.7.5", "--mount-socket <HOST:GUEST>", false),
+            ("1.7.6", "--mount-socket <HOST:GUEST>", false),
             ("1.8.1", "--docker-socket", false),
         ] {
             let executable = directory
@@ -896,7 +1062,7 @@ mod tests {
             std::fs::set_permissions(&executable, permissions).unwrap();
 
             assert_eq!(
-                smolvm_is_compatible(&executable, &minimum).await,
+                smolvm_is_compatible(&executable).await,
                 expected,
                 "version={version}, flag={flag}"
             );
@@ -907,7 +1073,10 @@ mod tests {
     fn platform_naming_covers_apple_silicon_and_linux() {
         match (std::env::consts::OS, std::env::consts::ARCH) {
             ("macos", "aarch64") => assert_eq!(smolvm_platform(), Some("darwin-arm64")),
-            ("macos", "x86_64") => assert_eq!(smolvm_platform(), Some("darwin-x86_64")),
+            // Official SmolVM ships no Intel macOS artifact; the platform must
+            // not be advertised (otherwise `preloop update` would claim a
+            // runtime it cannot install).
+            ("macos", "x86_64") => assert_eq!(smolvm_platform(), None),
             ("linux", "aarch64") => assert_eq!(smolvm_platform(), Some("linux-arm64")),
             ("linux", "x86_64") => assert_eq!(smolvm_platform(), Some("linux-x86_64")),
             other => assert_eq!(smolvm_platform(), None, "unexpected host {other:?}"),
@@ -928,7 +1097,6 @@ mod tests {
         std::fs::write(lib.join("nested").join("libfile"), b"lib").unwrap();
         std::fs::write(source.join("smolvm"), "#!/bin/sh\n").unwrap();
         std::fs::write(source.join("smolvm-bin"), "#!/bin/sh\n").unwrap();
-        std::fs::write(source.join("storage-template.ext4"), b"template").unwrap();
         std::fs::write(
             source.join("storage-template.ext4.zst"),
             b"compressed-template",
@@ -979,6 +1147,19 @@ mod tests {
             data_dir: directory.path().join("data"),
             bin_dir: directory.path().join("bin"),
         };
+        std::fs::create_dir_all(&install.prefix).unwrap();
+        std::fs::write(install.prefix.join("storage-template.ext4"), b"stale").unwrap();
+        std::fs::write(install.prefix.join("overlay-template.ext4"), b"stale").unwrap();
+        std::fs::write(
+            install.prefix.join("storage-template.ext4.zst"),
+            b"stale-compressed",
+        )
+        .unwrap();
+        std::fs::write(
+            install.prefix.join("overlay-template.ext4.zst"),
+            b"stale-compressed",
+        )
+        .unwrap();
         if let Err(error) = install_smolvm_from_archive(&archive_path, "9.9.9", &install) {
             eprintln!("install error: {error:?}");
             panic!("install failed: {error}");
@@ -994,10 +1175,8 @@ mod tests {
         );
         assert!(install.prefix.join("smolvm").is_file());
         assert!(install.prefix.join("smolvm-bin").is_file());
-        assert_eq!(
-            std::fs::read(install.prefix.join("storage-template.ext4")).unwrap(),
-            b"template"
-        );
+        assert!(!install.prefix.join("storage-template.ext4").exists());
+        assert!(!install.prefix.join("overlay-template.ext4").exists());
         assert_eq!(
             std::fs::read(install.prefix.join("storage-template.ext4.zst")).unwrap(),
             b"compressed-template"
@@ -1108,6 +1287,50 @@ mod tests {
     }
 
     #[test]
+    fn remove_stale_smolvm_templates_clears_old_layouts() {
+        let directory = tempfile::tempdir().unwrap();
+        let prefix = directory.path().join("prefix");
+        std::fs::create_dir_all(&prefix).unwrap();
+        for name in [
+            "storage-template.ext4",
+            "overlay-template.ext4",
+            "storage-template.ext4.zst",
+            "overlay-template.ext4.zst",
+        ] {
+            std::fs::write(prefix.join(name), b"stale").unwrap();
+        }
+
+        remove_stale_smolvm_templates(&prefix).unwrap();
+
+        for name in [
+            "storage-template.ext4",
+            "overlay-template.ext4",
+            "storage-template.ext4.zst",
+            "overlay-template.ext4.zst",
+        ] {
+            assert!(!prefix.join(name).exists(), "{name} must be removed");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_stale_smolvm_templates_propagates_removal_failures() {
+        let directory = tempfile::tempdir().unwrap();
+        let prefix = directory.path().join("prefix");
+        // A directory at the template path makes `remove_file` fail with
+        // IsADirectory; the cleanup must surface that instead of silently
+        // proceeding and reporting a successful install.
+        std::fs::create_dir_all(prefix.join("storage-template.ext4")).unwrap();
+
+        let error = remove_stale_smolvm_templates(&prefix).unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("remove stale smolvm template"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
     fn extracts_binary_from_cargo_dist_tarball() {
         let temp = tempfile::tempdir().expect("staging directory");
         let archive_path = temp.path().join("preloop-cli-aarch64-apple-darwin.tar.gz");
@@ -1135,5 +1358,81 @@ mod tests {
 
         extract_binary(&archive_path, &output_path).expect("extract binary");
         assert_eq!(std::fs::read(output_path).expect("binary"), contents);
+    }
+
+    #[test]
+    fn content_check_detects_same_version_drift() {
+        // The v0.30.2 incident: a locally built binary claimed the release
+        // version string, so the version-only gate declared it up to date
+        // and the shipped fix never installed. The same-version check must
+        // compare bytes, not versions: identical content matches, drifted
+        // content (same claimed version) does not, and an unreadable file is
+        // an error rather than a silent match.
+        let temp = tempfile::tempdir().expect("staging directory");
+        let installed = temp.path().join("installed");
+        let release = temp.path().join("release");
+        std::fs::write(&installed, b"installed-build").unwrap();
+        std::fs::write(&release, b"installed-build").unwrap();
+        assert!(
+            installed_binary_matches(&installed, &release).expect("both files readable"),
+            "byte-identical binaries must match"
+        );
+        std::fs::write(&release, b"release-build").unwrap();
+        assert!(
+            !installed_binary_matches(&installed, &release).expect("both files readable"),
+            "drifted content at the same version must be detected"
+        );
+        assert!(
+            installed_binary_matches(&installed, &temp.path().join("missing")).is_err(),
+            "an unreadable binary must not be reported as matching"
+        );
+    }
+
+    #[test]
+    fn extract_then_content_check_rejects_a_tampered_archive_payload() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let temp = tempfile::tempdir().expect("staging directory");
+        let archive_path = temp.path().join("preloop-cli-aarch64-apple-darwin.tar.gz");
+        let file = std::fs::File::create(&archive_path).expect("archive");
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        // Same archive layout, different payload bytes than the "installed"
+        // binary that claims the same version.
+        let payload = b"drifted-release-payload";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder
+            .append_data(
+                &mut header,
+                "preloop-cli-aarch64-apple-darwin/preloop",
+                &payload[..],
+            )
+            .expect("binary entry");
+        builder
+            .into_inner()
+            .expect("gzip stream")
+            .finish()
+            .expect("archive");
+
+        let installed = temp.path().join("installed");
+        std::fs::write(&installed, b"local-build-claiming-same-version").unwrap();
+        let extracted = temp.path().join(binary_name());
+        extract_binary(&archive_path, &extracted).expect("extract binary");
+        assert!(
+            !installed_binary_matches(&installed, &extracted).expect("both files readable"),
+            "a drifted payload at the same version must trigger reinstall"
+        );
+    }
+
+    #[test]
+    fn safe_asset_filename_rejects_traversal_and_absolute_paths() {
+        assert!(safe_asset_filename("preloop-v0.30.2-aarch64-apple-darwin.tar.gz").is_ok());
+        assert!(safe_asset_filename("../evil.tar.gz").is_err());
+        assert!(safe_asset_filename("/etc/passwd").is_err());
+        assert!(safe_asset_filename("").is_err());
     }
 }

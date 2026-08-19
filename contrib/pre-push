@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# pre-push hook: soft CI gate for preloop.
+#
+# Install per checkout:
+#   cp contrib/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+# (or let `preloop run` offer it for you).
+#
+# What it does, on `git push origin <branch>`:
+#   1. Skips the gate entirely when any pushed commit message carries [skip ci].
+#   2. Otherwise runs `preloop run` (CI on the current tree), holding the push
+#      open while CI runs. The gate itself never pushes anything — git's own
+#      push proceeds with your commits once CI is green. For the checked-out
+#      branch's current commit only: other refs pass with a warning, because
+#      the tree CI would test is not the tree being pushed.
+#   3. CI green  -> exit 0; git pushes normally.
+#   4. CI red    -> exit 1. The push is aborted; the branch never reaches GitHub.
+#   5. Fail-open -> if preloop is unreachable the push proceeds with a loud
+#      warning (a CI gate must not brick `git push` when the server restarts).
+#      Unreachability is decided from preloop's own machine-readable marker,
+#      never from CI step output that mentions a network error.
+#
+# Verdicts are cached per (remote, server, commit): a re-push of the same
+# commit reuses the recorded run's live terminal status instead of re-running
+# CI, and an interrupted hook resumes the run it already started.
+#
+# This is a SOFT gate: it is advisory per-machine. Anyone can push without the
+# hook (web UI, another machine). Server-side enforcement is a separate concern.
+
+set -euo pipefail
+
+# Chain a previously installed hook (another tool's), if any: run it first
+# with the same stdin refs; its verdict is authoritative.
+prev_hook="$(dirname "$0")/pre-push.preloop-prev"
+if [[ -x "$prev_hook" ]]; then
+  refs="$(cat)"
+  if printf '%s\n' "$refs" | "$prev_hook" "$@"; then
+    :
+  else
+    previous_status=$?
+    exit "$previous_status"
+  fi
+else
+  refs="$(cat)"
+fi
+
+preloop_bin="${PRELOOP_BIN:-preloop}"
+endpoint="${PRELOOP_URL:-http://127.0.0.1:9090}"
+remote_url="${2:-unknown-remote}"
+cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/preloop-push"
+mkdir -p "$cache_dir"
+zero_sha=0000000000000000000000000000000000000000
+
+head_branch="$(git symbolic-ref --short HEAD 2>/dev/null || true)"
+head_sha="$(git rev-parse HEAD 2>/dev/null || true)"
+
+run_ci_or_resume() {
+  local local_sha="$1" branch="$2" remote_sha="$3"
+  local log_range
+  # [skip ci] in any pushed commit bypasses the gate. A new branch carries an
+  # all-zero remote sha — log the single revision, not an invalid range.
+  if [[ "$remote_sha" == "$zero_sha" ]]; then
+    log_range="$local_sha"
+  else
+    log_range="${remote_sha}..$local_sha"
+  fi
+  if git log --format=%B "$log_range" 2>/dev/null | grep -qi '\[skip *ci\]'; then
+    echo "preloop: [skip ci] found — pushing ${branch} without the CI gate"
+    return 0
+  fi
+
+  # Scoped cache: keyed by (remote, endpoint, sha), recording the run id.
+  # Only a terminal-success verdict for this exact destination skips CI; the
+  # recorded run is validated live (and resumed) rather than trusting a bare
+  # "the hook exited 0" marker that an interruption could skip writing.
+  local cache_key cache run_id verdict
+  get_verdict() {
+    local status_err status_rc status_output
+    status_err="$(mktemp "${TMPDIR:-/tmp}/preloop-status-XXXXXX")"
+    set +e
+    status_output="$(PRELOOP_URL="$endpoint" "$preloop_bin" status "$1" 2>"$status_err")"
+    status_rc=$?
+    set -e
+    if [[ $status_rc -eq 0 ]]; then
+      printf '%s\n' "$status_output"
+    elif grep -q 'PRELOOP_UNREACHABLE' "$status_err"; then
+      printf 'unreachable\n'
+    else
+      printf 'error\n'
+    fi
+    rm -f "$status_err"
+  }
+  cache_key="$(printf '%s\n' "$remote_url" "$endpoint" "$local_sha" | git hash-object --stdin)"
+  cache="$cache_dir/$cache_key"
+  if [[ -f "$cache" ]]; then
+    IFS=$'\t' read -r run_id cached_remote cached_endpoint < "$cache" || true
+    if [[ "$cached_remote" == "$remote_url" && "$cached_endpoint" == "$endpoint" ]]; then
+      verdict="$(get_verdict "$run_id")"
+      case "$verdict" in
+        success)
+          echo "preloop: cached CI verdict for ${local_sha:0:12}: success"
+          return 0 ;;
+        failure|cancelled|skipped)
+          echo "preloop: cached CI verdict for ${local_sha:0:12}: ${verdict} — fix and re-push (or rm $cache)" >&2
+          return 1 ;;
+        in_progress|queued|pending)
+          echo "preloop: run ${run_id} still in progress — waiting for CI before pushing ${branch}..."
+          while :; do
+            sleep 15
+            verdict="$(get_verdict "$run_id")"
+            case "$verdict" in
+              success)
+                echo "preloop: CI passed for ${branch}"
+                return 0 ;;
+              failure|cancelled|skipped)
+                echo "preloop: cached CI verdict for ${local_sha:0:12}: ${verdict} — fix and re-push (or rm $cache)" >&2
+                return 1 ;;
+              in_progress|queued|pending) ;;
+              unreachable)
+                echo "preloop: cannot reach the engine to resume run ${run_id} — pushing ${branch} WITHOUT the CI gate (fail-open)" >&2
+                return 0 ;;
+              error)
+                echo "preloop: cannot validate cached run ${run_id} — push aborted" >&2
+                return 1 ;;
+            esac
+          done ;;
+        error)
+          echo "preloop: cannot resolve run ${run_id} — running CI fresh" >&2 ;;
+      esac
+    fi
+  fi
+
+  # Run CI. Fail open only on the machine-readable engine-unreachable marker
+  # emitted by preloop itself — never on CI step output that happens to
+  # mention a network error.
+  local log error_log run_pid run_status i
+  log="$(mktemp "${TMPDIR:-/tmp}/preloop-push-XXXXXX")"
+  error_log="$(mktemp "${TMPDIR:-/tmp}/preloop-push-error-XXXXXX")"
+  echo "preloop: running CI on preloop before pushing ${branch} (this holds the push)..."
+  set +e
+  "$preloop_bin" run >"$log" 2>"$error_log" &
+  run_pid=$!
+  # Record the run id as soon as the engine accepts it, so an interrupted
+  # hook (Ctrl-C, crash) resumes the same run on the next push instead of
+  # duplicating CI.
+  for i in $(seq 1 300); do
+    run_id="$(grep -oE 'Run [0-9a-fA-F-]{36} created' "$log" 2>/dev/null | head -1 | awk '{print $2}' || true)"
+    [[ -n "$run_id" ]] && break
+    sleep 0.2
+  done
+  if [[ -n "$run_id" ]]; then
+    printf '%s\t%s\t%s\n' "$run_id" "$remote_url" "$endpoint" > "$cache"
+  fi
+  wait "$run_pid"
+  run_status=$?
+  set -e
+  if grep -q 'PRELOOP_UNREACHABLE' "$error_log"; then
+    echo "preloop: engine unreachable — pushing ${branch} WITHOUT the CI gate (fail-open)" >&2
+    rm -f "$log" "$error_log"
+    return 0
+  fi
+  if [[ $run_status -ne 0 ]]; then
+    echo "preloop: CI failed for ${branch} — push aborted. Details:" >&2
+    tail -n 30 "$log" >&2
+    tail -n 30 "$error_log" >&2
+    rm -f "$log" "$error_log"
+    return 1
+  fi
+  rm -f "$log" "$error_log"
+  return 0
+}
+
+while read -r local_ref local_sha _remote_ref remote_sha; do
+  case "$local_ref" in refs/heads/*) ;; *) continue ;; esac
+  [[ "$local_sha" != "$zero_sha" ]] || continue # deletion
+  branch="${local_ref#refs/heads/}"
+  if [[ "$branch" != "$head_branch" || "$local_sha" != "$head_sha" ]]; then
+    echo "preloop: not gating push of ${branch} (only the checked-out branch is validated)" >&2
+    continue
+  fi
+  if ! run_ci_or_resume "$local_sha" "$branch" "$remote_sha"; then
+    exit 1
+  fi
+done <<< "$refs"
+exit 0

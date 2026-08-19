@@ -71,6 +71,13 @@ fn evaluate_template_inner(
                     }
                     // Lenient: preserve the original token so run scripts degrade.
                     debug!("Expression evaluation failed: {e}");
+                    if matches!(
+                        e,
+                        preloop_gha_expressions::ExpressionError::FormatOutputTooLarge(_)
+                            | preloop_gha_expressions::ExpressionError::EvaluationTooLarge(_)
+                    ) {
+                        return Err(e.into());
+                    }
                     result.push_str(&rest[start..expr_start + end + 2]);
                 }
             }
@@ -299,6 +306,13 @@ mod tests {
         assert_eq!(result, "plain text no expressions");
     }
 
+    #[test]
+    fn format_like_literal_is_not_evaluated() {
+        let ctx = make_ctx();
+        let literal = "format('literal {0}', github.repository)";
+        assert_eq!(evaluate_template(literal, &ctx).unwrap(), literal);
+    }
+
     // --- P1 expressions/templates gap coverage ---
 
     #[test]
@@ -442,5 +456,23 @@ mod tests {
             result,
             "echo \"only runs for ubuntu-latest \u{2014} os=ubuntu-latest\""
         );
+    }
+
+    #[test]
+    fn format_resource_errors_propagate_from_templates_and_conditions() {
+        let mut ctx = make_ctx();
+        ctx.insert("env", serde_json::json!({"BIG": "A".repeat(600_000)}));
+
+        let template_error =
+            evaluate_template("${{ format('{0}{0}', env.BIG) }}", &ctx).unwrap_err();
+        assert!(matches!(
+            template_error.downcast_ref::<preloop_gha_expressions::ExpressionError>(),
+            Some(preloop_gha_expressions::ExpressionError::FormatOutputTooLarge(_))
+        ));
+        let condition_error = evaluate_condition("format('{0}{0}', env.BIG)", &ctx).unwrap_err();
+        assert!(matches!(
+            condition_error.downcast_ref::<preloop_gha_expressions::ExpressionError>(),
+            Some(preloop_gha_expressions::ExpressionError::FormatOutputTooLarge(_))
+        ));
     }
 }

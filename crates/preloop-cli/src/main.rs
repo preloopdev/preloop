@@ -4,9 +4,9 @@ use anyhow::Context;
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
-use preloop_gha_protocol::{ExecutionStatus, NdjsonEvent, RunAccepted, WorkflowSubmission};
+use preloop_gha_protocol::{ExecutionStatus, NdjsonEvent, RunAccepted, RunId, WorkflowSubmission};
 use preloop_orchestrator::environment::{is_stock_base_image, DEFAULT_BASE_IMAGE};
-use preloop_orchestrator::{RunnerPool, RunnerPoolConfig};
+use preloop_orchestrator::{artifact_payload, RunnerPool, RunnerPoolConfig};
 use preloop_vm::SmolVmProvider;
 use rand::RngCore;
 use std::collections::BTreeMap;
@@ -57,6 +57,301 @@ fn mounted_control_origin(public_url: &str) -> Option<String> {
     loopback.then(|| public_url.trim_end_matches('/').to_owned())
 }
 
+// ── Pre-push hook ──────────────────────────────────────────────────────────
+const HOOK_MARKER: &str = "# pre-push hook: soft CI gate for preloop";
+
+/// Marker the pre-push hook greps for to decide fail-open. Emitted only when
+/// the engine itself cannot be reached (connection-level failure); a CI step
+/// that happens to print a network error must never look like an outage.
+pub(crate) const ENGINE_UNREACHABLE_MARKER: &str = "PRELOOP_UNREACHABLE";
+
+fn engine_unreachable_context() -> String {
+    format!("preloop engine unreachable ({ENGINE_UNREACHABLE_MARKER})")
+}
+
+const PRE_PUSH_HOOK: &str = r#"#!/usr/bin/env bash
+# pre-push hook: soft CI gate for preloop.
+set -euo pipefail
+
+# Chain a previously installed hook (another tool's), if any: run it first
+# with the same stdin refs; its verdict is authoritative.
+prev_hook="$(dirname "$0")/pre-push.preloop-prev"
+if [[ -x "$prev_hook" ]]; then
+  refs="$(cat)"
+  if printf '%s\n' "$refs" | "$prev_hook" "$@"; then
+    :
+  else
+    previous_status=$?
+    exit "$previous_status"
+  fi
+else
+  refs="$(cat)"
+fi
+
+preloop_bin="${PRELOOP_BIN:-preloop}"
+endpoint="${PRELOOP_URL:-http://127.0.0.1:9090}"
+remote_url="${2:-unknown-remote}"
+cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/preloop-push"
+mkdir -p "$cache_dir"
+zero_sha=0000000000000000000000000000000000000000
+
+# The gate only validates pushes of the checked-out branch's current commit:
+# for any other ref the tree CI would test is not the tree being pushed, and
+# a soft gate must not brick legitimate pushes it cannot verify — those pass
+# with a loud note. The gate itself never pushes anything (no push-back): it
+# holds `git push` open while CI runs and lets git proceed only when CI is
+# green. Cached verdicts are scoped to (remote, endpoint, sha) so a result
+# from another repository, server, or commit is never reused.
+head_branch="$(git symbolic-ref --short HEAD 2>/dev/null || true)"
+head_sha="$(git rev-parse HEAD 2>/dev/null || true)"
+
+run_ci_or_resume() {
+  local local_sha="$1" branch="$2" remote_sha="$3"
+  local log_range
+  # [skip ci] in any pushed commit bypasses the gate (mirrors preloop's
+  # server-side skip-label handling). A new branch carries an all-zero
+  # remote sha — log the single revision, not an invalid range.
+  if [[ "$remote_sha" == "$zero_sha" ]]; then
+    log_range="$local_sha"
+  else
+    log_range="${remote_sha}..$local_sha"
+  fi
+  if git log --format=%B "$log_range" 2>/dev/null | grep -qi '\[skip *ci\]'; then
+    echo "preloop: [skip ci] found — pushing ${branch} without the CI gate"
+    return 0
+  fi
+
+  # Scoped cache: keyed by (remote, endpoint, sha), recording the run id.
+  # Only a terminal-success verdict for this exact destination skips CI; a
+  # recorded run is validated live (and resumed) instead of trusting a bare
+  # "the hook exited 0" marker that an interruption could skip writing.
+  local cache_key cache run_id verdict
+  get_verdict() {
+    local status_err status_rc status_output
+    status_err="$(mktemp "${TMPDIR:-/tmp}/preloop-status-XXXXXX")"
+    set +e
+    status_output="$(PRELOOP_URL="$endpoint" "$preloop_bin" status "$1" 2>"$status_err")"
+    status_rc=$?
+    set -e
+    if [[ $status_rc -eq 0 ]]; then
+      printf '%s\n' "$status_output"
+    elif grep -q "$ENGINE_UNREACHABLE_MARKER" "$status_err"; then
+      printf 'unreachable\n'
+    else
+      printf 'error\n'
+    fi
+    rm -f "$status_err"
+  }
+  cache_key="$(printf '%s\n' "$remote_url" "$endpoint" "$local_sha" | git hash-object --stdin)"
+  cache="$cache_dir/$cache_key"
+  if [[ -f "$cache" ]]; then
+    IFS=$'\t' read -r run_id cached_remote cached_endpoint < "$cache" || true
+    if [[ "$cached_remote" == "$remote_url" && "$cached_endpoint" == "$endpoint" ]]; then
+      verdict="$(get_verdict "$run_id")"
+      case "$verdict" in
+        success)
+          echo "preloop: cached CI verdict for ${local_sha:0:12}: success"
+          return 0 ;;
+        failure|cancelled|skipped)
+          echo "preloop: cached CI verdict for ${local_sha:0:12}: ${verdict} — fix and re-push (or rm $cache)" >&2
+          return 1 ;;
+        in_progress|queued|pending)
+          echo "preloop: run ${run_id} still in progress — waiting for CI before pushing ${branch}..."
+          waited=0
+          timeout_secs="${PRELOOP_HOOK_TIMEOUT_SECS:-3600}"
+          while (( waited < timeout_secs )); do
+            sleep 15
+            waited=$(( waited + 15 ))
+            verdict="$(get_verdict "$run_id")"
+            case "$verdict" in
+              success)
+                echo "preloop: CI passed for ${branch}"
+                return 0 ;;
+              failure|cancelled|skipped)
+                echo "preloop: cached CI verdict for ${local_sha:0:12}: ${verdict} — fix and re-push (or rm $cache)" >&2
+                return 1 ;;
+              in_progress|queued|pending) ;;
+              unreachable)
+                echo "preloop: cannot reach the engine to resume run ${run_id} — pushing ${branch} WITHOUT the CI gate (fail-open)" >&2
+                return 0 ;;
+              error)
+                echo "preloop: cannot validate cached run ${run_id} — push aborted" >&2
+                return 1 ;;
+            esac
+          done
+          echo "preloop: CI did not finish within ${timeout_secs}s — push aborted" >&2
+          return 1 ;;
+        error)
+          echo "preloop: cannot resolve run ${run_id} — running CI fresh" >&2 ;;
+      esac
+    fi
+  fi
+
+  # Run CI. Fail open only on the machine-readable engine-unreachable marker
+  # emitted by preloop itself — never on CI step output that happens to
+  # mention a network error.
+  local log error_log run_pid run_status i
+  log="$(mktemp "${TMPDIR:-/tmp}/preloop-push-XXXXXX")"
+  error_log="$(mktemp "${TMPDIR:-/tmp}/preloop-push-error-XXXXXX")"
+  echo "preloop: running CI on preloop before pushing ${branch} (this holds the push)..."
+  set +e
+  "$preloop_bin" run >"$log" 2>"$error_log" &
+  run_pid=$!
+  # Record the run id as soon as the engine accepts it, so an interrupted
+  # hook (Ctrl-C, crash) resumes the same run on the next push instead of
+  # duplicating CI.
+  for i in $(seq 1 300); do
+    run_id="$(grep -oE 'Run [0-9a-fA-F-]{36} created' "$log" 2>/dev/null | head -1 | awk '{print $2}' || true)"
+    [[ -n "$run_id" ]] && break
+    sleep 0.2
+  done
+  if [[ -n "$run_id" ]]; then
+    printf '%s\t%s\t%s\n' "$run_id" "$remote_url" "$endpoint" > "$cache"
+  fi
+  wait "$run_pid"
+  run_status=$?
+  set -e
+  if grep -q "$ENGINE_UNREACHABLE_MARKER" "$error_log"; then
+    echo "preloop: engine unreachable — pushing ${branch} WITHOUT the CI gate (fail-open)" >&2
+    rm -f "$log" "$error_log"
+    return 0
+  fi
+  if [[ $run_status -ne 0 ]]; then
+    echo "preloop: CI failed for ${branch} — push aborted. Details:" >&2
+    tail -n 30 "$log" >&2
+    tail -n 30 "$error_log" >&2
+    rm -f "$log" "$error_log"
+    return 1
+  fi
+  rm -f "$log" "$error_log"
+  return 0
+}
+
+while read -r local_ref local_sha _remote_ref remote_sha; do
+  case "$local_ref" in refs/heads/*) ;; *) continue ;; esac
+  [[ "$local_sha" != "$zero_sha" ]] || continue
+  branch="${local_ref#refs/heads/}"
+  if [[ "$branch" != "$head_branch" || "$local_sha" != "$head_sha" ]]; then
+    echo "preloop: not gating push of ${branch} (only the checked-out branch is validated)" >&2
+    continue
+  fi
+  if ! run_ci_or_resume "$local_sha" "$branch" "$remote_sha"; then
+    exit 1
+  fi
+done <<< "$refs"
+exit 0
+"#;
+
+fn hook_installed() -> bool {
+    resolve_hooks_dir()
+        .ok()
+        .and_then(|dir| std::fs::read_to_string(dir.join("pre-push")).ok())
+        .is_some_and(|content| content.contains(HOOK_MARKER))
+}
+
+fn hook_decided() -> bool {
+    fn git_config_flag(key: &str) -> bool {
+        std::process::Command::new("git")
+            .args(["config", "--local", "--get", key])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .is_some_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "true")
+    }
+
+    git_config_flag("preloop.hook-installed") || git_config_flag("preloop.hook-declined")
+}
+
+fn set_hook_decision(key: &str) {
+    let _ = std::process::Command::new("git")
+        .args(["config", "--local", key, "true"])
+        .status();
+}
+
+fn mark_hook_installed() {
+    set_hook_decision("preloop.hook-installed");
+}
+
+fn mark_hook_declined() {
+    set_hook_decision("preloop.hook-declined");
+}
+
+fn install_hook() -> anyhow::Result<()> {
+    // `core.hooksPath` moves every hook out of `.git/hooks` (a global
+    // `core.hooksPath` like `~/.config/git/hooks` is common); writing to
+    // `.git/hooks` would leave the gate unused. Resolve the directory git
+    // actually consults, matching its own precedence.
+    let hooks_dir = resolve_hooks_dir()?;
+    std::fs::create_dir_all(&hooks_dir).context("create hooks directory")?;
+    let hook_path = hooks_dir.join("pre-push");
+    // Preserve a pre-existing hook (installed by another tool): chain it
+    // instead of clobbering repository checks. Reinstalling over our own
+    // hook backs nothing up (idempotent).
+    let existing_hook = std::fs::read(&hook_path).ok();
+    if existing_hook
+        .as_deref()
+        .is_some_and(|bytes| !String::from_utf8_lossy(bytes).contains(HOOK_MARKER))
+    {
+        let backup = hooks_dir.join("pre-push.preloop-prev");
+        std::fs::copy(&hook_path, &backup).context("back up previous pre-push hook")?;
+    }
+    std::fs::write(&hook_path, PRE_PUSH_HOOK).context("write pre-push hook")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&hook_path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&hook_path, perms)?;
+    }
+    mark_hook_installed();
+    Ok(())
+}
+
+/// The directory git runs hooks from, resolved by Git itself.
+fn resolve_hooks_dir() -> anyhow::Result<std::path::PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--git-path", "hooks"])
+        .output()
+        .context("resolve Git hooks directory")?;
+    if output.status.success() {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if !path.is_empty() {
+            return Ok(std::path::PathBuf::from(path));
+        }
+    }
+    anyhow::bail!(
+        "git rev-parse --git-path hooks failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
+}
+
+fn maybe_offer_hook() -> anyhow::Result<()> {
+    if hook_installed() || hook_decided() {
+        return Ok(());
+    }
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return Ok(());
+    }
+    eprintln!(
+        "preloop: add preloop CI as a pre-push hook to run CI on your working tree before\n\
+         \x20 committing? This will run CI on preloop before every `git push`."
+    );
+    eprint!("         [y/N] ");
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => {
+            install_hook()?;
+            eprintln!("preloop: installed .git/hooks/pre-push");
+        }
+        _ => {
+            mark_hook_declined();
+            eprintln!("preloop: not installing (won't ask again for this repo)");
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn api_token() -> Option<String> {
     std::env::var("PRELOOP_TOKEN")
         .or_else(|_| std::env::var("PRELOOP_SYSTEM_TOKEN"))
@@ -102,13 +397,10 @@ pub(crate) fn smolvm_command() -> anyhow::Result<std::process::Command> {
     // (see crates/preloop-cli/src/server_install.rs), so the engine records
     // its machines in that registry. A separately invoked `preloop shell` /
     // `preloop debug` must consult the SAME registry or it cannot find the
-    // paused, service-owned machine — the caller's default data dir would
-    // resolve a different one. An operator value wins, so this only fills
-    // the gap, never overrides.
-    if std::env::var_os("SMOLVM_DATA_DIR").is_none() {
-        let data_dir = preloop_home().join("smolvm");
-        command.env("SMOLVM_DATA_DIR", data_dir);
-    }
+    // paused, service-owned machine. `apply_smolvm_runtime_env` fills the
+    // same gap from the effective Preloop home (and isolates `HOME` on macOS,
+    // where SmolVM ignores `SMOLVM_DATA_DIR`); an operator value still wins.
+    preloop_vm::apply_smolvm_runtime_env(&mut command, None)?;
     preloop_vm::apply_smolvm_sandbox_env(&mut command)?;
     Ok(command)
 }
@@ -166,7 +458,11 @@ pub(crate) fn with_fake_smolvm_path<T>(test: impl FnOnce(&PathBuf) -> T) -> T {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "preloop", about = "Local CI with hardware isolation")]
+#[command(
+    name = "preloop",
+    about = "Local CI with hardware isolation",
+    version = env!("CARGO_PKG_VERSION")
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -174,13 +470,20 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Print the installed Preloop version.
+    Version,
+
     Run(RunArgs),
 
     /// Show the expanded job DAG without executing.
     Plan(PlanArgs),
 
-    /// Show active and recent runs.
-    Status,
+    /// Show active and recent runs, or the live status of one run (prints a
+    /// single machine-readable status word for scripting).
+    Status {
+        #[arg(value_name = "RUN_ID")]
+        run_id: Option<String>,
+    },
 
     Logs(LogsArgs),
 
@@ -362,8 +665,9 @@ struct RunArgs {
 
     /// After the run completes, push the tested commit to GitHub and
     /// publish the result: create or update the pull request for the branch
-    /// and report check runs for the commit. Requires a clean working tree
-    /// (the pushed commit must be exactly what was tested) and a GitHub
+    /// and report check runs for the commit. A dirty working tree is
+    /// allowed: CI runs on a snapshot of the uncommitted state, and the
+    /// pushed commit carries exactly that tested tree. Requires a GitHub
     /// origin.
     #[arg(long)]
     push: bool,
@@ -459,6 +763,10 @@ async fn main() -> anyhow::Result<()> {
     // Both run the daemon in this process, so neither may bootstrap another
     // one underneath itself.
     match cli.command {
+        Command::Version => {
+            println!("preloop {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
         Command::Serve(args) => return cmd_engine(args).await,
         Command::Engine => return cmd_engine(ServeArgs::default()).await,
         Command::BuildGolden(args) => return cmd_build_golden(args).await,
@@ -468,14 +776,17 @@ async fn main() -> anyhow::Result<()> {
         Command::Doctor(args) => return github_setup::cmd_doctor(args).await,
         Command::Secret(args) => return github_setup::cmd_secret(args).await,
         Command::Server(args) => return server_install::run(args),
+        // Planning parses local workflow files only; do not bootstrap the
+        // control-plane engine for a command that never contacts it.
+        Command::Plan(args) => return cmd_plan(args).await,
         _ => {}
     }
     ensure_engine_running().await?;
 
     match cli.command {
         Command::Run(args) => cmd_run(args).await,
-        Command::Plan(args) => cmd_plan(args).await,
-        Command::Status => cmd_status().await,
+        Command::Plan(_) => unreachable!("plan is handled before engine bootstrap"),
+        Command::Status { run_id } => cmd_status(run_id).await,
         Command::Logs(args) => cmd_logs(args).await,
         Command::Cancel(args) => cmd_cancel(args).await,
         Command::Shell(args) => cmd_shell(args).await,
@@ -488,6 +799,7 @@ async fn main() -> anyhow::Result<()> {
         | Command::Serve(_)
         | Command::Engine
         | Command::BuildGolden(_)
+        | Command::Version
         | Command::Setup(_)
         | Command::Doctor(_)
         | Command::Secret(_)
@@ -525,11 +837,28 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
     {
         verify_base_image(&args.base_image).await?;
     }
+    if env_flag("PRELOOP_REQUIRE_BASE_DIGEST", false) {
+        require_digest_pinned_base(&args.base_image)?;
+    }
     let config = RunnerPoolConfig {
         size: 1,
         use_fork: false,
         use_packed_artifact: false,
-        name_prefix: "preloop-release-golden".into(),
+        // Unique per bake: smolvm keys a machine's data dir by a hash of its
+        // name and reuses a dir left behind by a failed/interrupted run at its
+        // old on-disk size (smolvm#956). A stale dir then boots with the
+        // previous, smaller storage disk, so a large bake runs out of space
+        // mid-extraction with a confusing "Resource temporarily unavailable".
+        // A fresh name per run forces a fresh disk at the requested size.
+        name_prefix: std::env::var("PRELOOP_GOLDEN_NAME_PREFIX")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| {
+                // A constant fallback would make repeated local bakes reuse
+                // the same machine name (and its hash dir), defeating the
+                // fresh-disk guarantee above. Per-invocation suffix instead.
+                format!("preloop-release-golden-{}", std::process::id())
+            }),
         base_image: args.base_image,
         workspace: args.workspace.or_else(|| std::env::current_dir().ok()),
         artifact_stem: output.clone(),
@@ -560,15 +889,49 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         runner_key_dir: None,
         pending_jobs: None,
         preload_images: Vec::new(),
-        runner_user: None,
+        // The golden bake provisions the image (runner install, apt, service
+        // files); it must run as root. The official runner image declares
+        // USER=runner, so the machine's default exec user is not root.
+        runner_user: std::env::var("PRELOOP_RUNNER_USER")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .or_else(|| Some("root".to_owned())),
         runner_uid: None,
         next_job_runs_on: None,
         pending_registrations: None,
         preparing_signal: None,
     };
+    let payload = artifact_payload(&output, &config.base_image);
     RunnerPool::new(std::sync::Arc::new(SmolVmProvider::default()), config)?
         .rebuild_artifact()
         .await?;
+    if payload != output {
+        let temporary = output.with_file_name(format!(
+            ".{}.tmp-{}",
+            output
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("golden"),
+            std::process::id()
+        ));
+        let copy_result = (|| -> anyhow::Result<()> {
+            std::fs::copy(&payload, &temporary).with_context(|| {
+                format!(
+                    "copy generated golden {} to temporary output {}",
+                    payload.display(),
+                    temporary.display()
+                )
+            })?;
+            std::fs::rename(&temporary, &output).with_context(|| {
+                format!("atomically replace requested output {}", output.display())
+            })?;
+            Ok(())
+        })();
+        if copy_result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        copy_result?;
+    }
     anyhow::ensure!(
         output.is_file(),
         "golden build did not create {}",
@@ -580,15 +943,15 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
 
 /// Verify a registry base image's provenance before baking a golden from it.
 ///
-/// Runs two independent checks, both keyless (no long-lived keys on the build
-/// host):
+/// The dump pipeline's images carry cosign keyless signatures and in-toto
+/// attestations (SLSA provenance + SPDX SBOM), signed by the publishing
+/// workflow's OIDC identity. A mirror can instead publish signatures under a
+/// long-lived key and point `PRELOOP_BASE_IMAGE_PUBKEY` at the public key
+/// file; `gh attestation verify` only understands GitHub-API attestations
+/// (attest-build-provenance), which the dump does not produce, so verification
+/// is cosign-based.
 ///
-/// 1. `gh attestation verify` — the GitHub-signed SLSA provenance stored in
-///    GHCR, pinned to the publishing repository.
-/// 2. `cosign verify` — the Sigstore keyless signature, pinned to the
-///    publishing workflow's OIDC identity on the default branch.
-///
-/// Both tools must be installed on the build host. `PRELOOP_VERIFY_BASE_IMAGE`
+/// `cosign` must be installed on the build host. `PRELOOP_VERIFY_BASE_IMAGE`
 /// enables the check; `PRELOOP_VERIFY_BASE_IMAGE_REPO` names the repository
 /// that publishes the base image; `PRELOOP_BASE_IMAGE_IDENTITY_REGEXP`
 /// overrides the default certificate identity match.
@@ -599,30 +962,71 @@ async fn verify_base_image(base_image: &str) -> anyhow::Result<()> {
     if !base_image.contains('/') || base_image.starts_with('.') || base_image.starts_with('/') {
         anyhow::bail!("base image `{base_image}` is not a registry reference; nothing to verify");
     }
+    require_digest_pinned_base(base_image)?;
     verify_base_image_with(&repo, base_image)
 }
 
 fn verify_base_image_with(repo: &str, base_image: &str) -> anyhow::Result<()> {
-    run_verifier(
-        "gh",
-        &["attestation", "verify", base_image, "--repo", repo],
-        "GitHub attestation",
-    )?;
     let identity = std::env::var("PRELOOP_BASE_IMAGE_IDENTITY_REGEXP").unwrap_or_else(|_| {
-        format!("^https://github.com/{repo}/.github/workflows/dump.yml@refs/heads/")
+        format!(
+            "^https://github.com/{repo}/.github/workflows/(dump|attest-local)\\.yml@refs/heads/"
+        )
     });
-    run_verifier(
-        "cosign",
-        &[
-            "verify",
-            base_image,
+    // The dump pipeline's images carry cosign signatures and in-toto
+    // attestations (SLSA provenance + SPDX SBOM). They are keyless-signed by
+    // the publishing workflow's OIDC identity; a mirror can instead publish
+    // signatures under a long-lived key and point PRELOOP_BASE_IMAGE_PUBKEY
+    // at the public key file. `gh attestation verify` only understands
+    // GitHub-API attestations (attest-build-provenance), which the dump does
+    // not produce, so verification is cosign-based.
+    let key = std::env::var("PRELOOP_BASE_IMAGE_PUBKEY").ok();
+    let identity_args: Vec<&str> = match &key {
+        Some(_) => vec![],
+        None => vec![
             "--certificate-identity-regexp",
             &identity,
             "--certificate-oidc-issuer",
             "https://token.actions.githubusercontent.com",
         ],
-        "cosign signature",
-    )
+    };
+    let mut verify_args: Vec<&str> = vec!["verify", base_image];
+    if let Some(key) = &key {
+        verify_args.extend(["--key", key]);
+    }
+    verify_args.extend(identity_args.iter().copied());
+    run_verifier("cosign", &verify_args, "cosign signature")?;
+    let mut attest_args: Vec<&str> = vec!["verify-attestation", base_image, "--type", "spdx"];
+    if let Some(key) = &key {
+        attest_args.extend(["--key", key]);
+    }
+    attest_args.extend(identity_args.iter().copied());
+    run_verifier("cosign", &attest_args, "cosign SPDX SBOM attestation")
+}
+
+fn require_digest_pinned_base(base_image: &str) -> anyhow::Result<()> {
+    // Packed artifacts and local paths are already immutable inputs; this
+    // policy applies to registry references only. Release workflows enable
+    // this before baking so a mutable tag cannot silently become the golden's
+    // input after the provenance sidecars were captured.
+    if base_image.starts_with('.')
+        || base_image.starts_with('/')
+        || std::path::Path::new(base_image).exists()
+    {
+        return Ok(());
+    }
+    let digest = base_image
+        .split_once("@sha256:")
+        .map(|(_, digest)| digest)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "base image `{base_image}` must use an immutable @sha256:<digest> reference"
+            )
+        })?;
+    anyhow::ensure!(
+        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "base image `{base_image}` has an invalid sha256 digest"
+    );
+    Ok(())
 }
 
 fn run_verifier(binary: &str, args: &[&str], what: &str) -> anyhow::Result<()> {
@@ -1439,7 +1843,38 @@ fn default_local_activity_type(event: &str, payload: &serde_json::Value) -> Opti
     }
 }
 
+fn collect_local_reusable_workflows(
+    workflow_path: &std::path::Path,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let current_dir = std::env::current_dir()?;
+    let workflows_dir = current_dir.join(".github").join("workflows");
+    let mut reusable_workflows = BTreeMap::new();
+    let Ok(entries) = std::fs::read_dir(workflows_dir) else {
+        return Ok(reusable_workflows);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("yml" | "yaml")
+        ) || same_file_path(&path, workflow_path)
+        {
+            continue;
+        }
+        let Some(relative) = path.strip_prefix(&current_dir).ok() else {
+            continue;
+        };
+        let yaml = std::fs::read_to_string(&path)
+            .with_context(|| format!("read reusable workflow {}", path.display()))?;
+        reusable_workflows.insert(relative.to_string_lossy().into_owned(), yaml);
+    }
+    Ok(reusable_workflows)
+}
+
 async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
+    // A hook that fails to install after the user accepted is a real
+    // failure: report it instead of silently running ungated.
+    maybe_offer_hook()?;
     let workflow_path = resolve_workflow_path(args.file.as_deref())?;
     let workflow_yaml = std::fs::read_to_string(&workflow_path)
         .with_context(|| format!("failed to read workflow: {}", workflow_path.display()))?;
@@ -1449,28 +1884,7 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     // server the same way the native client does: everything under the
     // workspace `.github/workflows/`, keyed repository-relative, minus the
     // submitted workflow itself.
-    let mut reusable_workflows = BTreeMap::new();
-    if let Ok(current_dir) = std::env::current_dir() {
-        let workflows_dir = current_dir.join(".github").join("workflows");
-        if let Ok(entries) = std::fs::read_dir(&workflows_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !matches!(
-                    path.extension().and_then(|ext| ext.to_str()),
-                    Some("yml" | "yaml")
-                ) || same_file_path(&path, &workflow_path)
-                {
-                    continue;
-                }
-                let Some(relative) = path.strip_prefix(&current_dir).ok() else {
-                    continue;
-                };
-                let yaml = std::fs::read_to_string(&path)
-                    .with_context(|| format!("read reusable workflow {}", path.display()))?;
-                reusable_workflows.insert(relative.to_string_lossy().into_owned(), yaml);
-            }
-        }
-    }
+    let reusable_workflows = collect_local_reusable_workflows(&workflow_path)?;
 
     let payload = match args.payload.as_deref() {
         Some(path) => {
@@ -1495,19 +1909,18 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         }
     }
 
-    // Push-back requires the tested commit to be exactly what lands on
-    // GitHub: a dirty tree would run CI on commit + local edits, then push
-    // the commit alone — untested code. Refuse loudly instead of lying.
     let push_requested = args.push || args.create_pr;
-    let tested_head = if push_requested {
-        let dirty = git_porcelain().context("failed to check the working tree for --push")?;
-        if !dirty.is_empty() {
-            anyhow::bail!(
-                "--push requires a clean working tree so the pushed commit is exactly what \
-                 was tested. Uncommitted changes:\n  {}\n\nCommit or stash them first.",
-                dirty.join("\n  ")
-            );
-        }
+    // A dirty working tree is allowed with --push: CI runs on the server's
+    // snapshot of the uncommitted state, and after it passes the CLI
+    // materializes a commit whose tree is exactly what CI tested (see
+    // `decide_dirty_push_opts`). A clean tree pins the push to HEAD directly.
+    let dirty = if push_requested {
+        git_porcelain().context("failed to check the working tree for --push")?
+    } else {
+        Vec::new()
+    };
+    let dirty_push = push_requested && !dirty.is_empty();
+    let tested_head = if push_requested && !dirty_push {
         Some((git_rev_parse("HEAD")?, git_rev_parse("HEAD^{tree}")?))
     } else {
         None
@@ -1555,8 +1968,10 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     }
     // Overridden rather than set in the literal so a plain run keeps the
     // protocol's own defaults for `sha` and `actor`.
-    if let Some((head_sha, head_tree)) = tested_head {
-        submission.sha = head_sha;
+    if push_requested {
+        // The base commit: for a clean tree this IS the tested commit; for a
+        // dirty tree it is the parent of the materialized CI-verified commit.
+        submission.sha = git_rev_parse("HEAD")?;
         // The server names the requester in the PR body it opens.
         if let Some(name) = git_config_user_name() {
             submission.actor = name;
@@ -1564,8 +1979,13 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         submission.push = Some(preloop_gha_protocol::PushRequest {
             create_pr: args.create_pr,
             draft_pr: args.pr_draft,
+            // The server verifies the branch head for a dirty-tree push (the
+            // materialized commit) instead of the base sha.
+            dirty: dirty_push,
         });
-        submission.push_tree = Some(head_tree);
+        if let Some((_, head_tree)) = tested_head {
+            submission.push_tree = Some(head_tree);
+        }
     }
 
     let client = build_client();
@@ -1583,7 +2003,10 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     if let Some(token) = api_token() {
         request = request.bearer_auth(token);
     }
-    let response = request.send().await?;
+    let response = request
+        .send()
+        .await
+        .with_context(engine_unreachable_context)?;
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
@@ -1613,6 +2036,13 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     // explanation, so the first poll failure is reported instead of being
     // folded into "no session".
     let mut poll_warned = false;
+    // Warn once (not every backpressure tick) when the control plane is
+    // unreachable or no registered runner can claim the queued jobs, so a
+    // queued run does not stream `still waiting` forever without the one
+    // fact that explains it. The check is repeated while a claimable runner
+    // exists (one can die between ticks) and latches only once a warning
+    // actually prints.
+    let mut runner_warned = false;
     // Set when the run loop leaves through the debug prompt (abort, detach,
     // or a session error). The run is not terminal in those cases — the job
     // is paused and reattachable — so the generic conclusion below must not
@@ -1631,7 +2061,10 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         if let Some(token) = api_token() {
             events_request = events_request.bearer_auth(token);
         }
-        let events_response = events_request.send().await?;
+        let events_response = events_request
+            .send()
+            .await
+            .with_context(engine_unreachable_context)?;
         if !events_response.status().is_success() {
             let status = events_response.status();
             let body = events_response.text().await.unwrap_or_default();
@@ -1706,6 +2139,40 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                                          {paused_total} debug session(s) paused on the server \
                                          (preloop debug <id> to inspect)"
                                     );
+                                    if !runner_warned {
+                                        match runner_capacity(&client, &url, accepted.run_id).await
+                                        {
+                                            Ok(Some((queued, claimable)))
+                                                if queued > 0 && claimable == 0 =>
+                                            {
+                                                runner_warned = true;
+                                                eprintln!(
+                                                    "[preloop] warning: no registered runner on \
+                                                     {url} can claim the queued jobs (their \
+                                                     `runs-on:` labels match no runner). If \
+                                                     `preloop serve` is still provisioning its \
+                                                     runner pool this is expected; otherwise the \
+                                                     jobs will never start — register a runner \
+                                                     with matching labels."
+                                                );
+                                            }
+                                            // A claimable runner exists (or nothing
+                                            // runner-bound is queued): keep checking on
+                                            // later ticks instead of latching a premature
+                                            // "all quiet" state.
+                                            Ok(_) => {}
+                                            Err(error) => {
+                                                runner_warned = true;
+                                                eprintln!(
+                                                    "[preloop] warning: cannot determine runner \
+                                                     availability on {url} ({error:#}); older \
+                                                     control plane without /api/v1/runners or a \
+                                                     transient error. Queued jobs may still \
+                                                     start if a runner is registered."
+                                                );
+                                            }
+                                        }
+                                    }
                                     last_backpressure = std::time::Instant::now();
                                 }
                             }
@@ -1805,9 +2272,46 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         // the reviewable state. Sync progress goes to stderr so piped
         // stdout stays clean.
         let push_error = if push_requested {
-            push::push_run(&client, &url, api_token(), &accepted.run_id.to_string())
+            if dirty_push {
+                // The PR decision happens after CI for a dirty tree: the
+                // user saw the result and chooses y/N/d now (or a label /
+                // explicit flag decides in non-interactive runs).
+                match decide_dirty_push_opts(
+                    &dirty,
+                    args.push,
+                    args.create_pr,
+                    args.pr_draft,
+                    status == ExecutionStatus::Success,
+                )? {
+                    Some(opts) => push::push_run(
+                        &client,
+                        &url,
+                        api_token(),
+                        &accepted.run_id.to_string(),
+                        Some(opts),
+                    )
+                    .await
+                    .err(),
+                    None => {
+                        eprintln!(
+                            "not pushing (declined) — CI result was informational. \
+                             Re-run `preloop push {}` to push later.",
+                            accepted.run_id
+                        );
+                        None
+                    }
+                }
+            } else {
+                push::push_run(
+                    &client,
+                    &url,
+                    api_token(),
+                    &accepted.run_id.to_string(),
+                    None,
+                )
                 .await
                 .err()
+            }
         } else {
             None
         };
@@ -1833,6 +2337,52 @@ fn same_file_path(left: &std::path::Path, right: &std::path::Path) -> bool {
     match (left.canonicalize(), right.canonicalize()) {
         (Ok(left), Ok(right)) => left == right,
         _ => left == right,
+    }
+}
+
+/// Registered-runner capacity for a run's queued jobs, when the control
+/// plane supports the run-scoped runners query.
+///
+/// Returns `(queued, claimable)`: the run's ready-queue job count, and how
+/// many registered runners could claim at least one of them (the same
+/// `job_matches_runner` predicate the scheduler dispatches with). `None`
+/// when the server ignores `run_id` and returns the plain list — the caller
+/// then falls back to the raw count so a zero-runner control plane still
+/// gets the warning.
+async fn runner_capacity(
+    client: &reqwest::Client,
+    url: &str,
+    run_id: RunId,
+) -> anyhow::Result<Option<(usize, usize)>> {
+    let mut request = client.get(format!("{url}/api/v1/runners?run_id={run_id}"));
+    if let Some(token) = api_token() {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await?;
+    if !response.status().is_success() {
+        anyhow::bail!("server returned {}", response.status());
+    }
+    let body: serde_json::Value = response.json().await?;
+    match (
+        body.get("queued").and_then(serde_json::Value::as_u64),
+        body.get("claimable").and_then(serde_json::Value::as_u64),
+    ) {
+        (Some(queued), Some(claimable)) => Ok(Some((queued as usize, claimable as usize))),
+        // Older server (or one ignoring the query): only the raw count is
+        // available. When count is zero, represent that as 0 claimable runners
+        // for the queued jobs so the dead-pool warning fires. When count > 0,
+        // treat runners as claimable (optimistic fallback).
+        _ => {
+            let count = body
+                .get("count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            if count == 0 {
+                Ok(Some((1, 0)))
+            } else {
+                Ok(Some((count, count)))
+            }
+        }
     }
 }
 
@@ -1984,6 +2534,101 @@ fn git_porcelain() -> anyhow::Result<Vec<String>> {
         .collect())
 }
 
+/// Decide, after CI on a dirty tree, whether to materialize the tested tree,
+/// push it, and open a PR. Precedence: explicit `--create-pr` flag >
+/// head-commit labels (`[pr]` / `[draft]` / `[no-pr]`) > interactive prompt >
+/// safe default. An explicit `--push` (without `--create-pr`) still pushes
+/// the tested tree non-interactively — the user asked to push; `create_pr`
+/// stays false. Returns `None` when the push should not happen at all.
+fn decide_dirty_push_opts(
+    dirty: &[String],
+    explicit_push: bool,
+    explicit_pr: bool,
+    pr_draft: bool,
+    ci_passed: bool,
+) -> anyhow::Result<Option<push::PushOpts>> {
+    if !ci_passed {
+        eprintln!("not pushing a dirty tree because CI failed");
+        return Ok(None);
+    }
+    if explicit_pr {
+        return Ok(Some(push::PushOpts {
+            create_pr: true,
+            draft: pr_draft,
+        }));
+    }
+
+    let head_message = git_rev_parse("HEAD")
+        .ok()
+        .and_then(|sha| {
+            std::process::Command::new("git")
+                .args(["log", "-1", "--format=%B", &sha])
+                .output()
+                .ok()
+        })
+        .and_then(|output| {
+            output
+                .status
+                .success()
+                .then(|| String::from_utf8_lossy(&output.stdout).to_lowercase())
+        })
+        .unwrap_or_default();
+    if head_message.contains("[no-pr]") {
+        return Ok(Some(push::PushOpts {
+            create_pr: false,
+            draft: pr_draft,
+        }));
+    }
+    if head_message.contains("[pr]") || head_message.contains("[draft]") {
+        return Ok(Some(push::PushOpts {
+            create_pr: true,
+            draft: head_message.contains("[draft]") || pr_draft,
+        }));
+    }
+
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        // Non-interactive and no label. An explicit `--push` is still an
+        // explicit request: push the tested tree without opening a PR. A
+        // plain `--create-pr`-less run with a dirty tree stays a no-op.
+        return Ok(explicit_push.then_some(push::PushOpts {
+            create_pr: false,
+            draft: pr_draft,
+        }));
+    }
+
+    eprintln!(
+        "CI {} on your working tree ({} change(s) included):",
+        if ci_passed { "passed" } else { "failed" },
+        dirty.len()
+    );
+    for line in dirty {
+        eprintln!("  {line}");
+    }
+    loop {
+        eprint!("Commit the tested tree and open a PR? [y/N/d] ");
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .context("reading prompt answer")?;
+        match input.trim().to_ascii_lowercase().as_str() {
+            "" | "n" => return Ok(None),
+            "y" => {
+                return Ok(Some(push::PushOpts {
+                    create_pr: true,
+                    draft: pr_draft,
+                }))
+            }
+            "d" => {
+                return Ok(Some(push::PushOpts {
+                    create_pr: true,
+                    draft: true,
+                }))
+            }
+            _ => eprintln!("answer y, N, or d"),
+        }
+    }
+}
+
 fn git_rev_parse(rev: &str) -> anyhow::Result<String> {
     let output = std::process::Command::new("git")
         .args(["rev-parse", rev])
@@ -2019,26 +2664,170 @@ async fn cmd_push(args: PushArgs) -> anyhow::Result<()> {
             anyhow::anyhow!("no runs found; pass a run id: `preloop push <run_id>`")
         })?,
     };
-    push::push_run(&client, &url, api_token(), &run_id).await
+    push::push_run(&client, &url, api_token(), &run_id, None).await
+}
+
+fn materialize_plan_jobs(
+    plans: Vec<preloop_gha_protocol::JobPlan>,
+    reusable_workflows: &BTreeMap<String, String>,
+) -> anyhow::Result<Vec<preloop_gha_protocol::JobPlan>> {
+    let mut materialized = Vec::new();
+    for plan in plans {
+        let Some(call) = plan.reusable_call.as_ref() else {
+            materialized.push(plan);
+            continue;
+        };
+        // Needs-driven matrices are runtime placeholders. Their concrete
+        // cells require completed needs outputs, so do not send the empty
+        // matrix to `expand_reusable_call` (which correctly rejects it).
+        // Keep the placeholder visible and report its deferred expression.
+        if plan.deferred_matrix.is_some() {
+            materialized.push(plan);
+            continue;
+        }
+        let Some(yaml) = reusable_workflows.get(&call.workflow_file) else {
+            // Remote and unresolved calls remain explicit placeholders. The
+            // plan must not invent callee jobs without the referenced YAML.
+            materialized.push(plan);
+            continue;
+        };
+        let called = preloop_gha_parser::parse_workflow(yaml)
+            .map_err(|error| anyhow::anyhow!("parse reusable {}: {error}", call.workflow_file))?;
+        let expanded = preloop_gha_parser::expand_reusable_call(
+            &called,
+            &plan,
+            reusable_workflows,
+            &BTreeMap::new(),
+        )
+        .map_err(|error| anyhow::anyhow!("expand reusable {}: {error}", call.workflow_file))?;
+        // Keep the caller boundary in the output for downstream `needs`
+        // references, then append the concrete callee jobs it gates.
+        materialized.push(plan);
+        materialized.extend(materialize_plan_jobs(expanded.jobs, reusable_workflows)?);
+    }
+    Ok(materialized)
 }
 
 async fn cmd_plan(args: PlanArgs) -> anyhow::Result<()> {
-    let workflow = args
-        .file
-        .as_ref()
-        .map_or("all workflows".into(), |p| p.display().to_string());
+    let workflow_path = resolve_workflow_path(args.file.as_deref())?;
+    let workflow_yaml = std::fs::read_to_string(&workflow_path)
+        .with_context(|| format!("failed to read workflow: {}", workflow_path.display()))?;
 
-    println!("preloop plan: {workflow}");
+    let reusable_workflows = collect_local_reusable_workflows(&workflow_path)?;
+
+    let workflow = preloop_gha_parser::parse_workflow(&workflow_yaml)
+        .map_err(|error| anyhow::anyhow!("parse {}: {error}", workflow_path.display()))?;
+    let expanded =
+        preloop_gha_parser::expand_jobs_with_reusables(&workflow, &reusable_workflows)
+            .map_err(|error| anyhow::anyhow!("expand {}: {error}", workflow_path.display()))?;
+    let plans = materialize_plan_jobs(expanded.jobs, &reusable_workflows)?;
+
     if args.json {
-        println!("  format: json");
+        let value = serde_json::json!({
+            "workflow": workflow_path.display().to_string(),
+            "jobs": plans.iter().map(plan_json).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
     }
 
-    anyhow::bail!("")
+    println!(
+        "workflow: {} ({} jobs expanded from {} declared)",
+        workflow_path.display(),
+        plans.len(),
+        workflow.jobs.len()
+    );
+    let name = workflow.name.as_deref().unwrap_or("(unnamed)");
+    println!("name:     {name}");
+    println!();
+    for plan in &plans {
+        let matrix = if plan.matrix.is_empty() {
+            String::new()
+        } else {
+            let cells: Vec<String> = plan
+                .matrix
+                .iter()
+                .map(|(key, value)| match value {
+                    serde_json::Value::String(value) => format!("{key}={value}"),
+                    other => format!("{key}={other}"),
+                })
+                .collect();
+            format!("  [{}]", cells.join(", "))
+        };
+        let needs = if plan.needs.is_empty() {
+            String::new()
+        } else {
+            let ids: Vec<&str> = plan.needs.iter().map(|need| need.0.as_str()).collect();
+            format!("  needs: {}", ids.join(", "))
+        };
+        let runner_group = plan
+            .runner_group
+            .as_deref()
+            .map(|group| format!("  runner-group: {group}"))
+            .unwrap_or_default();
+        let deferred_matrix = plan
+            .deferred_matrix
+            .as_deref()
+            .map(|expression| format!("  deferred-matrix: {expression}"))
+            .unwrap_or_default();
+        println!(
+            "{}{}  runs-on: {}{}{}{}{}",
+            plan.id.0,
+            matrix,
+            plan.runs_on.join(", "),
+            needs,
+            runner_group,
+            deferred_matrix,
+            format_args!("  steps: {}", plan.steps.len()),
+        );
+    }
+    Ok(())
 }
 
-async fn cmd_status() -> anyhow::Result<()> {
+fn plan_json(plan: &preloop_gha_protocol::JobPlan) -> serde_json::Value {
+    serde_json::json!({
+        "id": plan.id.0,
+        "base_id": plan.base_id,
+        "name": plan.name,
+        "runner_group": plan.runner_group,
+        "runs_on": plan.runs_on,
+        "needs": plan.needs.iter().map(|need| need.0.clone()).collect::<Vec<_>>(),
+        "matrix": plan.matrix,
+        "deferred_matrix": plan.deferred_matrix,
+        "steps": plan.steps.len(),
+    })
+}
+
+async fn cmd_status(run_id: Option<String>) -> anyhow::Result<()> {
     let client = build_client();
     let url = server_url();
+    if let Some(run_id) = run_id {
+        // Single-run mode: one machine-readable status word
+        // (success/failure/cancelled/skipped/in_progress/queued/pending) for
+        // scripts like the pre-push hook. Connection failures carry the
+        // engine-unreachable marker so the hook can fail open.
+        let mut request = client.get(format!("{url}/api/v1/runs/{run_id}"));
+        if let Some(token) = api_token() {
+            request = request.bearer_auth(token);
+        }
+        let response = request
+            .send()
+            .await
+            .with_context(engine_unreachable_context)?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("server returned {status}: {body}");
+        }
+        let run: serde_json::Value = response.json().await?;
+        println!(
+            "{}",
+            run.get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+        );
+        return Ok(());
+    }
     let mut request = client.get(format!("{url}/api/v1/runs?limit=20"));
     if let Some(token) = api_token() {
         request = request.bearer_auth(token);
@@ -2351,6 +3140,17 @@ mod tests {
             "ghcr.io/acme/runner-images:ubuntu24-runner-large-latest-arm64"
         );
         assert_eq!(args.storage_gib, Some(80));
+    }
+
+    #[test]
+    fn base_digest_policy_rejects_mutable_registry_references() {
+        assert!(require_digest_pinned_base(
+            "mirror.gcr.io/library/ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90"
+        )
+        .is_ok());
+        assert!(require_digest_pinned_base("/tmp/preloop.smolmachine").is_ok());
+        assert!(require_digest_pinned_base("ghcr.io/acme/base:latest").is_err());
+        assert!(require_digest_pinned_base("ghcr.io/acme/base@sha256:not-a-digest").is_err());
     }
 
     #[test]
@@ -2942,9 +3742,118 @@ mod tests {
     }
 
     #[test]
+    fn version_subcommand_parses_without_starting_engine() {
+        let cli = parse(&["version"]).unwrap();
+        assert!(matches!(cli.command, Command::Version));
+    }
+
+    #[test]
+    fn version_flag_uses_package_version() {
+        let err = Cli::try_parse_from(["preloop", "--version"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayVersion);
+        assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
     fn status_parses() {
         let cli = parse(&["status"]).unwrap();
-        assert!(matches!(cli.command, Command::Status));
+        assert!(matches!(cli.command, Command::Status { run_id: None }));
+        let cli = parse(&["status", "550e8400-e29b-41d4-a716-446655440000"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Status {
+                run_id: Some(ref id)
+            } if id == "550e8400-e29b-41d4-a716-446655440000"
+        ));
+    }
+
+    #[test]
+    fn hook_lifecycle() {
+        // All tests in this binary share one process working directory and
+        // run in parallel threads; restore the original cwd so the tempdir
+        // (and this test's `.git/`) cannot leak into other tests.
+        struct CwdGuard(std::path::PathBuf);
+        impl Drop for CwdGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let original = std::env::current_dir().expect("current dir");
+        std::env::set_current_dir(repo).unwrap();
+        let _guard = CwdGuard(original);
+
+        // `git init` inside this standalone tempdir cannot use the parent
+        // checkout's `.git/`, and exercises the same Git path resolution as
+        // the real installation flow.
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .status()
+            .expect("git init")
+            .success()
+            .then_some(())
+            .expect("git init succeeds");
+
+        // A developer-configured global `core.hooksPath` (e.g.
+        // `~/.config/git/hooks`) would make `git rev-parse --git-path hooks`
+        // resolve outside this repository: `install_hook` would write into —
+        // and this test's assertions would miss — the shared location, and
+        // the "uninstall" step could clobber a real global hook. Pin the
+        // hooks directory to this repository's own `.git/hooks` via a local
+        // config so the whole lifecycle stays self-contained.
+        let local_hooks = std::fs::canonicalize(repo.join(".git/hooks")).expect("hooks dir");
+        assert!(
+            std::process::Command::new("git")
+                .args(["config", "--local", "core.hooksPath"])
+                .arg(&local_hooks)
+                .status()
+                .expect("git config core.hooksPath")
+                .success(),
+            "git config core.hooksPath succeeds"
+        );
+
+        assert!(!hook_installed(), "should not be installed yet");
+        assert!(!hook_decided(), "should not be decided yet");
+
+        install_hook().unwrap();
+        assert!(hook_installed(), "should be installed after install_hook");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(".git/hooks/pre-push")
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_ne!(mode & 0o111, 0, "hook must be executable");
+        }
+
+        // Install is idempotent — no error on second call.
+        install_hook().unwrap();
+        assert!(hook_installed());
+        assert!(
+            !std::path::Path::new(".git/hooks/pre-push.preloop-prev").exists(),
+            "reinstall over our own hook must not create a backup"
+        );
+
+        // A pre-existing third-party hook is chained, not clobbered.
+        std::fs::write(".git/hooks/pre-push", "#!/bin/sh\necho 'third-party'\n").unwrap();
+        install_hook().unwrap();
+        let backed = std::fs::read_to_string(".git/hooks/pre-push.preloop-prev").unwrap();
+        assert_eq!(
+            backed, "#!/bin/sh\necho 'third-party'\n",
+            "the previous hook must be preserved for chaining"
+        );
+        let installed = std::fs::read_to_string(".git/hooks/pre-push").unwrap();
+        assert!(
+            installed.contains("pre-push.preloop-prev"),
+            "the installed hook must chain the previous one"
+        );
+
+        // Uninstall and verify decline mark persists.
+        std::fs::remove_file(".git/hooks/pre-push").unwrap();
+        mark_hook_declined();
+        assert!(hook_decided(), "should be decided after declining");
     }
 
     #[test]

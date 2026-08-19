@@ -110,12 +110,7 @@ fn validate_schedule_crons(workflow: &preloop_gha_parser::Workflow) -> Result<()
 /// (repo/global/environment tiers). Native submissions carry no trust tier —
 /// `None` is therefore trusted.
 fn submission_allows_secrets(submission: &WorkflowSubmission) -> bool {
-    submission
-        .trust_tier
-        .as_deref()
-        .and_then(|value| {
-            serde_json::from_value::<crate::events::trust_tier::TrustTier>(json!(value)).ok()
-        })
+    crate::events::trust_tier::tier_of(submission)
         .map(|tier| tier.allows_secrets())
         .unwrap_or(true)
 }
@@ -548,6 +543,27 @@ pub(crate) async fn submit_run_inner(
     } else {
         None
     };
+
+    // A push-requested submission from a dirty tree carries no explicit
+    // tested tree (the client cannot know the snapshot tree in advance).
+    // Record the snapshot's tree so push-back can verify the client's
+    // materialized commit is byte-identical to what CI tested.
+    if submission.push.is_some() && submission.push_tree.is_none() {
+        if let Some(snapshot) = &workspace_snapshot {
+            submission.push_tree = Some(snapshot.tree_sha.clone());
+        }
+    }
+    // A push-requested run whose tree could not be captured can never be
+    // pushed: the push endpoint refuses runs without a recorded tested tree.
+    // Reject loudly at accept time instead of running CI on a submission
+    // that is permanently unpushable (the later `/push` would fail with a
+    // misleading "not submitted with --push").
+    if submission.push.is_some() && submission.push_tree.is_none() {
+        return Err(ApiError::bad_request(
+            "push-requested run needs a tested tree, but the workspace snapshot could not be \
+             created; commit or stash your changes and re-submit (or run without --push)",
+        ));
+    }
 
     // A local submission is a synthetic push/PR against the snapshot. Present
     // the same event shape GitHub would: changed-file actions
@@ -1410,6 +1426,10 @@ pub(crate) async fn submit_run(
     headers: axum::http::HeaderMap,
     Json(mut submission): Json<WorkflowSubmission>,
 ) -> Result<Json<RunAccepted>, ApiError> {
+    // Native callers cannot establish webhook provenance. Never allow a
+    // request body to select the trust tier used by auto-PR and secret policy;
+    // only the GitHub webhook adapters may stamp this field.
+    submission.trust_tier = None;
     if let Some(encoded) = headers
         .get("x-preloop-local-workspace")
         .and_then(|value| value.to_str().ok())
@@ -1434,39 +1454,57 @@ pub(crate) async fn submit_run(
             &submission.sha,
             &submission.git_ref,
             submission.push_tree.as_deref().unwrap_or_default(),
+            // A dirty-tree submission cannot know the tested tree up front:
+            // the server snapshots the workspace inside submit_run_inner and
+            // records the snapshot tree below. The client materializes its
+            // commit from that recorded tree after CI passes.
+            // The snapshot uses either the client's workspace header or the
+            // server-side configured workspace, so both count here.
+            submission.local_workspace.is_some() || shared.state.local_workspace.is_some(),
         )?;
     }
 
+    // A dirty-tree push has no known head commit at submit time: check runs
+    // would attach to the base commit and stay pending forever. The push
+    // endpoint reports them against the materialized branch head instead
+    // (`github_push.rs` step 4). Clean-tree pushes know their commit up
+    // front and get queued checks immediately.
+    let dirty_push = submission.push.as_ref().is_some_and(|push| push.dirty);
+    let clean_push_checks = push_requested && !dirty_push;
     let accepted = submit_run_inner(&shared, submission).await?;
     if push_requested {
-        // Report queued check runs for every job, exactly like the webhook
-        // adapter does for delivered events, so GitHub shows the run from
-        // the moment it is accepted. Jobs resolved terminal at submission
-        // (skipped, unsatisfiable needs) get their completion immediately.
         let run_id = accepted.run_id;
-        let (repository, sha, jobs) = {
-            let inner = shared.state.inner.lock().await;
-            let Some(run) = inner.runs.get(&run_id) else {
-                return Ok(Json(accepted));
-            };
-            (
-                run.submission.repository.clone(),
-                run.submission.sha.clone(),
-                run.jobs.keys().cloned().collect::<Vec<_>>(),
-            )
-        };
-        for job_id in &jobs {
-            crate::github::report_check_run_queued(&shared, &repository, &sha, job_id, run_id)
-                .await;
-            let status = {
+        if clean_push_checks {
+            // Report queued check runs for every job, exactly like the
+            // webhook adapter does for delivered events, so GitHub shows the
+            // run from the moment it is accepted. Jobs resolved terminal at
+            // submission (skipped, unsatisfiable needs) get their completion
+            // immediately.
+            let (repository, sha, jobs) = {
                 let inner = shared.state.inner.lock().await;
-                inner
-                    .runs
-                    .get(&run_id)
-                    .and_then(|run| run.jobs.get(job_id).copied())
+                let Some(run) = inner.runs.get(&run_id) else {
+                    return Ok(Json(accepted));
+                };
+                (
+                    run.submission.repository.clone(),
+                    run.submission.sha.clone(),
+                    run.jobs.keys().cloned().collect::<Vec<_>>(),
+                )
             };
-            if let Some(status) = status.filter(|status| status.is_terminal()) {
-                crate::github::report_check_run_completed(&shared, run_id, job_id, status).await;
+            for job_id in &jobs {
+                crate::github::report_check_run_queued(&shared, &repository, &sha, job_id, run_id)
+                    .await;
+                let status = {
+                    let inner = shared.state.inner.lock().await;
+                    inner
+                        .runs
+                        .get(&run_id)
+                        .and_then(|run| run.jobs.get(job_id).copied())
+                };
+                if let Some(status) = status.filter(|status| status.is_terminal()) {
+                    crate::github::report_check_run_completed(&shared, run_id, job_id, status)
+                        .await;
+                }
             }
         }
         let mut inner = shared.state.inner.lock().await;
@@ -1475,6 +1513,7 @@ pub(crate) async fn submit_run(
                 status: PushStatus::Pending,
                 error: None,
                 pr_number: None,
+                effective_sha: None,
             });
         }
     }
@@ -1573,6 +1612,19 @@ pub(crate) fn build_job_artifacts(
     job: &preloop_gha_protocol::JobPlan,
     github_token_override: Option<String>,
 ) -> Result<BuiltJobArtifacts, ApiError> {
+    // One policy drives every job-facing authority decision for this tier:
+    // stored secrets, the runner-visible `system.github.token.permissions`
+    // variable, the GitHub App installation-token request, the OIDC grant,
+    // and which external token (if any) the job may receive. Fork-restricted
+    // tiers (fork PRs, fail-closed unknown events) get GitHub's read-only
+    // fork profile no matter what the workflow declared.
+    let tier = crate::events::trust_tier::tier_of(submission);
+    let policy = crate::events::trust_tier::job_authorization(
+        tier,
+        job.permissions.as_ref(),
+        job.oidc_id_token_granted,
+    );
+
     // Environment secrets are per-job: a job's `environment:` selects the
     // tier, so the overlay happens here, not in the submission-level merge.
     // Precedence per name: submission-provided > environment > repo > global,
@@ -1582,7 +1634,7 @@ pub(crate) fn build_job_artifacts(
     // map can be large — copying it per job would be pure allocation cost.
     // The original map is borrowed directly in that case.
     let mut env_overlay: Option<BTreeMap<String, String>> = None;
-    if submission_allows_secrets(submission) {
+    if policy.allows_secrets {
         if let Some(env_name) = job.oidc_environment.as_deref() {
             let env_secrets = shared
                 .state
@@ -1616,6 +1668,22 @@ pub(crate) fn build_job_artifacts(
         .map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
 
     agent_msg.preloop_preserve_on_failure = submission.preserve_on_failure.then_some(true);
+
+    // The message builder already wrote the declared permission set into the
+    // wire variable; for a fork-restricted job that set must be restated as
+    // the downgraded fork profile, because the runner prints this variable
+    // as its `GITHUB_TOKEN Permissions` group and it must not claim write
+    // authority the job's token will not carry.
+    if policy.fork_restricted {
+        agent_msg.variables.insert(
+            "system.github.token.permissions".to_owned(),
+            preloop_gha_protocol::azdo::VariableValue::new(
+                preloop_gha_parser::job_builder::token_permissions_wire_json(
+                    &policy.token_permissions,
+                ),
+            ),
+        );
+    }
 
     // Pre-allocate request ID atomically (no lock needed).
     let request_id = shared
@@ -1662,7 +1730,10 @@ pub(crate) fn build_job_artifacts(
         }
     }
 
-    let id_token_granted = job.oidc_id_token_granted;
+    // Fork-restricted jobs never receive an OIDC grant: no request URL is
+    // emitted here (and the broker restates it only for granted jobs), and
+    // the `oidctoken` endpoint refuses via `id_token_grants`.
+    let id_token_granted = policy.id_token_granted;
     if id_token_granted {
         let oidc_url = format!(
             "{}/runner/server/_apis/distributedtask/hubs/actions/plans/{}/jobs/{}/oidctoken?api-version=2.0",
@@ -1679,7 +1750,16 @@ pub(crate) fn build_job_artifacts(
         }
     }
 
-    let github_token = github_token_override.unwrap_or_else(|| runtime_token.clone());
+    // The PAT override (used when no GitHub App is configured) is a static,
+    // repository-unscoped credential: embedding it in a fork-restricted job's
+    // message would hand hostile code authority GitHub would never grant the
+    // fork. Such jobs keep the local job-scoped runtime token, which
+    // authenticates only against this control plane.
+    let github_token = if policy.fork_restricted {
+        runtime_token.clone()
+    } else {
+        github_token_override.unwrap_or_else(|| runtime_token.clone())
+    };
     agent_msg.variables.insert(
         "system.github.token".to_owned(),
         preloop_gha_protocol::azdo::VariableValue::secret(github_token.clone()),
@@ -1821,9 +1901,9 @@ pub(crate) fn build_job_artifacts(
         .as_ref()
         .map(|_| GitHubTokenRequest {
             repository: submission.repository.clone(),
-            permissions: preloop_gha_parser::effective_token_permissions(job.permissions.as_ref())
-                .into_owned(),
+            permissions: policy.app_permissions,
             declared: job.permissions.is_some(),
+            untrusted: policy.fork_restricted,
         });
 
     Ok(BuiltJobArtifacts {

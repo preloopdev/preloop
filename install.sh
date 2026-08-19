@@ -68,6 +68,8 @@ release_json() { # tag or latest
     return 1
 }
 
+# --- smolvm runtime --------------------------------------------------------
+
 ensure_runtime() {
     say "installing compatible smolvm runtime..."
     # The freshly installed runtime lives in $HOME/.local/bin; put it ahead of

@@ -917,6 +917,10 @@ fn build_task_step(step: &crate::StepPlan, context: &Context) -> TaskStep {
         inputs: with,
         env,
         continue_on_error: step.continue_on_error,
+        shell: step
+            .shell
+            .as_ref()
+            .map(|shell| resolve_string(shell, context).unwrap_or_else(|_| shell.clone())),
         working_directory: step
             .working_directory
             .as_ref()

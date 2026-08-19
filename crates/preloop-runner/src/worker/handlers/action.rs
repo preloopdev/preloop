@@ -186,7 +186,12 @@ pub(crate) async fn ensure_remote_action_staged(
             .unwrap_or("");
         let job_id = ctx.job.job_id.as_str();
         let batch = resolver
-            .resolve_batch(&access_token, plan_id, job_id, &[(action_name.as_str(), git_ref)])
+            .resolve_batch(
+                &access_token,
+                plan_id,
+                job_id,
+                &[(action_name.as_str(), git_ref)],
+            )
             .await
             .with_context(|| format!("runnerresolve nested action {uses}"))?;
         resolved = batch.get(&key).cloned();
@@ -261,13 +266,17 @@ fn is_safe_relative_path(value: &str) -> bool {
     !value.is_empty()
         && !path.is_absolute()
         && !value.contains('\\')
-        && path.components().all(|component| {
-            matches!(component, std::path::Component::Normal(_))
-        })
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
-fn ensure_under_actions_dir(actions_dir: &std::path::Path, action_dir: &std::path::Path) -> Result<()> {
-    let actions_canon = std::fs::canonicalize(actions_dir).unwrap_or_else(|_| actions_dir.to_path_buf());
+fn ensure_under_actions_dir(
+    actions_dir: &std::path::Path,
+    action_dir: &std::path::Path,
+) -> Result<()> {
+    let actions_canon =
+        std::fs::canonicalize(actions_dir).unwrap_or_else(|_| actions_dir.to_path_buf());
     // action_dir may not exist yet for path-only resolution; walk parents.
     let mut probe = action_dir.to_path_buf();
     let action_canon = loop {
