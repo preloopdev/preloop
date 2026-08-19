@@ -21,6 +21,11 @@ pub(crate) struct PushState {
     /// Pull request number, when the branch has an open PR (created or
     /// pre-existing).
     pub(crate) pr_number: Option<u64>,
+    /// The commit the sync actually published (`submission.sha` for a clean
+    /// submission; the materialized branch head for a dirty one). Webhook
+    /// dedup matches the echo of our own push against this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) effective_sha: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -33,6 +38,25 @@ pub(crate) struct DapPortRegistration {
 pub(crate) struct StepRecord {
     pub(crate) name: String,
     pub(crate) conclusion: String,
+    /// Server-side observation of when the step first appeared (started) and
+    /// when it turned terminal (finished). Stamped at projection time, so
+    /// durations are authoritative even when the runner omits wire
+    /// timestamps (preloop-runner) or when a worker dies mid-step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) started_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) finished_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Server-side timing for the workspace snapshot created at submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SnapshotTiming {
+    /// Wall time spent capturing the tree, including the git operations.
+    pub(crate) duration_ms: u64,
+    /// Objects (loose + packed) in the snapshot repository.
+    pub(crate) object_count: u64,
+    /// Packed size in bytes (loose objects are negligible after repacking).
+    pub(crate) pack_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +134,10 @@ pub(crate) struct RunRecord {
     pub(crate) conclusion: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) push_state: Option<PushState>,
+    /// Submission-time workspace snapshot cost; present only for local
+    /// submissions that snapshot a workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) snapshot_timing: Option<SnapshotTiming>,
 }
 
 #[derive(Debug, Clone)]
@@ -189,6 +217,27 @@ pub(crate) struct GitHubTokenRequest {
     /// A declared set must be minted verbatim or fail visibly; the implicit
     /// default may be narrowed to what the App installation actually grants.
     pub(crate) declared: bool,
+    /// Whether the job's trust tier restricts GitHub authority (fork PR or
+    /// fail-closed unknown event). Such jobs carry only the read-only fork
+    /// profile, and a mint failure never falls back to the broad
+    /// `PRELOOP_GITHUB_TOKEN` PAT: the job keeps the local runtime token
+    /// instead of receiving authority GitHub would not grant the fork.
+    ///
+    /// Missing persisted metadata fails closed: a request written by a
+    /// pre-upgrade server has no `untrusted` field, and deserializing it as
+    /// trusted would silently re-enable the PAT fallback after a restart for
+    /// a job whose tier was never recorded. Newly created requests always
+    /// serialize the field explicitly (`false` for trusted jobs), so only
+    /// genuinely old state hits the fail-closed default.
+    #[serde(default = "default_untrusted")]
+    pub(crate) untrusted: bool,
+}
+
+/// Fail-closed default for persisted [`GitHubTokenRequest`]s that predate
+/// the `untrusted` field: no recorded trust metadata means the request may
+/// have belonged to an untrusted job, so it is treated as untrusted.
+fn default_untrusted() -> bool {
+    true
 }
 
 /// Runner metadata used by dispatch matching.

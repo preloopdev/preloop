@@ -361,7 +361,7 @@ workflow. All are fixed:
 | A custom `shell:` command line was collapsed into one argv entry                       | `taiki-e/install-action` declares `shell: /usr/bin/env -u ENV … /bin/sh -eu {0}`; `env` unset one absurdly named variable, found no command, printed the environment, exited 0 — the step "succeeded" installing nothing and the next step died with `no such command: hack`                                 | `resolve_shell` splits every whitespace token; `{0}` substitution per token                                                                                                                                                                                     |
 | Toolchain bin directories were not on the runner's PATH                                | `dtolnay/rust-toolchain` only appends `$CARGO_HOME/bin` to `$GITHUB_PATH` when it installs rustup itself, so on an image that already has rustup (ours, and GitHub's) anything `cargo install`-ed was unreachable                                                                                            | the guest runner is launched with an explicit PATH covering `$HOME/.cargo/bin` and `/usr/local/go/bin`                                                                                                                                                          |
 | The baseline wiped `/var/lib/apt/lists`                                                | uv's musl cell runs `sudo apt-get install musl-tools` with no `apt-get update`: `E: Unable to locate package`                                                                                                                                                                                                | keep the lists; a fork of a pack that shipped without them refreshes on provision                                                                                                                                                                               |
-| Rosetta enable failure left a half-created machine                                     | an Apple Silicon host without Rosetta 2 (or a transient `smolvm machine update --rosetta` failure) left a broken VM the pool kept reusing; x86_64 golden jobs failed at start instead of surfacing the cause                                                                                                 | the provider propagates the `update --rosetta` error and deletes the partial machine (`rosetta_update_failure_is_returned_and_partial_machine_is_deleted`); x86_64 guests on Apple Silicon run under Rosetta 2 translation, with arm64 native preferred (see `docs/internal/smolvm-benchmarks.md`)                              |
+| Rosetta enable failure left a half-created machine                                     | an Apple Silicon host without Rosetta 2 (or a transient `smolvm machine update --rosetta` failure) left a broken VM the pool kept reusing; x86_64 golden jobs failed at start instead of surfacing the cause                                                                                                 | the provider propagates the `update --rosetta` error and deletes the partial machine (`rosetta_update_failure_is_returned_and_partial_machine_is_deleted`); x86_64 guests on Apple Silicon run under Rosetta 2 translation, with arm64 native preferred (see `docs/vm-images.md`) |
 | A fork of the packed golden trusted the pack's bake                                    | a published pack predating the workspace's toolchain pin boots without cargo, and cargo-dist dies on "you don't appear to have cargo installed" in 11s                                                                                                                                                       | probe each toolchain layer per fork and install only what the pack lacks; and `build-golden` now bakes the workspace's toolchains (`rust-toolchain.toml` etc.) into the artifact, so forks inherit them — the per-fork install is gone once the pack is rebuilt |
 | The guest hostname did not resolve                                                     | every `sudo` call printed `sudo: unable to resolve host <name>`, which appears in no hosted log                                                                                                                                                                                                              | the baseline adds the hostname to `/etc/hosts`                                                                                                                                                                                                                  |
 | `apt-get install` prompted, and a step's stdin never reached EOF                       | the hosted images ship `/etc/apt/apt.conf.d/90assumeyes`, so uv's `sudo apt-get install musl-tools` (no `-y`) installs three packages without a prompt; here it asked `Do you want to continue? [Y/n]` and, because the runner is a child of a guest `exec` whose stdin never closes, blocked for 45 minutes | ship the same apt config, and give every step `Stdio::null()` for stdin                                                                                                                                                                                         |
@@ -380,13 +380,13 @@ workflow. All are fixed:
 
 ### 1b.4 Still open
 
-- **Non-Linux cells are skipped, not queued.** The microVM pool builds Linux
+- **Non-Linux cells are failed, not queued.** The microVM pool builds Linux
 guests only; macOS needs a `preloop-runner` on a Mac registered against the
 control plane, and Windows has no host at all. GitHub would leave such a job
-queued until it times out; we mark it `skipped` at submit so the run
+queued until it times out; we conclude it as `failure` at submit so the run
 finishes, dependents skip, and the reason lands in the log. A deliberate
 divergence — an unclaimable job that reports nothing is worse than a visible
-skip. The skip is conditional on *no* runner declaring that OS being
+failure. The conclusion is conditional on *no* runner declaring that OS being
 registered, so a Mac host serving `macos-latest` still runs the job.
 - **macOS and Windows image versions are not disambiguated.** `macos-13`
 (x86_64), `macos-14`/`macos-15` (arm64) and every `windows-*` image are
@@ -403,6 +403,141 @@ only match here because a self-hosted runner stands in for unknown labels.
 steps; GitHub exports only the step's own `env:` block. Harmless so far —
 `install-action`'s `BASH_FUNC_` guard does not trip on them — but it is a
 divergence a workflow could observe.
+
+### 1b.5 Pool reliability findings (2026-08-13)
+
+Found while measuring build-speed configs on the pool. Operational/reliability
+gaps (not protocol-shape gaps); tracked for fix:
+
+| Issue | Gap | Observed |
+| ----- | --- | -------- |
+| [#131](https://github.com/preloopdev/preloop/issues/131) | Runner never enforces the job timeout against a **hung step** — the runner keeps polling + renewing the job lock, so neither the liveness sweep nor the 45-min lease reclaims it; `timeout-minutes` never fires mid-step (official runner cancels at the budget) | `property-tests-fast` wedged 60+ min in `actions/checkout`, then again in a compile step; cancelled manually (runs `6a6f842f`, `9b7437a1`) |
+| [#132](https://github.com/preloopdev/preloop/issues/132) | Golden bakes `/etc/sudoers` owned by uid 1000 → `sudo` broken in every pool VM (docs' `sudo apt-get` pattern fails) | `sudo: error initializing audit plugin sudoers_audit` on running VM `preloop-runner-1-7`; first lld CI attempt failed on it |
+| [#133](https://github.com/preloopdev/preloop/issues/133) | GitHub App ran the **stale workflow YAML** for a push (first job attempt used the previous commit's ci.yml, then restarted with the correct one) | push `2b4090c1`: stale nextest config log `34425e86...`, correct config restarted 22:05 |
+| [#134](https://github.com/preloopdev/preloop/issues/134) | `GET /api/v1/runs/<id>/logs` returns **truncated** logs while `replay/results/*/job-logs.txt` is complete on disk | endpoint cut at 16:34:47 for a run whose file ends 16:46:03 (run `684a20e0`) |
+
+---
+
+## 1c. Large-repo conformance campaign (2026-08-12)
+
+Five large public repositories run unmodified against the local engine
+(aarch64 macOS host, packed golden + smolvm forks), with one x86 leg on the
+remote x86_64 control plane (`aksh.preloop.dev`). Workflows: moby/moby
+`ci.yml` (docker buildx/bake), neovim/neovim `test.yml` (zig/cmake matrix),
+microsoft/TypeScript `ci.yml` (node matrix), astral-sh/ruff `ci.yaml`
+(cargo/nextest matrix), nodejs/node `test-linux.yml` (x86 build+test).
+
+### 1c.1 Bugs found and fixed
+
+Every item below broke a real workflow step and was fixed in preloop:
+
+| Gap | Symptom | Fix |
+| --- | --- | --- |
+| Older SmolVM releases lost UID/GID ownership while extracting packed machines | packed images containing non-root service accounts or ownership-sensitive system files could not start correctly | `preloop update --ensure-runtime` requires SmolVM >=1.8.1 and installs the latest stable release when the current runtime is older or lacks the required socket capability |
+| SmolVM's non-streaming `machine exec` drops the connection after ~30s with no output | quiet provisioning execs such as toolchain installs were killed mid-flight | provider execs pass an explicit `--timeout 30m` |
+| Job/workflow-level `env:` never reached action processes | moby's `docker buildx bake` resolved `${DESTDIR}` to `""` because the hcl default took over — the `govulncheck` target's `output = ["${DESTDIR}"]` collapsed to an empty output list, the report was never exported, and the bake action failed on the missing path. The server put job env in the message `variables` map and left the wire `environmentVariables` (the field the official runner materializes into step environments) empty | the job message builder now populates `environmentVariables` from the job env |
+| A server restart left every queued run permanently wedged | jobs restored from the store sat "pending" forever: the on-demand pool only forks while its shared `queue_depth` atomic is non-zero, and after a restart no runner exists to refresh it from a broker poll | `serve` re-arms the atomic with the recovered ready-queue length and re-syncs `next_job_runs_on` |
+| A run stuck on unclaimable jobs permanently parks its concurrency group | neovim's `test.yml` pins `concurrency:` on the workflow; a run whose remaining jobs were `windows-*` cells (held queued indefinitely by the starvation sweep, which deliberately waits for an external host) never went terminal, so its run-level concurrency holder never released and every later submission in the group parked forever ("pending") | a later submission acquiring the same concurrency key now treats a holder whose remaining jobs all need an external host — with no such host registered — as stuck and takes the slot (a registered-but-busy host keeps it); restore-time reconciliation separately clears holders whose runs are terminal or missing. The stuck run stays queued and re-acquires if a host ever appears |
+| The golden lacked the Chromium/playwright runtime libraries | vite's tests died in playwright's host-requirements check (`Failed to launch browser`, missing `libnss3` etc.); GitHub's ubuntu-24.04 image ships these | 21 browser runtime libs pinned in `versions.toml` and added to the golden bake. Caveat: the *packed* artifact cache is keyed only by the base-image digest, so package-list changes reach a packed golden only after the artifact is rebuilt (`prepare_artifact` rebuilds when the payload file is missing) — the pins take effect immediately for non-packed goldens and for the next artifact build |
+| The golden lacked RubyGems and Perl's cpanminus | neovim's functionaltest setup runs `gem install … neovim` and `sudo cpanm -n Neovim::Ext`; `gem: command not found` killed every posix cell | `ruby`, `ruby-rubygems`, `perl`, `cpanminus` pinned in `versions.toml` and baked (artifact rebuilt for the campaign) |
+| The golden lacked the rest of the hosted image's apt baseline | neovim's LLVM install script died on `lsb_release: command not found`; each missing utility (`xvfb`, `telnet`, `sshpass`, …) was a separate workflow-killing gap | the remaining packages from the official ubuntu-24.04 image's apt list (image readme 20260720.247.2) pinned and baked: `lsb-release`, `fonts-noto-color-emoji`, `haveged`, `mediainfo`, `p7zip-rar`, `pollinate`, `sshpass`, `telnet`, `tk`, `xvfb`, `zsync`, `ftp`, `sphinxsearch`, `systemd-coredump`, `libnss3-tools` |
+| The runner VMs had 4 GiB of RAM against workflows that assume the hosted 7 GiB | TypeScript's `ci.yml` sets `NODE_OPTIONS=--max-old-space-size=6144` ("7 GiB by default on GitHub"); the jake test workers died with a silent exit-2 crash | local pool raised to `PRELOOP_RUNNER_MEMORY_MIB=8192` (the remote already runs 6144) |
+| The runner account could not `sudo` | `sudo` demanded a password — the GitHub image grants the runner user passwordless sudo | the provisioning wrapper writes `/etc/sudoers.d/preloop-runner` (`NOPASSWD: ALL`) when it creates the account. Trust boundary: this grants workflow code unrestricted root and is only safe because these are disposable, isolated runner VMs — never install it on shared or persistent hosts |
+| Job/workflow `env:` entries containing `${{ }}` were emitted verbatim | ruff's `sccache` step resolves `SCCACHE_GHA_ENABLED:${{ github.ref_name == 'main' }}` — the raw template string reached the step env and the sccache action died (`${{` is not valid in an env value for the official runner) | the job message builder now resolves env expressions server-side against the job context before emitting `environmentVariables`. Scope: expressions resolve where the value is known at build time; secrets resolve to their masking placeholder in that context (never shipped as plaintext); runner-only contexts (`github.workspace`, `runner.*`) are preserved for step-time evaluation by the runner |
+| The snapshot object cache was trusted without verification | partial-clone workspaces (cloned with `--filter=blob:none`) produce object caches with commits and trees but no blobs and no shallow marker, so fetches from the cache silently returned incomplete packs (a `--unshallow` fetch would fail later in the workflow); the cache completeness was assumed | the snapshot path now runs `git rev-list --objects --all --missing=print` and deepens from the workspace remote when real holes exist; `--refetch` is used when the cache is not marked shallow (a plain fetch only transfers what new refs need, which is nothing when refs are unchanged). Shallow-boundary graft entries (`0000…` shas) are excluded from the missing count |
+| `ACTIONS_CACHE_URL`/`ACTIONS_RESULTS_URL` lacked the trailing slash | sccache's GHA storage backend concatenates its twirp path directly onto the base URL, producing `http://host:9090twirp/…` → `invalid port number` → storage probe failed → sccache's compiler shim emitted nothing → node's configure reported "Could not determine compiler version info" | `ResultsServiceUrl` and `CacheServerUrl` are emitted with trailing slashes (both acquire paths) and the worker no longer trims them, matching the official results-receiver URL shape |
+| The cache twirp routes only accepted JSON bodies | actions/cache@v4 speaks twirp JSON, but sccache's GHA storage backend (the `ghac` crate) sends twirp **protobuf** (`content-type: application/protobuf`); the axum `Json` extractor answered 415 and sccache's storage probe failed (→ compiler shim → configure failure, same cascade as the URL bug). The protobuf field numbers also differ from the JSON shape: `metadata=1` (nested `CacheMetadata`→`CacheScope`), `key=2`, `restore_keys=3`, `version=4` (3 for create), and responses carry `ok=1` as a bool varint | the cache v2 create/finalize/get-download-url routes now decode protobuf requests and encode protobuf responses (field numbers verified against ghac 0.2.0's `cache.proto`) when the content-type says protobuf, falling back to JSON otherwise. This is what lets node's `main`-ref build (`CC: sccache clang-19`) run at all |
+| Reusable-callee jobs on unhostable platforms were only checked at submit time | a reusable caller defers its callee subtree to materialization, so the submit-time "no `windows` runner is registered" check never saw the callee's `runs-on: windows-2025`; the job sat queued forever (Linux VMs are label-excluded), while the caller's placeholder (empty `runs_on`) could be claimed by a Linux VM, run the foreign-OS steps, and wedge in cleanup — keeping the run `in_progress` forever and parking its concurrency group | `register_expanded_jobs` now concludes unhostable callee jobs as failures with the submit-path reason string |
+| Worker-crash completion left the active step `in_progress` and run logs empty | node's two test jobs terminalized as failures after `Build` passed, but the crashed workers never sent their final step update or `job-logs.txt`; the run API showed `Test: in_progress`, and `/logs` ignored six already-uploaded step blobs | terminal job completion now terminalizes any active step with the effective job conclusion; run-log aggregation falls back to ordered results-service step blobs when the final job log is absent |
+| SmolVM force-delete intermittently failed with `Directory not empty` | both spent node VMs remained registered after the agent/log writer raced SmolVM 1.7.7's recursive data-directory removal | force-delete retries this transient failure and treats an already-missing machine as successful, preserving an idempotent provider contract |
+| `docker create` output parsing took the first merged line as the container ID | stdout and stderr are merged into one stream and the platform warning can land before the ID; the runner fed the warning to `docker start` (`No such container: WARNING: …`) — every `container:`/`services:` job with any stderr broke | the ID is parsed as the first 64-hex-character line, never the first line |
+| Job-message expression inputs collapsed to "" across a persist → restore round-trip | `extract_template_map` read only `lit`; type-3 expression tokens carry `expr`, so any server restart emptied every expression-valued step input (mastodon's cache `key:` → "Input required and not supplied: key") | type-3 tokens reconstruct as `${{ expr }}` on decode |
+| Composite inner remote actions were never staged | job-start preparation only stages the message's own steps; `ruby/setup-ruby@v1` inside mastodon's local `setup-ruby` composite resolved to a missing `_actions` dir and silently did nothing | the composite downloads nested remote actions on demand, cached under `_actions/` |
+| Composite inner-step failures were swallowed | the inner loop broke on failure but the composite returned `Ok(())`, so setup-ruby "passed" without installing Ruby | the composite propagates the inner failure |
+| Composite inner-action `with:` values ignored inner-step outputs | `path: ${{ steps.<id>.outputs.dir }}` evaluated without the composite's nested step results → "" → cache "Input required: path" | inner `with:` values evaluate against the composite context (inputs + nested step outputs) |
+
+### 1c.2 Environmental findings
+
+- **The local server wedges and stops provisioning** (machines churn in
+  `created`, no exec processes, SIGTERM ignored). Restart with log capture
+  clears it; the restart wedge itself is the queue-depth bug above. The
+  pre-restart runs must be re-submitted.
+- **Shallow workspace clones break the snapshot's changed-files story**:
+  a depth-1 clone has no parent commit, the synthetic push's `before` is the
+  null SHA, and changed-files fetches die with `upload-pack: not our ref
+  00000000…`. The campaign re-clones unshallowed; `snapshots.rs` handles
+  shallow edges for the committed history it can see, but a truly rootless
+  tree has nothing to diff against.
+- **macOS/Windows cells are concluded as failures at submit when no runner
+  declares that OS.** GitHub would leave such a job queued; preloop fails it
+  immediately so the run finishes, dependents skip, and the reason lands in
+  the log. Jobs that reach the ready queue with an external-host label are
+  deliberately exempt from the 120s starvation sweep — they stay queued in
+  case a host appears — while other unclaimable jobs fail after the grace
+  window.
+- **The remote x86 server's pool runners lost their control bridge**
+  (broker poll connection refused inside the guests); a service restart
+  recreates them. Queued GitHub PR checks had been stalling.
+- **Cross-repo checkout auth**: the remote server's GitHub App installation
+  cannot mint tokens for repositories outside its installation, so
+  `actions/checkout` of a foreign public repo fails (`could not read
+  Username for 'https://github.com'`) when no workspace snapshot redirects
+  the checkout to the local snapshot server.
+- **The packed artifact cache ignores bake-content changes**: the artifact
+  cache key is the base-image digest only, so package pins added to the bake
+  never reach a *packed* golden until the artifact is rebuilt. Campaign
+  practice: delete `~/.preloop/vms/preloop-…-aarch64` and restart; noted for a
+  follow-up (key the artifact by the bake fingerprint).
+- **Multi-arch docker builds degrade to the host arch**: moby's `cross` job
+  resolves `linux/arm64` only because the golden lacks
+  qemu-user-static/binfmt, so the ppc64le/s390x/amd64 cells GitHub builds are
+  skipped rather than emulated. `docker/setup-qemu-action` would need binfmt
+  support in the golden to match GitHub.
+- **Code-scanning SARIF uploads cannot complete without GitHub**: moby's
+  govulncheck scan, SARIF validation and fingerprinting all pass; the final
+  `codeql-action/upload-sarif` POST to `api.github.com` fails (`Not Found`)
+  because there is no GitHub backend behind the job's token. The scan itself
+  is faithful; the upload needs a real GitHub token with
+  `security-events: write`.
+
+### 1c.3 Results
+
+| Repo | Workflow | Result |
+| --- | --- | --- |
+| `moby/moby` | `ci.yml` | build (binary/dynbinary, amd64+arm64 cells) ✅, validate-dco ✅, cross/build-dind/prepare-cross/success ✅, govulncheck ✅ after the env fix |
+| `neovim/neovim` | `test.yml` | lintc/lint/clang-analyzer/zig-build ✅; posix ubuntu cells ✅; macos/windows cells conclude as failures at submit (no such runners). The run-level `concurrency:` group deadlock found through this workflow is fixed (1c.1) |
+| `microsoft/TypeScript` | `ci.yml` | 15 ubuntu cells ✅ (node 14→lts/* matrix + baselines/format/knip/lint/misc/self-check/smoke/typecheck, package-size gated off, `required` gate ✅); windows/macos cells conclude as failures at submit; one coverage cell hit a transient virtiofs mount race |
+| `astral-sh/ruff` | `ci.yaml` | determine-changes gated matrix: unchanged-path jobs skip ✅; fmt/shellcheck/clippy/prek/mkdocs/formatter/ruff-lsp/instrumented-benchmarks/16 cargo+test cells ✅; remaining failures: Preloop does not register SmolVM's mounted Rosetta translator in the aarch64 guest (release/wasm test cells), `/tmp` tmpfs EXDEV (python-package), one cargo-package verification quirk |
+| `nodejs/node` | `test-linux.yml` | remote x86_64 leg: checkout/sudo/rustup/setup-python/apt all work (App-token checkout fixed via PAT + real payload SHA); remote builds keep flaking on apt under I/O contention. Local ubuntu + arm jobs both pass checkout, clang-19, rustup, setup-python, sccache and the full `make build-ci`; both workers then fail during `Test`. Their final test output was not uploaded, so the underlying assertion is unknown. The resulting terminal-step/log-recovery diagnostic gap is fixed in 1c.1 |
+
+### 1c.4 Still open
+
+- **Held runs are not persisted.** A run parked in a concurrency group has
+  its jobs only in memory; after a restart the group is reconciled (above)
+  but the parked run itself is stuck pending and must be cancelled and
+  re-submitted.
+- **Remote deployment lags the local tree**: `main` runs the
+  ownership-repair-era binary; the env-expression, snapshot-cache,
+  URL-slash and protobuf-cache fixes need a rebuild + deploy there for
+  remote runs to match local behavior.
+- **The local smolvm fleet is flaky under I/O load**: provisioning and
+  `smolvm machine exec` intermittently fail with `Resource temporarily
+  unavailable` — queued
+  jobs starve past the grace window while forks repair, which turns into
+  run failures that are fleet-caused, not workflow-caused. A re-run after
+  the fleet settles is the practical mitigation; baking the runner user
+  into the golden would remove the useradd write from the fork path.
+- **Rosetta is mounted but not registered inside aarch64 guests.** Preloop
+  already requests `smolvm machine update --rosetta` on Apple Silicon, and
+  the campaign VMs expose SmolVM's translator at `/mnt/rosetta`. The guest
+  has no corresponding binfmt registration, however, so directly executing
+  an x86_64 binary still fails. This is a Preloop guest-bootstrap gap, not a
+  SmolVM capability gap. Docker actions additionally need the Rosetta mount
+  propagated into containers.
+- **`/tmp` is tmpfs**, so third-party actions that `rename()` across
+  `/tmp` → toolcache die with `EXDEV` (setup-wasm-pack does exactly this).
+  GitHub's image keeps `/tmp` on disk; the golden could mask
+  `tmp.mount` for parity.
 
 ---
 
@@ -661,6 +796,42 @@ runner-correlation maps (`job_requests`, `inflight_requests`, …) the way
 runtime reusable expansion now does — jobs fanned out from
 `needs`-dependent matrices lack RenewJob/timeline correlation until that path
 adopts the shared `build_job_artifacts` helper.
+
+---
+
+### 3c. Fork trust isolation (2026-08-12)
+
+The fork-PR token hardening (commit `47278c2b`) makes untrusted fork runs
+behave like GitHub's: read-only `GITHUB_TOKEN`, no secrets, no OIDC, and no
+fallback that can widen the credential. Two per-repository features remain to
+be compared with GitHub:
+
+**Cache access — conformant (resolved 2026-08-13).** GitHub gives fork PR runs
+read-only cache access: they can restore from the base repository's cache but
+cannot save to it (actions/cache README: "Some workflow runs only have
+read-only access to the cache. A common case is a workflow triggered by a pull
+request from a fork"), so a fork cannot poison entries a trusted run later
+restores. Preloop previously allowed fork writes on both the cache v2 Twirp
+surface (`CacheService/CreateCacheEntry`, `FinalizeCacheEntryUpload`) and the
+legacy `/_apis/artifactcache` surface. All cache *write* handlers now reject
+fork-restricted jobs (403, resolved via the job runtime token →
+`events::trust_tier::fork_restricted_from_token`); restore handlers are
+unchanged. Reads stay open for everyone.
+
+**Concurrency groups — at parity, suggested divergence (not implemented).**
+Concurrency groups are keyed `(lowercased repo, lowercased group name)`
+(`concurrency::concurrency_key`, no trust tier), matching GitHub's documented
+per-repository model ("using the same concurrency group in the repository").
+GitHub documents no fork isolation for concurrency, so a fork PR can declare a
+static group name (e.g. `prod-deploy`) with `cancel-in-progress: true` and
+cancel a trusted run — on GitHub and preloop alike. Suggested divergence,
+strictly safer than GitHub: key groups by `(repo, fork_restricted, group)` so
+fork runs contend only with fork runs and can never cancel a trusted holder.
+Tradeoffs: breaks cross-trust serialization for deliberately shared groups
+(use distinct group names per trust domain); the persisted key shape in
+`store.rs` needs a migration; and it does not bound resource abuse (a fork can
+still flood the pool with runs — that needs queue/run limits, separate from
+concurrency). Not implemented; documented here for parity tracking.
 
 ---
 

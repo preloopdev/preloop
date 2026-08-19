@@ -327,6 +327,20 @@ impl TestEnvVar {
         std::env::set_var(key, value);
         Self { key, previous }
     }
+
+    /// Clear a variable for the duration of a test.
+    ///
+    /// The counterpart to [`TestEnvVar::set`] for tests whose contract is the
+    /// *absence* of a value — a configured `PRELOOP_GITHUB_TOKEN` flips the
+    /// check-run path from its mock to a live GitHub call, so a test asserting
+    /// the mock path has to guarantee no token is visible. Restores on drop,
+    /// so a panicking test cannot leak the cleared state onto the rest of the
+    /// suite.
+    pub(crate) fn unset(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::remove_var(key);
+        Self { key, previous }
+    }
 }
 
 #[cfg(test)]
@@ -404,6 +418,9 @@ pub struct AppState {
     pub(crate) github_pat: Option<preloop_gha_protocol::SecretString>,
     /// GitHub endpoints surfaced to workflows (server/api/graphql URLs).
     pub(crate) github_urls: GitHubUrls,
+    /// Auto-PR policy for webhook-driven push runs (env overrides the config
+    /// file, matching every other `PRELOOP_GITHUB_*` override).
+    pub(crate) pr_config: crate::config::PrConfig,
     /// Short-TTL cache of resolved action refs (`owner`, `repo`, `ref`) → SHA.
     /// Keeps a matrix fan-out from re-resolving the same `uses:` ref per cell
     /// and bounds GitHub API pressure; entries expire after
@@ -717,6 +734,52 @@ impl AppState {
             repo: config.repo_secrets,
             env: config.env_secrets,
         }));
+        // Env wins over the config file, matching every other `PRELOOP_GITHUB_*`
+        // override. An empty value in either source counts as unset.
+        let mut pr_config = config.github.pr.clone();
+        if let Ok(value) = env::var("PRELOOP_GITHUB_PR_AUTO") {
+            if !value.trim().is_empty() {
+                pr_config.auto = match value.trim().to_ascii_lowercase().as_str() {
+                    "feature" => crate::config::PrAuto::Feature,
+                    "never" => crate::config::PrAuto::Never,
+                    other => {
+                        tracing::warn!(
+                            value = other,
+                            "unknown PRELOOP_GITHUB_PR_AUTO; expected feature|never"
+                        );
+                        pr_config.auto
+                    }
+                };
+            }
+        }
+        if let Ok(value) = env::var("PRELOOP_GITHUB_PR_DRAFT") {
+            if !value.trim().is_empty() {
+                // A typo (`ture`) must not silently flip the configured
+                // draft policy: unknown values keep the configured default
+                // and warn, mirroring PRELOOP_GITHUB_PR_AUTO.
+                pr_config.draft = match value.trim().to_ascii_lowercase().as_str() {
+                    "1" | "true" | "yes" => true,
+                    "0" | "false" | "no" => false,
+                    other => {
+                        tracing::warn!(
+                            value = other,
+                            "unknown PRELOOP_GITHUB_PR_DRAFT; expected 1|true|yes|0|false|no"
+                        );
+                        pr_config.draft
+                    }
+                };
+            }
+        }
+        if let Ok(value) = env::var("PRELOOP_GITHUB_PR_EXCLUDE") {
+            if !value.trim().is_empty() {
+                pr_config.exclude = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|pattern| !pattern.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+            }
+        }
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
             store,
@@ -746,6 +809,7 @@ impl AppState {
             dispatch_actor_cache: Arc::new(crate::dispatch_auth::DispatchActorCache::default()),
             github_pat,
             github_urls,
+            pr_config,
             action_sha_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             config_path,
             pending_registrations: Arc::new(std::sync::RwLock::new(BTreeMap::new())),

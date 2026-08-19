@@ -33,6 +33,76 @@ fn actions_tarball_root(action_dir: &Path) -> Option<std::path::PathBuf> {
     Some(Path::new(base).join(parts[0]).join(parts[1]).join(parts[2]))
 }
 
+/// Build the expression context for composite inner steps: the job context
+/// plus the composite's inputs and the results of inner steps already run
+/// (`steps.<id>.outputs.*` and friends). GitHub evaluates every inner field —
+/// `if:`, `run:`, and nested-action `with:` values — against this context;
+/// without the nested results, an inner cache step keyed on
+/// `${{ steps.<id>.outputs.dir }}` resolves to an empty string.
+fn composite_inner_context(
+    ctx: &StepContext<'_>,
+    input_env: &std::collections::HashMap<String, String>,
+    nested_step_results: &indexmap::IndexMap<String, crate::worker::contexts::StepResult>,
+) -> preloop_gha_expressions::Context {
+    let mut expr_ctx = ctx.job.build_expression_context();
+    let mut inputs_map = serde_json::Map::new();
+    for (k, v) in input_env {
+        if let Some(name) = k.strip_prefix("INPUT_") {
+            inputs_map.insert(name.to_lowercase(), serde_json::json!(v));
+        }
+    }
+    expr_ctx.insert("inputs", serde_json::Value::Object(inputs_map));
+
+    let mut nested_steps_map = serde_json::Map::new();
+    for (sid, sresult) in nested_step_results {
+        let mut step_val = serde_json::Map::new();
+        // GitHub exposes steps.*.outcome/conclusion as lowercase strings
+        // (`success`, `failure`, `cancelled`, `skipped`) even though the
+        // runner's internal StepResult model keeps title case.
+        step_val.insert(
+            "outcome".into(),
+            serde_json::json!(sresult.outcome.to_ascii_lowercase()),
+        );
+        step_val.insert(
+            "conclusion".into(),
+            serde_json::json!(sresult.conclusion.to_ascii_lowercase()),
+        );
+        let mut out_map = serde_json::Map::new();
+        for (k, v) in &sresult.outputs {
+            out_map.insert(k.clone(), serde_json::json!(v));
+        }
+        step_val.insert("outputs".into(), serde_json::Value::Object(out_map));
+        nested_steps_map.insert(sid.clone(), serde_json::Value::Object(step_val));
+    }
+    expr_ctx.insert("steps", serde_json::Value::Object(nested_steps_map));
+    expr_ctx
+}
+
+/// Resolve `${{ }}` in a nested action's `with:` values against the composite
+/// inner context (inputs + prior inner-step outputs).
+fn resolve_inner_with(
+    with: &serde_json::Value,
+    expr_ctx: &preloop_gha_expressions::Context,
+) -> anyhow::Result<serde_json::Value> {
+    let serde_json::Value::Object(map) = with else {
+        return Ok(with.clone());
+    };
+    let mut resolved = serde_json::Map::new();
+    for (key, value) in map {
+        let raw = value
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| value.to_string());
+        // Strict, like the official runner's input conversion: an unevaluable
+        // expression fails the nested action instead of passing `${{ }}`
+        // through.
+        let evaluated = crate::worker::template::evaluate_template_strict(&raw, expr_ctx)
+            .with_context(|| format!("composite inner input '{key}'"))?;
+        resolved.insert(key.clone(), serde_json::json!(evaluated));
+    }
+    Ok(serde_json::Value::Object(resolved))
+}
+
 /// Run a composite action.
 pub async fn run_composite_action(
     manifest: &ActionManifest,
@@ -122,6 +192,11 @@ fn run_composite_action_inner<'a>(
             String,
             crate::worker::contexts::StepResult,
         > = indexmap::IndexMap::new();
+        // Inner-step failures are recorded on the composite result. Later
+        // steps still run only when their condition allows it under the
+        // implicit `success()` gate (`always()` / `failure()` cleanup still
+        // runs; plain steps and bare expressions do not).
+        let mut composite_failed: Option<anyhow::Error> = None;
 
         // Execute each composite step
         for (i, step) in steps.iter().enumerate() {
@@ -147,49 +222,51 @@ fn run_composite_action_inner<'a>(
 
             info!("  Composite step: {step_name}");
 
-            // Evaluate `if` condition — skip step if condition is false
+            // Evaluate condition with the same implicit `success()` gate as
+            // job-level StepsRunner. Default (no `if:`) is `success()`.
             let step_if = step.get("if").and_then(|v| v.as_str());
-            if let Some(condition) = step_if {
-                let mut if_ctx = ctx.job.build_expression_context();
-                // Include composite inputs and nested step results in if-condition context
-                let mut inputs_map = serde_json::Map::new();
-                for (k, v) in &input_env {
-                    if let Some(name) = k.strip_prefix("INPUT_") {
-                        inputs_map.insert(name.to_lowercase(), serde_json::json!(v));
-                    }
+            let cancelled = *cancel_rx.borrow();
+            let composite_has_failed = composite_failed.is_some();
+            let mut if_ctx = composite_inner_context(ctx, &input_env, &nested_step_results);
+            if_ctx = if_ctx.with_status(
+                !composite_has_failed && !cancelled,
+                composite_has_failed,
+                cancelled,
+            );
+            let effective = crate::worker::step_conditions::effective_condition(step_if);
+            match preloop_gha_expressions::eval_bool(&effective, &if_ctx) {
+                Ok(true) => {}
+                Ok(false) => {
+                    info!(
+                        "  Skipping composite step '{step_name}' (condition `{effective}` → false)"
+                    );
+                    nested_step_results.insert(
+                        step_id.clone(),
+                        crate::worker::contexts::StepResult {
+                            outcome: "Skipped".to_string(),
+                            conclusion: "Skipped".to_string(),
+                            outputs: Default::default(),
+                        },
+                    );
+                    continue;
                 }
-                if_ctx.insert("inputs", serde_json::Value::Object(inputs_map));
-                let mut nested_steps_map = serde_json::Map::new();
-                for (sid, sresult) in &nested_step_results {
-                    let mut step_val = serde_json::Map::new();
-                    step_val.insert("outcome".into(), serde_json::json!(sresult.outcome));
-                    step_val.insert("conclusion".into(), serde_json::json!(sresult.conclusion));
-                    let mut out_map = serde_json::Map::new();
-                    for (ok, ov) in &sresult.outputs {
-                        out_map.insert(ok.clone(), serde_json::json!(ov));
-                    }
-                    step_val.insert("outputs".into(), serde_json::Value::Object(out_map));
-                    nested_steps_map.insert(sid.clone(), serde_json::Value::Object(step_val));
-                }
-                if_ctx.insert("steps", serde_json::Value::Object(nested_steps_map));
-
-                match crate::worker::template::evaluate_condition(condition, &if_ctx) {
-                    Ok(true) => {} // condition met, continue
-                    Ok(false) => {
-                        info!("  Skipping composite step '{step_name}' (if: {condition} → false)");
-                        nested_step_results.insert(
-                            step_id.clone(),
-                            crate::worker::contexts::StepResult {
-                                outcome: "Skipped".to_string(),
-                                conclusion: "Skipped".to_string(),
-                                outputs: Default::default(),
-                            },
-                        );
-                        continue;
-                    }
-                    Err(e) => {
-                        warn!("  Failed to evaluate if condition for '{step_name}': {e:#}. Running step.");
-                    }
+                Err(e) => {
+                    // The official runner treats a condition-evaluation
+                    // error as a failed step and stops the composite
+                    // (CompositeActionHandler breaks after the error).
+                    warn!("  Failed to evaluate if condition for '{step_name}': {e:#}");
+                    composite_failed = Some(anyhow::anyhow!(
+                        "composite step '{step_name}' condition evaluation failed: {e:#}"
+                    ));
+                    nested_step_results.insert(
+                        step_id.clone(),
+                        crate::worker::contexts::StepResult {
+                            outcome: "Failure".to_string(),
+                            conclusion: "Failure".to_string(),
+                            outputs: Default::default(),
+                        },
+                    );
+                    break;
                 }
             }
 
@@ -209,28 +286,7 @@ fn run_composite_action_inner<'a>(
 
             let outcome = if let Some(script) = step_run {
                 // Build expression context with inputs + nested step results
-                let mut expr_ctx = ctx.job.build_expression_context();
-                let mut inputs_map = serde_json::Map::new();
-                for (k, v) in &input_env {
-                    if let Some(name) = k.strip_prefix("INPUT_") {
-                        inputs_map.insert(name.to_lowercase(), serde_json::json!(v));
-                    }
-                }
-                expr_ctx.insert("inputs", serde_json::Value::Object(inputs_map));
-
-                let mut nested_steps_map = serde_json::Map::new();
-                for (sid, sresult) in &nested_step_results {
-                    let mut step_val = serde_json::Map::new();
-                    step_val.insert("outcome".into(), serde_json::json!(sresult.outcome));
-                    step_val.insert("conclusion".into(), serde_json::json!(sresult.conclusion));
-                    let mut out_map = serde_json::Map::new();
-                    for (k, v) in &sresult.outputs {
-                        out_map.insert(k.clone(), serde_json::json!(v));
-                    }
-                    step_val.insert("outputs".into(), serde_json::Value::Object(out_map));
-                    nested_steps_map.insert(sid.clone(), serde_json::Value::Object(step_val));
-                }
-                expr_ctx.insert("steps", serde_json::Value::Object(nested_steps_map));
+                let expr_ctx = composite_inner_context(ctx, &input_env, &nested_step_results);
 
                 // Evaluate ${{ }} in step-level env: block and inject into ctx.env
                 let mut step_env_overrides = Vec::new();
@@ -286,79 +342,129 @@ fn run_composite_action_inner<'a>(
                     .get("with")
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({}));
-
-                // Recursively run nested composite actions with depth tracking
-                if uses.starts_with("$/") {
-                    // Official ResolveSelfRepositoryReferences at composite depth:
-                    // $/path → parent action repo root + path (already extracted).
-                    let subpath = uses.strip_prefix("$/").unwrap_or("").trim_start_matches('/');
-                    let inner_action_dir = match actions_tarball_root(action_dir) {
-                        Some(root) => root.join(subpath),
-                        None => {
-                            return Err(anyhow::anyhow!(
-                                "Unable to resolve self-reference '$/{subpath}'. Parent action directory is not under _actions/."
-                            ));
-                        }
-                    };
-                    match super::factory::load_action_manifest(&inner_action_dir) {
-                        Ok(inner_manifest) if inner_manifest.runs_using == "composite" => {
-                            run_composite_action_inner(
-                                &inner_manifest,
-                                &inner_action_dir,
+                // Nested-action `with:` values may reference inner-step
+                // outputs (`steps.<id>.outputs.*`) and composite inputs;
+                // resolve them against the composite context before dispatch.
+                let expr_ctx = composite_inner_context(ctx, &input_env, &nested_step_results);
+                // An unevaluable input fails this inner step (official
+                // AssertString semantics); the composite keeps running the
+                // remaining steps.
+                match resolve_inner_with(&inner_with, &expr_ctx) {
+                    Err(error) => Err(error),
+                    Ok(inner_with) => {
+                        // Recursively run nested composite actions with depth tracking
+                        if uses.starts_with("$/") {
+                            // Official ResolveSelfRepositoryReferences at composite depth:
+                            // $/path → parent action repo root + path (already extracted).
+                            let subpath = uses
+                                .strip_prefix("$/")
+                                .unwrap_or("")
+                                .trim_start_matches('/');
+                            let inner_action_dir = match actions_tarball_root(action_dir) {
+                                Some(root) => root.join(subpath),
+                                None => {
+                                    return Err(anyhow::anyhow!(
+                                        "Unable to resolve self-reference '$/{subpath}'. Parent action directory is not under _actions/."
+                                    ));
+                                }
+                            };
+                            match super::factory::load_action_manifest(&inner_action_dir) {
+                                Ok(inner_manifest) if inner_manifest.runs_using == "composite" => {
+                                    run_composite_action_inner(
+                                        &inner_manifest,
+                                        &inner_action_dir,
+                                        &inner_with,
+                                        workspace,
+                                        ctx,
+                                        depth + 1,
+                                        cancel_rx.clone(),
+                                    )
+                                    .await
+                                    .map(|_| "Success".to_string())
+                                }
+                                Ok(_) => super::action::run_action_from_dir(
+                                    &inner_action_dir,
+                                    &inner_with,
+                                    workspace,
+                                    ctx,
+                                    cancel_rx.clone(),
+                                    Some(uses),
+                                )
+                                .await
+                                .map(|_| "Success".to_string()),
+                                Err(e) => Err(e).context(format!(
+                                    "loading self-repository action at {}",
+                                    inner_action_dir.display()
+                                )),
+                            }
+                        } else if uses.starts_with("./") || uses.starts_with("../") {
+                            let inner_action_dir = action_dir.join(uses);
+                            match super::factory::load_action_manifest(&inner_action_dir) {
+                                Ok(inner_manifest)
+                                    if inner_manifest.runs_using == "composite" =>
+                                {
+                                    run_composite_action_inner(
+                                        &inner_manifest,
+                                        &inner_action_dir,
+                                        &inner_with,
+                                        workspace,
+                                        ctx,
+                                        depth + 1,
+                                        cancel_rx.clone(),
+                                    )
+                                    .await
+                                    .map(|_| "Success".to_string())
+                                }
+                                _ => super::action::run_action(
+                                    uses,
+                                    &inner_with,
+                                    workspace,
+                                    ctx,
+                                    cancel_rx.clone(),
+                                )
+                                .await
+                                .map(|_| "Success".to_string()),
+                            }
+                        } else if uses.starts_with("docker://") {
+                            // Docker refs have no @ref and must not enter
+                            // remote-action staging.
+                            super::action::run_action(
+                                uses,
                                 &inner_with,
                                 workspace,
                                 ctx,
-                                depth + 1,
                                 cancel_rx.clone(),
                             )
                             .await
                             .map(|_| "Success".to_string())
+                        } else {
+                            // Nested remote action: job-start preparation stages only
+                            // the message's own steps, so download it on demand.
+                            let staged =
+                                super::action::ensure_remote_action_staged(uses, workspace, ctx)
+                                    .await;
+                            match staged {
+                                Ok(action_dir) => {
+                                    // run_action_from_dir does not set
+                                    // github.action{,_repository,_ref}; do it
+                                    // here so nested remotes match top-level
+                                    // run_action() behavior.
+                                    super::action::set_action_repository_context(ctx, uses);
+                                    super::action::run_action_from_dir(
+                                        &action_dir,
+                                        &inner_with,
+                                        workspace,
+                                        ctx,
+                                        cancel_rx.clone(),
+                                        Some(uses),
+                                    )
+                                    .await
+                                    .map(|_| "Success".to_string())
+                                }
+                                Err(error) => Err(error),
+                            }
                         }
-                        Ok(_) => super::action::run_action_from_dir(
-                            &inner_action_dir,
-                            &inner_with,
-                            workspace,
-                            ctx,
-                            cancel_rx.clone(),
-                            Some(uses),
-                        )
-                        .await
-                        .map(|_| "Success".to_string()),
-                        Err(e) => Err(e).context(format!(
-                            "loading self-repository action at {}",
-                            inner_action_dir.display()
-                        )),
                     }
-                } else if uses.starts_with("./") || uses.starts_with("../") {
-                    let inner_action_dir = action_dir.join(uses);
-                    match super::factory::load_action_manifest(&inner_action_dir) {
-                        Ok(inner_manifest) if inner_manifest.runs_using == "composite" => {
-                            run_composite_action_inner(
-                                &inner_manifest,
-                                &inner_action_dir,
-                                &inner_with,
-                                workspace,
-                                ctx,
-                                depth + 1,
-                                cancel_rx.clone(),
-                            )
-                            .await
-                            .map(|_| "Success".to_string())
-                        }
-                        _ => super::action::run_action(
-                            uses,
-                            &inner_with,
-                            workspace,
-                            ctx,
-                            cancel_rx.clone(),
-                        )
-                        .await
-                        .map(|_| "Success".to_string()),
-                    }
-                } else {
-                    super::action::run_action(uses, &inner_with, workspace, ctx, cancel_rx.clone())
-                        .await
-                        .map(|_| "Success".to_string())
                 }
             } else {
                 Ok("Skipped".to_string())
@@ -408,8 +514,10 @@ fn run_composite_action_inner<'a>(
                 },
             );
 
-            if outcome.is_err() && !continue_on_error {
-                break;
+            if outcome.is_err() && !continue_on_error && composite_failed.is_none() {
+                // Record the failure; later steps still run only when their
+                // condition passes under the implicit success() gate.
+                composite_failed = outcome.err();
             }
         }
 
@@ -419,10 +527,13 @@ fn run_composite_action_inner<'a>(
                 .iter()
                 .map(|(id, result)| {
                     let mut step_val = serde_json::Map::new();
-                    step_val.insert("outcome".to_string(), serde_json::json!(result.outcome));
+                    step_val.insert(
+                        "outcome".to_string(),
+                        serde_json::json!(result.outcome.to_ascii_lowercase()),
+                    );
                     step_val.insert(
                         "conclusion".to_string(),
-                        serde_json::json!(result.conclusion),
+                        serde_json::json!(result.conclusion.to_ascii_lowercase()),
                     );
                     let outputs_map: serde_json::Map<String, serde_json::Value> = result
                         .outputs
@@ -489,6 +600,11 @@ fn run_composite_action_inner<'a>(
         }
             ctx.job
                 .set_github_context_value("action_status", previous_action_status);
+            if let Some(error) = composite_failed {
+                // The composite ran every step; its merged result is a
+                // failure, so the outer step fails too (official semantics).
+                return Err(error);
+            }
             Ok(())
         }
         .await;
@@ -667,7 +783,7 @@ mod tests {
         let mut ctx = StepContext::new(&mut job, "composite".into(), "Composite".into());
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
-        run_composite_action(
+        let result = run_composite_action(
             &manifest,
             workspace.path(),
             &serde_json::json!({}),
@@ -675,10 +791,57 @@ mod tests {
             &mut ctx,
             cancel_rx,
         )
-        .await
-        .unwrap();
+        .await;
+        assert!(
+            result.is_err(),
+            "a failed composite inner step must fail the composite (GitHub semantics)"
+        );
+        assert!(
+            !ctx.log_content().contains("should-not-run"),
+            "default success() gate must skip later inner steps after a failure"
+        );
+    }
 
-        assert!(!ctx.log_content().contains("should-not-run"));
+    #[tokio::test]
+    async fn composite_runs_always_cleanup_after_nested_failure() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let manifest = composite_manifest(vec![
+            serde_json::json!({
+                "id": "fail",
+                "run": "exit 1",
+                "shell": "bash"
+            }),
+            serde_json::json!({
+                "id": "cleanup",
+                "if": "always()",
+                "run": "echo cleanup-ran",
+                "shell": "bash"
+            }),
+        ]);
+        let mut job = JobContext::new(
+            "job".into(),
+            "job".into(),
+            serde_json::json!({}),
+            serde_json::json!({"github": {"workspace": workspace.path()}}),
+        );
+        job.workspace = Some(workspace.path().to_string_lossy().to_string());
+        let mut ctx = StepContext::new(&mut job, "composite".into(), "Composite".into());
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        let result = run_composite_action(
+            &manifest,
+            workspace.path(),
+            &serde_json::json!({}),
+            workspace.path().to_str().unwrap(),
+            &mut ctx,
+            cancel_rx,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            ctx.log_content().contains("cleanup-ran"),
+            "always() cleanup must still run after an inner failure"
+        );
     }
 
     #[tokio::test]
@@ -756,6 +919,70 @@ runs:
         .unwrap();
 
         assert!(ctx.log_content().contains("inner-executed"));
+    }
+
+    #[tokio::test]
+    async fn composite_nested_uses_with_resolves_inner_step_outputs() {
+        // Mastodon's setup-javascript composite keys an inner actions/cache
+        // step on `${{ steps.yarn-cache-dir-path.outputs.dir }}`; the nested
+        // action's `with:` must see the output produced by an earlier inner
+        // step, or the cache action fails with "Input required: path".
+        let workspace = tempfile::TempDir::new().unwrap();
+        let inner_dir = workspace.path().join("inner");
+        std::fs::create_dir_all(&inner_dir).unwrap();
+        std::fs::write(
+            inner_dir.join("action.yml"),
+            r#"
+name: Inner
+inputs:
+  where:
+    required: false
+runs:
+  using: composite
+  steps:
+    - run: echo "resolved-where=${{ inputs.where }}"
+      shell: bash
+"#,
+        )
+        .unwrap();
+
+        let manifest = composite_manifest(vec![
+            serde_json::json!({
+                "id": "gen",
+                "run": "echo dir=/tmp/yarn-cache >> \"$GITHUB_OUTPUT\"",
+                "shell": "bash"
+            }),
+            serde_json::json!({
+                "uses": "./inner",
+                "with": {"where": "${{ steps.gen.outputs.dir }}"}
+            }),
+        ]);
+        let mut job = JobContext::new(
+            "job".into(),
+            "job".into(),
+            serde_json::json!({}),
+            serde_json::json!({"github": {"workspace": workspace.path()}}),
+        );
+        job.workspace = Some(workspace.path().to_string_lossy().to_string());
+        let mut ctx = StepContext::new(&mut job, "composite".into(), "Composite".into());
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        run_composite_action(
+            &manifest,
+            workspace.path(),
+            &serde_json::json!({}),
+            workspace.path().to_str().unwrap(),
+            &mut ctx,
+            cancel_rx,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            ctx.log_content().contains("resolved-where=/tmp/yarn-cache"),
+            "nested with: must see the inner step output; log: {}",
+            ctx.log_content()
+        );
     }
 
     #[tokio::test]

@@ -202,6 +202,120 @@ pub(crate) fn cancel_run_inner(
     count
 }
 
+/// Drop concurrency-group holders whose runs are terminal or missing.
+///
+/// The persisted meta snapshot can name a holder whose run finished (or was
+/// cancelled) after the snapshot was written, or a run that never made it
+/// into the runs table at all. Such a holder parks every later submission in
+/// the same group forever — the observed "run stuck at pending" stall after
+/// a restart. Pending entries whose runs are gone are dropped the same way;
+/// live holders and pending entries are untouched.
+pub(crate) fn reconcile_concurrency_groups(inner: &mut InnerState) {
+    let terminal = |run_id: &RunId| {
+        inner.runs.get(run_id).is_none_or(|run| {
+            matches!(
+                run.status,
+                ExecutionStatus::Success
+                    | ExecutionStatus::Failure
+                    | ExecutionStatus::Cancelled
+                    | ExecutionStatus::Skipped
+            )
+        })
+    };
+    // A run whose *remaining* jobs all need an external host (macos/windows)
+    // with none registered is held queued by the starvation sweep on purpose
+    // — but it will never go terminal, so its concurrency holder parks every
+    // later submission in the same group forever. Treat it like a dead
+    // holder: release the slot; the run itself stays queued and picks the
+    // slot up again if a host ever appears.
+    let external_host_available = inner.runners.values().any(|runner| {
+        runner.labels.iter().any(|label| {
+            let label = label.to_ascii_lowercase();
+            label.starts_with("macos") || label.starts_with("windows")
+        })
+    });
+    let stuck = |inner: &InnerState, run_id: &RunId| {
+        if external_host_available {
+            return false;
+        }
+        run_stuck_on_external_hosts(inner, run_id)
+    };
+    let dead_running: Vec<(String, String)> = inner
+        .concurrency_groups
+        .iter()
+        .filter(|(_, group)| {
+            group
+                .running
+                .as_ref()
+                .is_some_and(|holder| terminal(&holder.run_id()) || stuck(inner, &holder.run_id()))
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in &dead_running {
+        if let Some(group) = inner.concurrency_groups.get_mut(key) {
+            group.running = None;
+        }
+    }
+    let dead_pending: Vec<((String, String), Vec<concurrency::Holder>)> = inner
+        .concurrency_groups
+        .iter()
+        .map(|(key, group)| {
+            let dead = group
+                .pending
+                .iter()
+                .filter(|holder| terminal(&holder.run_id()) || stuck(inner, &holder.run_id()))
+                .cloned()
+                .collect();
+            (key.clone(), dead)
+        })
+        .collect();
+    for (key, dead) in dead_pending {
+        if let Some(group) = inner.concurrency_groups.get_mut(&key) {
+            group.pending.retain(|holder| !dead.contains(holder));
+        }
+    }
+    inner
+        .concurrency_groups
+        .retain(|_, group| group.running.is_some() || !group.pending.is_empty());
+    let dead_keys: Vec<RunId> = inner
+        .holder_keys
+        .keys()
+        .filter(|run_id| terminal(run_id) || stuck(inner, run_id))
+        .cloned()
+        .collect();
+    for run_id in dead_keys {
+        inner.holder_keys.remove(&run_id);
+    }
+}
+
+/// Whether every non-terminal job of `run_id` is queued behind an external
+/// host label (macos/windows) with none registered.
+///
+/// The starvation sweep deliberately keeps such jobs queued forever (the
+/// host may appear), so the run never goes terminal on its own. Used to
+/// identify concurrency holders that would otherwise park the group forever.
+pub(crate) fn run_stuck_on_external_hosts(inner: &InnerState, run_id: &RunId) -> bool {
+    let Some(run) = inner.runs.get(run_id) else {
+        return true;
+    };
+    run.jobs.iter().all(|(job_id, status)| {
+        matches!(
+            status,
+            ExecutionStatus::Success
+                | ExecutionStatus::Failure
+                | ExecutionStatus::Cancelled
+                | ExecutionStatus::Skipped
+        ) || inner.queue.iter().any(|queued| {
+            queued.run_id == *run_id
+                && queued.job_id == *job_id
+                && queued.runs_on.iter().any(|label| {
+                    let label = label.to_ascii_lowercase();
+                    label.starts_with("macos") || label.starts_with("windows")
+                })
+        })
+    })
+}
+
 /// Cancel a single job (job-level concurrency / fail-fast style).
 pub(crate) fn cancel_job_inner(inner: &mut InnerState, run_id: RunId, job_id: &JobId) -> usize {
     let was_in_progress = {
@@ -691,6 +805,17 @@ pub(crate) fn try_acquire_concurrency(
     cancel_in_progress: bool,
     queue: preloop_gha_parser::ConcurrencyQueue,
 ) -> Result<bool, String> {
+    // A run whose *remaining* jobs all need an external host (macos/windows)
+    // with none registered never goes terminal — the starvation sweep keeps
+    // those jobs queued on purpose — so its run-level holder would park every
+    // later submission in this group forever. Check before the mutable borrow
+    // so the dead slot can be released and taken by the arriving run; the
+    // stuck run's jobs stay queued and re-acquire if a host appears.
+    let running_stuck = inner
+        .concurrency_groups
+        .get(&key)
+        .and_then(|group| group.running.as_ref())
+        .is_some_and(|running| run_stuck_on_external_hosts(inner, &running.run_id()));
     let group = inner
         .concurrency_groups
         .entry(key.clone())
@@ -709,7 +834,13 @@ pub(crate) fn try_acquire_concurrency(
         track_holder_key(inner, &holder, key);
         return Ok(true);
     }
-
+    if running_stuck {
+        group.running = None;
+        group.running = Some(holder.clone());
+        let _ = group;
+        track_holder_key(inner, &holder, key);
+        return Ok(true);
+    }
     if cancel_in_progress {
         let prev = group.running.take();
         // Docs: "any existing pending job or workflow in the same concurrency
@@ -1538,19 +1669,23 @@ pub(crate) fn pair_registered_runner(inner: &mut InnerState, runner_id: i64) {
     // back to the FIFO claim path), a stale mark means that provisioning died
     // before any machine registered — filtering those out is what left
     // long-waiting jobs invisible to the pool.
+    //
+    // Precompute matching queue positions in a single pass over the ready queue
+    // to avoid quadratic scanning under the global state mutex.
+    let queue_positions: std::collections::HashMap<(RunId, JobId), usize> = inner
+        .queue
+        .iter()
+        .enumerate()
+        .filter(|(_, job)| job_matches_runner_capabilities(job, &caps))
+        .map(|(idx, job)| ((job.run_id, job.job_id.clone()), idx))
+        .collect();
+
     let chosen = inner
         .pool_pending
         .iter()
-        .filter(|(key, _)| {
-            inner
-                .queue
-                .iter()
-                .find(|job| job.run_id == key.0 && job.job_id == key.1)
-                .map(|job| job_matches_runner_capabilities(job, &caps))
-                .unwrap_or(false)
-        })
-        .min_by_key(|(_, at)| **at)
-        .map(|(key, _)| key.clone());
+        .filter_map(|(key, at)| queue_positions.get(key).map(|&pos| (key, *at, pos)))
+        .min_by_key(|(_, at, pos)| (*at, *pos))
+        .map(|(key, _, _)| key.clone());
     if let Some(key) = chosen {
         // Rebinding to a replacement machine keeps the original first-bound
         // stamp, so repeated provisioning failures cannot extend the window
@@ -1585,7 +1720,7 @@ pub(crate) fn clear_assignment(inner: &mut InnerState, run_id: RunId, job_id: &J
         .any(|job| job.run_id == run_id && job.job_id == *job_id)
 }
 
-fn capabilities_of(runner: &RegisteredRunner) -> RunnerCapabilities {
+pub(crate) fn capabilities_of(runner: &RegisteredRunner) -> RunnerCapabilities {
     RunnerCapabilities {
         known: true,
         labels: runner.labels.clone(),
@@ -2189,12 +2324,39 @@ fn register_expanded_jobs(
     jobs: Vec<BuiltJob>,
 ) -> Vec<QueuedJob> {
     let mut queued = Vec::with_capacity(jobs.len());
+    // The submit path concludes `runs-on: windows-*`/`macos-*` jobs when no
+    // runner of that platform is registered, but a reusable caller defers its
+    // callee: those jobs are built here, after the submit-time check ran. A
+    // callee job on an unhostable platform must conclude the same way —
+    // otherwise it sits queued forever (a Linux VM is not allowed to claim
+    // it), and if its caller's own placeholder was claimed in the meantime,
+    // the foreign-OS steps run on Linux and the job wedges in cleanup.
+    let platforms = registered_runner_platforms(inner);
+    let mut unhostable: Vec<(JobId, String)> = Vec::new();
     for BuiltJob {
         plan,
         condition_context,
         artifacts,
     } in jobs
     {
+        if let Some(platform) = unhostable_platform(&plan.runs_on, platforms.clone()) {
+            unhostable.push((
+                plan.id.clone(),
+                format!(
+                    "no {platform} runner is registered with this server, so `runs-on: {}` \
+                     cannot be scheduled",
+                    plan.runs_on.join(", ")
+                ),
+            ));
+            if let Some(run) = inner.runs.get_mut(&run_id) {
+                run.jobs.insert(plan.id.clone(), ExecutionStatus::Failure);
+                run.job_base_ids
+                    .insert(plan.id.clone(), plan.base_id.clone());
+                run.job_needs.insert(plan.id.clone(), plan.needs.clone());
+                run.job_names.insert(plan.id.clone(), plan.name.clone());
+            }
+            continue;
+        }
         let job_request = artifacts.job_request;
         inner
             .id_token_grants
@@ -2285,6 +2447,14 @@ fn register_expanded_jobs(
             reusable_call: plan.reusable_call.clone(),
         });
     }
+    for (job_id, reason) in unhostable {
+        tracing::warn!(
+            run_id = %run_id.0,
+            job = %job_id.0,
+            %reason,
+            "materialized callee job is unhostable; failing it"
+        );
+    }
     queued
 }
 
@@ -2348,6 +2518,10 @@ fn retire_node_requests(
             .session_active_requests
             .retain(|_, &mut rid| rid != request_id);
         inner.inflight_requests.remove(&request_id);
+        // Terminal either way: a settled node stays in the run as a finished
+        // job and a purged one no longer exists, and neither can be claimed
+        // again. The deferred App-token request must not survive either.
+        inner.github_token_requests.remove(&request_id);
         match retirement {
             RequestRetirement::Settle(status) => {
                 if let Some(record) = inner.job_requests.get_mut(&request_id) {
@@ -2357,7 +2531,6 @@ fn retire_node_requests(
                 }
             }
             RequestRetirement::Purge => {
-                inner.github_token_requests.remove(&request_id);
                 let Some(record) = inner.job_requests.remove(&request_id) else {
                     continue;
                 };
@@ -2740,6 +2913,83 @@ mod assignment_tests {
             deferred_matrix: None,
             reusable_call: None,
         }
+    }
+
+    /// A restored concurrency group whose holder's run is terminal (or
+    /// missing) must not park later submissions forever.
+    #[test]
+    fn reconcile_concurrency_groups_drops_terminal_holders() {
+        let mut inner = InnerState {
+            pool_assignments_enabled: false,
+            ..Default::default()
+        };
+        let zombie = RunId::new();
+        let live = RunId::new();
+        inner.runs.insert(
+            live,
+            RunRecord {
+                run_id: live,
+                run_name: None,
+                submission: Arc::new(preloop_gha_protocol::WorkflowSubmission::default()),
+                jobs: BTreeMap::from([(JobId("build".to_owned()), ExecutionStatus::Queued)]),
+                job_outputs: BTreeMap::new(),
+                job_base_ids: BTreeMap::new(),
+                job_needs: BTreeMap::new(),
+                caller_plans: BTreeMap::new(),
+                job_names: BTreeMap::new(),
+                github: serde_json::Value::Null,
+                head_sha: String::new(),
+                workflow_ref: String::new(),
+                workspace_snapshot: None,
+                job_fail_fast: BTreeMap::new(),
+                job_continue_on_error: BTreeMap::new(),
+                job_check_run_ids: BTreeMap::new(),
+                reusable_calls: BTreeMap::new(),
+                jobs_list: Vec::new(),
+                created_at: chrono::Utc::now(),
+                started_at: None,
+                completed_at: None,
+                run_number: 1,
+                run_attempt: 1,
+                workflow_path_str: String::new(),
+                event: "push".to_owned(),
+                conclusion: None,
+                push_state: None,
+                snapshot_timing: None,
+                status: ExecutionStatus::Queued,
+            },
+        );
+        let mut queued = test_queued_job("build");
+        queued.run_id = live;
+        inner.queue.push_back(queued);
+        let group_key = ("repo".to_owned(), "g".to_owned());
+        inner.concurrency_groups.insert(
+            group_key.clone(),
+            crate::concurrency::ConcurrencyGroup {
+                display_name: "g".to_owned(),
+                running: Some(crate::concurrency::Holder::Run(zombie)),
+                pending: VecDeque::from([crate::concurrency::Holder::Run(live)]),
+            },
+        );
+        inner.holder_keys.insert(zombie, vec![group_key.clone()]);
+        inner.holder_keys.insert(live, vec![group_key.clone()]);
+
+        reconcile_concurrency_groups(&mut inner);
+
+        let group = inner.concurrency_groups.get(&group_key).unwrap();
+        assert!(
+            group.running.is_none(),
+            "a terminal/missing holder must not keep the group occupied"
+        );
+        assert_eq!(
+            group.pending.len(),
+            1,
+            "the live pending holder must survive"
+        );
+        assert!(
+            !inner.holder_keys.contains_key(&zombie),
+            "holder-key tracking for the dead run must be pruned"
+        );
     }
 
     #[test]

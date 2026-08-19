@@ -9,6 +9,170 @@ Releases before v0.27.0 predate the changelog.
 
 ## [Unreleased]
 
+### Fixed
+
+- SmolVM compatibility now comes from the central `versions.toml`
+  `smolvm_min_version` pin. `preloop-cli` and `preloop-vm` compile the same
+  floor, and `preloop update --ensure-runtime` installs the latest stable
+  SmolVM when the local runtime is below it or lacks required capabilities.
+  Preloop relies on SmolVM's packed-ownership implementation instead of
+  rewriting guest rootfs ownership.
+- A golden download had 10 minutes to complete, body included. The packed
+  arm64 golden is ~9.6 GB, so that budget demanded 128 Mbps sustained and
+  was unreachable on an ordinary link (measured: 84 Mbps from ghcr.io, so
+  the pull needs ~15 minutes). The deadline killed the transfer around
+  two-thirds through, `preloop serve` reported the official golden as
+  "unavailable", and the run fell through to a local bake. The budget is
+  now one hour, which covers any link above ~21 Mbps.
+
+### Changed
+
+- Golden download progress now reads as a percentage and a completion bar
+  in megabytes — `golden download (OCI): [########------------] 40%
+  (3850 MB / 9630 MB)` — instead of raw byte counts, and reports every
+  256 MB rather than every 1 GiB (about one line per 25 s on a 100 Mbps
+  link).
+
+## [0.30.10] - 2026-08-18
+
+### Fixed
+
+- A crashed server orphaned its detached `_boot-vm` hypervisor processes:
+  the pool never stopped them on death, and if the machine data dir was
+  cleaned out from under them (a home cleanup), the smolvm DB no longer
+  knew the machines — the `_boot-vm` kept the storage fds open and the
+  unlinked blocks leaked until the process exited (observed holding
+  hundreds of GB for 47 h). Pool startup and shutdown now purge orphaned
+  `_boot-vm` processes by their boot-config path under the Preloop home,
+  SIGKILLing whatever the smolvm delete could not reach.
+
+## [0.30.9] - 2026-08-18
+
+### Fixed
+
+- The exec-as-image-user branch of the runner wrapper used
+  `setpriv --init-groups`, which fails as a non-root user (setgroups needs
+  root) — so on the official golden (image USER runner) every configure/run
+  exec died with `initgroups failed: Operation not permitted`. The non-root
+  branch now self-drops with `--keep-groups` (verified on the official
+  smolvm: both the root and image-user branches land on uid 1001).
+- The packed-golden path now adopts an existing running, fingerprint-matched
+  golden instead of re-unpacking tens of GiB on every `serve` restart.
+- `conformance-5repos.sh` campaign fixes: golden symlink carries the
+  environment fingerprint, stale campaign home is cleaned between runs,
+  deno targets the generated `ci.generated.yml`, and the runner storage
+  default is 160 GiB (the runner-large golden unpacks past 80 GiB).
+
+## [0.30.8] - 2026-08-18
+
+### Changed
+
+- Guest commands no longer run through `smolvm machine exec --user root`
+  (a flag only the retained smolvm fork shipped). The wrapper now branches on
+  the uid it lands on: root runs the provisioning directly (locally baked
+  goldens), any other image user runs it via passwordless sudo (the official
+  runner image declares `USER runner`), then the runner still drops to uid
+  1001 via `setpriv`. This removes the fork dependency entirely: `preloop
+  update --ensure-runtime` installs the official smolvm again and v0.30.7's
+  fork-pointing is reverted.
+
+## [0.30.7] - 2026-08-18
+
+### Fixed
+
+- Every pool exec runs as root via `smolvm machine exec --user root`, a flag
+  that only exists in the retained fork's smolvm 1.8.2+ — but `preloop
+  update --ensure-runtime` installed the official smolvm, so on fresh
+  machines every golden/runner exec failed with `unexpected argument
+  '--user' found`. The runtime now comes from the retained fork
+  (`preloopdev/smolvm` v1.8.2 line), the compatibility probe also checks
+  `machine exec --user`, and `smolvm_min_version` is raised to 1.8.2.
+
+## [0.30.6] - 2026-08-17
+
+### Fixed
+
+- The SmolVM guest agent rootfs was never found on standard installs: it
+  lives in smolvm's platform data directory (`~/Library/Application
+  Support/smolvm` on macOS, `~/.local/share/smolvm` on Linux), but the
+  runtime environment only probed the derived Preloop data dir and the
+  legacy `~/.smolvm` layout. With the isolated macOS `HOME`, every golden
+  machine start failed with `verify rootfs: agent rootfs not found`. The
+  probe now checks the real host's platform data dir first, then the legacy
+  location, and an explicit `SMOLVM_DATA_DIR` still wins.
+
+## [0.30.5] - 2026-08-17
+
+### Fixed
+
+- OCI golden download decompressed the packed layer, but the published
+  `application/vnd.preloop.smolmachine.v1+zstd` layer is the raw
+  `.smolmachine` sidecar — zstd asset frames followed by the uncompressed
+  manifest and `SMOLPACK` footer — so every OCI pull failed and fell back to
+  the release asset or a slow local bake. The download now verifies the
+  layer digest and installs the sidecar as-is, which `machine create --from`
+  consumes directly.
+
+## [0.30.4] - 2026-08-17
+
+### Added
+
+- The official-runner packed golden is now the arm64 default:
+  `download_prebaked_golden` pulls the digest-pinned OCI artifact
+  (`ghcr.io/preloopdev/preloop-golden@sha256:a2f7caf3…`, overridable with
+  `PRELOOP_GOLDEN_OCI_REF`) when no `PRELOOP_GOLDEN_URL` is configured, with
+  bearer-token registry auth, layer digest verification, and zstd decoding of
+  the packed VM layer. The release asset remains the fallback and
+  `PRELOOP_GOLDEN_URL` still selects it over the OCI default.
+- `PRELOOP_CLIENT_TIMEOUT_SECONDS` bounds runner-client requests; rejected
+  workflow submissions now surface the server status and body.
+- `benchmarks/real-world/conformance-5repos.sh` plus `just conform-5repos`:
+  five-repository campaign runner against the official runner golden.
+
+### Fixed
+
+- OCI golden download parsed the layer descriptor's `mediaType` as
+  `media_type` (every standard manifest failed to parse, silently falling
+  back to the release asset) and installed the compressed layer without
+  decoding it; the download now renames the field, logs parse failures, and
+  zstd-decodes the verified layer into the `.smolmachine` payload.
+- SmolVM runtime environment now applies to recovery commands (status, list,
+  stop, delete), so they target the same registry and macOS `HOME` as boot;
+  derived `SMOLVM_DATA_DIR` and macOS `HOME` directories are created before
+  spawn; macOS `HOME` isolation works without an explicit `PRELOOP_HOME`;
+  the agent rootfs is probed from the SmolVM data directory first.
+- Runner-client remote workflow fetches reuse the timeout-configured client
+  (`lint` can no longer hang on a stalled GitHub API request).
+- conformance campaign script: INT/TERM traps exit with the conventional
+  statuses instead of resuming, curl calls are bounded, and polling fails
+  fast when the local server dies.
+
+## [0.30.3] - 2026-08-13
+
+### Fixed
+
+- `preloop update` is now content-aware when the remote release version
+  equals the installed version: it downloads the checksummed release asset,
+  verifies its SHA-256, and byte-compares the extracted binary against the
+  installed executable, reinstalling on mismatch. A version string is
+  self-reported and can lie (a source build or tampered binary claiming a
+  release version), so the old version-only gate declared such installs up
+  to date forever — this is how the v0.30.2 deaf-runner fix never reached
+  production. Lower versions still never downgrade; a failed content check
+  (fetch/checksum error) keeps the installed binary and retries next run.
+
+### Security
+
+- Fail closed on cache writes when the calling job no longer resolves. A
+  fork PR job's runtime JWT survives the job's retirement
+  (`RequestRetirement::Purge` drops the correlation records the fork-tier
+  lookup walks); treating that unresolvable token as a control-plane caller
+  let a fork worker smuggle a cache write past the read-only guard with a
+  leaked token. `fork_restricted_from_token` now denies any job-shaped
+  token whose subject/scope no longer resolves to a live job, instead of
+  only when it positively resolves to a fork-restricted tier. Non-job
+  bearers (system token, runner-listen, debug-worker) are unaffected.
+
 ## [0.30.2] - 2026-08-13
 
 ### Added
@@ -18,6 +182,38 @@ Releases before v0.27.0 predate the changelog.
   class (VM escape, hostile egress, secret theft, control-plane
   impersonation, resource sabotage, supply chain), and candid current
   limitations (internal doc).
+- Real-world large-repo conformance campaign (moby, neovim, TypeScript,
+  ruff, node): five unmodified workflows run end to end; campaign writeup
+  in `.runner-watch/repos-conformance-20260812.md` and `docs/fidelity-gap.md`
+  §1c.
+
+### Fixed
+
+- **Packed-machine ownership now comes from SmolVM**: the runtime updater
+  requires SmolVM 1.8.1 or newer and installs the latest stable release when
+  an older or incompatible runtime is detected. Preloop no longer rewrites
+  guest rootfs ownership or re-derives setuid modes itself.
+- **SmolVM non-streaming `machine exec` dropped after ~30s without
+  output**: quiet provisioning commands such as toolchain installs were
+  killed mid-flight. Provider execs now pass an explicit `--timeout`.
+- **Job/workflow-level `env:` never reached action processes**: the server
+  wrote job env only into the message `variables` map, leaving the wire
+  `environmentVariables` (which the official runner materializes into step
+  environments) empty — `docker buildx bake` HCL variables like moby's
+  `DESTDIR` silently resolved to their defaults and targets lost their
+  outputs. The job message builder now populates `environmentVariables`.
+- **Queued runs wedged across a server restart**: the on-demand pool only
+  forks while its shared `queue_depth` atomic is non-zero, and after a
+  restart no runner exists to refresh it; recovered queues sat "pending"
+  forever. `serve` re-arms the atomic from the recovered queue.
+- **Concurrency-group deadlock on unclaimable jobs**: a run whose remaining
+  jobs all need an external host (macos/windows) never goes terminal, so its
+  run-level concurrency holder parked every later submission in the same
+  group forever. Restore-time group reconciliation now releases holders
+  stuck that way (the run stays queued and re-acquires if a host appears).
+- **Golden missing Chromium/playwright runtime libraries**: 21 browser
+  runtime libs pinned in `versions.toml` and added to the golden bake
+  (fingerprint-invalidating, so the pool rebuilds).
 
 ### Security
 
@@ -91,6 +287,42 @@ Releases before v0.27.0 predate the changelog.
     root, and no longer replaceable by it.
   `preloop server uninstall` removes all three, so secrets no longer outlive
   an uninstall that only purges the state dir.
+
+- Enforce GitHub's read-only fork profile for untrusted fork pull requests:
+  fork PR jobs (and fail-closed unknown events) now receive a
+  `GITHUB_TOKEN` permission set clamped to read regardless of the workflow's
+  declared `permissions:` block, never get an OIDC request URL or token
+  grant, and can no longer receive the configured PAT — neither as a
+  mint-failure fallback nor as the build-time PAT override. The special
+  `id-token` permission is excluded rather than advertised as a read scope,
+  and the App installation-token request carries only real App repository
+  permissions (never `id-token`) for trusted jobs too. The trust tier is
+  applied as a single job-authorization policy shared by the runner wire
+  variable, the App installation-token request, the OIDC grant, and the
+  token fallback path, so a fork PR declaring `checks: write` and
+  `id-token: write` is downgraded end to end while `pull_request_target`,
+  internal PRs, push, schedule, and deployment runs keep their declared
+  permissions. Broker claims now keep every runner-visible token alias
+  (`system.github.token`, `github_token`, `GITHUB_TOKEN`, and the `github`
+  context token) on the minted App token, restate narrowed installation
+  grants without erasing a trusted job's `IdToken` metadata, and treat
+  persisted token requests that predate the `untrusted` field as untrusted
+  so a restart can never re-enable the PAT fallback for them.
+
+- Fork PR runs also get GitHub's read-only cache access: cache writes (the
+  `/_apis/artifactcache` reserve/upload/commit routes and the Twirp
+  `CreateCacheEntry`/`FinalizeCacheEntryUpload` handlers) are refused with
+  403 for fork-restricted jobs while restores stay open — a fork can no
+  longer poison cache entries that a trusted run later restores.
+
+- A deferred GitHub App token request no longer outlives the job it was built
+  for. It is deliberately retained past the first claim so a re-claim after a
+  runner disconnect re-mints under the build-time permission set instead of
+  rebuilding from the broader defaults, and it is now dropped wherever a job
+  request becomes terminal — the shared completion path (broker `completejob`,
+  the legacy `/_apis` finish endpoints, and the lease-expiry reaper alike) and
+  the scheduler's node retirement for cancelled, skipped, and
+  expansion-failed nodes.
 
 ### Changed
 
@@ -255,6 +487,7 @@ Releases before v0.27.0 predate the changelog.
 - `macos`/`windows` jobs wait for a registered external host instead of being
   failed by the Linux-only starvation sweep.
 - macOS BSD `tar` missing `--verbatim-files-from` is handled in sync.
+
 ## [0.29.8] - 2026-08-09
 
 ### Fixed
@@ -362,7 +595,8 @@ live-logs (8), and golden (8).
 Bootstrap the cargo-dist release pipeline for `preloop-cli` (binary
 installers for macOS and Linux).
 
-[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.29.8...HEAD
+[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.30.3...HEAD
+[0.30.3]: https://github.com/preloopdev/preloop/compare/v0.30.2...v0.30.3
 [0.29.8]: https://github.com/preloopdev/preloop/compare/v0.29.7...v0.29.8
 [0.29.7]: https://github.com/preloopdev/preloop/compare/v0.29.6...v0.29.7
 [0.29.6]: https://github.com/preloopdev/preloop/compare/v0.29.5...v0.29.6

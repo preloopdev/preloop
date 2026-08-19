@@ -1128,7 +1128,7 @@ fn expand_matrix(
             }
             let spec = matrix_expand::value_to_matrix_spec(job_id, &value)?;
             return Ok(MatrixExpansion::Combinations(
-                matrix_expand::expand_matrix_spec(&spec)
+                matrix_expand::try_expand_matrix_spec(job_id, &spec)?
                     .into_iter()
                     .map(|combination| combination.values)
                     .collect(),
@@ -1157,7 +1157,7 @@ fn expand_matrix(
     }
     let spec = matrix_expand::matrix_to_spec(job_id, &matrix)?;
     Ok(MatrixExpansion::Combinations(
-        matrix_expand::expand_matrix_spec(&spec)
+        matrix_expand::try_expand_matrix_spec(job_id, &spec)?
             .into_iter()
             .map(|combination| combination.values)
             .collect(),
@@ -1279,7 +1279,7 @@ fn resolve_deferred_matrix_cells(
     let value = eval_expression(expression, &ctx)
         .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
     let spec = matrix_expand::value_to_matrix_spec(job_id, &value)?;
-    Ok(matrix_expand::expand_matrix_spec(&spec)
+    Ok(matrix_expand::try_expand_matrix_spec(job_id, &spec)?
         .into_iter()
         .map(|combination| combination.values)
         .collect())

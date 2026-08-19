@@ -28,7 +28,7 @@ open one
 ## The flow
 
 ```
-1. work locally on branch feat/x        (tree must be CLEAN — see below)
+1. work locally on branch feat/x        (dirty trees are snapshotted; see below)
 2. preloop run --push --create-pr
 3. server runs CI on your workspace snapshot        ← no GitHub needed
 4. run reaches a terminal state (any conclusion)
@@ -41,9 +41,9 @@ open one
 The invariants that make it honest:
 
 - **The SHA that lands on GitHub is the SHA that was tested.** A dirty tree
-is refused at submit (`--push requires a clean working tree`); the push is
-pinned to the recorded `HEAD`; the server compares the pushed commit's
-tree against the tested tree and blocks on mismatch.
+is snapshotted at submit, then materialized into a commit after CI passes.
+The server compares the pushed commit's tree against the tested tree and
+blocks on mismatch.
 - **No clobbering.** The push is a branch creation or a fast-forward only. A
 diverged branch is refused with instructions — never a force-push.
 - **Default branches are refused.** Pushing `main` is blocked client-side
@@ -100,9 +100,9 @@ it only if you want the feature (the setup notes say exactly this).
 | **GitHub down at completion**      | Run already finished (results local). Push-back retries 1m → 5m → 15m, then tells you: `preloop push <run_id>` later                                                                                 |
 | **CLI interrupted mid-sync**       | The run keeps running; `preloop push <run_id>` resumes the publish step idempotently                                                                                                                 |
 | **Detached submit** (`--detach`)   | Submit returns immediately; run `preloop push` when you want to publish                                                                                                                              |
-| **Dirty tree**                     | Refused before submit: `--push requires a clean working tree… commit or stash first`                                                                                                                 |
+| **Dirty tree**                     | Snapshotted before CI and materialized only after a successful run; re-submit if the working tree changes before push                                                                                                                 |
 | **Branch diverged on GitHub**      | Refused: rebase your branch onto the remote (or reset to the tested commit) and re-submit                                                                                                            |
-| **Run failed**                     | Push-back still runs: the tested commit lands, the draft PR shows red checks — the reviewable state                                                                                                  |
+| **Run failed**                     | Clean-tree push-back still publishes red checks; dirty-tree snapshots are not materialized after a failed run                                                                                   |
 | **New PRs as ready**               | `--pr-draft=false` — reviewers get notified on creation                                                                                                                                              |
 | **PAT-only server**                | Runs + PR creation work; check runs 403 (needs an App)                                                                                                                                               |
 | **No GitHub at all**               | Plain `preloop run` — CI completes, results in `preloop status` / `preloop logs`, nothing ever leaves your machine                                                                                   |

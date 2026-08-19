@@ -155,6 +155,13 @@ pub struct PushRequest {
     /// Create newly-created pull requests as drafts so reviewers are not
     /// notified until the author marks them ready.
     pub draft_pr: bool,
+    /// The submission came from a dirty working tree: the client could not
+    /// know the tested tree up front, so the server records the snapshot
+    /// tree at accept time and the client materializes a commit from it
+    /// after CI passes. The push endpoint uses this to verify the branch
+    /// head (the materialized commit) instead of the submission's base sha.
+    #[serde(default)]
+    pub dirty: bool,
 }
 
 /// Complete workflow request submitted to the control plane.
@@ -698,6 +705,39 @@ pub struct JobCompletion {
     /// official runner's worker-crash detail from `ForceFailJob`).
     #[serde(default)]
     pub annotations: Vec<serde_json::Value>,
+    /// Authoritative per-step conclusions carried by `completejob`.
+    ///
+    /// The official runner always sends these (`CompleteJobRequest.stepResults`):
+    /// each entry's `status` is the TimelineRecordState (`completed`) and
+    /// `conclusion` the TaskResult (`succeeded`/`failed`/`skipped`/…). The
+    /// server applies them in preference to its own inference; a crashed
+    /// worker (ForceFailJob) sends none, and the server reconciles instead.
+    #[serde(default)]
+    pub step_results: Vec<CompletionStepResult>,
+}
+
+/// One entry of the `completejob` `stepResults` array.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionStepResult {
+    /// Step timeline record id.
+    #[serde(default)]
+    pub external_id: Option<String>,
+    /// 1-based step position within the job.
+    #[serde(default)]
+    pub number: Option<u64>,
+    /// Step name as reported by the runner (matches the run record's step
+    /// name for the same step).
+    #[serde(default)]
+    pub name: Option<String>,
+    /// TimelineRecordState: `"completed"`/`"inprogress"`/`"pending"` or the
+    /// numeric 0..3 form. Only a terminal status makes the conclusion
+    /// authoritative.
+    #[serde(default)]
+    pub status: Option<serde_json::Value>,
+    /// TaskResult: `"succeeded"`/`"failed"`/`"canceled"`/`"skipped"`/
+    /// `"abandoned"` or the numeric 0..5 form.
+    #[serde(default)]
+    pub conclusion: Option<serde_json::Value>,
 }
 
 /// Mask every string value in job-completion annotations with the run's

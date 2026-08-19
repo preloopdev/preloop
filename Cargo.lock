@@ -1849,7 +1849,7 @@ dependencies = [
 
 [[package]]
 name = "preloop-cli"
-version = "0.30.2"
+version = "0.30.10"
 dependencies = [
  "anyhow",
  "axum",
@@ -2006,6 +2006,7 @@ version = "0.21.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "futures",
  "preloop-gha-parser",
  "preloop-gha-protocol",
@@ -2156,6 +2157,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
+ "tar",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",

@@ -112,13 +112,30 @@ pub(crate) async fn twirp_workflow_steps_update(
                         } else {
                             "in_progress"
                         };
+                        let terminal = status_num == 6;
+                        let observed = chrono::Utc::now();
 
                         if let Some(pos) = job_detail.steps.iter().position(|s| s.name == name) {
                             job_detail.steps[pos].conclusion = conclusion_str.to_owned();
+                            // First non-terminal sighting is the start signal.
+                            if !terminal && job_detail.steps[pos].started_at.is_none() {
+                                job_detail.steps[pos].started_at = Some(observed);
+                            }
+                            if terminal && job_detail.steps[pos].finished_at.is_none() {
+                                job_detail.steps[pos].finished_at = Some(observed);
+                            }
                         } else {
+                            // First time we hear about this step:
+                            // - in_progress → record started_at only
+                            // - already terminal → record finished_at only
+                            //   (do not invent started_at == finished_at, which
+                            //   forces duration 0 for fast steps that complete
+                            //   before any in-progress update is processed)
                             job_detail.steps.push(StepRecord {
                                 name,
                                 conclusion: conclusion_str.to_owned(),
+                                started_at: (!terminal).then_some(observed),
+                                finished_at: terminal.then_some(observed),
                             });
                         }
                     }
@@ -407,28 +424,218 @@ pub(crate) struct CacheV2GetDlUrlRequest {
     pub(crate) repository: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Minimal protobuf (twirp) support for the cache routes.
+//
+// actions/cache@v4 speaks JSON, but sccache's GHA storage backend sends the
+// twirp protobuf encoding (content-type `application/protobuf`) and rejects
+// anything else with a 415.
+//
+// Official ghac / @actions/cache CacheService field numbers (do not "fix"
+// the decoder to a flat key=1 layout — that breaks the wire format):
+//   CreateCacheEntryRequest:         metadata=1 key=2 version=3
+//   FinalizeCacheEntryUploadRequest: metadata=1 key=2 size_bytes=3 version=4
+//   GetCacheEntryDownloadURLRequest: metadata=1 key=2 restore_keys=3 version=4
+//   GetCacheEntryDownloadURLResponse: ok=1 signed_download_url=2 matched_key=3
+//   CreateCacheEntryResponse:        ok=1 signed_upload_url=2
+//   FinalizeCacheEntryUploadResponse: ok=1 entry_id=2
+// Scope / repository live inside CacheMetadata (field 1), not as top-level
+// key=1 style fields. See `pb_cache_request` below.
+
+fn pb_varint(buf: &[u8], pos: usize) -> Option<(u64, usize)> {
+    let mut value: u64 = 0;
+    let mut shift = 0;
+    let mut i = pos;
+    while i < buf.len() && shift < 64 {
+        let byte = buf[i];
+        value |= u64::from(byte & 0x7f) << shift;
+        i += 1;
+        if byte & 0x80 == 0 {
+            return Some((value, i));
+        }
+        shift += 7;
+    }
+    None
+}
+
+fn pb_varint_bytes(mut value: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    while value >= 0x80 {
+        out.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+    out
+}
+
+/// Extract every length-delimited string value for one field number.
+/// `None` on malformed wire data.
+fn pb_strings(buf: &[u8], want: u64) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < buf.len() {
+        let (tag, ni) = pb_varint(buf, i)?;
+        let field = tag >> 3;
+        match tag & 7 {
+            0 => {
+                let (_, ni2) = pb_varint(buf, ni)?;
+                i = ni2;
+            }
+            2 => {
+                let (len, ni2) = pb_varint(buf, ni)?;
+                let start = ni2;
+                let end = start.checked_add(len as usize)?;
+                if end > buf.len() {
+                    return None;
+                }
+                if field == want {
+                    out.push(String::from_utf8_lossy(&buf[start..end]).into_owned());
+                }
+                i = end;
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+fn pb_string_field(field: u64, value: &str) -> Vec<u8> {
+    let mut out = pb_varint_bytes((field << 3) | 2);
+    out.extend(pb_varint_bytes(value.len() as u64));
+    out.extend(value.as_bytes());
+    out
+}
+
+type CachePbFields = (String, String, Vec<String>, Option<String>, Option<String>);
+
+fn pb_cache_request(body: &[u8]) -> Result<CachePbFields, ApiError> {
+    // ghac 0.2.0 field numbers: metadata=1 (message), key=2,
+    // restore_keys=3, version=4 (GetCacheEntryDownloadURL /
+    // FinalizeCacheEntryUpload) or 3 (CreateCacheEntry).
+    let one = |v: Option<Vec<String>>| {
+        v.and_then(|mut s| {
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.remove(0))
+            }
+        })
+    };
+    let key = one(pb_strings(body, 2)).unwrap_or_default();
+    let version = one(pb_strings(body, 4))
+        .or_else(|| one(pb_strings(body, 3)))
+        .unwrap_or_default();
+    let restore_keys = pb_strings(body, 3).ok_or_else(|| ApiError::bad_request("bad protobuf"))?;
+    // Scope lives inside the CacheMetadata message: metadata(1) ->
+    // CacheMetadata.scope(2) -> CacheScope.scope(1).
+    let scope = pb_strings(body, 1)
+        .and_then(|mut v| {
+            if v.is_empty() {
+                None
+            } else {
+                Some(v.remove(0))
+            }
+        })
+        .and_then(|meta| {
+            pb_strings(meta.as_bytes(), 2).and_then(|mut v| {
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v.remove(0))
+                }
+            })
+        })
+        .and_then(|entry| {
+            pb_strings(entry.as_bytes(), 1).and_then(|mut v| {
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v.remove(0))
+                }
+            })
+        });
+    let repository = None;
+    Ok((key, version, restore_keys, scope, repository))
+}
+
+/// Protobuf varint field (wire type 0), for the `ok` / `entry_id` fields.
+fn pb_uint_field(field: u64, value: u64) -> Vec<u8> {
+    let mut out = pb_varint_bytes(field << 3);
+    out.extend(pb_varint_bytes(value));
+    out
+}
+
+fn pb_or_json(
+    headers: &axum::http::HeaderMap,
+    fields: Vec<Vec<u8>>,
+    json: serde_json::Value,
+) -> axum::response::Response {
+    if headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.contains("protobuf"))
+    {
+        let body: Vec<u8> = fields.into_iter().flatten().collect();
+        axum::response::Response::builder()
+            .header(axum::http::header::CONTENT_TYPE, "application/protobuf")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    } else {
+        axum::Json(json).into_response()
+    }
+}
+
+/// The twirp cache routes accept JSON (actions/cache@v4) and protobuf
+/// (sccache's GHA storage backend). Returns `(key, version, restore_keys,
+/// scope, repository)`.
+fn cache_request_fields(
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+) -> Result<CachePbFields, ApiError> {
+    if headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.contains("protobuf"))
+    {
+        pb_cache_request(body)
+    } else {
+        let request: CacheV2GetDlUrlRequest = serde_json::from_slice(body)
+            .map_err(|e| ApiError::bad_request(format!("invalid JSON request: {e}")))?;
+        Ok((
+            request.key,
+            request.version,
+            request.restore_keys,
+            request.scope,
+            request.repository,
+        ))
+    }
+}
+
 pub(crate) async fn twirp_cache_v2_create(
     State(shared): State<Arc<SharedState>>,
-    Json(request): Json<CacheV2CreateRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let storage_key = scoped_cache_key(
-        &request.key,
-        request.scope.as_deref(),
-        request.repository.as_deref(),
-    );
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<axum::response::Response, ApiError> {
+    crate::events::trust_tier::ensure_cache_write_allowed(&shared.state, &headers).await?;
+    let (key, version, _restore, scope, repository) = cache_request_fields(&headers, &body)?;
+    let storage_key = scoped_cache_key(key.as_str(), scope.as_deref(), repository.as_deref());
     if shared
         .state
         .cache
-        .get(&storage_key, &request.version, &[])
+        .get(&storage_key, &version, &[])
         .await
         .map_err(|error| ApiError::internal(format!("cache lookup error: {error}")))?
         .is_some()
     {
-        return Ok(Json(json!({
-            "ok": false,
-            "signed_upload_url": "",
-            "message": "cache already exists"
-        })));
+        return Ok(pb_or_json(
+            &headers,
+            vec![pb_uint_field(1, 0), pb_string_field(2, "")],
+            json!({
+                "ok": false,
+                "signed_upload_url": "",
+                "message": "cache already exists"
+            }),
+        ));
     }
     let token = uuid::Uuid::new_v4().to_string();
     let stage_dir = shared
@@ -445,7 +652,7 @@ pub(crate) async fn twirp_cache_v2_create(
         if inner
             .cache_v2_pending
             .values()
-            .any(|pending| pending.key == storage_key && pending.version == request.version)
+            .any(|pending| pending.key == storage_key && pending.version == version)
         {
             true
         } else {
@@ -453,7 +660,7 @@ pub(crate) async fn twirp_cache_v2_create(
                 token.clone(),
                 CacheV2Pending {
                     key: storage_key,
-                    version: request.version,
+                    version,
                 },
             );
             let meta = crate::store::build_meta_snapshot(&inner);
@@ -465,36 +672,41 @@ pub(crate) async fn twirp_cache_v2_create(
     };
     if already_reserved {
         let _ = tokio::fs::remove_dir_all(&stage_dir).await;
-        return Ok(Json(json!({
-            "ok": false,
-            "signed_upload_url": "",
-            "message": "cache upload already reserved"
-        })));
+        return Ok(pb_or_json(
+            &headers,
+            vec![pb_uint_field(1, 0), pb_string_field(2, "")],
+            json!({
+                "ok": false,
+                "signed_upload_url": "",
+                "message": "cache upload already reserved"
+            }),
+        ));
     }
     let upload_url = format!("{}/twirp-blob/cache/{token}", runner_base_url());
     info!(token, "cache v2 create entry");
-    Ok(Json(
+    Ok(pb_or_json(
+        &headers,
+        vec![pb_uint_field(1, 1), pb_string_field(2, &upload_url)],
         json!({ "ok": true, "signed_upload_url": upload_url, "message": "" }),
     ))
 }
 
 pub(crate) async fn twirp_cache_v2_finalize(
     State(shared): State<Arc<SharedState>>,
-    Json(request): Json<CacheV2FinalizeRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<axum::response::Response, ApiError> {
+    crate::events::trust_tier::ensure_cache_write_allowed(&shared.state, &headers).await?;
     let t0 = std::time::Instant::now();
-    let storage_key = scoped_cache_key(
-        &request.key,
-        request.scope.as_deref(),
-        request.repository.as_deref(),
-    );
+    let (key, version, _restore, scope, repository) = cache_request_fields(&headers, &body)?;
+    let storage_key = scoped_cache_key(key.as_str(), scope.as_deref(), repository.as_deref());
     // Find the pending upload token matching key+version.
     let token = {
         let inner = shared.state.inner.lock().await;
         inner
             .cache_v2_pending
             .iter()
-            .find(|(_, p)| p.key == storage_key && p.version == request.version)
+            .find(|(_, p)| p.key == storage_key && p.version == version)
             .map(|(k, _)| k.clone())
     };
     let Some(token) = token else {
@@ -503,12 +715,16 @@ pub(crate) async fn twirp_cache_v2_finalize(
         if shared
             .state
             .cache
-            .get(&storage_key, &request.version, &[])
+            .get(&storage_key, &version, &[])
             .await
             .map_err(|error| ApiError::internal(format!("cache lookup error: {error}")))?
             .is_some()
         {
-            return Ok(Json(json!({ "ok": true, "entry_id": "1", "message": "" })));
+            return Ok(pb_or_json(
+                &headers,
+                vec![pb_uint_field(1, 1), pb_uint_field(2, 1)],
+                json!({ "ok": true, "entry_id": "1", "message": "" }),
+            ));
         }
         return Err(ApiError::not_found(
             "no pending cache upload for key+version",
@@ -573,29 +789,30 @@ pub(crate) async fn twirp_cache_v2_finalize(
         total_ms,
         "cache v2 finalized"
     );
-    Ok(Json(json!({ "ok": true, "entry_id": "1", "message": "" })))
+    Ok(pb_or_json(
+        &headers,
+        vec![pb_uint_field(1, 1), pb_uint_field(2, 1)],
+        json!({ "ok": true, "entry_id": "1", "message": "" }),
+    ))
 }
 
 pub(crate) async fn twirp_cache_v2_get_dl_url(
     State(shared): State<Arc<SharedState>>,
-    Json(request): Json<CacheV2GetDlUrlRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<axum::response::Response, ApiError> {
     let t0 = std::time::Instant::now();
-    let storage_key = scoped_cache_key(
-        &request.key,
-        request.scope.as_deref(),
-        request.repository.as_deref(),
-    );
-    let storage_restore_keys = request
-        .restore_keys
+    let (key, version, restore_keys, scope, repository) = cache_request_fields(&headers, &body)?;
+    let storage_key = scoped_cache_key(&key, scope.as_deref(), repository.as_deref());
+    let storage_restore_keys = restore_keys
         .iter()
-        .map(|key| scoped_cache_key(key, request.scope.as_deref(), request.repository.as_deref()))
+        .map(|key| scoped_cache_key(key, scope.as_deref(), repository.as_deref()))
         .collect::<Vec<_>>();
     let t_lookup = std::time::Instant::now();
     let result = shared
         .state
         .cache
-        .get(&storage_key, &request.version, &storage_restore_keys)
+        .get(&storage_key, &version, &storage_restore_keys)
         .await
         .map_err(|e| ApiError::internal(format!("cache lookup error: {e}")))?;
     let lookup_ms = t_lookup.elapsed().as_millis();
@@ -604,13 +821,19 @@ pub(crate) async fn twirp_cache_v2_get_dl_url(
         Some(r) => r,
         None => {
             tracing::info!(
-                key = %request.key,
-                version = %request.version,
+                key = %key,
+                version = %version,
                 lookup_ms,
                 outcome = "miss",
                 "cache restore"
             );
-            return Ok(Json(
+            return Ok(pb_or_json(
+                &headers,
+                vec![
+                    pb_uint_field(1, 0),
+                    pb_string_field(2, ""),
+                    pb_string_field(3, ""),
+                ],
                 json!({ "ok": false, "signed_download_url": "", "matched_key": "" }),
             ));
         }
@@ -632,16 +855,78 @@ pub(crate) async fn twirp_cache_v2_get_dl_url(
     let total_ms = t0.elapsed().as_millis();
     tracing::info!(
         key = %matched_key,
-        version = %request.version,
+        version = %version,
         size = entry.size,
         lookup_ms,
         total_ms,
         outcome = "hit",
         "cache restore"
     );
-    Ok(Json(json!({
-        "ok": true,
-        "signed_download_url": download_url,
-        "matched_key": matched_key
-    })))
+    Ok(pb_or_json(
+        &headers,
+        vec![
+            pb_uint_field(1, 1),
+            pb_string_field(2, &download_url),
+            pb_string_field(3, &matched_key),
+        ],
+        json!({
+            "ok": true,
+            "signed_download_url": download_url,
+            "matched_key": matched_key
+        }),
+    ))
+}
+
+#[cfg(test)]
+mod cache_pb_tests {
+    use super::*;
+
+    #[test]
+    fn pb_roundtrip_decodes_sccache_style_request() {
+        // ghac GetCacheEntryDownloadURLRequest: metadata=1 key=2
+        // restore_keys=3 version=4; scope nested in metadata.
+        let mut body = pb_string_field(2, ".sccache_check");
+        body.extend(pb_string_field(3, "restore-a"));
+        body.extend(pb_string_field(4, "abc123"));
+        // metadata(1) -> CacheMetadata.scope(2) -> CacheScope.scope(1)
+        let scope_entry = pb_string_field(1, "refs/heads/main");
+        let meta = pb_string_field(2, &String::from_utf8(scope_entry).unwrap());
+        body.extend(pb_string_field(1, &String::from_utf8(meta).unwrap()));
+        let (key, version, restore, scope, repository) = pb_cache_request(&body).unwrap();
+        assert_eq!(key, ".sccache_check");
+        assert_eq!(version, "abc123");
+        assert_eq!(restore, vec!["restore-a"]);
+        assert_eq!(scope.as_deref(), Some("refs/heads/main"));
+        assert_eq!(repository, None);
+    }
+
+    #[test]
+    fn pb_response_encoding_roundtrips_through_decoder() {
+        // The sccache client decodes what we encode; make sure our encoder
+        // produces fields our decoder reads back identically.
+        let wire: Vec<u8> = pb_string_field(1, "https://dl.example/x")
+            .into_iter()
+            .chain(pb_string_field(2, "hit-key"))
+            .collect();
+        let (url, matched) = (pb_strings(&wire, 1).unwrap(), pb_strings(&wire, 2).unwrap());
+        assert_eq!(url, vec!["https://dl.example/x"]);
+        assert_eq!(matched, vec!["hit-key"]);
+    }
+
+    #[test]
+    fn pb_or_json_returns_protobuf_for_protobuf_clients() {
+        let headers = axum::http::HeaderMap::from_iter([(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/protobuf"),
+        )]);
+        let out = pb_or_json(
+            &headers,
+            vec![pb_string_field(1, "k")],
+            serde_json::json!({}),
+        );
+        assert_eq!(
+            out.headers().get(axum::http::header::CONTENT_TYPE).unwrap(),
+            "application/protobuf"
+        );
+    }
 }

@@ -638,6 +638,7 @@ fn arb_literal_step() -> impl Strategy<Value = TaskStep> {
                     inputs,
                     env,
                     continue_on_error: Some(false),
+                    shell: None,
                     working_directory: None,
                     timeout_in_minutes: None,
                 }
@@ -774,6 +775,7 @@ fn task_step_serializes_as_runner_action_step() {
         display_name_token: None,
         condition: None,
         script: Some("echo hi".to_owned()),
+        shell: None,
         reference: None,
         inputs: BTreeMap::new(),
         env: BTreeMap::new(),
@@ -812,6 +814,7 @@ fn task_step_serializes_expression_as_format_token() {
         display_name_token: None,
         condition: None,
         script: None,
+        shell: None,
         reference: None,
         inputs,
         env: BTreeMap::new(),
@@ -1117,6 +1120,54 @@ fn tier2_codec_task_step_environment_aliases() {
         );
         assert!(encoded.get("env").is_none());
     }
+}
+
+#[test]
+fn task_step_input_expression_tokens_survive_persist_restore() {
+    // A type-3 expression token carries `expr`, not `lit`. The restore half
+    // of a persist → restore round-trip (server restart) must keep the
+    // evaluable template — collapsing it to "" empties expression-valued
+    // step inputs (a cache `key:` then fails with "Input required and not
+    // supplied: key").
+    let token_map = json!({
+        "type": 2,
+        "map": [
+            {
+                "Key": {"type": 0, "lit": "key"},
+                "Value": {
+                    "type": 3,
+                    "expr": "format('{0}-assets-{1}-{2}', matrix.mode, github.head_ref || github.ref_name, github.sha)",
+                },
+            },
+            {
+                "Key": {"type": 0, "lit": "path"},
+                "Value": {"type": 0, "lit": "public/assets"},
+            },
+        ],
+    });
+    let wire = json!({
+        "type": "action",
+        "reference": {"type": "script"},
+        "id": uuid::Uuid::nil(),
+        "inputs": token_map,
+    });
+    let decoded: TaskStep = serde_json::from_value(wire).unwrap();
+    let key = decoded.inputs.get("key").expect("key input present");
+    assert!(
+        key.contains("${{") && key.contains("matrix.mode"),
+        "expression input must survive decode as an evaluable template, got {key:?}"
+    );
+    assert_eq!(
+        decoded.inputs.get("path").map(String::as_str),
+        Some("public/assets")
+    );
+
+    // And the re-serialized message keeps the expression token (no collapse
+    // to a literal empty string).
+    let re_encoded = serde_json::to_value(&decoded).unwrap();
+    let key_token = &re_encoded["inputs"]["map"][0]["Value"];
+    assert_eq!(key_token["type"], 3);
+    assert!(key_token["expr"].as_str().unwrap().contains("matrix.mode"));
 }
 
 #[test]

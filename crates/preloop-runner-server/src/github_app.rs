@@ -56,7 +56,12 @@ const INSTALLATIONS_PER_PAGE: usize = 100;
 /// both are runtime-only, and forwarding either makes the installation-token
 /// request fail with HTTP 422 — which would push the job onto whatever
 /// [`MintFailurePolicy`] allows instead of the token it asked for.
-const ACTIONS_ONLY_SCOPES: [&str; 2] = ["id-token", "models"];
+///
+/// The authorization policy excludes these scopes from the App token request
+/// map before the request is even built (see
+/// [`crate::events::trust_tier::JobAuthorization::app_permissions`]), so a
+/// job's registered request carries only real App repository permissions.
+pub(crate) const ACTIONS_ONLY_SCOPES: [&str; 2] = ["id-token", "models"];
 
 /// The narrowest scope GitHub will issue an installation token for.
 ///

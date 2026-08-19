@@ -422,17 +422,24 @@ pub async fn start_job_container(
     args.push("-f".into());
     args.push("/dev/null".into());
 
-    let result = docker_cmd(&args.iter().map(|s| s.as_str()).collect::<Vec<_>>(), log).await?;
-
+    // The official runner takes the first stdout line as the container ID
+    // (`outputStrings.FirstOrDefault()` where the list is stdout-only). Parse
+    // stdout separately — docker's platform warning lands on stderr and the
+    // merged stream can surface it first.
+    let result =
+        docker_cmd_stdout(&args.iter().map(|s| s.as_str()).collect::<Vec<_>>(), log).await?;
     let container_id = result
         .first()
         .cloned()
         .unwrap_or_default()
         .trim()
-        .to_string();
+        .to_owned();
 
     if container_id.is_empty() {
-        anyhow::bail!("Failed to create job container — no ID returned");
+        anyhow::bail!(
+            "Failed to create job container — no ID returned (output: {})",
+            result.join(" | ")
+        );
     }
 
     // Start the container
@@ -534,19 +541,20 @@ pub async fn start_service_container(
 
     args.push(service.image.clone());
 
-    let result = docker_cmd(&args.iter().map(|s| s.as_str()).collect::<Vec<_>>(), log).await?;
-
+    let result =
+        docker_cmd_stdout(&args.iter().map(|s| s.as_str()).collect::<Vec<_>>(), log).await?;
     let container_id = result
         .first()
         .cloned()
         .unwrap_or_default()
         .trim()
-        .to_string();
+        .to_owned();
 
     if container_id.is_empty() {
         anyhow::bail!(
-            "Failed to create service container '{}' — no ID returned",
-            service.alias
+            "Failed to create service container '{}' — no ID returned (output: {})",
+            service.alias,
+            result.join(" | ")
         );
     }
 
@@ -898,6 +906,48 @@ async fn docker_cmd(args: &[&str], log: &mut Vec<String>) -> Result<Vec<String>>
     }
 
     Ok(result.lines)
+}
+
+/// Run a docker command and return the stdout-only lines.
+///
+/// The official runner collects stdout and stderr separately
+/// (`OutputDataReceived` vs `ErrorDataReceived`): everything is echoed to the
+/// log, but only stdout feeds the parse. `docker create` prints its container
+/// ID as the single stdout line, and docker's platform warning lands on
+/// stderr — the merged stream can surface the warning first, so parsing the
+/// merged stream is how the ID gets lost.
+async fn docker_cmd_stdout(args: &[&str], log: &mut Vec<String>) -> Result<Vec<String>> {
+    let cmd_line = format!("/usr/bin/docker {}", args.join(" "));
+    log.push(format!("##[command]{cmd_line}"));
+    debug!("docker {}", args.join(" "));
+
+    let result = process::invoke(
+        "docker",
+        args,
+        Path::new("."),
+        &HashMap::new(),
+        None,
+        None,
+        true,
+    )
+    .await
+    .with_context(|| format!("docker {}", args.first().unwrap_or(&"")))?;
+
+    // Log every line (both streams), matching the official runner echoing
+    // stdout and stderr to the console.
+    for line in &result.lines {
+        log.push(line.clone());
+    }
+
+    if result.exit_code != 0 {
+        anyhow::bail!(
+            "docker {} exited with code {}",
+            args.first().unwrap_or(&""),
+            result.exit_code
+        );
+    }
+
+    Ok(result.stdout_lines)
 }
 
 fn push_docker_create_env(args: &mut Vec<String>, key: &str, value: &str) {

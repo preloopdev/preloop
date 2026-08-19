@@ -104,6 +104,68 @@ pub(crate) async fn register_runner_native(
     Ok(Json(runner))
 }
 
+/// Optional run-scoped query for [`list_runners_native`].
+#[derive(Debug, Deserialize)]
+pub(crate) struct RunnerListQuery {
+    #[serde(default)]
+    run_id: Option<RunId>,
+}
+
+/// GET /api/v1/runners — list the runners currently registered with the
+/// control plane.
+///
+/// Read-only operator surface (native bearer). The CLI uses it to tell a
+/// queued run apart from a dead one: with `?run_id=`, `queued` and
+/// `claimable` report whether any registered runner could actually claim the
+/// run's ready-queue jobs. Zero claimable means no job will ever be picked
+/// up, however long `still waiting` prints — even when other runners are
+/// registered whose labels match nothing in the queue. Without `run_id` the
+/// response is the plain list.
+pub(crate) async fn list_runners_native(
+    State(shared): State<Arc<SharedState>>,
+    Query(query): Query<RunnerListQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let inner = shared.state.inner.lock().await;
+    let runners: Vec<serde_json::Value> = inner
+        .runners
+        .values()
+        .map(|runner| {
+            json!({
+                "id": runner.id,
+                "name": runner.name,
+                "labels": runner.labels,
+            })
+        })
+        .collect();
+    let mut response = json!({
+        "count": runners.len(),
+        "runners": runners,
+    });
+    if let Some(run_id) = query.run_id {
+        let queued = inner
+            .queue
+            .iter()
+            .filter(|job| job.run_id == run_id)
+            .count();
+        // A runner is claimable when it matches at least one of the run's
+        // queued jobs under the same predicate the scheduler dispatches with.
+        let claimable = inner
+            .runners
+            .values()
+            .filter(|runner| {
+                let caps = crate::runtime_scheduling::capabilities_of(runner);
+                inner.queue.iter().any(|job| {
+                    job.run_id == run_id
+                        && crate::runtime_scheduling::job_matches_runner_capabilities(job, &caps)
+                })
+            })
+            .count();
+        response["queued"] = json!(queued);
+        response["claimable"] = json!(claimable);
+    }
+    Ok(Json(response))
+}
+
 pub(crate) async fn create_session(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<RunnerSessionRequest>,

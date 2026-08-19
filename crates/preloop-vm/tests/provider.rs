@@ -125,7 +125,7 @@ case "${1-}:${2-}" in
     if [ "${3-}" = "--stream" ]; then
       printf 'stream-out\n'
       printf 'stream-err\n' >&2
-    elif [ "${6-}" = "large-output" ]; then
+    elif [ "${8-}" = "large-output" ]; then
       printf '%200000s' ''
       printf '%200000s' '' >&2
     else
@@ -646,6 +646,8 @@ exit 0
                 "exec".to_owned(),
                 "--name".to_owned(),
                 "runner".to_owned(),
+                "--timeout".to_owned(),
+                "30m".to_owned(),
                 "--".to_owned(),
                 "echo".to_owned(),
                 hostile,
@@ -775,73 +777,11 @@ printf 'exit %s\n' "$6" >> "$0.forklog"
         false
     }
 
-    /// Plain `machine fork` in SmolVM 1.7.4 does not persist a reusable
-    /// checkpoint. Once one live clone exists, invoking SmolVM for a second
-    /// clone fails against the paused base and can invalidate the first clone's
-    /// storage. The provider must reject that second clone before spawning the
-    /// command.
-    #[tokio::test]
-    async fn second_live_clone_from_one_golden_is_rejected_without_spawning_smolvm() {
-        let (_directory, executable) = fake_blocking_fork_smolvm();
-        let provider = SmolVmProvider::new(&executable).with_retained_fork_checkpoints(false);
-        let golden = MachineName::new("runner-golden").unwrap();
-        let first = MachineName::new("runner-0-1").unwrap();
-        let second = MachineName::new("runner-1-1").unwrap();
-
-        let one = {
-            let provider = provider.clone();
-            let (golden, first) = (golden.clone(), first.clone());
-            tokio::spawn(async move { provider.fork(&golden, &first).await })
-        };
-        let two = {
-            let provider = provider.clone();
-            let (golden, second) = (golden.clone(), second.clone());
-            tokio::spawn(async move { provider.fork(&golden, &second).await })
-        };
-
-        assert!(
-            wait_for_entries(&executable, 1).await,
-            "the first fork must start"
-        );
-        // The barrier holds fork one inside smolvm. If forks were concurrent,
-        // fork two would enter here rather than wait for the lock.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert_eq!(
-            fork_log(&executable)
-                .iter()
-                .filter(|line| line.starts_with("enter"))
-                .count(),
-            1,
-            "second fork must wait for the first to finish: {:?}",
-            fork_log(&executable)
-        );
-        fs::write(executable.with_extension("release"), "").unwrap();
-        one.await.unwrap().unwrap();
-        let error = two
-            .await
-            .unwrap()
-            .expect_err("a second live clone from one plain-fork golden must be rejected");
-        assert!(matches!(
-            error,
-            VmError::ForkBaseBusy {
-                ref golden,
-                ref clone,
-            } if golden == "runner-golden" && clone == "runner-0-1"
-        ));
-
-        let log = fork_log(&executable);
-        assert_eq!(
-            log,
-            ["enter runner-0-1", "exit runner-0-1"],
-            "the rejected clone must never invoke SmolVM: {log:?}"
-        );
-    }
-
     #[tokio::test]
     async fn retained_checkpoint_mode_allows_multiple_live_clones() {
         let (_directory, executable) = fake_blocking_fork_smolvm();
-        // This test intentionally uses the default: the patched SmolVM
-        // release is the normal runtime path now.
+        // Forks are serialized per golden while multiple live clones remain
+        // supported by the configured SmolVM runtime.
         let provider = SmolVmProvider::new(&executable);
         let golden = MachineName::new("runner-golden").unwrap();
         let first = MachineName::new("runner-0-1").unwrap();

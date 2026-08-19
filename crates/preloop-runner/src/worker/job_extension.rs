@@ -399,10 +399,8 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
                             .insert("ACTIONS_RESULTS_URL".to_string(), url.to_string());
                     }
                     if let Some(url) = data.get("CacheServerUrl").and_then(|v| v.as_str()) {
-                        job.env.insert(
-                            "ACTIONS_CACHE_URL".to_string(),
-                            url.trim_end_matches('/').to_string(),
-                        );
+                        job.env
+                            .insert("ACTIONS_CACHE_URL".to_string(), url.to_string());
                         job.env
                             .entry("ACTIONS_CACHE_SERVICE_V2".to_string())
                             .or_insert_with(|| "true".to_string());

@@ -395,9 +395,40 @@ pub fn build_agent_job_message_with_normalized_context(
         steps.push(task_step);
     }
 
-    // Materialize variables
-    let mut variables = BTreeMap::new();
+    // Materialize variables. Job/workflow `env:` values may carry `${{ }}`
+    // expressions (the canonical case is a boolean built from the github
+    // context: `SCCACHE_GHA_ENABLED: ${{ github.ref_name == 'main' }}`).
+    // GitHub resolves these server-side with the job context; preloop must
+    // too, or the raw template string lands in the step environment and
+    // tools that validate their inputs (sccache rejects anything that is not
+    // a boolean literal) fail on first use.
+    let mut resolved_env: BTreeMap<String, String> = BTreeMap::new();
     for (k, v) in &plan.env {
+        // Runtime-only context keys must survive job-build resolution:
+        // `github.workspace` is filled in by the runner at execution
+        // time (the server has no runner work directory), and the
+        // expression resolver turns a missing property into "" — so
+        // neovim's `BIN_DIR: ${{ github.workspace }}/bin` would silently
+        // collapse to `/bin` here. Leave those values untouched for the
+        // runner's step-time evaluation.
+        if v.contains("github.workspace") {
+            resolved_env.insert(k.clone(), v.clone());
+            continue;
+        }
+        // GitHub's server fails the workflow when an env expression cannot be
+        // evaluated (a parse error or unknown function); it never ships the
+        // raw template to the runner. Missing *properties* still coalesce to
+        // "" per the resolver.
+        let resolved = resolve_string(v, &job_expr_context).map_err(|error| {
+            format!(
+                "job `{}` env `{}` failed to evaluate: {error}",
+                plan.name, k
+            )
+        })?;
+        resolved_env.insert(k.clone(), resolved);
+    }
+    let mut variables = BTreeMap::new();
+    for (k, v) in &resolved_env {
         variables.insert(k.clone(), VariableValue::new(v));
     }
     for (k, v) in global_env {
@@ -419,6 +450,21 @@ pub fn build_agent_job_message_with_normalized_context(
         );
     }
     populate_runner_variables(&mut variables, plan);
+
+    // The official runner materializes job/workflow-level `env:` into the
+    // step environment from `AgentJobRequestMessage.EnvironmentVariables`,
+    // not from `variables` (which it treats as internal/bookkeeping plus
+    // secrets). Without this wire field, workflows that rely on job env
+    // reaching action processes — moby's `DESTDIR` driving `docker buildx
+    // bake` HCL variables is the canonical case — silently see empty values:
+    // bake resolves `${DESTDIR}` to `""` and drops the target's output.
+    // Emit one plain object per variable; the runner's template-map reader
+    // accepts that shape (and the `{map: [{Key, Value}]}` form upstream
+    // sends).
+    let environment_variables: Vec<serde_json::Value> = resolved_env
+        .iter()
+        .map(|(k, v)| serde_json::json!({ k: v }))
+        .collect();
 
     // GitHub supplies baseline regexes in addition to value-derived secret masks.
     let mut mask_hints = default_mask_hints();
@@ -573,7 +619,7 @@ pub fn build_agent_job_message_with_normalized_context(
         billing_owner_id: None,
         file_table: Vec::new(),
         defaults: Vec::new(),
-        environment_variables: Vec::new(),
+        environment_variables,
         snapshot: None,
         condition: plan.if_condition.as_deref().map(runner_condition),
         variables,
@@ -871,6 +917,10 @@ fn build_task_step(step: &crate::StepPlan, context: &Context) -> TaskStep {
         inputs: with,
         env,
         continue_on_error: step.continue_on_error,
+        shell: step
+            .shell
+            .as_ref()
+            .map(|shell| resolve_string(shell, context).unwrap_or_else(|_| shell.clone())),
         working_directory: step
             .working_directory
             .as_ref()
@@ -967,6 +1017,111 @@ jobs:
         );
     }
 
+    /// Job/workflow-level `env:` must reach the wire as
+    /// `environmentVariables` (the field the official runner materializes
+    /// into step environments), not only as `variables`.
+    #[test]
+    fn job_env_is_exposed_on_environment_variables() {
+        let workflow = parse_workflow(
+            r#"
+on: push
+env:
+  GLOBAL_VAR: gv
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      DESTDIR: ./build
+    steps:
+      - run: echo hi
+"#,
+        )
+        .unwrap();
+        let plan = &crate::expand_jobs(&workflow).unwrap()[0];
+        let message = build_agent_job_message(
+            plan,
+            &serde_json::json!({"event_name": "push"}),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        let env: std::collections::BTreeMap<String, String> = message
+            .environment_variables
+            .iter()
+            .flat_map(|value| {
+                value.as_object().into_iter().flat_map(|obj| {
+                    obj.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
+                })
+            })
+            .collect();
+        assert_eq!(env.get("DESTDIR").map(String::as_str), Some("./build"));
+        assert_eq!(env.get("GLOBAL_VAR").map(String::as_str), Some("gv"));
+        assert_eq!(
+            message
+                .variables
+                .get("DESTDIR")
+                .and_then(|v| v.value.clone()),
+            Some("./build".to_owned()),
+            "the variable projection must stay intact for expression contexts"
+        );
+    }
+
+    /// `${{ }}` expressions inside `env:` values are resolved with the job
+    /// context before they reach the wire (GitHub resolves them server-side;
+    /// passing the raw template breaks tools that validate their inputs).
+    #[test]
+    fn env_values_resolve_expressions_with_the_job_context() {
+        let workflow = parse_workflow(
+            r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      ENABLED: ${{ github.ref_name == 'main' }}
+      PLAIN: hello
+    steps:
+      - run: echo hi
+"#,
+        )
+        .unwrap();
+        let plan = &crate::expand_jobs(&workflow).unwrap()[0];
+        let github = serde_json::json!({
+            "event_name": "push",
+            "ref": "refs/heads/main",
+            "ref_name": "main",
+            "base_ref": "",
+        });
+        let message = build_agent_job_message(
+            plan,
+            &github,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        let env: std::collections::BTreeMap<String, String> = message
+            .environment_variables
+            .iter()
+            .flat_map(|value| {
+                value.as_object().into_iter().flat_map(|obj| {
+                    obj.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
+                })
+            })
+            .collect();
+        assert_eq!(
+            env.get("ENABLED").map(String::as_str),
+            Some("true"),
+            "the ref_name comparison must resolve to a boolean literal"
+        );
+        assert_eq!(env.get("PLAIN").map(String::as_str), Some("hello"));
+    }
+
     #[test]
     fn wrapped_conditions_are_unwrapped_for_the_official_runner() {
         let workflow = parse_workflow(
@@ -1060,6 +1215,65 @@ jobs:
         assert_eq!(idx1, serde_json::json!(1.0));
         assert_eq!(total0, serde_json::json!(2.0));
         assert_eq!(total1, serde_json::json!(2.0));
+    }
+
+    #[test]
+    fn with_input_templates_survive_to_the_wire() {
+        // Mastodon's cache step keys on
+        // `${{ matrix.mode }}-assets-${{ github.head_ref || github.ref_name }}-${{ github.sha }}`.
+        // The step's with-value must reach the job message as a template the
+        // runner can evaluate — a resolved-literal collapse to "" made
+        // actions/cache fail with "Input required and not supplied: key".
+        let yaml = r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        mode: [production]
+    steps:
+      - uses: actions/cache@v5
+        with:
+          path: public/assets
+          key: ${{ matrix.mode }}-assets-${{ github.head_ref || github.ref_name }}-${{ github.sha }}
+"#;
+        let workflow = parse_workflow(yaml).unwrap();
+        let plans = crate::expand_jobs(&workflow).unwrap();
+        assert_eq!(plans.len(), 1);
+        let github = serde_json::json!({
+            "event_name": "push",
+            "ref": "refs/heads/main",
+            "ref_name": "main",
+            "sha": "0123456789abcdef0123456789abcdef01234567",
+            "repository": "mastodon/mastodon",
+        });
+        let msg = build_agent_job_message(
+            &plans[0],
+            &github,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let cache = msg
+            .steps
+            .iter()
+            .find(|s| s.context_name.as_deref() == Some("__actions_cache"));
+        let Some(cache) = cache else {
+            panic!(
+                "cache step must be present; steps: {:?}",
+                msg.steps
+                    .iter()
+                    .map(|s| (s.context_name.clone(), s.name.clone()))
+                    .collect::<Vec<_>>()
+            );
+        };
+        let key = cache.inputs.get("key").cloned().unwrap_or_default();
+        assert!(
+            key.contains("assets") && key.contains("matrix.mode"),
+            "cache key must reach the runner as an evaluable template, got {key:?}"
+        );
     }
 
     #[test]

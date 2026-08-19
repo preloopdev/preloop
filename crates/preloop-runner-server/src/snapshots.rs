@@ -23,6 +23,10 @@ const MAX_GIT_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct WorkspaceSnapshot {
     pub(crate) commit_sha: String,
+    /// Tree of the snapshot commit — the exact tree the run tests. A
+    /// push-back client materializes a real commit from this tree so the
+    /// pushed commit is byte-identical to what CI validated.
+    pub(crate) tree_sha: String,
     /// The workspace's real HEAD commit (the commit the submission is based
     /// on), when the workspace has one. This is the identity a workflow sees
     /// as `github.sha`: it is what a custom checkout that fetches from the
@@ -42,6 +46,10 @@ pub(crate) struct WorkspaceSnapshot {
     /// covers the last commit the user wants tested). `None` on an unborn or
     /// initial-commit clean tree yields the null-SHA "initial push" base.
     pub(crate) before_sha: Option<String>,
+    /// Server-side cost of capturing this snapshot; present on snapshots
+    /// created after the timing instrumentation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) snapshot_timing: Option<crate::models::SnapshotTiming>,
 }
 
 /// Capture `workspace` as an immutable cache-backed bare repository for `run_id`.
@@ -57,6 +65,7 @@ pub(crate) async fn create_workspace_snapshot(
     run_id: RunId,
     github_pat: Option<&str>,
 ) -> Result<WorkspaceSnapshot, ApiError> {
+    let started = std::time::Instant::now();
     let workspace = std::fs::canonicalize(workspace).map_err(|error| {
         ApiError::bad_request(format!(
             "failed to resolve local workspace {}: {error}",
@@ -120,23 +129,98 @@ pub(crate) async fn create_workspace_snapshot(
 
     let SnapshotResult {
         commit_sha,
+        tree_sha,
         head_sha,
         default_branch,
         before_sha,
     } = result?;
+    let timing = match snapshot_repo_timing(&final_repository) {
+        Ok(mut stats) => {
+            stats.duration_ms = started.elapsed().as_millis() as u64;
+            Some(stats)
+        }
+        Err(error) => {
+            warn!(
+                %run_id,
+                %error,
+                "Failed to collect snapshot repository stats"
+            );
+            None
+        }
+    };
     info!(
         %run_id,
         %commit_sha,
+        duration_ms = timing.map(|t| t.duration_ms).unwrap_or_default(),
+        object_count = timing.map(|t| t.object_count).unwrap_or_default(),
+        pack_bytes = timing.map(|t| t.pack_bytes).unwrap_or_default(),
         repository = %final_repository.display(),
         "Created immutable workspace snapshot"
     );
     Ok(WorkspaceSnapshot {
         commit_sha,
+        tree_sha,
         head_sha,
         repository,
         default_branch,
         before_sha,
+        snapshot_timing: timing,
     })
+}
+
+/// Object-count and stored-size statistics for a snapshot repository.
+///
+/// The snapshot's own objects live in a pack inside the repo directory, but
+/// the bulk of a real tree is shared through the alternate object cache —
+/// `git count-objects -v` never sees alternates. The number a checkout's
+/// fetch would transfer is the reachable set, so count it with
+/// `rev-list --objects --all` (includes alternates). Stored bytes are the
+/// run-owned repository directory (`du`), the incremental storage the run
+/// added to the state directory.
+fn snapshot_repo_timing(repository: &FsPath) -> anyhow::Result<crate::models::SnapshotTiming> {
+    use std::process::Command;
+    let count = Command::new("git")
+        .arg("--git-dir")
+        .arg(repository)
+        .args(["rev-list", "--objects", "--all"])
+        .output()?;
+    if !count.status.success() {
+        anyhow::bail!(
+            "git rev-list failed: {}",
+            String::from_utf8_lossy(&count.stderr).trim()
+        );
+    }
+    let object_count = count.stdout.iter().filter(|byte| **byte == b'\n').count() as u64;
+    let du = Command::new("du").arg("-sk").arg(repository).output()?;
+    let size_kib = if du.status.success() {
+        String::from_utf8_lossy(&du.stdout)
+            .split_whitespace()
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    Ok(crate::models::SnapshotTiming {
+        duration_ms: 0, // filled by the caller
+        object_count,
+        pack_bytes: size_kib.saturating_mul(1024),
+    })
+}
+
+/// Count objects that `rev-list` explicitly reports as missing. With
+/// `--missing=print`, missing objects are prefixed with `?`; ordinary commit
+/// lines are bare object IDs, while tree/blob lines may include a path.
+async fn missing_snapshot_objects(repository: &FsPath) -> Result<u64, ApiError> {
+    let mut verify = Command::new("git");
+    verify
+        .env("GIT_DIR", repository)
+        .args(["rev-list", "--objects", "--all", "--missing=print"]);
+    let output = run_git(&mut verify, "verify snapshot object cache completeness").await?;
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.starts_with('?'))
+        .count() as u64)
 }
 
 async fn create_workspace_snapshot_inner(
@@ -744,6 +828,10 @@ async fn create_workspace_snapshot_inner(
         })?;
     Ok(SnapshotResult {
         commit_sha,
+        // The snapshot commit's tree — the exact staged dirty tree CI tests,
+        // not the workspace HEAD's tree. Push-back clients materialize their
+        // commit from this so pushed == tested.
+        tree_sha: tree.clone(),
         head_sha: source_head,
         default_branch,
         before_sha,
@@ -754,6 +842,7 @@ async fn create_workspace_snapshot_inner(
 /// the submission as a coherent GitHub event to changed-file actions.
 struct SnapshotResult {
     commit_sha: String,
+    tree_sha: String,
     head_sha: Option<String>,
     default_branch: Option<String>,
     before_sha: Option<String>,
@@ -1200,9 +1289,34 @@ async fn ensure_object_cache(
     // remote while the lock is held; once complete it stays complete and
     // later runs skip the fetch entirely.
     let mut ancestry_complete = !repository.join("shallow").is_file();
+    if ancestry_complete {
+        // A cache cloned from a `--filter=blob:none` workspace inherits the
+        // promisor pack contents (commits and trees but no blobs) without
+        // carrying the partial-clone markers, so the shallow-file check
+        // above cannot see the hole. `rev-list --missing=print` enumerates
+        // every object reachable from the refs and prints the absent ones
+        // as bare SHAs (present objects print "sha path"). Any hole means
+        // the cache advertises refs it cannot serve — every workflow
+        // `git fetch --unshallow origin` against the snapshot then dies
+        // with `Could not read <sha>` / "revision walk setup failed" — so
+        // recover the full ancestry from the workspace's remote, the same
+        // deepen the shallow path uses.
+        let missing = missing_snapshot_objects(&repository).await?;
+        if missing > 0 {
+            warn!(
+                cache = %repository.display(),
+                %missing,
+                "snapshot object cache is missing objects (partial-clone workspace?); deepening from the remote"
+            );
+            ancestry_complete = false;
+        }
+    }
     if !ancestry_complete {
         ancestry_complete =
             deepen_object_cache_from_remote(&repository, workspace, github_pat).await;
+        if ancestry_complete {
+            ancestry_complete = missing_snapshot_objects(&repository).await? == 0;
+        }
         refreshed = refreshed || ancestry_complete;
     }
     let mut index = repository.as_os_str().to_owned();
@@ -1305,6 +1419,10 @@ async fn deepen_object_cache_from_remote(
         .args(["fetch", "--quiet", "--force", "--no-tags"]);
     if shallow_marker.is_file() {
         fetch.arg("--unshallow");
+    } else {
+        // A filtered clone can have no shallow marker while omitting blobs.
+        // Refetch asks Git to transfer those promisor objects too.
+        fetch.arg("--refetch");
     }
     if let Some((key, value)) = github_pat.and_then(|pat| github_auth_header_for_remote(&url, pat))
     {
@@ -1432,9 +1550,14 @@ struct CacheLock(PathBuf);
 /// with HTTP 500. The persistent object cache is untouched: it is shared and
 /// is what makes the next snapshot cheap.
 pub(crate) async fn discard_workspace_snapshot(state_dir: &FsPath, run_id: RunId) {
+    let started = std::time::Instant::now();
     let repository = state_dir.join("snapshots").join(run_id.to_string());
     match tokio::fs::remove_dir_all(&repository).await {
-        Ok(()) => debug!(%run_id, "Discarded finished run's workspace snapshot"),
+        Ok(()) => debug!(
+            %run_id,
+            duration_ms = started.elapsed().as_millis() as u64,
+            "Discarded finished run's workspace snapshot"
+        ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => warn!(
             %run_id,
@@ -2054,9 +2177,11 @@ mod deepen_and_redirect_tests {
         WorkspaceSnapshot {
             head_sha: Some("f000000000000000000000000000000000000000".to_owned()),
             commit_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            tree_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
             repository: "snapshots/11111111-1111-4111-8111-111111111111".to_owned(),
             default_branch: Some("main".to_owned()),
             before_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+            snapshot_timing: None,
         }
     }
 

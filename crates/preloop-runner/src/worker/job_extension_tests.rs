@@ -529,7 +529,7 @@ fn inject_actions_env_from_system_vss_endpoint_data() {
     );
     assert_eq!(
         job.env.get("ACTIONS_CACHE_URL").map(String::as_str),
-        Some("https://cache.example")
+        Some("https://cache.example/")
     );
     assert_eq!(
         job.env.get("ACTIONS_CACHE_SERVICE_V2").map(String::as_str),
