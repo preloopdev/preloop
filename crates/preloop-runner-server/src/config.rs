@@ -69,7 +69,11 @@ pub struct GitHubConfig {
 /// One additional GitHub App in the multi-App registry (`github.apps`).
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct AppConfig {
-    /// Numeric App id, used as the `iss` claim of the App JWT.
+    /// Numeric App id, used as the `iss` claim of the App JWT. Accepts a
+    /// string or integer on deserialize — GitHub App ids are numbers, and
+    /// `github.apps` / `PRELOOP_GITHUB_APPS_JSON` entries are written by
+    /// hand, so `app_id: 12345` and `app_id: "12345"` must both load.
+    #[serde(deserialize_with = "de_string_or_integer")]
     pub app_id: String,
     /// App private key PEM (inline).
     pub pem: String,
@@ -82,6 +86,56 @@ pub struct AppConfig {
     /// single-installation deployments of this App.
     #[serde(default)]
     pub installation_id: Option<u64>,
+}
+
+/// Accept a string or integer for the numeric `app_id`, normalizing to a
+/// string. GitHub App ids are numbers; registry entries are written by hand,
+/// so both shapes must load. Anything else is a typo worth failing on.
+fn de_string_or_integer<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Visitor;
+
+    struct StringOrInteger;
+
+    impl<'de> Visitor<'de> for StringOrInteger {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a string or integer")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(value.to_owned())
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(value)
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(value.to_string())
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(value.to_string())
+        }
+    }
+
+    deserializer.deserialize_any(StringOrInteger)
 }
 
 /// Renders as `<redacted>` / `None` without quoting, for credential fields.

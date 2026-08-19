@@ -43,12 +43,6 @@ use tokio::sync::{oneshot, Mutex};
 const DEFAULT_PERMISSIONS: &[(&str, &str)] = &[
     ("checks", "write"),
     ("contents", "read"),
-    ("actions", "read"),
-    ("issues", "read"),
-    ("discussions", "read"),
-    ("deployments", "read"),
-    ("members", "read"),
-    ("pages", "read"),
     ("metadata", "read"),
     ("pull_requests", "read"),
 ];

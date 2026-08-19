@@ -385,12 +385,15 @@ const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
 /// by `preloop setup github --via pat` able to run CI but never able to push
 /// its result back, because that flow only ever writes the config file.
 async fn push_token(shared: &Arc<SharedState>, repository: &str) -> Option<String> {
-    if let Some(app_creds) = crate::github_app::select_app_for_repo(shared, repository).await {
-        let permissions = std::collections::BTreeMap::from([
-            ("checks".to_owned(), "write".to_owned()),
-            ("pull_requests".to_owned(), "write".to_owned()),
-            ("contents".to_owned(), "read".to_owned()),
-        ]);
+    let permissions = std::collections::BTreeMap::from([
+        ("checks".to_owned(), "write".to_owned()),
+        ("pull_requests".to_owned(), "write".to_owned()),
+        ("contents".to_owned(), "read".to_owned()),
+    ]);
+    // Try every candidate App in registry order: the first App installed on
+    // the owner may hold an installation that cannot reach this repository
+    // (e.g. a selected-repositories installation), and a later App can.
+    for app_creds in crate::github_app::candidate_apps_for_repo(shared, repository).await {
         match crate::github_app::get_or_mint_token(&app_creds, repository, &permissions).await {
             Ok(token) => return Some(token),
             Err(error) => tracing::warn!(%repository, %error, "push token mint failed"),

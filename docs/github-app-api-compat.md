@@ -1,7 +1,7 @@
 # GitHub App API Compatibility — Implementation Plan
 
-Status: Plan (implementation start)
-Author: design session
+Status: Implemented (M1–M4 per Implementation Log; M5 pending)
+Author: design session — see §11 for the implementation record
 Branch: `Bnjoroge/gh-app-api-compat`
 
 ## 1. Problem Statement
@@ -86,7 +86,9 @@ accidentally denied — see M2.
    - **Online path** (github.com reachable): validate with a github.com round-trip —
      `GET /installation` (bearer = the token) returns the installation (id, account,
      app_id, permissions); `GET /installation/repositories` returns repo access.
-     Require `actions: write` in the installation's granted permissions for dispatch.
+     Require the endpoint's permission in the installation's granted permissions
+     (`actions: write` for workflow dispatch, `contents: write` for repository
+     dispatch).
      Cache by token-hash with short TTL (60s), keyed also by expiry; fail **closed**
      on network error (do not fall through to "anonymous").
    - **Offline path** (no github.com): only tokens preloop itself minted are accepted —
@@ -96,9 +98,15 @@ accidentally denied — see M2.
 5. **Anything else** — 401. Third-party App JWTs are *never* accepted (no PEM to verify with).
 
 Actor resolution for the synthesized `sender`:
-- Installation token → `{account.login}[bot]` (App bot identity)
-- PAT → `GET /user` (cached) or a configured operator name
-- System bearer → configured actor
+- Installation token → `{app_slug}[bot]` (the App's bot login; the third-party
+  online path falls back to `{account.login}[bot]` when the slug is absent; the
+  offline mint-ledger path resolves the slug via `GET /app`, falling back to
+  `{app_id}[bot]` when github.com is unreachable)
+- Own-App JWT → `{slug}[bot]` (`GET /app`, cached), or `{app_id}[bot]` when
+  github.com is unreachable
+- PAT → `GET /user` (cached) when github.com is reachable, else the `preloop-pat`
+  placeholder
+- System bearer → `preloop-system`
 
 ### D3. Dispatch → run pipeline reuses the webhook adapters
 Do **not** write a parallel submit path. Synthesize the webhook-shaped payload,
@@ -182,7 +190,8 @@ is created. Missing input validation must not reject a *webhook*-delivered dispa
 ## 5. Endpoint Contracts (match github.com)
 
 ### `POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches`
-- Auth: D2 chain. Requirement: `actions: write` on the repo.
+- Auth: D2 chain. Requirement: `actions: write` on the repo (github.com requires
+  `actions: write` for workflow dispatch).
 - Body: `{ "ref": string?, "inputs": {k: v}? }` (ref defaults to default branch)
 - Success: `204 No Content` (empty body)
 - Errors:
@@ -195,8 +204,9 @@ is created. Missing input validation must not reject a *webhook*-delivered dispa
   reported exactly like webhook-driven runs.
 
 ### `POST /repos/{owner}/{repo}/dispatches`
-- Auth: D2 chain. Requirement: `actions: write` (github.com requires contents/actions
-  write for dispatch events; verify against the installation's granted permissions).
+- Auth: D2 chain. Requirement: `contents: write` (github.com requires
+  `contents: write` for repository dispatch; verified against the installation's
+  granted permissions).
 - Body: `{ "event_type": string (required, ≤100 chars), "client_payload": object? }`
 - Success: `204 No Content`
 - Errors: `401`, `403`, `404`, `422` (event_type missing or >100 chars)

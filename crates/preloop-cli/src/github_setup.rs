@@ -291,6 +291,17 @@ async fn setup_app(args: &GithubSetupArgs) -> anyhow::Result<()> {
                         }
                     };
                 }
+                // Only registry Apps are configured — there is no legacy
+                // primary App to point at a URL, and launching the browser
+                // flow would create another App the operator did not ask
+                // for. Say how to proceed instead.
+                println!(
+                    "GitHub Apps are already configured in the `github.apps` registry in {}.\n\
+                     \x20 --add              create an additional App via browser and add it to registry\n\
+                     \x20 --app-id/--pem-file add or update an App with existing credentials",
+                    preloop_runner_server::config::config_path().display()
+                );
+                return Ok(());
             }
             return setup_app_via_browser(args).await;
         }

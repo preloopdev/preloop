@@ -288,13 +288,6 @@ Regardless of which branch is taken, `ACTIONS_RUNTIME_TOKEN` and the pinned
 `actions/checkout` token stay local HMAC JWTs, so cache, artifacts, logs, OIDC,
 and local-workspace checkout behave identically in all three cases.
 
----
-
-## Related
-
-- [GitHub App Webhook Integration](./github-app-webhook.md) — webhook delivery, Checks API reporting, App registration walkthrough
-- [Fidelity Gap](./fidelity-gap.md) — what Preloop deliberately does not replicate
-
 ## 7. Dispatch API authentication (GitHub App API compatibility)
 
 The github.com-compatible dispatch endpoints
@@ -321,5 +314,13 @@ The `sender` / `github.actor` for a dispatched run is:
 - system token → `preloop-system`
 
 Installation-token dispatches carry the `AppDispatch` trust tier, which allows
-repository secrets (the caller has proven `actions: write`, matching github.com).
-System / PAT / own-App JWT dispatches stay on `AdminManual`.
+repository secrets (the caller has proven the endpoint's write permission,
+matching github.com). System / PAT / own-App JWT dispatches stay on
+`AdminManual`.
+
+---
+
+## Related
+
+- [GitHub App Webhook Integration](./github-app-webhook.md) — webhook delivery, Checks API reporting, App registration walkthrough
+- [Fidelity Gap](./fidelity-gap.md) — what Preloop deliberately does not replicate

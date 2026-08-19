@@ -113,6 +113,25 @@ impl DispatchIdentity {
         }
     }
 
+    /// Whether the caller proved `contents: write` on the target repository.
+    ///
+    /// System bearer, PAT, and own-App JWT are operator credentials and hold
+    /// every action; an installation token only holds what its installation
+    /// granted it.
+    pub(crate) fn has_contents_write(&self) -> bool {
+        match &self.kind {
+            DispatchAuthKind::InstallationToken(token) => {
+                let level = token
+                    .permissions
+                    .get("contents")
+                    .map(String::as_str)
+                    .unwrap_or("none");
+                matches!(level, "write" | "admin")
+            }
+            _ => true,
+        }
+    }
+
     /// Whether an installation token may reach `owner/repo`. Operator
     /// credentials always may; an installation token only the repos it can
     /// access (all repositories when the installation selected "all").
@@ -208,13 +227,27 @@ async fn authenticate(
     //
     // Fast path first: a token preloop itself minted is proven by the mint
     // ledger with no network traffic, which keeps dispatch working offline.
-    if let Some(entry) = shared
+    // The token may have been minted by any registered App — not just the
+    // legacy default — so the legacy ledger and every registry App's ledger
+    // are consulted; the entry carries `app_id`, so actor resolution works
+    // whichever ledger matched.
+    let ledger_entry = shared
         .state
         .github_app
         .as_ref()
         .and_then(|app| app.mint_ledger.lookup(bearer))
-    {
-        let actor = format!("{}[bot]", entry.account_login);
+        .or_else(|| {
+            shared.state.github_apps.as_ref().and_then(|registry| {
+                registry
+                    .apps
+                    .iter()
+                    .find_map(|app| app.mint_ledger.lookup(bearer))
+            })
+        });
+    if let Some(entry) = ledger_entry {
+        // The bot identity is the App's slug, not the repository owner the
+        // token was minted for.
+        let actor = resolve_app_actor(shared, &entry.app_id).await;
         return Ok(DispatchIdentity {
             actor,
             tier: TrustTier::AppDispatch,
@@ -374,13 +407,25 @@ async fn fetch_installation_repositories(
     token: &str,
 ) -> anyhow::Result<Vec<String>> {
     let mut repositories = Vec::new();
-    for page in 1..=10u32 {
+    // `total_count` (from the first response) is the authoritative stop point
+    // — an installation with more than 1,000 repositories must not be
+    // truncated — and a short page is the belt for a response that lies.
+    // Pages past the end return an empty array, so the loop always
+    // terminates.
+    let mut total_count: Option<usize> = None;
+    for page in 1u32.. {
         let body = fetch_json(
             &format!("{api_base}/installation/repositories?per_page=100&page={page}"),
             token,
         )
         .await
         .with_context(|| format!("GET /installation/repositories (page {page}) failed"))?;
+        if total_count.is_none() {
+            total_count = body
+                .get("total_count")
+                .and_then(serde_json::Value::as_u64)
+                .map(|count| count as usize);
+        }
         let batch = body
             .get("repositories")
             .and_then(serde_json::Value::as_array)
@@ -394,6 +439,9 @@ async fn fetch_installation_repositories(
                 .map(str::to_owned)
         }));
         if page_len < 100 {
+            break;
+        }
+        if total_count.is_some_and(|total| repositories.len() >= total) {
             break;
         }
     }
@@ -465,6 +513,9 @@ fn verify_app_jwt(
         .ok_or_else(|| "JWT has no `exp`".to_owned())?;
     if expires_at <= now {
         return Err("JWT is expired".to_owned());
+    }
+    if expires_at > now.saturating_add(600) {
+        return Err("JWT expiration is beyond GitHub's ten-minute App-JWT lifetime".to_owned());
     }
     let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(signature_b64)
@@ -574,15 +625,16 @@ fn find_app_by_id<'a>(
 }
 
 /// Authorization header value in either scheme GitHub accepts (`Bearer` or
-/// `token`).
+/// `token`). HTTP auth-scheme names are case-insensitive, so `bearer`,
+/// `BEARER`, `Token`, etc. all authenticate.
 fn dispatch_bearer(headers: &HeaderMap) -> Option<&str> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
-    for scheme in ["Bearer ", "token ", "Token "] {
-        if let Some(rest) = value.strip_prefix(scheme) {
-            return Some(rest);
-        }
+    let (scheme, rest) = value.split_once(' ')?;
+    if scheme.eq_ignore_ascii_case("Bearer") || scheme.eq_ignore_ascii_case("token") {
+        Some(rest.trim())
+    } else {
+        None
     }
-    None
 }
 
 /// Whether `token` has the shape of a GitHub App JWT: three dot-separated

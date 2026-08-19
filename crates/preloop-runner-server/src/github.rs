@@ -571,8 +571,59 @@ pub(crate) async fn fetch_workflows_at(
     api_base: &str,
 ) -> anyhow::Result<BTreeMap<String, String>> {
     if let Some(base_path) = &shared.state.local_workspace {
-        let workflows_dir = base_path.join(".github/workflows");
         let mut workflows = BTreeMap::new();
+        // A dispatch for a branch other than the checked-out tree must read
+        // the workflow definitions from that ref, not from the working tree.
+        if !git_ref.is_empty() {
+            let commitish: &str = &format!("{git_ref}^{{commit}}");
+            let resolved = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(base_path)
+                .args(["rev-parse", "--verify", commitish])
+                .output()
+                .await?;
+            if resolved.status.success() {
+                let listing = tokio::process::Command::new("git")
+                    .arg("-C")
+                    .arg(base_path)
+                    .args([
+                        "ls-tree", "-r", "--name-only", git_ref, "--", ".github/workflows",
+                    ])
+                    .output()
+                    .await?;
+                if listing.status.success() {
+                    for line in String::from_utf8_lossy(&listing.stdout).lines() {
+                        let path = line.trim();
+                        if path.is_empty() {
+                            continue;
+                        }
+                        let name = path.rsplit('/').next().unwrap_or(path);
+                        if name.ends_with(".yml") || name.ends_with(".yaml") {
+                            let path_ref: &str = &format!("{git_ref}:{path}");
+                            let content = tokio::process::Command::new("git")
+                                .arg("-C")
+                                .arg(base_path)
+                                .args(["show", path_ref])
+                                .output()
+                                .await?;
+                            if content.status.success() {
+                                workflows.insert(
+                                    name.to_owned(),
+                                    String::from_utf8_lossy(&content.stdout).into_owned(),
+                                );
+                            }
+                        }
+                    }
+                }
+                return Ok(workflows);
+            }
+            warn!(
+                %git_ref,
+                workspace = %base_path.display(),
+                "git_ref does not resolve in the local workspace; falling back to the checked-out tree",
+            );
+        }
+        let workflows_dir = base_path.join(".github/workflows");
         if workflows_dir.exists() {
             let mut dir = tokio::fs::read_dir(workflows_dir).await?;
             while let Some(entry) = dir.next_entry().await? {
@@ -1495,12 +1546,6 @@ pub(crate) async fn github_register(headers: HeaderMap) -> impl IntoResponse {
         "default_permissions": {
             "checks": "write",
             "contents": "read",
-            "actions": "read",
-            "issues": "read",
-            "discussions": "read",
-            "deployments": "read",
-            "members": "read",
-            "pages": "read",
             "metadata": "read",
             "pull_requests": "read"
         }

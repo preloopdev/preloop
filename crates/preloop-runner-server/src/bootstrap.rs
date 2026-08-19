@@ -491,6 +491,28 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             }
         });
     }
+    // Additional registered Apps (`github.apps` / `PRELOOP_GITHUB_APPS_JSON`)
+    // get the same startup read-back. The legacy default App — always the
+    // registry's `default_index` — is already covered by the branch above.
+    if let Some(registry) = state.github_apps.as_ref() {
+        for (index, app) in registry.apps.iter().enumerate() {
+            if index == registry.default_index {
+                continue;
+            }
+            let app = app.clone();
+            tokio::spawn(async move {
+                let app_id = app.app_id.clone();
+                match app.read_app_events().await {
+                    Ok(events) => crate::github_app::warn_missing_trigger_events(&app_id, &events),
+                    Err(error) => warn!(
+                        app_id,
+                        ?error,
+                        "could not read back the GitHub App's event subscription at startup"
+                    ),
+                }
+            });
+        }
+    }
     if let Some(path) = &config.record_flows {
         let file = std::fs::OpenOptions::new()
             .create(true)

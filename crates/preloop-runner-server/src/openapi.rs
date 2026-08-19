@@ -218,7 +218,10 @@ impl Modify for SecuritySchemes {
                         "GitHub-compatible dispatch credential: a GitHub App installation \
                          token (own App offline via mint ledger, any App online via GitHub \
                          round-trip), an own-App JWT, a PAT (`PRELOOP_GITHUB_TOKEN`), or the \
-                         system token. Requires `actions: write` on the repository.",
+                         system token. Dispatches require the endpoint's write permission \
+                         on the repository (`actions: write` for workflow dispatch, \
+                         `contents: write` for repository dispatch); the read endpoints \
+                         require repository read access.",
                     ))
                     .build(),
             ),
@@ -599,6 +602,7 @@ fn artifact() {}
     request_body = JsonValue,
     responses(
         (status = 204, description = "Run dispatched"),
+        (status = 400, description = "Malformed JSON body", body = ApiErrorResponse),
         (status = 401, description = "Missing or invalid credential", body = ApiErrorResponse),
         (status = 403, description = "No `actions: write` on the repository", body = ApiErrorResponse),
         (status = 404, description = "Unknown repository or workflow", body = ApiErrorResponse),
@@ -624,6 +628,7 @@ fn workflow_dispatch_trigger() {}
     request_body = JsonValue,
     responses(
         (status = 204, description = "Event dispatched"),
+        (status = 400, description = "Malformed JSON body", body = ApiErrorResponse),
         (status = 401, description = "Missing or invalid credential", body = ApiErrorResponse),
         (status = 403, description = "No dispatch permission on the repository", body = ApiErrorResponse),
         (status = 404, description = "Unknown repository", body = ApiErrorResponse),

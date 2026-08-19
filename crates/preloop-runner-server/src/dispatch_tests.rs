@@ -436,6 +436,12 @@ jobs:
     steps:
       - run: echo any
 "#;
+// `broken.yml` fails workflow *submission* (not trigger matching):
+// `submit_run_inner` validates `on.schedule` crons via
+// `validate_schedule_crons` on every submitted workflow, so the invalid cron
+// is a hard per-workflow submission failure. The broadcast test relies on
+// that: the broken workflow is rejected at submission while its
+// `repository_dispatch` types would otherwise match.
 const RD_BROKEN: &str = r#"
 name: broken
 on:
@@ -655,10 +661,10 @@ async fn dispatch_with_garbage_token_is_401() {
 
 #[tokio::test]
 async fn dispatch_with_pat_authenticates() {
-    // Held for the whole test: the actor fallback depends on github.com being
-    // unreachable, which requires PRELOOP_GITHUB_API_URL to be unset — other
-    // tests pin it under this same lock.
-    let _env_lock = crate::state::GITHUB_ENV_LOCK.lock().await;
+    // Pin the API base to an unreachable loopback port: the PAT actor
+    // fallback depends on github.com being unreachable, and pinning makes
+    // that deterministic regardless of any ambient PRELOOP_GITHUB_API_URL.
+    let _env = pin_api_base("http://127.0.0.1:1").await;
     let (state, app, _temp) = {
         let temp = tempfile::tempdir().unwrap();
         let ws = temp.path().join("ws");
@@ -797,6 +803,11 @@ async fn dispatch_with_expired_app_jwt_is_401() {
 
 #[tokio::test]
 async fn dispatch_with_own_minted_token_authenticates_offline_via_ledger() {
+    // The offline ledger path resolves the bot actor from the App (`GET /app`
+    // when reachable); pin the API base to a closed port so the fallback
+    // `{app_id}[bot]` is deterministic instead of depending on the ambient
+    // network.
+    let (_env, _env_lock) = pin_api_base("http://127.0.0.1:1").await;
     let (state, app, _key, _temp) =
         dispatch_fixture_with_app(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
     record_ledger_token(
@@ -816,9 +827,9 @@ async fn dispatch_with_own_minted_token_authenticates_offline_via_ledger() {
     assert_eq!(status, StatusCode::NO_CONTENT, "body={body}");
     let runs = recorded_runs(&state).await;
     assert_eq!(runs.len(), 1);
-    // The offline ledger path derives the bot actor from the installation's
-    // account login.
-    assert_eq!(runs[0].1.github["actor"], "octocat-org[bot]");
+    // The offline ledger path derives the bot actor from the App id when
+    // github.com cannot resolve the slug.
+    assert_eq!(runs[0].1.github["actor"], "424[bot]");
     // Installation-token dispatches carry the AppDispatch tier (secrets
     // allowed), distinct from AdminManual.
     assert_eq!(

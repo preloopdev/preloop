@@ -10,10 +10,10 @@
 //! submit path.
 //!
 //! Error semantics follow github.com: 401 (bad token), 403 (token valid but
-//! no `actions: write` / repo not accessible), 404 (unknown repo, workflow,
-//! or ref — existence is never leaked), 409 (workflow exists but is not
-//! `workflow_dispatch`-triggered), 422 (input validation, missing
-//! `event_type`).
+//! no `actions: write` or `contents: write` / repo not accessible), 404
+//! (unknown repo, workflow, or ref — existence is never leaked), 409
+//! (workflow exists but is not `workflow_dispatch`-triggered), 422 (input
+//! validation, missing `event_type`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -41,7 +41,7 @@ pub(crate) async fn workflow_dispatch(
     Extension(identity): Extension<DispatchIdentity>,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    authorize_dispatch(&identity, &owner, &repo)?;
+    authorize_workflow_dispatch(&identity, &owner, &repo)?;
     let repository = format!("{owner}/{repo}");
     let object = parse_object(&body)?;
     let selected_ref = object
@@ -133,7 +133,7 @@ pub(crate) async fn repository_dispatch(
     Extension(identity): Extension<DispatchIdentity>,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    authorize_dispatch(&identity, &owner, &repo)?;
+    authorize_repository_dispatch(&identity, &owner, &repo)?;
     let repository = format!("{owner}/{repo}");
     let object = parse_object(&body)?;
     let event_type = object
@@ -311,9 +311,10 @@ pub(crate) async fn list_actions_runs(
     ))
 }
 
-/// Shared authorization for the dispatch POSTs: `actions: write` on the repo
-/// plus repository reachability.
-fn authorize_dispatch(
+/// Authorization for the workflow_dispatch POST
+/// (`POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches`):
+/// `actions: write` on the repo plus repository reachability.
+fn authorize_workflow_dispatch(
     identity: &DispatchIdentity,
     owner: &str,
     repo: &str,
@@ -326,6 +327,27 @@ fn authorize_dispatch(
     if !identity.has_actions_write() {
         return Err(ApiError::forbidden(
             "the installation token does not grant `actions: write` on this repository",
+        ));
+    }
+    Ok(())
+}
+
+/// Authorization for the repository_dispatch POST
+/// (`POST /repos/{owner}/{repo}/dispatches`): `contents: write` on the repo
+/// plus repository reachability.
+fn authorize_repository_dispatch(
+    identity: &DispatchIdentity,
+    owner: &str,
+    repo: &str,
+) -> Result<(), ApiError> {
+    if !identity.covers_repository(owner, repo) {
+        return Err(ApiError::forbidden(format!(
+            "the installation token cannot access {owner}/{repo}"
+        )));
+    }
+    if !identity.has_contents_write() {
+        return Err(ApiError::forbidden(
+            "the installation token does not grant `contents: write` on this repository",
         ));
     }
     Ok(())
@@ -550,6 +572,28 @@ async fn resolve_default_branch(
             .arg("-C")
             .arg(workspace)
             .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+            .output()
+            .await;
+        if let Ok(output) = output {
+            if output.status.success() {
+                if let Ok(branch) = String::from_utf8(output.stdout) {
+                    // `git symbolic-ref --short refs/remotes/origin/HEAD` emits
+                    // `origin/<branch>` (e.g. `origin/main`) — strip the remote
+                    // prefix so the caller builds `refs/heads/main`.
+                    let trimmed = branch.trim();
+                    let branch = trimmed.strip_prefix("origin/").unwrap_or(trimmed);
+                    if !branch.is_empty() && !branch.contains(' ') {
+                        return Ok(branch.to_owned());
+                    }
+                }
+            }
+        }
+        // No `origin/HEAD`: answer with the currently checked-out branch,
+        // keeping `"main"` only as the final fallback (e.g. a detached HEAD).
+        let output = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(workspace)
+            .args(["symbolic-ref", "--short", "HEAD"])
             .output()
             .await;
         if let Ok(output) = output {

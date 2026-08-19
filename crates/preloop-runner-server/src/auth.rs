@@ -374,11 +374,6 @@ pub(crate) async fn runner_surface_only(
         // system credential, which workflow code never holds — so the carve
         // out cannot be used to mint anything.
         || (path.starts_with("/api/v3/") && path != "/api/v3/actions/runner-registration")
-        // `/repos/*` is the GitHub-compatible dispatch API — an
-        // engine-facing surface that workflow code must never reach through
-        // the mounted control socket, or a job could dispatch more runs with
-        // the server's authority.
-        || path.starts_with("/repos/")
         || (path.starts_with("/api/v1/")
             && !path.starts_with("/api/v1/actions/")
             && !worker_debug_route);

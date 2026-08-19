@@ -246,6 +246,15 @@ pub(crate) struct GitHubAppCredentials {
     /// Explicit installation id for single-installation deployments of this
     /// App, bypassing installation discovery.
     pub(crate) installation_id: Option<u64>,
+    /// Owning account login per override installation id, keyed by
+    /// (app id, installation id).
+    ///
+    /// An override installation id bypasses discovery, so nothing else checks
+    /// that the installation actually belongs to the repository's owner —
+    /// minting against a foreign installation would hand the job a token
+    /// GitHub scopes to someone else's repositories. The verified owner is
+    /// cached so the check costs one API call per (app, installation) pair.
+    verified_installation_owners: Arc<parking_lot::Mutex<HashMap<(String, u64), String>>>,
 }
 
 /// Registry of every configured GitHub App.
@@ -272,11 +281,16 @@ impl GitHubApps {
     pub(crate) fn webhook_secrets(&self, legacy: Option<&str>) -> Vec<String> {
         let mut secrets: Vec<String> = Vec::new();
         if let Some(legacy) = legacy {
-            secrets.push(legacy.to_owned());
+            // An empty secret makes `X-Hub-Signature-256` verification pass
+            // for the empty key — forgeable by anyone — so blank values are
+            // never registered.
+            if !legacy.is_empty() {
+                secrets.push(legacy.to_owned());
+            }
         }
         for app in &self.apps {
             if let Some(secret) = &app.webhook_secret {
-                if !secrets.iter().any(|have| have == secret) {
+                if !secret.is_empty() && !secrets.iter().any(|have| have == secret) {
                     secrets.push(secret.clone());
                 }
             }
@@ -359,6 +373,7 @@ impl GitHubAppCredentials {
             mint_ledger: Arc::new(MintLedger::default()),
             webhook_secret: None,
             installation_id: None,
+            verified_installation_owners: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
     }
 }
@@ -446,6 +461,7 @@ pub(crate) fn load_from(
                 // (`PRELOOP_WEBHOOK_SECRET`); the receiver dedups.
                 webhook_secret: None,
                 installation_id: installation_id_override()?,
+                verified_installation_owners: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             });
         }
         (None, None) => {}
@@ -491,6 +507,7 @@ pub(crate) fn load_from(
             mint_ledger: Arc::new(MintLedger::default()),
             webhook_secret: app.webhook_secret,
             installation_id: app.installation_id,
+            verified_installation_owners: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         });
     }
 
@@ -501,6 +518,61 @@ pub(crate) fn load_from(
         apps,
         default_index,
     }))
+}
+
+/// Every registered App whose installation covers `repository`'s owner, in
+/// registry order (D6).
+///
+/// With no registry, the legacy field (`shared.state.github_app`, tests and
+/// older callers) is the whole candidate list. With a registry, each App
+/// whose `installation_id_for` succeeds for the owner is a candidate — an
+/// App whose installation cannot reach the repository must not silently block
+/// a later one that can. A registry of exactly one App falls back to that App
+/// even when its installation lookup fails, exactly as `select_app_for_repo`
+/// always has: a lone misconfigured App is still the only App minting can
+/// try, and the mint failure policy (not selection) decides what happens.
+pub(crate) async fn candidate_apps_for_repo(
+    shared: &crate::state::SharedState,
+    repository: &str,
+) -> Vec<GitHubAppCredentials> {
+    let Some(registry) = shared.state.github_apps.as_ref() else {
+        // No registry — the legacy field (tests, older callers) is the App.
+        return shared.state.github_app.clone().into_iter().collect();
+    };
+    let owner = match split_repository(repository) {
+        Ok((owner, _)) => owner.to_owned(),
+        Err(_) => {
+            if registry.apps.len() == 1 {
+                return vec![registry.default_app().clone()];
+            }
+            return Vec::new();
+        }
+    };
+    let api_base = api_base();
+    let mut candidates: Vec<GitHubAppCredentials> = Vec::new();
+    for app in &registry.apps {
+        let app_jwt = match sign_app_jwt(&app.app_id, &app.private_key) {
+            Ok(jwt) => jwt,
+            Err(_) => continue,
+        };
+        if installation_id_for(&api_base, app, &app_jwt, &owner)
+            .await
+            .is_ok()
+        {
+            candidates.push(app.clone());
+        }
+    }
+    if candidates.is_empty() && registry.apps.len() == 1 {
+        candidates.push(registry.default_app().clone());
+    }
+    if candidates.is_empty() {
+        debug!(
+            repository,
+            apps_checked = registry.apps.len(),
+            "no registered GitHub App is installed on repository owner"
+        );
+    }
+    candidates
 }
 
 /// Select the App whose installation covers `repository`'s owner (D6).
@@ -514,42 +586,10 @@ pub(crate) async fn select_app_for_repo(
     shared: &crate::state::SharedState,
     repository: &str,
 ) -> Option<GitHubAppCredentials> {
-    let Some(registry) = shared.state.github_apps.as_ref() else {
-        // No registry — the legacy field (tests, older callers) is the App.
-        return shared.state.github_app.clone();
-    };
-    let owner = match split_repository(repository) {
-        Ok((owner, _)) => owner.to_owned(),
-        Err(_) => {
-            if registry.apps.len() == 1 {
-                return Some(registry.default_app().clone());
-            }
-            return None;
-        }
-    };
-    let api_base = api_base();
-    for app in &registry.apps {
-        let app_jwt = match sign_app_jwt(&app.app_id, &app.private_key) {
-            Ok(jwt) => jwt,
-            Err(_) => continue,
-        };
-        if installation_id_for(&api_base, app, &app_jwt, &owner)
-            .await
-            .is_ok()
-        {
-            return Some(app.clone());
-        }
-    }
-    if registry.apps.len() == 1 {
-        Some(registry.default_app().clone())
-    } else {
-        debug!(
-            repository,
-            apps_checked = registry.apps.len(),
-            "no registered GitHub App is installed on repository owner"
-        );
-        None
-    }
+    candidate_apps_for_repo(shared, repository)
+        .await
+        .into_iter()
+        .next()
 }
 
 /// Mint an installation token for `repository`, scoped to `permissions`.
@@ -889,9 +929,13 @@ async fn installation_id_for(
     // Per-App override first (D6 `AppConfig.installation_id`), then the
     // legacy global env override, then discovery (cached).
     if let Some(installation_id) = creds.installation_id {
+        verify_override_installation_owner(api_base, creds, app_jwt, installation_id, owner)
+            .await?;
         return Ok(installation_id);
     }
     if let Some(installation_id) = installation_id_override()? {
+        verify_override_installation_owner(api_base, creds, app_jwt, installation_id, owner)
+            .await?;
         return Ok(installation_id);
     }
     let key = owner.to_ascii_lowercase();
@@ -908,6 +952,72 @@ async fn installation_id_for(
         .await
         .insert(key, installation_id);
     Ok(installation_id)
+}
+
+/// Verify that an override installation id belongs to `owner`'s account.
+///
+/// Overrides (`AppConfig.installation_id`, `PRELOOP_GITHUB_APP_INSTALLATION_ID`)
+/// bypass discovery, so nothing else checks that the installation GitHub
+/// resolves under the id is on the account the repository names. Minting
+/// against a foreign installation would hand the job a token GitHub scopes to
+/// someone else's repositories (or select the wrong App entirely), so the
+/// owning account is fetched once per (app id, installation id) and cached;
+/// discovery (`find_installation`) already matches the owner and is untouched.
+async fn verify_override_installation_owner(
+    api_base: &str,
+    creds: &GitHubAppCredentials,
+    app_jwt: &str,
+    installation_id: u64,
+    owner: &str,
+) -> anyhow::Result<()> {
+    let cache_key = (creds.app_id.clone(), installation_id);
+    if let Some(verified) = creds.verified_installation_owners.lock().get(&cache_key) {
+        if verified.eq_ignore_ascii_case(owner) {
+            return Ok(());
+        }
+        // The installation's account is fixed by GitHub; a different owner
+        // asking for it is a mismatch, and the cached login is the account
+        // that owns it.
+        bail!(
+            "installation {installation_id} belongs to {verified:?}, not {owner:?}: \
+             the GitHub App installation id override does not cover {owner}"
+        );
+    }
+    let url = format!("{api_base}/app/installations/{installation_id}");
+    let response = CLIENT
+        .get(&url)
+        .header("User-Agent", "preloop")
+        .header("Authorization", format!("Bearer {app_jwt}"))
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    let status = response.status();
+    let payload = response
+        .text()
+        .await
+        .with_context(|| format!("GET {url} response body"))?;
+    if !status.is_success() {
+        let message: String = payload.chars().take(1024).collect();
+        bail!("GET {url} failed with {status}: {message}");
+    }
+    let payload: serde_json::Value = serde_json::from_str(&payload)
+        .with_context(|| format!("GET {url} returned a non-JSON body"))?;
+    let actual = payload
+        .pointer("/account/login")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if !actual.eq_ignore_ascii_case(owner) {
+        bail!(
+            "installation {installation_id} belongs to {actual:?}, not {owner:?}: \
+             the GitHub App installation id override does not cover {owner}"
+        );
+    }
+    creds
+        .verified_installation_owners
+        .lock()
+        .insert(cache_key, actual.to_owned());
+    Ok(())
 }
 
 /// Explicit installation id from `PRELOOP_GITHUB_APP_INSTALLATION_ID`, which
@@ -1313,6 +1423,7 @@ fn credentials_for(app_id: &str, pem: &str) -> anyhow::Result<GitHubAppCredentia
         mint_ledger: Arc::new(MintLedger::default()),
         webhook_secret: None,
         installation_id: None,
+        verified_installation_owners: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     })
 }
 
@@ -1592,6 +1703,7 @@ mod tests {
             mint_ledger: Arc::new(MintLedger::default()),
             webhook_secret: None,
             installation_id: None,
+            verified_installation_owners: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         };
         let permissions = BTreeMap::from([
             ("contents".to_owned(), "read".to_owned()),
