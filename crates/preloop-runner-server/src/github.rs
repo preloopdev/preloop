@@ -1733,7 +1733,13 @@ mod tests {
     }
 
     #[test]
-    fn manifest_default_events_use_minimal_ci_defaults() {
+    #[tokio::test]
+    async fn manifest_default_events_use_minimal_ci_defaults() {
+        // Held for the whole test: `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` is
+        // process-global and other tests build apps concurrently; the
+        // fallback must be asserted with the override absent.
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        std::env::remove_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS");
         let defaults = manifest_default_events();
         assert_eq!(defaults, vec!["push", "pull_request"]);
     }

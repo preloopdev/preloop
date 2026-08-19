@@ -1122,7 +1122,11 @@ async fn third_party_installation_token_dispatches_when_it_holds_actions_write()
     let calls = Arc::new(parking_lot::Mutex::new(0));
     let mut permissions = serde_json::Map::new();
     permissions.insert("actions".to_owned(), json!("write"));
-    permissions.insert("contents".to_owned(), json!("read"));
+    // The repository_dispatch leg below is gated on `contents: write`
+    // (github.com parity), so the token holds both endpoint write
+    // permissions: `actions: write` for workflow_dispatch, `contents:
+    // write` for repository_dispatch.
+    permissions.insert("contents".to_owned(), json!("write"));
     let stub = installation_stub(
         Arc::clone(&calls),
         permissions,
