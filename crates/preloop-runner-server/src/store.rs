@@ -18,8 +18,8 @@ use async_trait::async_trait;
 use preloop_gha_protocol::SessionId;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use sha2::Digest;
-use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex as StdMutex;
 
 const DATABASE_FILE: &str = "preloop.db";
 pub(crate) const SNAPSHOT_FORMAT: u8 = 2;

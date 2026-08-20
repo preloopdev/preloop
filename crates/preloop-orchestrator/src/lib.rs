@@ -3633,13 +3633,10 @@ fn fork_base_unusable(error: &VmError) -> bool {
 fn managed_golden(config: &RunnerPoolConfig, golden: &MachineName) -> bool {
     let prefix = format!("{}-golden", config.name_prefix);
     golden.as_str() == prefix
-        || golden
-            .as_str()
-            .strip_prefix(&prefix)
-            .is_some_and(|rest| {
-                rest.strip_prefix('-')
-                    .is_some_and(|fp| fp.len() == 12 && fp.bytes().all(|b| b.is_ascii_hexdigit()))
-            })
+        || golden.as_str().strip_prefix(&prefix).is_some_and(|rest| {
+            rest.strip_prefix('-')
+                .is_some_and(|fp| fp.len() == 12 && fp.bytes().all(|b| b.is_ascii_hexdigit()))
+        })
 }
 
 /// Create, boot, and register one ephemeral runner; return its `run` argv.
@@ -3659,8 +3656,7 @@ async fn provision_runner<P: VmProvider + 'static>(
         Some(golden) => match provider.fork(golden, name).await {
             Ok(()) => Some(golden),
             Err(error @ VmError::ForkBaseBusy { .. })
-                if config.use_packed_artifact
-                    && managed_golden(config, golden) =>
+                if config.use_packed_artifact && managed_golden(config, golden) =>
             {
                 // A live plain-fork clone still depends on the golden's frozen
                 // storage. Do not touch the base and do not create another VM
@@ -3676,9 +3672,7 @@ async fn provision_runner<P: VmProvider + 'static>(
                 direct_create_from_packed = false;
                 None
             }
-            Err(error)
-                if config.use_packed_artifact && managed_golden(config, golden) =>
-            {
+            Err(error) if config.use_packed_artifact && managed_golden(config, golden) => {
                 if fork_base_unusable(&error) {
                     // The base is spent. Re-arm it atomically with forking:
                     // partial-clone cleanup, the live-clone check, and the
@@ -3822,8 +3816,7 @@ async fn provision_runner<P: VmProvider + 'static>(
         // so an env-golden fork boots the bare stock base image. Install the
         // apt baseline and toolchains into the fork itself — it is the job's
         // single-use machine, so the writes persist for its lifetime.
-        let golden_is_packed =
-            config.use_packed_artifact && managed_golden(config, golden);
+        let golden_is_packed = config.use_packed_artifact && managed_golden(config, golden);
         if golden_is_packed {
             // The pack carries the apt baseline, but not necessarily apt's
             // indices — restore them before any workflow apt-installs. A
