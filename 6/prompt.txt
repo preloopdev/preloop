@@ -1,0 +1,5 @@
+Complete assignment thoroughly:
+
+# Target: crates/preloop-runner-server/src/{auth.rs,routes.rs,lib.rs,main.rs,config.rs,openapi.rs,errors.rs}
+# Change: Read each file thoroughly. Enumerate: (a) all routes gated by runner_bearer / job_runtime_bearer / debug_worker_bearer, (b) tower body limits (DefaultBodyLimit, RequestBodyLimit, ContentLengthLimit), (c) auth middleware allocations, (d) any Json/Bytes/Form extraction that buffers whole body.
+# Acceptance: List every authenticated route with its auth tier, extractor type, explicit body limit or "NONE", and max buffered size. Cite file:line.
