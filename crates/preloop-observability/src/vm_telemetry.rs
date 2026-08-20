@@ -79,8 +79,14 @@ pub fn build_fleet_snapshot(
     let runner = infos.iter().filter(|i| i.role == "runner").count() as u32;
     let golden = infos.iter().filter(|i| i.role == "golden").count() as u32;
     let vcpus: u32 = infos.iter().map(|i| u32::from(i.cpus)).sum();
-    let memory_bytes: u64 = infos.iter().map(|i| u64::from(i.memory_mib) * 1024 * 1024).sum();
-    let storage_bytes: u64 = infos.iter().map(|i| u64::from(i.storage_gb) * 1024 * 1024 * 1024).sum();
+    let memory_bytes: u64 = infos
+        .iter()
+        .map(|i| u64::from(i.memory_mib) * 1024 * 1024)
+        .sum();
+    let storage_bytes: u64 = infos
+        .iter()
+        .map(|i| u64::from(i.storage_gb) * 1024 * 1024 * 1024)
+        .sum();
     let overlay_bytes: u64 = infos
         .iter()
         .filter_map(|i| i.overlay_gb.map(|v| u64::from(v) * 1024 * 1024 * 1024))

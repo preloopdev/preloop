@@ -441,6 +441,7 @@ fn build_operational_snapshot_sync(
     shutdown_requested: bool,
     scheduler_enabled: bool,
     state_dir: &std::path::Path,
+    github_configured: bool,
 ) -> preloop_observability::status::OperationalSnapshot {
     use chrono::Utc;
     use preloop_observability::status::*;
@@ -548,7 +549,10 @@ fn build_operational_snapshot_sync(
         },
         limits: Vec::new(),
         tasks: Vec::new(),
-        github: GithubSnapshot::default(),
+        github: GithubSnapshot {
+            configured: github_configured,
+            ..Default::default()
+        },
         debug: DebugSnapshot::default(),
         telemetry: TelemetrySnapshot::default(),
         conditions: Vec::new(),
@@ -612,6 +616,7 @@ async fn run_state_sampler(shared: Arc<SharedState>) {
                     shared.shutdown.is_cancelled(),
                     scheduler_enabled,
                     &shared.state.state_dir,
+                    shared.state.github_app.is_some(),
                 );
                 *shared.state.status_snapshot.write() = snap;
             }
@@ -682,6 +687,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             false,
             false,
             &state.state_dir,
+            state.github_app.is_some(),
         );
         *state.status_snapshot.write() = init;
     }
