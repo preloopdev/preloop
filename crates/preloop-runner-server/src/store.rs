@@ -817,6 +817,39 @@ pub(crate) fn restore_session_key(
     Ok(SessionEncryption::from_key(payload.0))
 }
 
+/// Bound the WAL after a commit, and fail loudly when the checkpoint could not
+/// complete.
+///
+/// `PRAGMA wal_checkpoint(TRUNCATE)` returns a result row of
+/// `(busy, log_frames, checkpointed_frames)`; a blocked checkpoint reports
+/// `busy = 1` but does not raise a SQL error, so discarding the row would
+/// treat "WAL still full" as success. Backing off here also keeps one write
+/// from starving the next: the retry gives competing readers time to finish
+/// before we TRUNCATE again. Every post-commit write path funnels through
+/// this helper.
+fn checkpoint_wal(connection: &Connection) -> anyhow::Result<()> {
+    for _ in 0..10 {
+        let (busy, log, checkpointed) =
+            connection.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+        if busy == 0 {
+            return Ok(());
+        }
+        tracing::warn!(
+            log_frames = log,
+            checkpointed_frames = checkpointed,
+            "WAL checkpoint blocked; retrying"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    anyhow::bail!("WAL checkpoint stayed blocked after retries")
+}
+
 impl SqliteStore {
     pub(crate) fn open(path: &std::path::Path, cipher: Envelope) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
@@ -1201,6 +1234,7 @@ impl SqliteStore {
         )?;
         tx.commit()
             .map_err(|error| anyhow::anyhow!("committing log chunk: {error}"))?;
+        checkpoint_wal(&connection)?;
         Ok(())
     }
 
@@ -1349,9 +1383,7 @@ impl SqliteStore {
         // The WAL grows with every runner event; an unbounded WAL (hundreds of
         // MB) makes the next write's checkpoint sync stall the server for
         // minutes. Keep it small so a commit is never a multi-hundred-MB sync.
-        connection
-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-            .map_err(|error| anyhow::anyhow!("checkpointing WAL: {error}"))?;
+        checkpoint_wal(&connection)?;
         Ok(())
     }
 
@@ -1390,9 +1422,7 @@ impl SqliteStore {
         // Same rationale as the full-snapshot path: keep the WAL bounded so a
         // runner-event burst cannot stall the next commit behind a giant
         // checkpoint sync.
-        connection
-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-            .map_err(|error| anyhow::anyhow!("checkpointing WAL: {error}"))?;
+        checkpoint_wal(&connection)?;
         Ok(())
     }
 
@@ -1415,6 +1445,7 @@ impl SqliteStore {
         )?;
         tx.commit()
             .map_err(|error| anyhow::anyhow!("committing workflow run counter: {error}"))?;
+        checkpoint_wal(&connection)?;
         Ok(())
     }
 
@@ -1424,6 +1455,7 @@ impl SqliteStore {
         self.write_meta_tx(&tx, meta)?;
         tx.commit()
             .map_err(|error| anyhow::anyhow!("committing metadata: {error}"))?;
+        checkpoint_wal(&connection)?;
         Ok(())
     }
 
@@ -1570,6 +1602,7 @@ impl SqliteStore {
         self.insert_event_tx(&tx, event)?;
         tx.commit()
             .map_err(|error| anyhow::anyhow!("committing control event: {error}"))?;
+        checkpoint_wal(&connection)?;
         Ok(())
     }
 

@@ -1305,7 +1305,7 @@ fn docker_start_command() -> Vec<String> {
              modprobe overlay >/dev/null 2>&1 || true; \
              modprobe fuse >/dev/null 2>&1 || true; \
              mkdir -p /tmp/.preloop-ovprobe; \
-             if mount -t overlay overlay -o lowerdir=/tmp,/usr /tmp/.preloop-ovprobe 2>/dev/null; then \
+             if mount -t overlay overlay -o lowerdir=/tmp:/usr /tmp/.preloop-ovprobe 2>/dev/null; then \
                umount /tmp/.preloop-ovprobe 2>/dev/null || true; \
                DRIVER=overlay2; \
              else \
@@ -1313,17 +1313,28 @@ fn docker_start_command() -> Vec<String> {
              fi; \
              rmdir /tmp/.preloop-ovprobe 2>/dev/null || true; \
              printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\",\"storage-driver\":\"%s\"}}\\n' \"$DRIVER\" > /etc/docker/daemon.json; \
-             (dockerd >/var/log/dockerd.log 2>&1 &) ; \
-             for _ in $(seq 1 50); do \
-               docker info >/dev/null 2>&1 && exit 0; \
-               sleep 0.2; \
-             done; \
+             start_dockerd() {{ \
+               rm -f /var/run/docker.pid; \
+               dockerd >/var/log/dockerd.log 2>&1 & \
+               DOCKERD_PID=$!; \
+               ready=0; \
+               for _ in $(seq 1 50); do \
+                 docker info >/dev/null 2>&1 && {{ ready=1; break; }}; \
+                 sleep 0.2; \
+               done; \
+               if [ \"$ready\" -eq 0 ]; then \
+                 kill \"$DOCKERD_PID\" 2>/dev/null || true; \
+                 for _ in $(seq 1 25); do \
+                   kill -0 \"$DOCKERD_PID\" 2>/dev/null || break; \
+                   sleep 0.2; \
+                 done; \
+                 return 1; \
+               fi; \
+               return 0; \
+             }}; \
+             if start_dockerd; then exit 0; fi; \
              rm -rf {DOCKER_DATA_ROOT}/*; \
-             (dockerd >/var/log/dockerd.log 2>&1 &) ; \
-             for _ in $(seq 1 50); do \
-               docker info >/dev/null 2>&1 && exit 0; \
-               sleep 0.2; \
-             done; \
+             start_dockerd; \
              exit 0"
         )),
     ]
@@ -1933,7 +1944,8 @@ async fn prepare_rosetta_multiarch<P: VmProvider>(
     // scoping, every later apt-get update (including the per-fork
     // hosted-baseline install) fails on the amd64 fetch.
     let script = run_as_root_or_sudo(
-        "case \"$(uname -m)\" in \
+        "set -e; \
+         case \"$(uname -m)\" in \
            aarch64|arm64) ;; \
            *) echo 'guest is not arm64; rosetta multiarch install is a no-op' >&2; exit 0 ;; \
          esac; \
@@ -2086,6 +2098,18 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
         return Err(error);
     }
     if env_spec.curated {
+        // Same contract as the packed-golden path: on Apple Silicon the
+        // multiarch shim must reach the forkable base, or every dynamically
+        // linked x86_64 binary fails at job time. Runs before the baseline
+        // install so the amd64 sources are scoped before any later apt
+        // update. Fatal, not a warning — a half-installed golden would be
+        // adopted on later restarts (amd64 arch added, loader missing).
+        // Custom bases skip it along with the rest of the bake: the image is
+        // the operator's contract.
+        if let Err(error) = prepare_rosetta_multiarch(provider.as_ref(), golden).await {
+            let _ = provider.delete(golden).await;
+            return Err(error);
+        }
         if let Err(error) = install_base_dependencies(provider.as_ref(), golden).await {
             let _ = provider.delete(golden).await;
             return Err(error);
@@ -4695,10 +4719,8 @@ chmod +x "$destination/bin/node"
         let all = blobs
             .iter()
             .map(|b| {
-                String::from_utf8(
-                    base64::engine::general_purpose::STANDARD.decode(b).unwrap(),
-                )
-                .unwrap()
+                String::from_utf8(base64::engine::general_purpose::STANDARD.decode(b).unwrap())
+                    .unwrap()
             })
             .collect::<Vec<_>>()
             .join("\n");
