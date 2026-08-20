@@ -749,7 +749,8 @@ async fn main() -> anyhow::Result<()> {
     // `RUST_LOG` defaults to `info` (the old `fmt::init()` default of ERROR hid
     // pool provisioning faults). The runtime is held for the life of `main`
     // and flushed with a bounded 2s shutdown on exit.
-    let obs_config = preloop_observability::ObservabilityConfig::from_env();
+    let obs_config = preloop_observability::ObservabilityConfig::from_env()
+        .with_service_version(env!("CARGO_PKG_VERSION"));
     let (observability, observability_runtime) =
         preloop_observability::Observability::from_config(obs_config);
     preloop_observability::ObservabilityRuntime::install_fmt_subscriber(observability.config());

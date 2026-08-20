@@ -79,7 +79,8 @@ async fn main() -> anyhow::Result<()> {
     // like the CLI, instead of falling silent when unset. `PRELOOP_LOG_FORMAT`
     // controls pretty/json/auto. The `Observability` handle will be cloned
     // into `AppState`; for now it is held for the life of `main`.
-    let obs_config = preloop_observability::ObservabilityConfig::from_env();
+    let obs_config = preloop_observability::ObservabilityConfig::from_env()
+        .with_service_version(env!("CARGO_PKG_VERSION"));
     let (observability, observability_runtime) =
         preloop_observability::Observability::from_config(obs_config);
     preloop_observability::ObservabilityRuntime::install_fmt_subscriber(observability.config());

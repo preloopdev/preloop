@@ -72,6 +72,9 @@ pub struct ObservabilityConfig {
     pub rust_log: String,
     /// `service.name` — `preloop` or `OTEL_SERVICE_NAME`.
     pub service_name: String,
+    /// `service.version` — set by the host binary via `with_service_version`.
+    /// Defaults to this crate's version only until the binary overrides it.
+    pub service_version: String,
     /// Per-process instance ID (UUID v4).
     pub instance_id: String,
     /// `OTEL_EXPORTER_OTLP_ENDPOINT` or signal-specific variant, if any. Kept as
@@ -125,6 +128,7 @@ impl ObservabilityConfig {
             log_format,
             rust_log,
             service_name,
+            service_version: env!("CARGO_PKG_VERSION").to_string(),
             instance_id,
             otel_endpoint,
             otel_headers,
@@ -140,6 +144,13 @@ impl ObservabilityConfig {
     /// Whether any `OTEL_EXPORTER_OTLP_HEADERS` was supplied (for health reporting).
     pub fn has_otel_headers(&self) -> bool {
         self.otel_headers.is_some()
+    }
+
+    /// Override `service.version` with the host binary's version. The crate's
+    /// own version is meaningless to an operator reading telemetry.
+    pub fn with_service_version(mut self, version: &str) -> Self {
+        self.service_version = version.to_string();
+        self
     }
 
     /// Raw headers for transport construction. Never logged or in `Debug`.
@@ -171,6 +182,7 @@ impl fmt::Debug for ObservabilityConfig {
             .field("log_format", &self.log_format)
             .field("rust_log", &self.rust_log)
             .field("service_name", &self.service_name)
+            .field("service_version", &self.service_version)
             .field("instance_id", &self.instance_id)
             .field(
                 "otel_endpoint",
@@ -408,6 +420,7 @@ impl Observability {
             log_format: LogFormat::Auto,
             rust_log: "info".to_string(),
             service_name: "preloop".to_string(),
+            service_version: env!("CARGO_PKG_VERSION").to_string(),
             instance_id: Uuid::new_v4().to_string(),
             otel_endpoint: None,
             otel_headers: None,
@@ -435,6 +448,7 @@ impl Observability {
             config.otel_headers_raw(),
             &config.service_name,
             &config.instance_id,
+            &config.service_version,
         )
         .map(|(exporter, _health)| exporter);
         let handle = Self {
