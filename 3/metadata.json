@@ -1,0 +1,30 @@
+{
+  "cli_version": "0.10.0",
+  "checkpoint_id": "01M0GAKYM6G0NKH9HMWMFWGJCS",
+  "session_id": "01a01b95-b852-7001-9a28-79beb219bd0d",
+  "strategy": "manual-commit",
+  "created_at": "2026-08-20T19:33:33.314137Z",
+  "branch": "Bnjoroge/oobservability",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "docs/internal/observability.md"
+  ],
+  "agent": "Oh My Pi",
+  "model": "",
+  "turn_id": "09a5ca00f7ac",
+  "checkpoint_transcript_start": 32,
+  "transcript_lines_at_start": 32,
+  "compact_transcript_start": 9,
+  "initial_attribution": {
+    "calculated_at": "2026-08-20T19:33:33.303008Z",
+    "agent_lines": 0,
+    "agent_removed": 0,
+    "human_added": 87,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 87,
+    "total_lines_changed": 87,
+    "agent_percentage": 0,
+    "metric_version": 2
+  }
+}
