@@ -1,0 +1,43 @@
+# Optional reference telemetry backend. Preloop never starts this — it is
+# opt-in, loopback-bound, and pinned by digest. Credentials come from the
+# environment (systemd LoadCredential / .env outside version control),
+# never from this file.
+#
+# Upstream: https://github.com/openobserve/openobserve (AGPL-3.0).
+# Run the stock image as a separate process; do not vendor or modify it.
+services:
+  openobserve:
+    # Digest-pinned: a floating tag is not an immutable input.
+    image: public.ecr.aws/zinclabs/openobserve@sha256:88fb692ac791d3eaff69653a4a4686f1c7eceb9e105491d58d29ac2739560b3b
+    container_name: preloop-openobserve
+    restart: unless-stopped
+    # Loopback only. The OSS build has no SSO/RBAC — never put the UI on the
+    # public webhook origin. Front it with operator auth if shared.
+    ports:
+      - "127.0.0.1:5080:5080"
+    environment:
+      ZO_ROOT_USER_EMAIL: ${ZO_ROOT_USER_EMAIL:-admin@preloop.local}
+      ZO_ROOT_USER_PASSWORD: ${ZO_ROOT_USER_PASSWORD:-ChangeMe.Preloop1}
+      ZO_DATA_DIR: /data
+      # Short retention: this is operational telemetry (hours/days), not a
+      # data lake. Losing SQLite metadata makes the install inoperable, so
+      # back up the volume if you rely on it.
+      ZO_COMPACT_DATA_RETENTION_DAYS: "7"
+      ZO_TELEMETRY: "false"
+    volumes:
+      - openobserve-data:/data
+    # Measured caps: do not starve the VM pool. Re-measure on your host.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 2G
+    healthcheck:
+      test: ["CMD", "sh", "-c", "wget -qO- http://127.0.0.1:5080/healthz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 20s
+
+volumes:
+  openobserve-data:
