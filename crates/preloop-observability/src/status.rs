@@ -1,7 +1,5 @@
-//! Step 3 DTOs — OperationalSnapshot and supporting types.
+//!OperationalSnapshot and supporting types.
 //!
-//! Neutral, serializable DTOs shared by server and CLI. No dependency on
-//! server/orchestrator internals. Metric labels use only bounded enums.
 
 use std::sync::Arc;
 
@@ -218,15 +216,13 @@ impl PoolStatus {
 
     pub fn insert_pending(&self, token: String, at: std::time::SystemTime) {
         self.pending_tokens.write().insert(token, at);
-        self.inner.write().pending_registrations = self.pending_tokens.read().len() as u32;
+        // `snapshot()` derives `pending_registrations` from `pending_tokens`;
+        // writing it here too would be dead state plus a lock-order coupling
+        // between the two guards.
     }
 
     pub fn remove_pending(&self, token: &str) -> bool {
-        let removed = self.pending_tokens.write().remove(token).is_some();
-        if removed {
-            self.inner.write().pending_registrations = self.pending_tokens.read().len() as u32;
-        }
-        removed
+        self.pending_tokens.write().remove(token).is_some()
     }
 
     pub fn pending_tokens_snapshot(
@@ -237,7 +233,7 @@ impl PoolStatus {
 }
 
 // ---------------------------------------------------------------------------
-// VMs (stubbed for Step 3, full host sampler is Step 5)
+// VMs
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -283,9 +279,15 @@ pub struct VmConfigured {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VmHostUsage {
-    pub cpu_cores: f64,
-    pub memory_bytes: u64,
-    pub sparse_disk_allocated_bytes: u64,
+    /// `None` means "not measured yet" — absent in JSON, not a real zero.
+    /// A consumer of `/api/v1/status` must not read an idle fleet from an
+    /// unmeasured one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_cores: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sparse_disk_allocated_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -403,10 +405,6 @@ pub struct TaskEntry {
     pub state: String,
 }
 
-// ---------------------------------------------------------------------------
-// Conditions
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Condition {
     pub code: String,
@@ -422,10 +420,6 @@ pub struct ConditionExemplar {
     pub runner_id: Option<String>,
     pub machine_name: Option<String>,
 }
-
-// ---------------------------------------------------------------------------
-// OperationalSnapshot — the versioned status body
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperationalSnapshot {
@@ -459,7 +453,10 @@ impl Default for OperationalSnapshot {
             snapshot_age_seconds: 0.0,
             overall: Overall::Ok,
             service: ServiceSnapshot {
-                version: env!("CARGO_PKG_VERSION").to_string(),
+                // The host binary owns this value; this crate's version is
+                // meaningless to an operator reading status, and a stale
+                // value is worse than an empty one.
+                version: String::new(),
                 instance_id: String::new(),
                 uptime_seconds: 0,
                 shutdown_requested: false,

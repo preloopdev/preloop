@@ -743,7 +743,7 @@ struct ShellArgs {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Unified observability init (Step 2): one handle for the process, shared
+    // Unified observability init: one handle for the process, shared
     // with `AppState` and `RunnerPoolConfig` later. `PRELOOP_LOG_FORMAT` now
     // controls pretty/json/auto (auto = pretty on TTY, JSON when piped), and
     // `RUST_LOG` defaults to `info` (the old `fmt::init()` default of ERROR hid

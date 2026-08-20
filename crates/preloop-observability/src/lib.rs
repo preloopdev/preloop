@@ -1,4 +1,4 @@
-//! `preloop-observability` — Step 2 of Plan 002.
+//! `preloop-observability` — observability handle for Preloop.
 //!
 //! Small, explicit API with no dependency on server/orchestrator internals. Both
 //! `preloop` and `preloop-server` construct one handle/runtime before building
@@ -93,7 +93,7 @@ impl ObservabilityConfig {
 
         // CLI defaults to `info` when unset; the standalone server historically
         // used `EnvFilter::from_default_env()` with no fallback (silent when
-        // unset). We unify on `info` per Step 2.
+        // unset). We unify on `info`.
         let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
 
         let service_name =
@@ -475,7 +475,7 @@ pub struct ObservabilityRuntime {
 
 impl ObservabilityRuntime {
     fn new(handle: Observability) -> Self {
-        // Step 2 does not install the global subscriber here — the binaries do
+        // Does not install the global subscriber here — the binaries do
         // that via `install_fmt_subscriber`. This runtime is the place for the
         // future OTel provider guards and the 2s flush on `Drop`.
         Self {
@@ -513,10 +513,10 @@ impl ObservabilityRuntime {
 
     /// Attempt to flush exporters for at most 2s. Export failure is logged, never propagated.
     pub async fn shutdown(self) {
-        // Step 2 has no exporter worker yet; this is the bounded-flush seam for
+        // No exporter worker yet; this is the bounded-flush seam for
         // the future OTel BatchSpanProcessor / metrics reader.
         tokio::time::timeout(Duration::from_secs(2), async {
-            // No-op until OTel providers are wired in Step 3+.
+            // No-op until OTLP providers are wired.
             tokio::task::yield_now().await;
         })
         .await
@@ -531,7 +531,7 @@ impl fmt::Debug for ObservabilityRuntime {
 }
 
 // ---------------------------------------------------------------------------
-// Tests — Step 2 gates
+// Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
