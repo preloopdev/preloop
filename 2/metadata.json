@@ -1,9 +1,11 @@
 {
   "cli_version": "0.10.0",
   "checkpoint_id": "01M0GEMFJ1ZVSCEXFM2GM2EX52",
+  "session_id": "01a01d30-1822-7000-9382-a955e1f70e42",
   "strategy": "manual-commit",
+  "created_at": "2026-08-20T20:43:45.020439Z",
   "branch": "Bnjoroge/oobservability",
-  "checkpoints_count": 15,
+  "checkpoints_count": 1,
   "files_touched": [
     "Cargo.lock",
     "crates/preloop-cli/src/main.rs",
@@ -20,27 +22,22 @@
     "crates/preloop-runner-server/src/runs.rs",
     "crates/preloop-runner-server/src/state.rs"
   ],
-  "sessions": [
-    {
-      "metadata": "/0/metadata.json",
-      "transcript": "/0/full.jsonl",
-      "compact_transcript": "/0/transcript.jsonl",
-      "content_hash": "/0/content_hash.txt",
-      "prompt": ""
-    },
-    {
-      "metadata": "/1/metadata.json",
-      "transcript": "/1/full.jsonl",
-      "compact_transcript": "/1/transcript.jsonl",
-      "content_hash": "/1/content_hash.txt",
-      "prompt": ""
-    },
-    {
-      "metadata": "/2/metadata.json",
-      "transcript": "/2/full.jsonl",
-      "compact_transcript": "/2/transcript.jsonl",
-      "content_hash": "/2/content_hash.txt",
-      "prompt": ""
-    }
-  ]
+  "agent": "Oh My Pi",
+  "model": "",
+  "turn_id": "f3858e00dd69",
+  "checkpoint_transcript_start": 29,
+  "transcript_lines_at_start": 29,
+  "compact_transcript_start": 8,
+  "initial_attribution": {
+    "calculated_at": "2026-08-20T20:43:45.014668Z",
+    "agent_lines": 0,
+    "agent_removed": 0,
+    "human_added": 1423,
+    "human_modified": 70,
+    "human_removed": 0,
+    "total_committed": 1423,
+    "total_lines_changed": 1493,
+    "agent_percentage": 0,
+    "metric_version": 2
+  }
 }
