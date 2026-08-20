@@ -3,7 +3,7 @@
   "checkpoint_id": "01M0G47WANYPH2Y0GJA7CKAMP1",
   "strategy": "manual-commit",
   "branch": "fix/snapshot-tree-sha-default",
-  "checkpoints_count": 23,
+  "checkpoints_count": 24,
   "files_touched": [
     "crates/preloop-runner-server/src/snapshots.rs"
   ],
@@ -84,6 +84,13 @@
       "compact_transcript": "/10/transcript.jsonl",
       "content_hash": "/10/content_hash.txt",
       "prompt": "/10/prompt.txt"
+    },
+    {
+      "metadata": "/11/metadata.json",
+      "transcript": "/11/full.jsonl",
+      "compact_transcript": "/11/transcript.jsonl",
+      "content_hash": "/11/content_hash.txt",
+      "prompt": "/11/prompt.txt"
     }
   ]
 }

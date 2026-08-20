@@ -1,0 +1,10 @@
+Complete assignment thoroughly:
+
+# Target
+RWX's open-source and test-intelligence surface: GitHub orgs `rwx-cloud` and `rwx-research`. Specifically: `rwx-research/captain` (CLI source), captain docs (https://www.rwx.com/captain/docs or /docs/captain), `rwx-cloud/cli` (the `rwx`/`mint` CLI source), and any public leaf/package repos (e.g. `rwx-cloud/leaves` or `mint-leaves`) plus their GitHub Actions integration repos.
+
+# Change
+Read-only research via `read` on raw GitHub URLs / xd://github file_read. For `captain`: extract the actual feature mechanics from source + docs — supported test frameworks & result parsers (JUnit XML, RSpec JSON, Jest, pytest, etc.), flaky-test detection algorithm, quarantine semantics, `captain run` retry logic (`--retries`, `--retry-command`, substitution of failed test IDs), test partitioning algorithm (`captain partition` — timing-based bin packing, how timings are fetched), abort-on-failure, the `.captain/config.yaml` schema, and the API endpoints it talks to. For `rwx-cloud/cli`: command surface, how it uploads the task graph, how it does `rwx debug`/ssh-into-task, cache upload/download protocol if visible. For leaves: how a leaf is defined/versioned/published (the packaging format).
+
+# Acceptance
+Return markdown: (1) Captain deep-dive — features, algorithms (describe partitioning + flake detection precisely), config schema, framework support list, API surface; (2) CLI deep-dive — command inventory + notable internals with file paths; (3) Leaf/package format spec as best reconstructed. Cite repo file paths and URLs. No repo writes.
