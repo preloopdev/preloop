@@ -3,14 +3,29 @@
   "checkpoint_id": "01M0G9JJ3FE3Q591DR1YH8EJDH",
   "strategy": "manual-commit",
   "branch": "Bnjoroge/oobservability",
-  "checkpoints_count": 10,
-  "files_touched": null,
+  "checkpoints_count": 14,
+  "files_touched": [
+    "crates/preloop-runner-server/src/artifact_twirp.rs",
+    "crates/preloop-runner-server/src/blob_store.rs",
+    "crates/preloop-runner-server/src/distributed_task.rs",
+    "crates/preloop-runner-server/src/results_twirp.rs",
+    "crates/preloop-runner-server/src/store.rs",
+    "plans/002-observability-strategy.md",
+    "rules/no-sensitive-log-fields.yml"
+  ],
   "sessions": [
     {
       "metadata": "/0/metadata.json",
       "transcript": "/0/full.jsonl",
       "compact_transcript": "/0/transcript.jsonl",
       "content_hash": "/0/content_hash.txt",
+      "prompt": ""
+    },
+    {
+      "metadata": "/1/metadata.json",
+      "transcript": "/1/full.jsonl",
+      "compact_transcript": "/1/transcript.jsonl",
+      "content_hash": "/1/content_hash.txt",
       "prompt": ""
     }
   ]
