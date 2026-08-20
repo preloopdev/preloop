@@ -3,14 +3,32 @@
   "checkpoint_id": "01M0GC36ZYTA6J8Q1E0HY264R1",
   "strategy": "manual-commit",
   "branch": "Bnjoroge/oobservability",
-  "checkpoints_count": 10,
-  "files_touched": null,
+  "checkpoints_count": 14,
+  "files_touched": [
+    "Cargo.lock",
+    "Cargo.toml",
+    "crates/preloop-cli/Cargo.toml",
+    "crates/preloop-cli/src/main.rs",
+    "crates/preloop-observability/Cargo.toml",
+    "crates/preloop-observability/src/lib.rs",
+    "crates/preloop-runner-server/Cargo.toml",
+    "crates/preloop-runner-server/src/main.rs",
+    "crates/preloop-runner/Cargo.toml",
+    "crates/preloop-runner/src/main.rs"
+  ],
   "sessions": [
     {
       "metadata": "/0/metadata.json",
       "transcript": "/0/full.jsonl",
       "compact_transcript": "/0/transcript.jsonl",
       "content_hash": "/0/content_hash.txt",
+      "prompt": ""
+    },
+    {
+      "metadata": "/1/metadata.json",
+      "transcript": "/1/full.jsonl",
+      "compact_transcript": "/1/transcript.jsonl",
+      "content_hash": "/1/content_hash.txt",
       "prompt": ""
     }
   ]
