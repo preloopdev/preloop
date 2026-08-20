@@ -364,6 +364,15 @@ pub struct AppState {
     /// lock.  Monotonically increases; the inner counter is no longer the
     /// source of truth once this is in use.
     pub(crate) next_request_id: Arc<std::sync::atomic::AtomicI64>,
+    /// Observability handle (cloneable, holds heartbeat & limit registries).
+    pub(crate) observability: preloop_observability::Observability,
+    /// Cached operational snapshot, updated every 5s by the sampler without holding `inner`.
+    pub status_snapshot:
+        Arc<parking_lot::RwLock<preloop_observability::status::OperationalSnapshot>>,
+    /// Consolidated pool handle replacing the four ad-hoc Option<Arc<…>> fields.
+    pub pool_status: Arc<preloop_observability::status::PoolStatus>,
+    /// When this AppState was created (for uptime).
+    pub(crate) started_at: std::time::Instant,
     /// Jobs accepted and still waiting for a runner, refreshed whenever one
     /// is claimed. A supervising runner pool reads it to decide whether the
     /// work already queued outruns the runners it has left.
@@ -786,6 +795,12 @@ impl AppState {
             events,
             message_notify: Arc::new(Notify::new()),
             next_request_id: Arc::new(std::sync::atomic::AtomicI64::new(next_request_id)),
+            observability: preloop_observability::Observability::noop(),
+            status_snapshot: Arc::new(parking_lot::RwLock::new(
+                preloop_observability::status::OperationalSnapshot::default(),
+            )),
+            pool_status: Arc::new(preloop_observability::status::PoolStatus::default()),
+            started_at: std::time::Instant::now(),
             // Mirror the recovered ready-queue size so an on-demand runner
             // pool spawns against the right workload after restart.
             queue_depth: Arc::new(std::sync::atomic::AtomicUsize::new(recovered_queue_len)),

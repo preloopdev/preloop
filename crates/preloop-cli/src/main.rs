@@ -478,12 +478,8 @@ enum Command {
     /// Show the expanded job DAG without executing.
     Plan(PlanArgs),
 
-    /// Show active and recent runs, or the live status of one run (prints a
-    /// single machine-readable status word for scripting).
-    Status {
-        #[arg(value_name = "RUN_ID")]
-        run_id: Option<String>,
-    },
+    /// Show operational status, queue health, and recent runs.
+    Status(StatusArgs),
 
     Logs(LogsArgs),
 
@@ -709,6 +705,17 @@ struct PlanArgs {
 }
 
 #[derive(Debug, Parser)]
+struct StatusArgs {
+    /// Print the raw status JSON (no prose) for jq/scripting.
+    #[arg(long)]
+    json: bool,
+
+    /// Number of recent runs to show in the table.
+    #[arg(long, default_value = "20")]
+    limit: usize,
+}
+
+#[derive(Debug, Parser)]
 struct LogsArgs {
     /// Run ID. Defaults to the most recent run.
     run_id: Option<String>,
@@ -789,7 +796,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Run(args) => cmd_run(args).await,
         Command::Plan(_) => unreachable!("plan is handled before engine bootstrap"),
-        Command::Status { run_id } => cmd_status(run_id).await,
+        Command::Status(args) => cmd_status(args).await,
         Command::Logs(args) => cmd_logs(args).await,
         Command::Cancel(args) => cmd_cancel(args).await,
         Command::Shell(args) => cmd_shell(args).await,
@@ -903,6 +910,7 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         next_job_runs_on: None,
         pending_registrations: None,
         preparing_signal: None,
+        pool_status: None,
     };
     let payload = artifact_payload(&output, &config.base_image);
     RunnerPool::new(std::sync::Arc::new(SmolVmProvider::default()), config)?
@@ -1366,6 +1374,8 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
             next_job_runs_on: Some(next_job_runs_on.clone()),
             pool_preparing: Some(pool_preparing.clone()),
             pending_registrations: pool_available.then_some(pending_registrations),
+            pool_status: None,
+            observability: None,
             require_job_assignments: env_flag("PRELOOP_REQUIRE_JOB_ASSIGNMENTS", false),
             state_dir,
             store_url: args.store.clone(),
@@ -1459,24 +1469,85 @@ async fn engine_shutdown_signal() {
 }
 
 async fn wait_for_engine_socket(socket: &std::path::Path) -> anyhow::Result<()> {
+    // readyz probe: http://localhost/readyz (500ms timeout, 30s window)
     #[cfg(unix)]
     let client = reqwest::Client::builder().unix_socket(socket).build()?;
     #[cfg(not(unix))]
     let client = reqwest::Client::new();
     let start = std::time::Instant::now();
+    let mut last_reason: Option<String> = None;
     while start.elapsed() < Duration::from_secs(30) {
-        if client
-            .get("http://localhost/healthz")
+        match client
+            .get("http://localhost/readyz")
             .timeout(Duration::from_millis(500))
             .send()
             .await
-            .is_ok()
         {
-            return Ok(());
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    return Ok(());
+                }
+                // Non-2xx readyz: capture reason for timeout reporting.
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                let reason = extract_readyz_reason(&body)
+                    .unwrap_or_else(|| format!("{status}: {}", truncate_reason(&body)));
+                last_reason = Some(reason);
+            }
+            Err(err) => {
+                last_reason = Some(err.to_string());
+            }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    if let Some(reason) = last_reason {
+        anyhow::bail!("local control plane did not become ready within 30 seconds: last readyz reason: {reason}")
+    }
     anyhow::bail!("local control plane did not become ready within 30 seconds")
+}
+
+fn extract_readyz_reason(body: &str) -> Option<String> {
+    if body.trim().is_empty() {
+        return None;
+    }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        for key in ["reason", "code", "message", "error", "status"] {
+            if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
+                if !s.trim().is_empty() {
+                    return Some(s.to_owned());
+                }
+            }
+        }
+        // Nested { "ready": { "reason": ... } } or similar
+        if let Some(obj) = v.as_object() {
+            for (_, val) in obj {
+                if let Some(s) = val.as_str() {
+                    if !s.trim().is_empty() && s.len() < 200 {
+                        return Some(s.to_owned());
+                    }
+                }
+                if let Some(inner) = val.as_object() {
+                    for k in ["reason", "code"] {
+                        if let Some(s) = inner.get(k).and_then(|x| x.as_str()) {
+                            return Some(s.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+        // Return truncated JSON if no specific field
+        return Some(truncate_reason(body));
+    }
+    Some(truncate_reason(body))
+}
+
+fn truncate_reason(s: &str) -> String {
+    let t = s.trim();
+    if t.len() > 300 {
+        format!("{}…", &t[..300])
+    } else {
+        t.to_owned()
+    }
 }
 
 // Configuration assembly, not a public API: the parameter list mirrors the
@@ -1653,6 +1724,7 @@ fn local_runner_pool_config(
         next_job_runs_on: (!custom_base).then_some(next_job_runs_on),
         pending_registrations: Some(pending_registrations),
         preparing_signal: Some(preparing_signal),
+        pool_status: None,
     })
 }
 
@@ -2801,63 +2873,418 @@ fn plan_json(plan: &preloop_gha_protocol::JobPlan) -> serde_json::Value {
     })
 }
 
-async fn cmd_status(run_id: Option<String>) -> anyhow::Result<()> {
+async fn cmd_status(args: StatusArgs) -> anyhow::Result<()> {
     let client = build_client();
     let url = server_url();
-    if let Some(run_id) = run_id {
-        // Single-run mode: one machine-readable status word
-        // (success/failure/cancelled/skipped/in_progress/queued/pending) for
-        // scripts like the pre-push hook. Connection failures carry the
-        // engine-unreachable marker so the hook can fail open.
-        let mut request = client.get(format!("{url}/api/v1/runs/{run_id}"));
-        if let Some(token) = api_token() {
-            request = request.bearer_auth(token);
-        }
-        let response = request
-            .send()
-            .await
-            .with_context(engine_unreachable_context)?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("server returned {status}: {body}");
-        }
-        let run: serde_json::Value = response.json().await?;
-        println!(
-            "{}",
-            run.get("status")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown")
-        );
-        return Ok(());
-    }
-    let mut request = client.get(format!("{url}/api/v1/runs?limit=20"));
+    // Native bearer required for /api/v1/status (same as other native calls)
+    let mut status_req = client.get(format!("{url}/api/v1/status"));
     if let Some(token) = api_token() {
-        request = request.bearer_auth(token);
+        status_req = status_req.bearer_auth(token);
     }
-    let response = request.send().await?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+    let status_resp = status_req
+        .send()
+        .await
+        .with_context(engine_unreachable_context)?;
+    if !status_resp.status().is_success() {
+        let status = status_resp.status();
+        let body = status_resp.text().await.unwrap_or_default();
         anyhow::bail!("server returned {status}: {body}");
     }
-    let runs: Vec<serde_json::Value> = response.json().await?;
+    let status_text = status_resp.text().await?;
+    if args.json {
+        // Byte-for-byte, no prose: so jq works
+        print!("{}", status_text);
+        if !status_text.ends_with('\n') {
+            println!();
+        }
+        return Ok(());
+    }
+    let status: serde_json::Value =
+        serde_json::from_str(&status_text).context("parse status json")?;
+
+    // Fetch recent runs for table (preserve existing behavior)
+    let mut runs_req = client.get(format!("{url}/api/v1/runs?limit={}", args.limit));
+    if let Some(token) = api_token() {
+        runs_req = runs_req.bearer_auth(token);
+    }
+    let runs: Vec<serde_json::Value> = match runs_req.send().await {
+        Ok(r) if r.status().is_success() => r.json().await.unwrap_or_default(),
+        Ok(r) => {
+            let st = r.status();
+            let body = r.text().await.unwrap_or_default();
+            eprintln!("[warn] runs table unavailable: {st}: {body}");
+            Vec::new()
+        }
+        Err(e) => {
+            eprintln!("[warn] runs table unavailable: {e}");
+            Vec::new()
+        }
+    };
+
+    // --- Human rendering: 10 sections in order ---
+    render_status_human(&status, &runs, args.limit);
+    Ok(())
+}
+
+fn render_status_human(status: &serde_json::Value, runs: &[serde_json::Value], limit: usize) {
+    // Helpers to extract safely
+    let get_str = |v: &serde_json::Value, k: &str| -> Option<String> {
+        v.get(k).and_then(|x| x.as_str()).map(|s| s.to_owned())
+    };
+    let get_f64 =
+        |v: &serde_json::Value, k: &str| -> Option<f64> { v.get(k).and_then(|x| x.as_f64()) };
+    let get_u64 =
+        |v: &serde_json::Value, k: &str| -> Option<u64> { v.get(k).and_then(|x| x.as_u64()) };
+    let get_bool =
+        |v: &serde_json::Value, k: &str| -> Option<bool> { v.get(k).and_then(|x| x.as_bool()) };
+
+    // 1. service + snapshot age
+    println!("== service ==");
+    let service = status.get("service").unwrap_or(&serde_json::Value::Null);
+    let version =
+        get_str(service, "version").unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned());
+    let instance = get_str(service, "instance_id")
+        .or_else(|| get_str(status, "instance_id"))
+        .unwrap_or_else(|| "-".to_owned());
+    let uptime = get_f64(service, "uptime_seconds")
+        .or_else(|| get_f64(status, "uptime_seconds"))
+        .unwrap_or(0.0);
+    let shutdown = get_bool(service, "shutdown_requested")
+        .or_else(|| get_bool(status, "shutdown_requested"))
+        .unwrap_or(false);
+    let snapshot_age = get_f64(status, "snapshot_age_seconds").unwrap_or(0.0);
+    let observed_at = get_str(status, "observed_at").unwrap_or_else(|| "-".to_owned());
+    let overall = get_str(status, "overall").unwrap_or_else(|| "unknown".to_owned());
+    println!(
+        "  version: {version}  instance: {instance}  uptime: {uptime:.0}s  overall: {overall}"
+    );
+    println!(
+        "  observed_at: {observed_at}  snapshot_age: {snapshot_age:.1}s  shutdown: {shutdown}"
+    );
+    if status.get("schema_version").is_some() {
+        println!("  schema_version: {}", status["schema_version"]);
+    }
+
+    // 2. queue (ready/blocked + oldest)
+    println!("\n== queue ==");
+    let jobs = status.get("jobs").unwrap_or(&serde_json::Value::Null);
+    let ready = get_u64(jobs, "ready").unwrap_or(0);
+    let dep_blocked = get_u64(jobs, "dependency_blocked").unwrap_or(0);
+    let conc_blocked = get_u64(jobs, "concurrency_blocked").unwrap_or(0);
+    let pending_exp = get_u64(jobs, "pending_expansion").unwrap_or(0);
+    let expanding = get_u64(jobs, "expanding").unwrap_or(0);
+    let claimable = get_u64(jobs, "claimable").unwrap_or(0);
+    let unclaimable = get_u64(jobs, "unclaimable").unwrap_or(0);
+    let oldest = get_f64(jobs, "oldest_ready_seconds");
+    println!("  ready: {ready}  claimable: {claimable}  unclaimable: {unclaimable}  dependency_blocked: {dep_blocked}  concurrency_blocked: {conc_blocked}  pending_expansion: {pending_exp}  expanding: {expanding}");
+    match oldest {
+        Some(v) => println!("  oldest_ready: {v:.1}s"),
+        None => println!("  oldest_ready: -"),
+    }
+    // Also show runs queued/in_progress if present
+    if let Some(runs_obj) = status.get("runs") {
+        let q = get_u64(runs_obj, "queued").unwrap_or(0);
+        let ip = get_u64(runs_obj, "in_progress").unwrap_or(0);
+        let completed = get_u64(runs_obj, "completed").unwrap_or(0);
+        println!("  runs queued: {q}  in_progress: {ip}  completed: {completed}");
+    }
+
+    // 3. concurrency + scheduler
+    println!("\n== concurrency & scheduler ==");
+    let conc = status
+        .get("concurrency")
+        .unwrap_or(&serde_json::Value::Null);
+    let groups_active = get_u64(conc, "groups_active").unwrap_or(0);
+    let groups_contended = get_u64(conc, "groups_contended").unwrap_or(0);
+    let pending_holders = get_u64(conc, "pending_holders").unwrap_or(0);
+    let deepest = get_u64(conc, "deepest_group_pending").unwrap_or(0);
+    let qmax = get_u64(conc, "queue_max_pending").unwrap_or(0);
+    let overflow = get_u64(conc, "overflow_cancellations").unwrap_or(0);
+    println!("  groups active: {groups_active}  contended: {groups_contended}  pending_holders: {pending_holders}  deepest_pending: {deepest}  queue_max: {qmax}  overflow_cancellations: {overflow}");
+    let sched = status.get("scheduler").unwrap_or(&serde_json::Value::Null);
+    let enabled = get_bool(sched, "enabled").unwrap_or(false);
+    let schedules = get_u64(sched, "schedules").unwrap_or(0);
+    let last_scan = get_str(sched, "last_scan_at").unwrap_or_else(|| "-".to_owned());
+    let next_fire = get_str(sched, "next_fire_at").unwrap_or_else(|| "-".to_owned());
+    let fired = get_u64(sched, "fired").unwrap_or(0);
+    let skipped = get_u64(sched, "skipped_overlapping").unwrap_or(0);
+    let late = get_u64(sched, "late_fires").unwrap_or(0);
+    let max_delay = get_f64(sched, "max_fire_delay_seconds");
+    println!("  scheduler enabled: {enabled}  schedules: {schedules}  fired: {fired}  skipped_overlapping: {skipped}  late_fires: {late}");
+    println!(
+        "  last_scan: {last_scan}  next_fire: {next_fire}  max_delay: {}",
+        max_delay
+            .map(|v| format!("{v:.1}s"))
+            .unwrap_or_else(|| "-".to_owned())
+    );
+
+    // 4. pool + runners
+    println!("\n== pool & runners ==");
+    let pool = status.get("pool").unwrap_or(&serde_json::Value::Null);
+    let mode = get_str(pool, "mode").unwrap_or_else(|| "-".to_owned());
+    let desired = get_u64(pool, "desired").unwrap_or(0);
+    let preparing = pool
+        .get("preparing")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+    let building = get_u64(pool, "building").unwrap_or(0);
+    let provisioning = get_u64(pool, "provisioning").unwrap_or(0);
+    let pool_idle = get_u64(pool, "idle").unwrap_or(0);
+    let pool_busy = get_u64(pool, "busy").unwrap_or(0);
+    let paused = get_u64(pool, "paused").unwrap_or(0);
+    let failures = get_u64(pool, "consecutive_provision_failures").unwrap_or(0);
+    println!("  pool mode: {mode}  desired: {desired}  idle: {pool_idle}  busy: {pool_busy}  building: {building}  provisioning: {provisioning}  paused: {paused}  preparing: {preparing}  provision_failures: {failures}");
+    let runners = status.get("runners").unwrap_or(&serde_json::Value::Null);
+    let reg = get_u64(runners, "registered").unwrap_or(0);
+    let sessions = get_u64(runners, "sessions").unwrap_or(0);
+    let idle = get_u64(runners, "idle").unwrap_or(0);
+    let busy = get_u64(runners, "busy").unwrap_or(0);
+    let stale = get_u64(runners, "stale").unwrap_or(0);
+    let max_poll = get_f64(runners, "max_poll_age_seconds");
+    let max_lease = get_f64(runners, "max_lease_age_seconds");
+    println!("  runners registered: {reg}  sessions: {sessions}  idle: {idle}  busy: {busy}  stale: {stale}");
+    println!(
+        "  max_poll_age: {}  max_lease_age: {}",
+        max_poll
+            .map(|v| format!("{v:.1}s"))
+            .unwrap_or_else(|| "-".to_owned()),
+        max_lease
+            .map(|v| format!("{v:.1}s"))
+            .unwrap_or_else(|| "-".to_owned())
+    );
+
+    // 5. VM fleet stub
+    println!("\n== vm fleet ==");
+    let vms = status
+        .get("vms")
+        .unwrap_or(status.get("vm").unwrap_or(&serde_json::Value::Null));
+    if vms.is_null() || vms.as_object().map(|m| m.is_empty()).unwrap_or(false) {
+        println!("  source: unavailable  (host sampler not yet reporting)");
+        println!("  capabilities: cpu=false memory=false sparse_disk=false");
+        println!("  host_usage: -");
+    } else {
+        let source = get_str(vms, "source").unwrap_or_else(|| "unknown".to_owned());
+        let sample_age = get_f64(vms, "sample_age_seconds")
+            .map(|v| format!("{v:.1}s"))
+            .unwrap_or_else(|| "-".to_owned());
+        println!("  source: {source}  sample_age: {sample_age}");
+        if let Some(caps) = vms.get("capabilities") {
+            let cap_str = caps
+                .as_object()
+                .map(|m| {
+                    m.iter()
+                        .map(|(k, v)| format!("{k}={}", v.as_bool().unwrap_or(false)))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_else(|| "-".to_owned());
+            println!("  capabilities: {cap_str}");
+        }
+        if let Some(cnt) = vms.get("count") {
+            let runner = get_u64(cnt, "runner").unwrap_or(0);
+            let golden = get_u64(cnt, "golden").unwrap_or(0);
+            let unavailable = get_u64(cnt, "unavailable").unwrap_or(0);
+            println!("  count runner: {runner}  golden: {golden}  unavailable: {unavailable}");
+        }
+        if let Some(conf) = vms.get("configured") {
+            let vcpus = get_u64(conf, "vcpus")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_owned());
+            let mem = get_u64(conf, "memory_bytes")
+                .map(|v| format!("{v}"))
+                .unwrap_or_else(|| "-".to_owned());
+            let storage = get_u64(conf, "storage_bytes")
+                .map(|v| format!("{v}"))
+                .unwrap_or_else(|| "-".to_owned());
+            println!("  configured vcpus: {vcpus}  memory: {mem}  storage: {storage}");
+        }
+        if let Some(usage) = vms.get("host_usage") {
+            let cores = get_f64(usage, "cpu_cores")
+                .map(|v| format!("{v:.1}"))
+                .unwrap_or_else(|| "-".to_owned());
+            let mem = get_u64(usage, "memory_bytes")
+                .map(|v| format!("{v}"))
+                .unwrap_or_else(|| "-".to_owned());
+            println!("  host_usage cpu_cores: {cores}  memory: {mem}");
+        }
+        if let Some(top) = vms.get("top_consumers").and_then(|x| x.as_array()) {
+            if !top.is_empty() {
+                println!("  top_consumers ({}):", top.len().min(5));
+                for c in top.iter().take(5) {
+                    let name = c
+                        .get("machine_name")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("?");
+                    let role = c.get("role").and_then(|x| x.as_str()).unwrap_or("?");
+                    let activity = c.get("activity").and_then(|x| x.as_str()).unwrap_or("?");
+                    println!("    - {name} ({role}/{activity})");
+                }
+            } else {
+                println!("  top_consumers: -");
+            }
+        }
+    }
+
+    // 6. store/storage/GitHub/debug/telemetry
+    println!("\n== store / storage / github / debug / telemetry ==");
+    let store = status.get("store").unwrap_or(&serde_json::Value::Null);
+    let backend = get_str(store, "backend").unwrap_or_else(|| "-".to_owned());
+    let cfail = get_u64(store, "consecutive_failures").unwrap_or(0);
+    println!("  store backend: {backend}  consecutive_failures: {cfail}");
+    let storage = status.get("storage").unwrap_or(&serde_json::Value::Null);
+    if !storage.is_null() {
+        let free = get_u64(storage, "state_fs_free_bytes")
+            .map(|v| format!("{v}"))
+            .unwrap_or_else(|| "-".to_owned());
+        let ratio = get_f64(storage, "state_fs_free_ratio")
+            .map(|v| format!("{v:.2}"))
+            .unwrap_or_else(|| "-".to_owned());
+        println!("  storage free: {free}  ratio: {ratio}");
+        if let Some(comps) = storage.get("components").and_then(|x| x.as_array()) {
+            for c in comps {
+                let store_name = c.get("store").and_then(|x| x.as_str()).unwrap_or("?");
+                let bytes = c.get("bytes").and_then(|x| x.as_u64()).unwrap_or(0);
+                println!("    {store_name}: {bytes} bytes");
+            }
+        }
+    } else {
+        println!("  storage: -");
+    }
+    let github = status.get("github").unwrap_or(&serde_json::Value::Null);
+    if !github.is_null() {
+        let configured = get_bool(github, "configured").unwrap_or(false);
+        let pending = get_u64(github, "pending_check_updates").unwrap_or(0);
+        println!("  github configured: {configured}  pending_check_updates: {pending}");
+        if let Some(rl) = github.get("rate_limit") {
+            let remaining = get_u64(rl, "remaining").unwrap_or(0);
+            let limit_rl = get_u64(rl, "limit").unwrap_or(0);
+            println!("  github rate_limit: {remaining}/{limit_rl} remaining");
+        }
+        if let Some(exp) = github
+            .get("installation_token_expires_in_seconds")
+            .and_then(|x| x.as_u64())
+        {
+            println!("  github token expires_in: {exp}s");
+        }
+    } else {
+        println!("  github: -");
+    }
+    let debug = status.get("debug").unwrap_or(&serde_json::Value::Null);
+    if !debug.is_null() {
+        let active = get_u64(debug, "active_sessions").unwrap_or(0);
+        let oldest = debug
+            .get("oldest_session_seconds")
+            .and_then(|x| x.as_f64())
+            .map(|v| format!("{v:.0}s"))
+            .unwrap_or_else(|| "-".to_owned());
+        println!("  debug active_sessions: {active}  oldest: {oldest}");
+    }
+    let tele = status.get("telemetry").unwrap_or(&serde_json::Value::Null);
+    if !tele.is_null() {
+        let enabled = get_bool(tele, "otlp_enabled").unwrap_or(false);
+        let dropped = get_u64(tele, "dropped_records").unwrap_or(0);
+        println!("  telemetry otlp_enabled: {enabled}  dropped_records: {dropped}");
+    }
+
+    // 7. non-zero limits
+    println!("\n== limits (non-zero) ==");
+    let limits = status.get("limits").and_then(|x| x.as_array());
+    let mut any_limit = false;
+    if let Some(arr) = limits {
+        for l in arr {
+            let dropped = l.get("dropped").and_then(|x| x.as_u64()).unwrap_or(0);
+            let rejected = l.get("rejected").and_then(|x| x.as_u64()).unwrap_or(0);
+            if dropped > 0 || rejected > 0 {
+                any_limit = true;
+                let name = l.get("limit").and_then(|x| x.as_str()).unwrap_or("?");
+                let value = l
+                    .get("value")
+                    .and_then(|x| x.as_u64())
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".to_owned());
+                println!("  {name}: value={value} dropped={dropped} rejected={rejected}");
+            }
+        }
+    }
+    if !any_limit {
+        println!("  (no limits with drops/rejects)");
+    }
+
+    // 8. stale tasks
+    println!("\n== tasks (stale/exited) ==");
+    let tasks = status.get("tasks").and_then(|x| x.as_array());
+    let mut any_task = false;
+    if let Some(arr) = tasks {
+        for t in arr {
+            let state = t.get("state").and_then(|x| x.as_str()).unwrap_or("running");
+            if state == "stale" || state == "exited" {
+                any_task = true;
+                let name = t.get("name").and_then(|x| x.as_str()).unwrap_or("?");
+                let critical = t.get("critical").and_then(|x| x.as_bool()).unwrap_or(false);
+                let age = t
+                    .get("heartbeat_age_seconds")
+                    .and_then(|x| x.as_f64())
+                    .map(|v| format!("{v:.1}s"))
+                    .unwrap_or_else(|| "-".to_owned());
+                println!("  {name}: state={state} critical={critical} age={age}");
+            }
+        }
+    }
+    if !any_task {
+        println!("  (all tasks healthy)");
+    }
+
+    // 9. conditions with one-line actions (≤5 exemplars)
+    println!("\n== conditions ==");
+    let conditions = status.get("conditions").and_then(|x| x.as_array());
+    if let Some(arr) = conditions {
+        if arr.is_empty() {
+            println!("  (no conditions)");
+        } else {
+            for c in arr {
+                let code = c.get("code").and_then(|x| x.as_str()).unwrap_or("?");
+                let severity = c.get("severity").and_then(|x| x.as_str()).unwrap_or("info");
+                let msg = c.get("message").and_then(|x| x.as_str()).unwrap_or("");
+                let action = condition_action(code);
+                println!("  [{severity}] {code}: {msg} -> {action}");
+                if let Some(exs) = c.get("exemplars").and_then(|x| x.as_array()) {
+                    for ex in exs.iter().take(5) {
+                        let ex_str = match ex {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        println!("    - {ex_str}");
+                    }
+                    if exs.len() > 5 {
+                        println!("    ... and {} more", exs.len() - 5);
+                    }
+                } else if let Some(exs) = c.get("exemplar").and_then(|x| x.as_str()) {
+                    println!("    - {exs}");
+                }
+            }
+        }
+    } else {
+        println!("  (no conditions)");
+    }
+
+    // 10. recent runs table
+    println!("\n== recent runs (limit={}) ==", limit);
     if runs.is_empty() {
         println!("No runs found.");
-        return Ok(());
+        return;
     }
     println!(
         "{:<38}  {:<6}  {:<12}  {:<12}  {:<10}  WORKFLOW",
         "RUN ID", "#", "STATUS", "EVENT", "PUSH"
     );
     println!("{}", "-".repeat(104));
-    for run in &runs {
+    for run in runs {
         let run_id = run["run_id"].as_str().unwrap_or("?");
         let run_number = run
             .get("run_number")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
-        let status = run["status"].as_str().unwrap_or("?");
+        let st = run["status"].as_str().unwrap_or("?");
         let event = run
             .get("event")
             .and_then(serde_json::Value::as_str)
@@ -2881,21 +3308,56 @@ async fn cmd_status(run_id: Option<String>) -> anyhow::Result<()> {
             })
             .unwrap_or("?");
         let push = match run.get("push_state").and_then(|state| state.get("status")) {
-            Some(status) => {
-                let status = status.as_str().unwrap_or("?");
+            Some(s) => {
+                let s = s.as_str().unwrap_or("?");
                 match run["push_state"]["pr_number"].as_u64() {
-                    Some(number) => format!("{status} #{number}"),
-                    None => status.to_owned(),
+                    Some(n) => format!("{s} #{n}"),
+                    None => s.to_owned(),
                 }
             }
             None => "-".to_owned(),
         };
         println!(
             "{:<38}  {:<6}  {:<12}  {:<12}  {:<10}  {}",
-            run_id, run_number, status, event, push, workflow
+            run_id, run_number, st, event, push, workflow
         );
     }
-    Ok(())
+}
+
+fn condition_action(code: &str) -> &'static str {
+    match code {
+        "queue_no_registered_runner" => "register a runner or enable the pool",
+        "queue_label_mismatch" => "add a runner with that label",
+        "concurrency_queue_overflow" => "raise concurrency queue max or reduce parallelism",
+        "concurrency_group_starved" => "check concurrency group that starves others",
+        "scheduler_scan_stale" => "check scheduler scan heartbeat (restart if stuck)",
+        "scheduler_fire_late" => "check scheduler clock / load",
+        "pool_preparing" => "wait for image preparation to finish",
+        "pool_provisioning_deficit" => "check pool capacity / provision failures",
+        "pool_repeated_provision_failure" => "inspect provision logs and VM host capacity",
+        "runner_poll_stale" => "check runner connectivity and heartbeat",
+        "runner_lease_stale" => "check runner lease renewal",
+        "vm_sampler_stale" | "vm_sample_unavailable" | "vm_unreachable" => {
+            "check VM host sampler and SmolVM health"
+        }
+        "vm_host_memory_pressure" => "free host memory or reduce pool size",
+        "vm_host_cpu_throttled" => "reduce host CPU load or raise CPU quota",
+        "vm_host_oom_kill" => "check host OOM kills and runner memory",
+        "vm_sparse_disk_pressure" => "free disk space on VM data volume",
+        "store_write_failure" | "store_connection_down" => "check store connectivity and disk",
+        "storage_capacity_pressure" => "free disk space or run GC/prune",
+        "limit_drop_active" => "raise that limit or reduce load",
+        "limit_reject_active" => "raise that limit or back off",
+        "github_check_update_failure" => "check GitHub App permissions and network",
+        "github_terminal_check_pending" => "retry check update or check GitHub status",
+        "github_rate_limit_low" => "back off GitHub API or wait for rate-limit reset",
+        "github_installation_token_expiring" => "refresh GitHub installation token",
+        "debug_session_stale" => "close stale debug session",
+        "debug_audit_evicted" => "increase audit retention or flush audits",
+        "telemetry_export_failure" => "check OTLP endpoint and credentials",
+        "state_sampler_stale" | "task_stale" | "task_exited" => "check background task health",
+        _ => "see runbook for this condition",
+    }
 }
 
 async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
@@ -3760,14 +4222,23 @@ mod tests {
     #[test]
     fn status_parses() {
         let cli = parse(&["status"]).unwrap();
-        assert!(matches!(cli.command, Command::Status { run_id: None }));
-        let cli = parse(&["status", "550e8400-e29b-41d4-a716-446655440000"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Status {
-                run_id: Some(ref id)
-            } if id == "550e8400-e29b-41d4-a716-446655440000"
-        ));
+        let Command::Status(args) = cli.command else {
+            panic!("expected Status");
+        };
+        assert!(!args.json);
+        assert_eq!(args.limit, 20);
+        let cli = parse(&["status", "--json", "--limit", "5"]).unwrap();
+        let Command::Status(args) = cli.command else {
+            panic!("expected Status");
+        };
+        assert!(args.json);
+        assert_eq!(args.limit, 5);
+        // Default limit is 20 and --json defaults to false
+        let cli = parse(&["status", "--limit", "42"]).unwrap();
+        let Command::Status(args) = cli.command else {
+            panic!("expected Status");
+        };
+        assert_eq!(args.limit, 42);
     }
 
     #[test]

@@ -11,6 +11,8 @@
 //! - Always retain `stderr`/`journald` even when OTLP is configured.
 //! - `Debug` on config never reveals headers or credential-bearing endpoint parts.
 
+pub mod status;
+
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;

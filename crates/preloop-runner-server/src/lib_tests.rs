@@ -18536,6 +18536,8 @@ fn server_config_debug_redacts_store_url_password() {
         oidc_issuer: None,
         enable_scheduler: false,
         pending_registrations: None,
+        pool_status: None,
+        observability: None,
         require_job_assignments: false,
     };
     let debug = format!("{config:?}");
