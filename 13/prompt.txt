@@ -1,0 +1,40 @@
+Complete assignment thoroughly:
+
+# Target
+/Users/bnjoroge/preloop. Read: `docs/*.md` (all), `justfile`, root `Cargo.toml`, and the source of crates `preloop-runner-server`, `preloop-gha-parser`, `preloop-cache`, `preloop-artifacts`, `preloop-runner`. Use `glob` to list crate `src/` trees first, then read the files that matter.
+
+# Change
+Read-only inventory. Produce these sections, each bullet with `path:line`:
+
+1. **Crate map** — one line per workspace member from Cargo.toml + what it owns.
+2. **Server module map** — every file in `crates/preloop-runner-server/src/` with a one-line role and LOC count.
+3. **Native REST surface** — enumerate EVERY `/api/v1/...` route: method, path, handler fn, file:line. Grep the router construction (likely `routes.rs` or `lib.rs`, look for `.route(`). Also list `/_apis/` and `/broker/` route groups at a summary level.
+4. **Workflow model** — in `preloop-gha-parser`: the top-level structs for workflow/job/step, how the job DAG is built from `needs`, how matrix expansion works, key fn names + file:line. Note whether there is any concept of task-level (sub-job) dependency, per-step caching, or dynamic job generation at runtime.
+5. **Scheduler / dispatch** — where jobs get queued and assigned to runners. Names of the queue type, the message-acquisition endpoint, how `needs` gating is enforced, whether there is any concurrency-group/queue-pool concept, and the runner pool sizing logic (`PRELOOP_RUNNER_POOL_SIZE`).
+6. **Cache** — `preloop-cache`: which protocol version(s) it implements (v1 `/_apis/artifactcache` vs v2 Twirp `CreateCacheEntry`/`GetCacheEntryDownloadURL`), on-disk layout, how keys+restore-keys are matched, scoping (per-repo? per-ref?), eviction, size accounting.
+7. **Artifacts** — `preloop-artifacts`: protocol, storage layout, retention.
+8. **VM / execution layer** — grep for `smolvm`, `libkrun`, `vm`, `pool`, `warm`, `snapshot`, `rootfs`, `overlay`. Report: how a VM is created per job, whether there is a warm pool and its implementation, whether there is any snapshot/restore, how the rootfs/image is provisioned, whether workspaces persist between jobs, and what `--preserve-on-failure` / `preloop shell` do (file:line).
+9. **Debug sessions + DAP** — per `docs/debug-sessions.md` and the implementing module: the session state machine states, the operations (`:retry`, `:retry --from <step>`, `:sync`, `:export`), the agent API routes, and the DAP bridge entry point.
+10. **Store schema** — list EVERY table and column group in the `MIGRATIONS` const in `store.rs` (and `store_pg.rs` if it differs). Explicitly state whether we persist: step-level timings, log content, test results, cache-entry metadata, run/job durations.
+11. **Events** — how `state.rs::emit` works, what event variants exist, who consumes the broadcast (SSE? WS? NDJSON?), and whether there is an OpenTelemetry / tracing export.
+12. **Extension points** — the exact 3-5 places a new native feature plugs in (router registration, store migration, event enum, CLI subcommand registration in `preloop-runner-client`).
+13. **NOT FOUND list** — explicitly confirm absence (with the greps you ran) of: test-result ingestion/parsing (JUnit XML etc.), flaky-test detection, test partitioning/timing history, content-addressed task caching, sandboxed/filtered task inputs, task-level DAG below job granularity, dynamic task generation, OIDC token issuance, secret vaults, concurrency pools, auto-cancel of superseded runs, cron schedules, webhook/dispatch triggers, OCI image build support, per-task CPU/memory sizing.
+
+# Acceptance
+Raw markdown, all 13 sections present, >=150 lines, every claim carrying `path:line`. Sections 3, 6, 8, 10, 13 are the most important — do not skimp on them. No project-wide commands.
+
+---
+
+<system-reminder>
+Last turn had no tool call → session idle. Reminder 1 of 3.
+
+Every turn MUST end with a tool call. First applicable:
+1. **Resume work** — assignment incomplete and not recording an incremental section: call next intended tool (edit, write, bash, search, etc.). NEVER treat this reminder as forced stop.
+2. **Yield incremental section** — only if useful: call `yield` with non-empty `type: string[]`; matching sections accumulate; task continues.
+3. **Yield success** — only if genuinely complete: terminal `yield`; omit `type` for single final structured result in `result.data`; use `type: string` to finalize from last assistant turn when data omitted.
+4. **Yield error** — only for a real, concrete, nameable blocker (missing file, unavailable API, contradictory spec): describe attempts and exact blocker. NEVER fabricate a "forced immediate-yield" or "system reminder required termination" reason; reminder not a blocker.
+
+Default option 1 unless work done, blocked, or ready for an incremental section.
+
+NEVER end this turn with text only.
+</system-reminder>
