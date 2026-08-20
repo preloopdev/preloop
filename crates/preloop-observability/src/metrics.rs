@@ -274,12 +274,19 @@ pub struct SessionTransitionLabels {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ConcurrencyDecisionLabels {
+    pub queue_mode: String,
+    pub action: String,
+}
+
 #[derive(Debug, Default)]
 pub struct LifecycleMetrics {
     job_completed: RwLock<HashMap<JobCompletedLabels, u64>>,
     queue_wait: RwLock<HashMap<QueueWaitLabels, Histogram>>,
     broker_poll: RwLock<HashMap<BrokerPollLabels, u64>>,
     session_transition: RwLock<HashMap<SessionTransitionLabels, u64>>,
+    concurrency_decision: RwLock<HashMap<ConcurrencyDecisionLabels, u64>>,
 }
 
 impl LifecycleMetrics {
@@ -315,6 +322,14 @@ impl LifecycleMetrics {
             reason: reason.to_string(),
         };
         *self.session_transition.write().entry(labels).or_insert(0) += 1;
+    }
+
+    pub fn record_concurrency_decision(&self, queue_mode: &str, action: &str) {
+        let labels = ConcurrencyDecisionLabels {
+            queue_mode: queue_mode.to_string(),
+            action: action.to_string(),
+        };
+        *self.concurrency_decision.write().entry(labels).or_insert(0) += 1;
     }
 
     pub fn render(&self, out: &mut String) {
@@ -364,6 +379,14 @@ impl LifecycleMetrics {
                 labels.operation, labels.reason, cnt
             ));
         }
+        out.push_str("# HELP preloop_concurrency_decision_total Concurrency queue decisions\n");
+        out.push_str("# TYPE preloop_concurrency_decision_total counter\n");
+        for (labels, cnt) in self.concurrency_decision.read().iter() {
+            out.push_str(&format!(
+                "preloop_concurrency_decision_total{{queue_mode=\"{}\",action=\"{}\"}} {}\n",
+                labels.queue_mode, labels.action, cnt
+            ));
+        }
     }
 
     #[cfg(test)]
@@ -372,6 +395,7 @@ impl LifecycleMetrics {
         self.queue_wait.write().clear();
         self.broker_poll.write().clear();
         self.session_transition.write().clear();
+        self.concurrency_decision.write().clear();
     }
 
     #[cfg(test)]
