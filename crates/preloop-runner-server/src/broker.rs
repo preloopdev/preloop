@@ -855,6 +855,19 @@ pub(crate) async fn broker_acquire_job(
     message.request_id = 0;
     let payload = serde_json::to_value(&message)
         .map_err(|error| ApiError::internal(format!("serialize broker job payload: {error}")))?;
+    // Queue wait and broker poll outcomes — bounded, exactly one per successful claim.
+    shared
+        .state
+        .observability
+        .metrics()
+        .lifecycle
+        .record_queue_wait("claimed", std::time::Duration::from_secs(1));
+    shared
+        .state
+        .observability
+        .metrics()
+        .lifecycle
+        .record_broker_poll("job");
     Ok(Json(payload))
 }
 
