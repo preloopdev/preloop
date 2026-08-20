@@ -673,6 +673,7 @@ pub(crate) async fn twirp_cache_v2_create(
         .map_err(|e| ApiError::internal(format!("failed to create cache stage dir: {e}")))?;
     let already_reserved = {
         let mut inner = shared.state.inner.lock().await;
+        let job_backend_id = job_backend_id_from_bearer(&shared.state, &headers);
         if inner
             .cache_v2_pending
             .values()
@@ -680,11 +681,40 @@ pub(crate) async fn twirp_cache_v2_create(
         {
             true
         } else {
+            // F7: a runner is capped at MAX_PENDING_PER_JOB in-flight cache
+            // uploads. The job comes from the signed token scope, not the
+            // request body. A refusal is a plain `ok: false`, the same
+            // non-fatal shape actions/cache already handles for a miss.
+            if let Some(job_id) = &job_backend_id {
+                let pending = inner
+                    .cache_v2_pending
+                    .values()
+                    .filter(|pending| &pending.job_backend_id == job_id)
+                    .count();
+                if pending >= MAX_PENDING_PER_JOB {
+                    return Ok(pb_or_json(
+                        &headers,
+                        PbCreateCacheEntryResponse {
+                            ok: false,
+                            signed_upload_url: String::new(),
+                        },
+                        json!({
+                            "ok": false,
+                            "signed_upload_url": "",
+                            "message": format!(
+                                "job has {pending} pending cache uploads (cap {MAX_PENDING_PER_JOB})"
+                            )
+                        }),
+                    ));
+                }
+            }
             inner.cache_v2_pending.insert(
                 token.clone(),
                 CacheV2Pending {
                     key: storage_key,
                     version,
+                    job_backend_id: job_backend_id.unwrap_or_default(),
+                    created_unix: now_unix(),
                 },
             );
             let meta = crate::store::build_meta_snapshot(&inner);
@@ -897,6 +927,14 @@ pub(crate) async fn twirp_cache_v2_get_dl_url(
         inner
             .cache_v2_dl_tokens
             .insert(dl_token.clone(), (entry.key.clone(), entry.version.clone()));
+        // F7: bound the minted-token map; the oldest tokens are evicted
+        // first. A token that a runner has not yet fetched still works, so a
+        // real workflow's few concurrent downloads are never affected.
+        inner.cache_v2_dl_tokens_order.push_back(dl_token.clone());
+        inner
+            .cache_v2_dl_tokens_created
+            .insert(dl_token.clone(), now_unix());
+        trim_cache_dl_tokens(&mut inner);
     }
     let download_url = format!("{}/twirp-blob/cache/{dl_token}", runner_base_url());
     let matched_key = entry
@@ -996,8 +1034,14 @@ mod cache_pb_tests {
             metadata: Some(PbCacheMetadata {
                 repository_id: 42,
                 scope: vec![
-                    PbCacheScope { scope: "refs/heads/main".to_string(), permission: 1 },
-                    PbCacheScope { scope: "refs/heads/feature".to_string(), permission: 2 },
+                    PbCacheScope {
+                        scope: "refs/heads/main".to_string(),
+                        permission: 1,
+                    },
+                    PbCacheScope {
+                        scope: "refs/heads/feature".to_string(),
+                        permission: 2,
+                    },
                 ],
             }),
             key: "k".to_string(),
@@ -1015,7 +1059,10 @@ mod cache_pb_tests {
         let fixture = include_bytes!("../../../fixtures/wire/cache-multi-scope.pb");
         let (_, _, _, fixture_scopes, _) =
             pb_cache_request(fixture, CacheRequestKind::GetDownloadUrl).unwrap();
-        assert_eq!(fixture_scopes, vec!["refs/heads/main", "refs/heads/feature"]);
+        assert_eq!(
+            fixture_scopes,
+            vec!["refs/heads/main", "refs/heads/feature"]
+        );
     }
 
     #[test]

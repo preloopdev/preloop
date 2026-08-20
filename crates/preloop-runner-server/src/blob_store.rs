@@ -56,6 +56,18 @@ pub(crate) async fn blob_put(
 
     match query.comp.as_deref() {
         Some("block") => {
+            // F5: a block over the per-block cap is rejected up front. The
+            // official runner stages 4 MiB blocks, so nothing legitimate is
+            // lost; a large single PUT is an attacker, not an uploader.
+            if body.len() > MAX_BLOCK_BYTES {
+                warn!(
+                    kind,
+                    token,
+                    bytes = body.len(),
+                    "blob block exceeds the per-block cap"
+                );
+                return StatusCode::PAYLOAD_TOO_LARGE;
+            }
             let block_id = query.blockid.unwrap_or_default();
             let safe_id = blockid_to_filename(&block_id);
             let blocks_dir = blob_root.join("blocks");
@@ -83,39 +95,80 @@ pub(crate) async fn blob_put(
         Some("blocklist") => {
             let body_str = String::from_utf8_lossy(&body);
             let block_ids = parse_blocklist_xml(&body_str);
+            if block_ids.len() > MAX_BLOCKLIST_BLOCKS {
+                warn!(
+                    kind,
+                    token,
+                    blocks = block_ids.len(),
+                    "blocklist exceeds the block-id budget"
+                );
+                return StatusCode::PAYLOAD_TOO_LARGE;
+            }
             let blocks_dir = blob_root.join("blocks");
             let data_path = blob_root.join("data");
 
-            let mut assembled: Vec<u8> = Vec::new();
+            // F5: fail fast on the total assembly budget before reading any
+            // block, so a blocklist referencing > 512 MiB never starts
+            // assembling (or materializes the destination).
+            let mut total: u64 = 0;
             for bid in &block_ids {
                 let safe_id = blockid_to_filename(bid);
-                match tokio::fs::read(blocks_dir.join(&safe_id)).await {
-                    Ok(bytes) => assembled.extend_from_slice(&bytes),
+                match tokio::fs::metadata(blocks_dir.join(&safe_id)).await {
+                    Ok(md) => {
+                        total = total.saturating_add(md.len());
+                        if total > MAX_ASSEMBLED_BYTES as u64 {
+                            warn!(
+                                kind,
+                                token, total, "blocklist exceeds the total assembly budget"
+                            );
+                            return StatusCode::PAYLOAD_TOO_LARGE;
+                        }
+                    }
                     Err(e) => {
-                        warn!(kind, token, "failed to read block {safe_id}: {e}");
+                        warn!(kind, token, "failed to stat block {safe_id}: {e}");
                         return StatusCode::INTERNAL_SERVER_ERROR;
                     }
                 }
             }
-            match tokio::fs::write(&data_path, &assembled).await {
-                Ok(()) => {
+
+            // Stream block files into the destination; never materialize the
+            // assembled blob in memory. The copy-tracking below is a
+            // belt-and-braces guard for the TOCTOU window between the stat
+            // pre-check above and the reads.
+            match assemble_streaming(&blocks_dir, &data_path, &block_ids).await {
+                Ok(size) => {
                     let _ = tokio::fs::remove_dir_all(&blocks_dir).await;
                     info!(
                         kind,
                         token,
-                        size = assembled.len(),
+                        size,
                         blocks = block_ids.len(),
                         "blob assembled from blocks"
                     );
                     StatusCode::CREATED
                 }
-                Err(e) => {
+                Err(AssemblyError::Budget) => {
+                    let _ = tokio::fs::remove_file(&data_path).await;
+                    warn!(kind, token, "assembly budget exceeded during copy");
+                    StatusCode::PAYLOAD_TOO_LARGE
+                }
+                Err(AssemblyError::Io(e)) => {
+                    let _ = tokio::fs::remove_file(&data_path).await;
                     warn!(kind, token, "failed to write assembled blob: {e}");
                     StatusCode::INTERNAL_SERVER_ERROR
                 }
             }
         }
         _ => {
+            if body.len() > MAX_ASSEMBLED_BYTES {
+                warn!(
+                    kind,
+                    token,
+                    bytes = body.len(),
+                    "single-shot blob exceeds the assembly budget"
+                );
+                return StatusCode::PAYLOAD_TOO_LARGE;
+            }
             // Single-shot upload.
             if let Err(e) = tokio::fs::create_dir_all(&blob_root).await {
                 warn!(kind, token, "failed to create blob dir: {e}");
@@ -134,6 +187,40 @@ pub(crate) async fn blob_put(
             }
         }
     }
+}
+
+/// Failure mode for streaming blob assembly.
+enum AssemblyError {
+    Io(std::io::Error),
+    Budget,
+}
+
+/// Stream blocks (in `block_ids` order) into `data_path`, never holding more
+/// than one block in memory. Fails with [`AssemblyError::Budget`] if the
+/// running total exceeds [`MAX_ASSEMBLED_BYTES`].
+async fn assemble_streaming(
+    blocks_dir: &std::path::Path,
+    data_path: &std::path::Path,
+    block_ids: &[String],
+) -> Result<u64, AssemblyError> {
+    let mut dest = tokio::fs::File::create(data_path)
+        .await
+        .map_err(AssemblyError::Io)?;
+    let mut total: u64 = 0;
+    for bid in block_ids {
+        let safe_id = blockid_to_filename(bid);
+        let mut src = tokio::fs::File::open(blocks_dir.join(&safe_id))
+            .await
+            .map_err(AssemblyError::Io)?;
+        let copied = tokio::io::copy(&mut src, &mut dest)
+            .await
+            .map_err(AssemblyError::Io)?;
+        total = total.saturating_add(copied);
+        if total > MAX_ASSEMBLED_BYTES as u64 {
+            return Err(AssemblyError::Budget);
+        }
+    }
+    Ok(total)
 }
 
 pub(crate) async fn blob_get(

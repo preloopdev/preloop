@@ -137,6 +137,8 @@ async fn sqlite_recovery_restores_queued_runs_and_next_run_number() {
                 CacheV2Pending {
                     key: "cache-key".to_owned(),
                     version: "cache-version".to_owned(),
+                    job_backend_id: String::new(),
+                    created_unix: 0,
                 },
             );
             state
@@ -19270,4 +19272,613 @@ async fn dirty_push_sync_verifies_the_branch_head_and_reports_checks_on_the_mate
 
     std::env::remove_var("PRELOOP_GITHUB_TOKEN");
     std::env::remove_var("PRELOOP_GITHUB_API_URL");
+}
+
+// ── Memory-hardening repros (authenticated-runner memory-exhaustion) ────────
+//
+// Each test drives one sink the way a malicious authenticated runner would:
+// runner-listen or job runtime tokens presented to `require_protocol_bearer`
+// / `require_results_bearer`, repeated `200 OK` requests that used to grow
+// state inside `Arc<Mutex<InnerState>>` without bound. The assertions check
+// the bounded behavior; before the caps shipped the same requests exceeded
+// the budgets, so these tests failed with the unbounded sizes in the message.
+
+async fn try_req_with_bearer(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    body: Value,
+    bearer: &str,
+) -> (StatusCode, Value) {
+    let builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+    let request = if body.is_null() {
+        builder.body(Body::empty()).unwrap()
+    } else {
+        builder
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let val = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, val)
+}
+
+async fn raw_req_with_bearer(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    body: &[u8],
+    bearer: &str,
+) -> (StatusCode, Vec<u8>) {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+        .body(Body::from(body.to_vec()))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, bytes.to_vec())
+}
+
+fn runner_listen_token(state: &AppState, runner_id: i64) -> String {
+    state
+        .local_jwt(json!({
+            "sub": format!("preloop-runner-listen-{runner_id}"),
+            "scp": "ActionsRuntime.RunnerListen",
+        }))
+        .expect("fixed runner-listen claims must serialize")
+}
+
+/// A real queued run's plan id + agent job uuid, for minting a job runtime
+/// token that resolves to a live job request.
+async fn queued_job_identity(app: &Router, state: &AppState) -> (String, uuid::Uuid) {
+    let accepted = submit_simple_run(app).await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let inner = state.inner.lock().await;
+    let request = inner
+        .job_requests
+        .values()
+        .find(|request| request.run_id == run_id)
+        .expect("submitted run must have a job request");
+    (request.plan_id.clone(), request.agent_job_id)
+}
+
+#[tokio::test]
+async fn repro_f1_log_append_is_bounded_per_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let runner_token = runner_listen_token(&state, 1);
+
+    // 320 appends of 64 KiB = 20 MiB through one log key. The durable chunk
+    // store receives every append; only the in-memory buffer is capped.
+    let chunk = vec![b'x'; 64 * 1024];
+    let uri = "/_apis/v1/Logfiles/scope/actions/plan-1/1";
+    for _ in 0..320 {
+        let (status, _) = raw_req_with_bearer(&app, Method::POST, uri, &chunk, &runner_token).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "appends must stay accepted");
+    }
+
+    let inner = state.inner.lock().await;
+    let retained = inner.logs.get("plan-1/1").map(Vec::len).unwrap_or(0);
+    assert!(
+        retained <= MAX_LOG_BYTES_PER_KEY,
+        "per-key in-memory log grew to {retained} bytes (cap {MAX_LOG_BYTES_PER_KEY})"
+    );
+}
+
+#[tokio::test]
+async fn repro_f1_log_flood_across_log_ids_is_bounded_per_plan() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let runner_token = runner_listen_token(&state, 1);
+
+    // Nine logs × 8 MiB each = 72 MiB in one plan: over the 64 MiB plan
+    // budget, so the oldest logs must be evicted.
+    let chunk = vec![b'x'; 1024 * 1024];
+    for log_id in 1..=9 {
+        let uri = format!("/_apis/v1/Logfiles/scope/actions/plan-1/{log_id}");
+        for _ in 0..8 {
+            let (status, _) =
+                raw_req_with_bearer(&app, Method::POST, &uri, &chunk, &runner_token).await;
+            assert_eq!(status, StatusCode::ACCEPTED);
+        }
+    }
+
+    let inner = state.inner.lock().await;
+    let total: usize = inner
+        .logs
+        .iter()
+        .filter(|(key, _)| key.starts_with("plan-1/"))
+        .map(|(_, value)| value.len())
+        .sum();
+    assert!(
+        total <= MAX_LOG_BYTES_PER_PLAN,
+        "plan log retention grew to {total} bytes (cap {MAX_LOG_BYTES_PER_PLAN})"
+    );
+    assert!(
+        !inner.logs.contains_key("plan-1/1"),
+        "oldest log of the plan must be evicted first"
+    );
+    assert!(
+        inner.logs.contains_key("plan-1/9"),
+        "newest logs must survive the eviction"
+    );
+}
+
+#[tokio::test]
+async fn repro_f2_timeline_records_are_capped_per_timeline() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let runner_token = runner_listen_token(&state, 1);
+
+    let accepted = submit_simple_run(&app).await;
+    let plan_id = accepted["run_id"].as_str().unwrap().to_string();
+    let timeline = "timeline-1";
+    let uri = format!("/_apis/v1/Timeline/scope/actions/{plan_id}/{timeline}");
+
+    // 2000 distinct record ids in one PATCH — a real job has tens of records.
+    let records: Vec<Value> = (0..2000u64)
+        .map(|i| {
+            json!({
+                "id": format!("{i:032x}"),
+                "name": format!("step-{i}"),
+                "type": "step",
+                "state": "completed",
+                "result": "failed",
+            })
+        })
+        .collect();
+    let (status, _) = try_req_with_bearer(
+        &app,
+        Method::PATCH,
+        &uri,
+        json!({ "count": 2000, "value": records }),
+        &runner_token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let inner = state.inner.lock().await;
+    let stored = inner
+        .timeline_records
+        .get(&format!("{plan_id}/{timeline}"))
+        .map(|records| records.len())
+        .unwrap_or(0);
+    assert!(
+        stored <= MAX_TIMELINE_RECORDS,
+        "timeline grew to {stored} records (cap {MAX_TIMELINE_RECORDS})"
+    );
+}
+
+#[tokio::test]
+async fn repro_f3_timeline_events_are_ring_buffered_per_run() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let runner_token = runner_listen_token(&state, 1);
+
+    let accepted = submit_simple_run(&app).await;
+    let plan_id = accepted["run_id"].as_str().unwrap().to_string();
+    let run_id: RunId = plan_id.parse().unwrap();
+    let uri = format!("/_apis/v1/Timeline/scope/actions/{plan_id}/timeline-1");
+
+    // 25 PATCHes × 100 status-bearing records = 2500 projected events: over
+    // the 2048-event ring cap, so the oldest events must be drained.
+    let batch: Vec<Value> = (0..100u64)
+        .map(|i| {
+            json!({
+                "id": format!("{i:032x}"),
+                "name": format!("step-{i}"),
+                "type": "step",
+                "state": "completed",
+                "result": "failed",
+            })
+        })
+        .collect();
+    for _ in 0..25 {
+        let (status, _) = try_req_with_bearer(
+            &app,
+            Method::PATCH,
+            &uri,
+            json!({ "count": 100, "value": batch.clone() }),
+            &runner_token,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let inner = state.inner.lock().await;
+    let events = inner
+        .timeline_events
+        .get(&run_id)
+        .map(Vec::len)
+        .unwrap_or(0);
+    assert!(
+        events <= MAX_TIMELINE_EVENTS,
+        "run event history grew to {events} (ring cap {MAX_TIMELINE_EVENTS})"
+    );
+}
+
+#[tokio::test]
+async fn repro_f5_blob_block_assembly_rejects_oversized_block() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let job_token = state.mint_runtime_token("plan-1", &uuid::Uuid::new_v4());
+
+    // A 5 MiB block is over the 4 MiB per-block cap.
+    let oversized = vec![b'x'; 5 * 1024 * 1024];
+    let (status, _) = raw_req_with_bearer(
+        &app,
+        Method::PUT,
+        "/twirp-blob/artifact/repro-token?comp=block&blockid=Ymln",
+        &oversized,
+        &job_token,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "a block over the per-block cap must be rejected with 413"
+    );
+}
+
+#[tokio::test]
+async fn repro_f5_blob_blocklist_count_and_total_budgets_are_enforced() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let job_token = state.mint_runtime_token("plan-1", &uuid::Uuid::new_v4());
+    let commit_uri = "/twirp-blob/artifact/repro-token?comp=blocklist";
+
+    // Count cap: one blocklist naming more than MAX_BLOCKLIST_BLOCKS ids.
+    let too_many: String = (0..MAX_BLOCKLIST_BLOCKS as u64 + 1)
+        .map(|i| format!("<Latest>{i}</Latest>"))
+        .collect();
+    let (status, _) = raw_req_with_bearer(
+        &app,
+        Method::PUT,
+        commit_uri,
+        too_many.as_bytes(),
+        &job_token,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "a blocklist over the id-count budget must be rejected with 413"
+    );
+
+    // Total cap: stage blocks totaling more than MAX_ASSEMBLED_BYTES directly
+    // on disk (the per-block HTTP cap is bypassed on purpose), then commit.
+    // The assembly budget must be rejected before any block is read.
+    let blob_root = state
+        .state_dir
+        .join("blobs")
+        .join("artifact")
+        .join("repro-token");
+    let blocks_dir = blob_root.join("blocks");
+    std::fs::create_dir_all(&blocks_dir).unwrap();
+    let block = vec![b'x'; MAX_BLOCK_BYTES];
+    let block_count = MAX_ASSEMBLED_BYTES / MAX_BLOCK_BYTES + 1; // 129 × 4 MiB
+    for i in 0..block_count {
+        std::fs::write(blocks_dir.join(format!("block-{i}")), &block).unwrap();
+    }
+    let over_total: String = (0..block_count)
+        .map(|i| format!("<Latest>block-{i}</Latest>"))
+        .collect();
+    let (status, _) = raw_req_with_bearer(
+        &app,
+        Method::PUT,
+        commit_uri,
+        over_total.as_bytes(),
+        &job_token,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "an assembly over the total budget must be rejected with 413"
+    );
+}
+
+#[tokio::test]
+async fn repro_f5_blob_block_assembly_still_produces_correct_blob() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let job_token = state.mint_runtime_token("plan-1", &uuid::Uuid::new_v4());
+
+    // Two 1 MiB blocks staged over HTTP, then committed: the wire behavior of
+    // the blocklist commit must be unchanged by the streaming rewrite.
+    let block_a = vec![b'a'; 1024 * 1024];
+    let block_b = vec![b'b'; 1024 * 1024];
+    let (status, _) = raw_req_with_bearer(
+        &app,
+        Method::PUT,
+        "/twirp-blob/artifact/ok-token?comp=block&blockid=YTE=",
+        &block_a,
+        &job_token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = raw_req_with_bearer(
+        &app,
+        Method::PUT,
+        "/twirp-blob/artifact/ok-token?comp=block&blockid=YjI=",
+        &block_b,
+        &job_token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, _) = raw_req_with_bearer(
+        &app,
+        Method::PUT,
+        "/twirp-blob/artifact/ok-token?comp=blocklist",
+        b"<Latest>YTE=</Latest><Latest>YjI=</Latest>",
+        &job_token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = raw_req_with_bearer(
+        &app,
+        Method::GET,
+        "/twirp-blob/artifact/ok-token",
+        b"",
+        &job_token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.len(), 2 * 1024 * 1024);
+    assert_eq!(&body[..1024 * 1024], block_a.as_slice());
+    assert_eq!(&body[1024 * 1024..], block_b.as_slice());
+    assert!(
+        !state
+            .state_dir
+            .join("blobs/artifact/ok-token/blocks")
+            .exists(),
+        "blocks dir must be removed after a successful commit"
+    );
+}
+
+#[tokio::test]
+async fn repro_f6_timeline_get_is_paginated_and_capped() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let runner_token = runner_listen_token(&state, 1);
+
+    let accepted = submit_simple_run(&app).await;
+    let plan_id = accepted["run_id"].as_str().unwrap().to_string();
+    let timeline = "timeline-1";
+    let uri = format!("/_apis/v1/Timeline/scope/actions/{plan_id}/{timeline}");
+
+    let records: Vec<Value> = (0..2000u64)
+        .map(|i| {
+            json!({
+                "id": format!("{i:032x}"),
+                "name": format!("step-{i}"),
+                "type": "step",
+                "state": "completed",
+                "result": "failed",
+            })
+        })
+        .collect();
+    let (status, _) = try_req_with_bearer(
+        &app,
+        Method::PATCH,
+        &uri,
+        json!({ "count": 2000, "value": records }),
+        &runner_token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Plain GET must not return the whole timeline in one response.
+    let (status, body) =
+        try_req_with_bearer(&app, Method::GET, &uri, Value::Null, &runner_token).await;
+    assert_eq!(status, StatusCode::OK);
+    let returned = body["records"].as_array().map(Vec::len).unwrap_or(0);
+    assert!(
+        returned <= MAX_TOP_RECORDS,
+        "timeline GET returned {returned} records without pagination (server cap {MAX_TOP_RECORDS})"
+    );
+
+    // Explicit pages work.
+    let (_, page) = try_req_with_bearer(
+        &app,
+        Method::GET,
+        &format!("{uri}?skip=500&top=500"),
+        Value::Null,
+        &runner_token,
+    )
+    .await;
+    assert_eq!(
+        page["records"].as_array().map(Vec::len).unwrap_or(0),
+        500,
+        "a skip/top page must return exactly the requested page size"
+    );
+
+    // Oversized tops are clamped server-side.
+    let (_, clamped) = try_req_with_bearer(
+        &app,
+        Method::GET,
+        &format!("{uri}?top=9999"),
+        Value::Null,
+        &runner_token,
+    )
+    .await;
+    assert!(
+        clamped["records"].as_array().map(Vec::len).unwrap_or(0) <= MAX_TOP_RECORDS,
+        "an oversized ?top= must be clamped to {MAX_TOP_RECORDS}"
+    );
+}
+
+#[tokio::test]
+async fn repro_f7_artifact_v2_pending_uploads_are_capped_per_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (plan_id, job_id) = queued_job_identity(&app, &state).await;
+    let job_token = state.mint_runtime_token(&plan_id, &job_id);
+
+    let uri = "/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact";
+    let mut last_status = StatusCode::OK;
+    for i in 0..=MAX_PENDING_PER_JOB as u64 {
+        let (status, body) = try_req_with_bearer(
+            &app,
+            Method::POST,
+            uri,
+            json!({
+                "workflow_run_backend_id": plan_id,
+                "workflow_job_run_backend_id": job_id.to_string(),
+                "name": format!("artifact-{i}"),
+            }),
+            &job_token,
+        )
+        .await;
+        last_status = status;
+        if i == MAX_PENDING_PER_JOB as u64 {
+            assert_ne!(
+                status,
+                StatusCode::OK,
+                "the pending artifact create past the per-job cap must be rejected (got {status}, body {body})"
+            );
+        }
+    }
+    assert_ne!(last_status, StatusCode::OK);
+
+    let inner = state.inner.lock().await;
+    assert!(
+        inner.artifact_v2_pending.len() <= MAX_PENDING_PER_JOB,
+        "pending artifact uploads grew to {} (cap {MAX_PENDING_PER_JOB})",
+        inner.artifact_v2_pending.len()
+    );
+}
+
+#[tokio::test]
+async fn repro_f7_cache_v2_pending_uploads_are_capped_per_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (plan_id, job_id) = queued_job_identity(&app, &state).await;
+    let job_token = state.mint_runtime_token(&plan_id, &job_id);
+
+    let uri = "/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry";
+    let mut refused = false;
+    for i in 0..=MAX_PENDING_PER_JOB as u64 {
+        let (_, body) = try_req_with_bearer(
+            &app,
+            Method::POST,
+            uri,
+            json!({ "key": format!("key-{i}"), "version": "v1" }),
+            &job_token,
+        )
+        .await;
+        if i == MAX_PENDING_PER_JOB as u64 {
+            refused = body["ok"] == json!(false);
+            assert!(
+                refused,
+                "the pending cache create past the per-job cap must be refused: {body}"
+            );
+        }
+    }
+    assert!(refused);
+
+    let inner = state.inner.lock().await;
+    assert!(
+        inner.cache_v2_pending.len() <= MAX_PENDING_PER_JOB,
+        "pending cache uploads grew to {} (cap {MAX_PENDING_PER_JOB})",
+        inner.cache_v2_pending.len()
+    );
+}
+
+#[tokio::test]
+async fn repro_f7_cache_download_tokens_are_bounded() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (plan_id, job_id) = queued_job_identity(&app, &state).await;
+    let job_token = state.mint_runtime_token(&plan_id, &job_id);
+
+    // Seed a cache entry through the real twirp upload flow, then mint
+    // download URLs far past the token cap.
+    let (_, created) = try_req_with_bearer(
+        &app,
+        Method::POST,
+        "/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry",
+        json!({ "key": "dl-key", "version": "v1" }),
+        &job_token,
+    )
+    .await;
+    assert_eq!(
+        created["ok"],
+        json!(true),
+        "cache create must succeed: {created}"
+    );
+    let token = created["signed_upload_url"]
+        .as_str()
+        .and_then(|url| url.rsplit('/').next())
+        .expect("signed upload URL carries the token")
+        .to_string();
+    let (status, _) = raw_req_with_bearer(
+        &app,
+        Method::PUT,
+        &format!("/twirp-blob/cache/{token}"),
+        b"hello cache",
+        &job_token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, finalized) = try_req_with_bearer(
+        &app,
+        Method::POST,
+        "/twirp/github.actions.results.api.v1.CacheService/FinalizeCacheEntryUpload",
+        json!({ "key": "dl-key", "version": "v1" }),
+        &job_token,
+    )
+    .await;
+    assert_eq!(
+        finalized["ok"],
+        json!(true),
+        "cache finalize must succeed: {finalized}"
+    );
+
+    let uri = "/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL";
+    for _ in 0..=(MAX_CACHE_DL_TOKENS + 8) {
+        let (status, body) = try_req_with_bearer(
+            &app,
+            Method::POST,
+            uri,
+            json!({ "key": "dl-key", "version": "v1" }),
+            &job_token,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "dl url minting must keep working");
+        assert_eq!(
+            body["ok"],
+            json!(true),
+            "dl url minting must keep working: {body}"
+        );
+    }
+
+    let inner = state.inner.lock().await;
+    assert!(
+        inner.cache_v2_dl_tokens.len() <= MAX_CACHE_DL_TOKENS,
+        "cache download tokens grew to {} (cap {MAX_CACHE_DL_TOKENS})",
+        inner.cache_v2_dl_tokens.len()
+    );
 }

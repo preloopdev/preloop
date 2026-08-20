@@ -94,6 +94,10 @@ pub(crate) async fn patch_timeline_records(
             .entry(run_id.unwrap_or_else(|| RunId(uuid::Uuid::nil())))
             .or_default()
             .extend(projected.clone());
+        trim_timeline_events(
+            &mut inner,
+            run_id.unwrap_or_else(|| RunId(uuid::Uuid::nil())),
+        );
 
         if let (Some(run_id), Some(job_id)) = (run_id, &logical_job_id) {
             if let Some(run) = inner.runs.get_mut(&run_id) {
@@ -199,11 +203,19 @@ pub(crate) async fn patch_timeline_records(
     // Persist records (upsert by record ID) and return the full stored set.
     let (response_records, meta) = {
         let mut inner = shared.state.inner.lock().await;
-        let stored = inner.timeline_records.entry(timeline_key).or_default();
+        let stored = inner
+            .timeline_records
+            .entry(timeline_key.clone())
+            .or_default();
         for record in records {
             stored.insert(record.id, record);
         }
-        let vals: Vec<_> = stored.values().cloned().collect();
+        trim_timeline_after_patch(&mut inner, &timeline_key);
+        let vals: Vec<_> = inner
+            .timeline_records
+            .get(&timeline_key)
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default();
         (vals, crate::store::build_meta_snapshot(&inner))
     };
     // Persist after the lock is released so a slow backend does not serialize
@@ -252,6 +264,7 @@ pub(crate) async fn create_log(
         let key = format!("{}/{}", plan_id, next_id);
         inner.logs.entry(key.clone()).or_default();
         inner.log_metadata.entry(key).or_default();
+        trim_plan_logs(&mut inner, &plan_id);
         crate::store::build_meta_snapshot(&inner)
     };
     if let Err(error) = shared.state.store.store_meta_only(&meta).await {
@@ -279,6 +292,15 @@ pub(crate) async fn append_log(
             .entry(key.clone())
             .or_default()
             .extend_from_slice(&masked);
+        // F1: keep only the newest bytes in memory. The durable chunk store
+        // received every append, so a truncated buffer never loses log data.
+        if let Some(retained) = inner.logs.get_mut(&key) {
+            let excess = retained.len().saturating_sub(MAX_LOG_BYTES_PER_KEY);
+            if excess > 0 {
+                retained.drain(0..excess);
+            }
+        }
+        trim_plan_logs(&mut inner, &plan_id);
         let meta = inner.log_metadata.entry(key.clone()).or_default();
         meta.byte_count += byte_count;
         meta.line_count += line_count;
@@ -441,10 +463,21 @@ pub(crate) async fn patch_timeline_records_plan(
     .await
 }
 
-/// GET `/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id` — read back full timeline.
+/// F6 — pagination controls for timeline GET. `top` is clamped to
+/// [`MAX_TOP_RECORDS`] server-side; `skip` pages further.
+#[derive(Debug, Deserialize)]
+pub(crate) struct TimelineQuery {
+    #[serde(default)]
+    pub(crate) top: Option<usize>,
+    #[serde(default)]
+    pub(crate) skip: Option<usize>,
+}
+
+/// GET `/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id` — read back the timeline.
 pub(crate) async fn get_timeline_records(
     State(shared): State<Arc<SharedState>>,
     Path((_scope, _hub, plan_id, timeline_id)): Path<(String, String, String, String)>,
+    Query(query): Query<TimelineQuery>,
 ) -> Json<serde_json::Value> {
     let timeline_key = format!("{}/{}", plan_id, timeline_id);
     let inner = shared.state.inner.lock().await;
@@ -453,10 +486,12 @@ pub(crate) async fn get_timeline_records(
         .get(&timeline_key)
         .copied()
         .unwrap_or(0);
+    let top = query.top.unwrap_or(MAX_TOP_RECORDS).min(MAX_TOP_RECORDS);
+    let skip = query.skip.unwrap_or(0);
     let records: Vec<_> = inner
         .timeline_records
         .get(&timeline_key)
-        .map(|m| m.values().cloned().collect())
+        .map(|m| m.values().skip(skip).take(top).cloned().collect())
         .unwrap_or_default();
     Json(json!({
         "id": timeline_id,
@@ -471,10 +506,12 @@ pub(crate) async fn get_timeline_records(
 pub(crate) async fn get_timeline_records_plan(
     State(shared): State<Arc<SharedState>>,
     Path((plan_id, timeline_id)): Path<(String, String)>,
+    Query(query): Query<TimelineQuery>,
 ) -> Json<serde_json::Value> {
     get_timeline_records(
         State(shared),
         Path((String::new(), String::new(), plan_id, timeline_id)),
+        Query(query),
     )
     .await
 }

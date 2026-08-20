@@ -235,6 +235,14 @@ impl ApiError {
         }
     }
 
+    pub(crate) fn payload_too_large(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: message.into(),
+            kind: ApiErrorKind::BadRequest,
+        }
+    }
+
     pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,

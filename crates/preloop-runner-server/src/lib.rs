@@ -83,6 +83,8 @@ mod blob_store;
 use blob_store::*;
 mod connection;
 use connection::*;
+mod memory_caps;
+use memory_caps::*;
 
 /// Pure job-graph scheduler model and property tests.
 pub mod scheduling;

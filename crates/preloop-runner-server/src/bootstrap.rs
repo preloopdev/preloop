@@ -130,6 +130,10 @@ pub fn generate_self_signed_cert() -> anyhow::Result<SelfSignedCert> {
 pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
     let mut inner = shared.state.inner.lock().await;
     let now = SystemTime::now();
+    // F7: drop pending cache/artifact uploads and download tokens older than
+    // PENDING_UPLOAD_TTL. Entries restored from a persisted meta have no age
+    // and are left alone, so a restart never sweeps a legitimate upload.
+    sweep_pending_uploads(&mut inner, now_unix());
     let mut cancellations = Vec::new();
     let mut disconnected_completions = Vec::new();
     // Jobs failed by the starvation sweep, emitted after the lock is

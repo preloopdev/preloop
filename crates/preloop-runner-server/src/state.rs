@@ -1187,6 +1187,13 @@ pub(crate) struct InnerState {
     pub(crate) cache_v2_pending: BTreeMap<String, CacheV2Pending>,
     /// Cache v2 download tokens: dl_token → (key, version).
     pub(crate) cache_v2_dl_tokens: BTreeMap<String, (String, String)>,
+    /// Cache v2 download-token mint order (FIFO eviction). In-memory only:
+    /// restored tokens have no entry and are evicted only when the cap is
+    /// exceeded, never by age.
+    pub(crate) cache_v2_dl_tokens_order: VecDeque<String>,
+    /// Cache v2 download-token mint time (unix seconds), for the TTL sweep.
+    /// In-memory only, like `cache_v2_dl_tokens_order`.
+    pub(crate) cache_v2_dl_tokens_created: BTreeMap<String, i64>,
     /// Artifact v2 Twirp pending uploads: upload_token → registry_key.
     pub(crate) artifact_v2_pending: BTreeMap<String, ArtifactV2Pending>,
     /// Artifact v2 finalized registry: registry_key → metadata.
