@@ -83,7 +83,9 @@ async fn main() -> anyhow::Result<()> {
     let (observability, observability_runtime) =
         preloop_observability::Observability::from_config(obs_config);
     preloop_observability::ObservabilityRuntime::install_fmt_subscriber(observability.config());
-    let _observability = observability;
+    // The handle must reach `ServerConfig`; holding it here alone would leave
+    // the server on the no-op handle installed by `AppState::new`, so nothing
+    // would ever export.
     let _observability_runtime = observability_runtime;
 
     let cli = Cli::parse();
@@ -131,7 +133,7 @@ async fn main() -> anyhow::Result<()> {
                 pool_preparing: None,
                 listen,
                 pool_status: None,
-                observability: None,
+                observability: Some(observability.clone()),
                 systemd_socket_activation: false,
                 unix_socket,
                 state_dir,

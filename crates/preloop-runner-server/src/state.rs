@@ -841,6 +841,16 @@ impl AppState {
             _ => None,
         };
         let has_run_projection = run_id.is_some();
+        if let NdjsonEvent::RunAccepted { queued_jobs, .. } = &event {
+            self.observability.export_log(
+                "INFO",
+                "run.accepted",
+                vec![
+                    ("event.name".to_string(), "run.accepted".to_string()),
+                    ("queued_jobs".to_string(), queued_jobs.to_string()),
+                ],
+            );
+        }
         // Record job terminal transitions exactly once. Guard with is_terminal
         // so we don't double-count non-terminal status updates. The event
         // itself is the proof of old→terminal movement, so we record here
@@ -876,6 +886,19 @@ impl AppState {
                     .metrics()
                     .lifecycle
                     .record_job_completed(conclusion, bounded_reason);
+                self.observability.export_log(
+                    if *status == preloop_gha_protocol::ExecutionStatus::Success {
+                        "INFO"
+                    } else {
+                        "WARN"
+                    },
+                    "job.completed",
+                    vec![
+                        ("event.name".to_string(), "job.completed".to_string()),
+                        ("conclusion".to_string(), conclusion.to_string()),
+                        ("reason".to_string(), bounded_reason.to_string()),
+                    ],
+                );
             }
             NdjsonEvent::JobCompleted { status, .. } if status.is_terminal() => {
                 let conclusion = match status {
@@ -889,6 +912,14 @@ impl AppState {
                     .metrics()
                     .lifecycle
                     .record_job_completed(conclusion, "completed");
+                self.observability.export_log(
+                    "INFO",
+                    "job.completed",
+                    vec![
+                        ("event.name".to_string(), "job.completed".to_string()),
+                        ("conclusion".to_string(), conclusion.to_string()),
+                    ],
+                );
             }
             _ => {}
         }

@@ -11,6 +11,7 @@
 //! - Always retain `stderr`/`journald` even when OTLP is configured.
 //! - `Debug` on config never reveals headers or credential-bearing endpoint parts.
 
+pub mod export;
 pub mod metrics;
 pub mod status;
 pub mod vm_telemetry;
@@ -139,6 +140,11 @@ impl ObservabilityConfig {
     /// Whether any `OTEL_EXPORTER_OTLP_HEADERS` was supplied (for health reporting).
     pub fn has_otel_headers(&self) -> bool {
         self.otel_headers.is_some()
+    }
+
+    /// Raw headers for transport construction. Never logged or in `Debug`.
+    pub fn otel_headers_raw(&self) -> Option<&str> {
+        self.otel_headers.as_deref()
     }
 
     /// Sanitized endpoint for `Debug`/errors: strips userinfo and query.
@@ -385,6 +391,7 @@ struct Inner {
     limits: LimitRegistry,
     metrics: Arc<metrics::MetricsRegistry>,
     vm_registry: Arc<vm_telemetry::VmTelemetryRegistry>,
+    exporter: Option<export::Exporter>,
     is_noop: bool,
 }
 
@@ -413,6 +420,7 @@ impl Observability {
                 limits: LimitRegistry::default(),
                 metrics: Arc::new(metrics::MetricsRegistry::default()),
                 vm_registry: Arc::new(vm_telemetry::VmTelemetryRegistry::default()),
+                exporter: None,
                 is_noop: true,
             }),
         }
@@ -421,6 +429,14 @@ impl Observability {
     /// Real handle from `ObservabilityConfig`. Does not install the global subscriber — pair with `ObservabilityRuntime`.
     pub fn from_config(config: ObservabilityConfig) -> (Self, ObservabilityRuntime) {
         let is_noop = !config.otlp_enabled;
+        // Absent endpoint spawns nothing at all — no worker, no socket.
+        let exporter = export::spawn(
+            config.otel_endpoint_raw(),
+            config.otel_headers_raw(),
+            &config.service_name,
+            &config.instance_id,
+        )
+        .map(|(exporter, _health)| exporter);
         let handle = Self {
             inner: Arc::new(Inner {
                 config: Arc::new(config),
@@ -428,6 +444,7 @@ impl Observability {
                 limits: LimitRegistry::default(),
                 metrics: Arc::new(metrics::MetricsRegistry::default()),
                 vm_registry: Arc::new(vm_telemetry::VmTelemetryRegistry::default()),
+                exporter,
                 is_noop,
             }),
         };
@@ -465,6 +482,27 @@ impl Observability {
 
     pub fn vm_registry(&self) -> &vm_telemetry::VmTelemetryRegistry {
         &self.inner.vm_registry
+    }
+
+    /// Enqueue a log record for OTLP export. No-op when export is disabled.
+    pub fn export_log(
+        &self,
+        severity: &'static str,
+        body: impl Into<String>,
+        attributes: Vec<(String, String)>,
+    ) {
+        if let Some(exporter) = &self.inner.exporter {
+            exporter.log(export::LogRecord {
+                severity,
+                body: body.into(),
+                attributes,
+            });
+        }
+    }
+
+    /// Export health for `/api/v1/status` and `preloop.telemetry.export`.
+    pub fn export_health(&self) -> Option<&Arc<export::ExportHealth>> {
+        self.inner.exporter.as_ref().map(|e| e.health())
     }
 
     pub fn config(&self) -> &ObservabilityConfig {
