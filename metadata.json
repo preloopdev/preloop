@@ -1,0 +1,24 @@
+{
+  "cli_version": "0.10.0",
+  "checkpoint_id": "01M0GP28K4J52DGX9CMDJVCYF5",
+  "strategy": "manual-commit",
+  "branch": "Bnjoroge/oobservability",
+  "checkpoints_count": 10,
+  "files_touched": [
+    "crates/preloop-cli/src/main.rs",
+    "crates/preloop-observability/src/export.rs",
+    "crates/preloop-observability/src/lib.rs",
+    "crates/preloop-runner-server/src/main.rs",
+    "crates/preloop-runner-server/src/state.rs",
+    "crates/preloop-runner/src/main.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": ""
+    }
+  ]
+}
