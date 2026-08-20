@@ -764,7 +764,11 @@ async fn main() -> anyhow::Result<()> {
     // one underneath itself.
     match cli.command {
         Command::Version => {
-            println!("preloop {}", env!("CARGO_PKG_VERSION"));
+            println!(
+                "preloop {} ({})",
+                env!("CARGO_PKG_VERSION"),
+                env!("PRELOOP_BUILD_COMMIT")
+            );
             return Ok(());
         }
         Command::Serve(args) => return cmd_engine(args).await,

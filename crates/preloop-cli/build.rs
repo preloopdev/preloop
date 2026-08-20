@@ -11,6 +11,7 @@
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
@@ -43,4 +44,26 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     fs::write(out_dir.join("pins.rs"), out).expect("write pins.rs");
     println!("cargo:rerun-if-changed=../../versions.toml");
+
+    // Embed the exact source commit this binary was built from. The updater
+    // uses it to resolve same-version installs: a source build from newer
+    // main reports the same version string as the latest release tag, and
+    // byte-comparing the binaries would clobber the newer build with the
+    // stale release asset. The commit is the monotonic signal the version
+    // string cannot carry. Release assets are built in CI from a git
+    // checkout, so the SHA is always present there; a non-git build (e.g.
+    // `cargo install` from a crates.io tarball) falls back to a sentinel
+    // that the updater treats as "cannot verify, keep what is installed".
+    let commit = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&manifest_dir)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|sha| sha.trim().to_owned())
+        .filter(|sha| !sha.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned());
+    println!("cargo:rustc-env=PRELOOP_BUILD_COMMIT={commit}");
+    println!("cargo:rerun-if-changed=../../.git/HEAD");
 }
