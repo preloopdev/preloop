@@ -1,7 +1,6 @@
-//! Step 3 DTOs — OperationalSnapshot and supporting types.
+//!OperationalSnapshot and supporting types.
 //!
-//! Neutral, serializable DTOs shared by server and CLI. No dependency on
-//! server/orchestrator internals. Metric labels use only bounded enums.
+
 
 use std::sync::Arc;
 
@@ -237,7 +236,7 @@ impl PoolStatus {
 }
 
 // ---------------------------------------------------------------------------
-// VMs (stubbed for Step 3, full host sampler is Step 5)
+// VMs 
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -403,9 +402,6 @@ pub struct TaskEntry {
     pub state: String,
 }
 
-// ---------------------------------------------------------------------------
-// Conditions
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Condition {

@@ -743,7 +743,7 @@ struct ShellArgs {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Unified observability init (Step 2): one handle for the process, shared
+    // Unified observability init: one handle for the process, shared
     // with `AppState` and `RunnerPoolConfig` later. `PRELOOP_LOG_FORMAT` now
     // controls pretty/json/auto (auto = pretty on TTY, JSON when piped), and
     // `RUST_LOG` defaults to `info` (the old `fmt::init()` default of ERROR hid
@@ -754,7 +754,7 @@ async fn main() -> anyhow::Result<()> {
         preloop_observability::Observability::from_config(obs_config);
     preloop_observability::ObservabilityRuntime::install_fmt_subscriber(observability.config());
     // Keep the handle alive; the pool/server will clone it later. Suppress
-    // unused warning until the wiring lands in Step 3.
+    // unused warning until the wiring lands.
     let _observability = observability;
     let _observability_runtime = observability_runtime;
 

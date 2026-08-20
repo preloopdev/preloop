@@ -75,10 +75,10 @@ async fn main() -> anyhow::Result<()> {
         .install_default()
         .ok();
 
-    // Unified observability init (Step 2): `RUST_LOG` now defaults to `info`
+    // Unified observability init: `RUST_LOG` now defaults to `info`
     // like the CLI, instead of falling silent when unset. `PRELOOP_LOG_FORMAT`
     // controls pretty/json/auto. The `Observability` handle will be cloned
-    // into `AppState` in Step 3; for now it is held for the life of `main`.
+    // into `AppState`; for now it is held for the life of `main`.
     let obs_config = preloop_observability::ObservabilityConfig::from_env();
     let (observability, observability_runtime) =
         preloop_observability::Observability::from_config(obs_config);

@@ -3,7 +3,7 @@ name = "preloop-observability"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Observability handle for Preloop — metrics, logs, traces, status snapshot (Step 2)"
+description = "Observability handle for Preloop — metrics, logs, traces, status snapshot"
 repository = "https://github.com/preloopdev/preloop"
 
 [dependencies]

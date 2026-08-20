@@ -1,6 +1,6 @@
 # Observability — Internal Signal & Security Contract
 
-> **Status:** Step 1 of Plan 002 (`plans/002-observability-strategy.md` revised at `673bdfa0`). This is the **internal** contract that must land before any OTLP export is wired. The public `docs/observability.md` will be a redacted subset later. Do not publish this file.
+> **Status:** Internal contract for Plan 002 (`plans/002-observability-strategy.md` revised at `673bdfa0`). This is the **internal** contract that must land before any OTLP export is wired. The public `docs/observability.md` will be a redacted subset later. Do not publish this file.
 
 ## Why
 
