@@ -3620,11 +3620,14 @@ fn fork_base_unusable(error: &VmError) -> bool {
 /// Whether `golden` is a fork base this pool baked and manages.
 ///
 /// The plain form (`{prefix}-golden`) is the single golden baked for the
-/// default environment at pool startup; the fingerprint-suffixed form
-/// (`{prefix}-golden-{fingerprint12}`) is prepared on demand by `run_slot`
-/// when a job asks for a non-default base image. Both carry a packed golden
-/// artifact and both can lose their retained fork checkpoint, so the
-/// re-arm / independent-create fallback applies to each.
+/// default environment at pool startup from the packed artifact; the
+/// fingerprint-suffixed form (`{prefix}-golden-{fingerprint12}`) is prepared
+/// on demand by `run_slot` from the job's OCI image when a job asks for a
+/// non-default base. Only the plain form is packed — the suffixed form is an
+/// environment golden whose forks do not inherit the baked baseline. Both
+/// can lose their retained fork checkpoint, so the re-arm /
+/// independent-create fallback applies to each; callers must not conflate
+/// "managed" with "packed".
 ///
 /// A name like `{prefix}-golden-environment` is deliberately NOT matched:
 /// that is a baked environment golden serving a different `runs-on` image,
@@ -3816,7 +3819,17 @@ async fn provision_runner<P: VmProvider + 'static>(
         // so an env-golden fork boots the bare stock base image. Install the
         // apt baseline and toolchains into the fork itself — it is the job's
         // single-use machine, so the writes persist for its lifetime.
-        let golden_is_packed = config.use_packed_artifact && managed_golden(config, golden);
+        // Only the plain `{prefix}-golden` fork base is created from the
+        // packed artifact (`prepare_packed_golden` at pool startup), whose
+        // rootfs already carries the apt baseline and toolchains that forks
+        // inherit. Fingerprint-suffixed goldens are baked by
+        // `prepare_golden_for_env` from the job's OCI image via guest exec,
+        // and SmolVM's forkable snapshot does NOT carry post-create exec
+        // writes into clones — so those forks must install the baseline
+        // themselves. Treating an env golden as packed skipped that install
+        // and provisioned runners without the curated baseline.
+        let golden_is_packed = config.use_packed_artifact
+            && golden.as_str() == format!("{}-golden", config.name_prefix);
         if golden_is_packed {
             // The pack carries the apt baseline, but not necessarily apt's
             // indices — restore them before any workflow apt-installs. A
@@ -3875,7 +3888,19 @@ async fn provision_runner<P: VmProvider + 'static>(
             );
         }
     } else {
-        let uses_packed_artifact = direct_create_from_packed;
+        // The packed-artifact fallback is valid only for the plain packed
+        // golden: it boots the *default* OS image. A fingerprint-suffixed
+        // golden is an environment golden baked from the job's requested
+        // image, so every fork-failure fallback must boot that job's own
+        // environment instead — regardless of which branch failed the fork.
+        // When no golden was attempted (`golden` is None, the create-per-
+        // runner path), the packed artifact is the pool's normal image and
+        // stays as-is.
+        let golden_is_plain_packed = match golden {
+            Some(golden) => golden.as_str() == format!("{}-golden", config.name_prefix),
+            None => true,
+        };
+        let uses_packed_artifact = direct_create_from_packed && golden_is_plain_packed;
         let pack = packed_golden_path(&config.artifact_payload());
         let spec = MachineSpec {
             name: name.clone(),
@@ -5443,6 +5468,41 @@ chmod +x "$destination/bin/node"
         assert!(
             provider.has_machine(&name).await,
             "the retried fork must leave the clone provisioned"
+        );
+    }
+
+    /// A fingerprint-suffixed golden is an *environment* golden baked from
+    /// the job's requested image. When its fork fails and the pool falls
+    /// back to independent creation, the runner must boot that job's
+    /// environment — not the default packed artifact, which would run a
+    /// non-default `runs-on` job on the wrong operating system.
+    #[tokio::test]
+    async fn fingerprint_golden_fork_failure_falls_back_to_the_job_environment() {
+        let provider =
+            Arc::new(TestProvider::new(false, false, false, false, false).failing_fork());
+        let config = packed_fork_config();
+        let golden = MachineName::new("lifecycle-test-golden-3577f5d5a384").unwrap();
+        let name = MachineName::new("lifecycle-test-0-9").unwrap();
+        let env = test_runner_environment("mirror.gcr.io/library/ubuntu:22.04", Vec::new(), true);
+
+        provision_runner(
+            &provider,
+            &config,
+            &name,
+            Some(&golden),
+            &Arc::new(KeyPool::new()),
+            &env,
+        )
+        .await
+        .expect("an env-golden fork failure falls back to the job environment");
+
+        let created = provider
+            .created_image(&name)
+            .await
+            .expect("the fallback created the runner machine");
+        assert_eq!(
+            created, "mirror.gcr.io/library/ubuntu:22.04",
+            "an env-golden fallback must boot the job's requested image, not the default pack"
         );
     }
 

@@ -794,21 +794,42 @@ pub(crate) async fn broker_acquire_job(
             let run = record.and_then(|record| inner.runs.get(&record.run_id));
             match (record, run) {
                 (Some(record), Some(run)) => {
+                    // The submission stores the tier as a plain kebab-case
+                    // string (e.g. "untrusted-fork-pull-request"), not JSON.
+                    // `from_str` expects JSON and would reject the bare
+                    // string, yielding `None` — which `job_authorization`
+                    // treats as trusted, silently un-restricting a fork
+                    // job's token. Parse via a JSON string value so the
+                    // kebab-case variant decodes.
                     let tier = run.submission.trust_tier.as_deref().and_then(|tier| {
-                        serde_json::from_str::<crate::events::trust_tier::TrustTier>(tier).ok()
+                        serde_json::from_value(serde_json::Value::String(tier.to_owned())).ok()
                     });
-                    let declared = run
-                        .submission
-                        .payload
-                        .get("workflow_job")
-                        .and_then(|job| job.get("permissions"))
-                        .and_then(serde_json::Value::as_object)
-                        .map(|permissions| {
-                            permissions
-                                .iter()
-                                .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("read").to_owned()))
-                                .collect::<BTreeMap<_, _>>()
+                    // The job's resolved permission set lives in the
+                    // persisted message's `system.github.token.permissions`
+                    // variable (PascalCase wire spelling) — the same
+                    // variable the build path wrote from `JobPlan`
+                    // permissions. The event payload's `workflow_job` key is
+                    // absent for push/PR/dispatch events, so reading it there
+                    // would fall back to the broad default and grant scopes
+                    // the workflow withheld. Recover from the message
+                    // instead, converting the wire spelling back to
+                    // kebab-case for the token request.
+                    let wire_permissions = message
+                        .variables
+                        .get("system.github.token.permissions")
+                        .and_then(|variable| variable.value.as_deref())
+                        .and_then(|json| {
+                            serde_json::from_str::<BTreeMap<String, String>>(json).ok()
                         });
+                    // `system.github.token.permissions` carries the effective
+                    // set (defaults substituted when nothing was declared).
+                    // Passing it as the declared set is faithful: for a
+                    // declared job it is exactly the job's set, and for an
+                    // undeclared job `job_authorization` treats a set equal
+                    // to the default identically to `None`. The fork case is
+                    // safe too — the wire variable was restated to the fork
+                    // profile at build, and clamping it again is idempotent.
+                    let declared = wire_permissions.clone();
                     let policy = crate::events::trust_tier::job_authorization(
                         tier,
                         declared.as_ref(),
@@ -866,6 +887,25 @@ pub(crate) async fn broker_acquire_job(
                     "GITHUB_TOKEN".to_owned(),
                     preloop_gha_protocol::azdo::VariableValue::secret(token.clone()),
                 );
+                // Restate what the token carries when the installation could
+                // not grant everything, mirroring the normal mint path: the
+                // recovered message's wire set is the requested set, and
+                // leaving it would print authority the token does not have.
+                if let Some(effective) = minted.effective_permissions {
+                    let merged = merge_narrowed_wire_permissions(
+                        message
+                            .variables
+                            .get("system.github.token.permissions")
+                            .and_then(|variable| variable.value.as_deref()),
+                        &effective,
+                    );
+                    message.variables.insert(
+                        "system.github.token.permissions".to_owned(),
+                        preloop_gha_protocol::azdo::VariableValue::new(
+                            preloop_gha_parser::job_builder::token_permissions_wire_json(&merged),
+                        ),
+                    );
+                }
                 match message.context_data.get_mut("github") {
                     Some(preloop_gha_protocol::azdo::PipelineContextData::Dict(github)) => {
                         github.insert(

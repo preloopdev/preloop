@@ -164,12 +164,12 @@ pub(crate) async fn run(args: UpdateArgs) -> anyhow::Result<()> {
         // version string cannot carry: reinstall only when the release
         // commit is an ancestor of the installed one (the release is
         // strictly newer); keep anything newer or unverifiable.
-        match resolve_same_version(&client, &repository, &release.tag_name, &selected).await {
+        match resolve_same_version(&client, &api_url, &release.tag_name).await {
             Ok(SameVersionDecision::UpToDate) => {
                 println!("preloop {} is already up to date", current_version);
                 return Ok(());
             }
-            Ok(SameVersionDecision::Reinstall(staged)) => {
+            Ok(SameVersionDecision::Reinstall) => {
                 println!(
                     "preloop {} is older than release {}; {} ({target})",
                     current_version,
@@ -183,6 +183,7 @@ pub(crate) async fn run(args: UpdateArgs) -> anyhow::Result<()> {
                 if args.check {
                     return Ok(());
                 }
+                let staged = stage_release(&client, &selected).await?;
                 let lock_path = update_lock_path()?;
                 let _lock = UpdateLock::acquire(&lock_path)?;
                 let executable =
@@ -733,7 +734,9 @@ enum SameVersionDecision {
     /// Installed binary is the same commit as, or newer than, the release.
     UpToDate,
     /// The release commit is an ancestor of the installed one; reinstall.
-    Reinstall(StagedRelease),
+    /// The release binary is staged by the caller after the `--check` guard,
+    /// so check-only runs never download the asset.
+    Reinstall,
 }
 
 /// Resolve an equal-version install by comparing the commit the installed
@@ -750,9 +753,8 @@ enum SameVersionDecision {
 /// extra hourly poll.
 async fn resolve_same_version(
     client: &Client,
-    repository: &str,
+    api_url: &str,
     release_tag: &str,
-    selected: &SelectedAsset<'_>,
 ) -> anyhow::Result<SameVersionDecision> {
     let installed_commit = env!("PRELOOP_BUILD_COMMIT");
     if installed_commit == "unknown" {
@@ -763,9 +765,7 @@ async fn resolve_same_version(
         return Ok(SameVersionDecision::UpToDate);
     }
 
-    let url = format!(
-        "https://api.github.com/repos/{repository}/compare/{installed_commit}...{release_tag}"
-    );
+    let url = compare_url(api_url, installed_commit, release_tag);
     let response = client
         .get(&url)
         .send()
@@ -784,12 +784,24 @@ async fn resolve_same_version(
         .await
         .with_context(|| format!("decode compare response from {url}"))?;
     match same_version_decision(compare.status.as_str()) {
-        SameVersionOutcome::ReleaseNewer => {
-            let staged = stage_release(client, selected).await?;
-            Ok(SameVersionDecision::Reinstall(staged))
-        }
+        SameVersionOutcome::ReleaseNewer => Ok(SameVersionDecision::Reinstall),
         SameVersionOutcome::KeepInstalled => Ok(SameVersionDecision::UpToDate),
     }
+}
+
+/// Build the compare API URL from the configured releases API base.
+///
+/// `<base>/releases` (the endpoint `fetch_release` polls) becomes
+/// `<base>/compare/{installed}...{release}`. Deriving from the configured
+/// base keeps GitHub Enterprise and `PRELOOP_RELEASES_API` overrides working
+/// — a hard-coded api.github.com host would fail the comparison for those
+/// setups and never reinstall an older build.
+fn compare_url(api_url: &str, installed_commit: &str, release_tag: &str) -> String {
+    let base = api_url
+        .trim_end_matches('/')
+        .strip_suffix("/releases")
+        .unwrap_or(api_url.trim_end_matches('/'));
+    format!("{base}/compare/{installed_commit}...{release_tag}")
 }
 
 /// Map the GitHub compare API's `status` to a same-version decision.
@@ -1090,6 +1102,30 @@ mod tests {
                 same_version_decision(status),
                 SameVersionOutcome::KeepInstalled,
                 "status {status:?} must keep installed"
+            );
+        }
+    }
+
+    /// The compare endpoint must derive from the configured releases API
+    /// base, not a hard-coded github.com host — a GitHub Enterprise or
+    /// overridden endpoint would otherwise always fail the comparison and
+    /// never reinstall an older build.
+    #[test]
+    fn compare_url_derives_from_the_configured_api_base() {
+        for (api_url, expected_base) in [
+            (
+                "https://api.github.com/repos/preloopdev/preloop/releases",
+                "https://api.github.com/repos/preloopdev/preloop/compare",
+            ),
+            (
+                "https://github.example.com/api/v3/repos/acme/preloop/releases",
+                "https://github.example.com/api/v3/repos/acme/preloop/compare",
+            ),
+        ] {
+            assert_eq!(
+                compare_url(api_url, "deadbeef", "v0.30.10"),
+                format!("{expected_base}/deadbeef...v0.30.10"),
+                "compare URL must use the configured API base: {api_url}"
             );
         }
     }
