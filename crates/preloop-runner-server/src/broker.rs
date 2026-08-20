@@ -380,6 +380,12 @@ pub(crate) async fn broker_session_root(
             .broker_session_runners
             .insert(session_id.clone(), runner_id);
     }
+    shared
+        .state
+        .observability
+        .metrics()
+        .lifecycle
+        .record_session_transition("create", "ok");
     Ok((
         StatusCode::CREATED,
         Json(json!({
@@ -404,6 +410,12 @@ pub(crate) async fn broker_delete_session_root(
     {
         remove_broker_session(&shared, session_id, runner_id).await?;
     }
+    shared
+        .state
+        .observability
+        .metrics()
+        .lifecycle
+        .record_session_transition("delete", "ok");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -414,6 +426,12 @@ pub(crate) async fn broker_delete_session_by_path(
 ) -> Result<StatusCode, ApiError> {
     let runner_id = authenticated_runner_id(&shared, &headers, None)?;
     remove_broker_session(&shared, &session_id, runner_id).await?;
+    shared
+        .state
+        .observability
+        .metrics()
+        .lifecycle
+        .record_session_transition("delete", "ok");
     Ok(StatusCode::NO_CONTENT)
 }
 
