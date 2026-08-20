@@ -2056,6 +2056,7 @@ dependencies = [
  "glob",
  "hostname",
  "indexmap",
+ "nix",
  "parking_lot",
  "preloop-dap",
  "preloop-gha-expressions",

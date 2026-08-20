@@ -122,6 +122,12 @@ pub async fn invoke<'a>(
         .group_spawn()
         .with_context(|| format!("spawning {program}"))?;
 
+    // Capture the group id now, while the handle still reports one: the wait
+    // loop below reaps the leader the moment it exits, and a reaped handle
+    // addresses nothing. The group outlives its leader for as long as any
+    // member is alive, so cancellation has to escalate against this id.
+    let group = process_group(&child);
+
     let stdout = child.inner().stdout.take();
     let stderr = child.inner().stderr.take();
 
@@ -177,9 +183,7 @@ pub async fn invoke<'a>(
                 }
                 _ = tokio::time::sleep_until(stream_deadline.unwrap_or_else(tokio::time::Instant::now)), if stream_deadline.is_some() => {
                     tracing::info!("Killing process group for {program} after redirected streams remained open for {:?}", STREAM_DRAIN_GRACE);
-                    if let Err(error) = child.kill().await {
-                        tracing::warn!("Failed to kill process group after stream drain timeout: {error}");
-                    }
+                    force_kill_group(&mut child, group, program).await;
                     forced_stream_close = true;
                     break;
                 }
@@ -200,9 +204,7 @@ pub async fn invoke<'a>(
                 },
                 _ = tokio::time::sleep_until(stream_deadline.unwrap_or_else(tokio::time::Instant::now)), if stream_deadline.is_some() => {
                     tracing::info!("Killing process group for {program} after redirected streams remained open for {:?}", STREAM_DRAIN_GRACE);
-                    if let Err(error) = child.kill().await {
-                        tracing::warn!("Failed to kill process group after stream drain timeout: {error}");
-                    }
+                    force_kill_group(&mut child, group, program).await;
                     forced_stream_close = true;
                     break;
                 }
@@ -212,7 +214,7 @@ pub async fn invoke<'a>(
     }
 
     if cancel_requested {
-        terminate_process_group(&mut child, program).await;
+        terminate_process_group(&mut child, group, program).await;
         drain_chunks(
             stdout_handle,
             stderr_handle,
@@ -389,21 +391,91 @@ async fn drain_chunks(
 
 // ── Process group termination ───────────────────────────────────────────
 
-async fn terminate_process_group(child: &mut AsyncGroupChild, program: &str) {
-    if graceful_signal(child, program, ProcessSignal::Interrupt, SIGINT_GRACE).await {
+async fn terminate_process_group(child: &mut AsyncGroupChild, group: ProcessGroup, program: &str) {
+    if graceful_signal(
+        child,
+        group,
+        program,
+        ProcessSignal::Interrupt,
+        SIGINT_GRACE,
+    )
+    .await
+    {
         tracing::info!("Process group for {program} exited after SIGINT");
         return;
     }
 
-    if graceful_signal(child, program, ProcessSignal::Terminate, SIGTERM_GRACE).await {
+    if graceful_signal(
+        child,
+        group,
+        program,
+        ProcessSignal::Terminate,
+        SIGTERM_GRACE,
+    )
+    .await
+    {
         tracing::info!("Process group for {program} exited after SIGTERM");
         return;
     }
 
     tracing::info!("Killing process group for {program} after SIGINT/SIGTERM grace expired");
-    if let Err(e) = child.kill().await {
-        tracing::warn!("Failed to kill process group: {e}");
+    force_kill_group(child, group, program).await;
+}
+
+/// Hard-kill every surviving member of the group, then reap the leader.
+///
+/// `AsyncGroupChild::kill` can only reach a leader that is still unreaped, so
+/// on its own it leaves a backgrounded descendant running — reparented to
+/// init and outliving the job that spawned it. Sweeping the group is what
+/// makes this match `ProcessInvoker.cs`, which kills the remaining tree.
+async fn force_kill_group(child: &mut AsyncGroupChild, group: ProcessGroup, program: &str) {
+    #[cfg(unix)]
+    if let Some(group) = group {
+        signal_group(group, Signal::SIGKILL);
     }
+    #[cfg(not(unix))]
+    let _ = group;
+
+    if let Err(error) = child.kill().await {
+        // Routine once the wait loop has already collected the leader.
+        tracing::debug!("Leader for {program} was already reaped: {error}");
+    }
+}
+
+/// The process group cancellation escalates against, or `None` when none can
+/// be addressed safely.
+#[cfg(unix)]
+type ProcessGroup = Option<nix::unistd::Pid>;
+#[cfg(not(unix))]
+type ProcessGroup = ();
+
+#[cfg(unix)]
+fn process_group(child: &AsyncGroupChild) -> ProcessGroup {
+    let id = i32::try_from(child.id()?).ok()?;
+    // `killpg` reads a non-positive id as "my own group", which would signal
+    // the runner itself. `group_spawn` makes the child its own group leader,
+    // so an id matching our own group means it never got one.
+    if id <= 0 || id == nix::unistd::getpgrp().as_raw() {
+        return None;
+    }
+    Some(nix::unistd::Pid::from_raw(id))
+}
+
+#[cfg(not(unix))]
+fn process_group(_child: &AsyncGroupChild) -> ProcessGroup {}
+
+/// Deliver `signal` to every member of `group`. A failure means the group has
+/// already drained, which is the outcome the caller wanted anyway.
+#[cfg(unix)]
+fn signal_group(group: nix::unistd::Pid, signal: Signal) {
+    let _ = nix::sys::signal::killpg(group, signal);
+}
+
+/// Whether any member of `group` is still alive. The null signal runs the
+/// existence and permission checks without delivering anything.
+#[cfg(unix)]
+fn group_alive(group: nix::unistd::Pid) -> bool {
+    nix::sys::signal::killpg(group, None).is_ok()
 }
 
 #[derive(Copy, Clone)]
@@ -414,11 +486,12 @@ enum ProcessSignal {
 
 async fn graceful_signal(
     child: &mut AsyncGroupChild,
+    group: ProcessGroup,
     program: &str,
     signal: ProcessSignal,
     timeout: Duration,
 ) -> bool {
-    if let Err(e) = send_signal(child, signal) {
+    if let Err(e) = send_signal(child, group, signal) {
         tracing::warn!(
             "Failed to send {} to process group for {program}: {e}",
             signal.name()
@@ -426,7 +499,7 @@ async fn graceful_signal(
         return false;
     }
 
-    wait_for_exit(child, timeout).await
+    wait_for_group_exit(child, group, timeout).await
 }
 
 impl ProcessSignal {
@@ -439,28 +512,71 @@ impl ProcessSignal {
 }
 
 #[cfg(unix)]
-fn send_signal(child: &AsyncGroupChild, signal: ProcessSignal) -> std::io::Result<()> {
+fn send_signal(
+    child: &AsyncGroupChild,
+    group: ProcessGroup,
+    signal: ProcessSignal,
+) -> std::io::Result<()> {
     let signal = match signal {
         ProcessSignal::Interrupt => Signal::SIGINT,
         ProcessSignal::Terminate => Signal::SIGTERM,
     };
+
+    // Address the group id directly: once the leader is reaped the child
+    // handle can no longer reach the members that are still running.
+    if let Some(group) = group {
+        signal_group(group, signal);
+        return Ok(());
+    }
+
     child.signal(signal)
 }
 
 #[cfg(not(unix))]
-fn send_signal(child: &mut AsyncGroupChild, _signal: ProcessSignal) -> std::io::Result<()> {
+fn send_signal(
+    child: &mut AsyncGroupChild,
+    _group: ProcessGroup,
+    _signal: ProcessSignal,
+) -> std::io::Result<()> {
     child.start_kill()
 }
 
-async fn wait_for_exit(child: &mut AsyncGroupChild, timeout: Duration) -> bool {
+/// Wait until the whole group has drained, not merely the leader.
+///
+/// The leader is reaped as soon as it exits so its zombie cannot keep the
+/// group artificially alive, and only then is the group probed. Treating the
+/// leader's exit as "the group is gone" is precisely what let a backgrounded
+/// descendant outlive cancellation.
+async fn wait_for_group_exit(
+    child: &mut AsyncGroupChild,
+    group: ProcessGroup,
+    timeout: Duration,
+) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return true,
-            Ok(None) => {}
+        let leader_gone = match child.try_wait() {
+            Ok(status) => status.is_some(),
             Err(e) => {
                 tracing::warn!("Failed to poll process group status after signal: {e}");
                 return false;
+            }
+        };
+
+        #[cfg(unix)]
+        {
+            match group {
+                Some(group) if !group_alive(group) => return true,
+                // With no addressable group the leader's status is all there is.
+                None if leader_gone => return true,
+                _ => {}
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = group;
+            if leader_gone {
+                return true;
             }
         }
 
@@ -703,6 +819,19 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_interrupts_background_child_after_shell_exit() {
+        // The shell exits within a millisecond, so cancellation always lands
+        // after the leader has been reaped, and the backgrounded child ignores
+        // both graceful signals — SIGKILL against the group is the only thing
+        // that can reap it. Assert the child actually died rather than
+        // trusting the error string: a survivor is reparented to init and
+        // silently outlives the job.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_path = dir.path().join("background.pid");
+        let script = format!(
+            "(trap '' TERM INT; while :; do sleep 1; done) & echo $! > {}; echo ready",
+            pid_path.display()
+        );
+
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let cancel_task = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(150)).await;
@@ -710,13 +839,10 @@ mod tests {
         });
 
         let result = tokio::time::timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(5),
             invoke(
                 "sh",
-                &[
-                    "-c",
-                    "(trap '' TERM; while :; do sleep 1; done) & echo ready",
-                ],
+                &["-c", &script],
                 Path::new("."),
                 &HashMap::new(),
                 None,
@@ -732,6 +858,26 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("process cancelled"));
+
+        let pid = nix::unistd::Pid::from_raw(
+            std::fs::read_to_string(&pid_path)
+                .expect("background pid file")
+                .trim()
+                .parse()
+                .expect("background pid"),
+        );
+
+        // The sweep, the reparent, and init's reap all race this assertion.
+        let mut survived = true;
+        for _ in 0..100 {
+            // The null signal only probes for existence.
+            if nix::sys::signal::kill(pid, None).is_err() {
+                survived = false;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!survived, "background child {pid} survived cancellation");
     }
 
     #[tokio::test]
