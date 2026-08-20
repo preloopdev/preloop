@@ -1,7 +1,6 @@
 //!OperationalSnapshot and supporting types.
 //!
 
-
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -236,7 +235,7 @@ impl PoolStatus {
 }
 
 // ---------------------------------------------------------------------------
-// VMs 
+// VMs
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -402,7 +401,6 @@ pub struct TaskEntry {
     pub state: String,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Condition {
     pub code: String,
@@ -418,10 +416,6 @@ pub struct ConditionExemplar {
     pub runner_id: Option<String>,
     pub machine_name: Option<String>,
 }
-
-// ---------------------------------------------------------------------------
-// OperationalSnapshot — the versioned status body
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperationalSnapshot {

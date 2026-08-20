@@ -11,6 +11,7 @@
 //! - Always retain `stderr`/`journald` even when OTLP is configured.
 //! - `Debug` on config never reveals headers or credential-bearing endpoint parts.
 
+pub mod metrics;
 pub mod status;
 
 use std::collections::HashMap;
@@ -381,6 +382,7 @@ struct Inner {
     config: Arc<ObservabilityConfig>,
     heartbeat: TaskHeartbeat,
     limits: LimitRegistry,
+    metrics: Arc<metrics::MetricsRegistry>,
     is_noop: bool,
 }
 
@@ -407,6 +409,7 @@ impl Observability {
                 config: Arc::new(config),
                 heartbeat: TaskHeartbeat::default(),
                 limits: LimitRegistry::default(),
+                metrics: Arc::new(metrics::MetricsRegistry::default()),
                 is_noop: true,
             }),
         }
@@ -420,6 +423,7 @@ impl Observability {
                 config: Arc::new(config),
                 heartbeat: TaskHeartbeat::default(),
                 limits: LimitRegistry::default(),
+                metrics: Arc::new(metrics::MetricsRegistry::default()),
                 is_noop,
             }),
         };
@@ -449,6 +453,10 @@ impl Observability {
 
     pub fn limits(&self) -> &LimitRegistry {
         &self.inner.limits
+    }
+
+    pub fn metrics(&self) -> &metrics::MetricsRegistry {
+        &self.inner.metrics
     }
 
     pub fn config(&self) -> &ObservabilityConfig {

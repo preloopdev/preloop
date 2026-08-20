@@ -609,6 +609,25 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     .await?;
     // Wire observability if supplied (CLI/server will pass its handle).
     if let Some(obs) = config.observability.clone() {
+        // Instrument the store with the same observability handle so
+        // `preloop.store.operation.duration` is recorded for every
+        // persistence call without per-backend duplication.
+        let backend = if config
+            .store_url
+            .as_deref()
+            .map(|u| u.contains("postgres"))
+            .unwrap_or(false)
+            || std::env::var("PRELOOP_STORE_URL")
+                .map(|v| v.contains("postgres"))
+                .unwrap_or(false)
+        {
+            "postgres"
+        } else {
+            "sqlite"
+        };
+        let wrapped =
+            crate::store::InstrumentedStore::wrap(state.store.clone(), obs.clone(), backend);
+        state.store = wrapped;
         state.observability = obs;
     }
     if let Some(ps) = config.pool_status.clone() {
