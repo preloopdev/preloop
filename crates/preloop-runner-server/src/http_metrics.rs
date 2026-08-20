@@ -56,6 +56,20 @@ pub async fn http_metrics_middleware(
         shared.state.observability.metrics().http.inc_active(lbl);
     }
 
+    // Adopt an inbound W3C trace so a caller's trace continues through the
+    // control plane; otherwise start a root. Health and metrics probes are
+    // suppressed from trace export per the signal policy — they would swamp
+    // the trace store and tell an operator nothing.
+    let traced = shared.state.observability.tracing_enabled() && surface != "public";
+    let span_context = traced.then(|| {
+        preloop_observability::export::SpanContext::from_traceparent(
+            req.headers()
+                .get("traceparent")
+                .and_then(|value| value.to_str().ok()),
+        )
+    });
+    let span_start = preloop_observability::export::now_nanos();
+
     let start = Instant::now();
     let res = next.run(req).await;
     let elapsed = start.elapsed();
@@ -66,38 +80,39 @@ pub async fn http_metrics_middleware(
     if let Some(lbl) = labels {
         let mut lbl = lbl;
         lbl.status_class = sc.clone();
-        // Record duration only for non-live_logs
+        let metrics = shared.state.observability.metrics();
+        metrics.http.observe_duration(lbl.clone(), elapsed);
+        metrics.http.dec_active(&lbl);
+    }
+
+    if let Some(context) = span_context {
+        // Attributes are allowlisted, never derived from the raw URI: the
+        // route is the matched template and the surface is a finite set.
+        let attributes = vec![
+            ("http.request.method".to_string(), method.clone()),
+            ("http.route".to_string(), route.clone()),
+            ("preloop.surface".to_string(), surface.clone()),
+            ("http.response.status_code".to_string(), status.to_string()),
+        ];
         shared
             .state
             .observability
-            .metrics()
-            .http
-            .observe_duration(lbl.clone(), elapsed);
-        shared.state.observability.metrics().http.dec_active(&lbl);
+            .export_span(preloop_observability::export::SpanRecord {
+                context,
+                name: format!("{method} {route}"),
+                start_nanos: span_start,
+                end_nanos: preloop_observability::export::now_nanos(),
+                // Only 5xx is the server's fault; a 4xx is the caller's and
+                // marking it Error would make every unauthenticated probe
+                // look like an outage.
+                status: if status >= 500 {
+                    preloop_observability::export::SpanStatus::Error
+                } else {
+                    preloop_observability::export::SpanStatus::Unset
+                },
+                attributes,
+            });
     }
-
-    // Safe span: method + route template + surface + status, no headers/body/query.
-    // Use `tracing::info_span!` so it appears in logs when RUST_LOG includes it,
-    // but filtered at DEBUG by default (poll/renew are DEBUG).
-    let span = tracing::info_span!(
-        "http.request",
-        http.method = %method,
-        http.route = %route,
-        http.surface = %surface,
-        http.status_code = status,
-        http.status_class = %sc,
-        otel.kind = "server",
-    );
-    // Attach span to response for trace correlation; the span itself is not
-    // entered for the handler thread beyond this point (no await while held).
-
-    // Also emit a counter for broker poll outcomes — the control plane's
-    // poll is a long-poll that returns job|empty|cancel|error. That is
-    // already counted via the HTTP histogram, but the plan also wants
-    // `preloop.broker.poll{outcome}` to distinguish empty vs error.
-    // For now we just log at DEBUG; the dedicated broker counter is wired
-    // in the broker module itself (Step 4 lifecycle).
-    let _ = span;
 
     res
 }

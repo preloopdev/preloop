@@ -443,12 +443,16 @@ impl Observability {
     pub fn from_config(config: ObservabilityConfig) -> (Self, ObservabilityRuntime) {
         let is_noop = !config.otlp_enabled;
         // Absent endpoint spawns nothing at all — no worker, no socket.
+        // The registry is shared with the worker so metric export scrapes the
+        // same instruments `/metrics` renders — one source, never two.
+        let metrics = Arc::new(metrics::MetricsRegistry::default());
         let exporter = export::spawn(
             config.otel_endpoint_raw(),
             config.otel_headers_raw(),
             &config.service_name,
             &config.instance_id,
             &config.service_version,
+            Some(metrics.clone()),
         )
         .map(|(exporter, _health)| exporter);
         let handle = Self {
@@ -456,7 +460,7 @@ impl Observability {
                 config: Arc::new(config),
                 heartbeat: TaskHeartbeat::default(),
                 limits: LimitRegistry::default(),
-                metrics: Arc::new(metrics::MetricsRegistry::default()),
+                metrics,
                 vm_registry: Arc::new(vm_telemetry::VmTelemetryRegistry::default()),
                 exporter,
                 is_noop,
@@ -505,13 +509,40 @@ impl Observability {
         body: impl Into<String>,
         attributes: Vec<(String, String)>,
     ) {
+        self.export_log_in_span(severity, body, attributes, None);
+    }
+
+    /// As [`Observability::export_log`], correlated with a span so a backend
+    /// can pivot from a log line to the request that produced it.
+    pub fn export_log_in_span(
+        &self,
+        severity: &'static str,
+        body: impl Into<String>,
+        attributes: Vec<(String, String)>,
+        context: Option<&export::SpanContext>,
+    ) {
         if let Some(exporter) = &self.inner.exporter {
             exporter.log(export::LogRecord {
                 severity,
                 body: body.into(),
                 attributes,
+                trace_id: context.map(|c| c.trace_id.clone()),
+                span_id: context.map(|c| c.span_id.clone()),
             });
         }
+    }
+
+    /// Enqueue a completed span. No-op when export is disabled.
+    pub fn export_span(&self, record: export::SpanRecord) {
+        if let Some(exporter) = &self.inner.exporter {
+            exporter.span(record);
+        }
+    }
+
+    /// Whether spans are worth building. Lets a caller skip id and timestamp
+    /// work entirely when nothing would consume the result.
+    pub fn tracing_enabled(&self) -> bool {
+        self.inner.exporter.is_some()
     }
 
     /// Export health for `/api/v1/status` and `preloop.telemetry.export`.

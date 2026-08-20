@@ -566,3 +566,242 @@ mod tests {
         assert_eq!(m.series_count(), 1, "1000 distinct IDs must be 1 series");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Structured collection for OTLP export
+// ---------------------------------------------------------------------------
+
+/// One data point, already reduced to bounded attributes.
+#[derive(Debug, Clone)]
+pub enum MetricPoint {
+    /// Monotonic counter (OTLP `sum`, cumulative, `isMonotonic: true`).
+    Sum {
+        value: f64,
+        attributes: Vec<(String, String)>,
+    },
+    /// Instantaneous value (OTLP `gauge`).
+    Gauge {
+        value: f64,
+        attributes: Vec<(String, String)>,
+    },
+    /// Explicit-bucket histogram (OTLP `histogram`, cumulative).
+    ///
+    /// `bucket_counts` is one longer than `bounds`: OTLP requires the
+    /// implicit `+Inf` bucket to be present as the final entry.
+    Histogram {
+        count: u64,
+        sum: f64,
+        bounds: Vec<f64>,
+        bucket_counts: Vec<u64>,
+        attributes: Vec<(String, String)>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct MetricFamily {
+    pub name: String,
+    pub unit: &'static str,
+    pub points: Vec<MetricPoint>,
+}
+
+impl Histogram {
+    /// Cumulative bucket counts plus the implicit `+Inf` bucket OTLP requires.
+    fn otlp_bucket_counts(&self) -> Vec<u64> {
+        let mut counts: Vec<u64> = self.buckets.iter().map(|(_, c)| *c).collect();
+        counts.push(self.count);
+        counts
+    }
+
+    fn bounds(&self) -> Vec<f64> {
+        self.buckets.iter().map(|(le, _)| *le).collect()
+    }
+}
+
+impl HttpMetrics {
+    fn collect(&self, out: &mut Vec<MetricFamily>) {
+        let durations = self.durations.read();
+        if !durations.is_empty() {
+            out.push(MetricFamily {
+                name: "http.server.request.duration".to_string(),
+                unit: "s",
+                points: durations
+                    .iter()
+                    .map(|(labels, hist)| MetricPoint::Histogram {
+                        count: hist.count,
+                        sum: hist.sum,
+                        bounds: hist.bounds(),
+                        bucket_counts: hist.otlp_bucket_counts(),
+                        attributes: vec![
+                            ("http.request.method".to_string(), labels.method.clone()),
+                            ("http.route".to_string(), labels.route.clone()),
+                            ("preloop.surface".to_string(), labels.surface.clone()),
+                            (
+                                "http.response.status_class".to_string(),
+                                labels.status_class.clone(),
+                            ),
+                        ],
+                    })
+                    .collect(),
+            });
+        }
+        let active = self.active.read();
+        if !active.is_empty() {
+            out.push(MetricFamily {
+                name: "http.server.active_requests".to_string(),
+                unit: "{request}",
+                points: active
+                    .iter()
+                    .map(|(labels, value)| MetricPoint::Gauge {
+                        value: *value as f64,
+                        attributes: vec![
+                            ("http.request.method".to_string(), labels.method.clone()),
+                            ("http.route".to_string(), labels.route.clone()),
+                            ("preloop.surface".to_string(), labels.surface.clone()),
+                        ],
+                    })
+                    .collect(),
+            });
+        }
+    }
+}
+
+impl StoreMetrics {
+    fn collect(&self, out: &mut Vec<MetricFamily>) {
+        let durations = self.durations.read();
+        if !durations.is_empty() {
+            out.push(MetricFamily {
+                name: "preloop.store.operation.duration".to_string(),
+                unit: "s",
+                points: durations
+                    .iter()
+                    .map(|(labels, hist)| MetricPoint::Histogram {
+                        count: hist.count,
+                        sum: hist.sum,
+                        bounds: hist.bounds(),
+                        bucket_counts: hist.otlp_bucket_counts(),
+                        attributes: vec![
+                            ("db.system".to_string(), labels.backend.clone()),
+                            ("preloop.operation".to_string(), labels.operation.clone()),
+                            ("preloop.outcome".to_string(), labels.outcome.clone()),
+                        ],
+                    })
+                    .collect(),
+            });
+        }
+        let failures = self.consecutive_failures.read();
+        if !failures.is_empty() {
+            out.push(MetricFamily {
+                name: "preloop.store.consecutive_failures".to_string(),
+                unit: "{failure}",
+                points: failures
+                    .iter()
+                    .map(|(backend, value)| MetricPoint::Gauge {
+                        value: *value as f64,
+                        attributes: vec![("db.system".to_string(), backend.clone())],
+                    })
+                    .collect(),
+            });
+        }
+    }
+}
+
+impl LifecycleMetrics {
+    fn collect(&self, out: &mut Vec<MetricFamily>) {
+        let completed = self.job_completed.read();
+        if !completed.is_empty() {
+            out.push(MetricFamily {
+                name: "preloop.job.completed".to_string(),
+                unit: "{job}",
+                points: completed
+                    .iter()
+                    .map(|(labels, value)| MetricPoint::Sum {
+                        value: *value as f64,
+                        attributes: vec![
+                            ("preloop.conclusion".to_string(), labels.conclusion.clone()),
+                            ("preloop.reason".to_string(), labels.reason.clone()),
+                        ],
+                    })
+                    .collect(),
+            });
+        }
+        let wait = self.queue_wait.read();
+        if !wait.is_empty() {
+            out.push(MetricFamily {
+                name: "preloop.job.queue.wait".to_string(),
+                unit: "s",
+                points: wait
+                    .iter()
+                    .map(|(labels, hist)| MetricPoint::Histogram {
+                        count: hist.count,
+                        sum: hist.sum,
+                        bounds: hist.bounds(),
+                        bucket_counts: hist.otlp_bucket_counts(),
+                        attributes: vec![("preloop.outcome".to_string(), labels.outcome.clone())],
+                    })
+                    .collect(),
+            });
+        }
+        let poll = self.broker_poll.read();
+        if !poll.is_empty() {
+            out.push(MetricFamily {
+                name: "preloop.broker.poll".to_string(),
+                unit: "{poll}",
+                points: poll
+                    .iter()
+                    .map(|(labels, value)| MetricPoint::Sum {
+                        value: *value as f64,
+                        attributes: vec![("preloop.outcome".to_string(), labels.outcome.clone())],
+                    })
+                    .collect(),
+            });
+        }
+        let sessions = self.session_transition.read();
+        if !sessions.is_empty() {
+            out.push(MetricFamily {
+                name: "preloop.runner.session.transition".to_string(),
+                unit: "{transition}",
+                points: sessions
+                    .iter()
+                    .map(|(labels, value)| MetricPoint::Sum {
+                        value: *value as f64,
+                        attributes: vec![
+                            ("preloop.operation".to_string(), labels.operation.clone()),
+                            ("preloop.reason".to_string(), labels.reason.clone()),
+                        ],
+                    })
+                    .collect(),
+            });
+        }
+        let concurrency = self.concurrency_decision.read();
+        if !concurrency.is_empty() {
+            out.push(MetricFamily {
+                name: "preloop.concurrency.decision".to_string(),
+                unit: "{decision}",
+                points: concurrency
+                    .iter()
+                    .map(|(labels, value)| MetricPoint::Sum {
+                        value: *value as f64,
+                        attributes: vec![
+                            ("preloop.queue_mode".to_string(), labels.queue_mode.clone()),
+                            ("preloop.action".to_string(), labels.action.clone()),
+                        ],
+                    })
+                    .collect(),
+            });
+        }
+    }
+}
+
+impl MetricsRegistry {
+    /// Snapshot every instrument as OTLP-ready families.
+    ///
+    /// Read-only: takes each sub-registry's read lock in turn and never holds
+    /// two at once, so a scrape cannot deadlock against a recording caller.
+    pub fn collect(&self) -> Vec<MetricFamily> {
+        let mut families = Vec::new();
+        self.http.collect(&mut families);
+        self.store.collect(&mut families);
+        self.lifecycle.collect(&mut families);
+        families
+    }
+}
