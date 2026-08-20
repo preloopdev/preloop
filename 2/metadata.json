@@ -1,0 +1,30 @@
+{
+  "cli_version": "0.10.0",
+  "checkpoint_id": "01M0G47WANYPH2Y0GJA7CKAMP1",
+  "session_id": "01a01b67-3441-7000-96b3-d0e402ef0210",
+  "strategy": "manual-commit",
+  "created_at": "2026-08-20T17:42:06.396289Z",
+  "branch": "fix/snapshot-tree-sha-default",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "crates/preloop-runner-server/src/snapshots.rs"
+  ],
+  "agent": "Oh My Pi",
+  "model": "",
+  "turn_id": "7c7fa5692619",
+  "checkpoint_transcript_start": 78,
+  "transcript_lines_at_start": 78,
+  "compact_transcript_start": 15,
+  "initial_attribution": {
+    "calculated_at": "2026-08-20T17:42:06.381449Z",
+    "agent_lines": 41,
+    "agent_removed": 0,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 41,
+    "total_lines_changed": 41,
+    "agent_percentage": 100,
+    "metric_version": 2
+  }
+}

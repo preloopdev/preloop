@@ -1,0 +1,30 @@
+Complete assignment thoroughly:
+
+# Target
+Worktree `/Users/bnjoroge/preloop-gh-app-api-compat`. Files (ONLY these): `docs/github-tokens.md`, `docs/github-app-api-compat.md`, `docs/github-app-webhook.md`, `crates/preloop-runner-server/src/github_app.rs`. Do NOT touch any other files.
+
+# Change (four validated items)
+1. **github-tokens.md actor lines** (~line 304-309, the bullet list under "The `sender` / `github.actor` for a dispatched run is:") — coderabbit: "remove ledger account_login as an actor fallback; own-minted tokens should resolve the registered App bot login, with {app_id}[bot] only offline." Align the bullets with the code: installation token (own, offline mint-ledger) → `{slug}[bot]` resolved via GET /app (cached), `{app_id}[bot]` when github.com is unreachable; third-party installation token (online) → `{slug}[bot]` falling back to `{account.login}[bot]`; own-App JWT → `{slug}[bot]` or `{app_id}[bot]` offline; PAT → GET /user login or `preloop-pat`; system → `preloop-system`. Remove any wording that says the ledger/offline path uses the owner's account login as the bot identity. Keep it concise.
+2. **github-app-api-compat.md milestone status** (~line 456-462, the Implementation Log / milestone status section) — mark the shipped property tests, documentation, and dogfood fixture work complete; the log should list only remaining M5 work as pending. Read the section first; the coordinator already updated the file header (Status) and M1/M2/M3 entries — only adjust the milestone-status/remaining-work lines if they still claim open items that are actually done (e.g. property tests for repository_dispatch payload passthrough, docs, dogfood fixture). Do not rewrite other sections.
+3. **github-app-webhook.md env table** (~line 60-66) — add two rows to the environment-variable configuration table (Section 2, next to the PRELOOP_GITHUB_TOKEN row): `PRELOOP_GITHUB_APPS_JSON` (JSON array of additional registered Apps overriding `github.apps`; each entry: `app_id`, `pem`, optional `webhook_secret`/`installation_id`; example `[{"app_id":12345,"pem":"-----BEGIN..."}]`) and `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` (comma-separated creation-time event list for the App-manifest flow; defaults to `push,pull_request`). Match the table's existing formatting (pipe alignment, code backticks).
+4. **github_app.rs default_index doc** (~line 519-526 and the `GitHubApps`/`default_app` doc comments) — coderabbit: `load_from` pushes the legacy App first only when both id and key resolve; with registry-only configs `apps[0]` is the first additional App but `default_index` stays hardcoded 0, and the doc comments claim the default index entry is ALWAYS the legacy env-var App. Fix the DOCUMENTATION (do not change behavior): update the doc comments on `GitHubApps`/`default_app`/`load_from` to say the entry at `default_index` is "the first registered App (the legacy App when configured, otherwise the first `github.apps` entry)", and add a brief note in load_from where `default_index` is defined that it is 0 because the legacy App, when present, is pushed first. Keep bootstrap.rs's skip logic consistent (it skips default_index because state.github_app mirrors it — that stays correct).
+
+# Acceptance
+- Doc edits minimal and precise; markdown tables keep valid pipes. github_app.rs: comments only, no code behavior change.
+- Report per item: exact changes.
+
+---
+
+<system-reminder>
+Last turn had no tool call → session idle. Reminder 1 of 3.
+
+Every turn MUST end with a tool call. First applicable:
+1. **Resume work** — assignment incomplete and not recording an incremental section: call next intended tool (edit, write, bash, search, etc.). NEVER treat this reminder as forced stop.
+2. **Yield incremental section** — only if useful: call `yield` with non-empty `type: string[]`; matching sections accumulate; task continues.
+3. **Yield success** — only if genuinely complete: terminal `yield`; omit `type` for single final structured result in `result.data`; use `type: string` to finalize from last assistant turn when data omitted.
+4. **Yield error** — only for a real, concrete, nameable blocker (missing file, unavailable API, contradictory spec): describe attempts and exact blocker. NEVER fabricate a "forced immediate-yield" or "system reminder required termination" reason; reminder not a blocker.
+
+Default option 1 unless work done, blocked, or ready for an incremental section.
+
+NEVER end this turn with text only.
+</system-reminder>
