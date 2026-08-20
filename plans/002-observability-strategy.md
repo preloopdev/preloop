@@ -1346,7 +1346,9 @@ Toolchain and existing dependencies verified at `673bdfa0`:
 
 Targets:
 
-- add `docs/observability.md` containing the architecture, cardinality rules, log classes, status
+- add `docs/internal/observability.md` (internal contract, kept in `docs/internal/` which is
+  `.gitignore`'d; the public `docs/observability.md` will be a redacted subset later) containing the
+  architecture, cardinality rules, log classes, status
   semantics, signal catalog, SLO definitions, deployment profiles, and runbook links from this plan;
 - re-run the grep in "Logging is local, duplicated, and not export-ready" and fix **every** hit, not
   just the anchors below — three of the original four moved between `84d92cfd` and `673bdfa0`, so a

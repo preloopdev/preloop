@@ -683,8 +683,8 @@ pub(crate) async fn twirp_cache_v2_create(
             inner.cache_v2_pending.insert(
                 token.clone(),
                 CacheV2Pending {
-                    key: storage_key,
-                    version,
+                    key: storage_key.clone(),
+                    version: version.clone(),
                 },
             );
             let meta = crate::store::build_meta_snapshot(&inner);
@@ -710,7 +710,11 @@ pub(crate) async fn twirp_cache_v2_create(
         ));
     }
     let upload_url = format!("{}/twirp-blob/cache/{token}", runner_base_url());
-    info!(token, "cache v2 create entry");
+    info!(
+        key = %storage_key,
+        version = %version,
+        "cache v2 create entry"
+    );
     Ok(pb_or_json(
         &headers,
         PbCreateCacheEntryResponse {
@@ -996,8 +1000,14 @@ mod cache_pb_tests {
             metadata: Some(PbCacheMetadata {
                 repository_id: 42,
                 scope: vec![
-                    PbCacheScope { scope: "refs/heads/main".to_string(), permission: 1 },
-                    PbCacheScope { scope: "refs/heads/feature".to_string(), permission: 2 },
+                    PbCacheScope {
+                        scope: "refs/heads/main".to_string(),
+                        permission: 1,
+                    },
+                    PbCacheScope {
+                        scope: "refs/heads/feature".to_string(),
+                        permission: 2,
+                    },
                 ],
             }),
             key: "k".to_string(),
@@ -1015,7 +1025,10 @@ mod cache_pb_tests {
         let fixture = include_bytes!("../../../fixtures/wire/cache-multi-scope.pb");
         let (_, _, _, fixture_scopes, _) =
             pb_cache_request(fixture, CacheRequestKind::GetDownloadUrl).unwrap();
-        assert_eq!(fixture_scopes, vec!["refs/heads/main", "refs/heads/feature"]);
+        assert_eq!(
+            fixture_scopes,
+            vec!["refs/heads/main", "refs/heads/feature"]
+        );
     }
 
     #[test]

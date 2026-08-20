@@ -60,14 +60,13 @@ pub(crate) async fn blob_put(
             let safe_id = blockid_to_filename(&block_id);
             let blocks_dir = blob_root.join("blocks");
             if let Err(e) = tokio::fs::create_dir_all(&blocks_dir).await {
-                warn!(kind, token, "failed to create blocks dir: {e}");
+                warn!(kind, "failed to create blocks dir: {e}");
                 return StatusCode::INTERNAL_SERVER_ERROR;
             }
             match tokio::fs::write(blocks_dir.join(&safe_id), &body).await {
                 Ok(()) => {
                     debug!(
                         kind,
-                        token,
                         block = safe_id,
                         bytes = body.len(),
                         "blob block staged"
@@ -75,7 +74,7 @@ pub(crate) async fn blob_put(
                     StatusCode::CREATED
                 }
                 Err(e) => {
-                    warn!(kind, token, "failed to write block {safe_id}: {e}");
+                    warn!(kind, block = %safe_id, "failed to write block: {e}");
                     StatusCode::INTERNAL_SERVER_ERROR
                 }
             }
@@ -92,7 +91,7 @@ pub(crate) async fn blob_put(
                 match tokio::fs::read(blocks_dir.join(&safe_id)).await {
                     Ok(bytes) => assembled.extend_from_slice(&bytes),
                     Err(e) => {
-                        warn!(kind, token, "failed to read block {safe_id}: {e}");
+                        warn!(kind, block = %safe_id, "failed to read block: {e}");
                         return StatusCode::INTERNAL_SERVER_ERROR;
                     }
                 }
@@ -102,7 +101,6 @@ pub(crate) async fn blob_put(
                     let _ = tokio::fs::remove_dir_all(&blocks_dir).await;
                     info!(
                         kind,
-                        token,
                         size = assembled.len(),
                         blocks = block_ids.len(),
                         "blob assembled from blocks"
@@ -110,7 +108,11 @@ pub(crate) async fn blob_put(
                     StatusCode::CREATED
                 }
                 Err(e) => {
-                    warn!(kind, token, "failed to write assembled blob: {e}");
+                    warn!(
+                        kind,
+                        blocks = block_ids.len(),
+                        "failed to write assembled blob: {e}"
+                    );
                     StatusCode::INTERNAL_SERVER_ERROR
                 }
             }
@@ -118,17 +120,21 @@ pub(crate) async fn blob_put(
         _ => {
             // Single-shot upload.
             if let Err(e) = tokio::fs::create_dir_all(&blob_root).await {
-                warn!(kind, token, "failed to create blob dir: {e}");
+                warn!(kind, "failed to create blob dir: {e}");
                 return StatusCode::INTERNAL_SERVER_ERROR;
             }
             let data_path = blob_root.join("data");
             match tokio::fs::write(&data_path, &body).await {
                 Ok(()) => {
-                    info!(kind, token, size = body.len(), "blob single-shot upload");
+                    info!(kind, size = body.len(), "blob single-shot upload");
                     StatusCode::CREATED
                 }
                 Err(e) => {
-                    warn!(kind, token, "failed to write single-shot blob: {e}");
+                    warn!(
+                        kind,
+                        size = body.len(),
+                        "failed to write single-shot blob: {e}"
+                    );
                     StatusCode::INTERNAL_SERVER_ERROR
                 }
             }
