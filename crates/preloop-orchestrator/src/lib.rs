@@ -2259,6 +2259,9 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         if let Some(signal) = &self.config.preparing_signal {
             signal.store(true, std::sync::atomic::Ordering::Release);
         }
+        if let Some(ps) = &self.config.pool_status {
+            ps.set_preparing(true);
+        }
         ensure_host_externals(&self.config)?;
         if self.config.use_packed_artifact || self.config.control_socket.is_none() {
             self.prepare_artifact(true).await?;
@@ -2293,6 +2296,9 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // counts the full grace window from here.
         if let Some(signal) = &self.config.preparing_signal {
             signal.store(false, std::sync::atomic::Ordering::Release);
+        }
+        if let Some(ps) = &self.config.pool_status {
+            ps.set_preparing(false);
         }
 
         let mut slots = JoinSet::new();
