@@ -161,7 +161,7 @@ impl ToolchainLayer {
                          esac\n\
                          curl -fsSL \"https://static.rust-lang.org/rustup/archive/{}/$RUST_ARCH-unknown-linux-gnu/rustup-init\" -o /tmp/rustup-init\n\
                          chmod +x /tmp/rustup-init\n\
-                         /tmp/rustup-init -y --profile minimal --default-toolchain {}\n\
+                         /tmp/rustup-init -y --profile minimal --default-toolchain {} --component rustfmt,clippy\n\
                          rm -f /tmp/rustup-init",
                         crate::RUSTUP_VERSION,
                         safe_component(channel)
@@ -247,10 +247,19 @@ impl ToolchainLayer {
 /// the GitHub-hosted parity toolset (node/python/go toolcaches, git, git-lfs,
 /// docker, nvm, yarn — see `base_install_script`), so per-project version
 /// files add nothing there. Rust is the one toolchain the base bake lacks,
-/// so it is baked for everyone. `setup-*` actions download any other version
-/// a job asks for at job time — the same model GitHub-hosted runners use.
+/// so it is baked for everyone — pinned for CI-Bench reproducibility — and Go
+/// rides along at the corpus-pinned version so per-job VMs stay identical.
+/// `setup-*` actions download any other version a job asks for at job time —
+/// the same model GitHub-hosted runners use.
 pub fn curated_toolchains() -> Vec<ToolchainLayer> {
-    vec![ToolchainLayer::Rust("stable".into())]
+    // CI-Bench pins its corpus toolchains: Rust 1.88.0 (the version every
+    // task was authored and validated against) and Go 1.26.x. Baking them
+    // into every golden keeps the per-job VMs identical instead of
+    // re-installing per job.
+    vec![
+        ToolchainLayer::Rust("1.88.0".into()),
+        ToolchainLayer::Go("1.26".into()),
+    ]
 }
 
 /// Digest-pinned Ubuntu base images.
@@ -579,8 +588,10 @@ mod tests {
             "no duplicate toolchains"
         );
         // Rust is the one toolchain the base bake does not cover, so it is
-        // the deliberate member of the curated set.
-        assert!(first.contains(&ToolchainLayer::Rust("stable".into())));
+        // the deliberate member of the curated set (pinned for CI-Bench
+        // reproducibility; Go rides along).
+        assert!(first.contains(&ToolchainLayer::Rust("1.88.0".into())));
+        assert!(first.contains(&ToolchainLayer::Go("1.26".into())));
     }
 
     #[test]

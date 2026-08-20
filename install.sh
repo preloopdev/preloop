@@ -68,25 +68,59 @@ release_json() { # tag or latest
     return 1
 }
 
+# --- smolvm runtime --------------------------------------------------------
+
 ensure_runtime() {
-    say "installing pinned smolvm runtime..."
-    PATH="$BIN_DIR:$HOME/.local/bin:$PATH" \
+    say "installing compatible smolvm runtime..."
+    # The freshly installed runtime lives in $HOME/.local/bin; put it ahead of
+    # $BIN_DIR so a stale custom-prefix binary cannot shadow it.
+    PATH="$HOME/.local/bin:$BIN_DIR:$PATH" \
         "$BIN_DIR/preloop" update --ensure-runtime \
-        || die "could not install the pinned smolvm runtime"
+        || die "could not install a compatible smolvm runtime"
 
     local smolvm_bin="$HOME/.local/bin/smolvm"
     [ -x "$smolvm_bin" ] || die "smolvm was not installed at $smolvm_bin"
     local smolvm_version
     smolvm_version="$("$smolvm_bin" --version 2>/dev/null | awk '{print $NF}')"
-    [ "$smolvm_version" = "1.7.7" ] \
-        || die "expected smolvm 1.7.7, found ${smolvm_version:-unknown}"
+    [ -n "$smolvm_version" ] \
+        || die "installed smolvm did not report a version"
+    # Mirror SMOLVM_MIN_VERSION in crates/preloop-cli/src/update.rs: the
+    # ownership-preserving runtime is the minimum this installer can rely on,
+    # and `preloop update --ensure-runtime` may be bypassed or regress.
+    smolvm_version_ge "$smolvm_version" "1.8.1" \
+        || die "installed smolvm $smolvm_version is older than the required 1.8.1"
 
     # Keep custom-prefix installs self-contained and ahead of any incompatible
     # system smolvm already on PATH.
     if [ "$BIN_DIR" != "$HOME/.local/bin" ]; then
         ln -sfn "$smolvm_bin" "$BIN_DIR/smolvm"
     fi
-    say "installed smolvm 1.7.7"
+    say "installed smolvm $smolvm_version"
+}
+
+# Numeric dotted-version comparison for the smolvm runtime gate (POSIX sh).
+# Returns 0 when $1 >= $2, 1 otherwise. Non-numeric suffixes (e.g. "-rc1")
+# are ignored, so "1.8.1-rc1" compares as "1.8.1".
+smolvm_version_ge() {
+    awk -v installed="$1" -v min="$2" '
+        BEGIN {
+            result = cmp(installed, min) < 0
+            exit result
+        }
+        function nums(v,   i, a, out) {
+            n = split(v, a, /[^0-9]+/)
+            for (i = 1; i <= 3; i++) out = out (i > 1 ? "." : "") (a[i] + 0)
+            return out
+        }
+        function cmp(a, b,   x, y, i) {
+            split(nums(a), x, "."); split(nums(b), y, ".")
+            for (i = 1; i <= 3; i++) {
+                if (x[i] + 0 > y[i] + 0) return 1
+                if (x[i] + 0 < y[i] + 0) return -1
+            }
+            return 0
+        }
+    '
 }
 
 install_from_release() {

@@ -635,6 +635,7 @@ pub(crate) async fn twirp_cache_v2_create(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<axum::response::Response, ApiError> {
+    crate::events::trust_tier::ensure_cache_write_allowed(&shared.state, &headers).await?;
     let (key, version, _restore, scopes, repository) =
         cache_request_fields(&headers, &body, CacheRequestKind::Create)?;
     let scope = scopes.first().map(String::as_str);
@@ -725,6 +726,7 @@ pub(crate) async fn twirp_cache_v2_finalize(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<axum::response::Response, ApiError> {
+    crate::events::trust_tier::ensure_cache_write_allowed(&shared.state, &headers).await?;
     let t0 = std::time::Instant::now();
     let (key, version, _restore, scopes, repository) =
         cache_request_fields(&headers, &body, CacheRequestKind::Finalize)?;

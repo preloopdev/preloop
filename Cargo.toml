@@ -102,5 +102,15 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
+[profile.dev.build-override]
+# Proc macros and build scripts are executed, not shipped; optimize them
+# so the compiler spends less time inside them during dev/test builds.
+opt-level = 3
+
+[profile.test]
+# CI test binaries: skip DWARF emission (smaller artifacts, faster codegen
+# and link). Panic backtraces lose line numbers in tests — acceptable.
+debug = 0
+
 [profile.dist]
 inherits = "release"

@@ -1527,7 +1527,20 @@ async fn execute_step(
             working_directory,
         } => {
             // Evaluate ${{ }} expressions in the script body
-            let expr_ctx = ctx.job.build_expression_context();
+            let mut expr_ctx = ctx.job.build_expression_context();
+            // Step-level `env:` entries are part of the `env` context while
+            // evaluating the step's own script (official runner behavior —
+            // `run: ${{ env.CMD }}` with a step-level `env: CMD: ...` must
+            // resolve; the dump workflow relies on it). The process
+            // environment gets them separately at command launch.
+            if !ctx.env.is_empty() {
+                let overlay = ctx
+                    .env
+                    .iter()
+                    .map(|(k, v)| (k.clone(), serde_json::json!(v)))
+                    .collect();
+                expr_ctx.merge_root("env", serde_json::Value::Object(overlay));
+            }
             let evaluated_script = crate::worker::template::evaluate_template(script, &expr_ctx)
                 .unwrap_or_else(|_| script.clone());
             // Use step-level working-directory if set, otherwise job workspace

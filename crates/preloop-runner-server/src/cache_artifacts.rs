@@ -115,8 +115,10 @@ pub(crate) async fn cache_get(
 
 pub(crate) async fn cache_reserve(
     State(shared): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<CacheReserveRequest>,
-) -> Json<CacheReserveResponse> {
+) -> Result<Json<CacheReserveResponse>, ApiError> {
+    crate::events::trust_tier::ensure_cache_write_allowed(&shared.state, &headers).await?;
     let mut inner = shared.state.inner.lock().await;
     inner.next_cache_id += 1;
     let cache_id = inner.next_cache_id;
@@ -132,14 +134,16 @@ pub(crate) async fn cache_reserve(
     if let Err(error) = shared.state.store.store_meta_only(&meta).await {
         tracing::warn!(?error, "failed to persist cache reservation");
     }
-    Json(CacheReserveResponse { cache_id })
+    Ok(Json(CacheReserveResponse { cache_id }))
 }
 
 pub(crate) async fn cache_upload(
     State(shared): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
     Path(cache_id): Path<i64>,
     bytes: Bytes,
 ) -> Result<StatusCode, ApiError> {
+    crate::events::trust_tier::ensure_cache_write_allowed(&shared.state, &headers).await?;
     let mut inner = shared.state.inner.lock().await;
     let pending = inner
         .pending_caches
@@ -155,9 +159,11 @@ pub(crate) async fn cache_upload(
 
 pub(crate) async fn cache_commit(
     State(shared): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
     Path(cache_id): Path<i64>,
     Json(request): Json<CacheCommitRequest>,
 ) -> Result<Json<CacheLookupResponse>, ApiError> {
+    crate::events::trust_tier::ensure_cache_write_allowed(&shared.state, &headers).await?;
     let pending = {
         let mut inner = shared.state.inner.lock().await;
         inner

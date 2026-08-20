@@ -13,6 +13,7 @@ preloop-gha-protocol = { path = "../preloop-gha-protocol" }
 preloop-runner-server = { path = "../preloop-runner-server" }
 preloop-gha-parser = { path = "../preloop-gha-parser" }
 anyhow = { workspace = true }
+base64 = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 thiserror = { workspace = true }
@@ -25,7 +26,6 @@ serde_yaml = { workspace = true }
 sha2 = "0.10"
 uuid = { workspace = true }
 reqwest = { workspace = true }
-libc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true

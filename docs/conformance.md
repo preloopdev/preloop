@@ -138,6 +138,29 @@ implementation, and review. Every new release therefore lands as: a version
 bump in `versions.toml`, a fresh golden capture set, a conformance run, and
 specs/PRs for anything the delta changed.
 
+### Automated path (Renovate + CI)
+
+The manual loop above is also driven automatically. Renovate
+(`renovate.json`) watches the `actions/runner` releases and opens a
+`runner_version` bump PR (labeled `protocol-sync`) when a new release
+appears — that PR is the tripwire. `.github/workflows/runner-sync.yml` then
+runs the pipeline stages:
+
+1. **prep** (hosted): `diff` + `triage --no-agents` and posts the spec
+   summary on the tripwire PR.
+2. **sync** (self-hosted, opt-in): `record-golden` (official bytes via
+   mitmproxy), `conform` (replay against the built server), and `pr`, which
+   opens the tiered draft PRs — each tagged `protocol-sync` +
+   `priority:{critical,high,low}` — based on a `runner-sync/v<version>`
+   branch carrying the bump, goldens, conformance report, and docs.
+
+The sync job is inert until a `[self-hosted, runner-sync]` host exists with
+mitmproxy, the official runner cache, Rust toolchain, and `gh`, and
+`RUNNER_SYNC_HOST_WORKSPACE` is set on the repo. Agent stages
+(`implement`/`review`) run only when `RUNNER_SYNC_AGENTS=true` and the agent
+CLIs (`codex`, `claude`) are installed; otherwise the tiered PRs surface the
+specs for human implementation.
+
 ## Layer 2: replayed wire using the goldens
 
 `.runner-watch/golden/v2.335.1/` holds **23 scenario captures** from the
