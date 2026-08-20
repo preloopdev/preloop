@@ -49,6 +49,14 @@ serde_yaml.workspace = true
 regex.workspace = true
 zip.workspace = true
 
+# Cancellation signals the process group by id, because the child handle stops
+# addressing the group once the leader is reaped. `nix` is the safe wrapper:
+# the workspace forbids `unsafe`, which rules out raw `libc` calls. Already in
+# the tree via command-group. Unix-only — `nix` does not build on Windows,
+# where the `cfg(not(unix))` paths in `process.rs` apply instead.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.27", features = ["signal", "process"] }
+
 [dev-dependencies]
 tempfile.workspace = true
 proptest.workspace = true

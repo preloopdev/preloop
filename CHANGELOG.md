@@ -11,6 +11,19 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- Cancelling a job no longer leaves background processes running on the
+  runner host. Cancellation signalled the process group through the child
+  handle, but the wait loop reaps the shell as soon as it exits, and a reaped
+  handle addresses nothing — so any descendant that outlived its shell was
+  never signalled. The leader's exit was also read as "the group is gone",
+  which returned success from the SIGINT stage and skipped the SIGTERM and
+  SIGKILL escalation entirely. A step that backgrounds a process ignoring
+  SIGINT/SIGTERM (databases, daemons, `nohup`) therefore survived
+  cancellation, was reparented to init, and accumulated on the host across
+  runs. The group id is now captured at spawn and the escalation runs against
+  the group itself, matching `ProcessInvoker.cs`, which kills the remaining
+  process tree. The same gap in the stream-drain grace path is fixed too.
+
 - SmolVM compatibility now comes from the central `versions.toml`
   `smolvm_min_version` pin. `preloop-cli` and `preloop-vm` compile the same
   floor, and `preloop update --ensure-runtime` installs the latest stable
