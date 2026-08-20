@@ -3,7 +3,7 @@
   "checkpoint_id": "01M0GEMFJ1ZVSCEXFM2GM2EX52",
   "strategy": "manual-commit",
   "branch": "Bnjoroge/oobservability",
-  "checkpoints_count": 16,
+  "checkpoints_count": 17,
   "files_touched": [
     "Cargo.lock",
     "crates/preloop-cli/src/main.rs",
@@ -47,6 +47,13 @@
       "transcript": "/3/full.jsonl",
       "compact_transcript": "/3/transcript.jsonl",
       "content_hash": "/3/content_hash.txt",
+      "prompt": ""
+    },
+    {
+      "metadata": "/4/metadata.json",
+      "transcript": "/4/full.jsonl",
+      "compact_transcript": "/4/transcript.jsonl",
+      "content_hash": "/4/content_hash.txt",
       "prompt": ""
     }
   ]
