@@ -19,6 +19,7 @@ use preloop_gha_protocol::SessionId;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use sha2::Digest;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const DATABASE_FILE: &str = "preloop.db";
 pub(crate) const SNAPSHOT_FORMAT: u8 = 2;
@@ -193,7 +194,21 @@ impl RunProjection {
 pub(crate) struct SqliteStore {
     connection: Arc<StdMutex<Connection>>,
     cipher: Envelope,
+    /// Commits since the last forced WAL truncation. A full
+    /// `wal_checkpoint(TRUNCATE)` on every commit fsyncs the DB every runner
+    /// event (~35x slower in a WAL micro-benchmark and head-of-line blocking
+    /// on the single connection); instead SQLite's background
+    /// `wal_autocheckpoint` (PASSIVE) bounds routine growth and we force a
+    /// TRUNCATE only every [`WAL_CHECKPOINT_INTERVAL`] commits to reclaim the
+    /// file. Amortized cost is one blocking checkpoint per N events.
+    checkpoint_counter: Arc<AtomicU64>,
 }
+
+/// Force a WAL truncation every N commits. Between forced truncations the
+/// default `wal_autocheckpoint` (1000 pages ≈ 4 MB, PASSIVE, non-blocking)
+/// keeps the WAL bounded; the periodic TRUNCATE guarantees the file is
+/// reclaimed even when a reader kept PASSIVE from advancing.
+const WAL_CHECKPOINT_INTERVAL: u64 = 128;
 
 /// Where the server should look for durable state. Parsed from `PRELOOP_STORE_URL`
 /// (or an explicit override); see [`parse_store_url`].
@@ -817,6 +832,39 @@ pub(crate) fn restore_session_key(
     Ok(SessionEncryption::from_key(payload.0))
 }
 
+/// Bound the WAL after a commit, and fail loudly when the checkpoint could not
+/// complete.
+///
+/// `PRAGMA wal_checkpoint(TRUNCATE)` returns a result row of
+/// `(busy, log_frames, checkpointed_frames)`; a blocked checkpoint reports
+/// `busy = 1` but does not raise a SQL error, so discarding the row would
+/// treat "WAL still full" as success. Backing off here also keeps one write
+/// from starving the next: the retry gives competing readers time to finish
+/// before we TRUNCATE again. Every post-commit write path funnels through
+/// this helper.
+fn checkpoint_wal(connection: &Connection) -> anyhow::Result<()> {
+    for _ in 0..10 {
+        let (busy, log, checkpointed) =
+            connection.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+        if busy == 0 {
+            return Ok(());
+        }
+        tracing::warn!(
+            log_frames = log,
+            checkpointed_frames = checkpointed,
+            "WAL checkpoint blocked; retrying"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    anyhow::bail!("WAL checkpoint stayed blocked after retries")
+}
+
 impl SqliteStore {
     pub(crate) fn open(path: &std::path::Path, cipher: Envelope) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
@@ -838,7 +886,20 @@ impl SqliteStore {
         Ok(Self {
             connection: Arc::new(StdMutex::new(connection)),
             cipher,
+            checkpoint_counter: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Post-commit WAL maintenance. Forces a truncating checkpoint only every
+    /// [`WAL_CHECKPOINT_INTERVAL`] commits (the first commit truncates so a
+    /// fresh DB starts clean); routine growth between truncations is bounded
+    /// by SQLite's background `wal_autocheckpoint`. This replaces the previous
+    /// truncate-on-every-commit policy, which fsynced the DB per runner event.
+    fn maybe_checkpoint_wal(&self, connection: &Connection) -> anyhow::Result<()> {
+        if self.checkpoint_counter.fetch_add(1, Ordering::Relaxed) % WAL_CHECKPOINT_INTERVAL == 0 {
+            checkpoint_wal(connection)?;
+        }
+        Ok(())
     }
 
     /// Apply pending migrations. Each step runs in its own transaction inside
@@ -1201,6 +1262,7 @@ impl SqliteStore {
         )?;
         tx.commit()
             .map_err(|error| anyhow::anyhow!("committing log chunk: {error}"))?;
+        self.maybe_checkpoint_wal(&connection)?;
         Ok(())
     }
 
@@ -1346,6 +1408,11 @@ impl SqliteStore {
         self.write_meta_tx(&tx, &snapshot.meta)?;
         tx.commit()
             .map_err(|error| anyhow::anyhow!("committing store snapshot: {error}"))?;
+        // The WAL grows with every runner event; an unbounded WAL (hundreds of
+        // MB) makes a later checkpoint sync stall the server for minutes.
+        // Force a truncation periodically (autocheckpoint bounds the rest) so
+        // the file is reclaimed without an fsync on every commit.
+        self.maybe_checkpoint_wal(&connection)?;
         Ok(())
     }
 
@@ -1381,6 +1448,10 @@ impl SqliteStore {
         self.insert_event_tx(&tx, &projection.event)?;
         tx.commit()
             .map_err(|error| anyhow::anyhow!("committing run event: {error}"))?;
+        // Same rationale as the full-snapshot path: bound the WAL so a
+        // runner-event burst cannot stall a later commit behind a giant
+        // checkpoint sync — periodically, not on every event.
+        self.maybe_checkpoint_wal(&connection)?;
         Ok(())
     }
 
@@ -1403,6 +1474,7 @@ impl SqliteStore {
         )?;
         tx.commit()
             .map_err(|error| anyhow::anyhow!("committing workflow run counter: {error}"))?;
+        self.maybe_checkpoint_wal(&connection)?;
         Ok(())
     }
 
@@ -1412,6 +1484,7 @@ impl SqliteStore {
         self.write_meta_tx(&tx, meta)?;
         tx.commit()
             .map_err(|error| anyhow::anyhow!("committing metadata: {error}"))?;
+        self.maybe_checkpoint_wal(&connection)?;
         Ok(())
     }
 
@@ -1558,6 +1631,7 @@ impl SqliteStore {
         self.insert_event_tx(&tx, event)?;
         tx.commit()
             .map_err(|error| anyhow::anyhow!("committing control event: {error}"))?;
+        self.maybe_checkpoint_wal(&connection)?;
         Ok(())
     }
 
