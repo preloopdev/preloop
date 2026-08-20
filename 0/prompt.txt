@@ -1,0 +1,117 @@
+huh why did it fail?
+
+---
+
+ok are tehre any other stuff we do to ensure compat with 1.7.7 or something we shouldnt need any of it. its extra stuff that makes everything complicated
+
+---
+
+Okay, so we confirmed that if a user has a lowest small VM version, we upgrade them automatically, right? When we're doing pre-loop update.
+
+---
+
+Yeah, that's fine. What's that ensure runtime plug for exactly?
+
+---
+
+That's fine. Do we have a preloop version of command?
+
+---
+
+Alright, sounds good. Implement it
+
+---
+
+can u ssh to main anc tell me what processor is in ther
+
+---
+
+what can i do if im using tailscale ssh and main is offline even tho its on
+
+---
+
+try now
+
+---
+
+how about now
+
+---
+
+did i lose thebpening tasks in the queue
+
+---
+
+ok so requeu everything and let it drain
+
+---
+
+review bot comment
+
+---
+
+ok squash merge
+
+---
+
+cancel all jobs jn main
+
+---
+
+now theres a https://github.com/kvcache-ai/AgentENV we did some benchmarking before with firecracker. i want you to do the same with smolvm and agentenv. assume im trying to decide which one to use for my peoduction workload. so do heavy heavy load tests spinning up as many vms as u can fast, track all the metrics , run some real world workloads in each of these etc. i trust you to make an exhaustive experiment. theresa doc that had the other experiments we did with hypeman
+
+---
+
+what were the results
+
+---
+
+so what exactly made agent ev that much faster
+
+---
+
+what does preconfigured mean for agent env exactly
+
+---
+
+how about forking a golden
+
+---
+
+yea so redo with prewarmed smolvm golden
+
+---
+
+huh so why is that happening
+
+---
+
+s waht workflow is sing for 1.26?
+
+---
+
+ok so change to 1.24
+
+---
+
+Why the hell are we installing tool chains in a in the official image exactly? We should be using the official image exactly as it is. I don't understand why we're installing extra stuff in itYou should only install extra stuff in our curated image. so remove that pr
+
+---
+
+So if the curated image has 1.26, so what were the issues we were facing?
+
+---
+
+You update the results of the benchmark to the document?
+
+---
+
+https://github.com/tsirysndr/bsdkrun/releases/tag/v0.11.1
+
+---
+
+ok thanks can u also checky why my latest merge still has pending github checks
+
+---
+
+yea do it and fix, want it back to normal

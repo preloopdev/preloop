@@ -1,0 +1,17 @@
+{
+  "cli_version": "0.10.0",
+  "checkpoint_id": "01M0G47WANYPH2Y0GJA7CKAMP1",
+  "strategy": "manual-commit",
+  "branch": "fix/snapshot-tree-sha-default",
+  "checkpoints_count": 10,
+  "files_touched": null,
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": "/0/prompt.txt"
+    }
+  ]
+}
