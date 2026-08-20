@@ -1,0 +1,19 @@
+{
+  "cli_version": "0.10.0",
+  "checkpoint_id": "01M0FYZK2WG8WMY3E63DXQ37EX",
+  "strategy": "manual-commit",
+  "branch": "Bnjoroge/oobservability",
+  "checkpoints_count": 4,
+  "files_touched": [
+    "plans/002-observability-strategy.html"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": ""
+    }
+  ]
+}
