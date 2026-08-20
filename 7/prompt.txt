@@ -1,0 +1,5 @@
+Complete assignment thoroughly:
+
+# Target: crates/preloop-runner-server/src/{scheduling.rs,models.rs,store.rs,store_pg.rs,preloop-gha-protocol/*,crates/preloop-cache/*,crates/preloop-artifacts/*} plus grep for DefaultBodyLimit, BodyLimit, MAX, limit, cap, unbounded across workspace.
+# Change: Search workspace for any global http body limit, per-route limits, axum Json limits, tower-http limits, and protocol DTO limits (e.g., TimelineRecord, Log chunks, annotation counts). Check if limits exist but are not applied to runner routes. Also check wire-compat shims that deserialize with serde_json::Value or loose maps.
+# Acceptance: Report (a) global limits present/missing, (b) which runner routes bypass them, (c) DTOs with Vec fields that deserialize unbounded.
