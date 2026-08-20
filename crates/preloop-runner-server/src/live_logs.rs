@@ -58,14 +58,30 @@ impl LiveLogBuffer {
                 self.bytes -= Self::wrapper_bytes(&oldest);
             }
         }
+        self.compact_if_wasteful();
         true
+    }
+
+    /// Reclaim `VecDeque` backing-buffer slack after evictions. `pop_front`
+    /// never shrinks the allocation, so a batch of evictions can leave
+    /// capacity far above the retained length (many small wrappers displaced
+    /// by one large one). Shrinking keeps that unused allocation bounded.
+    fn compact_if_wasteful(&mut self) {
+        let len = self.lines.len();
+        if self.lines.capacity() > len.saturating_mul(2).saturating_add(64) {
+            self.lines.shrink_to_fit();
+        }
     }
 
     fn wrapper_bytes(wrapper: &LiveLogFeedLinesWrapper) -> usize {
         std::mem::size_of::<LiveLogFeedLinesWrapper>()
-            + wrapper.step_id.len()
-            + wrapper.value.len() * std::mem::size_of::<String>()
-            + wrapper.value.iter().map(|line| line.len()).sum::<usize>()
+            + wrapper.step_id.capacity()
+            + wrapper.value.capacity() * std::mem::size_of::<String>()
+            + wrapper
+                .value
+                .iter()
+                .map(|line| line.capacity())
+                .sum::<usize>()
     }
 }
 
@@ -276,6 +292,40 @@ mod tests {
         assert_eq!(buffer.lines[0].step_id, "b");
         assert_eq!(buffer.lines[1].step_id, "c");
         assert_eq!(buffer.total_bytes(), size * 2);
+    }
+
+    #[test]
+    fn buffer_compacts_deque_capacity_after_large_evictions() {
+        let small = wrapper("a", "hello");
+        let small_size = LiveLogBuffer::wrapper_bytes(&small);
+
+        let mut buffer = LiveLogBuffer::new(small_size * 128);
+        for _ in 0..128 {
+            assert!(buffer.push(wrapper("a", "hello")));
+        }
+        assert!(buffer.lines.capacity() >= 128);
+
+        // One wrapper accounting for ~120 small wrappers evicts the bulk of
+        // the retained tail. `pop_front` alone would leave the deque backing
+        // allocation at its old size, so this also verifies compaction.
+        let large = LiveLogFeedLinesWrapper {
+            step_id: String::new(),
+            start_line: 1,
+            count: 1,
+            value: vec!["x".repeat(small_size * 120)],
+        };
+        assert!(buffer.push(large));
+
+        let len = buffer.lines.len();
+        assert!(
+            len < 16,
+            "large wrapper should evict most small wrappers, got {len}"
+        );
+        assert!(
+            buffer.lines.capacity() <= len * 2 + 64,
+            "deque capacity {} should shrink near retained length {len}",
+            buffer.lines.capacity()
+        );
     }
 
     #[test]
