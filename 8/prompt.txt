@@ -1,0 +1,5 @@
+Complete assignment thoroughly:
+
+# Target: crates/preloop-runner-server/src/{broker.rs,distributed_task.rs,runner_lifecycle.rs,connection.rs,results_twirp.rs}
+# Change: Deep read. Find unbounded memory vectors reachable by authenticated runner: broker queues/channels, message sizes, timeline records, logs, DistributedTask endpoints, runner session state. Look for Vec push without cap, HashMap entry without eviction, broadcast channels with unbounded lag, NDJSON/event streams buffered in memory, pagination without limit.
+# Acceptance: Enumerate each vector with file:line, handler name, data structure, and why it grows without bound under malicious runner control.
