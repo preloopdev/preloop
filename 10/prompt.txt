@@ -1,0 +1,26 @@
+Complete assignment thoroughly:
+
+# Target
+Enumerate and read every post on https://www.rwx.com/blog (and any older https://www.rwx.com/mint or mintcli/mint.rwx.com blog archive, plus https://www.rwx.com/changelog if it exists). Also check their YouTube/conf-talk write-ups if linked, and any engineering posts on content-addressed CI caching, VM snapshotting, or test flakiness.
+
+# Change
+Read-only research. For each post: title, date, URL, and 2-4 sentences on the concrete technical claim, mechanism, or product announcement. Group by theme afterwards (execution engine, caching, VM/infra, test intelligence/Captain, DX/CLI, migration/positioning, pricing/business). Flag any post that reveals implementation internals (e.g. how cache keys are computed, how VMs boot/snapshot, how the DAG scheduler works, benchmark numbers vs GitHub Actions).
+
+# Acceptance
+Return: (1) a chronological table Title | Date | URL | technical claim; aim for full coverage of the archive (if paginated, follow pagination). (2) A themed synthesis of the 8-12 most technically substantive posts with the specific mechanisms and any numbers they publish. Cite URLs. No repo writes.
+
+---
+
+<system-reminder>
+Last turn had no tool call → session idle. Reminder 1 of 3.
+
+Every turn MUST end with a tool call. First applicable:
+1. **Resume work** — assignment incomplete and not recording an incremental section: call next intended tool (edit, write, bash, search, etc.). NEVER treat this reminder as forced stop.
+2. **Yield incremental section** — only if useful: call `yield` with non-empty `type: string[]`; matching sections accumulate; task continues.
+3. **Yield success** — only if genuinely complete: terminal `yield`; omit `type` for single final structured result in `result.data`; use `type: string` to finalize from last assistant turn when data omitted.
+4. **Yield error** — only for a real, concrete, nameable blocker (missing file, unavailable API, contradictory spec): describe attempts and exact blocker. NEVER fabricate a "forced immediate-yield" or "system reminder required termination" reason; reminder not a blocker.
+
+Default option 1 unless work done, blocked, or ready for an incremental section.
+
+NEVER end this turn with text only.
+</system-reminder>
