@@ -841,6 +841,57 @@ impl AppState {
             _ => None,
         };
         let has_run_projection = run_id.is_some();
+        // Record job terminal transitions exactly once. Guard with is_terminal
+        // so we don't double-count non-terminal status updates. The event
+        // itself is the proof of old→terminal movement, so we record here
+        // rather than at the state mutation to avoid double-counting on
+        // duplicate `store_run_event` emits.
+        match &event {
+            NdjsonEvent::JobStatus { status, reason, .. } if status.is_terminal() => {
+                let conclusion = match status {
+                    preloop_gha_protocol::ExecutionStatus::Success => "success",
+                    preloop_gha_protocol::ExecutionStatus::Failure => "failure",
+                    preloop_gha_protocol::ExecutionStatus::Cancelled => "cancelled",
+                    preloop_gha_protocol::ExecutionStatus::Skipped => "skipped",
+                    _ => "unknown",
+                };
+                let reason_str = reason.as_deref().unwrap_or("unknown");
+                // Bound the reason to the finite set the plan allows; unknown
+                // reasons are mapped to "unknown" so they don't create new series.
+                let bounded_reason = match reason_str {
+                    "timeout"
+                    | "no_runner"
+                    | "lease_expired"
+                    | "deaf_runner"
+                    | "startup_orphan"
+                    | "concurrency_cancelled"
+                    | "concurrency_pending"
+                    | "success"
+                    | "failure"
+                    | "cancelled"
+                    | "skipped" => reason_str,
+                    _ => "unknown",
+                };
+                self.observability
+                    .metrics()
+                    .lifecycle
+                    .record_job_completed(conclusion, bounded_reason);
+            }
+            NdjsonEvent::JobCompleted { status, .. } if status.is_terminal() => {
+                let conclusion = match status {
+                    preloop_gha_protocol::ExecutionStatus::Success => "success",
+                    preloop_gha_protocol::ExecutionStatus::Failure => "failure",
+                    preloop_gha_protocol::ExecutionStatus::Cancelled => "cancelled",
+                    preloop_gha_protocol::ExecutionStatus::Skipped => "skipped",
+                    _ => "unknown",
+                };
+                self.observability
+                    .metrics()
+                    .lifecycle
+                    .record_job_completed(conclusion, "completed");
+            }
+            _ => {}
+        }
         // Capture the projection under the lock, then persist after releasing
         // it: a slow or unavailable backend must not stall the control plane
         // (runner polling, heartbeats, other state mutations).

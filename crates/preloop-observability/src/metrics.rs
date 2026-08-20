@@ -228,6 +228,7 @@ impl StoreMetrics {
 pub struct MetricsRegistry {
     pub http: HttpMetrics,
     pub store: StoreMetrics,
+    pub lifecycle: LifecycleMetrics,
 }
 
 impl MetricsRegistry {
@@ -235,6 +236,7 @@ impl MetricsRegistry {
         let mut out = String::new();
         self.http.render(&mut out);
         self.store.render(&mut out);
+        self.lifecycle.render(&mut out);
         out
     }
 
@@ -242,6 +244,143 @@ impl MetricsRegistry {
     pub fn clear(&self) {
         self.http.clear();
         self.store.clear();
+        self.lifecycle.clear();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle metrics — run/job, queue, broker, runner
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct JobCompletedLabels {
+    pub conclusion: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct QueueWaitLabels {
+    pub outcome: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BrokerPollLabels {
+    pub outcome: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SessionTransitionLabels {
+    pub operation: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Default)]
+pub struct LifecycleMetrics {
+    job_completed: RwLock<HashMap<JobCompletedLabels, u64>>,
+    queue_wait: RwLock<HashMap<QueueWaitLabels, Histogram>>,
+    broker_poll: RwLock<HashMap<BrokerPollLabels, u64>>,
+    session_transition: RwLock<HashMap<SessionTransitionLabels, u64>>,
+}
+
+impl LifecycleMetrics {
+    pub fn record_job_completed(&self, conclusion: &str, reason: &str) {
+        let labels = JobCompletedLabels {
+            conclusion: conclusion.to_string(),
+            reason: reason.to_string(),
+        };
+        *self.job_completed.write().entry(labels).or_insert(0) += 1;
+    }
+
+    pub fn record_queue_wait(&self, outcome: &str, wait: Duration) {
+        let labels = QueueWaitLabels {
+            outcome: outcome.to_string(),
+        };
+        let mut g = self.queue_wait.write();
+        let hist = g
+            .entry(labels)
+            .or_insert_with(|| Histogram::new(QUEUE_BUCKETS));
+        hist.observe(wait.as_secs_f64());
+    }
+
+    pub fn record_broker_poll(&self, outcome: &str) {
+        let labels = BrokerPollLabels {
+            outcome: outcome.to_string(),
+        };
+        *self.broker_poll.write().entry(labels).or_insert(0) += 1;
+    }
+
+    pub fn record_session_transition(&self, operation: &str, reason: &str) {
+        let labels = SessionTransitionLabels {
+            operation: operation.to_string(),
+            reason: reason.to_string(),
+        };
+        *self.session_transition.write().entry(labels).or_insert(0) += 1;
+    }
+
+    pub fn render(&self, out: &mut String) {
+        out.push_str("# HELP preloop_job_completed Terminal jobs by conclusion and reason\n");
+        out.push_str("# TYPE preloop_job_completed counter\n");
+        for (labels, cnt) in self.job_completed.read().iter() {
+            out.push_str(&format!(
+                "preloop_job_completed{{conclusion=\"{}\",reason=\"{}\"}} {}\n",
+                labels.conclusion, labels.reason, cnt
+            ));
+        }
+        out.push_str("# HELP preloop_job_queue_wait_seconds Queue wait until claim or terminal\n");
+        out.push_str("# TYPE preloop_job_queue_wait_seconds histogram\n");
+        for (labels, hist) in self.queue_wait.read().iter() {
+            for (le, cnt) in &hist.buckets {
+                out.push_str(&format!(
+                    "preloop_job_queue_wait_seconds_bucket{{outcome=\"{}\",le=\"{}\"}} {}\n",
+                    labels.outcome, le, cnt
+                ));
+            }
+            out.push_str(&format!(
+                "preloop_job_queue_wait_seconds_bucket{{outcome=\"{}\",le=\"+Inf\"}} {}\n",
+                labels.outcome, hist.count
+            ));
+            out.push_str(&format!(
+                "preloop_job_queue_wait_seconds_sum{{outcome=\"{}\"}} {}\n",
+                labels.outcome, hist.sum
+            ));
+            out.push_str(&format!(
+                "preloop_job_queue_wait_seconds_count{{outcome=\"{}\"}} {}\n",
+                labels.outcome, hist.count
+            ));
+        }
+        out.push_str("# HELP preloop_broker_poll_total Broker poll outcomes\n");
+        out.push_str("# TYPE preloop_broker_poll_total counter\n");
+        for (labels, cnt) in self.broker_poll.read().iter() {
+            out.push_str(&format!(
+                "preloop_broker_poll_total{{outcome=\"{}\"}} {}\n",
+                labels.outcome, cnt
+            ));
+        }
+        out.push_str("# HELP preloop_runner_session_transition_total Session lifecycle\n");
+        out.push_str("# TYPE preloop_runner_session_transition_total counter\n");
+        for (labels, cnt) in self.session_transition.read().iter() {
+            out.push_str(&format!(
+                "preloop_runner_session_transition_total{{operation=\"{}\",reason=\"{}\"}} {}\n",
+                labels.operation, labels.reason, cnt
+            ));
+        }
+    }
+
+    #[cfg(test)]
+    pub fn clear(&self) {
+        self.job_completed.write().clear();
+        self.queue_wait.write().clear();
+        self.broker_poll.write().clear();
+        self.session_transition.write().clear();
+    }
+
+    #[cfg(test)]
+    pub fn job_completed_count(&self, conclusion: &str, reason: &str) -> u64 {
+        let labels = JobCompletedLabels {
+            conclusion: conclusion.to_string(),
+            reason: reason.to_string(),
+        };
+        *self.job_completed.read().get(&labels).unwrap_or(&0)
     }
 }
 
