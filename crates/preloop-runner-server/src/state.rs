@@ -597,8 +597,19 @@ fn bounded_termination_reason(value: &str) -> &'static str {
         "startup_orphan" => return "startup_orphan",
         _ => {}
     }
-    // Prose paths — match on the stable leading phrase, never the whole
-    // string, so an interpolated label cannot change the classification.
+    // Prose paths — match on the invariant phrase, never the whole string, so
+    // an interpolated label or platform cannot change the classification.
+    //
+    // Two distinct never-claimable conditions, and conflating them would hide
+    // the difference between "wait or add capacity" and "this will never work
+    // until you register that platform":
+    //   - the starvation sweep, which fires after a grace window;
+    //   - the external-host check, where the server has no runner of that
+    //     platform class at all (`no {platform} runner is registered with
+    //     this server, so `runs-on: …` cannot be scheduled`).
+    if value.contains("runner is registered with this server") {
+        return "no_platform_runner";
+    }
     if value.starts_with("no runner is registered for") {
         return "no_runner";
     }
@@ -938,11 +949,22 @@ impl AppState {
                     // separate JobCompleted event; naming both `job.completed`
                     // conflated two distinct records in the log stream.
                     "job.status.terminal",
-                    vec![
-                        ("event.name".to_string(), "job.status.terminal".to_string()),
-                        ("conclusion".to_string(), conclusion.to_string()),
-                        ("reason".to_string(), bounded_reason.to_string()),
-                    ],
+                    {
+                        let mut attributes = vec![
+                            ("event.name".to_string(), "job.status.terminal".to_string()),
+                            ("conclusion".to_string(), conclusion.to_string()),
+                            ("reason".to_string(), bounded_reason.to_string()),
+                        ];
+                        // The bounded code is the metric dimension; the prose
+                        // is what an operator actually needs to act. Logs may
+                        // carry it (they are not a label space), and without
+                        // it an `unrecognized` classification is a dead end —
+                        // you cannot tell which path produced it.
+                        if let Some(detail) = reason.as_deref() {
+                            attributes.push(("reason.detail".to_string(), detail.to_string()));
+                        }
+                        attributes
+                    },
                 );
             }
             NdjsonEvent::JobCompleted { status, .. } if status.is_terminal() => {
@@ -1439,6 +1461,32 @@ mod termination_reason_tests {
         let bounded = bounded_termination_reason(prose);
         assert_eq!(bounded, "no_runner");
         assert!(!bounded.contains("attacker"));
+    }
+
+    #[test]
+    fn external_host_prose_is_its_own_code() {
+        // `{platform}` is interpolated, so match the invariant phrase.
+        for platform in ["windows", "macos", "freebsd-13"] {
+            let prose = format!(
+                "no {platform} runner is registered with this server, so \
+                 `runs-on: {platform}-latest` cannot be scheduled"
+            );
+            assert_eq!(
+                bounded_termination_reason(&prose),
+                "no_platform_runner",
+                "{platform} must classify distinctly from the starvation sweep"
+            );
+        }
+    }
+
+    #[test]
+    fn platform_and_starvation_do_not_collide() {
+        let starved = "no runner is registered for `runs-on: self-hosted, Linux, ARM64` and none \
+                       appeared within 120s, so the job cannot be scheduled";
+        let platform = "no windows runner is registered with this server, so \
+                        `runs-on: windows-latest` cannot be scheduled";
+        assert_eq!(bounded_termination_reason(starved), "no_runner");
+        assert_eq!(bounded_termination_reason(platform), "no_platform_runner");
     }
 
     #[test]
