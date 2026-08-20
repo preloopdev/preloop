@@ -1,0 +1,10 @@
+Complete assignment thoroughly:
+
+# Target
+Crawl and read ALL of https://www.rwx.com/docs — start at /docs/getting-started, then follow every nav link (concepts, mint.yml/rwx.yml reference, tasks, caching, leaves/packages, agents, VMs, debugging, secrets/vault, GitHub integration, self-hosted, CLI reference, migration guides from GitHub Actions/CircleCI, test partitioning, dynamic tasks/task generation, artifacts, triggers, scheduling, concurrency/queueing, billing).
+
+# Change
+Read-only research. For each doc page, extract: the primitive it describes, its exact YAML/CLI syntax (copy real snippets verbatim, keep them short), and the mechanism that makes it work. Pay special attention to: content-based cache keys / automatic caching, filesystem snapshots, task-level granularity vs job-level, `use`/`filter`/`outputs`/`parallel`/`background` fields, the `mint`/`rwx` leaf ecosystem, `rwx debug`/remote breakpoint-into-a-running-task, VM warm pools & init snapshots, secrets/OIDC, and self-hosted/BYOC options. Also read the CLI reference and the pricing page.
+
+# Acceptance
+Return structured markdown: (a) a doc-page inventory with URL + one-line purpose; (b) the full config schema as you can reconstruct it, with 2-3 verbatim examples; (c) a mechanism writeup for caching, scheduling, and debugging; (d) CLI command inventory; (e) pricing model. Cite URLs inline. No repo writes, no project-wide commands.
