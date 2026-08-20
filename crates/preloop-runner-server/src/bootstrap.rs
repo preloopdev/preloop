@@ -440,6 +440,7 @@ fn build_operational_snapshot_sync(
     started_at: std::time::Instant,
     shutdown_requested: bool,
     scheduler_enabled: bool,
+    state_dir: &std::path::Path,
 ) -> preloop_observability::status::OperationalSnapshot {
     use chrono::Utc;
     use preloop_observability::status::*;
@@ -519,7 +520,26 @@ fn build_operational_snapshot_sync(
             ..Default::default()
         },
         store: StoreSnapshot::default(),
-        storage: StorageSnapshot::default(),
+        storage: {
+            // Per-component bytes for the state dir. Cheap `metadata` reads on
+            // the 5s tick; a recursive walk would belong on the 60s cadence and
+            // must never run under the state lock.
+            let component = |name: &str, path: std::path::PathBuf| StorageComponent {
+                store: name.to_string(),
+                bytes: std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+            };
+            StorageSnapshot {
+                state_dir: state_dir.display().to_string(),
+                state_fs_free_bytes: None,
+                state_fs_free_ratio: None,
+                components: vec![
+                    component("database", state_dir.join("preloop.db")),
+                    component("cache", state_dir.join("cache")),
+                    component("artifacts", state_dir.join("artifacts")),
+                ],
+                last_gc_at: None,
+            }
+        },
         limits: Vec::new(),
         tasks: Vec::new(),
         github: GithubSnapshot::default(),
@@ -585,6 +605,7 @@ async fn run_state_sampler(shared: Arc<SharedState>) {
                     shared.state.started_at,
                     shared.shutdown.is_cancelled(),
                     scheduler_enabled,
+                    &shared.state.state_dir,
                 );
                 *shared.state.status_snapshot.write() = snap;
             }
@@ -635,6 +656,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             state.started_at,
             false,
             false,
+            &state.state_dir,
         );
         *state.status_snapshot.write() = init;
     }
