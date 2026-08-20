@@ -1,0 +1,5 @@
+Complete assignment thoroughly:
+
+# Target: crates/preloop-runner-server/src/{live_logs.rs,timeline_logs.rs,artifact_twirp.rs,cache_artifacts.rs,blob_store.rs,debug_sessions.rs,state.rs,scheduler.rs,runtime_scheduling.rs}
+# Change: Read each file. Enumerate memory exhaustion via: live log ingestion, timeline logs, artifact upload/list, cache reserve, debug session events, state.rs in-memory stores (Arc<Mutex<...>>), scheduler job queues. Check for streaming vs buffering, chunk caps, per-run/session caps, total caps, backpressure.
+# Acceptance: List each vector with file:line, handler, buffering mode (stream vs buffer), caps present/missing, and whether an authenticated runner can drive growth.
