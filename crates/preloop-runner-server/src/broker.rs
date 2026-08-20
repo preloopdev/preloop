@@ -778,10 +778,117 @@ pub(crate) async fn broker_acquire_job(
         let mut inner = shared.state.inner.lock().await;
         inner.broker_messages.insert(request_id, message.clone());
     } else {
-        tracing::warn!(
+        // A token request registered at build time can be lost when the
+        // process dies before the next store snapshot flush (jobs enqueued
+        // since the last snapshot restore with `github_token_requests`
+        // missing). The claim then reaches here with no request to mint
+        // from, the checkout keeps the local runtime JWT, and every git
+        // fetch fails on auth. Re-derive the request from the run's
+        // submission and the job's declared permissions — the same inputs
+        // `build_job_artifacts` used — and mint under that policy.
+        let derived = if shared.state.github_app.is_none() {
+            None
+        } else {
+            let inner = shared.state.inner.lock().await;
+            let record = inner.job_requests.get(&request_id);
+            let run = record.and_then(|record| inner.runs.get(&record.run_id));
+            match (record, run) {
+                (Some(record), Some(run)) => {
+                    let tier = run
+                        .submission
+                        .trust_tier
+                        .as_deref()
+                        .and_then(|tier| {
+                            serde_json::from_str::<crate::events::trust_tier::TrustTier>(tier)
+                                .ok()
+                        });
+                    let declared = run
+                        .submission
+                        .payload
+                        .get("workflow_job")
+                        .and_then(|job| job.get("permissions"))
+                        .and_then(serde_json::Value::as_object)
+                        .map(|permissions| {
+                            permissions
+                                .iter()
+                                .map(|(k, v)| {
+                                    (k.clone(), v.as_str().unwrap_or("read").to_owned())
+                                })
+                                .collect::<BTreeMap<_, _>>()
+                        });
+                    let policy = crate::events::trust_tier::job_authorization(
+                        tier,
+                        declared.as_ref(),
+                        false,
+                    );
+                    Some((
+                        crate::models::GitHubTokenRequest {
+                            repository: run.submission.repository.clone(),
+                            permissions: policy.app_permissions,
+                            declared: declared.is_some(),
+                            untrusted: policy.fork_restricted,
+                        },
+                        record.request_id,
+                    ))
+                }
+                _ => None,
+            }
+        };
+        if let Some((token_request, derived_request_id)) = derived {
+        // Register the derived request so a re-claim after a disconnect
+        // re-mints under the same derived policy, then mint.
+        {
+            let mut inner = shared.state.inner.lock().await;
+            inner
+                .github_token_requests
+                .insert(derived_request_id, token_request.clone());
+        }
+        tracing::info!(
             request_id,
-            "broker acquire: no dispatch token request for job"
+            repository = %token_request.repository,
+            "broker acquire: re-derived missing dispatch token request at claim"
         );
+        let minted = match mint_dispatch_github_token(&shared, &token_request).await {
+            Ok(minted) => minted,
+            Err(error) => {
+                fail_unclaimable_request(&shared, request_id).await;
+                return Err(error);
+            }
+        };
+        if let Some(minted) = minted {
+            let token = minted.token;
+            tracing::info!(
+                token_len = token.len(),
+                "minted re-derived dispatch GitHub token at claim"
+            );
+            message.variables.insert(
+                "system.github.token".to_owned(),
+                preloop_gha_protocol::azdo::VariableValue::secret(token.clone()),
+            );
+            message.variables.insert(
+                "github_token".to_owned(),
+                preloop_gha_protocol::azdo::VariableValue::secret(token.clone()),
+            );
+            message.variables.insert(
+                "GITHUB_TOKEN".to_owned(),
+                preloop_gha_protocol::azdo::VariableValue::secret(token.clone()),
+            );
+            match message.context_data.get_mut("github") {
+                Some(preloop_gha_protocol::azdo::PipelineContextData::Dict(github)) => {
+                    github.insert(
+                        "token".to_owned(),
+                        preloop_gha_protocol::azdo::PipelineContextData::String(token),
+                    );
+                }
+                other => tracing::warn!(
+                    github_context = %match other { Some(_) => "non-dict", None => "missing" },
+                    "could not patch github context token for re-derived request"
+                ),
+            }
+            let mut inner = shared.state.inner.lock().await;
+            inner.broker_messages.insert(request_id, message.clone());
+        }
+    }
     }
     // The snapshot checkout token is pinned onto the step at submission,
     // but a job can sit queued well past its ~50-minute lifetime. The
