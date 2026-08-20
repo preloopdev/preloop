@@ -1,0 +1,1725 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Plan 002 — Make Preloop Observable Without Making a Backend Mandatory</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Source+Serif+4:ital,opsz,wght@0,8..60,300;0,8..60,400;0,8..60,600;0,8..60,700;1,8..60,400&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: oklch(97.5% 0.005 240);
+    --bg-sheet: oklch(100% 0 0);
+    --bg-raised: oklch(96% 0.005 240);
+    --bg-code: oklch(97% 0.006 240);
+    --bg-code-inline: oklch(93% 0.015 240);
+    --bg-terminal: oklch(18% 0.015 240);
+    --bg-terminal-header: oklch(22% 0.012 240);
+    --border: oklch(88% 0.008 240);
+    --border-strong: oklch(80% 0.01 240);
+    --text: oklch(20% 0.012 240);
+    --text-secondary: oklch(40% 0.008 240);
+    --text-muted: oklch(53% 0.006 240);
+    --accent: oklch(52% 0.16 240);
+    --accent-soft: oklch(94% 0.04 240);
+    --accent-hover: oklch(45% 0.18 240);
+    --teal: oklch(52% 0.10 195);
+    --teal-soft: oklch(94% 0.03 195);
+    --green: oklch(52% 0.13 155);
+    --green-soft: oklch(94% 0.04 155);
+    --amber: oklch(65% 0.14 75);
+    --amber-soft: oklch(95% 0.04 75);
+    --purple: oklch(52% 0.15 295);
+    --purple-soft: oklch(94% 0.04 295);
+    --red: oklch(55% 0.18 25);
+    --red-soft: oklch(94% 0.04 25);
+    --toc-width: 260px;
+    --content-max: 76ch;
+    --font-display: 'Outfit', system-ui, sans-serif;
+    --font-body: 'Source Serif 4', Georgia, serif;
+    --font-mono: 'Fira Code', Menlo, monospace;
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; scroll-padding-top: 1.5rem; }
+  body {
+    font-family: var(--font-body);
+    font-size: 1.02rem;
+    line-height: 1.7;
+    color: var(--text);
+    background: var(--bg);
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:hover { color: var(--accent-hover); }
+
+  /* Layout */
+  .page-grid {
+    display: grid;
+    grid-template-columns: var(--toc-width) minmax(0, 1fr);
+    gap: 2.5rem;
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 2.5rem 2rem 5rem;
+  }
+  /* TOC */
+  .toc {
+    position: sticky;
+    top: 1.5rem;
+    align-self: start;
+    max-height: calc(100vh - 3rem);
+    overflow-y: auto;
+    padding-right: 0.75rem;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border-strong) transparent;
+  }
+  .toc-title {
+    font-family: var(--font-display);
+    font-size: 0.68rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--text-muted);
+    margin-bottom: 0.75rem;
+  }
+  .toc ol { list-style: none; }
+  .toc li { margin-bottom: 0.22rem; }
+  .toc a {
+    font-family: var(--font-display);
+    font-size: 0.74rem;
+    font-weight: 400;
+    color: var(--text-secondary);
+    text-decoration: none;
+    line-height: 1.4;
+    display: block;
+    padding: 0.2rem 0.5rem;
+    border-radius: 4px;
+    transition: all 0.15s;
+  }
+  .toc a:hover { color: var(--accent); background: var(--accent-soft); }
+  .toc a.active { color: var(--accent); font-weight: 600; background: var(--accent-soft); }
+  .toc .toc-h3 { padding-left: 1rem; font-size: 0.71rem; }
+  .toc .toc-h4 { padding-left: 1.8rem; font-size: 0.68rem; opacity: 0.85; }
+  .toc-sep { border: none; border-top: 1px solid var(--border); margin: 0.75rem 0; }
+
+  /* Content */
+  .content { min-width: 0; max-width: var(--content-max); }
+
+  /* Hero */
+  .hero {
+    margin-bottom: 2.5rem;
+    padding-bottom: 2rem;
+    border-bottom: 1px solid var(--border);
+  }
+  .hero-eyebrow {
+    font-family: var(--font-display);
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    color: var(--accent);
+    margin-bottom: 0.6rem;
+  }
+  .hero h1 {
+    font-family: var(--font-display);
+    font-size: clamp(1.85rem, 3.8vw, 2.6rem);
+    font-weight: 800;
+    line-height: 1.1;
+    color: var(--text);
+    letter-spacing: -0.02em;
+    margin-bottom: 0.85rem;
+  }
+  .hero-sub {
+    font-size: 1.05rem;
+    color: var(--text-secondary);
+    line-height: 1.6;
+    margin-bottom: 1.25rem;
+  }
+  .hero-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem 1.25rem;
+    font-family: var(--font-display);
+    font-size: 0.75rem;
+    color: var(--text-muted);
+  }
+  .hero-meta .meta-label { font-weight: 600; color: var(--text-secondary); }
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.15rem 0.55rem;
+    border-radius: 100px;
+    font-family: var(--font-display);
+    font-size: 0.68rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+  .badge-todo { background: var(--amber-soft); color: oklch(42% 0.12 75); }
+  .badge-todo::before { content:''; width:6px; height:6px; border-radius:50%; background: var(--amber); }
+  .badge-revised { background: var(--accent-soft); color: var(--accent); border: 1px solid oklch(85% 0.05 240); }
+
+  /* Drift banner */
+  .drift-banner {
+    background: var(--amber-soft);
+    border: 1px solid oklch(85% 0.08 75);
+    border-radius: 8px;
+    padding: 0.85rem 1.1rem;
+    margin-bottom: 1.5rem;
+    font-family: var(--font-display);
+    font-size: 0.8rem;
+    line-height: 1.5;
+    color: oklch(30% 0.06 75);
+  }
+  .drift-banner strong { color: oklch(35% 0.10 75); }
+  .drift-banner code {
+    font-family: var(--font-mono);
+    font-size: 0.78em;
+    background: oklch(98% 0.02 75);
+    padding: 0.1em 0.3em;
+    border-radius: 3px;
+  }
+
+  /* Sections */
+  .content > h2 {
+    font-family: var(--font-display);
+    font-size: clamp(1.25rem, 2.4vw, 1.55rem);
+    font-weight: 700;
+    line-height: 1.25;
+    color: var(--text);
+    margin-top: 3rem;
+    margin-bottom: 0.85rem;
+    letter-spacing: -0.015em;
+    scroll-margin-top: 1.5rem;
+    padding-bottom: 0.4rem;
+    border-bottom: 2px solid var(--border);
+  }
+  .content > h3 {
+    font-family: var(--font-display);
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: var(--text);
+    margin-top: 2rem;
+    margin-bottom: 0.5rem;
+    scroll-margin-top: 1.5rem;
+  }
+  .content > h4 {
+    font-family: var(--font-display);
+    font-size: 0.92rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+    margin-top: 1.4rem;
+    margin-bottom: 0.35rem;
+  }
+  .content > p, .content > ul, .content > ol { margin-bottom: 0.9rem; }
+  .content > ul, .content > ol { padding-left: 1.35rem; }
+  .content li { margin-bottom: 0.28rem; }
+  .content li::marker { color: var(--accent); }
+
+  /* Priority list */
+  .priority-list {
+    list-style: none;
+    counter-reset: priority;
+    padding-left: 0;
+    margin: 1rem 0 1.25rem;
+  }
+  .priority-list li {
+    counter-increment: priority;
+    display: flex;
+    gap: 0.75rem;
+    align-items: flex-start;
+    padding: 0.7rem 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .priority-list li:last-child { border-bottom: none; }
+  .priority-list li::before {
+    content: counter(priority);
+    font-family: var(--font-display);
+    font-size: 0.72rem;
+    font-weight: 700;
+    color: white;
+    background: var(--accent);
+    min-width: 1.55rem;
+    height: 1.55rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    flex-shrink: 0;
+    margin-top: 0.15rem;
+  }
+  .priority-list li strong { color: var(--text); }
+
+  /* Tables */
+  .table-wrap {
+    overflow-x: auto;
+    margin: 1rem 0 1.25rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-sheet);
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 0.84rem; line-height: 1.5; }
+  thead { background: var(--bg-raised); }
+  th {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-secondary);
+    text-align: left;
+    padding: 0.6rem 0.85rem;
+    border-bottom: 1px solid var(--border-strong);
+    white-space: nowrap;
+  }
+  td { padding: 0.5rem 0.85rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: oklch(98% 0.004 240); }
+  td code, th code {
+    font-family: var(--font-mono);
+    font-size: 0.82em;
+    background: var(--bg-code-inline);
+    padding: 0.1em 0.3em;
+    border-radius: 3px;
+  }
+  td .mono { font-family: var(--font-mono); font-size: 0.82em; }
+
+  /* Code */
+  pre {
+    background: var(--bg-code);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.9rem 1.1rem;
+    overflow-x: auto;
+    margin: 0.85rem 0 1.15rem;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    line-height: 1.6;
+    color: var(--text);
+    scrollbar-width: thin;
+  }
+  pre code { background: none; padding: 0; }
+  .content > p code, .content > li code {
+    font-family: var(--font-mono);
+    font-size: 0.84em;
+    background: var(--bg-code-inline);
+    padding: 0.1em 0.3em;
+    border-radius: 3px;
+  }
+
+  /* Callouts */
+  .callout {
+    border-radius: 8px;
+    padding: 0.9rem 1.1rem;
+    margin: 1rem 0;
+    font-size: 0.88rem;
+    line-height: 1.6;
+  }
+  .callout-title {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    margin-bottom: 0.35rem;
+  }
+  .callout-blue { background: var(--accent-soft); border: 1px solid oklch(82% 0.05 240); }
+  .callout-blue .callout-title { color: var(--accent); }
+  .callout-green { background: var(--green-soft); border: 1px solid oklch(82% 0.04 155); }
+  .callout-green .callout-title { color: var(--green); }
+  .callout-amber { background: var(--amber-soft); border: 1px solid oklch(82% 0.06 75); }
+  .callout-amber .callout-title { color: oklch(42% 0.12 75); }
+  .callout-red { background: var(--red-soft); border: 1px solid oklch(82% 0.04 25); }
+  .callout-red .callout-title { color: var(--red); }
+  .callout-purple { background: var(--purple-soft); border: 1px solid oklch(82% 0.04 295); }
+  .callout-purple .callout-title { color: var(--purple); }
+  .callout-teal { background: var(--teal-soft); border: 1px solid oklch(82% 0.04 195); }
+  .callout-teal .callout-title { color: var(--teal); }
+
+  /* Invariant grid */
+  .invariant-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 0.6rem;
+    margin: 1rem 0 1.25rem;
+  }
+  .invariant-card {
+    background: var(--bg-sheet);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.75rem 0.9rem;
+    display: flex;
+    gap: 0.65rem;
+    align-items: flex-start;
+  }
+  .invariant-num {
+    font-family: var(--font-display);
+    font-size: 0.7rem;
+    font-weight: 700;
+    color: white;
+    background: var(--accent);
+    min-width: 1.4rem;
+    height: 1.4rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    flex-shrink: 0;
+    margin-top: 0.1rem;
+  }
+  .invariant-card strong { font-family: var(--font-display); font-size: 0.82rem; color: var(--text); }
+  .invariant-card p { font-size: 0.78rem; color: var(--text-secondary); line-height: 1.5; margin-top: 0.15rem; }
+
+  /* Architecture diagram */
+  .arch-wrap {
+    background: var(--bg-sheet);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.25rem;
+    margin: 1.25rem 0;
+    overflow-x: auto;
+  }
+  .arch-wrap .arch-title {
+    font-family: var(--font-display);
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    margin-bottom: 0.85rem;
+    text-align: center;
+  }
+  .arch-svg { width: 100%; min-height: 340px; display: block; }
+  .arch-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem 1rem;
+    justify-content: center;
+    margin-top: 0.85rem;
+    font-family: var(--font-display);
+    font-size: 0.68rem;
+    color: var(--text-muted);
+  }
+  .arch-legend span { display: inline-flex; align-items: center; gap: 0.3rem; }
+  .arch-legend .dot { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+
+  /* Terminal mockup */
+  .terminal {
+    background: var(--bg-terminal);
+    border-radius: 10px;
+    overflow: hidden;
+    margin: 1rem 0 1.25rem;
+    border: 1px solid oklch(25% 0.01 240);
+    box-shadow: 0 8px 30px oklch(15% 0.02 240 / 0.25);
+  }
+  .terminal-header {
+    background: var(--bg-terminal-header);
+    padding: 0.55rem 0.9rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    border-bottom: 1px solid oklch(28% 0.01 240);
+  }
+  .terminal-dots { display: flex; gap: 0.35rem; }
+  .terminal-dots span { width: 11px; height: 11px; border-radius: 50%; display: block; }
+  .dot-r { background: oklch(62% 0.18 25); }
+  .dot-y { background: oklch(75% 0.14 75); }
+  .dot-g { background: oklch(58% 0.13 155); }
+  .terminal-title {
+    font-family: var(--font-display);
+    font-size: 0.7rem;
+    font-weight: 500;
+    color: oklch(70% 0.01 240);
+    margin-left: 0.5rem;
+    letter-spacing: 0.02em;
+  }
+  .terminal-body {
+    padding: 1rem 1.1rem;
+    font-family: var(--font-mono);
+    font-size: 0.74rem;
+    line-height: 1.65;
+    color: oklch(85% 0.01 240);
+    overflow-x: auto;
+    white-space: pre;
+  }
+  .terminal-body .t-dim { color: oklch(55% 0.01 240); }
+  .terminal-body .t-green { color: oklch(68% 0.13 155); }
+  .terminal-body .t-amber { color: oklch(72% 0.14 75); }
+  .terminal-body .t-red { color: oklch(65% 0.18 25); }
+  .terminal-body .t-blue { color: oklch(68% 0.12 240); }
+  .terminal-body .t-purple { color: oklch(70% 0.13 295); }
+  .terminal-body .t-cyan { color: oklch(70% 0.09 195); }
+  .terminal-body .t-bold { font-weight: 600; color: oklch(92% 0.01 240); }
+  .terminal-body .t-warn { color: oklch(72% 0.14 75); background: oklch(35% 0.06 75 / 0.35); padding: 0 0.25em; border-radius: 2px; }
+  .terminal-body .t-ok { color: oklch(68% 0.13 155); }
+
+  /* JSON viewer */
+  .json-viewer {
+    background: var(--bg-terminal);
+    border-radius: 10px;
+    overflow: hidden;
+    margin: 1rem 0 1.25rem;
+    border: 1px solid oklch(25% 0.01 240);
+  }
+  .json-header {
+    background: var(--bg-terminal-header);
+    padding: 0.5rem 0.9rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid oklch(28% 0.01 240);
+  }
+  .json-header .json-title {
+    font-family: var(--font-display);
+    font-size: 0.7rem;
+    font-weight: 500;
+    color: oklch(70% 0.01 240);
+  }
+  .json-badge {
+    font-family: var(--font-display);
+    font-size: 0.62rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 0.15rem 0.4rem;
+    border-radius: 4px;
+    background: oklch(30% 0.04 240);
+    color: oklch(75% 0.02 240);
+  }
+  .json-body {
+    padding: 1rem 1.1rem;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    line-height: 1.6;
+    color: oklch(85% 0.01 240);
+    overflow-x: auto;
+  }
+  .json-body .jk { color: oklch(72% 0.10 240); }
+  .json-body .js { color: oklch(68% 0.11 155); }
+  .json-body .jn { color: oklch(72% 0.12 75); }
+  .json-body .jb { color: oklch(68% 0.14 295); }
+  .json-body .jc { color: oklch(45% 0.01 240); }
+
+  /* Tabs */
+  .tabs { margin: 1.25rem 0; }
+  .tabs-nav {
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid var(--border);
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .tabs-nav button {
+    font-family: var(--font-display);
+    font-size: 0.74rem;
+    font-weight: 600;
+    padding: 0.6rem 1rem;
+    border: none;
+    background: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+    white-space: nowrap;
+    transition: all 0.15s;
+  }
+  .tabs-nav button:hover { color: var(--text-secondary); }
+  .tabs-nav button.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .tab-panel { display: none; padding-top: 1rem; }
+  .tab-panel.active { display: block; }
+
+  /* Metrics table highlight */
+  .metric-row-highlight td { background: var(--accent-soft); }
+
+  /* Dashboard grid */
+  .dashboard-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 1rem;
+    margin: 1rem 0 1.25rem;
+  }
+  @media (min-width: 700px) {
+    .dashboard-grid { grid-template-columns: 1fr 1fr; }
+  }
+  .dashboard-card {
+    background: var(--bg-sheet);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .dashboard-card-header {
+    padding: 0.7rem 0.9rem 0.5rem;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .dashboard-card-header h4 {
+    font-family: var(--font-display);
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--text);
+    margin: 0;
+  }
+  .dashboard-card-header .dash-badge {
+    font-family: var(--font-display);
+    font-size: 0.6rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 0.15rem 0.4rem;
+    border-radius: 4px;
+  }
+  .dash-badge-blue { background: var(--accent-soft); color: var(--accent); }
+  .dash-badge-green { background: var(--green-soft); color: var(--green); }
+  .dash-badge-amber { background: var(--amber-soft); color: oklch(42% 0.12 75); }
+  .dash-badge-purple { background: var(--purple-soft); color: var(--purple); }
+  .dash-badge-teal { background: var(--teal-soft); color: var(--teal); }
+  .dash-badge-red { background: var(--red-soft); color: var(--red); }
+  .dashboard-card-body { padding: 0.75rem 0.9rem 0.9rem; }
+  .mini-panels {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.5rem;
+  }
+  .mini-panel {
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.55rem 0.65rem;
+  }
+  .mini-panel-label {
+    font-family: var(--font-display);
+    font-size: 0.62rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    margin-bottom: 0.25rem;
+  }
+  .mini-panel-value {
+    font-family: var(--font-display);
+    font-size: 1.15rem;
+    font-weight: 700;
+    color: var(--text);
+    line-height: 1.1;
+  }
+  .mini-panel-value.green { color: var(--green); }
+  .mini-panel-value.amber { color: oklch(48% 0.14 75); }
+  .mini-panel-value.red { color: var(--red); }
+  .mini-panel-value.accent { color: var(--accent); }
+  .mini-panel-sub {
+    font-family: var(--font-display);
+    font-size: 0.62rem;
+    color: var(--text-muted);
+    margin-top: 0.15rem;
+  }
+  .sparkline { width: 100%; height: 28px; margin-top: 0.35rem; }
+  .sparkline path { fill: none; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+  .sparkline .area { fill-opacity: 0.08; stroke: none; }
+
+  /* Alert cards */
+  .alert-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0.5rem;
+    margin: 1rem 0;
+  }
+  @media (min-width: 600px) { .alert-grid { grid-template-columns: 1fr 1fr; } }
+  .alert-card {
+    border-radius: 8px;
+    padding: 0.7rem 0.85rem;
+    display: flex;
+    gap: 0.6rem;
+    align-items: flex-start;
+    font-size: 0.82rem;
+    line-height: 1.5;
+  }
+  .alert-card .alert-icon {
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.7rem;
+    flex-shrink: 0;
+    margin-top: 0.05rem;
+  }
+  .alert-page { background: var(--red-soft); border: 1px solid oklch(84% 0.05 25); }
+  .alert-page .alert-icon { background: var(--red); color: white; }
+  .alert-warn { background: var(--amber-soft); border: 1px solid oklch(84% 0.07 75); }
+  .alert-warn .alert-icon { background: var(--amber); color: white; }
+  .alert-info { background: var(--accent-soft); border: 1px solid oklch(84% 0.05 240); }
+  .alert-info .alert-icon { background: var(--accent); color: white; }
+
+  /* Step timeline */
+  .step-timeline { margin: 1rem 0; }
+  .step-item {
+    display: grid;
+    grid-template-columns: 42px 1fr;
+    gap: 0;
+    position: relative;
+  }
+  .step-line {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  .step-dot {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--font-display);
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: white;
+    background: var(--accent);
+    flex-shrink: 0;
+    z-index: 1;
+  }
+  .step-dot.done { background: var(--green); }
+  .step-connector {
+    width: 2px;
+    flex: 1;
+    background: var(--border);
+    margin: 0.25rem 0;
+    min-height: 16px;
+  }
+  .step-item:last-child .step-connector { display: none; }
+  .step-content {
+    padding: 0.15rem 0 1.25rem 0.5rem;
+  }
+  .step-content h4 {
+    font-family: var(--font-display);
+    font-size: 0.88rem;
+    font-weight: 600;
+    color: var(--text);
+    margin: 0 0 0.25rem;
+  }
+  .step-content p { font-size: 0.82rem; color: var(--text-secondary); line-height: 1.55; margin: 0 0 0.4rem; }
+  .step-content code { font-family: var(--font-mono); font-size: 0.78em; background: var(--bg-code-inline); padding: 0.1em 0.3em; border-radius: 3px; }
+  .step-tag {
+    display: inline-flex;
+    font-family: var(--font-display);
+    font-size: 0.62rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 0.1rem 0.35rem;
+    border-radius: 3px;
+    margin-right: 0.3rem;
+  }
+  .tag-security { background: var(--red-soft); color: var(--red); }
+  .tag-crate { background: var(--accent-soft); color: var(--accent); }
+  .tag-api { background: var(--green-soft); color: var(--green); }
+  .tag-instrument { background: var(--purple-soft); color: var(--purple); }
+  .tag-vm { background: var(--amber-soft); color: oklch(42% 0.12 75); }
+  .tag-dash { background: var(--teal-soft); color: var(--teal); }
+  .tag-docs { background: oklch(94% 0.02 240); color: var(--text-muted); }
+
+  /* Condition chips */
+  .condition-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+    margin: 0.75rem 0;
+  }
+  .condition-chip {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    padding: 0.2rem 0.5rem;
+    border-radius: 100px;
+    border: 1px solid var(--border);
+    background: var(--bg-sheet);
+    color: var(--text-secondary);
+  }
+  .condition-chip.critical { background: var(--red-soft); border-color: oklch(82% 0.04 25); color: var(--red); }
+  .condition-chip.warn { background: var(--amber-soft); border-color: oklch(82% 0.06 75); color: oklch(42% 0.12 75); }
+
+  /* Prometheus */
+  .prom-block {
+    background: var(--bg-terminal);
+    border-radius: 8px;
+    padding: 0.9rem 1rem;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    line-height: 1.6;
+    color: oklch(80% 0.01 240);
+    overflow-x: auto;
+    margin: 0.85rem 0;
+    border: 1px solid oklch(25% 0.01 240);
+  }
+  .prom-block .pm-comment { color: oklch(50% 0.01 240); }
+  .prom-block .pm-name { color: oklch(72% 0.12 240); }
+  .prom-block .pm-label { color: oklch(68% 0.11 155); }
+
+  /* Divider */
+  .section-divider { border: none; border-top: 1px solid var(--border); margin: 2rem 0 0; }
+
+  /* Responsive */
+  @media (max-width: 900px) {
+    .page-grid { grid-template-columns: 1fr; padding: 1.5rem 1.25rem 4rem; gap: 0; }
+    .toc {
+      position: static;
+      max-height: none;
+      overflow: visible;
+      padding-right: 0;
+      margin-bottom: 1.5rem;
+      padding-bottom: 1.25rem;
+      border-bottom: 1px solid var(--border);
+    }
+    .hero h1 { font-size: 1.7rem; }
+    .invariant-grid { grid-template-columns: 1fr; }
+  }
+  @media print {
+    .toc { display: none; }
+    .page-grid { grid-template-columns: 1fr; max-width: 100%; }
+    body { background: white; }
+    .terminal, .json-viewer, .prom-block { break-inside: avoid; }
+  }
+  /* Scrollbar for code */
+  pre::-webkit-scrollbar, .terminal-body::-webkit-scrollbar { height: 6px; }
+  pre::-webkit-scrollbar-thumb, .terminal-body::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 3px; }
+  /* Anchor offset */
+  h2, h3 { scroll-margin-top: 1.5rem; }
+  /* Inline kbd */
+  kbd {
+    font-family: var(--font-mono);
+    font-size: 0.75em;
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-bottom-width: 2px;
+    padding: 0.1em 0.35em;
+    border-radius: 3px;
+  }
+</style>
+</head>
+<body>
+<div class="page-grid">
+
+<nav class="toc" aria-label="Table of contents">
+  <div class="toc-title">Plan 002 — Contents</div>
+  <ol>
+    <li><a href="#status">Status</a></li>
+    <li><a href="#executive-decision">Executive Decision</a></li>
+    <li><a href="#why-matters">Why This Matters</a></li>
+    <li><a href="#current-state">Current State</a></li>
+    <li><a href="#blind-spots" class="toc-h3">Six Blind Spots</a></li>
+    <li><a href="#architecture">Architecture &amp; Invariants</a></li>
+    <li><a href="#operator-surfaces">Operator Surfaces</a></li>
+    <li><a href="#mockups" class="toc-h3">UI Mockups — Live Preview</a></li>
+    <li><a href="#signal-contract">Signal Contract</a></li>
+    <li><a href="#vm-contract" class="toc-h3">VM Telemetry Contract</a></li>
+    <li><a href="#log-catalog">Structured Logs</a></li>
+    <li><a href="#trace-policy">Trace Policy</a></li>
+    <li><a href="#slos">SLOs &amp; Alerts</a></li>
+    <li><a href="#dashboards" class="toc-h3">Dashboard Gallery</a></li>
+    <li><a href="#openobserve">OpenObserve Evaluation</a></li>
+    <li><a href="#config">Configuration</a></li>
+    <li><a href="#scope">Scope</a></li>
+    <li><a href="#steps">Implementation Steps</a></li>
+    <li><a href="#test-plan">Test Plan</a></li>
+    <li><a href="#done">Done Criteria</a></li>
+    <li><a href="#stop">Stop Conditions</a></li>
+    <li><a href="#maintenance">Maintenance Notes</a></li>
+  </ol>
+  <hr class="toc-sep">
+  <div class="toc-title" style="margin-top:0.5rem;">Artifacts</div>
+  <ol>
+    <li><a href="#mockups">↗ Interactive Mockups</a></li>
+    <li><a href="#dashboards">↗ Dashboard Gallery</a></li>
+    <li><a href="https://github.com/preloopdev/preloop/blob/main/plans/002-observability-strategy.md" target="_blank">↗ Markdown Source</a></li>
+  </ol>
+</nav>
+
+<main class="content">
+
+<header class="hero">
+  <div class="hero-eyebrow">Plan 002 · Observability · Architecture &amp; Operations</div>
+  <h1>Make Preloop observable without making a backend mandatory</h1>
+  <p class="hero-sub">Every important control-plane question answerable from one authenticated endpoint, with no sidecar. OpenTelemetry and an optional single-node OpenObserve layer on top — fail-open, by design.</p>
+  <div class="hero-meta">
+    <span class="badge badge-todo">P1 — In Review</span>
+    <span><span class="meta-label">Effort</span> L · 7 PRs</span>
+    <span><span class="meta-label">Risk</span> MED</span>
+    <span><span class="meta-label">Category</span> direction · architecture · operations · security · DX</span>
+  </div>
+  <div class="hero-meta" style="margin-top:0.5rem;">
+    <span><span class="meta-label">Planned</span> <code>84d92cfd</code> · 2026-08-17</span>
+    <span class="badge badge-revised">Revised at <code>673bdfa0</code> · 2026-08-20</span>
+  </div>
+</header>
+
+<div class="drift-banner">
+  <strong>⚠ Drift check — run first.</strong> Every file:line anchor and version pin below was re-verified at <code>673bdfa0</code>. If the repository has moved, compare the excerpts with live code — a semantic mismatch is a <strong>STOP condition</strong>.
+  <br><code style="margin-top:0.4rem; display:inline-block;">git diff --stat 673bdfa0..HEAD -- Cargo.toml Cargo.lock crates/preloop-observability crates/preloop-cli crates/preloop-runner-server crates/preloop-orchestrator crates/preloop-vm crates/preloop-runner docs contrib/openobserve scripts rules justfile versions.toml CHANGELOG.md</code>
+</div>
+
+<!-- ════════════════════ STATUS ════════════════════ -->
+<h2 id="status">Status</h2>
+<table style="width:100%; font-size:0.84rem; border:1px solid var(--border); border-radius:8px; overflow:hidden; border-collapse:collapse;">
+  <thead><tr><th>Field</th><th>Value</th></tr></thead>
+  <tbody>
+    <tr><td style="padding:0.5rem 0.85rem; border-bottom:1px solid var(--border);"><strong>Priority</strong></td><td style="padding:0.5rem 0.85rem; border-bottom:1px solid var(--border);">P1</td></tr>
+    <tr><td style="padding:0.5rem 0.85rem; border-bottom:1px solid var(--border);"><strong>Effort</strong></td><td style="padding:0.5rem 0.85rem; border-bottom:1px solid var(--border);">L — seven independently reviewable PRs</td></tr>
+    <tr><td style="padding:0.5rem 0.85rem; border-bottom:1px solid var(--border);"><strong>Risk</strong></td><td style="padding:0.5rem 0.85rem; border-bottom:1px solid var(--border);">MED — HTTP/runner lifecycle are protocol-critical; telemetry must be fail-open</td></tr>
+    <tr><td style="padding:0.5rem 0.85rem;"><strong>Depends on</strong></td><td style="padding:0.5rem 0.85rem;">none — independent of Plan 001</td></tr>
+  </tbody>
+</table>
+<div class="callout callout-blue" style="margin-top:0.85rem;">
+  <div class="callout-title">Dependency note</div>
+  Plan 002 owns the stable observability contract. When Plan 001 touches cache/artifact operations it must emit through <code>preloop.storage.*</code> and register caps with <code>LimitRegistry</code> rather than inventing a parallel family.
+</div>
+
+<!-- ════════════════════ EXECUTIVE DECISION ════════════════════ -->
+<h2 id="executive-decision">Executive Decision</h2>
+<p>Build observability in three layers, in this order:</p>
+<ol class="priority-list">
+  <li><div><strong>Zero-dependency operator diagnostics</strong> — truthful liveness/readiness, an authenticated aggregate status endpoint, <code>preloop status --json</code>, structured stderr/journald logs, and authenticated Prometheus text at <code>/metrics</code>, including host-observed resource use for Preloop-owned microVMs. No sidecar. Answers “why is this job not moving?” when no telemetry backend exists.</div></li>
+  <li><div><strong>Vendor-neutral telemetry</strong> — OpenTelemetry metrics, logs, and short-lived traces exported through bounded OTLP/HTTP batches only when standard <code>OTEL_*</code> configuration is present. Export failure never rejects, delays, or cancels a workflow.</div></li>
+  <li><div><strong>OpenObserve as an optional reference backend</strong> — a pinned, private single-node deployment plus importable dashboards and alerts. Preloop neither embeds nor requires OpenObserve. Any OTLP backend remains interchangeable.</div></li>
+</ol>
+<div class="callout callout-green">
+  <div class="callout-title">Product boundary</div>
+  OpenObserve single-node is one binary/container, SQLite + local disk, OTLP ingest, dashboards and alerts. Its HA mode needs Kubernetes, object storage, Postgres, NATS, and five roles — not minimal. Keep the boundary at <strong>OTLP and Prometheus</strong>. The highest-priority deliverable is not a dashboard. It is <code>preloop status</code>.
+</div>
+
+<!-- ════════════════════ WHY MATTERS ════════════════════ -->
+<h2 id="why-matters">Why This Matters</h2>
+<p>Today Preloop can accept work while the pool repeatedly fails to provision, can leave an operator unable to distinguish “no compatible runner” from “runner has stopped polling,” and can report a healthy process while critical background behavior is degraded. The only built-in aggregate view is a recent-runs table.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Operator question</th><th>Answered today?</th><th>After this plan</th></tr></thead>
+  <tbody>
+    <tr><td>Is the critical event loop making progress?</td><td style="color:var(--red);">No — process can be wedged while <code>/healthz</code> returns 200</td><td><code>/readyz</code> + <code>TaskHeartbeat</code> registry</td></tr>
+    <tr><td>Why is this job not claimed?</td><td style="color:var(--red);">No</td><td><code>/api/v1/status</code> jobs + concurrency + pool blocks</td></tr>
+    <tr><td>Are runners polling / renewing leases?</td><td style="color:var(--red);">No visibility</td><td>runner poll/lease gauges + reaper heartbeat</td></tr>
+    <tr><td>Is VM CPU/memory/disk limiting capacity?</td><td style="color:var(--red);">No surface</td><td>VM fleet sample w/ host cgroup/process</td></tr>
+    <tr><td>Are store / GitHub writes succeeding?</td><td style="color:var(--red);">Silent divergent DB</td><td>store + GitHub budget gauges</td></tr>
+    <tr><td>Is telemetry itself healthy?</td><td style="color:var(--red);">No self-health</td><td><code>preloop.telemetry.export</code> + status</td></tr>
+    <tr><td>Is data being silently dropped?</td><td style="color:var(--red);">9 caps, zero counters</td><td><code>preloop.limit.*</code> + status <code>limits</code> array</td></tr>
+  </tbody>
+</table></div>
+
+<!-- ════════════════════ CURRENT STATE ════════════════════ -->
+<h2 id="current-state">Current State</h2>
+
+<h3>Logging is local, duplicated, and not export-ready</h3>
+<p><code>crates/preloop-cli/src/main.rs:743-745</code> initializes a plain formatting subscriber; the standalone server (<code>preloop-runner-server/src/main.rs:78-80</code>, no <code>info</code> fallback) and the Rust runner (<code>preloop-runner/src/main.rs:17-21</code>) each do the same. Three binaries, three slightly different filter defaults, no JSON selection, no OTLP pipeline.</p>
+<div class="callout callout-red">
+  <div class="callout-title">Security gate — four unsafe sites at <code>673bdfa0</code></div>
+  <ul style="margin:0; padding-left:1.2rem; font-size:0.84rem;">
+    <li><code>artifact_twirp.rs:94</code> — <code>info!(token, …)</code> capability token</li>
+    <li><code>results_twirp.rs:713</code> — <code>info!(token, …)</code> capability token</li>
+    <li><code>blob_store.rs:63,78,95,113,121,127,131</code> — seven <code>warn!/info!(kind, token)</code> sites</li>
+    <li><code>distributed_task.rs:327</code> — <code>info!(?body, …)</code> full PATCH JSON body</li>
+    <li><code>recording.rs:1-90</code> — deliberate full-header/body capture (excluded from export, mode 0600)</li>
+  </ul>
+  <p style="margin-top:0.6rem; font-size:0.82rem;">Three of these moved between <code>84d92cfd</code> and <code>673bdfa0</code>. Re-run the scan: <code>grep -rnE '(info|warn|error)!\(' crates/preloop-runner-server/src | grep -E '\b(token|authorization|cookie|headers|body|payload|signed_url)\b'</code></p>
+</div>
+
+<h3>Health and status do not diagnose the control plane</h3>
+<p><code>crates/preloop-runner-server/src/runs.rs:4-9</code> always returns <code>ok: true</code>. The router exposes only <code>GET /healthz</code> (<code>routes.rs:256</code>) and installs <code>TraceLayer::new_for_http()</code> at <code>routes.rs:805</code> — whose default span leaks raw URIs. No <code>/readyz</code>, no <code>/metrics</code>, no Prometheus dependency.</p>
+<p><code>preloop status</code> at <code>crates/preloop-cli/src/main.rs:2831</code> calls only <code>GET /api/v1/runs?limit=20</code>. <code>wait_for_engine_socket</code> (<code>main.rs:1458-1475</code>) probes <code>http://localhost/healthz</code> over 30 s, treating “accepts connections” as “usable”.</p>
+
+<h3>The state needed for useful diagnostics already exists</h3>
+<p><code>AppState</code> (<code>state.rs:358-503</code>) and <code>InnerState</code> (<code>state.rs:1067-1153</code>) already contain ready/dependency/concurrency/expansion queues, runners/sessions/claims/leases, pool reservations, debug sessions, plus the GitHub App surface added since the first draft. <code>AppState::emit</code> (<code>state.rs:819</code>, lock released at <code>827-832</code>) releases the mutex before persistence — in-memory is authoritative.</p>
+
+<h3>Six blind spots the first draft missed</h3>
+<p id="blind-spots">Re-auditing at <code>673bdfa0</code> found six classes of state with no surface at all. Each can independently make Preloop behave incorrectly with no visible signal.</p>
+
+<h4>1 · Bounded buffers and hard limits drop data silently</h4>
+<div class="table-wrap"><table>
+  <thead><tr><th>Limit</th><th>Location</th><th>Value</th><th>Observable?</th></tr></thead>
+  <tbody>
+    <tr><td>per-job live-log bytes</td><td class="mono">live_logs.rs:25</td><td>64 MiB</td><td style="color:var(--red); font-weight:600;">No — tail-drop</td></tr>
+    <tr><td>oversized live-log batch</td><td class="mono">live_logs.rs:250</td><td>&gt; cap</td><td style="color:var(--amber);">WARN only</td></tr>
+    <tr><td><code>queue: max</code> pending holders</td><td class="mono">concurrency.rs:255</td><td>100</td><td style="color:var(--red); font-weight:600;">No — cancels a job</td></tr>
+    <tr><td>archived debug sessions</td><td class="mono">debug_sessions.rs:64</td><td>64</td><td style="color:var(--red);">Ring eviction</td></tr>
+    <tr><td>debug session events</td><td class="mono">debug_sessions.rs:68</td><td>512</td><td style="color:var(--red);">Ring eviction</td></tr>
+    <tr><td>debug session audit</td><td class="mono">debug_sessions.rs:71</td><td>512</td><td style="color:var(--red); font-weight:600;">Silent audit loss</td></tr>
+    <tr><td>completed debug ops</td><td class="mono">debug_sessions.rs:74</td><td>256</td><td style="color:var(--red);">Ring eviction</td></tr>
+    <tr><td>git request body</td><td class="mono">snapshots.rs:20</td><td>16 MiB</td><td>Rejected, not counted</td></tr>
+    <tr><td>reusable workflow depth</td><td class="mono">remote_workflows.rs:6</td><td>4</td><td>Rejected, not counted</td></tr>
+  </tbody>
+</table></div>
+<div class="callout callout-red">
+  <div class="callout-title">Why this matters</div>
+  A cap that silently discards data is worse than an outage. <code>queue: max</code> overflow cancels a user's job with no distinction from any other cancellation. Silent audit eviction is a compliance defect. Fix: one bounded <code>preloop.limit.*</code> family whose <code>limit</code> attribute is the constant's name — a compile-time-finite set.
+</div>
+
+<h4>2 · Scheduled workflows have a history endpoint and no telemetry</h4>
+<p><code>scheduler.rs</code> drives cron workflows from <code>bootstrap.rs:479/485</code> and exposes <code>GET /api/v1/scheduler/history</code>. Nothing reports whether a schedule fired, fired late, was skipped for overlap, or stopped because the scan task died.</p>
+
+<h4>3 · GitHub dependency budget is untracked</h4>
+<p>Caches at <code>dispatch_auth.rs:46,49</code> (60 s TTL), <code>oidc.rs:25</code> (300 s), <code>actions.rs:32</code> (6 h). No <code>x-ratelimit-*</code> parsing, no token-expiry tracking, no hit-rate reporting. Rate-limit exhaustion is indistinguishable from “GitHub is slow”.</p>
+
+<h4>4 · Persistent storage growth is unbounded and unreported</h4>
+<p>State dir, cache, artifacts, run logs, snapshots, VM images all grow. Only the VM volume gets a free-space signal in the first draft. A full state-dir filesystem is a hard outage; the first symptom today is a store write failure with no capacity context.</p>
+
+<h4>5 · Fifteen background tasks, two proposed heartbeats</h4>
+<div class="table-wrap"><table>
+  <thead><tr><th>Task</th><th>Location</th><th>Cadence</th></tr></thead>
+  <tbody>
+    <tr><td>reaper</td><td class="mono">bootstrap.rs:396-410</td><td>10 s</td></tr>
+    <tr><td>scheduler scan</td><td class="mono">bootstrap.rs:479, 485</td><td>timer</td></tr>
+    <tr><td>GitHub App event loop</td><td class="mono">bootstrap.rs:497, 517</td><td>event-driven</td></tr>
+    <tr><td>shutdown supervisor</td><td class="mono">bootstrap.rs:568</td><td>event-driven</td></tr>
+    <tr><td>listener accept loops</td><td class="mono">bootstrap.rs:601,615,660,679</td><td>per-conn</td></tr>
+    <tr><td>snapshot GC</td><td class="mono">snapshots.rs:1896</td><td>periodic</td></tr>
+    <tr><td>replay prune</td><td class="mono">distributed_task.rs:895</td><td>periodic</td></tr>
+    <tr><td>Postgres connection</td><td class="mono">store_pg.rs:95</td><td>lifetime</td></tr>
+    <tr><td>GitHub check dispatch</td><td class="mono">github.rs:1064</td><td>event-driven</td></tr>
+    <tr><td>auto-PR gate</td><td class="mono">github_pr.rs:397</td><td>event-driven</td></tr>
+    <tr><td>pool supervisor</td><td class="mono">orchestrator/lib.rs:1880-2100</td><td>loop</td></tr>
+    <tr><td>guest pause watchers</td><td class="mono">orchestrator/lib.rs:3027</td><td>per-VM</td></tr>
+    <tr><td>key rotation</td><td class="mono">orchestrator/keys.rs:74</td><td>periodic</td></tr>
+  </tbody>
+</table></div>
+<p>Hand-wiring two heartbeats and leaving thirteen silent reproduces the failure mode. Fix: one <code>TaskHeartbeat</code> registry — register at spawn, beat each iteration, deregister on drop; readiness reads only the critical subset.</p>
+
+<h4>6 · HTTP surfaces are wider than classified</h4>
+<p><code>routes.rs</code> serves thirteen path families, not eight: <code>/_apis</code>, <code>/broker</code>, <code>/runner</code>, <code>/twirp</code>, <code>/api/v1</code>, <code>/ws/live-logs</code>, <code>/snapshots</code>, <code>/repos</code>, <code>/oidc</code>, etc. Two need different treatment from a duration histogram: the WebSocket and the git-object path.</p>
+
+<!-- ════════════════════ ARCHITECTURE ════════════════════ -->
+<h2 id="architecture">Architecture &amp; Invariants</h2>
+
+<div class="arch-wrap">
+  <div class="arch-title">Three layers — zero-dependency diagnostics first, vendor-neutral telemetry second, optional backend third</div>
+  <svg class="arch-svg" viewBox="0 0 860 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Observability architecture — three layers">
+    <defs>
+      <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker>
+      <marker id="arr-dash" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker>
+      <filter id="shadow" x="-8%" y="-8%" width="116%" height="116%"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-opacity="0.08"/></filter>
+    </defs>
+
+    <!-- Layer labels -->
+    <text x="20" y="22" font-family="Outfit, sans-serif" font-size="9" font-weight="700" letter-spacing="0.1em" fill="#94a3b8">LAYER 1 — ZERO-DEPENDENCY</text>
+    <text x="20" y="152" font-family="Outfit, sans-serif" font-size="9" font-weight="700" letter-spacing="0.1em" fill="#94a3b8">LAYER 2 — VENDOR-NEUTRAL TELEMETRY</text>
+    <text x="20" y="270" font-family="Outfit, sans-serif" font-size="9" font-weight="700" letter-spacing="0.1em" fill="#94a3b8">LAYER 3 — OPTIONAL BACKEND</text>
+
+    <!-- Layer 1 boxes: CLI, Probes, Prometheus -->
+    <!-- CLI -->
+    <g filter="url(#shadow)">
+      <rect x="20" y="32" width="150" height="48" rx="8" fill="white" stroke="#0ea5e9" stroke-width="1.4"/>
+      <text x="95" y="50" text-anchor="middle" font-family="Outfit, sans-serif" font-size="11" font-weight="700" fill="#0ea5e9">preloop status</text>
+      <text x="95" y="64" text-anchor="middle" font-family="Outfit, sans-serif" font-size="8.5" fill="#64748b">CLI · native bearer</text>
+    </g>
+    <!-- Probes -->
+    <g filter="url(#shadow)">
+      <rect x="200" y="32" width="150" height="48" rx="8" fill="white" stroke="#10b981" stroke-width="1.4"/>
+      <text x="275" y="50" text-anchor="middle" font-family="Outfit, sans-serif" font-size="11" font-weight="700" fill="#10b981">systemd / probes</text>
+      <text x="275" y="64" text-anchor="middle" font-family="Outfit, sans-serif" font-size="8.5" fill="#64748b">health checks</text>
+    </g>
+    <!-- Prometheus scraper -->
+    <g filter="url(#shadow)">
+      <rect x="380" y="32" width="150" height="48" rx="8" fill="white" stroke="#8b5cf6" stroke-width="1.4"/>
+      <text x="455" y="50" text-anchor="middle" font-family="Outfit, sans-serif" font-size="11" font-weight="700" fill="#8b5cf6">Prometheus</text>
+      <text x="455" y="64" text-anchor="middle" font-family="Outfit, sans-serif" font-size="8.5" fill="#64748b">scraper · bearer auth</text>
+    </g>
+
+    <!-- Endpoints -->
+    <g>
+      <rect x="40" y="100" width="110" height="32" rx="16" fill="#e0f2fe" stroke="#0ea5e9" stroke-width="1"/>
+      <text x="95" y="120" text-anchor="middle" font-family="Fira Code, monospace" font-size="9" font-weight="600" fill="#0369a1">/api/v1/status</text>
+    </g>
+    <g>
+      <rect x="220" y="100" width="110" height="32" rx="16" fill="#dcfce7" stroke="#10b981" stroke-width="1"/>
+      <text x="275" y="114" text-anchor="middle" font-family="Fira Code, monospace" font-size="8.5" font-weight="600" fill="#065f46">/healthz  /readyz</text>
+      <text x="275" y="125" text-anchor="middle" font-family="Fira Code, monospace" font-size="7" fill="#065f46">public · shallow</text>
+    </g>
+    <g>
+      <rect x="400" y="100" width="110" height="32" rx="16" fill="#ede9fe" stroke="#8b5cf6" stroke-width="1"/>
+      <text x="455" y="120" text-anchor="middle" font-family="Fira Code, monospace" font-size="9" font-weight="600" fill="#5b21b6">/metrics</text>
+    </g>
+
+    <!-- Arrows L1 -->
+    <line x1="95" y1="80" x2="95" y2="100" stroke="#94a3b8" stroke-width="1.2" marker-end="url(#arr)"/>
+    <line x1="275" y1="80" x2="275" y2="100" stroke="#94a3b8" stroke-width="1.2" marker-end="url(#arr)"/>
+    <line x1="455" y1="80" x2="455" y2="100" stroke="#94a3b8" stroke-width="1.2" marker-end="url(#arr)"/>
+
+    <!-- Control plane + Pool + VM sampler -> Observability -->
+    <g filter="url(#shadow)">
+      <rect x="100" y="162" width="170" height="52" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.2"/>
+      <text x="185" y="182" text-anchor="middle" font-family="Outfit, sans-serif" font-size="11" font-weight="700" fill="white">Control plane</text>
+      <text x="185" y="197" text-anchor="middle" font-family="Fira Code, monospace" font-size="7.5" fill="#94a3b8">broker · store · scheduler</text>
+    </g>
+    <g filter="url(#shadow)">
+      <rect x="300" y="162" width="150" height="52" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.2"/>
+      <text x="375" y="182" text-anchor="middle" font-family="Outfit, sans-serif" font-size="11" font-weight="700" fill="white">Runner pool</text>
+      <text x="375" y="197" text-anchor="middle" font-family="Fira Code, monospace" font-size="7.5" fill="#94a3b8">provision · slots · goldens</text>
+    </g>
+    <g filter="url(#shadow)">
+      <rect x="480" y="162" width="170" height="52" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.2"/>
+      <text x="565" y="182" text-anchor="middle" font-family="Outfit, sans-serif" font-size="11" font-weight="700" fill="white">Host VM sampler</text>
+      <text x="565" y="197" text-anchor="middle" font-family="Fira Code, monospace" font-size="7.5" fill="#94a3b8">cgroup · process · sparse disk</text>
+    </g>
+
+    <!-- Observability crate -->
+    <g filter="url(#shadow)">
+      <rect x="260" y="234" width="240" height="40" rx="8" fill="#0ea5e9" stroke="#0284c7" stroke-width="1.4"/>
+      <text x="380" y="252" text-anchor="middle" font-family="Outfit, sans-serif" font-size="11" font-weight="700" fill="white">preloop-observability</text>
+      <text x="380" y="265" text-anchor="middle" font-family="Fira Code, monospace" font-size="7" fill="white" opacity="0.85">metrics · logs · traces · status snapshot</text>
+    </g>
+    <!-- arrows into observability -->
+    <line x1="185" y1="214" x2="310" y2="234" stroke="#475569" stroke-width="1.2" marker-end="url(#arr)"/>
+    <line x1="375" y1="214" x2="380" y2="234" stroke="#475569" stroke-width="1.2" marker-end="url(#arr)"/>
+    <line x1="565" y1="214" x2="470" y2="234" stroke="#475569" stroke-width="1.2" marker-end="url(#arr)"/>
+
+    <!-- Outputs from observability -->
+    <g>
+      <rect x="80" y="298" width="130" height="32" rx="6" fill="white" stroke="#64748b" stroke-width="1"/>
+      <text x="145" y="314" text-anchor="middle" font-family="Fira Code, monospace" font-size="8.5" font-weight="600" fill="#334155">stderr / journald</text>
+      <text x="145" y="324" text-anchor="middle" font-family="Outfit, sans-serif" font-size="7" fill="#64748b">always retained</text>
+    </g>
+    <g>
+      <rect x="240" y="298" width="110" height="32" rx="6" fill="#ede9fe" stroke="#8b5cf6" stroke-width="1"/>
+      <text x="295" y="318" text-anchor="middle" font-family="Fira Code, monospace" font-size="8.5" font-weight="600" fill="#5b21b6">/metrics</text>
+    </g>
+    <g>
+      <rect x="380" y="298" width="140" height="32" rx="6" fill="#e0f2fe" stroke="#0ea5e9" stroke-width="1" stroke-dasharray="5 4"/>
+      <text x="450" y="314" text-anchor="middle" font-family="Outfit, sans-serif" font-size="9" font-weight="600" fill="#0369a1">OTLP/HTTP</text>
+      <text x="450" y="324" text-anchor="middle" font-family="Outfit, sans-serif" font-size="7" fill="#64748b">bounded · optional</text>
+    </g>
+    <line x1="310" y1="274" x2="145" y2="298" stroke="#64748b" stroke-width="1.2" marker-end="url(#arr)"/>
+    <line x1="360" y1="274" x2="295" y2="298" stroke="#8b5cf6" stroke-width="1.2" marker-end="url(#arr)"/>
+    <line x1="410" y1="274" x2="450" y2="298" stroke="#0ea5e9" stroke-width="1.2" stroke-dasharray="5 4" marker-end="url(#arr)"/>
+
+    <!-- OpenObserve -->
+    <g filter="url(#shadow)">
+      <rect x="560" y="298" width="160" height="48" rx="8" fill="white" stroke="#f59e0b" stroke-width="1.4" stroke-dasharray="6 4"/>
+      <text x="640" y="318" text-anchor="middle" font-family="Outfit, sans-serif" font-size="11" font-weight="700" fill="#92400e">OpenObserve</text>
+      <text x="640" y="332" text-anchor="middle" font-family="Outfit, sans-serif" font-size="7.5" fill="#92400e">or any OTLP backend</text>
+    </g>
+    <line x1="520" y1="314" x2="560" y2="322" stroke="#f59e0b" stroke-width="1.2" stroke-dasharray="5 4" marker-end="url(#arr-dash)"/>
+    <text x="540" y="308" text-anchor="middle" font-family="Outfit, sans-serif" font-size="6.5" fill="#94a3b8">opt-in</text>
+
+    <!-- Collector (optional) -->
+    <g opacity="0.75">
+      <rect x="560" y="360" width="160" height="32" rx="6" fill="white" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4 3"/>
+      <text x="640" y="376" text-anchor="middle" font-family="Outfit, sans-serif" font-size="8.5" font-weight="600" fill="#64748b">OTel Collector — optional</text>
+      <text x="640" y="386" text-anchor="middle" font-family="Outfit, sans-serif" font-size="7" fill="#94a3b8">host telemetry · fan-out</text>
+    </g>
+    <line x1="640" y1="346" x2="640" y2="360" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4 3" marker-end="url(#arr)"/>
+
+    <!-- Side: run logs + capture -->
+    <text x="740" y="175" font-family="Outfit, sans-serif" font-size="7" font-weight="600" fill="#94a3b8" letter-spacing="0.06em">SIDE CHANNELS — NOT TELEMETRY</text>
+    <g opacity="0.65">
+      <rect x="700" y="185" width="140" height="28" rx="6" fill="white" stroke="#94a3b8" stroke-width="1"/>
+      <text x="770" y="202" text-anchor="middle" font-family="Fira Code, monospace" font-size="7.5" fill="#64748b">run-log store</text>
+    </g>
+    <g opacity="0.65">
+      <rect x="700" y="220" width="140" height="28" rx="6" fill="white" stroke="#94a3b8" stroke-width="1"/>
+      <text x="770" y="237" text-anchor="middle" font-family="Fira Code, monospace" font-size="7.5" fill="#64748b">flow capture · 0600</text>
+    </g>
+    <line x1="270" y1="188" x2="700" y2="199" stroke="#94a3b8" stroke-width="0.8" stroke-dasharray="3 3" opacity="0.5"/>
+    <line x1="270" y1="192" x2="700" y2="234" stroke="#94a3b8" stroke-width="0.8" stroke-dasharray="3 3" opacity="0.5"/>
+
+  </svg>
+  <div class="arch-legend">
+    <span><span class="dot" style="background:#0ea5e9;"></span> Layer 1 — always on</span>
+    <span><span class="dot" style="background:#1e293b;"></span> In-process</span>
+    <span><span class="dot" style="background:white; border:1px dashed #f59e0b;"></span> Optional</span>
+    <span><span class="dot" style="background:white; border:1px dashed #94a3b8;"></span> Side channel</span>
+    <span>— solid = always · - - dashed = opt-in</span>
+  </div>
+</div>
+
+<h3>New crate — <code>preloop-observability</code></h3>
+<p>Small, explicit API with no dependency on server or orchestrator internals. Both <code>preloop</code> and standalone <code>preloop-server</code> construct one handle/runtime before building <code>ServerConfig</code>; the same handle is cloned into <code>AppState</code> and <code>RunnerPoolConfig</code>.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Symbol</th><th>Role</th></tr></thead>
+  <tbody>
+    <tr><td class="mono">ObservabilityConfig::from_env()</td><td>Parses <code>PRELOOP_LOG_FORMAT</code> + standard <code>OTEL_*</code> without exposing header values in <code>Debug</code></td></tr>
+    <tr><td class="mono">Observability::noop()</td><td>Allocation-light handle for tests — zero network I/O</td></tr>
+    <tr><td class="mono">Observability</td><td>Cloneable handle: instruments, cached snapshot, pool/VM handles, heartbeats, export health</td></tr>
+    <tr><td class="mono">TaskHeartbeat</td><td><code>register(name, critical) → HeartbeatHandle</code> · <code>beat()</code> · <code>Drop</code> deregisters</td></tr>
+    <tr><td class="mono">LimitRegistry</td><td><code>record_drop(limit, n)</code> / <code>record_reject(limit)</code> — <code>limit</code> is a <code>&amp;'static str</code> constant name</td></tr>
+    <tr><td class="mono">ObservabilityRuntime</td><td>Owns provider guards; bounded 2 s flush on shutdown</td></tr>
+  </tbody>
+</table></div>
+
+<h3>Non-negotiable invariants</h3>
+<div class="invariant-grid">
+  <div class="invariant-card"><span class="invariant-num">1</span><div><strong>Fail open</strong><p>Telemetry failure produces a warning + condition, never a failed request.</p></div></div>
+  <div class="invariant-card"><span class="invariant-num">2</span><div><strong>No request-path export</strong><p>Bounded non-blocking batches. Queue overflow drops telemetry, increments health.</p></div></div>
+  <div class="invariant-card"><span class="invariant-num">3</span><div><strong>Bounded shutdown</strong><p>Flush ≤ 2 s after pool shutdown. Then exit.</p></div></div>
+  <div class="invariant-card"><span class="invariant-num">4</span><div><strong>No backend by default</strong><p>Absent OTEL endpoint = disabled. <em>Documented deviation from spec default localhost:4318.</em></p></div></div>
+  <div class="invariant-card"><span class="invariant-num">5</span><div><strong>Always retain stderr</strong><p>OTLP augments, never replaces journald.</p></div></div>
+  <div class="invariant-card"><span class="invariant-num">6</span><div><strong>No wire changes</strong><p>No field/status/body changes on runner protocol routes.</p></div></div>
+  <div class="invariant-card"><span class="invariant-num">7</span><div><strong>No high-cardinality labels</strong><p>IDs and user strings are logs/traces only.</p></div></div>
+  <div class="invariant-card"><span class="invariant-num">8</span><div><strong>No workflow output export</strong><p>Workflow stdout stays in the run-log store.</p></div></div>
+  <div class="invariant-card"><span class="invariant-num">9</span><div><strong>No raw HTTP capture</strong><p>Allowlisted trace attributes, not denylisted.</p></div></div>
+  <div class="invariant-card"><span class="invariant-num">10</span><div><strong>No state-lock callbacks</strong><p>Sampler updates a cached snapshot; exporters read it.</p></div></div>
+  <div class="invariant-card"><span class="invariant-num">11</span><div><strong>No hot-path allocation</strong><p>Prebuilt instruments; poll/renew is metrics-only.</p></div></div>
+  <div class="invariant-card"><span class="invariant-num">12</span><div><strong>No guest polling</strong><p>Host cgroup/process/filesystem only. Never <code>free</code> inside the VM.</p></div></div>
+  <div class="invariant-card"><span class="invariant-num">13</span><div><strong>No fake zeroes</strong><p>Unsupported = absent + capability false.</p></div></div>
+  <div class="invariant-card" style="border-color: oklch(82% 0.04 25);"><span class="invariant-num" style="background:var(--red);">14</span><div><strong>No silent drop</strong><p>Any cap that discards data must record it via <code>LimitRegistry</code>.</p></div></div>
+  <div class="invariant-card" style="border-color: oklch(82% 0.04 25);"><span class="invariant-num" style="background:var(--red);">15</span><div><strong>No unregistered task</strong><p>Every long-lived spawn registers a <code>TaskHeartbeat</code>.</p></div></div>
+</div>
+
+<!-- ════════════════════ OPERATOR SURFACES ════════════════════ -->
+<h2 id="operator-surfaces">Operator Surfaces</h2>
+
+<h3><code>/healthz</code> — liveness only</h3>
+<p>Unauthenticated, shallow. 200 while serving, 503 during shutdown. Must not touch DB, GitHub, SmolVM, or <code>InnerState</code>.</p>
+<div class="json-viewer"><div class="json-header"><span class="json-title">GET /healthz — 200</span><span class="json-badge">public</span></div><div class="json-body"><span class="jc">// always lock-free</span>
+{<br>&nbsp;&nbsp;<span class="jk">"schema_version"</span>: <span class="jn">1</span>,<br>&nbsp;&nbsp;<span class="jk">"ok"</span>: <span class="jb">true</span>,<br>&nbsp;&nbsp;<span class="jk">"protocol_version"</span>: <span class="js">"0.1.0"</span>,<br>&nbsp;&nbsp;<span class="jk">"shutdown_requested"</span>: <span class="jb">false</span><br>}</div></div>
+
+<h3><code>/readyz</code> — critical-loop readiness</h3>
+<p>Unauthenticated, boolean + stable reason codes. 200 when the state sampler and every <strong>critical</strong> heartbeat are fresh. 503 for <code>starting</code>, <code>task_stale</code> (with the stale task's registry name), or <code>shutting_down</code>. Non-critical staleness never gates readiness.</p>
+<div class="callout callout-blue"><div class="callout-title">Critical set</div>State sampler · reaper (<code>bootstrap.rs:396</code>) · scheduler scan (<code>bootstrap.rs:479</code>) · store connection task when Postgres (<code>store_pg.rs:95</code>). Everything else degrades to <code>/api/v1/status</code>.</div>
+<p><code>wait_for_engine_socket</code> (<code>preloop-cli/src/main.rs:1458-1475</code>) now probes <code>/readyz</code>; on 30 s timeout it surfaces the last reason code instead of a generic timeout.</p>
+
+<h3><code>/api/v1/status</code> — authenticated operational diagnosis</h3>
+<p>Versioned snapshot, 5-second sampler, never blocks on <code>InnerState</code>. Reports <code>snapshot_age_seconds</code>. Bearer auth required.</p>
+
+<!-- INTERACTIVE MOCKUPS -->
+<h3 id="mockups">UI Mockups — Live Preview</h3>
+<p style="font-size:0.88rem; color:var(--text-secondary);">Interactive previews of every operator surface. Switch tabs to compare the human CLI, the machine JSON, and the metric wire format.</p>
+
+<div class="tabs" id="surface-tabs">
+  <div class="tabs-nav" role="tablist">
+    <button role="tab" class="active" data-tab="cli">preloop status</button>
+    <button role="tab" data-tab="json">preloop status --json</button>
+    <button role="tab" data-tab="readyz">GET /readyz</button>
+    <button role="tab" data-tab="metrics">GET /metrics</button>
+    <button role="tab" data-tab="logs">Structured Logs</button>
+  </div>
+
+  <!-- CLI tab -->
+  <div class="tab-panel active" data-panel="cli">
+    <div class="terminal">
+      <div class="terminal-header"><div class="terminal-dots"><span class="dot-r"></span><span class="dot-y"></span><span class="dot-g"></span></div><span class="terminal-title">preloop status — human output (sections 1–10)</span></div>
+      <div class="terminal-body"><span class="t-dim">preloop v0.29.0 · instance 9f3a…c1 · up 2h 14m · snapshot 0.4s ago</span>  <span class="t-ok">● ok</span>
+
+<span class="t-bold">Queue</span>  <span class="t-dim">— oldest ready 14.2s</span>
+  <span class="t-cyan">ready</span>               2 jobs  · <span class="t-ok">1 claimable</span> · <span class="t-amber">1 unclaimable</span> (label mismatch)
+  dependency_blocked  1  ·  concurrency_blocked  1  ·  expanding  0
+
+<span class="t-bold">Concurrency</span>  <span class="t-dim">— groups 3 · contended 1 · queue max 100</span>
+  deepest pending  4  ·  overflow cancellations  <span class="t-ok">0</span>
+
+<span class="t-bold">Scheduler</span>  <span class="t-dim">— 4 schedules · last scan 3.1s ago</span>
+  fired 12  ·  skipped (overlap) 1  ·  late fires 0  ·  max delay 2.1s
+
+<span class="t-bold">Pool</span>  <span class="t-dim">— mode warm · desired 2 · preparing false</span>
+  idle 1  ·  busy 1  ·  building 0  ·  provisioning 0  ·  paused 0  ·  consecutive failures 0
+
+<span class="t-bold">Runners</span>  <span class="t-dim">— registered 2 · sessions 2</span>
+  idle 1  ·  busy 1  ·  stale 0  ·  max poll age 3.1s  ·  max lease age 8.0s
+
+<span class="t-bold">VMs</span>  <span class="t-dim">— source cgroup_v2 · sample 1.2s ago · capabilities: cpu ✓ mem ✓ throttle ✓ oom ✓ pids ✓ sparse ✓</span>
+  runner  2  ·  golden 1  ·  <span class="t-red">unreachable 0</span>
+  configured  10 vCPUs · 20 GiB mem · 80 GiB storage
+  host usage  2.4 cores · 7.0 GiB · sparse 12 GiB
+  top consumers <span class="t-dim">(by memory pressure)</span>
+    <span class="t-blue">preloop-runner-0</span>  busy  1.8 cores · 4.0 GiB / 7.0 GiB  <span class="t-amber">57%</span>
+    <span class="t-blue">preloop-runner-1</span>  idle  0.2 cores · 0.9 GiB / 7.0 GiB  13%
+
+<span class="t-bold">Store</span>  <span class="t-dim">— sqlite · consecutive failures 0 · conn up</span>
+<span class="t-bold">Storage</span>  <span class="t-dim">— state dir 41 GiB free (42%)</span> · largest: vm_images 64 GiB · cache 2.0 GiB
+<span class="t-bold">GitHub</span>  <span class="t-dim">— configured · rate 4812/5000 (reset in 18m) · token 47m · cache 91/4 hits</span>
+<span class="t-bold">Debug</span>  <span class="t-dim">— active 1 · oldest 3m · audit cap 512 (evicted 0)</span>
+<span class="t-bold">Telemetry</span>  <span class="t-dim">— OTLP disabled · dropped 0</span>
+
+<span class="t-amber">▸ condition: queue_label_mismatch</span>  <span class="t-dim">—</span> job <span class="t-blue">abc123</span> requires <span class="t-cyan">runs-on: gpu</span> but no runner advertises it <span class="t-dim">(1 exemplar)</span>
+<span class="t-dim">  action: add a runner with that label or change runs-on</span>
+
+<span class="t-bold">Recent runs</span>  <span class="t-dim">— last 5</span>
+  <span class="t-green">✓</span> #42  push main  abc123  1.2m  <span class="t-dim">queued → in_progress → completed</span>
+  <span class="t-green">✓</span> #41  pull_request  def456  58s
+  <span class="t-amber">●</span> #43  schedule nightly  —  queued  <span class="t-dim">14s</span></div>
+    </div>
+    <p style="font-size:0.78rem; color:var(--text-muted); margin-top:0.4rem;">Human output omits healthy limits/tasks (all zero) and clean conditions. <code>--json</code> includes everything. One-line actions on every condition, bounded to five exemplars.</p>
+  </div>
+
+  <!-- JSON tab -->
+  <div class="tab-panel" data-panel="json">
+    <div class="json-viewer">
+      <div class="json-header"><span class="json-title">GET /api/v1/status — 200 · bearer required</span><span class="json-badge">schema v1 · snapshot_age 0.4s</span></div>
+      <div class="json-body">{
+&nbsp;&nbsp;<span class="jk">"schema_version"</span>: <span class="jn">1</span>,
+&nbsp;&nbsp;<span class="jk">"observed_at"</span>: <span class="js">"2026-08-20T11:30:42Z"</span>,
+&nbsp;&nbsp;<span class="jk">"snapshot_age_seconds"</span>: <span class="jn">0.4</span>,
+&nbsp;&nbsp;<span class="jk">"overall"</span>: <span class="js">"degraded"</span>,
+&nbsp;&nbsp;<span class="jk">"service"</span>: { <span class="jk">"version"</span>: <span class="js">"0.29.0"</span>, <span class="jk">"instance_id"</span>: <span class="js">"9f3a…c1"</span>, <span class="jk">"uptime_seconds"</span>: <span class="jn">8040</span> },
+&nbsp;&nbsp;<span class="jk">"jobs"</span>: { <span class="jk">"ready"</span>: <span class="jn">2</span>, <span class="jk">"claimable"</span>: <span class="jn">1</span>, <span class="jk">"unclaimable"</span>: <span class="jn">1</span>, <span class="jk">"oldest_ready_seconds"</span>: <span class="jn">14.2</span> },
+&nbsp;&nbsp;<span class="jk">"concurrency"</span>: { <span class="jk">"groups_active"</span>: <span class="jn">3</span>, <span class="jk">"deepest_group_pending"</span>: <span class="jn">4</span>, <span class="jk">"overflow_cancellations"</span>: <span class="jn">0</span> },
+&nbsp;&nbsp;<span class="jk">"scheduler"</span>: { <span class="jk">"enabled"</span>: <span class="jb">true</span>, <span class="jk">"schedules"</span>: <span class="jn">4</span>, <span class="jk">"late_fires"</span>: <span class="jn">0</span>, <span class="jk">"max_fire_delay_seconds"</span>: <span class="jn">2.1</span> },
+&nbsp;&nbsp;<span class="jk">"pool"</span>: { <span class="jk">"mode"</span>: <span class="js">"warm"</span>, <span class="jk">"desired"</span>: <span class="jn">2</span>, <span class="jk">"idle"</span>: <span class="jn">1</span>, <span class="jk">"busy"</span>: <span class="jn">1</span> },
+&nbsp;&nbsp;<span class="jk">"vms"</span>: {
+&nbsp;&nbsp;&nbsp;&nbsp;<span class="jk">"source"</span>: <span class="js">"cgroup_v2"</span>, <span class="jk">"count"</span>: { <span class="jk">"runner"</span>: <span class="jn">2</span>, <span class="jk">"golden"</span>: <span class="jn">1</span> },
+&nbsp;&nbsp;&nbsp;&nbsp;<span class="jk">"host_usage"</span>: { <span class="jk">"cpu_cores"</span>: <span class="jn">2.4</span>, <span class="jk">"memory_bytes"</span>: <span class="jn">7516192768</span> },
+&nbsp;&nbsp;&nbsp;&nbsp;<span class="jk">"capabilities"</span>: { <span class="jk">"cpu_throttling"</span>: <span class="jb">true</span>, <span class="jk">"host_oom_events"</span>: <span class="jb">true</span> }<span class="jc">, … 5 top consumers</span>
+&nbsp;&nbsp;},
+&nbsp;&nbsp;<span class="jk">"storage"</span>: { <span class="jk">"state_fs_free_bytes"</span>: <span class="jn">41231234560</span>, <span class="jk">"components"</span>: [<span class="jc">… 6 entries</span>] },
+&nbsp;&nbsp;<span class="jk">"limits"</span>: [{ <span class="jk">"limit"</span>: <span class="js">"LIVE_LOG_MAX_BYTES"</span>, <span class="jk">"value"</span>: <span class="jn">67108864</span>, <span class="jk">"dropped"</span>: <span class="jn">0</span>, <span class="jk">"rejected"</span>: <span class="jn">0</span> }<span class="jc">, … 8 more — all caps even at zero</span>],
+&nbsp;&nbsp;<span class="jk">"tasks"</span>: [{ <span class="jk">"name"</span>: <span class="js">"reaper"</span>, <span class="jk">"critical"</span>: <span class="jb">true</span>, <span class="jk">"heartbeat_age_seconds"</span>: <span class="jn">3.2</span>, <span class="jk">"state"</span>: <span class="js">"running"</span> }<span class="jc">, … 14 more</span>],
+&nbsp;&nbsp;<span class="jk">"github"</span>: { <span class="jk">"rate_limit"</span>: { <span class="jk">"remaining"</span>: <span class="jn">4812</span>, <span class="jk">"limit"</span>: <span class="jn">5000</span> }, <span class="jk">"installation_token_expires_in_seconds"</span>: <span class="jn">2841</span> },
+&nbsp;&nbsp;<span class="jk">"conditions"</span>: [{ <span class="jk">"code"</span>: <span class="js">"queue_label_mismatch"</span>, <span class="jk">"severity"</span>: <span class="js">"warn"</span>, <span class="jk">"exemplars"</span>: [<span class="jc">… ≤5, with run/job IDs</span>] }]
+}</div>
+    </div>
+    <div class="callout callout-blue"><div class="callout-title">Contract</div>Field names are frozen at schema v1. New fields are additive. <code>limits</code> and <code>tasks</code> are arrays of constant-named entries so the contract survives new caps/tasks. <code>preloop status --json</code> prints this body byte-for-byte — pipe-friendly for <code>jq</code>.</div>
+  </div>
+
+  <!-- Readyz tab -->
+  <div class="tab-panel" data-panel="readyz">
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:1rem;">
+      <div class="json-viewer" style="margin:0;"><div class="json-header"><span class="json-title">GET /readyz — 200</span><span class="json-badge" style="background:var(--green); color:white;">ready</span></div><div class="json-body">{<br>&nbsp;&nbsp;<span class="jk">"ready"</span>: <span class="jb">true</span>,<br>&nbsp;&nbsp;<span class="jk">"checks"</span>: {<br>&nbsp;&nbsp;&nbsp;&nbsp;<span class="jk">"state_sampler"</span>: <span class="js">"ok"</span>,<br>&nbsp;&nbsp;&nbsp;&nbsp;<span class="jk">"reaper"</span>: <span class="js">"ok"</span>,<br>&nbsp;&nbsp;&nbsp;&nbsp;<span class="jk">"scheduler_scan"</span>: <span class="js">"ok"</span>,<br>&nbsp;&nbsp;&nbsp;&nbsp;<span class="jk">"store_connection"</span>: <span class="js">"ok"</span><br>&nbsp;&nbsp;}<br>}</div></div>
+      <div class="json-viewer" style="margin:0;"><div class="json-header"><span class="json-title">GET /readyz — 503</span><span class="json-badge" style="background:var(--red); color:white;">not ready</span></div><div class="json-body">{<br>&nbsp;&nbsp;<span class="jk">"ready"</span>: <span class="jb">false</span>,<br>&nbsp;&nbsp;<span class="jk">"reason"</span>: <span class="js">"task_stale"</span>,<br>&nbsp;&nbsp;<span class="jk">"task"</span>: <span class="js">"scheduler_scan"</span>,<br>&nbsp;&nbsp;<span class="jk">"heartbeat_age_seconds"</span>: <span class="jn">38.4</span>,<br>&nbsp;&nbsp;<span class="jk">"hint"</span>: <span class="js">"schedule fires delayed — see /api/v1/status"</span><br>}</div></div>
+    </div>
+    <p style="font-size:0.78rem; color:var(--text-muted); margin-top:0.6rem;">Only the four critical heartbeats gate readiness. A stale non-critical task (e.g. snapshot GC) surfaces in <code>/api/v1/status</code> but still returns 200.</p>
+  </div>
+
+  <!-- Metrics tab -->
+  <div class="tab-panel" data-panel="metrics">
+    <div class="prom-block"><span class="pm-comment"># HELP preloop_job_queue_depth Jobs by queue kind</span>
+<span class="pm-comment"># TYPE preloop_job_queue_depth gauge</span>
+<span class="pm-name">preloop_job_queue_depth</span>{<span class="pm-label">queue="ready"</span>} 2
+<span class="pm-name">preloop_job_queue_depth</span>{<span class="pm-label">queue="concurrency_blocked"</span>} 1
+<span class="pm-name">preloop_concurrency_pending_depth</span> 4
+<span class="pm-name">preloop_scheduler_fire</span>{<span class="pm-label">outcome="fired"</span>} 12
+<span class="pm-name">preloop_scheduler_fire</span>{<span class="pm-label">outcome="skipped_overlapping"</span>} 1
+<span class="pm-name">preloop_limit_dropped</span>{<span class="pm-label">limit="LIVE_LOG_MAX_BYTES"</span>} 0
+<span class="pm-name">preloop_limit_rejected</span>{<span class="pm-label">limit="QUEUE_MAX_PENDING"</span>} 0
+<span class="pm-name">preloop_task_heartbeat_age</span>{<span class="pm-label">task="reaper"</span>} 3.2
+<span class="pm-name">preloop_vm_host_memory_usage</span>{<span class="pm-label">role="runner",source="cgroup_v2"</span>} 7516192768
+<span class="pm-name">preloop_github_rate_limit_remaining</span>{<span class="pm-label">resource="core"</span>} 4812
+<span class="pm-name">preloop_storage_fs_available</span>{<span class="pm-label">mount="state_dir"</span>} 41231234560
+<span class="pm-comment"># HELP http_server_request_duration API latency — matched route, never raw URI</span>
+<span class="pm-name">http_server_request_duration_bucket</span>{<span class="pm-label">method="POST",route="/api/v1/runs",surface="native",le="0.25"</span>} 42</div>
+    <div class="callout callout-purple"><div class="callout-title">Cardinality guard</div>A bounded set of metric names × finite label values. 1,000 distinct run/job/runner IDs must not increase series count — tested by driving 1,000 sentinels and asserting the Prometheus exposition is constant.</div>
+  </div>
+
+  <!-- Logs tab -->
+  <div class="tab-panel" data-panel="logs">
+    <div class="terminal" style="margin-top:0;">
+      <div class="terminal-header"><div class="terminal-dots"><span class="dot-r"></span><span class="dot-y"></span><span class="dot-g"></span></div><span class="terminal-title">journalctl -u preloop -o json | jq — structured logs (OTLP + stderr)</span></div>
+      <div class="terminal-body"><span class="t-dim">2026-08-20T11:30:42Z</span> <span class="t-green">INFO</span>  <span class="t-cyan">job.claimed</span>          run_id=<span class="t-blue">abc123</span> job_id=<span class="t-blue">job_7</span> runner_id=<span class="t-blue">42</span> duration_ms=<span class="t-amber">12</span>
+<span class="t-dim">2026-08-20T11:30:43Z</span> <span class="t-amber">WARN</span>  <span class="t-cyan">vm.host.memory.pressure</span>  machine=<span class="t-blue">preloop-runner-0</span> ratio=<span class="t-amber">0.92</span> current=<span class="t-amber">6.6GiB</span> limit=7.0GiB source=cgroup_v2
+<span class="t-dim">2026-08-20T11:30:44Z</span> <span class="t-amber">WARN</span>  <span class="t-cyan">limit.exceeded</span>           limit=<span class="t-amber">QUEUE_MAX_PENDING</span> value=100 rejected=<span class="t-amber">1</span>  <span class="t-dim"># concurrency group overflow</span>
+<span class="t-dim">2026-08-20T11:30:44Z</span> <span class="t-amber">WARN</span>  <span class="t-cyan">github.rate_limit.low</span>    resource=core remaining=<span class="t-amber">412</span> limit=5000 reset_in=847s
+<span class="t-dim">2026-08-20T11:30:45Z</span> <span class="t-green">INFO</span>  <span class="t-cyan">schedule.fired</span>           schedule=<span class="t-blue">nightly@04:00</span> delay_s=<span class="t-amber">1.8</span>  <span class="t-dim"># cron</span>
+<span class="t-dim">2026-08-20T11:30:46Z</span> <span class="t-red">ERROR</span> <span class="t-cyan">store.connection.lost</span>    backend=postgres  <span class="t-dim"># connection task exited</span>
+<span class="t-dim">2026-08-20T11:30:47Z</span> <span class="t-amber">WARN</span>  <span class="t-cyan">vm.unreachable</span>           machine=<span class="t-blue">preloop-golden-0</span> pid=18412 age=67s  <span class="t-dim"># vsock probe — stop forking from it</span></div>
+    </div>
+    <p style="font-size:0.78rem; color:var(--text-muted); margin-top:0.4rem;"><code>event.name</code> + stable fields on every line. Trace/span IDs provide correlation — no second UUID. Workflow step output never appears here.</p>
+  </div>
+</div>
+
+<!-- ════════════════════ SIGNAL CONTRACT ════════════════════ -->
+<h2 id="signal-contract">Signal Contract</h2>
+
+<h3>Resource attributes on every signal</h3>
+<div class="table-wrap"><table>
+  <thead><tr><th>Attribute</th><th>Value</th></tr></thead>
+  <tbody>
+    <tr><td class="mono">service.name</td><td><code>preloop</code> (overridable via <code>OTEL_SERVICE_NAME</code>)</td></tr>
+    <tr><td class="mono">service.version</td><td>crate version</td></tr>
+    <tr><td class="mono">service.instance.id</td><td>UUID per process start — not a substitute for distributed coordination</td></tr>
+    <tr><td class="mono">deployment.environment.name</td><td>only when supplied via <code>OTEL_RESOURCE_ATTRIBUTES</code></td></tr>
+  </tbody>
+</table></div>
+
+<h3>Metric attribute policy</h3>
+<p>Allowed values are bounded enums or finite route templates. Forbidden: IDs, repo/workflow/ref/SHA, <code>runs-on</code> values, cache keys, artifact names, raw URLs, error text, tokens.</p>
+<p>Three narrow exceptions — all compile-time-finite: <code>limit</code> (cap constant names), <code>task</code> (heartbeat registry names), <code>store</code> (storage component names). A cardinality test drives 1,000 distinct IDs through instrumentation and asserts a fixed series bound and no sentinel leakage.</p>
+
+<h3>Metrics catalog — highlights</h3>
+<p>Full catalog is 50+ instruments. Key additions since the first draft:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Instrument</th><th>Type</th><th>Key attributes</th><th>Purpose</th></tr></thead>
+  <tbody>
+    <tr style="background:var(--amber-soft);"><td class="mono">preloop.limit.dropped</td><td>counter</td><td>limit</td><td>tail-drops, ring evictions</td></tr>
+    <tr style="background:var(--amber-soft);"><td class="mono">preloop.limit.rejected</td><td>counter</td><td>limit</td><td>queue-max overflows, body rejections</td></tr>
+    <tr style="background:var(--amber-soft);"><td class="mono">preloop.limit.value</td><td>gauge</td><td>limit</td><td>configured ceiling — alerts compare against it</td></tr>
+    <tr><td class="mono">preloop.task.heartbeat.age</td><td>gauge</td><td>task</td><td>dead-loop detector (generic)</td></tr>
+    <tr><td class="mono">preloop.task.exited</td><td>counter</td><td>task, outcome</td><td>background task termination</td></tr>
+    <tr><td class="mono">preloop.concurrency.decision</td><td>counter</td><td>queue mode, action</td><td>why a job was parked/cancelled</td></tr>
+    <tr><td class="mono">preloop.scheduler.fire</td><td>counter</td><td>outcome</td><td>did the cron actually run</td></tr>
+    <tr><td class="mono">preloop.scheduler.fire.delay</td><td>histogram</td><td>—</td><td>schedule slot → dispatch (buckets 1s–3600s)</td></tr>
+    <tr><td class="mono">preloop.github.rate_limit.remaining</td><td>gauge</td><td>resource</td><td>x-ratelimit-remaining</td></tr>
+    <tr><td class="mono">preloop.github.token.expires_in</td><td>gauge</td><td>kind</td><td>credential countdown</td></tr>
+    <tr><td class="mono">preloop.storage.bytes</td><td>gauge</td><td>store</td><td>per-component footprint</td></tr>
+    <tr><td class="mono">preloop.storage.fs.available</td><td>gauge</td><td>mount</td><td>authoritative free space</td></tr>
+    <tr><td class="mono">preloop.store.connection.up</td><td>gauge</td><td>backend</td><td>Postgres connection liveness</td></tr>
+    <tr><td class="mono">preloop.snapshot.cache</td><td>counter</td><td>outcome</td><td>git object serving</td></tr>
+    <tr><td class="mono">preloop.livelog.connections</td><td>updown</td><td>—</td><td>WebSocket connections (not a duration)</td></tr>
+  </tbody>
+</table></div>
+<div class="callout callout-amber"><div class="callout-title">New bucket view</div>Scheduler fire delay: 1, 5, 15, 30, 60, 300, 900, 3600 s. A cron job is not late at 10 ms resolution — reusing HTTP buckets would waste eight of eleven boundaries. <code>/ws/live-logs</code> is excluded from <code>http.server.request.duration</code> entirely.</div>
+
+<h3 id="vm-contract">VM telemetry contract</h3>
+<p>VM metrics are first-class Preloop telemetry — the embedded pool owns these processes. General node telemetry remains optional via an OTel Collector.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Signal</th><th>Linux source</th><th>macOS / fallback</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td>configured CPU/mem/storage</td><td>cached SmolVM <code>--json</code></td><td>same</td><td>requested capacity, not use</td></tr>
+    <tr><td>CPU time / cores</td><td><code>cpu.stat usage_usec</code></td><td>VMM process CPU</td><td>host CPU for the VM runtime</td></tr>
+    <tr><td>CPU throttling</td><td><code>cpu.stat</code> throttle fields</td><td>unavailable</td><td>cgroup quota pressure</td></tr>
+    <tr><td>host memory</td><td><code>memory.current</code></td><td>VMM RSS</td><td>host memory charged to the VMM</td></tr>
+    <tr><td>host PIDs</td><td><code>pids.current</code></td><td>unavailable</td><td>VMM/helper processes, not guest</td></tr>
+    <tr><td>sparse disk</td><td><code>st_blocks × 512</code></td><td>same</td><td>physical blocks for VM files</td></tr>
+    <tr><td>free disk</td><td><code>statvfs</code></td><td>same</td><td>authoritative pressure — per-VM blocks are diagnostic only</td></tr>
+  </tbody>
+</table></div>
+<div class="callout callout-teal">
+  <div class="callout-title">SmolVM floor v1.8.1 — stronger than first draft assumed</div>
+  <p><code>machine status --json</code> and <code>machine ls --json</code> emit the <strong>same object</strong> from one helper (<code>machine_status_json</code>). <code>state</code> is vsock-probed and includes <code>Unreachable</code> — “VMM PID alive, guest agent not answering.” Fleet sampling needs <strong>one</strong> <code>machine ls --json</code> per slow pass, not one subprocess per VM (and <code>SmolVmProvider::list</code> already parses it).</p>
+  <p style="margin-top:0.5rem;">A missing <code>vm-&lt;pid&gt;</code> cgroup leaf (SmolVM's supervisor creates it, not Preloop) degrades to the process fallback — never an error, capability reported false.</p>
+</div>
+<div class="condition-grid">
+  <span class="condition-chip critical">vm_unreachable</span>
+  <span class="condition-chip warn">vm_host_memory_pressure</span>
+  <span class="condition-chip warn">vm_host_cpu_throttled</span>
+  <span class="condition-chip critical">vm_host_oom_kill</span>
+  <span class="condition-chip warn">vm_sparse_disk_pressure</span>
+  <span class="condition-chip warn">vm_sampler_stale</span>
+  <span class="condition-chip">vm_sampler_unavailable</span>
+</div>
+
+<h3 id="log-catalog">Structured log catalog</h3>
+<div class="table-wrap"><table>
+  <thead><tr><th>Event</th><th>Level</th><th>Key fields</th></tr></thead>
+  <tbody>
+    <tr><td class="mono">job.concurrency.cancelled</td><td><span style="background:var(--amber-soft); padding:0.1em 0.4em; border-radius:3px; font-size:0.78em;">WARN</span></td><td>run/job ID, queue mode, <strong>hash</strong> of group key (never raw)</td></tr>
+    <tr><td class="mono">schedule.fired / skipped</td><td>INFO / WARN</td><td>schedule ID, delay, reason</td></tr>
+    <tr><td class="mono">task.exited</td><td>WARN / ERROR</td><td>registry name, outcome; ERROR if critical</td></tr>
+    <tr><td class="mono">limit.exceeded</td><td>WARN</td><td>limit name, value, drop/reject delta (rate-limited)</td></tr>
+    <tr><td class="mono">vm.unreachable / reachable</td><td>WARN / INFO</td><td>machine, PID, age since reachable</td></tr>
+    <tr><td class="mono">store.connection.lost</td><td>ERROR</td><td>backend — Postgres connection task died</td></tr>
+    <tr><td class="mono">storage.pressure</td><td>WARN</td><td>mount, free bytes/ratio, largest component</td></tr>
+    <tr><td class="mono">github.rate_limit.low</td><td>WARN</td><td>resource, remaining, reset_in</td></tr>
+    <tr><td class="mono">debug.audit.evicted</td><td>WARN</td><td>session ID, evicted count, cap 512</td></tr>
+  </tbody>
+</table></div>
+<div class="callout callout-red"><div class="callout-title">Hash, don't leak</div><code>job.concurrency.cancelled</code> logs a <strong>hash</strong> of the group key, never the raw key — the expression interpolates branch names and PR titles. The hash still correlates all jobs in one group without exporting user data.</div>
+
+<h3 id="trace-policy">Trace policy</h3>
+<p>Short synchronous spans, not one hours-long workflow trace. Correlate via <code>run.id / job.id / runner.id / machine.name</code> fields. Suppress successful health probes, renewals, and empty long-polls.</p>
+
+<!-- ════════════════════ SLOs ════════════════════ -->
+<h2 id="slos">SLOs &amp; Alerts</h2>
+<div class="table-wrap"><table>
+  <thead><tr><th>SLI</th><th>Initial objective</th><th>Denominator</th></tr></thead>
+  <tbody>
+    <tr><td>Control API / broker availability</td><td>99.9%</td><td>exclude 4xx + empty long-polls</td></tr>
+    <tr><td>Dispatch latency</td><td>99% within 30 s</td><td>only claimable jobs; preparation reported separately</td></tr>
+    <tr><td>Terminal propagation</td><td>99% within 30 s</td><td>job terminal → run final + check ack</td></tr>
+    <tr><td>Durable-state writes</td><td>no failure &gt; 5 m</td><td>all store ops</td></tr>
+    <tr><td>Runner liveness</td><td>no deaf session beyond bound</td><td>active sessions</td></tr>
+    <tr><td>VM telemetry freshness</td><td>no stale fast sample &gt; 3 intervals</td><td>owned VMs</td></tr>
+    <tr style="background:var(--amber-soft);"><td><strong>Scheduled-trigger fidelity</strong></td><td>99% within 60 s</td><td>excludes deliberate overlap skips</td></tr>
+    <tr style="background:var(--amber-soft);"><td><strong>Critical-task liveness</strong></td><td>no critical heartbeat stale &gt; 3 intervals</td><td>registry critical set</td></tr>
+    <tr style="background:var(--amber-soft);"><td><strong>Data retention honesty</strong></td><td>zero unreported drops</td><td>every drop must have a visible condition</td></tr>
+  </tbody>
+</table></div>
+<p style="font-size:0.82rem; color:var(--text-muted);">Instrument first, baseline two weeks, then ratify. Do not page on workflow failure rate — user code fails legitimately.</p>
+
+<div class="alert-grid">
+  <div class="alert-card alert-page"><span class="alert-icon">!</span><div><strong>Telemetry absent</strong><br><span style="color:var(--text-secondary);">no <code>preloop.service.uptime</code> for 5 m</span></div></div>
+  <div class="alert-card alert-page"><span class="alert-icon">!</span><div><strong>Dispatch stalled</strong><br><span style="color:var(--text-secondary);">claimable job exceeds baseline while idle capacity exists</span></div></div>
+  <div class="alert-card alert-warn"><span class="alert-icon">⚠</span><div><strong>Unclaimable queue</strong><br><span style="color:var(--text-secondary);">label mismatch vs no runner — distinguished</span></div></div>
+  <div class="alert-card alert-page"><span class="alert-icon">!</span><div><strong>Pool deficit</strong><br><span style="color:var(--text-secondary);">desired &gt; idle+busy+building+provisioning</span></div></div>
+  <div class="alert-card alert-page"><span class="alert-icon">!</span><div><strong>Runner deaf</strong><br><span style="color:var(--text-secondary);">max poll/lease age near timeout</span></div></div>
+  <div class="alert-card alert-page"><span class="alert-icon">!</span><div><strong>Store failing</strong><br><span style="color:var(--text-secondary);">consecutive failures or connection down</span></div></div>
+  <div class="alert-card alert-warn"><span class="alert-icon">⚠</span><div><strong>Schedule did not fire</strong><br><span style="color:var(--text-secondary);">slot passed, no <code>scheduler.fire</code> — invisible to queue alerts</span></div></div>
+  <div class="alert-card alert-warn"><span class="alert-icon">⚠</span><div><strong>Concurrency overflow</strong><br><span style="color:var(--text-secondary);">user job cancelled by <code>queue: max</code> policy</span></div></div>
+  <div class="alert-card alert-warn"><span class="alert-icon">⚠</span><div><strong>Data being dropped</strong><br><span style="color:var(--text-secondary);">any <code>limit.dropped/rejected</code> — page on audit eviction</span></div></div>
+  <div class="alert-card alert-page"><span class="alert-icon">!</span><div><strong>GitHub budget low</strong><br><span style="color:var(--text-secondary);">remaining/limit &lt; 10% or token near expiry</span></div></div>
+  <div class="alert-card alert-page"><span class="alert-icon">!</span><div><strong>VM unreachable</strong><br><span style="color:var(--text-secondary);">wedged golden — stop forking from it</span></div></div>
+  <div class="alert-card alert-warn"><span class="alert-icon">⚠</span><div><strong>VM pressure</strong><br><span style="color:var(--text-secondary);">memory / CPU throttle / disk / OOM</span></div></div>
+  <div class="alert-card alert-page"><span class="alert-icon">!</span><div><strong>Background task dead</strong><br><span style="color:var(--text-secondary);"><code>task.heartbeat.age</code> &gt; 3 intervals or <code>task.exited</code></span></div></div>
+  <div class="alert-card alert-warn"><span class="alert-icon">⚠</span><div><strong>Storage capacity</strong><br><span style="color:var(--text-secondary);">free space low + component growing past GC</span></div></div>
+</div>
+
+<!-- ════════════════════ DASHBOARD GALLERY ════════════════════ -->
+<h3 id="dashboards">Dashboard Gallery — Six Importable Boards</h3>
+<p style="font-size:0.88rem; color:var(--text-secondary);">Every panel maps 1:1 to a metric in the catalog. No dashboard-only derivations for state the server already knows. Sparklines below are illustrative — real boards query the same Prometheus/OTLP source.</p>
+
+<div class="dashboard-grid">
+
+  <!-- 1 Overview -->
+  <div class="dashboard-card">
+    <div class="dashboard-card-header"><h4>1 · Overview</h4><span class="dash-badge dash-badge-blue">always on</span></div>
+    <div class="dashboard-card-body">
+      <div class="mini-panels">
+        <div class="mini-panel"><div class="mini-panel-label">Service uptime</div><div class="mini-panel-value accent">2h 14m</div><div class="mini-panel-sub">no-data heartbeat</div><svg class="sparkline" viewBox="0 0 100 28"><path class="area" d="M0,20 L0,8 L20,10 L40,6 L60,9 L80,5 L100,7 L100,20 Z" fill="#0ea5e9"/><path d="M0,8 L20,10 L40,6 L60,9 L80,5 L100,7" stroke="#0ea5e9"/></svg></div>
+        <div class="mini-panel"><div class="mini-panel-label">API p99 latency</div><div class="mini-panel-value green">42 ms</div><div class="mini-panel-sub">native + broker</div><svg class="sparkline" viewBox="0 0 100 28"><path class="area" d="M0,20 L0,14 L20,12 L40,16 L60,11 L80,13 L100,8 L100,20 Z" fill="#10b981"/><path d="M0,14 L20,12 L40,16 L60,11 L80,13 L100,8" stroke="#10b981"/></svg></div>
+        <div class="mini-panel"><div class="mini-panel-label">Runs active</div><div class="mini-panel-value">3</div><div class="mini-panel-sub">queued 1 · in_progress 2</div><svg class="sparkline" viewBox="0 0 100 28"><path d="M0,18 L20,16 L40,20 L60,12 L80,14 L100,10" stroke="#0ea5e9"/></svg></div>
+        <div class="mini-panel"><div class="mini-panel-label">Conditions</div><div class="mini-panel-value amber">1 warn</div><div class="mini-panel-sub">queue_label_mismatch</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 2 Scheduling / Queue -->
+  <div class="dashboard-card">
+    <div class="dashboard-card-header"><h4>2 · Scheduling &amp; Queue</h4><span class="dash-badge dash-badge-amber">new</span></div>
+    <div class="dashboard-card-body">
+      <div class="mini-panels">
+        <div class="mini-panel"><div class="mini-panel-label">Queue depth by kind</div><div class="mini-panel-value">2 ready</div><div class="mini-panel-sub">blocked 1 · expanding 0</div><svg class="sparkline" viewBox="0 0 100 28"><path d="M0,18 L20,14 L40,16 L60,8 L80,12 L100,6" stroke="#f59e0b"/></svg></div>
+        <div class="mini-panel"><div class="mini-panel-label">Oldest ready</div><div class="mini-panel-value amber">14.2 s</div><div class="mini-panel-sub">claimability: label mismatch</div></div>
+        <div class="mini-panel"><div class="mini-panel-label">Concurrency — deepest pending</div><div class="mini-panel-value">4</div><div class="mini-panel-sub">groups active 3 · contended 1</div><svg class="sparkline" viewBox="0 0 100 28"><path d="M0,20 L20,18 L40,20 L60,16 L80,10 L100,14" stroke="#f59e0b"/></svg></div>
+        <div class="mini-panel"><div class="mini-panel-label">Scheduler fires</div><div class="mini-panel-value green">12 · 1 skipped</div><div class="mini-panel-sub">max delay 2.1 s</div><svg class="sparkline" viewBox="0 0 100 28"><path d="M0,16 L20,8 L40,12 L60,6 L80,10 L100,4" stroke="#10b981"/></svg></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 3 Runners / Pool -->
+  <div class="dashboard-card">
+    <div class="dashboard-card-header"><h4>3 · Runners &amp; Pool</h4><span class="dash-badge dash-badge-green">capacity</span></div>
+    <div class="dashboard-card-body">
+      <div class="mini-panels">
+        <div class="mini-panel"><div class="mini-panel-label">Runners</div><div class="mini-panel-value">2 reg</div><div class="mini-panel-sub">idle 1 · busy 1 · stale 0</div><svg class="sparkline" viewBox="0 0 100 28"><path d="M0,16 L20,14 L40,12 L60,14 L80,12 L100,12" stroke="#10b981"/></svg></div>
+        <div class="mini-panel"><div class="mini-panel-label">Pool desired vs actual</div><div class="mini-panel-value">2 / 2</div><div class="mini-panel-sub">building 0 · provisioning 0</div><svg class="sparkline" viewBox="0 0 100 28"><path d="M0,12 L20,10 L40,14 L60,8 L80,10 L100,10" stroke="#10b981"/></svg></div>
+        <div class="mini-panel"><div class="mini-panel-label">Max poll age</div><div class="mini-panel-value green">3.1 s</div><div class="mini-panel-sub">max lease 8.0 s</div></div>
+        <div class="mini-panel"><div class="mini-panel-label">Session transitions</div><div class="mini-panel-value">—</div><div class="mini-panel-sub">create / delete / reap</div><svg class="sparkline" viewBox="0 0 100 28"><path d="M0,20 L20,18 L40,10 L60,14 L80,8 L100,12" stroke="#8b5cf6"/></svg></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 4 VM Host Resources -->
+  <div class="dashboard-card">
+    <div class="dashboard-card-header"><h4>4 · VM Host Resources</h4><span class="dash-badge dash-badge-amber">host-observed</span></div>
+    <div class="dashboard-card-body">
+      <div class="mini-panels">
+        <div class="mini-panel"><div class="mini-panel-label">Fleet</div><div class="mini-panel-value">3 VMs</div><div class="mini-panel-sub">runner 2 · golden 1 · unreachable 0</div></div>
+        <div class="mini-panel"><div class="mini-panel-label">Host CPU</div><div class="mini-panel-value">2.4 cores</div><div class="mini-panel-sub">of 10 vCPUs configured</div><svg class="sparkline" viewBox="0 0 100 28"><path class="area" d="M0,20 L0,12 L20,14 L40,8 L60,10 L80,6 L100,9 L100,20 Z" fill="#f59e0b"/><path d="M0,12 L20,14 L40,8 L60,10 L80,6 L100,9" stroke="#f59e0b"/></svg></div>
+        <div class="mini-panel"><div class="mini-panel-label">Host memory</div><div class="mini-panel-value amber">7.0 GiB</div><div class="mini-panel-sub">pressure events 0 · OOM 0</div><svg class="sparkline" viewBox="0 0 100 28"><path d="M0,14 L20,12 L40,15 L60,10 L80,12 L100,16" stroke="#f59e0b"/></svg></div>
+        <div class="mini-panel"><div class="mini-panel-label">Sparse disk</div><div class="mini-panel-value">12 GiB</div><div class="mini-panel-sub">free 41 GiB (42%) · capability ✓</div><svg class="sparkline" viewBox="0 0 100 28"><path d="M0,16 L20,14 L40,12 L60,10 L80,8 L100,6" stroke="#f59e0b"/></svg></div>
+      </div>
+      <div style="margin-top:0.6rem; font-family:var(--font-display); font-size:0.62rem; color:var(--text-muted); text-align:center; letter-spacing:0.04em;">Top consumers (authenticated <code>/api/v1/status</code> only — never metric labels)</div>
+    </div>
+  </div>
+
+  <!-- 5 Dependencies / Telemetry -->
+  <div class="dashboard-card">
+    <div class="dashboard-card-header"><h4>5 · Dependencies &amp; Telemetry</h4><span class="dash-badge dash-badge-purple">budget</span></div>
+    <div class="dashboard-card-body">
+      <div class="mini-panels">
+        <div class="mini-panel"><div class="mini-panel-label">GitHub rate limit</div><div class="mini-panel-value green">4812 / 5000</div><div class="mini-panel-sub">reset in 18 m · token 47 m</div><svg class="sparkline" viewBox="0 0 100 28"><path d="M0,6 L20,8 L40,10 L60,12 L80,14 L100,16" stroke="#8b5cf6"/></svg></div>
+        <div class="mini-panel"><div class="mini-panel-label">Token cache hit rate</div><div class="mini-panel-value green">96%</div><div class="mini-panel-sub">91 hits · 4 misses · TTL 60s</div></div>
+        <div class="mini-panel"><div class="mini-panel-label">Store</div><div class="mini-panel-value green">sqlite · 0 fail</div><div class="mini-panel-sub">conn up · WAL ckpt 128</div></div>
+        <div class="mini-panel"><div class="mini-panel-label">Telemetry export</div><div class="mini-panel-value">disabled</div><div class="mini-panel-sub">dropped 0 · OTLP opt-in</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 6 Limits & Tasks -->
+  <div class="dashboard-card" style="border-color: oklch(82% 0.04 25);">
+    <div class="dashboard-card-header"><h4>6 · Limits &amp; Background Tasks</h4><span class="dash-badge dash-badge-red">new</span></div>
+    <div class="dashboard-card-body">
+      <div class="mini-panels">
+        <div class="mini-panel" style="border-color: oklch(82% 0.04 155);"><div class="mini-panel-label">Caps registered</div><div class="mini-panel-value">9</div><div class="mini-panel-sub">all at 0 drops — clean</div></div>
+        <div class="mini-panel"><div class="mini-panel-label">Largest drop source</div><div class="mini-panel-value green">— none —</div><div class="mini-panel-sub">last drop: —</div></div>
+        <div class="mini-panel"><div class="mini-panel-label">Critical heartbeats</div><div class="mini-panel-value green">4 / 4 ok</div><div class="mini-panel-sub">sampler · reaper · scheduler · store</div><svg class="sparkline" viewBox="0 0 100 28"><path d="M0,12 L20,10 L40,12 L60,10 L80,10 L100,10" stroke="#10b981"/></svg></div>
+        <div class="mini-panel"><div class="mini-panel-label">All tasks</div><div class="mini-panel-value">15</div><div class="mini-panel-sub">11 non-critical · all running</div></div>
+      </div>
+      <div style="margin-top:0.6rem; font-family:var(--font-display); font-size:0.62rem; color:var(--text-muted); text-align:center;">Invariants 14 &amp; 15 — a new cap or spawn without a counter/heartbeat is a review failure.</div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ════════════════════ OPENOBSERVE ════════════════════ -->
+<h2 id="openobserve">OpenObserve Evaluation</h2>
+<p>Verdict: use OpenObserve as the documented, optional “batteries available” backend. Do not make it a runtime dependency, embed it, or shape signals around its fields.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Criterion</th><th>Assessment</th><th>Decision</th></tr></thead>
+  <tbody>
+    <tr><td>Minimal deployment</td><td>Good — single binary/container</td><td>Pinned compose, never auto-start</td></tr>
+    <tr><td>Unified signals</td><td>OTLP/HTTP + gRPC for logs/metrics/traces</td><td>Preloop does OTLP/HTTP first (no tonic)</td></tr>
+    <tr><td>Dashboards / alerts</td><td>Good</td><td>Six importable boards + 14 alerts</td></tr>
+    <tr><td>Storage</td><td>Another stateful volume</td><td>Short retention, persistent volume, backups</td></tr>
+    <tr><td>HA</td><td>Kubernetes + object store + PG + NATS + 5 roles</td><td>Not shipped; link upstream docs</td></tr>
+    <tr><td>Security</td><td>SSO/RBAC/audit are enterprise-only</td><td>Loopback by default, operator auth if shared</td></tr>
+    <tr><td>Licensing</td><td>AGPL-3.0</td><td>Separate process; legal review before bundling</td></tr>
+  </tbody>
+</table></div>
+<p style="font-size:0.84rem; color:var(--text-secondary);">Losing SQLite metadata makes the installation inoperable — persist and back up both metadata and stream data. Do not put the UI on the public webhook origin.</p>
+
+<!-- ════════════════════ CONFIG ════════════════════ -->
+<h2 id="config">Configuration Contract</h2>
+<p>One Preloop-specific setting: <code>PRELOOP_LOG_FORMAT=auto|pretty|json</code> (<code>auto</code> = TTY-aware, no ANSI in journald).</p>
+<p>Honor standard variables — do not invent backend-specific ones:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Variable</th><th>Purpose</th></tr></thead>
+  <tbody>
+    <tr><td class="mono">RUST_LOG</td><td>filter (standalone server now gets the same <code>info</code> fallback as the CLI)</td></tr>
+    <tr><td class="mono">OTEL_SERVICE_NAME</td><td>overrides <code>service.name</code></td></tr>
+    <tr><td class="mono">OTEL_EXPORTER_OTLP_ENDPOINT</td><td>enables export — absent means <strong>disabled</strong> (deviation from spec default <code>localhost:4318</code>)</td></tr>
+    <tr><td class="mono">OTEL_EXPORTER_OTLP_PROTOCOL</td><td><code>http/protobuf</code> — only supported value in this plan</td></tr>
+    <tr><td class="mono">OTEL_TRACES/METRICS/LOGS_EXPORTER</td><td><code>none</code> disables the signal</td></tr>
+  </tbody>
+</table></div>
+<div class="callout callout-amber"><div class="callout-title">Spec deviation — document it</div>OTel's default endpoint is <code>http://localhost:4318</code>. Preloop treats an absent variable as disabled so a CI control plane does not emit background connection attempts. State this next to the variable list in <code>docs/observability.md</code>.</div>
+
+<!-- ════════════════════ SCOPE ════════════════════ -->
+<h2 id="scope">Scope</h2>
+<div style="display:grid; grid-template-columns:1fr 1fr; gap:1rem;">
+  <div>
+    <h4 style="margin-top:0; color:var(--green);">In scope</h4>
+    <ul style="font-size:0.82rem; padding-left:1.2rem;">
+      <li><code>Cargo.toml</code>, <code>versions.toml</code> (floor only if needed)</li>
+      <li>new <code>crates/preloop-observability</code></li>
+      <li>CLI + server + orchestrator + VM crates</li>
+      <li><code>docs/{architecture,self-hosting,cli_reference,observability}.md</code></li>
+      <li><code>contrib/openobserve/</code> — pinned compose + 6 boards</li>
+      <li>one <code>rules/</code> ast-grep guard</li>
+    </ul>
+  </div>
+  <div>
+    <h4 style="margin-top:0; color:var(--red);">Out of scope</h4>
+    <ul style="font-size:0.82rem; padding-left:1.2rem;">
+      <li>Runner protocol changes · guest export</li>
+      <li>Workflow step output export</li>
+      <li>OpenObserve HA · multi-server Preloop</li>
+      <li>eBPF / required Collector</li>
+      <li>Guest-kernel metrics until SmolVM exposes them</li>
+      <li>Per-machine metric labels · fake zeroes</li>
+      <li>A new web UI inside Preloop</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ════════════════════ STEPS ════════════════════ -->
+<h2 id="steps">Implementation Steps — Seven PRs</h2>
+<p style="font-size:0.88rem; color:var(--text-secondary);">One commit per step. Keep protocol instrumentation separate from reference-backend assets.</p>
+
+<div class="step-timeline">
+  <div class="step-item">
+    <div class="step-line"><div class="step-dot">1</div><div class="step-connector"></div></div>
+    <div class="step-content"><h4>Freeze the signal/security contract and make existing logs safe</h4><p>Add <code>docs/observability.md</code>. Re-run the token/body grep and fix <strong>every</strong> hit (four moved between <code>84d92cfd</code> and <code>673bdfa0</code>). Add an ast-grep rule rejecting <code>token / authorization / cookie / headers / body / payload / signed_url</code> at INFO/WARN/ERROR. Audit all non-DEBUG macros.</p><span class="step-tag tag-security">security</span><span class="step-tag tag-docs">docs</span><p style="margin-top:0.4rem;"><code>just sg-scan-strict</code> + sentinel logging test — no sentinel appears, flow capture stays 0600.</p></div>
+  </div>
+  <div class="step-item">
+    <div class="step-line"><div class="step-dot">2</div><div class="step-connector"></div></div>
+    <div class="step-content"><h4>Add the observability crate and unify process initialization</h4><p>Workspace member <code>preloop-observability</code> at <code>opentelemetry 0.32 / tracing-opentelemetry 0.33 / prometheus 0.14 / sysinfo 0.39.6</code>. No-op / Prometheus-only / Prometheus+OTLP paths. <code>TaskHeartbeat</code> + <code>LimitRegistry</code> usable from the no-op handle. Fix standalone server's missing <code>info</code> fallback.</p><span class="step-tag tag-crate">crate</span><p style="margin-top:0.4rem;">No endpoint = no socket. Malformed endpoint never delays a request. Bounded queues, 2 s flush, sanitized <code>Debug</code>.</p></div>
+  </div>
+  <div class="step-item">
+    <div class="step-line"><div class="step-dot">3</div><div class="step-connector"></div></div>
+    <div class="step-content"><h4>Truthful liveness, readiness, aggregate status, and CLI output</h4><p>5 s sampler, <code>/readyz</code> gated on the four critical heartbeats, <code>/api/v1/status</code> + <code>/metrics</code> behind native bearer, consolidated <code>PoolStatus</code> replacing four ad-hoc handles. <code>preloop status --json</code> (copy <code>PlanArgs</code> shape) + 10-section human output.</p><span class="step-tag tag-api">api</span><span class="step-tag tag-crate">crate</span><p style="margin-top:0.4rem;">Health public/shallow; status/metrics 401 without bearer; claimability distinguishes absence / mismatch / preparing / provisioning.</p></div>
+  </div>
+  <div class="step-item">
+    <div class="step-line"><div class="step-dot">4</div><div class="step-connector"></div></div>
+    <div class="step-content"><h4>Instrument HTTP, runs/jobs, dispatch, runners, and the store</h4><p>Matched-route instrumentation, thirteen surfaces (WebSocket excluded from duration histogram), one <code>InstrumentedStore</code> wrapping <code>Arc&lt;dyn Store&gt;</code>, concurrency decisions + scheduler scan, Postgres connection liveness.</p><span class="step-tag tag-instrument">instrumentation</span><p style="margin-top:0.4rem;"><code>just conform-server-light</code> — no protocol diff. 1,000 IDs do not increase series.</p></div>
+  </div>
+  <div class="step-item">
+    <div class="step-line"><div class="step-dot">5</div><div class="step-connector"></div></div>
+    <div class="step-content"><h4>Instrument pool, VM resources, GitHub, webhook, cache/artifacts, and debug sessions</h4><p>Typed SmolVM inspection (<code>status --json</code> + <code>ls --json</code> fleet call), <code>MachineState::Unreachable</code>, 5 s / 60 s samplers, storage sampler, GitHub budget gauges, snapshot serving, ring-cap registrations.</p><span class="step-tag tag-vm">pool · vm · github</span><p style="margin-top:0.4rem;">Cgroup fixtures, PID-reuse safety, missing-leaf fallback, 1,000 ephemeral machines = constant series.</p></div>
+  </div>
+  <div class="step-item">
+    <div class="step-line"><div class="step-dot">6</div><div class="step-connector"></div></div>
+    <div class="step-content"><h4>Add the optional OpenObserve reference profile and assets</h4><p>Pinned compose (loopback, persistent volume, healthcheck, resource caps), six dashboards, 14 alerts. Measure resource caps — do not guess.</p><span class="step-tag tag-dash">compose · dashboards</span><p style="margin-top:0.4rem;"><code>just observability-openobserve-smoke</code> — one log, one metric, VM series, one trace queryable.</p></div>
+  </div>
+  <div class="step-item">
+    <div class="step-line"><div class="step-dot">7</div><div class="step-connector"></div></div>
+    <div class="step-content"><h4>Baseline, ratify alerts, document the incident workflow, and close the loop</h4><p>Two-week soak, tune buckets/thresholds, runbooks for every alert, architecture + self-hosting docs, <code>just test-ci && just conform-server-light && just dogfood</code>.</p><span class="step-tag tag-docs">docs · runbooks</span></div>
+  </div>
+</div>
+
+<!-- ════════════════════ TEST PLAN ════════════════════ -->
+<h2 id="test-plan">Test Plan</h2>
+<p>Permanent tests must defend observable contracts, not source text:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>#</th><th>Contract</th><th>How</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>Disabled path</td><td>No OTEL endpoint → no DNS/socket, status/metrics still usable</td></tr>
+    <tr><td>2</td><td>Failure isolation</td><td>Malformed/down/slow/full/timeout never alters API result</td></tr>
+    <tr><td>3</td><td>Security</td><td>Sentinel tokens/headers/bodies never enter logs/traces/metrics</td></tr>
+    <tr><td>4</td><td>Cardinality</td><td>1,000 IDs → constant bounded series, no sentinel in exposition</td></tr>
+    <tr><td>5</td><td>HTTP semantics</td><td>Matched templates + finite surfaces; query values absent</td></tr>
+    <tr><td>6</td><td>Status</td><td>All queue/capacity/GitHub/debug states + auth + stale snapshot</td></tr>
+    <tr><td>7</td><td>Lifecycle exactness</td><td>Each terminal reason fires exactly once</td></tr>
+    <tr><td>8</td><td>Pool balance</td><td>No gauge leak on early return/cancellation</td></tr>
+    <tr><td>9</td><td>VM sampling</td><td>v1.8.1 JSON, cgroup fallback, PID reuse, sparse allocation</td></tr>
+    <tr><td>14</td><td>Limit honesty</td><td>Every cap driven past its ceiling → counter moves</td></tr>
+    <tr><td>15</td><td>Task liveness</td><td>Panicked/early-returned task reported; non-critical does not gate readiness</td></tr>
+  </tbody>
+</table></div>
+
+<!-- ════════════════════ DONE ════════════════════ -->
+<h2 id="done">Done Criteria</h2>
+<div class="callout callout-green"><div class="callout-title">All must hold before closing</div>
+<ul style="margin:0; padding-left:1.2rem; font-size:0.84rem;">
+  <li><code>preloop status</code> explains queue, capacity, runner freshness, and every condition names an action.</li>
+  <li><code>preloop status --json</code> returns schema v1 exactly — no prose.</li>
+  <li><code>/healthz</code> / <code>/readyz</code> / <code>/api/v1/status</code> / <code>/metrics</code> have specified auth/semantics.</li>
+  <li>No backend contacted when OTLP endpoint absent.</li>
+  <li>OTLP failure cannot block a request; shutdown flush ≤ 2 s.</li>
+  <li>Every cap registered — zero drops still reported — and every long-lived task has a heartbeat.</li>
+  <li>Scheduled workflows, concurrency overflow, GitHub budget, and storage capacity are visible.</li>
+  <li>Four ad-hoc <code>RunnerPoolConfig</code> handles gone, replaced by one <code>PoolStatus</code>.</li>
+  <li>VM <code>Unreachable</code> state honored end-to-end.</li>
+  <li>Six dashboards + 14 alerts import and query real fields.</li>
+  <li><code>cargo fmt --all --check</code>, <code>just sg-scan-strict</code>, <code>just test-ci</code>, <code>just conform-server-light</code>, <code>just dogfood</code>, <code>just observability-openobserve-smoke</code> pass.</li>
+</ul>
+</div>
+
+<!-- ════════════════════ STOP ════════════════════ -->
+<h2 id="stop">Stop Conditions</h2>
+<div class="callout callout-red"><div class="callout-title">Stop and report — do not improvise</div>
+<ul style="margin:0; padding-left:1.2rem; font-size:0.84rem;">
+  <li>Instrumentation would change a runner wire response.</li>
+  <li>OTel crate versions cannot provide Prometheus + OTLP without a second instrument set.</li>
+  <li>An exporter performs I/O on the handler thread.</li>
+  <li>SmolVM floor lacks <code>status --json / ls --json / data-dir</code> or changes field semantics — including dropping the shared <code>machine_status_json</code> shape.</li>
+  <li>Adding <code>MachineState::Unreachable</code> would require changing pool scheduling behavior in the same PR.</li>
+  <li>PID start identity cannot be validated on a supported host.</li>
+  <li>A metric needs a user-controlled label.</li>
+  <li>Current code no longer has the named centralized boundaries.</li>
+  <li>Conformance or dogfood changes after instrumentation.</li>
+</ul>
+</div>
+
+<!-- ════════════════════ MAINTENANCE ════════════════════ -->
+<h2 id="maintenance">Maintenance Notes</h2>
+<ul style="font-size:0.88rem;">
+  <li>Signal names, units, label sets, status schema, condition codes, and termination reasons are public operational APIs — additive first, documented migration when not.</li>
+  <li>Every new cap/ring/truncation must register with <code>LimitRegistry</code> in the same PR. Every new <code>tokio::spawn</code> that outlives a request must register a <code>TaskHeartbeat</code>. Both are review checklist items.</li>
+  <li>Anchors rot fast — prefer the greps and symbol names over line numbers; re-run the drift check before each step.</li>
+  <li>VM names/docs must retain the <code>host</code> distinction: cgroup RSS/PIDs/OOM are VMM observations, not guest-kernel counters.</li>
+  <li>Keep OpenObserve digests and assets tested together. Preloop's OTLP contract must work with other vendors.</li>
+</ul>
+
+<hr class="section-divider">
+<p style="font-family:var(--font-display); font-size:0.78rem; color:var(--text-muted); text-align:center; margin-top:1.25rem;">
+  Plan 002 · <code>673bdfa0</code> · 2026-08-20 · <a href="https://github.com/preloopdev/preloop/blob/main/plans/002-observability-strategy.md">Markdown source</a> · <a href="https://github.com/preloopdev/preloop/blob/main/plans/README.md">Plans index</a>
+</p>
+
+</main>
+</div>
+
+<script>
+// TOC active link
+const tocLinks = document.querySelectorAll('.toc a[href^="#"]');
+const sections = [...tocLinks].map(a => document.querySelector(a.getAttribute('href'))).filter(Boolean);
+const observer = new IntersectionObserver(entries => {
+  entries.forEach(e => {
+    if (e.isIntersecting) {
+      tocLinks.forEach(a => a.classList.remove('active'));
+      const active = document.querySelector(`.toc a[href="#${e.target.id}"]`);
+      if (active) active.classList.add('active');
+    }
+  });
+}, { rootMargin: '-20% 0px -70% 0px', threshold: 0 });
+sections.forEach(s => observer.observe(s));
+
+// Tabs
+document.querySelectorAll('.tabs').forEach(tabs => {
+  const btns = tabs.querySelectorAll('[role="tab"]');
+  const panels = tabs.querySelectorAll('.tab-panel');
+  btns.forEach(btn => {
+    btn.addEventListener('click', () => {
+      const tab = btn.dataset.tab;
+      btns.forEach(b => b.classList.toggle('active', b === btn));
+      panels.forEach(p => p.classList.toggle('active', p.dataset.panel === tab));
+    });
+  });
+});
+</script>
+</body>
+</html>
