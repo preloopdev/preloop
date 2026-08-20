@@ -26,6 +26,9 @@ pub(crate) struct WorkspaceSnapshot {
     /// Tree of the snapshot commit — the exact tree the run tests. A
     /// push-back client materializes a real commit from this tree so the
     /// pushed commit is byte-identical to what CI validated.
+    /// Empty for snapshots persisted before this field existed, so a restart
+    /// can still load old run records.
+    #[serde(default)]
     pub(crate) tree_sha: String,
     /// The workspace's real HEAD commit (the commit the submission is based
     /// on), when the workspace has one. This is the identity a workflow sees
@@ -2257,5 +2260,43 @@ mod deepen_and_redirect_tests {
             1,
             "an empty ref is default-branch semantics"
         );
+    }
+}
+
+mod snapshot_deserialization_tests {
+    use super::WorkspaceSnapshot;
+
+    // A snapshot persisted before `tree_sha` existed has no such field. The
+    // store restores old run records at startup; a missing field must load as
+    // empty rather than abort the whole control plane (regression: the field
+    // was added without a serde default and a restart died with
+    // `missing field tree_sha` on the first pre-upgrade snapshot).
+    #[test]
+    fn snapshot_without_tree_sha_still_deserializes() {
+        let snapshot: WorkspaceSnapshot = serde_json::from_value(serde_json::json!({
+            "commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "repository": "preloopdev/preloop",
+            "default_branch": "main",
+            "before_sha": null,
+        }))
+        .unwrap();
+        assert_eq!(snapshot.tree_sha, "");
+        assert_eq!(snapshot.commit_sha, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(snapshot.head_sha.as_deref(), Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+    }
+
+    #[test]
+    fn snapshot_with_tree_sha_round_trips() {
+        let snapshot: WorkspaceSnapshot = serde_json::from_value(serde_json::json!({
+            "commit_sha": "cccccccccccccccccccccccccccccccccccccccc",
+            "tree_sha": "dddddddddddddddddddddddddddddddddddddddd",
+            "head_sha": null,
+            "repository": "preloopdev/preloop",
+            "default_branch": null,
+            "before_sha": null,
+        }))
+        .unwrap();
+        assert_eq!(snapshot.tree_sha, "dddddddddddddddddddddddddddddddddddddddd");
     }
 }
