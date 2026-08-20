@@ -103,11 +103,13 @@ pub fn spawn(
     headers: Option<&str>,
     service_name: &str,
     instance_id: &str,
+    service_version: &str,
 ) -> Option<(Exporter, Arc<ExportHealth>)> {
     let endpoint = endpoint?.trim_end_matches('/').to_string();
     let header_pairs = parse_headers(headers);
     let service_name = service_name.to_string();
     let instance_id = instance_id.to_string();
+    let service_version = service_version.to_string();
     let health = Arc::new(ExportHealth::default());
     let (tx, mut rx) = mpsc::channel::<LogRecord>(QUEUE_CAPACITY);
 
@@ -138,17 +140,17 @@ pub fn spawn(
                         Some(record) => {
                             buffer.push(record);
                             if buffer.len() >= BATCH_MAX {
-                                flush(&client, &logs_url, &header_pairs, &service_name, &instance_id, &mut buffer, &worker_health).await;
+                                flush(&client, &logs_url, &header_pairs, &service_name, &instance_id, &service_version, &mut buffer, &worker_health).await;
                             }
                         }
                         None => {
-                            flush(&client, &logs_url, &header_pairs, &service_name, &instance_id, &mut buffer, &worker_health).await;
+                            flush(&client, &logs_url, &header_pairs, &service_name, &instance_id, &service_version, &mut buffer, &worker_health).await;
                             break;
                         }
                     }
                 }
                 _ = ticker.tick() => {
-                    flush(&client, &logs_url, &header_pairs, &service_name, &instance_id, &mut buffer, &worker_health).await;
+                    flush(&client, &logs_url, &header_pairs, &service_name, &instance_id, &service_version, &mut buffer, &worker_health).await;
                 }
             }
         }
@@ -169,6 +171,7 @@ async fn flush(
     headers: &[(String, String)],
     service_name: &str,
     instance_id: &str,
+    service_version: &str,
     buffer: &mut Vec<LogRecord>,
     health: &Arc<ExportHealth>,
 ) {
@@ -177,7 +180,7 @@ async fn flush(
     }
     let batch = std::mem::take(buffer);
     let count = batch.len() as u64;
-    let payload = encode_logs(&batch, service_name, instance_id);
+    let payload = encode_logs(&batch, service_name, instance_id, service_version);
     let mut req = client.post(url).json(&payload);
     for (name, value) in headers {
         req = req.header(name.as_str(), value.as_str());
@@ -218,7 +221,12 @@ fn severity_number(severity: &str) -> u8 {
 }
 
 /// Encode a batch into the OTLP/HTTP JSON `ExportLogsServiceRequest` shape.
-pub fn encode_logs(batch: &[LogRecord], service_name: &str, instance_id: &str) -> Value {
+pub fn encode_logs(
+    batch: &[LogRecord],
+    service_name: &str,
+    instance_id: &str,
+    service_version: &str,
+) -> Value {
     let ts = now_nanos().to_string();
     let records: Vec<Value> = batch
         .iter()
@@ -241,7 +249,7 @@ pub fn encode_logs(batch: &[LogRecord], service_name: &str, instance_id: &str) -
                 "attributes": [
                     attr("service.name", service_name),
                     attr("service.instance.id", instance_id),
-                    attr("service.version", env!("CARGO_PKG_VERSION")),
+                    attr("service.version", service_version),
                 ]
             },
             "scopeLogs": [{
@@ -277,7 +285,7 @@ mod tests {
 
     #[test]
     fn absent_endpoint_spawns_nothing() {
-        assert!(spawn(None, None, "preloop", "abc").is_none());
+        assert!(spawn(None, None, "preloop", "abc", "9.9.9").is_none());
     }
 
     #[test]
@@ -300,7 +308,7 @@ mod tests {
             body: "pool provisioning failed".to_string(),
             attributes: vec![("event.name".to_string(), "pool.provision".to_string())],
         }];
-        let payload = encode_logs(&batch, "preloop", "inst-1");
+        let payload = encode_logs(&batch, "preloop", "inst-1", "9.9.9");
         let record = &payload["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0];
         assert_eq!(record["severityText"], "WARN");
         assert_eq!(record["severityNumber"], 13);
@@ -308,5 +316,10 @@ mod tests {
         let resource = &payload["resourceLogs"][0]["resource"]["attributes"];
         assert_eq!(resource[0]["key"], "service.name");
         assert_eq!(resource[0]["value"]["stringValue"], "preloop");
+        assert_eq!(resource[2]["key"], "service.version");
+        assert_eq!(
+            resource[2]["value"]["stringValue"], "9.9.9",
+            "service.version must come from the host binary, not this crate"
+        );
     }
 }

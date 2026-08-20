@@ -561,6 +561,62 @@ pub(crate) enum JobSetAdmissionResult {
     Blocked,
 }
 
+/// Bounded conclusion label for a terminal execution status.
+fn execution_conclusion(status: preloop_gha_protocol::ExecutionStatus) -> &'static str {
+    use preloop_gha_protocol::ExecutionStatus as S;
+    match status {
+        S::Success => "success",
+        S::Failure => "failure",
+        S::Cancelled => "cancelled",
+        S::Skipped => "skipped",
+        // Non-terminal statuses never reach here; the guard filters them.
+        _ => "unrecognized",
+    }
+}
+
+/// Classify a termination reason into a bounded code.
+///
+/// The control plane's `reason` is not a code — several paths build a prose
+/// sentence that interpolates the job's `runs-on` labels (see the starvation
+/// sweep in `bootstrap.rs`). Those values are user-controlled, so the raw
+/// string must never reach a metric label: it would both explode cardinality
+/// and export workflow content. Classify by the stable prefix each path
+/// writes, and fall back to `unrecognized` rather than passing prose through.
+///
+/// The full message is still available on the structured log record; only the
+/// metric dimension is bounded.
+fn bounded_termination_reason(value: &str) -> &'static str {
+    // Exact codes first — these come from `concurrency::*_reason()`.
+    match value {
+        "concurrency_pending" => return "concurrency_pending",
+        "concurrency_cancelled" => return "concurrency_cancelled",
+        "timeout" => return "timeout",
+        "no_runner" => return "no_runner",
+        "lease_expired" => return "lease_expired",
+        "deaf_runner" => return "deaf_runner",
+        "startup_orphan" => return "startup_orphan",
+        _ => {}
+    }
+    // Prose paths — match on the stable leading phrase, never the whole
+    // string, so an interpolated label cannot change the classification.
+    if value.starts_with("no runner is registered for") {
+        return "no_runner";
+    }
+    if value.starts_with("job exceeded its timeout")
+        || value.starts_with("timed out")
+        || value.contains("timeout-minutes")
+    {
+        return "timeout";
+    }
+    if value.starts_with("runner stopped polling") || value.contains("deaf") {
+        return "deaf_runner";
+    }
+    if value.contains("lease expired") {
+        return "lease_expired";
+    }
+    "unrecognized"
+}
+
 impl AppState {
     pub async fn new(state_dir: PathBuf) -> anyhow::Result<Self> {
         let config_path = crate::config::config_path();
@@ -858,29 +914,15 @@ impl AppState {
         // duplicate `store_run_event` emits.
         match &event {
             NdjsonEvent::JobStatus { status, reason, .. } if status.is_terminal() => {
-                let conclusion = match status {
-                    preloop_gha_protocol::ExecutionStatus::Success => "success",
-                    preloop_gha_protocol::ExecutionStatus::Failure => "failure",
-                    preloop_gha_protocol::ExecutionStatus::Cancelled => "cancelled",
-                    preloop_gha_protocol::ExecutionStatus::Skipped => "skipped",
-                    _ => "unknown",
-                };
-                let reason_str = reason.as_deref().unwrap_or("unknown");
-                // Bound the reason to the finite set the plan allows; unknown
-                // reasons are mapped to "unknown" so they don't create new series.
-                let bounded_reason = match reason_str {
-                    "timeout"
-                    | "no_runner"
-                    | "lease_expired"
-                    | "deaf_runner"
-                    | "startup_orphan"
-                    | "concurrency_cancelled"
-                    | "concurrency_pending"
-                    | "success"
-                    | "failure"
-                    | "cancelled"
-                    | "skipped" => reason_str,
-                    _ => "unknown",
+                let conclusion = execution_conclusion(*status);
+                // `reason: None` is the common case (most terminal transitions
+                // carry none) and means "no reason supplied" — not
+                // "unrecognized". Only a value outside the emitted set is
+                // `unrecognized`, which keeps the label bounded without
+                // mislabelling the majority.
+                let bounded_reason = match reason.as_deref() {
+                    None => "unspecified",
+                    Some(value) => bounded_termination_reason(value),
                 };
                 self.observability
                     .metrics()
@@ -892,22 +934,19 @@ impl AppState {
                     } else {
                         "WARN"
                     },
-                    "job.completed",
+                    // A terminal JobStatus is a status transition, not the
+                    // separate JobCompleted event; naming both `job.completed`
+                    // conflated two distinct records in the log stream.
+                    "job.status.terminal",
                     vec![
-                        ("event.name".to_string(), "job.completed".to_string()),
+                        ("event.name".to_string(), "job.status.terminal".to_string()),
                         ("conclusion".to_string(), conclusion.to_string()),
                         ("reason".to_string(), bounded_reason.to_string()),
                     ],
                 );
             }
             NdjsonEvent::JobCompleted { status, .. } if status.is_terminal() => {
-                let conclusion = match status {
-                    preloop_gha_protocol::ExecutionStatus::Success => "success",
-                    preloop_gha_protocol::ExecutionStatus::Failure => "failure",
-                    preloop_gha_protocol::ExecutionStatus::Cancelled => "cancelled",
-                    preloop_gha_protocol::ExecutionStatus::Skipped => "skipped",
-                    _ => "unknown",
-                };
+                let conclusion = execution_conclusion(*status);
                 self.observability
                     .metrics()
                     .lifecycle
@@ -1367,5 +1406,59 @@ mod tests {
             !state.verify_action_ticket("acme", "repo\nv1", "x", expires_at, &signature),
             "a ticket for one action must not validate for a newline-split twin"
         );
+    }
+}
+
+#[cfg(test)]
+mod termination_reason_tests {
+    use super::bounded_termination_reason;
+
+    #[test]
+    fn exact_codes_pass_through() {
+        assert_eq!(
+            bounded_termination_reason("concurrency_cancelled"),
+            "concurrency_cancelled"
+        );
+        assert_eq!(bounded_termination_reason("timeout"), "timeout");
+    }
+
+    #[test]
+    fn starvation_prose_classifies_to_no_runner() {
+        // The starvation sweep builds this sentence with the job's runs-on
+        // labels interpolated. It must classify, not pass through.
+        let prose = "no runner is registered for `runs-on: self-hosted, Linux, ARM64` and none \
+                     appeared within 120s, so the job cannot be scheduled";
+        assert_eq!(bounded_termination_reason(prose), "no_runner");
+    }
+
+    #[test]
+    fn user_controlled_labels_never_become_the_label() {
+        // A hostile or merely unusual `runs-on` must not reach the metric.
+        let prose = "no runner is registered for `runs-on: attacker-controlled-\u{1F4A5}-label` \
+                     and none appeared within 120s, so the job cannot be scheduled";
+        let bounded = bounded_termination_reason(prose);
+        assert_eq!(bounded, "no_runner");
+        assert!(!bounded.contains("attacker"));
+    }
+
+    #[test]
+    fn unknown_prose_is_bounded_not_passed_through() {
+        let bounded = bounded_termination_reason("something entirely new happened with id-99999");
+        assert_eq!(bounded, "unrecognized");
+        assert!(!bounded.contains("99999"));
+    }
+
+    #[test]
+    fn classification_is_a_finite_set() {
+        // Drive 1,000 distinct prose strings; the label set must stay bounded.
+        let mut seen = std::collections::BTreeSet::new();
+        for i in 0..1000 {
+            let prose = format!(
+                "no runner is registered for `runs-on: label-{i}` and none appeared within 120s"
+            );
+            seen.insert(bounded_termination_reason(&prose));
+            seen.insert(bounded_termination_reason(&format!("novel reason {i}")));
+        }
+        assert_eq!(seen.len(), 2, "expected exactly no_runner + unrecognized");
     }
 }
