@@ -3,7 +3,7 @@
   "checkpoint_id": "01M0FYZK2WG8WMY3E63DXQ37EX",
   "strategy": "manual-commit",
   "branch": "Bnjoroge/oobservability",
-  "checkpoints_count": 16,
+  "checkpoints_count": 17,
   "files_touched": [
     "plans/002-observability-strategy.html"
   ],
@@ -97,6 +97,13 @@
       "transcript": "/12/full.jsonl",
       "compact_transcript": "/12/transcript.jsonl",
       "content_hash": "/12/content_hash.txt",
+      "prompt": ""
+    },
+    {
+      "metadata": "/13/metadata.json",
+      "transcript": "/13/full.jsonl",
+      "compact_transcript": "/13/transcript.jsonl",
+      "content_hash": "/13/content_hash.txt",
       "prompt": ""
     }
   ]
