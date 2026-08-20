@@ -130,6 +130,8 @@ async fn main() -> anyhow::Result<()> {
                 next_job_runs_on: None,
                 pool_preparing: None,
                 listen,
+                pool_status: None,
+                observability: None,
                 systemd_socket_activation: false,
                 unix_socket,
                 state_dir,
