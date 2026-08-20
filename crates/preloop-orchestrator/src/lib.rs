@@ -3617,6 +3617,31 @@ fn fork_base_unusable(error: &VmError) -> bool {
     .any(|signature| message.contains(signature))
 }
 
+/// Whether `golden` is a fork base this pool baked and manages.
+///
+/// The plain form (`{prefix}-golden`) is the single golden baked for the
+/// default environment at pool startup; the fingerprint-suffixed form
+/// (`{prefix}-golden-{fingerprint12}`) is prepared on demand by `run_slot`
+/// when a job asks for a non-default base image. Both carry a packed golden
+/// artifact and both can lose their retained fork checkpoint, so the
+/// re-arm / independent-create fallback applies to each.
+///
+/// A name like `{prefix}-golden-environment` is deliberately NOT matched:
+/// that is a baked environment golden serving a different `runs-on` image,
+/// and replacing it with the packed artifact would run the job on the wrong
+/// operating system.
+fn managed_golden(config: &RunnerPoolConfig, golden: &MachineName) -> bool {
+    let prefix = format!("{}-golden", config.name_prefix);
+    golden.as_str() == prefix
+        || golden
+            .as_str()
+            .strip_prefix(&prefix)
+            .is_some_and(|rest| {
+                rest.strip_prefix('-')
+                    .is_some_and(|fp| fp.len() == 12 && fp.bytes().all(|b| b.is_ascii_hexdigit()))
+            })
+}
+
 /// Create, boot, and register one ephemeral runner; return its `run` argv.
 ///
 /// The caller owns cleanup: on any error the machine may already exist.
@@ -3635,7 +3660,7 @@ async fn provision_runner<P: VmProvider + 'static>(
             Ok(()) => Some(golden),
             Err(error @ VmError::ForkBaseBusy { .. })
                 if config.use_packed_artifact
-                    && golden.as_str() == format!("{}-golden", config.name_prefix) =>
+                    && managed_golden(config, golden) =>
             {
                 // A live plain-fork clone still depends on the golden's frozen
                 // storage. Do not touch the base and do not create another VM
@@ -3652,8 +3677,7 @@ async fn provision_runner<P: VmProvider + 'static>(
                 None
             }
             Err(error)
-                if config.use_packed_artifact
-                    && golden.as_str() == format!("{}-golden", config.name_prefix) =>
+                if config.use_packed_artifact && managed_golden(config, golden) =>
             {
                 if fork_base_unusable(&error) {
                     // The base is spent. Re-arm it atomically with forking:
@@ -3798,8 +3822,8 @@ async fn provision_runner<P: VmProvider + 'static>(
         // so an env-golden fork boots the bare stock base image. Install the
         // apt baseline and toolchains into the fork itself — it is the job's
         // single-use machine, so the writes persist for its lifetime.
-        let golden_is_packed = config.use_packed_artifact
-            && golden.as_str() == format!("{}-golden", config.name_prefix);
+        let golden_is_packed =
+            config.use_packed_artifact && managed_golden(config, golden);
         if golden_is_packed {
             // The pack carries the apt baseline, but not necessarily apt's
             // indices — restore them before any workflow apt-installs. A
@@ -5355,6 +5379,56 @@ chmod +x "$destination/bin/node"
         )
         .await
         .expect("the re-armed golden serves the fork");
+
+        let events = provider.events().await;
+        let expected = [
+            format!("fork:{}:{}", golden.as_str(), name.as_str()),
+            format!("rearm:{}", golden.as_str()),
+            format!("delete:{}", name.as_str()),
+            format!("stop:{}", golden.as_str()),
+            format!("start:{}", golden.as_str()),
+            format!("fork:{}:{}", golden.as_str(), name.as_str()),
+        ];
+        let mut cursor = 0;
+        for event in &expected {
+            let position = events[cursor..]
+                .iter()
+                .position(|seen| seen == event)
+                .expect("re-arm sequence must include every step");
+            cursor += position + 1;
+        }
+        assert!(
+            provider.has_machine(&name).await,
+            "the retried fork must leave the clone provisioned"
+        );
+    }
+
+    /// A fingerprint-suffixed golden (`{prefix}-golden-{fingerprint}`, the
+    /// name `run_slot` uses for a non-default base image) must be recognized
+    /// as managed by this pool. The stale guard matched only the plain
+    /// `{prefix}-golden` form, so a spent per-environment golden looped on
+    /// "already paused" forever instead of re-arming.
+    #[tokio::test]
+    async fn spent_fingerprint_suffixed_fork_base_is_rearmed_and_retried() {
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, false)
+                .with_live_forks(false)
+                .failing_fork_once_spent(),
+        );
+        let config = packed_fork_config();
+        let golden = MachineName::new("lifecycle-test-golden-3577f5d5a384").unwrap();
+        let name = MachineName::new("lifecycle-test-0-8").unwrap();
+
+        provision_runner(
+            &provider,
+            &config,
+            &name,
+            Some(&golden),
+            &Arc::new(KeyPool::new()),
+            &test_runner_environment(config.base_image.clone(), Vec::new(), true),
+        )
+        .await
+        .expect("the re-armed fingerprint-suffixed golden serves the fork");
 
         let events = provider.events().await;
         let expected = [
