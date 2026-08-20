@@ -519,7 +519,7 @@ struct PbGetCacheEntryDownloadUrlResponse {
     matched_key: String,
 }
 
-type CachePbFields = (String, String, Vec<String>, Option<String>, Option<String>);
+type CachePbFields = (String, String, Vec<String>, Vec<String>, Option<String>);
 
 #[derive(Clone, Copy)]
 enum CacheRequestKind {
@@ -528,17 +528,17 @@ enum CacheRequestKind {
     GetDownloadUrl,
 }
 
-fn metadata_fields(metadata: Option<PbCacheMetadata>) -> (Option<String>, Option<String>) {
+fn metadata_fields(metadata: Option<PbCacheMetadata>) -> (Vec<String>, Option<String>) {
     let Some(metadata) = metadata else {
-        return (None, None);
+        return (Vec::new(), None);
     };
     let repository = (metadata.repository_id > 0).then(|| metadata.repository_id.to_string());
-    let scope = metadata
+    let scopes = metadata
         .scope
         .into_iter()
-        .find(|scope| !scope.scope.is_empty())
-        .map(|scope| scope.scope);
-    (scope, repository)
+        .filter_map(|scope| (!scope.scope.is_empty()).then_some(scope.scope))
+        .collect();
+    (scopes, repository)
 }
 
 fn validate_cache_identity(key: &str, version: &str) -> Result<(), ApiError> {
@@ -555,28 +555,28 @@ fn pb_cache_request(body: &[u8], kind: CacheRequestKind) -> Result<CachePbFields
                 ApiError::bad_request(format!("invalid protobuf request: {error}"))
             })?;
             validate_cache_identity(&request.key, &request.version)?;
-            let (scope, repository) = metadata_fields(request.metadata);
-            Ok((request.key, request.version, Vec::new(), scope, repository))
+            let (scopes, repository) = metadata_fields(request.metadata);
+            Ok((request.key, request.version, Vec::new(), scopes, repository))
         }
         CacheRequestKind::Finalize => {
             let request = PbFinalizeCacheEntryUploadRequest::decode(body).map_err(|error| {
                 ApiError::bad_request(format!("invalid protobuf request: {error}"))
             })?;
             validate_cache_identity(&request.key, &request.version)?;
-            let (scope, repository) = metadata_fields(request.metadata);
-            Ok((request.key, request.version, Vec::new(), scope, repository))
+            let (scopes, repository) = metadata_fields(request.metadata);
+            Ok((request.key, request.version, Vec::new(), scopes, repository))
         }
         CacheRequestKind::GetDownloadUrl => {
             let request = PbGetCacheEntryDownloadUrlRequest::decode(body).map_err(|error| {
                 ApiError::bad_request(format!("invalid protobuf request: {error}"))
             })?;
             validate_cache_identity(&request.key, &request.version)?;
-            let (scope, repository) = metadata_fields(request.metadata);
+            let (scopes, repository) = metadata_fields(request.metadata);
             Ok((
                 request.key,
                 request.version,
                 request.restore_keys,
-                scope,
+                scopes,
                 repository,
             ))
         }
@@ -604,8 +604,7 @@ fn pb_or_json<M: Message>(
 }
 
 /// The twirp cache routes accept JSON (actions/cache@v4) and protobuf
-/// (sccache's GHA storage backend). Returns `(key, version, restore_keys,
-/// scope, repository)`.
+/// (sccache's GHA storage backend). Returns `(key, version, restore_keys, scopes, repository)`.
 fn cache_request_fields(
     headers: &axum::http::HeaderMap,
     body: &[u8],
@@ -625,7 +624,7 @@ fn cache_request_fields(
             request.key,
             request.version,
             request.restore_keys,
-            request.scope,
+            request.scope.into_iter().collect::<Vec<_>>(),
             request.repository,
         ))
     }
@@ -636,9 +635,10 @@ pub(crate) async fn twirp_cache_v2_create(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<axum::response::Response, ApiError> {
-    let (key, version, _restore, scope, repository) =
+    let (key, version, _restore, scopes, repository) =
         cache_request_fields(&headers, &body, CacheRequestKind::Create)?;
-    let storage_key = scoped_cache_key(key.as_str(), scope.as_deref(), repository.as_deref());
+    let scope = scopes.first().map(String::as_str);
+    let storage_key = scoped_cache_key(key.as_str(), scope, repository.as_deref());
     if shared
         .state
         .cache
@@ -726,9 +726,10 @@ pub(crate) async fn twirp_cache_v2_finalize(
     body: axum::body::Bytes,
 ) -> Result<axum::response::Response, ApiError> {
     let t0 = std::time::Instant::now();
-    let (key, version, _restore, scope, repository) =
+    let (key, version, _restore, scopes, repository) =
         cache_request_fields(&headers, &body, CacheRequestKind::Finalize)?;
-    let storage_key = scoped_cache_key(key.as_str(), scope.as_deref(), repository.as_deref());
+    let scope = scopes.first().map(String::as_str);
+    let storage_key = scoped_cache_key(key.as_str(), scope, repository.as_deref());
     // Find the pending upload token matching key+version.
     let token = {
         let inner = shared.state.inner.lock().await;
@@ -837,42 +838,55 @@ pub(crate) async fn twirp_cache_v2_get_dl_url(
     body: axum::body::Bytes,
 ) -> Result<axum::response::Response, ApiError> {
     let t0 = std::time::Instant::now();
-    let (key, version, restore_keys, scope, repository) =
+    let (key, version, restore_keys, scopes, repository) =
         cache_request_fields(&headers, &body, CacheRequestKind::GetDownloadUrl)?;
-    let storage_key = scoped_cache_key(&key, scope.as_deref(), repository.as_deref());
-    let storage_restore_keys = restore_keys
-        .iter()
-        .map(|key| scoped_cache_key(key, scope.as_deref(), repository.as_deref()))
-        .collect::<Vec<_>>();
-    let t_lookup = std::time::Instant::now();
-    let result = shared
-        .state
-        .cache
-        .get(&storage_key, &version, &storage_restore_keys)
-        .await
-        .map_err(|e| ApiError::internal(format!("cache lookup error: {e}")))?;
-    let lookup_ms = t_lookup.elapsed().as_millis();
-
-    let (entry, _bytes) = match result {
-        Some(r) => r,
-        None => {
-            tracing::info!(
-                key = %key,
-                version = %version,
-                lookup_ms,
-                outcome = "miss",
-                "cache restore"
-            );
-            return Ok(pb_or_json(
-                &headers,
-                PbGetCacheEntryDownloadUrlResponse {
-                    ok: false,
-                    signed_download_url: String::new(),
-                    matched_key: String::new(),
-                },
-                json!({ "ok": false, "signed_download_url": "", "matched_key": "" }),
-            ));
+    // Try each scope in wire order until a cache hit. This preserves
+    // authorization through any later scope: a download authorized via
+    // `refs/heads/feature` must not fail because `refs/heads/main` was first
+    // and misses. If no scopes were supplied, try the unscoped default once.
+    let primary_scopes: Vec<Option<String>> = if scopes.is_empty() {
+        vec![None]
+    } else {
+        scopes.into_iter().map(Some).collect()
+    };
+    let mut hit: Option<(preloop_cache::CacheEntry, Vec<u8>)> = None;
+    let mut lookup_ms: u128 = 0;
+    for primary in &primary_scopes {
+        let storage_key = scoped_cache_key(&key, primary.as_deref(), repository.as_deref());
+        let storage_restore_keys = restore_keys
+            .iter()
+            .map(|rk| scoped_cache_key(rk, primary.as_deref(), repository.as_deref()))
+            .collect::<Vec<_>>();
+        let t_lookup = std::time::Instant::now();
+        let result = shared
+            .state
+            .cache
+            .get(&storage_key, &version, &storage_restore_keys)
+            .await
+            .map_err(|e| ApiError::internal(format!("cache lookup error: {e}")))?;
+        lookup_ms = t_lookup.elapsed().as_millis();
+        if result.is_some() {
+            hit = result;
+            break;
         }
+    }
+    let Some((entry, _bytes)) = hit else {
+        tracing::info!(
+            key = %key,
+            version = %version,
+            lookup_ms,
+            outcome = "miss",
+            "cache restore"
+        );
+        return Ok(pb_or_json(
+            &headers,
+            PbGetCacheEntryDownloadUrlResponse {
+                ok: false,
+                signed_download_url: String::new(),
+                matched_key: String::new(),
+            },
+            json!({ "ok": false, "signed_download_url": "", "matched_key": "" }),
+        ));
     };
 
     let dl_token = uuid::Uuid::new_v4().to_string();
@@ -917,6 +931,11 @@ pub(crate) async fn twirp_cache_v2_get_dl_url(
 mod cache_pb_tests {
     use super::*;
 
+    const SCCACHE_CREATE_FIXTURE: &[u8] =
+        include_bytes!("../../../fixtures/wire/cache-create-sccache.pb");
+    const SCCACHE_GET_FIXTURE: &[u8] =
+        include_bytes!("../../../fixtures/wire/cache-get-sccache.pb");
+
     #[test]
     fn pb_roundtrip_decodes_sccache_style_request() {
         let request = PbGetCacheEntryDownloadUrlRequest {
@@ -934,13 +953,67 @@ mod cache_pb_tests {
         let mut body = request.encode_to_vec();
         // Unknown fields must be ignored for protobuf forward compatibility.
         body.extend([0x28, 0x01]); // field 5, varint 1
-        let (key, version, restore, scope, repository) =
+        let (key, version, restore, scopes, repository) =
             pb_cache_request(&body, CacheRequestKind::GetDownloadUrl).unwrap();
         assert_eq!(key, ".sccache_check");
         assert_eq!(version, "abc123");
         assert_eq!(restore, vec!["restore-a"]);
-        assert_eq!(scope.as_deref(), Some("refs/heads/main"));
+        assert_eq!(scopes, vec!["refs/heads/main"]);
         assert_eq!(repository.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn pb_golden_sccache_create_fixture_decodes() {
+        // Correct fixture: bytes generated with prost using official field
+        // numbers (metadata=1, key=2, version=3). This is the failing pre-fix
+        // exchange: hand-rolled flat key=1 decoder cannot parse it, prost does.
+        let (key, version, restore, scopes, repository) =
+            pb_cache_request(SCCACHE_CREATE_FIXTURE, CacheRequestKind::Create).unwrap();
+        assert_eq!(key, ".sccache_check");
+        assert_eq!(version, "abc123");
+        assert!(restore.is_empty());
+        assert_eq!(scopes, vec!["refs/heads/main"]);
+        assert_eq!(repository.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn pb_golden_sccache_get_fixture_decodes_with_unknown_field() {
+        // Includes trailing unknown field 5 (0x28 0x01) — must be ignored.
+        let (key, version, restore, scopes, repository) =
+            pb_cache_request(SCCACHE_GET_FIXTURE, CacheRequestKind::GetDownloadUrl).unwrap();
+        assert_eq!(key, ".sccache_check");
+        assert_eq!(version, "abc123");
+        assert_eq!(restore, vec!["restore-a"]);
+        assert_eq!(scopes, vec!["refs/heads/main"]);
+        assert_eq!(repository.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn pb_multi_scope_preserves_all_scopes_in_wire_order() {
+        let request = PbGetCacheEntryDownloadUrlRequest {
+            metadata: Some(PbCacheMetadata {
+                repository_id: 42,
+                scope: vec![
+                    PbCacheScope { scope: "refs/heads/main".to_string(), permission: 1 },
+                    PbCacheScope { scope: "refs/heads/feature".to_string(), permission: 2 },
+                ],
+            }),
+            key: "k".to_string(),
+            restore_keys: vec![],
+            version: "v".to_string(),
+        };
+        let (key, version, restore, scopes, repository) =
+            pb_cache_request(&request.encode_to_vec(), CacheRequestKind::GetDownloadUrl).unwrap();
+        assert_eq!(key, "k");
+        assert_eq!(version, "v");
+        assert!(restore.is_empty());
+        assert_eq!(scopes, vec!["refs/heads/main", "refs/heads/feature"]);
+        assert_eq!(repository.as_deref(), Some("42"));
+        // Also verify the golden multi-scope fixture decodes identically
+        let fixture = include_bytes!("../../../fixtures/wire/cache-multi-scope.pb");
+        let (_, _, _, fixture_scopes, _) =
+            pb_cache_request(fixture, CacheRequestKind::GetDownloadUrl).unwrap();
+        assert_eq!(fixture_scopes, vec!["refs/heads/main", "refs/heads/feature"]);
     }
 
     #[test]
