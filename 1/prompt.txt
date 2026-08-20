@@ -1,0 +1,151 @@
+I want us to do more conformance testing on main. So I want you to pick five repos. We're going to do both conformance and we're going to do benchmarking between preloop, smallvm and preloop using agentenv. Alright so agentenv is just the same benchmark we did before but this time we're doing it with real wild workloads. So I want you to pick five real-world workloads that we're going to bench. We're going to use, we're also going to use the official golden here. That's not what we're going to use in prod, so I just want you to use the official golden just for this experiment. But in prod, we'll stick back to the curated one that we were using before. I just want to see how it works in KVM and how especially it compares to AGE and ENV. So yeah, give me those five repos.
+
+---
+
+sounds good i want these in main tho. feel free to stop main server to run these experiments then after you are done make sure to restart it so that the rest of the queued stuff drains. remember track everything ther's an oci image for the official runner if agent env needs it. use your judgement for anything im going to sleep so you cant ask me something. i wanna wake up tomorrow and see  nice report.mtrack everything. very importnat to know about actual timings
+
+---
+
+<!-- Hidden continuation steer. role=user, suppressed from visible transcript. -->
+
+Continue active goal.
+
+<objective>
+sounds good i want these in main tho. feel free to stop main server to run these experiments then after you are done make sure to restart it so that the rest of the queued stuff drains. remember track everything ther's an oci image for the official runner if agent env needs it. use your judgement for anything im going to sleep so you cant ask me something. i wanna wake up tomorrow and see  nice report.mtrack everything. very importnat to know about actual timings
+</objective>
+
+Budget:
+- Tokens used: 306568
+- Token budget: none
+- Tokens remaining: unbounded
+- Time used: 1924 seconds
+
+Autonomous continuation; objective persists across turns. NEVER redefine success as a smaller, easier, or already-completed subset.
+
+Before `goal({op:"complete"})`, MUST audit current repo state:
+
+1. Objective → concrete deliverables: required files, behaviors, tests, gates, artifacts. Record in todo or reasoning.
+2. Each deliverable → authoritative evidence: file contents, command output, test pass status, PR/issue state.
+3. Inspect actual current state: read files; run commands/tests. NEVER rely on earlier-session memory — repo may have changed.
+4. Verification scope = claim scope. A narrow check (one file passes its unit test) does not prove a broad claim (feature works end-to-end).
+5. Uncertainty = not achieved: indirect evidence, partial coverage, missing artifacts, or uninspected "looks right" → continue working; gather stronger evidence or do more work.
+6. Budget exhaustion ≠ completion. NEVER call complete merely because tokens are nearly out. Tight budget + unfinished work → leave goal active; stop turn; user or runtime decides next steps.
+
+Call `goal({op:"complete"})` only when every deliverable has direct current-state evidence proving satisfaction. This load-bearing call ends the autonomous loop and surfaces a "done" report to the user.
+
+Unfinished: keep working. NEVER narrate continuation — execute.
+
+---
+
+update here
+
+---
+
+So what explains the results? So you said the write heavy jobs are better on small VM versus age and ENV. So can you explain it?
+
+---
+
+Fine so if you're building a remote ci platform right i currently already have preloops that are working for working you know using small vm but that's mostly well currently i have it working for both macOS and linux but i'm thinking about the remote ci platform and i was trying to evaluate whether it makes sense to use small VM as my data plane I don't think it's looking good right can you try to map out like you know all of the different CI workloads and which one you think is better which one is not
+
+---
+
+- Yeah, how would you install Docker in Firecracker or HNNV? Small VM does support Docker, so I don't know why that didn't work. Also, yeah, I want you to redo the... I want you to redo the... redo the CPU bond.- Tasks, so I can get a bette rpicture. make docker work in agentenv so u can compare
+
+---
+
+continue
+
+---
+
+whats the udpate
+
+---
+
+alright continue
+
+---
+
+finish and dont stop until you are done
+
+---
+
+continue
+
+---
+
+continue
+
+---
+
+yea rca
+
+---
+
+thers a smolvm locally, rebase with upstream. and do an RCA with the bug, and confirm it. onceu do show me the issue description, ttile descirption etc
+
+---
+
+nah remove them there
+
+---
+
+so its been fixex? then why did prod not get it?
+
+---
+
+have u verified with actual source? try to repro again
+
+---
+
+Alright fine, so I want you to do conform runs like we've been doing. I want you to peek 5 repos. Containers or stuff that you know just different kinds. I want you to run them here on this machine using print loop. Do not run them on the host. If you run into any issues with print loop, keep going until you fix them. Fix them. Do not run in the host. I don't care about running the workloads in the host. I care about running them on the pre-loop directly. Alright, so, yeah. Use the official goal then. yeah, if any issues come up, fix. Just like we've been doing. do a really nice performance testing. Create a goal or checkpoint for this. yeah, keep going. I'm gonna go to bed, so I want you to direct yourself. I don't want you to take any short turns. Make good judgment when you need to. I wanna link up and find, yeah, just a good report of what works and what didn't work.
+
+---
+
+<!-- Hidden continuation steer. role=user, suppressed from visible transcript. -->
+
+Continue active goal.
+
+<objective>
+sounds good i want these in main tho. feel free to stop main server to run these experiments then after you are done make sure to restart it so that the rest of the queued stuff drains. remember track everything ther's an oci image for the official runner if agent env needs it. use your judgement for anything im going to sleep so you cant ask me something. i wanna wake up tomorrow and see  nice report.mtrack everything. very importnat to know about actual timings
+</objective>
+
+Budget:
+- Tokens used: 887285
+- Token budget: none
+- Tokens remaining: unbounded
+- Time used: 51704 seconds
+
+Autonomous continuation; objective persists across turns. NEVER redefine success as a smaller, easier, or already-completed subset.
+
+Before `goal({op:"complete"})`, MUST audit current repo state:
+
+1. Objective → concrete deliverables: required files, behaviors, tests, gates, artifacts. Record in todo or reasoning.
+2. Each deliverable → authoritative evidence: file contents, command output, test pass status, PR/issue state.
+3. Inspect actual current state: read files; run commands/tests. NEVER rely on earlier-session memory — repo may have changed.
+4. Verification scope = claim scope. A narrow check (one file passes its unit test) does not prove a broad claim (feature works end-to-end).
+5. Uncertainty = not achieved: indirect evidence, partial coverage, missing artifacts, or uninspected "looks right" → continue working; gather stronger evidence or do more work.
+6. Budget exhaustion ≠ completion. NEVER call complete merely because tokens are nearly out. Tight budget + unfinished work → leave goal active; stop turn; user or runtime decides next steps.
+
+Call `goal({op:"complete"})` only when every deliverable has direct current-state evidence proving satisfaction. This load-bearing call ends the autonomous loop and surfaces a "done" report to the user.
+
+Unfinished: keep working. NEVER narrate continuation — execute.
+
+---
+
+pick 3 more
+
+---
+
+5 more
+
+---
+
+docker is supported what are u saying also wahts up with node fetch
+
+---
+
+https://blog.rust-lang.org/2026/08/20/supply-chain-attack-on-arrayref/ can u verify this
+
+---
+
+whats arrayred?
