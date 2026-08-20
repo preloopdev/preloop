@@ -13,6 +13,7 @@
 
 pub mod metrics;
 pub mod status;
+pub mod vm_telemetry;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -383,6 +384,7 @@ struct Inner {
     heartbeat: TaskHeartbeat,
     limits: LimitRegistry,
     metrics: Arc<metrics::MetricsRegistry>,
+    vm_registry: Arc<vm_telemetry::VmTelemetryRegistry>,
     is_noop: bool,
 }
 
@@ -410,6 +412,7 @@ impl Observability {
                 heartbeat: TaskHeartbeat::default(),
                 limits: LimitRegistry::default(),
                 metrics: Arc::new(metrics::MetricsRegistry::default()),
+                vm_registry: Arc::new(vm_telemetry::VmTelemetryRegistry::default()),
                 is_noop: true,
             }),
         }
@@ -424,6 +427,7 @@ impl Observability {
                 heartbeat: TaskHeartbeat::default(),
                 limits: LimitRegistry::default(),
                 metrics: Arc::new(metrics::MetricsRegistry::default()),
+                vm_registry: Arc::new(vm_telemetry::VmTelemetryRegistry::default()),
                 is_noop,
             }),
         };
@@ -457,6 +461,10 @@ impl Observability {
 
     pub fn metrics(&self) -> &metrics::MetricsRegistry {
         &self.inner.metrics
+    }
+
+    pub fn vm_registry(&self) -> &vm_telemetry::VmTelemetryRegistry {
+        &self.inner.vm_registry
     }
 
     pub fn config(&self) -> &ObservabilityConfig {

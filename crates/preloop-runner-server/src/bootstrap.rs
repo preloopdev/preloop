@@ -513,10 +513,16 @@ fn build_operational_snapshot_sync(
             max_lease_age_seconds: None,
         },
         pool: pool_snapshot,
-        vms: VmFleetSnapshot {
-            source: VmSource::Unavailable,
-            sample_age_seconds: None,
-            ..Default::default()
+        vms: {
+            // Host sampler is stubbed until the cgroup parser lands;
+            // the registry is the source of truth for configured counts
+            // and will be populated by RunnerPool on create/fork.
+            let caps = std::collections::HashMap::new();
+            preloop_observability::vm_telemetry::build_fleet_snapshot(
+                observability.vm_registry(),
+                None,
+                caps,
+            )
         },
         store: StoreSnapshot::default(),
         storage: StorageSnapshot::default(),

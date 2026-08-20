@@ -2190,6 +2190,7 @@ version = "0.21.0"
 dependencies = [
  "async-trait",
  "parking_lot",
+ "preloop-observability",
  "serde",
  "serde_json",
  "tar",
