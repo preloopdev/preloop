@@ -1,0 +1,62 @@
+{
+  "cli_version": "0.10.0",
+  "checkpoint_id": "01M0FY4G03TFAM8TXQEVEXV3TZ",
+  "session_id": "01a01ae5-8d1a-7000-95f6-c36b80f0114b",
+  "strategy": "manual-commit",
+  "created_at": "2026-08-20T15:55:20.808532Z",
+  "branch": "Bnjoroge/oobservability",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "plans/002-observability-strategy.md",
+    "plans/README.md"
+  ],
+  "agent": "Oh My Pi",
+  "model": "",
+  "turn_id": "446392afabd7",
+  "compact_transcript_start": 0,
+  "initial_attribution": {
+    "calculated_at": "2026-08-20T15:55:20.782883Z",
+    "agent_lines": 0,
+    "agent_removed": 0,
+    "human_added": 1892,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 1892,
+    "total_lines_changed": 1892,
+    "agent_percentage": 0,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 2224,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".pi/extensions/entire/index.ts": 147,
+        "benchmarks/virtualization/__init__.py": 1,
+        "benchmarks/virtualization/adapters/__init__.py": 10,
+        "benchmarks/virtualization/adapters/base.py": 108,
+        "benchmarks/virtualization/adapters/hypeman.py": 100,
+        "benchmarks/virtualization/adapters/smolvm.py": 66,
+        "benchmarks/virtualization/analyze.py": 266,
+        "benchmarks/virtualization/bench.py": 776,
+        "benchmarks/virtualization/campaign.example.toml": 78,
+        "benchmarks/virtualization/collect.py": 145,
+        "benchmarks/virtualization/tests/test_analysis.py": 68,
+        "benchmarks/virtualization/tests/test_manifest.py": 46,
+        "benchmarks/virtualization/tests/test_runtime.py": 179,
+        "benchmarks/virtualization/workflows/__init__.py": 1,
+        "benchmarks/virtualization/workflows/noop.yml": 7,
+        "benchmarks/virtualization/workflows/representative.yml": 8,
+        "benchmarks/virtualization/workflows/synthetic.yml": 44,
+        "benchmarks/virtualization/workloads/__init__.py": 3,
+        "benchmarks/virtualization/workloads/catalog.toml": 47,
+        "benchmarks/virtualization/workloads/common.py": 104,
+        "benchmarks/virtualization/workloads/image-manifest.toml": 14,
+        "benchmarks/virtualization/workloads/run.py": 6
+      }
+    }
+  ]
+}
