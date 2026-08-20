@@ -14,12 +14,14 @@ const MAX_REUSABLE_WORKFLOW_DEPTH: usize = 4;
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // Runner gets structured local logging only — never OTLP export by default.
+    // `PRELOOP_LOG_FORMAT` still controls pretty/json/auto for consistency.
+    let obs_config = preloop_observability::ObservabilityConfig::from_env();
+    let (observability, observability_runtime) =
+        preloop_observability::Observability::from_config(obs_config);
+    preloop_observability::ObservabilityRuntime::install_fmt_subscriber(observability.config());
+    let _observability = observability;
+    let _observability_runtime = observability_runtime;
 
     match cli.command {
         Commands::Configure(args) => {

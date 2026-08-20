@@ -15,6 +15,7 @@ members = [
     "crates/preloop-orchestrator",
     "crates/preloop-socket-activation",
     "crates/preloop-cli",
+    "crates/preloop-observability",
     "benchmarks/preloop-perf",
 ]
 resolver = "2"
