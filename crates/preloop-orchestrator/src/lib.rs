@@ -1334,8 +1334,9 @@ fn docker_start_command() -> Vec<String> {
              }}; \
              if start_dockerd; then exit 0; fi; \
              rm -rf {DOCKER_DATA_ROOT}/*; \
-             start_dockerd; \
-             exit 0"
+             if start_dockerd; then exit 0; fi; \
+             echo 'dockerd failed to start after data-root reset' >&2; \
+             exit 1"
         )),
     ]
 }
