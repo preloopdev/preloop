@@ -123,6 +123,8 @@ pub(crate) async fn metrics(State(shared): State<Arc<SharedState>>) -> impl Into
         "preloop_job_queue_depth{{queue=\"dependency_blocked\"}} {}\n",
         snap.jobs.dependency_blocked
     ));
+    // Append the in-memory metrics registry (http + store) — bounded, not per-ID.
+    out.push_str(&shared.state.observability.metrics().render());
     let body = out;
     (
         [(

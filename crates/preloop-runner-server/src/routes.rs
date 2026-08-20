@@ -812,7 +812,10 @@ pub(crate) fn build_app(
             shared.clone(),
             resolve_runner_identity,
         ))
-        .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn_with_state(
+            shared.clone(),
+            crate::http_metrics::http_metrics_middleware,
+        ))
         .layer(middleware::from_fn(errors::protocol_error_envelope))
         .layer(middleware::from_fn_with_state(
             state.clone(),
