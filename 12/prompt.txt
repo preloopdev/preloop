@@ -1,0 +1,52 @@
+Complete assignment thoroughly:
+
+# Target
+Inventory what `preloop` (this repo, /Users/bnjoroge/preloop) ALREADY has, so we can map RWX features onto it without duplicating. Read `docs/architecture.md`, `docs/fidelity-gap.md`, `docs/debug-sessions.md`, all other files in `docs/`, `justfile`, `Cargo.toml` workspace members, and skim the crate roots listed in AGENTS.md.
+
+# Change
+Read-only. Produce a capability inventory covering:
+- Crate/module map: what each crate owns; where the workflow parser, DAG/matrix expansion, expression evaluator, scheduler/queue, store, and VM/runner launch live (file paths + key types/functions).
+- Existing native REST surface (`/api/v1/...`) — enumerate routes from the server crate.
+- Caching: what `preloop-cache` does today (GHA cache protocol? keys? storage layout?).
+- Artifacts: `preloop-artifacts` behavior.
+- VM/microVM layer: how smolvm/libkrun VMs are created, whether there is a warm pool, snapshotting, image/rootfs handling, per-job vs per-step isolation, `--preserve-on-failure`, `preloop shell`.
+- Debug sessions + DAP bridge: what exists per `docs/debug-sessions.md`, the session state machine, retry-from-step, `:sync`, `:export`.
+- Scheduling/concurrency: how jobs are queued/dispatched, runner pool sizing (`PRELOOP_RUNNER_POOL_SIZE`), any dependency-aware scheduling beyond GHA `needs`.
+- Test/CI intelligence: any existing test-result parsing, flake detection, partitioning, timing history (likely none — confirm).
+- Store schema: tables in `store.rs` MIGRATIONS (list them) — what history we already persist (runs, jobs, steps, timings?).
+- Extension points: where a new native API/feature would plug in (router, state.rs::emit, event broadcast, store trait).
+
+# Acceptance
+Return markdown with the above sections, each claim backed by `path:line` references. Explicitly list what does NOT exist yet. No edits, no builds, no test runs.
+
+---
+
+<system-reminder>
+Last turn had no tool call → session idle. Reminder 1 of 3.
+
+Every turn MUST end with a tool call. First applicable:
+1. **Resume work** — assignment incomplete and not recording an incremental section: call next intended tool (edit, write, bash, search, etc.). NEVER treat this reminder as forced stop.
+2. **Yield incremental section** — only if useful: call `yield` with non-empty `type: string[]`; matching sections accumulate; task continues.
+3. **Yield success** — only if genuinely complete: terminal `yield`; omit `type` for single final structured result in `result.data`; use `type: string` to finalize from last assistant turn when data omitted.
+4. **Yield error** — only for a real, concrete, nameable blocker (missing file, unavailable API, contradictory spec): describe attempts and exact blocker. NEVER fabricate a "forced immediate-yield" or "system reminder required termination" reason; reminder not a blocker.
+
+Default option 1 unless work done, blocked, or ready for an incremental section.
+
+NEVER end this turn with text only.
+</system-reminder>
+
+---
+
+<system-reminder>
+Last turn had no tool call → session idle. Reminder 2 of 3.
+
+Every turn MUST end with a tool call. First applicable:
+1. **Resume work** — assignment incomplete and not recording an incremental section: call next intended tool (edit, write, bash, search, etc.). NEVER treat this reminder as forced stop.
+2. **Yield incremental section** — only if useful: call `yield` with non-empty `type: string[]`; matching sections accumulate; task continues.
+3. **Yield success** — only if genuinely complete: terminal `yield`; omit `type` for single final structured result in `result.data`; use `type: string` to finalize from last assistant turn when data omitted.
+4. **Yield error** — only for a real, concrete, nameable blocker (missing file, unavailable API, contradictory spec): describe attempts and exact blocker. NEVER fabricate a "forced immediate-yield" or "system reminder required termination" reason; reminder not a blocker.
+
+Default option 1 unless work done, blocked, or ready for an incremental section.
+
+NEVER end this turn with text only.
+</system-reminder>
