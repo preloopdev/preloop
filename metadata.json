@@ -3,7 +3,7 @@
   "checkpoint_id": "01M0GMAK0GBF4MWHPY34DVRZC3",
   "strategy": "manual-commit",
   "branch": "Bnjoroge/oobservability",
-  "checkpoints_count": 16,
+  "checkpoints_count": 17,
   "files_touched": [
     "crates/preloop-orchestrator/src/lib.rs"
   ],
@@ -34,6 +34,13 @@
       "transcript": "/3/full.jsonl",
       "compact_transcript": "/3/transcript.jsonl",
       "content_hash": "/3/content_hash.txt",
+      "prompt": ""
+    },
+    {
+      "metadata": "/4/metadata.json",
+      "transcript": "/4/full.jsonl",
+      "compact_transcript": "/4/transcript.jsonl",
+      "content_hash": "/4/content_hash.txt",
       "prompt": ""
     }
   ]
