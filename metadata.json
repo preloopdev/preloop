@@ -1,0 +1,26 @@
+{
+  "cli_version": "0.10.0",
+  "checkpoint_id": "01M0GYV2RD8RN1A6HRSW163RJ7",
+  "strategy": "manual-commit",
+  "branch": "Bnjoroge/oobservability",
+  "checkpoints_count": 10,
+  "files_touched": [
+    "Cargo.lock",
+    "contrib/openobserve/compose.yml",
+    "crates/preloop-observability/Cargo.toml",
+    "crates/preloop-observability/src/status.rs",
+    "crates/preloop-observability/src/vm_telemetry.rs",
+    "docs/internal/observability.md",
+    "plans/README.md",
+    "rules/no-sensitive-log-fields.yml"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": ""
+    }
+  ]
+}
