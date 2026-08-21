@@ -324,7 +324,17 @@ pub(crate) async fn agent_request_patch(
     Path((pool_id, request_id)): Path<(i64, i64)>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    info!(?body, "agent_request_patch received");
+    let result_hint = body
+        .get("result")
+        .and_then(|v| v.as_str())
+        .unwrap_or("renew");
+    info!(
+        pool_id,
+        request_id,
+        result = %result_hint,
+        has_result = body.get("result").is_some(),
+        "agent_request_patch received"
+    );
     // If this is a completion (has result), delegate to complete_job_inner
     // so summarize_run, promote_ready_jobs, and notify_waiters all fire.
     // The result field is only present on the final PATCH; renewals have no result.
