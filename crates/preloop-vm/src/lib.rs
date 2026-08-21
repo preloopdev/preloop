@@ -14,6 +14,8 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::warn;
 
+pub mod telemetry;
+
 const DEFAULT_CAPTURE_LIMIT: usize = 1024 * 1024;
 
 /// A validated persistent SmolVM machine name.
