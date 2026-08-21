@@ -1,0 +1,33 @@
+{
+  "cli_version": "0.10.0",
+  "checkpoint_id": "01M0GZGY1VK1H0EF7KKPXRCFKF",
+  "session_id": "01a0183e-9fc3-7000-be7a-6a7b65c0a18c",
+  "strategy": "manual-commit",
+  "created_at": "2026-08-21T01:38:54.565276Z",
+  "branch": "pr/5-otlp-export",
+  "checkpoints_count": 4,
+  "files_touched": [
+    "crates/preloop-runner-server/src/models.rs"
+  ],
+  "agent": "Oh My Pi",
+  "model": "deepseek-v4-flash",
+  "turn_id": "e26370be1dc7",
+  "checkpoint_transcript_start": 9905,
+  "transcript_lines_at_start": 9905,
+  "compact_transcript_start": 1271,
+  "session_metrics": {
+    "turn_count": 4
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-08-21T01:38:54.107208Z",
+    "agent_lines": 15,
+    "agent_removed": 0,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 15,
+    "total_lines_changed": 15,
+    "agent_percentage": 100,
+    "metric_version": 2
+  }
+}
