@@ -189,6 +189,21 @@ impl PoolStatus {
         self.inner.write().preparing = preparing;
     }
 
+    /// Mirror one pool count into the snapshot. Per-field setters, not
+    /// `set_counts`, so a RAII guard updating only the count it owns cannot
+    /// clobber the fields another guard just wrote.
+    pub fn set_idle(&self, idle: u32) {
+        self.inner.write().idle = idle;
+    }
+
+    pub fn set_building(&self, building: u32) {
+        self.inner.write().building = building;
+    }
+
+    pub fn set_provisioning(&self, provisioning: u32) {
+        self.inner.write().provisioning = provisioning;
+    }
+
     pub fn set_counts(&self, idle: u32, busy: u32, building: u32, provisioning: u32, paused: u32) {
         let mut g = self.inner.write();
         g.idle = idle;
