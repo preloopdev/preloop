@@ -3,7 +3,7 @@
   "checkpoint_id": "01M0K6TJ3Z57P6115TW88WCQG8",
   "strategy": "manual-commit",
   "branch": "pr/6-review-fixes",
-  "checkpoints_count": 10,
+  "checkpoints_count": 11,
   "files_touched": [
     "crates/preloop-observability/src/status.rs",
     "crates/preloop-orchestrator/src/lib.rs"
@@ -14,6 +14,13 @@
       "transcript": "/0/full.jsonl",
       "compact_transcript": "/0/transcript.jsonl",
       "content_hash": "/0/content_hash.txt",
+      "prompt": ""
+    },
+    {
+      "metadata": "/1/metadata.json",
+      "transcript": "/1/full.jsonl",
+      "compact_transcript": "/1/transcript.jsonl",
+      "content_hash": "/1/content_hash.txt",
       "prompt": ""
     }
   ]
