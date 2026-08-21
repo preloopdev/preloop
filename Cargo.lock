@@ -2020,9 +2020,10 @@ dependencies = [
 name = "preloop-observability"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "chrono",
  "parking_lot",
+ "rand 0.8.6",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
@@ -2191,6 +2192,7 @@ version = "0.21.0"
 dependencies = [
  "async-trait",
  "parking_lot",
+ "preloop-observability",
  "serde",
  "serde_json",
  "tar",
