@@ -65,5 +65,31 @@ fn main() {
         .filter(|sha| !sha.is_empty())
         .unwrap_or_else(|| "unknown".to_owned());
     println!("cargo:rustc-env=PRELOOP_BUILD_COMMIT={commit}");
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
+    // Make Cargo rebuild this crate when the checked-out commit changes.
+    // `.git/HEAD` alone is not enough: on a branch checkout it contains the
+    // symbolic ref (`ref: refs/heads/main`) whose contents do not change
+    // when the branch advances, so an incremental build would keep embedding
+    // the previous commit — and the updater could then compare that stale
+    // commit and clobber a newer source build with the release binary.
+    // Track HEAD, the ref it points at, and packed-refs (the ref file may
+    // live there instead of under refs/), all resolved through git itself.
+    let mut ref_paths = vec![String::from("../../.git/HEAD")];
+    if let Ok(output) = Command::new("git")
+        .args(["rev-parse", "--symbolic-full-name", "HEAD"])
+        .current_dir(&manifest_dir)
+        .output()
+    {
+        if output.status.success() {
+            if let Ok(ref_name) = String::from_utf8(output.stdout) {
+                let ref_name = ref_name.trim();
+                if let Some(short) = ref_name.strip_prefix("refs/") {
+                    ref_paths.push(format!("../../.git/{short}"));
+                }
+            }
+        }
+    }
+    ref_paths.push(String::from("../../.git/packed-refs"));
+    for path in ref_paths {
+        println!("cargo:rerun-if-changed={path}");
+    }
 }

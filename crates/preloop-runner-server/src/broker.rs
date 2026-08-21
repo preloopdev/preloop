@@ -821,6 +821,18 @@ pub(crate) async fn broker_acquire_job(
                         .and_then(|json| {
                             serde_json::from_str::<BTreeMap<String, String>>(json).ok()
                         });
+                    // The wire variable spells scopes PascalCase
+                    // ("PullRequests"); the installation-token request and
+                    // `job_authorization` expect the workflow's kebab-case
+                    // identities ("pull-requests"). Minting with PascalCase
+                    // keys fails (or falls back to the broad PAT), so
+                    // convert every key before building the request.
+                    let wire_permissions = wire_permissions.map(|permissions| {
+                        permissions
+                            .into_iter()
+                            .map(|(scope, level)| (wire_scope_to_kebab(&scope), level))
+                            .collect::<BTreeMap<_, _>>()
+                    });
                     // `system.github.token.permissions` carries the effective
                     // set (defaults substituted when nothing was declared).
                     // Passing it as the declared set is faithful: for a
