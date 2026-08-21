@@ -15,6 +15,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+preloop-observability = { path = "../preloop-observability" }
 preloop-gha-protocol = { path = "../preloop-gha-protocol" }
 preloop-gha-expressions = { path = "../preloop-gha-expressions" }
 preloop-gha-parser = { path = "../preloop-gha-parser" }
