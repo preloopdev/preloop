@@ -84,10 +84,10 @@ async fn main() -> anyhow::Result<()> {
     let (observability, observability_runtime) =
         preloop_observability::Observability::from_config(obs_config);
     preloop_observability::ObservabilityRuntime::install_fmt_subscriber(observability.config());
-    // The handle must reach `ServerConfig`; holding it here alone would leave
-    // the server on the no-op handle installed by `AppState::new`, so nothing
-    // would ever export.
-    let _observability_runtime = observability_runtime;
+    // The handle reaches `ServerConfig` below; holding it here alone would
+    // leave the server on the no-op handle installed by `AppState::new`, so
+    // nothing would ever export.
+    let mut observability_runtime = observability_runtime;
 
     let cli = Cli::parse();
     match cli.command {
@@ -159,5 +159,8 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         }
     }
+    // Bounded 2s flush of buffered telemetry before exit; a clean shutdown
+    // must not drop the last flush window's records.
+    observability_runtime.shutdown().await;
     Ok(())
 }
