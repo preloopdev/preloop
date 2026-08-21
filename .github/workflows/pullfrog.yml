@@ -28,7 +28,7 @@ jobs:
           fetch-depth: 0
 
       - name: Run Pullfrog (via GHES-compatible fork)
-        uses: Bnjoroge1/pullfrog@ghes-url-support
+        uses: Bnjoroge1/pullfrog@09dde428a88245ab3c448ff3dcadb8325e4e1d05 # ghes-url-support
         with:
           prompt: ${{ inputs.prompt }}
         env:
