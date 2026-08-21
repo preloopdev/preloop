@@ -17,7 +17,10 @@ services:
       - "127.0.0.1:5080:5080"
     environment:
       ZO_ROOT_USER_EMAIL: ${ZO_ROOT_USER_EMAIL:-admin@preloop.local}
-      ZO_ROOT_USER_PASSWORD: ${ZO_ROOT_USER_PASSWORD:-ChangeMe.Preloop1}
+      # No default password: a known admin credential on a loopback port is
+      # one forwarded-port or one other-local-user away from being public.
+      # Startup fails loudly until the operator supplies one.
+      ZO_ROOT_USER_PASSWORD: ${ZO_ROOT_USER_PASSWORD:?Set ZO_ROOT_USER_PASSWORD}
       ZO_DATA_DIR: /data
       # Short retention: this is operational telemetry (hours/days), not a
       # data lake. Losing SQLite metadata makes the install inoperable, so
