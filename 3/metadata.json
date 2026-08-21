@@ -3,10 +3,11 @@
   "checkpoint_id": "01M0GZ2NAT9NC1F5A0RS5XKKTX",
   "session_id": "01a01d30-1823-7000-b6cd-4da3f0a051a5",
   "strategy": "manual-commit",
-  "created_at": "2026-08-21T01:31:07.375738Z",
-  "branch": "pr/2-observability-foundation",
+  "created_at": "2026-08-21T01:31:41.888866Z",
+  "branch": "pr/3-status-endpoints",
   "checkpoints_count": 1,
   "files_touched": [
+    "Cargo.lock",
     "crates/preloop-observability/Cargo.toml"
   ],
   "agent": "Oh My Pi",
@@ -16,15 +17,15 @@
   "transcript_lines_at_start": 68,
   "compact_transcript_start": 21,
   "initial_attribution": {
-    "calculated_at": "2026-08-21T01:31:07.366877Z",
-    "agent_lines": 0,
-    "agent_removed": 0,
+    "calculated_at": "2026-08-21T01:31:41.879306Z",
+    "agent_lines": 5,
+    "agent_removed": 1,
     "human_added": 0,
     "human_modified": 0,
     "human_removed": 0,
-    "total_committed": 0,
-    "total_lines_changed": 0,
-    "agent_percentage": 0,
+    "total_committed": 5,
+    "total_lines_changed": 6,
+    "agent_percentage": 100,
     "metric_version": 2
   }
 }
