@@ -1,0 +1,30 @@
+{
+  "cli_version": "0.10.0",
+  "checkpoint_id": "01M0K0YEGG57X8YHEECV3FG9K9",
+  "session_id": "01a0221c-9435-7000-900a-e025af0dd7bf",
+  "strategy": "manual-commit",
+  "created_at": "2026-08-21T20:42:13.934143Z",
+  "branch": "fix/pullfrog-pin-sha",
+  "checkpoints_count": 1,
+  "files_touched": [
+    ".github/workflows/pullfrog.yml"
+  ],
+  "agent": "Oh My Pi",
+  "model": "",
+  "turn_id": "4179de1171c9",
+  "checkpoint_transcript_start": 172,
+  "transcript_lines_at_start": 172,
+  "compact_transcript_start": 31,
+  "initial_attribution": {
+    "calculated_at": "2026-08-21T20:42:13.90198Z",
+    "agent_lines": 1,
+    "agent_removed": 1,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 1,
+    "total_lines_changed": 2,
+    "agent_percentage": 100,
+    "metric_version": 2
+  }
+}
