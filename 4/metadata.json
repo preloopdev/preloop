@@ -1,0 +1,37 @@
+{
+  "cli_version": "0.10.0",
+  "checkpoint_id": "01M0GYSYWFM2CKN2YR1SHGTRV0",
+  "session_id": "01a01d30-1823-7001-8bad-40a85ae58ccc",
+  "strategy": "manual-commit",
+  "created_at": "2026-08-21T01:26:22.475019Z",
+  "branch": "Bnjoroge/oobservability",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "crates/preloop-runner-server/src/bootstrap.rs",
+    "crates/preloop-runner-server/src/broker.rs",
+    "crates/preloop-runner-server/src/models.rs",
+    "crates/preloop-runner-server/src/runs.rs",
+    "crates/preloop-runner-server/src/runtime_scheduling.rs",
+    "crates/preloop-runner-server/src/scheduler.rs",
+    "crates/preloop-runner-server/src/state.rs",
+    "crates/preloop-runner-server/src/store.rs"
+  ],
+  "agent": "Oh My Pi",
+  "model": "",
+  "turn_id": "cc2e85f2e99b",
+  "checkpoint_transcript_start": 47,
+  "transcript_lines_at_start": 47,
+  "compact_transcript_start": 14,
+  "initial_attribution": {
+    "calculated_at": "2026-08-21T01:26:22.464141Z",
+    "agent_lines": 212,
+    "agent_removed": 140,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 212,
+    "total_lines_changed": 352,
+    "agent_percentage": 100,
+    "metric_version": 2
+  }
+}
