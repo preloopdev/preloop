@@ -1,0 +1,21 @@
+{
+  "cli_version": "0.10.0",
+  "checkpoint_id": "01M0GZN3CAJJM3NXHQ4Q9QHKC4",
+  "strategy": "manual-commit",
+  "branch": "pr/3-status-endpoints",
+  "checkpoints_count": 10,
+  "files_touched": [
+    "crates/preloop-vm/Cargo.toml",
+    "crates/preloop-vm/src/lib.rs",
+    "crates/preloop-vm/src/telemetry.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": ""
+    }
+  ]
+}
