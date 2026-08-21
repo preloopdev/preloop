@@ -1,0 +1,13 @@
+can u check why my rust jobs were failing
+
+---
+
+Pull for a job also failed because I don't think you pinned the sha
+
+---
+
+filre
+
+---
+
+zizmor is still failing. did u not hange?
