@@ -1,0 +1,24 @@
+{
+  "cli_version": "0.10.0",
+  "checkpoint_id": "01M0GYZSHJ4PMAKPH7JJBVGTHB",
+  "strategy": "manual-commit",
+  "branch": "pr/1-log-hardening",
+  "checkpoints_count": 10,
+  "files_touched": [
+    "crates/preloop-runner-server/src/artifact_twirp.rs",
+    "crates/preloop-runner-server/src/blob_store.rs",
+    "crates/preloop-runner-server/src/distributed_task.rs",
+    "crates/preloop-runner-server/src/results_twirp.rs",
+    "crates/preloop-runner-server/src/store.rs",
+    "rules/no-sensitive-log-fields.yml"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": ""
+    }
+  ]
+}
