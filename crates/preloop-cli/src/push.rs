@@ -581,6 +581,12 @@ mod tests {
                 b.path().to_str().unwrap(),
             ],
         );
+        // The commit happens in B, and a clone does not inherit A's local
+        // config. Without this, the test only passes on hosts whose global
+        // git identity leaks into B (the CI fork has none, so it failed with
+        // "Author identity unknown").
+        git(b.path(), &["config", "user.email", "test@example.com"]);
+        git(b.path(), &["config", "user.name", "Test"]);
         assert_eq!(
             git(b.path(), &["rev-parse", "HEAD"]),
             head,

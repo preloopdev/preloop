@@ -778,10 +778,162 @@ pub(crate) async fn broker_acquire_job(
         let mut inner = shared.state.inner.lock().await;
         inner.broker_messages.insert(request_id, message.clone());
     } else {
-        tracing::warn!(
-            request_id,
-            "broker acquire: no dispatch token request for job"
-        );
+        // A token request registered at build time can be lost when the
+        // process dies before the next store snapshot flush (jobs enqueued
+        // since the last snapshot restore with `github_token_requests`
+        // missing). The claim then reaches here with no request to mint
+        // from, the checkout keeps the local runtime JWT, and every git
+        // fetch fails on auth. Re-derive the request from the run's
+        // submission and the job's declared permissions — the same inputs
+        // `build_job_artifacts` used — and mint under that policy.
+        let derived = if shared.state.github_app.is_none() {
+            None
+        } else {
+            let inner = shared.state.inner.lock().await;
+            let record = inner.job_requests.get(&request_id);
+            let run = record.and_then(|record| inner.runs.get(&record.run_id));
+            match (record, run) {
+                (Some(record), Some(run)) => {
+                    // The submission stores the tier as a plain kebab-case
+                    // string (e.g. "untrusted-fork-pull-request"), not JSON.
+                    // `from_str` expects JSON and would reject the bare
+                    // string, yielding `None` — which `job_authorization`
+                    // treats as trusted, silently un-restricting a fork
+                    // job's token. Parse via a JSON string value so the
+                    // kebab-case variant decodes.
+                    let tier = run.submission.trust_tier.as_deref().and_then(|tier| {
+                        serde_json::from_value(serde_json::Value::String(tier.to_owned())).ok()
+                    });
+                    // The job's resolved permission set lives in the
+                    // persisted message's `system.github.token.permissions`
+                    // variable (PascalCase wire spelling) — the same
+                    // variable the build path wrote from `JobPlan`
+                    // permissions. The event payload's `workflow_job` key is
+                    // absent for push/PR/dispatch events, so reading it there
+                    // would fall back to the broad default and grant scopes
+                    // the workflow withheld. Recover from the message
+                    // instead, converting the wire spelling back to
+                    // kebab-case for the token request.
+                    let wire_permissions = message
+                        .variables
+                        .get("system.github.token.permissions")
+                        .and_then(|variable| variable.value.as_deref())
+                        .and_then(|json| {
+                            serde_json::from_str::<BTreeMap<String, String>>(json).ok()
+                        });
+                    // The wire variable spells scopes PascalCase
+                    // ("PullRequests"); the installation-token request and
+                    // `job_authorization` expect the workflow's kebab-case
+                    // identities ("pull-requests"). Minting with PascalCase
+                    // keys fails (or falls back to the broad PAT), so
+                    // convert every key before building the request.
+                    let wire_permissions = wire_permissions.map(|permissions| {
+                        permissions
+                            .into_iter()
+                            .map(|(scope, level)| (wire_scope_to_kebab(&scope), level))
+                            .collect::<BTreeMap<_, _>>()
+                    });
+                    // `system.github.token.permissions` carries the effective
+                    // set (defaults substituted when nothing was declared).
+                    // Passing it as the declared set is faithful: for a
+                    // declared job it is exactly the job's set, and for an
+                    // undeclared job `job_authorization` treats a set equal
+                    // to the default identically to `None`. The fork case is
+                    // safe too — the wire variable was restated to the fork
+                    // profile at build, and clamping it again is idempotent.
+                    let declared = wire_permissions.clone();
+                    let policy = crate::events::trust_tier::job_authorization(
+                        tier,
+                        declared.as_ref(),
+                        false,
+                    );
+                    Some((
+                        crate::models::GitHubTokenRequest {
+                            repository: run.submission.repository.clone(),
+                            permissions: policy.app_permissions,
+                            declared: declared.is_some(),
+                            untrusted: policy.fork_restricted,
+                        },
+                        record.request_id,
+                    ))
+                }
+                _ => None,
+            }
+        };
+        if let Some((token_request, derived_request_id)) = derived {
+            // Register the derived request so a re-claim after a disconnect
+            // re-mints under the same derived policy, then mint.
+            {
+                let mut inner = shared.state.inner.lock().await;
+                inner
+                    .github_token_requests
+                    .insert(derived_request_id, token_request.clone());
+            }
+            tracing::info!(
+                request_id,
+                repository = %token_request.repository,
+                "broker acquire: re-derived missing dispatch token request at claim"
+            );
+            let minted = match mint_dispatch_github_token(&shared, &token_request).await {
+                Ok(minted) => minted,
+                Err(error) => {
+                    fail_unclaimable_request(&shared, request_id).await;
+                    return Err(error);
+                }
+            };
+            if let Some(minted) = minted {
+                let token = minted.token;
+                tracing::info!(
+                    token_len = token.len(),
+                    "minted re-derived dispatch GitHub token at claim"
+                );
+                message.variables.insert(
+                    "system.github.token".to_owned(),
+                    preloop_gha_protocol::azdo::VariableValue::secret(token.clone()),
+                );
+                message.variables.insert(
+                    "github_token".to_owned(),
+                    preloop_gha_protocol::azdo::VariableValue::secret(token.clone()),
+                );
+                message.variables.insert(
+                    "GITHUB_TOKEN".to_owned(),
+                    preloop_gha_protocol::azdo::VariableValue::secret(token.clone()),
+                );
+                // Restate what the token carries when the installation could
+                // not grant everything, mirroring the normal mint path: the
+                // recovered message's wire set is the requested set, and
+                // leaving it would print authority the token does not have.
+                if let Some(effective) = minted.effective_permissions {
+                    let merged = merge_narrowed_wire_permissions(
+                        message
+                            .variables
+                            .get("system.github.token.permissions")
+                            .and_then(|variable| variable.value.as_deref()),
+                        &effective,
+                    );
+                    message.variables.insert(
+                        "system.github.token.permissions".to_owned(),
+                        preloop_gha_protocol::azdo::VariableValue::new(
+                            preloop_gha_parser::job_builder::token_permissions_wire_json(&merged),
+                        ),
+                    );
+                }
+                match message.context_data.get_mut("github") {
+                    Some(preloop_gha_protocol::azdo::PipelineContextData::Dict(github)) => {
+                        github.insert(
+                            "token".to_owned(),
+                            preloop_gha_protocol::azdo::PipelineContextData::String(token),
+                        );
+                    }
+                    other => tracing::warn!(
+                        github_context = %match other { Some(_) => "non-dict", None => "missing" },
+                        "could not patch github context token for re-derived request"
+                    ),
+                }
+                let mut inner = shared.state.inner.lock().await;
+                inner.broker_messages.insert(request_id, message.clone());
+            }
+        }
     }
     // The snapshot checkout token is pinned onto the step at submission,
     // but a job can sit queued well past its ~50-minute lifetime. The

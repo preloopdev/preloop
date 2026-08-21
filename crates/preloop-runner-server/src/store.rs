@@ -18,8 +18,8 @@ use async_trait::async_trait;
 use preloop_gha_protocol::SessionId;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use sha2::Digest;
-use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex as StdMutex;
 
 const DATABASE_FILE: &str = "preloop.db";
 pub(crate) const SNAPSHOT_FORMAT: u8 = 2;
@@ -555,9 +555,18 @@ pub(crate) fn restore_run_record(cipher: &Envelope, blob: &[u8]) -> anyhow::Resu
             .unwrap_or_default()
             .to_owned();
         // `run_record_value` always writes the key (null when absent), so a
-        // JSON null must restore as `None` rather than fail to parse.
+        // JSON null must restore as `None` rather than fail to parse. A
+        // snapshot whose shape this binary no longer understands is dropped
+        // with a warning: the store is best-effort and one stale record must
+        // not brick startup (see `load_into`).
         run.workspace_snapshot = match object.get("workspace_snapshot") {
-            Some(value) if !value.is_null() => Some(serde_json::from_value(value.clone())?),
+            Some(value) if !value.is_null() => match serde_json::from_value(value.clone()) {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    tracing::warn!(run_id = %run.run_id, %error, "dropping undecodable workspace snapshot on load");
+                    None
+                }
+            },
             _ => None,
         };
     }

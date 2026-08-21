@@ -996,8 +996,14 @@ mod cache_pb_tests {
             metadata: Some(PbCacheMetadata {
                 repository_id: 42,
                 scope: vec![
-                    PbCacheScope { scope: "refs/heads/main".to_string(), permission: 1 },
-                    PbCacheScope { scope: "refs/heads/feature".to_string(), permission: 2 },
+                    PbCacheScope {
+                        scope: "refs/heads/main".to_string(),
+                        permission: 1,
+                    },
+                    PbCacheScope {
+                        scope: "refs/heads/feature".to_string(),
+                        permission: 2,
+                    },
                 ],
             }),
             key: "k".to_string(),
@@ -1015,7 +1021,10 @@ mod cache_pb_tests {
         let fixture = include_bytes!("../../../fixtures/wire/cache-multi-scope.pb");
         let (_, _, _, fixture_scopes, _) =
             pb_cache_request(fixture, CacheRequestKind::GetDownloadUrl).unwrap();
-        assert_eq!(fixture_scopes, vec!["refs/heads/main", "refs/heads/feature"]);
+        assert_eq!(
+            fixture_scopes,
+            vec!["refs/heads/main", "refs/heads/feature"]
+        );
     }
 
     #[test]
