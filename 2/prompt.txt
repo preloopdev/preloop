@@ -1,0 +1,33 @@
+zizmor is still failing. did u not hange?
+
+---
+
+do it
+
+---
+
+why are the woklofws runs in main not running
+
+---
+
+i obviously mean in my ci server
+
+---
+
+what?
+
+---
+
+yea so login adn check why
+
+---
+
+So why did the fork fail?
+
+---
+
+fix
+
+---
+
+watch until all ci passes. do not stop until everthing is green
