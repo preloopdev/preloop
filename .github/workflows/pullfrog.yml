@@ -1,0 +1,38 @@
+name: Pullfrog (GHES-compatible fork)
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: 'Prompt for the agent'
+        required: false
+        default: 'List the files in this repo and summarize the README in one paragraph.'
+  issue_comment:
+    types: [created]
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write
+
+jobs:
+  pullfrog:
+    runs-on: self-hosted
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Pullfrog (via GHES-compatible fork)
+        uses: Bnjoroge1/pullfrog@ghes-url-support
+        with:
+          prompt: ${{ inputs.prompt }}
+        env:
+          # Direct Codex/Claude subscriptions — no CLIProxy, no API keys
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Optional: add ANTHROPIC_API_KEY/OPENAI_API_KEY as fallback, but subscription is preferred
