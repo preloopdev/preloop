@@ -1,5 +1,1 @@
-now that we’ve set up, get him up API compatibility I want you to set up bullfrog for prelude right so create do whatever we need to do I think maybe you need a fork and add support for changing the URL or something basically just set up Paul frog use my Codex on my Claude subscriptions
-
----
-
-pullfrog not bullfrog. https://github.com/pullfrog/pullfrog
+You should set the server as the, as actually not local. Cause I wanted to run in CI. So instead of running in hosted actions, it would run in my environment. So do that.
