@@ -3,7 +3,7 @@
   "checkpoint_id": "01M0GZ9EAD3TT4DGQZDY03PBBX",
   "strategy": "manual-commit",
   "branch": "pr/3-status-endpoints",
-  "checkpoints_count": 14,
+  "checkpoints_count": 15,
   "files_touched": [
     "crates/preloop-cli/src/main.rs",
     "crates/preloop-observability/src/lib.rs",
@@ -24,6 +24,13 @@
       "transcript": "/1/full.jsonl",
       "compact_transcript": "/1/transcript.jsonl",
       "content_hash": "/1/content_hash.txt",
+      "prompt": ""
+    },
+    {
+      "metadata": "/2/metadata.json",
+      "transcript": "/2/full.jsonl",
+      "compact_transcript": "/2/transcript.jsonl",
+      "content_hash": "/2/content_hash.txt",
       "prompt": ""
     }
   ]
