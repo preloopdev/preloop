@@ -3,7 +3,7 @@
   "checkpoint_id": "01M0GZFAPGDSXX5JP9A2E0T5ZF",
   "strategy": "manual-commit",
   "branch": "pr/5-otlp-export",
-  "checkpoints_count": 18,
+  "checkpoints_count": 19,
   "files_touched": [
     "crates/preloop-observability/src/vm_telemetry.rs"
   ],
@@ -48,6 +48,13 @@
       "transcript": "/5/full.jsonl",
       "compact_transcript": "/5/transcript.jsonl",
       "content_hash": "/5/content_hash.txt",
+      "prompt": ""
+    },
+    {
+      "metadata": "/6/metadata.json",
+      "transcript": "/6/full.jsonl",
+      "compact_transcript": "/6/transcript.jsonl",
+      "content_hash": "/6/content_hash.txt",
       "prompt": ""
     }
   ]
