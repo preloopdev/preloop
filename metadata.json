@@ -1,0 +1,19 @@
+{
+  "cli_version": "0.10.0",
+  "checkpoint_id": "01M0GZPVH9X85W3FJMQR7512W8",
+  "strategy": "manual-commit",
+  "branch": "pr/6-review-fixes",
+  "checkpoints_count": 10,
+  "files_touched": [
+    "Cargo.lock"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": ""
+    }
+  ]
+}
