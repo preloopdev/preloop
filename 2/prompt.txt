@@ -1,13 +1,1 @@
-You should set the server as the, as actually not local. Cause I wanted to run in CI. So instead of running in hosted actions, it would run in my environment. So do that.
-
----
-
-looks good
-
----
-
-merge it
-
----
-
 yes ignore cliproxy
