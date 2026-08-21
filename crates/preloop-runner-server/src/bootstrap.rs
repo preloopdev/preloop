@@ -634,8 +634,34 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     )
     .await?;
     // Wire observability if supplied (CLI/server will pass its handle).
+    // Adopt the caller's handle when supplied; `AppState::new` already
+    // installed a no-op one otherwise. Either way the store is instrumented,
+    // so `preloop.store.operation.duration` is recorded even for the
+    // standalone `preloop-server` binary, which passes no handle.
     if let Some(obs) = config.observability.clone() {
         state.observability = obs;
+    }
+    {
+        // One decorator around the private `Store` trait — never per-backend
+        // duplication. The backend label is bounded to sqlite|postgres.
+        let backend = if config
+            .store_url
+            .as_deref()
+            .map(|u| u.contains("postgres"))
+            .unwrap_or(false)
+            || std::env::var("PRELOOP_STORE_URL")
+                .map(|v| v.contains("postgres"))
+                .unwrap_or(false)
+        {
+            "postgres"
+        } else {
+            "sqlite"
+        };
+        state.store = crate::store::InstrumentedStore::wrap(
+            state.store.clone(),
+            state.observability.clone(),
+            backend,
+        );
     }
     if let Some(ps) = config.pool_status.clone() {
         state.pool_status = ps;

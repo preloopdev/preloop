@@ -19,7 +19,9 @@ use preloop_gha_protocol::SessionId;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use sha2::Digest;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::time::Instant;
 
 const DATABASE_FILE: &str = "preloop.db";
 pub(crate) const SNAPSHOT_FORMAT: u8 = 2;
@@ -58,6 +60,147 @@ pub(crate) trait Store: Send + Sync {
     ) -> anyhow::Result<()>;
     /// Append a control event (`run_accepted` / `run_status` / `job_status`).
     async fn append_event(&self, event: &NdjsonEvent) -> anyhow::Result<()>;
+}
+
+/// Decorator that records `preloop.store.operation.duration` for every
+/// `Store` method. One wrapper, not per-backend duplication.
+pub(crate) struct InstrumentedStore {
+    inner: Arc<dyn Store>,
+    observability: preloop_observability::Observability,
+    backend: String,
+}
+
+impl InstrumentedStore {
+    pub(crate) fn new(
+        inner: Arc<dyn Store>,
+        observability: preloop_observability::Observability,
+        backend: &str,
+    ) -> Self {
+        Self {
+            inner,
+            observability,
+            backend: backend.to_string(),
+        }
+    }
+
+    pub(crate) fn wrap(
+        inner: Arc<dyn Store>,
+        observability: preloop_observability::Observability,
+        backend: &str,
+    ) -> Arc<dyn Store> {
+        Arc::new(Self::new(inner, observability, backend))
+    }
+}
+
+#[async_trait]
+impl Store for InstrumentedStore {
+    async fn load_into(&self, inner: &mut InnerState) -> anyhow::Result<()> {
+        let start = Instant::now();
+        let res = self.inner.load_into(inner).await;
+        let outcome = if res.is_ok() { "ok" } else { "error" };
+        self.observability.metrics().store.observe(
+            &self.backend,
+            "load_into",
+            outcome,
+            start.elapsed(),
+        );
+        res
+    }
+
+    async fn store_inner(&self, snapshot: &StoreSnapshot) -> anyhow::Result<()> {
+        let start = Instant::now();
+        let res = self.inner.store_inner(snapshot).await;
+        let outcome = if res.is_ok() { "ok" } else { "error" };
+        self.observability.metrics().store.observe(
+            &self.backend,
+            "store_inner",
+            outcome,
+            start.elapsed(),
+        );
+        res
+    }
+
+    async fn store_meta_only(&self, meta: &MetaSnapshot) -> anyhow::Result<()> {
+        let start = Instant::now();
+        let res = self.inner.store_meta_only(meta).await;
+        let outcome = if res.is_ok() { "ok" } else { "error" };
+        self.observability.metrics().store.observe(
+            &self.backend,
+            "store_meta_only",
+            outcome,
+            start.elapsed(),
+        );
+        res
+    }
+
+    async fn store_run_event(&self, projection: RunProjection) -> anyhow::Result<()> {
+        let start = Instant::now();
+        let res = self.inner.store_run_event(projection).await;
+        let outcome = if res.is_ok() { "ok" } else { "error" };
+        self.observability.metrics().store.observe(
+            &self.backend,
+            "store_run_event",
+            outcome,
+            start.elapsed(),
+        );
+        res
+    }
+
+    async fn store_workflow_run_counter(
+        &self,
+        workflow_path: &str,
+        next_run_number: u64,
+    ) -> anyhow::Result<()> {
+        let start = Instant::now();
+        let res = self
+            .inner
+            .store_workflow_run_counter(workflow_path, next_run_number)
+            .await;
+        let outcome = if res.is_ok() { "ok" } else { "error" };
+        self.observability.metrics().store.observe(
+            &self.backend,
+            "store_workflow_run_counter",
+            outcome,
+            start.elapsed(),
+        );
+        res
+    }
+
+    async fn store_log_chunk(
+        &self,
+        key: &str,
+        chunk_index: i64,
+        payload: &[u8],
+        byte_count: i64,
+        line_count: i64,
+    ) -> anyhow::Result<()> {
+        let start = Instant::now();
+        let res = self
+            .inner
+            .store_log_chunk(key, chunk_index, payload, byte_count, line_count)
+            .await;
+        let outcome = if res.is_ok() { "ok" } else { "error" };
+        self.observability.metrics().store.observe(
+            &self.backend,
+            "store_log_chunk",
+            outcome,
+            start.elapsed(),
+        );
+        res
+    }
+
+    async fn append_event(&self, event: &NdjsonEvent) -> anyhow::Result<()> {
+        let start = Instant::now();
+        let res = self.inner.append_event(event).await;
+        let outcome = if res.is_ok() { "ok" } else { "error" };
+        self.observability.metrics().store.observe(
+            &self.backend,
+            "append_event",
+            outcome,
+            start.elapsed(),
+        );
+        res
+    }
 }
 
 /// Owned projection of the in-memory state that a full snapshot persists.
