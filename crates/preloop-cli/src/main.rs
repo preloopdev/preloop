@@ -753,11 +753,6 @@ async fn main() -> anyhow::Result<()> {
     let (observability, observability_runtime) =
         preloop_observability::Observability::from_config(obs_config);
     preloop_observability::ObservabilityRuntime::install_fmt_subscriber(observability.config());
-    // Keep the handle alive; the pool/server will clone it later. Suppress
-    // unused warning until the wiring lands in Step 3.
-    let _observability = observability;
-    let _observability_runtime = observability_runtime;
-
     let cli = Cli::parse();
     // One config path for the whole process. `setup`/`doctor`/`secret` return
     // before `cmd_engine` runs, so pinning this only inside the engine let a
@@ -772,51 +767,55 @@ async fn main() -> anyhow::Result<()> {
     }
     // Both run the daemon in this process, so neither may bootstrap another
     // one underneath itself.
-    match cli.command {
+    let result = match cli.command {
         Command::Version => {
             println!("preloop {}", env!("CARGO_PKG_VERSION"));
-            return Ok(());
+            Ok(())
         }
-        Command::Serve(args) => return cmd_engine(args).await,
-        Command::Engine => return cmd_engine(ServeArgs::default()).await,
-        Command::BuildGolden(args) => return cmd_build_golden(args).await,
-        Command::Update(args) => return update::run(args).await,
+        Command::Serve(args) => cmd_engine(args, observability.clone()).await,
+        Command::Engine => cmd_engine(ServeArgs::default(), observability.clone()).await,
+        Command::BuildGolden(args) => cmd_build_golden(args).await,
+        Command::Update(args) => update::run(args).await,
         // Local configuration commands must not spawn the engine.
-        Command::Setup(args) => return github_setup::cmd_setup(args).await,
-        Command::Doctor(args) => return github_setup::cmd_doctor(args).await,
-        Command::Secret(args) => return github_setup::cmd_secret(args).await,
-        Command::Server(args) => return server_install::run(args),
+        Command::Setup(args) => github_setup::cmd_setup(args).await,
+        Command::Doctor(args) => github_setup::cmd_doctor(args).await,
+        Command::Secret(args) => github_setup::cmd_secret(args).await,
+        Command::Server(args) => server_install::run(args),
         // Planning parses local workflow files only; do not bootstrap the
         // control-plane engine for a command that never contacts it.
-        Command::Plan(args) => return cmd_plan(args).await,
-        _ => {}
-    }
-    ensure_engine_running().await?;
-
-    match cli.command {
-        Command::Run(args) => cmd_run(args).await,
-        Command::Plan(_) => unreachable!("plan is handled before engine bootstrap"),
-        Command::Status(args) => cmd_status(args).await,
-        Command::Logs(args) => cmd_logs(args).await,
-        Command::Cancel(args) => cmd_cancel(args).await,
-        Command::Shell(args) => cmd_shell(args).await,
-        Command::Debug(args) => {
-            debug_session::run(args, build_client(), server_url(), api_token()).await
+        Command::Plan(args) => cmd_plan(args).await,
+        _ => {
+            ensure_engine_running().await?;
+            match cli.command {
+                Command::Run(args) => cmd_run(args).await,
+                Command::Plan(_) => unreachable!("plan is handled before engine bootstrap"),
+                Command::Status(args) => cmd_status(args).await,
+                Command::Logs(args) => cmd_logs(args).await,
+                Command::Cancel(args) => cmd_cancel(args).await,
+                Command::Shell(args) => cmd_shell(args).await,
+                Command::Debug(args) => {
+                    debug_session::run(args, build_client(), server_url(), api_token()).await
+                }
+                Command::Dap(args) => dap_client::run(args, server_url(), api_token()).await,
+                Command::Push(args) => cmd_push(args).await,
+                Command::Update(_)
+                | Command::Serve(_)
+                | Command::Engine
+                | Command::BuildGolden(_)
+                | Command::Version
+                | Command::Setup(_)
+                | Command::Doctor(_)
+                | Command::Secret(_)
+                | Command::Server(_) => {
+                    unreachable!("daemon commands handled before client startup")
+                }
+            }
         }
-        Command::Dap(args) => dap_client::run(args, server_url(), api_token()).await,
-        Command::Push(args) => cmd_push(args).await,
-        Command::Update(_)
-        | Command::Serve(_)
-        | Command::Engine
-        | Command::BuildGolden(_)
-        | Command::Version
-        | Command::Setup(_)
-        | Command::Doctor(_)
-        | Command::Secret(_)
-        | Command::Server(_) => {
-            unreachable!("daemon commands handled before client startup")
-        }
-    }
+    };
+    // Bounded 2s flush of buffered telemetry on every exit path; a clean
+    // shutdown must not drop the last flush window's records.
+    observability_runtime.shutdown().await;
+    result
 }
 
 fn systemd_socket_activation_requested() -> bool {
@@ -1269,7 +1268,10 @@ fn resolve_github_auth(args: &ServeArgs, state_dir: &std::path::Path) -> anyhow:
     Ok(())
 }
 
-async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
+async fn cmd_engine(
+    args: ServeArgs,
+    observability: preloop_observability::Observability,
+) -> anyhow::Result<()> {
     let home = preloop_home();
     let state_dir = home.join("state");
     let socket = home.join("preloop.sock");
@@ -1336,6 +1338,12 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
             std::time::SystemTime,
         >::new()));
     let pool_enabled = env_flag("PRELOOP_RUNNER_POOL_ENABLED", DEFAULT_RUNNER_POOL_ENABLED);
+    // One shared handle: the server and the pool both observe the same
+    // preparing/queue state, and the server exports via the process handle
+    // instead of a fresh no-op one.
+    let pool_status = std::sync::Arc::new(preloop_observability::status::PoolStatus::new(
+        preloop_observability::status::PoolSnapshot::default(),
+    ));
     let pool_config = local_runner_pool_config(
         &home,
         runner_url.clone(),
@@ -1346,6 +1354,7 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
         pool_enabled,
         pool_preparing.clone(),
         pending_registrations.clone(),
+        pool_status.clone(),
     );
     let pool_available = match &pool_config {
         Ok(_) => true,
@@ -1374,8 +1383,8 @@ async fn cmd_engine(args: ServeArgs) -> anyhow::Result<()> {
             next_job_runs_on: Some(next_job_runs_on.clone()),
             pool_preparing: Some(pool_preparing.clone()),
             pending_registrations: pool_available.then_some(pending_registrations),
-            pool_status: None,
-            observability: None,
+            pool_status: Some(pool_status.clone()),
+            observability: Some(observability),
             require_job_assignments: env_flag("PRELOOP_REQUIRE_JOB_ASSIGNMENTS", false),
             state_dir,
             store_url: args.store.clone(),
@@ -1544,7 +1553,16 @@ fn extract_readyz_reason(body: &str) -> Option<String> {
 fn truncate_reason(s: &str) -> String {
     let t = s.trim();
     if t.len() > 300 {
-        format!("{}…", &t[..300])
+        // Byte slicing a `&str` panics when the cut lands inside a multi-byte
+        // character; the body is an arbitrary `/readyz` response (a localized
+        // proxy error page, for example), so cut on a character boundary.
+        let cut = t
+            .char_indices()
+            .map(|(index, _)| index)
+            .take_while(|index| *index <= 300)
+            .last()
+            .unwrap_or(0);
+        format!("{}…", &t[..cut])
     } else {
         t.to_owned()
     }
@@ -1565,6 +1583,7 @@ fn local_runner_pool_config(
     pending_registrations: std::sync::Arc<
         std::sync::RwLock<std::collections::BTreeMap<String, std::time::SystemTime>>,
     >,
+    pool_status: std::sync::Arc<preloop_observability::status::PoolStatus>,
 ) -> anyhow::Result<RunnerPoolConfig> {
     let control_bridge = home.join("control-bridge");
     std::fs::create_dir_all(&control_bridge)?;
@@ -1724,7 +1743,7 @@ fn local_runner_pool_config(
         next_job_runs_on: (!custom_base).then_some(next_job_runs_on),
         pending_registrations: Some(pending_registrations),
         preparing_signal: Some(preparing_signal),
-        pool_status: None,
+        pool_status: Some(pool_status),
     })
 }
 
@@ -2899,6 +2918,11 @@ async fn cmd_status(args: StatusArgs) -> anyhow::Result<()> {
         }
         return Ok(());
     }
+    // Parse into the typed DTO first: a server-side schema change then fails
+    // loudly here instead of silently rendering every section as zeros and
+    // dashes. `--json` above stays raw for byte-identical `jq` output.
+    let _snapshot: preloop_observability::status::OperationalSnapshot =
+        serde_json::from_str(&status_text).context("parse status json")?;
     let status: serde_json::Value =
         serde_json::from_str(&status_text).context("parse status json")?;
 
@@ -3548,6 +3572,20 @@ mod tests {
     static TEST_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn truncate_reason_cuts_on_char_boundary() {
+        // 200 four-byte characters = 800 bytes; byte-slicing at 300 would
+        // panic. The result must be a valid, shorter string ending with the
+        // ellipsis.
+        let long = "界".repeat(200);
+        let truncated = truncate_reason(&long);
+        assert!(truncated.ends_with('…'));
+        assert!(truncated.len() < long.len());
+        assert!(truncated.is_char_boundary(truncated.len()));
+        // Short input passes through untouched.
+        assert_eq!(truncate_reason("  ok  "), "ok");
+    }
+
+    #[test]
     fn first_serve_token_creates_private_home_and_file() {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("missing").join(".preloop");
@@ -3744,6 +3782,9 @@ mod tests {
                 false,
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 std::sync::Arc::new(std::sync::RwLock::new(std::collections::BTreeMap::new())),
+                std::sync::Arc::new(preloop_observability::status::PoolStatus::new(
+                    preloop_observability::status::PoolSnapshot::default(),
+                )),
             )
             .unwrap();
             unsafe {
@@ -3819,6 +3860,9 @@ mod tests {
                 false,
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 std::sync::Arc::new(std::sync::RwLock::new(std::collections::BTreeMap::new())),
+                std::sync::Arc::new(preloop_observability::status::PoolStatus::new(
+                    preloop_observability::status::PoolSnapshot::default(),
+                )),
             )
             .unwrap();
             unsafe {
