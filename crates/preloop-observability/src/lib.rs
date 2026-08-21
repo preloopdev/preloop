@@ -11,8 +11,10 @@
 //! - Always retain `stderr`/`journald` even when OTLP is configured.
 //! - `Debug` on config never reveals headers or credential-bearing endpoint parts.
 
+pub mod export;
 pub mod metrics;
 pub mod status;
+pub mod vm_telemetry;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -70,13 +72,23 @@ pub struct ObservabilityConfig {
     pub rust_log: String,
     /// `service.name` — `preloop` or `OTEL_SERVICE_NAME`.
     pub service_name: String,
+    /// `service.version` — set by the host binary via `with_service_version`.
+    /// Defaults to this crate's version only until the binary overrides it.
+    pub service_version: String,
     /// Per-process instance ID (UUID v4).
     pub instance_id: String,
-    /// `OTEL_EXPORTER_OTLP_ENDPOINT` or signal-specific variant, if any. Kept as
-    /// given for transport, but `Debug` redacts userinfo/query.
-    otel_endpoint: Option<String>,
-    /// `OTEL_EXPORTER_OTLP_HEADERS` or signal-specific variant, if any. Never shown in `Debug` or errors.
-    otel_headers: Option<String>,
+    /// Per-signal OTLP endpoints, each fully resolved: a signal-specific
+    /// variable wins and is used as-is; the generic base gets the
+    /// `/v1/<signal>` suffix appended. Kept raw for transport, but `Debug`
+    /// redacts userinfo/query.
+    otel_logs_endpoint: Option<String>,
+    otel_traces_endpoint: Option<String>,
+    otel_metrics_endpoint: Option<String>,
+    /// Per-signal `OTEL_EXPORTER_OTLP_*_HEADERS`, signal-specific first,
+    /// generic fallback applied per signal. Never shown in `Debug` or errors.
+    otel_logs_headers: Option<String>,
+    otel_traces_headers: Option<String>,
+    otel_metrics_headers: Option<String>,
     /// Whether any OTLP endpoint is present (i.e. export enabled).
     pub otlp_enabled: bool,
 }
@@ -100,49 +112,94 @@ impl ObservabilityConfig {
         let service_name =
             std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "preloop".to_string());
 
-        // Endpoint: generic or signal-specific. Presence — not value — enables export.
-        // This is a deliberate deviation from the OTel spec default `http://localhost:4318`.
-        let otel_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-            .or_else(|_| std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"))
-            .or_else(|_| std::env::var("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"))
-            .or_else(|_| std::env::var("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"))
+        // Presence — not value — enables export. This is a deliberate
+        // deviation from the OTel spec default `http://localhost:4318`.
+        let generic = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
             .ok()
-            .filter(|v| !v.trim().is_empty() && v.trim() != "none");
+            .filter(|v| !v.trim().is_empty() && v.trim() != "none")
+            .map(|v| v.trim_end_matches('/').to_string());
 
-        let otel_headers = std::env::var("OTEL_EXPORTER_OTLP_HEADERS")
-            .or_else(|_| std::env::var("OTEL_EXPORTER_OTLP_TRACES_HEADERS"))
-            .or_else(|_| std::env::var("OTEL_EXPORTER_OTLP_METRICS_HEADERS"))
-            .or_else(|_| std::env::var("OTEL_EXPORTER_OTLP_LOGS_HEADERS"))
+        // Signal-specific endpoint is a complete URL used as-is; the generic
+        // base needs the /v1/<signal> suffix. Appending the suffix to a
+        // signal-specific URL would produce `/v1/traces/v1/traces`, and
+        // sending every signal to one signal-specific URL misroutes the rest.
+        let resolve = |var: &str, suffix: &str| {
+            std::env::var(var)
+                .ok()
+                .filter(|v| !v.trim().is_empty() && v.trim() != "none")
+                .map(|v| v.trim_end_matches('/').to_string())
+                .or_else(|| generic.as_ref().map(|g| format!("{g}{suffix}")))
+        };
+        let otel_logs_endpoint = resolve("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "/v1/logs");
+        let otel_traces_endpoint = resolve("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "/v1/traces");
+        let otel_metrics_endpoint = resolve("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "/v1/metrics");
+
+        let generic_headers = std::env::var("OTEL_EXPORTER_OTLP_HEADERS")
             .ok()
             .filter(|v| !v.trim().is_empty());
+        let resolve_headers = |var: &str| {
+            std::env::var(var)
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .or_else(|| generic_headers.clone())
+        };
+        let otel_logs_headers = resolve_headers("OTEL_EXPORTER_OTLP_LOGS_HEADERS");
+        let otel_traces_headers = resolve_headers("OTEL_EXPORTER_OTLP_TRACES_HEADERS");
+        let otel_metrics_headers = resolve_headers("OTEL_EXPORTER_OTLP_METRICS_HEADERS");
 
-        let otlp_enabled = otel_endpoint.is_some();
+        let otlp_enabled = otel_logs_endpoint.is_some()
+            || otel_traces_endpoint.is_some()
+            || otel_metrics_endpoint.is_some();
         let instance_id = Uuid::new_v4().to_string();
 
         Self {
             log_format,
             rust_log,
             service_name,
+            service_version: env!("CARGO_PKG_VERSION").to_string(),
             instance_id,
-            otel_endpoint,
-            otel_headers,
+            otel_logs_endpoint,
+            otel_traces_endpoint,
+            otel_metrics_endpoint,
+            otel_logs_headers,
+            otel_traces_headers,
+            otel_metrics_headers,
             otlp_enabled,
         }
     }
 
-    /// Raw endpoint if export is enabled, for transport construction.
-    pub fn otel_endpoint_raw(&self) -> Option<&str> {
-        self.otel_endpoint.as_deref()
+    /// Fully-resolved per-signal destinations for the export worker.
+    pub fn export_targets(&self) -> export::ExportTargets {
+        let signal = |endpoint: &Option<String>, headers: &Option<String>| {
+            endpoint.as_ref().map(|url| export::SignalTarget {
+                url: url.clone(),
+                headers: export::parse_headers(headers.as_deref()),
+            })
+        };
+        export::ExportTargets {
+            logs: signal(&self.otel_logs_endpoint, &self.otel_logs_headers),
+            traces: signal(&self.otel_traces_endpoint, &self.otel_traces_headers),
+            metrics: signal(&self.otel_metrics_endpoint, &self.otel_metrics_headers),
+        }
     }
 
     /// Whether any `OTEL_EXPORTER_OTLP_HEADERS` was supplied (for health reporting).
     pub fn has_otel_headers(&self) -> bool {
-        self.otel_headers.is_some()
+        self.otel_logs_headers.is_some()
+            || self.otel_traces_headers.is_some()
+            || self.otel_metrics_headers.is_some()
+    }
+
+    /// Override `service.version` with the host binary's version. The crate's
+    /// own version is meaningless to an operator reading telemetry.
+    pub fn with_service_version(mut self, version: &str) -> Self {
+        self.service_version = version.to_string();
+        self
     }
 
     /// Sanitized endpoint for `Debug`/errors: strips userinfo and query.
     fn sanitized_endpoint(&self) -> Option<String> {
-        self.otel_endpoint.as_ref().map(|raw| {
+        self.otel_logs_endpoint.as_ref().map(|raw| {
             // Best-effort: hide `user:pass@` and `?...` without a URL parser dep.
             let without_query = raw.split('?').next().unwrap_or(raw);
             if let Some(at) = without_query.rfind('@') {
@@ -164,14 +221,12 @@ impl fmt::Debug for ObservabilityConfig {
             .field("log_format", &self.log_format)
             .field("rust_log", &self.rust_log)
             .field("service_name", &self.service_name)
+            .field("service_version", &self.service_version)
             .field("instance_id", &self.instance_id)
-            .field(
-                "otel_endpoint",
-                &self.sanitized_endpoint().map(|_| "<redacted-endpoint>"),
-            )
+            .field("otel_endpoint", &self.sanitized_endpoint())
             .field(
                 "otel_headers",
-                &self.otel_headers.as_ref().map(|_| "<redacted>"),
+                &(self.has_otel_headers().then(|| "<redacted>")),
             )
             .field("otlp_enabled", &self.otlp_enabled)
             .finish()
@@ -203,8 +258,6 @@ pub struct TaskHeartbeat {
 struct HeartbeatEntry {
     critical: Criticality,
     last_beat: Instant,
-    /// Whether the task has exited cleanly (Drop without panic).
-    exited: bool,
 }
 
 impl TaskHeartbeat {
@@ -215,7 +268,6 @@ impl TaskHeartbeat {
             HeartbeatEntry {
                 critical,
                 last_beat: Instant::now(),
-                exited: false,
             },
         );
         HeartbeatHandle {
@@ -235,12 +287,6 @@ impl TaskHeartbeat {
         self.inner.write().remove(name);
     }
 
-    pub(crate) fn mark_exited(&self, name: &'static str) {
-        if let Some(entry) = self.inner.write().get_mut(name) {
-            entry.exited = true;
-        }
-    }
-
     /// Snapshot for `/readyz` and `/api/v1/status`.
     pub fn snapshot(&self) -> Vec<TaskSnapshot> {
         self.inner
@@ -250,7 +296,6 @@ impl TaskHeartbeat {
                 name,
                 critical: e.critical,
                 heartbeat_age: e.last_beat.elapsed(),
-                exited: e.exited,
             })
             .collect()
     }
@@ -260,8 +305,7 @@ impl TaskHeartbeat {
         // Hold read lock across iteration to avoid TOCTOU.
         let guard = self.inner.read();
         for (name, e) in guard.iter() {
-            if e.critical == Criticality::Critical && !e.exited && e.last_beat.elapsed() > threshold
-            {
+            if e.critical == Criticality::Critical && e.last_beat.elapsed() > threshold {
                 return Some(*name);
             }
         }
@@ -306,7 +350,6 @@ pub struct TaskSnapshot {
     pub name: &'static str,
     pub critical: Criticality,
     pub heartbeat_age: Duration,
-    pub exited: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -327,16 +370,11 @@ struct LimitEntry {
 }
 
 impl LimitRegistry {
-    /// Register a cap with its configured ceiling. Idempotent.
+    /// Register a cap with its configured ceiling. Re-registration updates
+    /// the ceiling and keeps the counters. One lock acquisition so the write
+    /// is atomic against a concurrent `record_drop`/`record_reject`.
     pub fn register(&self, limit: &'static str, value: usize) {
-        self.inner.write().entry(limit).or_insert(LimitEntry {
-            value,
-            ..Default::default()
-        });
-        // Update value if re-registered with different ceiling (for tests).
-        if let Some(entry) = self.inner.write().get_mut(limit) {
-            entry.value = value;
-        }
+        self.inner.write().entry(limit).or_default().value = value;
     }
 
     pub fn record_drop(&self, limit: &'static str, n: u64) {
@@ -383,6 +421,8 @@ struct Inner {
     heartbeat: TaskHeartbeat,
     limits: LimitRegistry,
     metrics: Arc<metrics::MetricsRegistry>,
+    vm_registry: Arc<vm_telemetry::VmTelemetryRegistry>,
+    exporter: Option<export::Exporter>,
     is_noop: bool,
 }
 
@@ -399,9 +439,14 @@ impl Observability {
             log_format: LogFormat::Auto,
             rust_log: "info".to_string(),
             service_name: "preloop".to_string(),
+            service_version: env!("CARGO_PKG_VERSION").to_string(),
             instance_id: Uuid::new_v4().to_string(),
-            otel_endpoint: None,
-            otel_headers: None,
+            otel_logs_endpoint: None,
+            otel_traces_endpoint: None,
+            otel_metrics_endpoint: None,
+            otel_logs_headers: None,
+            otel_traces_headers: None,
+            otel_metrics_headers: None,
             otlp_enabled: false,
         };
         Self {
@@ -410,6 +455,8 @@ impl Observability {
                 heartbeat: TaskHeartbeat::default(),
                 limits: LimitRegistry::default(),
                 metrics: Arc::new(metrics::MetricsRegistry::default()),
+                vm_registry: Arc::new(vm_telemetry::VmTelemetryRegistry::default()),
+                exporter: None,
                 is_noop: true,
             }),
         }
@@ -418,16 +465,31 @@ impl Observability {
     /// Real handle from `ObservabilityConfig`. Does not install the global subscriber — pair with `ObservabilityRuntime`.
     pub fn from_config(config: ObservabilityConfig) -> (Self, ObservabilityRuntime) {
         let is_noop = !config.otlp_enabled;
+        // Absent endpoint spawns nothing at all — no worker, no socket.
+        // The registry is shared with the worker so metric export scrapes the
+        // same instruments `/metrics` renders — one source, never two.
+        let metrics = Arc::new(metrics::MetricsRegistry::default());
+        let spawned = export::spawn(
+            &config.export_targets(),
+            &config.service_name,
+            &config.instance_id,
+            &config.service_version,
+            Some(metrics.clone()),
+        );
+        let exporter = spawned.as_ref().map(|(exporter, _, _)| exporter.clone());
+        let worker = spawned.map(|(exporter, _, join)| (exporter, join));
         let handle = Self {
             inner: Arc::new(Inner {
                 config: Arc::new(config),
                 heartbeat: TaskHeartbeat::default(),
                 limits: LimitRegistry::default(),
-                metrics: Arc::new(metrics::MetricsRegistry::default()),
+                metrics,
+                vm_registry: Arc::new(vm_telemetry::VmTelemetryRegistry::default()),
+                exporter,
                 is_noop,
             }),
         };
-        let runtime = ObservabilityRuntime::new(handle.clone());
+        let runtime = ObservabilityRuntime::new(handle.clone(), worker);
         (handle, runtime)
     }
 
@@ -459,6 +521,61 @@ impl Observability {
         &self.inner.metrics
     }
 
+    pub fn vm_registry(&self) -> &vm_telemetry::VmTelemetryRegistry {
+        &self.inner.vm_registry
+    }
+
+    /// Enqueue a log record for OTLP export. No-op when export is disabled.
+    pub fn export_log(
+        &self,
+        severity: &'static str,
+        body: impl Into<String>,
+        attributes: Vec<(String, String)>,
+    ) {
+        self.export_log_in_span(severity, body, attributes, None);
+    }
+
+    /// As [`Observability::export_log`], correlated with a span so a backend
+    /// can pivot from a log line to the request that produced it.
+    pub fn export_log_in_span(
+        &self,
+        severity: &'static str,
+        body: impl Into<String>,
+        attributes: Vec<(String, String)>,
+        context: Option<&export::SpanContext>,
+    ) {
+        if let Some(exporter) = &self.inner.exporter {
+            exporter.log(export::LogRecord {
+                severity,
+                body: body.into(),
+                attributes,
+                trace_id: context.map(|c| c.trace_id.clone()),
+                span_id: context.map(|c| c.span_id.clone()),
+                // Stamp at enqueue, not at flush: a batch-level timestamp
+                // would collapse a flush window's records to one instant.
+                observed_unix_nanos: export::now_nanos(),
+            });
+        }
+    }
+
+    /// Enqueue a completed span. No-op when export is disabled.
+    pub fn export_span(&self, record: export::SpanRecord) {
+        if let Some(exporter) = &self.inner.exporter {
+            exporter.span(record);
+        }
+    }
+
+    /// Whether spans are worth building. Lets a caller skip id and timestamp
+    /// work entirely when nothing would consume the result.
+    pub fn tracing_enabled(&self) -> bool {
+        self.inner.exporter.is_some()
+    }
+
+    /// Export health for `/api/v1/status` and `preloop.telemetry.export`.
+    pub fn export_health(&self) -> Option<&Arc<export::ExportHealth>> {
+        self.inner.exporter.as_ref().map(|e| e.health())
+    }
+
     pub fn config(&self) -> &ObservabilityConfig {
         &self.inner.config
     }
@@ -470,6 +587,10 @@ impl Observability {
 /// Tests use scoped subscribers and never install the global one twice.
 pub struct ObservabilityRuntime {
     _handle: Observability,
+    // The export worker plus its completion handle, taken when the worker
+    // exists. `shutdown` drops the sender so the worker drains, then awaits
+    // the join inside the 2s bound.
+    worker: Option<(export::Exporter, tokio::task::JoinHandle<()>)>,
     // Hold the tracing guard so it isn't dropped early when we use a
     // non-global dispatcher in tests. For the global install, this is `None`
     // and the global dispatcher owns the guard.
@@ -482,12 +603,15 @@ pub struct ObservabilityRuntime {
 }
 
 impl ObservabilityRuntime {
-    fn new(handle: Observability) -> Self {
+    fn new(
+        handle: Observability,
+        worker: Option<(export::Exporter, tokio::task::JoinHandle<()>)>,
+    ) -> Self {
         // Does not install the global subscriber here — the binaries do
-        // that via `install_fmt_subscriber`. This runtime is the place for the
-        // future OTel provider guards and the 2s flush on `Drop`.
+        // that via `install_fmt_subscriber`.
         Self {
             _handle: handle,
+            worker,
             _guard: None,
         }
     }
@@ -519,16 +643,18 @@ impl ObservabilityRuntime {
         }
     }
 
-    /// Attempt to flush exporters for at most 2s. Export failure is logged, never propagated.
-    pub async fn shutdown(self) {
-        // No exporter worker yet; this is the bounded-flush seam for
-        // the future OTel BatchSpanProcessor / metrics reader.
-        tokio::time::timeout(Duration::from_secs(2), async {
-            // No-op until OTLP providers are wired.
-            tokio::task::yield_now().await;
-        })
-        .await
-        .ok();
+    /// Flush exporters for at most 2s, then exit. The worker is signalled to
+    /// drain its buffers; if it cannot finish within the bound the remaining
+    /// records are dropped rather than delaying shutdown. Export failure is
+    /// logged by the worker, never propagated.
+    pub async fn shutdown(mut self) {
+        let Some((exporter, join)) = self.worker.take() else {
+            return;
+        };
+        exporter.request_shutdown();
+        tokio::time::timeout(Duration::from_secs(2), join)
+            .await
+            .ok();
     }
 }
 
@@ -546,6 +672,17 @@ impl fmt::Debug for ObservabilityRuntime {
 mod tests {
     use super::*;
 
+    /// `ObservabilityConfig::from_env` reads process-global `OTEL_*`
+    /// variables, and several tests mutate them. Cargo runs unit tests on
+    /// many threads inside one process, so these tests race on the
+    /// environment and fail intermittently unless serialized.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Guard that serializes the env-mutating tests.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn noop_performs_no_network_io() {
         let obs = Observability::noop();
@@ -556,6 +693,7 @@ mod tests {
 
     #[test]
     fn absent_endpoint_means_disabled_not_localhost() {
+        let _guard = env_guard();
         // Ensure no ambient OTEL vars leak into the test.
         for k in [
             "OTEL_EXPORTER_OTLP_ENDPOINT",
@@ -579,7 +717,7 @@ mod tests {
             !cfg.otlp_enabled,
             "absent endpoint must be disabled, not localhost:4318"
         );
-        assert!(cfg.otel_endpoint_raw().is_none());
+        assert!(!cfg.otlp_enabled);
         let (obs, _rt) = Observability::from_config(cfg);
         assert!(!obs.otlp_enabled());
         assert!(obs.is_noop());
@@ -587,9 +725,67 @@ mod tests {
 
     #[test]
     fn none_disables_signal() {
+        let _guard = env_guard();
         std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "none");
         let cfg = ObservabilityConfig::from_env();
         assert!(!cfg.otlp_enabled, "`none` must disable export");
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+    }
+
+    #[test]
+    fn signal_specific_endpoint_is_used_as_is() {
+        let _guard = env_guard();
+        for k in [
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        ] {
+            std::env::remove_var(k);
+        }
+        std::env::set_var(
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+            "http://collector:4318/v1/traces",
+        );
+        let cfg = ObservabilityConfig::from_env();
+        let targets = cfg.export_targets();
+        assert!(cfg.otlp_enabled);
+        // The signal-specific URL must be used verbatim — appending the
+        // suffix would produce /v1/traces/v1/traces.
+        assert_eq!(
+            targets.traces.as_ref().unwrap().url,
+            "http://collector:4318/v1/traces"
+        );
+        // And it must not hijack the other signals.
+        assert!(targets.logs.is_none());
+        assert!(targets.metrics.is_none());
+        std::env::remove_var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT");
+    }
+
+    #[test]
+    fn generic_endpoint_gets_the_signal_suffix() {
+        let _guard = env_guard();
+        for k in [
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        ] {
+            std::env::remove_var(k);
+        }
+        std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318");
+        let cfg = ObservabilityConfig::from_env();
+        let targets = cfg.export_targets();
+        assert_eq!(
+            targets.logs.as_ref().unwrap().url,
+            "http://collector:4318/v1/logs"
+        );
+        assert_eq!(
+            targets.traces.as_ref().unwrap().url,
+            "http://collector:4318/v1/traces"
+        );
+        assert_eq!(
+            targets.metrics.as_ref().unwrap().url,
+            "http://collector:4318/v1/metrics"
+        );
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
     }
 
@@ -660,6 +856,7 @@ mod tests {
 
     #[test]
     fn debug_redacts_headers_and_endpoint_userinfo() {
+        let _guard = env_guard();
         std::env::set_var(
             "OTEL_EXPORTER_OTLP_ENDPOINT",
             "https://user:secret@example.com:4318/v1/traces?token=abc",

@@ -26,7 +26,14 @@ pub async fn http_metrics_middleware(
     req: Request,
     next: Next,
 ) -> Response {
-    let method = req.method().to_string();
+    // HTTP permits arbitrary extension-method tokens; a verbatim copy would
+    // give an unauthenticated caller an unbounded duration-series key.
+    let method = match req.method().as_str() {
+        "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS" | "CONNECT" | "TRACE" => {
+            req.method().as_str().to_string()
+        }
+        _ => "other".to_string(),
+    };
     // Prefer Axum's matched template; fallback to manual normalization for
     // the 1,000-IDs test and for unmatched routes.
     let raw_path = req.uri().path().to_string();
@@ -41,20 +48,44 @@ pub async fn http_metrics_middleware(
     // separately via `preloop.livelog.*`.
     let is_live_logs = surface == "live_logs";
 
-    let labels = if !is_live_logs {
-        Some(preloop_observability::metrics::HttpLabels {
+    // The in-flight gauge is keyed without `status_class`: the status is
+    // unknown until the response completes, so any status in the key would
+    // let the increment (pre-response) and decrement (post-response)
+    // disagree and leak the gauge permanently.
+    let active_guard = (!is_live_logs).then(|| {
+        let labels = preloop_observability::metrics::ActiveLabels {
             method: method.clone(),
             route: route.clone(),
             surface: surface.clone(),
-            status_class: "2xx".to_string(), // placeholder, updated after response
-        })
-    } else {
-        None
-    };
+        };
+        shared
+            .state
+            .observability
+            .metrics()
+            .http
+            .inc_active(&labels);
+        ActiveGuard {
+            shared: shared.clone(),
+            labels,
+        }
+    });
 
-    if let Some(lbl) = &labels {
-        shared.state.observability.metrics().http.inc_active(lbl);
-    }
+    // Adopt an inbound W3C trace so a caller's trace continues through the
+    // control plane; otherwise start a root. Health and metrics probes are
+    // suppressed from trace export per the signal policy — they would swamp
+    // the trace store and tell an operator nothing.
+    let traced = shared.state.observability.tracing_enabled() && surface != "public";
+    let span_context = traced.then(|| {
+        preloop_observability::export::SpanContext::from_traceparent(
+            req.headers()
+                .get("traceparent")
+                .and_then(|value| value.to_str().ok()),
+        )
+    });
+    // Only sample the clock when a span will actually be exported.
+    let span_start = span_context
+        .as_ref()
+        .map(|_| preloop_observability::export::now_nanos());
 
     let start = Instant::now();
     let res = next.run(req).await;
@@ -63,41 +94,67 @@ pub async fn http_metrics_middleware(
     let status = res.status().as_u16();
     let sc = status_class(status).to_string();
 
-    if let Some(lbl) = labels {
-        let mut lbl = lbl;
-        lbl.status_class = sc.clone();
-        // Record duration only for non-live_logs
+    if active_guard.is_some() {
+        shared.state.observability.metrics().http.observe_duration(
+            preloop_observability::metrics::HttpLabels {
+                method: method.clone(),
+                route: route.clone(),
+                surface: surface.clone(),
+                status_class: sc.clone(),
+            },
+            elapsed,
+        );
+    }
+    // Drop the guard (and the gauge slot) even when the inner future is
+    // cancelled or panics; the request is not in flight anymore either way.
+    drop(active_guard);
+
+    if let (Some(context), Some(start_nanos)) = (span_context, span_start) {
+        // Attributes are allowlisted, never derived from the raw URI: the
+        // route is the matched template and the surface is a finite set.
+        let attributes = vec![
+            ("http.request.method".to_string(), method.clone()),
+            ("http.route".to_string(), route.clone()),
+            ("preloop.surface".to_string(), surface),
+            ("http.response.status_code".to_string(), status.to_string()),
+        ];
         shared
+            .state
+            .observability
+            .export_span(preloop_observability::export::SpanRecord {
+                context,
+                name: format!("{method} {route}"),
+                start_nanos,
+                end_nanos: preloop_observability::export::now_nanos(),
+                // Only 5xx is the server's fault; a 4xx is the caller's and
+                // marking it Error would make every unauthenticated probe
+                // look like an outage.
+                status: if status >= 500 {
+                    preloop_observability::export::SpanStatus::Error
+                } else {
+                    preloop_observability::export::SpanStatus::Unset
+                },
+                attributes,
+            });
+    }
+
+    res
+}
+
+/// Releases the active-request gauge on drop, so cancellation, panics, and
+/// client disconnects during a long poll cannot leak the series.
+struct ActiveGuard {
+    shared: Arc<SharedState>,
+    labels: preloop_observability::metrics::ActiveLabels,
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.shared
             .state
             .observability
             .metrics()
             .http
-            .observe_duration(lbl.clone(), elapsed);
-        shared.state.observability.metrics().http.dec_active(&lbl);
+            .dec_active(&self.labels);
     }
-
-    // Safe span: method + route template + surface + status, no headers/body/query.
-    // Use `tracing::info_span!` so it appears in logs when RUST_LOG includes it,
-    // but filtered at DEBUG by default (poll/renew are DEBUG).
-    let span = tracing::info_span!(
-        "http.request",
-        http.method = %method,
-        http.route = %route,
-        http.surface = %surface,
-        http.status_code = status,
-        http.status_class = %sc,
-        otel.kind = "server",
-    );
-    // Attach span to response for trace correlation; the span itself is not
-    // entered for the handler thread beyond this point (no await while held).
-
-    // Also emit a counter for broker poll outcomes — the control plane's
-    // poll is a long-poll that returns job|empty|cancel|error. That is
-    // already counted via the HTTP histogram, but the plan also wants
-    // `preloop.broker.poll{outcome}` to distinguish empty vs error.
-    // For now we just log at DEBUG; the dedicated broker counter is wired
-    // in the broker module itself (Step 4 lifecycle).
-    let _ = span;
-
-    res
 }

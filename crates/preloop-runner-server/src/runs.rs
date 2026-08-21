@@ -1,6 +1,11 @@
 use super::*;
 use std::collections::BTreeSet;
 
+/// A heartbeat or sampler snapshot older than this is stale: three sampler
+/// intervals of 5s. Single source so `/readyz` and `/api/v1/status` cannot
+/// disagree when the interval changes.
+pub(crate) const STALENESS_THRESHOLD: Duration = Duration::from_secs(15);
+
 pub(crate) async fn healthz(State(shared): State<Arc<SharedState>>) -> impl IntoResponse {
     let shutdown = shared.shutdown.is_cancelled();
     let body = json!({
@@ -20,23 +25,21 @@ pub(crate) async fn readyz(State(shared): State<Arc<SharedState>>) -> impl IntoR
         let body = json!({ "ready": false, "reason": "shutting_down" });
         return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
     }
-    // Check critical heartbeats freshness (>15s stale is 3 intervals of 5s sampler)
     if let Some(stale) = shared
         .state
         .observability
         .heartbeat()
-        .any_critical_stale(Duration::from_secs(15))
+        .any_critical_stale(STALENESS_THRESHOLD)
     {
         let body = json!({ "ready": false, "reason": format!("task_stale:{}", stale) });
         return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
     }
-    // Also check snapshot age (>15s stale sampler)
     let age_secs = {
         let snap = shared.state.status_snapshot.read();
         let now = chrono::Utc::now();
         (now - snap.observed_at).num_milliseconds() as f64 / 1000.0
     };
-    if age_secs > 15.0 {
+    if age_secs > STALENESS_THRESHOLD.as_secs_f64() {
         let body = json!({ "ready": false, "reason": "state_sampler_stale" });
         return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
     }
@@ -68,9 +71,7 @@ pub(crate) async fn status(State(shared): State<Arc<SharedState>>) -> impl IntoR
                 name: t.name.to_string(),
                 critical: t.critical == preloop_observability::Criticality::Critical,
                 heartbeat_age_seconds: t.heartbeat_age.as_secs_f64(),
-                state: if t.exited {
-                    "exited".to_string()
-                } else if t.heartbeat_age > Duration::from_secs(15) {
+                state: if t.heartbeat_age > STALENESS_THRESHOLD {
                     "stale".to_string()
                 } else {
                     "running".to_string()
@@ -1126,6 +1127,7 @@ pub(crate) async fn submit_run_inner(
                 run_id,
                 job_id: job.id.clone(),
                 base_id: job.base_id.clone(),
+                enqueued_at_unix_nanos: crate::models::now_unix_nanos(),
                 needs: job.needs.clone(),
                 if_condition: job.if_condition.clone(),
                 condition_context: pb.condition_context,
