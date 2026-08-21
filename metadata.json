@@ -2,9 +2,10 @@
   "cli_version": "0.10.0",
   "checkpoint_id": "01M0GZ2NAT9NC1F5A0RS5XKKTX",
   "strategy": "manual-commit",
-  "branch": "pr/2-observability-foundation",
+  "branch": "pr/3-status-endpoints",
   "checkpoints_count": 19,
   "files_touched": [
+    "Cargo.lock",
     "crates/preloop-observability/Cargo.toml"
   ],
   "sessions": [
