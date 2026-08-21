@@ -31,7 +31,7 @@ jobs:
       - name: Run Pullfrog (via GHES-compatible fork)
         uses: Bnjoroge1/pullfrog@09dde428a88245ab3c448ff3dcadb8325e4e1d05 # ghes-url-support
         with:
-          prompt: ${{ inputs.prompt }}
+          prompt: ${{ inputs.prompt || toJSON(github.event) }}
         env:
           # Direct Codex/Claude subscriptions — no CLIProxy, no API keys
           CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
