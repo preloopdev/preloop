@@ -3,7 +3,7 @@
   "checkpoint_id": "01M0K0YEGG57X8YHEECV3FG9K9",
   "strategy": "manual-commit",
   "branch": "fix/pullfrog-pin-sha",
-  "checkpoints_count": 11,
+  "checkpoints_count": 13,
   "files_touched": [
     ".github/workflows/pullfrog.yml"
   ],
@@ -21,6 +21,13 @@
       "compact_transcript": "/1/transcript.jsonl",
       "content_hash": "/1/content_hash.txt",
       "prompt": ""
+    },
+    {
+      "metadata": "/2/metadata.json",
+      "transcript": "/2/full.jsonl",
+      "compact_transcript": "/2/transcript.jsonl",
+      "content_hash": "/2/content_hash.txt",
+      "prompt": "/2/prompt.txt"
     }
   ]
 }
