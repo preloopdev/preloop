@@ -1,0 +1,30 @@
+{
+  "cli_version": "0.10.0",
+  "checkpoint_id": "01M0GZ0QJYMZFKA3MSZ8EYV5QC",
+  "session_id": "01a01d30-1823-7002-ae82-4f91e75da805",
+  "strategy": "manual-commit",
+  "created_at": "2026-08-21T01:30:04.453896Z",
+  "branch": "pr/2-observability-foundation",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "crates/preloop-observability/Cargo.toml"
+  ],
+  "agent": "Oh My Pi",
+  "model": "",
+  "turn_id": "ade5ed338b4f",
+  "checkpoint_transcript_start": 35,
+  "transcript_lines_at_start": 35,
+  "compact_transcript_start": 8,
+  "initial_attribution": {
+    "calculated_at": "2026-08-21T01:30:04.443688Z",
+    "agent_lines": 24,
+    "agent_removed": 0,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 24,
+    "total_lines_changed": 24,
+    "agent_percentage": 100,
+    "metric_version": 2
+  }
+}
