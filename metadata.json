@@ -1,0 +1,19 @@
+{
+  "cli_version": "0.10.0",
+  "checkpoint_id": "01M0GZG5SQ5X8W0GSW9T53DGR2",
+  "strategy": "manual-commit",
+  "branch": "pr/5-otlp-export",
+  "checkpoints_count": 10,
+  "files_touched": [
+    "crates/preloop-runner-server/src/runs.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": ""
+    }
+  ]
+}
