@@ -1,9 +1,5 @@
-yea so change it
-
----
-
-merge
-
----
-
 can u check why my rust jobs were failing
+
+---
+
+Pull for a job also failed because I don't think you pinned the sha
