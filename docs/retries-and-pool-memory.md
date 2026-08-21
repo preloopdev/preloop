@@ -15,7 +15,8 @@ concurrency was sized by CPU only.
 > renewal; listener/session loops and the container-health poll retry forever
 > by design (the guest is expected to recover).
 > **Pool: retry-forever with exponential damping** — slot respawns back off
-> 500 ms → 30 s cap with success reset, golden re-arm bounded (12 × 10 s)
+> 500 ms → 30 s cap with success reset, golden re-arm exponential (10 s → 60 s,
+> ≤ 5 min budget) before fallback
 > before fallback.
 
 ## Control plane (`preloop-runner-server`)
@@ -42,7 +43,7 @@ on failure so GitHub's own redelivery is accepted (dedup window 300 s).
 |---|---|---|---|
 | `run_on_demand` slot supervisor | Re-spawn failed slots | exp 500 ms → 30 s cap, reset to 0 on success | attempts unbounded, sleep ≤30 s |
 | `run_on_demand_slot` provision failure | Fork/create failed | fixed 500 ms + continue; no counter | **unbounded** (tight-ish) |
-| `provision_runner` golden re-arm | Spent checkpoint after clone drain | 12 × 10 s (`GOLDEN_DRAIN_PROBE_DELAY`), then direct OCI create | yes (~2 min) |
+| `provision_runner` golden re-arm | Spent checkpoint after clone drain | exponential: 10 s → 60 s cap, total 300 s budget, then direct OCI create | yes (≤5 min) |
 | `await_guest_ready` | Guest agent readiness probe | 25 ms poll, 30 s deadline | yes |
 | golden download | Release/OCI asset | single attempt, 1 h timeout, then local-build fallback | n/a |
 | `preload_images` / `docker_start_command` | dockerd readiness / start | shell polls (30 s / 10 s+5 s), start retried once | yes |

@@ -1418,6 +1418,15 @@ const GUEST_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// golden fork base. Bounded retries; the probe loop is exercised by tests
 /// under paused Tokio time, so this is the only knob the delay is tied to.
 const GOLDEN_DRAIN_PROBE_DELAY: Duration = Duration::from_secs(10);
+/// Ceiling for the drain-probe backoff: probes start at
+/// `GOLDEN_DRAIN_PROBE_DELAY` and double up to this cap, so a long-running
+/// job's clone is re-checked every minute rather than every ten seconds.
+const GOLDEN_DRAIN_PROBE_MAX: Duration = Duration::from_secs(60);
+/// Total wall-clock budget for waiting on live clones to drain before
+/// falling back to independent OCI creation. The fork path is orders of
+/// magnitude faster than direct creation, so this is generous; a clone that
+/// has not exited within it is unlikely to do so soon.
+const GOLDEN_DRAIN_BUDGET: Duration = Duration::from_secs(300);
 /// Gap between guest readiness probes.
 const GUEST_READY_POLL: Duration = Duration::from_millis(25);
 
@@ -3804,14 +3813,22 @@ async fn provision_runner<P: VmProvider + 'static>(
                             // A live clone (another runner forked from the
                             // golden) blocks the re-freeze; those clones are
                             // ephemeral and exit after their job. Wait for
-                            // them to drain, then retry the re-arm a bounded
-                            // number of times before falling back to direct
-                            // creation (whose socket mount cannot serve the
-                            // control transport, so the fallback usually
-                            // fails registration anyway).
+                            // them to drain, probing with exponential backoff
+                            // so a long-running job does not force the slow
+                            // direct-create path for every queued job in the
+                            // meantime. The fork path is ~0.5 s vs ~8 min for
+                            // independent creation, so waiting is worth it up
+                            // to a generous total budget; only then fall back
+                            // to direct creation (whose socket mount cannot
+                            // serve the control transport, so the fallback
+                            // usually fails registration anyway).
                             let mut rearmed = false;
-                            for attempt in 0..12 {
-                                tokio::time::sleep(GOLDEN_DRAIN_PROBE_DELAY).await;
+                            let mut probe_delay = GOLDEN_DRAIN_PROBE_DELAY;
+                            let drain_deadline = tokio::time::Instant::now() + GOLDEN_DRAIN_BUDGET;
+                            let mut attempt = 0_u32;
+                            while tokio::time::Instant::now() < drain_deadline {
+                                tokio::time::sleep(probe_delay).await;
+                                attempt += 1;
                                 match provider.rearm_fork_base(golden, Some(name)).await {
                                     Ok(true) => {
                                         info!(
@@ -3823,8 +3840,12 @@ async fn provision_runner<P: VmProvider + 'static>(
                                     }
                                     Ok(false) => {
                                         // Live clones still hold the golden;
-                                        // keep probing until the bounded
-                                        // retries are exhausted.
+                                        // back off and probe again: the next
+                                        // probe costs little, and the clone
+                                        // may exit before the budget runs out.
+                                        probe_delay = probe_delay
+                                            .saturating_mul(2)
+                                            .min(GOLDEN_DRAIN_PROBE_MAX);
                                     }
                                     Err(drain_error) => {
                                         error!(
@@ -4437,6 +4458,9 @@ mod lifecycle_tests {
         /// Report live clones to `rearm_fork_base`; true by default so a spent
         /// base with dependents is never re-armed in tests either.
         live_forks: Mutex<bool>,
+        /// Simulate a clone exiting mid-drain: flip `live_forks` off after
+        /// this many `rearm_fork_base` calls (0 = never).
+        drain_live_forks_after: Mutex<u32>,
         fail_start: bool,
         fail_install: bool,
         fail_configure: bool,
@@ -4469,6 +4493,7 @@ mod lifecycle_tests {
                 fork_base_busy: false,
                 fail_fork_once_spent: Mutex::new(false),
                 live_forks: Mutex::new(true),
+                drain_live_forks_after: Mutex::new(0),
                 fail_start,
                 fail_install,
                 fail_configure,
@@ -4505,6 +4530,13 @@ mod lifecycle_tests {
         /// Report whether clones of the golden still exist.
         fn with_live_forks(mut self, live: bool) -> Self {
             *self.live_forks.get_mut() = live;
+            self
+        }
+
+        /// Simulate the last live clone exiting after `n` drain probes, so a
+        /// re-arm that keeps probing eventually succeeds.
+        fn drain_live_forks_after(mut self, n: u32) -> Self {
+            *self.drain_live_forks_after.get_mut() = n;
             self
         }
 
@@ -5184,6 +5216,13 @@ chmod +x "$destination/bin/node"
             if let Some(partial) = partial {
                 self.delete(partial).await?;
             }
+            let mut drain_after = self.drain_live_forks_after.lock().await;
+            if *drain_after > 0 {
+                *drain_after -= 1;
+                if *drain_after == 0 {
+                    *self.live_forks.lock().await = false;
+                }
+            }
             if *self.live_forks.lock().await {
                 return Ok(false);
             }
@@ -5669,6 +5708,57 @@ chmod +x "$destination/bin/node"
             provider.created_image(&name).await.as_deref(),
             Some(config.base_image.as_str()),
             "a live clone makes the shared packed payload unsafe; fallback must use OCI"
+        );
+    }
+
+    /// A live clone that exits mid-drain must be re-armed once it is gone:
+    /// the drain loop keeps probing with backoff, and the golden resumes
+    /// serving forks instead of falling back to slow direct creation.
+    /// Paused time advances the probe sleeps instantly.
+    #[tokio::test(start_paused = true)]
+    async fn spent_fork_base_with_clone_that_drains_is_rearmed_and_retried() {
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, false)
+                .with_live_forks(true)
+                .drain_live_forks_after(3)
+                .failing_fork_once_spent(),
+        );
+        let config = packed_fork_config();
+        let golden = MachineName::new("lifecycle-test-golden").unwrap();
+        let name = MachineName::new("lifecycle-test-0-10").unwrap();
+
+        provision_runner(
+            &provider,
+            &config,
+            &name,
+            Some(&golden),
+            &Arc::new(KeyPool::new()),
+            &test_runner_environment(config.base_image.clone(), Vec::new(), true),
+        )
+        .await
+        .expect("the re-armed golden serves the fork after the clone drains");
+
+        let events = provider.events().await;
+        let expected = [
+            format!("fork:{}:{}", golden.as_str(), name.as_str()),
+            format!("rearm:{}", golden.as_str()),
+            format!("rearm:{}", golden.as_str()),
+            format!("rearm:{}", golden.as_str()),
+            format!("stop:{}", golden.as_str()),
+            format!("start:{}", golden.as_str()),
+            format!("fork:{}:{}", golden.as_str(), name.as_str()),
+        ];
+        let mut cursor = 0;
+        for event in &expected {
+            let position = events[cursor..]
+                .iter()
+                .position(|seen| seen == event)
+                .expect("drain-and-re-arm sequence must include every step");
+            cursor += position + 1;
+        }
+        assert!(
+            provider.has_machine(&name).await,
+            "the retried fork must leave the clone provisioned"
         );
     }
 
