@@ -1,0 +1,26 @@
+{
+  "cli_version": "0.10.0",
+  "checkpoint_id": "01M0GYSYWFM2CKN2YR1SHGTRV0",
+  "strategy": "manual-commit",
+  "branch": "Bnjoroge/oobservability",
+  "checkpoints_count": 10,
+  "files_touched": [
+    "crates/preloop-runner-server/src/bootstrap.rs",
+    "crates/preloop-runner-server/src/broker.rs",
+    "crates/preloop-runner-server/src/models.rs",
+    "crates/preloop-runner-server/src/runs.rs",
+    "crates/preloop-runner-server/src/runtime_scheduling.rs",
+    "crates/preloop-runner-server/src/scheduler.rs",
+    "crates/preloop-runner-server/src/state.rs",
+    "crates/preloop-runner-server/src/store.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": ""
+    }
+  ]
+}
