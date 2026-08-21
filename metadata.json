@@ -3,7 +3,7 @@
   "checkpoint_id": "01M0GZJX756GZ2SZ14BS9M4RPW",
   "strategy": "manual-commit",
   "branch": "pr/6-review-fixes",
-  "checkpoints_count": 16,
+  "checkpoints_count": 17,
   "files_touched": [
     "crates/preloop-runner-server/src/bootstrap.rs",
     "crates/preloop-runner-server/src/broker.rs",
@@ -38,6 +38,13 @@
       "transcript": "/3/full.jsonl",
       "compact_transcript": "/3/transcript.jsonl",
       "content_hash": "/3/content_hash.txt",
+      "prompt": ""
+    },
+    {
+      "metadata": "/4/metadata.json",
+      "transcript": "/4/full.jsonl",
+      "compact_transcript": "/4/transcript.jsonl",
+      "content_hash": "/4/content_hash.txt",
       "prompt": ""
     }
   ]
