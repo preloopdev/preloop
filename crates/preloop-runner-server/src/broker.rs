@@ -271,6 +271,7 @@ pub(crate) async fn next_message_broker_ref(
             .queue_depth
             .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
         runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
+        record_claim_queue_wait(&shared, &claimed);
         let Some(queued) = claimed else {
             drop(inner);
             if wait_seconds == 0 {
@@ -397,6 +398,28 @@ pub(crate) async fn broker_session_root(
     ))
 }
 
+/// Record how long a claimed job sat in the ready queue. `enqueued_at` is
+/// stamped when the job enters the queue and survives requeues, so a job
+/// that bounced off a purged runner still measures total queue time. Jobs
+/// restored from a snapshot without the field (`0`) are not recorded.
+fn record_claim_queue_wait(shared: &Arc<SharedState>, claimed: &Option<QueuedJob>) {
+    let Some(queued) = claimed else { return };
+    if queued.enqueued_at_unix_nanos <= 0 {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
+    let elapsed = std::time::Duration::from_nanos((now - queued.enqueued_at_unix_nanos) as u64);
+    shared
+        .state
+        .observability
+        .metrics()
+        .lifecycle
+        .record_queue_wait("claimed", elapsed);
+}
+
 pub(crate) async fn broker_delete_session_root(
     State(shared): State<Arc<SharedState>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -409,13 +432,15 @@ pub(crate) async fn broker_delete_session_root(
     if let Some(session_id) = header_session.or_else(|| params.get("sessionId").map(String::as_str))
     {
         remove_broker_session(&shared, session_id, runner_id).await?;
+        shared
+            .state
+            .observability
+            .metrics()
+            .lifecycle
+            .record_session_transition("delete", "ok");
     }
-    shared
-        .state
-        .observability
-        .metrics()
-        .lifecycle
-        .record_session_transition("delete", "ok");
+    // No session id present: nothing was deleted, so no transition is
+    // recorded — a 204 with no-op must not count as a successful delete.
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -598,6 +623,7 @@ pub(crate) async fn next_message_broker_ref_root(
                     .queue_depth
                     .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
                 runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
+                record_claim_queue_wait(&shared, &claimed);
                 if let Some(queued) = claimed {
                     if let Some(run) = inner.runs.get_mut(&queued.run_id) {
                         run.status = ExecutionStatus::InProgress;
@@ -873,13 +899,11 @@ pub(crate) async fn broker_acquire_job(
     message.request_id = 0;
     let payload = serde_json::to_value(&message)
         .map_err(|error| ApiError::internal(format!("serialize broker job payload: {error}")))?;
-    // Queue wait and broker poll outcomes — bounded, exactly one per successful claim.
-    shared
-        .state
-        .observability
-        .metrics()
-        .lifecycle
-        .record_queue_wait("claimed", std::time::Duration::from_secs(1));
+    // Broker poll outcome — bounded, exactly one per successful claim. Queue
+    // wait is recorded at the claim sites in `next_message_broker_ref` /
+    // `next_message_disttask`, where the enqueue timestamp is still on the
+    // job; by the time the acquire payload is built the queue position has
+    // been lost.
     shared
         .state
         .observability
