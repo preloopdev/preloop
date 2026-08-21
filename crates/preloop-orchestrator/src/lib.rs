@@ -264,6 +264,62 @@ fn relax_externals_permissions(externals: &Path) {
 #[cfg(not(unix))]
 fn relax_externals_permissions(_externals: &Path) {}
 
+/// Total physical memory in MiB, or `None` when it cannot be determined.
+///
+/// Used to bound on-demand fork concurrency so the pool never schedules
+/// more runner VMs than the host can hold in RAM. `None` (an unreadable
+/// `/proc/meminfo`, a non-Linux/non-macOS host) falls back to CPU-only
+/// sizing rather than refusing to run.
+#[cfg(target_os = "linux")]
+fn host_memory_mib() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kib: u64 = meminfo.lines().find_map(|line| {
+        let line = line.trim();
+        let rest = line.strip_prefix("MemTotal:")?;
+        rest.trim().strip_suffix(" kB")?.trim().parse().ok()
+    })?;
+    Some(kib / 1024)
+}
+
+/// Total physical memory in MiB, or `None` when it cannot be determined.
+#[cfg(target_os = "macos")]
+fn host_memory_mib() -> Option<u64> {
+    let output = std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()?;
+    let bytes: u64 = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .ok()?;
+    Some(bytes / (1024 * 1024))
+}
+
+/// Total physical memory in MiB, or `None` when it cannot be determined.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn host_memory_mib() -> Option<u64> {
+    None
+}
+
+/// On-demand fork concurrency allowed by host memory alone.
+///
+/// Every on-demand fork inherits the golden's committed footprint and grows
+/// toward `runner_memory_mib` as its guest runs, so the pool must never
+/// schedule more concurrent runners than `(host_total - golden - reserve) /
+/// runner_ceiling` allows. The 2 GiB reserve keeps the control plane, OS,
+/// and page cache alive — without it the host OOMs *after* the forks are up,
+/// which is exactly the production failure this guards against. Floors at 1
+/// so a tiny host still runs a single job rather than refusing to work.
+fn on_demand_memory_cap(host_total_mib: u64, runner_memory_mib: u64) -> usize {
+    const HOST_RESERVE_MIB: u64 = 2048;
+    // Both the golden and each runner use the same ceiling. A degenerate
+    // zero ceiling means "unbounded" would be unsafe to divide by, so treat
+    // it as 1; the config layer validates `memory_mib > 0` in practice.
+    let runner_mib = runner_memory_mib.max(1);
+    let golden_mib = runner_mib;
+    (host_total_mib.saturating_sub(golden_mib + HOST_RESERVE_MIB) / runner_mib).max(1) as usize
+}
+
 fn default_golden_url(release_version: &str) -> String {
     format!(
         "https://github.com/preloopdev/preloop/releases/download/v{release_version}/preloop-ubuntu-24.04-{}",
@@ -2300,14 +2356,37 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         let building = Arc::new(AtomicUsize::new(0));
 
         // On-demand mode: size=0 means no warm pool. Fork runners only when
-        // jobs arrive, capped by the host's CPU budget.
+        // jobs arrive, capped by the host's CPU and memory budget.
         if self.config.size == 0 {
             return self
                 .run_on_demand(shutdown, golden_registry, idle, keys, building)
                 .await;
         }
 
-        for slot in 0..self.config.size {
+        // Warm mode: cap the configured pool size by host memory as well as
+        // CPU. Each warm slot forks from the golden and inherits its
+        // committed footprint (growing toward `memory_mib` while a job
+        // runs), and a slot provisions its successor mid-job — so on a
+        // small host the configured size can still exhaust RAM. Sizing down
+        // at startup is safer than OOMing mid-run; `PRELOOP_RUNNER_POOL_SIZE`
+        // remains an explicit override that wins.
+        let warm_size = match host_memory_mib() {
+            Some(total) => self.config.size.min(on_demand_memory_cap(
+                total,
+                u64::from(self.config.memory_mib),
+            )),
+            None => self.config.size,
+        };
+        if warm_size < self.config.size {
+            warn!(
+                configured = self.config.size,
+                warm_size,
+                memory_mib = self.config.memory_mib,
+                "reduced warm pool size to fit host memory"
+            );
+        }
+
+        for slot in 0..warm_size {
             let provider = self.provider.clone();
             let config = self.config.clone();
             let slot_shutdown = shutdown.child_token();
@@ -2380,7 +2459,21 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             // the fork back and spends the golden's retained checkpoint.
             let parallelism = std::thread::available_parallelism().map_or(2, |value| value.get());
             let per_runner = usize::from(self.config.cpus.max(1));
-            (parallelism / per_runner).saturating_sub(1).max(1)
+            let by_cpu = (parallelism / per_runner).saturating_sub(1).max(1);
+            // memory term: every on-demand fork inherits the golden's
+            // committed footprint and grows toward `memory_mib` as the guest
+            // runs. On a small host (the production 6-core/22 GiB machine)
+            // the CPU term alone allows enough 8 GiB forks to exhaust RAM
+            // and OOM the whole control plane. Reserve the golden's memory
+            // plus host headroom, then fit the remainder with per-runner
+            // ceilings. A host we cannot measure falls back to CPU-only.
+            match host_memory_mib() {
+                Some(total) => by_cpu.min(on_demand_memory_cap(
+                    total,
+                    u64::from(self.config.memory_mib),
+                )),
+                None => by_cpu,
+            }
         };
         info!(max_concurrent, "on-demand runner pool (size=0)");
 
@@ -4301,6 +4394,35 @@ mod lifecycle_tests {
     use std::os::unix::fs::PermissionsExt as _;
     use std::process::Command;
     use tokio::sync::Mutex;
+
+    /// The production scenario that OOMed: 22 GiB host, 8 GiB runners.
+    /// Golden (8 GiB) + 2 GiB reserve leaves 12 GiB → at most 1 concurrent
+    /// on-demand fork. CPU-only sizing allowed several and the host died.
+    #[test]
+    fn on_demand_memory_cap_fits_runners_after_golden_and_reserve() {
+        assert_eq!(on_demand_memory_cap(22 * 1024, 8 * 1024), 1);
+        assert_eq!(on_demand_memory_cap(64 * 1024, 8 * 1024), 6);
+        assert_eq!(on_demand_memory_cap(32 * 1024, 4 * 1024), 6);
+    }
+
+    /// A host too small for even one runner past the golden still runs one
+    /// job (floor of 1) rather than refusing to work.
+    #[test]
+    fn on_demand_memory_cap_floors_at_one() {
+        assert_eq!(on_demand_memory_cap(8 * 1024, 8 * 1024), 1);
+        assert_eq!(on_demand_memory_cap(4 * 1024, 8 * 1024), 1);
+    }
+
+    /// A zero runner ceiling (should not happen — config validates it) must
+    /// not divide by zero; it degrades to the 1 MiB floor and lets the host
+    /// run as many 1 MiB "runners" as fit.
+    #[test]
+    fn on_demand_memory_cap_handles_zero_runner_ceiling() {
+        assert_eq!(
+            on_demand_memory_cap(32 * 1024, 0),
+            (32 * 1024 - 2048 - 1) as usize
+        );
+    }
 
     #[derive(Debug)]
     struct TestProvider {
