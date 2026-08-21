@@ -3,7 +3,7 @@
   "checkpoint_id": "01M0GZ080HJ7TKVVNHNMPSNSEK",
   "strategy": "manual-commit",
   "branch": "pr/1-log-hardening",
-  "checkpoints_count": 15,
+  "checkpoints_count": 16,
   "files_touched": [
     "rules/no-sensitive-log-fields.yml"
   ],
@@ -27,6 +27,13 @@
       "transcript": "/2/full.jsonl",
       "compact_transcript": "/2/transcript.jsonl",
       "content_hash": "/2/content_hash.txt",
+      "prompt": ""
+    },
+    {
+      "metadata": "/3/metadata.json",
+      "transcript": "/3/full.jsonl",
+      "compact_transcript": "/3/transcript.jsonl",
+      "content_hash": "/3/content_hash.txt",
       "prompt": ""
     }
   ]
