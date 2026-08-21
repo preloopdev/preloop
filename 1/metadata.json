@@ -1,0 +1,33 @@
+{
+  "cli_version": "0.10.0",
+  "checkpoint_id": "01M0GZPVH9X85W3FJMQR7512W8",
+  "session_id": "01a0183e-9fc3-7000-be7a-6a7b65c0a18c",
+  "strategy": "manual-commit",
+  "created_at": "2026-08-21T01:42:08.65923Z",
+  "branch": "pr/6-review-fixes",
+  "checkpoints_count": 4,
+  "files_touched": [
+    "Cargo.lock"
+  ],
+  "agent": "Oh My Pi",
+  "model": "deepseek-v4-flash",
+  "turn_id": "e26370be1dc7",
+  "checkpoint_transcript_start": 9905,
+  "transcript_lines_at_start": 9905,
+  "compact_transcript_start": 1271,
+  "session_metrics": {
+    "turn_count": 4
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-08-21T01:42:08.19954Z",
+    "agent_lines": 3,
+    "agent_removed": 1,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 3,
+    "total_lines_changed": 4,
+    "agent_percentage": 100,
+    "metric_version": 2
+  }
+}
