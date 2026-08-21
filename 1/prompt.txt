@@ -1,0 +1,26 @@
+Complete assignment thoroughly:
+
+# Target
+Map every retry/backoff site in /tmp/preloop-deploy-build (preloop worktree).
+
+# Change
+This is READ-ONLY investigation. Do not edit anything.
+
+Use grep on the crates dirs listed below for: retry, Retry, backoff, Backoff, attempt, attempts, "sleep(", "for .* in 0..", "loop {", MAX_RETR, RETRY_, tokio_retry, retries. Follow each hit into the code to determine the exact policy.
+
+Crates to cover (all .rs files, excluding tests and #[cfg(test)] blocks):
+- crates/preloop-runner-server/src/*.rs (github.rs, github_app.rs, broker.rs, distributed_task.rs, store.rs, runner_lifecycle.rs, debug_sessions.rs, github_push.rs, state.rs, runtime_scheduling.rs, dispatch.rs, github.rs)
+- crates/preloop-orchestrator/src/lib.rs
+- crates/preloop-vm/src/lib.rs
+- crates/preloop-runner/src/**/*.rs
+- crates/preloop-runner-client/src/*.rs
+
+For each site report: file:line, enclosing fn, WHAT is retried, POLICY (fixed/exponential/bounded/unbounded + exact constants: Duration, attempt counts, caps like min/max), WHERE the loop lives (loop{} / for attempt in 0..N / helper), and whether success resets backoff.
+
+# Acceptance
+Produce a markdown report (write to local://retry-map.md) with:
+1. Table per crate: site | what | policy | bounded?
+2. GAPS section: unbounded retries, no-backoff tight loops, and any sleep that could be very long — with file:line for each.
+3. One-line summary of the retry philosophy you observe (e.g. server-retry-on-transient, pool-retry-forever, etc.).
+
+Do not run cargo. Do not modify files. Read-only.
