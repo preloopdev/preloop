@@ -3,7 +3,7 @@
   "checkpoint_id": "01M0GYZSHJ4PMAKPH7JJBVGTHB",
   "strategy": "manual-commit",
   "branch": "pr/1-log-hardening",
-  "checkpoints_count": 14,
+  "checkpoints_count": 15,
   "files_touched": [
     "crates/preloop-runner-server/src/artifact_twirp.rs",
     "crates/preloop-runner-server/src/blob_store.rs",
@@ -25,6 +25,13 @@
       "transcript": "/1/full.jsonl",
       "compact_transcript": "/1/transcript.jsonl",
       "content_hash": "/1/content_hash.txt",
+      "prompt": ""
+    },
+    {
+      "metadata": "/2/metadata.json",
+      "transcript": "/2/full.jsonl",
+      "compact_transcript": "/2/transcript.jsonl",
+      "content_hash": "/2/content_hash.txt",
       "prompt": ""
     }
   ]
