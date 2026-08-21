@@ -2380,10 +2380,11 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // at startup is safer than OOMing mid-run; `PRELOOP_RUNNER_POOL_SIZE`
         // remains an explicit override that wins.
         let warm_size = match host_memory_mib() {
-            Some(total) => self.config.size.min(on_demand_memory_cap(
-                total,
-                u64::from(self.config.memory_mib),
-            )),
+            Some(total) => self.config.size.min(
+                on_demand_memory_cap(total, u64::from(self.config.memory_mib))
+                    .saturating_div(2)
+                    .max(1),
+            ),
             None => self.config.size,
         };
         if warm_size < self.config.size {
