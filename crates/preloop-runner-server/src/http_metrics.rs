@@ -26,7 +26,14 @@ pub async fn http_metrics_middleware(
     req: Request,
     next: Next,
 ) -> Response {
-    let method = req.method().to_string();
+    // HTTP permits arbitrary extension-method tokens; a verbatim copy would
+    // give an unauthenticated caller an unbounded duration-series key.
+    let method = match req.method().as_str() {
+        "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS" | "CONNECT" | "TRACE" => {
+            req.method().as_str().to_string()
+        }
+        _ => "other".to_string(),
+    };
     // Prefer Axum's matched template; fallback to manual normalization for
     // the 1,000-IDs test and for unmatched routes.
     let raw_path = req.uri().path().to_string();
@@ -41,20 +48,27 @@ pub async fn http_metrics_middleware(
     // separately via `preloop.livelog.*`.
     let is_live_logs = surface == "live_logs";
 
-    let labels = if !is_live_logs {
-        Some(preloop_observability::metrics::HttpLabels {
+    // The in-flight gauge is keyed without `status_class`: the status is
+    // unknown until the response completes, so any status in the key would
+    // let the increment (pre-response) and decrement (post-response)
+    // disagree and leak the gauge permanently.
+    let active_guard = (!is_live_logs).then(|| {
+        let labels = preloop_observability::metrics::ActiveLabels {
             method: method.clone(),
             route: route.clone(),
             surface: surface.clone(),
-            status_class: "2xx".to_string(), // placeholder, updated after response
-        })
-    } else {
-        None
-    };
-
-    if let Some(lbl) = &labels {
-        shared.state.observability.metrics().http.inc_active(lbl);
-    }
+        };
+        shared
+            .state
+            .observability
+            .metrics()
+            .http
+            .inc_active(&labels);
+        ActiveGuard {
+            shared: shared.clone(),
+            labels,
+        }
+    });
 
     // Adopt an inbound W3C trace so a caller's trace continues through the
     // control plane; otherwise start a root. Health and metrics probes are
@@ -68,7 +82,10 @@ pub async fn http_metrics_middleware(
                 .and_then(|value| value.to_str().ok()),
         )
     });
-    let span_start = preloop_observability::export::now_nanos();
+    // Only sample the clock when a span will actually be exported.
+    let span_start = span_context
+        .as_ref()
+        .map(|_| preloop_observability::export::now_nanos());
 
     let start = Instant::now();
     let res = next.run(req).await;
@@ -77,21 +94,28 @@ pub async fn http_metrics_middleware(
     let status = res.status().as_u16();
     let sc = status_class(status).to_string();
 
-    if let Some(lbl) = labels {
-        let mut lbl = lbl;
-        lbl.status_class = sc.clone();
-        let metrics = shared.state.observability.metrics();
-        metrics.http.observe_duration(lbl.clone(), elapsed);
-        metrics.http.dec_active(&lbl);
+    if active_guard.is_some() {
+        shared.state.observability.metrics().http.observe_duration(
+            preloop_observability::metrics::HttpLabels {
+                method: method.clone(),
+                route: route.clone(),
+                surface: surface.clone(),
+                status_class: sc.clone(),
+            },
+            elapsed,
+        );
     }
+    // Drop the guard (and the gauge slot) even when the inner future is
+    // cancelled or panics; the request is not in flight anymore either way.
+    drop(active_guard);
 
-    if let Some(context) = span_context {
+    if let (Some(context), Some(start_nanos)) = (span_context, span_start) {
         // Attributes are allowlisted, never derived from the raw URI: the
         // route is the matched template and the surface is a finite set.
         let attributes = vec![
             ("http.request.method".to_string(), method.clone()),
             ("http.route".to_string(), route.clone()),
-            ("preloop.surface".to_string(), surface.clone()),
+            ("preloop.surface".to_string(), surface),
             ("http.response.status_code".to_string(), status.to_string()),
         ];
         shared
@@ -100,7 +124,7 @@ pub async fn http_metrics_middleware(
             .export_span(preloop_observability::export::SpanRecord {
                 context,
                 name: format!("{method} {route}"),
-                start_nanos: span_start,
+                start_nanos,
                 end_nanos: preloop_observability::export::now_nanos(),
                 // Only 5xx is the server's fault; a 4xx is the caller's and
                 // marking it Error would make every unauthenticated probe
@@ -115,4 +139,22 @@ pub async fn http_metrics_middleware(
     }
 
     res
+}
+
+/// Releases the active-request gauge on drop, so cancellation, panics, and
+/// client disconnects during a long poll cannot leak the series.
+struct ActiveGuard {
+    shared: Arc<SharedState>,
+    labels: preloop_observability::metrics::ActiveLabels,
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.shared
+            .state
+            .observability
+            .metrics()
+            .http
+            .dec_active(&self.labels);
+    }
 }
