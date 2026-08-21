@@ -3,7 +3,7 @@
   "checkpoint_id": "01M0GZG5SQ5X8W0GSW9T53DGR2",
   "strategy": "manual-commit",
   "branch": "pr/5-otlp-export",
-  "checkpoints_count": 14,
+  "checkpoints_count": 15,
   "files_touched": [
     "crates/preloop-runner-server/src/runs.rs"
   ],
@@ -20,6 +20,13 @@
       "transcript": "/1/full.jsonl",
       "compact_transcript": "/1/transcript.jsonl",
       "content_hash": "/1/content_hash.txt",
+      "prompt": ""
+    },
+    {
+      "metadata": "/2/metadata.json",
+      "transcript": "/2/full.jsonl",
+      "compact_transcript": "/2/transcript.jsonl",
+      "content_hash": "/2/content_hash.txt",
       "prompt": ""
     }
   ]
