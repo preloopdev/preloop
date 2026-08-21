@@ -1,12 +1,137 @@
 use super::*;
 use std::collections::BTreeSet;
 
-pub(crate) async fn healthz(State(shared): State<Arc<SharedState>>) -> Json<serde_json::Value> {
-    Json(json!({
-        "ok": true,
+pub(crate) async fn healthz(State(shared): State<Arc<SharedState>>) -> impl IntoResponse {
+    let shutdown = shared.shutdown.is_cancelled();
+    let body = json!({
+        "ok": !shutdown,
         "protocol_version": PROTOCOL_VERSION,
-        "shutdown_requested": shared.shutdown.is_cancelled(),
-    }))
+        "shutdown_requested": shutdown,
+    });
+    if shutdown {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+    } else {
+        (StatusCode::OK, Json(body)).into_response()
+    }
+}
+
+pub(crate) async fn readyz(State(shared): State<Arc<SharedState>>) -> impl IntoResponse {
+    if shared.shutdown.is_cancelled() {
+        let body = json!({ "ready": false, "reason": "shutting_down" });
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
+    }
+    // Check critical heartbeats freshness (>15s stale is 3 intervals of 5s sampler)
+    if let Some(stale) = shared
+        .state
+        .observability
+        .heartbeat()
+        .any_critical_stale(Duration::from_secs(15))
+    {
+        let body = json!({ "ready": false, "reason": format!("task_stale:{}", stale) });
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
+    }
+    // Also check snapshot age (>15s stale sampler)
+    let age_secs = {
+        let snap = shared.state.status_snapshot.read();
+        let now = chrono::Utc::now();
+        (now - snap.observed_at).num_milliseconds() as f64 / 1000.0
+    };
+    if age_secs > 15.0 {
+        let body = json!({ "ready": false, "reason": "state_sampler_stale" });
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
+    }
+    let body = json!({ "ready": true, "reason": serde_json::Value::Null });
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+pub(crate) async fn status(State(shared): State<Arc<SharedState>>) -> impl IntoResponse {
+    // Fail-open, no InnerState lock — clone cached snapshot and update age.
+    let mut snap = shared.state.status_snapshot.read().clone();
+    let now = chrono::Utc::now();
+    let age = (now - snap.observed_at).num_milliseconds() as f64 / 1000.0;
+    snap.snapshot_age_seconds = if age.is_finite() && age >= 0.0 {
+        age
+    } else {
+        0.0
+    };
+    // Also surface current heartbeat tasks without holding InnerState
+    // (best-effort: caller sees last sampler's tasks plus live heartbeat snapshot)
+    // We keep sampler's tasks but also append live task snapshot if empty.
+    if snap.tasks.is_empty() {
+        snap.tasks = shared
+            .state
+            .observability
+            .heartbeat()
+            .snapshot()
+            .into_iter()
+            .map(|t| preloop_observability::status::TaskEntry {
+                name: t.name.to_string(),
+                critical: t.critical == preloop_observability::Criticality::Critical,
+                heartbeat_age_seconds: t.heartbeat_age.as_secs_f64(),
+                state: if t.exited {
+                    "exited".to_string()
+                } else if t.heartbeat_age > Duration::from_secs(15) {
+                    "stale".to_string()
+                } else {
+                    "running".to_string()
+                },
+            })
+            .collect();
+    }
+    Json(snap).into_response()
+}
+
+pub(crate) async fn metrics(State(shared): State<Arc<SharedState>>) -> impl IntoResponse {
+    let snap = shared.state.status_snapshot.read().clone();
+    let mut out = String::new();
+    out.push_str("# HELP preloop_service_uptime_seconds Service uptime in seconds.\n");
+    out.push_str("# TYPE preloop_service_uptime_seconds gauge\n");
+    out.push_str(&format!(
+        "preloop_service_uptime_seconds {}\n",
+        snap.service.uptime_seconds
+    ));
+    out.push_str("# HELP preloop_pool_desired Desired pool size.\n");
+    out.push_str("# TYPE preloop_pool_desired gauge\n");
+    out.push_str(&format!("preloop_pool_desired {}\n", snap.pool.desired));
+    out.push_str("# HELP preloop_pool_preparing Pool preparing signal.\n");
+    out.push_str("# TYPE preloop_pool_preparing gauge\n");
+    out.push_str(&format!(
+        "preloop_pool_preparing {}\n",
+        if snap.pool.preparing { 1 } else { 0 }
+    ));
+    out.push_str("# HELP preloop_pool_idle Idle runners in pool.\n");
+    out.push_str("# TYPE preloop_pool_idle gauge\n");
+    out.push_str(&format!("preloop_pool_idle {}\n", snap.pool.idle));
+    out.push_str("# HELP preloop_pool_busy Busy runners in pool.\n");
+    out.push_str("# TYPE preloop_pool_busy gauge\n");
+    out.push_str(&format!("preloop_pool_busy {}\n", snap.pool.busy));
+    out.push_str("# HELP preloop_job_queue_depth Number of jobs by queue.\n");
+    out.push_str("# TYPE preloop_job_queue_depth gauge\n");
+    out.push_str(&format!(
+        "preloop_job_queue_depth{{queue=\"ready\"}} {}\n",
+        snap.jobs.ready
+    ));
+    out.push_str(&format!(
+        "preloop_job_queue_depth{{queue=\"claimable\"}} {}\n",
+        snap.jobs.claimable
+    ));
+    out.push_str(&format!(
+        "preloop_job_queue_depth{{queue=\"unclaimable\"}} {}\n",
+        snap.jobs.unclaimable
+    ));
+    out.push_str(&format!(
+        "preloop_job_queue_depth{{queue=\"dependency_blocked\"}} {}\n",
+        snap.jobs.dependency_blocked
+    ));
+    let body = out;
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response()
 }
 
 /// GitHub's `system.orchestrationId`: `{planId}.{jobId}.{suffix}` where the

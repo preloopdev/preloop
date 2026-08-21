@@ -1675,6 +1675,11 @@ pub struct RunnerPoolConfig {
     /// queued-job starvation clock during the warm; it is cleared before
     /// the pool serves its first job.
     pub preparing_signal: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Consolidated pool handle (replaces the four ad-hoc Option<Arc<…>> fields above).
+    /// When `Some`, the pool updates it and the server sampler reads it.
+    /// Retain the legacy fields for now for backwards compatibility; new code
+    /// should read/write `pool_status`.
+    pub pool_status: Option<Arc<preloop_observability::status::PoolStatus>>,
 }
 
 /// Cache of environment-specific golden VMs.
@@ -2254,6 +2259,9 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         if let Some(signal) = &self.config.preparing_signal {
             signal.store(true, std::sync::atomic::Ordering::Release);
         }
+        if let Some(ps) = &self.config.pool_status {
+            ps.set_preparing(true);
+        }
         ensure_host_externals(&self.config)?;
         if self.config.use_packed_artifact || self.config.control_socket.is_none() {
             self.prepare_artifact(true).await?;
@@ -2288,6 +2296,9 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // counts the full grace window from here.
         if let Some(signal) = &self.config.preparing_signal {
             signal.store(false, std::sync::atomic::Ordering::Release);
+        }
+        if let Some(ps) = &self.config.pool_status {
+            ps.set_preparing(false);
         }
 
         let mut slots = JoinSet::new();
@@ -4919,6 +4930,7 @@ chmod +x "$destination/bin/node"
             next_job_runs_on: None,
             pending_registrations: None,
             preparing_signal: None,
+            pool_status: None,
         }
     }
 

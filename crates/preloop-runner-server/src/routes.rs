@@ -252,8 +252,18 @@ pub(crate) fn build_app(
             crate::dispatch_auth::require_dispatch_auth,
         ));
 
+    let observability_routes = Router::new()
+        .route("/api/v1/status", get(status))
+        .route("/metrics", get(metrics))
+        .route_layer(middleware::from_fn_with_state(
+            shared.clone(),
+            require_native_bearer,
+        ));
+
     let router = Router::new()
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .merge(observability_routes)
         .route("/runs/:run_id", get(get_public_run))
         .route(
             "/openapi.json",
