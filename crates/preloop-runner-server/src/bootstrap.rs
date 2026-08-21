@@ -515,10 +515,16 @@ fn build_operational_snapshot_sync(
             max_lease_age_seconds: None,
         },
         pool: pool_snapshot,
-        vms: VmFleetSnapshot {
-            source: VmSource::Unavailable,
-            sample_age_seconds: None,
-            ..Default::default()
+        vms: {
+            // Host sampler is stubbed until the cgroup parser lands;
+            // the registry is the source of truth for configured counts
+            // and will be populated by RunnerPool on create/fork.
+            let caps = std::collections::HashMap::new();
+            preloop_observability::vm_telemetry::build_fleet_snapshot(
+                observability.vm_registry(),
+                None,
+                caps,
+            )
         },
         store: StoreSnapshot::default(),
         storage: {
@@ -533,11 +539,11 @@ fn build_operational_snapshot_sync(
                 state_dir: state_dir.display().to_string(),
                 state_fs_free_bytes: None,
                 state_fs_free_ratio: None,
-                components: vec![
-                    component("database", state_dir.join("preloop.db")),
-                    component("cache", state_dir.join("cache")),
-                    component("artifacts", state_dir.join("artifacts")),
-                ],
+                // Only the database is a single file. `cache` and `artifacts`
+                // are directories, whose `metadata().len()` is the inode
+                // size, not the contents size; they need the recursive walk
+                // on the 60s cadence.
+                components: vec![component("database", state_dir.join("preloop.db"))],
                 last_gc_at: None,
             }
         },
@@ -644,15 +650,16 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     {
         // One decorator around the private `Store` trait — never per-backend
         // duplication. The backend label is bounded to sqlite|postgres.
-        let backend = if config
+        // Mirror `open_store` precedence: the explicit URL wins, and the
+        // environment is consulted only when none was supplied. Otherwise a
+        // stale `PRELOOP_STORE_URL=postgres://…` would mislabel every
+        // SQLite operation.
+        let effective_url = config
             .store_url
-            .as_deref()
-            .map(|u| u.contains("postgres"))
-            .unwrap_or(false)
-            || std::env::var("PRELOOP_STORE_URL")
-                .map(|v| v.contains("postgres"))
-                .unwrap_or(false)
-        {
+            .clone()
+            .or_else(|| std::env::var("PRELOOP_STORE_URL").ok())
+            .unwrap_or_default();
+        let backend = if effective_url.contains("postgres") {
             "postgres"
         } else {
             "sqlite"
@@ -768,33 +775,33 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             shutdown: shutdown.clone(),
         });
         let scheduler_clone = scheduler.clone();
-        // Spawn a holder task for scheduler_scan heartbeat — keep handle alive for lifetime.
-        let hb_for_holder = scheduler_heartbeat.clone();
-        let shutdown_for_holder = shutdown.clone();
-        tokio::spawn(async move {
-            let _handle = hb_for_holder.register(
-                "scheduler_scan",
-                preloop_observability::Criticality::Critical,
-            );
-            hb_for_holder.beat("scheduler_scan");
-            let mut int = tokio::time::interval(Duration::from_secs(10));
-            int.tick().await;
-            while !shutdown_for_holder.is_cancelled() {
-                tokio::select! {
-                    _ = int.tick() => hb_for_holder.beat("scheduler_scan"),
-                    _ = shutdown_for_holder.cancelled() => break,
-                }
-            }
-        });
+        // The scheduler heartbeat must prove the startup scan progressed, not
+        // that an unrelated timer is awake. The scan tasks beat it per
+        // workflow file and deregister on completion: a scan that hangs or
+        // panics stops beating and `/readyz` goes 503; a completed scan is
+        // not a stale critical task.
+        let scan_hb = scheduler_heartbeat.clone();
         if let Some(workspace) = state.local_workspace.clone() {
+            let shared_for_scan = shared_for_scan.clone();
             tokio::spawn(async move {
+                let handle = scan_hb.register(
+                    "scheduler_scan",
+                    preloop_observability::Criticality::Critical,
+                );
                 scheduler_clone
-                    .scan_workspace(&workspace, shared_for_scan)
+                    .scan_workspace(&workspace, shared_for_scan, Some(handle))
                     .await;
             });
         } else {
+            let shared_for_scan = shared_for_scan.clone();
             tokio::spawn(async move {
-                scheduler_clone.scan_remote(shared_for_scan).await;
+                let handle = scan_hb.register(
+                    "scheduler_scan",
+                    preloop_observability::Criticality::Critical,
+                );
+                scheduler_clone
+                    .scan_remote(shared_for_scan, Some(handle))
+                    .await;
             });
         }
     }

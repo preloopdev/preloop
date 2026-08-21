@@ -301,7 +301,12 @@ impl Scheduler {
     /// Scan a local workspace directory and register all schedule workflows.
     ///
     /// Called once on server startup when `--enable-scheduler` is active.
-    pub async fn scan_workspace(self: &Arc<Self>, workspace: &PathBuf, shared: Arc<SharedState>) {
+    pub async fn scan_workspace(
+        self: &Arc<Self>,
+        workspace: &PathBuf,
+        shared: Arc<SharedState>,
+        heartbeat: Option<preloop_observability::HeartbeatHandle>,
+    ) {
         let wf_dir = workspace.join(".github").join("workflows");
         let entries = match std::fs::read_dir(&wf_dir) {
             Ok(e) => e,
@@ -309,6 +314,9 @@ impl Scheduler {
         };
         for entry in entries.flatten() {
             let path = entry.path();
+            if let Some(hb) = &heartbeat {
+                hb.beat();
+            }
             if !matches!(
                 path.extension().and_then(|e| e.to_str()),
                 Some("yml") | Some("yaml")
@@ -375,7 +383,14 @@ impl Scheduler {
     /// Fetch and install schedules for a remote-backed server at startup.
     /// The repository and token use `PRELOOP_GITHUB_REPOSITORY` and
     /// `PRELOOP_GITHUB_TOKEN`, the same explicit remote workflow configuration.
-    pub async fn scan_remote(self: &Arc<Self>, shared: Arc<SharedState>) {
+    pub async fn scan_remote(
+        self: &Arc<Self>,
+        shared: Arc<SharedState>,
+        heartbeat: Option<preloop_observability::HeartbeatHandle>,
+    ) {
+        if let Some(hb) = &heartbeat {
+            hb.beat();
+        }
         let (Ok(repository), Ok(token)) = (
             std::env::var("PRELOOP_GITHUB_REPOSITORY"),
             std::env::var("PRELOOP_GITHUB_TOKEN"),
