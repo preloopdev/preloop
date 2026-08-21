@@ -7,7 +7,6 @@ description = "Observability handle for Preloop — metrics, logs, traces, statu
 repository = "https://github.com/preloopdev/preloop"
 
 [dependencies]
-anyhow = { workspace = true }
 chrono = { workspace = true }
 parking_lot = { workspace = true }
 rand = { workspace = true }
@@ -20,9 +19,6 @@ uuid = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
 
 [lints]
 workspace = true

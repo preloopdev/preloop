@@ -9,7 +9,7 @@ Preloop can report healthy while the pool repeatedly fails to provision, can't d
 ## Architecture — Three Layers
 
 1. **Zero-dependency diagnostics** — `/healthz`, `/readyz`, `GET /api/v1/status`, `preloop status --json`, structured `stderr`/`journald`, `GET /metrics` (Prometheus text). No sidecar. Answers "why is this job not moving?" with no backend.
-2. **Vendor-neutral telemetry** — OpenTelemetry metrics/logs/short traces via bounded `OTLP/HTTP` batches only when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Fail-open: export never rejects/delays a workflow.
+2. **Vendor-neutral telemetry** — OpenTelemetry metrics/logs/short traces via bounded `OTLP/HTTP` batches only when an `OTEL_EXPORTER_OTLP_*_ENDPOINT` is set. Signal-specific variables (`..._LOGS_/TRACES_/METRICS_ENDPOINT`) are used as-is; the generic `OTEL_EXPORTER_OTLP_ENDPOINT` is a base with the `/v1/<signal>` suffix appended. Headers follow the same per-signal pattern with the generic fallback. Fail-open: export never rejects/delays a workflow.
 3. **Optional reference backend** — pinned single-node OpenObserve (SQLite + local disk, loopback) + importable dashboards. Product boundary is `OTLP + Prometheus`; any backend is interchangeable.
 
 ```

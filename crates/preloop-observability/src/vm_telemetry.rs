@@ -115,10 +115,12 @@ pub fn build_fleet_snapshot(
             storage_bytes,
             overlay_bytes,
         },
+        // The host sampler is not reporting yet, so every measurement is
+        // explicitly absent rather than a fabricated zero.
         host_usage: VmHostUsage {
-            cpu_cores: 0.0,
-            memory_bytes: 0,
-            sparse_disk_allocated_bytes: 0,
+            cpu_cores: None,
+            memory_bytes: None,
+            sparse_disk_allocated_bytes: None,
         },
         top_consumers: Vec::new(),
     }

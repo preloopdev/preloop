@@ -10,7 +10,7 @@ STOP conditions, run every verification gate, and update the corresponding statu
 | Plan | Title | Priority | Effort | Depends on | Status |
 |---|---|---:|---:|---|---|
 | [001](001-caching-performance-strategy.md) | Caching strategy for local and self-hosted CI | P1 | L | — | TODO |
-| [002](002-observability-strategy.md) | Make Preloop observable without making a backend mandatory | P1 | L | — | TODO (revised at `673bdfa0`) |
+| [002](002-observability-strategy.md) | Make Preloop observable without making a backend mandatory | P1 | L | — | IN PROGRESS (revised at `673bdfa0`) |
 
 Status values: `TODO` | `IN PROGRESS` | `DONE` | `BLOCKED: <reason>` | `REJECTED: <reason>`.
 
