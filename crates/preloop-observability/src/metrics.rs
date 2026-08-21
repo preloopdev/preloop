@@ -62,18 +62,29 @@ pub struct HttpLabels {
     pub status_class: String,
 }
 
+/// Identity of an in-flight request. Deliberately carries no
+/// `status_class`: the status is unknown until the response completes, so any
+/// status in the key would let the increment (pre-response) and decrement
+/// (post-response) disagree and permanently leak the gauge.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ActiveLabels {
+    pub method: String,
+    pub route: String,
+    pub surface: String,
+}
+
 #[derive(Debug, Default)]
 pub struct HttpMetrics {
-    active: RwLock<HashMap<HttpLabels, i64>>,
+    active: RwLock<HashMap<ActiveLabels, i64>>,
     durations: RwLock<HashMap<HttpLabels, Histogram>>,
 }
 
 impl HttpMetrics {
-    pub fn inc_active(&self, labels: &HttpLabels) {
+    pub fn inc_active(&self, labels: &ActiveLabels) {
         *self.active.write().entry(labels.clone()).or_insert(0) += 1;
     }
 
-    pub fn dec_active(&self, labels: &HttpLabels) {
+    pub fn dec_active(&self, labels: &ActiveLabels) {
         let mut g = self.active.write();
         if let Some(v) = g.get_mut(labels) {
             *v -= 1;
@@ -97,23 +108,26 @@ impl HttpMetrics {
         out.push_str("# TYPE http_server_request_duration_seconds histogram\n");
         let g = self.durations.read();
         for (labels, hist) in g.iter() {
+            let method = escape_label(&labels.method);
+            let route = escape_label(&labels.route);
+            let surface = escape_label(&labels.surface);
+            let status = escape_label(&labels.status_class);
             for (le, cnt) in &hist.buckets {
                 out.push_str(&format!(
-                    "http_server_request_duration_seconds_bucket{{method=\"{}\",route=\"{}\",surface=\"{}\",status_class=\"{}\",le=\"{}\"}} {}\n",
-                    labels.method, labels.route, labels.surface, labels.status_class, le, cnt
+                    "http_server_request_duration_seconds_bucket{{method=\"{method}\",route=\"{route}\",surface=\"{surface}\",status_class=\"{status}\",le=\"{le}\"}} {cnt}\n"
                 ));
             }
             out.push_str(&format!(
-                "http_server_request_duration_seconds_bucket{{method=\"{}\",route=\"{}\",surface=\"{}\",status_class=\"{}\",le=\"+Inf\"}} {}\n",
-                labels.method, labels.route, labels.surface, labels.status_class, hist.count
+                "http_server_request_duration_seconds_bucket{{method=\"{method}\",route=\"{route}\",surface=\"{surface}\",status_class=\"{status}\",le=\"+Inf\"}} {}\n",
+                hist.count
             ));
             out.push_str(&format!(
-                "http_server_request_duration_seconds_sum{{method=\"{}\",route=\"{}\",surface=\"{}\",status_class=\"{}\"}} {}\n",
-                labels.method, labels.route, labels.surface, labels.status_class, hist.sum
+                "http_server_request_duration_seconds_sum{{method=\"{method}\",route=\"{route}\",surface=\"{surface}\",status_class=\"{status}\"}} {}\n",
+                hist.sum
             ));
             out.push_str(&format!(
-                "http_server_request_duration_seconds_count{{method=\"{}\",route=\"{}\",surface=\"{}\",status_class=\"{}\"}} {}\n",
-                labels.method, labels.route, labels.surface, labels.status_class, hist.count
+                "http_server_request_duration_seconds_count{{method=\"{method}\",route=\"{route}\",surface=\"{surface}\",status_class=\"{status}\"}} {}\n",
+                hist.count
             ));
         }
         out.push_str("# HELP http_server_active_requests Current HTTP concurrency\n");
@@ -122,7 +136,10 @@ impl HttpMetrics {
         for (labels, v) in g2.iter() {
             out.push_str(&format!(
                 "http_server_active_requests{{method=\"{}\",route=\"{}\",surface=\"{}\"}} {}\n",
-                labels.method, labels.route, labels.surface, v
+                escape_label(&labels.method),
+                escape_label(&labels.route),
+                escape_label(&labels.surface),
+                v
             ));
         }
     }
@@ -454,10 +471,6 @@ pub fn classify_surface(route: &str) -> &'static str {
 pub fn normalize_route(raw: &str) -> String {
     // Strip query
     let path = raw.split('?').next().unwrap_or(raw);
-    // Already a template? (contains ':')
-    if path.contains(':') {
-        return path.to_string();
-    }
     // Known templates — longest prefix first
     const TEMPLATES: &[&str] = &[
         "/api/v1/runs/:run_id",
@@ -501,7 +514,9 @@ pub fn normalize_route(raw: &str) -> String {
                 // Ensure it's a segment boundary: /api/v1/runs/abc should match /api/v1/runs/:run_id
                 // but /api/v1/runsXYZ should not.
                 let rest = &path[prefix.len()..];
-                if rest.is_empty() || rest.starts_with('/') {
+                // A parameterized template needs a non-empty child segment;
+                // the bare collection path is matched by its own entry.
+                if rest.len() > 1 && rest.starts_with('/') {
                     return tmpl.to_string();
                 }
             }
@@ -509,6 +524,22 @@ pub fn normalize_route(raw: &str) -> String {
     }
     // Unknown — constant label, never raw path
     "/unknown".to_string()
+}
+
+/// Escape a label value for Prometheus exposition text. The label set is
+/// bounded, but a quote, backslash, or newline would corrupt the entire
+/// scrape; defense in depth on top of the bounded construction.
+fn escape_label(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 pub fn status_class(status: u16) -> &'static str {
@@ -537,6 +568,35 @@ mod tests {
         );
         assert_eq!(normalize_route("/api/v1/status"), "/api/v1/status");
         assert_eq!(normalize_route("/unknown/path/xyz"), "/unknown");
+        // A bare collection path resolves to its own template, not the
+        // single-item one — otherwise list latency is reported under the
+        // item route.
+        assert_eq!(normalize_route("/api/v1/runs"), "/api/v1/runs");
+        assert_eq!(
+            normalize_route("/_apis/artifactcache/cache"),
+            "/_apis/artifactcache/cache"
+        );
+        assert_eq!(
+            normalize_route("/runner/server/_apis/distributedtask/pools"),
+            "/runner/server/_apis/distributedtask/pools"
+        );
+    }
+
+    #[test]
+    fn colon_in_path_cannot_escape_the_template_set() {
+        // A colon is legal inside a path segment; an unauthenticated 404 can
+        // hit /evil:anything and must still land on the constant label.
+        assert_eq!(normalize_route("/evil:1234/path"), "/unknown");
+        assert_eq!(normalize_route("/api/v1/runs:junk"), "/unknown");
+        assert_eq!(normalize_route("/:colon"), "/unknown");
+    }
+
+    #[test]
+    fn escape_label_keeps_scrape_parseable() {
+        // A quote and a backslash must be escaped so the exposition stays
+        // parseable; a real newline must become the two-character escape.
+        assert_eq!(escape_label("a\"b\\c"), "a\\\"b\\\\c");
+        assert_eq!(escape_label("line\nbreak"), "line\\nbreak");
     }
 
     #[test]
@@ -547,6 +607,37 @@ mod tests {
         assert_eq!(classify_surface("/ws/live-logs/123"), "live_logs");
         assert_eq!(classify_surface("/healthz"), "public");
         assert_eq!(classify_surface("/unknown"), "unknown");
+    }
+
+    #[test]
+    fn otlp_bucket_counts_convert_cumulative_to_disjoint() {
+        let mut hist = Histogram::new(&[0.005, 0.01]);
+        // observe() bumps every bucket where value <= le, so buckets are
+        // cumulative: after these three, [3, 2, 0] with count 3.
+        hist.observe(0.004);
+        hist.observe(0.007);
+        hist.observe(0.02);
+        let counts = hist.otlp_bucket_counts();
+        // Disjoint: 1 under 0.005, 1 between 0.005 and 0.01, 1 above.
+        assert_eq!(counts, vec![1, 1, 1]);
+        assert_eq!(counts.iter().sum::<u64>(), hist.count);
+    }
+
+    #[test]
+    fn active_gauge_increment_and_decrement_are_idempotent() {
+        let m = HttpMetrics::default();
+        let labels = ActiveLabels {
+            method: "GET".to_string(),
+            route: "/api/v1/runs".to_string(),
+            surface: "native".to_string(),
+        };
+        m.inc_active(&labels);
+        m.inc_active(&labels);
+        m.dec_active(&labels);
+        // One still in flight; the gauge key carries no status_class, so a
+        // caller cannot increment under one key and decrement under another.
+        let g = m.active.read();
+        assert_eq!(g.get(&labels), Some(&1));
     }
 
     #[test]
@@ -605,11 +696,20 @@ pub struct MetricFamily {
 }
 
 impl Histogram {
-    /// Cumulative bucket counts plus the implicit `+Inf` bucket OTLP requires.
+    /// Convert the cumulative (Prometheus `le`) buckets to the disjoint
+    /// per-bucket counts OTLP requires, where every observation lands in
+    /// exactly one bucket and the counts sum to `count`. Emitting the
+    /// cumulative values as-if-disjoint would count each observation once
+    /// per bucket and blow the total past `count`.
     fn otlp_bucket_counts(&self) -> Vec<u64> {
-        let mut counts: Vec<u64> = self.buckets.iter().map(|(_, c)| *c).collect();
-        counts.push(self.count);
-        counts
+        let mut deltas = Vec::with_capacity(self.buckets.len() + 1);
+        let mut previous = 0;
+        for (_, c) in &self.buckets {
+            deltas.push(c - previous);
+            previous = *c;
+        }
+        deltas.push(self.count - previous);
+        deltas
     }
 
     fn bounds(&self) -> Vec<f64> {
