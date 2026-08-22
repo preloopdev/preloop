@@ -1,0 +1,33 @@
+{
+  "cli_version": "0.10.0",
+  "checkpoint_id": "01M0KPV2X1DB11FWHG7EV378X1",
+  "strategy": "manual-commit",
+  "branch": "pr/6-review-fixes",
+  "checkpoints_count": 10,
+  "files_touched": [
+    ".github/workflows/ci.yml",
+    "Cargo.lock",
+    "Cargo.toml",
+    "crates/preloop-cli/src/main.rs",
+    "crates/preloop-observability/Cargo.toml",
+    "crates/preloop-observability/src/export.rs",
+    "crates/preloop-observability/src/lib.rs",
+    "crates/preloop-observability/src/metrics.rs",
+    "crates/preloop-observability/src/status.rs",
+    "crates/preloop-observability/src/vm_telemetry.rs",
+    "crates/preloop-runner-server/Cargo.toml",
+    "crates/preloop-runner-server/src/http_metrics.rs",
+    "crates/preloop-runner-server/src/main.rs",
+    "crates/preloop-runner-server/src/runs.rs",
+    "crates/preloop-runner/src/main.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": ""
+    }
+  ]
+}
