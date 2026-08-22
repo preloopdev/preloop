@@ -1,13 +1,1 @@
-watch until all ci passes. do not stop until everthing is green
-
----
-
-i thought i told u to not stop until everything is green
-
----
-
-i did but im confused. so pullfrog uses my endpoint but needs the app in Github? huh?
-
----
-
 done
