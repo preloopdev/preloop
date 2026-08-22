@@ -896,7 +896,11 @@ impl SqliteStore {
     /// by SQLite's background `wal_autocheckpoint`. This replaces the previous
     /// truncate-on-every-commit policy, which fsynced the DB per runner event.
     fn maybe_checkpoint_wal(&self, connection: &Connection) -> anyhow::Result<()> {
-        if self.checkpoint_counter.fetch_add(1, Ordering::Relaxed) % WAL_CHECKPOINT_INTERVAL == 0 {
+        if self
+            .checkpoint_counter
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(WAL_CHECKPOINT_INTERVAL)
+        {
             checkpoint_wal(connection)?;
         }
         Ok(())
