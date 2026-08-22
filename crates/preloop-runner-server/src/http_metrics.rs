@@ -5,13 +5,18 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+use opentelemetry::propagation::TextMapPropagator;
+use opentelemetry::trace::{Span, Status, Tracer};
+use opentelemetry::KeyValue;
 use preloop_observability::metrics::{classify_surface, normalize_route, status_class};
+use preloop_observability::{HeaderExtractor, TraceContextPropagator};
 
 use crate::state::SharedState;
 use std::sync::Arc;
 
 /// Middleware that records `http.server.request.duration` and
-/// `http.server.active_requests` with bounded labels.
+/// `http.server.active_requests` with bounded labels, and exports a span for
+/// every non-public request when a traces endpoint is configured.
 ///
 /// - `method` — HTTP method (GET, POST, …)
 /// - `route` — Axum matched template (e.g. `/api/v1/runs/:run_id`), never concrete ID or query
@@ -75,19 +80,28 @@ pub async fn http_metrics_middleware(
     // suppressed from trace export per the signal policy — they would swamp
     // the trace store and tell an operator nothing.
     let traced = shared.state.observability.tracing_enabled() && surface != "public";
-    let span_context = traced.then(|| {
-        preloop_observability::export::SpanContext::from_traceparent(
-            req.headers()
-                .get("traceparent")
-                .and_then(|value| value.to_str().ok()),
-        )
-    });
-    // Only sample the clock when a span will actually be exported.
-    let span_start = span_context
-        .as_ref()
-        .map(|_| preloop_observability::export::now_nanos());
+    let parent_cx =
+        traced.then(|| TraceContextPropagator::new().extract(&HeaderExtractor(req.headers())));
+    let tracer = traced
+        .then(|| shared.state.observability.tracer())
+        .flatten();
 
     let start = Instant::now();
+    let mut span = tracer.as_ref().map(|tracer| {
+        let mut span = tracer.start_with_context(
+            format!("{method} {route}"),
+            parent_cx
+                .as_ref()
+                .unwrap_or(&opentelemetry::Context::current()),
+        );
+        // Attributes are allowlisted, never derived from the raw URI: the
+        // route is the matched template and the surface is a finite set.
+        span.set_attribute(KeyValue::new("http.request.method", method.clone()));
+        span.set_attribute(KeyValue::new("http.route", route.clone()));
+        span.set_attribute(KeyValue::new("preloop.surface", surface.clone()));
+        span
+    });
+
     let res = next.run(req).await;
     let elapsed = start.elapsed();
 
@@ -109,33 +123,18 @@ pub async fn http_metrics_middleware(
     // cancelled or panics; the request is not in flight anymore either way.
     drop(active_guard);
 
-    if let (Some(context), Some(start_nanos)) = (span_context, span_start) {
-        // Attributes are allowlisted, never derived from the raw URI: the
-        // route is the matched template and the surface is a finite set.
-        let attributes = vec![
-            ("http.request.method".to_string(), method.clone()),
-            ("http.route".to_string(), route.clone()),
-            ("preloop.surface".to_string(), surface),
-            ("http.response.status_code".to_string(), status.to_string()),
-        ];
-        shared
-            .state
-            .observability
-            .export_span(preloop_observability::export::SpanRecord {
-                context,
-                name: format!("{method} {route}"),
-                start_nanos,
-                end_nanos: preloop_observability::export::now_nanos(),
-                // Only 5xx is the server's fault; a 4xx is the caller's and
-                // marking it Error would make every unauthenticated probe
-                // look like an outage.
-                status: if status >= 500 {
-                    preloop_observability::export::SpanStatus::Error
-                } else {
-                    preloop_observability::export::SpanStatus::Unset
-                },
-                attributes,
-            });
+    if let Some(span) = &mut span {
+        span.set_attribute(KeyValue::new(
+            "http.response.status_code",
+            status.to_string(),
+        ));
+        // Only 5xx is the server's fault; a 4xx is the caller's and
+        // marking it Error would make every unauthenticated probe
+        // look like an outage.
+        if status >= 500 {
+            span.set_status(Status::error("server error"));
+        }
+        span.end();
     }
 
     res

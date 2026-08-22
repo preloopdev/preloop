@@ -5,24 +5,49 @@
 //! `ServerConfig`; the handle is cloned into `AppState` and `RunnerPoolConfig`.
 //! Tests use `Observability::noop()` which performs no network I/O.
 //!
+//! The transport is the OpenTelemetry SDK: `SdkTracerProvider`,
+//! `SdkMeterProvider`, and `SdkLoggerProvider`, each with OTLP/HTTP batch
+//! exporters (no tonic). A Prometheus reader always backs the meter provider so
+//! `/metrics` works with no backend at all.
+//!
 //! Invariants from the plan:
 //! - Fail open: export failure never rejects a workflow.
 //! - Bounded queues, 2s flush, no backend by default (absent `OTEL_EXPORTER_OTLP_*` = disabled, not `localhost:4318`).
 //! - Always retain `stderr`/`journald` even when OTLP is configured.
 //! - `Debug` on config never reveals headers or credential-bearing endpoint parts.
 
-pub mod export;
 pub mod metrics;
 pub mod status;
 pub mod vm_telemetry;
+
+/// Read `traceparent` from an `http::HeaderMap`. Re-exported for the
+/// middleware's span parent extraction.
+pub use opentelemetry_http::HeaderExtractor;
+/// W3C `traceparent` propagation. Re-exported so the server middleware can
+/// adopt an inbound trace without depending on the SDK crate directly.
+pub use opentelemetry_sdk::propagation::TraceContextPropagator;
 
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use opentelemetry::logs::{AnyValue, LogRecord, Logger, LoggerProvider, Severity};
+use opentelemetry::metrics::MeterProvider;
+use opentelemetry::trace::TracerProvider;
+use opentelemetry::{Key, KeyValue};
+use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
+use opentelemetry_sdk::logs::SdkLoggerProvider;
+use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider, Temporality};
+use opentelemetry_sdk::trace::SdkTracerProvider;
+use opentelemetry_sdk::Resource;
 use parking_lot::RwLock;
+use tracing_subscriber::layer::{Layer, SubscriberExt};
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Registry;
 use uuid::Uuid;
+
+use crate::metrics::{HTTP_BUCKETS, QUEUE_BUCKETS, STORE_BUCKETS};
 
 // ---------------------------------------------------------------------------
 // Log format
@@ -63,6 +88,48 @@ impl LogFormat {
 // ---------------------------------------------------------------------------
 // ObservabilityConfig
 // ---------------------------------------------------------------------------
+
+/// Fully-resolved destination for one signal: URL plus signal-scoped headers.
+#[derive(Debug, Clone)]
+pub struct SignalTarget {
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+}
+
+/// Per-signal export destinations. Resolution (which env var wins, whether
+/// the generic base needs the `/v1/<signal>` suffix) happens here; the SDK
+/// exporters never touch the URL shape again.
+#[derive(Debug, Clone, Default)]
+pub struct ExportTargets {
+    pub logs: Option<SignalTarget>,
+    pub traces: Option<SignalTarget>,
+    pub metrics: Option<SignalTarget>,
+}
+
+impl ExportTargets {
+    pub fn is_empty(&self) -> bool {
+        self.logs.is_none() && self.traces.is_none() && self.metrics.is_none()
+    }
+}
+
+/// Parse `OTEL_EXPORTER_OTLP_HEADERS` (`k1=v1,k2=v2`).
+pub fn parse_headers(raw: Option<&str>) -> Vec<(String, String)> {
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    raw.split(',')
+        .filter_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            let k = k.trim();
+            let v = v.trim();
+            if k.is_empty() || v.is_empty() {
+                None
+            } else {
+                Some((k.to_string(), v.to_string()))
+            }
+        })
+        .collect()
+}
 
 /// Parsed logging + OTel configuration. `Debug` is redacted.
 pub struct ObservabilityConfig {
@@ -168,15 +235,15 @@ impl ObservabilityConfig {
         }
     }
 
-    /// Fully-resolved per-signal destinations for the export worker.
-    pub fn export_targets(&self) -> export::ExportTargets {
+    /// Fully-resolved per-signal destinations for the SDK exporters.
+    pub fn export_targets(&self) -> ExportTargets {
         let signal = |endpoint: &Option<String>, headers: &Option<String>| {
-            endpoint.as_ref().map(|url| export::SignalTarget {
+            endpoint.as_ref().map(|url| SignalTarget {
                 url: url.clone(),
-                headers: export::parse_headers(headers.as_deref()),
+                headers: parse_headers(headers.as_deref()),
             })
         };
-        export::ExportTargets {
+        ExportTargets {
             logs: signal(&self.otel_logs_endpoint, &self.otel_logs_headers),
             traces: signal(&self.otel_traces_endpoint, &self.otel_traces_headers),
             metrics: signal(&self.otel_metrics_endpoint, &self.otel_metrics_headers),
@@ -226,7 +293,7 @@ impl fmt::Debug for ObservabilityConfig {
             .field("otel_endpoint", &self.sanitized_endpoint())
             .field(
                 "otel_headers",
-                &(self.has_otel_headers().then(|| "<redacted>")),
+                &(self.has_otel_headers().then_some("<redacted>")),
             )
             .field("otlp_enabled", &self.otlp_enabled)
             .finish()
@@ -316,6 +383,12 @@ impl TaskHeartbeat {
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.inner.read().len()
+    }
+
+    /// Whether any task is registered (for tests).
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.inner.read().is_empty()
     }
 }
 
@@ -415,21 +488,28 @@ pub struct LimitSnapshot {
 // Observability handle + Runtime
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+/// Cloneable handle — cheap to clone into `AppState` and `RunnerPoolConfig`.
+#[derive(Clone)]
+pub struct Observability {
+    inner: Arc<Inner>,
+}
+
 struct Inner {
     config: Arc<ObservabilityConfig>,
     heartbeat: TaskHeartbeat,
     limits: LimitRegistry,
     metrics: Arc<metrics::MetricsRegistry>,
     vm_registry: Arc<vm_telemetry::VmTelemetryRegistry>,
-    exporter: Option<export::Exporter>,
+    tracer: Option<opentelemetry_sdk::trace::Tracer>,
+    logger: Option<opentelemetry_sdk::logs::SdkLogger>,
+    prometheus_registry: Option<prometheus::Registry>,
     is_noop: bool,
 }
 
-/// Cloneable handle — cheap to clone into `AppState` and `RunnerPoolConfig`.
-#[derive(Debug, Clone)]
-pub struct Observability {
-    inner: Arc<Inner>,
+impl fmt::Debug for Observability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Observability").finish_non_exhaustive()
+    }
 }
 
 impl Observability {
@@ -456,7 +536,9 @@ impl Observability {
                 limits: LimitRegistry::default(),
                 metrics: Arc::new(metrics::MetricsRegistry::default()),
                 vm_registry: Arc::new(vm_telemetry::VmTelemetryRegistry::default()),
-                exporter: None,
+                tracer: None,
+                logger: None,
+                prometheus_registry: None,
                 is_noop: true,
             }),
         }
@@ -465,19 +547,81 @@ impl Observability {
     /// Real handle from `ObservabilityConfig`. Does not install the global subscriber — pair with `ObservabilityRuntime`.
     pub fn from_config(config: ObservabilityConfig) -> (Self, ObservabilityRuntime) {
         let is_noop = !config.otlp_enabled;
-        // Absent endpoint spawns nothing at all — no worker, no socket.
-        // The registry is shared with the worker so metric export scrapes the
-        // same instruments `/metrics` renders — one source, never two.
-        let metrics = Arc::new(metrics::MetricsRegistry::default());
-        let spawned = export::spawn(
-            &config.export_targets(),
-            &config.service_name,
-            &config.instance_id,
-            &config.service_version,
-            Some(metrics.clone()),
-        );
-        let exporter = spawned.as_ref().map(|(exporter, _, _)| exporter.clone());
-        let worker = spawned.map(|(exporter, _, join)| (exporter, join));
+        let targets = config.export_targets();
+        // One rustls client for every signal — the same stack the rest of the
+        // workspace uses (reqwest 0.13).
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .ok();
+        let resource = Resource::builder()
+            .with_attributes(vec![
+                KeyValue::new("service.name", config.service_name.clone()),
+                KeyValue::new("service.version", config.service_version.clone()),
+                KeyValue::new("service.instance.id", config.instance_id.clone()),
+            ])
+            .build();
+
+        // ---- Traces: OTLP/HTTP batch exporter when a traces endpoint exists.
+        let tracer_provider = targets.traces.as_ref().and_then(|target| {
+            let exporter = build_span_exporter(target, http_client.as_ref())?;
+            let provider = SdkTracerProvider::builder()
+                .with_batch_exporter(exporter)
+                .with_resource(resource.clone())
+                .build();
+            Some(provider)
+        });
+
+        // ---- Logs: OTLP/HTTP batch exporter when a logs endpoint exists.
+        let logger_provider = targets.logs.as_ref().and_then(|target| {
+            let exporter = build_log_exporter(target, http_client.as_ref())?;
+            let provider = SdkLoggerProvider::builder()
+                .with_batch_exporter(exporter)
+                .with_resource(resource.clone())
+                .build();
+            Some(provider)
+        });
+
+        // ---- Metrics: Prometheus reader always (local /metrics), OTLP
+        // periodic reader when a metrics endpoint exists. One instrument set,
+        // two readers — the plan's multi-reader requirement.
+        let prometheus_registry = prometheus::Registry::new();
+        let prometheus_exporter = opentelemetry_prometheus::exporter()
+            .with_registry(prometheus_registry.clone())
+            .without_scope_info()
+            .build()
+            .ok();
+        let mut meter_builder = SdkMeterProvider::builder()
+            .with_resource(resource.clone())
+            .with_view(histogram_view("http.server.request.duration", HTTP_BUCKETS))
+            .with_view(histogram_view(
+                "preloop.store.operation.duration",
+                STORE_BUCKETS,
+            ))
+            .with_view(histogram_view("preloop.job.queue.wait", QUEUE_BUCKETS));
+        if let Some(exporter) = prometheus_exporter {
+            meter_builder = meter_builder.with_reader(exporter);
+        }
+        if let Some(target) = targets.metrics.as_ref() {
+            if let Some(exporter) = build_metric_exporter(target, http_client.as_ref()) {
+                meter_builder = meter_builder.with_reader(
+                    PeriodicReader::builder(exporter)
+                        .with_interval(Duration::from_secs(60))
+                        .build(),
+                );
+            }
+        }
+        let meter_provider = meter_builder.build();
+        let meter = meter_provider.meter("preloop");
+        let metrics = Arc::new(metrics::MetricsRegistry::from_meter(meter));
+
+        let tracer = tracer_provider
+            .as_ref()
+            .map(|provider| provider.tracer("preloop"));
+        let logger = logger_provider
+            .as_ref()
+            .map(|provider| provider.logger("preloop"));
+
         let handle = Self {
             inner: Arc::new(Inner {
                 config: Arc::new(config),
@@ -485,11 +629,18 @@ impl Observability {
                 limits: LimitRegistry::default(),
                 metrics,
                 vm_registry: Arc::new(vm_telemetry::VmTelemetryRegistry::default()),
-                exporter,
+                tracer,
+                logger,
+                prometheus_registry: Some(prometheus_registry),
                 is_noop,
             }),
         };
-        let runtime = ObservabilityRuntime::new(handle.clone(), worker);
+        let runtime = ObservabilityRuntime {
+            _handle: handle.clone(),
+            tracer_provider,
+            meter_provider: Some(meter_provider),
+            logger_provider,
+        };
         (handle, runtime)
     }
 
@@ -525,6 +676,18 @@ impl Observability {
         &self.inner.vm_registry
     }
 
+    /// The SDK tracer, when a traces endpoint is configured. `None` for
+    /// no-op handles — callers skip span work entirely.
+    pub fn tracer(&self) -> Option<opentelemetry_sdk::trace::Tracer> {
+        self.inner.tracer.clone()
+    }
+
+    /// Whether spans are worth building. Lets a caller skip id and timestamp
+    /// work entirely when nothing would consume the result.
+    pub fn tracing_enabled(&self) -> bool {
+        self.inner.tracer.is_some()
+    }
+
     /// Enqueue a log record for OTLP export. No-op when export is disabled.
     pub fn export_log(
         &self,
@@ -542,119 +705,225 @@ impl Observability {
         severity: &'static str,
         body: impl Into<String>,
         attributes: Vec<(String, String)>,
-        context: Option<&export::SpanContext>,
+        context: Option<&opentelemetry::trace::SpanContext>,
     ) {
-        if let Some(exporter) = &self.inner.exporter {
-            exporter.log(export::LogRecord {
-                severity,
-                body: body.into(),
-                attributes,
-                trace_id: context.map(|c| c.trace_id.clone()),
-                span_id: context.map(|c| c.span_id.clone()),
-                // Stamp at enqueue, not at flush: a batch-level timestamp
-                // would collapse a flush window's records to one instant.
-                observed_unix_nanos: export::now_nanos(),
-            });
+        let Some(logger) = &self.inner.logger else {
+            return;
+        };
+        let mut record = logger.create_log_record();
+        record.set_severity_text(severity);
+        record.set_severity_number(severity_number(severity));
+        record.set_body(AnyValue::String(body.into().into()));
+        record.add_attributes(
+            attributes
+                .into_iter()
+                .map(|(k, v)| (Key::new(k), AnyValue::String(v.into()))),
+        );
+        if let Some(ctx) = context {
+            record.set_trace_context(ctx.trace_id(), ctx.span_id(), Some(ctx.trace_flags()));
         }
-    }
-
-    /// Enqueue a completed span. No-op when export is disabled.
-    pub fn export_span(&self, record: export::SpanRecord) {
-        if let Some(exporter) = &self.inner.exporter {
-            exporter.span(record);
-        }
-    }
-
-    /// Whether spans are worth building. Lets a caller skip id and timestamp
-    /// work entirely when nothing would consume the result.
-    pub fn tracing_enabled(&self) -> bool {
-        self.inner.exporter.is_some()
-    }
-
-    /// Export health for `/api/v1/status` and `preloop.telemetry.export`.
-    pub fn export_health(&self) -> Option<&Arc<export::ExportHealth>> {
-        self.inner.exporter.as_ref().map(|e| e.health())
+        logger.emit(record);
     }
 
     pub fn config(&self) -> &ObservabilityConfig {
         &self.inner.config
     }
+
+    /// Render the Prometheus registry text for `/metrics`. Empty when the
+    /// registry is absent (noop handles).
+    pub fn render_metrics(&self) -> String {
+        let Some(registry) = &self.inner.prometheus_registry else {
+            return String::new();
+        };
+        use prometheus::Encoder;
+        let encoder = prometheus::TextEncoder::new();
+        let families = registry.gather();
+        let mut out = Vec::new();
+        if encoder.encode(&families, &mut out).is_ok() {
+            String::from_utf8_lossy(&out).into_owned()
+        } else {
+            String::new()
+        }
+    }
+}
+
+fn severity_number(severity: &str) -> Severity {
+    match severity {
+        "TRACE" => Severity::Trace,
+        "DEBUG" => Severity::Debug,
+        "INFO" => Severity::Info,
+        "WARN" => Severity::Warn,
+        "ERROR" => Severity::Error,
+        _ => Severity::Info,
+    }
+}
+
+/// Build an OTLP/HTTP span exporter from a resolved signal target, reusing
+/// the shared rustls reqwest client. `None` on build failure — fail open.
+fn build_span_exporter(
+    target: &SignalTarget,
+    http_client: Option<&reqwest::Client>,
+) -> Option<opentelemetry_otlp::SpanExporter> {
+    use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithHttpConfig};
+    let mut builder = SpanExporter::builder()
+        .with_http()
+        .with_endpoint(&target.url);
+    if !target.headers.is_empty() {
+        builder = builder.with_headers(
+            target
+                .headers
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<HashMap<_, _>>(),
+        );
+    }
+    if let Some(client) = http_client {
+        builder = builder.with_http_client(client.clone());
+    }
+    builder.with_timeout(Duration::from_secs(10)).build().ok()
+}
+
+/// Build an OTLP/HTTP log exporter. `None` on build failure — fail open.
+fn build_log_exporter(
+    target: &SignalTarget,
+    http_client: Option<&reqwest::Client>,
+) -> Option<opentelemetry_otlp::LogExporter> {
+    use opentelemetry_otlp::{LogExporter, WithExportConfig, WithHttpConfig};
+    let mut builder = LogExporter::builder()
+        .with_http()
+        .with_endpoint(&target.url);
+    if !target.headers.is_empty() {
+        builder = builder.with_headers(
+            target
+                .headers
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<HashMap<_, _>>(),
+        );
+    }
+    if let Some(client) = http_client {
+        builder = builder.with_http_client(client.clone());
+    }
+    builder.with_timeout(Duration::from_secs(10)).build().ok()
+}
+
+/// Build an OTLP/HTTP metric exporter. `None` on build failure — fail open.
+fn build_metric_exporter(
+    target: &SignalTarget,
+    http_client: Option<&reqwest::Client>,
+) -> Option<opentelemetry_otlp::MetricExporter> {
+    use opentelemetry_otlp::{MetricExporter, WithExportConfig, WithHttpConfig};
+    let mut builder = MetricExporter::builder()
+        .with_http()
+        .with_endpoint(&target.url)
+        .with_temporality(Temporality::Cumulative);
+    if !target.headers.is_empty() {
+        builder = builder.with_headers(
+            target
+                .headers
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<HashMap<_, _>>(),
+        );
+    }
+    if let Some(client) = http_client {
+        builder = builder.with_http_client(client.clone());
+    }
+    builder.with_timeout(Duration::from_secs(10)).build().ok()
+}
+
+/// A view that pins a histogram's explicit bucket boundaries by instrument
+/// name. Without it the SDK default boundaries would apply to every
+/// histogram and the latency percentiles would be wrong.
+fn histogram_view(
+    name: &'static str,
+    boundaries: &'static [f64],
+) -> impl Fn(&opentelemetry_sdk::metrics::Instrument) -> Option<opentelemetry_sdk::metrics::Stream>
+       + Send
+       + Sync
+       + 'static {
+    move |instrument: &opentelemetry_sdk::metrics::Instrument| {
+        if instrument.name() != name {
+            return None;
+        }
+        opentelemetry_sdk::metrics::Stream::builder()
+            .with_aggregation(
+                opentelemetry_sdk::metrics::Aggregation::ExplicitBucketHistogram {
+                    boundaries: boundaries.to_vec(),
+                    record_min_max: true,
+                },
+            )
+            .build()
+            .ok()
+    }
 }
 
 /// Owns subscriber/provider guards and performs bounded shutdown/flush.
 ///
-/// On `Drop`, attempts to flush for at most 2s per invariant 3, then exits.
-/// Tests use scoped subscribers and never install the global one twice.
+/// On `shutdown`, flushes and shuts down each provider with a 2s bound
+/// (invariant 3), then exits. Tests use scoped subscribers and never install
+/// the global one twice.
 pub struct ObservabilityRuntime {
     _handle: Observability,
-    // The export worker plus its completion handle, taken when the worker
-    // exists. `shutdown` drops the sender so the worker drains, then awaits
-    // the join inside the 2s bound.
-    worker: Option<(export::Exporter, tokio::task::JoinHandle<()>)>,
-    // Hold the tracing guard so it isn't dropped early when we use a
-    // non-global dispatcher in tests. For the global install, this is `None`
-    // and the global dispatcher owns the guard.
-    _guard: Option<
-        tracing_subscriber::reload::Handle<
-            tracing_subscriber::EnvFilter,
-            tracing_subscriber::Registry,
-        >,
-    >,
+    tracer_provider: Option<SdkTracerProvider>,
+    meter_provider: Option<SdkMeterProvider>,
+    logger_provider: Option<SdkLoggerProvider>,
 }
 
 impl ObservabilityRuntime {
-    fn new(
-        handle: Observability,
-        worker: Option<(export::Exporter, tokio::task::JoinHandle<()>)>,
-    ) -> Self {
-        // Does not install the global subscriber here — the binaries do
-        // that via `install_fmt_subscriber`.
-        Self {
-            _handle: handle,
-            worker,
-            _guard: None,
-        }
-    }
-
-    /// Install the global `tracing_subscriber::fmt` layer once, respecting
-    /// `PRELOOP_LOG_FORMAT` and `RUST_LOG` from `config`. Safe to call at most
+    /// Install the global `tracing_subscriber` once: stderr fmt/JSON layer,
+    /// the OTel trace layer, and the OTel log bridge. Safe to call at most
     /// once per process; tests use `install_fmt_subscriber_for_test` instead.
-    pub fn install_fmt_subscriber(config: &ObservabilityConfig) {
-        let filter = tracing_subscriber::EnvFilter::try_new(&config.rust_log)
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    pub fn install_fmt_subscriber(&self) {
+        let config = self._handle.config();
+        let filter =
+            EnvFilter::try_new(&config.rust_log).unwrap_or_else(|_| EnvFilter::new("info"));
         let fmt = config.log_format.resolve();
-        match fmt {
-            LogFormat::Json => {
-                let subscriber = tracing_subscriber::fmt()
-                    .with_env_filter(filter)
-                    .json()
-                    .with_current_span(true)
-                    .with_span_list(true)
-                    .finish();
-                let _ = tracing::subscriber::set_global_default(subscriber);
-            }
-            LogFormat::Pretty | LogFormat::Auto => {
-                let subscriber = tracing_subscriber::fmt()
-                    .with_env_filter(filter)
-                    .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
-                    .finish();
-                let _ = tracing::subscriber::set_global_default(subscriber);
-            }
+
+        let fmt_layer = match fmt {
+            LogFormat::Json => tracing_subscriber::fmt::layer()
+                .json()
+                .with_current_span(true)
+                .with_span_list(true)
+                .boxed(),
+            LogFormat::Pretty | LogFormat::Auto => tracing_subscriber::fmt::layer()
+                .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
+                .boxed(),
+        };
+        // Build the layer chain as a boxed `Layer` so each signal's layer can
+        // be appended without naming the concrete `Layered` type, then wrap it
+        // in the registry. The tracing-opentelemetry layer requires
+        // `LookupSpan`, which the registry provides.
+        let mut chain: Box<
+            dyn tracing_subscriber::Layer<tracing_subscriber::registry::Registry> + Send + Sync,
+        > = Box::new(fmt_layer.with_filter(filter));
+        if let Some(provider) = &self.tracer_provider {
+            let tracer = provider.tracer("preloop");
+            let layer = tracing_opentelemetry::layer().with_tracer(tracer);
+            chain = Box::new(chain.and_then(layer));
         }
+        if let Some(provider) = &self.logger_provider {
+            let layer = OpenTelemetryTracingBridge::new(provider);
+            chain = Box::new(chain.and_then(layer));
+        }
+        let _ = tracing::subscriber::set_global_default(Registry::default().with(chain));
     }
 
-    /// Flush exporters for at most 2s, then exit. The worker is signalled to
-    /// drain its buffers; if it cannot finish within the bound the remaining
-    /// records are dropped rather than delaying shutdown. Export failure is
-    /// logged by the worker, never propagated.
+    /// Flush exporters for at most 2s, then exit. Each provider's bounded
+    /// queue is drained; a hung backend drops the remainder rather than
+    /// delaying shutdown. Export failure is logged by the SDK, never
+    /// propagated.
     pub async fn shutdown(mut self) {
-        let Some((exporter, join)) = self.worker.take() else {
-            return;
-        };
-        exporter.request_shutdown();
-        tokio::time::timeout(Duration::from_secs(2), join)
-            .await
-            .ok();
+        let timeout = Duration::from_secs(2);
+        if let Some(provider) = self.tracer_provider.take() {
+            let _ = provider.shutdown_with_timeout(timeout);
+        }
+        if let Some(provider) = self.meter_provider.take() {
+            let _ = provider.shutdown_with_timeout(timeout);
+        }
+        if let Some(provider) = self.logger_provider.take() {
+            let _ = provider.shutdown_with_timeout(timeout);
+        }
     }
 }
 
@@ -689,6 +958,8 @@ mod tests {
         assert!(obs.is_noop());
         assert!(!obs.otlp_enabled());
         assert!(!obs.instance_id().is_empty());
+        assert!(obs.tracer().is_none());
+        assert!(!obs.tracing_enabled());
     }
 
     #[test]
@@ -721,6 +992,8 @@ mod tests {
         let (obs, _rt) = Observability::from_config(cfg);
         assert!(!obs.otlp_enabled());
         assert!(obs.is_noop());
+        // No exporter workers: a no-op handle has no tracer, no logger.
+        assert!(obs.tracer().is_none());
     }
 
     #[test]
@@ -894,7 +1167,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_is_bounded() {
         let (obs, rt) = Observability::from_config(ObservabilityConfig::from_env());
-        // Must not hang even though there's no exporter.
+        // Must not hang even though there are no exporters.
         tokio::time::timeout(Duration::from_secs(3), rt.shutdown())
             .await
             .expect("shutdown must be bounded to 2s");

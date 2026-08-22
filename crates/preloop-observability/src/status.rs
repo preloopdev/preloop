@@ -11,19 +11,14 @@ use serde::{Deserialize, Serialize};
 // Overall
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Overall {
+    #[default]
     Ok,
     Degraded,
     Blocked,
     ShuttingDown,
-}
-
-impl Default for Overall {
-    fn default() -> Self {
-        Self::Ok
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -98,19 +93,14 @@ pub struct RunnersSnapshot {
 // Pool
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PoolMode {
+    #[default]
     Warm,
     OnDemand,
     External,
     Disabled,
-}
-
-impl Default for PoolMode {
-    fn default() -> Self {
-        Self::Warm
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -251,19 +241,14 @@ impl PoolStatus {
 // VMs
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VmSource {
     CgroupV2,
     Process,
     Mixed,
+    #[default]
     Unavailable,
-}
-
-impl Default for VmSource {
-    fn default() -> Self {
-        Self::Unavailable
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -321,17 +306,12 @@ use std::collections::HashMap;
 // Store / Storage / Github / Debug / Telemetry
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StoreBackend {
+    #[default]
     Sqlite,
     Postgres,
-}
-
-impl Default for StoreBackend {
-    fn default() -> Self {
-        Self::Sqlite
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
