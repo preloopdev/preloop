@@ -62,18 +62,29 @@ pub struct HttpLabels {
     pub status_class: String,
 }
 
+/// Identity of an in-flight request. Deliberately carries no
+/// `status_class`: the status is unknown until the response completes, so any
+/// status in the key would let the increment (pre-response) and decrement
+/// (post-response) disagree and permanently leak the gauge.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ActiveLabels {
+    pub method: String,
+    pub route: String,
+    pub surface: String,
+}
+
 #[derive(Debug, Default)]
 pub struct HttpMetrics {
-    active: RwLock<HashMap<HttpLabels, i64>>,
+    active: RwLock<HashMap<ActiveLabels, i64>>,
     durations: RwLock<HashMap<HttpLabels, Histogram>>,
 }
 
 impl HttpMetrics {
-    pub fn inc_active(&self, labels: &HttpLabels) {
+    pub fn inc_active(&self, labels: &ActiveLabels) {
         *self.active.write().entry(labels.clone()).or_insert(0) += 1;
     }
 
-    pub fn dec_active(&self, labels: &HttpLabels) {
+    pub fn dec_active(&self, labels: &ActiveLabels) {
         let mut g = self.active.write();
         if let Some(v) = g.get_mut(labels) {
             *v -= 1;
@@ -97,23 +108,26 @@ impl HttpMetrics {
         out.push_str("# TYPE http_server_request_duration_seconds histogram\n");
         let g = self.durations.read();
         for (labels, hist) in g.iter() {
+            let method = escape_label(&labels.method);
+            let route = escape_label(&labels.route);
+            let surface = escape_label(&labels.surface);
+            let status = escape_label(&labels.status_class);
             for (le, cnt) in &hist.buckets {
                 out.push_str(&format!(
-                    "http_server_request_duration_seconds_bucket{{method=\"{}\",route=\"{}\",surface=\"{}\",status_class=\"{}\",le=\"{}\"}} {}\n",
-                    labels.method, labels.route, labels.surface, labels.status_class, le, cnt
+                    "http_server_request_duration_seconds_bucket{{method=\"{method}\",route=\"{route}\",surface=\"{surface}\",status_class=\"{status}\",le=\"{le}\"}} {cnt}\n"
                 ));
             }
             out.push_str(&format!(
-                "http_server_request_duration_seconds_bucket{{method=\"{}\",route=\"{}\",surface=\"{}\",status_class=\"{}\",le=\"+Inf\"}} {}\n",
-                labels.method, labels.route, labels.surface, labels.status_class, hist.count
+                "http_server_request_duration_seconds_bucket{{method=\"{method}\",route=\"{route}\",surface=\"{surface}\",status_class=\"{status}\",le=\"+Inf\"}} {}\n",
+                hist.count
             ));
             out.push_str(&format!(
-                "http_server_request_duration_seconds_sum{{method=\"{}\",route=\"{}\",surface=\"{}\",status_class=\"{}\"}} {}\n",
-                labels.method, labels.route, labels.surface, labels.status_class, hist.sum
+                "http_server_request_duration_seconds_sum{{method=\"{method}\",route=\"{route}\",surface=\"{surface}\",status_class=\"{status}\"}} {}\n",
+                hist.sum
             ));
             out.push_str(&format!(
-                "http_server_request_duration_seconds_count{{method=\"{}\",route=\"{}\",surface=\"{}\",status_class=\"{}\"}} {}\n",
-                labels.method, labels.route, labels.surface, labels.status_class, hist.count
+                "http_server_request_duration_seconds_count{{method=\"{method}\",route=\"{route}\",surface=\"{surface}\",status_class=\"{status}\"}} {}\n",
+                hist.count
             ));
         }
         out.push_str("# HELP http_server_active_requests Current HTTP concurrency\n");
@@ -122,7 +136,10 @@ impl HttpMetrics {
         for (labels, v) in g2.iter() {
             out.push_str(&format!(
                 "http_server_active_requests{{method=\"{}\",route=\"{}\",surface=\"{}\"}} {}\n",
-                labels.method, labels.route, labels.surface, v
+                escape_label(&labels.method),
+                escape_label(&labels.route),
+                escape_label(&labels.surface),
+                v
             ));
         }
     }
@@ -454,10 +471,6 @@ pub fn classify_surface(route: &str) -> &'static str {
 pub fn normalize_route(raw: &str) -> String {
     // Strip query
     let path = raw.split('?').next().unwrap_or(raw);
-    // Already a template? (contains ':')
-    if path.contains(':') {
-        return path.to_string();
-    }
     // Known templates — longest prefix first
     const TEMPLATES: &[&str] = &[
         "/api/v1/runs/:run_id",
@@ -501,7 +514,9 @@ pub fn normalize_route(raw: &str) -> String {
                 // Ensure it's a segment boundary: /api/v1/runs/abc should match /api/v1/runs/:run_id
                 // but /api/v1/runsXYZ should not.
                 let rest = &path[prefix.len()..];
-                if rest.is_empty() || rest.starts_with('/') {
+                // A parameterized template needs a non-empty child segment;
+                // the bare collection path is matched by its own entry.
+                if rest.len() > 1 && rest.starts_with('/') {
                     return tmpl.to_string();
                 }
             }
@@ -509,6 +524,22 @@ pub fn normalize_route(raw: &str) -> String {
     }
     // Unknown — constant label, never raw path
     "/unknown".to_string()
+}
+
+/// Escape a label value for Prometheus exposition text. The label set is
+/// bounded, but a quote, backslash, or newline would corrupt the entire
+/// scrape; defense in depth on top of the bounded construction.
+fn escape_label(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 pub fn status_class(status: u16) -> &'static str {
@@ -537,6 +568,35 @@ mod tests {
         );
         assert_eq!(normalize_route("/api/v1/status"), "/api/v1/status");
         assert_eq!(normalize_route("/unknown/path/xyz"), "/unknown");
+        // A bare collection path resolves to its own template, not the
+        // single-item one — otherwise list latency is reported under the
+        // item route.
+        assert_eq!(normalize_route("/api/v1/runs"), "/api/v1/runs");
+        assert_eq!(
+            normalize_route("/_apis/artifactcache/cache"),
+            "/_apis/artifactcache/cache"
+        );
+        assert_eq!(
+            normalize_route("/runner/server/_apis/distributedtask/pools"),
+            "/runner/server/_apis/distributedtask/pools"
+        );
+    }
+
+    #[test]
+    fn colon_in_path_cannot_escape_the_template_set() {
+        // A colon is legal inside a path segment; an unauthenticated 404 can
+        // hit /evil:anything and must still land on the constant label.
+        assert_eq!(normalize_route("/evil:1234/path"), "/unknown");
+        assert_eq!(normalize_route("/api/v1/runs:junk"), "/unknown");
+        assert_eq!(normalize_route("/:colon"), "/unknown");
+    }
+
+    #[test]
+    fn escape_label_keeps_scrape_parseable() {
+        // A quote and a backslash must be escaped so the exposition stays
+        // parseable; a real newline must become the two-character escape.
+        assert_eq!(escape_label("a\"b\\c"), "a\\\"b\\\\c");
+        assert_eq!(escape_label("line\nbreak"), "line\\nbreak");
     }
 
     #[test]
@@ -547,6 +607,37 @@ mod tests {
         assert_eq!(classify_surface("/ws/live-logs/123"), "live_logs");
         assert_eq!(classify_surface("/healthz"), "public");
         assert_eq!(classify_surface("/unknown"), "unknown");
+    }
+
+    #[test]
+    fn otlp_bucket_counts_convert_cumulative_to_disjoint() {
+        let mut hist = Histogram::new(&[0.005, 0.01]);
+        // observe() bumps every bucket where value <= le, so buckets are
+        // cumulative: after these three, [3, 2, 0] with count 3.
+        hist.observe(0.004);
+        hist.observe(0.007);
+        hist.observe(0.02);
+        let counts = hist.otlp_bucket_counts();
+        // Disjoint: 1 under 0.005, 1 between 0.005 and 0.01, 1 above.
+        assert_eq!(counts, vec![1, 1, 1]);
+        assert_eq!(counts.iter().sum::<u64>(), hist.count);
+    }
+
+    #[test]
+    fn active_gauge_increment_and_decrement_are_idempotent() {
+        let m = HttpMetrics::default();
+        let labels = ActiveLabels {
+            method: "GET".to_string(),
+            route: "/api/v1/runs".to_string(),
+            surface: "native".to_string(),
+        };
+        m.inc_active(&labels);
+        m.inc_active(&labels);
+        m.dec_active(&labels);
+        // One still in flight; the gauge key carries no status_class, so a
+        // caller cannot increment under one key and decrement under another.
+        let g = m.active.read();
+        assert_eq!(g.get(&labels), Some(&1));
     }
 
     #[test]
@@ -564,5 +655,253 @@ mod tests {
             m.observe_duration(labels, Duration::from_millis(10));
         }
         assert_eq!(m.series_count(), 1, "1000 distinct IDs must be 1 series");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Structured collection for OTLP export
+// ---------------------------------------------------------------------------
+
+/// One data point, already reduced to bounded attributes.
+#[derive(Debug, Clone)]
+pub enum MetricPoint {
+    /// Monotonic counter (OTLP `sum`, cumulative, `isMonotonic: true`).
+    Sum {
+        value: f64,
+        attributes: Vec<(String, String)>,
+    },
+    /// Instantaneous value (OTLP `gauge`).
+    Gauge {
+        value: f64,
+        attributes: Vec<(String, String)>,
+    },
+    /// Explicit-bucket histogram (OTLP `histogram`, cumulative).
+    ///
+    /// `bucket_counts` is one longer than `bounds`: OTLP requires the
+    /// implicit `+Inf` bucket to be present as the final entry.
+    Histogram {
+        count: u64,
+        sum: f64,
+        bounds: Vec<f64>,
+        bucket_counts: Vec<u64>,
+        attributes: Vec<(String, String)>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct MetricFamily {
+    pub name: String,
+    pub unit: &'static str,
+    pub points: Vec<MetricPoint>,
+}
+
+impl Histogram {
+    /// Convert the cumulative (Prometheus `le`) buckets to the disjoint
+    /// per-bucket counts OTLP requires, where every observation lands in
+    /// exactly one bucket and the counts sum to `count`. Emitting the
+    /// cumulative values as-if-disjoint would count each observation once
+    /// per bucket and blow the total past `count`.
+    fn otlp_bucket_counts(&self) -> Vec<u64> {
+        let mut deltas = Vec::with_capacity(self.buckets.len() + 1);
+        let mut previous = 0;
+        for (_, c) in &self.buckets {
+            deltas.push(c - previous);
+            previous = *c;
+        }
+        deltas.push(self.count - previous);
+        deltas
+    }
+
+    fn bounds(&self) -> Vec<f64> {
+        self.buckets.iter().map(|(le, _)| *le).collect()
+    }
+}
+
+impl HttpMetrics {
+    fn collect(&self, out: &mut Vec<MetricFamily>) {
+        let durations = self.durations.read();
+        if !durations.is_empty() {
+            out.push(MetricFamily {
+                name: "http.server.request.duration".to_string(),
+                unit: "s",
+                points: durations
+                    .iter()
+                    .map(|(labels, hist)| MetricPoint::Histogram {
+                        count: hist.count,
+                        sum: hist.sum,
+                        bounds: hist.bounds(),
+                        bucket_counts: hist.otlp_bucket_counts(),
+                        attributes: vec![
+                            ("http.request.method".to_string(), labels.method.clone()),
+                            ("http.route".to_string(), labels.route.clone()),
+                            ("preloop.surface".to_string(), labels.surface.clone()),
+                            (
+                                "http.response.status_class".to_string(),
+                                labels.status_class.clone(),
+                            ),
+                        ],
+                    })
+                    .collect(),
+            });
+        }
+        let active = self.active.read();
+        if !active.is_empty() {
+            out.push(MetricFamily {
+                name: "http.server.active_requests".to_string(),
+                unit: "{request}",
+                points: active
+                    .iter()
+                    .map(|(labels, value)| MetricPoint::Gauge {
+                        value: *value as f64,
+                        attributes: vec![
+                            ("http.request.method".to_string(), labels.method.clone()),
+                            ("http.route".to_string(), labels.route.clone()),
+                            ("preloop.surface".to_string(), labels.surface.clone()),
+                        ],
+                    })
+                    .collect(),
+            });
+        }
+    }
+}
+
+impl StoreMetrics {
+    fn collect(&self, out: &mut Vec<MetricFamily>) {
+        let durations = self.durations.read();
+        if !durations.is_empty() {
+            out.push(MetricFamily {
+                name: "preloop.store.operation.duration".to_string(),
+                unit: "s",
+                points: durations
+                    .iter()
+                    .map(|(labels, hist)| MetricPoint::Histogram {
+                        count: hist.count,
+                        sum: hist.sum,
+                        bounds: hist.bounds(),
+                        bucket_counts: hist.otlp_bucket_counts(),
+                        attributes: vec![
+                            ("db.system".to_string(), labels.backend.clone()),
+                            ("preloop.operation".to_string(), labels.operation.clone()),
+                            ("preloop.outcome".to_string(), labels.outcome.clone()),
+                        ],
+                    })
+                    .collect(),
+            });
+        }
+        let failures = self.consecutive_failures.read();
+        if !failures.is_empty() {
+            out.push(MetricFamily {
+                name: "preloop.store.consecutive_failures".to_string(),
+                unit: "{failure}",
+                points: failures
+                    .iter()
+                    .map(|(backend, value)| MetricPoint::Gauge {
+                        value: *value as f64,
+                        attributes: vec![("db.system".to_string(), backend.clone())],
+                    })
+                    .collect(),
+            });
+        }
+    }
+}
+
+impl LifecycleMetrics {
+    fn collect(&self, out: &mut Vec<MetricFamily>) {
+        let completed = self.job_completed.read();
+        if !completed.is_empty() {
+            out.push(MetricFamily {
+                name: "preloop.job.completed".to_string(),
+                unit: "{job}",
+                points: completed
+                    .iter()
+                    .map(|(labels, value)| MetricPoint::Sum {
+                        value: *value as f64,
+                        attributes: vec![
+                            ("preloop.conclusion".to_string(), labels.conclusion.clone()),
+                            ("preloop.reason".to_string(), labels.reason.clone()),
+                        ],
+                    })
+                    .collect(),
+            });
+        }
+        let wait = self.queue_wait.read();
+        if !wait.is_empty() {
+            out.push(MetricFamily {
+                name: "preloop.job.queue.wait".to_string(),
+                unit: "s",
+                points: wait
+                    .iter()
+                    .map(|(labels, hist)| MetricPoint::Histogram {
+                        count: hist.count,
+                        sum: hist.sum,
+                        bounds: hist.bounds(),
+                        bucket_counts: hist.otlp_bucket_counts(),
+                        attributes: vec![("preloop.outcome".to_string(), labels.outcome.clone())],
+                    })
+                    .collect(),
+            });
+        }
+        let poll = self.broker_poll.read();
+        if !poll.is_empty() {
+            out.push(MetricFamily {
+                name: "preloop.broker.poll".to_string(),
+                unit: "{poll}",
+                points: poll
+                    .iter()
+                    .map(|(labels, value)| MetricPoint::Sum {
+                        value: *value as f64,
+                        attributes: vec![("preloop.outcome".to_string(), labels.outcome.clone())],
+                    })
+                    .collect(),
+            });
+        }
+        let sessions = self.session_transition.read();
+        if !sessions.is_empty() {
+            out.push(MetricFamily {
+                name: "preloop.runner.session.transition".to_string(),
+                unit: "{transition}",
+                points: sessions
+                    .iter()
+                    .map(|(labels, value)| MetricPoint::Sum {
+                        value: *value as f64,
+                        attributes: vec![
+                            ("preloop.operation".to_string(), labels.operation.clone()),
+                            ("preloop.reason".to_string(), labels.reason.clone()),
+                        ],
+                    })
+                    .collect(),
+            });
+        }
+        let concurrency = self.concurrency_decision.read();
+        if !concurrency.is_empty() {
+            out.push(MetricFamily {
+                name: "preloop.concurrency.decision".to_string(),
+                unit: "{decision}",
+                points: concurrency
+                    .iter()
+                    .map(|(labels, value)| MetricPoint::Sum {
+                        value: *value as f64,
+                        attributes: vec![
+                            ("preloop.queue_mode".to_string(), labels.queue_mode.clone()),
+                            ("preloop.action".to_string(), labels.action.clone()),
+                        ],
+                    })
+                    .collect(),
+            });
+        }
+    }
+}
+
+impl MetricsRegistry {
+    /// Snapshot every instrument as OTLP-ready families.
+    ///
+    /// Read-only: takes each sub-registry's read lock in turn and never holds
+    /// two at once, so a scrape cannot deadlock against a recording caller.
+    pub fn collect(&self) -> Vec<MetricFamily> {
+        let mut families = Vec::new();
+        self.http.collect(&mut families);
+        self.store.collect(&mut families);
+        self.lifecycle.collect(&mut families);
+        families
     }
 }

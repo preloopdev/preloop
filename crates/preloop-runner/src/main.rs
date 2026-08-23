@@ -16,7 +16,8 @@ async fn main() -> Result<()> {
 
     // Runner gets structured local logging only — never OTLP export by default.
     // `PRELOOP_LOG_FORMAT` still controls pretty/json/auto for consistency.
-    let obs_config = preloop_observability::ObservabilityConfig::from_env();
+    let obs_config = preloop_observability::ObservabilityConfig::from_env()
+        .with_service_version(env!("CARGO_PKG_VERSION"));
     let (observability, observability_runtime) =
         preloop_observability::Observability::from_config(obs_config);
     preloop_observability::ObservabilityRuntime::install_fmt_subscriber(observability.config());

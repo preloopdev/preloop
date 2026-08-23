@@ -79,12 +79,15 @@ async fn main() -> anyhow::Result<()> {
     // like the CLI, instead of falling silent when unset. `PRELOOP_LOG_FORMAT`
     // controls pretty/json/auto. The `Observability` handle will be cloned
     // into `AppState`; for now it is held for the life of `main`.
-    let obs_config = preloop_observability::ObservabilityConfig::from_env();
+    let obs_config = preloop_observability::ObservabilityConfig::from_env()
+        .with_service_version(env!("CARGO_PKG_VERSION"));
     let (observability, observability_runtime) =
         preloop_observability::Observability::from_config(obs_config);
     preloop_observability::ObservabilityRuntime::install_fmt_subscriber(observability.config());
-    let _observability = observability;
-    let _observability_runtime = observability_runtime;
+    // The handle reaches `ServerConfig` below; holding it here alone would
+    // leave the server on the no-op handle installed by `AppState::new`, so
+    // nothing would ever export.
+    let mut observability_runtime = observability_runtime;
 
     let cli = Cli::parse();
     match cli.command {
@@ -131,7 +134,7 @@ async fn main() -> anyhow::Result<()> {
                 pool_preparing: None,
                 listen,
                 pool_status: None,
-                observability: None,
+                observability: Some(observability.clone()),
                 systemd_socket_activation: false,
                 unix_socket,
                 state_dir,
@@ -156,5 +159,8 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         }
     }
+    // Bounded 2s flush of buffered telemetry before exit; a clean shutdown
+    // must not drop the last flush window's records.
+    observability_runtime.shutdown().await;
     Ok(())
 }
