@@ -9,6 +9,7 @@ description = "VM provider abstraction for Preloop CI"
 
 [dependencies]
 async-trait = { workspace = true }
+preloop-observability = { path = "../preloop-observability" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

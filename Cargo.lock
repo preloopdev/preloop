@@ -2021,7 +2021,10 @@ name = "preloop-observability"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "parking_lot",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2038,6 +2041,7 @@ dependencies = [
  "futures",
  "preloop-gha-parser",
  "preloop-gha-protocol",
+ "preloop-observability",
  "preloop-runner-server",
  "preloop-vm",
  "reqwest",

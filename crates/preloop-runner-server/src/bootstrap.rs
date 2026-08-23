@@ -48,6 +48,12 @@ pub struct ServerConfig {
     /// presents the matching provisioning token.
     pub pending_registrations:
         Option<Arc<std::sync::RwLock<std::collections::BTreeMap<String, std::time::SystemTime>>>>,
+    /// Consolidated pool handle (replaces the four ad-hoc Option<Arc<…>> fields).
+    /// When `Some`, the pool updates it and the sampler reads it.
+    pub pool_status: Option<Arc<preloop_observability::status::PoolStatus>>,
+    /// Observability handle to clone into AppState (heartbeat, limits).
+    /// `None` falls back to `Observability::noop()` (tests).
+    pub observability: Option<preloop_observability::Observability>,
     /// `PRELOOP_REQUIRE_JOB_ASSIGNMENTS`: refuse to dispatch any job without
     /// a recorded assignment, including to external runners.
     pub require_job_assignments: bool,
@@ -77,6 +83,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("oidc_issuer", &self.oidc_issuer)
             .field("enable_scheduler", &self.enable_scheduler)
             .field("pending_registrations", &self.pending_registrations)
+            .field("pool_status", &self.pool_status)
             .field("require_job_assignments", &self.require_job_assignments)
             .finish()
     }
@@ -182,7 +189,8 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
         .state
         .pool_preparing
         .as_ref()
-        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
+        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+        || shared.state.pool_status.snapshot().preparing;
     let queued_jobs: Vec<_> = inner.queue.iter().cloned().collect();
     let in_queue: std::collections::BTreeSet<(RunId, JobId)> = queued_jobs
         .iter()
@@ -397,15 +405,216 @@ async fn run_background_reaper(shared: Arc<SharedState>) {
     let mut interval = tokio::time::interval(Duration::from_secs(10));
     // Skip the first tick
     interval.tick().await;
+    //Heartbeat for reaper (critical) — beat each interval, no cadence change.
+    let heartbeat = shared.state.observability.heartbeat().clone();
+    let _reaper_handle = heartbeat.register("reaper", preloop_observability::Criticality::Critical);
+    heartbeat.beat("reaper");
 
     while !shared.shutdown.is_cancelled() {
         tokio::select! {
             _ = interval.tick() => {
+                heartbeat.beat("reaper");
                 reap_once(&shared).await;
             }
             _ = shared.shutdown.cancelled() => {
                 break;
             }
+        }
+    }
+}
+
+fn build_operational_snapshot_sync(
+    queue_len: usize,
+    pending_jobs_len: usize,
+    pending_expansions_len: usize,
+    expanding_len: usize,
+    runs_queued: u32,
+    runs_in_progress: u32,
+    runs_completed: u32,
+    registered: u32,
+    sessions_len: u32,
+    queue_jobs: Vec<QueuedJob>,
+    runner_labels: Vec<Vec<String>>,
+    pool_snapshot: preloop_observability::status::PoolSnapshot,
+    observability: &preloop_observability::Observability,
+    started_at: std::time::Instant,
+    shutdown_requested: bool,
+    scheduler_enabled: bool,
+    state_dir: &std::path::Path,
+    github_configured: bool,
+) -> preloop_observability::status::OperationalSnapshot {
+    use chrono::Utc;
+    use preloop_observability::status::*;
+    let now = Utc::now();
+    let uptime = started_at.elapsed().as_secs();
+    // Claimability: distinguish claimable vs unclaimable using existing runner label matching.
+    let (claimable, unclaimable) = if queue_jobs.is_empty() {
+        (0, 0)
+    } else if runner_labels.is_empty() {
+        (0, queue_jobs.len() as u32)
+    } else if pool_snapshot.preparing {
+        // Temporarily unclaimable while pool prepares.
+        (0, queue_jobs.len() as u32)
+    } else {
+        let mut claimable = 0u32;
+        for job in &queue_jobs {
+            let matches = runner_labels
+                .iter()
+                .any(|labels| crate::runtime_scheduling::job_matches_runner(&job.runs_on, labels));
+            if matches {
+                claimable += 1;
+            }
+        }
+        (claimable, queue_jobs.len() as u32 - claimable)
+    };
+
+    let oldest_ready_seconds = None; // TODO: track queued_at
+
+    OperationalSnapshot {
+        schema_version: 1,
+        observed_at: now,
+        snapshot_age_seconds: 0.0,
+        overall: if shutdown_requested {
+            Overall::ShuttingDown
+        } else {
+            Overall::Ok
+        },
+        service: ServiceSnapshot {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            instance_id: observability.instance_id().to_string(),
+            uptime_seconds: uptime,
+            shutdown_requested,
+        },
+        runs: RunsSnapshot {
+            queued: runs_queued,
+            in_progress: runs_in_progress,
+            completed: runs_completed,
+        },
+        jobs: JobsSnapshot {
+            ready: queue_len as u32,
+            dependency_blocked: pending_jobs_len as u32,
+            concurrency_blocked: 0,
+            pending_expansion: pending_expansions_len as u32,
+            expanding: expanding_len as u32,
+            claimable,
+            unclaimable,
+            oldest_ready_seconds,
+        },
+        concurrency: ConcurrencySnapshot::default(),
+        scheduler: SchedulerSnapshot {
+            enabled: scheduler_enabled,
+            ..Default::default()
+        },
+        runners: RunnersSnapshot {
+            registered,
+            sessions: sessions_len,
+            idle: 0,
+            busy: 0,
+            stale: 0,
+            max_poll_age_seconds: None,
+            max_lease_age_seconds: None,
+        },
+        pool: pool_snapshot,
+        vms: VmFleetSnapshot {
+            source: VmSource::Unavailable,
+            sample_age_seconds: None,
+            ..Default::default()
+        },
+        store: StoreSnapshot::default(),
+        storage: {
+            // Per-component bytes for the state dir. Cheap `metadata` reads on
+            // the 5s tick; a recursive walk would belong on the 60s cadence and
+            // must never run under the state lock.
+            let component = |name: &str, path: std::path::PathBuf| StorageComponent {
+                store: name.to_string(),
+                bytes: std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+            };
+            StorageSnapshot {
+                state_dir: state_dir.display().to_string(),
+                state_fs_free_bytes: None,
+                state_fs_free_ratio: None,
+                components: vec![
+                    component("database", state_dir.join("preloop.db")),
+                    component("cache", state_dir.join("cache")),
+                    component("artifacts", state_dir.join("artifacts")),
+                ],
+                last_gc_at: None,
+            }
+        },
+        limits: Vec::new(),
+        tasks: Vec::new(),
+        github: GithubSnapshot {
+            configured: github_configured,
+            ..Default::default()
+        },
+        debug: DebugSnapshot::default(),
+        telemetry: TelemetrySnapshot::default(),
+        conditions: Vec::new(),
+    }
+}
+
+async fn run_state_sampler(shared: Arc<SharedState>) {
+    let heartbeat = shared.state.observability.heartbeat().clone();
+    let _handle = heartbeat.register(
+        "state_sampler",
+        preloop_observability::Criticality::Critical,
+    );
+    heartbeat.beat("state_sampler");
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    // Immediate sample then every 5s.
+    interval.tick().await;
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                heartbeat.beat("state_sampler");
+                // Clone needed state under lock, release, then build.
+                let (queue_len, pending_jobs_len, pending_expansions_len, expanding_len, runs_queued, runs_in_progress, runs_completed, registered, sessions_len, queue_jobs, runner_labels, scheduler_enabled) = {
+                    let inner = shared.state.inner.lock().await;
+                    let queue_len = inner.queue.len();
+                    let pending_jobs_len = inner.pending_jobs.len();
+                    let pending_expansions_len = inner.pending_expansions.len();
+                    let expanding_len = inner.expanding.len();
+                    let mut q = 0u32; let mut ip = 0u32; let mut c = 0u32;
+                    for run in inner.runs.values() {
+                        match run.status {
+                            ExecutionStatus::Queued => q += 1,
+                            ExecutionStatus::InProgress => ip += 1,
+                            s if s.is_terminal() => c += 1,
+                            _ => {}
+                        }
+                    }
+                    let registered = inner.runners.len() as u32;
+                    let sessions_len = inner.sessions.len() as u32;
+                    let queue_jobs = inner.queue.iter().cloned().collect::<Vec<_>>();
+                    let runner_labels = inner.runners.values().map(|r| r.labels.clone()).collect::<Vec<_>>();
+                    let scheduler_enabled = shared.state.scheduler.is_some();
+                    // Clone pool snapshot outside inner lock? It's cheap, do after.
+                    (queue_len, pending_jobs_len, pending_expansions_len, expanding_len, q, ip, c, registered, sessions_len, queue_jobs, runner_labels, scheduler_enabled)
+                };
+                let pool_snapshot = shared.state.pool_status.snapshot();
+                let snap = build_operational_snapshot_sync(
+                    queue_len,
+                    pending_jobs_len,
+                    pending_expansions_len,
+                    expanding_len,
+                    runs_queued,
+                    runs_in_progress,
+                    runs_completed,
+                    registered,
+                    sessions_len,
+                    queue_jobs,
+                    runner_labels,
+                    pool_snapshot,
+                    &shared.state.observability,
+                    shared.state.started_at,
+                    shared.shutdown.is_cancelled(),
+                    scheduler_enabled,
+                    &shared.state.state_dir,
+                    shared.state.github_app.is_some(),
+                );
+                *shared.state.status_snapshot.write() = snap;
+            }
+            _ = shared.shutdown.cancelled() => break,
         }
     }
 }
@@ -424,6 +633,39 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         config.store_url.as_deref(),
     )
     .await?;
+    // Wire observability if supplied (CLI/server will pass its handle).
+    if let Some(obs) = config.observability.clone() {
+        state.observability = obs;
+    }
+    if let Some(ps) = config.pool_status.clone() {
+        state.pool_status = ps;
+    }
+    // Ensure uptime base is now (AppState::new set it, but re-arm after store load).
+    state.started_at = std::time::Instant::now();
+    // Seed initial snapshot so /readyz and /status have data before first 5s tick.
+    {
+        let init = build_operational_snapshot_sync(
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            Vec::new(),
+            Vec::new(),
+            state.pool_status.snapshot(),
+            &state.observability,
+            state.started_at,
+            false,
+            false,
+            &state.state_dir,
+            state.github_app.is_some(),
+        );
+        *state.status_snapshot.write() = init;
+    }
     if let Some(queue_depth) = config.queue_depth.clone() {
         state.queue_depth = queue_depth;
         // The pool shares this same atomic and only forks a runner while it
@@ -435,22 +677,45 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             state.inner.lock().await.queue.len(),
             std::sync::atomic::Ordering::Release,
         );
+        state
+            .pool_status
+            .set_queue_depth(state.queue_depth.load(std::sync::atomic::Ordering::Acquire) as u32);
     }
     if let Some(next_job_runs_on) = config.next_job_runs_on.clone() {
         state.next_job_runs_on = next_job_runs_on;
+        if let Ok(v) = state.next_job_runs_on.read() {
+            state.pool_status.set_next_job_runs_on(v.clone());
+        }
     }
     {
         let inner = state.inner.lock().await;
         crate::runtime_scheduling::sync_next_job_labels(&inner, &state.next_job_runs_on);
+        if state.pool_status.snapshot().next_job_runs_on.is_empty() {
+            if let Ok(v) = state.next_job_runs_on.read() {
+                state.pool_status.set_next_job_runs_on(v.clone());
+            }
+        }
     }
     {
         let pool_managed = config.pending_registrations.is_some();
         if let Some(pending_registrations) = config.pending_registrations.clone() {
             state.pending_registrations = pending_registrations;
+            // Mirror into consolidated handle for sampler visibility
+            if let Ok(map) = state.pending_registrations.read() {
+                for (k, v) in map.iter() {
+                    state.pool_status.insert_pending(k.clone(), *v);
+                }
+            }
         }
         let mut inner = state.inner.lock().await;
         inner.pool_assignments_enabled = pool_managed;
         inner.require_job_assignments = config.require_job_assignments;
+    }
+    if let Some(pool_preparing) = config.pool_preparing.clone() {
+        state.pool_preparing = Some(pool_preparing.clone());
+        if pool_preparing.load(std::sync::atomic::Ordering::Acquire) {
+            state.pool_status.set_preparing(true);
+        }
     }
     if !config.listen.ip().is_loopback() && state.system_token == DEFAULT_PRELOOP_SYSTEM_TOKEN {
         anyhow::bail!(
@@ -467,6 +732,8 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         inner.oidc_issuer = oidc_issuer;
     }
     let shutdown = CancellationToken::new();
+    // Heartbeat for scheduler scan (critical) if enabled — beat periodically.
+    let scheduler_heartbeat = state.observability.heartbeat().clone();
     if config.enable_scheduler {
         let scheduler = crate::scheduler::Scheduler::new();
         state.scheduler = Some(scheduler.clone());
@@ -475,6 +742,24 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             shutdown: shutdown.clone(),
         });
         let scheduler_clone = scheduler.clone();
+        // Spawn a holder task for scheduler_scan heartbeat — keep handle alive for lifetime.
+        let hb_for_holder = scheduler_heartbeat.clone();
+        let shutdown_for_holder = shutdown.clone();
+        tokio::spawn(async move {
+            let _handle = hb_for_holder.register(
+                "scheduler_scan",
+                preloop_observability::Criticality::Critical,
+            );
+            hb_for_holder.beat("scheduler_scan");
+            let mut int = tokio::time::interval(Duration::from_secs(10));
+            int.tick().await;
+            while !shutdown_for_holder.is_cancelled() {
+                tokio::select! {
+                    _ = int.tick() => hb_for_holder.beat("scheduler_scan"),
+                    _ = shutdown_for_holder.cancelled() => break,
+                }
+            }
+        });
         if let Some(workspace) = state.local_workspace.clone() {
             tokio::spawn(async move {
                 scheduler_clone
@@ -558,10 +843,15 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     };
     let router = build_app(state.clone(), shutdown.clone(), test_api_token);
 
-    state.pool_preparing = config.pool_preparing.clone();
     let shared = Arc::new(SharedState {
-        state,
+        state: state.clone(),
         shutdown: shutdown.clone(),
+    });
+
+    // 5s sampler — clone needed state under lock, release, then publish.
+    let sampler_shared = shared.clone();
+    tokio::spawn(async move {
+        run_state_sampler(sampler_shared).await;
     });
 
     let checker_shared = shared.clone();
