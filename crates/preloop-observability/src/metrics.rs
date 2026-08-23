@@ -1,12 +1,18 @@
-//! Metrics registry for HTTP and store — Step 4.
+//! Metrics registry for HTTP, store, and lifecycle — Step 4.
 //!
-//! In-memory, bounded, no network I/O. Instruments and attribute arrays are
-//! prebuilt where static; gauges are updated from the cached snapshot.
+//! Instruments are created from the shared `Meter` so the OTLP periodic reader
+//! and the Prometheus reader scrape the same instruments — one source, never
+//! two. The label machinery (route normalization, surface classification,
+//! bounded termination reasons) is unchanged; only the storage moved behind
+//! the OpenTelemetry SDK.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use opentelemetry::metrics::MeterProvider;
+use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, UpDownCounter};
+use opentelemetry::KeyValue;
 use parking_lot::RwLock;
 
 // ---------------------------------------------------------------------------
@@ -23,43 +29,28 @@ pub const QUEUE_BUCKETS: &[f64] = &[
     0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 900.0,
 ];
 
-#[derive(Debug, Default, Clone)]
-struct Histogram {
-    buckets: Vec<(f64, u64)>, // (le, count)
-    count: u64,
-    sum: f64,
-}
-
-impl Histogram {
-    fn new(buckets: &[f64]) -> Self {
-        Self {
-            buckets: buckets.iter().map(|&le| (le, 0)).collect(),
-            count: 0,
-            sum: 0.0,
-        }
-    }
-
-    fn observe(&mut self, value: f64) {
-        self.count += 1;
-        self.sum += value;
-        for (le, cnt) in &mut self.buckets {
-            if value <= *le {
-                *cnt += 1;
-            }
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Http metrics
 // ---------------------------------------------------------------------------
 
+/// Labels for a completed HTTP request duration observation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct HttpLabels {
     pub method: String,
     pub route: String,
     pub surface: String,
     pub status_class: String,
+}
+
+impl HttpLabels {
+    fn as_attrs(&self) -> [KeyValue; 4] {
+        [
+            KeyValue::new("method", self.method.clone()),
+            KeyValue::new("route", self.route.clone()),
+            KeyValue::new("surface", self.surface.clone()),
+            KeyValue::new("status_class", self.status_class.clone()),
+        ]
+    }
 }
 
 /// Identity of an in-flight request. Deliberately carries no
@@ -73,86 +64,59 @@ pub struct ActiveLabels {
     pub surface: String,
 }
 
-#[derive(Debug, Default)]
+impl ActiveLabels {
+    fn as_attrs(&self) -> [KeyValue; 3] {
+        [
+            KeyValue::new("method", self.method.clone()),
+            KeyValue::new("route", self.route.clone()),
+            KeyValue::new("surface", self.surface.clone()),
+        ]
+    }
+}
+
+/// HTTP instruments. `active` is an up-down counter so the pre-response
+/// increment and post-response decrement can disagree only transiently — the
+/// SDK keeps a signed value, unlike a Prometheus-style gauge that would go
+/// negative and be dropped.
+#[derive(Clone)]
 pub struct HttpMetrics {
-    active: RwLock<HashMap<ActiveLabels, i64>>,
-    durations: RwLock<HashMap<HttpLabels, Histogram>>,
+    active: UpDownCounter<i64>,
+    durations: Histogram<f64>,
+}
+
+impl std::fmt::Debug for HttpMetrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpMetrics").finish_non_exhaustive()
+    }
 }
 
 impl HttpMetrics {
+    fn new(meter: &Meter) -> Self {
+        Self {
+            active: meter
+                .i64_up_down_counter("http.server.active_requests")
+                .with_description("Current HTTP concurrency")
+                .with_unit("{request}")
+                .build(),
+            durations: meter
+                .f64_histogram("http.server.request.duration")
+                .with_description("API latency — matched route, never raw URI")
+                .with_unit("s")
+                .build(),
+        }
+    }
+
     pub fn inc_active(&self, labels: &ActiveLabels) {
-        *self.active.write().entry(labels.clone()).or_insert(0) += 1;
+        self.active.add(1, &labels.as_attrs());
     }
 
     pub fn dec_active(&self, labels: &ActiveLabels) {
-        let mut g = self.active.write();
-        if let Some(v) = g.get_mut(labels) {
-            *v -= 1;
-            if *v <= 0 {
-                g.remove(labels);
-            }
-        }
+        self.active.add(-1, &labels.as_attrs());
     }
 
     pub fn observe_duration(&self, labels: HttpLabels, duration: Duration) {
-        let secs = duration.as_secs_f64();
-        let mut g = self.durations.write();
-        let hist = g
-            .entry(labels)
-            .or_insert_with(|| Histogram::new(HTTP_BUCKETS));
-        hist.observe(secs);
-    }
-
-    pub fn render(&self, out: &mut String) {
-        out.push_str("# HELP http_server_request_duration_seconds API latency — matched route, never raw URI\n");
-        out.push_str("# TYPE http_server_request_duration_seconds histogram\n");
-        let g = self.durations.read();
-        for (labels, hist) in g.iter() {
-            let method = escape_label(&labels.method);
-            let route = escape_label(&labels.route);
-            let surface = escape_label(&labels.surface);
-            let status = escape_label(&labels.status_class);
-            for (le, cnt) in &hist.buckets {
-                out.push_str(&format!(
-                    "http_server_request_duration_seconds_bucket{{method=\"{method}\",route=\"{route}\",surface=\"{surface}\",status_class=\"{status}\",le=\"{le}\"}} {cnt}\n"
-                ));
-            }
-            out.push_str(&format!(
-                "http_server_request_duration_seconds_bucket{{method=\"{method}\",route=\"{route}\",surface=\"{surface}\",status_class=\"{status}\",le=\"+Inf\"}} {}\n",
-                hist.count
-            ));
-            out.push_str(&format!(
-                "http_server_request_duration_seconds_sum{{method=\"{method}\",route=\"{route}\",surface=\"{surface}\",status_class=\"{status}\"}} {}\n",
-                hist.sum
-            ));
-            out.push_str(&format!(
-                "http_server_request_duration_seconds_count{{method=\"{method}\",route=\"{route}\",surface=\"{surface}\",status_class=\"{status}\"}} {}\n",
-                hist.count
-            ));
-        }
-        out.push_str("# HELP http_server_active_requests Current HTTP concurrency\n");
-        out.push_str("# TYPE http_server_active_requests gauge\n");
-        let g2 = self.active.read();
-        for (labels, v) in g2.iter() {
-            out.push_str(&format!(
-                "http_server_active_requests{{method=\"{}\",route=\"{}\",surface=\"{}\"}} {}\n",
-                escape_label(&labels.method),
-                escape_label(&labels.route),
-                escape_label(&labels.surface),
-                v
-            ));
-        }
-    }
-
-    #[cfg(test)]
-    pub fn clear(&self) {
-        self.active.write().clear();
-        self.durations.write().clear();
-    }
-
-    #[cfg(test)]
-    pub fn series_count(&self) -> usize {
-        self.durations.read().len()
+        self.durations
+            .record(duration.as_secs_f64(), &labels.as_attrs());
     }
 }
 
@@ -160,6 +124,7 @@ impl HttpMetrics {
 // Store metrics
 // ---------------------------------------------------------------------------
 
+/// Labels for a store operation duration observation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StoreLabels {
     pub backend: String,
@@ -167,101 +132,76 @@ pub struct StoreLabels {
     pub outcome: String,
 }
 
-#[derive(Debug, Default)]
+impl StoreLabels {
+    fn as_attrs(&self) -> [KeyValue; 3] {
+        [
+            KeyValue::new("backend", self.backend.clone()),
+            KeyValue::new("operation", self.operation.clone()),
+            KeyValue::new("outcome", self.outcome.clone()),
+        ]
+    }
+}
+
+/// Store instruments: one latency histogram plus a consecutive-failures gauge
+/// per backend (restart-durability risk).
+#[derive(Clone)]
 pub struct StoreMetrics {
-    durations: RwLock<HashMap<StoreLabels, Histogram>>,
-    consecutive_failures: RwLock<HashMap<String, u64>>, // backend -> count
+    durations: Histogram<f64>,
+    consecutive_failures: Gauge<u64>,
+    /// Per-backend streak, authoritative for the gauge. Kept separately from
+    /// the SDK gauge because a gauge has no "increment" — the value must be
+    /// recomputed and set, and we want the streak to survive a partial
+    /// observation race (error then success in the same window).
+    streaks: Arc<RwLock<HashMap<String, u64>>>,
+}
+
+impl std::fmt::Debug for StoreMetrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoreMetrics").finish_non_exhaustive()
+    }
 }
 
 impl StoreMetrics {
+    fn new(meter: &Meter) -> Self {
+        Self {
+            durations: meter
+                .f64_histogram("preloop.store.operation.duration")
+                .with_description("Store operation latency")
+                .with_unit("s")
+                .build(),
+            consecutive_failures: meter
+                .u64_gauge("preloop.store.consecutive_failures")
+                .with_description("Restart-durability risk: consecutive store failures")
+                .with_unit("{failure}")
+                .build(),
+            streaks: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
     pub fn observe(&self, backend: &str, operation: &str, outcome: &str, duration: Duration) {
         let labels = StoreLabels {
             backend: backend.to_string(),
             operation: operation.to_string(),
             outcome: outcome.to_string(),
         };
-        let mut g = self.durations.write();
-        let hist = g
-            .entry(labels)
-            .or_insert_with(|| Histogram::new(STORE_BUCKETS));
-        hist.observe(duration.as_secs_f64());
+        self.durations
+            .record(duration.as_secs_f64(), &labels.as_attrs());
 
-        // Update consecutive failures
-        let mut cf = self.consecutive_failures.write();
-        if outcome == "error" {
-            *cf.entry(backend.to_string()).or_insert(0) += 1;
+        // Consecutive failures: +1 on error, reset to 0 on success. Update the
+        // streak under the lock, then publish the current value to the gauge
+        // so a scrape sees the latest streak even if observations race.
+        let mut streaks = self.streaks.write();
+        let streak = if outcome == "error" {
+            let entry = streaks.entry(backend.to_string()).or_insert(0);
+            *entry += 1;
+            *entry
         } else {
-            cf.insert(backend.to_string(), 0);
-        }
-    }
-
-    pub fn render(&self, out: &mut String) {
-        out.push_str("# HELP preloop_store_operation_duration_seconds Store operation latency\n");
-        out.push_str("# TYPE preloop_store_operation_duration_seconds histogram\n");
-        let g = self.durations.read();
-        for (labels, hist) in g.iter() {
-            for (le, cnt) in &hist.buckets {
-                out.push_str(&format!(
-                    "preloop_store_operation_duration_seconds_bucket{{backend=\"{}\",operation=\"{}\",outcome=\"{}\",le=\"{}\"}} {}\n",
-                    labels.backend, labels.operation, labels.outcome, le, cnt
-                ));
-            }
-            out.push_str(&format!(
-                "preloop_store_operation_duration_seconds_bucket{{backend=\"{}\",operation=\"{}\",outcome=\"{}\",le=\"+Inf\"}} {}\n",
-                labels.backend, labels.operation, labels.outcome, hist.count
-            ));
-            out.push_str(&format!(
-                "preloop_store_operation_duration_seconds_sum{{backend=\"{}\",operation=\"{}\",outcome=\"{}\"}} {}\n",
-                labels.backend, labels.operation, labels.outcome, hist.sum
-            ));
-            out.push_str(&format!(
-                "preloop_store_operation_duration_seconds_count{{backend=\"{}\",operation=\"{}\",outcome=\"{}\"}} {}\n",
-                labels.backend, labels.operation, labels.outcome, hist.count
-            ));
-        }
-        out.push_str("# HELP preloop_store_consecutive_failures Restart-durability risk\n");
-        out.push_str("# TYPE preloop_store_consecutive_failures gauge\n");
-        let g2 = self.consecutive_failures.read();
-        for (backend, v) in g2.iter() {
-            out.push_str(&format!(
-                "preloop_store_consecutive_failures{{backend=\"{}\"}} {}\n",
-                backend, v
-            ));
-        }
-    }
-
-    #[cfg(test)]
-    pub fn clear(&self) {
-        self.durations.write().clear();
-        self.consecutive_failures.write().clear();
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Registry
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Default)]
-pub struct MetricsRegistry {
-    pub http: HttpMetrics,
-    pub store: StoreMetrics,
-    pub lifecycle: LifecycleMetrics,
-}
-
-impl MetricsRegistry {
-    pub fn render(&self) -> String {
-        let mut out = String::new();
-        self.http.render(&mut out);
-        self.store.render(&mut out);
-        self.lifecycle.render(&mut out);
-        out
-    }
-
-    #[cfg(test)]
-    pub fn clear(&self) {
-        self.http.clear();
-        self.store.clear();
-        self.lifecycle.clear();
+            streaks.insert(backend.to_string(), 0);
+            0
+        };
+        drop(streaks);
+        let attrs = [KeyValue::new("backend", backend.to_string())];
+        self.consecutive_failures.record(streak, &attrs);
     }
 }
 
@@ -269,159 +209,162 @@ impl MetricsRegistry {
 // Lifecycle metrics — run/job, queue, broker, runner
 // ---------------------------------------------------------------------------
 
+/// Bounded conclusion + reason for a terminal job. The reason is already
+/// classified by `bounded_termination_reason` in the server, so these labels
+/// are a finite set.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct JobCompletedLabels {
     pub conclusion: String,
     pub reason: String,
 }
 
+/// Queue-wait outcome: claimed, terminal-while-queued, reaped, etc.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct QueueWaitLabels {
     pub outcome: String,
 }
 
+/// Broker poll outcome: job, no-job, error, etc.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BrokerPollLabels {
     pub outcome: String,
 }
 
+/// Runner session lifecycle transition.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SessionTransitionLabels {
     pub operation: String,
     pub reason: String,
 }
 
+/// Concurrency queue decision.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ConcurrencyDecisionLabels {
     pub queue_mode: String,
     pub action: String,
 }
 
-#[derive(Debug, Default)]
+/// Lifecycle instruments — counters for terminal jobs, session transitions,
+/// broker polls, and concurrency decisions; a histogram for queue wait.
+#[derive(Clone)]
 pub struct LifecycleMetrics {
-    job_completed: RwLock<HashMap<JobCompletedLabels, u64>>,
-    queue_wait: RwLock<HashMap<QueueWaitLabels, Histogram>>,
-    broker_poll: RwLock<HashMap<BrokerPollLabels, u64>>,
-    session_transition: RwLock<HashMap<SessionTransitionLabels, u64>>,
-    concurrency_decision: RwLock<HashMap<ConcurrencyDecisionLabels, u64>>,
+    job_completed: Counter<u64>,
+    queue_wait: Histogram<f64>,
+    broker_poll: Counter<u64>,
+    session_transition: Counter<u64>,
+    concurrency_decision: Counter<u64>,
+}
+
+impl std::fmt::Debug for LifecycleMetrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LifecycleMetrics").finish_non_exhaustive()
+    }
 }
 
 impl LifecycleMetrics {
+    fn new(meter: &Meter) -> Self {
+        Self {
+            job_completed: meter
+                .u64_counter("preloop.job.completed")
+                .with_description("Terminal jobs by conclusion and reason")
+                .with_unit("{job}")
+                .build(),
+            queue_wait: meter
+                .f64_histogram("preloop.job.queue.wait")
+                .with_description("Queue wait until claim or terminal")
+                .with_unit("s")
+                .build(),
+            broker_poll: meter
+                .u64_counter("preloop.broker.poll")
+                .with_description("Broker poll outcomes")
+                .with_unit("{poll}")
+                .build(),
+            session_transition: meter
+                .u64_counter("preloop.runner.session.transition")
+                .with_description("Session lifecycle transitions")
+                .with_unit("{transition}")
+                .build(),
+            concurrency_decision: meter
+                .u64_counter("preloop.concurrency.decision")
+                .with_description("Concurrency queue decisions")
+                .with_unit("{decision}")
+                .build(),
+        }
+    }
+
     pub fn record_job_completed(&self, conclusion: &str, reason: &str) {
-        let labels = JobCompletedLabels {
-            conclusion: conclusion.to_string(),
-            reason: reason.to_string(),
-        };
-        *self.job_completed.write().entry(labels).or_insert(0) += 1;
+        let attrs = [
+            KeyValue::new("conclusion", conclusion.to_string()),
+            KeyValue::new("reason", reason.to_string()),
+        ];
+        self.job_completed.add(1, &attrs);
     }
 
     pub fn record_queue_wait(&self, outcome: &str, wait: Duration) {
-        let labels = QueueWaitLabels {
-            outcome: outcome.to_string(),
-        };
-        let mut g = self.queue_wait.write();
-        let hist = g
-            .entry(labels)
-            .or_insert_with(|| Histogram::new(QUEUE_BUCKETS));
-        hist.observe(wait.as_secs_f64());
+        self.queue_wait.record(
+            wait.as_secs_f64(),
+            &[KeyValue::new("outcome", outcome.to_string())],
+        );
     }
 
     pub fn record_broker_poll(&self, outcome: &str) {
-        let labels = BrokerPollLabels {
-            outcome: outcome.to_string(),
-        };
-        *self.broker_poll.write().entry(labels).or_insert(0) += 1;
+        self.broker_poll
+            .add(1, &[KeyValue::new("outcome", outcome.to_string())]);
     }
 
     pub fn record_session_transition(&self, operation: &str, reason: &str) {
-        let labels = SessionTransitionLabels {
-            operation: operation.to_string(),
-            reason: reason.to_string(),
-        };
-        *self.session_transition.write().entry(labels).or_insert(0) += 1;
+        let attrs = [
+            KeyValue::new("operation", operation.to_string()),
+            KeyValue::new("reason", reason.to_string()),
+        ];
+        self.session_transition.add(1, &attrs);
     }
 
     pub fn record_concurrency_decision(&self, queue_mode: &str, action: &str) {
-        let labels = ConcurrencyDecisionLabels {
-            queue_mode: queue_mode.to_string(),
-            action: action.to_string(),
-        };
-        *self.concurrency_decision.write().entry(labels).or_insert(0) += 1;
+        let attrs = [
+            KeyValue::new("queue_mode", queue_mode.to_string()),
+            KeyValue::new("action", action.to_string()),
+        ];
+        self.concurrency_decision.add(1, &attrs);
     }
+}
 
-    pub fn render(&self, out: &mut String) {
-        out.push_str("# HELP preloop_job_completed Terminal jobs by conclusion and reason\n");
-        out.push_str("# TYPE preloop_job_completed counter\n");
-        for (labels, cnt) in self.job_completed.read().iter() {
-            out.push_str(&format!(
-                "preloop_job_completed{{conclusion=\"{}\",reason=\"{}\"}} {}\n",
-                labels.conclusion, labels.reason, cnt
-            ));
-        }
-        out.push_str("# HELP preloop_job_queue_wait_seconds Queue wait until claim or terminal\n");
-        out.push_str("# TYPE preloop_job_queue_wait_seconds histogram\n");
-        for (labels, hist) in self.queue_wait.read().iter() {
-            for (le, cnt) in &hist.buckets {
-                out.push_str(&format!(
-                    "preloop_job_queue_wait_seconds_bucket{{outcome=\"{}\",le=\"{}\"}} {}\n",
-                    labels.outcome, le, cnt
-                ));
-            }
-            out.push_str(&format!(
-                "preloop_job_queue_wait_seconds_bucket{{outcome=\"{}\",le=\"+Inf\"}} {}\n",
-                labels.outcome, hist.count
-            ));
-            out.push_str(&format!(
-                "preloop_job_queue_wait_seconds_sum{{outcome=\"{}\"}} {}\n",
-                labels.outcome, hist.sum
-            ));
-            out.push_str(&format!(
-                "preloop_job_queue_wait_seconds_count{{outcome=\"{}\"}} {}\n",
-                labels.outcome, hist.count
-            ));
-        }
-        out.push_str("# HELP preloop_broker_poll_total Broker poll outcomes\n");
-        out.push_str("# TYPE preloop_broker_poll_total counter\n");
-        for (labels, cnt) in self.broker_poll.read().iter() {
-            out.push_str(&format!(
-                "preloop_broker_poll_total{{outcome=\"{}\"}} {}\n",
-                labels.outcome, cnt
-            ));
-        }
-        out.push_str("# HELP preloop_runner_session_transition_total Session lifecycle\n");
-        out.push_str("# TYPE preloop_runner_session_transition_total counter\n");
-        for (labels, cnt) in self.session_transition.read().iter() {
-            out.push_str(&format!(
-                "preloop_runner_session_transition_total{{operation=\"{}\",reason=\"{}\"}} {}\n",
-                labels.operation, labels.reason, cnt
-            ));
-        }
-        out.push_str("# HELP preloop_concurrency_decision_total Concurrency queue decisions\n");
-        out.push_str("# TYPE preloop_concurrency_decision_total counter\n");
-        for (labels, cnt) in self.concurrency_decision.read().iter() {
-            out.push_str(&format!(
-                "preloop_concurrency_decision_total{{queue_mode=\"{}\",action=\"{}\"}} {}\n",
-                labels.queue_mode, labels.action, cnt
-            ));
-        }
+// ---------------------------------------------------------------------------
+// Registry
+// ---------------------------------------------------------------------------
+
+/// Instrument holder. `default()` is a no-op registry for tests and
+/// library-only consumers — instruments created from the noop meter record
+/// nothing.
+#[derive(Clone)]
+pub struct MetricsRegistry {
+    pub http: HttpMetrics,
+    pub store: StoreMetrics,
+    pub lifecycle: LifecycleMetrics,
+}
+
+impl std::fmt::Debug for MetricsRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetricsRegistry").finish_non_exhaustive()
     }
+}
 
-    #[cfg(test)]
-    pub fn clear(&self) {
-        self.job_completed.write().clear();
-        self.queue_wait.write().clear();
-        self.broker_poll.write().clear();
-        self.session_transition.write().clear();
-        self.concurrency_decision.write().clear();
+impl Default for MetricsRegistry {
+    fn default() -> Self {
+        let provider = opentelemetry::metrics::noop::NoopMeterProvider::new();
+        let meter = provider.meter("preloop-observability-noop");
+        Self::from_meter(meter)
     }
+}
 
-    #[cfg(test)]
-    pub fn job_completed_count(&self, conclusion: &str, reason: &str) -> u64 {
-        let labels = JobCompletedLabels {
-            conclusion: conclusion.to_string(),
-            reason: reason.to_string(),
-        };
-        *self.job_completed.read().get(&labels).unwrap_or(&0)
+impl MetricsRegistry {
+    /// Create instruments from a real meter (from the shared `SdkMeterProvider`).
+    pub fn from_meter(meter: Meter) -> Self {
+        Self {
+            http: HttpMetrics::new(&meter),
+            store: StoreMetrics::new(&meter),
+            lifecycle: LifecycleMetrics::new(&meter),
+        }
     }
 }
 
@@ -510,10 +453,9 @@ pub fn normalize_route(raw: &str) -> String {
         // Template with params: match prefix up to first ':'
         if let Some(colon) = tmpl.find(':') {
             let prefix = &tmpl[..colon - 1]; // up to '/' before ':'
-            if path.starts_with(prefix) {
+            if let Some(rest) = path.strip_prefix(prefix) {
                 // Ensure it's a segment boundary: /api/v1/runs/abc should match /api/v1/runs/:run_id
                 // but /api/v1/runsXYZ should not.
-                let rest = &path[prefix.len()..];
                 // A parameterized template needs a non-empty child segment;
                 // the bare collection path is matched by its own entry.
                 if rest.len() > 1 && rest.starts_with('/') {
@@ -524,22 +466,6 @@ pub fn normalize_route(raw: &str) -> String {
     }
     // Unknown — constant label, never raw path
     "/unknown".to_string()
-}
-
-/// Escape a label value for Prometheus exposition text. The label set is
-/// bounded, but a quote, backslash, or newline would corrupt the entire
-/// scrape; defense in depth on top of the bounded construction.
-fn escape_label(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            _ => out.push(ch),
-        }
-    }
-    out
 }
 
 pub fn status_class(status: u16) -> &'static str {
@@ -592,14 +518,6 @@ mod tests {
     }
 
     #[test]
-    fn escape_label_keeps_scrape_parseable() {
-        // A quote and a backslash must be escaped so the exposition stays
-        // parseable; a real newline must become the two-character escape.
-        assert_eq!(escape_label("a\"b\\c"), "a\\\"b\\\\c");
-        assert_eq!(escape_label("line\nbreak"), "line\\nbreak");
-    }
-
-    #[test]
     fn classify() {
         assert_eq!(classify_surface("/api/v1/runs"), "native");
         assert_eq!(classify_surface("/_apis/artifactcache/cache"), "runner");
@@ -610,298 +528,57 @@ mod tests {
     }
 
     #[test]
-    fn otlp_bucket_counts_convert_cumulative_to_disjoint() {
-        let mut hist = Histogram::new(&[0.005, 0.01]);
-        // observe() bumps every bucket where value <= le, so buckets are
-        // cumulative: after these three, [3, 2, 0] with count 3.
-        hist.observe(0.004);
-        hist.observe(0.007);
-        hist.observe(0.02);
-        let counts = hist.otlp_bucket_counts();
-        // Disjoint: 1 under 0.005, 1 between 0.005 and 0.01, 1 above.
-        assert_eq!(counts, vec![1, 1, 1]);
-        assert_eq!(counts.iter().sum::<u64>(), hist.count);
+    fn default_registry_is_noop() {
+        // Instruments created from the noop meter must record without
+        // panicking and without any storage behind them.
+        let registry = MetricsRegistry::default();
+        registry.http.inc_active(&ActiveLabels {
+            method: "GET".to_string(),
+            route: "/api/v1/runs".to_string(),
+            surface: "native".to_string(),
+        });
+        registry.http.observe_duration(
+            HttpLabels {
+                method: "GET".to_string(),
+                route: "/api/v1/runs".to_string(),
+                surface: "native".to_string(),
+                status_class: "2xx".to_string(),
+            },
+            Duration::from_millis(10),
+        );
+        registry
+            .store
+            .observe("sqlite", "store_inner", "ok", Duration::from_millis(1));
+        registry
+            .lifecycle
+            .record_job_completed("success", "unspecified");
+        registry
+            .lifecycle
+            .record_queue_wait("claimed", Duration::from_secs(2));
+        registry.lifecycle.record_broker_poll("job");
+        registry.lifecycle.record_session_transition("create", "ok");
+        registry
+            .lifecycle
+            .record_concurrency_decision("queue", "accept");
     }
 
     #[test]
-    fn active_gauge_increment_and_decrement_are_idempotent() {
-        let m = HttpMetrics::default();
-        let labels = ActiveLabels {
+    fn label_attrs_are_bounded() {
+        // The four label structs used by the middleware are exactly the four
+        // that appear in the instrument attribute sets — a new label must be
+        // added to both or the series set drifts.
+        let labels = HttpLabels {
+            method: "GET".to_string(),
+            route: "/api/v1/runs".to_string(),
+            surface: "native".to_string(),
+            status_class: "2xx".to_string(),
+        };
+        assert_eq!(labels.as_attrs().len(), 4);
+        let active = ActiveLabels {
             method: "GET".to_string(),
             route: "/api/v1/runs".to_string(),
             surface: "native".to_string(),
         };
-        m.inc_active(&labels);
-        m.inc_active(&labels);
-        m.dec_active(&labels);
-        // One still in flight; the gauge key carries no status_class, so a
-        // caller cannot increment under one key and decrement under another.
-        let g = m.active.read();
-        assert_eq!(g.get(&labels), Some(&1));
-    }
-
-    #[test]
-    fn http_series_bounded() {
-        let m = HttpMetrics::default();
-        for i in 0..1000 {
-            let route = format!("/api/v1/runs/{}", i);
-            let tmpl = normalize_route(&route);
-            let labels = HttpLabels {
-                method: "GET".to_string(),
-                route: tmpl,
-                surface: "native".to_string(),
-                status_class: "2xx".to_string(),
-            };
-            m.observe_duration(labels, Duration::from_millis(10));
-        }
-        assert_eq!(m.series_count(), 1, "1000 distinct IDs must be 1 series");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Structured collection for OTLP export
-// ---------------------------------------------------------------------------
-
-/// One data point, already reduced to bounded attributes.
-#[derive(Debug, Clone)]
-pub enum MetricPoint {
-    /// Monotonic counter (OTLP `sum`, cumulative, `isMonotonic: true`).
-    Sum {
-        value: f64,
-        attributes: Vec<(String, String)>,
-    },
-    /// Instantaneous value (OTLP `gauge`).
-    Gauge {
-        value: f64,
-        attributes: Vec<(String, String)>,
-    },
-    /// Explicit-bucket histogram (OTLP `histogram`, cumulative).
-    ///
-    /// `bucket_counts` is one longer than `bounds`: OTLP requires the
-    /// implicit `+Inf` bucket to be present as the final entry.
-    Histogram {
-        count: u64,
-        sum: f64,
-        bounds: Vec<f64>,
-        bucket_counts: Vec<u64>,
-        attributes: Vec<(String, String)>,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub struct MetricFamily {
-    pub name: String,
-    pub unit: &'static str,
-    pub points: Vec<MetricPoint>,
-}
-
-impl Histogram {
-    /// Convert the cumulative (Prometheus `le`) buckets to the disjoint
-    /// per-bucket counts OTLP requires, where every observation lands in
-    /// exactly one bucket and the counts sum to `count`. Emitting the
-    /// cumulative values as-if-disjoint would count each observation once
-    /// per bucket and blow the total past `count`.
-    fn otlp_bucket_counts(&self) -> Vec<u64> {
-        let mut deltas = Vec::with_capacity(self.buckets.len() + 1);
-        let mut previous = 0;
-        for (_, c) in &self.buckets {
-            deltas.push(c - previous);
-            previous = *c;
-        }
-        deltas.push(self.count - previous);
-        deltas
-    }
-
-    fn bounds(&self) -> Vec<f64> {
-        self.buckets.iter().map(|(le, _)| *le).collect()
-    }
-}
-
-impl HttpMetrics {
-    fn collect(&self, out: &mut Vec<MetricFamily>) {
-        let durations = self.durations.read();
-        if !durations.is_empty() {
-            out.push(MetricFamily {
-                name: "http.server.request.duration".to_string(),
-                unit: "s",
-                points: durations
-                    .iter()
-                    .map(|(labels, hist)| MetricPoint::Histogram {
-                        count: hist.count,
-                        sum: hist.sum,
-                        bounds: hist.bounds(),
-                        bucket_counts: hist.otlp_bucket_counts(),
-                        attributes: vec![
-                            ("http.request.method".to_string(), labels.method.clone()),
-                            ("http.route".to_string(), labels.route.clone()),
-                            ("preloop.surface".to_string(), labels.surface.clone()),
-                            (
-                                "http.response.status_class".to_string(),
-                                labels.status_class.clone(),
-                            ),
-                        ],
-                    })
-                    .collect(),
-            });
-        }
-        let active = self.active.read();
-        if !active.is_empty() {
-            out.push(MetricFamily {
-                name: "http.server.active_requests".to_string(),
-                unit: "{request}",
-                points: active
-                    .iter()
-                    .map(|(labels, value)| MetricPoint::Gauge {
-                        value: *value as f64,
-                        attributes: vec![
-                            ("http.request.method".to_string(), labels.method.clone()),
-                            ("http.route".to_string(), labels.route.clone()),
-                            ("preloop.surface".to_string(), labels.surface.clone()),
-                        ],
-                    })
-                    .collect(),
-            });
-        }
-    }
-}
-
-impl StoreMetrics {
-    fn collect(&self, out: &mut Vec<MetricFamily>) {
-        let durations = self.durations.read();
-        if !durations.is_empty() {
-            out.push(MetricFamily {
-                name: "preloop.store.operation.duration".to_string(),
-                unit: "s",
-                points: durations
-                    .iter()
-                    .map(|(labels, hist)| MetricPoint::Histogram {
-                        count: hist.count,
-                        sum: hist.sum,
-                        bounds: hist.bounds(),
-                        bucket_counts: hist.otlp_bucket_counts(),
-                        attributes: vec![
-                            ("db.system".to_string(), labels.backend.clone()),
-                            ("preloop.operation".to_string(), labels.operation.clone()),
-                            ("preloop.outcome".to_string(), labels.outcome.clone()),
-                        ],
-                    })
-                    .collect(),
-            });
-        }
-        let failures = self.consecutive_failures.read();
-        if !failures.is_empty() {
-            out.push(MetricFamily {
-                name: "preloop.store.consecutive_failures".to_string(),
-                unit: "{failure}",
-                points: failures
-                    .iter()
-                    .map(|(backend, value)| MetricPoint::Gauge {
-                        value: *value as f64,
-                        attributes: vec![("db.system".to_string(), backend.clone())],
-                    })
-                    .collect(),
-            });
-        }
-    }
-}
-
-impl LifecycleMetrics {
-    fn collect(&self, out: &mut Vec<MetricFamily>) {
-        let completed = self.job_completed.read();
-        if !completed.is_empty() {
-            out.push(MetricFamily {
-                name: "preloop.job.completed".to_string(),
-                unit: "{job}",
-                points: completed
-                    .iter()
-                    .map(|(labels, value)| MetricPoint::Sum {
-                        value: *value as f64,
-                        attributes: vec![
-                            ("preloop.conclusion".to_string(), labels.conclusion.clone()),
-                            ("preloop.reason".to_string(), labels.reason.clone()),
-                        ],
-                    })
-                    .collect(),
-            });
-        }
-        let wait = self.queue_wait.read();
-        if !wait.is_empty() {
-            out.push(MetricFamily {
-                name: "preloop.job.queue.wait".to_string(),
-                unit: "s",
-                points: wait
-                    .iter()
-                    .map(|(labels, hist)| MetricPoint::Histogram {
-                        count: hist.count,
-                        sum: hist.sum,
-                        bounds: hist.bounds(),
-                        bucket_counts: hist.otlp_bucket_counts(),
-                        attributes: vec![("preloop.outcome".to_string(), labels.outcome.clone())],
-                    })
-                    .collect(),
-            });
-        }
-        let poll = self.broker_poll.read();
-        if !poll.is_empty() {
-            out.push(MetricFamily {
-                name: "preloop.broker.poll".to_string(),
-                unit: "{poll}",
-                points: poll
-                    .iter()
-                    .map(|(labels, value)| MetricPoint::Sum {
-                        value: *value as f64,
-                        attributes: vec![("preloop.outcome".to_string(), labels.outcome.clone())],
-                    })
-                    .collect(),
-            });
-        }
-        let sessions = self.session_transition.read();
-        if !sessions.is_empty() {
-            out.push(MetricFamily {
-                name: "preloop.runner.session.transition".to_string(),
-                unit: "{transition}",
-                points: sessions
-                    .iter()
-                    .map(|(labels, value)| MetricPoint::Sum {
-                        value: *value as f64,
-                        attributes: vec![
-                            ("preloop.operation".to_string(), labels.operation.clone()),
-                            ("preloop.reason".to_string(), labels.reason.clone()),
-                        ],
-                    })
-                    .collect(),
-            });
-        }
-        let concurrency = self.concurrency_decision.read();
-        if !concurrency.is_empty() {
-            out.push(MetricFamily {
-                name: "preloop.concurrency.decision".to_string(),
-                unit: "{decision}",
-                points: concurrency
-                    .iter()
-                    .map(|(labels, value)| MetricPoint::Sum {
-                        value: *value as f64,
-                        attributes: vec![
-                            ("preloop.queue_mode".to_string(), labels.queue_mode.clone()),
-                            ("preloop.action".to_string(), labels.action.clone()),
-                        ],
-                    })
-                    .collect(),
-            });
-        }
-    }
-}
-
-impl MetricsRegistry {
-    /// Snapshot every instrument as OTLP-ready families.
-    ///
-    /// Read-only: takes each sub-registry's read lock in turn and never holds
-    /// two at once, so a scrape cannot deadlock against a recording caller.
-    pub fn collect(&self) -> Vec<MetricFamily> {
-        let mut families = Vec::new();
-        self.http.collect(&mut families);
-        self.store.collect(&mut families);
-        self.lifecycle.collect(&mut families);
-        families
+        assert_eq!(active.as_attrs().len(), 3);
     }
 }

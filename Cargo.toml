@@ -45,7 +45,7 @@ futures = "0.3"
 globset = "0.4"
 indexmap = { version = "2.2", features = ["serde"] }
 proptest = "1.4"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "form", "query"] }
 serde = { version = "1.0", features = ["derive", "rc"] }
 rand = "0.8"
 # `preserve_order` keeps `Value::Object` in document order instead of sorting
@@ -74,6 +74,18 @@ tokio-tungstenite = { version = "0.23", default-features = false, features = ["r
 tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.33"
+opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics", "logs"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics", "logs", "rt-tokio"] }
+# OTLP/HTTP only — never the tonic/gRPC stack (plan §435-437, §1289). Reuses
+# the workspace reqwest (now 0.13, same line the SDK targets) through
+# `opentelemetry_http::HttpClient`, so there is exactly one HTTP client.
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "trace", "metrics", "logs"] }
+opentelemetry-http = { version = "0.32", default-features = false, features = ["reqwest"] }
+opentelemetry-prometheus = "0.32"
+opentelemetry-appender-tracing = "0.32"
+opentelemetry-semantic-conventions = "0.32"
+prometheus = "0.14"
 uuid = { version = "1.8", features = ["v4", "serde"] }
 aes = "0.8"
 cbc = { version = "0.1", features = ["block-padding"] }

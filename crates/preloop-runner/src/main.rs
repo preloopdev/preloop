@@ -20,7 +20,7 @@ async fn main() -> Result<()> {
         .with_service_version(env!("CARGO_PKG_VERSION"));
     let (observability, observability_runtime) =
         preloop_observability::Observability::from_config(obs_config);
-    preloop_observability::ObservabilityRuntime::install_fmt_subscriber(observability.config());
+    observability_runtime.install_fmt_subscriber();
     let _observability = observability;
     let _observability_runtime = observability_runtime;
 

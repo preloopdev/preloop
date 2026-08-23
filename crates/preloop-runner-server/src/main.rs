@@ -83,11 +83,11 @@ async fn main() -> anyhow::Result<()> {
         .with_service_version(env!("CARGO_PKG_VERSION"));
     let (observability, observability_runtime) =
         preloop_observability::Observability::from_config(obs_config);
-    preloop_observability::ObservabilityRuntime::install_fmt_subscriber(observability.config());
+    observability_runtime.install_fmt_subscriber();
     // The handle reaches `ServerConfig` below; holding it here alone would
     // leave the server on the no-op handle installed by `AppState::new`, so
-    // nothing would ever export.
-    let mut observability_runtime = observability_runtime;
+    // nothing would ever export. The runtime stays alive for the whole
+    // process and flushes on shutdown.
 
     let cli = Cli::parse();
     match cli.command {

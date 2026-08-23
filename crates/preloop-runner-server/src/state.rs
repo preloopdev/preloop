@@ -607,11 +607,15 @@ fn bounded_termination_reason(value: &str) -> &'static str {
     //   - the external-host check, where the server has no runner of that
     //     platform class at all (`no {platform} runner is registered with
     //     this server, so `runs-on: …` cannot be scheduled`).
-    if value.contains("runner is registered with this server") {
-        return "no_platform_runner";
-    }
+    // The starvation prose interpolates workflow-controlled `runs-on`
+    // labels, so the anchored prefix MUST be checked before the substring:
+    // a crafted label containing the platform phrase must not flip a
+    // starvation reason into `no_platform_runner`.
     if value.starts_with("no runner is registered for") {
         return "no_runner";
+    }
+    if value.contains("runner is registered with this server") {
+        return "no_platform_runner";
     }
     if value.starts_with("job exceeded its timeout")
         || value.starts_with("timed out")
@@ -626,6 +630,25 @@ fn bounded_termination_reason(value: &str) -> &'static str {
         return "lease_expired";
     }
     "unrecognized"
+}
+
+/// Bound free-form reason prose for export as a telemetry attribute. The
+/// prose interpolates workflow input (e.g. `runs-on` labels), so one job
+/// must not emit an arbitrarily large attribute. Truncation cuts on a
+/// character boundary — byte slicing panics on multi-byte input.
+fn bounded_reason_detail(detail: &str) -> String {
+    const DETAIL_MAX: usize = 512;
+    let mut detail = detail.to_string();
+    if detail.len() > DETAIL_MAX {
+        let cut = detail
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|&i| i <= DETAIL_MAX)
+            .last()
+            .unwrap_or(0);
+        detail.truncate(cut);
+    }
+    detail
 }
 
 impl AppState {
@@ -961,27 +984,17 @@ impl AppState {
                         // it an `unrecognized` classification is a dead end —
                         // you cannot tell which path produced it.
                         if let Some(detail) = reason.as_deref() {
-                            attributes.push(("reason.detail".to_string(), detail.to_string()));
+                            attributes
+                                .push(("reason.detail".to_string(), bounded_reason_detail(detail)));
                         }
                         attributes
                     },
                 );
             }
-            NdjsonEvent::JobCompleted { status, .. } if status.is_terminal() => {
-                let conclusion = execution_conclusion(*status);
-                self.observability
-                    .metrics()
-                    .lifecycle
-                    .record_job_completed(conclusion, "completed");
-                self.observability.export_log(
-                    "INFO",
-                    "job.completed",
-                    vec![
-                        ("event.name".to_string(), "job.completed".to_string()),
-                        ("conclusion".to_string(), conclusion.to_string()),
-                    ],
-                );
-            }
+            // `NdjsonEvent::JobCompleted` has no constructor anywhere in the
+            // workspace — the terminal transition is reported as a terminal
+            // `JobStatus`, which the arm above records. Keeping a counter
+            // call here would make the record look double-sourced.
             _ => {}
         }
         // Capture the projection under the lock, then persist after releasing
@@ -1477,6 +1490,29 @@ mod termination_reason_tests {
                 "{platform} must classify distinctly from the starvation sweep"
             );
         }
+    }
+
+    #[test]
+    fn reason_detail_is_bounded_on_a_char_boundary() {
+        use super::bounded_reason_detail;
+        // 4-byte characters: 300 of them is 1200 bytes, way over the cap.
+        let long = "w".repeat(300);
+        let bounded = bounded_reason_detail(&long);
+        assert!(bounded.len() <= 512);
+        assert!(bounded.is_char_boundary(bounded.len()));
+        // Short prose passes through untouched.
+        assert_eq!(bounded_reason_detail("short"), "short");
+    }
+
+    #[test]
+    fn crafted_runs_on_label_cannot_flip_the_classification() {
+        // The starvation prose interpolates `runs-on` labels verbatim. A
+        // label containing the platform phrase must still classify as
+        // `no_runner` — the anchored prefix is checked first.
+        let starved = "no runner is registered for `runs-on: self-hosted, \
+                       runner is registered with this server` and none \
+                       appeared within 120s, so the job cannot be scheduled";
+        assert_eq!(bounded_termination_reason(starved), "no_runner");
     }
 
     #[test]

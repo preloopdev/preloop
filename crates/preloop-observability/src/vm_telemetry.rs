@@ -1,11 +1,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use parking_lot::RwLock;
 
-use crate::status::{VmConfigured, VmCount, VmFleetSnapshot, VmHostUsage, VmSource, VmTopConsumer};
+use crate::status::{VmConfigured, VmCount, VmFleetSnapshot, VmHostUsage, VmSource};
 
 #[derive(Debug, Clone)]
 pub struct VmRuntimeInfo {

@@ -753,7 +753,7 @@ async fn main() -> anyhow::Result<()> {
         .with_service_version(env!("CARGO_PKG_VERSION"));
     let (observability, observability_runtime) =
         preloop_observability::Observability::from_config(obs_config);
-    preloop_observability::ObservabilityRuntime::install_fmt_subscriber(observability.config());
+    observability_runtime.install_fmt_subscriber();
     let cli = Cli::parse();
     // One config path for the whole process. `setup`/`doctor`/`secret` return
     // before `cmd_engine` runs, so pinning this only inside the engine let a

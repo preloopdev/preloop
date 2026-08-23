@@ -2772,11 +2772,18 @@ struct SlotPlan<'a> {
 ///
 /// Held for the duration of the build so concurrent slots see it, and released
 /// on drop so an error path cannot strand the count.
-struct Reservation<'a>(&'a AtomicUsize);
+struct Reservation<'a> {
+    building: &'a AtomicUsize,
+    pool_status: Option<Arc<preloop_observability::status::PoolStatus>>,
+}
 
 impl<'a> Reservation<'a> {
     /// Claim a build slot, or `None` when `wanted` are already in flight.
-    fn take(building: &'a AtomicUsize, wanted: usize) -> Option<Self> {
+    fn take(
+        building: &'a AtomicUsize,
+        wanted: usize,
+        pool_status: Option<Arc<preloop_observability::status::PoolStatus>>,
+    ) -> Option<Self> {
         let mut current = building.load(Ordering::Acquire);
         loop {
             if current >= wanted {
@@ -2788,7 +2795,15 @@ impl<'a> Reservation<'a> {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Some(Self(building)),
+                Ok(_) => {
+                    if let Some(ps) = &pool_status {
+                        ps.set_building((current + 1) as u32);
+                    }
+                    return Some(Self {
+                        building,
+                        pool_status,
+                    });
+                }
                 Err(observed) => current = observed,
             }
         }
@@ -2797,7 +2812,13 @@ impl<'a> Reservation<'a> {
 
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        let remaining = self
+            .building
+            .fetch_sub(1, Ordering::AcqRel)
+            .saturating_sub(1);
+        if let Some(ps) = &self.pool_status {
+            ps.set_building(remaining as u32);
+        }
     }
 }
 
@@ -2808,16 +2829,28 @@ impl Drop for Reservation<'_> {
 struct PreparingGuard {
     active: Arc<AtomicUsize>,
     signal: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pool_status: Option<Arc<preloop_observability::status::PoolStatus>>,
 }
 
 impl PreparingGuard {
-    fn enter(active: Arc<AtomicUsize>, signal: Option<Arc<std::sync::atomic::AtomicBool>>) -> Self {
+    fn enter(
+        active: Arc<AtomicUsize>,
+        signal: Option<Arc<std::sync::atomic::AtomicBool>>,
+        pool_status: Option<Arc<preloop_observability::status::PoolStatus>>,
+    ) -> Self {
         if active.fetch_add(1, Ordering::AcqRel) == 0 {
             if let Some(signal) = &signal {
                 signal.store(true, Ordering::Release);
             }
         }
-        Self { active, signal }
+        if let Some(ps) = &pool_status {
+            ps.set_provisioning(active.load(Ordering::Acquire) as u32);
+        }
+        Self {
+            active,
+            signal,
+            pool_status,
+        }
     }
 }
 
@@ -2827,6 +2860,9 @@ impl Drop for PreparingGuard {
             if let Some(signal) = &self.signal {
                 signal.store(false, Ordering::Release);
             }
+        }
+        if let Some(ps) = &self.pool_status {
+            ps.set_provisioning(self.active.load(Ordering::Acquire) as u32);
         }
     }
 }
@@ -2949,7 +2985,11 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     semaphore: Arc<tokio::sync::Semaphore>,
     permit: Arc<std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
 ) -> Result<(), OrchestratorError> {
-    let preparing = PreparingGuard::enter(provisioning, config.preparing_signal.clone());
+    let preparing = PreparingGuard::enter(
+        provisioning,
+        config.preparing_signal.clone(),
+        config.pool_status.clone(),
+    );
     // Resolve the golden for the queued job's environment.
     let (golden, environment) = if config.use_fork {
         let env_base = match &config.next_job_runs_on {
@@ -3264,12 +3304,24 @@ async fn provision_slot<P: VmProvider + 'static>(
 ) -> Result<ReadyRunner, OrchestratorError> {
     let name = MachineName::new(format!("{}-{slot}-{generation}", config.name_prefix))?;
     match provision_runner(provider, config, &name, golden, keys, &environment).await {
-        Ok(run) => Ok(ReadyRunner {
-            name,
-            run,
-            environment,
-        }),
+        Ok(run) => {
+            // A provision that made it (fork or direct create, configure,
+            // registration) resets the consecutive-failure streak. The
+            // counter feeds `pool_repeated_provision_failure` and the
+            // `consecutive_provision_failures` status field.
+            if let Some(ps) = &config.pool_status {
+                ps.clear_provision_failures();
+            }
+            Ok(ReadyRunner {
+                name,
+                run,
+                environment,
+            })
+        }
         Err(error) => {
+            if let Some(ps) = &config.pool_status {
+                ps.record_provision_failure();
+            }
             if let Err(cleanup) = provider.delete(&name).await {
                 warn!(
                     machine = name.as_str(),
@@ -3375,6 +3427,9 @@ async fn run_one_runner<P: VmProvider + 'static>(
     let run_provider = provider.clone();
     let run_name = name.clone();
     idle.fetch_add(1, Ordering::AcqRel);
+    if let Some(ps) = &config.pool_status {
+        ps.set_idle(idle.load(Ordering::Acquire) as u32);
+    }
     let run_task = tokio::spawn(async move {
         let result = run_until_exit(&run_provider, &run_name, &run, busy_tx).await;
         let _ = done_tx.send(result);
@@ -3388,10 +3443,16 @@ async fn run_one_runner<P: VmProvider + 'static>(
     let build_successor = async {
         if busy_rx.await.is_err() {
             idle.fetch_sub(1, Ordering::AcqRel);
+            if let Some(ps) = &config.pool_status {
+                ps.set_idle(idle.load(Ordering::Acquire) as u32);
+            }
             return None;
         }
         successor_claimed.store(true, Ordering::Release);
         let idle_after = idle.fetch_sub(1, Ordering::AcqRel).saturating_sub(1);
+        if let Some(ps) = &config.pool_status {
+            ps.set_idle(idle.load(Ordering::Acquire) as u32);
+        }
         if !prebuild_successor {
             return None;
         }
@@ -3410,7 +3471,7 @@ async fn run_one_runner<P: VmProvider + 'static>(
         let wanted = queued
             .saturating_sub(idle_after)
             .max(usize::from(idle_after == 0));
-        let _reservation = Reservation::take(building, wanted)?;
+        let _reservation = Reservation::take(building, wanted, config.pool_status.clone())?;
         match provision_slot(
             &provider,
             config,
@@ -3443,6 +3504,9 @@ async fn run_one_runner<P: VmProvider + 'static>(
             run_task.abort();
             let _ = run_task.await;
             idle.fetch_sub(1, Ordering::AcqRel);
+            if let Some(ps) = &config.pool_status {
+                ps.set_idle(idle.load(Ordering::Acquire) as u32);
+            }
             info!(machine = name.as_str(), environment = %environment.base, "replacing idle runner for queued environment");
             (provider.stop(name).await.map_err(OrchestratorError::from), None)
         },
@@ -4883,8 +4947,8 @@ chmod +x "$destination/bin/node"
         let active = Arc::new(AtomicUsize::new(0));
         let signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        let first = PreparingGuard::enter(active.clone(), Some(signal.clone()));
-        let second = PreparingGuard::enter(active.clone(), Some(signal.clone()));
+        let first = PreparingGuard::enter(active.clone(), Some(signal.clone()), None);
+        let second = PreparingGuard::enter(active.clone(), Some(signal.clone()), None);
         assert!(signal.load(Ordering::Acquire));
 
         drop(first);
@@ -5252,6 +5316,58 @@ chmod +x "$destination/bin/node"
         let config = test_config(false);
         let golden = MachineName::new("lifecycle-test-golden").unwrap();
         provisioning_failure(provider, &config, Some(&golden), "configure-failure").await;
+    }
+
+    #[tokio::test]
+    async fn provision_failures_count_and_clear_on_pool_status() {
+        let mut config = test_config(false);
+        let pool_status = Arc::new(preloop_observability::status::PoolStatus::new(
+            preloop_observability::status::PoolSnapshot::default(),
+        ));
+        config.pool_status = Some(pool_status.clone());
+        let keys = Arc::new(KeyPool::new());
+
+        // A failing provision must increment the consecutive-failure counter,
+        // which feeds `pool_repeated_provision_failure` and the status field.
+        let failing = Arc::new(TestProvider::new(true, false, false, false, false));
+        let err = provision_slot(
+            &failing,
+            &config,
+            0,
+            1,
+            None,
+            &keys,
+            RunnerEnvironment {
+                fingerprint: None,
+                base: config.base_image.clone(),
+                toolchains: Vec::new(),
+                curated: true,
+            },
+        )
+        .await
+        .expect_err("start-failure must propagate");
+        assert!(err.to_string().contains("start-failure"));
+        assert_eq!(pool_status.snapshot().consecutive_provision_failures, 1);
+
+        // A succeeding provision must reset the streak to zero.
+        let ok = Arc::new(TestProvider::new(false, false, false, false, false));
+        provision_slot(
+            &ok,
+            &config,
+            0,
+            2,
+            None,
+            &keys,
+            RunnerEnvironment {
+                fingerprint: None,
+                base: config.base_image.clone(),
+                toolchains: Vec::new(),
+                curated: true,
+            },
+        )
+        .await
+        .expect("provisioning succeeds");
+        assert_eq!(pool_status.snapshot().consecutive_provision_failures, 0);
     }
 
     fn packed_fork_config() -> RunnerPoolConfig {

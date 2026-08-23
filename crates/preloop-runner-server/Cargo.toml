@@ -23,6 +23,7 @@ hyper.workspace = true
 hyper-util.workspace = true
 tower.workspace = true
 preloop-observability = { path = "../preloop-observability" }
+opentelemetry = { workspace = true }
 preloop-artifacts = { path = "../preloop-artifacts" }
 preloop-cache = { path = "../preloop-cache" }
 preloop-gha-parser = { path = "../preloop-gha-parser" }

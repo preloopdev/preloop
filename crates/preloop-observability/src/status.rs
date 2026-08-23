@@ -11,19 +11,14 @@ use serde::{Deserialize, Serialize};
 // Overall
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Overall {
+    #[default]
     Ok,
     Degraded,
     Blocked,
     ShuttingDown,
-}
-
-impl Default for Overall {
-    fn default() -> Self {
-        Self::Ok
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -98,19 +93,14 @@ pub struct RunnersSnapshot {
 // Pool
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PoolMode {
+    #[default]
     Warm,
     OnDemand,
     External,
     Disabled,
-}
-
-impl Default for PoolMode {
-    fn default() -> Self {
-        Self::Warm
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,6 +179,21 @@ impl PoolStatus {
         self.inner.write().preparing = preparing;
     }
 
+    /// Mirror one pool count into the snapshot. Per-field setters, not
+    /// `set_counts`, so a RAII guard updating only the count it owns cannot
+    /// clobber the fields another guard just wrote.
+    pub fn set_idle(&self, idle: u32) {
+        self.inner.write().idle = idle;
+    }
+
+    pub fn set_building(&self, building: u32) {
+        self.inner.write().building = building;
+    }
+
+    pub fn set_provisioning(&self, provisioning: u32) {
+        self.inner.write().provisioning = provisioning;
+    }
+
     pub fn set_counts(&self, idle: u32, busy: u32, building: u32, provisioning: u32, paused: u32) {
         let mut g = self.inner.write();
         g.idle = idle;
@@ -236,19 +241,14 @@ impl PoolStatus {
 // VMs
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VmSource {
     CgroupV2,
     Process,
     Mixed,
+    #[default]
     Unavailable,
-}
-
-impl Default for VmSource {
-    fn default() -> Self {
-        Self::Unavailable
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -306,17 +306,12 @@ use std::collections::HashMap;
 // Store / Storage / Github / Debug / Telemetry
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StoreBackend {
+    #[default]
     Sqlite,
     Postgres,
-}
-
-impl Default for StoreBackend {
-    fn default() -> Self {
-        Self::Sqlite
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
