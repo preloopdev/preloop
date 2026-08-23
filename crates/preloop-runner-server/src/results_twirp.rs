@@ -683,8 +683,8 @@ pub(crate) async fn twirp_cache_v2_create(
             inner.cache_v2_pending.insert(
                 token.clone(),
                 CacheV2Pending {
-                    key: storage_key,
-                    version,
+                    key: storage_key.clone(),
+                    version: version.clone(),
                 },
             );
             let meta = crate::store::build_meta_snapshot(&inner);
@@ -710,7 +710,11 @@ pub(crate) async fn twirp_cache_v2_create(
         ));
     }
     let upload_url = format!("{}/twirp-blob/cache/{token}", runner_base_url());
-    info!(token, "cache v2 create entry");
+    info!(
+        key = %storage_key,
+        version = %version,
+        "cache v2 create entry"
+    );
     Ok(pb_or_json(
         &headers,
         PbCreateCacheEntryResponse {
