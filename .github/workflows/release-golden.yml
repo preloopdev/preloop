@@ -305,6 +305,9 @@ jobs:
             # the retry cannot collide with the previous attempt's disks.
             smolvm machine delete --name "$builder" \
               --force --cascade >/dev/null 2>&1 || true
+            # The runner-large base image archive is ~18 GB; smolvm refuses
+            # local archives over its default 8 GiB cap.
+            export SMOLVM_MAX_IMAGE_BYTES=34359738368
             if ./target/release/preloop build-golden \
                 --runner-bundle "target/$RUNNER_TARGET/release" \
                 --output "dist/$GOLDEN_NAME"; then
@@ -559,6 +562,9 @@ jobs:
           # be larger than the stock 20 GiB default.
           export PRELOOP_RUNNER_STORAGE_GB=120
           export PRELOOP_RUNNER_OVERLAY_GB=120
+          # The runner-large base image archive is ~18 GB; smolvm refuses
+          # local archives over its default 8 GiB cap.
+          export SMOLVM_MAX_IMAGE_BYTES=34359738368
           ./target/release/preloop build-golden \
             --runner-bundle "target/$RUNNER_TARGET/release" \
             --output "dist/$GOLDEN_NAME"
