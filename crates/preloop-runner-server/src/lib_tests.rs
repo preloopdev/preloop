@@ -17319,6 +17319,50 @@ async fn replay_blob_uploads_require_a_ticket_bound_to_the_exact_path() {
         .unwrap();
     assert_eq!(forged.status(), StatusCode::UNAUTHORIZED);
 }
+#[tokio::test]
+async fn replay_job_log_upload_is_published_as_one_complete_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let plan = uuid::Uuid::new_v4().to_string();
+    let job = uuid::Uuid::new_v4().to_string();
+    let path = format!("/replay/results/{plan}/{job}/job-logs.txt");
+    let sig = crate::auth::sign_replay_upload_ticket(&state, &path);
+    let expected = "log line\n".repeat(1024);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(format!(
+                    "{path}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig={sig}"
+                ))
+                .body(Body::from(expected.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let results_dir = temp
+        .path()
+        .join("replay")
+        .join("results")
+        .join(&plan)
+        .join(&job);
+    assert_eq!(
+        tokio::fs::read(results_dir.join("job-logs.txt"))
+            .await
+            .unwrap(),
+        expected.as_bytes()
+    );
+    let mut entries = tokio::fs::read_dir(results_dir).await.unwrap();
+    let mut names = Vec::new();
+    while let Some(entry) = entries.next_entry().await.unwrap() {
+        names.push(entry.file_name());
+    }
+    assert_eq!(names, vec![std::ffi::OsString::from("job-logs.txt")]);
+}
 
 #[tokio::test]
 async fn replay_blob_urls_are_minted_only_for_the_callers_own_job() {
