@@ -47,11 +47,11 @@ permissions:
 jobs:
   prep:
     name: Prep runner sync (diff + triage)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
-      pull-requests: write
     outputs:
       moved: ${{ steps.moved.outputs.moved }}
       from: ${{ steps.versions.outputs.from }}
@@ -105,21 +105,6 @@ jobs:
       - name: Triage delta into specs
         if: steps.moved.outputs.moved == 'true'
         run: cargo run -q -p runner-watch -- triage --no-agents
-      - name: Summarize on the tripwire PR
-        if: steps.moved.outputs.moved == 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VER_FROM: ${{ steps.versions.outputs.from }}
-          VER_TO: ${{ steps.versions.outputs.to }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          SERVER_URL: ${{ github.server_url }}
-          REPO: ${{ github.repository }}
-          RUN_ID: ${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          SPECS="$(python3 -c 'import json; print(json.load(open(".runner-watch/triage-summary.json")).get("specs", 0))')"
-          BODY="runner-sync: $VER_FROM -> $VER_TO triaged into **$SPECS specs** (deterministic, no agents). See [the run]($SERVER_URL/$REPO/actions/runs/$RUN_ID) for delta.json and the spec set. The sync job then records goldens, conforms, and opens the tiered PRs once a runner-sync host is provisioned."
-          gh pr comment "$PR_NUMBER" --body "$BODY"
       - name: Upload triage artifacts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -131,20 +116,47 @@ jobs:
             .runner-watch/specs/**
           if-no-files-found: ignore
 
+  summarize:
+    name: Summarize runner sync
+    needs: prep
+    if: needs.prep.result == 'success' && needs.prep.outputs.moved == 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Download triage artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: runner-sync-prep
+          path: .runner-watch
+      - name: Comment on tripwire PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VER_FROM: ${{ needs.prep.outputs.from }}
+          VER_TO: ${{ needs.prep.outputs.to }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SERVER_URL: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          SPECS="$(python3 -c 'import json; print(json.load(open(".runner-watch/triage-summary.json")).get("specs", 0))')"
+          BODY="runner-sync: $VER_FROM -> $VER_TO triaged into **$SPECS specs** (deterministic, no agents). See [the run]($SERVER_URL/$REPO/actions/runs/$RUN_ID) for delta.json and the spec set. The sync job then records goldens, conforms, and opens the tiered PRs once a runner-sync host is provisioned."
+          gh pr comment "$PR_NUMBER" --body "$BODY"
+
   sync:
     name: Runner sync (record-golden + conform + tiered PRs)
     needs: prep
     # vars-only gate: the preloop dogfood CI evaluates job-level `if`s, so a
     # needs-outputs condition here would leave the job queued forever on that
     # pool; movement is instead detected in a step below.
-    if: vars.RUNNER_SYNC_HOST_WORKSPACE != ''
+    if: vars.RUNNER_SYNC_HOST_WORKSPACE != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, runner-sync]
     timeout-minutes: 180
     permissions:
       contents: write
       pull-requests: write
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       HOST_WORKSPACE: ${{ vars.RUNNER_SYNC_HOST_WORKSPACE }}
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
@@ -240,15 +252,14 @@ jobs:
           SERVER_PID=""
           trap - EXIT
           echo "conform: PASS"
-      - name: Open tiered sync PRs
+      - name: Render tiered sync changes
+        id: render
         if: steps.moved.outputs.moved == 'true'
         env:
           VER_TO: ${{ steps.versions.outputs.to }}
         run: |
           set -euo pipefail
-          gh auth setup-git
-          git config user.name "preloop-sync[bot]"
-          git config user.email "preloop-sync[bot]@users.noreply.github.com"
+          CHANGED=false
           BRANCH="runner-sync/v$VER_TO"
           git checkout -b "$BRANCH"
           # Renders the tiered PR bodies and updates versions.toml / README /
@@ -257,9 +268,26 @@ jobs:
           git add -A
           if ! git diff --cached --quiet; then
             git commit -m "chore(runner-sync): reconcile actions/runner v$VER_TO"
+            CHANGED=true
+          fi
+          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+      - name: Push and open tiered sync PRs
+        if: steps.render.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VER_TO: ${{ steps.versions.outputs.to }}
+        run: |
+          set -euo pipefail
+          BRANCH="runner-sync/v$VER_TO"
+          gh auth setup-git
+          git config user.name "preloop-sync[bot]"
+          git config user.email "preloop-sync[bot]@users.noreply.github.com"
+          if git rev-parse --verify HEAD >/dev/null; then
             git push origin "$BRANCH"
           fi
-          cargo run -q -p runner-watch -- pr --base main --head "$BRANCH"
+          # Use the already-built binary; this token-bearing step must not
+          # invoke Cargo or execute a build script.
+          target/debug/runner-watch pr --base main --head "$BRANCH"
       - name: Upload conformance report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

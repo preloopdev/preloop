@@ -50,8 +50,9 @@ __pycache__/
 
 # Local toolchains & runner binaries
 .cargo/*
-# Except the cargo-audit config, which the supply-chain gate needs tracked.
+# Except policy configs, which the supply-chain gate needs tracked.
 !.cargo/audit.toml
+!.cargo/config.toml
 .rustup/
 actions-runner/
 official-runner.tar.gz
@@ -143,6 +144,4 @@ skills-lock.json
 /logo.png
 /logo-square.png
 
-# Supply-chain gate: parked until the cargo vet backlog is dealt with
-/.github/workflows/supply-chain.yml
 .wrangler/

@@ -57,11 +57,12 @@ test-ci: fmt-check clippy zizmor
     just conform
     @echo CI: all checks passed
 
-# Supply-chain gate: dependency version-change policing (vet), RustSec
-# advisories (audit), and license/ban/source policy (deny). Local runs are on
-# trusted code; CI (supply-chain.yml) additionally drops any PR-shipped
-# .cargo/config.toml and rejects PRs that touch the policy files.
+# Supply-chain gate: reviewed build scripts, seven-day dependency cooldown,
+# dependency audits, and license/ban/source policy.
 supply-chain:
+    cargo fetch --locked
+    python3 scripts/check-build-script-hashes.py
+    cargo +nightly update -Z min-publish-age --dry-run --verbose
     cargo vet
     cargo audit
     cargo deny check all

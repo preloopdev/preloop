@@ -1,0 +1,550 @@
+# Reviewed SHA-256 hashes of every Cargo custom-build target.
+#
+# Regenerate only after reviewing dependency/build-script changes:
+#   cargo fetch --locked
+#   python3 scripts/check-build-script-hashes.py --write
+version = 1
+
+[[build_script]]
+package = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "89d1baedcff59822ed692d3a33f131c211a213bdec33c83f68b54110d9c64223"
+
+[[build_script]]
+package = "aws-lc-rs"
+version = "1.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "791f97e6abdb685bcc722342d49f2646b3146b209f68753669c178716f6cee01"
+
+[[build_script]]
+package = "aws-lc-sys"
+version = "0.42.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-main"
+path = "builder/main.rs"
+sha256 = "da7f62c929eaa06ecacbdadfb829ca9e40f7291b296a3edffa35194bda6a82dc"
+
+[[build_script]]
+package = "chrono-tz"
+version = "0.10.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "a95f00ef475e4250661ae26ea1bc1a2562695c44aee8b9bd4a7e175df27c21e7"
+
+[[build_script]]
+package = "crc32fast"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "62279ea110418e1b57e46ed5689cae892f3fa424ba237733ecbf4660c3dee71c"
+
+[[build_script]]
+package = "crossbeam-utils"
+version = "0.8.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "7a7f9e56ea7fb4f78c4e532b84b9d27be719d600e85eaeb3a2f4b79a4f0b419c"
+
+[[build_script]]
+package = "fs-err"
+version = "3.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "36914f4651b5c45fb7be5d26bea46ffa25ce3d90b6b565d997f36f076a5c4579"
+
+[[build_script]]
+package = "generic-array"
+version = "0.14.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "08fa30c4a2c1ad24fe5f987e721dfb20131f45ea5b5dc3e836dcf88a8e33248c"
+
+[[build_script]]
+package = "getrandom"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "d542c9c3bbc2f64a26c758eac8af16178aab52464bdd8bf0b9a767ba87665021"
+
+[[build_script]]
+package = "getrandom"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "662faa06d7b2a9c5bea2c17a127a90e00b9f9b31105b0360da516e47cf816e95"
+
+[[build_script]]
+package = "httparse"
+version = "1.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "eba8e341d746a6cf54249c62afe9eb237e7c21fcf9937223e894549e3a34d489"
+
+[[build_script]]
+package = "iana-time-zone-haiku"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "10304831100a60c1c2b990762dcfeb47dae8342cf9b54595bec94884e7de5784"
+
+[[build_script]]
+package = "icu_normalizer_data"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "c2d446772e3d766a804963dbf36e51729f910920f91f4b68c0c199fe6ca0853e"
+
+[[build_script]]
+package = "icu_properties_data"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "c2d446772e3d766a804963dbf36e51729f910920f91f4b68c0c199fe6ca0853e"
+
+[[build_script]]
+package = "jni-macros"
+version = "0.22.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "1efa966c0bf5a3887d88d9fad2e11a905e3927055e4981c2ee7e873ea6f1e80b"
+
+[[build_script]]
+package = "jni"
+version = "0.22.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "3eb6b10b06dedd9791dc7daddfb577086e59c2177c7dd91250df8c6eb3c51973"
+
+[[build_script]]
+package = "libc"
+version = "0.2.186"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "4b348c53d0a0cd0067ef9887b50f60a1fffdc5d00dda5c0e27fae6aa0ce3dee8"
+
+[[build_script]]
+package = "libm"
+version = "0.2.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "85dfa93693f40e282ecf2d9a3115280d8f508f056063862add9e529b8143b71b"
+
+[[build_script]]
+package = "libsqlite3-sys"
+version = "0.35.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "5f1984827787b3e4777d89fb6626a4a0a3889fac875443cd074ebe5141ed7259"
+
+[[build_script]]
+package = "num-bigint-dig"
+version = "0.8.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "bf1b914225d60b380be17ef123c023549e0a4924a85852e8830fb0d1c7bcbb36"
+
+[[build_script]]
+package = "num-traits"
+version = "0.2.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "d3969209fc1c9d201c66ed11820d0b328600d75b3971f8ceebeab04900bc0587"
+
+[[build_script]]
+package = "oid-registry"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "92bcabf416b47b4b1a75cc47ccc6ccfbbe24e1d9ef6404561a4dec02f66bea9d"
+
+[[build_script]]
+package = "parking_lot_core"
+version = "0.9.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "3698c936b75f8332d9b6b30a8a6838ea116c1ff0a819a025c9ea9696e4d8ce72"
+
+[[build_script]]
+package = "portable-atomic"
+version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "9d0b1e071715580497aadb918d4b3b124ee366ba66f15ac05a3d8045f0bc2cf0"
+
+[[build_script]]
+package = "proc-macro2"
+version = "1.0.106"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "baeb20b52f6b536be8657a566591a507bb2e34a45cf8baa42b135510a0c3c729"
+
+[[build_script]]
+package = "prometheus"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "b68a41b9f0f32360e192cc413717475ecb71db1395e7273fb2f485f36fe5f82f"
+
+[[build_script]]
+package = "protobuf"
+version = "3.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "347d9aa6d4b102b6e83c65aeef89b1e1752536bd8ef80fc834a2c78d5cb2ff80"
+
+[[build_script]]
+package = "quinn-udp"
+version = "0.5.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "1d7ecadda4a26fb0eba598789eef9b99a1b4febba9bcb61a34f0c92b1d1bbaeb"
+
+[[build_script]]
+package = "quinn"
+version = "0.11.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "da265b34113659b194be9d5972d4af6e5a334e0afa4adf02f949e4a1ab39a7ad"
+
+[[build_script]]
+package = "quote"
+version = "1.0.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "cd6808c02e476b09a520105e2c6f6d325cccb1ecd542cbbcc836a0ae6f6fb0f1"
+
+[[build_script]]
+package = "ring"
+version = "0.17.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "9d1928ffb1d8e15766c1c1b9ead73e4b81a21703dd25f7c27b87842a2e6e9cee"
+
+[[build_script]]
+package = "rustix"
+version = "1.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "74cb32e64aa6fe99c2496a425b016e22f4e43c438a8237966b8acae04a98eaf9"
+
+[[build_script]]
+package = "rustls"
+version = "0.23.41"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "380b9a051325baa7d4957bd9a4f1a637c27a663610b1b502f9524530f6995f4d"
+
+[[build_script]]
+package = "rustversion"
+version = "1.0.22"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build/build.rs"
+sha256 = "6d869d2230fa9c4f8ae0df956b06438a070df276649135d4309f56eac72ddbe3"
+
+[[build_script]]
+package = "serde_core"
+version = "1.0.228"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "a5fdacb9913eeede5fc08f39acbd31b2508483fdc20c79d6bc274d74407a1816"
+
+[[build_script]]
+package = "serde_json"
+version = "1.0.150"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "a681e754be844c7dbef957f5d2d00b01f37c5dca160ef1055a8d8f975697a881"
+
+[[build_script]]
+package = "serde"
+version = "1.0.228"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "c99c25e1a11f3e51b61dd8c25bdbfbd090e43e5f1f2014f41f28e214dd8310d5"
+
+[[build_script]]
+package = "system-configuration-sys"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "cf4c21c898e9671345d4684c75014189623574f9ec96414999a9db2d73b1e40f"
+
+[[build_script]]
+package = "thiserror"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "275d0ddbb22d5f015fba360f51a48da10b6309410efe8c6ca678412b1e8c9288"
+
+[[build_script]]
+package = "thiserror"
+version = "2.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "18bf4b4af0f507c7fdfe4dbfc98b5ac3d6a5ef924f46ee56125fd8b22fd61b4c"
+
+[[build_script]]
+package = "valuable"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "eb0a00e69154c13315daa09ad07a48d4c9c07ed8178402ba3723be824781e309"
+
+[[build_script]]
+package = "wasm-bindgen-shared"
+version = "0.2.126"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "cc562769f4d55da465e081bb3187502bab20beb4704f22cc7d07be5ba4b765ae"
+
+[[build_script]]
+package = "wasm-bindgen"
+version = "0.2.126"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "33c90a6eb1745c53f9047e0ecde135b249b0ea3d9e1a2a40c9610a33f225e6c9"
+
+[[build_script]]
+package = "winapi-i686-pc-windows-gnu"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "4344ce95f51197e1377429cd9ef7a8e3f97d39546776705857991f2f9416f545"
+
+[[build_script]]
+package = "winapi-x86_64-pc-windows-gnu"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "b4ab421e1dc98159dd4440813cdaf7d9ea98278324bc6118d0f7cf378933f371"
+
+[[build_script]]
+package = "winapi"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "fa1782968d33345772093666220c7841c2fb4f6dd32fa47951c68a3a400a1a98"
+
+[[build_script]]
+package = "windows_aarch64_gnullvm"
+version = "0.52.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "6d40bd2c0ed4cbea5126dfcd89d72f229c7d986540cbf0dc34acc1017f1de20f"
+
+[[build_script]]
+package = "windows_aarch64_gnullvm"
+version = "0.53.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "6d40bd2c0ed4cbea5126dfcd89d72f229c7d986540cbf0dc34acc1017f1de20f"
+
+[[build_script]]
+package = "windows_aarch64_msvc"
+version = "0.52.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "6d40bd2c0ed4cbea5126dfcd89d72f229c7d986540cbf0dc34acc1017f1de20f"
+
+[[build_script]]
+package = "windows_aarch64_msvc"
+version = "0.53.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "6d40bd2c0ed4cbea5126dfcd89d72f229c7d986540cbf0dc34acc1017f1de20f"
+
+[[build_script]]
+package = "windows_i686_gnullvm"
+version = "0.52.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "6d40bd2c0ed4cbea5126dfcd89d72f229c7d986540cbf0dc34acc1017f1de20f"
+
+[[build_script]]
+package = "windows_i686_gnullvm"
+version = "0.53.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "6d40bd2c0ed4cbea5126dfcd89d72f229c7d986540cbf0dc34acc1017f1de20f"
+
+[[build_script]]
+package = "windows_i686_gnu"
+version = "0.52.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "6d40bd2c0ed4cbea5126dfcd89d72f229c7d986540cbf0dc34acc1017f1de20f"
+
+[[build_script]]
+package = "windows_i686_gnu"
+version = "0.53.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "6d40bd2c0ed4cbea5126dfcd89d72f229c7d986540cbf0dc34acc1017f1de20f"
+
+[[build_script]]
+package = "windows_i686_msvc"
+version = "0.52.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "6d40bd2c0ed4cbea5126dfcd89d72f229c7d986540cbf0dc34acc1017f1de20f"
+
+[[build_script]]
+package = "windows_i686_msvc"
+version = "0.53.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "6d40bd2c0ed4cbea5126dfcd89d72f229c7d986540cbf0dc34acc1017f1de20f"
+
+[[build_script]]
+package = "windows_x86_64_gnullvm"
+version = "0.52.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "6d40bd2c0ed4cbea5126dfcd89d72f229c7d986540cbf0dc34acc1017f1de20f"
+
+[[build_script]]
+package = "windows_x86_64_gnullvm"
+version = "0.53.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "6d40bd2c0ed4cbea5126dfcd89d72f229c7d986540cbf0dc34acc1017f1de20f"
+
+[[build_script]]
+package = "windows_x86_64_gnu"
+version = "0.52.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "6d40bd2c0ed4cbea5126dfcd89d72f229c7d986540cbf0dc34acc1017f1de20f"
+
+[[build_script]]
+package = "windows_x86_64_gnu"
+version = "0.53.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "6d40bd2c0ed4cbea5126dfcd89d72f229c7d986540cbf0dc34acc1017f1de20f"
+
+[[build_script]]
+package = "windows_x86_64_msvc"
+version = "0.52.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "6d40bd2c0ed4cbea5126dfcd89d72f229c7d986540cbf0dc34acc1017f1de20f"
+
+[[build_script]]
+package = "windows_x86_64_msvc"
+version = "0.53.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "6d40bd2c0ed4cbea5126dfcd89d72f229c7d986540cbf0dc34acc1017f1de20f"
+
+[[build_script]]
+package = "wit-bindgen"
+version = "0.57.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "99b4276049457d3ea1d304277d66b0ff1abba0b9b1f5d60a5e25bdd3fd897a91"
+
+[[build_script]]
+package = "zerocopy"
+version = "0.8.52"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "916639a8cc523f6b7551c946706f551b24352cd50c84a2284ca313798bc77ee5"
+
+[[build_script]]
+package = "zip"
+version = "2.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "src/build.rs"
+sha256 = "8a048f0daacc5e4067f432b107cafe331426f6aecd4f76759a8be42d5556027e"
+
+[[build_script]]
+package = "zmij"
+version = "1.0.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "13201b550236a9ff2186b5303c77341d3b0874989fdaf39613a7452e4ce57817"
+
+[[build_script]]
+package = "preloop-cli"
+version = "0.30.10"
+source = "workspace"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "67be5f5380b797e43e495b9a733cfbc1bf2aac89c845f11cd34c9683f26eecaa"
+
+[[build_script]]
+package = "preloop-orchestrator"
+version = "0.21.0"
+source = "workspace"
+target = "build-script-build"
+path = "build.rs"
+sha256 = "e0b0daae4b72e477a261003fa58e4a260866b00499641628017666c8ceff948d"

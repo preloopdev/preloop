@@ -44,6 +44,8 @@ jobs:
   rust:
     # Runs on the preloop self-hosted pool: the product's own runner is the
     # CI executor (dogfood).
+    # Fork PRs must never execute untrusted build scripts on that pool.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: self-hosted
     timeout-minutes: 60
     env:
@@ -102,7 +104,8 @@ jobs:
   property-tests-fast:
     runs-on: self-hosted
     timeout-minutes: 30
-    if: github.event_name != 'schedule'
+    # Fork PRs must never execute untrusted build scripts on that pool.
+    if: github.event_name != 'pull_request' && github.event_name != 'schedule' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:

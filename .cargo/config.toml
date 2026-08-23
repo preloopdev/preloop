@@ -1,0 +1,10 @@
+# Dependency cooldown policy.
+#
+# This is consumed by nightly Cargo when resolving or updating the lockfile.
+# Stable Cargo ignores the unstable feature; CI's supply-chain job invokes the
+# pinned nightly explicitly.
+[unstable]
+min-publish-age = true
+
+[registry]
+global-min-publish-age = "7 days"

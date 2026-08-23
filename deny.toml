@@ -101,6 +101,7 @@ allow = [
     "MPL-2.0",
     "Zlib",
     "BSL-1.0",
+    "FSL-1.1-MIT",
     "OpenSSL",
     "Unicode-3.0",
     "Unicode-DFS-2016",
