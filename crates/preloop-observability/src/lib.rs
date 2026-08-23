@@ -1,3 +1,5 @@
+#![allow(missing_docs)]
+
 //! `preloop-observability` — observability handle for Preloop.
 //!
 //! Small, explicit API with no dependency on server/orchestrator internals. Both
@@ -29,6 +31,7 @@ pub use opentelemetry_sdk::propagation::TraceContextPropagator;
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -190,12 +193,20 @@ impl ObservabilityConfig {
         // base needs the /v1/<signal> suffix. Appending the suffix to a
         // signal-specific URL would produce `/v1/traces/v1/traces`, and
         // sending every signal to one signal-specific URL misroutes the rest.
-        let resolve = |var: &str, suffix: &str| {
-            std::env::var(var)
-                .ok()
-                .filter(|v| !v.trim().is_empty() && v.trim() != "none")
-                .map(|v| v.trim_end_matches('/').to_string())
-                .or_else(|| generic.as_ref().map(|g| format!("{g}{suffix}")))
+        let resolve = |var: &str, suffix: &str| match std::env::var(var) {
+            Ok(value) => {
+                let value = value.trim();
+                if value.eq_ignore_ascii_case("none") {
+                    // An explicit per-signal disable must not fall back to
+                    // the generic endpoint.
+                    None
+                } else if value.is_empty() {
+                    generic.as_ref().map(|g| format!("{g}{suffix}"))
+                } else {
+                    Some(value.trim_end_matches('/').to_string())
+                }
+            }
+            Err(_) => generic.as_ref().map(|g| format!("{g}{suffix}")),
         };
         let otel_logs_endpoint = resolve("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "/v1/logs");
         let otel_traces_endpoint = resolve("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "/v1/traces");
@@ -318,49 +329,74 @@ pub enum Criticality {
 /// registers here per invariant 15.
 #[derive(Debug, Clone, Default)]
 pub struct TaskHeartbeat {
-    inner: Arc<RwLock<HashMap<&'static str, HeartbeatEntry>>>,
+    inner: Arc<RwLock<HashMap<u64, HeartbeatEntry>>>,
+    next_id: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone)]
 struct HeartbeatEntry {
+    name: &'static str,
     critical: Criticality,
     last_beat: Instant,
+    panicked: bool,
 }
 
 impl TaskHeartbeat {
-    /// Register a task. Returns a guard — `Drop` deregisters.
+    /// Register a task. Returns a guard — normal `Drop` deregisters, while
+    /// panic unwinding preserves the entry as failed for readiness checks.
     pub fn register(&self, name: &'static str, critical: Criticality) -> HeartbeatHandle {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.inner.write().insert(
-            name,
+            id,
             HeartbeatEntry {
+                name,
                 critical,
                 last_beat: Instant::now(),
+                panicked: false,
             },
         );
         HeartbeatHandle {
             registry: self.clone(),
+            id,
             name,
         }
     }
 
     /// Record a beat for `name`. No-op if not registered (so tests can `noop()` without registering).
     pub fn beat(&self, name: &'static str) {
-        if let Some(entry) = self.inner.write().get_mut(name) {
+        for entry in self
+            .inner
+            .write()
+            .values_mut()
+            .filter(|entry| entry.name == name)
+        {
             entry.last_beat = Instant::now();
         }
     }
 
-    pub(crate) fn deregister(&self, name: &'static str) {
-        self.inner.write().remove(name);
+    fn beat_id(&self, id: u64) {
+        if let Some(entry) = self.inner.write().get_mut(&id) {
+            entry.last_beat = Instant::now();
+        }
+    }
+
+    fn deregister(&self, id: u64) {
+        self.inner.write().remove(&id);
+    }
+
+    fn mark_panicked(&self, id: u64) {
+        if let Some(entry) = self.inner.write().get_mut(&id) {
+            entry.panicked = true;
+        }
     }
 
     /// Snapshot for `/readyz` and `/api/v1/status`.
     pub fn snapshot(&self) -> Vec<TaskSnapshot> {
         self.inner
             .read()
-            .iter()
-            .map(|(name, e)| TaskSnapshot {
-                name,
+            .values()
+            .map(|e| TaskSnapshot {
+                name: e.name,
                 critical: e.critical,
                 heartbeat_age: e.last_beat.elapsed(),
             })
@@ -371,9 +407,11 @@ impl TaskHeartbeat {
     pub fn any_critical_stale(&self, threshold: Duration) -> Option<&'static str> {
         // Hold read lock across iteration to avoid TOCTOU.
         let guard = self.inner.read();
-        for (name, e) in guard.iter() {
-            if e.critical == Criticality::Critical && e.last_beat.elapsed() > threshold {
-                return Some(*name);
+        for e in guard.values() {
+            if e.critical == Criticality::Critical
+                && (e.panicked || e.last_beat.elapsed() > threshold)
+            {
+                return Some(e.name);
             }
         }
         None
@@ -392,21 +430,27 @@ impl TaskHeartbeat {
     }
 }
 
-/// Guard — `beat()` updates, `Drop` deregisters.
+/// Guard — `beat()` updates, normal `Drop` deregisters, and panic unwinding
+/// preserves the task as failed.
 pub struct HeartbeatHandle {
     registry: TaskHeartbeat,
+    id: u64,
     name: &'static str,
 }
 
 impl HeartbeatHandle {
     pub fn beat(&self) {
-        self.registry.beat(self.name);
+        self.registry.beat_id(self.id);
     }
 }
 
 impl Drop for HeartbeatHandle {
     fn drop(&mut self) {
-        self.registry.deregister(self.name);
+        if std::thread::panicking() {
+            self.registry.mark_panicked(self.id);
+        } else {
+            self.registry.deregister(self.id);
+        }
     }
 }
 
@@ -1063,6 +1107,39 @@ mod tests {
     }
 
     #[test]
+    fn signal_specific_none_disables_only_that_signal() {
+        let _guard = env_guard();
+        for k in [
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        ] {
+            std::env::remove_var(k);
+        }
+        std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318");
+        std::env::set_var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "none");
+
+        let targets = ObservabilityConfig::from_env().export_targets();
+        assert!(targets.traces.is_none());
+        assert_eq!(
+            targets.logs.as_ref().unwrap().url,
+            "http://collector:4318/v1/logs"
+        );
+        assert_eq!(
+            targets.metrics.as_ref().unwrap().url,
+            "http://collector:4318/v1/metrics"
+        );
+
+        for k in [
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        ] {
+            std::env::remove_var(k);
+        }
+    }
+
+    #[test]
     fn heartbeat_register_beat_deregister() {
         let obs = Observability::noop();
         assert_eq!(obs.heartbeat().len(), 0);
@@ -1078,6 +1155,39 @@ mod tests {
                 .is_none());
         }
         assert_eq!(obs.heartbeat().len(), 0, "Drop must deregister");
+    }
+
+    #[test]
+    fn heartbeat_duplicate_handles_are_independent() {
+        let obs = Observability::noop();
+        let first = obs.heartbeat().register("same_name", Criticality::Critical);
+        let second = obs.heartbeat().register("same_name", Criticality::Critical);
+        assert_eq!(obs.heartbeat().len(), 2);
+
+        drop(first);
+        assert_eq!(obs.heartbeat().len(), 1);
+        second.beat();
+        assert!(obs
+            .heartbeat()
+            .any_critical_stale(Duration::from_secs(1))
+            .is_none());
+    }
+
+    #[test]
+    fn critical_heartbeat_survives_panic_as_stale() {
+        let obs = Observability::noop();
+        let registry = obs.heartbeat().clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _handle = registry.register("panicked_task", Criticality::Critical);
+            panic!("test critical task failure");
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(registry.len(), 1);
+        assert_eq!(
+            registry.any_critical_stale(Duration::from_secs(1)),
+            Some("panicked_task")
+        );
     }
 
     #[test]

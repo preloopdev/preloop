@@ -777,9 +777,10 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         let scheduler_clone = scheduler.clone();
         // The scheduler heartbeat must prove the startup scan progressed, not
         // that an unrelated timer is awake. The scan tasks beat it per
-        // workflow file and deregister on completion: a scan that hangs or
-        // panics stops beating and `/readyz` goes 503; a completed scan is
-        // not a stale critical task.
+        // workflow file and deregister on completion: a scan that hangs
+        // stops beating and `/readyz` goes 503; a completed scan is
+        // not a stale critical task. A panic preserves the handle as failed,
+        // so `/readyz` remains unhealthy instead of losing the task entry.
         let scan_hb = scheduler_heartbeat.clone();
         if let Some(workspace) = state.local_workspace.clone() {
             let shared_for_scan = shared_for_scan.clone();
