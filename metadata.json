@@ -1,0 +1,21 @@
+{
+  "cli_version": "0.10.0",
+  "checkpoint_id": "01M0QWDPXM4C1R50GWD2PAY9YG",
+  "strategy": "manual-commit",
+  "branch": "pr/6-review-fixes",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "crates/preloop-observability/src/lib.rs",
+    "crates/preloop-runner-server/src/bootstrap.rs",
+    "crates/preloop-runner-server/src/store.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": ""
+    }
+  ]
+}
