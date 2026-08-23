@@ -1875,6 +1875,7 @@ dependencies = [
  "libc",
  "preloop-gha-parser",
  "preloop-gha-protocol",
+ "preloop-observability",
  "preloop-orchestrator",
  "preloop-runner-server",
  "preloop-vm",
@@ -2016,6 +2017,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "preloop-observability"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "parking_lot",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "preloop-orchestrator"
 version = "0.21.0"
 dependencies = [
@@ -2062,6 +2075,7 @@ dependencies = [
  "preloop-gha-expressions",
  "preloop-gha-parser",
  "preloop-gha-protocol",
+ "preloop-observability",
  "proptest",
  "rand 0.8.6",
  "regex",
@@ -2125,6 +2139,7 @@ dependencies = [
  "preloop-gha-expressions",
  "preloop-gha-parser",
  "preloop-gha-protocol",
+ "preloop-observability",
  "preloop-runner",
  "preloop-socket-activation",
  "proptest",

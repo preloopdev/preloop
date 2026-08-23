@@ -736,17 +736,20 @@ struct ShellArgs {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // `fmt::init()` alone filters to ERROR when `RUST_LOG` is unset, which hid
-    // a runner pool that failed to provision 77 times in a row: every
-    // provisioning fault logs at `warn` or `info`, so the operator saw a server
-    // that accepted webhooks and silently never ran anything. Default to `info`
-    // and let `RUST_LOG` override as usual.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // Unified observability init (Step 2): one handle for the process, shared
+    // with `AppState` and `RunnerPoolConfig` later. `PRELOOP_LOG_FORMAT` now
+    // controls pretty/json/auto (auto = pretty on TTY, JSON when piped), and
+    // `RUST_LOG` defaults to `info` (the old `fmt::init()` default of ERROR hid
+    // pool provisioning faults). The runtime is held for the life of `main`
+    // and flushed with a bounded 2s shutdown on exit.
+    let obs_config = preloop_observability::ObservabilityConfig::from_env();
+    let (observability, observability_runtime) =
+        preloop_observability::Observability::from_config(obs_config);
+    preloop_observability::ObservabilityRuntime::install_fmt_subscriber(observability.config());
+    // Keep the handle alive; the pool/server will clone it later. Suppress
+    // unused warning until the wiring lands in Step 3.
+    let _observability = observability;
+    let _observability_runtime = observability_runtime;
 
     let cli = Cli::parse();
     // One config path for the whole process. `setup`/`doctor`/`secret` return

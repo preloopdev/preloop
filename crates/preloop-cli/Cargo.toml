@@ -15,6 +15,7 @@ name = "preloop"
 path = "src/main.rs"
 
 [dependencies]
+preloop-observability = { path = "../preloop-observability" }
 preloop-orchestrator = { path = "../preloop-orchestrator" }
 preloop-vm = { path = "../preloop-vm" }
 preloop-runner-server = { path = "../preloop-runner-server" }
