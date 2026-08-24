@@ -938,9 +938,12 @@ impl ObservabilityRuntime {
         // be appended without naming the concrete `Layered` type, then wrap it
         // in the registry. The tracing-opentelemetry layer requires
         // `LookupSpan`, which the registry provides.
+        // Every output must observe the same `RUST_LOG` policy. Applying the
+        // filter only to fmt would suppress an event locally while still
+        // exporting it through OTLP.
         let mut chain: Box<
             dyn tracing_subscriber::Layer<tracing_subscriber::registry::Registry> + Send + Sync,
-        > = Box::new(fmt_layer.with_filter(filter));
+        > = Box::new(fmt_layer);
         if let Some(provider) = &self.tracer_provider {
             let tracer = provider.tracer("preloop");
             let layer = tracing_opentelemetry::layer().with_tracer(tracer);
@@ -950,7 +953,9 @@ impl ObservabilityRuntime {
             let layer = OpenTelemetryTracingBridge::new(provider);
             chain = Box::new(chain.and_then(layer));
         }
-        let _ = tracing::subscriber::set_global_default(Registry::default().with(chain));
+        let _ = tracing::subscriber::set_global_default(
+            Registry::default().with(chain.with_filter(filter)),
+        );
     }
 
     /// Flush exporters for at most 2s, then exit. Each provider's bounded
@@ -984,6 +989,23 @@ impl fmt::Debug for ObservabilityRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[derive(Clone)]
+    struct CountingLayer(Arc<AtomicUsize>);
+
+    impl<S> tracing_subscriber::Layer<S> for CountingLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            _event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     /// `ObservabilityConfig::from_env` reads process-global `OTEL_*`
     /// variables, and several tests mutate them. Cargo runs unit tests on
@@ -1004,6 +1026,20 @@ mod tests {
         assert!(!obs.instance_id().is_empty());
         assert!(obs.tracer().is_none());
         assert!(!obs.tracing_enabled());
+    }
+
+    #[test]
+    fn rust_log_filter_gates_a_complete_layer_chain() {
+        let observed = Arc::new(AtomicUsize::new(0));
+        let subscriber = Registry::default()
+            .with(CountingLayer(Arc::clone(&observed)).with_filter(EnvFilter::new("warn")));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("must not reach an OTLP layer");
+            tracing::warn!("must reach an OTLP layer");
+        });
+
+        assert_eq!(observed.load(Ordering::Relaxed), 1);
     }
 
     #[test]

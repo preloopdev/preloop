@@ -1,84 +1,61 @@
 id: no-sensitive-log-fields
 message: |
   INFO/WARN/ERROR tracing fields must not carry capability material: token,
-  authorization, cookie, headers, body, payload, or signed_url. These leak
+  authorization, cookie, headers, signed_url, body, or payload. These leak
   bearer material into journald and OTLP. Use operation/kind/size/result
   fields instead. The conformance flow recorder (recording.rs) is exempt.
 severity: error
 language: rust
 # recording.rs deliberately captures every header and body for conformance.
 ignores:
-  - "**/recording.rs"
+  - "crates/preloop-runner-server/src/recording.rs"
 rule:
-  any:
-    # info!(token, …) / warn!(authorization = …, …)
-    - pattern: info!($$$ARGS, token, $$$REST)
-    - pattern: warn!($$$ARGS, token, $$$REST)
-    - pattern: error!($$$ARGS, token, $$$REST)
-    - pattern: info!(token, $$$REST)
-    - pattern: warn!(token, $$$REST)
-    - pattern: error!(token, $$$REST)
-    - pattern: info!($$$ARGS, authorization, $$$REST)
-    - pattern: warn!($$$ARGS, authorization, $$$REST)
-    - pattern: error!($$$ARGS, authorization, $$$REST)
-    - pattern: info!($$$ARGS, cookie, $$$REST)
-    - pattern: warn!($$$ARGS, cookie, $$$REST)
-    - pattern: error!($$$ARGS, cookie, $$$REST)
-    - pattern: info!($$$ARGS, headers, $$$REST)
-    - pattern: warn!($$$ARGS, headers, $$$REST)
-    - pattern: error!($$$ARGS, headers, $$$REST)
-    - pattern: info!($$$ARGS, signed_url, $$$REST)
-    - pattern: warn!($$$ARGS, signed_url, $$$REST)
-    - pattern: error!($$$ARGS, signed_url, $$$REST)
-    # Assigned form: info!(token = value, …) — the shorthand patterns above
-    # do not match it, so a sensitive field could bypass the rule.
-    - pattern: info!($$$ARGS, token = $$$VALUE, $$$REST)
-    - pattern: warn!($$$ARGS, token = $$$VALUE, $$$REST)
-    - pattern: error!($$$ARGS, token = $$$VALUE, $$$REST)
-    - pattern: info!($$$ARGS, authorization = $$$VALUE, $$$REST)
-    - pattern: warn!($$$ARGS, authorization = $$$VALUE, $$$REST)
-    - pattern: error!($$$ARGS, authorization = $$$VALUE, $$$REST)
-    - pattern: info!($$$ARGS, cookie = $$$VALUE, $$$REST)
-    - pattern: warn!($$$ARGS, cookie = $$$VALUE, $$$REST)
-    - pattern: error!($$$ARGS, cookie = $$$VALUE, $$$REST)
-    - pattern: info!($$$ARGS, headers = $$$VALUE, $$$REST)
-    - pattern: warn!($$$ARGS, headers = $$$VALUE, $$$REST)
-    - pattern: error!($$$ARGS, headers = $$$VALUE, $$$REST)
-    - pattern: info!($$$ARGS, signed_url = $$$VALUE, $$$REST)
-    - pattern: warn!($$$ARGS, signed_url = $$$VALUE, $$$REST)
-    - pattern: error!($$$ARGS, signed_url = $$$VALUE, $$$REST)
-    # Assigned body/payload in plain, ?-debug and %-display forms.
-    - pattern: info!($$$ARGS, body = $$$VALUE, $$$REST)
-    - pattern: warn!($$$ARGS, body = $$$VALUE, $$$REST)
-    - pattern: error!($$$ARGS, body = $$$VALUE, $$$REST)
-    - pattern: info!($$$ARGS, ?body = $$$VALUE, $$$REST)
-    - pattern: warn!($$$ARGS, ?body = $$$VALUE, $$$REST)
-    - pattern: error!($$$ARGS, ?body = $$$VALUE, $$$REST)
-    - pattern: info!($$$ARGS, %body = $$$VALUE, $$$REST)
-    - pattern: warn!($$$ARGS, %body = $$$VALUE, $$$REST)
-    - pattern: error!($$$ARGS, %body = $$$VALUE, $$$REST)
-    - pattern: info!($$$ARGS, payload = $$$VALUE, $$$REST)
-    - pattern: warn!($$$ARGS, payload = $$$VALUE, $$$REST)
-    - pattern: error!($$$ARGS, payload = $$$VALUE, $$$REST)
-    - pattern: info!($$$ARGS, ?payload = $$$VALUE, $$$REST)
-    - pattern: warn!($$$ARGS, ?payload = $$$VALUE, $$$REST)
-    - pattern: error!($$$ARGS, ?payload = $$$VALUE, $$$REST)
-    - pattern: info!($$$ARGS, %payload = $$$VALUE, $$$REST)
-    - pattern: warn!($$$ARGS, %payload = $$$VALUE, $$$REST)
-    - pattern: error!($$$ARGS, %payload = $$$VALUE, $$$REST)
-    # ?body / body = … inside the macro
-    - pattern: info!(?body, $$$REST)
-    - pattern: warn!(?body, $$$REST)
-    - pattern: error!(?body, $$$REST)
-    - pattern: info!(body, $$$REST)
-    - pattern: warn!(body, $$$REST)
-    - pattern: error!(body, $$$REST)
-    - pattern: info!(%body, $$$REST)
-    - pattern: warn!(%body, $$$REST)
-    - pattern: error!(%body, $$$REST)
-    - pattern: info!(payload, $$$REST)
-    - pattern: warn!(payload, $$$REST)
-    - pattern: error!(payload, $$$REST)
-    - pattern: info!(?payload, $$$REST)
-    - pattern: warn!(?payload, $$$REST)
-    - pattern: error!(?payload, $$$REST)
+  all:
+    # Restrict generic macro matching to the tracing macros, in bare,
+    # `tracing::`, or `::tracing::` form.
+    - regex: '^(?:::)?(?:tracing::)?(?:info|warn|error)!'
+    - any:
+        # Shorthand fields in any argument position — plain, ?-debug, %-display.
+        - pattern: $MACRO!($$$ARGS, token, $$$REST)
+        - pattern: $MACRO!($$$ARGS, ?token, $$$REST)
+        - pattern: $MACRO!($$$ARGS, %token, $$$REST)
+        - pattern: $MACRO!($$$ARGS, authorization, $$$REST)
+        - pattern: $MACRO!($$$ARGS, ?authorization, $$$REST)
+        - pattern: $MACRO!($$$ARGS, %authorization, $$$REST)
+        - pattern: $MACRO!($$$ARGS, cookie, $$$REST)
+        - pattern: $MACRO!($$$ARGS, ?cookie, $$$REST)
+        - pattern: $MACRO!($$$ARGS, %cookie, $$$REST)
+        - pattern: $MACRO!($$$ARGS, headers, $$$REST)
+        - pattern: $MACRO!($$$ARGS, ?headers, $$$REST)
+        - pattern: $MACRO!($$$ARGS, %headers, $$$REST)
+        - pattern: $MACRO!($$$ARGS, signed_url, $$$REST)
+        - pattern: $MACRO!($$$ARGS, ?signed_url, $$$REST)
+        - pattern: $MACRO!($$$ARGS, %signed_url, $$$REST)
+        - pattern: $MACRO!($$$ARGS, body, $$$REST)
+        - pattern: $MACRO!($$$ARGS, ?body, $$$REST)
+        - pattern: $MACRO!($$$ARGS, %body, $$$REST)
+        - pattern: $MACRO!($$$ARGS, payload, $$$REST)
+        - pattern: $MACRO!($$$ARGS, ?payload, $$$REST)
+        - pattern: $MACRO!($$$ARGS, %payload, $$$REST)
+        # Assigned fields in any argument position — plain, ?-debug, %-display.
+        - pattern: $MACRO!($$$ARGS, token = $$$VALUE, $$$REST)
+        - pattern: $MACRO!($$$ARGS, ?token = $$$VALUE, $$$REST)
+        - pattern: $MACRO!($$$ARGS, %token = $$$VALUE, $$$REST)
+        - pattern: $MACRO!($$$ARGS, authorization = $$$VALUE, $$$REST)
+        - pattern: $MACRO!($$$ARGS, ?authorization = $$$VALUE, $$$REST)
+        - pattern: $MACRO!($$$ARGS, %authorization = $$$VALUE, $$$REST)
+        - pattern: $MACRO!($$$ARGS, cookie = $$$VALUE, $$$REST)
+        - pattern: $MACRO!($$$ARGS, ?cookie = $$$VALUE, $$$REST)
+        - pattern: $MACRO!($$$ARGS, %cookie = $$$VALUE, $$$REST)
+        - pattern: $MACRO!($$$ARGS, headers = $$$VALUE, $$$REST)
+        - pattern: $MACRO!($$$ARGS, ?headers = $$$VALUE, $$$REST)
+        - pattern: $MACRO!($$$ARGS, %headers = $$$VALUE, $$$REST)
+        - pattern: $MACRO!($$$ARGS, signed_url = $$$VALUE, $$$REST)
+        - pattern: $MACRO!($$$ARGS, ?signed_url = $$$VALUE, $$$REST)
+        - pattern: $MACRO!($$$ARGS, %signed_url = $$$VALUE, $$$REST)
+        - pattern: $MACRO!($$$ARGS, body = $$$VALUE, $$$REST)
+        - pattern: $MACRO!($$$ARGS, ?body = $$$VALUE, $$$REST)
+        - pattern: $MACRO!($$$ARGS, %body = $$$VALUE, $$$REST)
+        - pattern: $MACRO!($$$ARGS, payload = $$$VALUE, $$$REST)
+        - pattern: $MACRO!($$$ARGS, ?payload = $$$VALUE, $$$REST)
+        - pattern: $MACRO!($$$ARGS, %payload = $$$VALUE, $$$REST)
