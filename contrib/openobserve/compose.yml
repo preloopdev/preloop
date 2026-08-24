@@ -35,12 +35,9 @@ services:
         limits:
           cpus: "1.0"
           memory: 2G
-    healthcheck:
-      test: ["CMD", "sh", "-c", "wget -qO- http://127.0.0.1:5080/healthz || exit 1"]
-      interval: 10s
-      timeout: 3s
-      retries: 10
-      start_period: 20s
+    # The pinned image is distroless: it has neither a shell nor an HTTP
+    # client. Do not install a permanently failing Docker healthcheck; probe
+    # http://127.0.0.1:5080/healthz from the operator host instead.
 
 volumes:
   openobserve-data:

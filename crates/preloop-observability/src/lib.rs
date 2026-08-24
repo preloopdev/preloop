@@ -115,6 +115,42 @@ impl ExportTargets {
     }
 }
 
+/// Append an OTLP signal path without moving an existing query or fragment
+/// into the path.
+fn append_signal_path(base: &str, suffix: &str) -> Option<String> {
+    let mut endpoint = reqwest::Url::parse(base).ok()?;
+    let path = endpoint.path().trim_end_matches('/');
+    endpoint.set_path(&format!("{path}{suffix}"));
+    Some(endpoint.to_string())
+}
+
+fn percent_decode_header_value(value: &str) -> Option<String> {
+    let Some(first_escape) = value.as_bytes().iter().position(|byte| *byte == b'%') else {
+        return Some(value.to_owned());
+    };
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    decoded.extend_from_slice(&bytes[..first_escape]);
+    let mut index = first_escape;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        let high = bytes.get(index + 1)?.to_ascii_lowercase();
+        let low = bytes.get(index + 2)?.to_ascii_lowercase();
+        let hex = |byte: u8| match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
+        };
+        decoded.push((hex(high)? << 4) | hex(low)?);
+        index += 3;
+    }
+    String::from_utf8(decoded).ok()
+}
+
 /// Parse `OTEL_EXPORTER_OTLP_HEADERS` (`k1=v1,k2=v2`).
 pub fn parse_headers(raw: Option<&str>) -> Vec<(String, String)> {
     let Some(raw) = raw else {
@@ -128,7 +164,7 @@ pub fn parse_headers(raw: Option<&str>) -> Vec<(String, String)> {
             if k.is_empty() || v.is_empty() {
                 None
             } else {
-                Some((k.to_string(), v.to_string()))
+                Some((k.to_string(), percent_decode_header_value(v)?))
             }
         })
         .collect()
@@ -187,7 +223,7 @@ impl ObservabilityConfig {
         let generic = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
             .ok()
             .filter(|v| !v.trim().is_empty() && v.trim() != "none")
-            .map(|v| v.trim_end_matches('/').to_string());
+            .map(|v| v.trim().to_string());
 
         // Signal-specific endpoint is a complete URL used as-is; the generic
         // base needs the /v1/<signal> suffix. Appending the suffix to a
@@ -201,12 +237,18 @@ impl ObservabilityConfig {
                     // the generic endpoint.
                     None
                 } else if value.is_empty() {
-                    generic.as_ref().map(|g| format!("{g}{suffix}"))
+                    generic
+                        .as_deref()
+                        .and_then(|generic| append_signal_path(generic, suffix))
                 } else {
-                    Some(value.trim_end_matches('/').to_string())
+                    // Signal-specific endpoints are complete URLs, including
+                    // a potentially significant trailing slash.
+                    Some(value.to_string())
                 }
             }
-            Err(_) => generic.as_ref().map(|g| format!("{g}{suffix}")),
+            Err(_) => generic
+                .as_deref()
+                .and_then(|generic| append_signal_path(generic, suffix)),
         };
         let otel_logs_endpoint = resolve("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "/v1/logs");
         let otel_traces_endpoint = resolve("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "/v1/traces");
@@ -544,8 +586,8 @@ struct Inner {
     limits: LimitRegistry,
     metrics: Arc<metrics::MetricsRegistry>,
     vm_registry: Arc<vm_telemetry::VmTelemetryRegistry>,
-    tracer: Option<opentelemetry_sdk::trace::Tracer>,
-    logger: Option<opentelemetry_sdk::logs::SdkLogger>,
+    tracer: RwLock<Option<opentelemetry_sdk::trace::Tracer>>,
+    logger: RwLock<Option<opentelemetry_sdk::logs::SdkLogger>>,
     prometheus_registry: Option<prometheus::Registry>,
     is_noop: bool,
 }
@@ -580,8 +622,8 @@ impl Observability {
                 limits: LimitRegistry::default(),
                 metrics: Arc::new(metrics::MetricsRegistry::default()),
                 vm_registry: Arc::new(vm_telemetry::VmTelemetryRegistry::default()),
-                tracer: None,
-                logger: None,
+                tracer: RwLock::new(None),
+                logger: RwLock::new(None),
                 prometheus_registry: None,
                 is_noop: true,
             }),
@@ -592,12 +634,26 @@ impl Observability {
     pub fn from_config(config: ObservabilityConfig) -> (Self, ObservabilityRuntime) {
         let is_noop = !config.otlp_enabled;
         let targets = config.export_targets();
-        // One rustls client for every signal — the same stack the rest of the
-        // workspace uses (reqwest 0.13).
-        let http_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .ok();
+        // SDK batch processors and periodic readers export from blocking
+        // worker threads. Give them a blocking rustls client so every signal
+        // uses the execution model those providers require.
+        let http_client = (!targets.is_empty())
+            .then(|| {
+                // `reqwest::blocking::Client::build` creates an internal
+                // runtime and must not run while Tokio's current-thread
+                // runtime is entered. Configuration is one-time, so build it
+                // on a plain OS thread and keep shutdown on a blocking task.
+                std::thread::spawn(|| {
+                    reqwest::blocking::Client::builder()
+                        .timeout(Duration::from_secs(10))
+                        .build()
+                        .ok()
+                })
+                .join()
+                .ok()
+                .flatten()
+            })
+            .flatten();
         let resource = Resource::builder()
             .with_attributes(vec![
                 KeyValue::new("service.name", config.service_name.clone()),
@@ -673,8 +729,8 @@ impl Observability {
                 limits: LimitRegistry::default(),
                 metrics,
                 vm_registry: Arc::new(vm_telemetry::VmTelemetryRegistry::default()),
-                tracer,
-                logger,
+                tracer: RwLock::new(tracer),
+                logger: RwLock::new(logger),
                 prometheus_registry: Some(prometheus_registry),
                 is_noop,
             }),
@@ -723,13 +779,13 @@ impl Observability {
     /// The SDK tracer, when a traces endpoint is configured. `None` for
     /// no-op handles — callers skip span work entirely.
     pub fn tracer(&self) -> Option<opentelemetry_sdk::trace::Tracer> {
-        self.inner.tracer.clone()
+        self.inner.tracer.read().clone()
     }
 
     /// Whether spans are worth building. Lets a caller skip id and timestamp
     /// work entirely when nothing would consume the result.
     pub fn tracing_enabled(&self) -> bool {
-        self.inner.tracer.is_some()
+        self.inner.tracer.read().is_some()
     }
 
     /// Enqueue a log record for OTLP export. No-op when export is disabled.
@@ -751,7 +807,7 @@ impl Observability {
         attributes: Vec<(String, String)>,
         context: Option<&opentelemetry::trace::SpanContext>,
     ) {
-        let Some(logger) = &self.inner.logger else {
+        let Some(logger) = self.inner.logger.read().clone() else {
             return;
         };
         let mut record = logger.create_log_record();
@@ -803,10 +859,10 @@ fn severity_number(severity: &str) -> Severity {
 }
 
 /// Build an OTLP/HTTP span exporter from a resolved signal target, reusing
-/// the shared rustls reqwest client. `None` on build failure — fail open.
+/// the shared blocking rustls client. `None` on build failure — fail open.
 fn build_span_exporter(
     target: &SignalTarget,
-    http_client: Option<&reqwest::Client>,
+    http_client: Option<&reqwest::blocking::Client>,
 ) -> Option<opentelemetry_otlp::SpanExporter> {
     use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithHttpConfig};
     let mut builder = SpanExporter::builder()
@@ -830,7 +886,7 @@ fn build_span_exporter(
 /// Build an OTLP/HTTP log exporter. `None` on build failure — fail open.
 fn build_log_exporter(
     target: &SignalTarget,
-    http_client: Option<&reqwest::Client>,
+    http_client: Option<&reqwest::blocking::Client>,
 ) -> Option<opentelemetry_otlp::LogExporter> {
     use opentelemetry_otlp::{LogExporter, WithExportConfig, WithHttpConfig};
     let mut builder = LogExporter::builder()
@@ -854,7 +910,7 @@ fn build_log_exporter(
 /// Build an OTLP/HTTP metric exporter. `None` on build failure — fail open.
 fn build_metric_exporter(
     target: &SignalTarget,
-    http_client: Option<&reqwest::Client>,
+    http_client: Option<&reqwest::blocking::Client>,
 ) -> Option<opentelemetry_otlp::MetricExporter> {
     use opentelemetry_otlp::{MetricExporter, WithExportConfig, WithHttpConfig};
     let mut builder = MetricExporter::builder()
@@ -957,17 +1013,28 @@ impl ObservabilityRuntime {
     /// queue is drained; a hung backend drops the remainder rather than
     /// delaying shutdown. Export failure is logged by the SDK, never
     /// propagated.
-    pub async fn shutdown(mut self) {
+    pub async fn shutdown(self) {
         let timeout = Duration::from_secs(2);
-        if let Some(provider) = self.tracer_provider.take() {
-            let _ = provider.shutdown_with_timeout(timeout);
-        }
-        if let Some(provider) = self.meter_provider.take() {
-            let _ = provider.shutdown_with_timeout(timeout);
-        }
-        if let Some(provider) = self.logger_provider.take() {
-            let _ = provider.shutdown_with_timeout(timeout);
-        }
+        // The SDK default processors and reqwest's blocking client both own
+        // worker resources. Shut them down and drop their final
+        // handles outside Tokio's async context.
+        let _ = tokio::task::spawn_blocking(move || {
+            let mut runtime = self;
+            let tracer = runtime._handle.inner.tracer.write().take();
+            let logger = runtime._handle.inner.logger.write().take();
+            if let Some(provider) = runtime.tracer_provider.take() {
+                let _ = provider.shutdown_with_timeout(timeout);
+            }
+            if let Some(provider) = runtime.meter_provider.take() {
+                let _ = provider.shutdown_with_timeout(timeout);
+            }
+            if let Some(provider) = runtime.logger_provider.take() {
+                let _ = provider.shutdown_with_timeout(timeout);
+            }
+            drop(logger);
+            drop(tracer);
+        })
+        .await;
     }
 }
 
@@ -1079,6 +1146,29 @@ mod tests {
     }
 
     #[test]
+    fn signal_specific_endpoint_preserves_trailing_slash() {
+        let _guard = env_guard();
+        for k in [
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        ] {
+            std::env::remove_var(k);
+        }
+        std::env::set_var(
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+            "http://collector:4318/custom/",
+        );
+
+        let targets = ObservabilityConfig::from_env().export_targets();
+        assert_eq!(
+            targets.traces.as_ref().unwrap().url,
+            "http://collector:4318/custom/"
+        );
+        std::env::remove_var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT");
+    }
+
+    #[test]
     fn generic_endpoint_gets_the_signal_suffix() {
         let _guard = env_guard();
         for k in [
@@ -1104,6 +1194,40 @@ mod tests {
             "http://collector:4318/v1/metrics"
         );
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+    }
+
+    #[test]
+    fn generic_endpoint_inserts_signal_suffix_before_query_and_fragment() {
+        let _guard = env_guard();
+        for k in [
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        ] {
+            std::env::remove_var(k);
+        }
+        std::env::set_var(
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "http://collector:4318/base?token=x#fragment",
+        );
+
+        let targets = ObservabilityConfig::from_env().export_targets();
+        assert_eq!(
+            targets.logs.as_ref().unwrap().url,
+            "http://collector:4318/base/v1/logs?token=x#fragment"
+        );
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+    }
+
+    #[test]
+    fn parse_headers_percent_decodes_values() {
+        assert_eq!(
+            parse_headers(Some("Authorization=Basic%20abc,opaque=a%2Cb")),
+            vec![
+                ("Authorization".to_string(), "Basic abc".to_string()),
+                ("opaque".to_string(), "a,b".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -1276,11 +1400,115 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_is_bounded() {
-        let (obs, rt) = Observability::from_config(ObservabilityConfig::from_env());
+        let (obs, rt) = {
+            let _guard = env_guard();
+            for key in [
+                "OTEL_EXPORTER_OTLP_ENDPOINT",
+                "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+            ] {
+                std::env::remove_var(key);
+            }
+            Observability::from_config(ObservabilityConfig::from_env())
+        };
         // Must not hang even though there are no exporters.
         tokio::time::timeout(Duration::from_secs(3), rt.shutdown())
             .await
             .expect("shutdown must be bounded to 2s");
+        drop(obs);
+    }
+
+    #[tokio::test]
+    async fn shutdown_with_configured_otlp_is_bounded() {
+        let (obs, rt) = {
+            let _guard = env_guard();
+            for key in [
+                "OTEL_EXPORTER_OTLP_ENDPOINT",
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+            ] {
+                std::env::remove_var(key);
+            }
+            std::env::set_var(
+                "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+                "http://127.0.0.1:9/v1/logs",
+            );
+            let result = Observability::from_config(ObservabilityConfig::from_env());
+            std::env::remove_var("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT");
+            result
+        };
+        tokio::time::timeout(Duration::from_secs(3), rt.shutdown())
+            .await
+            .expect("shutdown must be bounded with an OTLP client");
+        drop(obs);
+    }
+
+    #[tokio::test]
+    async fn shutdown_with_configured_metric_exporter_is_bounded() {
+        let (obs, rt) = {
+            let _guard = env_guard();
+            for key in [
+                "OTEL_EXPORTER_OTLP_ENDPOINT",
+                "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+            ] {
+                std::env::remove_var(key);
+            }
+            std::env::set_var(
+                "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+                "http://127.0.0.1:9/v1/metrics",
+            );
+            let result = Observability::from_config(ObservabilityConfig::from_env());
+            std::env::remove_var("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT");
+            result
+        };
+        tokio::time::timeout(Duration::from_secs(3), rt.shutdown())
+            .await
+            .expect("shutdown must be bounded with a metric exporter");
+        drop(obs);
+    }
+
+    #[tokio::test]
+    async fn configured_blocking_exporter_posts_log_during_shutdown() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind OTLP test receiver");
+        let address = listener.local_addr().expect("receiver address");
+        let receiver = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept OTLP export");
+            let mut request = [0_u8; 4096];
+            let read = stream.read(&mut request).expect("read OTLP request");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .expect("respond to OTLP export");
+            String::from_utf8_lossy(&request[..read]).into_owned()
+        });
+        let (obs, rt) = {
+            let _guard = env_guard();
+            for key in [
+                "OTEL_EXPORTER_OTLP_ENDPOINT",
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+            ] {
+                std::env::remove_var(key);
+            }
+            std::env::set_var(
+                "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+                format!("http://{address}/v1/logs"),
+            );
+            let result = Observability::from_config(ObservabilityConfig::from_env());
+            std::env::remove_var("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT");
+            result
+        };
+        obs.export_log("INFO", "export test", Vec::new());
+        tokio::time::timeout(Duration::from_secs(3), rt.shutdown())
+            .await
+            .expect("shutdown must flush the OTLP log export");
+
+        let request = receiver.join().expect("OTLP receiver thread");
+        assert!(request.starts_with("POST /v1/logs HTTP/1.1"));
         drop(obs);
     }
 }

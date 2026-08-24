@@ -22,9 +22,8 @@ async fn main() -> Result<()> {
         preloop_observability::Observability::from_config(obs_config);
     observability_runtime.install_fmt_subscriber();
     let _observability = observability;
-    let _observability_runtime = observability_runtime;
 
-    match cli.command {
+    let result = match cli.command {
         Commands::Configure(args) => {
             preloop_runner::configure::run_configure(args, &cli.global).await
         }
@@ -59,7 +58,9 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-    }
+    };
+    observability_runtime.shutdown().await;
+    result
 }
 
 async fn collect_reusable_workflows(
