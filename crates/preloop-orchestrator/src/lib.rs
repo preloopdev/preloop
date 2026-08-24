@@ -24,7 +24,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -1754,6 +1754,10 @@ pub(crate) struct GoldenRegistry {
     /// `prepare_golden_for_env` removes any existing machine of that name).
     build_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     name_prefix: String,
+    /// Set when the startup packed-golden import failed. In that case the
+    /// pool must create runners directly from their requested base image
+    /// rather than attempting a second environment-golden bake.
+    packed_unavailable: AtomicBool,
 }
 
 impl GoldenRegistry {
@@ -1762,12 +1766,25 @@ impl GoldenRegistry {
             goldens: RwLock::new(HashMap::new()),
             build_locks: RwLock::new(HashMap::new()),
             name_prefix,
+            packed_unavailable: AtomicBool::new(false),
         }
     }
 
     /// Return the name prefix used for golden VM names.
     pub fn name_prefix(&self) -> &str {
         &self.name_prefix
+    }
+
+    /// Disable packed-golden and environment-golden preparation after the
+    /// startup packed import fails. Direct per-runner creation is the only
+    /// honest fallback: a second environment golden would repeat the same
+    /// disk-heavy unpack under a different name.
+    pub fn disable_packed(&self) {
+        self.packed_unavailable.store(true, Ordering::Release);
+    }
+
+    pub fn is_packed_disabled(&self) -> bool {
+        self.packed_unavailable.load(Ordering::Acquire)
     }
 
     /// Get existing golden or return None if not yet prepared.
@@ -2280,8 +2297,14 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
         dns: config.dns.clone(),
         rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
     };
-    provider.create(&spec).await?;
-    provider.start(golden).await?;
+    if let Err(error) = provider.create(&spec).await {
+        let _ = provider.delete(golden).await;
+        return Err(error.into());
+    }
+    if let Err(error) = provider.start(golden).await {
+        let _ = provider.delete(golden).await;
+        return Err(error.into());
+    }
     if let Err(error) = await_guest_ready(provider.as_ref(), golden).await {
         let _ = provider.delete(golden).await;
         return Err(error);
@@ -2340,7 +2363,16 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     .await
             };
             if let Err(error) = result {
-                warn!(%error, "golden fork base unavailable; falling back to create-per-runner");
+                if self.config.use_packed_artifact {
+                    golden_registry.disable_packed();
+                    warn!(
+                        %error,
+                        "packed golden fork base unavailable; using direct per-runner creation \
+                         instead of building a second environment golden"
+                    );
+                } else {
+                    warn!(%error, "golden fork base unavailable; falling back to direct creation");
+                }
             } else {
                 golden_registry
                     .insert(default_environment.fingerprint, golden)
@@ -3041,6 +3073,11 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     semaphore: Arc<tokio::sync::Semaphore>,
     permit: Arc<std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
 ) -> Result<(), OrchestratorError> {
+    let mut config = config;
+    if golden_registry.is_packed_disabled() {
+        config.use_packed_artifact = false;
+        config.use_fork = false;
+    }
     let preparing = PreparingGuard::enter(provisioning, config.preparing_signal.clone());
     // Resolve the golden for the queued job's environment.
     let (golden, environment) = if config.use_fork {
@@ -3178,6 +3215,11 @@ async fn run_slot<P: VmProvider + 'static>(
     golden_registry: Arc<GoldenRegistry>,
     handles: PoolHandles,
 ) -> Result<(), OrchestratorError> {
+    let mut config = config;
+    if golden_registry.is_packed_disabled() {
+        config.use_packed_artifact = false;
+        config.use_fork = false;
+    }
     let PoolHandles {
         idle,
         keys,
@@ -6377,6 +6419,14 @@ mod golden_registry_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn packed_failure_disables_secondary_environment_bakes() {
+        let registry = GoldenRegistry::new("test".to_owned());
+        assert!(!registry.is_packed_disabled());
+        registry.disable_packed();
+        assert!(registry.is_packed_disabled());
+    }
 
     /// Distinct environments must build concurrently: one fingerprint's bake
     /// must not park other slots (the pre-freeze `build_lock` behavior).
