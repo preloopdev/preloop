@@ -296,6 +296,23 @@ jobs:
         run: |
           # Write and read notes from a file to avoid quoting breaking things
           echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
+          version="${{ needs.plan.outputs.tag }}"
+          version="${version#v}"
+          python3 - "$version" "$RUNNER_TEMP/notes.txt" <<'PY'
+          import re
+          import sys
+
+          version, notes_path = sys.argv[1:]
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          match = re.search(
+              rf"^## \[{re.escape(version)}\][^\n]*\n(?P<body>.*?)(?=^## \[|\Z)",
+              text,
+              re.M | re.S,
+          )
+          if match and "preloop:skip-golden" in match.group("body"):
+              with open(notes_path, "a", encoding="utf-8") as notes:
+                  notes.write("\n<!-- preloop:skip-golden -->\n")
+          PY
 
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
