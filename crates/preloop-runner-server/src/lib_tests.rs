@@ -9304,6 +9304,129 @@ jobs:
     assert!(*check_run_id > 0);
 }
 
+#[tokio::test]
+async fn github_webhook_fetches_workflow_from_event_sha_not_current_branch() {
+    // This is a local-workspace reproduction of the same race as the remote
+    // App path: the webhook names an older commit while the branch has already
+    // advanced to a different workflow definition.
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+    let _no_api_url = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_API_URL");
+
+    let temp = tempfile::tempdir().unwrap();
+    let ws_dir = temp.path().join("workspace");
+    std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
+
+    let old_workflow = r#"
+name: old
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo old-workflow
+"#;
+    let new_workflow = r#"
+name: new
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo new-workflow
+"#;
+    std::fs::write(ws_dir.join(".github/workflows/build.yml"), old_workflow).unwrap();
+
+    let git = |args: &[&str]| -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&ws_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "preloop-tests@example.invalid"]);
+    git(&["config", "user.name", "Preloop Tests"]);
+    git(&["add", ".github/workflows/build.yml"]);
+    git(&["commit", "-m", "old workflow"]);
+    let event_sha = git(&["rev-parse", "HEAD"]);
+
+    std::fs::write(ws_dir.join(".github/workflows/build.yml"), new_workflow).unwrap();
+    git(&["add", ".github/workflows/build.yml"]);
+    git(&["commit", "-m", "new workflow"]);
+    let branch_sha = git(&["rev-parse", "HEAD"]);
+    assert_ne!(event_sha, branch_sha);
+
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.webhook_secret = Some("super-secret".to_owned());
+    state.local_workspace = Some(ws_dir);
+    let app = app(state.clone(), CancellationToken::new());
+
+    let payload = serde_json::json!({
+        "ref": "refs/heads/main",
+        "before": "0000000000000000000000000000000000000000",
+        "after": event_sha,
+        "repository": {
+            "full_name": "owner/repo",
+            "default_branch": "main"
+        },
+        "commits": [{
+            "id": event_sha,
+            "added": [".github/workflows/build.yml"],
+            "modified": [],
+            "removed": []
+        }]
+    });
+    let payload_bytes = serde_json::to_vec(&payload).unwrap();
+
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = HmacSha256::new_from_slice(b"super-secret").unwrap();
+    mac.update(&payload_bytes);
+    let signature = mac
+        .finalize()
+        .into_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/github/webhooks")
+                .header("x-github-event", "push")
+                .header("x-github-delivery", "sha-pinned-workflow")
+                .header("x-hub-signature-256", format!("sha256={signature}"))
+                .header("content-type", "application/json")
+                .body(Body::from(payload_bytes))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let inner = state.inner.lock().await;
+    let run = inner.runs.values().next().expect("webhook created a run");
+    assert_eq!(
+        run.submission.resolved_sha.as_deref(),
+        Some(event_sha.as_str())
+    );
+    assert!(
+        run.submission.workflow_yaml.contains("old-workflow"),
+        "workflow must be loaded from the webhook commit, not current main"
+    );
+    assert!(!run.submission.workflow_yaml.contains("new-workflow"));
+}
+
 /// Check-run ids must survive a restart even when no job status event ever
 /// fired — a long queue can sit between check-run creation and the job's
 /// first status event, and a deploy in that window used to restore the run
