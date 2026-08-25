@@ -1473,13 +1473,52 @@ mod tests {
     async fn configured_blocking_exporter_posts_log_during_shutdown() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
+        use std::time::Instant;
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind OTLP test receiver");
+        listener
+            .set_nonblocking(true)
+            .expect("make OTLP listener nonblocking");
         let address = listener.local_addr().expect("receiver address");
         let receiver = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept OTLP export");
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "timed out waiting for OTLP export"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept OTLP export: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("set OTLP receiver timeout");
             let mut request = [0_u8; 4096];
-            let read = stream.read(&mut request).expect("read OTLP request");
+            let mut read = 0;
+            while read < request.len()
+                && !request[..read]
+                    .windows(4)
+                    .any(|window| window == b"\r\n\r\n")
+            {
+                let count = stream
+                    .read(&mut request[read..])
+                    .expect("read OTLP request");
+                if count == 0 {
+                    break;
+                }
+                read += count;
+            }
+            assert!(
+                request[..read]
+                    .windows(4)
+                    .any(|window| window == b"\r\n\r\n"),
+                "timed out waiting for complete OTLP request headers"
+            );
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
                 .expect("respond to OTLP export");

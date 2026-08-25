@@ -31,32 +31,40 @@ async fn main() -> Result<()> {
         Commands::Run(args) => preloop_runner::listener::run_listener(args, &cli.global).await,
         Commands::Worker(args) => preloop_runner::worker::run_worker(args).await,
         Commands::Lint(args) => {
-            let workflow_yaml = tokio::fs::read_to_string(&args.workflow)
-                .await
-                .map_err(|e| anyhow::anyhow!("read workflow {}: {e}", args.workflow.display()))?;
-            let parsed = preloop_gha_parser::parse_workflow(&workflow_yaml)
-                .map_err(|e| anyhow::anyhow!("parse workflow {}: {e}", args.workflow.display()))?;
-            let reusable_workflows =
-                collect_reusable_workflows(args.workspace_root.as_deref(), &args.workflow).await?;
-            let reusable_workflows =
-                resolve_remote_workflows(reusable_workflows, &workflow_yaml).await?;
-            let expanded =
-                preloop_gha_parser::expand_jobs_with_reusables(&parsed, &reusable_workflows)
-                    .map_err(|e| {
-                        anyhow::anyhow!("expand workflow {}: {e}", args.workflow.display())
-                    })?;
+            async {
+                let workflow_yaml =
+                    tokio::fs::read_to_string(&args.workflow)
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!("read workflow {}: {e}", args.workflow.display())
+                        })?;
+                let parsed = preloop_gha_parser::parse_workflow(&workflow_yaml).map_err(|e| {
+                    anyhow::anyhow!("parse workflow {}: {e}", args.workflow.display())
+                })?;
+                let reusable_workflows =
+                    collect_reusable_workflows(args.workspace_root.as_deref(), &args.workflow)
+                        .await?;
+                let reusable_workflows =
+                    resolve_remote_workflows(reusable_workflows, &workflow_yaml).await?;
+                let expanded =
+                    preloop_gha_parser::expand_jobs_with_reusables(&parsed, &reusable_workflows)
+                        .map_err(|e| {
+                            anyhow::anyhow!("expand workflow {}: {e}", args.workflow.display())
+                        })?;
 
-            let step_count: usize = expanded.jobs.iter().map(|j| j.steps.len()).sum();
-            println!(
-                "✓ Workflow {} is valid: parsed {} job plan(s) and {} total step(s).",
-                args.workflow.display(),
-                expanded.jobs.len(),
-                step_count
-            );
-            for job in &expanded.jobs {
-                println!("  - Job: {} ({})", job.id.0, job.name);
+                let step_count: usize = expanded.jobs.iter().map(|j| j.steps.len()).sum();
+                println!(
+                    "✓ Workflow {} is valid: parsed {} job plan(s) and {} total step(s).",
+                    args.workflow.display(),
+                    expanded.jobs.len(),
+                    step_count
+                );
+                for job in &expanded.jobs {
+                    println!("  - Job: {} ({})", job.id.0, job.name);
+                }
+                Ok(())
             }
-            Ok(())
+            .await
         }
     };
     observability_runtime.shutdown().await;
