@@ -52,7 +52,7 @@ impl EventAdapter for Adapter {
         vec![EffectiveEvent {
             event: "pull_request_target".to_owned(),
             git_ref: format!("refs/heads/{base_ref}"),
-            sha: base_sha.or(head_sha).map(|s| s.to_owned()),
+            sha: base_sha.map(|s| s.to_owned()),
             status_check_sha: head_sha.map(|s| s.to_owned()),
             activity_type,
             trust_tier: Some(TrustTier::PullRequestTarget),
@@ -85,7 +85,7 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_head_when_base_sha_missing() {
+    fn leaves_checkout_sha_missing_when_base_sha_missing() {
         let payload = serde_json::json!({
             "action": "opened",
             "pull_request": {
@@ -95,6 +95,6 @@ mod tests {
             "repository": { "default_branch": "main" }
         });
         let events = Adapter.project(&payload);
-        assert_eq!(events[0].sha, Some("head-sha-789".to_owned()));
+        assert_eq!(events[0].sha, None);
     }
 }
