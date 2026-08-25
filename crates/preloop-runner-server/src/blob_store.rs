@@ -314,12 +314,19 @@ pub(crate) async fn replay_results_put(
     if let Some(parent) = dest.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    match std::fs::write(&dest, &body) {
+
+    // Publish the completed blob with a same-filesystem rename. A direct
+    // write exposes a growing file to GET /api/v1/runs/:run_id/logs, which
+    // can observe a prefix while the runner is still uploading the body.
+    let temp = dest.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let result = std::fs::write(&temp, &body).and_then(|()| std::fs::rename(&temp, &dest));
+    match result {
         Ok(()) => {
             tracing::info!("Stored {} bytes at replay/results/{path}", body.len());
             StatusCode::CREATED
         }
         Err(e) => {
+            let _ = std::fs::remove_file(&temp);
             tracing::warn!("Failed to store replay/results/{path}: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
         }

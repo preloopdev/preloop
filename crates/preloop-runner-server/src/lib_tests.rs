@@ -17319,6 +17319,103 @@ async fn replay_blob_uploads_require_a_ticket_bound_to_the_exact_path() {
         .unwrap();
     assert_eq!(forged.status(), StatusCode::UNAUTHORIZED);
 }
+#[tokio::test]
+async fn replay_job_log_upload_is_published_as_one_complete_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let accepted = submit_yaml(
+        &app,
+        r#"
+on: push
+jobs:
+  first:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo first
+  second:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo second
+"#,
+        "owner/repo",
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let requests = {
+        let inner = state.inner.lock().await;
+        let mut requests = inner
+            .job_requests
+            .values()
+            .filter(|request| request.run_id == run_id)
+            .map(|request| {
+                (
+                    request.request_id,
+                    request.plan_id.clone(),
+                    request.agent_job_id.to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        requests.sort_by_key(|(request_id, _, _)| *request_id);
+        requests
+    };
+    assert_eq!(requests.len(), 2);
+
+    let first_log = "first job line\n".repeat(4096);
+    let second_log = "second job line\n".repeat(4096);
+    for ((_, plan, job), body) in requests
+        .iter()
+        .zip([first_log.as_str(), second_log.as_str()])
+    {
+        let path = format!("/replay/results/{plan}/{job}/job-logs.txt");
+        let sig = crate::auth::sign_replay_upload_ticket(&state, &path);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!(
+                        "{path}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig={sig}"
+                    ))
+                    .body(Body::from(body.to_owned()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/v1/runs/{run_id}/logs"))
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let expected = [first_log.as_bytes(), second_log.as_bytes()].concat();
+    assert_eq!(body.as_ref(), expected);
+
+    for (_, plan, job) in &requests {
+        let results_dir = temp
+            .path()
+            .join("replay")
+            .join("results")
+            .join(plan)
+            .join(job);
+        let mut entries = tokio::fs::read_dir(results_dir).await.unwrap();
+        let mut names = Vec::new();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            names.push(entry.file_name());
+        }
+        assert_eq!(names, vec![std::ffi::OsString::from("job-logs.txt")]);
+    }
+}
 
 #[tokio::test]
 async fn replay_blob_urls_are_minted_only_for_the_callers_own_job() {
