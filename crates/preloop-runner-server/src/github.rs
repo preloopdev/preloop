@@ -1333,47 +1333,52 @@ async fn process_github_webhook(
                 // the current default-branch head rather than this delivery's
                 // possibly stale event commit. Triggered runs still use the
                 // event-pinned `workflows` above.
-                let scheduler_sha = match resolve_ref_sha(shared, &repo_full_name, &ref_default)
+                let scheduler_source = match resolve_ref_sha(shared, &repo_full_name, &ref_default)
                     .await
                 {
-                    Ok(Some(sha)) => sha,
+                    Ok(Some(scheduler_sha)) => {
+                        let scheduler_workflows = if scheduler_sha == resolved_sha {
+                            Some(workflows.clone())
+                        } else {
+                            match fetch_workflows(shared, &repo_full_name, &scheduler_sha).await {
+                                Ok(workflows) => Some(workflows),
+                                Err(error) => {
+                                    warn!(
+                                        sha = %scheduler_sha,
+                                        ?error,
+                                        "failed to fetch current default-branch workflows — skipping cron reconciliation"
+                                    );
+                                    None
+                                }
+                            }
+                        };
+                        scheduler_workflows.map(|workflows| (scheduler_sha, workflows))
+                    }
                     Ok(None) => {
-                        error!(
+                        warn!(
                             ref_name = %ref_default,
-                            "current default branch has no resolvable commit SHA — delivery failed, will be redelivered"
+                            "current default branch has no resolvable commit SHA — skipping cron reconciliation"
                         );
-                        return Err(StatusCode::BAD_GATEWAY);
+                        None
                     }
                     Err(error) => {
-                        error!(
+                        warn!(
                             ?error,
                             ref_name = %ref_default,
-                            "failed to resolve current default branch SHA — delivery failed, will be redelivered"
+                            "failed to resolve current default branch SHA — skipping cron reconciliation"
                         );
-                        return Err(StatusCode::BAD_GATEWAY);
+                        None
                     }
                 };
-                let scheduler_workflows = if scheduler_sha == resolved_sha {
-                    workflows.clone()
-                } else {
-                    fetch_workflows(shared, &repo_full_name, &scheduler_sha)
-                        .await
-                        .map_err(|error| {
-                            error!(
-                                sha = %scheduler_sha,
-                                ?error,
-                                "failed to fetch current default-branch workflows — delivery failed, will be redelivered"
-                            );
-                            StatusCode::BAD_GATEWAY
-                        })?
-                };
-                let mut scheduler_payload = payload_val.clone();
-                if let Some(object) = scheduler_payload.as_object_mut() {
-                    object.insert("after".to_owned(), Value::String(scheduler_sha));
+                if let Some((scheduler_sha, scheduler_workflows)) = scheduler_source {
+                    let mut scheduler_payload = payload_val.clone();
+                    if let Some(object) = scheduler_payload.as_object_mut() {
+                        object.insert("after".to_owned(), Value::String(scheduler_sha));
+                    }
+                    scheduler
+                        .reconcile_all(&scheduler_workflows, scheduler_payload, shared.clone())
+                        .await;
                 }
-                scheduler
-                    .reconcile_all(&scheduler_workflows, scheduler_payload, shared.clone())
-                    .await;
             }
         }
 
