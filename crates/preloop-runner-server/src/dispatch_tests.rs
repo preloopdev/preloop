@@ -120,6 +120,21 @@ fn git_ok(ws: &std::path::Path, args: &[&str]) {
     );
 }
 
+fn git_head(ws: &std::path::Path) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(ws)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git rev-parse failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
 /// POST a raw JSON body to `uri` with `bearer` (defaults to the system
 /// token). Returns (status, parsed body).
 async fn post_json(
@@ -1024,6 +1039,7 @@ async fn webhook_receiver_accepts_any_registered_app_secret() {
     )
     .unwrap();
     init_git_repo(&ws);
+    let event_sha = git_head(&ws);
     let mut state = AppState::new(temp.path().join("state").to_path_buf())
         .await
         .unwrap();
@@ -1035,7 +1051,7 @@ async fn webhook_receiver_accepts_any_registered_app_secret() {
 
     let payload = json!({
         "ref": "refs/heads/main",
-        "after": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        "after": event_sha,
         "repository": {"full_name": "octocat/repo", "default_branch": "main"},
         "commits": [],
     });
