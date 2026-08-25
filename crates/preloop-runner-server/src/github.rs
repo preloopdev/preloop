@@ -1284,36 +1284,46 @@ async fn process_github_webhook(
         } else {
             &effective.git_ref
         };
-        let workflows = fetch_workflows(shared, &repo_full_name, workflow_ref)
-            .await
-            .map_err(|error| {
-                error!(
-                    event = %effective.event,
-                    ?error,
-                    "Failed to fetch workflows — delivery failed, will be redelivered"
-                );
-                StatusCode::BAD_GATEWAY
-            })?;
+
+        // The event ref is mutable: another push can move it while this
+        // delivery is in flight, and GitHub's webhook/API views may briefly
+        // converge at different times. Keep it for github.ref and trigger
+        // semantics, but resolve the workflow definition from the immutable
+        // commit that the event identifies.
         let resolved_sha = match &effective.sha {
             Some(sha) => sha.clone(),
-            None => match resolve_ref_sha(shared, &repo_full_name, &effective.git_ref).await {
+            None => match resolve_ref_sha(shared, &repo_full_name, workflow_ref).await {
                 Ok(Some(sha)) => sha,
                 Ok(None) => {
                     error!(
-                        ref_name = %effective.git_ref,
-                        "webhook ref has no resolvable commit SHA — delivery failed, will be redelivered"
+                        ref_name = %workflow_ref,
+                        "webhook workflow ref has no resolvable commit SHA — delivery failed, will be redelivered"
                     );
                     return Err(StatusCode::BAD_GATEWAY);
                 }
                 Err(error) => {
                     error!(
                         ?error,
-                        "failed to resolve webhook ref SHA — delivery failed, will be redelivered"
+                        ref_name = %workflow_ref,
+                        "failed to resolve webhook workflow ref SHA — delivery failed, will be redelivered"
                     );
                     return Err(StatusCode::BAD_GATEWAY);
                 }
             },
         };
+
+        let workflows = fetch_workflows(shared, &repo_full_name, &resolved_sha)
+            .await
+            .map_err(|error| {
+                error!(
+                    event = %effective.event,
+                    sha = %resolved_sha,
+                    source_ref = %workflow_ref,
+                    ?error,
+                    "Failed to fetch workflows at the event commit — delivery failed, will be redelivered"
+                );
+                StatusCode::BAD_GATEWAY
+            })?;
         if effective.event == "push" && effective.git_ref == ref_default {
             if let Some(scheduler) = &shared.state.scheduler {
                 scheduler
