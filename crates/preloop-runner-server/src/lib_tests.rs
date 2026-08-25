@@ -15997,6 +15997,7 @@ jobs:
     upload_request.extend_from_slice(b"0000");
     upload_request.extend_from_slice(&pkt_line(b"done\n"));
     let upload = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method(Method::POST)
@@ -16054,6 +16055,42 @@ jobs:
         index_result.status.success(),
         "Git rejected the route's fetched pack: {}",
         String::from_utf8_lossy(&index_result.stderr)
+    );
+
+    let mut protocol_v2_request = pkt_line(b"command=fetch\n");
+    protocol_v2_request.extend_from_slice(&pkt_line(b"agent=git/2.43.0\n"));
+    protocol_v2_request.extend_from_slice(&pkt_line(b"object-format=sha1\n"));
+    protocol_v2_request.extend_from_slice(b"0001");
+    protocol_v2_request.extend_from_slice(&pkt_line(format!("want {commit}\n").as_bytes()));
+    protocol_v2_request.extend_from_slice(&pkt_line(b"filter blob:none\n"));
+    protocol_v2_request.extend_from_slice(&pkt_line(b"done\n"));
+    protocol_v2_request.extend_from_slice(b"0000");
+    let protocol_v2_upload = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/snapshots/{run_id}/git-upload-pack"))
+                .header(header::AUTHORIZATION, format!("Bearer {runtime_token}"))
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/x-git-upload-pack-request",
+                )
+                .header("Git-Protocol", "version=2")
+                .body(Body::from(protocol_v2_request))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(protocol_v2_upload.status(), StatusCode::OK);
+    let protocol_v2_body = to_bytes(protocol_v2_upload.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        protocol_v2_body.starts_with(b"0008NAK\n")
+            || protocol_v2_body.windows(4).any(|window| window == b"PACK"),
+        "protocol v2 upload-pack response should remain pkt-line or pack framed: {:?}",
+        &protocol_v2_body[..protocol_v2_body.len().min(128)]
     );
 
     let bare_repository = state_dir.join(repository);
