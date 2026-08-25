@@ -668,7 +668,7 @@ pub(crate) async fn fetch_workflows_at(
             let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
             Some(crate::github_app::get_or_mint_token_at(api_base, &app, repo, &permissions).await?)
         } else {
-            std::env::var("PRELOOP_GITHUB_TOKEN").ok()
+            shared.state.static_github_pat()
         };
         if let Some(token) = &token {
             fetch_remote_workflows(token, repo, git_ref, api_base).await
