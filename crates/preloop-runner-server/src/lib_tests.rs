@@ -7542,6 +7542,78 @@ async fn app_only_server_fetches_webhook_workflows_with_installation_token() {
 }
 
 #[tokio::test]
+async fn pat_only_server_fetches_webhook_workflows_with_configured_pat() {
+    use axum::http::HeaderMap;
+    use axum::routing::get;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", listener.local_addr().unwrap());
+    let download_url = format!("{api_base}/raw/ci.yml");
+    let stub = Router::new()
+        .route(
+            "/repos/preloopdev/preloop/contents/.github/workflows",
+            get(move |headers: HeaderMap| {
+                let download_url = download_url.clone();
+                async move {
+                    assert_eq!(
+                        headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok()),
+                        Some("Bearer ghp_config_workflow_token")
+                    );
+                    Json(json!([{
+                        "name": "ci.yml",
+                        "type": "file",
+                        "download_url": download_url
+                    }]))
+                }
+            }),
+        )
+        .route(
+            "/raw/ci.yml",
+            get(|headers: HeaderMap| async move {
+                assert_eq!(
+                    headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("Bearer ghp_config_workflow_token")
+                );
+                "on: push\njobs:\n  test:\n    runs-on: self-hosted\n    steps:\n      - run: true\n"
+            }),
+        );
+    tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        "[github]\npat = \"ghp_config_workflow_token\"\n",
+    )
+    .unwrap();
+    let mut state = AppState::new_with_config(temp.path().join("state"), config_path)
+        .await
+        .unwrap();
+    state.local_workspace = None;
+    assert!(state.github_app.is_none());
+    let shared = Arc::new(SharedState {
+        state,
+        shutdown: CancellationToken::new(),
+    });
+
+    let workflows = crate::github::fetch_workflows_at(
+        &shared,
+        "preloopdev/preloop",
+        "refs/heads/main",
+        &api_base,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(workflows.len(), 1);
+    assert!(workflows["ci.yml"].contains("runs-on: self-hosted"));
+}
+
+#[tokio::test]
 async fn app_only_server_resolves_pull_request_changed_files_with_installation_token() {
     use crate::github_app::{GitHubAppCredentials, MintFailurePolicy};
     use axum::extract::{Path, Query};
