@@ -1,5 +1,7 @@
+#![allow(missing_docs)]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
 use std::time::{Duration, SystemTime};
 
 use parking_lot::RwLock;

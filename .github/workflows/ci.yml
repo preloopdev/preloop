@@ -47,7 +47,10 @@ jobs:
     runs-on: self-hosted
     timeout-minutes: 60
     env:
-      
+      # 2 parallel debug rustc + GNU ld links peak ~4.6 GiB in the guest
+      # (measured on the pool, 2026-08-13); the 5 GiB VM ceiling is the
+      # floor. Unbounded parallelism OOM-killed the host once; the ceiling
+      # must stay above the build peak or the guest OOM-kills rustc.
       CARGO_BUILD_JOBS: "2"
       # The dedicated property job carries the 256-case profile. Keep this
       # workspace gate aligned with `just test-ci` and bound libtest
@@ -80,16 +83,17 @@ jobs:
       # inline run steps work against preloop
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
 
-      
+      # Runner executes as root in the pool VM; sudo's audit plugin fails on
+      # the mis-owned /etc/sudoers in the golden, so call apt directly.
       - name: Install lld linker
         run: apt-get update && apt-get install -y --no-install-recommends lld
 
       - run: cargo fmt --all --check
       - run: |
           # Run clippy on warning-free crates with strict -D warnings
-          cargo clippy --locked -p preloop-gha-protocol -p preloop-gha-parser -p preloop-gha-expressions -p preloop-cache -p preloop-artifacts -p runner-watch -p preloop-conformance --all-targets -- -D warnings
+          cargo clippy --locked -p preloop-gha-protocol -p preloop-gha-parser -p preloop-gha-expressions -p preloop-cache -p preloop-artifacts -p runner-watch -p preloop-conformance -p preloop-observability --all-targets -- -D warnings
           # Run clippy on crates with pre-existing warnings without -D warnings
-          cargo clippy --locked -p preloop-observability -p preloop-runner -p preloop-runner-server -p preloop-runner-client -p preloop-dap --all-targets
+          cargo clippy --locked -p preloop-runner -p preloop-runner-server -p preloop-runner-client -p preloop-dap --all-targets
       # cargo test (libtest) measured faster than nextest on this pool:
       # nextest's per-test process model cost ~4 min of spawn overhead on
       # 1628 fast unit tests (exec 17.5-18.0 min vs libtest 13.4 across

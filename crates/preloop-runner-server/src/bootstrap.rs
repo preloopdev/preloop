@@ -619,6 +619,22 @@ async fn run_state_sampler(shared: Arc<SharedState>) {
                     shared.state.github_app.is_some(),
                 );
                 *shared.state.status_snapshot.write() = snap;
+                // Record pool/queue gauges into OTel instruments so `/metrics`
+                // has a single exposition source (the SDK renderer).
+                {
+                    let s = shared.state.status_snapshot.read();
+                    shared.state.observability.metrics().pool.record(
+                        s.service.uptime_seconds,
+                        s.pool.desired as u64,
+                        s.pool.preparing,
+                        s.pool.idle as u64,
+                        s.pool.busy as u64,
+                        s.jobs.ready as u64,
+                        s.jobs.claimable as u64,
+                        s.jobs.unclaimable as u64,
+                        s.jobs.dependency_blocked as u64,
+                    );
+                }
             }
             _ = shared.shutdown.cancelled() => break,
         }
@@ -659,7 +675,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             .clone()
             .or_else(|| std::env::var("PRELOOP_STORE_URL").ok())
             .unwrap_or_default();
-        let backend = if effective_url.contains("postgres") {
+        let backend = if effective_url.starts_with("postgres") {
             "postgres"
         } else {
             "sqlite"

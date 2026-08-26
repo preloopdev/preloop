@@ -1,3 +1,5 @@
+#![allow(missing_docs)]
+
 //! Metrics registry for HTTP, store, and lifecycle — Step 4.
 //!
 //! Instruments are created from the shared `Meter` so the OTLP periodic reader
@@ -333,6 +335,114 @@ impl LifecycleMetrics {
 // Registry
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Pool & service gauges sampler-driven, replaces hand-rolled /metrics text
+// ---------------------------------------------------------------------------
+
+/// Pool instruments: gauges updated by the 5s state sampler. These replace
+/// the hand-rolled Prometheus text in the `/metrics` handler so there is
+/// exactly one exposition source (the SDK ManualReader).
+#[derive(Clone)]
+pub struct PoolMetrics {
+    uptime: Gauge<u64>,
+    desired: Gauge<u64>,
+    preparing: Gauge<u64>,
+    idle: Gauge<u64>,
+    busy: Gauge<u64>,
+    queue_ready: Gauge<u64>,
+    queue_claimable: Gauge<u64>,
+    queue_unclaimable: Gauge<u64>,
+    queue_dependency_blocked: Gauge<u64>,
+}
+
+impl std::fmt::Debug for PoolMetrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PoolMetrics").finish_non_exhaustive()
+    }
+}
+
+impl PoolMetrics {
+    fn new(meter: &Meter) -> Self {
+        Self {
+            uptime: meter
+                .u64_gauge("preloop.service.uptime")
+                .with_description("Service uptime")
+                .with_unit("s")
+                .build(),
+            desired: meter
+                .u64_gauge("preloop.pool.desired")
+                .with_description("Desired pool size")
+                .with_unit("{runner}")
+                .build(),
+            preparing: meter
+                .u64_gauge("preloop.pool.preparing")
+                .with_description("Pool preparing signal (1 = preparing)")
+                .with_unit("{bool}")
+                .build(),
+            idle: meter
+                .u64_gauge("preloop.pool.idle")
+                .with_description("Idle runners in pool")
+                .with_unit("{runner}")
+                .build(),
+            busy: meter
+                .u64_gauge("preloop.pool.busy")
+                .with_description("Busy runners in pool")
+                .with_unit("{runner}")
+                .build(),
+            queue_ready: meter
+                .u64_gauge("preloop.job.queue_depth")
+                .with_description("Jobs in the ready queue")
+                .with_unit("{job}")
+                .build(),
+            queue_claimable: meter
+                .u64_gauge("preloop.job.claimable")
+                .with_description("Jobs claimable by a registered runner")
+                .with_unit("{job}")
+                .build(),
+            queue_unclaimable: meter
+                .u64_gauge("preloop.job.unclaimable")
+                .with_description("Jobs no registered runner can claim")
+                .with_unit("{job}")
+                .build(),
+            queue_dependency_blocked: meter
+                .u64_gauge("preloop.job.dependency_blocked")
+                .with_description("Jobs blocked on dependency")
+                .with_unit("{job}")
+                .build(),
+        }
+    }
+
+    /// Record current pool/queue state from the sampler snapshot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record(
+        &self,
+        uptime_seconds: u64,
+        desired: u64,
+        preparing: bool,
+        idle: u64,
+        busy: u64,
+        ready: u64,
+        claimable: u64,
+        unclaimable: u64,
+        dependency_blocked: u64,
+    ) {
+        self.uptime.record(uptime_seconds, &[]);
+        self.desired.record(desired, &[]);
+        self.preparing.record(u64::from(preparing), &[]);
+        self.idle.record(idle, &[]);
+        self.busy.record(busy, &[]);
+        self.queue_ready.record(ready, &[]);
+        self.queue_claimable.record(claimable, &[]);
+        self.queue_unclaimable.record(unclaimable, &[]);
+        self.queue_dependency_blocked
+            .record(dependency_blocked, &[]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Registry
+// ---------------------------------------------------------------------------
+
 /// Instrument holder. `default()` is a no-op registry for tests and
 /// library-only consumers — instruments created from the noop meter record
 /// nothing.
@@ -341,6 +451,7 @@ pub struct MetricsRegistry {
     pub http: HttpMetrics,
     pub store: StoreMetrics,
     pub lifecycle: LifecycleMetrics,
+    pub pool: PoolMetrics,
 }
 
 impl std::fmt::Debug for MetricsRegistry {
@@ -364,6 +475,7 @@ impl MetricsRegistry {
             http: HttpMetrics::new(&meter),
             store: StoreMetrics::new(&meter),
             lifecycle: LifecycleMetrics::new(&meter),
+            pool: PoolMetrics::new(&meter),
         }
     }
 }

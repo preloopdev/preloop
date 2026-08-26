@@ -1,6 +1,6 @@
 #![allow(missing_docs)]
 
-//! `preloop-observability` — observability handle for Preloop.
+//! `preloop-observability` main observability handle for Preloop.
 //!
 //! Small, explicit API with no dependency on server/orchestrator internals. Both
 //! `preloop` and `preloop-server` construct one handle/runtime before building
@@ -9,20 +9,21 @@
 //!
 //! The transport is the OpenTelemetry SDK: `SdkTracerProvider`,
 //! `SdkMeterProvider`, and `SdkLoggerProvider`, each with OTLP/HTTP batch
-//! exporters (no tonic). A Prometheus reader always backs the meter provider so
-//! `/metrics` works with no backend at all.
+//! exporters (no tonic). A `ManualReader` always backs the meter provider so
+//! `/metrics` works with no backend at all (the deprecated
+//! `opentelemetry-prometheus` crate is not used).
 //!
-//! Invariants from the plan:
+//! Invariants:
 //! - Fail open: export failure never rejects a workflow.
 //! - Bounded queues, 2s flush, no backend by default (absent `OTEL_EXPORTER_OTLP_*` = disabled, not `localhost:4318`).
 //! - Always retain `stderr`/`journald` even when OTLP is configured.
 //! - `Debug` on config never reveals headers or credential-bearing endpoint parts.
 
 pub mod metrics;
+pub mod prometheus;
 pub mod status;
 pub mod vm_telemetry;
 
-/// Read `traceparent` from an `http::HeaderMap`. Re-exported for the
 /// middleware's span parent extraction.
 pub use opentelemetry_http::HeaderExtractor;
 /// W3C `traceparent` propagation. Re-exported so the server middleware can
@@ -45,12 +46,13 @@ use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider, Temporality};
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::Resource;
 use parking_lot::RwLock;
+use tracing::level_filters::LevelFilter;
 use tracing_subscriber::layer::{Layer, SubscriberExt};
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::Registry;
+use tracing_subscriber::{EnvFilter, Registry};
 use uuid::Uuid;
 
 use crate::metrics::{HTTP_BUCKETS, QUEUE_BUCKETS, STORE_BUCKETS};
+use crate::prometheus::PrometheusHandle;
 
 // ---------------------------------------------------------------------------
 // Log format
@@ -142,7 +144,7 @@ pub struct ObservabilityConfig {
     pub rust_log: String,
     /// `service.name` — `preloop` or `OTEL_SERVICE_NAME`.
     pub service_name: String,
-    /// `service.version` — set by the host binary via `with_service_version`.
+    /// `service.version` is set by the host binary via `with_service_version`.
     /// Defaults to this crate's version only until the binary overrides it.
     pub service_version: String,
     /// Per-process instance ID (UUID v4).
@@ -276,8 +278,8 @@ impl ObservabilityConfig {
     }
 
     /// Sanitized endpoint for `Debug`/errors: strips userinfo and query.
-    fn sanitized_endpoint(&self) -> Option<String> {
-        self.otel_logs_endpoint.as_ref().map(|raw| {
+    fn sanitized_endpoints(&self) -> Vec<(&'static str, String)> {
+        let sanitize = |raw: &str| -> String {
             // Best-effort: hide `user:pass@` and `?...` without a URL parser dep.
             let without_query = raw.split('?').next().unwrap_or(raw);
             if let Some(at) = without_query.rfind('@') {
@@ -289,7 +291,18 @@ impl ObservabilityConfig {
                 return format!("***@{}", &without_query[at + 1..]);
             }
             without_query.to_string()
-        })
+        };
+        let mut out = Vec::new();
+        if let Some(url) = &self.otel_traces_endpoint {
+            out.push(("traces", sanitize(url)));
+        }
+        if let Some(url) = &self.otel_logs_endpoint {
+            out.push(("logs", sanitize(url)));
+        }
+        if let Some(url) = &self.otel_metrics_endpoint {
+            out.push(("metrics", sanitize(url)));
+        }
+        out
     }
 }
 
@@ -301,7 +314,7 @@ impl fmt::Debug for ObservabilityConfig {
             .field("service_name", &self.service_name)
             .field("service_version", &self.service_version)
             .field("instance_id", &self.instance_id)
-            .field("otel_endpoint", &self.sanitized_endpoint())
+            .field("otel_endpoints", &self.sanitized_endpoints())
             .field(
                 "otel_headers",
                 &(self.has_otel_headers().then_some("<redacted>")),
@@ -546,7 +559,7 @@ struct Inner {
     vm_registry: Arc<vm_telemetry::VmTelemetryRegistry>,
     tracer: Option<opentelemetry_sdk::trace::Tracer>,
     logger: Option<opentelemetry_sdk::logs::SdkLogger>,
-    prometheus_registry: Option<prometheus::Registry>,
+    prometheus_handle: Option<PrometheusHandle>,
     is_noop: bool,
 }
 
@@ -582,7 +595,7 @@ impl Observability {
                 vm_registry: Arc::new(vm_telemetry::VmTelemetryRegistry::default()),
                 tracer: None,
                 logger: None,
-                prometheus_registry: None,
+                prometheus_handle: None,
                 is_noop: true,
             }),
         }
@@ -629,12 +642,8 @@ impl Observability {
         // ---- Metrics: Prometheus reader always (local /metrics), OTLP
         // periodic reader when a metrics endpoint exists. One instrument set,
         // two readers — the plan's multi-reader requirement.
-        let prometheus_registry = prometheus::Registry::new();
-        let prometheus_exporter = opentelemetry_prometheus::exporter()
-            .with_registry(prometheus_registry.clone())
-            .without_scope_info()
-            .build()
-            .ok();
+        let prometheus_handle =
+            PrometheusHandle::new(opentelemetry_sdk::metrics::ManualReader::default());
         let mut meter_builder = SdkMeterProvider::builder()
             .with_resource(resource.clone())
             .with_view(histogram_view("http.server.request.duration", HTTP_BUCKETS))
@@ -643,9 +652,7 @@ impl Observability {
                 STORE_BUCKETS,
             ))
             .with_view(histogram_view("preloop.job.queue.wait", QUEUE_BUCKETS));
-        if let Some(exporter) = prometheus_exporter {
-            meter_builder = meter_builder.with_reader(exporter);
-        }
+        meter_builder = meter_builder.with_reader(prometheus_handle.clone());
         if let Some(target) = targets.metrics.as_ref() {
             if let Some(exporter) = build_metric_exporter(target, http_client.as_ref()) {
                 meter_builder = meter_builder.with_reader(
@@ -675,7 +682,7 @@ impl Observability {
                 vm_registry: Arc::new(vm_telemetry::VmTelemetryRegistry::default()),
                 tracer,
                 logger,
-                prometheus_registry: Some(prometheus_registry),
+                prometheus_handle: Some(prometheus_handle),
                 is_noop,
             }),
         };
@@ -774,20 +781,12 @@ impl Observability {
     }
 
     /// Render the Prometheus registry text for `/metrics`. Empty when the
-    /// registry is absent (noop handles).
+    /// handle is absent (noop handles).
     pub fn render_metrics(&self) -> String {
-        let Some(registry) = &self.inner.prometheus_registry else {
+        let Some(handle) = &self.inner.prometheus_handle else {
             return String::new();
         };
-        use prometheus::Encoder;
-        let encoder = prometheus::TextEncoder::new();
-        let families = registry.gather();
-        let mut out = Vec::new();
-        if encoder.encode(&families, &mut out).is_ok() {
-            String::from_utf8_lossy(&out).into_owned()
-        } else {
-            String::new()
-        }
+        handle.render()
     }
 }
 
@@ -943,11 +942,17 @@ impl ObservabilityRuntime {
         > = Box::new(fmt_layer.with_filter(filter));
         if let Some(provider) = &self.tracer_provider {
             let tracer = provider.tracer("preloop");
-            let layer = tracing_opentelemetry::layer().with_tracer(tracer);
+            let layer = tracing_opentelemetry::layer()
+                .with_tracer(tracer)
+                .with_filter(LevelFilter::INFO);
             chain = Box::new(chain.and_then(layer));
         }
         if let Some(provider) = &self.logger_provider {
-            let layer = OpenTelemetryTracingBridge::new(provider);
+            // Filter the log bridge to INFO+ to avoid exporting TRACE/DEBUG
+            // noise from hyper, h2, reqwest, and tokio internals, and to
+            // prevent infinite recursion (the OTLP exporter uses reqwest,
+            // whose tracing events would re-enter the bridge).
+            let layer = OpenTelemetryTracingBridge::new(provider).with_filter(LevelFilter::INFO);
             chain = Box::new(chain.and_then(layer));
         }
         let _ = tracing::subscriber::set_global_default(Registry::default().with(chain));

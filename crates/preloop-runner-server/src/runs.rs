@@ -83,51 +83,7 @@ pub(crate) async fn status(State(shared): State<Arc<SharedState>>) -> impl IntoR
 }
 
 pub(crate) async fn metrics(State(shared): State<Arc<SharedState>>) -> impl IntoResponse {
-    let snap = shared.state.status_snapshot.read().clone();
-    let mut out = String::new();
-    out.push_str("# HELP preloop_service_uptime_seconds Service uptime in seconds.\n");
-    out.push_str("# TYPE preloop_service_uptime_seconds gauge\n");
-    out.push_str(&format!(
-        "preloop_service_uptime_seconds {}\n",
-        snap.service.uptime_seconds
-    ));
-    out.push_str("# HELP preloop_pool_desired Desired pool size.\n");
-    out.push_str("# TYPE preloop_pool_desired gauge\n");
-    out.push_str(&format!("preloop_pool_desired {}\n", snap.pool.desired));
-    out.push_str("# HELP preloop_pool_preparing Pool preparing signal.\n");
-    out.push_str("# TYPE preloop_pool_preparing gauge\n");
-    out.push_str(&format!(
-        "preloop_pool_preparing {}\n",
-        if snap.pool.preparing { 1 } else { 0 }
-    ));
-    out.push_str("# HELP preloop_pool_idle Idle runners in pool.\n");
-    out.push_str("# TYPE preloop_pool_idle gauge\n");
-    out.push_str(&format!("preloop_pool_idle {}\n", snap.pool.idle));
-    out.push_str("# HELP preloop_pool_busy Busy runners in pool.\n");
-    out.push_str("# TYPE preloop_pool_busy gauge\n");
-    out.push_str(&format!("preloop_pool_busy {}\n", snap.pool.busy));
-    out.push_str("# HELP preloop_job_queue_depth Number of jobs by queue.\n");
-    out.push_str("# TYPE preloop_job_queue_depth gauge\n");
-    out.push_str(&format!(
-        "preloop_job_queue_depth{{queue=\"ready\"}} {}\n",
-        snap.jobs.ready
-    ));
-    out.push_str(&format!(
-        "preloop_job_queue_depth{{queue=\"claimable\"}} {}\n",
-        snap.jobs.claimable
-    ));
-    out.push_str(&format!(
-        "preloop_job_queue_depth{{queue=\"unclaimable\"}} {}\n",
-        snap.jobs.unclaimable
-    ));
-    out.push_str(&format!(
-        "preloop_job_queue_depth{{queue=\"dependency_blocked\"}} {}\n",
-        snap.jobs.dependency_blocked
-    ));
-    // Append the SDK-backed metrics registry (http + store + lifecycle) —
-    // bounded, not per-ID.
-    out.push_str(&shared.state.observability.render_metrics());
-    let body = out;
+    let body = shared.state.observability.render_metrics();
     (
         [(
             header::CONTENT_TYPE,

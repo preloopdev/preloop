@@ -1,3 +1,5 @@
+#![allow(missing_docs)]
+
 //!OperationalSnapshot and supporting types.
 //!
 
