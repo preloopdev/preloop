@@ -24,7 +24,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -263,6 +263,62 @@ fn relax_externals_permissions(externals: &Path) {
 
 #[cfg(not(unix))]
 fn relax_externals_permissions(_externals: &Path) {}
+
+/// Total physical memory in MiB, or `None` when it cannot be determined.
+///
+/// Used to bound on-demand fork concurrency so the pool never schedules
+/// more runner VMs than the host can hold in RAM. `None` (an unreadable
+/// `/proc/meminfo`, a non-Linux/non-macOS host) falls back to CPU-only
+/// sizing rather than refusing to run.
+#[cfg(target_os = "linux")]
+fn host_memory_mib() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kib: u64 = meminfo.lines().find_map(|line| {
+        let line = line.trim();
+        let rest = line.strip_prefix("MemTotal:")?;
+        rest.trim().strip_suffix(" kB")?.trim().parse().ok()
+    })?;
+    Some(kib / 1024)
+}
+
+/// Total physical memory in MiB, or `None` when it cannot be determined.
+#[cfg(target_os = "macos")]
+fn host_memory_mib() -> Option<u64> {
+    let output = std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()?;
+    let bytes: u64 = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .ok()?;
+    Some(bytes / (1024 * 1024))
+}
+
+/// Total physical memory in MiB, or `None` when it cannot be determined.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn host_memory_mib() -> Option<u64> {
+    None
+}
+
+/// On-demand fork concurrency allowed by host memory alone.
+///
+/// Every on-demand fork inherits the golden's committed footprint and grows
+/// toward `runner_memory_mib` as its guest runs, so the pool must never
+/// schedule more concurrent runners than `(host_total - golden - reserve) /
+/// runner_ceiling` allows. The 2 GiB reserve keeps the control plane, OS,
+/// and page cache alive — without it the host OOMs *after* the forks are up,
+/// which is exactly the production failure this guards against. Floors at 1
+/// so a tiny host still runs a single job rather than refusing to work.
+fn on_demand_memory_cap(host_total_mib: u64, runner_memory_mib: u64) -> usize {
+    const HOST_RESERVE_MIB: u64 = 2048;
+    // Both the golden and each runner use the same ceiling. A degenerate
+    // zero ceiling means "unbounded" would be unsafe to divide by, so treat
+    // it as 1; the config layer validates `memory_mib > 0` in practice.
+    let runner_mib = runner_memory_mib.max(1);
+    let golden_mib = runner_mib;
+    (host_total_mib.saturating_sub(golden_mib + HOST_RESERVE_MIB) / runner_mib).max(1) as usize
+}
 
 fn default_golden_url(release_version: &str) -> String {
     format!(
@@ -1362,6 +1418,15 @@ const GUEST_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// golden fork base. Bounded retries; the probe loop is exercised by tests
 /// under paused Tokio time, so this is the only knob the delay is tied to.
 const GOLDEN_DRAIN_PROBE_DELAY: Duration = Duration::from_secs(10);
+/// Ceiling for the drain-probe backoff: probes start at
+/// `GOLDEN_DRAIN_PROBE_DELAY` and double up to this cap, so a long-running
+/// job's clone is re-checked every minute rather than every ten seconds.
+const GOLDEN_DRAIN_PROBE_MAX: Duration = Duration::from_secs(60);
+/// Total wall-clock budget for waiting on live clones to drain before
+/// falling back to independent OCI creation. The fork path is orders of
+/// magnitude faster than direct creation, so this is generous; a clone that
+/// has not exited within it is unlikely to do so soon.
+const GOLDEN_DRAIN_BUDGET: Duration = Duration::from_secs(300);
 /// Gap between guest readiness probes.
 const GUEST_READY_POLL: Duration = Duration::from_millis(25);
 
@@ -1694,6 +1759,10 @@ pub(crate) struct GoldenRegistry {
     /// `prepare_golden_for_env` removes any existing machine of that name).
     build_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     name_prefix: String,
+    /// Set when the startup packed-golden import failed. In that case the
+    /// pool must create runners directly from their requested base image
+    /// rather than attempting a second environment-golden bake.
+    packed_unavailable: AtomicBool,
 }
 
 impl GoldenRegistry {
@@ -1702,12 +1771,25 @@ impl GoldenRegistry {
             goldens: RwLock::new(HashMap::new()),
             build_locks: RwLock::new(HashMap::new()),
             name_prefix,
+            packed_unavailable: AtomicBool::new(false),
         }
     }
 
     /// Return the name prefix used for golden VM names.
     pub fn name_prefix(&self) -> &str {
         &self.name_prefix
+    }
+
+    /// Disable packed-golden and environment-golden preparation after the
+    /// startup packed import fails. Direct per-runner creation is the only
+    /// honest fallback: a second environment golden would repeat the same
+    /// disk-heavy unpack under a different name.
+    pub fn disable_packed(&self) {
+        self.packed_unavailable.store(true, Ordering::Release);
+    }
+
+    pub fn is_packed_disabled(&self) -> bool {
+        self.packed_unavailable.load(Ordering::Acquire)
     }
 
     /// Get existing golden or return None if not yet prepared.
@@ -2220,8 +2302,14 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
         dns: config.dns.clone(),
         rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
     };
-    provider.create(&spec).await?;
-    provider.start(golden).await?;
+    if let Err(error) = provider.create(&spec).await {
+        let _ = provider.delete(golden).await;
+        return Err(error.into());
+    }
+    if let Err(error) = provider.start(golden).await {
+        let _ = provider.delete(golden).await;
+        return Err(error.into());
+    }
     if let Err(error) = await_guest_ready(provider.as_ref(), golden).await {
         let _ = provider.delete(golden).await;
         return Err(error);
@@ -2283,7 +2371,16 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     .await
             };
             if let Err(error) = result {
-                warn!(%error, "golden fork base unavailable; falling back to create-per-runner");
+                if self.config.use_packed_artifact {
+                    golden_registry.disable_packed();
+                    warn!(
+                        %error,
+                        "packed golden fork base unavailable; using direct per-runner creation \
+                         instead of building a second environment golden"
+                    );
+                } else {
+                    warn!(%error, "golden fork base unavailable; falling back to direct creation");
+                }
             } else {
                 golden_registry
                     .insert(default_environment.fingerprint, golden)
@@ -2311,14 +2408,38 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         let building = Arc::new(AtomicUsize::new(0));
 
         // On-demand mode: size=0 means no warm pool. Fork runners only when
-        // jobs arrive, capped by the host's CPU budget.
+        // jobs arrive, capped by the host's CPU and memory budget.
         if self.config.size == 0 {
             return self
                 .run_on_demand(shutdown, golden_registry, idle, keys, building)
                 .await;
         }
 
-        for slot in 0..self.config.size {
+        // Warm mode: cap the configured pool size by host memory as well as
+        // CPU. Each warm slot forks from the golden and inherits its
+        // committed footprint (growing toward `memory_mib` while a job
+        // runs), and a slot provisions its successor mid-job — so on a
+        // small host the configured size can still exhaust RAM. Sizing down
+        // at startup is safer than OOMing mid-run; `PRELOOP_RUNNER_POOL_SIZE`
+        // remains an explicit override that wins.
+        let warm_size = match host_memory_mib() {
+            Some(total) => self.config.size.min(
+                on_demand_memory_cap(total, u64::from(self.config.memory_mib))
+                    .saturating_div(2)
+                    .max(1),
+            ),
+            None => self.config.size,
+        };
+        if warm_size < self.config.size {
+            warn!(
+                configured = self.config.size,
+                warm_size,
+                memory_mib = self.config.memory_mib,
+                "reduced warm pool size to fit host memory"
+            );
+        }
+
+        for slot in 0..warm_size {
             let provider = self.provider.clone();
             let config = self.config.clone();
             let slot_shutdown = shutdown.child_token();
@@ -2391,7 +2512,21 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             // the fork back and spends the golden's retained checkpoint.
             let parallelism = std::thread::available_parallelism().map_or(2, |value| value.get());
             let per_runner = usize::from(self.config.cpus.max(1));
-            (parallelism / per_runner).saturating_sub(1).max(1)
+            let by_cpu = (parallelism / per_runner).saturating_sub(1).max(1);
+            // memory term: every on-demand fork inherits the golden's
+            // committed footprint and grows toward `memory_mib` as the guest
+            // runs. On a small host (the production 6-core/22 GiB machine)
+            // the CPU term alone allows enough 8 GiB forks to exhaust RAM
+            // and OOM the whole control plane. Reserve the golden's memory
+            // plus host headroom, then fit the remainder with per-runner
+            // ceilings. A host we cannot measure falls back to CPU-only.
+            match host_memory_mib() {
+                Some(total) => by_cpu.min(on_demand_memory_cap(
+                    total,
+                    u64::from(self.config.memory_mib),
+                )),
+                None => by_cpu,
+            }
         };
         info!(max_concurrent, "on-demand runner pool (size=0)");
 
@@ -2985,6 +3120,11 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     semaphore: Arc<tokio::sync::Semaphore>,
     permit: Arc<std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
 ) -> Result<(), OrchestratorError> {
+    let mut config = config;
+    if golden_registry.is_packed_disabled() {
+        config.use_packed_artifact = false;
+        config.use_fork = false;
+    }
     let preparing = PreparingGuard::enter(
         provisioning,
         config.preparing_signal.clone(),
@@ -3126,6 +3266,11 @@ async fn run_slot<P: VmProvider + 'static>(
     golden_registry: Arc<GoldenRegistry>,
     handles: PoolHandles,
 ) -> Result<(), OrchestratorError> {
+    let mut config = config;
+    if golden_registry.is_packed_disabled() {
+        config.use_packed_artifact = false;
+        config.use_fork = false;
+    }
     let PoolHandles {
         idle,
         keys,
@@ -3692,6 +3837,31 @@ fn fork_base_unusable(error: &VmError) -> bool {
     .any(|signature| message.contains(signature))
 }
 
+/// Whether `golden` is a fork base this pool baked and manages.
+///
+/// The plain form (`{prefix}-golden`) is the single golden baked for the
+/// default environment at pool startup from the packed artifact; the
+/// fingerprint-suffixed form (`{prefix}-golden-{fingerprint12}`) is prepared
+/// on demand by `run_slot` from the job's OCI image when a job asks for a
+/// non-default base. Only the plain form is packed — the suffixed form is an
+/// environment golden whose forks do not inherit the baked baseline. Both
+/// can lose their retained fork checkpoint, so the re-arm /
+/// independent-create fallback applies to each; callers must not conflate
+/// "managed" with "packed".
+///
+/// A name like `{prefix}-golden-environment` is deliberately NOT matched:
+/// that is a baked environment golden serving a different `runs-on` image,
+/// and replacing it with the packed artifact would run the job on the wrong
+/// operating system.
+fn managed_golden(config: &RunnerPoolConfig, golden: &MachineName) -> bool {
+    let prefix = format!("{}-golden", config.name_prefix);
+    golden.as_str() == prefix
+        || golden.as_str().strip_prefix(&prefix).is_some_and(|rest| {
+            rest.strip_prefix('-')
+                .is_some_and(|fp| fp.len() == 12 && fp.bytes().all(|b| b.is_ascii_hexdigit()))
+        })
+}
+
 /// Create, boot, and register one ephemeral runner; return its `run` argv.
 ///
 /// The caller owns cleanup: on any error the machine may already exist.
@@ -3709,8 +3879,7 @@ async fn provision_runner<P: VmProvider + 'static>(
         Some(golden) => match provider.fork(golden, name).await {
             Ok(()) => Some(golden),
             Err(error @ VmError::ForkBaseBusy { .. })
-                if config.use_packed_artifact
-                    && golden.as_str() == format!("{}-golden", config.name_prefix) =>
+                if config.use_packed_artifact && managed_golden(config, golden) =>
             {
                 // A live plain-fork clone still depends on the golden's frozen
                 // storage. Do not touch the base and do not create another VM
@@ -3726,10 +3895,7 @@ async fn provision_runner<P: VmProvider + 'static>(
                 direct_create_from_packed = false;
                 None
             }
-            Err(error)
-                if config.use_packed_artifact
-                    && golden.as_str() == format!("{}-golden", config.name_prefix) =>
-            {
+            Err(error) if config.use_packed_artifact && managed_golden(config, golden) => {
                 if fork_base_unusable(&error) {
                     // The base is spent. Re-arm it atomically with forking:
                     // partial-clone cleanup, the live-clone check, and the
@@ -3765,14 +3931,22 @@ async fn provision_runner<P: VmProvider + 'static>(
                             // A live clone (another runner forked from the
                             // golden) blocks the re-freeze; those clones are
                             // ephemeral and exit after their job. Wait for
-                            // them to drain, then retry the re-arm a bounded
-                            // number of times before falling back to direct
-                            // creation (whose socket mount cannot serve the
-                            // control transport, so the fallback usually
-                            // fails registration anyway).
+                            // them to drain, probing with exponential backoff
+                            // so a long-running job does not force the slow
+                            // direct-create path for every queued job in the
+                            // meantime. The fork path is ~0.5 s vs ~8 min for
+                            // independent creation, so waiting is worth it up
+                            // to a generous total budget; only then fall back
+                            // to direct creation (whose socket mount cannot
+                            // serve the control transport, so the fallback
+                            // usually fails registration anyway).
                             let mut rearmed = false;
-                            for attempt in 0..12 {
-                                tokio::time::sleep(GOLDEN_DRAIN_PROBE_DELAY).await;
+                            let mut probe_delay = GOLDEN_DRAIN_PROBE_DELAY;
+                            let drain_deadline = tokio::time::Instant::now() + GOLDEN_DRAIN_BUDGET;
+                            let mut attempt = 0_u32;
+                            while tokio::time::Instant::now() < drain_deadline {
+                                tokio::time::sleep(probe_delay).await;
+                                attempt += 1;
                                 match provider.rearm_fork_base(golden, Some(name)).await {
                                     Ok(true) => {
                                         info!(
@@ -3784,8 +3958,12 @@ async fn provision_runner<P: VmProvider + 'static>(
                                     }
                                     Ok(false) => {
                                         // Live clones still hold the golden;
-                                        // keep probing until the bounded
-                                        // retries are exhausted.
+                                        // back off and probe again: the next
+                                        // probe costs little, and the clone
+                                        // may exit before the budget runs out.
+                                        probe_delay = probe_delay
+                                            .saturating_mul(2)
+                                            .min(GOLDEN_DRAIN_PROBE_MAX);
                                     }
                                     Err(drain_error) => {
                                         error!(
@@ -3873,6 +4051,15 @@ async fn provision_runner<P: VmProvider + 'static>(
         // so an env-golden fork boots the bare stock base image. Install the
         // apt baseline and toolchains into the fork itself — it is the job's
         // single-use machine, so the writes persist for its lifetime.
+        // Only the plain `{prefix}-golden` fork base is created from the
+        // packed artifact (`prepare_packed_golden` at pool startup), whose
+        // rootfs already carries the apt baseline and toolchains that forks
+        // inherit. Fingerprint-suffixed goldens are baked by
+        // `prepare_golden_for_env` from the job's OCI image via guest exec,
+        // and SmolVM's forkable snapshot does NOT carry post-create exec
+        // writes into clones — so those forks must install the baseline
+        // themselves. Treating an env golden as packed skipped that install
+        // and provisioned runners without the curated baseline.
         let golden_is_packed = config.use_packed_artifact
             && golden.as_str() == format!("{}-golden", config.name_prefix);
         if golden_is_packed {
@@ -3933,7 +4120,19 @@ async fn provision_runner<P: VmProvider + 'static>(
             );
         }
     } else {
-        let uses_packed_artifact = direct_create_from_packed;
+        // The packed-artifact fallback is valid only for the plain packed
+        // golden: it boots the *default* OS image. A fingerprint-suffixed
+        // golden is an environment golden baked from the job's requested
+        // image, so every fork-failure fallback must boot that job's own
+        // environment instead — regardless of which branch failed the fork.
+        // When no golden was attempted (`golden` is None, the create-per-
+        // runner path), the packed artifact is the pool's normal image and
+        // stays as-is.
+        let golden_is_plain_packed = match golden {
+            Some(golden) => golden.as_str() == format!("{}-golden", config.name_prefix),
+            None => true,
+        };
+        let uses_packed_artifact = direct_create_from_packed && golden_is_plain_packed;
         let pack = packed_golden_path(&config.artifact_payload());
         let spec = MachineSpec {
             name: name.clone(),
@@ -4335,6 +4534,35 @@ mod lifecycle_tests {
     use std::process::Command;
     use tokio::sync::Mutex;
 
+    /// The production scenario that OOMed: 22 GiB host, 8 GiB runners.
+    /// Golden (8 GiB) + 2 GiB reserve leaves 12 GiB → at most 1 concurrent
+    /// on-demand fork. CPU-only sizing allowed several and the host died.
+    #[test]
+    fn on_demand_memory_cap_fits_runners_after_golden_and_reserve() {
+        assert_eq!(on_demand_memory_cap(22 * 1024, 8 * 1024), 1);
+        assert_eq!(on_demand_memory_cap(64 * 1024, 8 * 1024), 6);
+        assert_eq!(on_demand_memory_cap(32 * 1024, 4 * 1024), 6);
+    }
+
+    /// A host too small for even one runner past the golden still runs one
+    /// job (floor of 1) rather than refusing to work.
+    #[test]
+    fn on_demand_memory_cap_floors_at_one() {
+        assert_eq!(on_demand_memory_cap(8 * 1024, 8 * 1024), 1);
+        assert_eq!(on_demand_memory_cap(4 * 1024, 8 * 1024), 1);
+    }
+
+    /// A zero runner ceiling (should not happen — config validates it) must
+    /// not divide by zero; it degrades to the 1 MiB floor and lets the host
+    /// run as many 1 MiB "runners" as fit.
+    #[test]
+    fn on_demand_memory_cap_handles_zero_runner_ceiling() {
+        assert_eq!(
+            on_demand_memory_cap(32 * 1024, 0),
+            (32 * 1024 - 2048 - 1) as usize
+        );
+    }
+
     #[derive(Debug)]
     struct TestProvider {
         machines: Mutex<HashMap<String, MachineState>>,
@@ -4348,6 +4576,9 @@ mod lifecycle_tests {
         /// Report live clones to `rearm_fork_base`; true by default so a spent
         /// base with dependents is never re-armed in tests either.
         live_forks: Mutex<bool>,
+        /// Simulate a clone exiting mid-drain: flip `live_forks` off after
+        /// this many `rearm_fork_base` calls (0 = never).
+        drain_live_forks_after: Mutex<u32>,
         fail_start: bool,
         fail_install: bool,
         fail_configure: bool,
@@ -4380,6 +4611,7 @@ mod lifecycle_tests {
                 fork_base_busy: false,
                 fail_fork_once_spent: Mutex::new(false),
                 live_forks: Mutex::new(true),
+                drain_live_forks_after: Mutex::new(0),
                 fail_start,
                 fail_install,
                 fail_configure,
@@ -4416,6 +4648,13 @@ mod lifecycle_tests {
         /// Report whether clones of the golden still exist.
         fn with_live_forks(mut self, live: bool) -> Self {
             *self.live_forks.get_mut() = live;
+            self
+        }
+
+        /// Simulate the last live clone exiting after `n` drain probes, so a
+        /// re-arm that keeps probing eventually succeeds.
+        fn drain_live_forks_after(mut self, n: u32) -> Self {
+            *self.drain_live_forks_after.get_mut() = n;
             self
         }
 
@@ -5096,6 +5335,13 @@ chmod +x "$destination/bin/node"
             if let Some(partial) = partial {
                 self.delete(partial).await?;
             }
+            let mut drain_after = self.drain_live_forks_after.lock().await;
+            if *drain_after > 0 {
+                *drain_after -= 1;
+                if *drain_after == 0 {
+                    *self.live_forks.lock().await = false;
+                }
+            }
             if *self.live_forks.lock().await {
                 return Ok(false);
             }
@@ -5507,6 +5753,91 @@ chmod +x "$destination/bin/node"
         );
     }
 
+    /// A fingerprint-suffixed golden (`{prefix}-golden-{fingerprint}`, the
+    /// name `run_slot` uses for a non-default base image) must be recognized
+    /// as managed by this pool. The stale guard matched only the plain
+    /// `{prefix}-golden` form, so a spent per-environment golden looped on
+    /// "already paused" forever instead of re-arming.
+    #[tokio::test]
+    async fn spent_fingerprint_suffixed_fork_base_is_rearmed_and_retried() {
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, false)
+                .with_live_forks(false)
+                .failing_fork_once_spent(),
+        );
+        let config = packed_fork_config();
+        let golden = MachineName::new("lifecycle-test-golden-3577f5d5a384").unwrap();
+        let name = MachineName::new("lifecycle-test-0-8").unwrap();
+
+        provision_runner(
+            &provider,
+            &config,
+            &name,
+            Some(&golden),
+            &Arc::new(KeyPool::new()),
+            &test_runner_environment(config.base_image.clone(), Vec::new(), true),
+        )
+        .await
+        .expect("the re-armed fingerprint-suffixed golden serves the fork");
+
+        let events = provider.events().await;
+        let expected = [
+            format!("fork:{}:{}", golden.as_str(), name.as_str()),
+            format!("rearm:{}", golden.as_str()),
+            format!("delete:{}", name.as_str()),
+            format!("stop:{}", golden.as_str()),
+            format!("start:{}", golden.as_str()),
+            format!("fork:{}:{}", golden.as_str(), name.as_str()),
+        ];
+        let mut cursor = 0;
+        for event in &expected {
+            let position = events[cursor..]
+                .iter()
+                .position(|seen| seen == event)
+                .expect("re-arm sequence must include every step");
+            cursor += position + 1;
+        }
+        assert!(
+            provider.has_machine(&name).await,
+            "the retried fork must leave the clone provisioned"
+        );
+    }
+
+    /// A fingerprint-suffixed golden is an *environment* golden baked from
+    /// the job's requested image. When its fork fails and the pool falls
+    /// back to independent creation, the runner must boot that job's
+    /// environment — not the default packed artifact, which would run a
+    /// non-default `runs-on` job on the wrong operating system.
+    #[tokio::test]
+    async fn fingerprint_golden_fork_failure_falls_back_to_the_job_environment() {
+        let provider =
+            Arc::new(TestProvider::new(false, false, false, false, false).failing_fork());
+        let config = packed_fork_config();
+        let golden = MachineName::new("lifecycle-test-golden-3577f5d5a384").unwrap();
+        let name = MachineName::new("lifecycle-test-0-9").unwrap();
+        let env = test_runner_environment("mirror.gcr.io/library/ubuntu:22.04", Vec::new(), true);
+
+        provision_runner(
+            &provider,
+            &config,
+            &name,
+            Some(&golden),
+            &Arc::new(KeyPool::new()),
+            &env,
+        )
+        .await
+        .expect("an env-golden fork failure falls back to the job environment");
+
+        let created = provider
+            .created_image(&name)
+            .await
+            .expect("the fallback created the runner machine");
+        assert_eq!(
+            created, "mirror.gcr.io/library/ubuntu:22.04",
+            "an env-golden fallback must boot the job's requested image, not the default pack"
+        );
+    }
+
     /// A spent base that still has live clones must NOT be re-armed: resuming
     /// it would corrupt the copy-on-write clones. The pool falls back to a
     /// full create instead.
@@ -5548,6 +5879,57 @@ chmod +x "$destination/bin/node"
             provider.created_image(&name).await.as_deref(),
             Some(config.base_image.as_str()),
             "a live clone makes the shared packed payload unsafe; fallback must use OCI"
+        );
+    }
+
+    /// A live clone that exits mid-drain must be re-armed once it is gone:
+    /// the drain loop keeps probing with backoff, and the golden resumes
+    /// serving forks instead of falling back to slow direct creation.
+    /// Paused time advances the probe sleeps instantly.
+    #[tokio::test(start_paused = true)]
+    async fn spent_fork_base_with_clone_that_drains_is_rearmed_and_retried() {
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, false)
+                .with_live_forks(true)
+                .drain_live_forks_after(3)
+                .failing_fork_once_spent(),
+        );
+        let config = packed_fork_config();
+        let golden = MachineName::new("lifecycle-test-golden").unwrap();
+        let name = MachineName::new("lifecycle-test-0-10").unwrap();
+
+        provision_runner(
+            &provider,
+            &config,
+            &name,
+            Some(&golden),
+            &Arc::new(KeyPool::new()),
+            &test_runner_environment(config.base_image.clone(), Vec::new(), true),
+        )
+        .await
+        .expect("the re-armed golden serves the fork after the clone drains");
+
+        let events = provider.events().await;
+        let expected = [
+            format!("fork:{}:{}", golden.as_str(), name.as_str()),
+            format!("rearm:{}", golden.as_str()),
+            format!("rearm:{}", golden.as_str()),
+            format!("rearm:{}", golden.as_str()),
+            format!("stop:{}", golden.as_str()),
+            format!("start:{}", golden.as_str()),
+            format!("fork:{}:{}", golden.as_str(), name.as_str()),
+        ];
+        let mut cursor = 0;
+        for event in &expected {
+            let position = events[cursor..]
+                .iter()
+                .position(|seen| seen == event)
+                .expect("drain-and-re-arm sequence must include every step");
+            cursor += position + 1;
+        }
+        assert!(
+            provider.has_machine(&name).await,
+            "the retried fork must leave the clone provisioned"
         );
     }
 
@@ -6165,6 +6547,14 @@ mod golden_registry_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn packed_failure_disables_secondary_environment_bakes() {
+        let registry = GoldenRegistry::new("test".to_owned());
+        assert!(!registry.is_packed_disabled());
+        registry.disable_packed();
+        assert!(registry.is_packed_disabled());
+    }
 
     /// Distinct environments must build concurrently: one fingerprint's bake
     /// must not park other slots (the pre-freeze `build_lock` behavior).

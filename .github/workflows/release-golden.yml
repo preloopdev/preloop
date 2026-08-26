@@ -23,7 +23,10 @@ on:
 jobs:
   reuse-previous-goldens:
     name: Reuse Previous Golden Artifacts
-    if: github.event_name == 'workflow_dispatch' && inputs.reuse_previous_goldens
+    # An explicit workflow dispatch can request a source tag. Release events
+    # carrying the skip marker reuse the newest prior release with both
+    # architectures instead of silently leaving the new release incomplete.
+    if: (github.event_name == 'workflow_dispatch' && inputs.reuse_previous_goldens) || (github.event_name == 'release' && contains(github.event.release.body, '<!-- preloop:skip-golden -->'))
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -31,15 +34,47 @@ jobs:
       - name: Copy goldens to target release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TARGET_TAG: ${{ inputs.release_tag }}
-          PREVIOUS_TAG: ${{ inputs.previous_release_tag }}
+          TARGET_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+          REQUESTED_SOURCE_TAG: ${{ inputs.previous_release_tag }}
         run: |
           set -euo pipefail
           if [ -z "$TARGET_TAG" ]; then
             TARGET_TAG="$(gh release view --json tagName --jq .tagName)"
           fi
+          SOURCE_TAG="$REQUESTED_SOURCE_TAG"
+          if [ -z "$SOURCE_TAG" ]; then
+            SOURCE_TAG="$(
+              gh release list \
+                --repo "$GITHUB_REPOSITORY" \
+                --limit 100 \
+                --json tagName,isDraft,isPrerelease \
+                --jq '.[] | select(.isDraft == false and .isPrerelease == false) | .tagName' |
+              while IFS= read -r candidate; do
+                [ -z "$candidate" ] && continue
+                [ "$candidate" = "$TARGET_TAG" ] && continue
+                has_both="$(
+                  gh release view "$candidate" \
+                    --repo "$GITHUB_REPOSITORY" \
+                    --json assets \
+                    --jq '[.assets[].name] |
+                      if (index("preloop-ubuntu-24.04-x86_64") != null and
+                          index("preloop-ubuntu-24.04-aarch64") != null)
+                      then "yes" else empty end'
+                )"
+                if [ "$has_both" = "yes" ]; then
+                  printf '%s\n' "$candidate"
+                  break
+          fi
+              done
+            )"
+          fi
+          if [ -z "$SOURCE_TAG" ]; then
+            echo "no prior release contains both architecture goldens" >&2
+            exit 1
+          fi
+          echo "reusing goldens from $SOURCE_TAG for $TARGET_TAG"
           mkdir -p dist
-          gh release download "$PREVIOUS_TAG" \
+          gh release download "$SOURCE_TAG" \
             --pattern 'preloop-ubuntu-24.04-*' \
             --dir dist \
             --repo "$GITHUB_REPOSITORY"
@@ -305,6 +340,9 @@ jobs:
             # the retry cannot collide with the previous attempt's disks.
             smolvm machine delete --name "$builder" \
               --force --cascade >/dev/null 2>&1 || true
+            # The runner-large base image archive is ~18 GB; smolvm refuses
+            # local archives over its default 8 GiB cap.
+            export SMOLVM_MAX_IMAGE_BYTES=34359738368
             if ./target/release/preloop build-golden \
                 --runner-bundle "target/$RUNNER_TARGET/release" \
                 --output "dist/$GOLDEN_NAME"; then
@@ -559,6 +597,9 @@ jobs:
           # be larger than the stock 20 GiB default.
           export PRELOOP_RUNNER_STORAGE_GB=120
           export PRELOOP_RUNNER_OVERLAY_GB=120
+          # The runner-large base image archive is ~18 GB; smolvm refuses
+          # local archives over its default 8 GiB cap.
+          export SMOLVM_MAX_IMAGE_BYTES=34359738368
           ./target/release/preloop build-golden \
             --runner-bundle "target/$RUNNER_TARGET/release" \
             --output "dist/$GOLDEN_NAME"

@@ -46,6 +46,10 @@ Releases before v0.27.0 predate the changelog.
   256 MB rather than every 1 GiB (about one line per 25 s on a 100 Mbps
   link).
 
+## [0.31.1] - 2026-08-23
+
+<!-- preloop:skip-golden -->
+
 ## [0.30.10] - 2026-08-18
 
 ### Fixed

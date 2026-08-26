@@ -579,79 +579,71 @@ pub(crate) async fn fetch_workflows_at(
         // A dispatch for a branch other than the checked-out tree must read
         // the workflow definitions from that ref, not from the working tree.
         if !git_ref.is_empty() {
-            // A ref beginning with '-' would be parsed by git as an option
-            // (e.g. `git rev-parse --verify -x^{commit}`); treat it as
-            // unresolvable and fall back to the checked-out tree.
             if git_ref.starts_with('-') {
-                warn!(
-                    %git_ref,
-                    workspace = %base_path.display(),
-                    "git_ref starts with '-' and is not a valid ref; falling back to the checked-out tree",
-                );
-            } else {
-                let commitish: &str = &format!("{git_ref}^{{commit}}");
-                let resolved = tokio::process::Command::new("git")
-                    .arg("-C")
-                    .arg(base_path)
-                    .args(["rev-parse", "--verify", commitish])
-                    .output()
-                    .await?;
-                if resolved.status.success() {
-                    let listing = tokio::process::Command::new("git")
-                        .arg("-C")
-                        .arg(base_path)
-                        .args([
-                            "ls-tree",
-                            "-r",
-                            "--name-only",
-                            git_ref,
-                            "--",
-                            ".github/workflows",
-                        ])
-                        .output()
-                        .await?;
-                    if !listing.status.success() {
-                        anyhow::bail!(
-                            "git ls-tree for ref {git_ref:?} in {} failed: {}",
-                            base_path.display(),
-                            String::from_utf8_lossy(&listing.stderr),
-                        );
-                    }
-                    for line in String::from_utf8_lossy(&listing.stdout).lines() {
-                        let path = line.trim();
-                        if path.is_empty() {
-                            continue;
-                        }
-                        let name = path.rsplit('/').next().unwrap_or(path);
-                        if name.ends_with(".yml") || name.ends_with(".yaml") {
-                            let path_ref: &str = &format!("{git_ref}:{path}");
-                            let content = tokio::process::Command::new("git")
-                                .arg("-C")
-                                .arg(base_path)
-                                .args(["show", path_ref])
-                                .output()
-                                .await?;
-                            if !content.status.success() {
-                                anyhow::bail!(
-                                    "git show {path_ref:?} in {} failed: {}",
-                                    base_path.display(),
-                                    String::from_utf8_lossy(&content.stderr),
-                                );
-                            }
-                            workflows.insert(
-                                name.to_owned(),
-                                String::from_utf8_lossy(&content.stdout).into_owned(),
-                            );
-                        }
-                    }
-                    return Ok(workflows);
-                }
-                warn!(
-                    %git_ref,
-                    workspace = %base_path.display(),
-                    "git_ref does not resolve in the local workspace; falling back to the checked-out tree",
+                anyhow::bail!("workflow revision {git_ref:?} is not a valid Git ref");
+            }
+            let commitish = format!("{git_ref}^{{commit}}");
+            let resolved = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(base_path)
+                .args(["rev-parse", "--verify", &commitish])
+                .output()
+                .await?;
+            if !resolved.status.success() {
+                anyhow::bail!(
+                    "workflow revision {git_ref:?} is unavailable in local workspace {}: {}",
+                    base_path.display(),
+                    String::from_utf8_lossy(&resolved.stderr),
                 );
             }
+            let listing = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(base_path)
+                .args([
+                    "ls-tree",
+                    "-r",
+                    "--name-only",
+                    git_ref,
+                    "--",
+                    ".github/workflows",
+                ])
+                .output()
+                .await?;
+            if !listing.status.success() {
+                anyhow::bail!(
+                    "git ls-tree for ref {git_ref:?} in {} failed: {}",
+                    base_path.display(),
+                    String::from_utf8_lossy(&listing.stderr),
+                );
+            }
+            for line in String::from_utf8_lossy(&listing.stdout).lines() {
+                let path = line.trim();
+                if path.is_empty() {
+                    continue;
+                }
+                let name = path.rsplit('/').next().unwrap_or(path);
+                if name.ends_with(".yml") || name.ends_with(".yaml") {
+                    let path_ref = format!("{git_ref}:{path}");
+                    let content = tokio::process::Command::new("git")
+                        .arg("-C")
+                        .arg(base_path)
+                        .args(["show", &path_ref])
+                        .output()
+                        .await?;
+                    if !content.status.success() {
+                        anyhow::bail!(
+                            "git show {path_ref:?} in {} failed: {}",
+                            base_path.display(),
+                            String::from_utf8_lossy(&content.stderr),
+                        );
+                    }
+                    workflows.insert(
+                        name.to_owned(),
+                        String::from_utf8_lossy(&content.stdout).into_owned(),
+                    );
+                }
+            }
+            return Ok(workflows);
         }
         let workflows_dir = base_path.join(".github/workflows");
         if workflows_dir.exists() {
@@ -676,12 +668,15 @@ pub(crate) async fn fetch_workflows_at(
             let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
             Some(crate::github_app::get_or_mint_token_at(api_base, &app, repo, &permissions).await?)
         } else {
-            std::env::var("PRELOOP_GITHUB_TOKEN").ok()
+            shared.state.static_github_pat()
         };
         if let Some(token) = &token {
             fetch_remote_workflows(token, repo, git_ref, api_base).await
+        } else if !git_ref.is_empty() {
+            anyhow::bail!(
+                "cannot fetch workflow revision {git_ref:?} without a local workspace or GitHub credentials"
+            );
         } else {
-            // Default fallback to current workspace root if nothing is configured
             let workflows_dir = PathBuf::from(".").join(".github/workflows");
             let mut workflows = BTreeMap::new();
             if workflows_dir.exists() {
@@ -1284,41 +1279,106 @@ async fn process_github_webhook(
         } else {
             &effective.git_ref
         };
-        let workflows = fetch_workflows(shared, &repo_full_name, workflow_ref)
-            .await
-            .map_err(|error| {
-                error!(
-                    event = %effective.event,
-                    ?error,
-                    "Failed to fetch workflows — delivery failed, will be redelivered"
-                );
-                StatusCode::BAD_GATEWAY
-            })?;
+
+        // The event ref is mutable: another push can move it while this
+        // delivery is in flight, and GitHub's webhook/API views may briefly
+        // converge at different times. Keep it for github.ref and trigger
+        // semantics, but resolve the workflow definition from the immutable
+        // commit that the event identifies.
         let resolved_sha = match &effective.sha {
             Some(sha) => sha.clone(),
-            None => match resolve_ref_sha(shared, &repo_full_name, &effective.git_ref).await {
+            None if effective.event == "pull_request_target" => {
+                error!(
+                    event = %effective.event,
+                    ref_name = %workflow_ref,
+                    "pull_request_target has no base commit SHA — delivery failed, will be redelivered"
+                );
+                return Err(StatusCode::BAD_GATEWAY);
+            }
+            None => match resolve_ref_sha(shared, &repo_full_name, workflow_ref).await {
                 Ok(Some(sha)) => sha,
                 Ok(None) => {
                     error!(
-                        ref_name = %effective.git_ref,
-                        "webhook ref has no resolvable commit SHA — delivery failed, will be redelivered"
+                        ref_name = %workflow_ref,
+                        "webhook workflow ref has no resolvable commit SHA — delivery failed, will be redelivered"
                     );
                     return Err(StatusCode::BAD_GATEWAY);
                 }
                 Err(error) => {
                     error!(
                         ?error,
-                        "failed to resolve webhook ref SHA — delivery failed, will be redelivered"
+                        ref_name = %workflow_ref,
+                        "failed to resolve webhook workflow ref SHA — delivery failed, will be redelivered"
                     );
                     return Err(StatusCode::BAD_GATEWAY);
                 }
             },
         };
+
+        let workflows = fetch_workflows(shared, &repo_full_name, &resolved_sha)
+            .await
+            .map_err(|error| {
+                error!(
+                    event = %effective.event,
+                    sha = %resolved_sha,
+                    source_ref = %workflow_ref,
+                    ?error,
+                    "Failed to fetch workflows at the event commit — delivery failed, will be redelivered"
+                );
+                StatusCode::BAD_GATEWAY
+            })?;
         if effective.event == "push" && effective.git_ref == ref_default {
             if let Some(scheduler) = &shared.state.scheduler {
-                scheduler
-                    .reconcile_all(&workflows, payload_val.clone(), shared.clone())
-                    .await;
+                // Cron definitions are global state, so reconcile them from
+                // the current default-branch head rather than this delivery's
+                // possibly stale event commit. Triggered runs still use the
+                // event-pinned `workflows` above.
+                let scheduler_source = match resolve_ref_sha(shared, &repo_full_name, &ref_default)
+                    .await
+                {
+                    Ok(Some(scheduler_sha)) => {
+                        let scheduler_workflows = if scheduler_sha == resolved_sha {
+                            Some(workflows.clone())
+                        } else {
+                            match fetch_workflows(shared, &repo_full_name, &scheduler_sha).await {
+                                Ok(workflows) => Some(workflows),
+                                Err(error) => {
+                                    warn!(
+                                        sha = %scheduler_sha,
+                                        ?error,
+                                        "failed to fetch current default-branch workflows — skipping cron reconciliation"
+                                    );
+                                    None
+                                }
+                            }
+                        };
+                        scheduler_workflows.map(|workflows| (scheduler_sha, workflows))
+                    }
+                    Ok(None) => {
+                        warn!(
+                            ref_name = %ref_default,
+                            "current default branch has no resolvable commit SHA — skipping cron reconciliation"
+                        );
+                        None
+                    }
+                    Err(error) => {
+                        warn!(
+                            ?error,
+                            ref_name = %ref_default,
+                            "failed to resolve current default branch SHA — skipping cron reconciliation"
+                        );
+                        None
+                    }
+                };
+                if let Some((scheduler_sha, scheduler_workflows)) = scheduler_source {
+                    let mut scheduler_payload = payload_val.clone();
+                    if let Some(object) = scheduler_payload.as_object_mut() {
+                        object.insert("after".to_owned(), Value::String(scheduler_sha));
+                    }
+                    scheduler
+                        .reconcile_all(&scheduler_workflows, scheduler_payload, shared.clone())
+                        .await;
+                }
             }
         }
 
@@ -1735,6 +1795,34 @@ mod tests {
         format!("sha256={hex}")
     }
 
+    fn git_output(workspace: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(workspace)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn commit_workspace(workspace: &std::path::Path) -> String {
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.email", "github-tests@example.invalid"][..],
+            &["config", "user.name", "GitHub Tests"][..],
+        ] {
+            git_output(workspace, args);
+        }
+        git_output(workspace, &["add", "-A"]);
+        git_output(workspace, &["commit", "-qm", "test workflow"]);
+        git_output(workspace, &["rev-parse", "HEAD"])
+    }
+
     #[test]
     fn github_owned_workflow_filter_matches_filename_or_path() {
         let configured =
@@ -1781,14 +1869,14 @@ mod tests {
     }
 
     /// The signed push payload GitHub would deliver for `owner/repo`.
-    fn signed_push_payload() -> (Vec<u8>, String) {
+    fn signed_push_payload(after: &str) -> (Vec<u8>, String) {
         let payload = serde_json::json!({
             "ref": "refs/heads/main",
             "before": "0000000000000000000000000000000000000000",
-            "after": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            "after": after,
             "repository": {"full_name": "owner/repo", "default_branch": "main"},
             "commits": [{
-                "id": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                "id": after,
                 "added": ["src/main.rs"],
                 "modified": [],
                 "removed": []
@@ -1805,6 +1893,7 @@ mod tests {
     struct WebhookFixture {
         state: AppState,
         app: axum::Router,
+        workspace: std::path::PathBuf,
         payload_bytes: Vec<u8>,
         signature_header: String,
     }
@@ -1823,20 +1912,33 @@ mod tests {
         }
 
         async fn with_workspace(temp: &tempfile::TempDir, ws_dir: std::path::PathBuf) -> Self {
+            let event_sha = if ws_dir.join(".github/workflows").is_dir() {
+                commit_workspace(&ws_dir)
+            } else {
+                "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned()
+            };
             let mut state = AppState::new(temp.path().join("state").to_path_buf())
                 .await
                 .unwrap();
             state.webhook_secret = Some("super-secret".to_owned());
-            state.local_workspace = Some(ws_dir);
+            state.local_workspace = Some(ws_dir.clone());
             let app =
                 crate::app_with_test_api(state.clone(), CancellationToken::new(), "test-token");
-            let (payload_bytes, signature_header) = signed_push_payload();
+            let (payload_bytes, signature_header) = signed_push_payload(&event_sha);
             Self {
                 state,
                 app,
+                workspace: ws_dir,
                 payload_bytes,
                 signature_header,
             }
+        }
+
+        fn refresh_payload_from_head(&mut self) {
+            let event_sha = git_output(&self.workspace, &["rev-parse", "HEAD"]);
+            let (payload_bytes, signature_header) = signed_push_payload(&event_sha);
+            self.payload_bytes = payload_bytes;
+            self.signature_header = signature_header;
         }
 
         /// Deliver the signed standard payload under `delivery`.
@@ -1879,11 +1981,10 @@ mod tests {
         let ws_dir = temp.path().join("ws");
         std::fs::create_dir_all(&ws_dir).unwrap();
         std::fs::create_dir_all(ws_dir.join(".github")).unwrap();
-        // `.github/workflows` exists but is a regular file: the inventory read
-        // fails deterministically (read_dir on a non-directory errors), so the
-        // delivery cannot be processed.
+        // The initial workspace has no Git object for the immutable payload
+        // SHA, so processing fails before the delivery can be acknowledged.
         std::fs::write(ws_dir.join(".github/workflows"), "not a directory").unwrap();
-        let fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
 
         let status = fixture.post("delivery-fetch-fail", Some("push")).await;
         assert_eq!(
@@ -1915,6 +2016,8 @@ mod tests {
             "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
         )
         .unwrap();
+        commit_workspace(&ws_dir);
+        fixture.refresh_payload_from_head();
 
         assert_eq!(
             fixture.post("delivery-fetch-fail", Some("push")).await,
@@ -1936,12 +2039,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let fixture = WebhookFixture::new(&temp).await;
 
-        // A push without `after` leaves the effective SHA unresolved, and the
-        // local workspace is not a Git repository, so no SHA can be resolved:
-        // the delivery's work cannot be done.
+        // A push that names a commit absent from the local repository must
+        // fail rather than execute workflow YAML from the current checkout.
+        // The delivery's work cannot be done until that immutable commit is
+        // available.
         let payload = serde_json::json!({
             "ref": "refs/heads/main",
             "before": "0000000000000000000000000000000000000000",
+            "after": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
             "repository": {"full_name": "owner/repo", "default_branch": "main"},
             "commits": [{
                 "id": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",

@@ -74,21 +74,6 @@ jobs:
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/dist
-      # Every release must ship a changelog entry. This must run before the
-      # plan step: on tag pushes that step runs `dist host --steps=create`,
-      # which would create the GitHub Release before the guard could fail.
-      - name: Verify changelog entry for this release
-        if: ${{ !github.event.pull_request }}
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          python3 - "$version" <<'PY'
-          import re, sys
-          version = sys.argv[1]
-          text = open("CHANGELOG.md", encoding="utf-8").read()
-          if not re.search(rf"^## \[{re.escape(version)}\]", text, re.M):
-              sys.exit(f"CHANGELOG.md has no entry for [{version}]; add one before cutting the release")
-          print(f"CHANGELOG.md entry for [{version}] found")
-          PY
       # sure would be cool if github gave us proper conditionals...
       # so here's a doubly-nested ternary-via-truthiness to try to provide the best possible
       # functionality based on whether this is a pull_request, and whether it's from a fork.
@@ -311,8 +296,41 @@ jobs:
         run: |
           # Write and read notes from a file to avoid quoting breaking things
           echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
+          version="${{ needs.plan.outputs.tag }}"
+          version="${version#v}"
+          python3 - "$version" "$RUNNER_TEMP/notes.txt" <<'PY'
+          import re
+          import sys
+
+          version, notes_path = sys.argv[1:]
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          match = re.search(
+              rf"^## \[{re.escape(version)}\][^\n]*\n(?P<body>.*?)(?=^## \[|\Z)",
+              text,
+              re.M | re.S,
+          )
+          if match and "preloop:skip-golden" in match.group("body"):
+              with open(notes_path, "a", encoding="utf-8") as notes:
+                  notes.write("\n<!-- preloop:skip-golden -->\n")
+          PY
 
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+
+      - name: Generate release notes from merged PRs
+        env:
+          # Same reason as the step above: the org disables workflow write
+          # tokens, so editing the release needs the scoped RELEASES_TOKEN.
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          tag="${{ needs.plan.outputs.tag }}"
+          # GitHub-generated "What's Changed" (merged PRs since the previous
+          # tagged release; previous_tag_name defaults to it). Prepend it to
+          # the dist-generated install/download tables.
+          gh api "repos/${{ github.repository }}/releases/generate-notes" \
+            -F tag_name="$tag" --jq '.body' > "$RUNNER_TEMP/pr-notes.md"
+          gh release view "$tag" --json body --jq .body > "$RUNNER_TEMP/dist-notes.md"
+          cat "$RUNNER_TEMP/pr-notes.md" "$RUNNER_TEMP/dist-notes.md" > "$RUNNER_TEMP/notes.md"
+          gh release edit "$tag" --notes-file "$RUNNER_TEMP/notes.md"
 
   announce:
     needs:

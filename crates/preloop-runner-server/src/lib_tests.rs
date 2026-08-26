@@ -7126,6 +7126,27 @@ async fn fork_pull_request_webhook_jobs_are_downgraded_and_secrets_denied() {
     .await
     .unwrap();
 
+    let git = |args: &[&str]| -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&ws_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "preloop-tests@example.invalid"]);
+    git(&["config", "user.name", "Preloop Tests"]);
+    git(&["add", ".github/workflows/test.yml"]);
+    git(&["commit", "-m", "test workflow"]);
+    let base_sha = git(&["rev-parse", "HEAD"]);
+
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     state.webhook_secret = Some("super-secret".to_owned());
     state.local_workspace = Some(ws_dir);
@@ -7150,8 +7171,9 @@ async fn fork_pull_request_webhook_jobs_are_downgraded_and_secrets_denied() {
             },
             "base": {
                 "ref": "main",
-                "sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
-            }
+                "sha": base_sha.clone()
+            },
+            "merge_commit_sha": base_sha
         },
         "repository": {
             "full_name": "owner/repo",
@@ -7501,6 +7523,78 @@ async fn app_only_server_fetches_webhook_workflows_with_installation_token() {
         RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap(),
         MintFailurePolicy::LocalJwt,
     ));
+    let shared = Arc::new(SharedState {
+        state,
+        shutdown: CancellationToken::new(),
+    });
+
+    let workflows = crate::github::fetch_workflows_at(
+        &shared,
+        "preloopdev/preloop",
+        "refs/heads/main",
+        &api_base,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(workflows.len(), 1);
+    assert!(workflows["ci.yml"].contains("runs-on: self-hosted"));
+}
+
+#[tokio::test]
+async fn pat_only_server_fetches_webhook_workflows_with_configured_pat() {
+    use axum::http::HeaderMap;
+    use axum::routing::get;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", listener.local_addr().unwrap());
+    let download_url = format!("{api_base}/raw/ci.yml");
+    let stub = Router::new()
+        .route(
+            "/repos/preloopdev/preloop/contents/.github/workflows",
+            get(move |headers: HeaderMap| {
+                let download_url = download_url.clone();
+                async move {
+                    assert_eq!(
+                        headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok()),
+                        Some("Bearer ghp_config_workflow_token")
+                    );
+                    Json(json!([{
+                        "name": "ci.yml",
+                        "type": "file",
+                        "download_url": download_url
+                    }]))
+                }
+            }),
+        )
+        .route(
+            "/raw/ci.yml",
+            get(|headers: HeaderMap| async move {
+                assert_eq!(
+                    headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("Bearer ghp_config_workflow_token")
+                );
+                "on: push\njobs:\n  test:\n    runs-on: self-hosted\n    steps:\n      - run: true\n"
+            }),
+        );
+    tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        "[github]\npat = \"ghp_config_workflow_token\"\n",
+    )
+    .unwrap();
+    let mut state = AppState::new_with_config(temp.path().join("state"), config_path)
+        .await
+        .unwrap();
+    state.local_workspace = None;
+    assert!(state.github_app.is_none());
     let shared = Arc::new(SharedState {
         state,
         shutdown: CancellationToken::new(),
@@ -9208,6 +9302,27 @@ jobs:
         .await
         .unwrap();
 
+    let git = |args: &[&str]| -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&ws_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "preloop-tests@example.invalid"]);
+    git(&["config", "user.name", "Preloop Tests"]);
+    git(&["add", ".github/workflows/build.yml"]);
+    git(&["commit", "-m", "test workflow"]);
+    let event_sha = git(&["rev-parse", "HEAD"]);
+
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     state.webhook_secret = Some("super-secret".to_owned());
     state.local_workspace = Some(ws_dir.clone());
@@ -9221,14 +9336,14 @@ jobs:
     let payload = serde_json::json!({
         "ref": "refs/heads/main",
         "before": "0000000000000000000000000000000000000000",
-        "after": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+        "after": event_sha.clone(),
         "repository": {
             "full_name": "owner/repo",
             "default_branch": "main"
         },
         "commits": [
             {
-                "id": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+                "id": event_sha,
                 "added": ["src/main.rs"],
                 "modified": [],
                 "removed": []
@@ -9304,6 +9419,328 @@ jobs:
     assert!(*check_run_id > 0);
 }
 
+#[tokio::test]
+async fn github_webhook_fetches_workflow_from_event_sha_not_current_branch() {
+    // This is a local-workspace reproduction of the same race as the remote
+    // App path: the webhook names an older commit while the branch has already
+    // advanced to a different workflow definition.
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+    let _no_api_url = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_API_URL");
+
+    let temp = tempfile::tempdir().unwrap();
+    let ws_dir = temp.path().join("workspace");
+    std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
+
+    let old_workflow = r#"
+name: old
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo old-workflow
+"#;
+    let new_workflow = r#"
+name: new
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo new-workflow
+"#;
+    std::fs::write(ws_dir.join(".github/workflows/build.yml"), old_workflow).unwrap();
+
+    let git = |args: &[&str]| -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&ws_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "preloop-tests@example.invalid"]);
+    git(&["config", "user.name", "Preloop Tests"]);
+    git(&["add", ".github/workflows/build.yml"]);
+    git(&["commit", "-m", "old workflow"]);
+    let event_sha = git(&["rev-parse", "HEAD"]);
+
+    std::fs::write(ws_dir.join(".github/workflows/build.yml"), new_workflow).unwrap();
+    git(&["add", ".github/workflows/build.yml"]);
+    git(&["commit", "-m", "new workflow"]);
+    let branch_sha = git(&["rev-parse", "HEAD"]);
+    assert_ne!(event_sha, branch_sha);
+
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.webhook_secret = Some("super-secret".to_owned());
+    state.local_workspace = Some(ws_dir);
+    let app = app(state.clone(), CancellationToken::new());
+
+    let payload = serde_json::json!({
+        "ref": "refs/heads/main",
+        "before": "0000000000000000000000000000000000000000",
+        "after": event_sha,
+        "repository": {
+            "full_name": "owner/repo",
+            "default_branch": "main"
+        },
+        "commits": [{
+            "id": event_sha,
+            "added": [".github/workflows/build.yml"],
+            "modified": [],
+            "removed": []
+        }]
+    });
+    let payload_bytes = serde_json::to_vec(&payload).unwrap();
+
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = HmacSha256::new_from_slice(b"super-secret").unwrap();
+    mac.update(&payload_bytes);
+    let signature = mac
+        .finalize()
+        .into_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/github/webhooks")
+                .header("x-github-event", "push")
+                .header("x-github-delivery", "sha-pinned-workflow")
+                .header("x-hub-signature-256", format!("sha256={signature}"))
+                .header("content-type", "application/json")
+                .body(Body::from(payload_bytes))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let inner = state.inner.lock().await;
+    let run = inner.runs.values().next().expect("webhook created a run");
+    assert_eq!(
+        run.submission.resolved_sha.as_deref(),
+        Some(event_sha.as_str())
+    );
+    assert!(
+        run.submission.workflow_yaml.contains("old-workflow"),
+        "workflow must be loaded from the webhook commit, not current main"
+    );
+    assert!(!run.submission.workflow_yaml.contains("new-workflow"));
+}
+
+#[tokio::test]
+async fn github_webhook_rejects_missing_event_sha_without_workspace_fallback() {
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+    let _no_api_url = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_API_URL");
+
+    let temp = tempfile::tempdir().unwrap();
+    let ws_dir = temp.path().join("workspace");
+    fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
+    fs::write(
+        ws_dir.join(".github/workflows/build.yml"),
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo current-worktree
+"#,
+    )
+    .unwrap();
+
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&ws_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "preloop-tests@example.invalid"]);
+    git(&["config", "user.name", "Preloop Tests"]);
+    git(&["add", ".github/workflows/build.yml"]);
+    git(&["commit", "-m", "current workflow"]);
+
+    let missing_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.webhook_secret = Some("super-secret".to_owned());
+    state.local_workspace = Some(ws_dir);
+    let app = app(state.clone(), CancellationToken::new());
+
+    let payload = serde_json::json!({
+        "ref": "refs/heads/main",
+        "before": "0000000000000000000000000000000000000000",
+        "after": missing_sha,
+        "repository": {
+            "full_name": "owner/repo",
+            "default_branch": "main"
+        },
+        "commits": [{
+            "id": missing_sha,
+            "added": [".github/workflows/build.yml"],
+            "modified": [],
+            "removed": []
+        }]
+    });
+    let payload_bytes = serde_json::to_vec(&payload).unwrap();
+
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = HmacSha256::new_from_slice(b"super-secret").unwrap();
+    mac.update(&payload_bytes);
+    let signature = mac
+        .finalize()
+        .into_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/github/webhooks")
+                .header("x-github-event", "push")
+                .header("x-github-delivery", "missing-event-sha")
+                .header("x-hub-signature-256", format!("sha256={signature}"))
+                .header("content-type", "application/json")
+                .body(Body::from(payload_bytes))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+    let inner = state.inner.lock().await;
+    assert!(
+        inner.runs.is_empty(),
+        "missing event SHA must not execute current-worktree YAML"
+    );
+}
+
+#[tokio::test]
+async fn github_webhook_rejects_pull_request_target_without_base_sha() {
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+    let _no_api_url = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_API_URL");
+
+    let temp = tempfile::tempdir().unwrap();
+    let ws_dir = temp.path().join("workspace");
+    fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
+    fs::write(
+        ws_dir.join(".github/workflows/build.yml"),
+        r#"
+on: pull_request_target
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo base-workflow
+"#,
+    )
+    .unwrap();
+
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&ws_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "preloop-tests@example.invalid"]);
+    git(&["config", "user.name", "Preloop Tests"]);
+    git(&["add", ".github/workflows/build.yml"]);
+    git(&["commit", "-m", "base workflow"]);
+
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.webhook_secret = Some("super-secret".to_owned());
+    state.local_workspace = Some(ws_dir);
+    let app = app(state.clone(), CancellationToken::new());
+
+    let payload = serde_json::json!({
+        "action": "opened",
+        "number": 42,
+        "pull_request": {
+            "number": 42,
+            "base": { "ref": "main" },
+            "head": {
+                "ref": "feature/fork",
+                "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "repo": { "fork": true }
+            }
+        },
+        "repository": {
+            "full_name": "owner/repo",
+            "default_branch": "main"
+        }
+    });
+    let payload_bytes = serde_json::to_vec(&payload).unwrap();
+
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = HmacSha256::new_from_slice(b"super-secret").unwrap();
+    mac.update(&payload_bytes);
+    let signature = mac
+        .finalize()
+        .into_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/github/webhooks")
+                .header("x-github-event", "pull_request")
+                .header("x-github-delivery", "missing-base-sha")
+                .header("x-hub-signature-256", format!("sha256={signature}"))
+                .header("content-type", "application/json")
+                .body(Body::from(payload_bytes))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+    let inner = state.inner.lock().await;
+    assert!(
+        inner.runs.is_empty(),
+        "pull_request_target must not execute head-controlled YAML"
+    );
+}
+
 /// Check-run ids must survive a restart even when no job status event ever
 /// fired — a long queue can sit between check-run creation and the job's
 /// first status event, and a deploy in that window used to restore the run
@@ -9334,6 +9771,27 @@ jobs:
         .await
         .unwrap();
 
+    let git = |args: &[&str]| -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&ws_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "preloop-tests@example.invalid"]);
+    git(&["config", "user.name", "Preloop Tests"]);
+    git(&["add", ".github/workflows/build.yml"]);
+    git(&["commit", "-m", "test workflow"]);
+    let event_sha = git(&["rev-parse", "HEAD"]);
+
     let run_id = {
         let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
         state.webhook_secret = Some("super-secret".to_owned());
@@ -9343,14 +9801,14 @@ jobs:
         let payload = serde_json::json!({
             "ref": "refs/heads/main",
             "before": "0000000000000000000000000000000000000000",
-            "after": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+            "after": event_sha.clone(),
             "repository": {
                 "full_name": "owner/repo",
                 "default_branch": "main"
             },
             "commits": [
                 {
-                    "id": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+                    "id": event_sha,
                     "added": ["src/main.rs"],
                     "modified": [],
                     "removed": []
@@ -9512,6 +9970,27 @@ impl WebhookDedupFixture {
         )
         .unwrap();
 
+        let git = |args: &[&str]| -> String {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(&ws_dir)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "preloop-tests@example.invalid"]);
+        git(&["config", "user.name", "Preloop Tests"]);
+        git(&["add", ".github/workflows/build.yml"]);
+        git(&["commit", "-m", "test workflow"]);
+        let event_sha = git(&["rev-parse", "HEAD"]);
+
         let mut state = AppState::new(temp.path().join("state").to_path_buf())
             .await
             .unwrap();
@@ -9522,10 +10001,10 @@ impl WebhookDedupFixture {
         let payload = serde_json::json!({
             "ref": "refs/heads/main",
             "before": "0000000000000000000000000000000000000000",
-            "after": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            "after": event_sha.clone(),
             "repository": {"full_name": "owner/repo", "default_branch": "main"},
             "commits": [{
-                "id": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                "id": event_sha,
                 "added": ["src/main.rs"],
                 "modified": [],
                 "removed": []
@@ -9686,6 +10165,29 @@ jobs:
         .await
         .unwrap();
 
+    let git = |args: &[&str]| -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&ws_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "preloop-tests@example.invalid"]);
+    git(&["config", "user.name", "Preloop Tests"]);
+    git(&["add", ".github/workflows/test.yml"]);
+    git(&["commit", "-m", "test workflow"]);
+    let base_sha = git(&["rev-parse", "HEAD"]);
+    git(&["commit", "--allow-empty", "-m", "head commit"]);
+    let head_sha = git(&["rev-parse", "HEAD"]);
+
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     state.webhook_secret = Some("super-secret".to_owned());
     state.local_workspace = Some(ws_dir.clone());
@@ -9699,12 +10201,12 @@ jobs:
         "pull_request": {
             "head": {
                 "ref": "feature-branch",
-                "sha": "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3"
+                "sha": head_sha
             },
             "base": {
                 "ref": "main",
-                "sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
-            }
+                "sha": base_sha.clone()
+            },
         },
         "repository": {
             "full_name": "owner/repo",
@@ -9753,7 +10255,7 @@ jobs:
     // the job. Falling through to all-zeros makes every checkout ask the
     // server for `0000…` and fail as "not our ref".
     assert_eq!(
-        run_record.head_sha, "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3",
+        run_record.head_sha, head_sha,
         "pull_request head sha must drive github.sha"
     );
 }
@@ -10672,6 +11174,27 @@ async fn config_webhook_secret_verifies_signed_deliveries() {
     )
     .await
     .unwrap();
+
+    let git = |args: &[&str]| -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&ws_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "preloop-tests@example.invalid"]);
+    git(&["config", "user.name", "Preloop Tests"]);
+    git(&["add", ".github/workflows/build.yml"]);
+    git(&["commit", "-m", "test workflow"]);
+    let event_sha = git(&["rev-parse", "HEAD"]);
     let config_path = temp.path().join("config.toml");
     std::fs::write(
         &config_path,
@@ -10695,10 +11218,10 @@ async fn config_webhook_secret_verifies_signed_deliveries() {
     let payload = serde_json::json!({
         "ref": "refs/heads/main",
         "before": "0000000000000000000000000000000000000000",
-        "after": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+        "after": event_sha.clone(),
         "repository": {"full_name": "owner/repo", "default_branch": "main"},
         "commits": [{
-            "id": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+            "id": event_sha,
             "added": ["src/main.rs"],
             "modified": [],
             "removed": []
@@ -15997,6 +16520,7 @@ jobs:
     upload_request.extend_from_slice(b"0000");
     upload_request.extend_from_slice(&pkt_line(b"done\n"));
     let upload = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method(Method::POST)
@@ -16055,6 +16579,44 @@ jobs:
         "Git rejected the route's fetched pack: {}",
         String::from_utf8_lossy(&index_result.stderr)
     );
+
+    for filter in ["blob:none", "tree:0", "combine:blob:none+tree:0"] {
+        let mut protocol_v2_request = pkt_line(b"command=fetch\n");
+        protocol_v2_request.extend_from_slice(&pkt_line(b"agent=git/2.43.0\n"));
+        protocol_v2_request.extend_from_slice(&pkt_line(b"object-format=sha1\n"));
+        protocol_v2_request.extend_from_slice(b"0001");
+        protocol_v2_request.extend_from_slice(&pkt_line(format!("want {commit}\n").as_bytes()));
+        protocol_v2_request.extend_from_slice(&pkt_line(format!("filter {filter}\n").as_bytes()));
+        protocol_v2_request.extend_from_slice(&pkt_line(b"done\n"));
+        protocol_v2_request.extend_from_slice(b"0000");
+        let protocol_v2_upload = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/snapshots/{run_id}/git-upload-pack"))
+                    .header(header::AUTHORIZATION, format!("Bearer {runtime_token}"))
+                    .header(
+                        header::CONTENT_TYPE,
+                        "application/x-git-upload-pack-request",
+                    )
+                    .header("Git-Protocol", "version=2")
+                    .body(Body::from(protocol_v2_request))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(protocol_v2_upload.status(), StatusCode::OK);
+        let protocol_v2_body = to_bytes(protocol_v2_upload.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            protocol_v2_body.starts_with(b"0008NAK\n")
+                || protocol_v2_body.windows(4).any(|window| window == b"PACK"),
+            "protocol v2 {filter} response should remain pkt-line or pack framed: {:?}",
+            &protocol_v2_body[..protocol_v2_body.len().min(128)]
+        );
+    }
 
     let bare_repository = state_dir.join(repository);
     assert!(
@@ -17281,6 +17843,103 @@ async fn replay_blob_uploads_require_a_ticket_bound_to_the_exact_path() {
         .await
         .unwrap();
     assert_eq!(forged.status(), StatusCode::UNAUTHORIZED);
+}
+#[tokio::test]
+async fn replay_job_log_upload_is_published_as_one_complete_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let accepted = submit_yaml(
+        &app,
+        r#"
+on: push
+jobs:
+  first:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo first
+  second:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo second
+"#,
+        "owner/repo",
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let requests = {
+        let inner = state.inner.lock().await;
+        let mut requests = inner
+            .job_requests
+            .values()
+            .filter(|request| request.run_id == run_id)
+            .map(|request| {
+                (
+                    request.request_id,
+                    request.plan_id.clone(),
+                    request.agent_job_id.to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        requests.sort_by_key(|(request_id, _, _)| *request_id);
+        requests
+    };
+    assert_eq!(requests.len(), 2);
+
+    let first_log = "first job line\n".repeat(4096);
+    let second_log = "second job line\n".repeat(4096);
+    for ((_, plan, job), body) in requests
+        .iter()
+        .zip([first_log.as_str(), second_log.as_str()])
+    {
+        let path = format!("/replay/results/{plan}/{job}/job-logs.txt");
+        let sig = crate::auth::sign_replay_upload_ticket(&state, &path);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!(
+                        "{path}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig={sig}"
+                    ))
+                    .body(Body::from(body.to_owned()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/v1/runs/{run_id}/logs"))
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let expected = [first_log.as_bytes(), second_log.as_bytes()].concat();
+    assert_eq!(body.as_ref(), expected);
+
+    for (_, plan, job) in &requests {
+        let results_dir = temp
+            .path()
+            .join("replay")
+            .join("results")
+            .join(plan)
+            .join(job);
+        let mut entries = tokio::fs::read_dir(results_dir).await.unwrap();
+        let mut names = Vec::new();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            names.push(entry.file_name());
+        }
+        assert_eq!(names, vec![std::ffi::OsString::from("job-logs.txt")]);
+    }
 }
 
 #[tokio::test]
