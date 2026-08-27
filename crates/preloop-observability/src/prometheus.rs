@@ -18,6 +18,7 @@
 
 use std::fmt::Write;
 
+use std::collections::HashSet;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -87,12 +88,23 @@ impl MetricReader for PrometheusHandle {
 /// Render a `ResourceMetrics` snapshot as Prometheus exposition text.
 fn render_resource_metrics(rm: &ResourceMetrics) -> String {
     let mut out = String::with_capacity(4096);
+    // Prometheus rejects a scrape with duplicate #HELP/#TYPE lines. Two
+    // scopes may publish the same instrument name, so emit the metadata
+    // lines once per emitted name while still rendering every series.
+    let mut emitted: HashSet<String> = HashSet::new();
     for scope in rm.scope_metrics() {
         for metric in scope.metrics() {
             let raw_name = metric.name();
             let unit = metric.unit();
             let description = metric.description();
-            render_metric(&mut out, raw_name, unit, description, metric.data());
+            render_metric(
+                &mut out,
+                &mut emitted,
+                raw_name,
+                unit,
+                description,
+                metric.data(),
+            );
         }
     }
     out
@@ -100,29 +112,39 @@ fn render_resource_metrics(rm: &ResourceMetrics) -> String {
 
 fn render_metric(
     out: &mut String,
+    emitted: &mut HashSet<String>,
     raw_name: &str,
     unit: &str,
     description: &str,
     data: &AggregatedMetrics,
 ) {
     match data {
-        AggregatedMetrics::F64(md) => render_metric_data(out, raw_name, unit, description, md),
-        AggregatedMetrics::U64(md) => render_metric_data(out, raw_name, unit, description, md),
-        AggregatedMetrics::I64(md) => render_metric_data(out, raw_name, unit, description, md),
+        AggregatedMetrics::F64(md) => {
+            render_metric_data(out, emitted, raw_name, unit, description, md)
+        }
+        AggregatedMetrics::U64(md) => {
+            render_metric_data(out, emitted, raw_name, unit, description, md)
+        }
+        AggregatedMetrics::I64(md) => {
+            render_metric_data(out, emitted, raw_name, unit, description, md)
+        }
     }
 }
 
 fn render_metric_data<T: NumericValue>(
     out: &mut String,
+    emitted: &mut HashSet<String>,
     raw_name: &str,
     unit: &str,
     description: &str,
     data: &MetricData<T>,
 ) {
     match data {
-        MetricData::Sum(sum) => render_sum(out, raw_name, unit, description, sum),
-        MetricData::Gauge(gauge) => render_gauge(out, raw_name, unit, description, gauge),
-        MetricData::Histogram(hist) => render_histogram(out, raw_name, unit, description, hist),
+        MetricData::Sum(sum) => render_sum(out, emitted, raw_name, unit, description, sum),
+        MetricData::Gauge(gauge) => render_gauge(out, emitted, raw_name, unit, description, gauge),
+        MetricData::Histogram(hist) => {
+            render_histogram(out, emitted, raw_name, unit, description, hist)
+        }
         MetricData::ExponentialHistogram(_) => {
             // Exponential histograms have no standard Prometheus text mapping.
         }
@@ -131,6 +153,7 @@ fn render_metric_data<T: NumericValue>(
 
 fn render_sum<T: NumericValue>(
     out: &mut String,
+    emitted: &mut HashSet<String>,
     raw_name: &str,
     unit: &str,
     description: &str,
@@ -143,10 +166,12 @@ fn render_sum<T: NumericValue>(
     };
     let base = prom_name(raw_name, unit);
     let full = format!("{base}{suffix}");
-    if !description.is_empty() {
-        let _ = writeln!(out, "# HELP {full} {description}");
+    if emitted.insert(full.clone()) {
+        if !description.is_empty() {
+            let _ = writeln!(out, "# HELP {full} {description}");
+        }
+        let _ = writeln!(out, "# TYPE {full} {prom_type}");
     }
-    let _ = writeln!(out, "# TYPE {full} {prom_type}");
     for dp in sum.data_points() {
         write_sample(out, &full, dp.attributes(), dp.value());
     }
@@ -154,16 +179,19 @@ fn render_sum<T: NumericValue>(
 
 fn render_gauge<T: NumericValue>(
     out: &mut String,
+    emitted: &mut HashSet<String>,
     raw_name: &str,
     unit: &str,
     description: &str,
     gauge: &Gauge<T>,
 ) {
     let name = prom_name(raw_name, unit);
-    if !description.is_empty() {
-        let _ = writeln!(out, "# HELP {name} {description}");
+    if emitted.insert(name.clone()) {
+        if !description.is_empty() {
+            let _ = writeln!(out, "# HELP {name} {description}");
+        }
+        let _ = writeln!(out, "# TYPE {name} gauge");
     }
-    let _ = writeln!(out, "# TYPE {name} gauge");
     for dp in gauge.data_points() {
         write_sample(out, &name, dp.attributes(), dp.value());
     }
@@ -171,16 +199,19 @@ fn render_gauge<T: NumericValue>(
 
 fn render_histogram<T: NumericValue>(
     out: &mut String,
+    emitted: &mut HashSet<String>,
     raw_name: &str,
     unit: &str,
     description: &str,
     hist: &Histogram<T>,
 ) {
     let base = prom_name(raw_name, unit);
-    if !description.is_empty() {
-        let _ = writeln!(out, "# HELP {base} {description}");
+    if emitted.insert(base.clone()) {
+        if !description.is_empty() {
+            let _ = writeln!(out, "# HELP {base} {description}");
+        }
+        let _ = writeln!(out, "# TYPE {base} histogram");
     }
-    let _ = writeln!(out, "# TYPE {base} histogram");
     for dp in hist.data_points() {
         let attrs: Vec<KeyValue> = dp.attributes().cloned().collect();
         // Cumulative bucket counts for Prometheus' cumulative histogram.
@@ -381,5 +412,43 @@ mod tests {
         );
         assert!(text.contains("method=\"GET\""), "missing label in: {text}");
         assert!(text.contains(" 42"), "missing value in: {text}");
+    }
+
+    #[test]
+    fn duplicate_instrument_across_scopes_emits_one_type_line() {
+        use opentelemetry::metrics::MeterProvider;
+        use opentelemetry_sdk::metrics::SdkMeterProvider;
+
+        let handle = PrometheusHandle::new(ManualReader::default());
+        let provider = SdkMeterProvider::builder()
+            .with_reader(handle.clone())
+            .build();
+        // Two scopes publishing the same instrument name must not emit
+        // duplicate #HELP/#TYPE lines (Prometheus rejects the whole scrape);
+        // every series must still be rendered.
+        provider
+            .meter("scope-a")
+            .u64_counter("test.requests")
+            .with_unit("{request}")
+            .build()
+            .add(1, &[KeyValue::new("scope", "a")]);
+        provider
+            .meter("scope-b")
+            .u64_counter("test.requests")
+            .with_unit("{request}")
+            .build()
+            .add(2, &[KeyValue::new("scope", "b")]);
+
+        let text = handle.render();
+        let type_lines = text
+            .lines()
+            .filter(|l| l.starts_with("# TYPE test_requests_total"))
+            .count();
+        let sample_lines = text
+            .lines()
+            .filter(|l| l.starts_with("test_requests_total{"))
+            .count();
+        assert_eq!(type_lines, 1, "duplicate #TYPE line in: {text}");
+        assert_eq!(sample_lines, 2, "series dropped in: {text}");
     }
 }

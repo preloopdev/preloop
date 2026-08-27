@@ -71,7 +71,10 @@ pub(crate) async fn status(State(shared): State<Arc<SharedState>>) -> impl IntoR
                 name: t.name.to_string(),
                 critical: t.critical == preloop_observability::Criticality::Critical,
                 heartbeat_age_seconds: t.heartbeat_age.as_secs_f64(),
-                state: if t.heartbeat_age > STALENESS_THRESHOLD {
+                panicked: t.panicked,
+                state: if t.panicked {
+                    "failed".to_string()
+                } else if t.heartbeat_age > STALENESS_THRESHOLD {
                     "stale".to_string()
                 } else {
                     "running".to_string()

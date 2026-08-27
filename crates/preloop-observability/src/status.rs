@@ -152,11 +152,25 @@ impl Default for PoolSnapshot {
 ///
 /// Consolidates the four ad-hoc `Option<Arc<…>>` handles. Single writer (pool)
 /// + multiple readers (sampler, status) — cheap `RwLock`.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct PoolStatus {
     inner: Arc<RwLock<PoolSnapshot>>,
     /// One-time provision tokens (separate from snapshot to avoid cloning large map on every snapshot).
     pending_tokens: Arc<RwLock<std::collections::BTreeMap<String, std::time::SystemTime>>>,
+}
+
+impl std::fmt::Debug for PoolStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The tokens are one-time secrets plus timestamps — never print them;
+        // surface only the pending count, like `snapshot()` does.
+        let mut dbg = f.debug_struct("PoolStatus");
+        match self.inner.try_read() {
+            Some(inner) => dbg.field("inner", &*inner),
+            None => dbg.field("inner", &"<locked>"),
+        };
+        dbg.field("pending_registrations", &self.pending_tokens.read().len());
+        dbg.finish()
+    }
 }
 
 impl PoolStatus {
@@ -181,9 +195,9 @@ impl PoolStatus {
         self.inner.write().preparing = preparing;
     }
 
-    /// Mirror one pool count into the snapshot. Per-field setters, not
-    /// `set_counts`, so a RAII guard updating only the count it owns cannot
-    /// clobber the fields another guard just wrote.
+    /// Mirror one pool count into the snapshot. Per-field setters, so a RAII
+    /// guard updating only the count it owns cannot clobber the fields
+    /// another guard just wrote.
     pub fn set_idle(&self, idle: u32) {
         self.inner.write().idle = idle;
     }
@@ -194,15 +208,6 @@ impl PoolStatus {
 
     pub fn set_provisioning(&self, provisioning: u32) {
         self.inner.write().provisioning = provisioning;
-    }
-
-    pub fn set_counts(&self, idle: u32, busy: u32, building: u32, provisioning: u32, paused: u32) {
-        let mut g = self.inner.write();
-        g.idle = idle;
-        g.busy = busy;
-        g.building = building;
-        g.provisioning = provisioning;
-        g.paused = paused;
     }
 
     pub fn record_provision_failure(&self) {
@@ -400,6 +405,9 @@ pub struct TaskEntry {
     pub critical: bool,
     pub heartbeat_age_seconds: f64,
     pub state: String,
+    /// True when the task panicked while holding its heartbeat handle.
+    #[serde(default)]
+    pub panicked: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

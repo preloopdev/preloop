@@ -192,6 +192,7 @@ impl StoreMetrics {
         // Consecutive failures: +1 on error, reset to 0 on success. Update the
         // streak under the lock, then publish the current value to the gauge
         // so a scrape sees the latest streak even if observations race.
+        let attrs = [KeyValue::new("backend", backend.to_string())];
         let mut streaks = self.streaks.write();
         let streak = if outcome == "error" {
             let entry = streaks.entry(backend.to_string()).or_insert(0);
@@ -201,8 +202,9 @@ impl StoreMetrics {
             streaks.insert(backend.to_string(), 0);
             0
         };
-        drop(streaks);
-        let attrs = [KeyValue::new("backend", backend.to_string())];
+        // Keep the lock held until after the gauge record: dropping it early
+        // lets a concurrent success/failure interleave and publish a stale
+        // streak (gauge has no increment — the value is recomputed and set).
         self.consecutive_failures.record(streak, &attrs);
     }
 }
@@ -522,7 +524,8 @@ pub fn classify_surface(route: &str) -> &'static str {
 /// Normalize a raw path (with concrete IDs) to a bounded route template.
 ///
 /// Uses Axum's matched templates where available; otherwise falls back to
-/// prefix matching for the known route set. Query strings are stripped.
+/// segment-wise matching against the known route set. Query strings are
+/// stripped.
 pub fn normalize_route(raw: &str) -> String {
     // Strip query
     let path = raw.split('?').next().unwrap_or(raw);
@@ -557,23 +560,30 @@ pub fn normalize_route(raw: &str) -> String {
         "/readyz",
         "/metrics",
     ];
+    // Segment-wise matching: split both sides on '/' and require equal
+    // segment counts. Literal segments must be byte-equal; a `:param`
+    // segment matches exactly one non-empty segment. Prefix-only matching
+    // let `/broker/42/acquirejob` collide with other templates and let
+    // trailing segments sneak in (e.g. `/api/v1/runs/abc/extra` reported as
+    // `/api/v1/runs/:run_id`); neither is possible with count equality.
+    let path_segments: Vec<&str> = path.split('/').collect();
     for tmpl in TEMPLATES {
-        // Template without params matches exactly
-        if !tmpl.contains(':') && path == *tmpl {
-            return tmpl.to_string();
+        let tmpl_segments: Vec<&str> = tmpl.split('/').collect();
+        if tmpl_segments.len() != path_segments.len() {
+            continue;
         }
-        // Template with params: match prefix up to first ':'
-        if let Some(colon) = tmpl.find(':') {
-            let prefix = &tmpl[..colon - 1]; // up to '/' before ':'
-            if let Some(rest) = path.strip_prefix(prefix) {
-                // Ensure it's a segment boundary: /api/v1/runs/abc should match /api/v1/runs/:run_id
-                // but /api/v1/runsXYZ should not.
-                // A parameterized template needs a non-empty child segment;
-                // the bare collection path is matched by its own entry.
-                if rest.len() > 1 && rest.starts_with('/') {
-                    return tmpl.to_string();
+        let matched = tmpl_segments
+            .iter()
+            .zip(path_segments.iter())
+            .all(|(t, p)| {
+                if t.starts_with(':') {
+                    !p.is_empty()
+                } else {
+                    t == p
                 }
-            }
+            });
+        if matched {
+            return tmpl.to_string();
         }
     }
     // Unknown — constant label, never raw path
@@ -627,6 +637,32 @@ mod tests {
         assert_eq!(normalize_route("/evil:1234/path"), "/unknown");
         assert_eq!(normalize_route("/api/v1/runs:junk"), "/unknown");
         assert_eq!(normalize_route("/:colon"), "/unknown");
+    }
+
+    #[test]
+    fn route_matching_requires_exact_segment_counts() {
+        // Broker acquire/renew/complete must stay distinct templates —
+        // prefix matching collapsed them into one series.
+        assert_eq!(
+            normalize_route("/broker/42/acquirejob"),
+            "/broker/:runner_id/acquirejob"
+        );
+        assert_eq!(
+            normalize_route("/broker/42/renewjob"),
+            "/broker/:runner_id/renewjob"
+        );
+        assert_eq!(
+            normalize_route("/broker/42/completejob"),
+            "/broker/:runner_id/completejob"
+        );
+        // A shorter path cannot match a longer template (no partial match):
+        // 2 segments vs the 3-segment acquirejob template.
+        assert_eq!(normalize_route("/broker/acquirejob"), "/unknown");
+        assert_eq!(normalize_route("/api/v1/status/x"), "/unknown");
+        // Trailing segments cannot be silently dropped either.
+        assert_eq!(normalize_route("/api/v1/runs/abc123/extra"), "/unknown");
+        // A `:param` segment still matches exactly one non-empty segment.
+        assert_eq!(normalize_route("/broker//acquirejob"), "/unknown");
     }
 
     #[test]
