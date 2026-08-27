@@ -18,13 +18,11 @@ async fn main() -> Result<()> {
     // `PRELOOP_LOG_FORMAT` still controls pretty/json/auto for consistency.
     let obs_config = preloop_observability::ObservabilityConfig::from_env()
         .with_service_version(env!("CARGO_PKG_VERSION"));
-    let (observability, observability_runtime) =
+    let (_observability, observability_runtime) =
         preloop_observability::Observability::from_config(obs_config);
     observability_runtime.install_fmt_subscriber();
-    let _observability = observability;
-    let _observability_runtime = observability_runtime;
 
-    match cli.command {
+    let result = match cli.command {
         Commands::Configure(args) => {
             preloop_runner::configure::run_configure(args, &cli.global).await
         }
@@ -59,7 +57,11 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-    }
+    };
+    // Bounded 2s flush of buffered telemetry before exit; a clean shutdown
+    // must not drop the last flush window's records.
+    observability_runtime.shutdown().await;
+    result
 }
 
 async fn collect_reusable_workflows(

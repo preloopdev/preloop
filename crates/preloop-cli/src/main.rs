@@ -478,7 +478,8 @@ enum Command {
     /// Show the expanded job DAG without executing.
     Plan(PlanArgs),
 
-    /// Show operational status, queue health, and recent runs.
+    /// Show operational status, queue health, and recent runs — or, with a
+    /// RUN_ID, a single machine-readable status word for scripts.
     Status(StatusArgs),
 
     Logs(LogsArgs),
@@ -706,6 +707,11 @@ struct PlanArgs {
 
 #[derive(Debug, Parser)]
 struct StatusArgs {
+    /// Run ID: print a single machine-readable status word for scripts
+    /// (the historical `preloop status <run_id>` mode).
+    #[arg(value_name = "RUN_ID")]
+    run_id: Option<String>,
+
     /// Print the raw status JSON (no prose) for jq/scripting.
     #[arg(long)]
     json: bool,
@@ -790,30 +796,35 @@ async fn main() -> anyhow::Result<()> {
         // control-plane engine for a command that never contacts it.
         Command::Plan(args) => cmd_plan(args).await,
         _ => {
-            ensure_engine_running().await?;
-            match cli.command {
-                Command::Run(args) => cmd_run(args).await,
-                Command::Plan(_) => unreachable!("plan is handled before engine bootstrap"),
-                Command::Status(args) => cmd_status(args).await,
-                Command::Logs(args) => cmd_logs(args).await,
-                Command::Cancel(args) => cmd_cancel(args).await,
-                Command::Shell(args) => cmd_shell(args).await,
-                Command::Debug(args) => {
-                    debug_session::run(args, build_client(), server_url(), api_token()).await
-                }
-                Command::Dap(args) => dap_client::run(args, server_url(), api_token()).await,
-                Command::Push(args) => cmd_push(args).await,
-                Command::Update(_)
-                | Command::Serve(_)
-                | Command::Engine
-                | Command::BuildGolden(_)
-                | Command::Version
-                | Command::Setup(_)
-                | Command::Doctor(_)
-                | Command::Secret(_)
-                | Command::Server(_) => {
-                    unreachable!("daemon commands handled before client startup")
-                }
+            // Bootstrap the engine for client commands, but bind the outcome
+            // instead of `?` so the telemetry flush below still runs when
+            // engine startup fails.
+            match ensure_engine_running().await {
+                Ok(()) => match cli.command {
+                    Command::Run(args) => cmd_run(args).await,
+                    Command::Plan(_) => unreachable!("plan is handled before engine bootstrap"),
+                    Command::Status(args) => cmd_status(args).await,
+                    Command::Logs(args) => cmd_logs(args).await,
+                    Command::Cancel(args) => cmd_cancel(args).await,
+                    Command::Shell(args) => cmd_shell(args).await,
+                    Command::Debug(args) => {
+                        debug_session::run(args, build_client(), server_url(), api_token()).await
+                    }
+                    Command::Dap(args) => dap_client::run(args, server_url(), api_token()).await,
+                    Command::Push(args) => cmd_push(args).await,
+                    Command::Update(_)
+                    | Command::Serve(_)
+                    | Command::Engine
+                    | Command::BuildGolden(_)
+                    | Command::Version
+                    | Command::Setup(_)
+                    | Command::Doctor(_)
+                    | Command::Secret(_)
+                    | Command::Server(_) => {
+                        unreachable!("daemon commands handled before client startup")
+                    }
+                },
+                Err(error) => Err(error),
             }
         }
     };
@@ -915,6 +926,7 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         pending_registrations: None,
         preparing_signal: None,
         pool_status: None,
+        observability: None,
     };
     let payload = artifact_payload(&output, &config.base_image);
     RunnerPool::new(std::sync::Arc::new(SmolVmProvider::default()), config)?
@@ -1345,9 +1357,19 @@ async fn cmd_engine(
     let pool_enabled = env_flag("PRELOOP_RUNNER_POOL_ENABLED", DEFAULT_RUNNER_POOL_ENABLED);
     // One shared handle: the server and the pool both observe the same
     // preparing/queue state, and the server exports via the process handle
-    // instead of a fresh no-op one.
+    // instead of a fresh no-op one. Seed `mode` from the pool switch — the
+    // one snapshot field with no per-field setter — so `preloop status`
+    // never shows a warm pool that is not configured; `desired` is filled
+    // from the resolved config below.
     let pool_status = std::sync::Arc::new(preloop_observability::status::PoolStatus::new(
-        preloop_observability::status::PoolSnapshot::default(),
+        preloop_observability::status::PoolSnapshot {
+            mode: if pool_enabled {
+                preloop_observability::status::PoolMode::Warm
+            } else {
+                preloop_observability::status::PoolMode::OnDemand
+            },
+            ..Default::default()
+        },
     ));
     let pool_config = local_runner_pool_config(
         &home,
@@ -1360,7 +1382,13 @@ async fn cmd_engine(
         pool_preparing.clone(),
         pending_registrations.clone(),
         pool_status.clone(),
+        observability.clone(),
     );
+    // Report the real pool configuration: the configured warm size (or zero
+    // in on-demand mode) instead of the zero-sized warm default.
+    if let Ok(config) = &pool_config {
+        pool_status.set_desired(config.size as u32);
+    }
     let pool_available = match &pool_config {
         Ok(_) => true,
         Err(error) => {
@@ -1405,7 +1433,7 @@ async fn cmd_engine(
     // instead of a generic socket-wait timeout.
     tokio::select! {
         result = &mut server => return result?,
-        result = wait_for_engine_socket(&socket) => result?,
+        result = wait_for_engine_socket(&socket, listen) => result?,
     }
 
     let shutdown = tokio_util::sync::CancellationToken::new();
@@ -1482,17 +1510,23 @@ async fn engine_shutdown_signal() {
     }
 }
 
-async fn wait_for_engine_socket(socket: &std::path::Path) -> anyhow::Result<()> {
-    // readyz probe: http://localhost/readyz (500ms timeout, 30s window)
+async fn wait_for_engine_socket(
+    socket: &std::path::Path,
+    listen: std::net::SocketAddr,
+) -> anyhow::Result<()> {
+    // readyz probe: TCP requests target the configured listen address (host
+    // and port); the Unix client rides the control socket instead. 500ms
+    // timeout, 30s window.
     #[cfg(unix)]
     let client = reqwest::Client::builder().unix_socket(socket).build()?;
     #[cfg(not(unix))]
     let client = reqwest::Client::new();
+    let readyz_url = format!("http://{listen}/readyz");
     let start = std::time::Instant::now();
     let mut last_reason: Option<String> = None;
     while start.elapsed() < Duration::from_secs(30) {
         match client
-            .get("http://localhost/readyz")
+            .get(&readyz_url)
             .timeout(Duration::from_millis(500))
             .send()
             .await
@@ -1589,6 +1623,7 @@ fn local_runner_pool_config(
         std::sync::RwLock<std::collections::BTreeMap<String, std::time::SystemTime>>,
     >,
     pool_status: std::sync::Arc<preloop_observability::status::PoolStatus>,
+    observability: preloop_observability::Observability,
 ) -> anyhow::Result<RunnerPoolConfig> {
     let control_bridge = home.join("control-bridge");
     std::fs::create_dir_all(&control_bridge)?;
@@ -1749,6 +1784,7 @@ fn local_runner_pool_config(
         pending_registrations: Some(pending_registrations),
         preparing_signal: Some(preparing_signal),
         pool_status: Some(pool_status),
+        observability: Some(observability),
     })
 }
 
@@ -2900,6 +2936,33 @@ fn plan_json(plan: &preloop_gha_protocol::JobPlan) -> serde_json::Value {
 async fn cmd_status(args: StatusArgs) -> anyhow::Result<()> {
     let client = build_client();
     let url = server_url();
+    if let Some(run_id) = args.run_id {
+        // Single-run mode: one machine-readable status word
+        // (success/failure/cancelled/skipped/in_progress/queued/pending) for
+        // scripts like the pre-push hook. Connection failures carry the
+        // engine-unreachable marker so the hook can fail open.
+        let mut request = client.get(format!("{url}/api/v1/runs/{run_id}"));
+        if let Some(token) = api_token() {
+            request = request.bearer_auth(token);
+        }
+        let response = request
+            .send()
+            .await
+            .with_context(engine_unreachable_context)?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("server returned {status}: {body}");
+        }
+        let run: serde_json::Value = response.json().await?;
+        println!(
+            "{}",
+            run.get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+        );
+        return Ok(());
+    }
     // Native bearer required for /api/v1/status (same as other native calls)
     let mut status_req = client.get(format!("{url}/api/v1/status"));
     if let Some(token) = api_token() {
@@ -2923,11 +2986,18 @@ async fn cmd_status(args: StatusArgs) -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    // Parse into the typed DTO first: a server-side schema change then fails
-    // loudly here instead of silently rendering every section as zeros and
-    // dashes. `--json` above stays raw for byte-identical `jq` output.
-    let _snapshot: preloop_observability::status::OperationalSnapshot =
-        serde_json::from_str(&status_text).context("parse status json")?;
+    // Parse into the typed DTO for a schema check, but degrade instead of
+    // failing: the CLI self-updates while a supervised engine lags, so a
+    // mismatch must not take `preloop status` down at the moment it is most
+    // needed. `--json` above stays raw for byte-identical `jq` output.
+    if let Err(error) =
+        serde_json::from_str::<preloop_observability::status::OperationalSnapshot>(&status_text)
+    {
+        eprintln!(
+            "[warn] status schema differs from this CLI ({error}); \
+             some sections may render as dashes. Use --json for the raw payload."
+        );
+    }
     let status: serde_json::Value =
         serde_json::from_str(&status_text).context("parse status json")?;
 
@@ -3790,6 +3860,7 @@ mod tests {
                 std::sync::Arc::new(preloop_observability::status::PoolStatus::new(
                     preloop_observability::status::PoolSnapshot::default(),
                 )),
+                preloop_observability::Observability::noop(),
             )
             .unwrap();
             unsafe {
@@ -3868,6 +3939,7 @@ mod tests {
                 std::sync::Arc::new(preloop_observability::status::PoolStatus::new(
                     preloop_observability::status::PoolSnapshot::default(),
                 )),
+                preloop_observability::Observability::noop(),
             )
             .unwrap();
             unsafe {
@@ -4288,6 +4360,12 @@ mod tests {
             panic!("expected Status");
         };
         assert_eq!(args.limit, 42);
+        // Historical single-run mode: `preloop status <run_id>` still parses.
+        let cli = parse(&["status", "run-abc"]).unwrap();
+        let Command::Status(args) = cli.command else {
+            panic!("expected Status");
+        };
+        assert_eq!(args.run_id.as_deref(), Some("run-abc"));
     }
 
     #[test]

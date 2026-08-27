@@ -396,6 +396,7 @@ impl Fixture {
             next_job_runs_on: None,
             pending_registrations: None,
             preparing_signal: None,
+            observability: None,
         };
         Self {
             _env_guard: env_guard,

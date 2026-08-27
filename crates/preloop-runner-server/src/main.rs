@@ -90,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
     // process and flushes on shutdown.
 
     let cli = Cli::parse();
-    match cli.command {
+    let result = match cli.command {
         Command::Cert { output } => {
             std::fs::create_dir_all(&output)?;
             let cert = preloop_runner_server::generate_self_signed_cert()?;
@@ -107,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
                 cert_path.display(),
                 key_path.display()
             );
+            Ok(())
         }
         Command::Serve {
             listen,
@@ -156,11 +157,11 @@ async fn main() -> anyhow::Result<()> {
                     })
                     .unwrap_or(false),
             })
-            .await?;
+            .await
         }
-    }
+    };
     // Bounded 2s flush of buffered telemetry before exit; a clean shutdown
     // must not drop the last flush window's records.
     observability_runtime.shutdown().await;
-    Ok(())
+    result
 }
