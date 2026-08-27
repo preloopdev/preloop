@@ -710,9 +710,19 @@ pub(crate) async fn twirp_cache_v2_create(
         ));
     }
     let upload_url = format!("{}/twirp-blob/cache/{token}", runner_base_url());
+    // The cache key is workflow-controlled content; never log it or the
+    // version verbatim. A SHA-256 digest identifies the entry well enough to
+    // correlate with the finalize/restore logs while leaking nothing.
+    let cache_id = {
+        use sha2::Digest;
+        format!(
+            "{:x}",
+            sha2::Sha256::digest(format!("{storage_key}\u{0}{version}").as_bytes())
+        )
+    };
     info!(
-        key = %storage_key,
-        version = %version,
+        cache_id = %cache_id,
+        version_len = version.len(),
         "cache v2 create entry"
     );
     Ok(pb_or_json(

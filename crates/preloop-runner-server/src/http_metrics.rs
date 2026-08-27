@@ -6,7 +6,7 @@ use axum::{
     response::Response,
 };
 use opentelemetry::propagation::TextMapPropagator;
-use opentelemetry::trace::{Span, Status, Tracer};
+use opentelemetry::trace::{FutureExt, Span, Status, TraceContextExt, Tracer};
 use opentelemetry::KeyValue;
 use preloop_observability::metrics::{classify_surface, normalize_route, status_class};
 use preloop_observability::{HeaderExtractor, TraceContextPropagator};
@@ -87,7 +87,7 @@ pub async fn http_metrics_middleware(
         .flatten();
 
     let start = Instant::now();
-    let mut span = tracer.as_ref().map(|tracer| {
+    let span = tracer.as_ref().map(|tracer| {
         let mut span = tracer.start_with_context(
             format!("{method} {route}"),
             parent_cx
@@ -102,7 +102,16 @@ pub async fn http_metrics_middleware(
         span
     });
 
-    let res = next.run(req).await;
+    // Make the request span current while the handler runs so tracing events
+    // and log records emitted inside become children of it, instead of
+    // dangling as siblings. `with_context` attaches the context only while
+    // the future is polled, so it is safe across await points.
+    let span_cx = span.map(opentelemetry::Context::current_with_span);
+    let res = if let Some(cx) = &span_cx {
+        next.run(req).with_context(cx.clone()).await
+    } else {
+        next.run(req).await
+    };
     let elapsed = start.elapsed();
 
     let status = res.status().as_u16();
@@ -123,7 +132,8 @@ pub async fn http_metrics_middleware(
     // cancelled or panics; the request is not in flight anymore either way.
     drop(active_guard);
 
-    if let Some(span) = &mut span {
+    if let Some(cx) = &span_cx {
+        let span = cx.span();
         span.set_attribute(KeyValue::new(
             "http.response.status_code",
             status.to_string(),

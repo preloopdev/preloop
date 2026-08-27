@@ -424,6 +424,9 @@ impl Scheduler {
                 return;
             }
         };
+        if let Some(hb) = &heartbeat {
+            hb.beat();
+        }
         let default_branch = metadata
             .get("default_branch")
             .and_then(|value| value.as_str())
@@ -451,6 +454,9 @@ impl Scheduler {
                 }),
             _ => None,
         };
+        if let Some(hb) = &heartbeat {
+            hb.beat();
+        }
         let workflows = match crate::github::fetch_workflows(
             &shared,
             &repository,
@@ -464,12 +470,18 @@ impl Scheduler {
                 return;
             }
         };
+        if let Some(hb) = &heartbeat {
+            hb.beat();
+        }
         let context = serde_json::json!({
             "ref": format!("refs/heads/{default_branch}"),
             "after": sha,
             "repository": { "full_name": repository, "default_branch": default_branch },
         });
         self.reconcile_all(&workflows, context, shared).await;
+        if let Some(hb) = &heartbeat {
+            hb.beat();
+        }
     }
 
     /// Reconcile the complete default-branch workflow inventory, including
@@ -498,6 +510,15 @@ impl Scheduler {
             });
         }
         for (path, yaml) in workflows {
+            // One beat per workflow so a reconcile that hangs mid-inventory
+            // shows up in /readyz as a stale `scheduler_scan` task instead of
+            // looking healthy. No-op when the task is not registered (e.g.
+            // the push path on a server whose scan already completed).
+            shared
+                .state
+                .observability
+                .heartbeat()
+                .beat("scheduler_scan");
             self.reconcile(path, yaml, push_payload.clone(), Arc::clone(&shared))
                 .await;
         }
