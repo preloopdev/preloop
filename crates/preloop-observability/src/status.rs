@@ -195,6 +195,10 @@ impl PoolStatus {
         self.inner.write().preparing = preparing;
     }
 
+    pub fn set_mode(&self, mode: PoolMode) {
+        self.inner.write().mode = mode;
+    }
+
     /// Mirror one pool count into the snapshot. Per-field setters, so a RAII
     /// guard updating only the count it owns cannot clobber the fields
     /// another guard just wrote.
@@ -235,6 +239,19 @@ impl PoolStatus {
 
     pub fn remove_pending(&self, token: &str) -> bool {
         self.pending_tokens.write().remove(token).is_some()
+    }
+
+    /// Forget pending provision tokens older than `max_age`. Tokens whose
+    /// timestamp is in the future (clock skew) are kept: a registration that
+    /// may still arrive is never dropped preemptively.
+    pub fn retain_pending_newer_than(&self, max_age: std::time::Duration) {
+        let now = std::time::SystemTime::now();
+        self.pending_tokens
+            .write()
+            .retain(|_token, at| match now.duration_since(*at) {
+                Ok(age) => age <= max_age,
+                Err(_) => true,
+            });
     }
 
     pub fn pending_tokens_snapshot(

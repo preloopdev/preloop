@@ -18,7 +18,7 @@
 
 use std::fmt::Write;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -88,31 +88,93 @@ impl MetricReader for PrometheusHandle {
 /// Render a `ResourceMetrics` snapshot as Prometheus exposition text.
 fn render_resource_metrics(rm: &ResourceMetrics) -> String {
     let mut out = String::with_capacity(4096);
-    // Prometheus rejects a scrape with duplicate #HELP/#TYPE lines. Two
-    // scopes may publish the same instrument name, so emit the metadata
-    // lines once per emitted name while still rendering every series.
-    let mut emitted: HashSet<String> = HashSet::new();
+
+    // Prometheus rejects a scrape with duplicate #HELP/#TYPE lines, and a
+    // series rendered under the wrong #TYPE is silently misread. Two scopes
+    // may publish the same instrument name: same-kind duplicates are fine
+    // (metadata emitted once, samples deduplicated per label-set), but when
+    // one rendered name maps to two different kinds (e.g. a gauge
+    // `requests_total` in one scope and a monotonic sum `requests` in
+    // another, or a gauge `requests` and a histogram `requests`) the samples
+    // would be merged under whichever #TYPE came first — garbage. Detect the
+    // conflicts up front and drop the whole name (no metadata, no samples).
+    let mut kind_by_name: HashMap<String, &'static str> = HashMap::new();
+    let mut conflicted: HashSet<String> = HashSet::new();
+    for scope in rm.scope_metrics() {
+        for metric in scope.metrics() {
+            if let Some((full, kind)) = prom_identity(metric.name(), metric.unit(), metric.data()) {
+                match kind_by_name.get(&full) {
+                    Some(prev) if *prev != kind => {
+                        conflicted.insert(full);
+                    }
+                    Some(_) => {}
+                    None => {
+                        kind_by_name.insert(full, kind);
+                    }
+                }
+            }
+        }
+    }
+
+    // Metadata lines are emitted once per (rendered name, kind); sample
+    // lines are deduplicated per series (rendered name + label-set) so a
+    // second scope publishing the same label-set cannot double a sample.
+    let mut emitted: HashSet<(String, &'static str)> = HashSet::new();
+    let mut written: HashSet<String> = HashSet::new();
     for scope in rm.scope_metrics() {
         for metric in scope.metrics() {
             let raw_name = metric.name();
             let unit = metric.unit();
             let description = metric.description();
+            let data = metric.data();
+            if let Some((full, _)) = prom_identity(raw_name, unit, data) {
+                if conflicted.contains(&full) {
+                    continue;
+                }
+            }
             render_metric(
                 &mut out,
                 &mut emitted,
+                &mut written,
                 raw_name,
                 unit,
                 description,
-                metric.data(),
+                data,
             );
         }
     }
     out
 }
 
+/// Rendered Prometheus name and `# TYPE` kind for a metric, or `None` for
+/// kinds the renderer skips entirely (exponential histograms).
+fn prom_identity(
+    raw_name: &str,
+    unit: &str,
+    data: &AggregatedMetrics,
+) -> Option<(String, &'static str)> {
+    let base = prom_name(raw_name, unit);
+    match data {
+        AggregatedMetrics::F64(md) => prom_identity_data(base, md),
+        AggregatedMetrics::U64(md) => prom_identity_data(base, md),
+        AggregatedMetrics::I64(md) => prom_identity_data(base, md),
+    }
+}
+
+fn prom_identity_data<T>(base: String, data: &MetricData<T>) -> Option<(String, &'static str)> {
+    match data {
+        MetricData::Sum(sum) if sum.is_monotonic() => Some((format!("{base}_total"), "counter")),
+        MetricData::Sum(_) => Some((base, "gauge")),
+        MetricData::Gauge(_) => Some((base, "gauge")),
+        MetricData::Histogram(_) => Some((base, "histogram")),
+        MetricData::ExponentialHistogram(_) => None,
+    }
+}
+
 fn render_metric(
     out: &mut String,
-    emitted: &mut HashSet<String>,
+    emitted: &mut HashSet<(String, &'static str)>,
+    written: &mut HashSet<String>,
     raw_name: &str,
     unit: &str,
     description: &str,
@@ -120,30 +182,33 @@ fn render_metric(
 ) {
     match data {
         AggregatedMetrics::F64(md) => {
-            render_metric_data(out, emitted, raw_name, unit, description, md)
+            render_metric_data(out, emitted, written, raw_name, unit, description, md)
         }
         AggregatedMetrics::U64(md) => {
-            render_metric_data(out, emitted, raw_name, unit, description, md)
+            render_metric_data(out, emitted, written, raw_name, unit, description, md)
         }
         AggregatedMetrics::I64(md) => {
-            render_metric_data(out, emitted, raw_name, unit, description, md)
+            render_metric_data(out, emitted, written, raw_name, unit, description, md)
         }
     }
 }
 
 fn render_metric_data<T: NumericValue>(
     out: &mut String,
-    emitted: &mut HashSet<String>,
+    emitted: &mut HashSet<(String, &'static str)>,
+    written: &mut HashSet<String>,
     raw_name: &str,
     unit: &str,
     description: &str,
     data: &MetricData<T>,
 ) {
     match data {
-        MetricData::Sum(sum) => render_sum(out, emitted, raw_name, unit, description, sum),
-        MetricData::Gauge(gauge) => render_gauge(out, emitted, raw_name, unit, description, gauge),
+        MetricData::Sum(sum) => render_sum(out, emitted, written, raw_name, unit, description, sum),
+        MetricData::Gauge(gauge) => {
+            render_gauge(out, emitted, written, raw_name, unit, description, gauge)
+        }
         MetricData::Histogram(hist) => {
-            render_histogram(out, emitted, raw_name, unit, description, hist)
+            render_histogram(out, emitted, written, raw_name, unit, description, hist)
         }
         MetricData::ExponentialHistogram(_) => {
             // Exponential histograms have no standard Prometheus text mapping.
@@ -153,7 +218,8 @@ fn render_metric_data<T: NumericValue>(
 
 fn render_sum<T: NumericValue>(
     out: &mut String,
-    emitted: &mut HashSet<String>,
+    emitted: &mut HashSet<(String, &'static str)>,
+    written: &mut HashSet<String>,
     raw_name: &str,
     unit: &str,
     description: &str,
@@ -166,47 +232,49 @@ fn render_sum<T: NumericValue>(
     };
     let base = prom_name(raw_name, unit);
     let full = format!("{base}{suffix}");
-    if emitted.insert(full.clone()) {
+    if emitted.insert((full.clone(), prom_type)) {
         if !description.is_empty() {
             let _ = writeln!(out, "# HELP {full} {description}");
         }
         let _ = writeln!(out, "# TYPE {full} {prom_type}");
     }
     for dp in sum.data_points() {
-        write_sample(out, &full, dp.attributes(), dp.value());
+        write_sample(out, written, &full, dp.attributes(), dp.value());
     }
 }
 
 fn render_gauge<T: NumericValue>(
     out: &mut String,
-    emitted: &mut HashSet<String>,
+    emitted: &mut HashSet<(String, &'static str)>,
+    written: &mut HashSet<String>,
     raw_name: &str,
     unit: &str,
     description: &str,
     gauge: &Gauge<T>,
 ) {
     let name = prom_name(raw_name, unit);
-    if emitted.insert(name.clone()) {
+    if emitted.insert((name.clone(), "gauge")) {
         if !description.is_empty() {
             let _ = writeln!(out, "# HELP {name} {description}");
         }
         let _ = writeln!(out, "# TYPE {name} gauge");
     }
     for dp in gauge.data_points() {
-        write_sample(out, &name, dp.attributes(), dp.value());
+        write_sample(out, written, &name, dp.attributes(), dp.value());
     }
 }
 
 fn render_histogram<T: NumericValue>(
     out: &mut String,
-    emitted: &mut HashSet<String>,
+    emitted: &mut HashSet<(String, &'static str)>,
+    written: &mut HashSet<String>,
     raw_name: &str,
     unit: &str,
     description: &str,
     hist: &Histogram<T>,
 ) {
     let base = prom_name(raw_name, unit);
-    if emitted.insert(base.clone()) {
+    if emitted.insert((base.clone(), "histogram")) {
         if !description.is_empty() {
             let _ = writeln!(out, "# HELP {base} {description}");
         }
@@ -229,13 +297,20 @@ fn render_histogram<T: NumericValue>(
             bucket_attrs.push(KeyValue::new("le", le));
             write_sample(
                 out,
+                written,
                 &format!("{base}_bucket"),
                 bucket_attrs.iter(),
                 cumulative,
             );
         }
-        write_sample(out, &format!("{base}_sum"), attrs.iter(), dp.sum());
-        write_sample(out, &format!("{base}_count"), attrs.iter(), dp.count());
+        write_sample(out, written, &format!("{base}_sum"), attrs.iter(), dp.sum());
+        write_sample(
+            out,
+            written,
+            &format!("{base}_count"),
+            attrs.iter(),
+            dp.count(),
+        );
     }
 }
 
@@ -267,32 +342,46 @@ fn prom_name(raw: &str, unit: &str) -> String {
     name
 }
 
-/// Write one sample line: `name{labels} value\n`.
+/// Write one sample line: `name{labels} value\n`. Label pairs are sorted so
+/// the same label-set from another scope (possibly in a different order)
+/// deduplicates to a single series; a label-set already written for this
+/// name is skipped (the first one wins).
 fn write_sample<'a, T: NumericValue>(
     out: &mut String,
+    written: &mut HashSet<String>,
     name: &str,
     attrs: impl Iterator<Item = &'a KeyValue>,
     value: T,
 ) {
-    out.push_str(name);
-    let mut first = true;
-    for kv in attrs {
-        if first {
-            out.push('{');
-            first = false;
-        } else {
-            out.push(',');
+    // Canonical series identity: name + sorted `key="value"` pairs.
+    let mut attrs: Vec<&KeyValue> = attrs.collect();
+    attrs.sort_by(|a, b| {
+        a.key
+            .as_str()
+            .cmp(b.key.as_str())
+            .then_with(|| a.value.as_str().cmp(&b.value.as_str()))
+    });
+    let mut prefix = String::with_capacity(name.len() + 16);
+    prefix.push_str(name);
+    if !attrs.is_empty() {
+        prefix.push('{');
+        for (i, kv) in attrs.iter().enumerate() {
+            if i > 0 {
+                prefix.push(',');
+            }
+            let _ = write!(
+                prefix,
+                "{}=\"{}\"",
+                kv.key,
+                escape_label_value(kv.value.as_str().as_ref())
+            );
         }
-        let _ = write!(
-            out,
-            "{}=\"{}\"",
-            kv.key,
-            escape_label_value(kv.value.as_str().as_ref())
-        );
+        prefix.push('}');
     }
-    if !first {
-        out.push('}');
+    if !written.insert(prefix.clone()) {
+        return; // identical label-set already rendered for this series
     }
+    out.push_str(&prefix);
     out.push(' ');
     value.write_to(out);
     out.push('\n');
@@ -419,13 +508,12 @@ mod tests {
         use opentelemetry::metrics::MeterProvider;
         use opentelemetry_sdk::metrics::SdkMeterProvider;
 
+        // Same kind in two scopes: metadata emitted once, every series still
+        // rendered.
         let handle = PrometheusHandle::new(ManualReader::default());
         let provider = SdkMeterProvider::builder()
             .with_reader(handle.clone())
             .build();
-        // Two scopes publishing the same instrument name must not emit
-        // duplicate #HELP/#TYPE lines (Prometheus rejects the whole scrape);
-        // every series must still be rendered.
         provider
             .meter("scope-a")
             .u64_counter("test.requests")
@@ -450,5 +538,74 @@ mod tests {
             .count();
         assert_eq!(type_lines, 1, "duplicate #TYPE line in: {text}");
         assert_eq!(sample_lines, 2, "series dropped in: {text}");
+
+        // Same kind and the same label-set in two scopes (attributes given
+        // in a different order): one sample line, not two.
+        let handle = PrometheusHandle::new(ManualReader::default());
+        let provider = SdkMeterProvider::builder()
+            .with_reader(handle.clone())
+            .build();
+        provider
+            .meter("scope-a")
+            .u64_counter("test.requests")
+            .with_unit("{request}")
+            .build()
+            .add(
+                1,
+                &[KeyValue::new("method", "GET"), KeyValue::new("path", "/x")],
+            );
+        provider
+            .meter("scope-b")
+            .u64_counter("test.requests")
+            .with_unit("{request}")
+            .build()
+            .add(
+                2,
+                &[KeyValue::new("path", "/x"), KeyValue::new("method", "GET")],
+            );
+
+        let text = handle.render();
+        let sample_lines = text
+            .lines()
+            .filter(|l| l.starts_with("test_requests_total{"))
+            .count();
+        assert_eq!(sample_lines, 1, "duplicate sample lines in: {text}");
+
+        // Conflicting kinds for the same rendered name: a gauge
+        // `test.requests_total` and a monotonic sum `test.requests` (which
+        // also renders as `test_requests_total`) would otherwise merge
+        // samples under the first #TYPE. Both are dropped — no metadata, no
+        // samples — rather than emitting garbage.
+        let handle = PrometheusHandle::new(ManualReader::default());
+        let provider = SdkMeterProvider::builder()
+            .with_reader(handle.clone())
+            .build();
+        provider
+            .meter("scope-a")
+            .u64_counter("test.requests")
+            .with_unit("{request}")
+            .build()
+            .add(1, &[KeyValue::new("method", "GET")]);
+        provider
+            .meter("scope-b")
+            .u64_gauge("test.requests_total")
+            .with_unit("{request}")
+            .build()
+            .record(7, &[KeyValue::new("method", "GET")]);
+
+        let text = handle.render();
+        let type_lines = text
+            .lines()
+            .filter(|l| l.starts_with("# TYPE test_requests_total"))
+            .count();
+        let sample_lines = text
+            .lines()
+            .filter(|l| l.starts_with("test_requests_total{"))
+            .count();
+        assert_eq!(type_lines, 0, "conflicting-kind metadata leaked in: {text}");
+        assert_eq!(
+            sample_lines, 0,
+            "conflicting-kind samples leaked in: {text}"
+        );
     }
 }
