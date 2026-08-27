@@ -79,12 +79,13 @@ pub(crate) fn try_enqueue_with_job_concurrency(
     inner: &mut InnerState,
     github: &serde_json::Value,
     submission: &WorkflowSubmission,
-    queued_job: QueuedJob,
+    mut queued_job: QueuedJob,
     statuses: &mut BTreeMap<JobId, ExecutionStatus>,
 ) -> Result<bool, ()> {
     match try_acquire_job_gate(inner, github, submission, &queued_job) {
         JobGateOutcome::Proceed => {
             statuses.insert(queued_job.job_id.clone(), ExecutionStatus::Queued);
+            stamp_ready_enqueue(&mut queued_job);
             on_job_enqueued(inner, &queued_job);
             inner.queue.push_back(queued_job);
             Ok(true)
@@ -667,6 +668,7 @@ pub(crate) fn promote_next_from_group(
                                 if let Some(run) = inner.runs.get_mut(&run_id) {
                                     hydrate_needs_context(&mut job, run);
                                 }
+                                stamp_ready_enqueue(&mut job);
                                 on_job_enqueued(inner, &job);
                                 inner.queue.push_back(job);
                             }
@@ -729,6 +731,7 @@ pub(crate) fn promote_next_from_group(
                 run.jobs.insert(job.job_id.clone(), ExecutionStatus::Queued);
                 hydrate_needs_context(&mut job, run);
             }
+            stamp_ready_enqueue(&mut job);
             on_job_enqueued(inner, &job);
             inner.queue.push_back(job);
         }
@@ -779,6 +782,7 @@ pub(crate) fn promote_next_from_group(
                         run.jobs.insert(job.job_id.clone(), ExecutionStatus::Queued);
                         hydrate_needs_context(&mut job, run);
                     }
+                    stamp_ready_enqueue(&mut job);
                     on_job_enqueued(inner, &job);
                     inner.queue.push_back(job);
                 } else {
@@ -1156,6 +1160,9 @@ pub(crate) fn promote_ready_jobs(inner: &mut InnerState) -> SchedulingOutcome {
         }
 
         outcome.promoted += promoted.len();
+        for job in &mut promoted {
+            stamp_ready_enqueue(job);
+        }
         inner.pending_jobs = remaining;
         inner.queue.extend(promoted);
         if !settled {
@@ -1601,6 +1608,18 @@ pub(crate) fn on_job_enqueued(inner: &mut InnerState, job: &QueuedJob) {
     if inner.pool_assignments_enabled {
         inner.pool_pending.insert(key, std::time::SystemTime::now());
     }
+}
+
+/// Stamp the instant a job actually enters the ready queue.
+///
+/// `enqueued_at_unix_nanos` is deliberately not stamped at job construction:
+/// a job held for needs, workflow/job concurrency, or max-parallel would
+/// otherwise report dependency time as queue wait. Only the promotion sites —
+/// where the job is pushed into `inner.queue` — stamp it. Requeues (a claimed
+/// job bouncing off a purged runner) preserve the original stamp so total
+/// queue time is still measured.
+fn stamp_ready_enqueue(job: &mut QueuedJob) {
+    job.enqueued_at_unix_nanos = crate::models::now_unix_nanos();
 }
 
 /// Pair a just-registered pool runner with the earliest pending job it can
@@ -2426,6 +2445,10 @@ fn register_expanded_jobs(
             run_id,
             job_id: plan.id.clone(),
             base_id: plan.base_id.clone(),
+            // Stamped by the promotion sites when the job enters the ready
+            // queue, never here: a job delayed by needs, concurrency, or
+            // max-parallel must not count dependency time as queue wait.
+            enqueued_at_unix_nanos: 0,
             needs: plan.needs.clone(),
             if_condition: plan.if_condition.clone(),
             condition_context,
@@ -2890,6 +2913,7 @@ mod assignment_tests {
             run_id: RunId::new(),
             job_id: JobId(job_id.to_owned()),
             base_id: job_id.to_owned(),
+            enqueued_at_unix_nanos: 0,
             needs: Vec::new(),
             if_condition: None,
             condition_context: preloop_gha_expressions::Context::default(),

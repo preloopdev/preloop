@@ -677,6 +677,9 @@ pub(crate) async fn register_runner_compat(
                 .write()
                 .map(|mut pending| pending.remove(&token).is_some())
                 .unwrap_or(false);
+            // Mirror into the consolidated pool handle so the sampler's
+            // pending-registration count drops with the consume.
+            shared.state.pool_status.remove_pending(&token);
             if accepted {
                 crate::runtime_scheduling::pair_registered_runner(&mut inner, result.id);
             }

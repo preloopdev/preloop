@@ -48,6 +48,12 @@ pub struct ServerConfig {
     /// presents the matching provisioning token.
     pub pending_registrations:
         Option<Arc<std::sync::RwLock<std::collections::BTreeMap<String, std::time::SystemTime>>>>,
+    /// Consolidated pool handle (replaces the four ad-hoc Option<Arc<…>> fields).
+    /// When `Some`, the pool updates it and the sampler reads it.
+    pub pool_status: Option<Arc<preloop_observability::status::PoolStatus>>,
+    /// Observability handle to clone into AppState (heartbeat, limits).
+    /// `None` falls back to `Observability::noop()` (tests).
+    pub observability: Option<preloop_observability::Observability>,
     /// `PRELOOP_REQUIRE_JOB_ASSIGNMENTS`: refuse to dispatch any job without
     /// a recorded assignment, including to external runners.
     pub require_job_assignments: bool,
@@ -77,6 +83,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("oidc_issuer", &self.oidc_issuer)
             .field("enable_scheduler", &self.enable_scheduler)
             .field("pending_registrations", &self.pending_registrations)
+            .field("pool_status", &self.pool_status)
             .field("require_job_assignments", &self.require_job_assignments)
             .finish()
     }
@@ -182,7 +189,8 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
         .state
         .pool_preparing
         .as_ref()
-        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
+        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+        || shared.state.pool_status.snapshot().preparing;
     let queued_jobs: Vec<_> = inner.queue.iter().cloned().collect();
     let in_queue: std::collections::BTreeSet<(RunId, JobId)> = queued_jobs
         .iter()
@@ -397,13 +405,432 @@ async fn run_background_reaper(shared: Arc<SharedState>) {
     let mut interval = tokio::time::interval(Duration::from_secs(10));
     // Skip the first tick
     interval.tick().await;
+    //Heartbeat for reaper (critical) — beat each interval, no cadence change.
+    let heartbeat = shared.state.observability.heartbeat().clone();
+    let _reaper_handle = heartbeat.register("reaper", preloop_observability::Criticality::Critical);
+    heartbeat.beat("reaper");
 
     while !shared.shutdown.is_cancelled() {
         tokio::select! {
             _ = interval.tick() => {
+                heartbeat.beat("reaper");
                 reap_once(&shared).await;
             }
             _ = shared.shutdown.cancelled() => {
+                break;
+            }
+        }
+    }
+}
+
+/// Everything the operational snapshot reads from `inner`, collected under a
+/// single lock acquisition. The 5s sampler and the startup seed after a store
+/// restore both build their snapshots from this, so the two cannot drift.
+struct SnapshotInputs {
+    queue_len: usize,
+    pending_jobs_len: usize,
+    pending_expansions_len: usize,
+    expanding_len: usize,
+    runs_queued: u32,
+    runs_in_progress: u32,
+    runs_completed: u32,
+    registered: u32,
+    /// Distinct session ids across the modern broker map and the legacy map
+    /// (every session creation path inserts into both, so the sum would
+    /// double count).
+    sessions: u32,
+    runner_idle: u32,
+    runner_busy: u32,
+    runner_stale: u32,
+    /// Per queued job, in queue order: the `runs-on` labels and any explicit
+    /// runner group. Only this label surface is needed for claimability —
+    /// never the full message payload.
+    queue_runner_reqs: Vec<(Vec<String>, Option<String>)>,
+    /// Capabilities (labels + group identity) of every registered runner.
+    runner_caps: Vec<RunnerCapabilities>,
+    debug_active_sessions: u32,
+    debug_oldest_session_seconds: Option<f64>,
+    /// Jobs parked behind job-level concurrency gates (FIFO).
+    concurrency_blocked: u32,
+    /// Concurrency-group admission state, derived from
+    /// `inner.concurrency_groups`. Queue-mode limits and overflow counts are
+    /// not tracked in group state and stay zero.
+    concurrency_groups_active: u32,
+    concurrency_groups_contended: u32,
+    concurrency_pending_holders: u32,
+    concurrency_deepest_group_pending: u32,
+}
+
+/// Collect [`SnapshotInputs`] from `inner` while the state lock is held.
+fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
+    let mut runs_queued = 0u32;
+    let mut runs_in_progress = 0u32;
+    let mut runs_completed = 0u32;
+    for run in inner.runs.values() {
+        match run.status {
+            ExecutionStatus::Queued => runs_queued += 1,
+            ExecutionStatus::InProgress => runs_in_progress += 1,
+            s if s.is_terminal() => runs_completed += 1,
+            _ => {}
+        }
+    }
+    let session_ids: std::collections::BTreeSet<&String> = inner
+        .broker_session_runners
+        .keys()
+        .chain(inner.sessions.keys())
+        .collect();
+
+    // Runner state: busy = an owned session holds an active job assignment;
+    // stale = no poll within the crate's staleness threshold; idle = neither.
+    // Busy and stale are independent predicates — a runner that stopped
+    // polling mid-job is both — so idle is the remainder, not the complement.
+    let now = std::time::Instant::now();
+    let mut runner_idle = 0u32;
+    let mut runner_busy = 0u32;
+    let mut runner_stale = 0u32;
+    for runner_id in inner.runners.keys() {
+        let mut owned: std::collections::BTreeSet<&String> = inner
+            .broker_session_runners
+            .iter()
+            .filter(|(_, owner)| **owner == *runner_id)
+            .map(|(session_id, _)| session_id)
+            .collect();
+        owned.extend(
+            inner
+                .sessions
+                .iter()
+                .filter(|(_, session)| session.runner_id == *runner_id)
+                .map(|(session_id, _)| session_id),
+        );
+        let busy = owned
+            .iter()
+            .any(|session_id| inner.session_active_requests.contains_key(*session_id));
+        // Sessions restored from a restart have no last-seen entry; like the
+        // liveness sweep, treat an unknown poll time as not-yet-stale rather
+        // than asserting staleness we cannot observe.
+        let stale = !owned.is_empty()
+            && owned.iter().all(|session_id| {
+                inner
+                    .session_last_seen
+                    .get(*session_id)
+                    .is_some_and(|seen| now.duration_since(*seen) > STALENESS_THRESHOLD)
+            });
+        if busy {
+            runner_busy += 1;
+        }
+        if stale {
+            runner_stale += 1;
+        }
+        if !busy && !stale {
+            runner_idle += 1;
+        }
+    }
+
+    // Live debug sessions: count open sessions and the age of the oldest.
+    let debug_sessions = inner.debug_sessions.list();
+    let debug_oldest_session_seconds = debug_sessions
+        .iter()
+        .map(|session| session.created_at_ms)
+        .min()
+        .map(|created_at_ms| {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            now_ms.saturating_sub(created_at_ms) as f64 / 1000.0
+        });
+
+    // Concurrency-group admission state: one group per (repo, group) key,
+    // holding at most one running holder plus a FIFO pending queue.
+    let mut concurrency_groups_active = 0u32;
+    let mut concurrency_groups_contended = 0u32;
+    let mut concurrency_pending_holders = 0u32;
+    let mut concurrency_deepest_group_pending = 0u32;
+    for group in inner.concurrency_groups.values() {
+        if group.running.is_some() {
+            concurrency_groups_active += 1;
+        }
+        if !group.pending.is_empty() {
+            concurrency_groups_contended += 1;
+        }
+        concurrency_pending_holders += group.pending.len() as u32;
+        concurrency_deepest_group_pending =
+            concurrency_deepest_group_pending.max(group.pending.len() as u32);
+    }
+
+    SnapshotInputs {
+        queue_len: inner.queue.len(),
+        pending_jobs_len: inner.pending_jobs.len(),
+        pending_expansions_len: inner.pending_expansions.len(),
+        expanding_len: inner.expanding.len(),
+        runs_queued,
+        runs_in_progress,
+        runs_completed,
+        registered: inner.runners.len() as u32,
+        sessions: session_ids.len() as u32,
+        runner_idle,
+        runner_busy,
+        runner_stale,
+        queue_runner_reqs: inner
+            .queue
+            .iter()
+            .map(|job| (job.runs_on.clone(), job.runner_group.clone()))
+            .collect(),
+        runner_caps: inner
+            .runners
+            .values()
+            .map(crate::runtime_scheduling::capabilities_of)
+            .collect(),
+        debug_active_sessions: debug_sessions.len() as u32,
+        debug_oldest_session_seconds,
+        concurrency_blocked: inner.concurrency_blocked.len() as u32,
+        concurrency_groups_active,
+        concurrency_groups_contended,
+        concurrency_pending_holders,
+        concurrency_deepest_group_pending,
+    }
+}
+
+fn build_operational_snapshot_sync(
+    inputs: SnapshotInputs,
+    pool_snapshot: preloop_observability::status::PoolSnapshot,
+    observability: &preloop_observability::Observability,
+    started_at: std::time::Instant,
+    shutdown_requested: bool,
+    scheduler_enabled: bool,
+    state_dir: &std::path::Path,
+    storage_components: Vec<preloop_observability::status::StorageComponent>,
+    github_configured: bool,
+    store_backend: preloop_observability::status::StoreBackend,
+) -> preloop_observability::status::OperationalSnapshot {
+    use chrono::Utc;
+    use preloop_observability::status::*;
+    let now = Utc::now();
+    let uptime = started_at.elapsed().as_secs();
+    // Claimability: distinguish claimable vs unclaimable using the same
+    // predicates the scheduler dispatches with — label matching plus the
+    // explicit runner-group check, so a job restricted to a specialized
+    // group is not reported claimable by default-group runners.
+    let (claimable, unclaimable) = if inputs.queue_len == 0 {
+        (0, 0)
+    } else if inputs.runner_caps.is_empty() {
+        (0, inputs.queue_len as u32)
+    } else if pool_snapshot.preparing {
+        // Temporarily unclaimable while pool prepares.
+        (0, inputs.queue_len as u32)
+    } else {
+        let mut claimable = 0u32;
+        for (runs_on, runner_group) in &inputs.queue_runner_reqs {
+            let matches = inputs.runner_caps.iter().any(|caps| {
+                crate::runtime_scheduling::job_matches_runner(runs_on, &caps.labels)
+                    && crate::runtime_scheduling::job_matches_runner_group(
+                        runner_group.as_deref(),
+                        caps,
+                    )
+            });
+            if matches {
+                claimable += 1;
+            }
+        }
+        (claimable, inputs.queue_len as u32 - claimable)
+    };
+
+    let oldest_ready_seconds = None; // TODO: track queued_at
+
+    OperationalSnapshot {
+        schema_version: 1,
+        observed_at: now,
+        snapshot_age_seconds: 0.0,
+        overall: if shutdown_requested {
+            Overall::ShuttingDown
+        } else {
+            Overall::Ok
+        },
+        service: ServiceSnapshot {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            instance_id: observability.instance_id().to_string(),
+            uptime_seconds: uptime,
+            shutdown_requested,
+        },
+        runs: RunsSnapshot {
+            queued: inputs.runs_queued,
+            in_progress: inputs.runs_in_progress,
+            completed: inputs.runs_completed,
+        },
+        jobs: JobsSnapshot {
+            ready: inputs.queue_len as u32,
+            dependency_blocked: inputs.pending_jobs_len as u32,
+            concurrency_blocked: inputs.concurrency_blocked,
+            pending_expansion: inputs.pending_expansions_len as u32,
+            expanding: inputs.expanding_len as u32,
+            claimable,
+            unclaimable,
+            oldest_ready_seconds,
+        },
+        concurrency: ConcurrencySnapshot {
+            groups_active: inputs.concurrency_groups_active,
+            groups_contended: inputs.concurrency_groups_contended,
+            pending_holders: inputs.concurrency_pending_holders,
+            deepest_group_pending: inputs.concurrency_deepest_group_pending,
+            ..Default::default()
+        },
+        scheduler: SchedulerSnapshot {
+            enabled: scheduler_enabled,
+            ..Default::default()
+        },
+        runners: RunnersSnapshot {
+            registered: inputs.registered,
+            sessions: inputs.sessions,
+            idle: inputs.runner_idle,
+            busy: inputs.runner_busy,
+            stale: inputs.runner_stale,
+            max_poll_age_seconds: None,
+            max_lease_age_seconds: None,
+        },
+        pool: pool_snapshot,
+        vms: {
+            // Host sampler is stubbed until the cgroup parser lands;
+            // the registry is the source of truth for configured counts
+            // and will be populated by RunnerPool on create/fork.
+            let caps = std::collections::HashMap::new();
+            preloop_observability::vm_telemetry::build_fleet_snapshot(
+                observability.vm_registry(),
+                None,
+                caps,
+            )
+        },
+        store: StoreSnapshot {
+            backend: store_backend,
+            ..Default::default()
+        },
+        storage: {
+            StorageSnapshot {
+                state_dir: state_dir.display().to_string(),
+                state_fs_free_bytes: None,
+                state_fs_free_ratio: None,
+                components: storage_components,
+                last_gc_at: None,
+            }
+        },
+        limits: Vec::new(),
+        tasks: Vec::new(),
+        github: GithubSnapshot {
+            configured: github_configured,
+            ..Default::default()
+        },
+        debug: DebugSnapshot {
+            active_sessions: inputs.debug_active_sessions,
+            oldest_session_seconds: inputs.debug_oldest_session_seconds,
+        },
+        telemetry: TelemetrySnapshot {
+            otlp_enabled: observability.otlp_enabled(),
+            ..Default::default()
+        },
+        conditions: Vec::new(),
+    }
+}
+
+/// Per-component bytes for the state dir. The `metadata` reads are
+/// synchronous filesystem access; the sampler runs this in
+/// `spawn_blocking` so a stalled state filesystem can never stall the async
+/// executor (request handling, shutdown). A recursive walk would belong on
+/// the 60s cadence and must never run under the state lock.
+fn collect_storage_components(
+    state_dir: &std::path::Path,
+) -> Vec<preloop_observability::status::StorageComponent> {
+    let component =
+        |name: &str, path: std::path::PathBuf| preloop_observability::status::StorageComponent {
+            store: name.to_string(),
+            bytes: std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+        };
+    // Only the database is a single file. `cache` and `artifacts` are
+    // directories, whose `metadata().len()` is the inode size, not the
+    // contents size; they need the recursive walk on the 60s cadence.
+    vec![component("database", state_dir.join("preloop.db"))]
+}
+
+/// Build and publish an operational snapshot from live state. The 5s tick and
+/// the shutdown publish share this path so the final snapshot cannot drift
+/// from the regular cadence; the startup seed builds the same content
+/// synchronously via the same collector + builder.
+async fn publish_snapshot(
+    shared: &SharedState,
+    store_backend: &preloop_observability::status::StoreBackend,
+    shutdown_requested: bool,
+) {
+    // Clone needed state under lock, release, then build.
+    let inputs = {
+        let inner = shared.state.inner.lock().await;
+        collect_snapshot_inputs(&inner)
+    };
+    let pool_snapshot = shared.state.pool_status.snapshot();
+    // The storage bytes are a synchronous filesystem read; run it on the
+    // blocking pool so a stalled state filesystem cannot stall request
+    // handling or shutdown on the executor.
+    let state_dir = shared.state.state_dir.clone();
+    let state_dir_for_meta = state_dir.clone();
+    let storage_components =
+        tokio::task::spawn_blocking(move || collect_storage_components(&state_dir_for_meta))
+            .await
+            .unwrap_or_default();
+    let snap = build_operational_snapshot_sync(
+        inputs,
+        pool_snapshot,
+        &shared.state.observability,
+        shared.state.started_at,
+        shutdown_requested,
+        shared.state.scheduler.is_some(),
+        &state_dir,
+        storage_components,
+        shared.state.github_app.is_some(),
+        store_backend.clone(),
+    );
+    *shared.state.status_snapshot.write() = snap;
+}
+
+async fn run_state_sampler(
+    shared: Arc<SharedState>,
+    store_backend: preloop_observability::status::StoreBackend,
+) {
+    let heartbeat = shared.state.observability.heartbeat().clone();
+    let _handle = heartbeat.register(
+        "state_sampler",
+        preloop_observability::Criticality::Critical,
+    );
+    heartbeat.beat("state_sampler");
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    // Immediate sample then every 5s.
+    interval.tick().await;
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                heartbeat.beat("state_sampler");
+                publish_snapshot(&shared, &store_backend, false).await;
+                // Record pool/queue gauges into OTel instruments so `/metrics`
+                // has a single exposition source (the SDK renderer).
+                {
+                    let s = shared.state.status_snapshot.read();
+                    shared.state.observability.metrics().pool.record(
+                        s.service.uptime_seconds,
+                        s.pool.desired as u64,
+                        s.pool.preparing,
+                        s.pool.idle as u64,
+                        s.pool.busy as u64,
+                        s.jobs.ready as u64,
+                        s.jobs.claimable as u64,
+                        s.jobs.unclaimable as u64,
+                        s.jobs.dependency_blocked as u64,
+                    );
+                }
+            }
+            _ = shared.shutdown.cancelled() => {
+                // Publish one last snapshot with the shutdown flag set so
+                // /api/v1/status reports `overall: shutting_down` and
+                // `shutdown_requested: true` while /healthz//readyz already
+                // 503 — without this the flag would only land on the next 5s
+                // tick that never comes.
+                heartbeat.beat("state_sampler");
+                publish_snapshot(&shared, &store_backend, true).await;
                 break;
             }
         }
@@ -424,6 +851,49 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         config.store_url.as_deref(),
     )
     .await?;
+    // Wire observability if supplied (CLI/server will pass its handle).
+    // Adopt the caller's handle when supplied; `AppState::new` already
+    // installed a no-op one otherwise. Either way the store is instrumented,
+    // so `preloop.store.operation.duration` is recorded even for the
+    // standalone `preloop-server` binary, which passes no handle.
+    if let Some(obs) = config.observability.clone() {
+        state.observability = obs;
+    }
+    // Resolve the effective store URL exactly once, mirroring `open_store`
+    // precedence: the explicit URL wins, then the environment, then SQLite at
+    // the state dir. Both the instrumentation label and the status-snapshot
+    // backend are derived from this single parsed value so they cannot
+    // drift — a stale `PRELOOP_STORE_URL=postgres://…` must not mislabel
+    // every SQLite operation.
+    let store_backend = {
+        let effective_url = config
+            .store_url
+            .clone()
+            .or_else(|| std::env::var(crate::store::STORE_URL_ENV).ok())
+            .unwrap_or_default();
+        let store_url = crate::store::parse_store_url(&effective_url);
+        // One decorator around the private `Store` trait — never per-backend
+        // duplication. The backend label is bounded to sqlite|postgres.
+        state.store = crate::store::InstrumentedStore::wrap(
+            state.store.clone(),
+            state.observability.clone(),
+            match &store_url {
+                Ok(crate::store::StoreUrl::Postgres(_)) => "postgres",
+                _ => "sqlite",
+            },
+        );
+        match &store_url {
+            Ok(crate::store::StoreUrl::Postgres(_)) => {
+                preloop_observability::status::StoreBackend::Postgres
+            }
+            _ => preloop_observability::status::StoreBackend::Sqlite,
+        }
+    };
+    if let Some(ps) = config.pool_status.clone() {
+        state.pool_status = ps;
+    }
+    // Ensure uptime base is now (AppState::new set it, but re-arm after store load).
+    state.started_at = std::time::Instant::now();
     if let Some(queue_depth) = config.queue_depth.clone() {
         state.queue_depth = queue_depth;
         // The pool shares this same atomic and only forks a runner while it
@@ -435,22 +905,73 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             state.inner.lock().await.queue.len(),
             std::sync::atomic::Ordering::Release,
         );
+        state
+            .pool_status
+            .set_queue_depth(state.queue_depth.load(std::sync::atomic::Ordering::Acquire) as u32);
     }
     if let Some(next_job_runs_on) = config.next_job_runs_on.clone() {
         state.next_job_runs_on = next_job_runs_on;
+        if let Ok(v) = state.next_job_runs_on.read() {
+            state.pool_status.set_next_job_runs_on(v.clone());
+        }
     }
     {
         let inner = state.inner.lock().await;
         crate::runtime_scheduling::sync_next_job_labels(&inner, &state.next_job_runs_on);
+        if state.pool_status.snapshot().next_job_runs_on.is_empty() {
+            if let Ok(v) = state.next_job_runs_on.read() {
+                state.pool_status.set_next_job_runs_on(v.clone());
+            }
+        }
     }
     {
         let pool_managed = config.pending_registrations.is_some();
         if let Some(pending_registrations) = config.pending_registrations.clone() {
             state.pending_registrations = pending_registrations;
+            // Mirror into consolidated handle for sampler visibility
+            if let Ok(map) = state.pending_registrations.read() {
+                for (k, v) in map.iter() {
+                    state.pool_status.insert_pending(k.clone(), *v);
+                }
+            }
         }
         let mut inner = state.inner.lock().await;
         inner.pool_assignments_enabled = pool_managed;
         inner.require_job_assignments = config.require_job_assignments;
+    }
+    if let Some(pool_preparing) = config.pool_preparing.clone() {
+        state.pool_preparing = Some(pool_preparing.clone());
+        if pool_preparing.load(std::sync::atomic::Ordering::Acquire) {
+            state.pool_status.set_preparing(true);
+        }
+    }
+    // Seed the initial snapshot from the recovered state so /readyz and
+    // /api/v1/status have real data before the first 5s tick: a restart with
+    // persisted queued/in-progress runs must not report an empty status for
+    // the first interval. Runs after the pool-status wiring above so the
+    // seeded pool section already carries the initialized queue depth,
+    // next-job labels, pending registrations and preparing flag instead of
+    // waiting for the first 5s tick to mirror them.
+    {
+        let inputs = {
+            let inner = state.inner.lock().await;
+            collect_snapshot_inputs(&inner)
+        };
+        let init = build_operational_snapshot_sync(
+            inputs,
+            state.pool_status.snapshot(),
+            &state.observability,
+            state.started_at,
+            false,
+            state.scheduler.is_some(),
+            &state.state_dir,
+            // Startup-time read, before the server accepts requests; the
+            // 5s tick performs the same read on the blocking pool instead.
+            collect_storage_components(&state.state_dir),
+            state.github_app.is_some(),
+            store_backend.clone(),
+        );
+        *state.status_snapshot.write() = init;
     }
     if !config.listen.ip().is_loopback() && state.system_token == DEFAULT_PRELOOP_SYSTEM_TOKEN {
         anyhow::bail!(
@@ -467,6 +988,8 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         inner.oidc_issuer = oidc_issuer;
     }
     let shutdown = CancellationToken::new();
+    // Heartbeat for scheduler scan (critical) if enabled — beat periodically.
+    let scheduler_heartbeat = state.observability.heartbeat().clone();
     if config.enable_scheduler {
         let scheduler = crate::scheduler::Scheduler::new();
         state.scheduler = Some(scheduler.clone());
@@ -475,15 +998,34 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             shutdown: shutdown.clone(),
         });
         let scheduler_clone = scheduler.clone();
+        // The scheduler heartbeat must prove the startup scan progressed, not
+        // that an unrelated timer is awake. The scan tasks beat it per
+        // workflow file and deregister on completion: a scan that hangs
+        // stops beating and `/readyz` goes 503; a completed scan is
+        // not a stale critical task. A panic preserves the handle as failed,
+        // so `/readyz` remains unhealthy instead of losing the task entry.
+        let scan_hb = scheduler_heartbeat.clone();
         if let Some(workspace) = state.local_workspace.clone() {
+            let shared_for_scan = shared_for_scan.clone();
             tokio::spawn(async move {
+                let handle = scan_hb.register(
+                    "scheduler_scan",
+                    preloop_observability::Criticality::Critical,
+                );
                 scheduler_clone
-                    .scan_workspace(&workspace, shared_for_scan)
+                    .scan_workspace(&workspace, shared_for_scan, Some(handle))
                     .await;
             });
         } else {
+            let shared_for_scan = shared_for_scan.clone();
             tokio::spawn(async move {
-                scheduler_clone.scan_remote(shared_for_scan).await;
+                let handle = scan_hb.register(
+                    "scheduler_scan",
+                    preloop_observability::Criticality::Critical,
+                );
+                scheduler_clone
+                    .scan_remote(shared_for_scan, Some(handle))
+                    .await;
             });
         }
     }
@@ -558,10 +1100,15 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     };
     let router = build_app(state.clone(), shutdown.clone(), test_api_token);
 
-    state.pool_preparing = config.pool_preparing.clone();
     let shared = Arc::new(SharedState {
-        state,
+        state: state.clone(),
         shutdown: shutdown.clone(),
+    });
+
+    // 5s sampler — clone needed state under lock, release, then publish.
+    let sampler_shared = shared.clone();
+    tokio::spawn(async move {
+        run_state_sampler(sampler_shared, store_backend).await;
     });
 
     let checker_shared = shared.clone();

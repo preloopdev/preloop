@@ -7126,26 +7126,7 @@ async fn fork_pull_request_webhook_jobs_are_downgraded_and_secrets_denied() {
     .await
     .unwrap();
 
-    let git = |args: &[&str]| -> String {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(&ws_dir)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout).unwrap().trim().to_owned()
-    };
-    git(&["init", "-b", "main"]);
-    git(&["config", "user.email", "preloop-tests@example.invalid"]);
-    git(&["config", "user.name", "Preloop Tests"]);
-    git(&["add", ".github/workflows/test.yml"]);
-    git(&["commit", "-m", "test workflow"]);
-    let base_sha = git(&["rev-parse", "HEAD"]);
+    let base_sha = commit_workflow_fixture(&ws_dir, &[".github/workflows/test.yml"]);
 
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     state.webhook_secret = Some("super-secret".to_owned());
@@ -9302,26 +9283,7 @@ jobs:
         .await
         .unwrap();
 
-    let git = |args: &[&str]| -> String {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(&ws_dir)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout).unwrap().trim().to_owned()
-    };
-    git(&["init", "-b", "main"]);
-    git(&["config", "user.email", "preloop-tests@example.invalid"]);
-    git(&["config", "user.name", "Preloop Tests"]);
-    git(&["add", ".github/workflows/build.yml"]);
-    git(&["commit", "-m", "test workflow"]);
-    let event_sha = git(&["rev-parse", "HEAD"]);
+    let event_sha = commit_workflow_fixture(&ws_dir, &[".github/workflows/build.yml"]);
 
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     state.webhook_secret = Some("super-secret".to_owned());
@@ -9466,12 +9428,7 @@ jobs:
         );
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
     };
-    git(&["init", "-b", "main"]);
-    git(&["config", "user.email", "preloop-tests@example.invalid"]);
-    git(&["config", "user.name", "Preloop Tests"]);
-    git(&["add", ".github/workflows/build.yml"]);
-    git(&["commit", "-m", "old workflow"]);
-    let event_sha = git(&["rev-parse", "HEAD"]);
+    let event_sha = commit_workflow_fixture(&ws_dir, &[".github/workflows/build.yml"]);
 
     std::fs::write(ws_dir.join(".github/workflows/build.yml"), new_workflow).unwrap();
     git(&["add", ".github/workflows/build.yml"]);
@@ -9564,24 +9521,7 @@ jobs:
     )
     .unwrap();
 
-    let git = |args: &[&str]| {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(&ws_dir)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    };
-    git(&["init", "-b", "main"]);
-    git(&["config", "user.email", "preloop-tests@example.invalid"]);
-    git(&["config", "user.name", "Preloop Tests"]);
-    git(&["add", ".github/workflows/build.yml"]);
-    git(&["commit", "-m", "current workflow"]);
+    commit_workflow_fixture(&ws_dir, &[".github/workflows/build.yml"]);
 
     let missing_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned();
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -9663,24 +9603,7 @@ jobs:
     )
     .unwrap();
 
-    let git = |args: &[&str]| {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(&ws_dir)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    };
-    git(&["init", "-b", "main"]);
-    git(&["config", "user.email", "preloop-tests@example.invalid"]);
-    git(&["config", "user.name", "Preloop Tests"]);
-    git(&["add", ".github/workflows/build.yml"]);
-    git(&["commit", "-m", "base workflow"]);
+    commit_workflow_fixture(&ws_dir, &[".github/workflows/build.yml"]);
 
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     state.webhook_secret = Some("super-secret".to_owned());
@@ -9723,7 +9646,7 @@ jobs:
             Request::builder()
                 .method(Method::POST)
                 .uri("/api/v1/github/webhooks")
-                .header("x-github-event", "pull_request")
+                .header("x-github-event", "pull_request_target")
                 .header("x-github-delivery", "missing-base-sha")
                 .header("x-hub-signature-256", format!("sha256={signature}"))
                 .header("content-type", "application/json")
@@ -9771,26 +9694,7 @@ jobs:
         .await
         .unwrap();
 
-    let git = |args: &[&str]| -> String {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(&ws_dir)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout).unwrap().trim().to_owned()
-    };
-    git(&["init", "-b", "main"]);
-    git(&["config", "user.email", "preloop-tests@example.invalid"]);
-    git(&["config", "user.name", "Preloop Tests"]);
-    git(&["add", ".github/workflows/build.yml"]);
-    git(&["commit", "-m", "test workflow"]);
-    let event_sha = git(&["rev-parse", "HEAD"]);
+    let event_sha = commit_workflow_fixture(&ws_dir, &[".github/workflows/build.yml"]);
 
     let run_id = {
         let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -9970,26 +9874,7 @@ impl WebhookDedupFixture {
         )
         .unwrap();
 
-        let git = |args: &[&str]| -> String {
-            let output = Command::new("git")
-                .args(args)
-                .current_dir(&ws_dir)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "git {:?} failed: {}",
-                args,
-                String::from_utf8_lossy(&output.stderr)
-            );
-            String::from_utf8(output.stdout).unwrap().trim().to_owned()
-        };
-        git(&["init", "-b", "main"]);
-        git(&["config", "user.email", "preloop-tests@example.invalid"]);
-        git(&["config", "user.name", "Preloop Tests"]);
-        git(&["add", ".github/workflows/build.yml"]);
-        git(&["commit", "-m", "test workflow"]);
-        let event_sha = git(&["rev-parse", "HEAD"]);
+        let event_sha = commit_workflow_fixture(&ws_dir, &[".github/workflows/build.yml"]);
 
         let mut state = AppState::new(temp.path().join("state").to_path_buf())
             .await
@@ -10179,12 +10064,7 @@ jobs:
         );
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
     };
-    git(&["init", "-b", "main"]);
-    git(&["config", "user.email", "preloop-tests@example.invalid"]);
-    git(&["config", "user.name", "Preloop Tests"]);
-    git(&["add", ".github/workflows/test.yml"]);
-    git(&["commit", "-m", "test workflow"]);
-    let base_sha = git(&["rev-parse", "HEAD"]);
+    let base_sha = commit_workflow_fixture(&ws_dir, &[".github/workflows/test.yml"]);
     git(&["commit", "--allow-empty", "-m", "head commit"]);
     let head_sha = git(&["rev-parse", "HEAD"]);
 
@@ -11175,26 +11055,7 @@ async fn config_webhook_secret_verifies_signed_deliveries() {
     .await
     .unwrap();
 
-    let git = |args: &[&str]| -> String {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(&ws_dir)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout).unwrap().trim().to_owned()
-    };
-    git(&["init", "-b", "main"]);
-    git(&["config", "user.email", "preloop-tests@example.invalid"]);
-    git(&["config", "user.name", "Preloop Tests"]);
-    git(&["add", ".github/workflows/build.yml"]);
-    git(&["commit", "-m", "test workflow"]);
-    let event_sha = git(&["rev-parse", "HEAD"]);
+    let event_sha = commit_workflow_fixture(&ws_dir, &[".github/workflows/build.yml"]);
     let config_path = temp.path().join("config.toml");
     std::fs::write(
         &config_path,
@@ -14958,6 +14819,23 @@ async fn generated_server_dag_properties_1000_cases() {
             );
         }
     }
+}
+
+fn commit_workflow_fixture(worktree: &FsPath, paths: &[&str]) -> String {
+    git_fixture_command(worktree, &["init", "-b", "main"]);
+    git_fixture_command(
+        worktree,
+        &["config", "user.email", "preloop-tests@example.invalid"],
+    );
+    git_fixture_command(worktree, &["config", "user.name", "Preloop Tests"]);
+    let mut add = vec!["add"];
+    add.extend_from_slice(paths);
+    git_fixture_command(worktree, &add);
+    git_fixture_command(worktree, &["commit", "-m", "test workflow"]);
+    String::from_utf8(git_fixture_output(worktree, &["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_owned()
 }
 
 fn git_fixture_command(worktree: &FsPath, args: &[&str]) {
@@ -19195,6 +19073,8 @@ fn server_config_debug_redacts_store_url_password() {
         oidc_issuer: None,
         enable_scheduler: false,
         pending_registrations: None,
+        pool_status: None,
+        observability: None,
         require_job_assignments: false,
     };
     let debug = format!("{config:?}");

@@ -91,7 +91,7 @@ jobs:
       - run: cargo fmt --all --check
       - run: |
           # Run clippy on warning-free crates with strict -D warnings
-          cargo clippy --locked -p preloop-gha-protocol -p preloop-gha-parser -p preloop-gha-expressions -p preloop-cache -p preloop-artifacts -p runner-watch -p preloop-conformance --all-targets -- -D warnings
+          cargo clippy --locked -p preloop-gha-protocol -p preloop-gha-parser -p preloop-gha-expressions -p preloop-cache -p preloop-artifacts -p runner-watch -p preloop-conformance -p preloop-observability --all-targets -- -D warnings
           # Run clippy on crates with pre-existing warnings without -D warnings
           cargo clippy --locked -p preloop-runner -p preloop-runner-server -p preloop-runner-client -p preloop-dap --all-targets
       # cargo test (libtest) measured faster than nextest on this pool:
