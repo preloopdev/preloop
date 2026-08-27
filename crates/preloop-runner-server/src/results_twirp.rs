@@ -393,6 +393,18 @@ pub(crate) fn scoped_cache_key(key: &str, scope: Option<&str>, repository: Optio
     )
 }
 
+/// SHA-256 digest of a scoped cache key + version. The cache key is
+/// workflow-controlled content; log the digest (plus `version_len`) instead
+/// of the raw key/version so entries correlate across the create/finalize
+/// log records while leaking nothing.
+fn cache_id_digest(key: &str, version: &str) -> String {
+    use sha2::Digest;
+    format!(
+        "{:x}",
+        sha2::Sha256::digest(format!("{key}\u{0}{version}").as_bytes())
+    )
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct CacheV2CreateRequest {
     pub(crate) key: String,
@@ -713,13 +725,7 @@ pub(crate) async fn twirp_cache_v2_create(
     // The cache key is workflow-controlled content; never log it or the
     // version verbatim. A SHA-256 digest identifies the entry well enough to
     // correlate with the finalize/restore logs while leaking nothing.
-    let cache_id = {
-        use sha2::Digest;
-        format!(
-            "{:x}",
-            sha2::Sha256::digest(format!("{storage_key}\u{0}{version}").as_bytes())
-        )
-    };
+    let cache_id = cache_id_digest(&storage_key, &version);
     info!(
         cache_id = %cache_id,
         version_len = version.len(),
@@ -830,9 +836,12 @@ pub(crate) async fn twirp_cache_v2_finalize(
     .await;
 
     let total_ms = t0.elapsed().as_millis();
+    // Match the create record: log the digest + length, never the raw
+    // workflow-controlled key/version.
+    let cache_id = cache_id_digest(&key, &version);
     tracing::info!(
-        key,
-        version,
+        cache_id = %cache_id,
+        version_len = version.len(),
         size = bytes.len(),
         read_ms,
         total_ms,

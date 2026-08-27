@@ -369,6 +369,12 @@ pub struct AppState {
     /// Cached operational snapshot, updated every 5s by the sampler without holding `inner`.
     pub status_snapshot:
         Arc<parking_lot::RwLock<preloop_observability::status::OperationalSnapshot>>,
+    /// (run, job) pairs whose terminal transition has already been recorded
+    /// (`preloop.job.completed` metric + terminal log). Seeded from the
+    /// restored run record at startup; guards `emit` so a replayed terminal
+    /// `JobStatus` (repeated timeline PATCH after completion) is recorded
+    /// exactly once per job.
+    pub(crate) terminal_jobs_recorded: Arc<std::sync::Mutex<BTreeSet<(RunId, JobId)>>>,
     /// Consolidated pool handle replacing the four ad-hoc Option<Arc<…>> fields.
     pub pool_status: Arc<preloop_observability::status::PoolStatus>,
     /// When this AppState was created (for uptime).
@@ -744,6 +750,21 @@ impl AppState {
             .unwrap_or(0)
             .saturating_add(1);
         let inner = recovered;
+        // Seed the terminal-transition marker from the restored run record so
+        // a replayed terminal `JobStatus` after a restart cannot double-record
+        // `preloop.job.completed` for a job that already completed.
+        let terminal_jobs_recorded = Arc::new(std::sync::Mutex::new(
+            inner
+                .runs
+                .iter()
+                .flat_map(|(run_id, run)| {
+                    run.jobs
+                        .iter()
+                        .filter(|(_, status)| status.is_terminal())
+                        .map(move |(job_id, _)| (*run_id, job_id.clone()))
+                })
+                .collect::<BTreeSet<(RunId, JobId)>>(),
+        ));
         // Capture queue length before moving `inner` into the Mutex so the
         // `queue_depth` atomic is set to the recovered ready-queue size.
         let recovered_queue_len = inner.queue.len();
@@ -889,6 +910,7 @@ impl AppState {
             status_snapshot: Arc::new(parking_lot::RwLock::new(
                 preloop_observability::status::OperationalSnapshot::default(),
             )),
+            terminal_jobs_recorded,
             pool_status: Arc::new(preloop_observability::status::PoolStatus::default()),
             started_at: std::time::Instant::now(),
             // Mirror the recovered ready-queue size so an on-demand runner
@@ -941,13 +963,34 @@ impl AppState {
                 ],
             );
         }
-        // Record job terminal transitions exactly once. Guard with is_terminal
-        // so we don't double-count non-terminal status updates. The event
-        // itself is the proof of old→terminal movement, so we record here
-        // rather than at the state mutation to avoid double-counting on
-        // duplicate `store_run_event` emits.
+        // Record job terminal transitions exactly once per job. `is_terminal`
+        // alone is not enough: repeated timeline PATCHes (and replayed
+        // completions) can re-deliver a terminal `JobStatus` after the job
+        // already completed, and every delivery would inflate
+        // `preloop.job.completed` and duplicate the terminal log record.
+        // The first terminal event for a job wins; the marker is seeded from
+        // the restored run record at startup so a post-restart replay cannot
+        // double-record either. Recording here rather than at the state
+        // mutation avoids double-counting on duplicate `store_run_event`
+        // emits. A duplicate event is still a duplicate — drop it entirely
+        // (side effects, persistence and broadcast) rather than re-append the
+        // same terminal record to the timeline.
         match &event {
-            NdjsonEvent::JobStatus { status, reason, .. } if status.is_terminal() => {
+            NdjsonEvent::JobStatus {
+                run_id,
+                job_id,
+                status,
+                reason,
+                ..
+            } if status.is_terminal() => {
+                let first_terminal = self
+                    .terminal_jobs_recorded
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert((*run_id, job_id.clone()));
+                if !first_terminal {
+                    return;
+                }
                 let conclusion = execution_conclusion(*status);
                 // `reason: None` is the common case (most terminal transitions
                 // carry none) and means "no reason supplied" — not

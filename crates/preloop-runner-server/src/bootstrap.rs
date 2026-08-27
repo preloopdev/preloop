@@ -450,6 +450,15 @@ struct SnapshotInputs {
     runner_caps: Vec<RunnerCapabilities>,
     debug_active_sessions: u32,
     debug_oldest_session_seconds: Option<f64>,
+    /// Jobs parked behind job-level concurrency gates (FIFO).
+    concurrency_blocked: u32,
+    /// Concurrency-group admission state, derived from
+    /// `inner.concurrency_groups`. Queue-mode limits and overflow counts are
+    /// not tracked in group state and stay zero.
+    concurrency_groups_active: u32,
+    concurrency_groups_contended: u32,
+    concurrency_pending_holders: u32,
+    concurrency_deepest_group_pending: u32,
 }
 
 /// Collect [`SnapshotInputs`] from `inner` while the state lock is held.
@@ -531,6 +540,24 @@ fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
             now_ms.saturating_sub(created_at_ms) as f64 / 1000.0
         });
 
+    // Concurrency-group admission state: one group per (repo, group) key,
+    // holding at most one running holder plus a FIFO pending queue.
+    let mut concurrency_groups_active = 0u32;
+    let mut concurrency_groups_contended = 0u32;
+    let mut concurrency_pending_holders = 0u32;
+    let mut concurrency_deepest_group_pending = 0u32;
+    for group in inner.concurrency_groups.values() {
+        if group.running.is_some() {
+            concurrency_groups_active += 1;
+        }
+        if !group.pending.is_empty() {
+            concurrency_groups_contended += 1;
+        }
+        concurrency_pending_holders += group.pending.len() as u32;
+        concurrency_deepest_group_pending =
+            concurrency_deepest_group_pending.max(group.pending.len() as u32);
+    }
+
     SnapshotInputs {
         queue_len: inner.queue.len(),
         pending_jobs_len: inner.pending_jobs.len(),
@@ -556,6 +583,11 @@ fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
             .collect(),
         debug_active_sessions: debug_sessions.len() as u32,
         debug_oldest_session_seconds,
+        concurrency_blocked: inner.concurrency_blocked.len() as u32,
+        concurrency_groups_active,
+        concurrency_groups_contended,
+        concurrency_pending_holders,
+        concurrency_deepest_group_pending,
     }
 }
 
@@ -567,6 +599,7 @@ fn build_operational_snapshot_sync(
     shutdown_requested: bool,
     scheduler_enabled: bool,
     state_dir: &std::path::Path,
+    storage_components: Vec<preloop_observability::status::StorageComponent>,
     github_configured: bool,
     store_backend: preloop_observability::status::StoreBackend,
 ) -> preloop_observability::status::OperationalSnapshot {
@@ -627,14 +660,20 @@ fn build_operational_snapshot_sync(
         jobs: JobsSnapshot {
             ready: inputs.queue_len as u32,
             dependency_blocked: inputs.pending_jobs_len as u32,
-            concurrency_blocked: 0,
+            concurrency_blocked: inputs.concurrency_blocked,
             pending_expansion: inputs.pending_expansions_len as u32,
             expanding: inputs.expanding_len as u32,
             claimable,
             unclaimable,
             oldest_ready_seconds,
         },
-        concurrency: ConcurrencySnapshot::default(),
+        concurrency: ConcurrencySnapshot {
+            groups_active: inputs.concurrency_groups_active,
+            groups_contended: inputs.concurrency_groups_contended,
+            pending_holders: inputs.concurrency_pending_holders,
+            deepest_group_pending: inputs.concurrency_deepest_group_pending,
+            ..Default::default()
+        },
         scheduler: SchedulerSnapshot {
             enabled: scheduler_enabled,
             ..Default::default()
@@ -665,22 +704,11 @@ fn build_operational_snapshot_sync(
             ..Default::default()
         },
         storage: {
-            // Per-component bytes for the state dir. Cheap `metadata` reads on
-            // the 5s tick; a recursive walk would belong on the 60s cadence and
-            // must never run under the state lock.
-            let component = |name: &str, path: std::path::PathBuf| StorageComponent {
-                store: name.to_string(),
-                bytes: std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
-            };
             StorageSnapshot {
                 state_dir: state_dir.display().to_string(),
                 state_fs_free_bytes: None,
                 state_fs_free_ratio: None,
-                // Only the database is a single file. `cache` and `artifacts`
-                // are directories, whose `metadata().len()` is the inode
-                // size, not the contents size; they need the recursive walk
-                // on the 60s cadence.
-                components: vec![component("database", state_dir.join("preloop.db"))],
+                components: storage_components,
                 last_gc_at: None,
             }
         },
@@ -702,6 +730,64 @@ fn build_operational_snapshot_sync(
     }
 }
 
+/// Per-component bytes for the state dir. The `metadata` reads are
+/// synchronous filesystem access; the sampler runs this in
+/// `spawn_blocking` so a stalled state filesystem can never stall the async
+/// executor (request handling, shutdown). A recursive walk would belong on
+/// the 60s cadence and must never run under the state lock.
+fn collect_storage_components(
+    state_dir: &std::path::Path,
+) -> Vec<preloop_observability::status::StorageComponent> {
+    let component =
+        |name: &str, path: std::path::PathBuf| preloop_observability::status::StorageComponent {
+            store: name.to_string(),
+            bytes: std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+        };
+    // Only the database is a single file. `cache` and `artifacts` are
+    // directories, whose `metadata().len()` is the inode size, not the
+    // contents size; they need the recursive walk on the 60s cadence.
+    vec![component("database", state_dir.join("preloop.db"))]
+}
+
+/// Build and publish an operational snapshot from live state. The 5s tick and
+/// the shutdown publish share this path so the final snapshot cannot drift
+/// from the regular cadence; the startup seed builds the same content
+/// synchronously via the same collector + builder.
+async fn publish_snapshot(
+    shared: &SharedState,
+    store_backend: &preloop_observability::status::StoreBackend,
+    shutdown_requested: bool,
+) {
+    // Clone needed state under lock, release, then build.
+    let inputs = {
+        let inner = shared.state.inner.lock().await;
+        collect_snapshot_inputs(&inner)
+    };
+    let pool_snapshot = shared.state.pool_status.snapshot();
+    // The storage bytes are a synchronous filesystem read; run it on the
+    // blocking pool so a stalled state filesystem cannot stall request
+    // handling or shutdown on the executor.
+    let state_dir = shared.state.state_dir.clone();
+    let state_dir_for_meta = state_dir.clone();
+    let storage_components =
+        tokio::task::spawn_blocking(move || collect_storage_components(&state_dir_for_meta))
+            .await
+            .unwrap_or_default();
+    let snap = build_operational_snapshot_sync(
+        inputs,
+        pool_snapshot,
+        &shared.state.observability,
+        shared.state.started_at,
+        shutdown_requested,
+        shared.state.scheduler.is_some(),
+        &state_dir,
+        storage_components,
+        shared.state.github_app.is_some(),
+        store_backend.clone(),
+    );
+    *shared.state.status_snapshot.write() = snap;
+}
+
 async fn run_state_sampler(
     shared: Arc<SharedState>,
     store_backend: preloop_observability::status::StoreBackend,
@@ -719,24 +805,7 @@ async fn run_state_sampler(
         tokio::select! {
             _ = interval.tick() => {
                 heartbeat.beat("state_sampler");
-                // Clone needed state under lock, release, then build.
-                let inputs = {
-                    let inner = shared.state.inner.lock().await;
-                    collect_snapshot_inputs(&inner)
-                };
-                let pool_snapshot = shared.state.pool_status.snapshot();
-                let snap = build_operational_snapshot_sync(
-                    inputs,
-                    pool_snapshot,
-                    &shared.state.observability,
-                    shared.state.started_at,
-                    shared.shutdown.is_cancelled(),
-                    shared.state.scheduler.is_some(),
-                    &shared.state.state_dir,
-                    shared.state.github_app.is_some(),
-                    store_backend.clone(),
-                );
-                *shared.state.status_snapshot.write() = snap;
+                publish_snapshot(&shared, &store_backend, false).await;
                 // Record pool/queue gauges into OTel instruments so `/metrics`
                 // has a single exposition source (the SDK renderer).
                 {
@@ -754,7 +823,16 @@ async fn run_state_sampler(
                     );
                 }
             }
-            _ = shared.shutdown.cancelled() => break,
+            _ = shared.shutdown.cancelled() => {
+                // Publish one last snapshot with the shutdown flag set so
+                // /api/v1/status reports `overall: shutting_down` and
+                // `shutdown_requested: true` while /healthz//readyz already
+                // 503 — without this the flag would only land on the next 5s
+                // tick that never comes.
+                heartbeat.beat("state_sampler");
+                publish_snapshot(&shared, &store_backend, true).await;
+                break;
+            }
         }
     }
 }
@@ -781,39 +859,30 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     if let Some(obs) = config.observability.clone() {
         state.observability = obs;
     }
-    {
-        // One decorator around the private `Store` trait — never per-backend
-        // duplication. The backend label is bounded to sqlite|postgres.
-        // Mirror `open_store` precedence: the explicit URL wins, and the
-        // environment is consulted only when none was supplied. Otherwise a
-        // stale `PRELOOP_STORE_URL=postgres://…` would mislabel every
-        // SQLite operation.
-        let effective_url = config
-            .store_url
-            .clone()
-            .or_else(|| std::env::var("PRELOOP_STORE_URL").ok())
-            .unwrap_or_default();
-        let backend = if effective_url.starts_with("postgres") {
-            "postgres"
-        } else {
-            "sqlite"
-        };
-        state.store = crate::store::InstrumentedStore::wrap(
-            state.store.clone(),
-            state.observability.clone(),
-            backend,
-        );
-    }
-    // The store backend for the status snapshot, resolved with the same
-    // precedence as `open_store`: the explicit URL wins, then the
-    // environment, then SQLite at the state dir.
+    // Resolve the effective store URL exactly once, mirroring `open_store`
+    // precedence: the explicit URL wins, then the environment, then SQLite at
+    // the state dir. Both the instrumentation label and the status-snapshot
+    // backend are derived from this single parsed value so they cannot
+    // drift — a stale `PRELOOP_STORE_URL=postgres://…` must not mislabel
+    // every SQLite operation.
     let store_backend = {
         let effective_url = config
             .store_url
             .clone()
             .or_else(|| std::env::var(crate::store::STORE_URL_ENV).ok())
             .unwrap_or_default();
-        match crate::store::parse_store_url(&effective_url) {
+        let store_url = crate::store::parse_store_url(&effective_url);
+        // One decorator around the private `Store` trait — never per-backend
+        // duplication. The backend label is bounded to sqlite|postgres.
+        state.store = crate::store::InstrumentedStore::wrap(
+            state.store.clone(),
+            state.observability.clone(),
+            match &store_url {
+                Ok(crate::store::StoreUrl::Postgres(_)) => "postgres",
+                _ => "sqlite",
+            },
+        );
+        match &store_url {
             Ok(crate::store::StoreUrl::Postgres(_)) => {
                 preloop_observability::status::StoreBackend::Postgres
             }
@@ -825,28 +894,6 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     }
     // Ensure uptime base is now (AppState::new set it, but re-arm after store load).
     state.started_at = std::time::Instant::now();
-    // Seed the initial snapshot from the recovered state so /readyz and
-    // /api/v1/status have real data before the first 5s tick: a restart with
-    // persisted queued/in-progress runs must not report an empty status for
-    // the first interval.
-    {
-        let inputs = {
-            let inner = state.inner.lock().await;
-            collect_snapshot_inputs(&inner)
-        };
-        let init = build_operational_snapshot_sync(
-            inputs,
-            state.pool_status.snapshot(),
-            &state.observability,
-            state.started_at,
-            false,
-            state.scheduler.is_some(),
-            &state.state_dir,
-            state.github_app.is_some(),
-            store_backend.clone(),
-        );
-        *state.status_snapshot.write() = init;
-    }
     if let Some(queue_depth) = config.queue_depth.clone() {
         state.queue_depth = queue_depth;
         // The pool shares this same atomic and only forks a runner while it
@@ -897,6 +944,34 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         if pool_preparing.load(std::sync::atomic::Ordering::Acquire) {
             state.pool_status.set_preparing(true);
         }
+    }
+    // Seed the initial snapshot from the recovered state so /readyz and
+    // /api/v1/status have real data before the first 5s tick: a restart with
+    // persisted queued/in-progress runs must not report an empty status for
+    // the first interval. Runs after the pool-status wiring above so the
+    // seeded pool section already carries the initialized queue depth,
+    // next-job labels, pending registrations and preparing flag instead of
+    // waiting for the first 5s tick to mirror them.
+    {
+        let inputs = {
+            let inner = state.inner.lock().await;
+            collect_snapshot_inputs(&inner)
+        };
+        let init = build_operational_snapshot_sync(
+            inputs,
+            state.pool_status.snapshot(),
+            &state.observability,
+            state.started_at,
+            false,
+            state.scheduler.is_some(),
+            &state.state_dir,
+            // Startup-time read, before the server accepts requests; the
+            // 5s tick performs the same read on the blocking pool instead.
+            collect_storage_components(&state.state_dir),
+            state.github_app.is_some(),
+            store_backend.clone(),
+        );
+        *state.status_snapshot.write() = init;
     }
     if !config.listen.ip().is_loopback() && state.system_token == DEFAULT_PRELOOP_SYSTEM_TOKEN {
         anyhow::bail!(

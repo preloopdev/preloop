@@ -1147,7 +1147,7 @@ pub(crate) async fn submit_run_inner(
                         .observability
                         .metrics()
                         .lifecycle
-                        .record_concurrency_decision("queue", "accept");
+                        .record_concurrency_decision("workflow", "accept");
                     inner.run_concurrency.insert(run_id, raw.clone());
                 }
                 Ok(false) => {
@@ -1156,7 +1156,7 @@ pub(crate) async fn submit_run_inner(
                         .observability
                         .metrics()
                         .lifecycle
-                        .record_concurrency_decision("queue", "pending");
+                        .record_concurrency_decision("workflow", "pending");
                     hold_entire_run = true;
                     inner.run_concurrency.insert(run_id, raw.clone());
                 }
@@ -1166,7 +1166,7 @@ pub(crate) async fn submit_run_inner(
                         .observability
                         .metrics()
                         .lifecycle
-                        .record_concurrency_decision("queue", "reject");
+                        .record_concurrency_decision("workflow", "reject");
                     // Cancel this run immediately — all jobs Cancelled.
                     for job in &built_jobs {
                         statuses.insert(job.job_id.clone(), ExecutionStatus::Cancelled);
@@ -1234,7 +1234,7 @@ pub(crate) async fn submit_run_inner(
                         .observability
                         .metrics()
                         .lifecycle
-                        .record_concurrency_decision("queue", "reject");
+                        .record_concurrency_decision("workflow", "reject");
                     return Err(ApiError::bad_request(e));
                 }
             }
@@ -1412,7 +1412,7 @@ pub(crate) async fn submit_run_inner(
                             .observability
                             .metrics()
                             .lifecycle
-                            .record_concurrency_decision("queue", "accept");
+                            .record_concurrency_decision("job", "accept");
                         *ready_by_base.entry(base_id).or_default() += 1;
                         ready_jobs += 1;
                     }
@@ -1422,7 +1422,7 @@ pub(crate) async fn submit_run_inner(
                             .observability
                             .metrics()
                             .lifecycle
-                            .record_concurrency_decision("queue", "pending");
+                            .record_concurrency_decision("job", "pending");
                         // parked pending
                     }
                     Err(_) => {
@@ -1431,7 +1431,7 @@ pub(crate) async fn submit_run_inner(
                             .observability
                             .metrics()
                             .lifecycle
-                            .record_concurrency_decision("queue", "reject");
+                            .record_concurrency_decision("job", "reject");
                         // cancelled by queue overflow or eval failure already marked
                     }
                 }
