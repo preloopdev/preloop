@@ -34,14 +34,29 @@ pub(crate) async fn readyz(State(shared): State<Arc<SharedState>>) -> impl IntoR
         let body = json!({ "ready": false, "reason": format!("task_stale:{}", stale) });
         return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
     }
-    let age_secs = {
-        let snap = shared.state.status_snapshot.read();
-        let now = chrono::Utc::now();
-        (now - snap.observed_at).num_milliseconds() as f64 / 1000.0
-    };
-    if age_secs > STALENESS_THRESHOLD.as_secs_f64() {
-        let body = json!({ "ready": false, "reason": "state_sampler_stale" });
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
+    // The snapshot is only refreshed by the `state_sampler` task. An app
+    // built through `routes::app` without one (tests, embedded harnesses)
+    // never promises snapshot freshness, so its `observed_at` age must not
+    // turn /readyz into a permanent 503. Once a sampler has started (and
+    // registered its critical heartbeat), a stale snapshot is a real
+    // outage and is reported as such.
+    let sampler_running = shared
+        .state
+        .observability
+        .heartbeat()
+        .snapshot()
+        .iter()
+        .any(|task| task.name == "state_sampler");
+    if sampler_running {
+        let age_secs = {
+            let snap = shared.state.status_snapshot.read();
+            let now = chrono::Utc::now();
+            (now - snap.observed_at).num_milliseconds() as f64 / 1000.0
+        };
+        if age_secs > STALENESS_THRESHOLD.as_secs_f64() {
+            let body = json!({ "ready": false, "reason": "state_sampler_stale" });
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
+        }
     }
     let body = json!({ "ready": true, "reason": serde_json::Value::Null });
     (StatusCode::OK, Json(body)).into_response()
@@ -1087,7 +1102,10 @@ pub(crate) async fn submit_run_inner(
                 run_id,
                 job_id: job.id.clone(),
                 base_id: job.base_id.clone(),
-                enqueued_at_unix_nanos: crate::models::now_unix_nanos(),
+                // Stamped when the job actually enters the ready queue (the
+                // promotion sites in runtime_scheduling), never at build
+                // time: dependency/concurrency delay is not queue wait.
+                enqueued_at_unix_nanos: 0,
                 needs: job.needs.clone(),
                 if_condition: job.if_condition.clone(),
                 condition_context: pb.condition_context,
@@ -1124,13 +1142,31 @@ pub(crate) async fn submit_run_inner(
                 *queue,
             ) {
                 Ok(true) => {
+                    shared
+                        .state
+                        .observability
+                        .metrics()
+                        .lifecycle
+                        .record_concurrency_decision("queue", "accept");
                     inner.run_concurrency.insert(run_id, raw.clone());
                 }
                 Ok(false) => {
+                    shared
+                        .state
+                        .observability
+                        .metrics()
+                        .lifecycle
+                        .record_concurrency_decision("queue", "pending");
                     hold_entire_run = true;
                     inner.run_concurrency.insert(run_id, raw.clone());
                 }
                 Err(e) if e == "concurrency_queue_overflow" => {
+                    shared
+                        .state
+                        .observability
+                        .metrics()
+                        .lifecycle
+                        .record_concurrency_decision("queue", "reject");
                     // Cancel this run immediately — all jobs Cancelled.
                     for job in &built_jobs {
                         statuses.insert(job.job_id.clone(), ExecutionStatus::Cancelled);
@@ -1193,6 +1229,12 @@ pub(crate) async fn submit_run_inner(
                     });
                 }
                 Err(e) => {
+                    shared
+                        .state
+                        .observability
+                        .metrics()
+                        .lifecycle
+                        .record_concurrency_decision("queue", "reject");
                     return Err(ApiError::bad_request(e));
                 }
             }
@@ -1365,13 +1407,31 @@ pub(crate) async fn submit_run_inner(
                     &mut statuses,
                 ) {
                     Ok(true) => {
+                        shared
+                            .state
+                            .observability
+                            .metrics()
+                            .lifecycle
+                            .record_concurrency_decision("queue", "accept");
                         *ready_by_base.entry(base_id).or_default() += 1;
                         ready_jobs += 1;
                     }
                     Ok(false) => {
+                        shared
+                            .state
+                            .observability
+                            .metrics()
+                            .lifecycle
+                            .record_concurrency_decision("queue", "pending");
                         // parked pending
                     }
                     Err(_) => {
+                        shared
+                            .state
+                            .observability
+                            .metrics()
+                            .lifecycle
+                            .record_concurrency_decision("queue", "reject");
                         // cancelled by queue overflow or eval failure already marked
                     }
                 }
