@@ -1386,8 +1386,12 @@ async fn cmd_engine(
     );
     // Report the real pool configuration: the configured warm size (or zero
     // in on-demand mode) instead of the zero-sized warm default.
-    if let Ok(config) = &pool_config {
-        pool_status.set_desired(config.size as u32);
+    match &pool_config {
+        Ok(config) => pool_status.set_desired(config.size as u32),
+        // A failed config (e.g. missing Linux runner bundle, warned below)
+        // means no pool will ever run: surface that as Disabled instead of
+        // the Warm/OnDemand seed picked from the enable switch alone.
+        Err(_) => pool_status.set_mode(preloop_observability::status::PoolMode::Disabled),
     }
     let pool_available = match &pool_config {
         Ok(_) => true,

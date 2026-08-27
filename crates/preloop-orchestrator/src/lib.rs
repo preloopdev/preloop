@@ -2177,8 +2177,8 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
     // longer carries it.
     remove_golden_record(config, golden);
     if provider.status(golden).await? != MachineState::Missing {
-        vm_telemetry_deregister(config, golden);
         provider.delete(golden).await?;
+        vm_telemetry_deregister(config, golden);
     }
     let spec = MachineSpec {
         name: golden.clone(),
@@ -2288,8 +2288,8 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
     }
     remove_golden_record(config, golden);
     if provider.status(golden).await? != MachineState::Missing {
-        vm_telemetry_deregister(config, golden);
         provider.delete(golden).await?;
+        vm_telemetry_deregister(config, golden);
     }
     // smolvm's `machine create --from` consumes the SMOLPACK, not the ELF
     // launcher stub written at the payload stem. A downloaded release asset
@@ -2340,8 +2340,16 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
             %error, "image preload failed; jobs will pull at run time"
         );
     }
-    provider.stop(golden).await?;
-    provider.start_forkable(golden).await?;
+    if let Err(error) = provider.stop(golden).await {
+        vm_telemetry_deregister(config, golden);
+        let _ = provider.delete(golden).await;
+        return Err(error.into());
+    }
+    if let Err(error) = provider.start_forkable(golden).await {
+        vm_telemetry_deregister(config, golden);
+        let _ = provider.delete(golden).await;
+        return Err(error.into());
+    }
     write_golden_record(config, golden, &env_spec.fingerprint);
     info!(
         machine = golden.as_str(),
@@ -4401,6 +4409,10 @@ async fn provision_runner<P: VmProvider + 'static>(
                     // consume removes it from both stores.
                     if let Some(ps) = &config.pool_status {
                         ps.insert_pending(token, std::time::SystemTime::now());
+                        // Same 600s window as the legacy pending-map prune
+                        // below, so stale tokens don't inflate
+                        // `pending_registrations` forever.
+                        ps.retain_pending_newer_than(std::time::Duration::from_secs(600));
                     }
                     let now = std::time::SystemTime::now();
                     guard.retain(|_, at| {
