@@ -182,6 +182,18 @@ impl MatcherRegistry {
         Self::default()
     }
 
+    /// Merge matchers registered in `current` but absent from `base` into
+    /// `self`. Used to fold a background step's `::add-matcher::` /
+    /// `::remove-matcher::` changes into the job at step completion —
+    /// mirroring the official coordinator's deferred-state flush.
+    pub(crate) fn merge_delta(&mut self, base: &Self, current: &Self) {
+        for (owner, matcher) in &current.matchers {
+            if !base.matchers.contains_key(owner) {
+                self.matchers.insert(owner.clone(), matcher.clone());
+            }
+        }
+    }
+
     /// Add a matcher from a JSON file.
     pub fn add_from_file(&mut self, path: &Path) -> Result<()> {
         let content = std::fs::read_to_string(path)
