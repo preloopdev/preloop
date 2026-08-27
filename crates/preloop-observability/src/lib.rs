@@ -46,7 +46,6 @@ use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider, Temporality};
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::Resource;
 use parking_lot::RwLock;
-use tracing::level_filters::LevelFilter;
 use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::{EnvFilter, Registry};
 use uuid::Uuid;
@@ -95,10 +94,29 @@ impl LogFormat {
 // ---------------------------------------------------------------------------
 
 /// Fully-resolved destination for one signal: URL plus signal-scoped headers.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is redacted: URL userinfo/query are stripped and header values are
+/// masked so OTLP credentials never reach logs.
+#[derive(Clone)]
 pub struct SignalTarget {
     pub url: String,
     pub headers: Vec<(String, String)>,
+}
+
+impl fmt::Debug for SignalTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SignalTarget")
+            .field("url", &sanitize_endpoint(&self.url))
+            .field(
+                "headers",
+                &self
+                    .headers
+                    .iter()
+                    .map(|(k, _)| (k.as_str(), "<redacted>"))
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 /// Per-signal export destinations. Resolution (which env var wins, whether
@@ -134,6 +152,30 @@ pub fn parse_headers(raw: Option<&str>) -> Vec<(String, String)> {
             }
         })
         .collect()
+}
+
+/// Append `/v1/<signal>` to a generic endpoint, keeping any query string at
+/// the end (per the OTLP spec the signal path precedes the query).
+fn with_signal_suffix(generic: &str, suffix: &str) -> String {
+    match generic.split_once('?') {
+        Some((path, query)) => format!("{path}{suffix}?{query}"),
+        None => format!("{generic}{suffix}"),
+    }
+}
+
+/// Best-effort URL sanitizer for `Debug`/errors: strips userinfo and query
+/// without a URL-parser dependency.
+fn sanitize_endpoint(raw: &str) -> String {
+    let without_query = raw.split('?').next().unwrap_or(raw);
+    if let Some(at) = without_query.rfind('@') {
+        // Keep scheme + host/path, hide userinfo.
+        if let Some(scheme_end) = without_query.find("://") {
+            let scheme = &without_query[..scheme_end + 3];
+            return format!("{scheme}***@{}", &without_query[at + 1..]);
+        }
+        return format!("***@{}", &without_query[at + 1..]);
+    }
+    without_query.to_string()
 }
 
 /// Parsed logging + OTel configuration. `Debug` is redacted.
@@ -188,7 +230,10 @@ impl ObservabilityConfig {
         // deviation from the OTel spec default `http://localhost:4318`.
         let generic = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
             .ok()
-            .filter(|v| !v.trim().is_empty() && v.trim() != "none")
+            .filter(|v| {
+                let v = v.trim();
+                !v.is_empty() && !v.eq_ignore_ascii_case("none")
+            })
             .map(|v| v.trim_end_matches('/').to_string());
 
         // Signal-specific endpoint is a complete URL used as-is; the generic
@@ -203,12 +248,12 @@ impl ObservabilityConfig {
                     // the generic endpoint.
                     None
                 } else if value.is_empty() {
-                    generic.as_ref().map(|g| format!("{g}{suffix}"))
+                    generic.as_ref().map(|g| with_signal_suffix(g, suffix))
                 } else {
                     Some(value.trim_end_matches('/').to_string())
                 }
             }
-            Err(_) => generic.as_ref().map(|g| format!("{g}{suffix}")),
+            Err(_) => generic.as_ref().map(|g| with_signal_suffix(g, suffix)),
         };
         let otel_logs_endpoint = resolve("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "/v1/logs");
         let otel_traces_endpoint = resolve("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "/v1/traces");
@@ -279,28 +324,15 @@ impl ObservabilityConfig {
 
     /// Sanitized endpoint for `Debug`/errors: strips userinfo and query.
     fn sanitized_endpoints(&self) -> Vec<(&'static str, String)> {
-        let sanitize = |raw: &str| -> String {
-            // Best-effort: hide `user:pass@` and `?...` without a URL parser dep.
-            let without_query = raw.split('?').next().unwrap_or(raw);
-            if let Some(at) = without_query.rfind('@') {
-                // Keep scheme + host/path, hide userinfo.
-                if let Some(scheme_end) = without_query.find("://") {
-                    let scheme = &without_query[..scheme_end + 3];
-                    return format!("{scheme}***@{}", &without_query[at + 1..]);
-                }
-                return format!("***@{}", &without_query[at + 1..]);
-            }
-            without_query.to_string()
-        };
         let mut out = Vec::new();
         if let Some(url) = &self.otel_traces_endpoint {
-            out.push(("traces", sanitize(url)));
+            out.push(("traces", sanitize_endpoint(url)));
         }
         if let Some(url) = &self.otel_logs_endpoint {
-            out.push(("logs", sanitize(url)));
+            out.push(("logs", sanitize_endpoint(url)));
         }
         if let Some(url) = &self.otel_metrics_endpoint {
-            out.push(("metrics", sanitize(url)));
+            out.push(("metrics", sanitize_endpoint(url)));
         }
         out
     }
@@ -412,6 +444,7 @@ impl TaskHeartbeat {
                 name: e.name,
                 critical: e.critical,
                 heartbeat_age: e.last_beat.elapsed(),
+                panicked: e.panicked,
             })
             .collect()
     }
@@ -480,6 +513,10 @@ pub struct TaskSnapshot {
     pub name: &'static str,
     pub critical: Criticality,
     pub heartbeat_age: Duration,
+    /// True when the task panicked while holding its heartbeat handle. The
+    /// task is gone but deliberately kept visible so status consumers can
+    /// distinguish a crashed task from one with a fresh heartbeat.
+    pub panicked: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -605,12 +642,22 @@ impl Observability {
     pub fn from_config(config: ObservabilityConfig) -> (Self, ObservabilityRuntime) {
         let is_noop = !config.otlp_enabled;
         let targets = config.export_targets();
-        // One rustls client for every signal — the same stack the rest of the
-        // workspace uses (reqwest 0.13).
-        let http_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .ok();
+        // One rustls blocking client for every signal — the same stack the
+        // rest of the workspace uses (reqwest 0.13). A blocking client is
+        // required: the SDK's batch/periodic processors export from plain
+        // worker threads, where an async client would never complete. The
+        // client is built on a fresh thread: reqwest's blocking client spins
+        // up an internal runtime whose drop panics when constructed inside an
+        // entered tokio runtime (we are called from async main / tests).
+        let http_client = std::thread::spawn(|| {
+            reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .ok()
+        })
+        .join()
+        .ok()
+        .flatten();
         let resource = Resource::builder()
             .with_attributes(vec![
                 KeyValue::new("service.name", config.service_name.clone()),
@@ -802,10 +849,10 @@ fn severity_number(severity: &str) -> Severity {
 }
 
 /// Build an OTLP/HTTP span exporter from a resolved signal target, reusing
-/// the shared rustls reqwest client. `None` on build failure — fail open.
+/// the shared rustls blocking reqwest client. `None` on build failure — fail open.
 fn build_span_exporter(
     target: &SignalTarget,
-    http_client: Option<&reqwest::Client>,
+    http_client: Option<&reqwest::blocking::Client>,
 ) -> Option<opentelemetry_otlp::SpanExporter> {
     use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithHttpConfig};
     let mut builder = SpanExporter::builder()
@@ -829,7 +876,7 @@ fn build_span_exporter(
 /// Build an OTLP/HTTP log exporter. `None` on build failure — fail open.
 fn build_log_exporter(
     target: &SignalTarget,
-    http_client: Option<&reqwest::Client>,
+    http_client: Option<&reqwest::blocking::Client>,
 ) -> Option<opentelemetry_otlp::LogExporter> {
     use opentelemetry_otlp::{LogExporter, WithExportConfig, WithHttpConfig};
     let mut builder = LogExporter::builder()
@@ -853,7 +900,7 @@ fn build_log_exporter(
 /// Build an OTLP/HTTP metric exporter. `None` on build failure — fail open.
 fn build_metric_exporter(
     target: &SignalTarget,
-    http_client: Option<&reqwest::Client>,
+    http_client: Option<&reqwest::blocking::Client>,
 ) -> Option<opentelemetry_otlp::MetricExporter> {
     use opentelemetry_otlp::{MetricExporter, WithExportConfig, WithHttpConfig};
     let mut builder = MetricExporter::builder()
@@ -939,40 +986,54 @@ impl ObservabilityRuntime {
         // `LookupSpan`, which the registry provides.
         let mut chain: Box<
             dyn tracing_subscriber::Layer<tracing_subscriber::registry::Registry> + Send + Sync,
-        > = Box::new(fmt_layer.with_filter(filter));
+        > = Box::new(fmt_layer.with_filter(filter.clone()));
         if let Some(provider) = &self.tracer_provider {
             let tracer = provider.tracer("preloop");
             let layer = tracing_opentelemetry::layer()
                 .with_tracer(tracer)
-                .with_filter(LevelFilter::INFO);
+                .with_filter(filter.clone());
             chain = Box::new(chain.and_then(layer));
         }
         if let Some(provider) = &self.logger_provider {
-            // Filter the log bridge to INFO+ to avoid exporting TRACE/DEBUG
-            // noise from hyper, h2, reqwest, and tokio internals, and to
-            // prevent infinite recursion (the OTLP exporter uses reqwest,
-            // whose tracing events would re-enter the bridge).
-            let layer = OpenTelemetryTracingBridge::new(provider).with_filter(LevelFilter::INFO);
+            // Honor `RUST_LOG` on the export path too: an operator who sets
+            // `RUST_LOG=warn` expects the collector to receive warn+ only.
+            // With no `RUST_LOG` set the filter defaults to `info`, matching
+            // the previous INFO+ cap on exported events.
+            let layer = OpenTelemetryTracingBridge::new(provider).with_filter(filter);
             chain = Box::new(chain.and_then(layer));
         }
         let _ = tracing::subscriber::set_global_default(Registry::default().with(chain));
     }
 
-    /// Flush exporters for at most 2s, then exit. Each provider's bounded
-    /// queue is drained; a hung backend drops the remainder rather than
+    /// Flush exporters for at most 2s, then exit.
+    ///
+    /// The synchronous provider shutdowns run on a blocking thread so the
+    /// async executor is never blocked (a current-thread runtime would
+    /// otherwise hang on its own exporter worker), and one 2s deadline bounds
+    /// the entire sequence — a hung backend drops the remainder rather than
     /// delaying shutdown. Export failure is logged by the SDK, never
     /// propagated.
     pub async fn shutdown(mut self) {
-        let timeout = Duration::from_secs(2);
-        if let Some(provider) = self.tracer_provider.take() {
-            let _ = provider.shutdown_with_timeout(timeout);
-        }
-        if let Some(provider) = self.meter_provider.take() {
-            let _ = provider.shutdown_with_timeout(timeout);
-        }
-        if let Some(provider) = self.logger_provider.take() {
-            let _ = provider.shutdown_with_timeout(timeout);
-        }
+        let deadline = Duration::from_secs(2);
+        let providers = (
+            self.tracer_provider.take(),
+            self.meter_provider.take(),
+            self.logger_provider.take(),
+        );
+        let task = tokio::task::spawn_blocking(move || {
+            if let Some(provider) = providers.0 {
+                let _ = provider.shutdown_with_timeout(deadline);
+            }
+            if let Some(provider) = providers.1 {
+                let _ = provider.shutdown_with_timeout(deadline);
+            }
+            if let Some(provider) = providers.2 {
+                let _ = provider.shutdown_with_timeout(deadline);
+            }
+        });
+        // `spawn_blocking` cannot be cancelled; if the deadline passes we
+        // stop awaiting and let the blocking task drain in the background.
+        let _ = tokio::time::timeout(deadline, task).await;
     }
 }
 
@@ -1055,6 +1116,25 @@ mod tests {
     }
 
     #[test]
+    fn generic_none_is_case_insensitive() {
+        let _guard = env_guard();
+        for k in [
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        ] {
+            std::env::remove_var(k);
+        }
+        std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "NONE");
+        let cfg = ObservabilityConfig::from_env();
+        assert!(
+            !cfg.otlp_enabled,
+            "`NONE` must disable export case-insensitively"
+        );
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+    }
+
+    #[test]
     fn signal_specific_endpoint_is_used_as_is() {
         let _guard = env_guard();
         for k in [
@@ -1107,6 +1187,34 @@ mod tests {
         assert_eq!(
             targets.metrics.as_ref().unwrap().url,
             "http://collector:4318/v1/metrics"
+        );
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+    }
+
+    #[test]
+    fn generic_endpoint_query_string_keeps_suffix_before_query() {
+        let _guard = env_guard();
+        for k in [
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        ] {
+            std::env::remove_var(k);
+        }
+        std::env::set_var(
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "https://collector/acme?tenant=x",
+        );
+        let cfg = ObservabilityConfig::from_env();
+        let targets = cfg.export_targets();
+        // The signal path must precede the query string, not become part of it.
+        assert_eq!(
+            targets.traces.as_ref().unwrap().url,
+            "https://collector/acme/v1/traces?tenant=x"
+        );
+        assert_eq!(
+            targets.logs.as_ref().unwrap().url,
+            "https://collector/acme/v1/logs?tenant=x"
         );
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
     }
@@ -1249,6 +1357,13 @@ mod tests {
             "OTEL_EXPORTER_OTLP_ENDPOINT",
             "https://user:secret@example.com:4318/v1/traces?token=abc",
         );
+        for k in [
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        ] {
+            std::env::remove_var(k);
+        }
         std::env::set_var(
             "OTEL_EXPORTER_OTLP_HEADERS",
             "Authorization=Bearer secret123",
@@ -1267,6 +1382,18 @@ mod tests {
             !dbg.contains("user:"),
             "Debug must not contain userinfo: {dbg}"
         );
+        // `SignalTarget`/`ExportTargets` Debug must redact too — they carry
+        // the resolved headers an operator would most likely log.
+        let targets = cfg.export_targets();
+        let targets_dbg = format!("{targets:?}");
+        assert!(
+            !targets_dbg.contains("secret123"),
+            "Debug must not contain header values: {targets_dbg}"
+        );
+        assert!(
+            !targets_dbg.contains("Authorization=Bearer"),
+            "Debug must not contain raw header pairs: {targets_dbg}"
+        );
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
         std::env::remove_var("OTEL_EXPORTER_OTLP_HEADERS");
     }
@@ -1281,7 +1408,12 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_is_bounded() {
-        let (obs, rt) = Observability::from_config(ObservabilityConfig::from_env());
+        // Env is only read during `from_config`; the guard must not be held
+        // across the await below (it is a non-async `std` guard).
+        let (obs, rt) = {
+            let _guard = env_guard();
+            Observability::from_config(ObservabilityConfig::from_env())
+        };
         // Must not hang even though there are no exporters.
         tokio::time::timeout(Duration::from_secs(3), rt.shutdown())
             .await

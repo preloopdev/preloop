@@ -45,7 +45,7 @@ futures = "0.3"
 globset = "0.4"
 indexmap = { version = "2.2", features = ["serde"] }
 proptest = "1.4"
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "form", "query"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "form", "query", "blocking"] }
 serde = { version = "1.0", features = ["derive", "rc"] }
 rand = "0.8"
 # `preserve_order` keeps `Value::Object` in document order instead of sorting
@@ -80,7 +80,9 @@ opentelemetry_sdk = { version = "0.32", default-features = false, features = ["t
 # OTLP/HTTP only — never the tonic/gRPC stack (plan §435-437, §1289). Reuses
 # the workspace reqwest (now 0.13, same line the SDK targets) through
 # `opentelemetry_http::HttpClient`, so there is exactly one HTTP client.
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "trace", "metrics", "logs"] }
+# `reqwest-blocking-client` lets the SDK's plain-thread batch/periodic
+# processors export (an async client never completes off-runtime).
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "trace", "metrics", "logs", "reqwest-blocking-client"] }
 opentelemetry-http = { version = "0.32", default-features = false, features = ["reqwest"] }
 opentelemetry-appender-tracing = "0.32"
 opentelemetry-semantic-conventions = "0.32"
