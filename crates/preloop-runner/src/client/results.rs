@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use super::http::HttpClient;
 
 /// Client for the results service (Twirp/proto endpoints).
+#[derive(Clone)]
 pub struct ResultsClient {
     http: HttpClient,
     base_url: String,
