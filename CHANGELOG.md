@@ -9,6 +9,10 @@ Releases before v0.27.0 predate the changelog.
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-08-28
+
+<!-- preloop:skip-golden -->
+
 ### Fixed
 
 - Cancelling a job no longer leaves background processes running on the
@@ -37,6 +41,17 @@ Releases before v0.27.0 predate the changelog.
   two-thirds through, `preloop serve` reported the official golden as
   "unavailable", and the run fell through to a local bake. The budget is
   now one hour, which covers any link above ~21 Mbps.
+
+- The GitHub App webhook-subscription check no longer warns about events
+  GitHub can never report. `pull_request_target` is a workflow trigger
+  synthesized from the `pull_request` webhook, not a deliverable event, and
+  `check_run`/`check_suite` are auto-subscribed for Apps holding `checks:
+  write` and so never appear in `GET /app`'s `events`. Both made the startup
+  warning fire forever on a correctly configured App. The check now also
+  reads the App's permissions from the same response and separates events
+  that can be ticked today from those whose checkbox GitHub does not render
+  until the gating permission is granted — the previous message sent
+  operators looking for controls that were not on the page.
 
 ### Changed
 
