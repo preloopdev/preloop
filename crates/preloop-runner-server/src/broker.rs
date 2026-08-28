@@ -271,6 +271,7 @@ pub(crate) async fn next_message_broker_ref(
             .queue_depth
             .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
         runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
+        record_claim_queue_wait(&shared, &claimed);
         let Some(queued) = claimed else {
             drop(inner);
             if wait_seconds == 0 {
@@ -380,6 +381,12 @@ pub(crate) async fn broker_session_root(
             .broker_session_runners
             .insert(session_id.clone(), runner_id);
     }
+    shared
+        .state
+        .observability
+        .metrics()
+        .lifecycle
+        .record_session_transition("create", "ok");
     Ok((
         StatusCode::CREATED,
         Json(json!({
@@ -389,6 +396,35 @@ pub(crate) async fn broker_session_root(
             "orchestrationId": ""
         })),
     ))
+}
+
+/// Record how long a claimed job sat in the ready queue. `enqueued_at` is
+/// stamped when the job enters the queue and survives requeues, so a job
+/// that bounced off a purged runner still measures total queue time. Jobs
+/// restored from a snapshot without the field (`0`) are not recorded.
+fn record_claim_queue_wait(shared: &Arc<SharedState>, claimed: &Option<QueuedJob>) {
+    let Some(queued) = claimed else { return };
+    if queued.enqueued_at_unix_nanos <= 0 {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
+    // Compute the elapsed difference first and only record a positive wait:
+    // a backwards clock or a stamp raced by a requeue must not cast a
+    // negative difference into a huge u64 duration.
+    let elapsed_nanos = now.saturating_sub(queued.enqueued_at_unix_nanos);
+    if elapsed_nanos <= 0 {
+        return;
+    }
+    let elapsed = std::time::Duration::from_nanos(elapsed_nanos as u64);
+    shared
+        .state
+        .observability
+        .metrics()
+        .lifecycle
+        .record_queue_wait("claimed", elapsed);
 }
 
 pub(crate) async fn broker_delete_session_root(
@@ -403,7 +439,15 @@ pub(crate) async fn broker_delete_session_root(
     if let Some(session_id) = header_session.or_else(|| params.get("sessionId").map(String::as_str))
     {
         remove_broker_session(&shared, session_id, runner_id).await?;
+        shared
+            .state
+            .observability
+            .metrics()
+            .lifecycle
+            .record_session_transition("delete", "ok");
     }
+    // No session id present: nothing was deleted, so no transition is
+    // recorded — a 204 with no-op must not count as a successful delete.
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -414,6 +458,12 @@ pub(crate) async fn broker_delete_session_by_path(
 ) -> Result<StatusCode, ApiError> {
     let runner_id = authenticated_runner_id(&shared, &headers, None)?;
     remove_broker_session(&shared, &session_id, runner_id).await?;
+    shared
+        .state
+        .observability
+        .metrics()
+        .lifecycle
+        .record_session_transition("delete", "ok");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -580,6 +630,7 @@ pub(crate) async fn next_message_broker_ref_root(
                     .queue_depth
                     .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
                 runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
+                record_claim_queue_wait(&shared, &claimed);
                 if let Some(queued) = claimed {
                     if let Some(run) = inner.runs.get_mut(&queued.run_id) {
                         run.status = ExecutionStatus::InProgress;
@@ -699,75 +750,11 @@ pub(crate) async fn broker_acquire_job(
             }
         };
         if let Some(minted) = minted {
-            let token = minted.token;
             tracing::info!(
-                token_len = token.len(),
+                token_len = minted.token.len(),
                 "minted dispatch GitHub token at claim"
             );
-            message.variables.insert(
-                "system.github.token".to_owned(),
-                preloop_gha_protocol::azdo::VariableValue::secret(token.clone()),
-            );
-            message.variables.insert(
-                "github_token".to_owned(),
-                preloop_gha_protocol::azdo::VariableValue::secret(token.clone()),
-            );
-            // The build-time message also injects the token as `GITHUB_TOKEN`
-            // (the `${{ secrets.GITHUB_TOKEN }}` alias). It must follow the
-            // minted token too, or a fork job's hostile step code could read
-            // the stale local runtime token from `secrets.GITHUB_TOKEN`
-            // while `github.token` already carries the scoped mint.
-            message.variables.insert(
-                "GITHUB_TOKEN".to_owned(),
-                preloop_gha_protocol::azdo::VariableValue::secret(token.clone()),
-            );
-            // Restate what the token carries when the installation could not
-            // grant everything. The message was built with the requested set,
-            // and leaving it would print authority the token does not have in
-            // the runner's `GITHUB_TOKEN Permissions` group — sending anyone
-            // debugging the resulting 403 to the wrong place. The narrowed
-            // grant replaces only App-scoped entries: Actions-only metadata
-            // (`IdToken: write` for a trusted job whose OIDC grant is still
-            // live) is preserved from the build-time wire set, and a
-            // fork-restricted job's wire set has no IdToken to preserve.
-            if let Some(effective) = minted.effective_permissions {
-                let merged = merge_narrowed_wire_permissions(
-                    message
-                        .variables
-                        .get("system.github.token.permissions")
-                        .and_then(|variable| variable.value.as_deref()),
-                    &effective,
-                );
-                message.variables.insert(
-                    "system.github.token.permissions".to_owned(),
-                    preloop_gha_protocol::azdo::VariableValue::new(
-                        preloop_gha_parser::job_builder::token_permissions_wire_json(&merged),
-                    ),
-                );
-            }
-            // The workflow's `github` context is built at submission time,
-            // before the App token can exist, so `${{ github.token }}`
-            // inputs (actions/checkout's token, the persist-credentials
-            // config, the non-persist temp-config include) resolve empty
-            // and every git fetch prompts for a username. Patch the minted
-            // token into the context at claim so checkout authenticates
-            // exactly like it does on GitHub-hosted runners — no runner-side
-            // env header needed (an env `extraheader` would duplicate the
-            // one checkout persists itself: "Duplicate header: Authorization",
-            // HTTP 400).
-            match message.context_data.get_mut("github") {
-                Some(preloop_gha_protocol::azdo::PipelineContextData::Dict(github)) => {
-                    github.insert(
-                        "token".to_owned(),
-                        preloop_gha_protocol::azdo::PipelineContextData::String(token),
-                    );
-                    tracing::info!("patched minted token into github context");
-                }
-                other => tracing::warn!(
-                    github_context = %match other { Some(_) => "non-dict", None => "missing" },
-                    "could not patch github context token"
-                ),
-            }
+            apply_minted_token_to_message(&mut message, &minted, false);
         }
         // The token request stays registered for the job's lifetime so a
         // re-claim re-mints under the build-time conditions (permission set
@@ -882,54 +869,11 @@ pub(crate) async fn broker_acquire_job(
                 }
             };
             if let Some(minted) = minted {
-                let token = minted.token;
                 tracing::info!(
-                    token_len = token.len(),
+                    token_len = minted.token.len(),
                     "minted re-derived dispatch GitHub token at claim"
                 );
-                message.variables.insert(
-                    "system.github.token".to_owned(),
-                    preloop_gha_protocol::azdo::VariableValue::secret(token.clone()),
-                );
-                message.variables.insert(
-                    "github_token".to_owned(),
-                    preloop_gha_protocol::azdo::VariableValue::secret(token.clone()),
-                );
-                message.variables.insert(
-                    "GITHUB_TOKEN".to_owned(),
-                    preloop_gha_protocol::azdo::VariableValue::secret(token.clone()),
-                );
-                // Restate what the token carries when the installation could
-                // not grant everything, mirroring the normal mint path: the
-                // recovered message's wire set is the requested set, and
-                // leaving it would print authority the token does not have.
-                if let Some(effective) = minted.effective_permissions {
-                    let merged = merge_narrowed_wire_permissions(
-                        message
-                            .variables
-                            .get("system.github.token.permissions")
-                            .and_then(|variable| variable.value.as_deref()),
-                        &effective,
-                    );
-                    message.variables.insert(
-                        "system.github.token.permissions".to_owned(),
-                        preloop_gha_protocol::azdo::VariableValue::new(
-                            preloop_gha_parser::job_builder::token_permissions_wire_json(&merged),
-                        ),
-                    );
-                }
-                match message.context_data.get_mut("github") {
-                    Some(preloop_gha_protocol::azdo::PipelineContextData::Dict(github)) => {
-                        github.insert(
-                            "token".to_owned(),
-                            preloop_gha_protocol::azdo::PipelineContextData::String(token),
-                        );
-                    }
-                    other => tracing::warn!(
-                        github_context = %match other { Some(_) => "non-dict", None => "missing" },
-                        "could not patch github context token for re-derived request"
-                    ),
-                }
+                apply_minted_token_to_message(&mut message, &minted, true);
                 let mut inner = shared.state.inner.lock().await;
                 inner.broker_messages.insert(request_id, message.clone());
             }
@@ -1007,6 +951,17 @@ pub(crate) async fn broker_acquire_job(
     message.request_id = 0;
     let payload = serde_json::to_value(&message)
         .map_err(|error| ApiError::internal(format!("serialize broker job payload: {error}")))?;
+    // Broker poll outcome — bounded, exactly one per successful claim. Queue
+    // wait is recorded at the claim sites in `next_message_broker_ref` /
+    // `next_message_disttask`, where the enqueue timestamp is still on the
+    // job; by the time the acquire payload is built the queue position has
+    // been lost.
+    shared
+        .state
+        .observability
+        .metrics()
+        .lifecycle
+        .record_broker_poll("job");
     Ok(Json(payload))
 }
 
@@ -1047,6 +1002,87 @@ pub(crate) fn re_mint_snapshot_tokens(
 pub(crate) struct MintedGitHubToken {
     pub(crate) token: String,
     pub(crate) effective_permissions: Option<BTreeMap<String, String>>,
+}
+
+/// Apply a freshly minted dispatch token to the job message: inject the
+/// three secret variables (`system.github.token`, `github_token`,
+/// `GITHUB_TOKEN`), restate the narrowed permission set, and patch the
+/// minted token into the `github` context so `${{ github.token }}` inputs
+/// (checkout's token, persist-credentials config) authenticate. Shared by
+/// the normal mint path and the re-derived-request fallback, which had
+/// already diverged (the fallback lost the success log). `re_derived` only
+/// tailors the log wording: the derived path historically logged no
+/// success line.
+fn apply_minted_token_to_message(
+    message: &mut azdo::AgentJobRequestMessage,
+    minted: &MintedGitHubToken,
+    re_derived: bool,
+) {
+    let token = &minted.token;
+    message.variables.insert(
+        "system.github.token".to_owned(),
+        preloop_gha_protocol::azdo::VariableValue::secret(token.clone()),
+    );
+    message.variables.insert(
+        "github_token".to_owned(),
+        preloop_gha_protocol::azdo::VariableValue::secret(token.clone()),
+    );
+    // The build-time message also injects the token as `GITHUB_TOKEN` (the
+    // `${{ secrets.GITHUB_TOKEN }}` alias). It must follow the minted token
+    // too, or a fork job's hostile step code could read the stale local
+    // runtime token from `secrets.GITHUB_TOKEN` while `github.token` already
+    // carries the scoped mint.
+    message.variables.insert(
+        "GITHUB_TOKEN".to_owned(),
+        preloop_gha_protocol::azdo::VariableValue::secret(token.clone()),
+    );
+    // Restate what the token carries when the installation could not grant
+    // everything. The message was built with the requested set, and leaving
+    // it would print authority the token does not have in the runner's
+    // `GITHUB_TOKEN Permissions` group — sending anyone debugging the
+    // resulting 403 to the wrong place. The narrowed grant replaces only
+    // App-scoped entries: Actions-only metadata (`IdToken: write` for a
+    // trusted job whose OIDC grant is still live) is preserved from the
+    // build-time wire set, and a fork-restricted job's wire set has no
+    // IdToken to preserve.
+    if let Some(effective) = &minted.effective_permissions {
+        let merged = merge_narrowed_wire_permissions(
+            message
+                .variables
+                .get("system.github.token.permissions")
+                .and_then(|variable| variable.value.as_deref()),
+            effective,
+        );
+        message.variables.insert(
+            "system.github.token.permissions".to_owned(),
+            preloop_gha_protocol::azdo::VariableValue::new(
+                preloop_gha_parser::job_builder::token_permissions_wire_json(&merged),
+            ),
+        );
+    }
+    // The workflow's `github` context is built at submission time, before
+    // the App token can exist, so `${{ github.token }}` inputs resolve
+    // empty and every git fetch prompts for a username. Patch the minted
+    // token into the context at claim so checkout authenticates exactly
+    // like it does on GitHub-hosted runners — no runner-side env header
+    // needed (an env `extraheader` would duplicate the one checkout
+    // persists itself: "Duplicate header: Authorization", HTTP 400).
+    match message.context_data.get_mut("github") {
+        Some(preloop_gha_protocol::azdo::PipelineContextData::Dict(github)) => {
+            github.insert(
+                "token".to_owned(),
+                preloop_gha_protocol::azdo::PipelineContextData::String(token.clone()),
+            );
+            if !re_derived {
+                tracing::info!("patched minted token into github context");
+            }
+        }
+        other => tracing::warn!(
+            github_context = %match other { Some(_) => "non-dict", None => "missing" },
+            "could not patch github context token{}",
+            if re_derived { " for re-derived request" } else { "" }
+        ),
+    }
 }
 
 /// Release a claimed request that can never be dispatched, using the same

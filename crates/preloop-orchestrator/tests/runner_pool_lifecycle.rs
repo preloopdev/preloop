@@ -368,6 +368,7 @@ impl Fixture {
             use_fork: false,
             use_packed_artifact: false,
             name_prefix: format!("pool-{label}-{id}"),
+            pool_status: None,
             base_image: BASE_IMAGE.to_owned(),
             workspace: None,
             artifact_stem,
@@ -395,6 +396,7 @@ impl Fixture {
             next_job_runs_on: None,
             pending_registrations: None,
             preparing_signal: None,
+            observability: None,
         };
         Self {
             _env_guard: env_guard,

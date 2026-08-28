@@ -179,7 +179,10 @@ pub(crate) struct RunResponse {
         list_dispatch_runs,
         github_register,
         github_callback,
-        list_runners
+        list_runners,
+        readyz,
+        status,
+        metrics
     ),
     components(
         schemas(
@@ -281,6 +284,38 @@ type JsonValue = serde_json::Value;
     responses((status = 200, description = "Server is healthy", body = JsonValue))
 )]
 fn healthz() {}
+
+/// Server readiness check (public, reason codes on 503).
+#[utoipa::path(
+    get, path = "/readyz", tag = "Health",
+    responses(
+        (status = 200, description = "Ready", body = JsonValue),
+        (status = 503, description = "Not ready", body = JsonValue)
+    )
+)]
+fn readyz() {}
+
+/// Operational status snapshot (native bearer required).
+#[utoipa::path(
+    get, path = "/api/v1/status", tag = "Health",
+    responses(
+        (status = 200, description = "Operational snapshot", body = JsonValue),
+        (status = 401, description = "Unauthorized", body = ApiErrorResponse)
+    ),
+    security(("native_bearer" = []))
+)]
+fn status() {}
+
+/// Prometheus metrics (native bearer required).
+#[utoipa::path(
+    get, path = "/metrics", tag = "Health",
+    responses(
+        (status = 200, description = "Prometheus text", content_type = "text/plain", body = String),
+        (status = 401, description = "Unauthorized", body = ApiErrorResponse)
+    ),
+    security(("native_bearer" = []))
+)]
+fn metrics() {}
 
 // ── Runs ────────────────────────────────────────────────────────────────────
 

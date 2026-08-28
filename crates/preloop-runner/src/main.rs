@@ -14,14 +14,15 @@ const MAX_REUSABLE_WORKFLOW_DEPTH: usize = 4;
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // Runner gets structured local logging only — never OTLP export by default.
+    // `PRELOOP_LOG_FORMAT` still controls pretty/json/auto for consistency.
+    let obs_config = preloop_observability::ObservabilityConfig::from_env()
+        .with_service_version(env!("CARGO_PKG_VERSION"));
+    let (_observability, observability_runtime) =
+        preloop_observability::Observability::from_config(obs_config);
+    observability_runtime.install_fmt_subscriber();
 
-    match cli.command {
+    let result = match cli.command {
         Commands::Configure(args) => {
             preloop_runner::configure::run_configure(args, &cli.global).await
         }
@@ -56,7 +57,11 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-    }
+    };
+    // Bounded 2s flush of buffered telemetry before exit; a clean shutdown
+    // must not drop the last flush window's records.
+    observability_runtime.shutdown().await;
+    result
 }
 
 async fn collect_reusable_workflows(

@@ -301,7 +301,12 @@ impl Scheduler {
     /// Scan a local workspace directory and register all schedule workflows.
     ///
     /// Called once on server startup when `--enable-scheduler` is active.
-    pub async fn scan_workspace(self: &Arc<Self>, workspace: &PathBuf, shared: Arc<SharedState>) {
+    pub async fn scan_workspace(
+        self: &Arc<Self>,
+        workspace: &PathBuf,
+        shared: Arc<SharedState>,
+        heartbeat: Option<preloop_observability::HeartbeatHandle>,
+    ) {
         let wf_dir = workspace.join(".github").join("workflows");
         let entries = match std::fs::read_dir(&wf_dir) {
             Ok(e) => e,
@@ -309,6 +314,9 @@ impl Scheduler {
         };
         for entry in entries.flatten() {
             let path = entry.path();
+            if let Some(hb) = &heartbeat {
+                hb.beat();
+            }
             if !matches!(
                 path.extension().and_then(|e| e.to_str()),
                 Some("yml") | Some("yaml")
@@ -375,7 +383,14 @@ impl Scheduler {
     /// Fetch and install schedules for a remote-backed server at startup.
     /// The repository and token use `PRELOOP_GITHUB_REPOSITORY` and
     /// `PRELOOP_GITHUB_TOKEN`, the same explicit remote workflow configuration.
-    pub async fn scan_remote(self: &Arc<Self>, shared: Arc<SharedState>) {
+    pub async fn scan_remote(
+        self: &Arc<Self>,
+        shared: Arc<SharedState>,
+        heartbeat: Option<preloop_observability::HeartbeatHandle>,
+    ) {
+        if let Some(hb) = &heartbeat {
+            hb.beat();
+        }
         let (Ok(repository), Ok(token)) = (
             std::env::var("PRELOOP_GITHUB_REPOSITORY"),
             std::env::var("PRELOOP_GITHUB_TOKEN"),
@@ -409,6 +424,9 @@ impl Scheduler {
                 return;
             }
         };
+        if let Some(hb) = &heartbeat {
+            hb.beat();
+        }
         let default_branch = metadata
             .get("default_branch")
             .and_then(|value| value.as_str())
@@ -436,6 +454,9 @@ impl Scheduler {
                 }),
             _ => None,
         };
+        if let Some(hb) = &heartbeat {
+            hb.beat();
+        }
         let workflows = match crate::github::fetch_workflows(
             &shared,
             &repository,
@@ -449,12 +470,18 @@ impl Scheduler {
                 return;
             }
         };
+        if let Some(hb) = &heartbeat {
+            hb.beat();
+        }
         let context = serde_json::json!({
             "ref": format!("refs/heads/{default_branch}"),
             "after": sha,
             "repository": { "full_name": repository, "default_branch": default_branch },
         });
         self.reconcile_all(&workflows, context, shared).await;
+        if let Some(hb) = &heartbeat {
+            hb.beat();
+        }
     }
 
     /// Reconcile the complete default-branch workflow inventory, including
@@ -483,6 +510,15 @@ impl Scheduler {
             });
         }
         for (path, yaml) in workflows {
+            // One beat per workflow so a reconcile that hangs mid-inventory
+            // shows up in /readyz as a stale `scheduler_scan` task instead of
+            // looking healthy. No-op when the task is not registered (e.g.
+            // the push path on a server whose scan already completed).
+            shared
+                .state
+                .observability
+                .heartbeat()
+                .beat("scheduler_scan");
             self.reconcile(path, yaml, push_payload.clone(), Arc::clone(&shared))
                 .await;
         }
