@@ -55,3 +55,7 @@ will it also open the official runner atch workflow asin trigger it
 ---
 
 ok i also want u to remove the comments from the workflow files and just put those in an internal doc. dont want people knowing the specifics of our reasoning
+
+---
+
+runner sycn seems like tis running on ubunut-latest are u sure thats gonna get picked up by preloop and not github hosted
