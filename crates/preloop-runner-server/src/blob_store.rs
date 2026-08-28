@@ -1,5 +1,38 @@
 use super::*;
 
+use axum::body::Body;
+use axum::http::{header::CONTENT_LENGTH, HeaderMap, StatusCode};
+use std::collections::BTreeMap;
+use std::sync::{Arc, LazyLock};
+use tokio::sync::Mutex;
+
+static BLOB_LOCKS: LazyLock<std::sync::Mutex<BTreeMap<String, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
+
+fn blob_lock_for(kind: &str, token: &str) -> Arc<Mutex<()>> {
+    let key = format!("{kind}/{token}");
+    let mut map = BLOB_LOCKS.lock().expect("blob lock poisoned");
+    map.entry(key)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+/// Drop a per-`(kind,token)` commit lock from `BLOB_LOCKS` once no in-flight
+/// commit is using it, keeping the map bounded (a runner minting unbounded
+/// tokens would otherwise leak an `Arc<Mutex>` per token forever). Holding the
+/// map mutex serializes against `blob_lock_for`, so a strong count of 2 (the
+/// map's ref plus the caller's `arc`) proves no other commit holds a clone.
+fn release_blob_lock(kind: &str, token: &str, arc: Arc<Mutex<()>>) {
+    let key = format!("{kind}/{token}");
+    let mut map = BLOB_LOCKS.lock().expect("blob lock poisoned");
+    if let Some(existing) = map.get(&key) {
+        if Arc::strong_count(existing) <= 2 {
+            map.remove(&key);
+        }
+    }
+    drop(arc);
+}
+
 // ─── Azure Block Blob compat blob store ───────────────────────────────────────
 //
 // Both actions/cache@v4 and actions/upload-artifact@v4 upload via the Azure SDK
@@ -45,8 +78,45 @@ pub(crate) async fn blob_put(
     State(shared): State<Arc<SharedState>>,
     Path((kind, token)): Path<(String, String)>,
     Query(query): Query<BlobPutQuery>,
-    body: axum::body::Bytes,
+    headers: HeaderMap,
+    body: Body,
 ) -> StatusCode {
+    // Early Content-Length check before buffering — avoids allocating 512 MiB
+    // for a block that will be rejected at 4 MiB.
+    if let Some(cl) = headers
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        let cap = match query.comp.as_deref() {
+            Some("block") => MAX_BLOCK_BYTES,
+            Some("blocklist") => 1024 * 1024, // XML is tiny; 1 MiB is generous
+            _ => MAX_ASSEMBLED_BYTES,
+        };
+        if cl > cap {
+            warn!(kind, token, cl, cap, "blob content-length exceeds cap");
+            return StatusCode::PAYLOAD_TOO_LARGE;
+        }
+    }
+    // Stream the body with a mode-specific limit — never buffer more than the
+    // per-mode cap. Single-shot may be up to 512 MiB, which is the route's
+    // DefaultBodyLimit already.
+    let limit = match query.comp.as_deref() {
+        Some("block") => MAX_BLOCK_BYTES,
+        Some("blocklist") => 1024 * 1024,
+        _ => MAX_ASSEMBLED_BYTES,
+    };
+    let body_bytes = match axum::body::to_bytes(body, limit).await {
+        Ok(b) => b,
+        Err(_) => {
+            warn!(
+                kind,
+                token, limit, "blob body exceeds limit while streaming"
+            );
+            return StatusCode::PAYLOAD_TOO_LARGE;
+        }
+    };
+    let body = body_bytes;
     let blob_root = shared
         .state
         .state_dir
@@ -131,33 +201,46 @@ pub(crate) async fn blob_put(
                 }
             }
 
-            // Stream block files into the destination; never materialize the
-            // assembled blob in memory. The copy-tracking below is a
-            // belt-and-braces guard for the TOCTOU window between the stat
-            // pre-check above and the reads.
-            match assemble_streaming(&blocks_dir, &data_path, &block_ids).await {
-                Ok(size) => {
-                    let _ = tokio::fs::remove_dir_all(&blocks_dir).await;
-                    info!(
-                        kind,
-                        token,
-                        size,
-                        blocks = block_ids.len(),
-                        "blob assembled from blocks"
-                    );
-                    StatusCode::CREATED
-                }
+            // Serialize blocklist commits per (kind,token) so concurrent
+            // commits don't clobber each other's `data` file. Assemble into
+            // a temp file and atomically rename on success — a failed commit
+            // never truncates or deletes the previously committed blob.
+            let lock = blob_lock_for(&kind, &token);
+            let guard = lock.lock().await;
+            let tmp_path = data_path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
+            let status = match assemble_streaming(&blocks_dir, &tmp_path, &block_ids).await {
+                Ok(size) => match tokio::fs::rename(&tmp_path, &data_path).await {
+                    Ok(()) => {
+                        let _ = tokio::fs::remove_dir_all(&blocks_dir).await;
+                        info!(
+                            kind,
+                            token,
+                            size,
+                            blocks = block_ids.len(),
+                            "blob assembled from blocks"
+                        );
+                        StatusCode::CREATED
+                    }
+                    Err(e) => {
+                        let _ = tokio::fs::remove_file(&tmp_path).await;
+                        warn!(kind, token, "failed to commit assembled blob: {e}");
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                },
                 Err(AssemblyError::Budget) => {
-                    let _ = tokio::fs::remove_file(&data_path).await;
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
                     warn!(kind, token, "assembly budget exceeded during copy");
                     StatusCode::PAYLOAD_TOO_LARGE
                 }
                 Err(AssemblyError::Io(e)) => {
-                    let _ = tokio::fs::remove_file(&data_path).await;
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
                     warn!(kind, token, "failed to write assembled blob: {e}");
                     StatusCode::INTERNAL_SERVER_ERROR
                 }
-            }
+            };
+            drop(guard);
+            release_blob_lock(&kind, &token, lock);
+            status
         }
         _ => {
             if body.len() > MAX_ASSEMBLED_BYTES {
