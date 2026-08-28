@@ -121,15 +121,16 @@ impl PatternMatch {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
+/// Severity level of a problem matcher.
 pub enum SeveritySpec {
     Capture(usize),
     Literal(String),
 }
 
 /// A single matcher pattern.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct MatcherPattern {
     pub regexp: String,
     #[serde(default)]
@@ -182,14 +183,33 @@ impl MatcherRegistry {
         Self::default()
     }
 
-    /// Merge matchers registered in `current` but absent from `base` into
-    /// `self`. Used to fold a background step's `::add-matcher::` /
-    /// `::remove-matcher::` changes into the job at step completion —
-    /// mirroring the official coordinator's deferred-state flush.
+    /// Fold a background step's matcher delta into `self`: install owners the
+    /// step added or re-registered with a changed definition, and remove
+    /// owners it deleted via `::remove-matcher::`. Mirrors the official
+    /// coordinator's deferred matcher flush — the diff against the
+    /// dispatch-time snapshot (`base`) recovers additions, removals, and
+    /// re-registrations alike.
     pub(crate) fn merge_delta(&mut self, base: &Self, current: &Self) {
         for (owner, matcher) in &current.matchers {
-            if !base.matchers.contains_key(owner) {
+            let changed = match base.matchers.get(owner) {
+                // Compare the definition, not the runtime state: `state` and
+                // `compiled_regexes` are derived from the pattern set and are
+                // not comparable.
+                Some(base_matcher) => {
+                    base_matcher.from_path != matcher.from_path
+                        || base_matcher.patterns != matcher.patterns
+                }
+                None => true,
+            };
+            if changed {
                 self.matchers.insert(owner.clone(), matcher.clone());
+            }
+        }
+        // Owners present at dispatch but gone from the step's registry were
+        // removed by `::remove-matcher::`; they must not stay active.
+        for owner in base.matchers.keys() {
+            if !current.matchers.contains_key(owner) {
+                self.matchers.remove(owner);
             }
         }
     }
@@ -728,6 +748,56 @@ mod tests {
         assert_eq!(annotations[0].line, Some(12));
         assert_eq!(annotations[0].col, Some(34));
         assert_eq!(annotations[0].message, "boom");
+    }
+
+    fn registry_with(matcher_json: &str) -> (MatcherRegistry, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("matcher.json");
+        std::fs::write(&path, matcher_json).unwrap();
+        let mut registry = MatcherRegistry::new();
+        registry.add_from_file(&path).unwrap();
+        (registry, dir)
+    }
+
+    #[test]
+    fn merge_delta_applies_additions_removals_and_replacements() {
+        let (base, _base_dir) = registry_with(
+            r#"{
+              "problemMatcher": [
+                { "owner": "keep", "pattern": [{ "regexp": "^KEEP_OLD (.*)$", "message": 1 }] },
+                { "owner": "remove", "pattern": [{ "regexp": "^REMOVE (.*)$", "message": 1 }] }
+              ]
+            }"#,
+        );
+        let (current, _current_dir) = registry_with(
+            r#"{
+              "problemMatcher": [
+                { "owner": "keep", "pattern": [{ "regexp": "^KEEP_NEW (.*)$", "message": 1 }] },
+                { "owner": "add", "pattern": [{ "regexp": "^ADD (.*)$", "message": 1 }] }
+              ]
+            }"#,
+        );
+
+        // `self` starts as the dispatch-time snapshot, then folds the step's
+        // delta — exactly what flush_step does.
+        let mut self_registry = base.clone();
+        self_registry.merge_delta(&base, &current);
+
+        // Addition.
+        assert!(
+            self_registry.matchers.contains_key("add"),
+            "added owner must be installed"
+        );
+        // Removal (`::remove-matcher::`).
+        assert!(
+            !self_registry.matchers.contains_key("remove"),
+            "removed owner must no longer be active"
+        );
+        // Replacement (re-registration with new patterns).
+        assert_eq!(
+            self_registry.matchers["keep"].patterns[0].regexp, "^KEEP_NEW (.*)$",
+            "re-registered owner must use the new definition"
+        );
     }
 
     #[test]

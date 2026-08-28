@@ -35,7 +35,7 @@ use tracing::{info, warn};
 use super::contexts::{JobContext, SharedSteps, StepResult};
 use super::execution_context::StepContext;
 use super::job_runner::ReportingContext;
-use super::server_queue::{step_conclusion, step_status, ServerQueue, StepUpdate};
+use super::server_queue::{step_status, ServerQueue, StepUpdate};
 use super::steps_runner::Step;
 
 /// Default max concurrent background steps (official `DefaultMaxBackgroundSteps`).
@@ -65,6 +65,9 @@ struct BackgroundEntry {
     /// The step's result. Set once — first writer wins, so a grace-period
     /// force-mark is never overwritten by the task finishing late.
     outcome: Option<BackgroundStepOutcome>,
+    /// Whether the step tolerates failure (official `continue-on-error`),
+    /// needed by the panic fallback to report the right conclusion.
+    continue_on_error: bool,
 }
 
 /// Everything a background step task needs to run off-loop.
@@ -109,6 +112,10 @@ pub(crate) struct BackgroundStepOutcome {
     pub log_content: String,
     #[allow(dead_code)] // asserted by tests; upload happens inside the task
     pub summary_content: String,
+    /// Complete step result for synthetic outcomes (forced cancellation,
+    /// task panic) that have no job snapshot to diff. `flush_step` writes
+    /// this directly into `job.steps`.
+    pub direct_result: Option<StepResult>,
 }
 
 impl BackgroundStepOutcome {
@@ -126,12 +133,13 @@ impl BackgroundStepOutcome {
             conclusion: "Cancelled".to_string(),
             log_content: String::new(),
             summary_content: String::new(),
+            direct_result: None,
         }
     }
 
     /// Fallback for a task that panicked or was aborted by the runtime:
     /// official's generic catch-all marks the step Failed.
-    fn failed(context_name: String) -> Self {
+    fn failed(context_name: String, conclusion: String) -> Self {
         Self {
             started: true,
             working_job: JobContext::new(
@@ -148,9 +156,14 @@ impl BackgroundStepOutcome {
             ),
             context_name,
             outcome: "Failure".to_string(),
-            conclusion: "Failure".to_string(),
+            conclusion: conclusion.clone(),
             log_content: String::new(),
             summary_content: String::new(),
+            direct_result: Some(StepResult {
+                outcome: "Failure".to_string(),
+                conclusion,
+                outputs: std::collections::HashMap::new(),
+            }),
         }
     }
 
@@ -178,6 +191,11 @@ impl BackgroundStepOutcome {
             conclusion: "Cancelled".to_string(),
             log_content: String::new(),
             summary_content: String::new(),
+            direct_result: Some(StepResult {
+                outcome: "Cancelled".to_string(),
+                conclusion: "Cancelled".to_string(),
+                outputs: std::collections::HashMap::new(),
+            }),
         }
     }
 }
@@ -259,6 +277,7 @@ impl BackgroundStepCoordinator {
     ) {
         let context_name = step.context_name.clone();
         let id = step.id.clone();
+        let continue_on_error = step.continue_on_error;
         info!("Background step '{context_name}' queued (slot acquired asynchronously)");
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -298,6 +317,7 @@ impl BackgroundStepCoordinator {
                 explicit_cancel_tx,
                 handle: Some(handle),
                 outcome: None,
+                continue_on_error,
             },
         );
     }
@@ -500,6 +520,18 @@ impl BackgroundStepCoordinator {
             self.cancel_with_grace(&to_cancel).await;
         }
 
+        // Harvest finished-but-unjoined tasks: a step that completed before
+        // the cancel control ran still carries its outcome in the join
+        // handle. Joining here (instant for finished handles) ensures its
+        // result and deferred state are flushed instead of being dropped as
+        // completed-but-never-merged. Handles still running after the grace
+        // period were force-marked above, so this loop cannot block.
+        for id in step_ids {
+            if self.entries.get(id).is_some_and(|e| e.outcome.is_none()) {
+                self.join_entry(id).await;
+            }
+        }
+
         // Flush deferred state and mark canceled steps as completed.
         self.complete_waited_steps(step_ids, job);
     }
@@ -543,6 +575,23 @@ impl BackgroundStepCoordinator {
                         "Background step '{id}' did not terminate within the \
                          {CANCEL_GRACE_SECONDS}s grace period; marking as canceled"
                     );
+                    // The task is aborted by the final drain and will never
+                    // queue its own terminal update — emit it here so the
+                    // server timeline does not stay InProgress forever.
+                    let external_id = entry.id.clone();
+                    let number = entry.step_number;
+                    let name = entry.display_name.clone();
+                    let ts = crate::worker::helpers::iso_now();
+                    let mut q = self.queue.lock().await;
+                    q.queue_update(StepUpdate {
+                        external_id,
+                        number,
+                        name,
+                        status: step_status::COMPLETED,
+                        started_at: Some(ts.clone()),
+                        completed_at: Some(ts),
+                        conclusion: ServerQueue::conclusion_to_proto("Cancelled"),
+                    });
                     entry.outcome = Some(BackgroundStepOutcome::forced_cancel(id.clone()));
                 }
             }
@@ -557,6 +606,20 @@ impl BackgroundStepCoordinator {
     fn complete_waited_steps(&mut self, step_ids: &[String], job: &mut JobContext) -> String {
         let mut merged = "Success".to_string();
         for id in step_ids {
+            if self.completed.contains(id) {
+                // Already flushed by an earlier wait/cancel. Re-merge the
+                // stored conclusion like official (which re-reads the
+                // ExecutionContext result) but do not re-flush — that would
+                // duplicate append-only state such as job-level annotations.
+                // Never-started steps carry no result (official: null), so
+                // they contribute nothing.
+                if let Some(outcome) = self.entries.get(id).and_then(|e| e.outcome.as_ref()) {
+                    if outcome.started {
+                        merged = merge_conclusions(&merged, &outcome.conclusion);
+                    }
+                }
+                continue;
+            }
             self.completed.insert(id.clone());
             if let Some(entry) = self.entries.get(id) {
                 if let Some(outcome) = &entry.outcome {
@@ -595,7 +658,15 @@ impl BackgroundStepCoordinator {
                 // The task panicked or was aborted — official's generic
                 // catch-all fails the step.
                 warn!("Background step '{id}' task failed unexpectedly");
-                entry.outcome = Some(BackgroundStepOutcome::failed(id.to_string()));
+                let (_, conclusion_str) = if entry.continue_on_error {
+                    ("Failure".to_string(), "Success".to_string())
+                } else {
+                    ("Failure".to_string(), "Failure".to_string())
+                };
+                entry.outcome = Some(BackgroundStepOutcome::failed(
+                    id.to_string(),
+                    conclusion_str.clone(),
+                ));
                 let ts = crate::worker::helpers::iso_now();
                 let mut q = self.queue.lock().await;
                 q.queue_update(StepUpdate {
@@ -605,7 +676,7 @@ impl BackgroundStepCoordinator {
                     status: step_status::COMPLETED,
                     started_at: Some(ts.clone()),
                     completed_at: Some(ts),
-                    conclusion: step_conclusion::FAILED,
+                    conclusion: ServerQueue::conclusion_to_proto(&conclusion_str),
                 });
             }
         }
@@ -668,17 +739,31 @@ async fn execute_background_step(mut launch: BackgroundStepLaunch) -> Background
     let step_number = launch.step_number;
     let timeout_minutes = launch.step.timeout_minutes;
 
-    // Slot acquisition — official `WaitAsync(bgCts.Token)`. A job
-    // cancellation while waiting abandons the step before it starts; it
-    // queues no timeline update and merges nothing (official: `Start()` is
-    // deferred until the slot is acquired, and the faulted task leaves no
-    // record).
+    // Slot acquisition — official `WaitAsync(bgCts.Token)`. A job or
+    // explicit cancellation while waiting abandons the step before it
+    // starts; it queues no timeline update and merges nothing (official:
+    // `Start()` is deferred until the slot is acquired, and the faulted task
+    // leaves no record). Official links the per-step token into this wait,
+    // so an explicit `cancel` aborts a queued step too — not just job
+    // cancellation.
     let _permit = loop {
         tokio::select! {
             permit = Arc::clone(&launch.slots).acquire_owned() => break permit,
             changed = launch.job_cancel_rx.changed() => {
                 if changed.is_err() || *launch.job_cancel_rx.borrow() {
                     info!("Background step '{context_name}' abandoned before start (job cancelled)");
+                    return BackgroundStepOutcome::cancelled_before_start(
+                        launch.working_job,
+                        launch.base_job,
+                        context_name,
+                    );
+                }
+            }
+            changed = launch.explicit_cancel_rx.changed() => {
+                if changed.is_err() || *launch.explicit_cancel_rx.borrow() {
+                    info!(
+                        "Background step '{context_name}' abandoned before start (explicitly cancelled)"
+                    );
                     return BackgroundStepOutcome::cancelled_before_start(
                         launch.working_job,
                         launch.base_job,
@@ -823,6 +908,8 @@ async fn execute_background_step(mut launch: BackgroundStepLaunch) -> Background
             "##[error]The background step '{display_name}' has timed out after {} minutes.",
             timeout_minutes.unwrap_or(0)
         ));
+    } else if cancel_signaled && conclusion_str == "Cancelled" {
+        step_ctx.log("##[error]The operation was canceled.");
     } else if let Err(error) = &execute_result {
         let msg = error.to_string();
         if !cancel_signaled
@@ -951,6 +1038,7 @@ async fn execute_background_step(mut launch: BackgroundStepLaunch) -> Background
         conclusion: conclusion_str,
         log_content,
         summary_content,
+        direct_result: None,
     }
 }
 
@@ -1014,6 +1102,14 @@ fn flush_step(job: &mut JobContext, outcome: &BackgroundStepOutcome) {
     let private = &outcome.working_job;
     let base = &outcome.base_job;
 
+    // Synthetic outcomes (forced cancellation, task panic) carry a complete
+    // StepResult instead of a job snapshot to diff — install it directly so
+    // `steps.<id>` reflects the terminal state.
+    if let Some(result) = &outcome.direct_result {
+        job.steps
+            .insert(outcome.context_name.clone(), result.clone());
+    }
+
     // GITHUB_ENV — merge only keys the step wrote (value differs from the
     // dispatch-time snapshot), so concurrent foreground writes survive.
     for (k, v) in &private.env {
@@ -1043,15 +1139,25 @@ fn flush_step(job: &mut JobContext, outcome: &BackgroundStepOutcome) {
     }
 
     // GITHUB_STATE — keyed by step id with the same __pre_/__post_ aliasing
-    // the inline path uses.
+    // the inline path uses. Like env, only keys the step changed (value
+    // differs from the dispatch-time snapshot) are merged, so a background
+    // step's stale snapshot cannot clobber a newer foreground write.
     for (step_id, state) in &private.state {
         let effective = step_id
             .strip_prefix("__pre_")
             .or_else(|| step_id.strip_prefix("__post_"))
             .unwrap_or(step_id);
-        let target = job.state.entry(effective.to_string()).or_default();
+        let base_state = base
+            .state
+            .get(step_id)
+            .or_else(|| base.state.get(effective));
         for (k, v) in state {
-            target.insert(k.clone(), v.clone());
+            if base_state.and_then(|m| m.get(k)) != Some(v) {
+                job.state
+                    .entry(effective.to_string())
+                    .or_default()
+                    .insert(k.clone(), v.clone());
+            }
         }
     }
 

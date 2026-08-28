@@ -121,6 +121,10 @@ pub async fn run_steps(
     let mut init_failed = false;
     let mut cancelled = false;
     let now = crate::worker::helpers::iso_now();
+    // Precomputed background-step flags: range replays must not re-execute
+    // background steps (a re-dispatch would orphan the original task), and
+    // this must be checked without borrowing `steps` while `step` is held.
+    let background_flags: Vec<bool> = steps.iter().map(|s| s.is_background).collect();
 
     // Background steps run off-loop under the coordinator (official
     // BackgroundStepCoordinator, v2.336.0). The concurrency ceiling is
@@ -491,10 +495,88 @@ pub async fn run_steps(
         if step.is_background {
             let expr_ctx = job.build_expression_context();
             let mut bg_env = HashMap::new();
+            let mut bg_env_error: Option<anyhow::Error> = None;
             for (k, v) in &step.env {
-                let evaluated = crate::worker::template::evaluate_template(v, &expr_ctx)
-                    .unwrap_or_else(|_| v.clone());
-                bg_env.insert(k.clone(), evaluated);
+                // Foreground steps evaluate step env strictly and fail the
+                // step on error; a literal `${{ }}` must never reach the
+                // process environment. Background steps follow the same rule.
+                match crate::worker::template::evaluate_template_strict(v, &expr_ctx) {
+                    Ok(evaluated) => {
+                        bg_env.insert(k.clone(), evaluated);
+                    }
+                    Err(error) => {
+                        bg_env_error
+                            .get_or_insert_with(|| anyhow::anyhow!("step env '{k}' {error:#}"));
+                    }
+                }
+            }
+            if let Some(error) = bg_env_error {
+                // Mirror the foreground step_env_error handling: the step
+                // fails (continue-on-error still applies). The coordinator
+                // never learns about this step — the implicit wait-all
+                // tolerates unknown ids.
+                let (outcome_str, conclusion_str) = if step.continue_on_error {
+                    ("Failure".to_string(), "Success".to_string())
+                } else {
+                    ("Failure".to_string(), "Failure".to_string())
+                };
+                let start_ts = crate::worker::helpers::iso_now();
+                {
+                    let mut q = queue.lock().await;
+                    q.queue_update(StepUpdate {
+                        external_id: step.id.clone(),
+                        number: step_number,
+                        name: resolved_display_name.clone(),
+                        status: step_status::IN_PROGRESS,
+                        started_at: Some(start_ts.clone()),
+                        completed_at: None,
+                        conclusion: 0,
+                    });
+                }
+                let mut step_ctx = StepContext::new(
+                    job,
+                    step.context_name.clone(),
+                    resolved_display_name.clone(),
+                );
+                step_ctx.log(&format!("##[error]{error:#}"));
+                step_ctx.job.steps.insert(
+                    step.context_name.clone(),
+                    StepResult {
+                        outcome: outcome_str.clone(),
+                        conclusion: conclusion_str.clone(),
+                        outputs: HashMap::new(),
+                    },
+                );
+                coordinator.publish_step(step_ctx.job, &step.context_name);
+                if conclusion_str == "Failure" {
+                    any_failed = true;
+                    step_ctx.job.job_status = JobStatus::Failure;
+                }
+                let step_end = crate::worker::helpers::iso_now();
+                let conclusion_proto = ServerQueue::conclusion_to_proto(&conclusion_str);
+                let log_content = step_ctx.log_content();
+                {
+                    let mut q = queue.lock().await;
+                    q.queue_update(StepUpdate {
+                        external_id: step.id.clone(),
+                        number: step_number,
+                        name: resolved_display_name.clone(),
+                        status: step_status::COMPLETED,
+                        started_at: Some(start_ts),
+                        completed_at: Some(step_end),
+                        conclusion: conclusion_proto,
+                    });
+                    if !log_content.is_empty() {
+                        q.record_step_logs(&step.id, &log_content);
+                    }
+                }
+                if let Some(rpt) = &reporting {
+                    if !log_content.is_empty() {
+                        crate::worker::reporting::upload_step_log(rpt, &step.id, &log_content)
+                            .await;
+                    }
+                }
+                continue 'step_loop;
             }
             // Snapshot the job state at dispatch time; the step executes
             // against a private copy and the flush diffs the two.
@@ -546,9 +628,16 @@ pub async fn run_steps(
             step_ids,
         } = &step.step_type
         {
-            let (outcome_str, conclusion_str) = coordinator
+            let (outcome_str, mut conclusion_str) = coordinator
                 .run_control_flow(&mut step_ctx, control_type, step_ids)
                 .await;
+
+            // A tolerated control-flow failure reports outcome=Failure,
+            // conclusion=Success — the same continue-on-error override
+            // ordinary steps get.
+            if conclusion_str == "Failure" && step.continue_on_error {
+                conclusion_str = "Success".to_string();
+            }
 
             step_ctx.job.steps.insert(
                 step.context_name.clone(),
@@ -1361,48 +1450,67 @@ pub async fn run_steps(
 
         // Replay an earlier range, now that this attempt has been reported.
         if let Some(target) = jump_to {
-            let context_name = step.context_name.clone();
-            // A jumped range may include other pinned checkout steps whose
-            // submission-time credential expired while the job waited. Swap
-            // in the verdict's replacement for all of them before the replay.
-            if let Some(token) = pending_snapshot_token.as_deref() {
-                if let Some(client) = debug_client.as_ref() {
-                    client.refresh_snapshot_tokens(&mut steps, token);
+            // Range replays must not re-execute background steps: a
+            // re-dispatch would replace the entry handle and orphan the
+            // original task, which keeps running and can outlive run_steps
+            // while emitting conflicting state. Refuse the jump and keep the
+            // current-step retry instead.
+            if (target..=idx).any(|i| background_flags[i]) {
+                warn!(
+                    "retry_from_step {} spans background step(s); range replay refused",
+                    target + 1
+                );
+                step_ctx.log(
+                    "##[warning]Range replay over background step(s) is not supported; only the failed step was retried.",
+                );
+            } else {
+                let context_name = step.context_name.clone();
+                // A jumped range may include other pinned checkout steps whose
+                // submission-time credential expired while the job waited. Swap
+                // in the verdict's replacement for all of them before the replay.
+                if let Some(token) = pending_snapshot_token.as_deref() {
+                    if let Some(client) = debug_client.as_ref() {
+                        client.refresh_snapshot_tokens(&mut steps, token);
+                    }
                 }
+                // Clear every runner-managed per-step value for the range about
+                // to re-run. Restoring only the target snapshot leaves saveState
+                // and annotations from later steps visible during their second
+                // pass.
+                clear_replayed_step_state(step_ctx.job, &job_step_summaries, target, idx);
+                // Restore the snapshot captured before the *target* step, not
+                // the current step. Without this, the target step's prior
+                // GITHUB_ENV/GITHUB_PATH/state writes remain and are doubled.
+                if let Some(target_snapshot) = step_snapshots.get(&target) {
+                    target_snapshot.restore(step_ctx.job, &steps[target].context_name);
+                } else {
+                    step_state_snapshot.restore(step_ctx.job, &context_name);
+                }
+                coordinator.publish_all_steps(step_ctx.job);
+                // Recompute from surviving step results. init_failed is tracked
+                // separately so container-init failures are never lost.
+                any_failed = init_failed
+                    || step_ctx
+                        .job
+                        .steps
+                        .values()
+                        .any(|result| result.conclusion == "Failure");
+                step_ctx.job.job_status = if any_failed {
+                    JobStatus::Failure
+                } else {
+                    JobStatus::Success
+                };
+                info!(
+                    "Jumping back to step {} ('{}')",
+                    target + 1,
+                    steps[target].display_name
+                );
+                // The replay may re-cross the post-job boundary, so the
+                // safety net must run again for anything dispatched after it.
+                safety_net_done = false;
+                step_idx = target;
+                continue 'step_loop;
             }
-            // Clear every runner-managed per-step value for the range about to
-            // re-run. Restoring only the target snapshot leaves saveState and
-            // annotations from later steps visible during their second pass.
-            clear_replayed_step_state(step_ctx.job, &job_step_summaries, target, idx);
-            // Restore the snapshot captured before the *target* step, not
-            // the current step. Without this, the target step's prior
-            // GITHUB_ENV/GITHUB_PATH/state writes remain and are doubled.
-            if let Some(target_snapshot) = step_snapshots.get(&target) {
-                target_snapshot.restore(step_ctx.job, &steps[target].context_name);
-            } else {
-                step_state_snapshot.restore(step_ctx.job, &context_name);
-            }
-            coordinator.publish_all_steps(step_ctx.job);
-            // Recompute from surviving step results. init_failed is tracked
-            // separately so container-init failures are never lost.
-            any_failed = init_failed
-                || step_ctx
-                    .job
-                    .steps
-                    .values()
-                    .any(|result| result.conclusion == "Failure");
-            step_ctx.job.job_status = if any_failed {
-                JobStatus::Failure
-            } else {
-                JobStatus::Success
-            };
-            info!(
-                "Jumping back to step {} ('{}')",
-                target + 1,
-                steps[target].display_name
-            );
-            step_idx = target;
-            continue 'step_loop;
         }
     }
 
@@ -1418,6 +1526,14 @@ pub async fn run_steps(
             cancelled = true;
             job.job_status = JobStatus::Cancelled;
         }
+    }
+    // A job cancellation may have arrived while a control step or the safety
+    // net was awaiting. Background steps that never acquired a slot produce
+    // no mergeable outcome, so the merged conclusion alone cannot reflect
+    // it — recheck the flag so a cancelled job never concludes Succeeded.
+    if *cancel_rx.borrow() {
+        cancelled = true;
+        job.job_status = JobStatus::Cancelled;
     }
     coordinator.drain().await;
 
