@@ -18881,6 +18881,144 @@ jobs:
     );
 }
 
+#[tokio::test]
+async fn cancel_preserves_completed_reusable_caller_result() {
+    // MC-3 review follow-up: a nested reusable caller that finished Success
+    // while the run stayed active still sits in `run.caller_plans` with an
+    // unsettled request record (`propagate_reusable_outputs` retires none).
+    // The run-cancel sweep settles every expandable node, so it must settle
+    // this one with its real verdict — Success — not clobber it to Cancelled.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": r#"
+on: push
+jobs:
+  outer:
+    uses: ./.github/workflows/outer.yml
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo keepalive
+"#,
+            "event": "push",
+            "repository": "owner/repo",
+            "reusable_workflows": {
+                ".github/workflows/outer.yml": r#"
+on: workflow_call
+jobs:
+  nested:
+    uses: ./.github/workflows/inner.yml
+"#,
+                ".github/workflows/inner.yml": r#"
+on: workflow_call
+jobs:
+  work:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo work
+"#,
+            }
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let nested_caller = JobId("outer/nested".to_string());
+
+    // The gate-free nested call materializes its whole subtree at submit.
+    let leaf = {
+        let inner = state.inner.lock().await;
+        inner.runs[&run_id]
+            .jobs
+            .keys()
+            .find(|id| id.0.starts_with("outer/nested/"))
+            .expect("nested callee leaf must materialize at submit")
+            .clone()
+    };
+
+    // Drive the nested caller to Success by completing its only leaf, while
+    // `keepalive` stays queued so the run does not conclude.
+    request_json(
+        &app,
+        Method::POST,
+        "/internal/test/jobs/complete",
+        json!({
+            "run_id": run_id,
+            "job_id": leaf.0,
+            "status": "success"
+        }),
+    )
+    .await;
+
+    let caller_request_id = {
+        let inner = state.inner.lock().await;
+        assert_eq!(
+            inner.runs[&run_id].jobs.get(&nested_caller),
+            Some(&ExecutionStatus::Success),
+            "nested caller must aggregate to Success once its leaf completes"
+        );
+        assert!(
+            inner.runs[&run_id]
+                .caller_plans
+                .contains_key(&nested_caller),
+            "completed nested caller stays in caller_plans"
+        );
+        let record = inner
+            .job_requests
+            .values()
+            .find(|r| r.run_id == run_id && r.job_id == nested_caller)
+            .expect("nested caller minted a request record at expansion");
+        // The completion path never settles a caller's own record: this is the
+        // pre-existing unsettled state the cancel sweep must not corrupt.
+        assert_eq!(
+            record.result, None,
+            "nested caller's record is unsettled before cancel"
+        );
+        record.request_id
+    };
+
+    request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/runs/{run_id}/cancel"),
+        Value::Null,
+    )
+    .await;
+
+    let inner = state.inner.lock().await;
+    let record = inner
+        .job_requests
+        .get(&caller_request_id)
+        .expect("cancel keeps the settled caller record");
+    assert_eq!(
+        record.result,
+        Some(ExecutionStatus::Success),
+        "MC-3: cancel must settle a completed caller with Success, not Cancelled"
+    );
+    assert!(
+        !inner.inflight_requests.contains_key(&caller_request_id),
+        "MC-3: settled caller record must leave inflight_requests"
+    );
+    assert_eq!(
+        inner.runs[&run_id].jobs.get(&nested_caller),
+        Some(&ExecutionStatus::Success),
+        "the completed caller keeps its Success status through cancellation"
+    );
+    assert_eq!(
+        inner.runs[&run_id]
+            .jobs
+            .get(&JobId("keepalive".to_string())),
+        Some(&ExecutionStatus::Cancelled),
+        "the still-queued keepalive job is cancelled by the run cancel"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Durable-store restart contracts.
 //

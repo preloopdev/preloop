@@ -183,12 +183,15 @@ pub(crate) fn cancel_run_inner(
     inner.pending_expansions.retain(|job| job.run_id != run_id);
     inner.expanding.retain(|(id, _)| *id != run_id);
     for node_id in expandable {
-        retire_node_requests(
-            inner,
-            run_id,
-            &node_id,
-            RequestRetirement::Settle(ExecutionStatus::Cancelled),
-        );
+        // Settle with the node's own concluded status, never a hardcoded
+        // Cancelled: the status loop above already flipped every non-terminal
+        // node in this run to Cancelled, but an already-terminal expandable
+        // node keeps its verdict. A nested reusable caller that finished
+        // Success while the run stayed active still sits in `caller_plans`
+        // with an unsettled record (`propagate_reusable_outputs` never
+        // retires it); stamping Cancelled would contradict `run.jobs`.
+        let status = node_settle_status(inner, run_id, &node_id);
+        retire_node_requests(inner, run_id, &node_id, RequestRetirement::Settle(status));
     }
 
     // Release any concurrency holders belonging to this run and promote next.
@@ -317,9 +320,8 @@ pub(crate) fn run_stuck_on_external_hosts(inner: &InnerState, run_id: &RunId) ->
 /// Cancel a single job (job-level concurrency / fail-fast style).
 pub(crate) fn cancel_job_inner(inner: &mut InnerState, run_id: RunId, job_id: &JobId) -> usize {
     // MC-3: an expandable node cancelled before it dispatches never reaches
-    // the completion path that settles its submit-time request correlation.
-    // Settle it here exactly as completion would; the reusable-caller path
-    // needs no equivalent because callers mint no records at submit.
+    // the completion path that settles its request correlation. Settle it
+    // below exactly as completion would, with its own concluded status.
     let expandable = is_expandable_node(inner, run_id, job_id);
     let was_in_progress = {
         let Some(record) = inner.runs.get_mut(&run_id) else {
@@ -374,19 +376,6 @@ pub(crate) fn cancel_job_inner(inner: &mut InnerState, run_id: RunId, job_id: &J
         .pending_expansions
         .retain(|j| !(j.run_id == run_id && j.job_id == *job_id));
     inner.expanding.remove(&(run_id, job_id.clone()));
-    let deferred_matrix = inner
-        .runs
-        .get(&run_id)
-        .and_then(|run| run.caller_plans.get(job_id))
-        .is_some_and(|plan| plan.deferred_matrix.is_some());
-    if deferred_matrix {
-        retire_node_requests(
-            inner,
-            run_id,
-            job_id,
-            RequestRetirement::Settle(ExecutionStatus::Cancelled),
-        );
-    }
 
     // Cancelling a reusable caller cancels its materialized subtree with it.
     let inner_ids = inner
@@ -400,12 +389,12 @@ pub(crate) fn cancel_job_inner(inner: &mut InnerState, run_id: RunId, job_id: &J
     }
 
     if expandable {
-        retire_node_requests(
-            inner,
-            run_id,
-            job_id,
-            RequestRetirement::Settle(ExecutionStatus::Cancelled),
-        );
+        // Settle with the node's own status, not a hardcoded Cancelled: the
+        // was_in_progress block above flipped a live node to Cancelled, but an
+        // already-terminal expandable node (e.g. a completed reusable caller
+        // still in `caller_plans` with an unsettled record) keeps its verdict.
+        let status = node_settle_status(inner, run_id, job_id);
+        retire_node_requests(inner, run_id, job_id, RequestRetirement::Settle(status));
     }
     release_concurrency_for_job(inner, run_id, job_id);
     count
@@ -2542,6 +2531,24 @@ pub(crate) enum RequestRetirement {
     /// The node no longer exists in the run, so nothing can reference it
     /// again: every correlation entry goes.
     Purge,
+}
+
+/// The status to settle an expandable node's leaked request record with during
+/// cancellation: the node's own concluded verdict from `run.jobs`, falling
+/// back to `Cancelled` for a node the run no longer records.
+///
+/// The cancel paths flip live nodes to `Cancelled` before settling, so a
+/// placeholder that never ran settles `Cancelled`. An already-terminal
+/// expandable node — most notably a nested reusable caller that finished
+/// `Success` while the run stayed active and still carries an unsettled record
+/// (`propagate_reusable_outputs` retires none) — keeps its real verdict rather
+/// than being clobbered to `Cancelled`.
+fn node_settle_status(inner: &InnerState, run_id: RunId, node_id: &JobId) -> ExecutionStatus {
+    inner
+        .runs
+        .get(&run_id)
+        .and_then(|run| run.jobs.get(node_id).copied())
+        .unwrap_or(ExecutionStatus::Cancelled)
 }
 
 /// Whether a single job is an expandable node: a deferred reusable caller or
