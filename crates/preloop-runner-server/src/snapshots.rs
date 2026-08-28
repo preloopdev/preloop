@@ -818,6 +818,17 @@ async fn create_workspace_snapshot_inner(
         "allow tip sha wants in snapshot upload-pack",
     )
     .await?;
+    let mut uploadpack_filter = Command::new("git");
+    uploadpack_filter.env("GIT_DIR", staging_repository).args([
+        "config",
+        "uploadpack.allowFilter",
+        "true",
+    ]);
+    run_git(
+        &mut uploadpack_filter,
+        "allow filtered wants in snapshot upload-pack",
+    )
+    .await?;
 
     tokio::fs::rename(staging_repository, final_repository)
         .await

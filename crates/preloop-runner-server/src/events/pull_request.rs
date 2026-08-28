@@ -5,7 +5,7 @@
 //! Pull request webhook always emits `pull_request_target` AND conditionally
 //! emits `pull_request` (gated on AllowPullRequests / non-fork).
 //!
-//! - pull_request_target: ref = refs/heads/{base.ref}, sha = head.sha
+//! - pull_request_target: ref = refs/heads/{base.ref}, sha = base.sha (required)
 //! - pull_request: ref = refs/pull/{n}/merge, sha = merge_commit_sha
 //!   (or refs/pull/{n}/head if no merge pseudo-branch)
 
@@ -104,7 +104,7 @@ impl EventAdapter for Adapter {
         events.push(EffectiveEvent {
             event: "pull_request_target".to_owned(),
             git_ref: format!("refs/heads/{base}"),
-            sha: base_checkout.or_else(|| Some(head.to_owned())),
+            sha: base_checkout,
             status_check_sha: Some(head.to_owned()),
             activity_type: act.clone(),
             trust_tier: Some(TrustTier::PullRequestTarget),
@@ -187,6 +187,11 @@ mod tests {
         });
         let events = Adapter.project(&payload);
         assert_eq!(events.len(), 2);
+        let target = events
+            .iter()
+            .find(|event| event.event == "pull_request_target")
+            .unwrap();
+        assert_eq!(target.sha, None);
         let pr = events
             .iter()
             .find(|event| event.event == "pull_request")

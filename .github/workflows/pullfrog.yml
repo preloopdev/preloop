@@ -34,7 +34,5 @@ jobs:
           prompt: ${{ inputs.prompt || toJSON(github.event) }}
           model: openai/gpt-5.6-terra
         env:
-          # Direct Codex/Claude subscriptions — no CLIProxy, no API keys
           CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          # Optional: add ANTHROPIC_API_KEY/OPENAI_API_KEY as fallback, but subscription is preferred

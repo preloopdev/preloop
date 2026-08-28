@@ -10,6 +10,7 @@ description = "Job scheduling and VM lifecycle orchestration for Preloop CI"
 [dependencies]
 preloop-vm = { path = "../preloop-vm" }
 preloop-gha-protocol = { path = "../preloop-gha-protocol" }
+preloop-observability = { path = "../preloop-observability" }
 preloop-runner-server = { path = "../preloop-runner-server" }
 preloop-gha-parser = { path = "../preloop-gha-parser" }
 anyhow = { workspace = true }

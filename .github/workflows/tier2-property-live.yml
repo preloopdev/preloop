@@ -1,17 +1,5 @@
 name: tier2-property-live
 
-# The official GitHub-hosted runner is the oracle for this live conformance job.
-# Workflow command documentation (file commands, stop-commands, and add-mask):
-# https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands
-# Action metadata and pre/main/post lifecycle documentation:
-# https://docs.github.com/en/actions/creating-actions/metadata-syntax-for-github-actions
-# Pinned runner reference: actions/runner v2.335.1, commit
-# 7d737449ef346f6524f75688d0c9c95fa10ba10a.
-# ActionRunner.cs lifecycle dispatch:
-# https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionRunner.cs#L79-L110
-# ActionManager.cs preparation/order:
-# https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionManager.cs#L301-L360
-
 on:
   push:
     paths:
@@ -58,8 +46,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Cargo exits successfully when a filter matches zero tests. Keep this
-          # gate explicit so a renamed or removed property cannot silently pass.
           run_filter() {
             local package="$1"
             local filter="$2"
@@ -83,8 +69,6 @@ jobs:
           run_filter preloop-runner lifecycle
           run_filter preloop-runner-server workflow_steps_update_
 
-      # The official runner does not support local pre actions, so this fixture
-      # is pinned to an immutable, isolated action-only commit in this repository.
       - name: Run remote JavaScript oracle (declaration 1)
         id: oracle_first
         uses: preloopdev/preloop/.github/actions/tier2-property-oracle@88e5328dd1ee742206bc5e4f12823613744aa311
@@ -135,8 +119,6 @@ jobs:
           printf '::%s::\n' "$stop_token"
           printf '::notice::stop-commands-resumed\n'
 
-          # The sentinel is deliberately printed after add-mask for inspection
-          # in the live job log; the official runner must redact its value.
           sha="${GITHUB_SHA:-000000000000}"
           sha_short="${sha:0:12}"
           mask_sentinel="tier2-mask-${run_id}-${run_attempt}-${sha_short}"

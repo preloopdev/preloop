@@ -1,0 +1,31 @@
+[package]
+name = "preloop-observability"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Observability handle for Preloop — metrics, logs, traces, status snapshot"
+repository = "https://github.com/preloopdev/preloop"
+
+[dependencies]
+chrono = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry-appender-tracing = { workspace = true }
+opentelemetry-http = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry-semantic-conventions = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+parking_lot = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+
+[lints]
+workspace = true

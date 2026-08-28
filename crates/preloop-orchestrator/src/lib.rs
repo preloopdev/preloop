@@ -24,7 +24,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -1740,6 +1740,16 @@ pub struct RunnerPoolConfig {
     /// queued-job starvation clock during the warm; it is cleared before
     /// the pool serves its first job.
     pub preparing_signal: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Consolidated pool handle (replaces the four ad-hoc Option<Arc<…>> fields above).
+    /// When `Some`, the pool updates it and the server sampler reads it.
+    /// Retain the legacy fields for now for backwards compatibility; new code
+    /// should read/write `pool_status`.
+    pub pool_status: Option<Arc<preloop_observability::status::PoolStatus>>,
+    /// Observability handle whose VM registry tracks this pool's live
+    /// machines. When `Some`, the pool registers created/forked VMs and
+    /// deregisters them at teardown; `None` (tests, legacy callers) skips
+    /// the wiring.
+    pub observability: Option<preloop_observability::Observability>,
 }
 
 /// Cache of environment-specific golden VMs.
@@ -1754,6 +1764,10 @@ pub(crate) struct GoldenRegistry {
     /// `prepare_golden_for_env` removes any existing machine of that name).
     build_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     name_prefix: String,
+    /// Set when the startup packed-golden import failed. In that case the
+    /// pool must create runners directly from their requested base image
+    /// rather than attempting a second environment-golden bake.
+    packed_unavailable: AtomicBool,
 }
 
 impl GoldenRegistry {
@@ -1762,12 +1776,25 @@ impl GoldenRegistry {
             goldens: RwLock::new(HashMap::new()),
             build_locks: RwLock::new(HashMap::new()),
             name_prefix,
+            packed_unavailable: AtomicBool::new(false),
         }
     }
 
     /// Return the name prefix used for golden VM names.
     pub fn name_prefix(&self) -> &str {
         &self.name_prefix
+    }
+
+    /// Disable packed-golden and environment-golden preparation after the
+    /// startup packed import fails. Direct per-runner creation is the only
+    /// honest fallback: a second environment golden would repeat the same
+    /// disk-heavy unpack under a different name.
+    pub fn disable_packed(&self) {
+        self.packed_unavailable.store(true, Ordering::Release);
+    }
+
+    pub fn is_packed_disabled(&self) -> bool {
+        self.packed_unavailable.load(Ordering::Acquire)
     }
 
     /// Get existing golden or return None if not yet prepared.
@@ -2151,6 +2178,7 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
     remove_golden_record(config, golden);
     if provider.status(golden).await? != MachineState::Missing {
         provider.delete(golden).await?;
+        vm_telemetry_deregister(config, golden);
     }
     let spec = MachineSpec {
         name: golden.clone(),
@@ -2174,7 +2202,9 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
     };
     provider.create(&spec).await?;
     provider.start(golden).await?;
+    vm_telemetry_register(config, golden, "golden", Some(&spec));
     if let Err(error) = await_guest_ready(provider.as_ref(), golden).await {
+        vm_telemetry_deregister(config, golden);
         let _ = provider.delete(golden).await;
         return Err(error);
     }
@@ -2188,10 +2218,12 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
         // Custom bases skip it along with the rest of the bake: the image is
         // the operator's contract.
         if let Err(error) = prepare_rosetta_multiarch(provider.as_ref(), golden).await {
+            vm_telemetry_deregister(config, golden);
             let _ = provider.delete(golden).await;
             return Err(error);
         }
         if let Err(error) = install_base_dependencies(provider.as_ref(), golden).await {
+            vm_telemetry_deregister(config, golden);
             let _ = provider.delete(golden).await;
             return Err(error);
         }
@@ -2199,6 +2231,7 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
     for layer in &env_spec.toolchains {
         for command in layer.install_commands() {
             if let Err(error) = provider.exec(golden, &command).await {
+                vm_telemetry_deregister(config, golden);
                 let _ = provider.delete(golden).await;
                 return Err(error.into());
             }
@@ -2216,10 +2249,12 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
         );
     }
     if let Err(error) = provider.stop(golden).await {
+        vm_telemetry_deregister(config, golden);
         let _ = provider.delete(golden).await;
         return Err(error.into());
     }
     if let Err(error) = provider.start_forkable(golden).await {
+        vm_telemetry_deregister(config, golden);
         let _ = provider.delete(golden).await;
         return Err(error.into());
     }
@@ -2254,6 +2289,7 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
     remove_golden_record(config, golden);
     if provider.status(golden).await? != MachineState::Missing {
         provider.delete(golden).await?;
+        vm_telemetry_deregister(config, golden);
     }
     // smolvm's `machine create --from` consumes the SMOLPACK, not the ELF
     // launcher stub written at the payload stem. A downloaded release asset
@@ -2280,9 +2316,17 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
         dns: config.dns.clone(),
         rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
     };
-    provider.create(&spec).await?;
-    provider.start(golden).await?;
+    if let Err(error) = provider.create(&spec).await {
+        let _ = provider.delete(golden).await;
+        return Err(error.into());
+    }
+    if let Err(error) = provider.start(golden).await {
+        let _ = provider.delete(golden).await;
+        return Err(error.into());
+    }
+    vm_telemetry_register(config, golden, "golden", Some(&spec));
     if let Err(error) = await_guest_ready(provider.as_ref(), golden).await {
+        vm_telemetry_deregister(config, golden);
         let _ = provider.delete(golden).await;
         return Err(error);
     }
@@ -2296,8 +2340,16 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
             %error, "image preload failed; jobs will pull at run time"
         );
     }
-    provider.stop(golden).await?;
-    provider.start_forkable(golden).await?;
+    if let Err(error) = provider.stop(golden).await {
+        vm_telemetry_deregister(config, golden);
+        let _ = provider.delete(golden).await;
+        return Err(error.into());
+    }
+    if let Err(error) = provider.start_forkable(golden).await {
+        vm_telemetry_deregister(config, golden);
+        let _ = provider.delete(golden).await;
+        return Err(error.into());
+    }
     write_golden_record(config, golden, &env_spec.fingerprint);
     info!(
         machine = golden.as_str(),
@@ -2319,6 +2371,17 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         if let Some(signal) = &self.config.preparing_signal {
             signal.store(true, std::sync::atomic::Ordering::Release);
         }
+        if let Some(ps) = &self.config.pool_status {
+            ps.set_preparing(true);
+        }
+        // Any error exit below (host externals, artifact prep, stale-machine
+        // cleanup, golden bake) must clear the flag again; the guard is
+        // disarmed once the warm completes.
+        let mut clear_preparing = ClearPreparingOnDrop {
+            signal: self.config.preparing_signal.clone(),
+            pool_status: self.config.pool_status.clone(),
+            armed: true,
+        };
         ensure_host_externals(&self.config)?;
         if self.config.use_packed_artifact || self.config.control_socket.is_none() {
             self.prepare_artifact(true).await?;
@@ -2340,7 +2403,16 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     .await
             };
             if let Err(error) = result {
-                warn!(%error, "golden fork base unavailable; falling back to create-per-runner");
+                if self.config.use_packed_artifact {
+                    golden_registry.disable_packed();
+                    warn!(
+                        %error,
+                        "packed golden fork base unavailable; using direct per-runner creation \
+                         instead of building a second environment golden"
+                    );
+                } else {
+                    warn!(%error, "golden fork base unavailable; falling back to direct creation");
+                }
             } else {
                 golden_registry
                     .insert(default_environment.fingerprint, golden)
@@ -2354,11 +2426,15 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         if let Some(signal) = &self.config.preparing_signal {
             signal.store(false, std::sync::atomic::Ordering::Release);
         }
+        if let Some(ps) = &self.config.pool_status {
+            ps.set_preparing(false);
+        }
+        clear_preparing.armed = false;
 
         let mut slots = JoinSet::new();
         // Runners currently registered and waiting for work. Slots consult it
         // to decide whether a replacement is worth booting mid-job.
-        let idle = Arc::new(AtomicUsize::new(0));
+        let idle = Arc::new(std::sync::Mutex::new(0));
         // Filled in the background so no slot ever waits on RSA generation.
         let keys = Arc::new(KeyPool::new());
         keys.spawn_refill();
@@ -2445,6 +2521,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         while slots.join_next().await.is_some() {}
         // Clean up every environment-specific golden fork base.
         for golden in golden_registry.all_names().await {
+            vm_telemetry_deregister(&self.config, &golden);
             let _ = self.provider.delete(&golden).await;
         }
         self.remove_stale_machines().await?;
@@ -2458,7 +2535,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         &self,
         shutdown: CancellationToken,
         golden_registry: Arc<GoldenRegistry>,
-        idle: Arc<AtomicUsize>,
+        idle: Arc<std::sync::Mutex<usize>>,
         keys: Arc<KeyPool>,
         building: Arc<AtomicUsize>,
     ) -> Result<(), OrchestratorError> {
@@ -2488,7 +2565,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         info!(max_concurrent, "on-demand runner pool (size=0)");
 
         let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
-        let provisioning = Arc::new(AtomicUsize::new(0));
+        let provisioning = Arc::new(std::sync::Mutex::new(0));
         let mut slots = JoinSet::new();
         let mut next_slot: usize = 0;
 
@@ -2593,6 +2670,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // Drain remaining runners on shutdown.
         while slots.join_next().await.is_some() {}
         for golden in golden_registry.all_names().await {
+            vm_telemetry_deregister(&self.config, &golden);
             let _ = self.provider.delete(&golden).await;
         }
         self.remove_stale_machines().await?;
@@ -2751,6 +2829,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                 .starts_with(&format!("{}-", self.config.name_prefix))
             {
                 notify_runner_gone(&self.config, &name).await;
+                vm_telemetry_deregister(&self.config, &name);
                 if let Err(error) = self.provider.delete(&name).await {
                     warn!(machine = name.as_str(), %error, "failed to delete stale Preloop runner");
                 }
@@ -2833,7 +2912,7 @@ struct RunnerEnvironment {
 #[derive(Clone)]
 struct PoolHandles {
     /// Runners across the whole pool that are registered and unclaimed.
-    idle: Arc<AtomicUsize>,
+    idle: Arc<std::sync::Mutex<usize>>,
     /// Keypairs generated ahead of time for runner registration.
     keys: Arc<KeyPool>,
     /// Replacements currently being built across the whole pool.
@@ -2851,7 +2930,7 @@ struct SlotPlan<'a> {
     /// Environment selected for the replacement.
     environment: RunnerEnvironment,
     /// Runners across the whole pool that are registered and unclaimed.
-    idle: &'a AtomicUsize,
+    idle: &'a std::sync::Mutex<usize>,
     /// Keypairs generated ahead of time for runner registration.
     keys: &'a Arc<KeyPool>,
     /// Replacements currently being built across the whole pool.
@@ -2864,11 +2943,18 @@ struct SlotPlan<'a> {
 ///
 /// Held for the duration of the build so concurrent slots see it, and released
 /// on drop so an error path cannot strand the count.
-struct Reservation<'a>(&'a AtomicUsize);
+struct Reservation<'a> {
+    building: &'a AtomicUsize,
+    pool_status: Option<Arc<preloop_observability::status::PoolStatus>>,
+}
 
 impl<'a> Reservation<'a> {
     /// Claim a build slot, or `None` when `wanted` are already in flight.
-    fn take(building: &'a AtomicUsize, wanted: usize) -> Option<Self> {
+    fn take(
+        building: &'a AtomicUsize,
+        wanted: usize,
+        pool_status: Option<Arc<preloop_observability::status::PoolStatus>>,
+    ) -> Option<Self> {
         let mut current = building.load(Ordering::Acquire);
         loop {
             if current >= wanted {
@@ -2880,7 +2966,19 @@ impl<'a> Reservation<'a> {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Some(Self(building)),
+                Ok(_) => {
+                    // Publish the counter's current value, not the pre-CAS
+                    // `current + 1`: a concurrent reservation may have
+                    // incremented again in between, and publishing the stale
+                    // computed value would under-report in-flight builds.
+                    if let Some(ps) = &pool_status {
+                        ps.set_building(building.load(Ordering::Acquire) as u32);
+                    }
+                    return Some(Self {
+                        building,
+                        pool_status,
+                    });
+                }
                 Err(observed) => current = observed,
             }
         }
@@ -2889,7 +2987,14 @@ impl<'a> Reservation<'a> {
 
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        self.building.fetch_sub(1, Ordering::AcqRel);
+        // Re-read after the decrement: a concurrent take or drop may have
+        // changed the counter again, and publishing the value captured at
+        // this reservation's own decrement could overwrite a newer status
+        // update with an older one.
+        if let Some(ps) = &self.pool_status {
+            ps.set_building(self.building.load(Ordering::Acquire) as u32);
+        }
     }
 }
 
@@ -2898,27 +3003,77 @@ impl Drop for Reservation<'_> {
 /// create several runners concurrently; the first completed runner must not
 /// clear the signal while another job's runner is still bootstrapping.
 struct PreparingGuard {
-    active: Arc<AtomicUsize>,
+    active: Arc<std::sync::Mutex<usize>>,
     signal: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pool_status: Option<Arc<preloop_observability::status::PoolStatus>>,
 }
 
 impl PreparingGuard {
-    fn enter(active: Arc<AtomicUsize>, signal: Option<Arc<std::sync::atomic::AtomicBool>>) -> Self {
-        if active.fetch_add(1, Ordering::AcqRel) == 0 {
+    fn enter(
+        active: Arc<std::sync::Mutex<usize>>,
+        signal: Option<Arc<std::sync::atomic::AtomicBool>>,
+        pool_status: Option<Arc<preloop_observability::status::PoolStatus>>,
+    ) -> Self {
+        // The counter mutation and the status publication share one lock, so
+        // a concurrent enter/drop can never publish an older count over a
+        // newer one: `snapshot().provisioning` always matches the live
+        // counter and cannot report a runner that no longer exists.
+        let mut count = active.lock().unwrap();
+        if *count == 0 {
             if let Some(signal) = &signal {
                 signal.store(true, Ordering::Release);
             }
         }
-        Self { active, signal }
+        *count += 1;
+        if let Some(ps) = &pool_status {
+            ps.set_provisioning(*count as u32);
+        }
+        drop(count);
+        Self {
+            active,
+            signal,
+            pool_status,
+        }
     }
 }
 
 impl Drop for PreparingGuard {
     fn drop(&mut self) {
-        if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+        let mut count = self.active.lock().unwrap();
+        *count = count.saturating_sub(1);
+        if *count == 0 {
             if let Some(signal) = &self.signal {
                 signal.store(false, Ordering::Release);
             }
+        }
+        if let Some(ps) = &self.pool_status {
+            ps.set_provisioning(*count as u32);
+        }
+    }
+}
+
+/// Clears the pool's preparing flag on drop unless startup completed.
+///
+/// Any startup step failing — host externals, artifact prep, stale-machine
+/// cleanup, golden bake — returns early, and without this the flag would
+/// stay `true` forever, marking every queued job unclaimable in the
+/// operational snapshot. Disarmed once the warm completes.
+struct ClearPreparingOnDrop {
+    signal: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pool_status: Option<Arc<preloop_observability::status::PoolStatus>>,
+    armed: bool,
+}
+
+impl Drop for ClearPreparingOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(ps) = &self.pool_status {
+            ps.set_preparing(false);
+        }
+        if let Some(signal) = &self.signal {
+            signal.store(false, std::sync::atomic::Ordering::Release);
         }
     }
 }
@@ -3037,11 +3192,20 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     shutdown: CancellationToken,
     golden_registry: Arc<GoldenRegistry>,
     handles: PoolHandles,
-    provisioning: Arc<AtomicUsize>,
+    provisioning: Arc<std::sync::Mutex<usize>>,
     semaphore: Arc<tokio::sync::Semaphore>,
     permit: Arc<std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
 ) -> Result<(), OrchestratorError> {
-    let preparing = PreparingGuard::enter(provisioning, config.preparing_signal.clone());
+    let mut config = config;
+    if golden_registry.is_packed_disabled() {
+        config.use_packed_artifact = false;
+        config.use_fork = false;
+    }
+    let preparing = PreparingGuard::enter(
+        provisioning,
+        config.preparing_signal.clone(),
+        config.pool_status.clone(),
+    );
     // Resolve the golden for the queued job's environment.
     let (golden, environment) = if config.use_fork {
         let env_base = match &config.next_job_runs_on {
@@ -3162,6 +3326,7 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     match result {
         Ok(Some(successor)) => {
             notify_runner_gone(&config, &successor.name).await;
+            vm_telemetry_deregister(&config, &successor.name);
             let _ = provider.delete(&successor.name).await;
             Ok(())
         }
@@ -3178,6 +3343,11 @@ async fn run_slot<P: VmProvider + 'static>(
     golden_registry: Arc<GoldenRegistry>,
     handles: PoolHandles,
 ) -> Result<(), OrchestratorError> {
+    let mut config = config;
+    if golden_registry.is_packed_disabled() {
+        config.use_packed_artifact = false;
+        config.use_fork = false;
+    }
     let PoolHandles {
         idle,
         keys,
@@ -3271,6 +3441,7 @@ async fn run_slot<P: VmProvider + 'static>(
                     slot,
                     "discarding spare runner built for a different environment"
                 );
+                vm_telemetry_deregister(&config, &ready.name);
                 let _ = provider.delete(&ready.name).await;
             }
         }
@@ -3336,6 +3507,7 @@ async fn run_slot<P: VmProvider + 'static>(
 
     if let Some(spare) = spare {
         notify_runner_gone(&config, &spare.name).await;
+        vm_telemetry_deregister(&config, &spare.name);
         let _ = provider.delete(&spare.name).await;
     }
     Ok(())
@@ -3356,12 +3528,25 @@ async fn provision_slot<P: VmProvider + 'static>(
 ) -> Result<ReadyRunner, OrchestratorError> {
     let name = MachineName::new(format!("{}-{slot}-{generation}", config.name_prefix))?;
     match provision_runner(provider, config, &name, golden, keys, &environment).await {
-        Ok(run) => Ok(ReadyRunner {
-            name,
-            run,
-            environment,
-        }),
+        Ok(run) => {
+            // A provision that made it (fork or direct create, configure,
+            // registration) resets the consecutive-failure streak. The
+            // counter feeds `pool_repeated_provision_failure` and the
+            // `consecutive_provision_failures` status field.
+            if let Some(ps) = &config.pool_status {
+                ps.clear_provision_failures();
+            }
+            Ok(ReadyRunner {
+                name,
+                run,
+                environment,
+            })
+        }
         Err(error) => {
+            if let Some(ps) = &config.pool_status {
+                ps.record_provision_failure();
+            }
+            vm_telemetry_deregister(config, &name);
             if let Err(cleanup) = provider.delete(&name).await {
                 warn!(
                     machine = name.as_str(),
@@ -3466,7 +3651,17 @@ async fn run_one_runner<P: VmProvider + 'static>(
     let claimed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let run_provider = provider.clone();
     let run_name = name.clone();
-    idle.fetch_add(1, Ordering::AcqRel);
+    // The counter mutation and the status publication share one lock, so a
+    // concurrent claim can never publish an older count over a newer one:
+    // `snapshot().idle` cannot report an idle runner that was already
+    // claimed.
+    {
+        let mut idle = idle.lock().unwrap();
+        *idle += 1;
+        if let Some(ps) = &config.pool_status {
+            ps.set_idle(*idle as u32);
+        }
+    }
     let run_task = tokio::spawn(async move {
         let result = run_until_exit(&run_provider, &run_name, &run, busy_tx).await;
         let _ = done_tx.send(result);
@@ -3479,11 +3674,24 @@ async fn run_one_runner<P: VmProvider + 'static>(
     let successor_claimed = claimed.clone();
     let build_successor = async {
         if busy_rx.await.is_err() {
-            idle.fetch_sub(1, Ordering::AcqRel);
+            {
+                let mut idle = idle.lock().unwrap();
+                *idle = idle.saturating_sub(1);
+                if let Some(ps) = &config.pool_status {
+                    ps.set_idle(*idle as u32);
+                }
+            }
             return None;
         }
         successor_claimed.store(true, Ordering::Release);
-        let idle_after = idle.fetch_sub(1, Ordering::AcqRel).saturating_sub(1);
+        let idle_after = {
+            let mut idle = idle.lock().unwrap();
+            *idle = idle.saturating_sub(1);
+            if let Some(ps) = &config.pool_status {
+                ps.set_idle(*idle as u32);
+            }
+            *idle
+        };
         if !prebuild_successor {
             return None;
         }
@@ -3502,7 +3710,7 @@ async fn run_one_runner<P: VmProvider + 'static>(
         let wanted = queued
             .saturating_sub(idle_after)
             .max(usize::from(idle_after == 0));
-        let _reservation = Reservation::take(building, wanted)?;
+        let _reservation = Reservation::take(building, wanted, config.pool_status.clone())?;
         match provision_slot(
             &provider,
             config,
@@ -3534,7 +3742,13 @@ async fn run_one_runner<P: VmProvider + 'static>(
         _ = wait_for_environment_change(config, &environment.base, claimed) => {
             run_task.abort();
             let _ = run_task.await;
-            idle.fetch_sub(1, Ordering::AcqRel);
+            {
+                let mut idle = idle.lock().unwrap();
+                *idle = idle.saturating_sub(1);
+                if let Some(ps) = &config.pool_status {
+                    ps.set_idle(*idle as u32);
+                }
+            }
             info!(machine = name.as_str(), environment = %environment.base, "replacing idle runner for queued environment");
             (provider.stop(name).await.map_err(OrchestratorError::from), None)
         },
@@ -3578,6 +3792,7 @@ async fn run_one_runner<P: VmProvider + 'static>(
     if let Some(debug_dir) = preserved {
         hold_for_debugging(name, &debug_dir, &shutdown).await;
         notify_runner_gone(config, name).await;
+        vm_telemetry_deregister(config, name);
         if let Err(error) = provider.delete(name).await {
             warn!(machine = name.as_str(), %error, "failed to delete preserved machine");
         }
@@ -3586,6 +3801,7 @@ async fn run_one_runner<P: VmProvider + 'static>(
 
     // Report the runner's own failure in preference to a teardown failure.
     notify_runner_gone(config, name).await;
+    vm_telemetry_deregister(config, name);
     let delete_result = provider.delete(name).await.map_err(OrchestratorError::from);
     finish(&provider, config, result.and(delete_result), successor).await
 }
@@ -3606,6 +3822,7 @@ async fn finish<P: VmProvider + 'static>(
         Err(error) => {
             if let Some(successor) = successor {
                 notify_runner_gone(config, &successor.name).await;
+                vm_telemetry_deregister(config, &successor.name);
                 if let Err(cleanup) = provider.delete(&successor.name).await {
                     warn!(
                         machine = successor.name.as_str(),
@@ -3737,12 +3954,71 @@ fn fork_base_unusable(error: &VmError) -> bool {
 /// and replacing it with the packed artifact would run the job on the wrong
 /// operating system.
 fn managed_golden(config: &RunnerPoolConfig, golden: &MachineName) -> bool {
-    let prefix = format!("{}-golden", config.name_prefix);
+    let prefix = plain_packed_golden_name(config);
     golden.as_str() == prefix
         || golden.as_str().strip_prefix(&prefix).is_some_and(|rest| {
             rest.strip_prefix('-')
                 .is_some_and(|fp| fp.len() == 12 && fp.bytes().all(|b| b.is_ascii_hexdigit()))
         })
+}
+
+/// The plain packed golden: the single golden baked at pool startup from the
+/// packed artifact for the default environment.
+fn plain_packed_golden_name(config: &RunnerPoolConfig) -> String {
+    format!("{}-golden", config.name_prefix)
+}
+
+/// Best-effort VM telemetry: register a just-created or forked machine.
+///
+/// Fills what the pool knows about the machine; unknown fields stay unset.
+/// No-op without a wired observability handle.
+fn vm_telemetry_register(
+    config: &RunnerPoolConfig,
+    name: &MachineName,
+    role: &str,
+    spec: Option<&MachineSpec>,
+) {
+    let Some(observability) = &config.observability else {
+        return;
+    };
+    let (cpus, memory_mib, storage_gb, overlay_gb) = match spec {
+        Some(spec) => (
+            spec.cpus,
+            spec.memory_mib,
+            spec.storage_gib,
+            spec.overlay_gib,
+        ),
+        // A fork inherits the golden's resources, which match the pool's
+        // configured values.
+        None => (
+            config.cpus,
+            config.memory_mib,
+            config.storage_gib,
+            config.overlay_gib,
+        ),
+    };
+    observability
+        .vm_registry()
+        .register(preloop_observability::vm_telemetry::VmRuntimeInfo {
+            name: name.as_str().to_owned(),
+            role: role.to_owned(),
+            activity: "running".to_owned(),
+            pid: None,
+            start_time: None,
+            cpus,
+            memory_mib,
+            storage_gb,
+            overlay_gb,
+            data_dir: None,
+            created_at: None,
+        });
+}
+
+/// Best-effort VM telemetry: drop a machine from the registry at teardown.
+fn vm_telemetry_deregister(config: &RunnerPoolConfig, name: &MachineName) {
+    if let Some(observability) = &config.observability {
+        observability.vm_registry().deregister(name.as_str());
+    }
 }
 
 /// Create, boot, and register one ephemeral runner; return its `run` argv.
@@ -3924,6 +4200,8 @@ async fn provision_runner<P: VmProvider + 'static>(
     };
 
     if let Some(golden) = forked_golden {
+        // The fork succeeded, so the clone exists as a live machine.
+        vm_telemetry_register(config, name, "runner", None);
         // Fork from the already-booted golden VM instant CoW clone.
         // The PACKED golden carries its bake inside the artifact's flattened
         // rootfs, which forks inherit through the storage chain — so the apt
@@ -3943,8 +4221,8 @@ async fn provision_runner<P: VmProvider + 'static>(
         // writes into clones — so those forks must install the baseline
         // themselves. Treating an env golden as packed skipped that install
         // and provisioned runners without the curated baseline.
-        let golden_is_packed = config.use_packed_artifact
-            && golden.as_str() == format!("{}-golden", config.name_prefix);
+        let golden_is_packed =
+            config.use_packed_artifact && golden.as_str() == plain_packed_golden_name(config);
         if golden_is_packed {
             // The pack carries the apt baseline, but not necessarily apt's
             // indices — restore them before any workflow apt-installs. A
@@ -4012,7 +4290,7 @@ async fn provision_runner<P: VmProvider + 'static>(
         // runner path), the packed artifact is the pool's normal image and
         // stays as-is.
         let golden_is_plain_packed = match golden {
-            Some(golden) => golden.as_str() == format!("{}-golden", config.name_prefix),
+            Some(golden) => golden.as_str() == plain_packed_golden_name(config),
             None => true,
         };
         let uses_packed_artifact = direct_create_from_packed && golden_is_plain_packed;
@@ -4045,6 +4323,7 @@ async fn provision_runner<P: VmProvider + 'static>(
         };
         provider.create(&spec).await?;
         provider.start(name).await?;
+        vm_telemetry_register(config, name, "runner", Some(&spec));
         // The packed artifact is the golden's frozen image; the live golden
         // receives the apt baseline and toolchain bake *after* boot, so a
         // machine created from the artifact is bare and must install the
@@ -4123,7 +4402,18 @@ async fn provision_runner<P: VmProvider + 'static>(
         }) {
             Ok(path) => {
                 if let Ok(mut guard) = pending.write() {
-                    guard.insert(token, std::time::SystemTime::now());
+                    guard.insert(token.clone(), std::time::SystemTime::now());
+                    // Mirror the mint into the consolidated status handle so
+                    // `PoolStatus::snapshot().pending_registrations` counts
+                    // tokens issued after startup too. The server-side
+                    // consume removes it from both stores.
+                    if let Some(ps) = &config.pool_status {
+                        ps.insert_pending(token, std::time::SystemTime::now());
+                        // Same 600s window as the legacy pending-map prune
+                        // below, so stale tokens don't inflate
+                        // `pending_registrations` forever.
+                        ps.retain_pending_newer_than(std::time::Duration::from_secs(600));
+                    }
                     let now = std::time::SystemTime::now();
                     guard.retain(|_, at| {
                         now.duration_since(*at)
@@ -5066,11 +5356,11 @@ chmod +x "$destination/bin/node"
 
     #[test]
     fn concurrent_on_demand_provisioning_keeps_preparing_signal_raised() {
-        let active = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(std::sync::Mutex::new(0));
         let signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        let first = PreparingGuard::enter(active.clone(), Some(signal.clone()));
-        let second = PreparingGuard::enter(active.clone(), Some(signal.clone()));
+        let first = PreparingGuard::enter(active.clone(), Some(signal.clone()), None);
+        let second = PreparingGuard::enter(active.clone(), Some(signal.clone()), None);
         assert!(signal.load(Ordering::Acquire));
 
         drop(first);
@@ -5116,6 +5406,8 @@ chmod +x "$destination/bin/node"
             next_job_runs_on: None,
             pending_registrations: None,
             preparing_signal: None,
+            pool_status: None,
+            observability: None,
         }
     }
 
@@ -5444,6 +5736,58 @@ chmod +x "$destination/bin/node"
         let config = test_config(false);
         let golden = MachineName::new("lifecycle-test-golden").unwrap();
         provisioning_failure(provider, &config, Some(&golden), "configure-failure").await;
+    }
+
+    #[tokio::test]
+    async fn provision_failures_count_and_clear_on_pool_status() {
+        let mut config = test_config(false);
+        let pool_status = Arc::new(preloop_observability::status::PoolStatus::new(
+            preloop_observability::status::PoolSnapshot::default(),
+        ));
+        config.pool_status = Some(pool_status.clone());
+        let keys = Arc::new(KeyPool::new());
+
+        // A failing provision must increment the consecutive-failure counter,
+        // which feeds `pool_repeated_provision_failure` and the status field.
+        let failing = Arc::new(TestProvider::new(true, false, false, false, false));
+        let err = provision_slot(
+            &failing,
+            &config,
+            0,
+            1,
+            None,
+            &keys,
+            RunnerEnvironment {
+                fingerprint: None,
+                base: config.base_image.clone(),
+                toolchains: Vec::new(),
+                curated: true,
+            },
+        )
+        .await
+        .expect_err("start-failure must propagate");
+        assert!(err.to_string().contains("start-failure"));
+        assert_eq!(pool_status.snapshot().consecutive_provision_failures, 1);
+
+        // A succeeding provision must reset the streak to zero.
+        let ok = Arc::new(TestProvider::new(false, false, false, false, false));
+        provision_slot(
+            &ok,
+            &config,
+            0,
+            2,
+            None,
+            &keys,
+            RunnerEnvironment {
+                fingerprint: None,
+                base: config.base_image.clone(),
+                toolchains: Vec::new(),
+                curated: true,
+            },
+        )
+        .await
+        .expect("provisioning succeeds");
+        assert_eq!(pool_status.snapshot().consecutive_provision_failures, 0);
     }
 
     fn packed_fork_config() -> RunnerPoolConfig {
@@ -6036,7 +6380,7 @@ chmod +x "$destination/bin/node"
         )
         .await
         .expect("provisioning succeeds");
-        let idle = AtomicUsize::new(0);
+        let idle = std::sync::Mutex::new(0);
         let error = run_one_runner(
             provider,
             &config,
@@ -6071,7 +6415,7 @@ chmod +x "$destination/bin/node"
         let mut config = test_config(false);
         config.size = 0;
         let handles = PoolHandles {
-            idle: Arc::new(AtomicUsize::new(0)),
+            idle: Arc::new(std::sync::Mutex::new(0)),
             keys: Arc::new(KeyPool::new()),
             building: Arc::new(AtomicUsize::new(0)),
         };
@@ -6083,7 +6427,7 @@ chmod +x "$destination/bin/node"
             CancellationToken::new(),
             Arc::new(GoldenRegistry::new(config.name_prefix.clone())),
             handles,
-            Arc::new(AtomicUsize::new(0)),
+            Arc::new(std::sync::Mutex::new(0)),
             Arc::new(tokio::sync::Semaphore::new(1)),
             Arc::new(std::sync::Mutex::new(None)),
         )
@@ -6377,6 +6721,14 @@ mod golden_registry_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn packed_failure_disables_secondary_environment_bakes() {
+        let registry = GoldenRegistry::new("test".to_owned());
+        assert!(!registry.is_packed_disabled());
+        registry.disable_packed();
+        assert!(registry.is_packed_disabled());
+    }
 
     /// Distinct environments must build concurrently: one fingerprint's bake
     /// must not park other slots (the pre-freeze `build_lock` behavior).
