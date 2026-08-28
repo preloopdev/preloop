@@ -1206,6 +1206,21 @@ pub(crate) async fn submit_run_inner(
                             snapshot_timing: None,
                         },
                     );
+                    // The run died on arrival: nothing will ever dispatch,
+                    // so the expandable nodes' minted request correlation has
+                    // to be settled here (MC-3), exactly like a cancellation.
+                    for job in &built_jobs {
+                        if job.deferred_matrix.is_some() || job.reusable_call.is_some() {
+                            runtime_scheduling::retire_node_requests(
+                                &mut inner,
+                                run_id,
+                                &job.job_id,
+                                runtime_scheduling::RequestRetirement::Settle(
+                                    ExecutionStatus::Cancelled,
+                                ),
+                            );
+                        }
+                    }
                     drop(inner);
                     shared
                         .state

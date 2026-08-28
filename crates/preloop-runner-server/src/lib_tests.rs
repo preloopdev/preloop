@@ -18441,6 +18441,584 @@ jobs:
     }
 }
 
+#[tokio::test]
+async fn cancelled_deferred_matrix_node_settles_submit_requests() {
+    // MC-3: a needs-deferred matrix node cancelled before its expansion never
+    // dispatches, so no completion, result patch or disconnect ever settles
+    // the submit-time request correlation minted for it. The run-cancel path
+    // must settle those records (result Cancelled, out of inflight, out of
+    // every session) exactly as completion would — the state the
+    // reusable-caller path has from submit, since callers mint nothing.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": r#"
+on: push
+jobs:
+  generator:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo gen
+  downstream:
+    needs: [generator]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.generator.outputs.matrix) }}
+    steps:
+      - run: echo dynamic
+"#,
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let placeholder = JobId("downstream".to_string());
+
+    let (request_id, plan_id, agent_job_id, timeline_id) = {
+        let inner = state.inner.lock().await;
+        let record = inner
+            .job_requests
+            .values()
+            .find(|r| r.run_id == run_id && r.job_id == placeholder)
+            .expect("deferred-matrix placeholder must have a submit-time request");
+        assert!(
+            inner.inflight_requests.contains_key(&record.request_id),
+            "placeholder request must start out inflight"
+        );
+        (
+            record.request_id,
+            record.plan_id.clone(),
+            record.agent_job_id,
+            record.timeline_id,
+        )
+    };
+
+    let cancelled = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/runs/{run_id}/cancel"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(cancelled["status"], "cancelled");
+
+    let inner = state.inner.lock().await;
+    let record = inner
+        .job_requests
+        .get(&request_id)
+        .expect("settled placeholder keeps its record, like a completed job");
+    assert_eq!(
+        record.result,
+        Some(ExecutionStatus::Cancelled),
+        "MC-3: cancelled placeholder request must be settled"
+    );
+    assert!(
+        !inner.inflight_requests.contains_key(&request_id),
+        "MC-3: cancelled placeholder must leave inflight_requests"
+    );
+    assert!(
+        !inner
+            .session_active_requests
+            .values()
+            .any(|&rid| rid == request_id),
+        "MC-3: cancelled placeholder must leave session_active_requests"
+    );
+    // The correlation indexes keep resolving to the settled record, exactly
+    // as they do for a job a runner completed.
+    assert_eq!(
+        inner.plan_requests.get(&plan_id),
+        Some(&request_id),
+        "plan_requests must keep resolving to the settled placeholder"
+    );
+    assert_eq!(
+        inner.agent_job_requests.get(&agent_job_id),
+        Some(&request_id),
+        "agent_job_requests must keep resolving to the settled placeholder"
+    );
+    assert_eq!(
+        inner.timeline_requests.get(&timeline_id),
+        Some(&request_id),
+        "timeline_requests must keep resolving to the settled placeholder"
+    );
+    // RenewJob correlation end-state: the broker refuses to renew a request
+    // no session owns, so a cancelled placeholder can neither be renewed nor
+    // resurrected.
+    assert!(
+        crate::broker::ensure_broker_request_owner(&inner, request_id, 1).is_err(),
+        "MC-3: no runner may renew the cancelled placeholder"
+    );
+    // Completion-equivalent grant semantics, verified rather than assumed:
+    // nothing outside the Purge arm ever removes these maps, for any job, so
+    // a settled placeholder keeps its entries exactly like a completed job.
+    assert!(
+        inner
+            .id_token_grants
+            .contains_key(&(run_id, placeholder.clone())),
+        "settled placeholder keeps its id-token grant like a completed job"
+    );
+    assert!(
+        inner
+            .oidc_job_contexts
+            .contains_key(&(run_id, placeholder.clone())),
+        "settled placeholder keeps its OIDC context like a completed job"
+    );
+    drop(inner);
+
+    let run = get_run_json(&app, &run_id.to_string()).await;
+    assert_eq!(run["jobs"]["downstream"], "cancelled");
+}
+
+#[tokio::test]
+async fn cancelled_deferred_matrix_node_job_cancel_settles_requests() {
+    // MC-3: the job-level cancel path (job-level concurrency cancel-in-
+    // progress, holder cancellation) hits the same leak as a run cancel: a
+    // parked deferred-matrix node's submit-time records stay active forever.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": r#"
+on: push
+jobs:
+  generator:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo gen
+  downstream:
+    needs: [generator]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.generator.outputs.matrix) }}
+    steps:
+      - run: echo dynamic
+"#,
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let placeholder = JobId("downstream".to_string());
+
+    let request_id = {
+        let inner = state.inner.lock().await;
+        inner
+            .job_requests
+            .values()
+            .find(|r| r.run_id == run_id && r.job_id == placeholder)
+            .expect("deferred-matrix placeholder must have a submit-time request")
+            .request_id
+    };
+
+    {
+        let mut inner = state.inner.lock().await;
+        crate::runtime_scheduling::cancel_job_inner(&mut inner, run_id, &placeholder);
+    }
+
+    let inner = state.inner.lock().await;
+    let record = inner
+        .job_requests
+        .get(&request_id)
+        .expect("settled placeholder keeps its record, like a completed job");
+    assert_eq!(
+        record.result,
+        Some(ExecutionStatus::Cancelled),
+        "MC-3: job-cancelled placeholder request must be settled"
+    );
+    assert!(
+        !inner.inflight_requests.contains_key(&request_id),
+        "MC-3: job-cancelled placeholder must leave inflight_requests"
+    );
+    assert_eq!(
+        inner.runs[&run_id].jobs.get(&placeholder),
+        Some(&ExecutionStatus::Cancelled),
+        "job cancel must still mark the node cancelled in the run"
+    );
+}
+
+#[tokio::test]
+async fn overflowed_run_settles_deferred_matrix_node_requests() {
+    // MC-3: a run cancelled at submit by a workflow-concurrency queue
+    // overflow never dispatches anything, yet the deferred-matrix node's
+    // submit-time request records were minted before the gate check. They
+    // must be settled like any other cancellation instead of leaking as
+    // active forever.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let yaml = r#"
+on: push
+concurrency:
+  group: overflow-group
+  queue: max
+jobs:
+  generator:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo gen
+  downstream:
+    needs: [generator]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.generator.outputs.matrix) }}
+    steps:
+      - run: echo dynamic
+"#;
+    // 1 running + 100 pending = 101 holders; 102nd arrival cancelled.
+    let mut ids = Vec::new();
+    for _ in 0..101 {
+        let r = submit_yaml(&app, yaml, "owner/repo").await;
+        ids.push(r["run_id"].as_str().unwrap().to_owned());
+    }
+    let overflow_id = submit_yaml(&app, yaml, "owner/repo").await;
+    let overflow_id = overflow_id["run_id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        get_run_json(&app, &overflow_id).await["status"],
+        "cancelled"
+    );
+
+    let run_id: RunId = overflow_id.parse().unwrap();
+    let inner = state.inner.lock().await;
+    let record = inner
+        .job_requests
+        .values()
+        .find(|r| r.run_id == run_id && r.job_id == JobId("downstream".to_string()))
+        .expect("overflowed run must still have minted the placeholder request");
+    assert_eq!(
+        record.result,
+        Some(ExecutionStatus::Cancelled),
+        "MC-3: overflowed run placeholder request must be settled"
+    );
+    assert!(
+        !inner.inflight_requests.contains_key(&record.request_id),
+        "MC-3: overflowed run placeholder must leave inflight_requests"
+    );
+}
+
+#[tokio::test]
+async fn dependency_skipped_deferred_matrix_node_settles_requests() {
+    // MC-3: a needs-deferred matrix node whose dependency fails is concluded
+    // as Skipped by the dependency-decision arm of the promote sweep — never
+    // dispatched, so no completion path settles its submit-time request
+    // correlation. The skip arm must settle it like any other terminal
+    // conclusion.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": r#"
+on: push
+jobs:
+  generator:
+    runs-on: ubuntu-latest
+    steps:
+      - run: exit 1
+  downstream:
+    needs: [generator]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.generator.outputs.matrix) }}
+    steps:
+      - run: echo dynamic
+"#,
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let placeholder = JobId("downstream".to_string());
+
+    let request_id = {
+        let inner = state.inner.lock().await;
+        inner
+            .job_requests
+            .values()
+            .find(|r| r.run_id == run_id && r.job_id == placeholder)
+            .expect("deferred-matrix placeholder must have a submit-time request")
+            .request_id
+    };
+
+    request_json(
+        &app,
+        Method::POST,
+        "/internal/test/jobs/complete",
+        json!({
+            "run_id": run_id,
+            "job_id": "generator",
+            "status": "failure"
+        }),
+    )
+    .await;
+
+    let inner = state.inner.lock().await;
+    let record = inner
+        .job_requests
+        .get(&request_id)
+        .expect("skipped placeholder keeps its record, like a completed job");
+    assert_eq!(
+        record.result,
+        Some(ExecutionStatus::Skipped),
+        "MC-3: dependency-skipped placeholder request must be settled"
+    );
+    assert!(
+        !inner.inflight_requests.contains_key(&request_id),
+        "MC-3: dependency-skipped placeholder must leave inflight_requests"
+    );
+    assert!(
+        !inner
+            .session_active_requests
+            .values()
+            .any(|&rid| rid == request_id),
+        "MC-3: dependency-skipped placeholder must leave session_active_requests"
+    );
+    assert_eq!(
+        inner.runs[&run_id].jobs.get(&placeholder),
+        Some(&ExecutionStatus::Skipped),
+        "the node itself must be concluded Skipped in the run"
+    );
+}
+
+#[tokio::test]
+async fn dependency_error_deferred_matrix_node_settles_requests() {
+    // MC-3: a needs-deferred matrix node whose `if:` expression fails to
+    // evaluate is concluded as Failure by the dependency-decision arm of the
+    // promote sweep. Its submit-time request correlation must be settled the
+    // same way.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": r#"
+on: push
+jobs:
+  generator:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo gen
+  downstream:
+    needs: [generator]
+    # Parse-valid but a runtime evaluation error: `format` cannot resolve the
+    # placeholder with no arguments, a genuine condition error rather than a
+    # false value, so the node concludes Failure rather than Skipped.
+    if: ${{ format('{}') }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.generator.outputs.matrix) }}
+    steps:
+      - run: echo dynamic
+"#,
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let placeholder = JobId("downstream".to_string());
+
+    let request_id = {
+        let inner = state.inner.lock().await;
+        inner
+            .job_requests
+            .values()
+            .find(|r| r.run_id == run_id && r.job_id == placeholder)
+            .expect("deferred-matrix placeholder must have a submit-time request")
+            .request_id
+    };
+
+    request_json(
+        &app,
+        Method::POST,
+        "/internal/test/jobs/complete",
+        json!({
+            "run_id": run_id,
+            "job_id": "generator",
+            "status": "success"
+        }),
+    )
+    .await;
+
+    let inner = state.inner.lock().await;
+    let record = inner
+        .job_requests
+        .get(&request_id)
+        .expect("errored placeholder keeps its record, like a completed job");
+    assert_eq!(
+        record.result,
+        Some(ExecutionStatus::Failure),
+        "MC-3: condition-error placeholder request must be settled"
+    );
+    assert!(
+        !inner.inflight_requests.contains_key(&request_id),
+        "MC-3: condition-error placeholder must leave inflight_requests"
+    );
+    assert_eq!(
+        inner.runs[&run_id].jobs.get(&placeholder),
+        Some(&ExecutionStatus::Failure),
+        "the node itself must be concluded Failure in the run"
+    );
+}
+
+#[tokio::test]
+async fn cancel_preserves_completed_reusable_caller_result() {
+    // MC-3 review follow-up: a nested reusable caller that finished Success
+    // while the run stayed active still sits in `run.caller_plans` with an
+    // unsettled request record (`propagate_reusable_outputs` retires none).
+    // The run-cancel sweep settles every expandable node, so it must settle
+    // this one with its real verdict — Success — not clobber it to Cancelled.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": r#"
+on: push
+jobs:
+  outer:
+    uses: ./.github/workflows/outer.yml
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo keepalive
+"#,
+            "event": "push",
+            "repository": "owner/repo",
+            "reusable_workflows": {
+                ".github/workflows/outer.yml": r#"
+on: workflow_call
+jobs:
+  nested:
+    uses: ./.github/workflows/inner.yml
+"#,
+                ".github/workflows/inner.yml": r#"
+on: workflow_call
+jobs:
+  work:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo work
+"#,
+            }
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let nested_caller = JobId("outer/nested".to_string());
+
+    // The gate-free nested call materializes its whole subtree at submit.
+    let leaf = {
+        let inner = state.inner.lock().await;
+        inner.runs[&run_id]
+            .jobs
+            .keys()
+            .find(|id| id.0.starts_with("outer/nested/"))
+            .expect("nested callee leaf must materialize at submit")
+            .clone()
+    };
+
+    // Drive the nested caller to Success by completing its only leaf, while
+    // `keepalive` stays queued so the run does not conclude.
+    request_json(
+        &app,
+        Method::POST,
+        "/internal/test/jobs/complete",
+        json!({
+            "run_id": run_id,
+            "job_id": leaf.0,
+            "status": "success"
+        }),
+    )
+    .await;
+
+    let caller_request_id = {
+        let inner = state.inner.lock().await;
+        assert_eq!(
+            inner.runs[&run_id].jobs.get(&nested_caller),
+            Some(&ExecutionStatus::Success),
+            "nested caller must aggregate to Success once its leaf completes"
+        );
+        assert!(
+            inner.runs[&run_id]
+                .caller_plans
+                .contains_key(&nested_caller),
+            "completed nested caller stays in caller_plans"
+        );
+        let record = inner
+            .job_requests
+            .values()
+            .find(|r| r.run_id == run_id && r.job_id == nested_caller)
+            .expect("nested caller minted a request record at expansion");
+        // The completion path never settles a caller's own record: this is the
+        // pre-existing unsettled state the cancel sweep must not corrupt.
+        assert_eq!(
+            record.result, None,
+            "nested caller's record is unsettled before cancel"
+        );
+        record.request_id
+    };
+
+    request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/runs/{run_id}/cancel"),
+        Value::Null,
+    )
+    .await;
+
+    let inner = state.inner.lock().await;
+    let record = inner
+        .job_requests
+        .get(&caller_request_id)
+        .expect("cancel keeps the settled caller record");
+    assert_eq!(
+        record.result,
+        Some(ExecutionStatus::Success),
+        "MC-3: cancel must settle a completed caller with Success, not Cancelled"
+    );
+    assert!(
+        !inner.inflight_requests.contains_key(&caller_request_id),
+        "MC-3: settled caller record must leave inflight_requests"
+    );
+    assert_eq!(
+        inner.runs[&run_id].jobs.get(&nested_caller),
+        Some(&ExecutionStatus::Success),
+        "the completed caller keeps its Success status through cancellation"
+    );
+    assert_eq!(
+        inner.runs[&run_id]
+            .jobs
+            .get(&JobId("keepalive".to_string())),
+        Some(&ExecutionStatus::Cancelled),
+        "the still-queued keepalive job is cancelled by the run cancel"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Durable-store restart contracts.
 //
