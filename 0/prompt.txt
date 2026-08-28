@@ -1,0 +1,21 @@
+main is back up can u checkin if preloop's running
+
+---
+
+can you give me a description of the smolvm bug that an another agent can reproduce with the source code. also explain why the github app isnt sgetting those events. pretty sure i subscribed to them
+
+---
+
+im confused about the github explain it abit more
+
+---
+
+wait so workflow dispatch the checkboxes would appear where? per pr? or in Github actions tab?
+
+---
+
+ok and waht was that preloop bug u mentioned
+
+---
+
+ok fix and open pr
