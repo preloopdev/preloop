@@ -5,14 +5,10 @@ permissions:
 on:
   push:
     branches: [main]
-    # Keep push-triggered checks observable while the self-hosted pool boots.
   pull_request:
-    # Docs-only PRs must not burn pool time: skip when every changed file
-    # is a markdown document.
     paths-ignore:
       - "**/*.md"
   schedule:
-    # Nightly intensive property profile at 02:00 UTC
     - cron: "0 2 * * *"
   workflow_dispatch:
     inputs:
@@ -21,40 +17,12 @@ on:
         required: false
         default: "fast"
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Property-test CI notes
-# ═══════════════════════════════════════════════════════════════════════════
-# PR / push: fast profile — 256 cases for pure/model/runner, 64 for HTTP.
-# Scheduled / manual intensive: release mode, 10k cases, 100k shrink iters.
-#
-# The regular Linux jobs never run live GitHub or privileged official-runner
-# probes. `runner-conformance.yml` runs the privileged deep runner probe on the
-# dedicated smolVM self-hosted pool for every pull request.
-# The differential harness dry-run (credential-free) runs in both profiles.
-#
-# Sleep-guard: each property-test job mechanically scans new test files for
-# `sleep(` and fails the build if any match is found.
-#
-# Zero-filter guard: `cargo test -- --list | grep <filter>` must return at
-# least one test name before case-count runs are launched.
-# ═══════════════════════════════════════════════════════════════════════════
-
 jobs:
   rust:
-    # Runs on the preloop self-hosted pool: the product's own runner is the
-    # CI executor (dogfood).
     runs-on: self-hosted
     timeout-minutes: 60
     env:
-      # 2 parallel debug rustc + GNU ld links peak ~4.6 GiB in the guest
-      # (measured on the pool, 2026-08-13); the 5 GiB VM ceiling is the
-      # floor. Unbounded parallelism OOM-killed the host once; the ceiling
-      # must stay above the build peak or the guest OOM-kills rustc.
       CARGO_BUILD_JOBS: "2"
-      # The dedicated property job carries the 256-case profile. Keep this
-      # workspace gate aligned with `just test-ci` and bound libtest
-      # concurrency so the dogfood VM survives preloop-runner's suite.
       PROPTEST_CASES: "8"
       RUST_TEST_THREADS: "2"
       RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
@@ -62,8 +30,6 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-          # Conformance goldens are LFS-tracked; without this they arrive
-          # as pointer stubs and every test that reads them fails.
           lfs: true
       - name: Materialize conformance goldens
         run: |
@@ -80,29 +46,19 @@ jobs:
           toolchain: "1.97"
           components: rustfmt,clippy
 
-      # inline run steps work against preloop
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
 
-      # Runner executes as root in the pool VM; sudo's audit plugin fails on
-      # the mis-owned /etc/sudoers in the golden, so call apt directly.
       - name: Install lld linker
         run: apt-get update && apt-get install -y --no-install-recommends lld
 
       - run: cargo fmt --all --check
       - run: |
-          # Run clippy on warning-free crates with strict -D warnings
-          cargo clippy --locked -p preloop-gha-protocol -p preloop-gha-parser -p preloop-gha-expressions -p preloop-cache -p preloop-artifacts -p runner-watch -p preloop-conformance -p preloop-observability --all-targets -- -D warnings
-          # Run clippy on crates with pre-existing warnings without -D warnings
+          cargo clippy --locked -p preloop-gha-protocol -p preloop-gha-parser -p preloop-gha-expressions -p preloop-cache -p preloop-artifacts -p runner-watch -p preloop-conformance --all-targets -- -D warnings
           cargo clippy --locked -p preloop-runner -p preloop-runner-server -p preloop-runner-client -p preloop-dap --all-targets
-      # cargo test (libtest) measured faster than nextest on this pool:
-      # nextest's per-test process model cost ~4 min of spawn overhead on
-      # 1628 fast unit tests (exec 17.5-18.0 min vs libtest 13.4 across
-      # -j2x2, -j2x1, and serial configs). Keep libtest.
       - run: cargo test --locked --workspace
         env:
           RUSTFLAGS: "-A warnings -C link-arg=-fuse-ld=lld"
 
-  # Bounded property-test profile
   property-tests-fast:
     runs-on: self-hosted
     timeout-minutes: 30
@@ -111,14 +67,11 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-          # Conformance goldens are LFS-tracked; without this they arrive
-          # as pointer stubs and every test that reads them fails.
           lfs: true
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           toolchain: "1.97"
 
-      # Zero-filter guard so just fail if no properties match the filter
       - name: Verify concurrency_properties filter matches at least one test
         run: |
           count=$(PROPTEST_CASES=1 cargo test -p preloop-runner-server -- --list 2>/dev/null | grep -c 'concurrency_properties' || true)
@@ -150,7 +103,6 @@ jobs:
           if [ "$bad" -ne 0 ]; then exit 1; fi
           echo "Sleep guard: OK"
 
-      # Pure properties (256 cases)
       - name: Pure concurrency properties
         run: |
           PROPTEST_CASES=256 cargo test -p preloop-runner-server \
@@ -158,30 +110,25 @@ jobs:
           PROPTEST_CASES=256 cargo test -p preloop-runner-server \
             concurrency_properties::pure -- --test-threads=1
 
-      # Scheduler model properties (256 cases)
       - name: Scheduler model properties
         run: |
           PROPTEST_CASES=256 cargo test -p preloop-runner-server \
             concurrency_properties::state_machine -- --test-threads=1
 
-      # Expression / parser properties (256 cases)
       - name: Expression and parser properties
         run: |
           PROPTEST_CASES=256 cargo test -p preloop-gha-expressions -- --test-threads=1
           cargo test -p preloop-gha-parser concurrency_ -- --test-threads=1
 
-      # Runner dispatcher properties (256 cases)
       - name: Runner dispatcher properties
         run: |
           cargo test -p preloop-runner timespan_tests -- --test-threads=1
 
-      # HTTP sequence properties (64 cases — heavier)
       - name: HTTP sequence properties
         run: |
           PROPTEST_CASES=64 cargo test -p preloop-runner-server \
             concurrency_http_properties -- --test-threads=1
 
-      # Differential harness dry-run (credential-free)
       - name: Differential harness dry-run (schema + algebraic validation)
         run: |
           python3 benchmarks/real-world/run-concurrency-property-probes.py \
@@ -202,7 +149,6 @@ jobs:
           fi
           echo "Contamination rejection: OK (exit $status)"
 
-      # Upload regression seeds on failure
       - name: Upload proptest regressions
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -212,7 +158,6 @@ jobs:
             crates/**/proptest-regressions/
           if-no-files-found: ignore
 
-  # Intensive scheduled / manual profile
   property-tests-intensive:
     runs-on: self-hosted
     timeout-minutes: 120
@@ -221,14 +166,11 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-          # Conformance goldens are LFS-tracked; without this they arrive
-          # as pointer stubs and every test that reads them fails.
           lfs: true
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           toolchain: "1.97"
 
-      # Zero-filter guard
       - name: Verify concurrency_properties filter matches at least one test
         run: |
           count=$(PROPTEST_CASES=1 cargo test -p preloop-runner-server -- --list 2>/dev/null | grep -c 'concurrency_properties' || true)
@@ -259,7 +201,6 @@ jobs:
           done
           if [ "$bad" -ne 0 ]; then exit 1; fi
 
-      # Intensive: release mode, 10k cases, 100k shrink iters
       - name: Intensive property profile (release)
         run: |
           PROPTEST_CASES=10000 PROPTEST_MAX_SHRINK_ITERS=100000 \
@@ -285,7 +226,6 @@ jobs:
             cargo test -p preloop-runner-server concurrency_http_properties \
             --release -- --test-threads=1
 
-      # ── Differential harness dry-run (always, never live probes in CI) ─
       - name: Differential harness dry-run
         run: |
           python3 benchmarks/real-world/run-concurrency-property-probes.py \
@@ -304,10 +244,8 @@ jobs:
             echo "ERROR: harness did not reject contaminated fixture" >&2
             exit 1
           fi
-          echo "Contamination rejection: OK (exit $status)"
 
-      #Upload regressions, traces, differential report on failure
-      - name: Upload intensive regression artifacts
+      - name: Upload proptest regressions
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:

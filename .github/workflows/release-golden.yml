@@ -23,10 +23,7 @@ on:
 jobs:
   reuse-previous-goldens:
     name: Reuse Previous Golden Artifacts
-    # An explicit workflow dispatch can request a source tag. Release events
-    # carrying the skip marker reuse the newest prior release with both
-    # architectures instead of silently leaving the new release incomplete.
-    if: (github.event_name == 'workflow_dispatch' && inputs.reuse_previous_goldens) || (github.event_name == 'release' && contains(github.event.release.body, '<!-- preloop:skip-golden -->'))
+    if: github.event_name == 'workflow_dispatch' && inputs.reuse_previous_goldens
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -34,52 +31,19 @@ jobs:
       - name: Copy goldens to target release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TARGET_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
-          REQUESTED_SOURCE_TAG: ${{ inputs.previous_release_tag }}
+          TARGET_TAG: ${{ inputs.release_tag }}
+          PREVIOUS_TAG: ${{ inputs.previous_release_tag }}
         run: |
           set -euo pipefail
           if [ -z "$TARGET_TAG" ]; then
             TARGET_TAG="$(gh release view --json tagName --jq .tagName)"
           fi
-          SOURCE_TAG="$REQUESTED_SOURCE_TAG"
-          if [ -z "$SOURCE_TAG" ]; then
-            SOURCE_TAG="$(
-              gh release list \
-                --repo "$GITHUB_REPOSITORY" \
-                --limit 100 \
-                --json tagName,isDraft,isPrerelease \
-                --jq '.[] | select(.isDraft == false and .isPrerelease == false) | .tagName' |
-              while IFS= read -r candidate; do
-                [ -z "$candidate" ] && continue
-                [ "$candidate" = "$TARGET_TAG" ] && continue
-                has_both="$(
-                  gh release view "$candidate" \
-                    --repo "$GITHUB_REPOSITORY" \
-                    --json assets \
-                    --jq '[.assets[].name] |
-                      if (index("preloop-ubuntu-24.04-x86_64") != null and
-                          index("preloop-ubuntu-24.04-aarch64") != null)
-                      then "yes" else empty end'
-                )"
-                if [ "$has_both" = "yes" ]; then
-                  printf '%s\n' "$candidate"
-                  break
-          fi
-              done
-            )"
-          fi
-          if [ -z "$SOURCE_TAG" ]; then
-            echo "no prior release contains both architecture goldens" >&2
-            exit 1
-          fi
-          echo "reusing goldens from $SOURCE_TAG for $TARGET_TAG"
           mkdir -p dist
-          gh release download "$SOURCE_TAG" \
+          gh release download "$PREVIOUS_TAG" \
             --pattern 'preloop-ubuntu-24.04-*' \
             --dir dist \
             --repo "$GITHUB_REPOSITORY"
-          # Preserve the signatures, attestations, and base-evidence sidecars
-          # when a release intentionally reuses an earlier golden.
+          # Preserve signatures, attestations, and provenance sidecars
           gh release upload "$TARGET_TAG" \
             dist/preloop-ubuntu-24.04-* \
             --clobber \
@@ -88,8 +52,6 @@ jobs:
   build-and-publish-linux-binaries:
     name: Build Linux ${{ matrix.arch }} release
     if: github.event_name == 'release'
-    # Cross-compilation needs no KVM. Keep the scarce self-hosted executor
-    # available for the golden VM build and the repository's normal CI.
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -110,9 +72,6 @@ jobs:
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
-          # Pin the workspace toolchain: the action's `stable` default does
-          # not reliably install the cross std on self-hosted runners
-          # (E0463: can't find crate for `core`).
           toolchain: "1.97"
           targets: ${{ matrix.target }}
 
@@ -121,8 +80,6 @@ jobs:
         with:
           version: 0.14.1
 
-      # Prebuilt binary: `cargo install` rebuilt this from source on every
-      # release run for no benefit.
       - name: Install cargo-zigbuild
         uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad
         with:
@@ -163,21 +120,14 @@ jobs:
 
   build-and-publish-golden:
     name: Build & Publish Golden MicroVM Artifact
-    # Binary-only hotfixes can retain the previous golden. Add the hidden
-    # `preloop:skip-golden` marker to the release notes for those releases.
     if: (github.event_name == 'workflow_dispatch' && !inputs.reuse_previous_goldens) || (github.event_name == 'release' && !contains(github.event.release.body, '<!-- preloop:skip-golden -->'))
     runs-on: [self-hosted, Linux, X64]
     env:
-      # Release rustc peaks far past the pool's 4.5 GiB VM ceiling when the
-      # workspace compiles several crates at once; the golden job's release
-      # build must stay serial or the guest OOM-kills rustc (SIGKILL). The
-      # bake step dominates the job's wall time anyway, so this costs little.
       CARGO_BUILD_JOBS: "1"
     permissions:
       contents: write
       id-token: write
       attestations: write
-      # The provenance capture exchanges the token against the registry.
       packages: read
     steps:
       - name: Check out repository
@@ -243,25 +193,11 @@ jobs:
           mkdir -p "$DATA_DIR"
           rm -rf "$DATA_DIR/agent-rootfs"
           cp -R "$SRC/agent-rootfs" "$DATA_DIR/agent-rootfs"
-          # The stock template from smolvm ships with only 32,768 inodes (designed
-          # for minimal containers). The official runner image carries >200,000 files
-          # across 18 layers, so extraction ran out of inodes on the dotnet SDK layer.
-          # Format fresh 120 GiB sparse templates with 7.8 million inodes directly on the host.
           rm -f "$HOME/.smolvm/storage-template.ext4" "$HOME/.smolvm/overlay-template.ext4"
           truncate -s 120G "$HOME/.smolvm/storage-template.ext4"
           mkfs.ext4 -F -q -O ^has_journal -b 4096 "$HOME/.smolvm/storage-template.ext4"
           truncate -s 120G "$HOME/.smolvm/overlay-template.ext4"
           mkfs.ext4 -F -q -O ^has_journal -b 4096 -L smolvm-overlay "$HOME/.smolvm/overlay-template.ext4"
-          # Alpine's default guest init PATH (/bin:/usr/bin) omits /usr/sbin,
-          # so `Command::new("resize2fs")` during `mount_storage_disk` failed
-          # with NotFound — leaving /storage at its initial unresized 512 MiB
-          # template size and causing guest ENOSPC on large layer extractions.
-          # Symlink e2fsprogs into standard binary paths.
-          # Absolute targets: on Alpine's merged-/usr, /bin and /usr/bin are
-          # the same directory, so a relative "../usr/sbin/resize2fs" from
-          # /usr/bin resolves to /usr/usr/sbin/resize2fs and the tool is
-          # still missing — the 120 GiB template then never expands and the
-          # guest ENOSPCs on large layer extractions.
           ln -sf /usr/sbin/resize2fs "$DATA_DIR/agent-rootfs/bin/resize2fs" || true
           ln -sf /sbin/e2fsck "$DATA_DIR/agent-rootfs/bin/e2fsck" || true
           ln -sf /usr/sbin/resize2fs "$DATA_DIR/agent-rootfs/usr/bin/resize2fs" || true
@@ -274,22 +210,11 @@ jobs:
       - name: Pack Golden MicroVM Artifact
         env:
           GOLDEN_NAME: preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
-          # smolvm's Go agent pulls the base image with Go's HTTP/2 client,
-          # whose flow-control window throttles the multi-GB layers to a few
-          # MB/s and then desyncs into "stream error: ... PROTOCOL_ERROR;
-          # received from peer" mid-transfer (the CDN and host are both
-          # healthy; a plain curl pulls the same blob at ~57 MB/s). Force the
-          # agent's transport down to HTTP/1.1, where each request is one
-          # connection with no multiplexed streams to corrupt.
           GODEBUG: http2client=0
         run: |
           set -euo pipefail
           mkdir -p dist
           rm -f "dist/$GOLDEN_NAME"
-          # Pull the base image via the host Docker daemon (which runs as root,
-          # downloads layers in parallel with chunked resume, and caches them),
-          # then export to a local tarball. This eliminates in-guest vsock socket
-          # read timeouts (IMAGE_PULL_TIMEOUT_SECS = 600) completely.
           IMAGE_TAR="$(pwd)/base-image.tar"
           if [ ! -s "$IMAGE_TAR" ]; then
             echo "Pulling base image via host Docker daemon..."
@@ -301,24 +226,10 @@ jobs:
 
           export PRELOOP_REQUIRE_BASE_DIGEST=1
           export PRELOOP_RUNNER_BASE_IMAGE="$IMAGE_TAR"
-          # The official runner snapshot extracts to ~60 GB; the bake VM must
-          # be larger than the stock 20 GiB default.
           export PRELOOP_RUNNER_STORAGE_GB=120
           export PRELOOP_RUNNER_OVERLAY_GB=120
-          # smolvm keys a machine's data dir by a hash of its name and reuses
-          # a dir left by a failed run at its old size (smolvm#956): a stale
-          # dir boots with the previous, smaller storage disk and a large bake
-          # dies mid-extraction with "Resource temporarily unavailable". A
-          # unique name per run forces a fresh disk at the requested size.
           export PRELOOP_GOLDEN_NAME_PREFIX="preloop-release-golden-${GITHUB_RUN_ID}"
           builder="preloop-release-golden-${GITHUB_RUN_ID}-builder"
-          # This runner is also the production smolvm-host: the CI pool runs
-          # several 5 GiB runner VMs on the same 22 GiB box. The builder guest
-          # needs 4 GiB of *committable* RAM, and smolvm boots it only AFTER
-          # the ~20 minute, 60 GB base-image pull — so a pool burst turns the
-          # whole pull into a wasted `EAGAIN` ("Resource temporarily
-          # unavailable"). Gate every attempt on measured headroom and retry,
-          # so a job landing mid-pull costs one retry instead of the run.
           need_mib=6144
           attempts=3
           headroom() { awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo; }
@@ -331,18 +242,12 @@ jobs:
             done
             available="$(headroom)"
             if [ "$available" -lt "$need_mib" ]; then
-              echo "host never freed ${need_mib} MiB (last ${available} MiB);" \
-                "the CI pool is saturating this runner" >&2
+              echo "host never freed ${need_mib} MiB (last ${available} MiB)" >&2
               exit 1
             fi
             echo "attempt ${attempt}/${attempts} with ${available} MiB available"
-            # A failed boot leaves the builder machine registered; drop it so
-            # the retry cannot collide with the previous attempt's disks.
             smolvm machine delete --name "$builder" \
               --force --cascade >/dev/null 2>&1 || true
-            # The runner-large base image archive is ~18 GB; smolvm refuses
-            # local archives over its default 8 GiB cap.
-            export SMOLVM_MAX_IMAGE_BYTES=34359738368
             if ./target/release/preloop build-golden \
                 --runner-bundle "target/$RUNNER_TARGET/release" \
                 --output "dist/$GOLDEN_NAME"; then
@@ -372,9 +277,6 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
-      # Keyless signature (Fulcio + Rekor) on the pack blob, verified against
-      # this workflow's own OIDC identity before upload. Consumers verify
-      # with: cosign verify-blob --bundle <pack>.bundle <pack>
       - name: Sign golden (cosign keyless)
         env:
           GOLDEN_NAME: preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
@@ -388,25 +290,15 @@ jobs:
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             "dist/$GOLDEN_NAME"
 
-      # GitHub-signed SLSA provenance for the pack; consumers verify with:
-      # gh attestation verify <pack> --repo preloopdev/preloop
       - name: Attest golden (GitHub provenance)
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          # Attest the golden and the immutable base-evidence sidecars in one
-          # signed statement. The provenance manifest binds their hashes and
-          # records the exact base/platform digest used for the bake.
           subject-path: |
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.base-provenance.json
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.base-sbom.spdx.json
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.provenance.json
 
-      # The packed golden routinely exceeds GitHub's 2 GiB release-asset
-      # limit (the official-image golden is ~10-15 GiB), so the golden is
-      # always retained as a workflow artifact BEFORE the (failing) upload:
-      # download from the run page for pool installs, or point
-      # PRELOOP_GOLDEN_URL at a custom host.
       - name: Retain Golden Artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -434,11 +326,6 @@ jobs:
           if [ -z "$TARGET_TAG" ]; then
             TARGET_TAG="$(gh release view --json tagName --jq .tagName)"
           fi
-          # The golden routinely exceeds GitHub's 2 GiB per-asset limit and
-          # cannot be a release asset; publish only the signed pointers and
-          # provenance sidecars. The pack itself is retained as a workflow
-          # artifact (above) and is served to pools via PRELOOP_GOLDEN_URL
-          # pointing at OCI/object storage.
           gh release upload "$TARGET_TAG" \
             "dist/$GOLDEN_NAME.sha256" \
             "dist/$GOLDEN_NAME.bundle" \
@@ -451,23 +338,10 @@ jobs:
           GOLDEN_NAME: preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
         run: |
           set -euo pipefail
-          # upload-artifact caps a single artifact at 10 GB; the official-image
-          # golden is ~10-15 GB. Split it into <4 GB parts so the retention
-          # step below cannot fail late. Reassemble with
-          # `cat preloop-ubuntu-24.04-<arch>.part.* > preloop-ubuntu-24.04-<arch>`
-          # and verify against the .sha256 sidecar.
           rm -f "dist/$GOLDEN_NAME.part."*
           split -b 4G -d "dist/$GOLDEN_NAME" "dist/$GOLDEN_NAME.part."
           sha256sum "dist/$GOLDEN_NAME.part."* > "dist/$GOLDEN_NAME.parts.sha256"
 
-      # A dispatched build has no release to upload to; without this the
-      # golden would sit only on the runner's workspace and be lost. Keep it
-      # as a downloadable workflow artifact so the pool can be updated from
-      # the run page.
-  # The aarch64 golden can only be built on an arm64 host (the guest VM runs
-  # on the host's own architecture). GitHub-hosted Apple Silicon runners do
-  # not support nested virtualization, so this must run on a bare-metal
-  # self-hosted Mac with Hypervisor.framework access.
   build-and-publish-golden-macos:
     name: Build & Publish aarch64 Golden (macOS)
     if: (github.event_name == 'workflow_dispatch' && !inputs.reuse_previous_goldens) || (github.event_name == 'release' && !contains(github.event.release.body, '<!-- preloop:skip-golden -->'))
@@ -476,7 +350,6 @@ jobs:
       contents: write
       id-token: write
       attestations: write
-      # The provenance capture exchanges the token against the registry.
       packages: read
     steps:
       - name: Check out repository
@@ -521,12 +394,8 @@ jobs:
             -p preloop-runner
 
       - name: Install compatible smolvm
-        env:
-          SMOLVM_VERSION: "1.8.2"
         run: |
           set -euo pipefail
-          # The verified golden release, pinned in versions.toml and bumped
-          # by Renovate; smolvm-release-verify.yml gates the bump.
           SMOLVM_VERSION="$(grep '^smolvm_golden_version' versions.toml | cut -d'"' -f2)"
           [ -n "$SMOLVM_VERSION" ] || { echo "smolvm_golden_version missing from versions.toml" >&2; exit 1; }
           ARCHIVE="smolvm-${SMOLVM_VERSION}-darwin-arm64.tar.gz"
@@ -539,15 +408,8 @@ jobs:
           mkdir -p "$HOME/.smolvm"
           rm -rf "$HOME/.smolvm/lib"
           cp -R "$SRC/lib" "$HOME/.smolvm/lib"
-          # Drop every template variant before copying the archive's payload:
-          # smolvm's lazy extraction treats an existing uncompressed template
-          # as already prepared, so a stale file from a previous install
-          # would silently win over the new release's.
           rm -f "$HOME/.smolvm"/storage-template.ext4 "$HOME/.smolvm"/overlay-template.ext4 \
             "$HOME/.smolvm"/storage-template.ext4.zst "$HOME/.smolvm"/overlay-template.ext4.zst
-          # Copy whichever storage/overlay template format the archive
-          # carries (mirrors the update installer, which copies only files
-          # that exist).
           rm -f "$HOME/.smolvm/storage-template.ext4" \
               "$HOME/.smolvm/overlay-template.ext4" \
               "$HOME/.smolvm/storage-template.ext4.zst" \
@@ -593,13 +455,8 @@ jobs:
 
           export PRELOOP_REQUIRE_BASE_DIGEST=1
           export PRELOOP_RUNNER_BASE_IMAGE="$BASE_IMAGE"
-          # The official runner snapshot extracts to ~60 GB; the bake VM must
-          # be larger than the stock 20 GiB default.
           export PRELOOP_RUNNER_STORAGE_GB=120
           export PRELOOP_RUNNER_OVERLAY_GB=120
-          # The runner-large base image archive is ~18 GB; smolvm refuses
-          # local archives over its default 8 GiB cap.
-          export SMOLVM_MAX_IMAGE_BYTES=34359738368
           ./target/release/preloop build-golden \
             --runner-bundle "target/$RUNNER_TARGET/release" \
             --output "dist/$GOLDEN_NAME"
@@ -619,9 +476,6 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
-      # Keyless signature (Fulcio + Rekor) on the pack blob, verified against
-      # this workflow's own OIDC identity before upload. Consumers verify
-      # with: cosign verify-blob --bundle <pack>.bundle <pack>
       - name: Sign golden (cosign keyless)
         env:
           GOLDEN_NAME: preloop-ubuntu-24.04-aarch64
@@ -635,25 +489,15 @@ jobs:
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             "dist/$GOLDEN_NAME"
 
-      # GitHub-signed SLSA provenance for the pack; consumers verify with:
-      # gh attestation verify <pack> --repo preloopdev/preloop
       - name: Attest golden (GitHub provenance)
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          # Attest the golden and the immutable base-evidence sidecars in one
-          # signed statement. The provenance manifest binds their hashes and
-          # records the exact base/platform digest used for the bake.
           subject-path: |
             dist/preloop-ubuntu-24.04-aarch64
             dist/preloop-ubuntu-24.04-aarch64.base-provenance.json
             dist/preloop-ubuntu-24.04-aarch64.base-sbom.spdx.json
             dist/preloop-ubuntu-24.04-aarch64.provenance.json
 
-      # The packed golden routinely exceeds GitHub's 2 GiB release-asset
-      # limit (the official-image golden is ~10-15 GiB), so the golden is
-      # always retained as a workflow artifact BEFORE the (failing) upload:
-      # download from the run page for pool installs, or point
-      # PRELOOP_GOLDEN_URL at a custom host.
       - name: Retain Golden Artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
