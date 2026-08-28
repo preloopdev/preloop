@@ -129,8 +129,15 @@ pub(crate) fn cancel_run_inner(
     run_id: RunId,
     reason: Option<&str>,
 ) -> usize {
+    // An expandable node (deferred reusable caller or needs-driven matrix)
+    // never dispatches, but its submit-time request correlation is minted
+    // like a real job's. Cancellation must settle it the way the completion
+    // path would: a leaked record stays `result: None` forever and keeps the
+    // request inflight and renewable for the life of the process, resolvable
+    // to a job expansion has already deleted from the run.
+    // Collect the set before the queue retains below drop the nodes.
+    let expandable = expandable_job_ids(inner, run_id);
     let mut in_progress: Vec<JobId> = Vec::new();
-    let mut deferred_nodes: Vec<JobId> = Vec::new();
     {
         let Some(record) = inner.runs.get_mut(&run_id) else {
             return 0;
@@ -145,13 +152,6 @@ pub(crate) fn cancel_run_inner(
                 ExecutionStatus::Queued | ExecutionStatus::Pending | ExecutionStatus::InProgress
             ) {
                 *status = ExecutionStatus::Cancelled;
-                if record
-                    .caller_plans
-                    .get(job_id)
-                    .is_some_and(|plan| plan.deferred_matrix.is_some())
-                {
-                    deferred_nodes.push(job_id.clone());
-                }
             }
         }
     }
@@ -181,14 +181,11 @@ pub(crate) fn cancel_run_inner(
     // of folding cancelled jobs back into the run.
     inner.pending_expansions.retain(|job| job.run_id != run_id);
     inner.expanding.retain(|(id, _)| *id != run_id);
-    // Deferred matrix placeholders have a submit-time request record, but are
-    // never delivered to a runner. No RenewJob/CompleteJob callback can retire
-    // that record after cancellation, so settle it explicitly.
-    for job_id in deferred_nodes {
+    for node_id in expandable {
         retire_node_requests(
             inner,
             run_id,
-            &job_id,
+            &node_id,
             RequestRetirement::Settle(ExecutionStatus::Cancelled),
         );
     }
@@ -318,6 +315,11 @@ pub(crate) fn run_stuck_on_external_hosts(inner: &InnerState, run_id: &RunId) ->
 
 /// Cancel a single job (job-level concurrency / fail-fast style).
 pub(crate) fn cancel_job_inner(inner: &mut InnerState, run_id: RunId, job_id: &JobId) -> usize {
+    // MC-3: an expandable node cancelled before it dispatches never reaches
+    // the completion path that settles its submit-time request correlation.
+    // Settle it here exactly as completion would; the reusable-caller path
+    // needs no equivalent because callers mint no records at submit.
+    let expandable = is_expandable_node(inner, run_id, job_id);
     let was_in_progress = {
         let Some(record) = inner.runs.get_mut(&run_id) else {
             return 0;
@@ -396,6 +398,14 @@ pub(crate) fn cancel_job_inner(inner: &mut InnerState, run_id: RunId, job_id: &J
         count += cancel_job_inner(inner, run_id, &JobId(inner_id));
     }
 
+    if expandable {
+        retire_node_requests(
+            inner,
+            run_id,
+            job_id,
+            RequestRetirement::Settle(ExecutionStatus::Cancelled),
+        );
+    }
     release_concurrency_for_job(inner, run_id, job_id);
     count
 }
@@ -1125,15 +1135,29 @@ pub(crate) fn promote_ready_jobs(inner: &mut InnerState) -> SchedulingOutcome {
                     }
                 }
                 DependencyDecision::Skip | DependencyDecision::Error => {
+                    let status = if decision == DependencyDecision::Skip {
+                        ExecutionStatus::Skipped
+                    } else {
+                        ExecutionStatus::Failure
+                    };
                     if let Some(run) = inner.runs.get_mut(&job.run_id) {
-                        let status = if decision == DependencyDecision::Skip {
-                            ExecutionStatus::Skipped
-                        } else {
-                            ExecutionStatus::Failure
-                        };
                         run.jobs.insert(job.job_id.clone(), status);
                         run.status = summarize_run(run.jobs.values().copied());
                         finalize_run_if_complete(run);
+                    }
+                    // MC-3: a deferred-matrix node concluded here (its needs
+                    // failed or skipped, or its `if:` errored) never
+                    // dispatches, so no completion path ever settles the
+                    // submit-time request correlation minted for it. Settle
+                    // it like any other terminal conclusion; the node stays
+                    // in the run, so Settle mirrors the completion path.
+                    if job.deferred_matrix.is_some() || job.reusable_call.is_some() {
+                        retire_node_requests(
+                            inner,
+                            job.run_id,
+                            &job.job_id,
+                            RequestRetirement::Settle(status),
+                        );
                     }
                     // MC-S2: a run that concludes through this arm (dependency
                     // skip / eval error) never passes through the normal
@@ -2482,14 +2506,80 @@ fn fail_expansion_node(
 
 /// How to retire the request correlation an expandable node minted at submit.
 #[derive(Clone, Copy)]
-enum RequestRetirement {
+pub(crate) enum RequestRetirement {
     /// The node stays in the run as a terminal job: record the result and drop
-    /// the live claim state, exactly as the completion path does for a job a
-    /// runner actually finished.
+    /// the live claim state (inflight + session claims), exactly as the
+    /// completion path does for a job a runner actually finished.
+    ///
+    /// `id_token_grants` and `oidc_job_contexts` are deliberately kept: no
+    /// path outside the Purge arm ever removes them, for any job — completed
+    /// and cancelled real jobs keep theirs for the life of the process and
+    /// the store, so a settled placeholder keeps the same shape.
     Settle(ExecutionStatus),
     /// The node no longer exists in the run, so nothing can reference it
     /// again: every correlation entry goes.
     Purge,
+}
+
+/// Whether a single job is an expandable node: a deferred reusable caller or
+/// a needs-driven dynamic-matrix node.
+///
+/// Membership test for the per-job paths ([`cancel_job_inner`]), which need
+/// one answer rather than the run-wide set [`expandable_job_ids`] builds.
+fn is_expandable_node(inner: &InnerState, run_id: RunId, job_id: &JobId) -> bool {
+    inner
+        .pending_jobs
+        .iter()
+        .chain(inner.pending_expansions.iter())
+        .chain(inner.queue.iter())
+        .chain(inner.concurrency_blocked.iter())
+        .chain(inner.held_runs.get(&run_id).into_iter().flatten())
+        .any(|job| {
+            job.run_id == run_id
+                && job.job_id == *job_id
+                && (job.deferred_matrix.is_some() || job.reusable_call.is_some())
+        })
+        || inner.expanding.contains(&(run_id, job_id.clone()))
+        || inner
+            .runs
+            .get(&run_id)
+            .is_some_and(|run| run.caller_plans.contains_key(job_id))
+}
+
+/// The ids of every expandable node in a run: deferred reusable callers and
+/// needs-driven dynamic-matrix nodes.
+///
+/// These nodes never dispatch — submit mints their request correlation
+/// records anyway (a deferred-matrix node is non-caller), so the cancellation
+/// paths use this set to settle those records. Reusable callers mint nothing,
+/// so retiring them is a no-op; settling a matrix node leaves exactly the
+/// state a reusable caller has from submit.
+fn expandable_job_ids(inner: &InnerState, run_id: RunId) -> BTreeSet<JobId> {
+    let mut ids = BTreeSet::new();
+    for job in inner
+        .pending_jobs
+        .iter()
+        .chain(inner.pending_expansions.iter())
+        .chain(inner.queue.iter())
+        .chain(inner.concurrency_blocked.iter())
+        .chain(inner.held_runs.get(&run_id).into_iter().flatten())
+    {
+        if job.run_id == run_id && (job.deferred_matrix.is_some() || job.reusable_call.is_some()) {
+            ids.insert(job.job_id.clone());
+        }
+    }
+    for (id, job_id) in &inner.expanding {
+        if *id == run_id {
+            ids.insert(job_id.clone());
+        }
+    }
+    if let Some(run) = inner.runs.get(&run_id) {
+        // `register_expanded_jobs` keeps a deferred node's plan in
+        // `caller_plans` when the node lives inside a reusable callee; nested
+        // nodes are found here even after they left every queue.
+        ids.extend(run.caller_plans.keys().cloned());
+    }
+    ids
 }
 
 /// Retire the request records an expandable node acquired at submit.
@@ -2497,11 +2587,12 @@ enum RequestRetirement {
 /// MC-2: `runs.rs` mints a full set of correlation records for every
 /// non-caller job, and a deferred-matrix node is non-caller — but such a node
 /// is routed to expansion and never dispatched to a runner. No completion,
-/// result patch or disconnect ever fires for it, and those are the only paths
-/// that clear `inflight_requests`. Without this the node's request stays
-/// inflight for the life of the process, resolvable to a job that expansion
-/// has already deleted from the run.
-fn retire_node_requests(
+/// result patch or disconnect ever fires for it — completion, result patch,
+/// disconnect, and the expandable-node retirement paths here are the only
+/// things that clear `inflight_requests`. Without this the node's request
+/// stays inflight and renewable for the life of the process, resolvable to a
+/// job that expansion has already deleted from the run.
+pub(crate) fn retire_node_requests(
     inner: &mut InnerState,
     run_id: RunId,
     node_id: &JobId,
