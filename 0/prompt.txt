@@ -15,3 +15,7 @@ wait so workflow dispatch the checkboxes would appear where? per pr? or in Githu
 ---
 
 ok and waht was that preloop bug u mentioned
+
+---
+
+ok fix and open pr
