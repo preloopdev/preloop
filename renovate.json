@@ -1,45 +1,75 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:recommended"],
-  "dependencyDashboard": true,
-  "regexManagers": [
-    {
-      "description": "Official actions/runner release pin in versions.toml. The bump PR is the tripwire: it is labeled protocol-sync, and .github/workflows/runner-sync.yml runs watch-pipeline stages on it and opens the tiered PRs (docs/conformance.md). It must never auto-merge.",
-      "fileMatch": ["^versions\\.toml$"],
-      "matchStrings": ["runner_version\\s*=\\s*\"(?<currentValue>[^\"]+)\""],
-      "depNameTemplate": "actions/runner",
-      "datasourceTemplate": "github-releases",
-      "extractVersion": "^v(?<version>.*)$",
-      "versioningTemplate": "semver"
-    },
-    {
-      "description": "SmolVM release the golden workflow builds with. The bump PR is gated by .github/workflows/smolvm-release-verify.yml, which installs the candidate and runs the real-VM E2E on the smolvm-host; green runs auto-merge.",
-      "fileMatch": ["^versions\\.toml$"],
-      "matchStrings": ["smolvm_golden_version\\s*=\\s*\"(?<currentValue>[^\"]+)\""],
-      "depNameTemplate": "smol-machines/smolvm",
-      "datasourceTemplate": "github-releases",
-      "extractVersion": "^v(?<version>.*)$",
-      "versioningTemplate": "semver"
-    }
+  "extends": [
+    "config:recommended"
   ],
+  "dependencyDashboard": true,
   "packageRules": [
     {
-      "matchDatasources": ["github-releases"],
-      "matchDepNames": ["actions/runner", "smol-machines/smolvm"],
-      "labels": ["dependencies"]
+      "matchDatasources": [
+        "github-releases"
+      ],
+      "matchDepNames": [
+        "actions/runner",
+        "smol-machines/smolvm"
+      ],
+      "labels": [
+        "dependencies"
+      ]
     },
     {
-      "matchDatasources": ["github-releases"],
-      "matchDepNames": ["smol-machines/smolvm"],
+      "matchDatasources": [
+        "github-releases"
+      ],
+      "matchDepNames": [
+        "smol-machines/smolvm"
+      ],
       "description": "SmolVM bumps auto-merge once ci.yml and the smolvm-release-verify check pass. The verify job is inert until a [self-hosted, macOS, ARM64, smolvm-host] runner is registered and SMOLVM_VERIFY_HOST_WORKSPACE is set — do not trust auto-merge before then.",
       "automerge": true,
       "automergeType": "pr"
     },
     {
-      "matchDatasources": ["github-releases"],
-      "matchDepNames": ["actions/runner"],
+      "matchDatasources": [
+        "github-releases"
+      ],
+      "matchDepNames": [
+        "actions/runner"
+      ],
       "description": "Runner bump PR is the tripwire for the runner-watch pipeline (diff -> triage -> record-golden -> conform -> tiered PRs). Never auto-merge: the protocol delta needs the pipeline's goldens and review.",
-      "labels": ["protocol-sync", "dependencies"]
+      "labels": [
+        "protocol-sync",
+        "dependencies"
+      ]
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Official actions/runner release pin in versions.toml. The bump PR is the tripwire: it is labeled protocol-sync, and .github/workflows/runner-sync.yml runs watch-pipeline stages on it and opens the tiered PRs (docs/conformance.md). It must never auto-merge.",
+      "fileMatch": [
+        "^versions\\.toml$"
+      ],
+      "matchStrings": [
+        "runner_version\\s*=\\s*\"(?<currentValue>[^\"]+)\""
+      ],
+      "depNameTemplate": "actions/runner",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "semver",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "customType": "regex",
+      "description": "SmolVM release the golden workflow builds with. The bump PR is gated by .github/workflows/smolvm-release-verify.yml, which installs the candidate and runs the real-VM E2E on the smolvm-host; green runs auto-merge.",
+      "fileMatch": [
+        "^versions\\.toml$"
+      ],
+      "matchStrings": [
+        "smolvm_golden_version\\s*=\\s*\"(?<currentValue>[^\"]+)\""
+      ],
+      "depNameTemplate": "smol-machines/smolvm",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "semver",
+      "extractVersionTemplate": "^v(?<version>.*)$"
     }
   ]
 }
