@@ -1,0 +1,80 @@
+{
+  "cli_version": "0.10.0",
+  "checkpoint_id": "01M14QES1JKPA549MK0ZZ966NE",
+  "session_id": "01a04919-ad30-7000-a118-05197a349e00",
+  "strategy": "manual-commit",
+  "created_at": "2026-08-28T17:42:37.177851Z",
+  "branch": "fix/github-app-trigger-event-warning",
+  "checkpoints_count": 4,
+  "save_step_count": 4,
+  "files_touched": [
+    ".github/workflows/ci.yml",
+    ".github/workflows/conformance.yml",
+    ".github/workflows/pullfrog.yml",
+    ".github/workflows/push-route-probe.yml",
+    ".github/workflows/release-golden.yml",
+    ".github/workflows/release-linux-runner.yml",
+    ".github/workflows/runner-conformance.yml",
+    ".github/workflows/runner-sync.yml",
+    ".github/workflows/smolvm-release-verify.yml",
+    ".github/workflows/tier2-property-live.yml"
+  ],
+  "agent": "Oh My Pi",
+  "model": "gemini-3.7-flash",
+  "turn_id": "598178487d3a",
+  "checkpoint_transcript_start": 292,
+  "transcript_lines_at_start": 292,
+  "compact_transcript_start": 103,
+  "session_metrics": {
+    "turn_count": 15
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 147,
+      "user_lines_removed": 0,
+      "agent_lines_added": 2387,
+      "agent_lines_removed": 29,
+      "user_added_per_file": {
+        ".pi/extensions/entire/index.ts": 147
+      }
+    },
+    {
+      "checkpoint_number": 3,
+      "user_lines_added": 147,
+      "user_lines_removed": 0,
+      "agent_lines_added": 2387,
+      "agent_lines_removed": 29,
+      "user_added_per_file": {
+        ".pi/extensions/entire/index.ts": 147
+      }
+    },
+    {
+      "checkpoint_number": 4,
+      "user_lines_added": 147,
+      "user_lines_removed": 0,
+      "agent_lines_added": 2387,
+      "agent_lines_removed": 29,
+      "user_added_per_file": {
+        ".pi/extensions/entire/index.ts": 147
+      }
+    },
+    {
+      "checkpoint_number": 5,
+      "user_lines_added": 147,
+      "user_lines_removed": 0,
+      "agent_lines_added": 2390,
+      "agent_lines_removed": 347,
+      "user_added_per_file": {
+        ".pi/extensions/entire/index.ts": 147
+      }
+    }
+  ]
+}

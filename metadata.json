@@ -1,0 +1,28 @@
+{
+  "cli_version": "0.10.0",
+  "checkpoint_id": "01M14QES1JKPA549MK0ZZ966NE",
+  "strategy": "manual-commit",
+  "branch": "fix/github-app-trigger-event-warning",
+  "checkpoints_count": 4,
+  "files_touched": [
+    ".github/workflows/ci.yml",
+    ".github/workflows/conformance.yml",
+    ".github/workflows/pullfrog.yml",
+    ".github/workflows/push-route-probe.yml",
+    ".github/workflows/release-golden.yml",
+    ".github/workflows/release-linux-runner.yml",
+    ".github/workflows/runner-conformance.yml",
+    ".github/workflows/runner-sync.yml",
+    ".github/workflows/smolvm-release-verify.yml",
+    ".github/workflows/tier2-property-live.yml"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": "/0/prompt.txt"
+    }
+  ]
+}
