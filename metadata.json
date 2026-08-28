@@ -2,7 +2,7 @@
   "cli_version": "0.10.0",
   "checkpoint_id": "01M14QFDGHW6ZTJZGMQR7BMRXR",
   "strategy": "manual-commit",
-  "checkpoints_count": 5,
+  "checkpoints_count": 9,
   "files_touched": [
     ".github/workflows/ci.yml",
     ".github/workflows/conformance.yml",
@@ -22,6 +22,13 @@
       "transcript": "/0/full.jsonl",
       "compact_transcript": "/0/transcript.jsonl",
       "content_hash": "/0/content_hash.txt",
+      "prompt": ""
+    },
+    {
+      "metadata": "/1/metadata.json",
+      "transcript": "/1/full.jsonl",
+      "compact_transcript": "/1/transcript.jsonl",
+      "content_hash": "/1/content_hash.txt",
       "prompt": ""
     }
   ]
