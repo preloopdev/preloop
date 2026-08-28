@@ -763,6 +763,62 @@ pub(crate) fn apply_meta_snapshot(inner: &mut InnerState, meta: MetaSnapshot) {
     inner.cache_v2_dl_tokens = meta.cache_v2_dl_tokens.into_iter().collect();
     inner.artifact_v2_pending = meta.artifact_v2_pending.into_iter().collect();
     inner.artifact_v2_registry = meta.artifact_v2_registry.into_iter().collect();
+    // Rebuild in-memory order queues for FIFO eviction and apply caps so a
+    // restart doesn't reload unbounded history that was pending before the
+    // caps shipped.
+    inner.log_order.clear();
+    for key in inner.logs.keys() {
+        inner.log_order.push_back(key.clone());
+    }
+    {
+        let plans: std::collections::BTreeSet<String> = inner
+            .logs
+            .keys()
+            .filter_map(|k| k.split('/').next().map(|s| s.to_owned()))
+            .collect();
+        for plan in plans {
+            crate::memory_caps::trim_plan_logs(inner, &plan);
+        }
+        // Also trim per-key overlong logs that were persisted before the
+        // 16 MiB cap: keep only the newest bytes.
+        for buf in inner.logs.values_mut() {
+            let excess = buf
+                .len()
+                .saturating_sub(crate::memory_caps::MAX_LOG_BYTES_PER_KEY);
+            if excess > 0 {
+                buf.drain(0..excess);
+            }
+        }
+    }
+    inner.timeline_records_order.clear();
+    for key in inner.timeline_records.keys() {
+        inner.timeline_records_order.push_back(key.clone());
+    }
+    // Enforce global caps after restore.
+    {
+        let keys: Vec<String> = inner.timeline_records.keys().cloned().collect();
+        for key in keys {
+            crate::memory_caps::trim_timeline_after_patch(inner, &key, &[]);
+        }
+    }
+    inner.timeline_events_order.clear();
+    for run in inner.timeline_events.keys().copied() {
+        inner.timeline_events_order.push_back(run);
+    }
+    {
+        let runs: Vec<RunId> = inner.timeline_events.keys().copied().collect();
+        for run in runs {
+            crate::memory_caps::trim_timeline_events(inner, run);
+        }
+    }
+    inner.artifact_registry_order.clear();
+    for key in inner.artifact_v2_registry.keys() {
+        inner.artifact_registry_order.push_back(key.clone());
+    }
+    crate::memory_caps::trim_artifact_registry(inner);
+    crate::memory_caps::trim_cache_dl_tokens(inner);
+    // Cache dl tokens order deque was not persisted — nothing to rebuild, but
+    // ensure restored map doesn't already exceed the cap.
     inner.github_token_requests = meta.github_token_requests.into_iter().collect();
     inner.cancellation_queue = meta.cancellation_queue;
     inner.runner_client_ids = meta.runner_client_ids.into_iter().collect();

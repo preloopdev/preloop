@@ -207,10 +207,13 @@ pub(crate) async fn patch_timeline_records(
             .timeline_records
             .entry(timeline_key.clone())
             .or_default();
+        // Ids just upserted by this PATCH — protect them from eviction so a
+        // low-sorting UUID isn't dropped out of the response/timeline.
+        let patched_ids: Vec<uuid::Uuid> = records.iter().map(|r| r.id).collect();
         for record in records {
             stored.insert(record.id, record);
         }
-        trim_timeline_after_patch(&mut inner, &timeline_key);
+        trim_timeline_after_patch(&mut inner, &timeline_key, &patched_ids);
         let vals: Vec<_> = inner
             .timeline_records
             .get(&timeline_key)
@@ -263,7 +266,10 @@ pub(crate) async fn create_log(
         log.id = next_id as i64;
         let key = format!("{}/{}", plan_id, next_id);
         inner.logs.entry(key.clone()).or_default();
-        inner.log_metadata.entry(key).or_default();
+        inner.log_metadata.entry(key.clone()).or_default();
+        if !inner.log_order.iter().any(|k| k == &key) {
+            inner.log_order.push_back(key.clone());
+        }
         trim_plan_logs(&mut inner, &plan_id);
         crate::store::build_meta_snapshot(&inner)
     };
@@ -284,6 +290,7 @@ pub(crate) async fn append_log(
     // after releasing it.
     let (masked, chunk_index, byte_count, line_count) = {
         let mut inner = shared.state.inner.lock().await;
+        let is_new = !inner.logs.contains_key(&key);
         let masked = mask_log_bytes(&inner, &plan_id, &body);
         let byte_count = masked.len();
         let line_count = masked.iter().filter(|&&b| b == b'\n').count();
@@ -292,6 +299,9 @@ pub(crate) async fn append_log(
             .entry(key.clone())
             .or_default()
             .extend_from_slice(&masked);
+        if is_new && !inner.log_order.iter().any(|k| k == &key) {
+            inner.log_order.push_back(key.clone());
+        }
         // F1: keep only the newest bytes in memory. The durable chunk store
         // received every append, so a truncated buffer never loses log data.
         if let Some(retained) = inner.logs.get_mut(&key) {
@@ -300,15 +310,20 @@ pub(crate) async fn append_log(
                 retained.drain(0..excess);
             }
         }
+        // Update metadata before trimming so the newest log isn't miscounted,
+        // but release the borrow before calling `trim_plan_logs`.
+        {
+            let meta = inner.log_metadata.entry(key.clone()).or_default();
+            meta.byte_count += byte_count;
+            meta.line_count += line_count;
+        }
         trim_plan_logs(&mut inner, &plan_id);
-        let meta = inner.log_metadata.entry(key.clone()).or_default();
-        meta.byte_count += byte_count;
-        meta.line_count += line_count;
         // Hot path: write the chunk to `log_chunks` and UPSERT the per-log
         // counter, instead of rewriting the entire meta snapshot for every
         // append. The counter is small and idempotent; the chunk is the
         // append-only event stream. We use the new byte count as the chunk
         // index so each append maps to a unique `(log_key, chunk_index)` row.
+        let meta = inner.log_metadata.get(&key).cloned().unwrap_or_default();
         (
             masked,
             meta.byte_count as i64,
@@ -486,8 +501,14 @@ pub(crate) async fn get_timeline_records(
         .get(&timeline_key)
         .copied()
         .unwrap_or(0);
-    let top = query.top.unwrap_or(MAX_TOP_RECORDS).min(MAX_TOP_RECORDS);
-    let skip = query.skip.unwrap_or(0);
+    // When `top` is absent the official runner expects the full timeline
+    // (it does not paginate). Storage itself is already capped at
+    // MAX_TIMELINE_RECORDS=1024, so returning all is bounded. When `top`
+    // is present we clamp to MAX_TOP_RECORDS.
+    let (top, skip) = match query.top {
+        Some(t) => (t.min(MAX_TOP_RECORDS), query.skip.unwrap_or(0)),
+        None => (usize::MAX, query.skip.unwrap_or(0)),
+    };
     let records: Vec<_> = inner
         .timeline_records
         .get(&timeline_key)

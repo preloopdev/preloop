@@ -692,6 +692,11 @@ pub(crate) async fn twirp_cache_v2_create(
                     .filter(|pending| &pending.job_backend_id == job_id)
                     .count();
                 if pending >= MAX_PENDING_PER_JOB {
+                    // Drop the stage dir we just created — the pending map never
+                    // learns this token, so the sweeper can't find it.
+                    let dir = stage_dir.clone();
+                    drop(inner);
+                    let _ = tokio::fs::remove_dir_all(&dir).await;
                     return Ok(pb_or_json(
                         &headers,
                         PbCreateCacheEntryResponse {

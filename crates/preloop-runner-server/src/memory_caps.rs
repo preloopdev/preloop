@@ -26,9 +26,21 @@ pub(crate) const MAX_LOG_BYTES_PER_PLAN: usize = 64 * 1024 * 1024;
 /// byte budget alone would let an attacker create unbounded distinct keys.
 pub(crate) const MAX_LOGS_PER_PLAN: usize = 512;
 
+/// F1 — global retained byte budget across all plans. Prevents a runner
+/// from fabricating unlimited `plan_id` values to bypass the per-plan cap.
+pub(crate) const MAX_LOG_BYTES_GLOBAL: usize = 256 * 1024 * 1024;
+
+/// F1 — global retained log entry cap.
+pub(crate) const MAX_LOGS_GLOBAL: usize = 4096;
+
 /// F2 — per-timeline record cap. PATCH upserts beyond this evict the oldest
 /// (deterministically first-keyed) records. Real jobs stay far below it.
 pub(crate) const MAX_TIMELINE_RECORDS: usize = 1024;
+
+/// F2 — per-timeline byte budget for stored records. Each record's
+/// `currentOperation` can be ~1 MiB; count caps alone leave an unbounded
+/// byte budget (1024 × 4096 × 1 MiB). Aggregate bytes are bounded here.
+pub(crate) const MAX_TIMELINE_BYTES_PER_TIMELINE: usize = 8 * 1024 * 1024;
 
 /// F3 — per-run ring-buffer cap for projected timeline events. The oldest
 /// events are drained once the retained Vec exceeds this.
@@ -145,6 +157,33 @@ pub(crate) fn trim_plan_logs(inner: &mut InnerState, plan_id: &str) {
         let Some(oldest_key) = oldest_key else { break };
         inner.logs.remove(&oldest_key);
         inner.log_metadata.remove(&oldest_key);
+        inner.log_order.retain(|k| k != &oldest_key);
+    }
+    // Global caps — prevent fabricated plan_ids from bypassing per-plan limits.
+    loop {
+        let total_bytes: usize = inner.logs.values().map(|v| v.len()).sum();
+        let count = inner.logs.len();
+        if total_bytes <= MAX_LOG_BYTES_GLOBAL && count <= MAX_LOGS_GLOBAL {
+            break;
+        }
+        // Pop oldest by insertion order; fall back to lexicographic smallest.
+        let oldest = inner
+            .log_order
+            .pop_front()
+            .filter(|k| inner.logs.contains_key(k))
+            .or_else(|| inner.logs.keys().next().cloned());
+        let Some(oldest) = oldest else { break };
+        // Drain any stale deque entries that point to already-evicted keys.
+        if !inner.logs.contains_key(&oldest) {
+            continue;
+        }
+        inner.logs.remove(&oldest);
+        inner.log_metadata.remove(&oldest);
+    }
+    // Compact order deque to avoid unbounded stale entries.
+    if inner.log_order.len() > inner.logs.len() + 1024 {
+        let live: std::collections::HashSet<String> = inner.logs.keys().cloned().collect();
+        inner.log_order.retain(|k| live.contains(k));
     }
 }
 
@@ -152,29 +191,118 @@ pub(crate) fn trim_plan_logs(inner: &mut InnerState, plan_id: &str) {
 /// `MAX_TIMELINE_RECORDS` (evicting the oldest keys) and the number of
 /// distinct timeline keys to `MAX_TIMELINE_KEYS` (evicting whole timelines,
 /// records and change-id counter together).
-pub(crate) fn trim_timeline_after_patch(inner: &mut InnerState, timeline_key: &str) {
+pub(crate) fn trim_timeline_after_patch(
+    inner: &mut InnerState,
+    timeline_key: &str,
+    protected: &[uuid::Uuid],
+) {
+    // Track insertion order for global eviction.
+    if !inner
+        .timeline_records_order
+        .iter()
+        .any(|k| k == timeline_key)
+    {
+        inner
+            .timeline_records_order
+            .push_back(timeline_key.to_owned());
+    }
     if let Some(records) = inner.timeline_records.get_mut(timeline_key) {
+        // Evict oldest records past the count cap. The BTreeMap orders by
+        // UUID, not insertion time, so prefer evicting records NOT part of
+        // this PATCH — otherwise a new record whose UUID sorts first would be
+        // deleted and the response/subsequent GETs would omit its update.
+        // If the just-patched set alone exceeds the cap (a flood in one
+        // PATCH), fall through to evicting the oldest regardless so the bound
+        // always holds.
         while records.len() > MAX_TIMELINE_RECORDS {
-            if let Some(oldest) = records.keys().next().copied() {
-                records.remove(&oldest);
-            } else {
+            let victim = records
+                .keys()
+                .find(|id| !protected.contains(*id))
+                .copied()
+                .or_else(|| records.keys().next().copied());
+            let Some(victim) = victim else { break };
+            records.remove(&victim);
+        }
+        // Byte budget per timeline — evict oldest non-protected record until
+        // under budget.
+        loop {
+            let total_bytes: usize = records
+                .values()
+                .map(|r| {
+                    r.name.as_ref().map(|s| s.len()).unwrap_or(0)
+                        + r.display_name.as_ref().map(|s| s.len()).unwrap_or(0)
+                        + r.current_operation.as_ref().map(|s| s.len()).unwrap_or(0)
+                        + 256 // overhead for other fields
+                })
+                .sum();
+            if total_bytes <= MAX_TIMELINE_BYTES_PER_TIMELINE || records.len() <= 1 {
                 break;
             }
+            let victim = records
+                .keys()
+                .find(|id| !protected.contains(*id))
+                .copied()
+                .or_else(|| records.keys().next().copied());
+            let Some(victim) = victim else { break };
+            records.remove(&victim);
         }
     }
     while inner.timeline_records.len() > MAX_TIMELINE_KEYS {
-        let Some(oldest_key) = inner.timeline_records.keys().next().cloned() else {
-            break;
-        };
+        let oldest_key = inner
+            .timeline_records_order
+            .pop_front()
+            .filter(|k| inner.timeline_records.contains_key(k))
+            .or_else(|| inner.timeline_records.keys().next().cloned());
+        let Some(oldest_key) = oldest_key else { break };
+        if !inner.timeline_records.contains_key(&oldest_key) {
+            continue;
+        }
+        // Never evict the timeline we just patched — otherwise a PATCH
+        // whose key sorts first would return empty records.
+        // Only protect if the timeline actually has a change-id counter;
+        // otherwise the record and counter maps would drift by one (as in
+        // the restore test where the patched timeline has no counter).
+        if oldest_key == timeline_key && inner.timeline_change_ids.contains_key(timeline_key) {
+            // Put it back and evict the next oldest instead.
+            let next = inner
+                .timeline_records_order
+                .pop_front()
+                .filter(|k| inner.timeline_records.contains_key(k))
+                .or_else(|| {
+                    inner
+                        .timeline_records
+                        .keys()
+                        .find(|k| *k != timeline_key)
+                        .cloned()
+                });
+            // Re-queue the protected key at the back (most recent).
+            inner
+                .timeline_records_order
+                .push_back(timeline_key.to_owned());
+            let Some(next_key) = next else { break };
+            inner.timeline_records.remove(&next_key);
+            inner.timeline_change_ids.remove(&next_key);
+            continue;
+        }
         inner.timeline_records.remove(&oldest_key);
         inner.timeline_change_ids.remove(&oldest_key);
     }
+    // Ensure change_id map stays in sync with records — orphaned counters
+    // are pruned so a no-op protection doesn't leave a drift.
+    inner
+        .timeline_change_ids
+        .retain(|k, _| inner.timeline_records.contains_key(k));
 }
 
 /// F3 — after timeline events are projected: ring-buffer each run's event
 /// Vec to `MAX_TIMELINE_EVENTS` and bound the number of distinct run buckets
 /// to `MAX_TIMELINE_EVENT_KEYS`.
 pub(crate) fn trim_timeline_events(inner: &mut InnerState, run_id: RunId) {
+    if !inner.timeline_events_order.iter().any(|r| r == &run_id)
+        && inner.timeline_events.contains_key(&run_id)
+    {
+        inner.timeline_events_order.push_back(run_id);
+    }
     if let Some(events) = inner.timeline_events.get_mut(&run_id) {
         let excess = events.len().saturating_sub(MAX_TIMELINE_EVENTS);
         if excess > 0 {
@@ -182,9 +310,33 @@ pub(crate) fn trim_timeline_events(inner: &mut InnerState, run_id: RunId) {
         }
     }
     while inner.timeline_events.len() > MAX_TIMELINE_EVENT_KEYS {
-        let Some(oldest_run) = inner.timeline_events.keys().next().copied() else {
-            break;
-        };
+        let oldest_run = inner
+            .timeline_events_order
+            .pop_front()
+            .filter(|r| inner.timeline_events.contains_key(r))
+            .or_else(|| inner.timeline_events.keys().next().copied());
+        let Some(oldest_run) = oldest_run else { break };
+        if !inner.timeline_events.contains_key(&oldest_run) {
+            continue;
+        }
+        if oldest_run == run_id {
+            // Protect the active run — evict the next oldest instead.
+            let next = inner
+                .timeline_events_order
+                .pop_front()
+                .filter(|r| inner.timeline_events.contains_key(r))
+                .or_else(|| {
+                    inner
+                        .timeline_events
+                        .keys()
+                        .find(|k| **k != run_id)
+                        .copied()
+                });
+            inner.timeline_events_order.push_back(run_id);
+            let Some(next_run) = next else { break };
+            inner.timeline_events.remove(&next_run);
+            continue;
+        }
         inner.timeline_events.remove(&oldest_run);
     }
 }
@@ -206,12 +358,63 @@ pub(crate) fn trim_cache_dl_tokens(inner: &mut InnerState) {
 }
 
 /// F7 — bound the finalized artifact v2 registry: `MAX_ARTIFACTS_PER_RUN` per
-/// run and `MAX_ARTIFACT_REGISTRY_ENTRIES` globally, evicting oldest entries.
+/// run and `MAX_ARTIFACT_REGISTRY_ENTRIES` globally, evicting oldest entries
+/// by finalization order (not lexicographic key order).
 pub(crate) fn trim_artifact_registry(inner: &mut InnerState) {
+    // Per-run cap — enforce 500 per workflow_run_backend_id.
+    {
+        let mut per_run: BTreeMap<String, usize> = BTreeMap::new();
+        for key in inner.artifact_v2_registry.keys() {
+            if let Some(run) = key.split('/').next() {
+                *per_run.entry(run.to_owned()).or_default() += 1;
+            }
+        }
+        for (run, count) in per_run {
+            if count <= MAX_ARTIFACTS_PER_RUN {
+                continue;
+            }
+            let mut excess = count - MAX_ARTIFACTS_PER_RUN;
+            // Evict oldest entries for this run first (FIFO).
+            let mut to_remove: Vec<String> = Vec::new();
+            for key in inner.artifact_registry_order.iter() {
+                if excess == 0 {
+                    break;
+                }
+                if key.starts_with(&format!("{run}/"))
+                    && inner.artifact_v2_registry.contains_key(key)
+                {
+                    to_remove.push(key.clone());
+                    excess -= 1;
+                }
+            }
+            // Fallback to BTree order if order deque is incomplete (restored).
+            if excess > 0 {
+                for key in inner.artifact_v2_registry.keys() {
+                    if excess == 0 {
+                        break;
+                    }
+                    if key.starts_with(&format!("{run}/")) && !to_remove.contains(key) {
+                        to_remove.push(key.clone());
+                        excess -= 1;
+                    }
+                }
+            }
+            for key in to_remove {
+                inner.artifact_v2_registry.remove(&key);
+                inner.artifact_registry_order.retain(|k| k != &key);
+            }
+        }
+    }
     while inner.artifact_v2_registry.len() > MAX_ARTIFACT_REGISTRY_ENTRIES {
-        let Some(oldest_key) = inner.artifact_v2_registry.keys().next().cloned() else {
-            break;
-        };
+        let oldest = inner
+            .artifact_registry_order
+            .pop_front()
+            .filter(|k| inner.artifact_v2_registry.contains_key(k))
+            .or_else(|| inner.artifact_v2_registry.keys().next().cloned());
+        let Some(oldest_key) = oldest else { break };
+        if !inner.artifact_v2_registry.contains_key(&oldest_key) {
+            continue;
+        }
         inner.artifact_v2_registry.remove(&oldest_key);
     }
 }
@@ -249,6 +452,15 @@ pub(crate) fn sweep_pending_uploads(inner: &mut InnerState, now_unix_secs: i64) 
     for token in stale_dl {
         inner.cache_v2_dl_tokens.remove(&token);
         inner.cache_v2_dl_tokens_created.remove(&token);
+        inner
+            .cache_v2_dl_tokens_order
+            .retain(|queued| queued != &token);
+    }
+    // Compact order deque if it grew with stale entries while under cap.
+    if inner.cache_v2_dl_tokens_order.len() > inner.cache_v2_dl_tokens.len() + 1024 {
+        let live: std::collections::HashSet<String> =
+            inner.cache_v2_dl_tokens.keys().cloned().collect();
+        inner.cache_v2_dl_tokens_order.retain(|k| live.contains(k));
     }
 }
 
@@ -307,7 +519,7 @@ mod tests {
                 .or_default()
                 .insert(uuid::Uuid::new_v4(), minimal_record());
         }
-        trim_timeline_after_patch(&mut inner, "plan-a/0000");
+        trim_timeline_after_patch(&mut inner, "plan-a/0000", &[]);
         assert!(inner.timeline_records["plan-a/0000"].len() <= MAX_TIMELINE_RECORDS);
 
         for i in 0..(MAX_TIMELINE_KEYS + 16) {
@@ -315,12 +527,45 @@ mod tests {
             inner.timeline_records.entry(key.clone()).or_default();
             inner.timeline_change_ids.insert(key, i as i32);
         }
-        trim_timeline_after_patch(&mut inner, "plan-a/0000");
+        trim_timeline_after_patch(&mut inner, "plan-a/0000", &[]);
         assert!(inner.timeline_records.len() <= MAX_TIMELINE_KEYS);
         assert_eq!(
             inner.timeline_change_ids.len(),
             inner.timeline_records.len(),
             "change-id counters must be evicted with their timelines"
+        );
+    }
+
+    #[test]
+    fn trim_timeline_after_patch_keeps_just_patched_low_uuid_record() {
+        let mut inner = InnerState::default();
+        let tl = "plan-a/0000";
+        // Fill the timeline to the cap; every v4 UUID sorts above nil.
+        for _ in 0..MAX_TIMELINE_RECORDS {
+            inner
+                .timeline_records
+                .entry(tl.to_owned())
+                .or_default()
+                .insert(uuid::Uuid::new_v4(), minimal_record());
+        }
+        // A freshly patched record whose UUID sorts before every existing one.
+        let patched = uuid::Uuid::nil();
+        inner
+            .timeline_records
+            .get_mut(tl)
+            .unwrap()
+            .insert(patched, minimal_record());
+        assert_eq!(
+            inner.timeline_records[tl].len(),
+            MAX_TIMELINE_RECORDS + 1
+        );
+
+        trim_timeline_after_patch(&mut inner, tl, &[patched]);
+
+        assert_eq!(inner.timeline_records[tl].len(), MAX_TIMELINE_RECORDS);
+        assert!(
+            inner.timeline_records[tl].contains_key(&patched),
+            "the just-patched low-UUID record must survive eviction"
         );
     }
 

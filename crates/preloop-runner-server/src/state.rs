@@ -1194,6 +1194,16 @@ pub(crate) struct InnerState {
     /// Cache v2 download-token mint time (unix seconds), for the TTL sweep.
     /// In-memory only, like `cache_v2_dl_tokens_order`.
     pub(crate) cache_v2_dl_tokens_created: BTreeMap<String, i64>,
+    /// Insertion order for timeline keys (`{plan}/{timeline}`) — FIFO for
+    /// global eviction. In-memory only.
+    pub(crate) timeline_records_order: VecDeque<String>,
+    /// Insertion order for run event buckets — FIFO for global eviction.
+    pub(crate) timeline_events_order: VecDeque<RunId>,
+    /// Finalization order for artifact registry — FIFO for global and
+    /// per-run eviction. In-memory only.
+    pub(crate) artifact_registry_order: VecDeque<String>,
+    /// Insertion order for log keys — FIFO for global log eviction.
+    pub(crate) log_order: VecDeque<String>,
     /// Artifact v2 Twirp pending uploads: upload_token → registry_key.
     pub(crate) artifact_v2_pending: BTreeMap<String, ArtifactV2Pending>,
     /// Artifact v2 finalized registry: registry_key → metadata.

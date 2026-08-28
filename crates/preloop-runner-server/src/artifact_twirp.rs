@@ -95,6 +95,9 @@ pub(crate) async fn twirp_artifact_v2_create(
                 .filter(|pending| &pending.job_backend_id == job_id)
                 .count();
             if pending >= MAX_PENDING_PER_JOB {
+                // Clean up the directory we just created — the TTL sweep has no
+                // token to find it otherwise, so it would leak forever.
+                let _ = tokio::fs::remove_dir_all(&stage_dir).await;
                 return Err(ApiError::conflict(format!(
                     "job has {pending} pending artifact uploads (cap {MAX_PENDING_PER_JOB})"
                 )));
@@ -168,7 +171,7 @@ pub(crate) async fn twirp_artifact_v2_finalize(
             _ => None,
         });
         inner.artifact_v2_registry.insert(
-            registry_key,
+            registry_key.clone(),
             ArtifactV2Entry {
                 id: artifact_id,
                 workflow_run_backend_id: request.workflow_run_backend_id,
@@ -180,6 +183,8 @@ pub(crate) async fn twirp_artifact_v2_finalize(
                 blob_token: token,
             },
         );
+        // Track finalization order for FIFO eviction.
+        inner.artifact_registry_order.push_back(registry_key);
         // F7: keep the registry bounded per run (500) and globally (10k);
         // oldest entries are evicted first.
         trim_artifact_registry(&mut inner);

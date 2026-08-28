@@ -128,12 +128,67 @@ pub fn generate_self_signed_cert() -> anyhow::Result<SelfSignedCert> {
 }
 
 pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
+    let (expired_cache_tokens, expired_artifact_tokens) = {
+        let mut inner = shared.state.inner.lock().await;
+        // Migrate legacy pending entries that restored with `created_unix == 0`
+        // (pre-cap state) so they don't live forever. Give them `now` once
+        // so the TTL sweeper can eventually collect them if never finalized.
+        let now_u = now_unix();
+        for pending in inner.cache_v2_pending.values_mut() {
+            if pending.created_unix == 0 {
+                pending.created_unix = now_u;
+            }
+        }
+        for pending in inner.artifact_v2_pending.values_mut() {
+            if pending.created_unix == 0 {
+                pending.created_unix = now_u;
+            }
+        }
+        // F7: drop pending cache/artifact uploads and download tokens older than
+        // PENDING_UPLOAD_TTL. Entries restored from a persisted meta have no age
+        // and are left alone, so a restart never sweeps a legitimate upload.
+        let expired_cache: Vec<String> = inner
+            .cache_v2_pending
+            .iter()
+            .filter(|(_, p)| {
+                p.created_unix > 0 && p.created_unix < now_u - PENDING_UPLOAD_TTL.as_secs() as i64
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        let expired_artifact: Vec<String> = inner
+            .artifact_v2_pending
+            .iter()
+            .filter(|(_, p)| {
+                p.created_unix > 0 && p.created_unix < now_u - PENDING_UPLOAD_TTL.as_secs() as i64
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        sweep_pending_uploads(&mut inner, now_u);
+        // Release lock before doing I/O.
+        (expired_cache, expired_artifact)
+    };
+    // Delete staging directories for expired reservations — otherwise they
+    // accumulate on disk forever.
+    for token in expired_cache_tokens {
+        let dir = shared
+            .state
+            .state_dir
+            .join("blobs")
+            .join("cache")
+            .join(token);
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+    for token in expired_artifact_tokens {
+        let dir = shared
+            .state
+            .state_dir
+            .join("blobs")
+            .join("artifact")
+            .join(token);
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
     let mut inner = shared.state.inner.lock().await;
     let now = SystemTime::now();
-    // F7: drop pending cache/artifact uploads and download tokens older than
-    // PENDING_UPLOAD_TTL. Entries restored from a persisted meta have no age
-    // and are left alone, so a restart never sweeps a legitimate upload.
-    sweep_pending_uploads(&mut inner, now_unix());
     let mut cancellations = Vec::new();
     let mut disconnected_completions = Vec::new();
     // Jobs failed by the starvation sweep, emitted after the lock is

@@ -19687,14 +19687,20 @@ async fn repro_f6_timeline_get_is_paginated_and_capped() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    // Plain GET must not return the whole timeline in one response.
+    // Plain GET without pagination returns the full timeline (official runner
+    // compat — it doesn't send `top` and has no continuation token). Storage
+    // itself is bounded at MAX_TIMELINE_RECORDS=1024, so this is still capped.
     let (status, body) =
         try_req_with_bearer(&app, Method::GET, &uri, Value::Null, &runner_token).await;
     assert_eq!(status, StatusCode::OK);
     let returned = body["records"].as_array().map(Vec::len).unwrap_or(0);
     assert!(
-        returned <= MAX_TOP_RECORDS,
-        "timeline GET returned {returned} records without pagination (server cap {MAX_TOP_RECORDS})"
+        returned <= MAX_TIMELINE_RECORDS,
+        "timeline GET returned {returned} records without pagination (storage cap {MAX_TIMELINE_RECORDS})"
+    );
+    assert!(
+        returned > MAX_TOP_RECORDS,
+        "plain GET should return full storage beyond the page cap for compat — got {returned}, page cap {MAX_TOP_RECORDS}"
     );
 
     // Explicit pages work.
