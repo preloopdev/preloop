@@ -32,12 +32,29 @@ the App's settings → Webhooks → Edit.
 
 At startup preloop reads an existing App's subscription back from GitHub
 (`GET /app`, App-JWT auth) and **warns loudly** when the trigger events it
-turns into runs are missing (`push`, `pull_request`, `pull_request_target`,
-`pull_request_review`, `workflow_dispatch`, `workflow_run`,
-`repository_dispatch`, `issue_comment`, `issues`, `check_run`, `check_suite`,
-`create`, `delete`, `release`). GitHub cannot change an App's event
-subscription through the API — tick the missing events under the App's
-settings → Webhooks → Edit.
+turns into runs are missing (`push`, `pull_request`, `pull_request_review`,
+`workflow_dispatch`, `workflow_run`, `repository_dispatch`, `issue_comment`,
+`issues`, `check_run`, `check_suite`, `create`, `delete`, `release`). GitHub
+cannot change an App's event subscription through the API — tick the missing
+events under the App's settings → Permissions & events → Subscribe to events.
+
+Two subtleties the warning accounts for, so it stays silent on a correctly
+configured App:
+
+- **Permissions gate the checkboxes.** GitHub only renders an event's checkbox
+  once the App holds the permission that event requires (`issues` → Issues,
+  `workflow_run` → Actions, `create`/`delete`/`release`/`push`/
+  `workflow_dispatch`/`repository_dispatch` → Contents, `pull_request*` → Pull
+  requests). The warning names the permission to grant first; the installation
+  must also accept the widened permissions before delivery starts.
+- **`check_run`/`check_suite` are implicit.** Apps with `checks: write` are
+  auto-subscribed and GitHub never lists these in `events`, so preloop treats
+  write access as satisfying them.
+
+`pull_request_target` is deliberately not in the list: it is a workflow
+trigger preloop synthesizes from the `pull_request` webhook
+(`src/events/pull_request.rs`), never an event GitHub delivers, so requiring a
+subscription to it warned forever.
 
 ### Data Flow diagram:
 
@@ -136,9 +153,12 @@ If `PRELOOP_GITHUB_TOKEN` is not configured, these requests are simulated in-mem
    tick every event in the table above; the manifest flow
    (`GET /api/v1/github/register`) does this automatically for new Apps.
    At minimum, tick the trigger events: `push`, `pull_request`,
-   `pull_request_target`, `pull_request_review`, `workflow_dispatch`,
-   `workflow_run`, `repository_dispatch`, `issue_comment`, `issues`,
-   `check_run`, `check_suite`, `create`, `delete`, `release`.
+   `pull_request_review`, `workflow_dispatch`, `workflow_run`,
+   `repository_dispatch`, `issue_comment`, `issues`, `create`, `delete`,
+   `release`. `check_run`/`check_suite` need no tick when the App holds
+   `checks: write` — GitHub subscribes those automatically. An event whose
+   permission the App lacks has no checkbox at all; grant the permission
+   first (see the two subtleties above).
 
 ### Step 2: Start `preloop-runner-server`
 Run the server with the environment variables set:

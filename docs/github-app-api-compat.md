@@ -163,10 +163,13 @@ is created. Missing input validation must not reject a *webhook*-delivered dispa
   `push`, `pull_request`. Operators who need additional events must add them
   manually in the App settings UI because GitHub's API cannot change event
   subscriptions after App creation. The trigger events Apps may need include
-  `pull_request_target`, `pull_request_review`, `workflow_dispatch`,
-  `workflow_run`, `repository_dispatch`, `issue_comment`, `issues`, `check_run`,
-  `check_suite`, `create`, `delete`, `release`, plus the Tier B/C events the
-  adapters already handle.
+  `pull_request_review`, `workflow_dispatch`, `workflow_run`,
+  `repository_dispatch`, `issue_comment`, `issues`, `check_run`, `check_suite`,
+  `create`, `delete`, `release`, plus the Tier B/C events the adapters already
+  handle. `pull_request_target` is not among them: preloop synthesizes it from
+  the `pull_request` webhook, and GitHub delivers no such event. `check_run`
+  and `check_suite` need no explicit subscription when the App holds
+  `checks: write` — GitHub auto-subscribes those and omits them from `events`.
 - **Caveat**: GitHub's `PATCH /app/hook/config` cannot change an App's event
   subscription (only url/content_type/secret). Event subscriptions are set at App
   creation (manifest) or in the App settings UI. So:
