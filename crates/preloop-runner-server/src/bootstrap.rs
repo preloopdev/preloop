@@ -1037,8 +1037,10 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     if let Some(app) = state.github_app.clone() {
         let app_id = app.app_id.clone();
         tokio::spawn(async move {
-            match app.read_app_events().await {
-                Ok(events) => crate::github_app::warn_missing_trigger_events(&app_id, &events),
+            match app.read_app_subscription().await {
+                Ok(subscription) => {
+                    crate::github_app::warn_missing_trigger_events(&app_id, &subscription)
+                }
                 Err(error) => warn!(
                     app_id,
                     ?error,
@@ -1058,8 +1060,10 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             let app = app.clone();
             tokio::spawn(async move {
                 let app_id = app.app_id.clone();
-                match app.read_app_events().await {
-                    Ok(events) => crate::github_app::warn_missing_trigger_events(&app_id, &events),
+                match app.read_app_subscription().await {
+                    Ok(subscription) => {
+                        crate::github_app::warn_missing_trigger_events(&app_id, &subscription)
+                    }
                     Err(error) => warn!(
                         app_id,
                         ?error,

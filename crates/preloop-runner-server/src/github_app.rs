@@ -388,11 +388,12 @@ impl GitHubAppCredentials {
 }
 
 impl GitHubAppCredentials {
-    /// Read the App's subscribed webhook events from GitHub (`GET /app`).
+    /// Read the App's webhook subscription and permissions from GitHub
+    /// (`GET /app`).
     ///
     /// Authenticates with the App JWT, the only credential `/app` accepts.
-    pub(crate) async fn read_app_events(&self) -> anyhow::Result<Vec<String>> {
-        read_app_events_at(&api_base(), &self.app_id, &self.private_key).await
+    pub(crate) async fn read_app_subscription(&self) -> anyhow::Result<AppSubscription> {
+        read_app_subscription_at(&api_base(), &self.app_id, &self.private_key).await
     }
 }
 
@@ -1313,8 +1314,8 @@ async fn set_app_webhook_config_at(
         // read the subscription back and warn when the trigger events preloop
         // turns into runs are missing — the operator has to tick them in the
         // App settings UI.
-        match read_app_events_at(api_base, app_id, &creds.private_key).await {
-            Ok(events) => warn_missing_trigger_events(app_id, &events),
+        match read_app_subscription_at(api_base, app_id, &creds.private_key).await {
+            Ok(subscription) => warn_missing_trigger_events(app_id, &subscription),
             Err(error) => warn!(
                 app_id,
                 ?error,
@@ -1331,70 +1332,192 @@ async fn set_app_webhook_config_at(
     )
 }
 
-/// Webhook events a preloop GitHub App must subscribe to for the full CI
-/// surface to work (D7). These are the Tier A + trigger events the adapters
-/// turn into runs; an App not subscribed to one of them will never deliver
-/// that webhook to preloop no matter how the workflow YAML is written.
-pub(crate) fn required_trigger_events() -> &'static [&'static str] {
-    &[
-        "push",
-        "pull_request",
-        "pull_request_target",
-        "pull_request_review",
-        "workflow_dispatch",
-        "workflow_run",
-        "repository_dispatch",
-        "issue_comment",
-        "issues",
-        "check_run",
-        "check_suite",
-        "create",
-        "delete",
-        "release",
-    ]
+/// A webhook event preloop turns into runs, paired with the repository
+/// permission GitHub gates its subscription on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TriggerEvent {
+    /// Event name exactly as GitHub reports it in `GET /app`'s `events`.
+    pub event: &'static str,
+    /// `GET /app` permission key that must be granted before the event can be
+    /// subscribed to. The App settings UI does not render an event's checkbox
+    /// while its permission is missing, so reporting the event alone sends the
+    /// operator looking for a control that is not on the page.
+    pub permission: &'static str,
+    /// GitHub subscribes Apps holding `permission: write` to this event
+    /// automatically and never lists it in `events`, so its absence from the
+    /// subscription proves nothing (`check_run`, `check_suite`).
+    pub implicit_with_write: bool,
 }
 
-/// The required trigger events `subscribed` is missing, in canonical order.
-pub(crate) fn missing_trigger_events(subscribed: &[String]) -> Vec<String> {
+/// Webhook events a preloop GitHub App must receive for the full CI surface to
+/// work (D7). These are the Tier A + trigger events the adapters turn into
+/// runs; without delivery of one, no workflow YAML can trigger on it.
+///
+/// Every entry must be a real webhook event that `GET /app` can report.
+/// `pull_request_target` is deliberately absent: it is a workflow trigger
+/// preloop synthesizes from the `pull_request` webhook (`events/pull_request.rs`),
+/// not an event GitHub delivers, so requiring it here warned forever.
+///
+/// Permissions mirror each event's "To subscribe to this event, a GitHub App
+/// must have at least read-level access for the … permission" clause in
+/// GitHub's webhook events reference.
+pub(crate) fn required_trigger_events() -> &'static [TriggerEvent] {
+    const fn event(event: &'static str, permission: &'static str) -> TriggerEvent {
+        TriggerEvent {
+            event,
+            permission,
+            implicit_with_write: false,
+        }
+    }
+    const fn implicit(event: &'static str, permission: &'static str) -> TriggerEvent {
+        TriggerEvent {
+            event,
+            permission,
+            implicit_with_write: true,
+        }
+    }
+    const EVENTS: &[TriggerEvent] = &[
+        event("push", "contents"),
+        event("pull_request", "pull_requests"),
+        event("pull_request_review", "pull_requests"),
+        event("workflow_dispatch", "contents"),
+        event("workflow_run", "actions"),
+        event("repository_dispatch", "contents"),
+        event("issue_comment", "issues"),
+        event("issues", "issues"),
+        implicit("check_run", "checks"),
+        implicit("check_suite", "checks"),
+        event("create", "contents"),
+        event("delete", "contents"),
+        event("release", "contents"),
+    ];
+    EVENTS
+}
+
+/// A required event GitHub does not currently deliver to preloop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MissingTriggerEvent {
+    pub event: &'static str,
+    pub permission: &'static str,
+    /// Whether the App already holds the gating permission — i.e. whether the
+    /// operator can tick the checkbox today or must widen permissions first.
+    pub permission_granted: bool,
+}
+
+/// The required trigger events `subscription` does not cover, in canonical order.
+pub(crate) fn missing_trigger_events(subscription: &AppSubscription) -> Vec<MissingTriggerEvent> {
     required_trigger_events()
         .iter()
-        .filter(|event| !subscribed.iter().any(|have| have == *event))
-        .map(|event| (*event).to_owned())
+        .filter(|required| !subscription.delivers(required))
+        .map(|required| MissingTriggerEvent {
+            event: required.event,
+            permission: required.permission,
+            permission_granted: subscription.has_permission(required.permission),
+        })
         .collect()
 }
 
-/// Loudly warn when an App's subscribed events do not cover the trigger set.
+/// Loudly warn when an App's subscription does not cover the trigger set.
 ///
-/// GitHub cannot change an App's event subscription through the API — only
-/// the App settings UI can — so this is a warning with exact instructions,
-/// not an attempt to fix the App.
-pub(crate) fn warn_missing_trigger_events(app_id: &str, subscribed: &[String]) {
-    let missing = missing_trigger_events(subscribed);
+/// GitHub cannot change an App's event subscription through the API — only the
+/// App settings UI can — so this is a warning with exact instructions, not an
+/// attempt to fix the App. Events whose permission is missing are reported
+/// separately: their checkbox does not exist until the permission is granted
+/// and the installation accepts the change.
+pub(crate) fn warn_missing_trigger_events(app_id: &str, subscription: &AppSubscription) {
+    let missing = missing_trigger_events(subscription);
     if missing.is_empty() {
         return;
     }
+    let all = missing
+        .iter()
+        .map(|missing| missing.event)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let tickable = missing
+        .iter()
+        .filter(|missing| missing.permission_granted)
+        .map(|missing| missing.event)
+        .collect::<Vec<_>>();
+    let mut blocked: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for missing in missing.iter().filter(|missing| !missing.permission_granted) {
+        blocked
+            .entry(missing.permission)
+            .or_default()
+            .push(missing.event);
+    }
+    let mut steps = Vec::new();
+    if !tickable.is_empty() {
+        steps.push(format!(
+            "Tick these under Subscribe to events: {}.",
+            tickable.join(", ")
+        ));
+    }
+    if !blocked.is_empty() {
+        let grants = blocked
+            .iter()
+            .map(|(permission, events)| format!("{permission} (for {})", events.join(", ")))
+            .collect::<Vec<_>>()
+            .join("; ");
+        steps.push(format!(
+            "These need a permission granted first — GitHub renders no checkbox \
+             until then, and the installation must accept the change before \
+             delivery starts: {grants}."
+        ));
+    }
     tracing::warn!(
         app_id,
-        missing = %missing.join(", "),
-        "GitHub App {app_id} is not subscribed to webhook events preloop needs \
-         (missing: {}). GitHub will never deliver those events to preloop. Open \
-         the App's settings (https://github.com/settings/apps/{app_id}) → Webhooks \
-         → Edit → and tick the missing events.",
-        missing.join(", ")
+        missing = %all,
+        "GitHub App {app_id} does not receive webhook events preloop needs \
+         (missing: {all}). GitHub will never deliver those events to preloop. \
+         Open https://github.com/settings/apps/{app_id}/permissions. {}",
+        steps.join(" ")
     );
 }
 
-/// Read the webhook events an App is subscribed to via `GET /app`.
+/// What GitHub reports about an App's webhook delivery: the events it is
+/// explicitly subscribed to, plus the permissions that decide which events it
+/// may subscribe to at all and which it receives implicitly.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AppSubscription {
+    /// `GET /app`'s `events` array.
+    pub events: Vec<String>,
+    /// `GET /app`'s `permissions` object, e.g. `checks` → `write`.
+    pub permissions: BTreeMap<String, String>,
+}
+
+impl AppSubscription {
+    /// Whether the App holds `permission` at any level.
+    fn has_permission(&self, permission: &str) -> bool {
+        self.permissions.contains_key(permission)
+    }
+
+    /// Whether the App holds `permission` at write level.
+    fn has_write_permission(&self, permission: &str) -> bool {
+        self.permissions
+            .get(permission)
+            .is_some_and(|level| level == "write")
+    }
+
+    /// Whether GitHub delivers `required` today — either because the App is
+    /// explicitly subscribed, or because write access auto-subscribes it.
+    fn delivers(&self, required: &TriggerEvent) -> bool {
+        self.events.iter().any(|have| have == required.event)
+            || (required.implicit_with_write && self.has_write_permission(required.permission))
+    }
+}
+
+/// Read an App's webhook subscription and permissions via `GET /app`.
 ///
 /// Authenticates with the App JWT — the only credential `/app` accepts.
-/// Returns the `events` array; a transport or auth failure is an error so
-/// the caller decides how loudly to fail (fail closed, never pretend the
-/// subscription is fine when it could not be read).
-pub(crate) async fn read_app_events_at(
+/// A transport or auth failure is an error so the caller decides how loudly to
+/// fail (fail closed, never pretend the subscription is fine when it could not
+/// be read).
+pub(crate) async fn read_app_subscription_at(
     api_base: &str,
     app_id: &str,
     private_key: &rsa::RsaPrivateKey,
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<AppSubscription> {
     let app_jwt = sign_app_jwt(app_id, private_key)?;
     let response = CLIENT
         .get(format!("{api_base}/app"))
@@ -1424,7 +1547,22 @@ pub(crate) async fn read_app_events_at(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    Ok(events)
+    let permissions = payload
+        .get("permissions")
+        .and_then(serde_json::Value::as_object)
+        .map(|permissions| {
+            permissions
+                .iter()
+                .filter_map(|(name, level)| {
+                    level.as_str().map(|level| (name.clone(), level.to_owned()))
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    Ok(AppSubscription {
+        events,
+        permissions,
+    })
 }
 
 /// Build credentials from raw config pieces (no environment involved).
@@ -2218,38 +2356,166 @@ mod tests {
         );
     }
 
+    /// Subscription helper: `events` explicit, `permissions` as `key:level`.
+    fn subscription(events: &[&str], permissions: &[(&str, &str)]) -> AppSubscription {
+        AppSubscription {
+            events: events.iter().map(|event| (*event).to_owned()).collect(),
+            permissions: permissions
+                .iter()
+                .map(|(name, level)| ((*name).to_owned(), (*level).to_owned()))
+                .collect(),
+        }
+    }
+
+    fn missing_names(subscription: &AppSubscription) -> Vec<&'static str> {
+        missing_trigger_events(subscription)
+            .into_iter()
+            .map(|missing| missing.event)
+            .collect()
+    }
+
+    /// Every required entry must be a real webhook event GitHub can report in
+    /// `GET /app`'s `events`. Asserted against a literal list transcribed from
+    /// GitHub's webhook events reference — deriving it from the table under
+    /// test would pass for fictional names like `pull_request_target`, which
+    /// is a workflow trigger, not a deliverable webhook.
+    #[test]
+    fn required_trigger_events_are_real_github_webhook_events() {
+        const GITHUB_WEBHOOK_EVENTS: &[&str] = &[
+            "branch_protection_rule",
+            "check_run",
+            "check_suite",
+            "commit_comment",
+            "create",
+            "delete",
+            "deployment",
+            "deployment_status",
+            "discussion",
+            "discussion_comment",
+            "fork",
+            "gollum",
+            "issue_comment",
+            "issues",
+            "label",
+            "member",
+            "merge_group",
+            "milestone",
+            "package",
+            "page_build",
+            "project",
+            "public",
+            "pull_request",
+            "pull_request_review",
+            "pull_request_review_comment",
+            "pull_request_review_thread",
+            "push",
+            "registry_package",
+            "release",
+            "repository",
+            "repository_dispatch",
+            "status",
+            "watch",
+            "workflow_dispatch",
+            "workflow_job",
+            "workflow_run",
+        ];
+        for required in required_trigger_events() {
+            assert!(
+                GITHUB_WEBHOOK_EVENTS.contains(&required.event),
+                "'{}' is not a webhook event GitHub delivers, so `GET /app` can \
+                 never report it and the warning would fire forever",
+                required.event
+            );
+        }
+        assert!(
+            !required_trigger_events()
+                .iter()
+                .any(|required| required.event == "pull_request_target"),
+            "pull_request_target is synthesized from the pull_request webhook, \
+             never delivered by GitHub"
+        );
+    }
+
     #[test]
     fn missing_trigger_events_reports_only_absent_required_events() {
-        let complete = required_trigger_events()
-            .iter()
-            .map(|event| (*event).to_owned())
-            .collect::<Vec<_>>();
+        let all_permissions = [
+            ("contents", "read"),
+            ("pull_requests", "read"),
+            ("issues", "read"),
+            ("actions", "read"),
+            ("checks", "write"),
+        ];
+        let complete = subscription(
+            &required_trigger_events()
+                .iter()
+                .map(|required| required.event)
+                .collect::<Vec<_>>(),
+            &all_permissions,
+        );
         assert!(
             missing_trigger_events(&complete).is_empty(),
             "a full subscription has nothing missing"
         );
 
-        let partial = vec![
-            "push".to_owned(),
-            "pull_request".to_owned(),
-            "repository_dispatch".to_owned(),
-        ];
-        let missing = missing_trigger_events(&partial);
-        assert!(missing.contains(&"workflow_dispatch".to_owned()));
-        assert!(missing.contains(&"issue_comment".to_owned()));
-        assert!(!missing.contains(&"push".to_owned()));
+        let partial = subscription(
+            &["push", "pull_request", "repository_dispatch"],
+            &all_permissions,
+        );
+        let missing = missing_names(&partial);
+        assert!(missing.contains(&"workflow_dispatch"));
+        assert!(missing.contains(&"issue_comment"));
+        assert!(!missing.contains(&"push"));
         // Canonical order (the order of `required_trigger_events`), no
         // duplicates.
-        let canonical: Vec<String> = required_trigger_events()
+        let canonical: Vec<&str> = required_trigger_events()
             .iter()
-            .filter(|event| missing.iter().any(|missing| missing == *event))
-            .map(|event| (*event).to_owned())
+            .map(|required| required.event)
+            .filter(|event| missing.contains(event))
             .collect();
         assert_eq!(missing, canonical);
     }
 
+    /// Apps with `checks: write` are auto-subscribed to `check_run`/`check_suite`
+    /// and GitHub never lists them in `events`, so absence is not a gap.
+    #[test]
+    fn checks_write_satisfies_the_implicitly_delivered_check_events() {
+        let checks_write = subscription(&["push"], &[("checks", "write")]);
+        let missing = missing_names(&checks_write);
+        assert!(
+            !missing.contains(&"check_run") && !missing.contains(&"check_suite"),
+            "write access auto-subscribes both check events: {missing:?}"
+        );
+
+        // Read-level Checks does not auto-subscribe, so they are genuinely missing.
+        let checks_read = subscription(&["push"], &[("checks", "read")]);
+        let missing = missing_names(&checks_read);
+        assert!(missing.contains(&"check_run") && missing.contains(&"check_suite"));
+    }
+
+    /// An event whose permission is absent cannot be ticked at all — the
+    /// checkbox is not rendered — so it is reported as permission-blocked.
+    #[test]
+    fn missing_events_record_whether_their_permission_is_granted() {
+        let subscription = subscription(&["push", "pull_request"], &[("contents", "read")]);
+        let missing = missing_trigger_events(&subscription);
+        let blocked = |event: &str| {
+            missing
+                .iter()
+                .find(|missing| missing.event == event)
+                .unwrap_or_else(|| panic!("{event} must be reported missing"))
+        };
+        // Issues/Actions are absent: GitHub hides these checkboxes entirely.
+        assert!(!blocked("issues").permission_granted);
+        assert_eq!(blocked("issues").permission, "issues");
+        assert!(!blocked("workflow_run").permission_granted);
+        assert_eq!(blocked("workflow_run").permission, "actions");
+        // Contents is granted, so `create` is tickable right now.
+        assert!(blocked("create").permission_granted);
+        assert_eq!(blocked("create").permission, "contents");
+    }
+
     #[tokio::test]
-    async fn read_app_events_parses_the_subscription_from_github() {
+    async fn read_app_subscription_parses_events_and_permissions_from_github() {
         use axum::routing::get;
         use axum::Json;
         use axum::Router;
@@ -2270,7 +2536,8 @@ mod tests {
                         Json(json!({
                             "id": 424,
                             "slug": "preloop-local-app",
-                            "events": ["push", "pull_request", "workflow_dispatch"]
+                            "events": ["push", "pull_request", "workflow_dispatch"],
+                            "permissions": {"checks": "write", "contents": "read"}
                         }))
                     }
                 }
@@ -2283,17 +2550,23 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, stub).await.expect("serve stub API") });
 
         let key = test_key();
-        let events = read_app_events_at(&api_base, "424", &key)
+        let subscription = read_app_subscription_at(&api_base, "424", &key)
             .await
             .expect("the stub serves the App's subscription");
         assert_eq!(
-            events,
+            subscription.events,
             vec![
                 "push".to_owned(),
                 "pull_request".to_owned(),
                 "workflow_dispatch".to_owned(),
             ]
         );
+        assert!(
+            subscription.has_write_permission("checks"),
+            "permissions decide which events are deliverable at all"
+        );
+        assert!(subscription.has_permission("contents"));
+        assert!(!subscription.has_permission("issues"));
         let auth = seen_auth.lock().expect("stub state");
         let token = auth
             .as_deref()
@@ -2306,7 +2579,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_app_events_fails_closed_when_github_refuses() {
+    async fn read_app_subscription_fails_closed_when_github_refuses() {
         use axum::http::StatusCode;
         use axum::routing::get;
         use axum::Router;
@@ -2321,7 +2594,7 @@ mod tests {
         let api_base = format!("http://{}", listener.local_addr().expect("stub address"));
         tokio::spawn(async move { axum::serve(listener, stub).await.expect("serve stub API") });
 
-        let error = read_app_events_at(&api_base, "424", &test_key())
+        let error = read_app_subscription_at(&api_base, "424", &test_key())
             .await
             .expect_err("a refused read-back must be an error, never an empty subscription");
         assert!(
