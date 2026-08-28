@@ -1,0 +1,9 @@
+there's been a few new smolvm releases, why is renovate not checking and creating prs as it should be?
+
+---
+
+what were in the smolvm changes ever since
+
+---
+
+ok can u update the smolvm version here
