@@ -15,7 +15,8 @@
       ],
       "labels": [
         "dependencies"
-      ]
+      ],
+      "dependencyDashboardApproval": false
     },
     {
       "matchDatasources": [

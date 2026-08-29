@@ -1,23 +1,5 @@
 name: release-golden
 
-# Golden rebuilds on a `release` event are OPT-IN via a
-# `<!-- preloop:build-golden -->` marker in the release body.
-#
-# They used to be opt-OUT via `<!-- preloop:skip-golden -->`, which never
-# worked: cargo-dist owns the release body (see release.yml) and generates
-# install/download instructions from scratch, so a marker written into
-# CHANGELOG.md never reached `github.event.release.body` and the guard was
-# always true. Every release therefore rebuilt the golden, even when the bake
-# content (packages, install script) had not changed.
-#
-# That is not free: `build-and-publish-golden` runs on the [self-hosted, Linux,
-# X64] box that also hosts the runner pool. On v0.32.0 it compiled alongside a
-# `cargo test --workspace` job and triggered a host-wide OOM that killed the
-# runner VM (anon-rss 8 GiB) and preloop.service with it, failing CI on a
-# release commit whose tree passed `just test-ci` locally.
-#
-# Deliberate golden builds still run via workflow_dispatch, which is how they
-# have actually been produced in practice.
 on:
   release:
     types: [published]
@@ -138,7 +120,7 @@ jobs:
 
   build-and-publish-golden:
     name: Build & Publish Golden MicroVM Artifact
-    if: (github.event_name == 'workflow_dispatch' && !inputs.reuse_previous_goldens) || (github.event_name == 'release' && contains(github.event.release.body, '<!-- preloop:build-golden -->'))
+    if: (github.event_name == 'workflow_dispatch' && !inputs.reuse_previous_goldens) || (github.event_name == 'release' && !contains(github.event.release.body, '<!-- preloop:skip-golden -->'))
     runs-on: [self-hosted, Linux, X64]
     env:
       CARGO_BUILD_JOBS: "1"
@@ -362,7 +344,7 @@ jobs:
 
   build-and-publish-golden-macos:
     name: Build & Publish aarch64 Golden (macOS)
-    if: (github.event_name == 'workflow_dispatch' && !inputs.reuse_previous_goldens) || (github.event_name == 'release' && contains(github.event.release.body, '<!-- preloop:build-golden -->'))
+    if: (github.event_name == 'workflow_dispatch' && !inputs.reuse_previous_goldens) || (github.event_name == 'release' && !contains(github.event.release.body, '<!-- preloop:skip-golden -->'))
     runs-on: [self-hosted, macOS, ARM64]
     permissions:
       contents: write
