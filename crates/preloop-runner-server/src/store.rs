@@ -55,6 +55,10 @@ pub(crate) trait Store: Send + Sync {
         byte_count: i64,
         line_count: i64,
     ) -> anyhow::Result<()>;
+    /// Delete a log entirely (parent `log_files` row + all `log_chunks` via
+    /// cascade). Called when the in-memory retention caps evict a log key so
+    /// the durable store cannot outgrow memory (D2).
+    async fn delete_log(&self, key: &str) -> anyhow::Result<()>;
     /// Append a control event (`run_accepted` / `run_status` / `job_status`).
     async fn append_event(&self, event: &NdjsonEvent) -> anyhow::Result<()>;
 }
@@ -1255,8 +1259,27 @@ impl SqliteStore {
              VALUES (?1, ?2, ?3, ?4)",
             params![key, chunk_index, payload, now_us()],
         )?;
+        // D2: bound durable bytes per log key to the in-memory retention.
+        // `chunk_index` is the cumulative byte count after this append, so
+        // chunks whose index is at or below `byte_count - MAX_LOG_BYTES_PER_KEY`
+        // fall entirely outside the retained tail and can be dropped. Restart
+        // reload trims to the same budget, so nothing recoverable is lost.
+        let cutoff = byte_count - crate::memory_caps::MAX_LOG_BYTES_PER_KEY as i64;
+        if cutoff > 0 {
+            tx.execute(
+                "DELETE FROM log_chunks WHERE log_key = ?1 AND chunk_index <= ?2",
+                params![key, cutoff],
+            )?;
+        }
         tx.commit()
             .map_err(|error| anyhow::anyhow!("committing log chunk: {error}"))?;
+        Ok(())
+    }
+
+    /// Delete a log's parent row; `log_chunks` cascade away with it.
+    pub(crate) fn delete_log(&self, key: &str) -> anyhow::Result<()> {
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        connection.execute("DELETE FROM log_files WHERE log_key = ?1", params![key])?;
         Ok(())
     }
 
@@ -1701,6 +1724,14 @@ impl Store for SqliteStore {
         })
         .await
         .map_err(|error| anyhow::anyhow!("store log-chunk task panicked: {error}"))?
+    }
+
+    async fn delete_log(&self, key: &str) -> anyhow::Result<()> {
+        let store = self.clone();
+        let key = key.to_owned();
+        tokio::task::spawn_blocking(move || store.delete_log(&key))
+            .await
+            .map_err(|error| anyhow::anyhow!("delete log task panicked: {error}"))?
     }
 
     async fn append_event(&self, event: &NdjsonEvent) -> anyhow::Result<()> {

@@ -259,7 +259,7 @@ pub(crate) async fn create_log(
     Path((_scope, _hub, plan_id)): Path<(String, String, String)>,
     Json(mut log): Json<azdo::TaskLog>,
 ) -> Json<serde_json::Value> {
-    let meta = {
+    let (meta, evicted) = {
         let mut inner = shared.state.inner.lock().await;
         let next_id = inner.next_log_id;
         inner.next_log_id = next_id.wrapping_add(1);
@@ -270,9 +270,16 @@ pub(crate) async fn create_log(
         if !inner.log_order.iter().any(|k| k == &key) {
             inner.log_order.push_back(key.clone());
         }
-        trim_plan_logs(&mut inner, &plan_id);
-        crate::store::build_meta_snapshot(&inner)
+        let evicted = trim_plan_logs(&mut inner, &plan_id);
+        (crate::store::build_meta_snapshot(&inner), evicted)
     };
+    // Delete durably any logs the caps just evicted from memory, so the
+    // on-disk store never outgrows the in-memory retention (D2).
+    for key in &evicted {
+        if let Err(error) = shared.state.store.delete_log(key).await {
+            warn!(?error, key, "failed to delete evicted log from store");
+        }
+    }
     if let Err(error) = shared.state.store.store_meta_only(&meta).await {
         warn!(?error, "failed to persist created log");
     }
@@ -288,7 +295,7 @@ pub(crate) async fn append_log(
     let key = log_key(&plan_id, &log_id);
     // Hot path: mutate and capture the chunk under the lock, then persist
     // after releasing it.
-    let (masked, chunk_index, byte_count, line_count) = {
+    let (masked, chunk_index, byte_count, line_count, evicted) = {
         let mut inner = shared.state.inner.lock().await;
         let is_new = !inner.logs.contains_key(&key);
         let masked = mask_log_bytes(&inner, &plan_id, &body);
@@ -302,8 +309,11 @@ pub(crate) async fn append_log(
         if is_new && !inner.log_order.iter().any(|k| k == &key) {
             inner.log_order.push_back(key.clone());
         }
-        // F1: keep only the newest bytes in memory. The durable chunk store
-        // received every append, so a truncated buffer never loses log data.
+        // F1: keep only the newest bytes in memory. `log_chunks` is the live
+        // console recovery buffer (read only by restart to refill this map),
+        // bounded to the SAME per-key budget in `store_log_chunk` — see D2.
+        // The complete, permanent logs are the step/job-log blobs the runner
+        // uploads separately, so trimming this tail never drops real log data.
         if let Some(retained) = inner.logs.get_mut(&key) {
             let excess = retained.len().saturating_sub(MAX_LOG_BYTES_PER_KEY);
             if excess > 0 {
@@ -317,7 +327,7 @@ pub(crate) async fn append_log(
             meta.byte_count += byte_count;
             meta.line_count += line_count;
         }
-        trim_plan_logs(&mut inner, &plan_id);
+        let evicted = trim_plan_logs(&mut inner, &plan_id);
         // Hot path: write the chunk to `log_chunks` and UPSERT the per-log
         // counter, instead of rewriting the entire meta snapshot for every
         // append. The counter is small and idempotent; the chunk is the
@@ -329,8 +339,16 @@ pub(crate) async fn append_log(
             meta.byte_count as i64,
             meta.byte_count as i64,
             meta.line_count as i64,
+            evicted,
         )
     };
+    // Delete durably any logs the caps just evicted from memory (D2). The just
+    // appended key is never in this list — it is the newest.
+    for key in &evicted {
+        if let Err(error) = shared.state.store.delete_log(key).await {
+            warn!(?error, key, "failed to delete evicted log from store");
+        }
+    }
     if let Err(error) = shared
         .state
         .store

@@ -8,13 +8,15 @@ use super::*;
 // (`live_logs.rs::LiveLogBuffer`): a documented constant per sink, retention
 // of the newest data past the cap (tail-drop/truncation) or a deterministic
 // eviction, and a rejection status (413) when a single payload is too large
-// on its own. The durable store remains the source of truth wherever a
-// per-key truncation is used, so the caps never lose data that was already
-// persisted.
+// on its own. The complete, permanent logs are the step/job-log blobs the
+// runner uploads separately; the `logs`/`log_chunks` path here is only the
+// live console stream, so these caps never drop real log data.
 
 /// F1 — per-log retained byte cap. `append_log` keeps only the newest bytes
-/// within this budget in `InnerState::logs`; the durable chunk store
-/// (`store_log_chunk`) still receives every append, so full logs survive.
+/// within this budget in `InnerState::logs`. The durable `log_chunks` copy is
+/// the live-console recovery buffer (read only by a restart to refill this
+/// map) and is bounded to the SAME budget in `store_log_chunk` (D2) — keeping
+/// more on disk is pointless since a restart trims it back to this cap.
 pub(crate) const MAX_LOG_BYTES_PER_KEY: usize = 16 * 1024 * 1024;
 
 /// F1 — per-plan retained byte budget across all of a plan's logs. The oldest
@@ -125,8 +127,12 @@ pub(crate) fn job_backend_id_from_bearer(state: &AppState, headers: &HeaderMap) 
 
 /// F1 — bound one plan's retained logs to `MAX_LOG_BYTES_PER_PLAN` bytes and
 /// `MAX_LOGS_PER_PLAN` entries by evicting the oldest logs first. Called after
-/// every append (and log creation).
-pub(crate) fn trim_plan_logs(inner: &mut InnerState, plan_id: &str) {
+/// every append (and log creation). Returns the log keys evicted from memory
+/// so the caller can delete them from the durable store too — otherwise the
+/// on-disk `log_files`/`log_chunks` grow without bound even though memory is
+/// capped (D2).
+pub(crate) fn trim_plan_logs(inner: &mut InnerState, plan_id: &str) -> Vec<String> {
+    let mut evicted = Vec::new();
     let prefix = format!("{plan_id}/");
     loop {
         let total_bytes: usize = inner
@@ -158,6 +164,7 @@ pub(crate) fn trim_plan_logs(inner: &mut InnerState, plan_id: &str) {
         inner.logs.remove(&oldest_key);
         inner.log_metadata.remove(&oldest_key);
         inner.log_order.retain(|k| k != &oldest_key);
+        evicted.push(oldest_key);
     }
     // Global caps — prevent fabricated plan_ids from bypassing per-plan limits.
     loop {
@@ -179,12 +186,14 @@ pub(crate) fn trim_plan_logs(inner: &mut InnerState, plan_id: &str) {
         }
         inner.logs.remove(&oldest);
         inner.log_metadata.remove(&oldest);
+        evicted.push(oldest);
     }
     // Compact order deque to avoid unbounded stale entries.
     if inner.log_order.len() > inner.logs.len() + 1024 {
         let live: std::collections::HashSet<String> = inner.logs.keys().cloned().collect();
         inner.log_order.retain(|k| live.contains(k));
     }
+    evicted
 }
 
 /// F2 — after a timeline PATCH upsert: bound the per-timeline record map to
@@ -555,10 +564,7 @@ mod tests {
             .get_mut(tl)
             .unwrap()
             .insert(patched, minimal_record());
-        assert_eq!(
-            inner.timeline_records[tl].len(),
-            MAX_TIMELINE_RECORDS + 1
-        );
+        assert_eq!(inner.timeline_records[tl].len(), MAX_TIMELINE_RECORDS + 1);
 
         trim_timeline_after_patch(&mut inner, tl, &[patched]);
 
