@@ -27,7 +27,7 @@ jobs:
         run: python3 benchmarks/real-world/runner-conformance.py --mode light
       - name: Upload light report
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: runner-light-conformance
           path: benchmarks/compatibility/runner/behavior/RUNNER-CONFORMANCE-REPORT.md
@@ -57,7 +57,7 @@ jobs:
           python3 benchmarks/real-world/runner-conformance.py --mode deep
       - name: Upload deep report and captures
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: runner-deep-conformance
           path: |
