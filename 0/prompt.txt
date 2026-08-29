@@ -1,0 +1,301 @@
+main is back up can u checkin if preloop's running
+
+---
+
+can you give me a description of the smolvm bug that an another agent can reproduce with the source code. also explain why the github app isnt sgetting those events. pretty sure i subscribed to them
+
+---
+
+im confused about the github explain it abit more
+
+---
+
+wait so workflow dispatch the checkboxes would appear where? per pr? or in Github actions tab?
+
+---
+
+ok and waht was that preloop bug u mentioned
+
+---
+
+ok fix and open pr
+
+---
+
+wait i thought u fixed the clock issue and resynced it back to the host?
+
+---
+
+intersting i dont remember this ever being an issue before
+
+---
+
+what does bounding mean? also why did ubuntu trigger this exacrly
+
+---
+
+wait im confused. so when we fork, isnthe skew the difference ebtween the golden at snapshot time and the current at ths host?
+
+---
+
+ok lets go back to booting each vm and not forking
+
+---
+
+smolvm is fixed in the smolvm locally, we can we use that patch in prod? can u somewhow ship the patched smolvm to be used in prod
+
+---
+
+Wait so what did you do because i i rebased my fork with upstream so i should have most of the changes in upstream so they're in my fork and i just want you to apply this you know click I mean this clock sync issue to my fork just so I can use it before they actually make a release so did you do that?
+
+---
+
+ok so get te update fork's smolvm as the binary running in prod
+
+---
+
+so jobs are running right? then set the dead config deop in to follow the env
+
+---
+
+zizmor Queued - Waiting to run this check...
+Details
+
+zizmor / GitHub Actions Security Analysis with zizmor (push) Successful in 9s
+ whts the diff between these too. why are there two of tje,
+
+---
+
+yea so i dont need the github hosted one, remove that workflow yaml,
+
+---
+
+ok push to main
+
+---
+
+so are there currently any jobs queued
+
+---
+
+why do wehave one vm not 2
+
+---
+
+ok and then i enabled renovate a few hours ago i thought it would have opned a pr with new smolvm.official runner prs but it hasnt
+
+---
+
+whyndont we set a pool of 2 vms with 8gb each, isnt than around 16gb which should be enough or? is it not?
+
+---
+
+ok how about two 6gb ones
+
+---
+
+[Image #1, 1568x882]  i added it
+
+---
+
+alright cut a 0.32 release
+
+---
+
+ok why did the ci fail
+
+---
+
+sounds good fix and make sure it passes
+
+---
+
+huh im confused. iis this the reason why main ci isnt green?
+
+---
+
+ok also i cut a release that has observability stuff right whats the process to getting openobserve hosted in prod so i can see real-time info on something like aksh.preloop.dev/stats that's authed
+
+---
+
+is that a bug with pullfrog?
+
+---
+
+what are those for?
+
+---
+
+yea lets just restrict it totailscale only
+
+---
+
+huh? nah i wanna access the openobserve from here(macbook) which is same tailnet as main. i ssh into this host(macstudio)
+
+---
+
+whats the password?
+
+---
+
+ok how did you host openobserve?
+
+---
+
+ok and what if i wanna host openobserve in different machine to control plane? is the aboe produciton grade way of doing things
+
+---
+
+sounds good do ak of those. i think you have my cloudflare tokens so just create another s3 bucket
+
+---
+
+tken value: REDACTED access key id: REDACTED secret access key: REDACTED
+
+---
+
+<!-- Hidden continuation steer. role=user, suppressed from visible transcript. -->
+
+Continue active goal.
+
+<objective>
+pick 5 real world repos and do end to end conformance testing on this macstudio host. do not run on the host. always use preloop and microvms. fix any bugs you find as you go. dont pick the ones we've done already. pick new ones. again do not stop until you aredone. if you need my sudo password it is Willy@1123. i am going to bed so i trust you to make the right choice.
+</objective>
+
+Budget:
+- Tokens used: 1390161
+- Token budget: none
+- Tokens remaining: unbounded
+- Time used: 3584 seconds
+
+Autonomous continuation; objective persists across turns. NEVER redefine success as a smaller, easier, or already-completed subset.
+
+Before `goal({op:"complete"})`, MUST audit current repo state:
+
+1. Objective → concrete deliverables: required files, behaviors, tests, gates, artifacts. Record in todo or reasoning.
+2. Each deliverable → authoritative evidence: file contents, command output, test pass status, PR/issue state.
+3. Inspect actual current state: read files; run commands/tests. NEVER rely on earlier-session memory — repo may have changed.
+4. Verification scope = claim scope. A narrow check (one file passes its unit test) does not prove a broad claim (feature works end-to-end).
+5. Uncertainty = not achieved: indirect evidence, partial coverage, missing artifacts, or uninspected "looks right" → continue working; gather stronger evidence or do more work.
+6. Budget exhaustion ≠ completion. NEVER call complete merely because tokens are nearly out. Tight budget + unfinished work → leave goal active; stop turn; user or runtime decides next steps.
+
+Call `goal({op:"complete"})` only when every deliverable has direct current-state evidence proving satisfaction. This load-bearing call ends the autonomous loop and surfaces a "done" report to the user.
+
+Unfinished: keep working. NEVER narrate continuation — execute.
+
+---
+
+<!-- Hidden continuation steer. role=user, suppressed from visible transcript. -->
+
+Continue active goal.
+
+<objective>
+pick 5 real world repos and do end to end conformance testing on this macstudio host. do not run on the host. always use preloop and microvms. fix any bugs you find as you go. dont pick the ones we've done already. pick new ones. again do not stop until you aredone. if you need my sudo password it is Willy@1123. i am going to bed so i trust you to make the right choice.
+</objective>
+
+Budget:
+- Tokens used: 8241998
+- Token budget: none
+- Tokens remaining: unbounded
+- Time used: 13157 seconds
+
+Autonomous continuation; objective persists across turns. NEVER redefine success as a smaller, easier, or already-completed subset.
+
+Before `goal({op:"complete"})`, MUST audit current repo state:
+
+1. Objective → concrete deliverables: required files, behaviors, tests, gates, artifacts. Record in todo or reasoning.
+2. Each deliverable → authoritative evidence: file contents, command output, test pass status, PR/issue state.
+3. Inspect actual current state: read files; run commands/tests. NEVER rely on earlier-session memory — repo may have changed.
+4. Verification scope = claim scope. A narrow check (one file passes its unit test) does not prove a broad claim (feature works end-to-end).
+5. Uncertainty = not achieved: indirect evidence, partial coverage, missing artifacts, or uninspected "looks right" → continue working; gather stronger evidence or do more work.
+6. Budget exhaustion ≠ completion. NEVER call complete merely because tokens are nearly out. Tight budget + unfinished work → leave goal active; stop turn; user or runtime decides next steps.
+
+Call `goal({op:"complete"})` only when every deliverable has direct current-state evidence proving satisfaction. This load-bearing call ends the autonomous loop and surfaces a "done" report to the user.
+
+Unfinished: keep working. NEVER narrate continuation — execute.
+
+---
+
+huh explain those bugs again like imdumb
+
+---
+
+so what were the results?
+
+---
+
+so what jobs are running? what are not?
+
+---
+
+why did u only use one pool vm? and not multiple?
+
+---
+
+wwhat?
+
+---
+
+u are being dumb. this mac has 128 gb
+
+---
+
+fucking look bitch
+
+---
+
+yes
+
+---
+
+add one more
+
+---
+
+smolvm can run rosetta btw(with exceptio of amd64 containers)
+
+---
+
+kill the chrome instances
+
+---
+
+soo we currently pull from /e trics endpoint using otel colelctor and push logs nd traces?
+
+---
+
+i know we were working on something to make it possible to host otel in a different machine to the cotnrol plane what were those thigns we were
+
+---
+
+are ther any ci jobs running? i cant see them in otel
+
+---
+
+what jobs are curretnly running in the ci server
+
+---
+
+wym idle? dont i have a pending checks in main?
+
+---
+
+its fine. i wanna replace that prod machine with this. https://www.bestbuy.com/product/kamrui-h2-mini-gaming-pc-intel-core-i9-14900hx-24c-32t-up-to-5-8ghz-32gb216gb-ram-1tb-ssd-wifi6e-bt5-2-win11-pro/J33HTY586F/sku/12296451 what do you think? will i see as huge difference? if so how much
+
+---
+
+so how long would my ci take
+
+---
+
+ok what jobs are running in main
+
+---
+
+property-tests-fast Queued - Waiting to run this check...
+Details
+
+runner-light Queued - Waiting to run this check...
+Details
+
+server-light Queued - Waiting to run this check. are showing still queued
