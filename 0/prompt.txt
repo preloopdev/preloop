@@ -79,3 +79,7 @@ is there internet in the server? can u ssh into it
 ---
 
 and remind me again why the tmp got full from pullfrog
+
+---
+
+ok whats the update now
