@@ -4738,6 +4738,130 @@ async fn twirp_diag_route_issues_random_blob_url_and_accepts_bearerless_upload()
 }
 
 #[tokio::test]
+async fn blob_single_shot_streams_to_disk_and_roundtrips() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let token = state.mint_runtime_token("plan-blob", &uuid::Uuid::new_v4());
+
+    // A 3 MiB single-shot upload is streamed to a temp file, never buffered
+    // whole in memory, and must round-trip byte-for-byte.
+    let payload = vec![b'z'; 3 * 1024 * 1024];
+    let put = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/twirp-blob/artifact/single-shot-tok")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::from(payload.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::CREATED);
+
+    let get = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/twirp-blob/artifact/single-shot-tok")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get.status(), StatusCode::OK);
+    let body = to_bytes(get.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(body.len(), payload.len());
+    assert_eq!(body.as_ref(), payload.as_slice());
+}
+
+#[tokio::test]
+async fn blob_blocklist_commits_are_serialized_and_survive_concurrency() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let token = state.mint_runtime_token("plan-blob", &uuid::Uuid::new_v4());
+    let bearer = format!("Bearer {token}");
+    let put_uri = "/twirp-blob/artifact/concurrent-tok";
+
+    // Stage two 1 MiB blocks (ids are base64-safe, so they survive
+    // blockid_to_filename unchanged and match the commit XML verbatim).
+    for (bid, byte) in [("YmxvY2sx", b'a'), ("YmxvY2sy", b'b')] {
+        let chunk = vec![byte; 1024 * 1024];
+        let staged = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!("{put_uri}?comp=block&blockid={bid}"))
+                    .header(header::AUTHORIZATION, bearer.clone())
+                    .body(Body::from(chunk))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(staged.status(), StatusCode::CREATED);
+    }
+
+    let commit_xml =
+        "<BlockList><Latest>YmxvY2sx</Latest><Latest>YmxvY2sy</Latest></BlockList>".to_string();
+    let commit = |app: Router, bearer: String, xml: String| {
+        tokio::spawn(async move {
+            app.oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/twirp-blob/artifact/concurrent-tok?comp=blocklist")
+                    .header(header::AUTHORIZATION, bearer)
+                    .body(Body::from(xml))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+        })
+    };
+
+    // Two identical commits race. The per-(kind,token) lock serializes them,
+    // and assembly goes through a temp file + atomic rename, so a losing/late
+    // commit can never truncate or delete the blob the winner committed.
+    let (s1, s2) = tokio::join!(
+        commit(app.clone(), bearer.clone(), commit_xml.clone()),
+        commit(app.clone(), bearer.clone(), commit_xml.clone()),
+    );
+    let (s1, s2) = (s1.unwrap(), s2.unwrap());
+    assert!(
+        s1 == StatusCode::CREATED || s2 == StatusCode::CREATED,
+        "at least one concurrent commit must succeed (got {s1}, {s2})"
+    );
+
+    // The committed blob is exactly the two blocks concatenated — never a
+    // truncated or missing `data` file from a clobbering concurrent commit.
+    let get = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(put_uri)
+                .header(header::AUTHORIZATION, bearer)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get.status(), StatusCode::OK);
+    let body = to_bytes(get.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        body.len(),
+        2 * 1024 * 1024,
+        "assembled blob must contain both blocks, never truncated"
+    );
+    assert!(body[..1024 * 1024].iter().all(|&b| b == b'a'));
+    assert!(body[1024 * 1024..].iter().all(|&b| b == b'b'));
+}
+
+#[tokio::test]
 async fn native_api_rejects_job_runtime_token() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
