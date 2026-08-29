@@ -28,6 +28,7 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
+          fetch-depth: 2
 
       - name: Detect golden-pin movement
         id: changed
@@ -105,6 +106,8 @@ jobs:
           smolvm --version
           smolvm machine create --help | grep -q -- --mount-socket \
             || { echo "candidate lacks --mount-socket" >&2; exit 1; }
+          smolvm machine exec --help | grep -q -- --user \
+            || { echo "candidate lacks --user" >&2; exit 1; }
 
       - name: Boot a VM with the candidate (regression smoke)
         if: github.event_name == 'workflow_dispatch' || steps.changed.outputs.changed == 'true'
@@ -142,7 +145,10 @@ jobs:
             smolvm machine status --name "$NAME" 2>&1 || true
             exit 1
           fi
-          echo "candidate smolvm boots VMs: PASS"
+          echo "testing execution as root and non-root users..."
+          smolvm machine exec --name "$NAME" --user root -- id -u | grep -q '^0$' \
+            || { echo "exec as root failed" >&2; exit 1; }
+          echo "candidate smolvm boots VMs and handles user exec: PASS"
 
       - name: Verify packed ownership preservation
         if: github.event_name == 'workflow_dispatch' || steps.changed.outputs.changed == 'true'
