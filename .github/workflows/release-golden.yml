@@ -120,7 +120,7 @@ jobs:
 
   build-and-publish-golden:
     name: Build & Publish Golden MicroVM Artifact
-    if: (github.event_name == 'workflow_dispatch' && !inputs.reuse_previous_goldens) || (github.event_name == 'release' && !contains(github.event.release.body, '<!-- preloop:skip-golden -->'))
+    if: (github.event_name == 'workflow_dispatch' && !inputs.reuse_previous_goldens) || (github.event_name == 'release' && contains(github.event.release.body, '<!-- preloop:build-golden -->'))
     runs-on: [self-hosted, Linux, X64]
     env:
       CARGO_BUILD_JOBS: "1"
@@ -344,7 +344,7 @@ jobs:
 
   build-and-publish-golden-macos:
     name: Build & Publish aarch64 Golden (macOS)
-    if: (github.event_name == 'workflow_dispatch' && !inputs.reuse_previous_goldens) || (github.event_name == 'release' && !contains(github.event.release.body, '<!-- preloop:skip-golden -->'))
+    if: (github.event_name == 'workflow_dispatch' && !inputs.reuse_previous_goldens) || (github.event_name == 'release' && contains(github.event.release.body, '<!-- preloop:build-golden -->'))
     runs-on: [self-hosted, macOS, ARM64]
     permissions:
       contents: write
