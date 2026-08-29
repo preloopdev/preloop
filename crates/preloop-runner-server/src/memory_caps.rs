@@ -133,6 +133,12 @@ pub(crate) fn job_backend_id_from_bearer(state: &AppState, headers: &HeaderMap) 
 /// capped (D2).
 pub(crate) fn trim_plan_logs(inner: &mut InnerState, plan_id: &str) -> Vec<String> {
     let mut evicted = Vec::new();
+    // Fast path: when the whole retained set is under the per-plan budget, no
+    // single plan (a subset) can exceed it, and the larger global caps hold
+    // too — so skip the O(keys) scans on the hot append path.
+    if inner.log_bytes_total <= MAX_LOG_BYTES_PER_PLAN && inner.logs.len() <= MAX_LOGS_PER_PLAN {
+        return evicted;
+    }
     let prefix = format!("{plan_id}/");
     loop {
         let total_bytes: usize = inner
@@ -161,7 +167,9 @@ pub(crate) fn trim_plan_logs(inner: &mut InnerState, plan_id: &str) -> Vec<Strin
             })
             .cloned();
         let Some(oldest_key) = oldest_key else { break };
-        inner.logs.remove(&oldest_key);
+        if let Some(removed) = inner.logs.remove(&oldest_key) {
+            inner.log_bytes_total = inner.log_bytes_total.saturating_sub(removed.len());
+        }
         inner.log_metadata.remove(&oldest_key);
         inner.log_order.retain(|k| k != &oldest_key);
         evicted.push(oldest_key);
@@ -184,7 +192,9 @@ pub(crate) fn trim_plan_logs(inner: &mut InnerState, plan_id: &str) -> Vec<Strin
         if !inner.logs.contains_key(&oldest) {
             continue;
         }
-        inner.logs.remove(&oldest);
+        if let Some(removed) = inner.logs.remove(&oldest) {
+            inner.log_bytes_total = inner.log_bytes_total.saturating_sub(removed.len());
+        }
         inner.log_metadata.remove(&oldest);
         evicted.push(oldest);
     }
@@ -485,6 +495,7 @@ mod tests {
         for id in 1..=9usize {
             inner.logs.insert(format!("plan-1/{id}"), chunk.clone());
         }
+        inner.log_bytes_total = inner.logs.values().map(Vec::len).sum();
         trim_plan_logs(&mut inner, "plan-1");
         let total: usize = inner
             .logs
@@ -506,6 +517,7 @@ mod tests {
         for id in 0..(MAX_LOGS_PER_PLAN + 64) {
             inner.logs.insert(format!("plan-2/{id}"), Vec::new());
         }
+        inner.log_bytes_total = inner.logs.values().map(Vec::len).sum();
         trim_plan_logs(&mut inner, "plan-2");
         let count = inner
             .logs

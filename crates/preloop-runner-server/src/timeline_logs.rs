@@ -306,6 +306,7 @@ pub(crate) async fn append_log(
             .entry(key.clone())
             .or_default()
             .extend_from_slice(&masked);
+        inner.log_bytes_total = inner.log_bytes_total.saturating_add(byte_count);
         if is_new && !inner.log_order.iter().any(|k| k == &key) {
             inner.log_order.push_back(key.clone());
         }
@@ -318,6 +319,7 @@ pub(crate) async fn append_log(
             let excess = retained.len().saturating_sub(MAX_LOG_BYTES_PER_KEY);
             if excess > 0 {
                 retained.drain(0..excess);
+                inner.log_bytes_total = inner.log_bytes_total.saturating_sub(excess);
             }
         }
         // Update metadata before trimming so the newest log isn't miscounted,

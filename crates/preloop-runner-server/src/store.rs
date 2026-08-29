@@ -770,21 +770,10 @@ pub(crate) fn apply_meta_snapshot(inner: &mut InnerState, meta: MetaSnapshot) {
     // Rebuild in-memory order queues for FIFO eviction and apply caps so a
     // restart doesn't reload unbounded history that was pending before the
     // caps shipped.
-    inner.log_order.clear();
-    for key in inner.logs.keys() {
-        inner.log_order.push_back(key.clone());
-    }
     {
-        let plans: std::collections::BTreeSet<String> = inner
-            .logs
-            .keys()
-            .filter_map(|k| k.split('/').next().map(|s| s.to_owned()))
-            .collect();
-        for plan in plans {
-            crate::memory_caps::trim_plan_logs(inner, &plan);
-        }
-        // Also trim per-key overlong logs that were persisted before the
-        // 16 MiB cap: keep only the newest bytes.
+        // Trim per-key overlong logs that were persisted before the 16 MiB
+        // cap FIRST, then seed `log_bytes_total` from the trimmed sizes so
+        // `trim_plan_logs` sees the correct total (its fast path keys on it).
         for buf in inner.logs.values_mut() {
             let excess = buf
                 .len()
@@ -792,6 +781,19 @@ pub(crate) fn apply_meta_snapshot(inner: &mut InnerState, meta: MetaSnapshot) {
             if excess > 0 {
                 buf.drain(0..excess);
             }
+        }
+        inner.log_bytes_total = inner.logs.values().map(Vec::len).sum();
+        inner.log_order.clear();
+        for key in inner.logs.keys() {
+            inner.log_order.push_back(key.clone());
+        }
+        let plans: std::collections::BTreeSet<String> = inner
+            .logs
+            .keys()
+            .filter_map(|k| k.split('/').next().map(|s| s.to_owned()))
+            .collect();
+        for plan in plans {
+            crate::memory_caps::trim_plan_logs(inner, &plan);
         }
     }
     inner.timeline_records_order.clear();

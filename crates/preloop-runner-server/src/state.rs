@@ -1158,6 +1158,10 @@ pub(crate) struct InnerState {
     pub(crate) artifacts: BTreeMap<String, ArtifactRecord>,
     pub(crate) logs: BTreeMap<String, Vec<u8>>,
     pub(crate) log_metadata: BTreeMap<String, LogMetadata>,
+    /// Sum of all retained in-memory log byte lengths (`logs` values). Kept
+    /// incrementally so `trim_plan_logs` can early-return in the common case
+    /// without rescanning the whole map on every append.
+    pub(crate) log_bytes_total: usize,
     pub(crate) timeline_events: BTreeMap<RunId, Vec<NdjsonEvent>>,
     /// Per-timeline changeId counter for timeline PATCH versioning.
     pub(crate) timeline_change_ids: BTreeMap<String, i32>,
