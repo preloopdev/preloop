@@ -1,4 +1,4 @@
-runner_version = "2.336.0"
+runner_version = "2.337.0"
 
 # SmolVM runtime floor: v1.8.1 is the first release that restores archived
 # UID/GID metadata when extracting packed machines — but only for an
