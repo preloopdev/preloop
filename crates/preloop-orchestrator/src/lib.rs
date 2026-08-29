@@ -2472,6 +2472,14 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             );
         }
 
+        // Warm slots boot their first runners *after* the warm completes and
+        // the preparing flag clears, so those boots must raise the shared
+        // provisioning guard or a job queued during the ~minutes-long boot
+        // window would starve (the server's sweep fails jobs queued 120s
+        // with no matching runner). One counter for the whole pool: the
+        // first completed slot must not clear the signal while its siblings
+        // are still bootstrapping.
+        let provisioning = Arc::new(std::sync::Mutex::new(0));
         for slot in 0..warm_size {
             let provider = self.provider.clone();
             let config = self.config.clone();
@@ -2481,6 +2489,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                 idle: idle.clone(),
                 keys: keys.clone(),
                 building: building.clone(),
+                provisioning: provisioning.clone(),
             };
             slots.spawn(async move {
                 run_slot(
@@ -2609,6 +2618,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                 idle: idle.clone(),
                 keys: keys.clone(),
                 building: building.clone(),
+                provisioning: provisioning.clone(),
             };
             let slot_provisioning = provisioning.clone();
             // Shared with the slot's pause watcher: a job parked in a debug
@@ -2917,6 +2927,10 @@ struct PoolHandles {
     keys: Arc<KeyPool>,
     /// Replacements currently being built across the whole pool.
     building: Arc<AtomicUsize>,
+    /// Provisions in flight across the whole pool. Raised so the server's
+    /// starvation sweep keeps the queued-job grace clock paused while any
+    /// warm-mode slot is still booting its runner.
+    provisioning: Arc<std::sync::Mutex<usize>>,
 }
 
 /// What a slot needs in order to build its next runner.
@@ -2935,6 +2949,8 @@ struct SlotPlan<'a> {
     keys: &'a Arc<KeyPool>,
     /// Replacements currently being built across the whole pool.
     building: &'a AtomicUsize,
+    /// Provisions in flight across the whole pool (see `PoolHandles`).
+    provisioning: &'a Arc<std::sync::Mutex<usize>>,
     /// Whether this slot keeps a warm successor after the current job.
     prebuild_successor: bool,
 }
@@ -3312,6 +3328,7 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
             idle: &handles.idle,
             keys: &handles.keys,
             building: &handles.building,
+            provisioning: &handles.provisioning,
             prebuild_successor: false,
         },
     )
@@ -3352,6 +3369,7 @@ async fn run_slot<P: VmProvider + 'static>(
         idle,
         keys,
         building,
+        provisioning,
     } = handles;
     let mut generation: u64 = 0;
     let mut spare: Option<ReadyRunner> = None;
@@ -3450,6 +3468,18 @@ async fn run_slot<P: VmProvider + 'static>(
             Some(runner) => runner,
             None => {
                 generation += 1;
+                // Warm mode cleared the preparing flag when the golden bake
+                // finished, but this slot's fork+boot+register still takes
+                // minutes. Raise the shared provisioning guard for the
+                // duration so the server's starvation sweep does not fail a
+                // job queued during that window: `provision_slot` returns
+                // only after the runner has registered, at which point a
+                // matching runner is directly visible to the sweep.
+                let preparing = PreparingGuard::enter(
+                    provisioning.clone(),
+                    config.preparing_signal.clone(),
+                    config.pool_status.clone(),
+                );
                 match provision_slot(
                     &provider,
                     &config,
@@ -3461,8 +3491,12 @@ async fn run_slot<P: VmProvider + 'static>(
                 )
                 .await
                 {
-                    Ok(runner) => runner,
+                    Ok(runner) => {
+                        drop(preparing);
+                        runner
+                    }
                     Err(error) => {
+                        drop(preparing);
                         warn!(slot, %error, "provisioning runner failed; retrying");
                         tokio::select! {
                             _ = shutdown.cancelled() => break,
@@ -3488,6 +3522,7 @@ async fn run_slot<P: VmProvider + 'static>(
                 idle: &idle,
                 keys: &keys,
                 building: &building,
+                provisioning: &provisioning,
                 prebuild_successor: true,
             },
         )
@@ -3638,6 +3673,7 @@ async fn run_one_runner<P: VmProvider + 'static>(
         idle,
         keys,
         building,
+        provisioning,
         prebuild_successor,
     } = plan;
 
@@ -3711,6 +3747,15 @@ async fn run_one_runner<P: VmProvider + 'static>(
             .saturating_sub(idle_after)
             .max(usize::from(idle_after == 0));
         let _reservation = Reservation::take(building, wanted, config.pool_status.clone())?;
+        // The successor boot runs alongside the job; while it is in flight a
+        // matching runner may not be registered yet (all slots busy). Hold
+        // the shared provisioning guard so the server's starvation sweep
+        // keeps the queued-job grace clock paused for the boot duration.
+        let preparing = PreparingGuard::enter(
+            provisioning.clone(),
+            config.preparing_signal.clone(),
+            config.pool_status.clone(),
+        );
         match provision_slot(
             &provider,
             config,
@@ -3722,8 +3767,12 @@ async fn run_one_runner<P: VmProvider + 'static>(
         )
         .await
         {
-            Ok(successor) => Some(successor),
+            Ok(successor) => {
+                drop(preparing);
+                Some(successor)
+            }
             Err(error) => {
+                drop(preparing);
                 warn!(slot, %error, "pre-provisioning the replacement runner failed");
                 None
             }
@@ -4758,6 +4807,9 @@ mod lifecycle_tests {
         fail_run: bool,
         fail_delete: bool,
         announce_busy: bool,
+        /// When set, `exec_with_secret_env` (the configure step) blocks until
+        /// notified, so a test can observe the pool mid-provision.
+        configure_gate: Option<Arc<tokio::sync::Notify>>,
         /// Binary that `command -v` cannot find until its toolchain installs.
         absent_binary: Mutex<Option<&'static str>>,
         /// Guest pause marker state: when set, the exec probe for the debug
@@ -4791,10 +4843,16 @@ mod lifecycle_tests {
                 fail_run,
                 fail_delete,
                 announce_busy: false,
+                configure_gate: None,
                 absent_binary: Mutex::new(None),
                 pause_marker: std::sync::atomic::AtomicBool::new(false),
                 probe_transport_error: std::sync::atomic::AtomicBool::new(false),
             }
+        }
+
+        fn with_configure_gate(mut self, gate: Arc<tokio::sync::Notify>) -> Self {
+            self.configure_gate = Some(gate);
+            self
         }
 
         fn announcing_busy(mut self) -> Self {
@@ -5373,6 +5431,69 @@ chmod +x "$destination/bin/node"
         assert!(!signal.load(Ordering::Acquire));
     }
 
+    #[tokio::test]
+    async fn warm_slot_raises_preparing_signal_while_provisioning() {
+        // A warm slot clears the pool's preparing flag at the end of the
+        // golden bake, then boots its first runner minutes later. The boot
+        // must re-raise the shared signal, or the server's starvation sweep
+        // fails a job queued during that window ("starving queued job failed
+        // after 120s") even though a runner is on the way.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, false).with_configure_gate(gate.clone()),
+        );
+        let mut config = test_config(false);
+        config.size = 1;
+        let signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        config.preparing_signal = Some(signal.clone());
+
+        let handles = PoolHandles {
+            idle: Arc::new(std::sync::Mutex::new(0)),
+            keys: Arc::new(KeyPool::new()),
+            building: Arc::new(AtomicUsize::new(0)),
+            provisioning: Arc::new(std::sync::Mutex::new(0)),
+        };
+        let shutdown = CancellationToken::new();
+        let slot = tokio::spawn(run_slot(
+            provider.clone(),
+            config.clone(),
+            0,
+            shutdown.clone(),
+            Arc::new(GoldenRegistry::new(config.name_prefix.clone())),
+            handles,
+        ));
+
+        // Wait until the slot's first provision reaches configure (i.e. the
+        // runner is mid-boot, before registration).
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        loop {
+            if provider
+                .events()
+                .await
+                .iter()
+                .any(|event| event.starts_with("configure:"))
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "slot never reached the configure step"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            signal.load(Ordering::Acquire),
+            "warm-mode provisioning must raise the preparing signal"
+        );
+
+        // Release the gate, then stop the slot.
+        gate.notify_waiters();
+        shutdown.cancel();
+        slot.abort();
+        let _ = slot.await;
+    }
+
     fn test_config(control_socket: bool) -> RunnerPoolConfig {
         RunnerPoolConfig {
             size: 1,
@@ -5626,6 +5747,9 @@ chmod +x "$destination/bin/node"
                 .lock()
                 .await
                 .push(format!("configure:{}", name.as_str()));
+            if let Some(gate) = &self.configure_gate {
+                gate.notified().await;
+            }
             if self.fail_configure {
                 return Err(test_error("configure-failure"));
             }
@@ -6399,6 +6523,7 @@ chmod +x "$destination/bin/node"
                 idle: &idle,
                 keys: &Arc::new(KeyPool::new()),
                 building: &AtomicUsize::new(0),
+                provisioning: &Arc::new(std::sync::Mutex::new(0)),
                 prebuild_successor: true,
             },
         )
@@ -6418,6 +6543,7 @@ chmod +x "$destination/bin/node"
             idle: Arc::new(std::sync::Mutex::new(0)),
             keys: Arc::new(KeyPool::new()),
             building: Arc::new(AtomicUsize::new(0)),
+            provisioning: Arc::new(std::sync::Mutex::new(0)),
         };
 
         run_on_demand_slot(
