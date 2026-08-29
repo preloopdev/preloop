@@ -1,0 +1,151 @@
+there's been a few new smolvm releases, why is renovate not checking and creating prs as it should be?
+
+---
+
+what were in the smolvm changes ever since
+
+---
+
+ok can u update the smolvm version here
+
+---
+
+wait so can u cehck if the app is connected? i just configured it to prleoop
+
+---
+
+[Image #1, 1568x882] i did though
+
+---
+
+can u confirm this
+
+---
+
+right so why is renovate not actually working
+
+---
+
+ok and this is also repsonible for official runner pipleine? or how does that get triggered
+
+---
+
+ok adn do we have the agent part configured yet tho for actually doing the implementations?
+
+---
+
+thats fine the draft PRs are fine. so the jobs runs fine in our self hosted version like the rst of the workflows right
+
+---
+
+sounds good merge the renovate work
+
+---
+
+alright coninue
+
+---
+
+just push to main directly
+
+---
+
+will it also open the official runner atch workflow asin trigger it
+
+---
+
+ok i also want u to remove the comments from the workflow files and just put those in an internal doc. dont want people knowing the specifics of our reasoning
+
+---
+
+runner sycn seems like tis running on ubunut-latest are u sure thats gonna get picked up by preloop and not github hosted
+
+---
+
+ok and in main how many jobs are running etc. wahts the status on the jobs in the ci server
+
+---
+
+ok and also i added support for observability right? do we ahve that wired up with the preloop prod version?
+
+---
+
+why did my latest ci runs fail
+
+---
+
+is there internet in the server? can u ssh into it
+
+---
+
+and remind me again why the tmp got full from pullfrog
+
+---
+
+ok whats the update now
+
+---
+
+i meant the jobs that failed in main
+
+---
+
+so wht do we need to do to get those runs to pass
+
+---
+
+ok also for some reaso i cant see logs in the main server openobserve instant? i see the metrics but not logs or traces,, are we using the default app?
+
+---
+
+i only see default, nativetest, and preloop above the search bar. [Image #1, 1568x882]
+
+---
+
+[Image #1, 1568x882] Error: Search stream not found.
+
+Trace ID: 01a04e1e7046743ea3b14f273fd6b4f4
+
+---
+
+ok can we rename default to preloop and not default.
+
+---
+
+i9 got a pullfrog commetn in #pr197
+
+---
+
+yea so explain that comment feedback that we dont actually boot smolvm etc how do we validate the new version is fine
+
+---
+
+wym the base sha was not fetched in the shallow clone?
+
+---
+
+so fetch depth 0 would pull the entire preloop repo?
+
+---
+
+so why does depth 1 not useful for a pr diff?
+
+---
+
+ook add depth 2 and make sure that workflow actually checks smolvm. actually before that, what exacty do we need to knwo from smolvm to ensure no regressions? i know we test the mount socket and pack size thing, but what else
+
+---
+
+ok add these smolvm invariants to the workflow
+
+---
+
+hmm so what should the fix be
+
+---
+
+can u find and explain this smolvm bug exactly
+
+---
+
+so what is the way forward
