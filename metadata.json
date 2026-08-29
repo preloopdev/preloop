@@ -2,7 +2,7 @@
   "cli_version": "0.10.0",
   "checkpoint_id": "01M1750VK0J69TW8H0FWGCZ2Q1",
   "strategy": "manual-commit",
-  "checkpoints_count": 7,
+  "checkpoints_count": 19,
   "files_touched": null,
   "sessions": [
     {
@@ -11,6 +11,13 @@
       "compact_transcript": "/0/transcript.jsonl",
       "content_hash": "/0/content_hash.txt",
       "prompt": "/0/prompt.txt"
+    },
+    {
+      "metadata": "/1/metadata.json",
+      "transcript": "/1/full.jsonl",
+      "compact_transcript": "/1/transcript.jsonl",
+      "content_hash": "/1/content_hash.txt",
+      "prompt": "/1/prompt.txt"
     }
   ]
 }
