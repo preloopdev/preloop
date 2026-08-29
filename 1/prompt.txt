@@ -133,3 +133,7 @@ so why does depth 1 not useful for a pr diff?
 ---
 
 ook add depth 2 and make sure that workflow actually checks smolvm. actually before that, what exacty do we need to knwo from smolvm to ensure no regressions? i know we test the mount socket and pack size thing, but what else
+
+---
+
+ok add these smolvm invariants to the workflow
