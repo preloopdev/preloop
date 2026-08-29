@@ -1,0 +1,17 @@
+{
+  "cli_version": "0.10.0",
+  "checkpoint_id": "01M17519J1NGXH01PJA9MCP0GN",
+  "session_id": "01a04915-ca16-7000-a6dc-2b69d1d60661",
+  "strategy": "manual-commit",
+  "created_at": "2026-08-29T16:18:26.446331Z",
+  "checkpoints_count": 7,
+  "save_step_count": 1,
+  "files_touched": [],
+  "agent": "Oh My Pi",
+  "model": "muse-spark-1.2-contributor",
+  "turn_id": "9cdb7186934f",
+  "compact_transcript_start": 0,
+  "session_metrics": {
+    "turn_count": 7
+  }
+}
