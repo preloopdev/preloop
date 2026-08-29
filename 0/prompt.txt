@@ -1,0 +1,117 @@
+main is back up can u checkin if preloop's running
+
+---
+
+can you give me a description of the smolvm bug that an another agent can reproduce with the source code. also explain why the github app isnt sgetting those events. pretty sure i subscribed to them
+
+---
+
+im confused about the github explain it abit more
+
+---
+
+wait so workflow dispatch the checkboxes would appear where? per pr? or in Github actions tab?
+
+---
+
+ok and waht was that preloop bug u mentioned
+
+---
+
+ok fix and open pr
+
+---
+
+wait i thought u fixed the clock issue and resynced it back to the host?
+
+---
+
+intersting i dont remember this ever being an issue before
+
+---
+
+what does bounding mean? also why did ubuntu trigger this exacrly
+
+---
+
+wait im confused. so when we fork, isnthe skew the difference ebtween the golden at snapshot time and the current at ths host?
+
+---
+
+ok lets go back to booting each vm and not forking
+
+---
+
+smolvm is fixed in the smolvm locally, we can we use that patch in prod? can u somewhow ship the patched smolvm to be used in prod
+
+---
+
+Wait so what did you do because i i rebased my fork with upstream so i should have most of the changes in upstream so they're in my fork and i just want you to apply this you know click I mean this clock sync issue to my fork just so I can use it before they actually make a release so did you do that?
+
+---
+
+ok so get te update fork's smolvm as the binary running in prod
+
+---
+
+so jobs are running right? then set the dead config deop in to follow the env
+
+---
+
+zizmor Queued - Waiting to run this check...
+Details
+
+zizmor / GitHub Actions Security Analysis with zizmor (push) Successful in 9s
+ whts the diff between these too. why are there two of tje,
+
+---
+
+yea so i dont need the github hosted one, remove that workflow yaml,
+
+---
+
+ok push to main
+
+---
+
+so are there currently any jobs queued
+
+---
+
+why do wehave one vm not 2
+
+---
+
+ok and then i enabled renovate a few hours ago i thought it would have opned a pr with new smolvm.official runner prs but it hasnt
+
+---
+
+whyndont we set a pool of 2 vms with 8gb each, isnt than around 16gb which should be enough or? is it not?
+
+---
+
+ok how about two 6gb ones
+
+---
+
+[Image #1, 1568x882]  i added it
+
+---
+
+alright cut a 0.32 release
+
+---
+
+ok why did the ci fail
+
+---
+
+sounds good fix and make sure it passes
+
+---
+
+huh im confused. iis this the reason why main ci isnt green?
+
+---
+
+ok also i cut a release that has observability stuff right whats the process to getting openobserve hosted in prod so i can see real-time info on something like aksh.preloop.dev/stats that's authed
