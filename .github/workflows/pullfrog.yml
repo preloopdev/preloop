@@ -34,5 +34,18 @@ jobs:
           prompt: ${{ inputs.prompt || toJSON(github.event) }}
           model: openai/gpt-5.6-terra
         env:
+          # The action clones the repo into a `pullfrog-XXXXXX` directory under
+          # the system temp dir and never removes it. On the self-hosted host
+          # `/tmp` is a tmpfs sized at 50% of RAM, so every PR synchronize
+          # permanently consumed ~469 MB of memory. On 2026-08-28 that reached
+          # 58 leaked clones (12 GB, /tmp 100% full), leaving too little RAM for
+          # an 8 GB runner VM plus compilers: the kernel OOM-killed the runner
+          # VM and the preloop control plane four times, taking down the `rust`
+          # and `server-light` checks.
+          #
+          # RUNNER_TEMP is disk-backed and the runner clears it between jobs, so
+          # pointing the action there keeps the clones off RAM and makes cleanup
+          # someone else's job.
+          TMPDIR: ${{ runner.temp }}
           CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
