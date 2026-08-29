@@ -273,3 +273,7 @@ are ther any ci jobs running? i cant see them in otel
 ---
 
 what jobs are curretnly running in the ci server
+
+---
+
+wym idle? dont i have a pending checks in main?
