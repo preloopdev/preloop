@@ -316,8 +316,11 @@ pub(crate) async fn append_log(
         // The complete, permanent logs are the step/job-log blobs the runner
         // uploads separately, so trimming this tail never drops real log data.
         if let Some(retained) = inner.logs.get_mut(&key) {
-            let excess = retained.len().saturating_sub(MAX_LOG_BYTES_PER_KEY);
-            if excess > 0 {
+            // Only trim once the buffer grows a full slack window past the cap,
+            // then drop back down to the cap — amortizes the O(n) front-shift
+            // to O(1) per byte instead of shifting on every append.
+            if retained.len() > MAX_LOG_BYTES_PER_KEY + LOG_KEY_TRIM_SLACK {
+                let excess = retained.len() - MAX_LOG_BYTES_PER_KEY;
                 retained.drain(0..excess);
                 inner.log_bytes_total = inner.log_bytes_total.saturating_sub(excess);
             }

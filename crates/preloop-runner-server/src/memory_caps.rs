@@ -19,6 +19,14 @@ use super::*;
 /// more on disk is pointless since a restart trims it back to this cap.
 pub(crate) const MAX_LOG_BYTES_PER_KEY: usize = 16 * 1024 * 1024;
 
+/// F1 — slack above `MAX_LOG_BYTES_PER_KEY` before the in-memory retained
+/// buffer is trimmed. `Vec::drain(0..excess)` front-shifts the whole tail, so
+/// trimming on every append (e.g. 64 KiB appends into a 16 MiB buffer) is
+/// O(n) per append. Letting the buffer grow one slack window past the cap and
+/// then trimming back to the cap amortizes the shift to O(1) per byte, at the
+/// cost of at most one extra slack window of memory per key.
+pub(crate) const LOG_KEY_TRIM_SLACK: usize = 1024 * 1024;
+
 /// F1 — per-plan retained byte budget across all of a plan's logs. The oldest
 /// logs of the plan are evicted once the total (bytes or entry count) exceeds
 /// the budget, so a flood of distinct `log_id`s cannot grow the map either.
