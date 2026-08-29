@@ -226,6 +226,13 @@ jobs:
           [ -n "$READY" ] || { echo "ownership fixture VM did not become ready" >&2; exit 1; }
           smolvm machine stop --name "$BASE_NAME"
           smolvm pack create --from-vm "$BASE_NAME" --output "$PACK" --no-sign
+          # This runner is root, but preloop.service runs as an unprivileged
+          # user, so smolvm's per-VM uid drop is inactive in production. Match
+          # that here: as root the drop is on by default and squashes packed
+          # ownership (see docs/internal/workflows.md), which is an upstream
+          # defect (smol-machines/smolvm#1094), not a property of the release
+          # under test.
+          export SMOLVM_VM_UID_DROP=off
           smolvm machine create --name "$CLONE_NAME" --from "${PACK}.smolmachine"
           smolvm machine start --name "$CLONE_NAME"
           ACTUAL=""
@@ -244,6 +251,59 @@ jobs:
           [ "$ACTUAL" = "2345:2345" ] \
             || { echo "packed ownership mismatch: expected 2345:2345, got $ACTUAL" >&2; exit 1; }
           echo "packed ownership preservation: PASS"
+
+      - name: Probe packed ownership under the per-VM uid drop
+        if: github.event_name == 'workflow_dispatch' || steps.changed.outputs.changed == 'true'
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          # Non-blocking: tracks the upstream defect where a privileged smolvm
+          # preserves the archived uid on disk and then presents it to the guest
+          # through a count-1 idmapped mount, so any non-zero uid surfaces as the
+          # overflow uid. Blocking on it would gate our bumps on an upstream fix
+          # we do not ship; losing the signal entirely would let it regress
+          # silently if preloop ever runs privileged. See
+          # smol-machines/smolvm#1094 and docs/internal/workflows.md.
+          BASE_NAME="preloop-uiddrop-base-$(date +%s)"
+          CLONE_NAME="${BASE_NAME}-clone"
+          WORK="$(mktemp -d "${TMPDIR:-/tmp}/preloop-uiddrop.XXXXXX")"
+          PACK="$WORK/uiddrop-pack"
+          cleanup() {
+            smolvm machine stop --name "$CLONE_NAME" >/dev/null 2>&1 || true
+            smolvm machine delete --name "$CLONE_NAME" -f --cascade >/dev/null 2>&1 || true
+            smolvm machine stop --name "$BASE_NAME" >/dev/null 2>&1 || true
+            smolvm machine delete --name "$BASE_NAME" -f --cascade >/dev/null 2>&1 || true
+            rm -rf "$WORK"
+          }
+          trap cleanup EXIT
+
+          if [ "$(id -u)" -ne 0 ]; then
+            echo "uid drop is inactive for an unprivileged smolvm; probe not applicable"
+            exit 0
+          fi
+
+          smolvm machine create --name "$BASE_NAME" \
+            --image alpine:3.20 \
+            --net \
+            --init 'touch /opt/preloop-ownership && chown 2345:2345 /opt/preloop-ownership'
+          smolvm machine start --name "$BASE_NAME"
+          sleep 5
+          smolvm machine stop --name "$BASE_NAME"
+          smolvm pack create --from-vm "$BASE_NAME" --output "$PACK" --no-sign
+          smolvm machine create --name "$CLONE_NAME" --from "${PACK}.smolmachine"
+          smolvm machine start --name "$CLONE_NAME"
+          sleep 5
+          OWNED="$(smolvm machine exec --name "$CLONE_NAME" -- \
+            sh -c 'stat -c %u:%g /opt/preloop-ownership' 2>/dev/null | tail -n 1 || true)"
+          ROOT_OWNED="$(smolvm machine exec --name "$CLONE_NAME" -- \
+            sh -c 'stat -c %u:%g /etc/passwd' 2>/dev/null | tail -n 1 || true)"
+          echo "uid 2345 file presented to guest as: ${OWNED:-<unavailable>}"
+          echo "root-owned file presented to guest as: ${ROOT_OWNED:-<unavailable>}"
+          if [ "$OWNED" = "2345:2345" ] && [ "$ROOT_OWNED" = "0:0" ]; then
+            echo "privileged packed ownership: FIXED UPSTREAM — drop the workaround in the gate above"
+          else
+            echo "privileged packed ownership: still squashed (known upstream defect)"
+          fi
 
       - name: Cleanup ownership regression machines
         if: always()
