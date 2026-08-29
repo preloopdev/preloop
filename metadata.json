@@ -23,5 +23,17 @@
       "content_hash": "/1/content_hash.txt",
       "prompt": "/1/prompt.txt"
     }
-  ]
+  ],
+  "combined_attribution": {
+    "calculated_at": "2026-08-29T23:59:34.219905Z",
+    "agent_lines": 7,
+    "agent_removed": 6,
+    "human_added": 38,
+    "human_modified": 0,
+    "human_removed": 38,
+    "total_committed": 45,
+    "total_lines_changed": 89,
+    "agent_percentage": 14.606741573033707,
+    "metric_version": 2
+  }
 }
