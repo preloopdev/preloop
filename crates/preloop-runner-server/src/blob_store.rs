@@ -98,25 +98,6 @@ pub(crate) async fn blob_put(
             return StatusCode::PAYLOAD_TOO_LARGE;
         }
     }
-    // Stream the body with a mode-specific limit — never buffer more than the
-    // per-mode cap. Single-shot may be up to 512 MiB, which is the route's
-    // DefaultBodyLimit already.
-    let limit = match query.comp.as_deref() {
-        Some("block") => MAX_BLOCK_BYTES,
-        Some("blocklist") => 1024 * 1024,
-        _ => MAX_ASSEMBLED_BYTES,
-    };
-    let body_bytes = match axum::body::to_bytes(body, limit).await {
-        Ok(b) => b,
-        Err(_) => {
-            warn!(
-                kind,
-                token, limit, "blob body exceeds limit while streaming"
-            );
-            return StatusCode::PAYLOAD_TOO_LARGE;
-        }
-    };
-    let body = body_bytes;
     let blob_root = shared
         .state
         .state_dir
@@ -126,18 +107,17 @@ pub(crate) async fn blob_put(
 
     match query.comp.as_deref() {
         Some("block") => {
-            // F5: a block over the per-block cap is rejected up front. The
-            // official runner stages 4 MiB blocks, so nothing legitimate is
-            // lost; a large single PUT is an attacker, not an uploader.
-            if body.len() > MAX_BLOCK_BYTES {
-                warn!(
-                    kind,
-                    token,
-                    bytes = body.len(),
-                    "blob block exceeds the per-block cap"
-                );
-                return StatusCode::PAYLOAD_TOO_LARGE;
-            }
+            // F5: buffer at most the per-block cap. The official runner stages
+            // 4 MiB blocks, so nothing legitimate is lost; `to_bytes` aborts
+            // (413) once a streamed block exceeds the cap, so an attacker never
+            // materializes more than 4 MiB here.
+            let body = match axum::body::to_bytes(body, MAX_BLOCK_BYTES).await {
+                Ok(b) => b,
+                Err(_) => {
+                    warn!(kind, token, "blob block exceeds the per-block cap");
+                    return StatusCode::PAYLOAD_TOO_LARGE;
+                }
+            };
             let block_id = query.blockid.unwrap_or_default();
             let safe_id = blockid_to_filename(&block_id);
             let blocks_dir = blob_root.join("blocks");
@@ -163,6 +143,14 @@ pub(crate) async fn blob_put(
             }
         }
         Some("blocklist") => {
+            // The commit body is a small XML block list; buffer at most 1 MiB.
+            let body = match axum::body::to_bytes(body, 1024 * 1024).await {
+                Ok(b) => b,
+                Err(_) => {
+                    warn!(kind, token, "blocklist body exceeds 1 MiB");
+                    return StatusCode::PAYLOAD_TOO_LARGE;
+                }
+            };
             let body_str = String::from_utf8_lossy(&body);
             let block_ids = parse_blocklist_xml(&body_str);
             if block_ids.len() > MAX_BLOCKLIST_BLOCKS {
@@ -243,27 +231,35 @@ pub(crate) async fn blob_put(
             status
         }
         _ => {
-            if body.len() > MAX_ASSEMBLED_BYTES {
-                warn!(
-                    kind,
-                    token,
-                    bytes = body.len(),
-                    "single-shot blob exceeds the assembly budget"
-                );
-                return StatusCode::PAYLOAD_TOO_LARGE;
-            }
-            // Single-shot upload.
+            // F5: stream the single-shot body straight to a temp file, never
+            // buffering the whole (up to 512 MiB) blob in memory, then
+            // atomically rename it into place. A body past the assembly budget
+            // is rejected mid-stream before it can fill the disk either.
             if let Err(e) = tokio::fs::create_dir_all(&blob_root).await {
                 warn!(kind, token, "failed to create blob dir: {e}");
                 return StatusCode::INTERNAL_SERVER_ERROR;
             }
             let data_path = blob_root.join("data");
-            match tokio::fs::write(&data_path, &body).await {
-                Ok(()) => {
-                    info!(kind, token, size = body.len(), "blob single-shot upload");
-                    StatusCode::CREATED
+            let tmp_path = data_path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
+            match stream_body_to_file(body, &tmp_path, MAX_ASSEMBLED_BYTES).await {
+                Ok(size) => match tokio::fs::rename(&tmp_path, &data_path).await {
+                    Ok(()) => {
+                        info!(kind, token, size, "blob single-shot upload");
+                        StatusCode::CREATED
+                    }
+                    Err(e) => {
+                        let _ = tokio::fs::remove_file(&tmp_path).await;
+                        warn!(kind, token, "failed to commit single-shot blob: {e}");
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                },
+                Err(AssemblyError::Budget) => {
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    warn!(kind, token, "single-shot blob exceeds the assembly budget");
+                    StatusCode::PAYLOAD_TOO_LARGE
                 }
-                Err(e) => {
+                Err(AssemblyError::Io(e)) => {
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
                     warn!(kind, token, "failed to write single-shot blob: {e}");
                     StatusCode::INTERNAL_SERVER_ERROR
                 }
@@ -276,6 +272,34 @@ pub(crate) async fn blob_put(
 enum AssemblyError {
     Io(std::io::Error),
     Budget,
+}
+
+/// Stream an HTTP request body straight to `dest`, never buffering the whole
+/// (up to `cap`-byte) payload in memory. Fails with [`AssemblyError::Budget`]
+/// as soon as the running total exceeds `cap`.
+async fn stream_body_to_file(
+    body: Body,
+    dest: &std::path::Path,
+    cap: usize,
+) -> Result<u64, AssemblyError> {
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    let mut file = tokio::fs::File::create(dest)
+        .await
+        .map_err(AssemblyError::Io)?;
+    let mut total: u64 = 0;
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| AssemblyError::Io(std::io::Error::other(e)))?;
+        total = total.saturating_add(chunk.len() as u64);
+        if total > cap as u64 {
+            return Err(AssemblyError::Budget);
+        }
+        file.write_all(&chunk).await.map_err(AssemblyError::Io)?;
+    }
+    file.flush().await.map_err(AssemblyError::Io)?;
+    Ok(total)
 }
 
 /// Stream blocks (in `block_ids` order) into `data_path`, never holding more
