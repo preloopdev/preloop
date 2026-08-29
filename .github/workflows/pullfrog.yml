@@ -20,6 +20,7 @@ permissions:
 
 jobs:
   pullfrog:
+    if: github.actor != 'renovate[bot]' && github.actor != 'dependabot[bot]' && github.actor != 'pullfrog[bot]'
     runs-on: self-hosted
     timeout-minutes: 60
     steps:

@@ -1804,10 +1804,37 @@ pub(crate) async fn snapshot_git_http(
         .headers()
         .get("git-protocol")
         .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
+        .map(str::to_owned)
+        .or_else(|| {
+            request
+                .headers()
+                .get("Git-Protocol")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        });
     let request_body = to_bytes(request.into_body(), MAX_GIT_REQUEST_BYTES)
         .await
         .map_err(|error| ApiError::bad_request(format!("invalid Git request body: {error}")))?;
+    {
+        let prefix_len = std::cmp::min(200, request_body.len());
+        let hex_prefix: String = request_body[..prefix_len]
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        let text_prefix = String::from_utf8_lossy(&request_body[..prefix_len]);
+        tracing::debug!(
+            %run_id,
+            %method,
+            %path,
+            %query,
+            ?content_type,
+            ?git_protocol,
+            body_len = request_body.len(),
+            %hex_prefix,
+            %text_prefix,
+            "snapshot http-backend request"
+        );
+    }
 
     let project_root = shared.state.state_dir.join("snapshots");
     let repository = project_root.join(run_id.to_string());
