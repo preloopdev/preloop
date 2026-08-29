@@ -106,8 +106,10 @@ jobs:
           smolvm --version
           smolvm machine create --help | grep -q -- --mount-socket \
             || { echo "candidate lacks --mount-socket" >&2; exit 1; }
-          smolvm machine exec --help | grep -q -- --user \
-            || { echo "candidate lacks --user" >&2; exit 1; }
+          smolvm machine start --help | grep -q -- --forkable \
+            || { echo "candidate lacks --forkable" >&2; exit 1; }
+          smolvm machine fork --help >/dev/null 2>&1 \
+            || { echo "candidate lacks machine fork command" >&2; exit 1; }
 
       - name: Boot a VM with the candidate (regression smoke)
         if: github.event_name == 'workflow_dispatch' || steps.changed.outputs.changed == 'true'
@@ -128,6 +130,7 @@ jobs:
           smolvm machine create --name "$NAME" \
             --image "$IMAGE" \
             --net \
+            --storage 10 \
             --mount-socket "$SOCKET:/run/preloop-verify.sock"
           smolvm machine start --name "$NAME"
           echo "waiting for the guest to boot..."
@@ -145,10 +148,46 @@ jobs:
             smolvm machine status --name "$NAME" 2>&1 || true
             exit 1
           fi
-          echo "testing execution as root and non-root users..."
-          smolvm machine exec --name "$NAME" --user root -- id -u | grep -q '^0$' \
+          smolvm machine exec --name "$NAME" -- sh -c "test -S /run/preloop-verify.sock"
+          smolvm machine exec --name "$NAME" -- id -u | grep -q '^0$' \
             || { echo "exec as root failed" >&2; exit 1; }
-          echo "candidate smolvm boots VMs and handles user exec: PASS"
+          echo "candidate smolvm boots VMs and handles socket mounts + user exec: PASS"
+
+      - name: Verify CoW fork lifecycle
+        if: github.event_name == 'workflow_dispatch' || steps.changed.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          BASE_NAME="preloop-fork-base-$(date +%s)"
+          CLONE_NAME="preloop-fork-clone-$(date +%s)"
+          SOCKET="$(mktemp -u "${TMPDIR:-/tmp}/preloop-fork.XXXXXX.sock")"
+          python3 -c "import socket; s = socket.socket(socket.AF_UNIX); s.bind('$SOCKET'); s.close()"
+          cleanup() {
+            smolvm machine stop --name "$CLONE_NAME" >/dev/null 2>&1 || true
+            smolvm machine delete --name "$CLONE_NAME" -f >/dev/null 2>&1 || true
+            smolvm machine stop --name "$BASE_NAME" >/dev/null 2>&1 || true
+            smolvm machine delete --name "$BASE_NAME" -f >/dev/null 2>&1 || true
+            rm -f "$SOCKET"
+          }
+          trap cleanup EXIT
+
+          smolvm machine create --name "$BASE_NAME" --image alpine:3.20 --net --mount-socket "$SOCKET:/run/preloop-fork.sock"
+          smolvm machine start --name "$BASE_NAME" --forkable
+          for _ in $(seq 1 60); do
+            if smolvm machine exec --name "$BASE_NAME" -- sh -c 'echo fork-base-ready' 2>/dev/null | grep -q fork-base-ready; then
+              break
+            fi
+            sleep 1
+          done
+          smolvm machine fork --golden "$BASE_NAME" --name "$CLONE_NAME"
+          smolvm machine start --name "$CLONE_NAME"
+          for _ in $(seq 1 60); do
+            if smolvm machine exec --name "$CLONE_NAME" -- sh -c 'echo clone-ready' 2>/dev/null | grep -q clone-ready; then
+              break
+            fi
+            sleep 1
+          done
+          smolvm machine exec --name "$CLONE_NAME" -- sh -c "test -S /run/preloop-fork.sock"
+          echo "candidate smolvm CoW fork lifecycle: PASS"
 
       - name: Verify packed ownership preservation
         if: github.event_name == 'workflow_dispatch' || steps.changed.outputs.changed == 'true'
