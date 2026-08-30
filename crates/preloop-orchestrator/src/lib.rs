@@ -3375,6 +3375,19 @@ async fn run_slot<P: VmProvider + 'static>(
     let mut spare: Option<ReadyRunner> = None;
 
     while !shutdown.is_cancelled() {
+        // Warm mode cleared the pool's preparing flag once the golden bake
+        // finished, but this slot still has to resolve (and possibly bake)
+        // the golden for the queued job's environment and then
+        // fork+boot+register its first runner -- minutes with no runner
+        // registered. Hold the shared provisioning guard across that whole
+        // window, golden preparation included, so the server's starvation
+        // sweep keeps the queued-job grace clock paused; drop it once a
+        // registered runner is in hand.
+        let preparing = PreparingGuard::enter(
+            provisioning.clone(),
+            config.preparing_signal.clone(),
+            config.pool_status.clone(),
+        );
         let (golden, environment) = if config.use_fork {
             // Read the `runs-on` labels of the next queued job so the pool
             // can select the correct base-image golden before forking.
@@ -3468,18 +3481,6 @@ async fn run_slot<P: VmProvider + 'static>(
             Some(runner) => runner,
             None => {
                 generation += 1;
-                // Warm mode cleared the preparing flag when the golden bake
-                // finished, but this slot's fork+boot+register still takes
-                // minutes. Raise the shared provisioning guard for the
-                // duration so the server's starvation sweep does not fail a
-                // job queued during that window: `provision_slot` returns
-                // only after the runner has registered, at which point a
-                // matching runner is directly visible to the sweep.
-                let preparing = PreparingGuard::enter(
-                    provisioning.clone(),
-                    config.preparing_signal.clone(),
-                    config.pool_status.clone(),
-                );
                 match provision_slot(
                     &provider,
                     &config,
@@ -3491,12 +3492,8 @@ async fn run_slot<P: VmProvider + 'static>(
                 )
                 .await
                 {
-                    Ok(runner) => {
-                        drop(preparing);
-                        runner
-                    }
+                    Ok(runner) => runner,
                     Err(error) => {
-                        drop(preparing);
                         warn!(slot, %error, "provisioning runner failed; retrying");
                         tokio::select! {
                             _ = shutdown.cancelled() => break,
@@ -3507,6 +3504,10 @@ async fn run_slot<P: VmProvider + 'static>(
                 }
             }
         };
+
+        // Runner is registered (or an already-registered spare); the sweep
+        // can see a matching runner directly now, so resume its grace clock.
+        drop(preparing);
 
         generation += 1;
         let successor = run_one_runner(
