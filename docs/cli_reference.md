@@ -77,8 +77,29 @@ No flags.
 
 | Flag | Description |
 |---|---|
-| `--job <JOB>` | Filter by job ID |
-| `--step <STEP>` | Filter by step number |
+| `--job <JOB>` | Narrow to one job: the workflow job key (`build`) or its agent job UUID |
+| `--step <STEP>` | Narrow to one 1-based step within the job, in execution order |
+| `-f`, `--follow` | Stream output as it arrives and exit when the run reaches a terminal state |
+
+Without flags, every job's log is merged in job-request order.
+
+`--step` counts user-visible steps from 1, matching `preloop debug --from`. It
+needs `--job` when a run has more than one job, because numbering restarts per
+job. A job whose runner uploaded a single merged log has no recoverable step
+boundaries; asking for a step there fails with `409` rather than returning the
+whole job under a step's name.
+
+`--follow` tracks one job's live console feed, so it needs `--job` unless the
+run has exactly one job. It replays the retained buffer before going live, so a
+late follower still sees earlier output, and it cannot be combined with
+`--step` (the feed carries whole steps as they stream).
+
+```bash
+preloop logs                          # whole latest run
+preloop logs --job test               # just the `test` job
+preloop logs --job test --step 3      # just that job's third step
+preloop logs -f --job test            # tail it live
+```
 
 ## `preloop cancel [RUN_ID]`
 

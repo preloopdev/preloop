@@ -104,10 +104,76 @@ pub(crate) async fn live_logs_sse(
     State(shared): State<Arc<SharedState>>,
     Path((run_id, job_id)): Path<(RunId, String)>,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
+    live_log_stream(&shared, run_id, &job_id).await
+}
+
+/// Job selector for the native live-log route.
+///
+/// Mirrors `RunLogsQuery::job` so `--job` means the same thing whether the
+/// caller is reading a finished log or following a running one.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct LiveLogsQuery {
+    #[serde(default)]
+    job: Option<String>,
+}
+
+/// Native-bearer live console feed for one job of a run.
+///
+/// The runner-protocol route above is reachable only with a runner or job
+/// token, which the CLI does not hold. This exposes the same feed to the
+/// native API principal — no new information, since that principal can already
+/// read the whole log through `GET /api/v1/runs/:run_id/logs`.
+///
+/// `job` may be omitted when the run has exactly one job; with more, the
+/// candidates are named rather than one being chosen arbitrarily.
+pub(crate) async fn live_run_logs_sse(
+    State(shared): State<Arc<SharedState>>,
+    Path(run_id): Path<RunId>,
+    Query(query): Query<LiveLogsQuery>,
+) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
+    let job_id = match query.job {
+        Some(job) => job,
+        None => {
+            let inner = shared.state.inner.lock().await;
+            if !inner.runs.contains_key(&run_id) {
+                return Err(ApiError::not_found("run not found"));
+            }
+            let mut jobs: Vec<&str> = inner
+                .job_requests
+                .values()
+                .filter(|request| request.run_id == run_id)
+                .map(|request| request.job_id.0.as_str())
+                .collect();
+            jobs.sort_unstable();
+            jobs.dedup();
+            match jobs.len() {
+                0 => return Err(ApiError::not_found("run has no jobs to follow")),
+                1 => jobs[0].to_owned(),
+                _ => {
+                    return Err(ApiError::bad_request(format!(
+                        "`job` needs a value when a run has {} jobs: {}",
+                        jobs.len(),
+                        jobs.join(", ")
+                    )));
+                }
+            }
+        }
+    };
+    live_log_stream(&shared, run_id, &job_id).await
+}
+
+/// Replay the retained per-job buffer, then follow the live broadcast.
+///
+/// Shared by both auth surfaces so the two never drift in what they emit.
+async fn live_log_stream(
+    shared: &Arc<SharedState>,
+    run_id: RunId,
+    job_id: &str,
+) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
     // Grab per-job handles under the global lock, then drop it immediately.
     let (job_lines, rx) = {
         let mut inner = shared.state.inner.lock().await;
-        let key = live_log_key_for_job(&inner, run_id, &job_id)
+        let key = live_log_key_for_job(&inner, run_id, job_id)
             .ok_or_else(|| ApiError::not_found("job not found"))?;
         let lines_arc = inner.live_log_lines.entry(key.clone()).or_default().clone();
         let tx = live_log_sender(&mut inner, &key);

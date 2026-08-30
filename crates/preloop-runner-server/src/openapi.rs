@@ -358,13 +358,19 @@ fn list_runs() {}
 )]
 fn get_run() {}
 
-/// Get formatted run logs (HTML).
+/// Get run logs as plain text, optionally narrowed to one job or step.
 #[utoipa::path(
     get, path = "/api/v1/runs/{run_id}/logs", tag = "Runs",
-    params(("run_id" = String, Path, description = "Run UUID")),
+    params(
+        ("run_id" = String, Path, description = "Run UUID"),
+        ("job" = Option<String>, Query, description = "Workflow job key or agent job UUID; omit for every job"),
+        ("step" = Option<usize>, Query, description = "1-based step index within the job, in execution order")
+    ),
     responses(
-        (status = 200, content_type = "text/html", description = "Rendered log page", body = String),
-        (status = 404, description = "Run not found", body = ApiErrorResponse)
+        (status = 200, content_type = "text/plain", description = "Merged log text", body = String),
+        (status = 400, description = "`step` given without `job` in a multi-job run", body = ApiErrorResponse),
+        (status = 404, description = "Run, job, or step not found", body = ApiErrorResponse),
+        (status = 409, description = "Job reported one merged log, which has no step boundaries", body = ApiErrorResponse)
     ),
     security(("native_bearer" = []))
 )]

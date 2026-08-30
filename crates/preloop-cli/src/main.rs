@@ -726,13 +726,24 @@ struct LogsArgs {
     /// Run ID. Defaults to the most recent run.
     run_id: Option<String>,
 
-    /// Filter by job ID.
+    /// Filter by job: the workflow job key (`build`) or its agent job UUID.
     #[arg(long)]
     job: Option<String>,
 
-    /// Filter by step number.
+    /// Filter by 1-based step number within the job, in execution order.
+    ///
+    /// Needs `--job` when the run has more than one job, because step
+    /// numbering restarts per job.
     #[arg(long)]
-    step: Option<u32>,
+    step: Option<usize>,
+
+    /// Stream output as it arrives, like `tail -f`, and exit when the run
+    /// reaches a terminal state.
+    ///
+    /// Follows one job's live console feed, so it needs `--job` unless the run
+    /// has exactly one job. Cannot be combined with `--step`.
+    #[arg(short = 'f', long)]
+    follow: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -3463,6 +3474,21 @@ fn condition_action(code: &str) -> &'static str {
     }
 }
 
+/// Build the `?job=&step=` pairs for a filtered log request.
+///
+/// Split out so a test can assert the wire query without a live server: these
+/// pairs silently going missing is exactly the bug this replaced.
+fn logs_query(job: Option<&str>, step: Option<usize>) -> Vec<(&'static str, String)> {
+    let mut query = Vec::new();
+    if let Some(job) = job {
+        query.push(("job", job.to_owned()));
+    }
+    if let Some(step) = step {
+        query.push(("step", step.to_string()));
+    }
+    query
+}
+
 async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
     let client = build_client();
     let url = server_url();
@@ -3472,7 +3498,24 @@ async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
             .await?
             .ok_or_else(|| anyhow::anyhow!("no runs found"))?,
     };
+
+    if args.follow {
+        // The live feed carries whole steps as they stream; it has no notion of
+        // "just step N". Refuse instead of quietly ignoring one of the flags.
+        if args.step.is_some() {
+            anyhow::bail!(
+                "`--step` cannot be combined with `--follow`: the live feed is per job, not \
+                 per step. Follow the job, or drop `--follow` to read one finished step."
+            );
+        }
+        return follow_run_logs(&client, &url, &run_id, args.job.as_deref()).await;
+    }
+
     let mut request = client.get(format!("{url}/api/v1/runs/{run_id}/logs"));
+    let query = logs_query(args.job.as_deref(), args.step);
+    if !query.is_empty() {
+        request = request.query(&query);
+    }
     if let Some(token) = api_token() {
         request = request.bearer_auth(token);
     }
@@ -3485,6 +3528,112 @@ async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
     let body = response.text().await?;
     print!("{body}");
     Ok(())
+}
+
+/// Fetch a run's overall execution status.
+///
+/// `None` when the field is absent or unrecognized, which the caller treats as
+/// "keep following" rather than a reason to stop.
+async fn run_status(
+    client: &reqwest::Client,
+    url: &str,
+    run_id: &str,
+) -> anyhow::Result<Option<preloop_gha_protocol::ExecutionStatus>> {
+    let mut request = client.get(format!("{url}/api/v1/runs/{run_id}"));
+    if let Some(token) = api_token() {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("server returned {status}: {body}");
+    }
+    let record: serde_json::Value = response.json().await?;
+    Ok(serde_json::from_value(record["status"].clone()).ok())
+}
+
+/// Stream one job's live console feed until the run reaches a terminal state.
+///
+/// Consumes the server's SSE feed rather than polling the whole log and
+/// diffing: the feed replays the retained snapshot before going live, so a late
+/// follower still sees earlier output. Job selection is the server's job — it
+/// defaults a single-job run and names the candidates otherwise, so the rule
+/// matches the one behind `?job=` on the non-streaming route.
+async fn follow_run_logs(
+    client: &reqwest::Client,
+    url: &str,
+    run_id: &str,
+    job: Option<&str>,
+) -> anyhow::Result<()> {
+    use futures_util::StreamExt as _;
+
+    let mut request = client.get(format!("{url}/api/v1/runs/{run_id}/logs/live"));
+    if let Some(job) = job {
+        request = request.query(&[("job", job)]);
+    }
+    if let Some(token) = api_token() {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("server returned {status}: {body}");
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
+    // The feed stays open with keep-alive comments after a job ends, so the
+    // run's own status is what decides when following is done.
+    let mut status_poll = tokio::time::interval(Duration::from_secs(3));
+    status_poll.tick().await;
+
+    loop {
+        tokio::select! {
+            chunk = stream.next() => match chunk {
+                Some(Ok(bytes)) => {
+                    buffer.push_str(&String::from_utf8_lossy(&bytes));
+                    // SSE frames are separated by a blank line.
+                    while let Some(split) = buffer.find("\n\n") {
+                        let frame = buffer[..split].to_owned();
+                        buffer.drain(..split + 2);
+                        print_live_log_frame(&frame);
+                    }
+                }
+                Some(Err(error)) => anyhow::bail!("live log stream failed: {error}"),
+                None => break,
+            },
+            _ = status_poll.tick() => {
+                if let Ok(Some(status)) = run_status(client, url, run_id).await {
+                    if status.is_terminal() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Print the console lines carried by one SSE frame.
+///
+/// Non-`data:` lines (keep-alive comments, the `event:` name) carry no output.
+/// An unparseable payload is skipped rather than aborting a long follow.
+fn print_live_log_frame(frame: &str) {
+    for line in frame.lines() {
+        let Some(payload) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim_start();
+        if let Ok(wrapper) =
+            serde_json::from_str::<preloop_gha_protocol::LiveLogFeedLinesWrapper>(payload)
+        {
+            for console_line in wrapper.value {
+                println!("{console_line}");
+            }
+        }
+    }
 }
 
 async fn cmd_cancel(args: CancelArgs) -> anyhow::Result<()> {
@@ -4118,6 +4267,71 @@ mod tests {
         };
         assert_eq!(args.job.unwrap(), "build");
         assert_eq!(args.step.unwrap(), 3);
+    }
+
+    /// The flags used to parse and then be dropped on the floor. Assert the
+    /// wire query itself, not just that clap accepted the argument.
+    #[test]
+    fn logs_filters_reach_the_query_string() {
+        assert_eq!(
+            logs_query(Some("build"), Some(3)),
+            vec![("job", "build".to_owned()), ("step", "3".to_owned())]
+        );
+    }
+
+    #[test]
+    fn logs_query_omits_absent_filters() {
+        assert!(logs_query(None, None).is_empty());
+        assert_eq!(
+            logs_query(Some("test"), None),
+            vec![("job", "test".to_owned())]
+        );
+        assert_eq!(logs_query(None, Some(2)), vec![("step", "2".to_owned())]);
+    }
+
+    #[test]
+    fn logs_follow_flag_parses_short_and_long() {
+        for argv in [vec!["logs", "-f"], vec!["logs", "--follow"]] {
+            let cli = parse(&argv).unwrap();
+            let Command::Logs(args) = cli.command else {
+                panic!("expected Logs");
+            };
+            assert!(args.follow, "{argv:?} should enable follow");
+        }
+    }
+
+    #[test]
+    fn logs_defaults_to_no_follow_and_no_filters() {
+        let cli = parse(&["logs"]).unwrap();
+        let Command::Logs(args) = cli.command else {
+            panic!("expected Logs");
+        };
+        assert!(!args.follow);
+        assert!(args.job.is_none());
+        assert!(args.step.is_none());
+    }
+
+    #[test]
+    fn live_log_frame_prints_only_console_lines() {
+        let frame = "event: live-log\ndata: {\"stepId\":\"s1\",\"startLine\":1,\"count\":2,\
+                     \"value\":[\"first\",\"second\"]}";
+        // Captured behavior: the payload's `value` lines are the output, and the
+        // `event:` name is not.
+        let wrapper: preloop_gha_protocol::LiveLogFeedLinesWrapper = frame
+            .lines()
+            .find_map(|line| line.strip_prefix("data:"))
+            .map(|payload| serde_json::from_str(payload.trim_start()).unwrap())
+            .expect("frame carries a data payload");
+        assert_eq!(wrapper.value, vec!["first", "second"]);
+        assert_eq!(wrapper.step_id, "s1");
+    }
+
+    #[test]
+    fn live_log_frame_tolerates_keepalive_and_garbage() {
+        // Keep-alive comments and unparseable payloads must not abort a follow.
+        print_live_log_frame(":");
+        print_live_log_frame("event: live-log\ndata: not-json");
+        print_live_log_frame("");
     }
 
     #[test]
