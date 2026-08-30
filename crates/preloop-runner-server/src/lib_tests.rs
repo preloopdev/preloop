@@ -4451,6 +4451,34 @@ async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
         b"dotted-tar-content"
     );
 
+    // 1c. Ref containing literal % (e.g. v1%tag)
+    let pct_dir = temp
+        .path()
+        .join("actions")
+        .join("test-owner")
+        .join("test-repo")
+        .join("v1%tag");
+    tokio::fs::create_dir_all(&pct_dir).await.unwrap();
+    tokio::fs::write(pct_dir.join("action.tar.gz"), b"pct-tar-content")
+        .await
+        .unwrap();
+    let pct_sig = state.sign_action_ticket("test-owner", "test-repo", "v1%tag", expires_at);
+    let enc_pct_ref = percent_encode_path_segment("v1%tag"); // "v1%25tag"
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/api/v1/actions/download/test-owner/test-repo/{enc_pct_ref}?exp={expires_at}&sig={pct_sig}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
     // 2. Reject path traversal
     let response = app
         .clone()

@@ -133,25 +133,6 @@ pub(crate) fn percent_encode_path_segment(input: &str) -> String {
     encoded
 }
 
-/// Percent-decode an RFC 3986 path segment.
-fn percent_decode_path_segment(input: &str) -> Option<String> {
-    let mut bytes = Vec::with_capacity(input.len());
-    let mut chars = input.bytes();
-    while let Some(byte) = chars.next() {
-        if byte == b'%' {
-            let high = chars.next()?;
-            let low = chars.next()?;
-            let hex = [high, low];
-            let hex_str = std::str::from_utf8(&hex).ok()?;
-            let val = u8::from_str_radix(hex_str, 16).ok()?;
-            bytes.push(val);
-        } else {
-            bytes.push(byte);
-        }
-    }
-    String::from_utf8(bytes).ok()
-}
-
 #[derive(serde::Deserialize)]
 pub(crate) struct ActionTicketQuery {
     #[serde(default)]
@@ -162,16 +143,9 @@ pub(crate) struct ActionTicketQuery {
 
 pub(crate) async fn download_action_tarball(
     State(shared): State<Arc<SharedState>>,
-    Path((raw_owner, raw_repo, raw_git_ref)): Path<(String, String, String)>,
+    Path((owner, repo, git_ref)): Path<(String, String, String)>,
     Query(ticket): Query<ActionTicketQuery>,
 ) -> Result<Response, ApiError> {
-    let owner = percent_decode_path_segment(&raw_owner)
-        .ok_or_else(|| ApiError::bad_request("invalid percent-encoding in owner"))?;
-    let repo = percent_decode_path_segment(&raw_repo)
-        .ok_or_else(|| ApiError::bad_request("invalid percent-encoding in repo"))?;
-    let git_ref = percent_decode_path_segment(&raw_git_ref)
-        .ok_or_else(|| ApiError::bad_request("invalid percent-encoding in git_ref"))?;
-
     // 1. Sanitize parameters to avoid directory traversal
     if owner.is_empty()
         || repo.is_empty()
