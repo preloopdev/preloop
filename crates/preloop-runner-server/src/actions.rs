@@ -85,7 +85,9 @@ async fn resolve_ref_to_sha(
     let url = format!("{api_base}/repos/{enc_owner}/{enc_repo}/commits/{enc_git_ref}");
     let mut request = crate::shared_http::CLIENT.get(&url);
     if let Some(pat) = state.static_github_pat() {
-        request = request.bearer_auth(pat);
+        if url.starts_with("https://") {
+            request = request.bearer_auth(pat);
+        }
     }
     let response = match request.send().await {
         Ok(response) => response,
@@ -252,7 +254,9 @@ pub(crate) async fn download_action_tarball(
     // repos (a GitHub App installation token is scoped to the App's repos).
     let mut request = client.get(&github_url);
     if let Some(pat) = shared.state.static_github_pat() {
-        request = request.bearer_auth(pat);
+        if github_url.starts_with("https://") {
+            request = request.bearer_auth(pat);
+        }
     }
     let response = request.send().await.map_err(|e| {
         ApiError::internal(format!("failed to send download request to GitHub: {e}"))
@@ -393,9 +397,9 @@ pub(crate) async fn collect_runnerresolve_refs(
 ) {
     let mut requests: Vec<(String, Option<String>)> = Vec::new();
     collect_runnerresolve_requests(value, &mut requests);
-    requests.truncate(MAX_ACTION_BATCH_SIZE);
     let mut seen = std::collections::HashSet::new();
     requests.retain(|request| seen.insert(request.clone()));
+    requests.truncate(MAX_ACTION_BATCH_SIZE);
 
     let stream = futures::stream::iter(requests.into_iter().map(|(action, version)| async move {
         runnerresolve_action(state, &action, version.as_deref()).await
@@ -415,7 +419,7 @@ pub(crate) async fn collect_action_download_infos(
 ) -> ActionDownloadInfoCollection {
     let mut requests: Vec<(String, Option<String>)> = Vec::new();
     if let Ok(list) = serde_json::from_value::<ActionReferenceList>(value.clone()) {
-        for item in list.actions.into_iter().take(MAX_ACTION_BATCH_SIZE) {
+        for item in list.actions.into_iter() {
             if !item.name_with_owner.is_empty() {
                 let ref_opt = if item.r#ref.is_empty() {
                     None
@@ -427,11 +431,11 @@ pub(crate) async fn collect_action_download_infos(
         }
     } else {
         collect_runnerresolve_requests(value, &mut requests);
-        requests.truncate(MAX_ACTION_BATCH_SIZE);
     }
 
     let mut seen = std::collections::HashSet::new();
     requests.retain(|request| seen.insert(request.clone()));
+    requests.truncate(MAX_ACTION_BATCH_SIZE);
 
     let stream = futures::stream::iter(requests.into_iter().map(|(action, version)| async move {
         action_download_info_entry(state, &action, version.as_deref()).await
