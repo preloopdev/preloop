@@ -61,6 +61,7 @@ pub(crate) async fn save_artifact_v2_registry(
 }
 pub(crate) async fn twirp_artifact_v2_create(
     State(shared): State<Arc<SharedState>>,
+    headers: HeaderMap,
     Json(request): Json<ArtifactV2CreateRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     validate_artifact_name(&request.name)
@@ -71,6 +72,11 @@ pub(crate) async fn twirp_artifact_v2_create(
         &request.workflow_job_run_backend_id,
         &request.name,
     );
+    // F7: the job is taken from the signed runtime token scope, not the
+    // request body, so a runner cannot evade its per-job pending cap by
+    // inventing other job ids. Control-plane callers (no job token) reserve
+    // without a per-job budget; the TTL sweep still bounds them by age.
+    let job_backend_id = job_backend_id_from_bearer(&shared.state, &headers);
     let stage_dir = shared
         .state
         .state_dir
@@ -82,9 +88,29 @@ pub(crate) async fn twirp_artifact_v2_create(
         .map_err(|e| ApiError::internal(format!("failed to create artifact stage dir: {e}")))?;
     {
         let mut inner = shared.state.inner.lock().await;
-        inner
-            .artifact_v2_pending
-            .insert(token.clone(), ArtifactV2Pending { registry_key });
+        if let Some(job_id) = &job_backend_id {
+            let pending = inner
+                .artifact_v2_pending
+                .values()
+                .filter(|pending| &pending.job_backend_id == job_id)
+                .count();
+            if pending >= MAX_PENDING_PER_JOB {
+                // Clean up the directory we just created — the TTL sweep has no
+                // token to find it otherwise, so it would leak forever.
+                let _ = tokio::fs::remove_dir_all(&stage_dir).await;
+                return Err(ApiError::conflict(format!(
+                    "job has {pending} pending artifact uploads (cap {MAX_PENDING_PER_JOB})"
+                )));
+            }
+        }
+        inner.artifact_v2_pending.insert(
+            token.clone(),
+            ArtifactV2Pending {
+                registry_key,
+                job_backend_id: job_backend_id.unwrap_or_default(),
+                created_unix: now_unix(),
+            },
+        );
         let meta = crate::store::build_meta_snapshot(&inner);
         if let Err(error) = shared.state.store.store_meta_only(&meta).await {
             tracing::warn!(?error, "failed to persist artifact v2 reservation");
@@ -150,7 +176,7 @@ pub(crate) async fn twirp_artifact_v2_finalize(
             _ => None,
         });
         inner.artifact_v2_registry.insert(
-            registry_key,
+            registry_key.clone(),
             ArtifactV2Entry {
                 id: artifact_id,
                 workflow_run_backend_id: request.workflow_run_backend_id,
@@ -162,6 +188,11 @@ pub(crate) async fn twirp_artifact_v2_finalize(
                 blob_token: token,
             },
         );
+        // Track finalization order for FIFO eviction.
+        inner.artifact_registry_order.push_back(registry_key);
+        // F7: keep the registry bounded per run (500) and globally (10k);
+        // oldest entries are evicted first.
+        trim_artifact_registry(&mut inner);
         let meta = crate::store::build_meta_snapshot(&inner);
         if let Err(error) = shared.state.store.store_meta_only(&meta).await {
             tracing::warn!(?error, "failed to persist artifact v2 finalization");

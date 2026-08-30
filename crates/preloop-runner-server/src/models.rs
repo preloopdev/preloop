@@ -297,6 +297,16 @@ pub(crate) struct ArtifactRecord {
 pub(crate) struct CacheV2Pending {
     pub(crate) key: String,
     pub(crate) version: String,
+    /// Job backend id that reserved the upload, derived from the runtime
+    /// token scope. `#[serde(default)]` keeps old persisted metas restoring
+    /// (an empty value means the entry predates per-job accounting and is
+    /// never billed to any job).
+    #[serde(default)]
+    pub(crate) job_backend_id: String,
+    /// Unix seconds the reservation was made; `0` for restored entries so
+    /// the TTL sweeper leaves them alone.
+    #[serde(default)]
+    pub(crate) created_unix: i64,
 }
 
 /// Pending artifact v2 upload (Twirp ArtifactService).
@@ -304,6 +314,14 @@ pub(crate) struct CacheV2Pending {
 pub(crate) struct ArtifactV2Pending {
     /// Registry key = "{run_backend_id}/{job_backend_id}/{name}".
     pub(crate) registry_key: String,
+    /// Job backend id that reserved the upload, derived from the runtime
+    /// token scope. `#[serde(default)]` keeps old persisted metas restoring.
+    #[serde(default)]
+    pub(crate) job_backend_id: String,
+    /// Unix seconds the reservation was made; `0` for restored entries so
+    /// the TTL sweeper leaves them alone.
+    #[serde(default)]
+    pub(crate) created_unix: i64,
 }
 
 /// Finalized artifact v2 entry.

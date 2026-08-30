@@ -58,6 +58,10 @@ pub(crate) trait Store: Send + Sync {
         byte_count: i64,
         line_count: i64,
     ) -> anyhow::Result<()>;
+    /// Delete a log entirely (parent `log_files` row + all `log_chunks` via
+    /// cascade). Called when the in-memory retention caps evict a log key so
+    /// the durable store cannot outgrow memory (D2).
+    async fn delete_log(&self, key: &str) -> anyhow::Result<()>;
     /// Append a control event (`run_accepted` / `run_status` / `job_status`).
     async fn append_event(&self, event: &NdjsonEvent) -> anyhow::Result<()>;
 }
@@ -177,6 +181,11 @@ impl Store for InstrumentedStore {
     async fn append_event(&self, event: &NdjsonEvent) -> anyhow::Result<()> {
         let start = Instant::now();
         self.record("append_event", start, self.inner.append_event(event).await)
+    }
+
+    async fn delete_log(&self, key: &str) -> anyhow::Result<()> {
+        let start = Instant::now();
+        self.record("delete_log", start, self.inner.delete_log(key).await)
     }
 }
 
@@ -907,6 +916,64 @@ pub(crate) fn apply_meta_snapshot(inner: &mut InnerState, meta: MetaSnapshot) {
     inner.cache_v2_dl_tokens = meta.cache_v2_dl_tokens.into_iter().collect();
     inner.artifact_v2_pending = meta.artifact_v2_pending.into_iter().collect();
     inner.artifact_v2_registry = meta.artifact_v2_registry.into_iter().collect();
+    // Rebuild in-memory order queues for FIFO eviction and apply caps so a
+    // restart doesn't reload unbounded history that was pending before the
+    // caps shipped.
+    {
+        // Trim per-key overlong logs that were persisted before the 16 MiB
+        // cap FIRST, then seed `log_bytes_total` from the trimmed sizes so
+        // `trim_plan_logs` sees the correct total (its fast path keys on it).
+        for buf in inner.logs.values_mut() {
+            let excess = buf
+                .len()
+                .saturating_sub(crate::memory_caps::MAX_LOG_BYTES_PER_KEY);
+            if excess > 0 {
+                buf.drain(0..excess);
+            }
+        }
+        inner.log_bytes_total = inner.logs.values().map(Vec::len).sum();
+        inner.log_order.clear();
+        for key in inner.logs.keys() {
+            inner.log_order.push_back(key.clone());
+        }
+        let plans: std::collections::BTreeSet<String> = inner
+            .logs
+            .keys()
+            .filter_map(|k| k.split('/').next().map(|s| s.to_owned()))
+            .collect();
+        for plan in plans {
+            crate::memory_caps::trim_plan_logs(inner, &plan);
+        }
+    }
+    inner.timeline_records_order.clear();
+    for key in inner.timeline_records.keys() {
+        inner.timeline_records_order.push_back(key.clone());
+    }
+    // Enforce global caps after restore.
+    {
+        let keys: Vec<String> = inner.timeline_records.keys().cloned().collect();
+        for key in keys {
+            crate::memory_caps::trim_timeline_after_patch(inner, &key, &[]);
+        }
+    }
+    inner.timeline_events_order.clear();
+    for run in inner.timeline_events.keys().copied() {
+        inner.timeline_events_order.push_back(run);
+    }
+    {
+        let runs: Vec<RunId> = inner.timeline_events.keys().copied().collect();
+        for run in runs {
+            crate::memory_caps::trim_timeline_events(inner, run);
+        }
+    }
+    inner.artifact_registry_order.clear();
+    for key in inner.artifact_v2_registry.keys() {
+        inner.artifact_registry_order.push_back(key.clone());
+    }
+    crate::memory_caps::trim_artifact_registry(inner);
+    crate::memory_caps::trim_cache_dl_tokens(inner);
+    // Cache dl tokens order deque was not persisted — nothing to rebuild, but
+    // ensure restored map doesn't already exceed the cap.
     inner.github_token_requests = meta.github_token_requests.into_iter().collect();
     inner.cancellation_queue = meta.cancellation_queue;
     inner.runner_client_ids = meta.runner_client_ids.into_iter().collect();
@@ -1393,9 +1460,28 @@ impl SqliteStore {
              VALUES (?1, ?2, ?3, ?4)",
             params![key, chunk_index, payload, now_us()],
         )?;
+        // D2: bound durable bytes per log key to the in-memory retention.
+        // `chunk_index` is the cumulative byte count after this append, so
+        // chunks whose index is at or below `byte_count - MAX_LOG_BYTES_PER_KEY`
+        // fall entirely outside the retained tail and can be dropped. Restart
+        // reload trims to the same budget, so nothing recoverable is lost.
+        let cutoff = byte_count - crate::memory_caps::MAX_LOG_BYTES_PER_KEY as i64;
+        if cutoff > 0 {
+            tx.execute(
+                "DELETE FROM log_chunks WHERE log_key = ?1 AND chunk_index <= ?2",
+                params![key, cutoff],
+            )?;
+        }
         tx.commit()
             .map_err(|error| anyhow::anyhow!("committing log chunk: {error}"))?;
         self.maybe_checkpoint_wal(&connection)?;
+        Ok(())
+    }
+
+    /// Delete a log's parent row; `log_chunks` cascade away with it.
+    pub(crate) fn delete_log(&self, key: &str) -> anyhow::Result<()> {
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        connection.execute("DELETE FROM log_files WHERE log_key = ?1", params![key])?;
         Ok(())
     }
 
@@ -1852,6 +1938,14 @@ impl Store for SqliteStore {
         })
         .await
         .map_err(|error| anyhow::anyhow!("store log-chunk task panicked: {error}"))?
+    }
+
+    async fn delete_log(&self, key: &str) -> anyhow::Result<()> {
+        let store = self.clone();
+        let key = key.to_owned();
+        tokio::task::spawn_blocking(move || store.delete_log(&key))
+            .await
+            .map_err(|error| anyhow::anyhow!("delete log task panicked: {error}"))?
     }
 
     async fn append_event(&self, event: &NdjsonEvent) -> anyhow::Result<()> {

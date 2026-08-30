@@ -1372,6 +1372,10 @@ pub(crate) struct InnerState {
     pub(crate) artifacts: BTreeMap<String, ArtifactRecord>,
     pub(crate) logs: BTreeMap<String, Vec<u8>>,
     pub(crate) log_metadata: BTreeMap<String, LogMetadata>,
+    /// Sum of all retained in-memory log byte lengths (`logs` values). Kept
+    /// incrementally so `trim_plan_logs` can early-return in the common case
+    /// without rescanning the whole map on every append.
+    pub(crate) log_bytes_total: usize,
     pub(crate) timeline_events: BTreeMap<RunId, Vec<NdjsonEvent>>,
     /// Per-timeline changeId counter for timeline PATCH versioning.
     pub(crate) timeline_change_ids: BTreeMap<String, i32>,
@@ -1401,6 +1405,23 @@ pub(crate) struct InnerState {
     pub(crate) cache_v2_pending: BTreeMap<String, CacheV2Pending>,
     /// Cache v2 download tokens: dl_token → (key, version).
     pub(crate) cache_v2_dl_tokens: BTreeMap<String, (String, String)>,
+    /// Cache v2 download-token mint order (FIFO eviction). In-memory only:
+    /// restored tokens have no entry and are evicted only when the cap is
+    /// exceeded, never by age.
+    pub(crate) cache_v2_dl_tokens_order: VecDeque<String>,
+    /// Cache v2 download-token mint time (unix seconds), for the TTL sweep.
+    /// In-memory only, like `cache_v2_dl_tokens_order`.
+    pub(crate) cache_v2_dl_tokens_created: BTreeMap<String, i64>,
+    /// Insertion order for timeline keys (`{plan}/{timeline}`) — FIFO for
+    /// global eviction. In-memory only.
+    pub(crate) timeline_records_order: VecDeque<String>,
+    /// Insertion order for run event buckets — FIFO for global eviction.
+    pub(crate) timeline_events_order: VecDeque<RunId>,
+    /// Finalization order for artifact registry — FIFO for global and
+    /// per-run eviction. In-memory only.
+    pub(crate) artifact_registry_order: VecDeque<String>,
+    /// Insertion order for log keys — FIFO for global log eviction.
+    pub(crate) log_order: VecDeque<String>,
     /// Artifact v2 Twirp pending uploads: upload_token → registry_key.
     pub(crate) artifact_v2_pending: BTreeMap<String, ArtifactV2Pending>,
     /// Artifact v2 finalized registry: registry_key → metadata.

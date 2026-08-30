@@ -94,6 +94,10 @@ pub(crate) async fn patch_timeline_records(
             .entry(run_id.unwrap_or_else(|| RunId(uuid::Uuid::nil())))
             .or_default()
             .extend(projected.clone());
+        trim_timeline_events(
+            &mut inner,
+            run_id.unwrap_or_else(|| RunId(uuid::Uuid::nil())),
+        );
 
         if let (Some(run_id), Some(job_id)) = (run_id, &logical_job_id) {
             if let Some(run) = inner.runs.get_mut(&run_id) {
@@ -199,11 +203,22 @@ pub(crate) async fn patch_timeline_records(
     // Persist records (upsert by record ID) and return the full stored set.
     let (response_records, meta) = {
         let mut inner = shared.state.inner.lock().await;
-        let stored = inner.timeline_records.entry(timeline_key).or_default();
+        let stored = inner
+            .timeline_records
+            .entry(timeline_key.clone())
+            .or_default();
+        // Ids just upserted by this PATCH — protect them from eviction so a
+        // low-sorting UUID isn't dropped out of the response/timeline.
+        let patched_ids: Vec<uuid::Uuid> = records.iter().map(|r| r.id).collect();
         for record in records {
             stored.insert(record.id, record);
         }
-        let vals: Vec<_> = stored.values().cloned().collect();
+        trim_timeline_after_patch(&mut inner, &timeline_key, &patched_ids);
+        let vals: Vec<_> = inner
+            .timeline_records
+            .get(&timeline_key)
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default();
         (vals, crate::store::build_meta_snapshot(&inner))
     };
     // Persist after the lock is released so a slow backend does not serialize
@@ -244,16 +259,27 @@ pub(crate) async fn create_log(
     Path((_scope, _hub, plan_id)): Path<(String, String, String)>,
     Json(mut log): Json<azdo::TaskLog>,
 ) -> Json<serde_json::Value> {
-    let meta = {
+    let (meta, evicted) = {
         let mut inner = shared.state.inner.lock().await;
         let next_id = inner.next_log_id;
         inner.next_log_id = next_id.wrapping_add(1);
         log.id = next_id as i64;
         let key = format!("{}/{}", plan_id, next_id);
         inner.logs.entry(key.clone()).or_default();
-        inner.log_metadata.entry(key).or_default();
-        crate::store::build_meta_snapshot(&inner)
+        inner.log_metadata.entry(key.clone()).or_default();
+        if !inner.log_order.iter().any(|k| k == &key) {
+            inner.log_order.push_back(key.clone());
+        }
+        let evicted = trim_plan_logs(&mut inner, &plan_id);
+        (crate::store::build_meta_snapshot(&inner), evicted)
     };
+    // Delete durably any logs the caps just evicted from memory, so the
+    // on-disk store never outgrows the in-memory retention (D2).
+    for key in &evicted {
+        if let Err(error) = shared.state.store.delete_log(key).await {
+            warn!(?error, key, "failed to delete evicted log from store");
+        }
+    }
     if let Err(error) = shared.state.store.store_meta_only(&meta).await {
         warn!(?error, "failed to persist created log");
     }
@@ -269,8 +295,9 @@ pub(crate) async fn append_log(
     let key = log_key(&plan_id, &log_id);
     // Hot path: mutate and capture the chunk under the lock, then persist
     // after releasing it.
-    let (masked, chunk_index, byte_count, line_count) = {
+    let (masked, chunk_index, byte_count, line_count, evicted) = {
         let mut inner = shared.state.inner.lock().await;
+        let is_new = !inner.logs.contains_key(&key);
         let masked = mask_log_bytes(&inner, &plan_id, &body);
         let byte_count = masked.len();
         let line_count = masked.iter().filter(|&&b| b == b'\n').count();
@@ -279,21 +306,54 @@ pub(crate) async fn append_log(
             .entry(key.clone())
             .or_default()
             .extend_from_slice(&masked);
-        let meta = inner.log_metadata.entry(key.clone()).or_default();
-        meta.byte_count += byte_count;
-        meta.line_count += line_count;
+        inner.log_bytes_total = inner.log_bytes_total.saturating_add(byte_count);
+        if is_new && !inner.log_order.iter().any(|k| k == &key) {
+            inner.log_order.push_back(key.clone());
+        }
+        // F1: keep only the newest bytes in memory. `log_chunks` is the live
+        // console recovery buffer (read only by restart to refill this map),
+        // bounded to the SAME per-key budget in `store_log_chunk` — see D2.
+        // The complete, permanent logs are the step/job-log blobs the runner
+        // uploads separately, so trimming this tail never drops real log data.
+        if let Some(retained) = inner.logs.get_mut(&key) {
+            // Only trim once the buffer grows a full slack window past the cap,
+            // then drop back down to the cap — amortizes the O(n) front-shift
+            // to O(1) per byte instead of shifting on every append.
+            if retained.len() > MAX_LOG_BYTES_PER_KEY + LOG_KEY_TRIM_SLACK {
+                let excess = retained.len() - MAX_LOG_BYTES_PER_KEY;
+                retained.drain(0..excess);
+                inner.log_bytes_total = inner.log_bytes_total.saturating_sub(excess);
+            }
+        }
+        // Update metadata before trimming so the newest log isn't miscounted,
+        // but release the borrow before calling `trim_plan_logs`.
+        {
+            let meta = inner.log_metadata.entry(key.clone()).or_default();
+            meta.byte_count += byte_count;
+            meta.line_count += line_count;
+        }
+        let evicted = trim_plan_logs(&mut inner, &plan_id);
         // Hot path: write the chunk to `log_chunks` and UPSERT the per-log
         // counter, instead of rewriting the entire meta snapshot for every
         // append. The counter is small and idempotent; the chunk is the
         // append-only event stream. We use the new byte count as the chunk
         // index so each append maps to a unique `(log_key, chunk_index)` row.
+        let meta = inner.log_metadata.get(&key).cloned().unwrap_or_default();
         (
             masked,
             meta.byte_count as i64,
             meta.byte_count as i64,
             meta.line_count as i64,
+            evicted,
         )
     };
+    // Delete durably any logs the caps just evicted from memory (D2). The just
+    // appended key is never in this list — it is the newest.
+    for key in &evicted {
+        if let Err(error) = shared.state.store.delete_log(key).await {
+            warn!(?error, key, "failed to delete evicted log from store");
+        }
+    }
     if let Err(error) = shared
         .state
         .store
@@ -441,10 +501,21 @@ pub(crate) async fn patch_timeline_records_plan(
     .await
 }
 
-/// GET `/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id` — read back full timeline.
+/// F6 — pagination controls for timeline GET. `top` is clamped to
+/// [`MAX_TOP_RECORDS`] server-side; `skip` pages further.
+#[derive(Debug, Deserialize)]
+pub(crate) struct TimelineQuery {
+    #[serde(default)]
+    pub(crate) top: Option<usize>,
+    #[serde(default)]
+    pub(crate) skip: Option<usize>,
+}
+
+/// GET `/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id` — read back the timeline.
 pub(crate) async fn get_timeline_records(
     State(shared): State<Arc<SharedState>>,
     Path((_scope, _hub, plan_id, timeline_id)): Path<(String, String, String, String)>,
+    Query(query): Query<TimelineQuery>,
 ) -> Json<serde_json::Value> {
     let timeline_key = format!("{}/{}", plan_id, timeline_id);
     let inner = shared.state.inner.lock().await;
@@ -453,10 +524,18 @@ pub(crate) async fn get_timeline_records(
         .get(&timeline_key)
         .copied()
         .unwrap_or(0);
+    // When `top` is absent the official runner expects the full timeline
+    // (it does not paginate). Storage itself is already capped at
+    // MAX_TIMELINE_RECORDS=1024, so returning all is bounded. When `top`
+    // is present we clamp to MAX_TOP_RECORDS.
+    let (top, skip) = match query.top {
+        Some(t) => (t.min(MAX_TOP_RECORDS), query.skip.unwrap_or(0)),
+        None => (usize::MAX, query.skip.unwrap_or(0)),
+    };
     let records: Vec<_> = inner
         .timeline_records
         .get(&timeline_key)
-        .map(|m| m.values().cloned().collect())
+        .map(|m| m.values().skip(skip).take(top).cloned().collect())
         .unwrap_or_default();
     Json(json!({
         "id": timeline_id,
@@ -471,10 +550,12 @@ pub(crate) async fn get_timeline_records(
 pub(crate) async fn get_timeline_records_plan(
     State(shared): State<Arc<SharedState>>,
     Path((plan_id, timeline_id)): Path<(String, String)>,
+    Query(query): Query<TimelineQuery>,
 ) -> Json<serde_json::Value> {
     get_timeline_records(
         State(shared),
         Path((String::new(), String::new(), plan_id, timeline_id)),
+        Query(query),
     )
     .await
 }

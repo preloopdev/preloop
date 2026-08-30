@@ -917,9 +917,28 @@ impl Store for PgStore {
             &[&key, &chunk_index, &payload, &now_us()],
         )
         .await?;
+        // D2: bound durable bytes per log key to the in-memory retention
+        // (see the SQLite backend for the rationale). `chunk_index` is the
+        // cumulative byte count after this append.
+        let cutoff = byte_count - crate::memory_caps::MAX_LOG_BYTES_PER_KEY as i64;
+        if cutoff > 0 {
+            tx.execute(
+                "DELETE FROM log_chunks WHERE log_key = $1 AND chunk_index <= $2",
+                &[&key, &cutoff],
+            )
+            .await?;
+        }
         tx.commit()
             .await
             .map_err(|error| anyhow::anyhow!("committing log chunk: {error}"))?;
+        Ok(())
+    }
+
+    async fn delete_log(&self, key: &str) -> anyhow::Result<()> {
+        let client = self.connection.lock().await;
+        client
+            .execute("DELETE FROM log_files WHERE log_key = $1", &[&key])
+            .await?;
         Ok(())
     }
 

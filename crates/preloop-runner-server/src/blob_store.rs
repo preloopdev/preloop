@@ -1,5 +1,38 @@
 use super::*;
 
+use axum::body::Body;
+use axum::http::{header::CONTENT_LENGTH, HeaderMap, StatusCode};
+use std::collections::BTreeMap;
+use std::sync::{Arc, LazyLock};
+use tokio::sync::Mutex;
+
+static BLOB_LOCKS: LazyLock<std::sync::Mutex<BTreeMap<String, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
+
+fn blob_lock_for(kind: &str, token: &str) -> Arc<Mutex<()>> {
+    let key = format!("{kind}/{token}");
+    let mut map = BLOB_LOCKS.lock().expect("blob lock poisoned");
+    map.entry(key)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+/// Drop a per-`(kind,token)` commit lock from `BLOB_LOCKS` once no in-flight
+/// commit is using it, keeping the map bounded (a runner minting unbounded
+/// tokens would otherwise leak an `Arc<Mutex>` per token forever). Holding the
+/// map mutex serializes against `blob_lock_for`, so a strong count of 2 (the
+/// map's ref plus the caller's `arc`) proves no other commit holds a clone.
+fn release_blob_lock(kind: &str, token: &str, arc: Arc<Mutex<()>>) {
+    let key = format!("{kind}/{token}");
+    let mut map = BLOB_LOCKS.lock().expect("blob lock poisoned");
+    if let Some(existing) = map.get(&key) {
+        if Arc::strong_count(existing) <= 2 {
+            map.remove(&key);
+        }
+    }
+    drop(arc);
+}
+
 // ─── Azure Block Blob compat blob store ───────────────────────────────────────
 //
 // Both actions/cache@v4 and actions/upload-artifact@v4 upload via the Azure SDK
@@ -45,8 +78,26 @@ pub(crate) async fn blob_put(
     State(shared): State<Arc<SharedState>>,
     Path((kind, token)): Path<(String, String)>,
     Query(query): Query<BlobPutQuery>,
-    body: axum::body::Bytes,
+    headers: HeaderMap,
+    body: Body,
 ) -> StatusCode {
+    // Early Content-Length check before buffering — avoids allocating 512 MiB
+    // for a block that will be rejected at 4 MiB.
+    if let Some(cl) = headers
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        let cap = match query.comp.as_deref() {
+            Some("block") => MAX_BLOCK_BYTES,
+            Some("blocklist") => 1024 * 1024, // XML is tiny; 1 MiB is generous
+            _ => MAX_ASSEMBLED_BYTES,
+        };
+        if cl > cap {
+            warn!(kind, token, cl, cap, "blob content-length exceeds cap");
+            return StatusCode::PAYLOAD_TOO_LARGE;
+        }
+    }
     let blob_root = shared
         .state
         .state_dir
@@ -56,6 +107,17 @@ pub(crate) async fn blob_put(
 
     match query.comp.as_deref() {
         Some("block") => {
+            // F5: buffer at most the per-block cap. The official runner stages
+            // 4 MiB blocks, so nothing legitimate is lost; `to_bytes` aborts
+            // (413) once a streamed block exceeds the cap, so an attacker never
+            // materializes more than 4 MiB here.
+            let body = match axum::body::to_bytes(body, MAX_BLOCK_BYTES).await {
+                Ok(b) => b,
+                Err(_) => {
+                    warn!(kind, token, "blob block exceeds the per-block cap");
+                    return StatusCode::PAYLOAD_TOO_LARGE;
+                }
+            };
             let block_id = query.blockid.unwrap_or_default();
             let safe_id = blockid_to_filename(&block_id);
             let blocks_dir = blob_root.join("blocks");
@@ -80,66 +142,191 @@ pub(crate) async fn blob_put(
             }
         }
         Some("blocklist") => {
+            // The commit body is a small XML block list; buffer at most 1 MiB.
+            let body = match axum::body::to_bytes(body, 1024 * 1024).await {
+                Ok(b) => b,
+                Err(_) => {
+                    warn!(kind, token, "blocklist body exceeds 1 MiB");
+                    return StatusCode::PAYLOAD_TOO_LARGE;
+                }
+            };
             let body_str = String::from_utf8_lossy(&body);
             let block_ids = parse_blocklist_xml(&body_str);
+            if block_ids.len() > MAX_BLOCKLIST_BLOCKS {
+                warn!(
+                    kind,
+                    token,
+                    blocks = block_ids.len(),
+                    "blocklist exceeds the block-id budget"
+                );
+                return StatusCode::PAYLOAD_TOO_LARGE;
+            }
             let blocks_dir = blob_root.join("blocks");
             let data_path = blob_root.join("data");
 
-            let mut assembled: Vec<u8> = Vec::new();
+            // F5: fail fast on the total assembly budget before reading any
+            // block, so a blocklist referencing > 512 MiB never starts
+            // assembling (or materializes the destination).
+            let mut total: u64 = 0;
             for bid in &block_ids {
                 let safe_id = blockid_to_filename(bid);
-                match tokio::fs::read(blocks_dir.join(&safe_id)).await {
-                    Ok(bytes) => assembled.extend_from_slice(&bytes),
+                match tokio::fs::metadata(blocks_dir.join(&safe_id)).await {
+                    Ok(md) => {
+                        total = total.saturating_add(md.len());
+                        if total > MAX_ASSEMBLED_BYTES as u64 {
+                            warn!(
+                                kind,
+                                token, total, "blocklist exceeds the total assembly budget"
+                            );
+                            return StatusCode::PAYLOAD_TOO_LARGE;
+                        }
+                    }
                     Err(e) => {
-                        warn!(kind, block = %safe_id, "failed to read block: {e}");
+                        warn!(kind, token, "failed to stat block {safe_id}: {e}");
                         return StatusCode::INTERNAL_SERVER_ERROR;
                     }
                 }
             }
-            match tokio::fs::write(&data_path, &assembled).await {
-                Ok(()) => {
-                    let _ = tokio::fs::remove_dir_all(&blocks_dir).await;
-                    info!(
-                        kind,
-                        size = assembled.len(),
-                        blocks = block_ids.len(),
-                        "blob assembled from blocks"
-                    );
-                    StatusCode::CREATED
+
+            // Serialize blocklist commits per (kind,token) so concurrent
+            // commits don't clobber each other's `data` file. Assemble into
+            // a temp file and atomically rename on success — a failed commit
+            // never truncates or deletes the previously committed blob.
+            let lock = blob_lock_for(&kind, &token);
+            let guard = lock.lock().await;
+            let tmp_path = data_path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
+            let status = match assemble_streaming(&blocks_dir, &tmp_path, &block_ids).await {
+                Ok(size) => match tokio::fs::rename(&tmp_path, &data_path).await {
+                    Ok(()) => {
+                        let _ = tokio::fs::remove_dir_all(&blocks_dir).await;
+                        info!(
+                            kind,
+                            token,
+                            size,
+                            blocks = block_ids.len(),
+                            "blob assembled from blocks"
+                        );
+                        StatusCode::CREATED
+                    }
+                    Err(e) => {
+                        let _ = tokio::fs::remove_file(&tmp_path).await;
+                        warn!(kind, token, "failed to commit assembled blob: {e}");
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                },
+                Err(AssemblyError::Budget) => {
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    warn!(kind, token, "assembly budget exceeded during copy");
+                    StatusCode::PAYLOAD_TOO_LARGE
                 }
-                Err(e) => {
-                    warn!(
-                        kind,
-                        blocks = block_ids.len(),
-                        "failed to write assembled blob: {e}"
-                    );
+                Err(AssemblyError::Io(e)) => {
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    warn!(kind, token, "failed to write assembled blob: {e}");
                     StatusCode::INTERNAL_SERVER_ERROR
                 }
-            }
+            };
+            drop(guard);
+            release_blob_lock(&kind, &token, lock);
+            status
         }
         _ => {
-            // Single-shot upload.
+            // F5: stream the single-shot body straight to a temp file, never
+            // buffering the whole (up to 512 MiB) blob in memory, then
+            // atomically rename it into place. A body past the assembly budget
+            // is rejected mid-stream before it can fill the disk either.
             if let Err(e) = tokio::fs::create_dir_all(&blob_root).await {
                 warn!(kind, "failed to create blob dir: {e}");
                 return StatusCode::INTERNAL_SERVER_ERROR;
             }
             let data_path = blob_root.join("data");
-            match tokio::fs::write(&data_path, &body).await {
-                Ok(()) => {
-                    info!(kind, size = body.len(), "blob single-shot upload");
-                    StatusCode::CREATED
+            let tmp_path = data_path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
+            match stream_body_to_file(body, &tmp_path, MAX_ASSEMBLED_BYTES).await {
+                Ok(size) => match tokio::fs::rename(&tmp_path, &data_path).await {
+                    Ok(()) => {
+                        info!(kind, token, size, "blob single-shot upload");
+                        StatusCode::CREATED
+                    }
+                    Err(e) => {
+                        let _ = tokio::fs::remove_file(&tmp_path).await;
+                        warn!(kind, token, "failed to commit single-shot blob: {e}");
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                },
+                Err(AssemblyError::Budget) => {
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    warn!(kind, token, "single-shot blob exceeds the assembly budget");
+                    StatusCode::PAYLOAD_TOO_LARGE
                 }
-                Err(e) => {
-                    warn!(
-                        kind,
-                        size = body.len(),
-                        "failed to write single-shot blob: {e}"
-                    );
+                Err(AssemblyError::Io(e)) => {
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    warn!(kind, token, "failed to write single-shot blob: {e}");
                     StatusCode::INTERNAL_SERVER_ERROR
                 }
             }
         }
     }
+}
+
+/// Failure mode for streaming blob assembly.
+enum AssemblyError {
+    Io(std::io::Error),
+    Budget,
+}
+
+/// Stream an HTTP request body straight to `dest`, never buffering the whole
+/// (up to `cap`-byte) payload in memory. Fails with [`AssemblyError::Budget`]
+/// as soon as the running total exceeds `cap`.
+async fn stream_body_to_file(
+    body: Body,
+    dest: &std::path::Path,
+    cap: usize,
+) -> Result<u64, AssemblyError> {
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    let mut file = tokio::fs::File::create(dest)
+        .await
+        .map_err(AssemblyError::Io)?;
+    let mut total: u64 = 0;
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| AssemblyError::Io(std::io::Error::other(e)))?;
+        total = total.saturating_add(chunk.len() as u64);
+        if total > cap as u64 {
+            return Err(AssemblyError::Budget);
+        }
+        file.write_all(&chunk).await.map_err(AssemblyError::Io)?;
+    }
+    file.flush().await.map_err(AssemblyError::Io)?;
+    Ok(total)
+}
+
+/// Stream blocks (in `block_ids` order) into `data_path`, never holding more
+/// than one block in memory. Fails with [`AssemblyError::Budget`] if the
+/// running total exceeds [`MAX_ASSEMBLED_BYTES`].
+async fn assemble_streaming(
+    blocks_dir: &std::path::Path,
+    data_path: &std::path::Path,
+    block_ids: &[String],
+) -> Result<u64, AssemblyError> {
+    let mut dest = tokio::fs::File::create(data_path)
+        .await
+        .map_err(AssemblyError::Io)?;
+    let mut total: u64 = 0;
+    for bid in block_ids {
+        let safe_id = blockid_to_filename(bid);
+        let mut src = tokio::fs::File::open(blocks_dir.join(&safe_id))
+            .await
+            .map_err(AssemblyError::Io)?;
+        let copied = tokio::io::copy(&mut src, &mut dest)
+            .await
+            .map_err(AssemblyError::Io)?;
+        total = total.saturating_add(copied);
+        if total > MAX_ASSEMBLED_BYTES as u64 {
+            return Err(AssemblyError::Budget);
+        }
+    }
+    Ok(total)
 }
 
 pub(crate) async fn blob_get(
