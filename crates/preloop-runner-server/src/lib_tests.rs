@@ -4199,6 +4199,49 @@ async fn action_download_info_returns_null_auth_when_token_unset() {
 }
 
 #[tokio::test]
+async fn action_download_info_discards_malformed_or_abbreviated_sha() {
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    // Mock API returns an abbreviated 7-char SHA rather than full 40-char SHA
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", api_listener.local_addr().unwrap());
+    let mock = axum::Router::new().route(
+        "/repos/:owner/:repo/commits/:git_ref",
+        axum::routing::get(|| async { axum::Json(serde_json::json!({"sha": "abc1234"})) }),
+    );
+    tokio::spawn(async move {
+        axum::serve(api_listener, mock).await.unwrap();
+    });
+    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+
+    let temp = tempfile::tempdir().unwrap();
+    let app = app(
+        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        CancellationToken::new(),
+    );
+
+    let response = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/ActionDownloadInfo/scope/actions/plan",
+        json!({
+            "actions": [
+                {"nameWithOwner": "actions/checkout", "ref": "v4", "path": ""}
+            ]
+        }),
+    )
+    .await;
+
+    let actions = response["actions"].as_object().unwrap();
+    let checkout = &actions["actions/checkout@v4"];
+    // Short SHA was discarded; resolvedSha is null and tarball URL falls back to ref
+    assert!(checkout["resolvedSha"].is_null());
+    assert!(checkout["tarballUrl"]
+        .as_str()
+        .unwrap()
+        .contains("actions/checkout/v4?"));
+}
+
+#[tokio::test]
 async fn runnerresolve_actions_returns_runner_parseable_tar_urls() {
     // Held for the whole test: `PRELOOP_GITHUB_API_URL` is process-global.
     let _env = crate::state::GITHUB_ENV_LOCK.lock().await;

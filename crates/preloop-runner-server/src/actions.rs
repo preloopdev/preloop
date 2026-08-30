@@ -102,6 +102,7 @@ async fn resolve_ref_to_sha(
             .and_then(|body| {
                 body.get("sha")
                     .and_then(|value| value.as_str())
+                    .filter(|sha| sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()))
                     .map(str::to_owned)
             })
     } else {
