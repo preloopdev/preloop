@@ -162,6 +162,9 @@ pub(crate) async fn download_action_tarball(
         || repo.contains('/')
         || repo.contains('\\')
         || repo.contains('\0')
+        || git_ref.starts_with('/')
+        || git_ref.starts_with('\\')
+        || std::path::Path::new(&git_ref).is_absolute()
         || git_ref.contains('\\')
         || git_ref.contains('\0')
         || git_ref.split('/').any(|seg| seg == "..")
@@ -325,6 +328,12 @@ pub(crate) fn action_download_ticket(
         action.split_once('@')?
     };
     if git_ref.is_empty() {
+        return None;
+    }
+    if git_ref.starts_with('/')
+        || git_ref.starts_with('\\')
+        || std::path::Path::new(git_ref).is_absolute()
+    {
         return None;
     }
 

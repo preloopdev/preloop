@@ -4547,6 +4547,7 @@ async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method(Method::GET)
@@ -4557,6 +4558,28 @@ async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // 2b. Reject absolute paths and leading slashes in ref
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/actions/download/test-owner/test-repo/%2Ftmp%2Fescape")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // action_download_ticket returns None for absolute refs
+    assert!(crate::actions::action_download_ticket(
+        &state,
+        "test-owner/test-repo@/tmp/escape",
+        None
+    )
+    .is_none());
 }
 
 #[tokio::test]
