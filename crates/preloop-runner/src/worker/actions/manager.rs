@@ -88,6 +88,9 @@ pub fn extract_tarball(bytes: &[u8], dest: &Path) -> Result<()> {
     let dest_dir = cap_std::fs::Dir::open_ambient_dir(dest, cap_std::ambient_authority())
         .with_context(|| format!("opening capability sandbox for {}", dest.display()))?;
 
+    #[cfg(unix)]
+    use cap_std::fs::PermissionsExt;
+
     let decoder = flate2::read::GzDecoder::new(bytes);
     let mut archive = tar::Archive::new(decoder);
 
@@ -111,13 +114,49 @@ pub fn extract_tarball(bytes: &[u8], dest: &Path) -> Result<()> {
                 path.display()
             );
         }
-        if let Some(parent) = stripped.parent() {
-            if parent.components().count() > 0 {
-                dest_dir.create_dir_all(parent)?;
+
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_dir() {
+            dest_dir.create_dir_all(&stripped)?;
+        } else if entry_type.is_file() {
+            if let Some(parent) = stripped.parent() {
+                if parent.components().count() > 0 {
+                    dest_dir.create_dir_all(parent)?;
+                }
             }
+            let mut outfile = dest_dir.create(&stripped)?;
+            std::io::copy(&mut entry, &mut outfile)?;
+
+            #[cfg(unix)]
+            if let Ok(mode) = entry.header().mode() {
+                let perms = cap_std::fs::Permissions::from_mode(mode);
+                let _ = outfile.set_permissions(perms);
+            }
+        } else if entry_type.is_symlink() {
+            if let Some(link_target) = entry.link_name()? {
+                if link_target.is_absolute()
+                    || link_target.starts_with("/")
+                    || link_target.starts_with("\\")
+                {
+                    anyhow::bail!(
+                        "symlink with absolute target rejected: {}",
+                        link_target.display()
+                    );
+                }
+                if let Some(parent) = stripped.parent() {
+                    if parent.components().count() > 0 {
+                        dest_dir.create_dir_all(parent)?;
+                    }
+                }
+                dest_dir.symlink(&link_target, &stripped)?;
+            }
+        } else {
+            anyhow::bail!(
+                "unsupported or dangerous archive entry type {:?} for {}",
+                entry_type,
+                path.display()
+            );
         }
-        let target = dest.join(&stripped);
-        entry.unpack(&target)?;
     }
 
     Ok(())
@@ -171,6 +210,30 @@ mod tests {
         enc.finish().unwrap()
     }
 
+    fn create_test_tarball_with_custom_entry(
+        path: &str,
+        entry_type: tar::EntryType,
+        link_name: Option<&str>,
+        content: &[u8],
+    ) -> Vec<u8> {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        {
+            let mut tar = tar::Builder::new(&mut enc);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_entry_type(entry_type);
+            header.as_mut_bytes()[..path.len()].copy_from_slice(path.as_bytes());
+            if let Some(target) = link_name {
+                header.set_link_name(target).unwrap();
+            }
+            header.set_cksum();
+            tar.append(&header, content).unwrap();
+            tar.finish().unwrap();
+        }
+        enc.finish().unwrap()
+    }
+
     #[test]
     fn extract_tarball_unpacks_safely_inside_sandbox() {
         let temp = TempDir::new().unwrap();
@@ -200,5 +263,83 @@ mod tests {
         let tar_bytes = create_test_tarball(&[("root/../../escape.txt", b"evil")]);
         let result = extract_tarball(&tar_bytes, &dest);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn extract_tarball_rejects_hard_links() {
+        let temp = TempDir::new().unwrap();
+        let dest = temp.path().join("action_dest");
+
+        let tar_bytes = create_test_tarball_with_custom_entry(
+            "root/evil_hardlink",
+            tar::EntryType::Link,
+            Some("/etc/passwd"),
+            b"",
+        );
+        let result = extract_tarball(&tar_bytes, &dest);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported or dangerous"));
+    }
+
+    #[test]
+    fn extract_tarball_rejects_absolute_symlinks() {
+        let temp = TempDir::new().unwrap();
+        let dest = temp.path().join("action_dest");
+
+        let tar_bytes = create_test_tarball_with_custom_entry(
+            "root/evil_symlink",
+            tar::EntryType::Symlink,
+            Some("/etc/shadow"),
+            b"",
+        );
+        let result = extract_tarball(&tar_bytes, &dest);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("symlink with absolute target rejected"));
+    }
+
+    #[test]
+    fn extract_tarball_rejects_escaping_symlink_traversal() {
+        let temp = TempDir::new().unwrap();
+        let dest = temp.path().join("action_dest");
+        let outside_file = temp.path().join("escaped_target.txt");
+        std::fs::write(&outside_file, b"initial").unwrap();
+
+        // Archive has:
+        // 1. symlink `sub/evil_link` -> `../../escaped_target.txt`
+        // 2. file `sub/evil_link` trying to overwrite through it or traverse it
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        {
+            let mut tar = tar::Builder::new(&mut enc);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_mode(0o777);
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.as_mut_bytes()[.."root/sub/evil_link".len()]
+                .copy_from_slice(b"root/sub/evil_link");
+            header.set_link_name("../../escaped_target.txt").unwrap();
+            header.set_cksum();
+            tar.append(&header, &b""[..]).unwrap();
+
+            let mut file_header = tar::Header::new_gnu();
+            file_header.set_size(7);
+            file_header.set_mode(0o644);
+            file_header.set_entry_type(tar::EntryType::Regular);
+            file_header.as_mut_bytes()[.."root/sub/evil_link/pwn".len()]
+                .copy_from_slice(b"root/sub/evil_link/pwn");
+            file_header.set_cksum();
+            tar.append(&file_header, &b"hacked!"[..]).unwrap();
+            tar.finish().unwrap();
+        }
+        let tar_bytes = enc.finish().unwrap();
+        let result = extract_tarball(&tar_bytes, &dest);
+        assert!(result.is_err());
+        // Verify outside file was untouched
+        assert_eq!(std::fs::read_to_string(&outside_file).unwrap(), "initial");
     }
 }
