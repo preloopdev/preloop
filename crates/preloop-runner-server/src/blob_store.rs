@@ -122,14 +122,13 @@ pub(crate) async fn blob_put(
             let safe_id = blockid_to_filename(&block_id);
             let blocks_dir = blob_root.join("blocks");
             if let Err(e) = tokio::fs::create_dir_all(&blocks_dir).await {
-                warn!(kind, token, "failed to create blocks dir: {e}");
+                warn!(kind, "failed to create blocks dir: {e}");
                 return StatusCode::INTERNAL_SERVER_ERROR;
             }
             match tokio::fs::write(blocks_dir.join(&safe_id), &body).await {
                 Ok(()) => {
                     debug!(
                         kind,
-                        token,
                         block = safe_id,
                         bytes = body.len(),
                         "blob block staged"
@@ -137,7 +136,7 @@ pub(crate) async fn blob_put(
                     StatusCode::CREATED
                 }
                 Err(e) => {
-                    warn!(kind, token, "failed to write block {safe_id}: {e}");
+                    warn!(kind, block = %safe_id, "failed to write block: {e}");
                     StatusCode::INTERNAL_SERVER_ERROR
                 }
             }
@@ -236,7 +235,7 @@ pub(crate) async fn blob_put(
             // atomically rename it into place. A body past the assembly budget
             // is rejected mid-stream before it can fill the disk either.
             if let Err(e) = tokio::fs::create_dir_all(&blob_root).await {
-                warn!(kind, token, "failed to create blob dir: {e}");
+                warn!(kind, "failed to create blob dir: {e}");
                 return StatusCode::INTERNAL_SERVER_ERROR;
             }
             let data_path = blob_root.join("data");
@@ -502,12 +501,19 @@ pub(crate) async fn replay_results_put(
     if let Some(parent) = dest.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    match std::fs::write(&dest, &body) {
+
+    // Publish the completed blob with a same-filesystem rename. A direct
+    // write exposes a growing file to GET /api/v1/runs/:run_id/logs, which
+    // can observe a prefix while the runner is still uploading the body.
+    let temp = dest.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let result = std::fs::write(&temp, &body).and_then(|()| std::fs::rename(&temp, &dest));
+    match result {
         Ok(()) => {
             tracing::info!("Stored {} bytes at replay/results/{path}", body.len());
             StatusCode::CREATED
         }
         Err(e) => {
+            let _ = std::fs::remove_file(&temp);
             tracing::warn!("Failed to store replay/results/{path}: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
         }

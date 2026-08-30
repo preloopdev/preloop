@@ -9,7 +9,24 @@ Releases before v0.27.0 predate the changelog.
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-08-28
+
+<!-- preloop:skip-golden -->
+
 ### Fixed
+
+- Cancelling a job no longer leaves background processes running on the
+  runner host. Cancellation signalled the process group through the child
+  handle, but the wait loop reaps the shell as soon as it exits, and a reaped
+  handle addresses nothing — so any descendant that outlived its shell was
+  never signalled. The leader's exit was also read as "the group is gone",
+  which returned success from the SIGINT stage and skipped the SIGTERM and
+  SIGKILL escalation entirely. A step that backgrounds a process ignoring
+  SIGINT/SIGTERM (databases, daemons, `nohup`) therefore survived
+  cancellation, was reparented to init, and accumulated on the host across
+  runs. The group id is now captured at spawn and the escalation runs against
+  the group itself, matching `ProcessInvoker.cs`, which kills the remaining
+  process tree. The same gap in the stream-drain grace path is fixed too.
 
 - SmolVM compatibility now comes from the central `versions.toml`
   `smolvm_min_version` pin. `preloop-cli` and `preloop-vm` compile the same
@@ -25,6 +42,17 @@ Releases before v0.27.0 predate the changelog.
   "unavailable", and the run fell through to a local bake. The budget is
   now one hour, which covers any link above ~21 Mbps.
 
+- The GitHub App webhook-subscription check no longer warns about events
+  GitHub can never report. `pull_request_target` is a workflow trigger
+  synthesized from the `pull_request` webhook, not a deliverable event, and
+  `check_run`/`check_suite` are auto-subscribed for Apps holding `checks:
+  write` and so never appear in `GET /app`'s `events`. Both made the startup
+  warning fire forever on a correctly configured App. The check now also
+  reads the App's permissions from the same response and separates events
+  that can be ticked today from those whose checkbox GitHub does not render
+  until the gating permission is granted — the previous message sent
+  operators looking for controls that were not on the page.
+
 ### Changed
 
 - Golden download progress now reads as a percentage and a completion bar
@@ -32,6 +60,10 @@ Releases before v0.27.0 predate the changelog.
   (3850 MB / 9630 MB)` — instead of raw byte counts, and reports every
   256 MB rather than every 1 GiB (about one line per 25 s on a 100 Mbps
   link).
+
+## [0.31.1] - 2026-08-23
+
+<!-- preloop:skip-golden -->
 
 ## [0.30.10] - 2026-08-18
 

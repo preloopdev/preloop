@@ -1,0 +1,56 @@
+name: Pullfrog (GHES-compatible fork)
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: 'Prompt for the agent'
+        required: false
+        default: 'List the files in this repo and summarize the README in one paragraph.'
+  issue_comment:
+    types: [created]
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write
+
+# Single-flight across the whole repo. Each run clones ~470 MB and the
+# self-hosted host has 23 GB of RAM shared with an 8 GB runner VM and the
+# control plane, so a comment burst launching several at once is what
+# exhausts the box. Queue instead of cancelling: a superseded review is
+# still cheaper than losing one that was asked for.
+concurrency:
+  group: pullfrog
+  cancel-in-progress: false
+
+jobs:
+  pullfrog:
+    if: github.actor != 'renovate[bot]' && github.actor != 'dependabot[bot]' && github.actor != 'pullfrog[bot]'
+    runs-on: self-hosted
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Run Pullfrog (via GHES-compatible fork)
+        uses: Bnjoroge1/pullfrog@09dde428a88245ab3c448ff3dcadb8325e4e1d05 # ghes-url-support
+        with:
+          prompt: ${{ inputs.prompt || toJSON(github.event) }}
+          model: openai/gpt-5.6-terra
+        env:
+          # LOAD-BEARING, do not delete: the action clones into
+          # `pullfrog-XXXXXX` under the system temp dir and never cleans up.
+          # `/tmp` on the self-hosted host is a tmpfs at 50% of RAM, so each
+          # leaked clone costs ~470 MB of memory permanently. Without this the
+          # leak filled /tmp and the kernel OOM-killed the runner VM and the
+          # control plane (#194, #195; regressed once by a comment cleanup).
+          # runner.temp is disk-backed and cleared between jobs.
+          TMPDIR: ${{ runner.temp }}
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}

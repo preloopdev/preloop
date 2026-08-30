@@ -368,6 +368,7 @@ impl Fixture {
             use_fork: false,
             use_packed_artifact: false,
             name_prefix: format!("pool-{label}-{id}"),
+            pool_status: None,
             base_image: BASE_IMAGE.to_owned(),
             workspace: None,
             artifact_stem,
@@ -395,6 +396,7 @@ impl Fixture {
             next_job_runs_on: None,
             pending_registrations: None,
             preparing_signal: None,
+            observability: None,
         };
         Self {
             _env_guard: env_guard,
@@ -693,7 +695,7 @@ async fn runner_keeps_public_only_egress_and_wires_control_socket_and_environmen
     // to tell a controller which VM to open a shell into.
     let expected_prefix = vec![
         "/usr/bin/env".to_owned(),
-        format!("PATH={}", preloop_orchestrator::guest_runner_path()),
+        format!("PATH={}", preloop_orchestrator::guest_runner_path(&config)),
         format!("PRELOOP_MACHINE_NAME={runner}"),
         "PRELOOP_CONTROL_ORIGIN=https://preloop.example".to_owned(),
         "PRELOOP_CONTROL_SOCKET=/run/preloop-control/engine.sock".to_owned(),
@@ -781,7 +783,7 @@ async fn guest_environment_tracks_control_socket_and_debug_dir_independently() {
             .map(String::as_str)
             .collect();
         let machine_name = format!("PRELOOP_MACHINE_NAME={runner}");
-        let path = format!("PATH={}", preloop_orchestrator::guest_runner_path());
+        let path = format!("PATH={}", preloop_orchestrator::guest_runner_path(&config));
         let mut want = vec!["/usr/bin/env", path.as_str(), machine_name.as_str()];
         want.extend(expected);
         assert_eq!(

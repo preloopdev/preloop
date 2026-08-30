@@ -1,33 +1,7 @@
 name: runner-sync
 
-# Drives the runner-watch pipeline for a new official actions/runner release.
-#
-# Renovate's runner_version bump PR (labeled protocol-sync) is the tripwire.
-# This workflow reconciles it:
-#   prep (hosted, every PR): diff + triage the upstream delta and post the
-#     spec summary on the tripwire PR, so the change surface is reviewable
-#     immediately.
-#   sync (self-hosted, opt-in): implement/review (when agents are enabled),
-#     record-golden (official bytes via mitmproxy), conform (replay against
-#     the built server), and open the tiered draft PRs, each tagged
-#     protocol-sync + priority:{critical,high,low} (see the `pr` command).
-#     The runner_version bump and pipeline artifacts land on a
-#     runner-sync/v<version> branch; the tiered PRs are based on it.
-#
-# The sync job is inert until a runner-sync host exists (mitmproxy + official
-# runner + Rust toolchain + gh) and RUNNER_SYNC_HOST_WORKSPACE is set — the
-# same opt-in pattern as conformance.yml, so nothing queues forever. Agent
-# stages run only when RUNNER_SYNC_AGENTS=true and the agent CLIs (codex,
-# claude) are installed on the host; otherwise triage ships specs for human
-# implementation, which the tiered PRs surface.
-
 on:
   pull_request:
-    # Only Renovate's bump PRs (and the rare human versions.toml change)
-    # need the pipeline; running on every PR wastes pool slots on the
-    # preloop CI host, where the needs-gated sync job queues until prep
-    # completes. The preloop server honors paths filters (unevaluable ->
-    # rejected, not queued).
     paths:
       - versions.toml
   workflow_dispatch:
@@ -47,7 +21,7 @@ permissions:
 jobs:
   prep:
     name: Prep runner sync (diff + triage)
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 30
     permissions:
       contents: read
@@ -61,7 +35,8 @@ jobs:
         with:
           persist-credentials: false
           lfs: true
-      - uses: dtolnay/rust-toolchain@52699249a776424c51ebc9ee197baf0f9dbf0d8a
+          fetch-depth: 2
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
       - name: Resolve versions
         id: versions
         env:
@@ -122,7 +97,7 @@ jobs:
           gh pr comment "$PR_NUMBER" --body "$BODY"
       - name: Upload triage artifacts
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: runner-sync-prep
           path: |
@@ -134,9 +109,6 @@ jobs:
   sync:
     name: Runner sync (record-golden + conform + tiered PRs)
     needs: prep
-    # vars-only gate: the preloop dogfood CI evaluates job-level `if`s, so a
-    # needs-outputs condition here would leave the job queued forever on that
-    # pool; movement is instead detected in a step below.
     if: vars.RUNNER_SYNC_HOST_WORKSPACE != ''
     runs-on: [self-hosted, runner-sync]
     timeout-minutes: 180
@@ -151,7 +123,8 @@ jobs:
         with:
           persist-credentials: false
           lfs: true
-      - uses: dtolnay/rust-toolchain@52699249a776424c51ebc9ee197baf0f9dbf0d8a
+          fetch-depth: 2
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
       - name: Detect runner_version movement
         id: moved
         env:
@@ -251,8 +224,6 @@ jobs:
           git config user.email "preloop-sync[bot]@users.noreply.github.com"
           BRANCH="runner-sync/v$VER_TO"
           git checkout -b "$BRANCH"
-          # Renders the tiered PR bodies and updates versions.toml / README /
-          # fidelity-gap for the new version.
           cargo run -q -p runner-watch -- pr --dry-run
           git add -A
           if ! git diff --cached --quiet; then
@@ -262,7 +233,7 @@ jobs:
           cargo run -q -p runner-watch -- pr --base main --head "$BRANCH"
       - name: Upload conformance report
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: runner-sync-conformance
           path: |

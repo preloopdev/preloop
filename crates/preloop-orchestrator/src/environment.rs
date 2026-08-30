@@ -376,6 +376,13 @@ impl EnvironmentSpec {
             // bases skip the bake entirely, so the fingerprint records that
             // too.
             "bake": if curated { crate::base_install_script() } else { String::new() },
+            // Rosetta x86_64 translation exists only on Apple Silicon hosts.
+            // The packed-golden prep installs the amd64 loader + libc into
+            // arm64 goldens so dynamically linked x86_64 binaries run under
+            // it; the fingerprint records whether that shim is present so a
+            // host-class change re-preps the golden once instead of adopting
+            // a base built for the other class.
+            "rosetta_libs": cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
         });
         let bytes =
             serde_json::to_vec(&normalized).expect("normalized environment is serializable");

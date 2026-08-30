@@ -75,12 +75,22 @@ async fn main() -> anyhow::Result<()> {
         .install_default()
         .ok();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    // Unified observability init: `RUST_LOG` now defaults to `info`
+    // like the CLI, instead of falling silent when unset. `PRELOOP_LOG_FORMAT`
+    // controls pretty/json/auto. The `Observability` handle will be cloned
+    // into `AppState`; for now it is held for the life of `main`.
+    let obs_config = preloop_observability::ObservabilityConfig::from_env()
+        .with_service_version(env!("CARGO_PKG_VERSION"));
+    let (observability, observability_runtime) =
+        preloop_observability::Observability::from_config(obs_config);
+    observability_runtime.install_fmt_subscriber();
+    // The handle reaches `ServerConfig` below; holding it here alone would
+    // leave the server on the no-op handle installed by `AppState::new`, so
+    // nothing would ever export. The runtime stays alive for the whole
+    // process and flushes on shutdown.
 
     let cli = Cli::parse();
-    match cli.command {
+    let result = match cli.command {
         Command::Cert { output } => {
             std::fs::create_dir_all(&output)?;
             let cert = preloop_runner_server::generate_self_signed_cert()?;
@@ -97,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
                 cert_path.display(),
                 key_path.display()
             );
+            Ok(())
         }
         Command::Serve {
             listen,
@@ -123,6 +134,8 @@ async fn main() -> anyhow::Result<()> {
                 next_job_runs_on: None,
                 pool_preparing: None,
                 listen,
+                pool_status: None,
+                observability: Some(observability.clone()),
                 systemd_socket_activation: false,
                 unix_socket,
                 state_dir,
@@ -144,8 +157,11 @@ async fn main() -> anyhow::Result<()> {
                     })
                     .unwrap_or(false),
             })
-            .await?;
+            .await
         }
-    }
-    Ok(())
+    };
+    // Bounded 2s flush of buffered telemetry before exit; a clean shutdown
+    // must not drop the last flush window's records.
+    observability_runtime.shutdown().await;
+    result
 }

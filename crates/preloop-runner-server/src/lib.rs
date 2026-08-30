@@ -39,6 +39,7 @@ mod live_logs;
 mod openapi;
 use live_logs::*;
 mod debug;
+mod http_metrics;
 use debug::*;
 mod debug_sessions;
 mod runner_lifecycle;
@@ -133,7 +134,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
-use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, warn};
 
 /// Default local token used when `PRELOOP_SYSTEM_TOKEN` is not configured.

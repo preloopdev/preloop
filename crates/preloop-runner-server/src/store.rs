@@ -18,7 +18,10 @@ use async_trait::async_trait;
 use preloop_gha_protocol::SessionId;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use sha2::Digest;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::time::Instant;
 
 const DATABASE_FILE: &str = "preloop.db";
 pub(crate) const SNAPSHOT_FORMAT: u8 = 2;
@@ -61,6 +64,129 @@ pub(crate) trait Store: Send + Sync {
     async fn delete_log(&self, key: &str) -> anyhow::Result<()>;
     /// Append a control event (`run_accepted` / `run_status` / `job_status`).
     async fn append_event(&self, event: &NdjsonEvent) -> anyhow::Result<()>;
+}
+
+/// Decorator that records `preloop.store.operation.duration` for every
+/// `Store` method. One wrapper, not per-backend duplication.
+pub(crate) struct InstrumentedStore {
+    inner: Arc<dyn Store>,
+    observability: preloop_observability::Observability,
+    backend: String,
+}
+
+impl InstrumentedStore {
+    fn new(
+        inner: Arc<dyn Store>,
+        observability: preloop_observability::Observability,
+        backend: &str,
+    ) -> Self {
+        Self {
+            inner,
+            observability,
+            backend: backend.to_string(),
+        }
+    }
+
+    pub(crate) fn wrap(
+        inner: Arc<dyn Store>,
+        observability: preloop_observability::Observability,
+        backend: &str,
+    ) -> Arc<dyn Store> {
+        Arc::new(Self::new(inner, observability, backend))
+    }
+
+    /// Time one delegated call, record duration and outcome, return the
+    /// original result unchanged. Centralizing this means a newly added
+    /// `Store` method cannot silently skip instrumentation.
+    fn record<T>(
+        &self,
+        operation: &'static str,
+        start: Instant,
+        result: anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let outcome = if result.is_ok() { "ok" } else { "error" };
+        self.observability.metrics().store.observe(
+            &self.backend,
+            operation,
+            outcome,
+            start.elapsed(),
+        );
+        result
+    }
+}
+
+#[async_trait]
+impl Store for InstrumentedStore {
+    async fn load_into(&self, inner: &mut InnerState) -> anyhow::Result<()> {
+        let start = Instant::now();
+        self.record("load_into", start, self.inner.load_into(inner).await)
+    }
+
+    async fn store_inner(&self, snapshot: &StoreSnapshot) -> anyhow::Result<()> {
+        let start = Instant::now();
+        self.record("store_inner", start, self.inner.store_inner(snapshot).await)
+    }
+
+    async fn store_meta_only(&self, meta: &MetaSnapshot) -> anyhow::Result<()> {
+        let start = Instant::now();
+        self.record(
+            "store_meta_only",
+            start,
+            self.inner.store_meta_only(meta).await,
+        )
+    }
+
+    async fn store_run_event(&self, projection: RunProjection) -> anyhow::Result<()> {
+        let start = Instant::now();
+        self.record(
+            "store_run_event",
+            start,
+            self.inner.store_run_event(projection).await,
+        )
+    }
+
+    async fn store_workflow_run_counter(
+        &self,
+        workflow_path: &str,
+        next_run_number: u64,
+    ) -> anyhow::Result<()> {
+        let start = Instant::now();
+        self.record(
+            "store_workflow_run_counter",
+            start,
+            self.inner
+                .store_workflow_run_counter(workflow_path, next_run_number)
+                .await,
+        )
+    }
+
+    async fn store_log_chunk(
+        &self,
+        key: &str,
+        chunk_index: i64,
+        payload: &[u8],
+        byte_count: i64,
+        line_count: i64,
+    ) -> anyhow::Result<()> {
+        let start = Instant::now();
+        self.record(
+            "store_log_chunk",
+            start,
+            self.inner
+                .store_log_chunk(key, chunk_index, payload, byte_count, line_count)
+                .await,
+        )
+    }
+
+    async fn append_event(&self, event: &NdjsonEvent) -> anyhow::Result<()> {
+        let start = Instant::now();
+        self.record("append_event", start, self.inner.append_event(event).await)
+    }
+
+    async fn delete_log(&self, key: &str) -> anyhow::Result<()> {
+        let start = Instant::now();
+        self.record("delete_log", start, self.inner.delete_log(key).await)
+    }
 }
 
 /// Owned projection of the in-memory state that a full snapshot persists.
@@ -197,7 +323,21 @@ impl RunProjection {
 pub(crate) struct SqliteStore {
     connection: Arc<StdMutex<Connection>>,
     cipher: Envelope,
+    /// Commits since the last forced WAL truncation. A full
+    /// `wal_checkpoint(TRUNCATE)` on every commit fsyncs the DB every runner
+    /// event (~35x slower in a WAL micro-benchmark and head-of-line blocking
+    /// on the single connection); instead SQLite's background
+    /// `wal_autocheckpoint` (PASSIVE) bounds routine growth and we force a
+    /// TRUNCATE only every [`WAL_CHECKPOINT_INTERVAL`] commits to reclaim the
+    /// file. Amortized cost is one blocking checkpoint per N events.
+    checkpoint_counter: Arc<AtomicU64>,
 }
+
+/// Force a WAL truncation every N commits. Between forced truncations the
+/// default `wal_autocheckpoint` (1000 pages ≈ 4 MB, PASSIVE, non-blocking)
+/// keeps the WAL bounded; the periodic TRUNCATE guarantees the file is
+/// reclaimed even when a reader kept PASSIVE from advancing.
+const WAL_CHECKPOINT_INTERVAL: u64 = 128;
 
 /// Where the server should look for durable state. Parsed from `PRELOOP_STORE_URL`
 /// (or an explicit override); see [`parse_store_url`].
@@ -544,9 +684,18 @@ pub(crate) fn restore_run_record(cipher: &Envelope, blob: &[u8]) -> anyhow::Resu
             .unwrap_or_default()
             .to_owned();
         // `run_record_value` always writes the key (null when absent), so a
-        // JSON null must restore as `None` rather than fail to parse.
+        // JSON null must restore as `None` rather than fail to parse. A
+        // snapshot whose shape this binary no longer understands is dropped
+        // with a warning: the store is best-effort and one stale record must
+        // not brick startup (see `load_into`).
         run.workspace_snapshot = match object.get("workspace_snapshot") {
-            Some(value) if !value.is_null() => Some(serde_json::from_value(value.clone())?),
+            Some(value) if !value.is_null() => match serde_json::from_value(value.clone()) {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    tracing::warn!(run_id = %run.run_id, %error, "dropping undecodable workspace snapshot on load");
+                    None
+                }
+            },
             _ => None,
         };
     }
@@ -879,6 +1028,39 @@ pub(crate) fn restore_session_key(
     Ok(SessionEncryption::from_key(payload.0))
 }
 
+/// Bound the WAL after a commit, and fail loudly when the checkpoint could not
+/// complete.
+///
+/// `PRAGMA wal_checkpoint(TRUNCATE)` returns a result row of
+/// `(busy, log_frames, checkpointed_frames)`; a blocked checkpoint reports
+/// `busy = 1` but does not raise a SQL error, so discarding the row would
+/// treat "WAL still full" as success. Backing off here also keeps one write
+/// from starving the next: the retry gives competing readers time to finish
+/// before we TRUNCATE again. Every post-commit write path funnels through
+/// this helper.
+fn checkpoint_wal(connection: &Connection) -> anyhow::Result<()> {
+    for _ in 0..10 {
+        let (busy, log, checkpointed) =
+            connection.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+        if busy == 0 {
+            return Ok(());
+        }
+        tracing::warn!(
+            log_frames = log,
+            checkpointed_frames = checkpointed,
+            "WAL checkpoint blocked; retrying"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    anyhow::bail!("WAL checkpoint stayed blocked after retries")
+}
+
 impl SqliteStore {
     pub(crate) fn open(path: &std::path::Path, cipher: Envelope) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
@@ -900,7 +1082,24 @@ impl SqliteStore {
         Ok(Self {
             connection: Arc::new(StdMutex::new(connection)),
             cipher,
+            checkpoint_counter: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Post-commit WAL maintenance. Forces a truncating checkpoint only every
+    /// [`WAL_CHECKPOINT_INTERVAL`] commits (the first commit truncates so a
+    /// fresh DB starts clean); routine growth between truncations is bounded
+    /// by SQLite's background `wal_autocheckpoint`. This replaces the previous
+    /// truncate-on-every-commit policy, which fsynced the DB per runner event.
+    fn maybe_checkpoint_wal(&self, connection: &Connection) -> anyhow::Result<()> {
+        if self
+            .checkpoint_counter
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(WAL_CHECKPOINT_INTERVAL)
+        {
+            checkpoint_wal(connection)?;
+        }
+        Ok(())
     }
 
     /// Apply pending migrations. Each step runs in its own transaction inside
@@ -1275,6 +1474,7 @@ impl SqliteStore {
         }
         tx.commit()
             .map_err(|error| anyhow::anyhow!("committing log chunk: {error}"))?;
+        self.maybe_checkpoint_wal(&connection)?;
         Ok(())
     }
 
@@ -1427,6 +1627,11 @@ impl SqliteStore {
         self.write_meta_tx(&tx, &snapshot.meta)?;
         tx.commit()
             .map_err(|error| anyhow::anyhow!("committing store snapshot: {error}"))?;
+        // The WAL grows with every runner event; an unbounded WAL (hundreds of
+        // MB) makes a later checkpoint sync stall the server for minutes.
+        // Force a truncation periodically (autocheckpoint bounds the rest) so
+        // the file is reclaimed without an fsync on every commit.
+        self.maybe_checkpoint_wal(&connection)?;
         Ok(())
     }
 
@@ -1462,6 +1667,10 @@ impl SqliteStore {
         self.insert_event_tx(&tx, &projection.event)?;
         tx.commit()
             .map_err(|error| anyhow::anyhow!("committing run event: {error}"))?;
+        // Same rationale as the full-snapshot path: bound the WAL so a
+        // runner-event burst cannot stall a later commit behind a giant
+        // checkpoint sync — periodically, not on every event.
+        self.maybe_checkpoint_wal(&connection)?;
         Ok(())
     }
 
@@ -1484,6 +1693,7 @@ impl SqliteStore {
         )?;
         tx.commit()
             .map_err(|error| anyhow::anyhow!("committing workflow run counter: {error}"))?;
+        self.maybe_checkpoint_wal(&connection)?;
         Ok(())
     }
 
@@ -1493,6 +1703,7 @@ impl SqliteStore {
         self.write_meta_tx(&tx, meta)?;
         tx.commit()
             .map_err(|error| anyhow::anyhow!("committing metadata: {error}"))?;
+        self.maybe_checkpoint_wal(&connection)?;
         Ok(())
     }
 
@@ -1639,6 +1850,7 @@ impl SqliteStore {
         self.insert_event_tx(&tx, event)?;
         tx.commit()
             .map_err(|error| anyhow::anyhow!("committing control event: {error}"))?;
+        self.maybe_checkpoint_wal(&connection)?;
         Ok(())
     }
 

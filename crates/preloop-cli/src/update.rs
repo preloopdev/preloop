@@ -153,20 +153,25 @@ pub(crate) async fn run(args: UpdateArgs) -> anyhow::Result<()> {
         None => bail!("release {} has no asset for {target}", release.tag_name),
     };
     if remote_version == current_version {
-        // The version string is self-reported and can lie: a source build or
-        // a tampered binary claims the release version while its bytes
-        // differ, and a version-only gate then declares it up to date
-        // forever (this is how the v0.30.2 deaf-runner fix never reached
-        // production). Verify the installed binary against the checksummed
-        // release asset and reinstall on mismatch.
-        match check_same_version_content(&client, &selected).await {
-            Ok(ContentCheck::Matches) => {
+        // The version string is self-reported and can lie: a source build
+        // claims the release version while it predates the release commit,
+        // and a version-only gate then declares it up to date forever (this
+        // is how the v0.30.2 deaf-runner fix never reached production). But
+        // byte-comparing against the release asset has the opposite failure:
+        // a source build from *newer* main also reports the same version
+        // (no bump between the tag and HEAD) and would be clobbered with the
+        // stale release binary. The commit is the monotonic signal the
+        // version string cannot carry: reinstall only when the release
+        // commit is an ancestor of the installed one (the release is
+        // strictly newer); keep anything newer or unverifiable.
+        match resolve_same_version(&client, &api_url, &release.tag_name).await {
+            Ok(SameVersionDecision::UpToDate) => {
                 println!("preloop {} is already up to date", current_version);
                 return Ok(());
             }
-            Ok(ContentCheck::Drift(staged)) => {
+            Ok(SameVersionDecision::Reinstall) => {
                 println!(
-                    "preloop {} does not match release {}; {} ({target})",
+                    "preloop {} is older than release {}; {} ({target})",
                     current_version,
                     release.tag_name,
                     if args.check {
@@ -178,6 +183,7 @@ pub(crate) async fn run(args: UpdateArgs) -> anyhow::Result<()> {
                 if args.check {
                     return Ok(());
                 }
+                let staged = stage_release(&client, &selected).await?;
                 let lock_path = update_lock_path()?;
                 let _lock = UpdateLock::acquire(&lock_path)?;
                 let executable =
@@ -190,7 +196,9 @@ pub(crate) async fn run(args: UpdateArgs) -> anyhow::Result<()> {
             }
             Err(error) => {
                 // A transient failure to fetch or verify the asset must not
-                // fail the hourly update timer; the next run retries.
+                // fail the hourly update timer; the next run retries. Keep
+                // what is installed: an unverifiable comparison must never
+                // clobber a possibly-newer build.
                 println!(
                     "warning: could not verify the installed binary against release {}: {error:#}",
                     release.tag_name
@@ -722,37 +730,100 @@ async fn stage_release(
     })
 }
 
-enum ContentCheck {
-    Matches,
-    Drift(StagedRelease),
+enum SameVersionDecision {
+    /// Installed binary is the same commit as, or newer than, the release.
+    UpToDate,
+    /// The release commit is an ancestor of the installed one; reinstall.
+    /// The release binary is staged by the caller after the `--check` guard,
+    /// so check-only runs never download the asset.
+    Reinstall,
 }
 
-/// Compare the installed binary against the checksummed release asset.
-async fn check_same_version_content(
+/// Resolve an equal-version install by comparing the commit the installed
+/// binary was built from against the release tag's commit.
+///
+/// The version string is the only thing the two share, so it cannot decide
+/// this case. The embedded build commit is monotonic: a source build from
+/// newer main is a *descendant* of the release commit (keep it — it carries
+/// fixes the release does not), while a source build that predates the
+/// release tag is an *ancestor* (reinstall — this is the v0.30.2 deaf-runner
+/// case where the fix never reached production). Anything unverifiable
+/// (no embedded commit, diverged history, compare API failure) is kept:
+/// clobbering a possibly-newer build on a heuristic is worse than one
+/// extra hourly poll.
+async fn resolve_same_version(
     client: &Client,
-    selected: &SelectedAsset<'_>,
-) -> anyhow::Result<ContentCheck> {
-    let staged = stage_release(client, selected).await?;
+    api_url: &str,
+    release_tag: &str,
+) -> anyhow::Result<SameVersionDecision> {
+    let installed_commit = env!("PRELOOP_BUILD_COMMIT");
+    if installed_commit == "unknown" {
+        println!(
+            "installed binary has no embedded build commit; keeping it (cannot verify against {} {release_tag})",
+            env!("CARGO_PKG_VERSION")
+        );
+        return Ok(SameVersionDecision::UpToDate);
+    }
 
-    let installed = std::env::current_exe().context("locate running preloop executable")?;
-    // macOS installs are launched through the `preloop` symlink into
-    // `<prefix>/bin/preloop`; canonicalize so a future compare of paths
-    // (and anyone reading this) sees the real file.
-    let installed =
-        fs::canonicalize(&installed).with_context(|| format!("resolve {}", installed.display()))?;
-    if installed_binary_matches(&installed, &staged.binary_path)? {
-        Ok(ContentCheck::Matches)
-    } else {
-        Ok(ContentCheck::Drift(staged))
+    let url = compare_url(api_url, installed_commit, release_tag);
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("poll GitHub compare API: {url}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        bail!("GitHub compare API returned {status} for {url}");
+    }
+    #[derive(Deserialize)]
+    struct Compare {
+        status: String,
+    }
+    let compare: Compare = response
+        .json()
+        .await
+        .with_context(|| format!("decode compare response from {url}"))?;
+    match same_version_decision(compare.status.as_str()) {
+        SameVersionOutcome::ReleaseNewer => Ok(SameVersionDecision::Reinstall),
+        SameVersionOutcome::KeepInstalled => Ok(SameVersionDecision::UpToDate),
     }
 }
 
-/// Content comparison behind the same-version check: `true` only when the
-/// installed binary is byte-identical to the release binary. A missing or
-/// unreadable file is an `Err`, never a silent `true` — the caller treats
-/// "unknown" as "keep what is installed and retry later", not "matches".
-fn installed_binary_matches(installed: &Path, release_binary: &Path) -> anyhow::Result<bool> {
-    Ok(sha256_file(installed)? == sha256_file(release_binary)?)
+/// Build the compare API URL from the configured releases API base.
+///
+/// `<base>/releases` (the endpoint `fetch_release` polls) becomes
+/// `<base>/compare/{installed}...{release}`. Deriving from the configured
+/// base keeps GitHub Enterprise and `PRELOOP_RELEASES_API` overrides working
+/// — a hard-coded api.github.com host would fail the comparison for those
+/// setups and never reinstall an older build.
+fn compare_url(api_url: &str, installed_commit: &str, release_tag: &str) -> String {
+    let base = api_url
+        .trim_end_matches('/')
+        .strip_suffix("/releases")
+        .unwrap_or(api_url.trim_end_matches('/'));
+    format!("{base}/compare/{installed_commit}...{release_tag}")
+}
+
+/// Map the GitHub compare API's `status` to a same-version decision.
+///
+/// The endpoint reports from the perspective of `head` (the release tag):
+/// `ahead` means the release is strictly ahead of the installed commit —
+/// reinstall. `behind`/`identical` mean the installed commit is at or
+/// beyond the release — keep. Anything else (a `diverged` history, or an
+/// unexpected status) keeps what is installed: never clobber a real build
+/// over an ambiguous comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SameVersionOutcome {
+    ReleaseNewer,
+    KeepInstalled,
+}
+
+fn same_version_decision(compare_status: &str) -> SameVersionOutcome {
+    match compare_status {
+        "ahead" => SameVersionOutcome::ReleaseNewer,
+        "behind" | "identical" => SameVersionOutcome::KeepInstalled,
+        _ => SameVersionOutcome::KeepInstalled,
+    }
 }
 
 fn extract_binary(archive_path: &Path, destination: &Path) -> anyhow::Result<()> {
@@ -993,6 +1064,70 @@ mod tests {
         assert!(is_binary_entry(Path::new(
             "preloop-v0.22.0-aarch64-apple-darwin/preloop"
         )));
+    }
+
+    /// The release commit is strictly ahead of the installed commit (a
+    /// source build older than the tag — the v0.30.2 deaf-runner case):
+    /// reinstall so the fix that never reached production finally does.
+    #[test]
+    fn same_version_release_ahead_reinstalls() {
+        assert_eq!(
+            same_version_decision("ahead"),
+            SameVersionOutcome::ReleaseNewer
+        );
+    }
+
+    /// Installed commit is at or beyond the release (a source build from
+    /// newer main with no version bump — the production regression this
+    /// replaces the byte compare for): keep the newer build.
+    #[test]
+    fn same_version_installed_at_or_ahead_keeps() {
+        assert_eq!(
+            same_version_decision("behind"),
+            SameVersionOutcome::KeepInstalled
+        );
+        assert_eq!(
+            same_version_decision("identical"),
+            SameVersionOutcome::KeepInstalled
+        );
+    }
+
+    /// A diverged history (or any unexpected status) must keep what is
+    /// installed: clobbering a real build over an ambiguous comparison is
+    /// the failure mode we are removing.
+    #[test]
+    fn same_version_diverged_or_unknown_keeps() {
+        for status in ["diverged", "unknown", "unexpected"] {
+            assert_eq!(
+                same_version_decision(status),
+                SameVersionOutcome::KeepInstalled,
+                "status {status:?} must keep installed"
+            );
+        }
+    }
+
+    /// The compare endpoint must derive from the configured releases API
+    /// base, not a hard-coded github.com host — a GitHub Enterprise or
+    /// overridden endpoint would otherwise always fail the comparison and
+    /// never reinstall an older build.
+    #[test]
+    fn compare_url_derives_from_the_configured_api_base() {
+        for (api_url, expected_base) in [
+            (
+                "https://api.github.com/repos/preloopdev/preloop/releases",
+                "https://api.github.com/repos/preloopdev/preloop/compare",
+            ),
+            (
+                "https://github.example.com/api/v3/repos/acme/preloop/releases",
+                "https://github.example.com/api/v3/repos/acme/preloop/compare",
+            ),
+        ] {
+            assert_eq!(
+                compare_url(api_url, "deadbeef", "v0.30.10"),
+                format!("{expected_base}/deadbeef...v0.30.10"),
+                "compare URL must use the configured API base: {api_url}"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -1360,74 +1495,6 @@ mod tests {
 
         extract_binary(&archive_path, &output_path).expect("extract binary");
         assert_eq!(std::fs::read(output_path).expect("binary"), contents);
-    }
-
-    #[test]
-    fn content_check_detects_same_version_drift() {
-        // The v0.30.2 incident: a locally built binary claimed the release
-        // version string, so the version-only gate declared it up to date
-        // and the shipped fix never installed. The same-version check must
-        // compare bytes, not versions: identical content matches, drifted
-        // content (same claimed version) does not, and an unreadable file is
-        // an error rather than a silent match.
-        let temp = tempfile::tempdir().expect("staging directory");
-        let installed = temp.path().join("installed");
-        let release = temp.path().join("release");
-        std::fs::write(&installed, b"installed-build").unwrap();
-        std::fs::write(&release, b"installed-build").unwrap();
-        assert!(
-            installed_binary_matches(&installed, &release).expect("both files readable"),
-            "byte-identical binaries must match"
-        );
-        std::fs::write(&release, b"release-build").unwrap();
-        assert!(
-            !installed_binary_matches(&installed, &release).expect("both files readable"),
-            "drifted content at the same version must be detected"
-        );
-        assert!(
-            installed_binary_matches(&installed, &temp.path().join("missing")).is_err(),
-            "an unreadable binary must not be reported as matching"
-        );
-    }
-
-    #[test]
-    fn extract_then_content_check_rejects_a_tampered_archive_payload() {
-        use flate2::write::GzEncoder;
-        use flate2::Compression;
-
-        let temp = tempfile::tempdir().expect("staging directory");
-        let archive_path = temp.path().join("preloop-cli-aarch64-apple-darwin.tar.gz");
-        let file = std::fs::File::create(&archive_path).expect("archive");
-        let encoder = GzEncoder::new(file, Compression::default());
-        let mut builder = tar::Builder::new(encoder);
-        // Same archive layout, different payload bytes than the "installed"
-        // binary that claims the same version.
-        let payload = b"drifted-release-payload";
-        let mut header = tar::Header::new_gnu();
-        header.set_size(payload.len() as u64);
-        header.set_mode(0o755);
-        header.set_cksum();
-        builder
-            .append_data(
-                &mut header,
-                "preloop-cli-aarch64-apple-darwin/preloop",
-                &payload[..],
-            )
-            .expect("binary entry");
-        builder
-            .into_inner()
-            .expect("gzip stream")
-            .finish()
-            .expect("archive");
-
-        let installed = temp.path().join("installed");
-        std::fs::write(&installed, b"local-build-claiming-same-version").unwrap();
-        let extracted = temp.path().join(binary_name());
-        extract_binary(&archive_path, &extracted).expect("extract binary");
-        assert!(
-            !installed_binary_matches(&installed, &extracted).expect("both files readable"),
-            "a drifted payload at the same version must trigger reinstall"
-        );
     }
 
     #[test]

@@ -117,7 +117,12 @@ pub(crate) async fn twirp_artifact_v2_create(
         }
     }
     let upload_url = format!("{}/twirp-blob/artifact/{token}", runner_base_url());
-    info!(token, name = request.name, "artifact v2 create");
+    info!(
+        name = request.name,
+        workflow_run_backend_id = request.workflow_run_backend_id,
+        workflow_job_run_backend_id = request.workflow_job_run_backend_id,
+        "artifact v2 create"
+    );
     Ok(Json(json!({ "ok": true, "signed_upload_url": upload_url })))
 }
 

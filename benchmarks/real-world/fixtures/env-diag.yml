@@ -1,0 +1,23 @@
+name: env-diag
+on: push
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dump environment
+        run: |
+          echo "HOME=$HOME"
+          echo "USER=$(id -un)"
+          echo "PATH=$PATH"
+          echo "RUSTUP_HOME=${RUSTUP_HOME:-unset}"
+          echo "CARGO_HOME=${CARGO_HOME:-unset}"
+          echo "--- cargo ---"
+          which cargo; cargo --version 2>&1 | head -1
+          echo "--- rustup ---"
+          which rustup; rustup show 2>&1 | head -5 || echo "rustup show failed"
+          echo "--- sudo ---"
+          which sudo || echo "no sudo"
+          echo "--- pip pep668 ---"
+          ls /usr/lib/python3.12/EXTERNALLY-MANAGED 2>/dev/null && echo "PEP668-MARKER-PRESENT" || echo "no-pep668-marker"
+          echo "--- tools ---"
+          which go node python3 protoc clang-18 clang-22 git make 2>/dev/null

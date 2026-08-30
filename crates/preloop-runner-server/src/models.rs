@@ -188,6 +188,12 @@ pub(crate) struct QueuedJob {
     pub(crate) run_id: RunId,
     pub(crate) job_id: JobId,
     pub(crate) base_id: String,
+    /// Unix nanoseconds when the job entered the ready queue, used to
+    /// measure true queue latency at claim time. `0` means unknown (a
+    /// snapshot persisted before this field existed); such jobs are not
+    /// recorded, so a restart never fabricates a latency.
+    #[serde(default)]
+    pub(crate) enqueued_at_unix_nanos: i64,
     pub(crate) needs: Vec<JobId>,
     pub(crate) if_condition: Option<String>,
     pub(crate) condition_context: preloop_gha_expressions::Context,
@@ -330,4 +336,13 @@ pub(crate) struct ArtifactV2Entry {
     pub(crate) digest: Option<String>,
     /// Upload token used to find the assembled blob on disk.
     pub(crate) blob_token: String,
+}
+
+/// Unix nanoseconds now, for queue-latency bookkeeping. `i64` keeps the
+/// field serde-friendly (it travels in persisted job snapshots).
+pub(crate) fn now_unix_nanos() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
 }

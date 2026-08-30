@@ -1,11 +1,16 @@
 runner_version = "2.336.0"
 
-# SmolVM runtime floor: v1.8.1 preserves archived UID/GID metadata while
-# extracting packed machines. `preloop update --ensure-runtime` accepts any
-# stable release >= this and installs the latest stable when the local runtime
-# is below the floor or lacks the required socket capability. Compiled into
-# preloop-cli and preloop-vm. Keep it at the first release that satisfies all
-# runtime invariants; the golden release pin below is Renovate-managed.
+# SmolVM runtime floor: v1.8.1 is the first release that restores archived
+# UID/GID metadata when extracting packed machines — but only for an
+# UNPRIVILEGED smolvm. Run as root, the per-VM uid drop presents packed layers
+# through a count-1 idmapped mount and every non-zero uid surfaces as the
+# overflow uid (65534); see docs/internal/workflows.md. preloop.service runs
+# unprivileged, so the floor holds for us. `preloop update --ensure-runtime`
+# accepts any stable release >= this and installs the latest stable when the
+# local runtime is below the floor or lacks the required socket capability.
+# Compiled into preloop-cli and preloop-vm. Keep it at the first release that
+# satisfies all runtime invariants; the golden release pin below is
+# Renovate-managed.
 smolvm_min_version = "1.8.1"
 
 # SmolVM release the golden-image workflow (.github/workflows/release-golden.yml)
@@ -13,7 +18,7 @@ smolvm_min_version = "1.8.1"
 # .github/workflows/smolvm-release-verify.yml gates the merge with the real-VM
 # E2E on the smolvm-host. Deliberately separate from smolvm_min_version:
 # goldens track the last *verified* release, the runtime floor rarely moves.
-smolvm_golden_version = "1.8.2"
+smolvm_golden_version = "1.13.1"
 
 # Image inputs for the runner golden. The OCI bases are immutable filesystem
 # inputs. `github_runner_image_version` is the actions/runner-images snapshot

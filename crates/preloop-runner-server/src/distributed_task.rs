@@ -324,7 +324,29 @@ pub(crate) async fn agent_request_patch(
     Path((pool_id, request_id)): Path<(i64, i64)>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    info!(?body, "agent_request_patch received");
+    // `result` is untyped request content; never log it raw. Derive a fixed
+    // label from the status mapping instead ("success"/"failure"/…, or
+    // "unknown"/"renew").
+    let has_result = body.get("result").is_some();
+    let result_hint = body
+        .get("result")
+        .and_then(|v| v.as_str())
+        .and_then(execution_status_from_runner_result)
+        .map(|status| format!("{status:?}").to_ascii_lowercase())
+        .unwrap_or_else(|| {
+            if has_result {
+                "unknown".to_owned()
+            } else {
+                "renew".to_owned()
+            }
+        });
+    info!(
+        pool_id,
+        request_id,
+        result = %result_hint,
+        has_result,
+        "agent_request_patch received"
+    );
     // If this is a completion (has result), delegate to complete_job_inner
     // so summarize_run, promote_ready_jobs, and notify_waiters all fire.
     // The result field is only present on the final PATCH; renewals have no result.
@@ -332,7 +354,11 @@ pub(crate) async fn agent_request_patch(
         let new_status = match execution_status_from_runner_result(result) {
             Some(status) => status,
             None => {
-                info!(request_id, %result, "unknown agent_request_patch result; skipping completion");
+                info!(
+                        request_id,
+                        result = %result_hint,
+                        "unknown agent_request_patch result; skipping completion"
+                );
                 return Json(
                     json!({ "requestId": request_id, "lockedUntil": agent_request_locked_until() }),
                 );
@@ -352,11 +378,17 @@ pub(crate) async fn agent_request_patch(
                 inner.inflight_requests.remove(&request_id);
                 info!(
                     request_id,
-                    result, "agent request already completed; refreshing result only"
+                    result = %result_hint,
+                    "agent request already completed; refreshing result only"
                 );
                 None
             } else if let Some((run_id, job_id)) = inner.inflight_requests.remove(&request_id) {
-                info!(%run_id, %job_id, result, "job completed via agent_request_patch");
+                info!(
+                    %run_id,
+                    %job_id,
+                    result = %result_hint,
+                    "job completed via agent_request_patch"
+                );
                 Some(JobCompletion {
                     run_id,
                     job_id,

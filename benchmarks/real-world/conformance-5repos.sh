@@ -28,7 +28,7 @@ POOL_SIZE="${PRELOOP_RUNNER_POOL_SIZE:-1}"
 HOST_HOME="${HOME:-}"
 SMOLVM_PROCESS_HOME="${CONFORMANCE_SMOLVM_HOME:-$CAMPAIGN_HOME/smolvm-home}"
 export PRELOOP_SYSTEM_TOKEN="${PRELOOP_SYSTEM_TOKEN:-preloop-system-token}"
-export PRELOOP_CLIENT_TIMEOUT_SECONDS="${PRELOOP_CLIENT_TIMEOUT_SECONDS:-600}"
+export PRELOOP_CLIENT_TIMEOUT_SECONDS="${PRELOOP_CLIENT_TIMEOUT_SECONDS:-3600}"
 
 SERVER_BIN="${PRELOOP_BIN:-$ROOT/target/debug/preloop}"
 CLIENT_BIN="${PRELOOP_CLIENT_BIN:-$ROOT/target/debug/preloop-runner-client}"
@@ -84,23 +84,44 @@ target_cfg() {
       # frontend-metrics.yml was renamed to frontend-lint.yml upstream.
       echo "grafana https://github.com/grafana/grafana.git main .github/workflows/frontend-lint.yml push refs/heads/main" ;;
     deno/ci)
+      # ci.generated.yml is 36 jobs -> 134 after matrix expansion (each job is
+      # well under GitHub's 256-per-job cap; the earlier "408 sections" count
+      # was a misread). It is the only deno workflow that triggers on push;
+      # the compat-test and pr workflows are schedule/pull_request-only.
       echo "deno https://github.com/denoland/deno.git main .github/workflows/ci.generated.yml push refs/heads/main" ;;
     pydantic/ci)
       echo "pydantic https://github.com/pydantic/pydantic.git main .github/workflows/ci.yml push refs/heads/main" ;;
     pydantic/test)
-      echo "pydantic https://github.com/pydantic/pydantic.git main .github/workflows/test.yml push refs/heads/main" ;;
+      # pydantic has no test.yml; its test suite lives in ci.yml (the pydantic/ci
+      # target). Use the other large matrix workflow for this target.
+      echo "pydantic https://github.com/pydantic/pydantic.git main .github/workflows/third-party.yml push refs/heads/main" ;;
     valkey/ci)
       echo "valkey https://github.com/valkey-io/valkey.git unstable .github/workflows/ci.yml push refs/heads/unstable" ;;
     cli/test)
-      echo "cli https://github.com/cli/cli.git trunk .github/workflows/test.yml push refs/heads/trunk" ;;
+      # cli has no test.yml; its test suite is go.yml (tests + lint).
+      echo "cli https://github.com/cli/cli.git trunk .github/workflows/go.yml push refs/heads/trunk" ;;
     cli/lint)
       echo "cli https://github.com/cli/cli.git trunk .github/workflows/lint.yml push refs/heads/trunk" ;;
+    typescript/ci)
+      echo "typescript https://github.com/microsoft/TypeScript.git main .github/workflows/ci.yml push refs/heads/main" ;;
+    nodejs/test)
+      echo "nodejs https://github.com/nodejs/node.git main .github/workflows/test-linux.yml push refs/heads/main" ;;
+    react/ci)
+      echo "react https://github.com/facebook/react.git main .github/workflows/runtime_build_and_test.yml push refs/heads/main" ;;
+    vscode/test)
+      # pr.yml is pull_request-only; the script's push->pull_request retry
+      # handles it (payload now carries an action).
+      echo "vscode https://github.com/microsoft/vscode.git main .github/workflows/pr.yml push refs/heads/main" ;;
+    spark/ci)
+      # build_and_test.yml is workflow_call-only; build_main.yml is the push
+      # entry point that calls it.
+      echo "spark https://github.com/apache/spark.git master .github/workflows/build_main.yml push refs/heads/master" ;;
     *) return 1 ;;
   esac
 }
 
 all_targets() {
-  echo "grafana/ci grafana/frontend-metrics deno/ci pydantic/ci pydantic/test valkey/ci cli/test cli/lint"
+  echo "grafana/ci grafana/frontend-metrics deno/ci pydantic/ci pydantic/test valkey/ci cli/test cli/lint typescript/ci nodejs/test react/ci vscode/test spark/ci"
 }
 
 repo_targets() {
@@ -110,6 +131,11 @@ repo_targets() {
     pydantic) echo "pydantic/ci pydantic/test" ;;
     valkey) echo "valkey/ci" ;;
     cli) echo "cli/test cli/lint" ;;
+    typescript) echo "typescript/ci" ;;
+    nodejs) echo "nodejs/test" ;;
+    react) echo "react/ci" ;;
+    vscode) echo "vscode/test" ;;
+    spark) echo "spark/ci" ;;
     *) return 1 ;;
   esac
 }
@@ -138,7 +164,15 @@ prepare_golden_home() {
   # so nothing is curated and there are no toolchains).
   fingerprint="$(python3 - "$OFFICIAL_GOLDEN_BASE" <<'INNERPY'
 import hashlib, json, sys
-normalized = {"base": sys.argv[1], "toolchains": [], "curated": False, "bake": ""}
+import platform
+rosetta = platform.system() == "Darwin" and platform.machine() in ("arm64", "aarch64")
+normalized = {
+    "base": sys.argv[1],
+    "toolchains": [],
+    "curated": False,
+    "bake": "",
+    "rosetta_libs": rosetta,
+}
 print(hashlib.sha256(json.dumps(normalized, separators=(",", ":")).encode()).hexdigest())
 INNERPY
 )"
@@ -269,11 +303,20 @@ except subprocess.CalledProcessError:
     before = "0" * 40
 # A campaign run is intentionally a synthetic "changed everything" event:
 # it must exercise the selected workflow even when the current upstream commit
-# touched an unrelated path.  The list is complete, so the server can still
-# evaluate path filters without guessing.
-paths = git("ls-files")
+# touched an unrelated path.  The full `ls-files` list is deliberately NOT
+# used: the payload is embedded in every job message's github context, so a
+# multi-thousand-file list makes run creation take minutes per workflow
+# (measured: 3000+ paths -> >120s; 2 paths -> 9s).  Path filters only need a
+# non-empty set that is not fully ignored, so a spread sample of the tree is
+# enough to make the workflow run.
+all_paths = git("ls-files")
+paths = all_paths[:25] + all_paths[-25:]
 
 print(json.dumps({
+    # pull_request activity type: the server's event matcher requires one of
+    # the default PR types (opened/synchronize/reopened) when a workflow
+    # declares a pull_request trigger; the push submission ignores it.
+    "action": "synchronize",
     "before": before,
     "after": head,
     "ref": f"refs/heads/{branch}",
@@ -326,13 +369,15 @@ EOF
   clone_repo "$slug" "$url" "$branch"
   ws_dir="$WORKSPACE_ROOT/$slug"
   [ -f "$ws_dir/$workflow" ] || fail "$target workflow is missing after checkout: $ws_dir/$workflow"
+  repo_slug="$(echo "$url" | sed -E 's#^https://github.com/([^/]+/[^/.]+)(\.git)?$#\1#' | sed 's/\.git$//')"
+  [ -n "$repo_slug" ] || repo_slug="$slug"
   target_dir="$OUTPUT_ROOT/$target"
   rm -rf "$target_dir"
   mkdir -p "$target_dir"
   write_push_payload "$ws_dir" "$branch" "$target_dir/event.json"
   echo "=== [$target] submitting $workflow ($event $git_ref) ==="
   if ! submit="$("$CLIENT_BIN" --server "http://127.0.0.1:$PORT" submit \
-    -W "$ws_dir/$workflow" --workspace-root "$ws_dir" \
+    -W "$ws_dir/$workflow" --workspace-root "$ws_dir" --repository "$repo_slug" \
     --git-ref "$git_ref" --event "$event" --payload "$target_dir/event.json" 2>&1)"; then
     # Some upstream workflows intentionally omit push and only accept
     # pull_request.  The same complete changed-file payload is valid for the
@@ -341,7 +386,7 @@ EOF
       event="pull_request"
       echo "[$target] retrying with pull_request trigger"
       submit="$("$CLIENT_BIN" --server "http://127.0.0.1:$PORT" submit \
-        -W "$ws_dir/$workflow" --workspace-root "$ws_dir" \
+        -W "$ws_dir/$workflow" --workspace-root "$ws_dir" --repository "$repo_slug" \
         --git-ref "$git_ref" --event "$event" --payload "$target_dir/event.json" 2>&1)" || {
           printf '%s\n' "$submit" | tee "$target_dir/submit.txt"
           fail "[$target] workflow submission failed"
@@ -355,8 +400,11 @@ EOF
   run_id="$(printf '%s\n' "$submit" | python3 -c 'import json,sys; print(json.load(sys.stdin)["run_id"])')"
   printf '%s\n' "$run_id" >"$target_dir/run-id.txt"
   final_status="$(wait_run "$target" "$run_id")"
-  run_snapshot "$run_id" "$target_dir/run.json"
-  printf '%s\n' "$final_status" >"$target_dir/status.txt"
+  # The snapshot curl and status write must never kill the campaign under
+  # `set -e`: a transient server hiccup after the run concluded would abort
+  # the whole run and lose the recorded result.
+  run_snapshot "$run_id" "$target_dir/run.json" || true
+  printf '%s\n' "$final_status" >"$target_dir/status.txt" || true
   echo "=== [$target] final status: $final_status ==="
   case "$final_status" in
     success|skipped) ;;

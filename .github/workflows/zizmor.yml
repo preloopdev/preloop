@@ -12,7 +12,7 @@ on:
 jobs:
   zizmor:
     name: GitHub Actions Security Analysis with zizmor
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     permissions:
       contents: read
     steps:
@@ -26,3 +26,13 @@ jobs:
 
       - name: Run zizmor
         run: uvx zizmor .github/workflows/
+
+      # zizmor checks that actions are SHA-pinned; this checks that the
+      # `# <ref>` comment beside each SHA is true. Renovate reads that comment
+      # to decide what the pin is, and silently skips any pin without one, so a
+      # missing or stale comment freezes the action with no signal. Eight pins
+      # were frozen this way before this check existed.
+      - name: Verify action pin comments match their SHAs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/verify-action-pins.py .github/workflows

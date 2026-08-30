@@ -364,6 +364,21 @@ pub struct AppState {
     /// lock.  Monotonically increases; the inner counter is no longer the
     /// source of truth once this is in use.
     pub(crate) next_request_id: Arc<std::sync::atomic::AtomicI64>,
+    /// Observability handle (cloneable, holds heartbeat & limit registries).
+    pub(crate) observability: preloop_observability::Observability,
+    /// Cached operational snapshot, updated every 5s by the sampler without holding `inner`.
+    pub status_snapshot:
+        Arc<parking_lot::RwLock<preloop_observability::status::OperationalSnapshot>>,
+    /// (run, job) pairs whose terminal transition has already been recorded
+    /// (`preloop.job.completed` metric + terminal log). Seeded from the
+    /// restored run record at startup; guards `emit` so a replayed terminal
+    /// `JobStatus` (repeated timeline PATCH after completion) is recorded
+    /// exactly once per job.
+    pub(crate) terminal_jobs_recorded: Arc<std::sync::Mutex<BTreeSet<(RunId, JobId)>>>,
+    /// Consolidated pool handle replacing the four ad-hoc Option<Arc<…>> fields.
+    pub pool_status: Arc<preloop_observability::status::PoolStatus>,
+    /// When this AppState was created (for uptime).
+    pub(crate) started_at: std::time::Instant,
     /// Jobs accepted and still waiting for a runner, refreshed whenever one
     /// is claimed. A supervising runner pool reads it to decide whether the
     /// work already queued outruns the runners it has left.
@@ -552,6 +567,96 @@ pub(crate) enum JobSetAdmissionResult {
     Blocked,
 }
 
+/// Bounded conclusion label for a terminal execution status.
+fn execution_conclusion(status: preloop_gha_protocol::ExecutionStatus) -> &'static str {
+    use preloop_gha_protocol::ExecutionStatus as S;
+    match status {
+        S::Success => "success",
+        S::Failure => "failure",
+        S::Cancelled => "cancelled",
+        S::Skipped => "skipped",
+        // Non-terminal statuses never reach here; the guard filters them.
+        _ => "unrecognized",
+    }
+}
+
+/// Classify a termination reason into a bounded code.
+///
+/// The control plane's `reason` is not a code — several paths build a prose
+/// sentence that interpolates the job's `runs-on` labels (see the starvation
+/// sweep in `bootstrap.rs`). Those values are user-controlled, so the raw
+/// string must never reach a metric label: it would both explode cardinality
+/// and export workflow content. Classify by the stable prefix each path
+/// writes, and fall back to `unrecognized` rather than passing prose through.
+///
+/// The full message is still available on the structured log record; only the
+/// metric dimension is bounded.
+fn bounded_termination_reason(value: &str) -> &'static str {
+    // Exact codes first — these come from `concurrency::*_reason()`.
+    match value {
+        "concurrency_pending" => return "concurrency_pending",
+        "concurrency_cancelled" => return "concurrency_cancelled",
+        "timeout" => return "timeout",
+        "no_runner" => return "no_runner",
+        "lease_expired" => return "lease_expired",
+        "deaf_runner" => return "deaf_runner",
+        "startup_orphan" => return "startup_orphan",
+        _ => {}
+    }
+    // Prose paths — match on the invariant phrase, never the whole string, so
+    // an interpolated label or platform cannot change the classification.
+    //
+    // Two distinct never-claimable conditions, and conflating them would hide
+    // the difference between "wait or add capacity" and "this will never work
+    // until you register that platform":
+    //   - the starvation sweep, which fires after a grace window;
+    //   - the external-host check, where the server has no runner of that
+    //     platform class at all (`no {platform} runner is registered with
+    //     this server, so `runs-on: …` cannot be scheduled`).
+    // The starvation prose interpolates workflow-controlled `runs-on`
+    // labels, so the anchored prefix MUST be checked before the substring:
+    // a crafted label containing the platform phrase must not flip a
+    // starvation reason into `no_platform_runner`.
+    if value.starts_with("no runner is registered for") {
+        return "no_runner";
+    }
+    if value.contains("runner is registered with this server") {
+        return "no_platform_runner";
+    }
+    if value.starts_with("job exceeded its timeout")
+        || value.starts_with("timed out")
+        || value.contains("timeout-minutes")
+    {
+        return "timeout";
+    }
+    if value.starts_with("runner stopped polling") || value.contains("deaf") {
+        return "deaf_runner";
+    }
+    if value.contains("lease expired") {
+        return "lease_expired";
+    }
+    "unrecognized"
+}
+
+/// Bound free-form reason prose for export as a telemetry attribute. The
+/// prose interpolates workflow input (e.g. `runs-on` labels), so one job
+/// must not emit an arbitrarily large attribute. Truncation cuts on a
+/// character boundary — byte slicing panics on multi-byte input.
+fn bounded_reason_detail(detail: &str) -> String {
+    const DETAIL_MAX: usize = 512;
+    let mut detail = detail.to_string();
+    if detail.len() > DETAIL_MAX {
+        let cut = detail
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|&i| i <= DETAIL_MAX)
+            .last()
+            .unwrap_or(0);
+        detail.truncate(cut);
+    }
+    detail
+}
+
 impl AppState {
     pub async fn new(state_dir: PathBuf) -> anyhow::Result<Self> {
         let config_path = crate::config::config_path();
@@ -645,6 +750,21 @@ impl AppState {
             .unwrap_or(0)
             .saturating_add(1);
         let inner = recovered;
+        // Seed the terminal-transition marker from the restored run record so
+        // a replayed terminal `JobStatus` after a restart cannot double-record
+        // `preloop.job.completed` for a job that already completed.
+        let terminal_jobs_recorded = Arc::new(std::sync::Mutex::new(
+            inner
+                .runs
+                .iter()
+                .flat_map(|(run_id, run)| {
+                    run.jobs
+                        .iter()
+                        .filter(|(_, status)| status.is_terminal())
+                        .map(move |(job_id, _)| (*run_id, job_id.clone()))
+                })
+                .collect::<BTreeSet<(RunId, JobId)>>(),
+        ));
         // Capture queue length before moving `inner` into the Mutex so the
         // `queue_depth` atomic is set to the recovered ready-queue size.
         let recovered_queue_len = inner.queue.len();
@@ -786,6 +906,13 @@ impl AppState {
             events,
             message_notify: Arc::new(Notify::new()),
             next_request_id: Arc::new(std::sync::atomic::AtomicI64::new(next_request_id)),
+            observability: preloop_observability::Observability::noop(),
+            status_snapshot: Arc::new(parking_lot::RwLock::new(
+                preloop_observability::status::OperationalSnapshot::default(),
+            )),
+            terminal_jobs_recorded,
+            pool_status: Arc::new(preloop_observability::status::PoolStatus::default()),
+            started_at: std::time::Instant::now(),
             // Mirror the recovered ready-queue size so an on-demand runner
             // pool spawns against the right workload after restart.
             queue_depth: Arc::new(std::sync::atomic::AtomicUsize::new(recovered_queue_len)),
@@ -826,6 +953,93 @@ impl AppState {
             _ => None,
         };
         let has_run_projection = run_id.is_some();
+        if let NdjsonEvent::RunAccepted { queued_jobs, .. } = &event {
+            self.observability.export_log(
+                "INFO",
+                "run.accepted",
+                vec![
+                    ("event.name".to_string(), "run.accepted".to_string()),
+                    ("queued_jobs".to_string(), queued_jobs.to_string()),
+                ],
+            );
+        }
+        // Record job terminal transitions exactly once per job. `is_terminal`
+        // alone is not enough: repeated timeline PATCHes (and replayed
+        // completions) can re-deliver a terminal `JobStatus` after the job
+        // already completed, and every delivery would inflate
+        // `preloop.job.completed` and duplicate the terminal log record.
+        // The first terminal event for a job wins; the marker is seeded from
+        // the restored run record at startup so a post-restart replay cannot
+        // double-record either. Recording here rather than at the state
+        // mutation avoids double-counting on duplicate `store_run_event`
+        // emits. A duplicate event is still a duplicate — drop it entirely
+        // (side effects, persistence and broadcast) rather than re-append the
+        // same terminal record to the timeline.
+        match &event {
+            NdjsonEvent::JobStatus {
+                run_id,
+                job_id,
+                status,
+                reason,
+                ..
+            } if status.is_terminal() => {
+                let first_terminal = self
+                    .terminal_jobs_recorded
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert((*run_id, job_id.clone()));
+                if !first_terminal {
+                    return;
+                }
+                let conclusion = execution_conclusion(*status);
+                // `reason: None` is the common case (most terminal transitions
+                // carry none) and means "no reason supplied" — not
+                // "unrecognized". Only a value outside the emitted set is
+                // `unrecognized`, which keeps the label bounded without
+                // mislabelling the majority.
+                let bounded_reason = match reason.as_deref() {
+                    None => "unspecified",
+                    Some(value) => bounded_termination_reason(value),
+                };
+                self.observability
+                    .metrics()
+                    .lifecycle
+                    .record_job_completed(conclusion, bounded_reason);
+                self.observability.export_log(
+                    if *status == preloop_gha_protocol::ExecutionStatus::Success {
+                        "INFO"
+                    } else {
+                        "WARN"
+                    },
+                    // A terminal JobStatus is a status transition, not the
+                    // separate JobCompleted event; naming both `job.completed`
+                    // conflated two distinct records in the log stream.
+                    "job.status.terminal",
+                    {
+                        let mut attributes = vec![
+                            ("event.name".to_string(), "job.status.terminal".to_string()),
+                            ("conclusion".to_string(), conclusion.to_string()),
+                            ("reason".to_string(), bounded_reason.to_string()),
+                        ];
+                        // The bounded code is the metric dimension; the prose
+                        // is what an operator actually needs to act. Logs may
+                        // carry it (they are not a label space), and without
+                        // it an `unrecognized` classification is a dead end —
+                        // you cannot tell which path produced it.
+                        if let Some(detail) = reason.as_deref() {
+                            attributes
+                                .push(("reason.detail".to_string(), bounded_reason_detail(detail)));
+                        }
+                        attributes
+                    },
+                );
+            }
+            // `NdjsonEvent::JobCompleted` has no constructor anywhere in the
+            // workspace — the terminal transition is reported as a terminal
+            // `JobStatus`, which the arm above records. Keeping a counter
+            // call here would make the record look double-sourced.
+            _ => {}
+        }
         // Capture the projection under the lock, then persist after releasing
         // it: a slow or unavailable backend must not stall the control plane
         // (runner polling, heartbeats, other state mutations).
@@ -1291,5 +1505,108 @@ mod tests {
             !state.verify_action_ticket("acme", "repo\nv1", "x", expires_at, &signature),
             "a ticket for one action must not validate for a newline-split twin"
         );
+    }
+}
+
+#[cfg(test)]
+mod termination_reason_tests {
+    use super::bounded_termination_reason;
+
+    #[test]
+    fn exact_codes_pass_through() {
+        assert_eq!(
+            bounded_termination_reason("concurrency_cancelled"),
+            "concurrency_cancelled"
+        );
+        assert_eq!(bounded_termination_reason("timeout"), "timeout");
+    }
+
+    #[test]
+    fn starvation_prose_classifies_to_no_runner() {
+        // The starvation sweep builds this sentence with the job's runs-on
+        // labels interpolated. It must classify, not pass through.
+        let prose = "no runner is registered for `runs-on: self-hosted, Linux, ARM64` and none \
+                     appeared within 120s, so the job cannot be scheduled";
+        assert_eq!(bounded_termination_reason(prose), "no_runner");
+    }
+
+    #[test]
+    fn user_controlled_labels_never_become_the_label() {
+        // A hostile or merely unusual `runs-on` must not reach the metric.
+        let prose = "no runner is registered for `runs-on: attacker-controlled-\u{1F4A5}-label` \
+                     and none appeared within 120s, so the job cannot be scheduled";
+        let bounded = bounded_termination_reason(prose);
+        assert_eq!(bounded, "no_runner");
+        assert!(!bounded.contains("attacker"));
+    }
+
+    #[test]
+    fn external_host_prose_is_its_own_code() {
+        // `{platform}` is interpolated, so match the invariant phrase.
+        for platform in ["windows", "macos", "freebsd-13"] {
+            let prose = format!(
+                "no {platform} runner is registered with this server, so \
+                 `runs-on: {platform}-latest` cannot be scheduled"
+            );
+            assert_eq!(
+                bounded_termination_reason(&prose),
+                "no_platform_runner",
+                "{platform} must classify distinctly from the starvation sweep"
+            );
+        }
+    }
+
+    #[test]
+    fn reason_detail_is_bounded_on_a_char_boundary() {
+        use super::bounded_reason_detail;
+        // 4-byte characters: 300 of them is 1200 bytes, way over the cap.
+        let long = "w".repeat(300);
+        let bounded = bounded_reason_detail(&long);
+        assert!(bounded.len() <= 512);
+        assert!(bounded.is_char_boundary(bounded.len()));
+        // Short prose passes through untouched.
+        assert_eq!(bounded_reason_detail("short"), "short");
+    }
+
+    #[test]
+    fn crafted_runs_on_label_cannot_flip_the_classification() {
+        // The starvation prose interpolates `runs-on` labels verbatim. A
+        // label containing the platform phrase must still classify as
+        // `no_runner` — the anchored prefix is checked first.
+        let starved = "no runner is registered for `runs-on: self-hosted, \
+                       runner is registered with this server` and none \
+                       appeared within 120s, so the job cannot be scheduled";
+        assert_eq!(bounded_termination_reason(starved), "no_runner");
+    }
+
+    #[test]
+    fn platform_and_starvation_do_not_collide() {
+        let starved = "no runner is registered for `runs-on: self-hosted, Linux, ARM64` and none \
+                       appeared within 120s, so the job cannot be scheduled";
+        let platform = "no windows runner is registered with this server, so \
+                        `runs-on: windows-latest` cannot be scheduled";
+        assert_eq!(bounded_termination_reason(starved), "no_runner");
+        assert_eq!(bounded_termination_reason(platform), "no_platform_runner");
+    }
+
+    #[test]
+    fn unknown_prose_is_bounded_not_passed_through() {
+        let bounded = bounded_termination_reason("something entirely new happened with id-99999");
+        assert_eq!(bounded, "unrecognized");
+        assert!(!bounded.contains("99999"));
+    }
+
+    #[test]
+    fn classification_is_a_finite_set() {
+        // Drive 1,000 distinct prose strings; the label set must stay bounded.
+        let mut seen = std::collections::BTreeSet::new();
+        for i in 0..1000 {
+            let prose = format!(
+                "no runner is registered for `runs-on: label-{i}` and none appeared within 120s"
+            );
+            seen.insert(bounded_termination_reason(&prose));
+            seen.insert(bounded_termination_reason(&format!("novel reason {i}")));
+        }
+        assert_eq!(seen.len(), 2, "expected exactly no_runner + unrecognized");
     }
 }
