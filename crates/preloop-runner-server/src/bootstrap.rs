@@ -181,16 +181,31 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
     // left the queue drop their entry, so no enqueue-site coordination is
     // needed and the map cannot go stale. While a co-hosted pool is still
     // preparing its machine image (artifact download or build, golden prep)
-    // it cannot register a runner no matter how long the job waits, so the
-    // clock is reset for the whole warm: a job queued mid-warm gets a full
-    // grace window once provisioning actually starts.
+    // or booting a runner it cannot register a runner no matter how long the
+    // job waits, so the clock is reset for the whole warm: a job queued
+    // mid-warm gets a full grace window once provisioning actually starts.
+    // The reset is bounded by MAX_QUEUED_GRACE (see below) so continuous
+    // provisioning cannot pause the clock forever.
     const QUEUED_JOB_GRACE: Duration = Duration::from_secs(120);
+    // Absolute backstop, measured from ready-enqueue, on how long
+    // provisioning/preparing may pause a job's starvation clock. It protects
+    // a job whose runner is genuinely on the way, but keeps continuous
+    // successor prebuilds or a provision that fails and retries forever from
+    // masking an unschedulable job (bad `runs-on`, or a persistently broken
+    // provision) indefinitely.
+    const MAX_QUEUED_GRACE: Duration = Duration::from_secs(600);
+    let pool_status = shared.state.pool_status.snapshot();
     let pool_preparing = shared
         .state
         .pool_preparing
         .as_ref()
         .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
-        || shared.state.pool_status.snapshot().preparing;
+        || pool_status.preparing
+        // A consolidated-handle embedding may drive only `pool_status` (no
+        // legacy `preparing_signal`). Warm-slot and successor provisioning
+        // raise `provisioning`, not `preparing`, so treat an in-flight
+        // provision as preparing or those boots would go unprotected here.
+        || pool_status.provisioning > 0;
     let queued_jobs: Vec<_> = inner.queue.iter().cloned().collect();
     let in_queue: std::collections::BTreeSet<(RunId, JobId)> = queued_jobs
         .iter()
@@ -218,29 +233,42 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
             inner.queued_at.remove(&key);
             continue;
         }
-        if pool_preparing {
-            // The pool is warming and cannot register a runner yet; do not
-            // let the grace window expire while the first machine image is
-            // still being produced.
-            inner.queued_at.remove(&key);
-            continue;
-        }
-        let first_seen = *inner.queued_at.entry(key.clone()).or_insert(now);
-        if now.duration_since(first_seen).unwrap_or_default() < QUEUED_JOB_GRACE {
-            continue;
-        }
+        let grace = if pool_preparing {
+            // The pool is warming or booting a runner that may serve this
+            // job, so hold the grace window rather than failing a job whose
+            // runner is genuinely on the way. Bound the hold by
+            // MAX_QUEUED_GRACE measured from ready-enqueue: once a job has
+            // waited that long it starves even while the pool is still
+            // preparing, so sustained provisioning cannot mask it forever.
+            let enqueued = if job.enqueued_at_unix_nanos > 0 {
+                SystemTime::UNIX_EPOCH + Duration::from_nanos(job.enqueued_at_unix_nanos as u64)
+            } else {
+                now
+            };
+            if now.duration_since(enqueued).unwrap_or_default() < MAX_QUEUED_GRACE {
+                inner.queued_at.remove(&key);
+                continue;
+            }
+            MAX_QUEUED_GRACE
+        } else {
+            let first_seen = *inner.queued_at.entry(key.clone()).or_insert(now);
+            if now.duration_since(first_seen).unwrap_or_default() < QUEUED_JOB_GRACE {
+                continue;
+            }
+            QUEUED_JOB_GRACE
+        };
         let reason = format!(
             "no runner is registered for `runs-on: {}` and none appeared \
              within {}s, so the job cannot be scheduled",
             job.runs_on.join(", "),
-            QUEUED_JOB_GRACE.as_secs()
+            grace.as_secs()
         );
         tracing::warn!(
             run_id = %job.run_id,
             job_id = %job.job_id.0,
             labels = ?job.runs_on,
             "starving queued job failed after {}s without a matching runner",
-            QUEUED_JOB_GRACE.as_secs()
+            grace.as_secs()
         );
         starved_keys.push((job.run_id, job.job_id.clone(), reason));
     }

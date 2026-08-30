@@ -8015,6 +8015,59 @@ async fn queued_job_survives_the_grace_window_while_the_pool_is_preparing() {
 }
 
 #[tokio::test]
+async fn queued_job_starves_past_the_ceiling_even_while_the_pool_is_preparing() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+
+    // The pool signals "preparing" indefinitely -- e.g. a provision that
+    // keeps failing and retrying, or continuous successor prebuilds under
+    // sustained load -- so the signal never clears. A job this pool can
+    // never serve must still hit the bounded starvation failure path
+    // instead of being masked forever.
+    state.pool_preparing = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+        true,
+    )));
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+
+    let accepted = submit_simple_run(&app).await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    // Age the job's ready-enqueue past the absolute ceiling.
+    {
+        let mut inner = state.inner.lock().await;
+        let cutoff = (SystemTime::now() - Duration::from_secs(700))
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        for job in inner.queue.iter_mut() {
+            if job.run_id == run_id {
+                job.enqueued_at_unix_nanos = cutoff;
+            }
+        }
+    }
+    reap_once(&shared).await;
+    {
+        let inner = state.inner.lock().await;
+        assert!(
+            inner.queue.is_empty(),
+            "a job past the ceiling must starve even while the pool is preparing"
+        );
+        let run = inner.runs.get(&run_id).expect("run record must survive");
+        assert_eq!(
+            run.jobs.get(&JobId("build".to_owned())),
+            Some(&ExecutionStatus::Failure),
+            "the unschedulable job must fail, not queue forever"
+        );
+        assert_eq!(run.status, ExecutionStatus::Failure);
+    }
+}
+
+#[tokio::test]
 async fn job_timeout_enforcement_cancels_job() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
