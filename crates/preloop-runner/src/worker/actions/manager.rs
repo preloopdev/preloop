@@ -204,16 +204,40 @@ pub fn extract_tarball(bytes: &[u8], dest: &Path) -> Result<()> {
         } else if entry_type.is_symlink() {
             if let Some(link_target) = entry.link_name()? {
                 let parent = stripped.parent();
-                if !is_safe_relative_symlink(parent, &link_target) {
-                    anyhow::bail!(
-                        "symlink with escaping or absolute target rejected: {}",
-                        link_target.display()
-                    );
-                }
                 if let Some(parent) = parent {
                     if parent.components().count() > 0 {
                         dest_dir.create_dir_all(parent)?;
                     }
+                }
+
+                // Resolve physical parent directory relative to dest to account for
+                // preceding symlinks that shift the physical parent depth.
+                let canonical_dest = dest.canonicalize()?;
+                let physical_parent = if let Some(parent) = parent {
+                    let parent_path = dest.join(parent);
+                    if let Ok(canonical_parent) = parent_path.canonicalize() {
+                        if !canonical_parent.starts_with(&canonical_dest) {
+                            anyhow::bail!(
+                                "symlink parent directory escapes destination root: {}",
+                                parent.display()
+                            );
+                        }
+                        canonical_parent
+                            .strip_prefix(&canonical_dest)
+                            .ok()
+                            .map(Path::to_path_buf)
+                    } else {
+                        Some(parent.to_path_buf())
+                    }
+                } else {
+                    None
+                };
+
+                if !is_safe_relative_symlink(physical_parent.as_deref(), &link_target) {
+                    anyhow::bail!(
+                        "symlink with escaping or absolute target rejected: {}",
+                        link_target.display()
+                    );
                 }
                 dest_dir.symlink(&link_target, &stripped)?;
             }
@@ -278,11 +302,31 @@ fn copy_dir_recursive_inner(src: &Path, dst: &Path, root_src: &Path) -> Result<(
             let entry_path = entry.path();
             let target = std::fs::read_link(&entry_path)
                 .with_context(|| format!("reading symlink {}", entry_path.display()))?;
-            let rel_parent = entry_path
-                .strip_prefix(root_src)
-                .ok()
-                .and_then(|p| p.parent());
-            if !is_safe_relative_symlink(rel_parent, &target) {
+            let canonical_root = root_src.canonicalize()?;
+            let physical_parent = if let Some(parent) = entry_path.parent() {
+                if let Ok(canonical_parent) = parent.canonicalize() {
+                    if !canonical_parent.starts_with(&canonical_root) {
+                        anyhow::bail!(
+                            "symlink parent directory escapes source root: {}",
+                            parent.display()
+                        );
+                    }
+                    canonical_parent
+                        .strip_prefix(&canonical_root)
+                        .ok()
+                        .map(Path::to_path_buf)
+                } else {
+                    entry_path
+                        .strip_prefix(root_src)
+                        .ok()
+                        .and_then(|p| p.parent())
+                        .map(Path::to_path_buf)
+                }
+            } else {
+                None
+            };
+
+            if !is_safe_relative_symlink(physical_parent.as_deref(), &target) {
                 anyhow::bail!(
                     "local action contains escaping or absolute symlink: {} -> {}",
                     entry.path().display(),
@@ -293,10 +337,17 @@ fn copy_dir_recursive_inner(src: &Path, dst: &Path, root_src: &Path) -> Result<(
             std::os::unix::fs::symlink(&target, &dest)
                 .with_context(|| format!("creating symlink {}", dest.display()))?;
             #[cfg(windows)]
-            if target.is_dir() {
-                std::os::windows::fs::symlink_dir(&target, &dest)?;
-            } else {
-                std::os::windows::fs::symlink_file(&target, &dest)?;
+            {
+                let is_dir = if let Some(parent) = entry_path.parent() {
+                    parent.join(&target).is_dir()
+                } else {
+                    target.is_dir()
+                };
+                if is_dir {
+                    std::os::windows::fs::symlink_dir(&target, &dest)?;
+                } else {
+                    std::os::windows::fs::symlink_file(&target, &dest)?;
+                }
             }
         } else if ty.is_dir() {
             copy_dir_recursive_inner(&entry.path(), &dest, root_src)?;
@@ -470,6 +521,56 @@ mod tests {
         assert!(result.is_err());
         // Verify outside file was untouched
         assert_eq!(std::fs::read_to_string(&outside_file).unwrap(), "initial");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_tarball_rejects_chained_symlink_escape() {
+        let temp = TempDir::new().unwrap();
+        let dest = temp.path().join("action_dest");
+
+        // Archive has:
+        // 1. directory `root/b`
+        // 2. symlink `root/a/deep` -> `../b`
+        // 3. symlink `root/a/deep/link` -> `../../outside` (lexically looks like depth 2 with 2 '..' = 0, but physically is depth 1 with 2 '..' = -1!)
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        {
+            let mut tar = tar::Builder::new(&mut enc);
+            let mut dir_header = tar::Header::new_gnu();
+            dir_header.set_size(0);
+            dir_header.set_mode(0o755);
+            dir_header.set_entry_type(tar::EntryType::Directory);
+            dir_header.as_mut_bytes()[.."root/b/".len()].copy_from_slice(b"root/b/");
+            dir_header.set_cksum();
+            tar.append(&dir_header, &b""[..]).unwrap();
+
+            let mut link1_header = tar::Header::new_gnu();
+            link1_header.set_size(0);
+            link1_header.set_mode(0o777);
+            link1_header.set_entry_type(tar::EntryType::Symlink);
+            link1_header.as_mut_bytes()[.."root/a/deep".len()].copy_from_slice(b"root/a/deep");
+            link1_header.set_link_name("../b").unwrap();
+            link1_header.set_cksum();
+            tar.append(&link1_header, &b""[..]).unwrap();
+
+            let mut link2_header = tar::Header::new_gnu();
+            link2_header.set_size(0);
+            link2_header.set_mode(0o777);
+            link2_header.set_entry_type(tar::EntryType::Symlink);
+            link2_header.as_mut_bytes()[.."root/a/deep/link".len()]
+                .copy_from_slice(b"root/a/deep/link");
+            link2_header.set_link_name("../../outside").unwrap();
+            link2_header.set_cksum();
+            tar.append(&link2_header, &b""[..]).unwrap();
+            tar.finish().unwrap();
+        }
+        let tar_bytes = enc.finish().unwrap();
+        let result = extract_tarball(&tar_bytes, &dest);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("symlink with escaping or absolute target rejected"));
     }
 
     #[cfg(unix)]
