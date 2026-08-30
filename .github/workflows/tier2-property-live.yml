@@ -39,7 +39,7 @@ jobs:
           persist-credentials: false
 
       - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@52699249a776424c51ebc9ee197baf0f9dbf0d8a
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
       - name: Run targeted Tier 2 Rust property filters
         shell: bash
@@ -71,13 +71,13 @@ jobs:
 
       - name: Run remote JavaScript oracle (declaration 1)
         id: oracle_first
-        uses: preloopdev/preloop/.github/actions/tier2-property-oracle@88e5328dd1ee742206bc5e4f12823613744aa311
+        uses: preloopdev/preloop/.github/actions/tier2-property-oracle@88e5328dd1ee742206bc5e4f12823613744aa311 # tier2-property-oracle-v2
         with:
           id: first
 
       - name: Run remote JavaScript oracle (declaration 2)
         id: oracle_second
-        uses: preloopdev/preloop/.github/actions/tier2-property-oracle@88e5328dd1ee742206bc5e4f12823613744aa311
+        uses: preloopdev/preloop/.github/actions/tier2-property-oracle@88e5328dd1ee742206bc5e4f12823613744aa311 # tier2-property-oracle-v2
         with:
           id: second
 

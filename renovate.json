@@ -1,7 +1,8 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "config:recommended"
+    "config:recommended",
+    "helpers:pinGitHubActionDigests"
   ],
   "dependencyDashboard": true,
   "packageRules": [
@@ -25,7 +26,7 @@
       "matchDepNames": [
         "smol-machines/smolvm"
       ],
-      "description": "SmolVM bumps auto-merge once ci.yml and the smolvm-release-verify check pass. The verify job is inert until a [self-hosted, macOS, ARM64, smolvm-host] runner is registered and SMOLVM_VERIFY_HOST_WORKSPACE is set — do not trust auto-merge before then.",
+      "description": "SmolVM bumps auto-merge once ci.yml and the smolvm-release-verify check pass. The verify job is inert until a [self-hosted, macOS, ARM64, smolvm-host] runner is registered and SMOLVM_VERIFY_HOST_WORKSPACE is set \u2014 do not trust auto-merge before then.",
       "automerge": true,
       "automergeType": "pr"
     },
