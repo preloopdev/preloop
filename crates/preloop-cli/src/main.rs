@@ -1982,6 +1982,197 @@ fn default_local_activity_type(event: &str, payload: &serde_json::Value) -> Opti
     }
 }
 
+/// Events for which GitHub supplies a changed-file list, so a local run can
+/// stand in for one by deriving the same list from git.
+///
+/// Everything else (`workflow_dispatch`, `schedule`, …) has no file list on
+/// GitHub either, so deriving one would invent a contract the real event does
+/// not have.
+fn event_carries_changed_files(event: &str) -> bool {
+    matches!(
+        event,
+        "push" | "pull_request" | "pull_request_target" | "pull_request_review" | "merge_group"
+    )
+}
+
+/// Extract the path from one `git status --porcelain` line.
+///
+/// Layout is two status columns, a space, then the path; renames read
+/// `R  old -> new`, where only the destination exists now. Quoted paths (set
+/// by `core.quotePath`) keep their quotes stripped so they match the
+/// repository-relative names a workflow filter is written against.
+fn porcelain_path(line: &str) -> Option<String> {
+    let rest = line.get(3..)?.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let path = rest.rsplit(" -> ").next().unwrap_or(rest);
+    Some(path.trim_matches('"').to_owned())
+}
+
+/// Whether `base` can actually be diffed against `HEAD`.
+///
+/// Resolving is not enough. A fork remote (`origin` pointing at someone
+/// else's copy) resolves fine but can share no history, and `git diff
+/// base...HEAD` then fails with "no merge base". Checking here keeps that
+/// failure out of the derived change set.
+fn usable_diff_base(base: &str) -> bool {
+    if git_rev_parse(base).is_err() {
+        return false;
+    }
+    std::process::Command::new("git")
+        .args(["merge-base", base, "HEAD"])
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+/// Remotes configured for this repository, in git's order.
+fn git_remotes() -> Vec<String> {
+    std::process::Command::new("git")
+        .arg("remote")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Resolve the ref a local run should diff against.
+///
+/// `--base` wins. Otherwise prefer the branch's own tracking ref — the most
+/// reliable statement of "where this branch came from" — then each remote's
+/// default, then local `main`/`master`. Every candidate must share history
+/// with `HEAD`, so a fork remote cannot be picked and then fail to diff.
+///
+/// Returns `None` when nothing usable is found, so the caller leaves
+/// `changed_paths_known` false rather than claiming an empty change set — an
+/// empty *known* list would make every `paths:` filter reject the run.
+fn resolve_local_diff_base(explicit: Option<&str>) -> Option<String> {
+    if let Some(base) = explicit {
+        return usable_diff_base(base).then(|| base.to_owned());
+    }
+    let mut candidates: Vec<String> = Vec::new();
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "@{upstream}"])
+        .output()
+    {
+        if output.status.success() {
+            let tracking = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if !tracking.is_empty() {
+                candidates.push(tracking);
+            }
+        }
+    }
+    for remote in git_remotes() {
+        candidates.push(format!("{remote}/HEAD"));
+        candidates.push(format!("{remote}/main"));
+        candidates.push(format!("{remote}/master"));
+    }
+    candidates.push("main".to_owned());
+    candidates.push("master".to_owned());
+    candidates
+        .into_iter()
+        .find(|candidate| usable_diff_base(candidate))
+}
+
+/// Changed files for a local run: the merge-base diff against `base`, plus
+/// anything uncommitted.
+///
+/// Uncommitted files count because the server snapshots the working tree, not
+/// `HEAD` — a `paths:` filter judged only on committed history would ignore
+/// the very edit the user is testing.
+fn local_changed_paths(base: &str) -> anyhow::Result<Vec<String>> {
+    let output = std::process::Command::new("git")
+        .args(["diff", "--name-only", &format!("{base}...HEAD")])
+        .output()
+        .context("git diff")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git diff against `{base}` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let mut paths: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect();
+    paths.extend(
+        git_porcelain()?
+            .iter()
+            .filter_map(|line| porcelain_path(line)),
+    );
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+/// Derive the changed-file list for a local run, or `None` to leave it unknown.
+///
+/// An explicit `--payload` carrying `paths` or `commits` wins: the caller
+/// stated the change set and must not be second-guessed.
+fn default_local_changed_paths(
+    event: &str,
+    base: Option<&str>,
+    payload: &serde_json::Value,
+) -> Option<Vec<String>> {
+    if !event_carries_changed_files(event) {
+        return None;
+    }
+    if payload.get("paths").is_some() || payload.get("commits").is_some() {
+        return None;
+    }
+    let base = resolve_local_diff_base(base)?;
+    local_changed_paths(&base).ok()
+}
+
+/// Branch a `pull_request` run should be filtered against.
+///
+/// GitHub applies `on.pull_request.branches` to the PR's *target* branch, not
+/// the head branch. Without this a local PR run filters on the checked-out
+/// branch and a workflow gated to `branches: [main]` never matches. Only
+/// derived when the payload does not already carry a base ref.
+fn default_local_filter_branch(
+    event: &str,
+    base: Option<&str>,
+    payload: &serde_json::Value,
+) -> Option<String> {
+    if !matches!(event, "pull_request" | "pull_request_target") {
+        return None;
+    }
+    if payload
+        .get("pull_request")
+        .and_then(|pr| pr.get("base"))
+        .and_then(|base| base.get("ref"))
+        .is_some()
+    {
+        return None;
+    }
+    // An explicit `--base` is the user's stated PR target and names the branch
+    // filters apply to whether or not the ref exists locally — shallow clones
+    // and un-fetched bases are normal. Only the fallback needs a real ref,
+    // because it has nothing else to go on.
+    let base = match base {
+        Some(base) => base.to_owned(),
+        None => resolve_local_diff_base(None)?,
+    };
+    // Filters are written against branch names (`main`), not remote-qualified
+    // refs (`origin/main`).
+    let name = base
+        .rsplit_once('/')
+        .map_or(base.as_str(), |(_, name)| name)
+        .to_owned();
+    (!name.is_empty()).then_some(name)
+}
+
 fn collect_local_reusable_workflows(
     workflow_path: &std::path::Path,
 ) -> anyhow::Result<BTreeMap<String, String>> {
@@ -2035,6 +2226,11 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         None => serde_json::json!({}),
     };
     let activity_type = default_local_activity_type(event, &payload);
+    // A local run stands in for a webhook delivery, so supply the parts of that
+    // delivery git can answer for. Anything git cannot know (PR number, actor,
+    // labels, upstream run) stays absent rather than invented.
+    let derived_changed_paths = default_local_changed_paths(event, args.base.as_deref(), &payload);
+    let derived_filter_branch = default_local_filter_branch(event, args.base.as_deref(), &payload);
 
     let mut secrets = preloop_gha_protocol::SecretMap::default();
     for secret in &args.secrets {
@@ -2078,6 +2274,9 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         selected_jobs: args.job.into_iter().collect(),
         base_ref: args.base,
         activity_type,
+        changed_paths: derived_changed_paths.clone().unwrap_or_default(),
+        changed_paths_known: derived_changed_paths.is_some(),
+        filter_branch: derived_filter_branch,
         // On by default where it can be acted on: a paused job blocks until a
         // controller answers, so pausing a piped or detached run would hang
         // something with no way to respond. `--preserve-on-failure` is the
@@ -3993,6 +4192,101 @@ mod tests {
         );
         assert_eq!(
             default_local_activity_type("push", &serde_json::json!({})),
+            None
+        );
+    }
+
+    #[test]
+    fn porcelain_path_handles_status_columns_renames_and_quotes() {
+        assert_eq!(
+            porcelain_path(" M src/lib.rs").as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(porcelain_path("?? new.rs").as_deref(), Some("new.rs"));
+        assert_eq!(porcelain_path("A  added.rs").as_deref(), Some("added.rs"));
+        // Only the destination of a rename exists in the tree now.
+        assert_eq!(
+            porcelain_path("R  old.rs -> new.rs").as_deref(),
+            Some("new.rs")
+        );
+        // `core.quotePath` wraps non-ASCII names; filters are written unquoted.
+        assert_eq!(
+            porcelain_path("?? \"src/späte.rs\"").as_deref(),
+            Some("src/späte.rs")
+        );
+        assert_eq!(porcelain_path(""), None);
+        assert_eq!(porcelain_path("   "), None);
+    }
+
+    #[test]
+    fn only_file_list_events_derive_changed_paths() {
+        for event in [
+            "push",
+            "pull_request",
+            "pull_request_target",
+            "pull_request_review",
+            "merge_group",
+        ] {
+            assert!(event_carries_changed_files(event), "{event}");
+        }
+        // GitHub sends no file list for these, so deriving one would invent a
+        // contract the real event does not have.
+        for event in ["workflow_dispatch", "schedule", "release", "issue_comment"] {
+            assert!(!event_carries_changed_files(event), "{event}");
+        }
+    }
+
+    /// An explicit payload states the change set; derivation must not override
+    /// it, or `--payload` would silently stop working.
+    #[test]
+    fn explicit_payload_paths_suppress_derivation() {
+        assert!(
+            default_local_changed_paths("push", None, &serde_json::json!({"paths": ["a.rs"]}))
+                .is_none()
+        );
+        assert!(default_local_changed_paths(
+            "push",
+            None,
+            &serde_json::json!({"commits": [{"modified": ["a.rs"]}]})
+        )
+        .is_none());
+        // Events without a file list never derive, payload or not.
+        assert!(
+            default_local_changed_paths("workflow_dispatch", None, &serde_json::json!({}))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn filter_branch_derives_pr_target_not_head() {
+        // GitHub filters a PR on its target branch; `--base` names it.
+        assert_eq!(
+            default_local_filter_branch("pull_request", Some("main"), &serde_json::json!({}))
+                .as_deref(),
+            Some("main")
+        );
+        // Remote-qualified refs are reduced to the branch name filters use.
+        assert_eq!(
+            default_local_filter_branch(
+                "pull_request",
+                Some("origin/release-2"),
+                &serde_json::json!({})
+            )
+            .as_deref(),
+            Some("release-2")
+        );
+        // A payload that already carries the base ref wins.
+        assert_eq!(
+            default_local_filter_branch(
+                "pull_request",
+                Some("main"),
+                &serde_json::json!({"pull_request": {"base": {"ref": "develop"}}})
+            ),
+            None
+        );
+        // Only PR-family events have a target branch.
+        assert_eq!(
+            default_local_filter_branch("push", Some("main"), &serde_json::json!({})),
             None
         );
     }

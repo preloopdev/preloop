@@ -21,6 +21,7 @@ pub use expand::{
     expand_reusable_call, DEFAULT_TOKEN_PERMISSIONS, PERMISSION_SCOPES,
 };
 pub use models::*;
+pub use trigger::TriggerMismatch;
 pub use yaml::{parse_action_metadata, parse_workflow};
 
 #[cfg(test)]
