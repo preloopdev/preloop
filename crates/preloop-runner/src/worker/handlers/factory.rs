@@ -59,6 +59,18 @@ pub fn load_action_manifest(action_dir: &Path) -> Result<ActionManifest> {
         );
     };
 
+    if let (Ok(canonical_dir), Ok(canonical_manifest)) =
+        (action_dir.canonicalize(), manifest_path.canonicalize())
+    {
+        if !canonical_manifest.starts_with(&canonical_dir) {
+            anyhow::bail!(
+                "action manifest {} escapes action directory {}",
+                manifest_path.display(),
+                action_dir.display()
+            );
+        }
+    }
+
     let content = std::fs::read_to_string(&manifest_path)
         .with_context(|| format!("reading {}", manifest_path.display()))?;
 
@@ -506,5 +518,31 @@ runs:
             steps[1].get("if").and_then(|v| v.as_str()),
             Some("runner.os == 'Linux'")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_action_manifest_rejects_escaping_symlink() {
+        let temp = TempDir::new().unwrap();
+        let action_dir = temp.path().join("action");
+        std::fs::create_dir_all(&action_dir).unwrap();
+
+        let outside_dir = temp.path().join("outside");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let outside_manifest = outside_dir.join("action.yml");
+        std::fs::write(
+            &outside_manifest,
+            "name: Evil\nruns:\n  using: node20\n  main: index.js\n",
+        )
+        .unwrap();
+
+        std::os::unix::fs::symlink(&outside_manifest, action_dir.join("action.yml")).unwrap();
+
+        let result = load_action_manifest(&action_dir);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("escapes action directory"));
     }
 }

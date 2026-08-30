@@ -202,7 +202,31 @@ pub fn copy_local_action(source: &Path, actions_dir: &Path, action_name: &str) -
     if dest.exists() {
         return Ok(dest);
     }
-    copy_dir_recursive(source, &dest)?;
+    let parent_dir = dest
+        .parent()
+        .context("destination must have parent directory")?;
+    std::fs::create_dir_all(parent_dir)?;
+    let staging = tempfile::Builder::new()
+        .prefix(".local_action_tmp_")
+        .tempdir_in(parent_dir)?;
+    copy_dir_recursive(source, staging.path())?;
+    let staging_path = staging.keep();
+    if !dest.exists() {
+        if let Err(err) = std::fs::rename(&staging_path, &dest) {
+            let _ = std::fs::remove_dir_all(&staging_path);
+            if !dest.exists() {
+                return Err(err).with_context(|| {
+                    format!(
+                        "moving copied local action from {} to {}",
+                        staging_path.display(),
+                        dest.display()
+                    )
+                });
+            }
+        }
+    } else {
+        let _ = std::fs::remove_dir_all(&staging_path);
+    }
     Ok(dest)
 }
 
@@ -213,7 +237,35 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         let entry = entry?;
         let ty = entry.file_type()?;
         let dest = dst.join(entry.file_name());
-        if ty.is_dir() {
+        if ty.is_symlink() {
+            let target = std::fs::read_link(entry.path())
+                .with_context(|| format!("reading symlink {}", entry.path().display()))?;
+            if target.is_absolute()
+                || target.components().any(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                })
+            {
+                anyhow::bail!(
+                    "local action contains escaping or absolute symlink: {} -> {}",
+                    entry.path().display(),
+                    target.display()
+                );
+            }
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target, &dest)
+                .with_context(|| format!("creating symlink {}", dest.display()))?;
+            #[cfg(windows)]
+            if target.is_dir() {
+                std::os::windows::fs::symlink_dir(&target, &dest)?;
+            } else {
+                std::os::windows::fs::symlink_file(&target, &dest)?;
+            }
+        } else if ty.is_dir() {
             copy_dir_recursive(&entry.path(), &dest)?;
         } else {
             std::fs::copy(entry.path(), &dest)?;
@@ -481,5 +533,50 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(cached_res, res);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_local_action_rejects_escaping_symlinks() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source_action");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("action.yml"), "name: Local\n").unwrap();
+
+        // Create escaping symlink pointing outside action
+        let outside = temp.path().join("secret.txt");
+        std::fs::write(&outside, "secret").unwrap();
+        std::os::unix::fs::symlink("../secret.txt", source.join("escape_link")).unwrap();
+
+        let actions_dir = temp.path().join("actions");
+        let result = copy_local_action(&source, &actions_dir, "my-local-action");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("escaping or absolute symlink"));
+        assert!(!actions_dir.join("my-local-action").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_local_action_allows_safe_internal_symlinks() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source_action");
+        std::fs::create_dir_all(source.join("dist")).unwrap();
+        std::fs::create_dir_all(source.join("bin")).unwrap();
+        std::fs::write(source.join("action.yml"), "name: Local\n").unwrap();
+        std::fs::write(source.join("dist/index.js"), "console.log('hi');\n").unwrap();
+
+        // Create safe internal symlink
+        std::os::unix::fs::symlink("dist/index.js", source.join("main.js")).unwrap();
+
+        let actions_dir = temp.path().join("actions");
+        let dest = copy_local_action(&source, &actions_dir, "my-local-action").unwrap();
+        assert!(dest.exists());
+        assert_eq!(
+            std::fs::read_to_string(dest.join("main.js")).unwrap(),
+            "console.log('hi');\n"
+        );
     }
 }

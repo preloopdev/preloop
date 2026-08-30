@@ -183,6 +183,19 @@ pub async fn run_node_action(
         anyhow::bail!("action entry point not found: {}", entry_point.display());
     }
 
+    // Validate that the canonical entry point path stays within the action directory
+    if let (Ok(canonical_dir), Ok(canonical_entry)) =
+        (action_dir.canonicalize(), entry_point.canonicalize())
+    {
+        if !canonical_entry.starts_with(&canonical_dir) {
+            anyhow::bail!(
+                "action entry point {} escapes action directory {}",
+                entry_point.display(),
+                action_dir.display()
+            );
+        }
+    }
+
     // Resolve node binary and apply the runner's Node 20 migration policy.
     let runs_using = manifest.runs_using.as_str();
     if runs_using == "node12" || runs_using == "node16" {
@@ -675,5 +688,43 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("missing runs.main"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn escaping_entry_point_symlink_errors() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let action_dir = temp.path().join("action");
+        std::fs::create_dir_all(&action_dir).unwrap();
+
+        let outside_dir = temp.path().join("outside");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let outside_script = outside_dir.join("payload.js");
+        std::fs::write(&outside_script, "console.log('evil');").unwrap();
+
+        std::os::unix::fs::symlink(&outside_script, action_dir.join("index.js")).unwrap();
+
+        let manifest = node_manifest("index.js");
+        let mut job = crate::worker::contexts::JobContext::new(
+            "job".into(),
+            "job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let mut ctx = StepContext::new(&mut job, "step1".into(), "Step".into());
+        let (_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        let err = run_node_action(
+            &manifest,
+            &action_dir,
+            &serde_json::json!({}),
+            action_dir.to_str().unwrap(),
+            &mut ctx,
+            cancel_rx,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("escapes action directory"));
     }
 }
