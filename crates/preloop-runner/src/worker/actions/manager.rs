@@ -122,11 +122,7 @@ pub fn extract_tarball(bytes: &[u8], dest: &Path) -> Result<()> {
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
-        let stripped: PathBuf = path.components().skip(1).collect();
-        if stripped.components().count() == 0 {
-            continue;
-        }
-        if stripped.components().any(|c| {
+        if path.components().any(|c| {
             matches!(
                 c,
                 std::path::Component::ParentDir
@@ -138,6 +134,11 @@ pub fn extract_tarball(bytes: &[u8], dest: &Path) -> Result<()> {
                 "malicious archive entry escapes sandbox: {}",
                 path.display()
             );
+        }
+
+        let stripped: PathBuf = path.components().skip(1).collect();
+        if stripped.components().count() == 0 {
+            continue;
         }
 
         let entry_type = entry.header().entry_type();
@@ -154,17 +155,25 @@ pub fn extract_tarball(bytes: &[u8], dest: &Path) -> Result<()> {
 
             #[cfg(unix)]
             if let Ok(mode) = entry.header().mode() {
-                let perms = cap_std::fs::Permissions::from_mode(mode);
-                let _ = outfile.set_permissions(perms);
+                // Mask to standard rwx permissions (0o777), stripping setuid (0o4000), setgid (0o2000), and sticky (0o1000) bits
+                let safe_mode = mode & 0o777;
+                let perms = cap_std::fs::Permissions::from_mode(safe_mode);
+                outfile
+                    .set_permissions(perms)
+                    .with_context(|| format!("setting permissions on {}", stripped.display()))?;
             }
         } else if entry_type.is_symlink() {
             if let Some(link_target) = entry.link_name()? {
-                if link_target.is_absolute()
-                    || link_target.starts_with("/")
-                    || link_target.starts_with("\\")
-                {
+                if link_target.components().any(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                }) {
                     anyhow::bail!(
-                        "symlink with absolute target rejected: {}",
+                        "symlink with escaping or absolute target rejected: {}",
                         link_target.display()
                     );
                 }
@@ -291,6 +300,16 @@ mod tests {
     }
 
     #[test]
+    fn extract_tarball_rejects_absolute_paths() {
+        let temp = TempDir::new().unwrap();
+        let dest = temp.path().join("action_dest");
+
+        let tar_bytes = create_test_tarball(&[("/escape.txt", b"evil")]);
+        let result = extract_tarball(&tar_bytes, &dest);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn extract_tarball_rejects_hard_links() {
         let temp = TempDir::new().unwrap();
         let dest = temp.path().join("action_dest");
@@ -325,7 +344,7 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("symlink with absolute target rejected"));
+            .contains("symlink with escaping or absolute target rejected"));
     }
 
     #[test]
@@ -366,6 +385,36 @@ mod tests {
         assert!(result.is_err());
         // Verify outside file was untouched
         assert_eq!(std::fs::read_to_string(&outside_file).unwrap(), "initial");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_tarball_masks_special_permission_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let dest = temp.path().join("action_dest");
+
+        // Entry with setuid (0o4755)
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        {
+            let mut tar = tar::Builder::new(&mut enc);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(5);
+            header.set_mode(0o4755);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.as_mut_bytes()[.."root/script.sh".len()].copy_from_slice(b"root/script.sh");
+            header.set_cksum();
+            tar.append(&header, &b"echo\n"[..]).unwrap();
+            tar.finish().unwrap();
+        }
+        let tar_bytes = enc.finish().unwrap();
+        extract_tarball(&tar_bytes, &dest).unwrap();
+
+        let metadata = std::fs::metadata(dest.join("script.sh")).unwrap();
+        let mode = metadata.permissions().mode();
+        // The setuid bit (0o4000) must be stripped, leaving only rwxr-xr-x (0o755)
+        assert_eq!(mode & 0o7777, 0o755);
     }
 
     #[tokio::test]
