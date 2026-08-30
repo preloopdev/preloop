@@ -539,19 +539,9 @@ pub(crate) async fn action_download_info_entry(
 ) -> Option<(String, ActionDownloadInfo)> {
     let (key, name, git_ref, resolved_sha, tar_url) =
         resolve_action_download(state, action, version_override).await?;
-
-    let authentication = state.static_github_pat().map(|pat| {
-        let expires_at = (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|value| value.as_secs())
-            .unwrap_or_default()
-            + ACTION_TICKET_TTL_SECS)
-            .to_string();
-        ActionDownloadAuthentication {
-            expires_at: Some(expires_at),
-            token: Some(pat.to_string()),
-        }
-    });
+    // Preloop download capability URLs are HMAC-signed and bearerless.
+    // Operator PAT is kept server-side to avoid leaking broad credentials to untrusted workflows.
+    let authentication = None;
 
     Some((
         key,

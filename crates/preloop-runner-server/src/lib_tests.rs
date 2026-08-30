@@ -4141,9 +4141,8 @@ async fn action_download_info_returns_batch_download_collection() {
         "http://127.0.0.1:9090/api/v1/actions/download/actions/checkout/abc123def456abc123def456abc123def456abc1"
     );
     assert!(query.contains("exp=") && query.contains("sig="), "{query}");
-    // Bearer token mode: when PRELOOP_GITHUB_TOKEN is set, authentication carries the token.
-    assert_eq!(checkout["authentication"]["token"], "mock-bearer-token");
-    assert!(checkout["authentication"]["expiresAt"].is_string());
+    // Preloop's own download capability route is HMAC signed and bearerless; operator PAT is never leaked.
+    assert!(checkout["authentication"].is_null());
 
     // Repositories with dots in their names (e.g. actions/setup-node.js) resolve cleanly.
     let node = &actions["actions/setup-node.js@v4"];
