@@ -1,8 +1,7 @@
 use super::*;
 use futures::StreamExt;
 use preloop_gha_protocol::azdo::{
-    ActionDownloadAuthentication, ActionDownloadInfo, ActionDownloadInfoCollection,
-    ActionReferenceList,
+    ActionDownloadInfo, ActionDownloadInfoCollection, ActionReferenceList,
 };
 use std::collections::BTreeMap;
 
@@ -79,8 +78,11 @@ async fn resolve_ref_to_sha(
         }
     }
 
+    let enc_owner = percent_encode_path_segment(owner);
+    let enc_repo = percent_encode_path_segment(repo);
+    let enc_git_ref = percent_encode_path_segment(git_ref);
     let api_base = state.github_urls.api_url.trim_end_matches('/').to_owned();
-    let url = format!("{api_base}/repos/{owner}/{repo}/commits/{git_ref}");
+    let url = format!("{api_base}/repos/{enc_owner}/{enc_repo}/commits/{enc_git_ref}");
     let mut request = crate::shared_http::CLIENT.get(&url);
     if let Some(pat) = state.static_github_pat() {
         request = request.bearer_auth(pat);
@@ -221,7 +223,11 @@ pub(crate) async fn download_action_tarball(
     // archive). The rename is the atomic publish; the loser serves the
     // winner's file.
     let temp_path = cache_dir.join(format!("action.tar.gz.{}.tmp", uuid::Uuid::new_v4()));
-    let github_url = format!("https://api.github.com/repos/{owner}/{repo}/tarball/{git_ref}");
+    let enc_owner = percent_encode_path_segment(&owner);
+    let enc_repo = percent_encode_path_segment(&repo);
+    let enc_git_ref = percent_encode_path_segment(&git_ref);
+    let api_base = shared.state.github_urls.api_url.trim_end_matches('/');
+    let github_url = format!("{api_base}/repos/{enc_owner}/{enc_repo}/tarball/{enc_git_ref}");
 
     info!(
         owner,

@@ -4478,6 +4478,60 @@ async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
+    // 1d. Cache miss with special ref (v1#beta) correctly percent-encodes outbound fetch
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", api_listener.local_addr().unwrap());
+    let mock = axum::Router::new().route(
+        "/repos/:owner/:repo/tarball/:git_ref",
+        axum::routing::get(
+            |axum::extract::Path((_owner, _repo, git_ref)): axum::extract::Path<(
+                String,
+                String,
+                String,
+            )>| async move {
+                assert_eq!(
+                    git_ref, "v1#beta",
+                    "outbound fetch must preserve exact tag without fragment stripping"
+                );
+                axum::response::Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from("fetched-tar-content"))
+                    .unwrap()
+            },
+        ),
+    );
+    tokio::spawn(async move {
+        axum::serve(api_listener, mock).await.unwrap();
+    });
+    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+
+    let miss_temp = tempfile::tempdir().unwrap();
+    let miss_state = AppState::new(miss_temp.path().to_path_buf()).await.unwrap();
+    let miss_app = crate::routes::app(miss_state.clone(), CancellationToken::new());
+    let miss_sig = miss_state.sign_action_ticket("test-owner", "test-repo", "v1#beta", expires_at);
+    let enc_hash_ref = percent_encode_path_segment("v1#beta");
+    let response = miss_app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/api/v1/actions/download/test-owner/test-repo/{enc_hash_ref}?exp={expires_at}&sig={miss_sig}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"fetched-tar-content"
+    );
+
     // 2. Reject path traversal
     let response = app
         .clone()
