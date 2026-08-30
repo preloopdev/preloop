@@ -232,6 +232,8 @@ deprecation warnings, job-level annotations, and background step control-flow.
 | Reusable workflows                                              | parsing, `secrets: inherit`, required secrets/inputs, input type validation, OIDC `environment` propagation, `oidc_job_workflow_ref`; depth limit = 4                                                                                                                                                                                                                                                                                                                                | ✅ good                                               |
 | Node 20→24 migration/deprecation warnings                       | implemented: flag source precedence, conflict warning, ARM32 fallback (Plan 008)                                                                                                                                                                                                                                                                                                                                                                                                     | ✅ good                                               |
 
+> **Externals pin divergence (v2.336.0 vs v2.337.0):** preloop ships `node24_externals_version = 24.19.0` and `node20_externals_version = 20.20.2` (the final Node 20 release) while the `v2.336.0` golden pins Node 24 `24.18.0`. The `24.19.0` patch is a secure forward-port matching the `v2.337.0` externals with no wire-protocol change; conformance is unaffected.
+
 
 ---
 

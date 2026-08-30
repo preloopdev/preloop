@@ -663,12 +663,17 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    /// A timeline PATCH for an in-flight job must keep the truthful
-    /// "in_progress" conclusion. The raw Debug spelling ("inprogress") and
-    /// the run-level status_string projection ("success") both lie about a
-    /// job that is still running.
-    #[tokio::test]
-    async fn timeline_patch_keeps_in_progress_conclusion_for_in_flight_job() {
+    /// Seed a single in-flight run with one job, its plan→request mapping, and
+    /// timeline id. Returns the owned `TempDir` (keeps the store file alive for
+    /// the test's lifetime) alongside the handles tests assert against.
+    async fn seed_inflight_run() -> (
+        tempfile::TempDir,
+        Arc<SharedState>,
+        RunId,
+        JobId,
+        String,
+        uuid::Uuid,
+    ) {
         let temp = tempfile::tempdir().unwrap();
         let state = crate::AppState::new(temp.path().to_path_buf())
             .await
@@ -744,6 +749,17 @@ mod tests {
                 },
             );
         }
+        (temp, shared, run_id, job_id, plan_id, timeline_id)
+    }
+
+    /// A timeline PATCH for an in-flight job must keep the truthful
+    /// "in_progress" conclusion. The raw Debug spelling ("inprogress") and
+    /// the run-level status_string projection ("success") both lie about a
+    /// job that is still running.
+    #[tokio::test]
+    async fn timeline_patch_keeps_in_progress_conclusion_for_in_flight_job() {
+        let (_temp, shared, run_id, _job_id, plan_id, timeline_id) = seed_inflight_run().await;
+        let state = shared.state.clone();
 
         let _ = patch_timeline_records(
             State(shared),
@@ -770,6 +786,121 @@ mod tests {
         assert_eq!(
             detail.conclusion, "in_progress",
             "an in-flight job must not read as 'success' or 'inprogress'"
+        );
+    }
+
+    /// A job-level Node.js 20 deprecation warning arrives from the runner as a
+    /// `Warning` issue on the job timeline record. The server must preserve it
+    /// on read-back and project it as a job-level annotation (no `step_id`).
+    /// Preloop never synthesizes this warning itself — it only surfaces what
+    /// the runner sends.
+    #[tokio::test]
+    async fn timeline_patch_preserves_node20_deprecation_warning() {
+        let (_temp, shared, run_id, _job_id, plan_id, timeline_id) = seed_inflight_run().await;
+        let state = shared.state.clone();
+
+        let node20_message = "Node.js 20 actions are deprecated. The following actions are \
+             running on Node.js 20 and may not work as expected: actions/checkout@v3, \
+             actions/setup-node@v3."
+            .to_owned();
+
+        let job_record = azdo::TimelineRecord {
+            id: uuid::Uuid::new_v4(),
+            change_id: None,
+            parent_id: None,
+            name: Some("build".to_owned()),
+            display_name: Some("build".to_owned()),
+            record_type: Some(azdo::TimelineRecordType::Job),
+            state: Some(azdo::TimelineRecordState::InProgress),
+            result: None,
+            start_time: None,
+            finish_time: None,
+            issues: vec![azdo::Issue {
+                issue_type: azdo::IssueType::Warning,
+                category: None,
+                message: Some(node20_message.clone()),
+                data: BTreeMap::new(),
+                is_infrastructure_issue: None,
+            }],
+            variables: BTreeMap::new(),
+            current_operation: None,
+            percent_complete: None,
+            worker_name: None,
+            error_count: None,
+            warning_count: Some(1),
+            is_background: None,
+            background_control_type: None,
+            background_control_step_ids: Vec::new(),
+            parallel_group_id: None,
+            steps: Vec::new(),
+            last_modified: None,
+            log: None,
+        };
+        let record_id = job_record.id;
+
+        let _ = patch_timeline_records(
+            State(shared.clone()),
+            Path((
+                "scope".to_owned(),
+                "hub".to_owned(),
+                plan_id.clone(),
+                timeline_id.to_string(),
+            )),
+            Json(azdo::VssJsonCollectionWrapper {
+                count: 1,
+                value: vec![job_record],
+            }),
+        )
+        .await;
+
+        // Preserved on read-back.
+        let response = get_timeline_records(
+            State(shared.clone()),
+            Path((
+                "scope".to_owned(),
+                "hub".to_owned(),
+                plan_id,
+                timeline_id.to_string(),
+            )),
+        )
+        .await;
+        let records = response
+            .0
+            .get("records")
+            .and_then(|v| v.as_array())
+            .expect("records array");
+        let stored = records
+            .iter()
+            .find(|r| r["id"] == record_id.to_string())
+            .expect("job record persisted");
+        let issues = stored["issues"].as_array().expect("issues preserved");
+        assert_eq!(issues.len(), 1, "the Node 20 warning issue must survive");
+        assert_eq!(issues[0]["type"], "warning");
+        assert_eq!(issues[0]["message"], node20_message);
+
+        // Projected as a job-level annotation (no step_id).
+        let inner = state.inner.lock().await;
+        let events = inner
+            .timeline_events
+            .get(&run_id)
+            .expect("timeline events recorded for the run");
+        let (level, message, step_id) = events
+            .iter()
+            .find_map(|event| match event {
+                NdjsonEvent::Annotation {
+                    level,
+                    message,
+                    step_id,
+                    ..
+                } => Some((*level, message.clone(), step_id.clone())),
+                _ => None,
+            })
+            .expect("Node 20 warning projected as an annotation");
+        assert!(matches!(level, AnnotationLevel::Warning));
+        assert_eq!(message, node20_message);
+        assert!(
+            step_id.is_none(),
+            "a job-level annotation must not carry a step_id"
         );
     }
 }
