@@ -6,11 +6,14 @@
 //! - Node.js externals download (unless --no-externals)
 //! - Agent creation/deletion via the distributedtask API
 
+use std::future::Future;
+
 use anyhow::{bail, Context, Result};
 use tracing::{info, warn};
 
 use crate::cli::{ConfigureArgs, GlobalArgs, RemoveArgs};
 use crate::client::http::HttpClient;
+use crate::node_externals;
 use crate::settings::{CredentialData, RsaParameters, RunnerConfig, RunnerSettings};
 
 const DISTTASK_POOLS_ACCEPT: &str = "application/json; api-version=5.1-preview.1";
@@ -573,47 +576,88 @@ fn export_keypair(
 }
 
 /// Download Node.js externals for running JS-based actions.
+///
+/// Cache validation (R2): each `externals/nodeXX` must contain `preloop-node.json`
+/// with matching version and a `bin/node --version` that prints `v<version>`.
+/// Stale/missing/mismatched entries are re-materialized (download into temp dir,
+/// verify SHA256 via pinned table + SHASUMS256.txt, atomic rename).
 async fn download_externals(http: &HttpClient, root: &std::path::Path) -> Result<()> {
-    // Node versions matching official runner v2.335.1 externals
-    let node_versions = [("node20", "v20.19.0"), ("node24", "v24.3.0")];
+    download_externals_with_fetcher(
+        |url| {
+            let http = http.clone();
+            let url = url.to_owned();
+            async move { http.get_bytes(&url).await }
+        },
+        root,
+    )
+    .await
+}
+
+/// Injectable fetcher variant for tests — `fetcher` is called for both the tarball
+/// and the `SHASUMS256.txt` URL.
+async fn download_externals_with_fetcher<F, Fut>(fetcher: F, root: &std::path::Path) -> Result<()>
+where
+    F: Fn(&str) -> Fut + Sync,
+    Fut: Future<Output = Result<bytes::Bytes>> + Send,
+{
+    // Versions from `versions.toml` (build-time pins with fallback).
+    let node_versions = [
+        ("node20", crate::NODE20_EXTERNALS_VERSION),
+        ("node24", crate::NODE24_EXTERNALS_VERSION),
+    ];
 
     let externals_dir = root.join("externals");
     std::fs::create_dir_all(&externals_dir)?;
 
-    let os = if cfg!(target_os = "macos") {
-        "darwin"
-    } else if cfg!(target_os = "windows") {
-        "win"
-    } else {
-        "linux"
-    };
-    let arch = if cfg!(target_arch = "aarch64") {
-        "arm64"
-    } else {
-        "x64"
-    };
+    let platform = node_externals::current_platform();
 
     for (name, version) in &node_versions {
-        let dest = externals_dir.join(name);
-        let node_binary = if cfg!(target_os = "windows") {
-            dest.join("node.exe")
+        let version = version.trim();
+        let version_v = if version.starts_with('v') {
+            version.to_owned()
         } else {
-            dest.join("bin/node")
+            format!("v{version}")
         };
-        if node_binary.is_file() {
-            info!("Externals {name} already present, skipping");
+        let version_plain = version.trim_start_matches('v');
+        let dest = externals_dir.join(name);
+        if node_externals::is_valid_externals_dir(&dest, name, version_plain) {
+            info!("Externals {name} {version_v} already valid, skipping");
             continue;
         }
+        // If dest exists but is invalid, we will replace it.
+        if dest.exists() {
+            info!("Externals {name} stale or invalid (expected {version_v}), re-downloading");
+        }
 
-        let archive_name = if cfg!(target_os = "windows") {
-            format!("node-{version}-{os}-{arch}.zip")
-        } else {
-            format!("node-{version}-{os}-{arch}.tar.gz")
-        };
-        let url = format!("https://nodejs.org/dist/{version}/{archive_name}");
+        let archive_name = node_externals::archive_name(&version_v, &platform);
+        let url = node_externals::source_url(&version_v, &archive_name);
+        let shasums_url = node_externals::shasums_url(&version_v);
         info!("Downloading {name} from {url}");
 
-        let bytes = http.get_bytes(&url).await?;
+        let bytes = fetcher(&url)
+            .await
+            .with_context(|| format!("fetch {url}"))?;
+        // Fetch SHASUMS for belt-and-braces verification (best-effort).
+        let shasums = match fetcher(&shasums_url).await {
+            Ok(b) => Some(String::from_utf8_lossy(&b).into_owned()),
+            Err(e) => {
+                warn!("could not fetch SHASUMS256.txt for {version_v}: {e:#}; relying on pinned SHA only");
+                None
+            }
+        };
+        let digest = node_externals::sha256_hex(bytes.as_ref());
+        let pinned_key = node_externals::pinned_key(name, &version_v, &platform);
+        let pinned = crate::node_externals_pinned_sha256(&pinned_key);
+        if let Err(e) =
+            node_externals::verify_digest(&digest, &archive_name, pinned, shasums.as_deref())
+        {
+            anyhow::bail!(
+                "checksum verification failed for {name} {version_v} ({archive_name}): {e}"
+            );
+        }
+        if pinned.is_none() && shasums.is_none() {
+            warn!("no pinned SHA and no SHASUMS for {archive_name}; proceeding without verification (offline test?)");
+        }
         // Extract into a temporary directory, then publish atomically. A
         // failed download or extraction must not leave a directory that a
         // later configure mistakenly treats as a complete external.
@@ -674,6 +718,11 @@ async fn download_externals(http: &HttpClient, root: &std::path::Path) -> Result
             std::fs::remove_dir_all(&temp)?;
             anyhow::bail!("downloaded {name} archive did not contain bin/node");
         }
+        // Write manifest into temp before publishing atomically.
+        let manifest =
+            node_externals::NodeManifest::new(name, version_plain, &platform, &digest, &url);
+        node_externals::write_manifest(&temp, &manifest)
+            .with_context(|| format!("writing manifest for {name}"))?;
         if dest.exists() {
             std::fs::remove_dir_all(&dest)?;
         }
@@ -701,5 +750,248 @@ fn current_arch_label() -> &'static str {
         "ARM64"
     } else {
         "X64"
+    }
+}
+
+#[cfg(test)]
+mod node_externals_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn fake_node_tar(version: &str, platform: &str) -> Vec<u8> {
+        // Create a minimal tar.gz containing bin/node that prints v<version>
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let dir_name = format!("node-v{version}-{platform}/bin/");
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_mode(0o755);
+            header.set_size(0);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, &dir_name, &[][..])
+                .unwrap();
+
+            let script = format!("#!/bin/sh\necho v{version}\n");
+            let file_name = format!("node-v{version}-{platform}/bin/node");
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o755);
+            header.set_size(script.len() as u64);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, &file_name, script.as_bytes())
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut gz = Vec::new();
+        {
+            use flate2::write::GzEncoder;
+            use flate2::Compression;
+            use std::io::Write;
+            let mut enc = GzEncoder::new(&mut gz, Compression::default());
+            enc.write_all(&tar_data).unwrap();
+            enc.finish().unwrap();
+        }
+        gz
+    }
+
+    fn shasums_for(bytes: &[u8], archive_name: &str) -> String {
+        let digest = node_externals::sha256_hex(bytes);
+        format!("{digest}  {archive_name}\n")
+    }
+
+    #[tokio::test]
+    async fn stale_manifest_triggers_redownload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let externals_dir = root.join("externals");
+        std::fs::create_dir_all(externals_dir.join("node24/bin")).unwrap();
+        // Write stale manifest with old version and a fake node that claims old version.
+        let stale_version = "24.2.0";
+        let expected = crate::NODE24_EXTERNALS_VERSION;
+        assert_ne!(stale_version, expected, "test requires stale != expected");
+        let manifest = node_externals::NodeManifest::new(
+            "node24",
+            stale_version,
+            &node_externals::current_platform(),
+            "oldsha",
+            "https://example.com/old",
+        );
+        node_externals::write_manifest(&externals_dir.join("node24"), &manifest).unwrap();
+        let fake_node = externals_dir.join("node24/bin/node");
+        std::fs::write(&fake_node, format!("#!/bin/sh\necho v{stale_version}\n")).unwrap();
+        std::fs::set_permissions(&fake_node, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Also need node20 dir to avoid extra download interfering; make it valid
+        let platform = node_externals::current_platform();
+        for name in ["node20", "node24"] {
+            let ver = if name == "node20" {
+                crate::NODE20_EXTERNALS_VERSION
+            } else {
+                crate::NODE24_EXTERNALS_VERSION
+            };
+            let plain = ver.trim_start_matches('v');
+            // For node20 we make valid so only node24 is stale; for node24 we already made stale
+            if name == "node20" {
+                let dir = externals_dir.join(name);
+                std::fs::create_dir_all(dir.join("bin")).unwrap();
+                let m = node_externals::NodeManifest::new(
+                    name,
+                    plain,
+                    &platform,
+                    "abc",
+                    "https://example.com",
+                );
+                node_externals::write_manifest(&dir, &m).unwrap();
+                let fake = dir.join("bin/node");
+                std::fs::write(&fake, format!("#!/bin/sh\necho v{plain}\n")).unwrap();
+                std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+
+        // Prepare fetcher that returns correct tar for the expected version.
+        let platform = node_externals::current_platform();
+        let expected_plain = expected.trim_start_matches('v');
+        let archive_name = node_externals::archive_name(&format!("v{expected_plain}"), &platform);
+        let tar_bytes = fake_node_tar(expected_plain, &platform);
+        let shasums = shasums_for(&tar_bytes, &archive_name);
+        let tar_bytes_clone = tar_bytes.clone();
+        let archive_name_clone = archive_name.clone();
+        let shasums_clone = shasums.clone();
+        let fetcher = move |url: &str| {
+            let url = url.to_owned();
+            let tar = tar_bytes_clone.clone();
+            let shas = shasums_clone.clone();
+            let an = archive_name_clone.clone();
+            async move {
+                if url.ends_with(&an) {
+                    Ok(bytes::Bytes::from(tar))
+                } else if url.ends_with("SHASUMS256.txt") {
+                    Ok(bytes::Bytes::from(shas))
+                } else {
+                    anyhow::bail!("unexpected url {url}")
+                }
+            }
+        };
+
+        download_externals_with_fetcher(fetcher, root)
+            .await
+            .unwrap();
+        // After download, manifest should be updated to expected version.
+        let new_manifest = node_externals::read_manifest(&externals_dir.join("node24")).unwrap();
+        assert_eq!(new_manifest.version, expected_plain);
+        // Binary should now report expected version.
+        let out = std::process::Command::new(externals_dir.join("node24/bin/node"))
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            format!("v{expected_plain}")
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupted_tarball_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let externals_dir = root.join("externals");
+        std::fs::create_dir_all(&externals_dir).unwrap();
+        // Ensure no valid cache for node24 so it must download
+        let platform = node_externals::current_platform();
+        let expected = crate::NODE24_EXTERNALS_VERSION;
+        let expected_plain = expected.trim_start_matches('v');
+        let archive_name = node_externals::archive_name(&format!("v{expected_plain}"), &platform);
+
+        // Create corrupted bytes (not a valid digest vs shasums)
+        let bad_bytes = b"corrupted content".to_vec();
+        let _shasums = shasums_for(&bad_bytes, &archive_name);
+        // But also create a pinned mismatch: we won't have pinned, so verification is against shasums only.
+        // To make it fail, provide shasums for DIFFERENT bytes than we return.
+        let good_bytes = fake_node_tar(expected_plain, &platform);
+        let good_shasums = shasums_for(&good_bytes, &archive_name);
+        let fetcher = move |url: &str| {
+            let url = url.to_owned();
+            let bad = bad_bytes.clone();
+            let good_shas = good_shasums.clone();
+            let an = archive_name.clone();
+            async move {
+                if url.ends_with(&an) {
+                    Ok(bytes::Bytes::from(bad))
+                } else if url.ends_with("SHASUMS256.txt") {
+                    Ok(bytes::Bytes::from(good_shas))
+                } else {
+                    // For node20, return good bytes to not fail other runtime
+                    // Need to handle node20 fetch as well: we will provide valid for node20
+                    // This branch for node20 archive_name will be different string, but our archive_name is for node24 only.
+                    // Simplify: return good_bytes for any other tarball
+                    let plat = node_externals::current_platform();
+                    let v20_plain = crate::NODE20_EXTERNALS_VERSION.trim_start_matches('v');
+                    let an20 = node_externals::archive_name(&format!("v{v20_plain}"), &plat);
+                    let tar20 = fake_node_tar(v20_plain, &plat);
+                    let shas20 = shasums_for(&tar20, &an20);
+                    if url.ends_with(&an20) {
+                        Ok(bytes::Bytes::from(tar20))
+                    } else {
+                        Ok(bytes::Bytes::from(shas20))
+                    }
+                }
+            }
+        };
+
+        let result = download_externals_with_fetcher(fetcher, root).await;
+        assert!(result.is_err(), "corrupted tarball should be rejected");
+        // Ensure no directory was installed
+        assert!(!externals_dir.join("node24/bin/node").exists());
+        assert!(!externals_dir.join("node24/preloop-node.json").exists());
+    }
+
+    #[tokio::test]
+    async fn fresh_correct_cache_is_not_redownloaded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let externals_dir = root.join("externals");
+        let platform = node_externals::current_platform();
+        for name in ["node20", "node24"] {
+            let ver = if name == "node20" {
+                crate::NODE20_EXTERNALS_VERSION
+            } else {
+                crate::NODE24_EXTERNALS_VERSION
+            };
+            let plain = ver.trim_start_matches('v');
+            let dir = externals_dir.join(name);
+            std::fs::create_dir_all(dir.join("bin")).unwrap();
+            let m = node_externals::NodeManifest::new(
+                name,
+                plain,
+                &platform,
+                "abc",
+                "https://example.com",
+            );
+            node_externals::write_manifest(&dir, &m).unwrap();
+            let fake = dir.join("bin/node");
+            std::fs::write(&fake, format!("#!/bin/sh\necho v{plain}\n")).unwrap();
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mtime_before = std::fs::metadata(externals_dir.join("node24/preloop-node.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        // Fetcher that would panic if called
+        let fetcher = |_url: &str| async {
+            anyhow::bail!("network should not be called for fresh cache") as Result<bytes::Bytes>
+        };
+        download_externals_with_fetcher(fetcher, root)
+            .await
+            .unwrap();
+        let mtime_after = std::fs::metadata(externals_dir.join("node24/preloop-node.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(
+            mtime_before, mtime_after,
+            "fresh cache should not be re-downloaded"
+        );
     }
 }
