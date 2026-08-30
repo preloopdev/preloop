@@ -1258,3 +1258,69 @@ fn template_string_token_escapes_literal_braces() {
     assert_eq!(token["type"], 0);
     assert_eq!(token["lit"], "plain {not} an expression");
 }
+
+#[test]
+fn action_reference_list_roundtrips_wire_format() {
+    let json = serde_json::json!({
+        "actions": [
+            {"nameWithOwner": "actions/checkout", "ref": "v4", "path": ""},
+            {"nameWithOwner": "actions/setup-node", "ref": "v4"}
+        ],
+        "dependencies": ["actions/checkout@v4"]
+    });
+
+    let parsed: ActionReferenceList = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(parsed.actions.len(), 2);
+    assert_eq!(parsed.actions[0].name_with_owner, "actions/checkout");
+    assert_eq!(parsed.actions[0].r#ref, "v4");
+    assert_eq!(parsed.actions[0].path.as_deref(), Some(""));
+    assert_eq!(parsed.actions[1].name_with_owner, "actions/setup-node");
+    assert_eq!(parsed.actions[1].r#ref, "v4");
+    assert_eq!(parsed.actions[1].path, None);
+    assert_eq!(
+        parsed.dependencies.as_deref(),
+        Some(&["actions/checkout@v4".to_string()][..])
+    );
+
+    let serialized = serde_json::to_value(&parsed).unwrap();
+    assert_eq!(
+        serialized["actions"][0]["nameWithOwner"],
+        "actions/checkout"
+    );
+    assert_eq!(serialized["actions"][0]["ref"], "v4");
+}
+
+#[test]
+fn action_download_info_collection_roundtrips_with_bearer_token() {
+    let mut actions = BTreeMap::new();
+    actions.insert(
+        "actions/checkout@v4".to_string(),
+        ActionDownloadInfo {
+            authentication: Some(ActionDownloadAuthentication {
+                expires_at: Some("2026-08-30T12:00:00Z".to_string()),
+                token: Some("ghs_bearer123".to_string()),
+            }),
+            package_details: None,
+            name_with_owner: Some("actions/checkout".to_string()),
+            resolved_name_with_owner: Some("actions/checkout".to_string()),
+            resolved_sha: Some("abc123def456abc123def456abc123def456abc1".to_string()),
+            tarball_url: Some("https://codeload.github.com/actions/checkout/tar.gz/abc123def456abc123def456abc123def456abc1".to_string()),
+            r#ref: Some("v4".to_string()),
+            zipball_url: None,
+        },
+    );
+
+    let collection = ActionDownloadInfoCollection { actions };
+    let serialized = serde_json::to_value(&collection).unwrap();
+    assert_eq!(
+        serialized["actions"]["actions/checkout@v4"]["resolvedSha"],
+        "abc123def456abc123def456abc123def456abc1"
+    );
+    assert_eq!(
+        serialized["actions"]["actions/checkout@v4"]["authentication"]["token"],
+        "ghs_bearer123"
+    );
+
+    let deserialized: ActionDownloadInfoCollection = serde_json::from_value(serialized).unwrap();
+    assert_eq!(deserialized.actions.len(), 1);
+}

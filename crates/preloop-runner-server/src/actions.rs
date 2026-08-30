@@ -1,20 +1,18 @@
 use super::*;
+use futures::StreamExt;
+use preloop_gha_protocol::azdo::{
+    ActionDownloadAuthentication, ActionDownloadInfo, ActionDownloadInfoCollection,
+    ActionReferenceList,
+};
+use std::collections::BTreeMap;
 
 /// POST action download info — resolve action references to download URLs.
 pub(crate) async fn action_download_info(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    let mut tickets = serde_json::Map::new();
-    collect_action_download_refs(&shared.state, &request, &mut tickets);
-
-    Json(json!({
-        "archiveDownloadTickets": tickets.clone(),
-        // Some runner/protocol paths call the same payload an actionsDownloadInfo
-        // map. Return both names so legacy and batch clients can consume the same
-        // local fallback without a second resolution path.
-        "actionsDownloadInfo": tickets,
-    }))
+    let collection = collect_action_download_infos(&shared.state, &request).await;
+    Json(serde_json::to_value(collection).unwrap_or_else(|_| json!({ "actions": {} })))
 }
 
 pub(crate) async fn runnerresolve_actions(
@@ -119,6 +117,41 @@ async fn resolve_ref_to_sha(
     sha
 }
 
+/// Percent-encode a path component for RFC 3986 URL safety.
+pub(crate) fn percent_encode_path_segment(input: &str) -> String {
+    let mut encoded = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                encoded.push_str(&format!("%{:02X}", byte));
+            }
+        }
+    }
+    encoded
+}
+
+/// Percent-decode an RFC 3986 path segment.
+fn percent_decode_path_segment(input: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(input.len());
+    let mut chars = input.bytes();
+    while let Some(byte) = chars.next() {
+        if byte == b'%' {
+            let high = chars.next()?;
+            let low = chars.next()?;
+            let hex = [high, low];
+            let hex_str = std::str::from_utf8(&hex).ok()?;
+            let val = u8::from_str_radix(hex_str, 16).ok()?;
+            bytes.push(val);
+        } else {
+            bytes.push(byte);
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
 #[derive(serde::Deserialize)]
 pub(crate) struct ActionTicketQuery {
     #[serde(default)]
@@ -129,18 +162,33 @@ pub(crate) struct ActionTicketQuery {
 
 pub(crate) async fn download_action_tarball(
     State(shared): State<Arc<SharedState>>,
-    Path((owner, repo, git_ref)): Path<(String, String, String)>,
+    Path((raw_owner, raw_repo, raw_git_ref)): Path<(String, String, String)>,
     Query(ticket): Query<ActionTicketQuery>,
 ) -> Result<Response, ApiError> {
+    let owner = percent_decode_path_segment(&raw_owner)
+        .ok_or_else(|| ApiError::bad_request("invalid percent-encoding in owner"))?;
+    let repo = percent_decode_path_segment(&raw_repo)
+        .ok_or_else(|| ApiError::bad_request("invalid percent-encoding in repo"))?;
+    let git_ref = percent_decode_path_segment(&raw_git_ref)
+        .ok_or_else(|| ApiError::bad_request("invalid percent-encoding in git_ref"))?;
+
     // 1. Sanitize parameters to avoid directory traversal
-    if owner.contains('.')
+    if owner.is_empty()
+        || repo.is_empty()
+        || git_ref.is_empty()
+        || owner == "."
+        || owner == ".."
+        || repo == "."
+        || repo == ".."
         || owner.contains('/')
         || owner.contains('\\')
-        || repo.contains('.')
+        || owner.contains('\0')
         || repo.contains('/')
         || repo.contains('\\')
-        || git_ref.contains("..")
+        || repo.contains('\0')
         || git_ref.contains('\\')
+        || git_ref.contains('\0')
+        || git_ref.split('/').any(|seg| seg == "..")
     {
         return Err(ApiError::bad_request("invalid owner, repo, or git_ref"));
     }
@@ -282,48 +330,6 @@ pub(crate) async fn download_action_tarball(
     Ok(res)
 }
 
-pub(crate) fn collect_action_download_refs(
-    state: &AppState,
-    value: &serde_json::Value,
-    tickets: &mut serde_json::Map<String, serde_json::Value>,
-) {
-    match value {
-        serde_json::Value::String(raw) => {
-            if let Some((key, ticket)) = action_download_ticket(state, raw, None) {
-                tickets.entry(key).or_insert(ticket);
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                collect_action_download_refs(state, item, tickets);
-            }
-        }
-        serde_json::Value::Object(map) => {
-            let action = map
-                .get("action")
-                .or_else(|| map.get("name"))
-                .or_else(|| map.get("nameWithOwner"))
-                .or_else(|| map.get("repository"))
-                .and_then(|v| v.as_str());
-            let version = map
-                .get("version")
-                .or_else(|| map.get("ref"))
-                .or_else(|| map.get("reference"))
-                .and_then(|v| v.as_str());
-            if let Some(action) = action {
-                if let Some((key, ticket)) = action_download_ticket(state, action, version) {
-                    tickets.entry(key).or_insert(ticket);
-                }
-            }
-
-            for nested in map.values() {
-                collect_action_download_refs(state, nested, tickets);
-            }
-        }
-        _ => {}
-    }
-}
-
 pub(crate) fn action_download_ticket(
     state: &AppState,
     action: &str,
@@ -345,7 +351,13 @@ pub(crate) fn action_download_ticket(
     let mut parts = repo_part.split('/');
     let owner = parts.next()?;
     let repo = parts.next()?;
-    if owner.is_empty() || repo.is_empty() {
+    if owner.is_empty()
+        || repo.is_empty()
+        || owner == "."
+        || owner == ".."
+        || repo == "."
+        || repo == ".."
+    {
         return None;
     }
 
@@ -361,8 +373,11 @@ pub(crate) fn action_download_ticket(
         .unwrap_or_default()
         + ACTION_TICKET_TTL_SECS;
     let signature = state.sign_action_ticket(owner, repo, git_ref, expires_at);
+    let enc_owner = percent_encode_path_segment(owner);
+    let enc_repo = percent_encode_path_segment(repo);
+    let enc_ref = percent_encode_path_segment(git_ref);
     let url = format!(
-        "{runner_url}/api/v1/actions/download/{owner}/{repo}/{git_ref}\
+        "{runner_url}/api/v1/actions/download/{enc_owner}/{enc_repo}/{enc_ref}\
 ?exp={expires_at}&sig={signature}"
     );
     Some((
@@ -376,34 +391,70 @@ pub(crate) fn action_download_ticket(
     ))
 }
 
+/// Maximum number of actions accepted in a single resolution batch to bound memory.
+pub(crate) const MAX_ACTION_BATCH_SIZE: usize = 256;
+/// Maximum concurrent outbound GitHub ref resolution requests.
+pub(crate) const MAX_ACTION_CONCURRENCY: usize = 16;
+
 pub(crate) async fn collect_runnerresolve_refs(
     state: &AppState,
     value: &serde_json::Value,
     actions: &mut serde_json::Map<String, serde_json::Value>,
 ) {
-    // Collect the (action, version) pairs first (sync recursion), then
-    // resolve them — async recursion would need boxing for no benefit.
     let mut requests: Vec<(String, Option<String>)> = Vec::new();
     collect_runnerresolve_requests(value, &mut requests);
-    // A payload repeats the same `uses:` once per step and once per matrix
-    // cell. Resolving a duplicate costs a full round trip before the cache is
-    // populated, so collapse them first; the retained order is what decides
-    // `or_insert` precedence below.
+    requests.truncate(MAX_ACTION_BATCH_SIZE);
     let mut seen = std::collections::HashSet::new();
     requests.retain(|request| seen.insert(request.clone()));
-    // Concurrently: each entry is an independent GitHub round trip, and the
-    // whole set sits on the job-setup critical path. Sequential awaits made a
-    // job with N actions pay N × the client timeout on a slow or unreachable
-    // API.
-    let resolved = futures::future::join_all(
-        requests
-            .iter()
-            .map(|(action, version)| runnerresolve_action(state, action, version.as_deref())),
-    )
-    .await;
+
+    let stream = futures::stream::iter(requests.into_iter().map(|(action, version)| async move {
+        runnerresolve_action(state, &action, version.as_deref()).await
+    }))
+    .buffer_unordered(MAX_ACTION_CONCURRENCY);
+
+    let resolved: Vec<Option<(String, serde_json::Value)>> = stream.collect().await;
     for (key, value) in resolved.into_iter().flatten() {
         actions.entry(key).or_insert(value);
     }
+}
+
+/// Batch collector for the official JobServer `ActionDownloadInfo` endpoint.
+pub(crate) async fn collect_action_download_infos(
+    state: &AppState,
+    value: &serde_json::Value,
+) -> ActionDownloadInfoCollection {
+    let mut requests: Vec<(String, Option<String>)> = Vec::new();
+    if let Ok(list) = serde_json::from_value::<ActionReferenceList>(value.clone()) {
+        for item in list.actions.into_iter().take(MAX_ACTION_BATCH_SIZE) {
+            if !item.name_with_owner.is_empty() {
+                let ref_opt = if item.r#ref.is_empty() {
+                    None
+                } else {
+                    Some(item.r#ref)
+                };
+                requests.push((item.name_with_owner, ref_opt));
+            }
+        }
+    } else {
+        collect_runnerresolve_requests(value, &mut requests);
+        requests.truncate(MAX_ACTION_BATCH_SIZE);
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    requests.retain(|request| seen.insert(request.clone()));
+
+    let stream = futures::stream::iter(requests.into_iter().map(|(action, version)| async move {
+        action_download_info_entry(state, &action, version.as_deref()).await
+    }))
+    .buffer_unordered(MAX_ACTION_CONCURRENCY);
+
+    let resolved: Vec<Option<(String, ActionDownloadInfo)>> = stream.collect().await;
+    let mut actions = BTreeMap::new();
+    for (key, value) in resolved.into_iter().flatten() {
+        actions.insert(key, value);
+    }
+
+    ActionDownloadInfoCollection { actions }
 }
 
 fn collect_runnerresolve_requests(
@@ -443,49 +494,102 @@ fn collect_runnerresolve_requests(
     }
 }
 
-pub(crate) async fn runnerresolve_action(
+/// Resolve one action reference to its pinned download parts, shared by both
+/// the JobServer (`ActionDownloadInfo`) and Launch (`runnerresolve`) wire
+/// shapes. Returns `(lookup_key, name_with_owner, ref, resolved_sha,
+/// tar_url)`.
+///
+/// The first `action_download_ticket` call is the validation gate as well as
+/// the key source: it rejects `./`, `../` and `docker://` references, so those
+/// never reach the network lookup below. Its ticket is discarded because the
+/// final URL has to carry the resolved SHA, which is not known until after
+/// resolution.
+///
+/// Pin the ref to the SHA GitHub would resolve at job time. The ticket URL
+/// then carries the SHA, so both the server-side tarball cache and the
+/// runner's `_actions/{owner}/{repo}/{sha}` extraction dir are keyed by
+/// content identity: when the ref moves, the next job gets a fresh SHA, a
+/// fresh download, and the stale archive is never served again. When the
+/// lookup is unavailable the ref itself is used, preserving the historical
+/// ref-keyed behavior.
+async fn resolve_action_download(
     state: &AppState,
     action: &str,
     version_override: Option<&str>,
-) -> Option<(String, serde_json::Value)> {
-    // First call is the validation gate as well as the key source: it rejects
-    // `./`, `../` and `docker://` references, so those never reach the network
-    // lookup below. The ticket it mints is discarded because the final URL has
-    // to carry the resolved SHA, which is not known until after resolution.
+) -> Option<(String, String, String, Option<String>, String)> {
     let (key, _) = action_download_ticket(state, action, version_override)?;
-    let (name, version) = key.split_once('@')?;
+    let (name, git_ref) = key.split_once('@')?;
     let name = name.to_string();
-    let version = version.to_string();
-    let (repo_part, git_ref) = if let Some(version) = version_override {
-        (action.to_owned(), version.to_owned())
+    let git_ref = git_ref.to_string();
+    let repo_part = if version_override.is_some() {
+        action.to_owned()
     } else {
-        action
-            .split_once('@')
-            .map(|(n, v)| (n.to_owned(), v.to_owned()))?
+        action.split_once('@')?.0.to_owned()
     };
     let mut parts = repo_part.split('/');
     let owner = parts.next()?.to_owned();
     let repo = parts.next()?.to_owned();
 
-    // Pin the ref to the SHA GitHub would resolve at job time. The ticket URL
-    // then carries the SHA, so both the server-side tarball cache and the
-    // runner's `_actions/{owner}/{repo}/{sha}` extraction dir are keyed by
-    // content identity: when the ref moves, the next job gets a fresh SHA, a
-    // fresh download, and the stale archive is never served again. When the
-    // lookup is unavailable the ref itself is used, preserving the historical
-    // ref-keyed behavior.
     let pinned = resolve_ref_to_sha(state, &owner, &repo, &git_ref).await;
-    let effective_ref = pinned.as_deref().unwrap_or(&git_ref);
-    let (_, ticket) = action_download_ticket(state, action, Some(effective_ref))?;
+    let effective_ref = pinned.as_deref().unwrap_or(&git_ref).to_owned();
+    let (_, ticket) = action_download_ticket(state, action, Some(&effective_ref))?;
     let tar_url = ticket.get("url")?.as_str()?.to_string();
+    Some((key, name, git_ref, pinned, tar_url))
+}
+
+pub(crate) async fn runnerresolve_action(
+    state: &AppState,
+    action: &str,
+    version_override: Option<&str>,
+) -> Option<(String, serde_json::Value)> {
+    let (key, name, git_ref, resolved_sha_opt, tar_url) =
+        resolve_action_download(state, action, version_override).await?;
+    let resolved_sha = resolved_sha_opt.unwrap_or_else(|| git_ref.clone());
     Some((
         key,
         json!({
             "name": name,
-            "version": version,
-            "resolved_sha": effective_ref,
+            "version": git_ref,
+            "resolved_sha": resolved_sha,
             "tar_url": tar_url,
             "authentication": null,
         }),
+    ))
+}
+
+/// One `ActionDownloadInfo` entry in the official `ActionDownloadInfoCollection` wire shape.
+pub(crate) async fn action_download_info_entry(
+    state: &AppState,
+    action: &str,
+    version_override: Option<&str>,
+) -> Option<(String, ActionDownloadInfo)> {
+    let (key, name, git_ref, resolved_sha, tar_url) =
+        resolve_action_download(state, action, version_override).await?;
+
+    let authentication = state.static_github_pat().map(|pat| {
+        let expires_at = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_secs())
+            .unwrap_or_default()
+            + ACTION_TICKET_TTL_SECS)
+            .to_string();
+        ActionDownloadAuthentication {
+            expires_at: Some(expires_at),
+            token: Some(pat.to_string()),
+        }
+    });
+
+    Some((
+        key,
+        ActionDownloadInfo {
+            name_with_owner: Some(name.clone()),
+            resolved_name_with_owner: Some(name),
+            resolved_sha,
+            r#ref: Some(git_ref),
+            tarball_url: Some(tar_url),
+            zipball_url: None,
+            authentication,
+            package_details: None,
+        },
     ))
 }
