@@ -901,7 +901,7 @@ const BASE_PACKAGES: &str = "\
      haveged mediainfo p7zip-rar pollinate sshpass telnet tk xvfb zsync ftp \
      sphinxsearch systemd-coredump libnss3-tools software-properties-common \
      build-essential pkg-config libssl-dev make autoconf automake libtool m4 \
-     bison flex texinfo patchelf swig dpkg-dev fakeroot binutils \
+     bison flex texinfo patchelf swig dpkg-dev fakeroot binutils lld \
      libicu-dev libsqlite3-dev libyaml-dev \
      python3 python3-pip python-is-python3 \
      unzip zip xz-utils zstd bzip2 brotli lz4 pigz p7zip-full tar \
@@ -1058,6 +1058,7 @@ fn base_packages_pinned() -> String {
         dpkg-dev={APT_DPKG_DEV} \
         fakeroot={APT_FAKEROOT} \
         binutils={APT_BINUTILS} \
+        lld={APT_LLD} \
         libicu-dev={APT_LIBICU_DEV} \
         libsqlite3-dev={APT_LIBSQLITE3_DEV} \
         libyaml-dev={APT_LIBYAML_DEV} \

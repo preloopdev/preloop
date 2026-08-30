@@ -10,6 +10,7 @@
 //! - `GitHub.DistributedTask.WebApi` NuGet package (shared DTOs)
 #![allow(missing_docs)]
 
+mod action_download;
 mod completion;
 mod context_data;
 mod job;
@@ -19,6 +20,7 @@ mod resources;
 mod timeline;
 mod variables;
 
+pub use action_download::*;
 pub use completion::*;
 pub use context_data::*;
 pub use job::*;

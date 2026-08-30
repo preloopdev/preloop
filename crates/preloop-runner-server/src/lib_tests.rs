@@ -4077,7 +4077,106 @@ async fn broker_job_refs_use_session_runner_id_for_pool_and_root_polls() {
 }
 
 #[tokio::test]
-async fn action_download_info_returns_remote_action_tickets() {
+async fn action_download_info_returns_batch_download_collection() {
+    // Held for the whole test: `PRELOOP_GITHUB_API_URL` is process-global.
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "mock-bearer-token");
+
+    // Hermetic ref→SHA resolution: a mock GitHub API answers `commits/{ref}`
+    // with a fixed SHA so the batch handler never touches real GitHub.
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", api_listener.local_addr().unwrap());
+    let mock = axum::Router::new().route(
+        "/repos/:owner/:repo/commits/:git_ref",
+        axum::routing::get(|| async {
+            axum::Json(serde_json::json!({"sha": "abc123def456abc123def456abc123def456abc1"}))
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(api_listener, mock).await.unwrap();
+    });
+    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+
+    let temp = tempfile::tempdir().unwrap();
+    let app = app(
+        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        CancellationToken::new(),
+    );
+
+    // Official runner batch shape: `ActionReferenceList` of
+    // `{nameWithOwner, ref, path}`. Local (`./`) and docker refs are dropped.
+    let response = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/ActionDownloadInfo/scope/actions/plan",
+        json!({
+            "actions": [
+                {"nameWithOwner": "actions/checkout", "ref": "v4", "path": ""},
+                {"nameWithOwner": "owner/repo", "ref": "main", "path": "sub/dir"},
+                {"nameWithOwner": "actions/setup-node.js", "ref": "v4", "path": ""},
+                {"nameWithOwner": "./.github/actions/local", "ref": ""},
+                {"nameWithOwner": "docker://alpine:3.20", "ref": ""}
+            ]
+        }),
+    )
+    .await;
+
+    // Reply is an `ActionDownloadInfoCollection`: `actions` keyed by
+    // `nameWithOwner@ref`, each entry an `ActionDownloadInfo`.
+    let actions = response["actions"].as_object().unwrap();
+
+    let checkout = &actions["actions/checkout@v4"];
+    assert_eq!(checkout["nameWithOwner"], "actions/checkout");
+    assert_eq!(checkout["ref"], "v4");
+    // The ref is pinned to the SHA the mock API resolves.
+    assert_eq!(
+        checkout["resolvedSha"],
+        "abc123def456abc123def456abc123def456abc1"
+    );
+    // The runner reads `tarballUrl`; it carries a signed, expiring ticket
+    // pinned to the resolved SHA (the bearerless route treats the URL as the
+    // capability).
+    let tarball = checkout["tarballUrl"].as_str().unwrap();
+    let (base, query) = tarball.split_once('?').expect("ticket query");
+    assert_eq!(
+        base,
+        "http://127.0.0.1:9090/api/v1/actions/download/actions/checkout/abc123def456abc123def456abc123def456abc1"
+    );
+    assert!(query.contains("exp=") && query.contains("sig="), "{query}");
+    // Preloop's own download capability route is HMAC signed and bearerless; operator PAT is never leaked.
+    assert!(checkout["authentication"].is_null());
+
+    // Repositories with dots in their names (e.g. actions/setup-node.js) resolve cleanly.
+    let node = &actions["actions/setup-node.js@v4"];
+    assert_eq!(node["nameWithOwner"], "actions/setup-node.js");
+    assert!(node["tarballUrl"]
+        .as_str()
+        .unwrap()
+        .contains("actions/setup-node.js/abc123def456abc123def456abc123def456abc1"));
+
+    // Subpath actions key on `nameWithOwner@ref` (path excluded, matching the
+    // runner's `GetDownloadInfoLookupKey`).
+    let sub = &actions["owner/repo@main"];
+    assert_eq!(sub["nameWithOwner"], "owner/repo");
+    assert!(
+        sub["tarballUrl"].as_str().unwrap().starts_with(
+            "http://127.0.0.1:9090/api/v1/actions/download/owner/repo/abc123def456abc123def456abc123def456abc1?"
+        ),
+        "{}",
+        sub["tarballUrl"]
+    );
+
+    // Local and docker refs are never resolvable to a download.
+    assert!(!actions.contains_key("./.github/actions/local@"));
+    assert!(!actions.contains_key("docker://alpine:3.20@"));
+    assert_eq!(actions.len(), 3);
+}
+
+#[tokio::test]
+async fn action_download_info_returns_null_auth_when_token_unset() {
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+
     let temp = tempfile::tempdir().unwrap();
     let app = app(
         AppState::new(temp.path().to_path_buf()).await.unwrap(),
@@ -4090,40 +4189,98 @@ async fn action_download_info_returns_remote_action_tickets() {
         "/runner/server/_apis/v1/ActionDownloadInfo/scope/actions/plan",
         json!({
             "actions": [
-                {"action": "actions/checkout", "version": "v4"},
-                "dtolnay/rust-toolchain@stable",
-                "./.github/actions/local",
-                "docker://alpine:3.20"
+                {"nameWithOwner": "actions/checkout", "ref": "v4", "path": ""}
             ]
         }),
     )
     .await;
 
-    let tickets = response["archiveDownloadTickets"].as_object().unwrap();
-    // The URL carries a signed, expiring ticket: the download route is
-    // bearerless, so the URL itself is the capability.
-    let checkout = tickets["actions/checkout@v4"]["url"].as_str().unwrap();
-    let (base, query) = checkout.split_once('?').expect("ticket query");
-    assert_eq!(
-        base,
-        "http://127.0.0.1:9090/api/v1/actions/download/actions/checkout/v4"
+    let actions = response["actions"].as_object().unwrap();
+    let checkout = &actions["actions/checkout@v4"];
+    assert!(checkout["authentication"].is_null());
+}
+
+#[tokio::test]
+async fn action_download_info_discards_malformed_or_abbreviated_sha() {
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    // Mock API returns an abbreviated 7-char SHA rather than full 40-char SHA
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", api_listener.local_addr().unwrap());
+    let mock = axum::Router::new().route(
+        "/repos/:owner/:repo/commits/:git_ref",
+        axum::routing::get(|| async { axum::Json(serde_json::json!({"sha": "abc1234"})) }),
     );
-    assert!(query.contains("exp=") && query.contains("sig="), "{query}");
-    assert!(
-        tickets["dtolnay/rust-toolchain@stable"]["url"]
-            .as_str()
-            .unwrap()
-            .starts_with(
-                "http://127.0.0.1:9090/api/v1/actions/download/dtolnay/rust-toolchain/stable?"
-            ),
-        "{}",
-        tickets["dtolnay/rust-toolchain@stable"]["url"]
+    tokio::spawn(async move {
+        axum::serve(api_listener, mock).await.unwrap();
+    });
+    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+
+    let temp = tempfile::tempdir().unwrap();
+    let app = app(
+        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        CancellationToken::new(),
     );
-    assert!(!tickets.contains_key("./.github/actions/local"));
-    assert!(!tickets.contains_key("docker://alpine:3.20"));
+
+    let response = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/ActionDownloadInfo/scope/actions/plan",
+        json!({
+            "actions": [
+                {"nameWithOwner": "actions/checkout", "ref": "v4", "path": ""}
+            ]
+        }),
+    )
+    .await;
+
+    let actions = response["actions"].as_object().unwrap();
+    let checkout = &actions["actions/checkout@v4"];
+    // Short SHA was discarded; resolvedSha is null and tarball URL falls back to ref
+    assert!(checkout["resolvedSha"].is_null());
+    assert!(checkout["tarballUrl"]
+        .as_str()
+        .unwrap()
+        .contains("actions/checkout/v4?"));
+}
+
+#[tokio::test]
+async fn resolve_ref_to_sha_omits_pat_over_http() {
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "secret-pat");
+
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", api_listener.local_addr().unwrap());
+    let mock = axum::Router::new().route(
+        "/repos/:owner/:repo/commits/:git_ref",
+        axum::routing::get(|headers: axum::http::HeaderMap| async move {
+            assert!(
+                !headers.contains_key(axum::http::header::AUTHORIZATION),
+                "PAT must never be transmitted over plain unencrypted HTTP"
+            );
+            axum::Json(serde_json::json!({"sha": "abc123def456abc123def456abc123def456abc1"}))
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(api_listener, mock).await.unwrap();
+    });
+    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+
+    let temp = tempfile::tempdir().unwrap();
+    let app = app(
+        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        CancellationToken::new(),
+    );
+
+    let response = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/ActionDownloadInfo/scope/actions/plan",
+        json!({ "actions": [{"nameWithOwner": "actions/checkout", "ref": "v4"}] }),
+    )
+    .await;
     assert_eq!(
-        response["actionsDownloadInfo"],
-        response["archiveDownloadTickets"]
+        response["actions"]["actions/checkout@v4"]["resolvedSha"],
+        "abc123def456abc123def456abc123def456abc1"
     );
 }
 
@@ -4145,14 +4302,13 @@ async fn runnerresolve_actions_returns_runner_parseable_tar_urls() {
     tokio::spawn(async move {
         axum::serve(api_listener, mock).await.unwrap();
     });
-    std::env::set_var("PRELOOP_GITHUB_API_URL", &api_base);
+    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
 
     let temp = tempfile::tempdir().unwrap();
     let app = app(
         AppState::new(temp.path().to_path_buf()).await.unwrap(),
         CancellationToken::new(),
     );
-    std::env::remove_var("PRELOOP_GITHUB_API_URL");
 
     let response = request_json(
         &app,
@@ -4314,6 +4470,18 @@ async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
         .await
         .unwrap();
 
+    // Cache entry for repo with dots in its name
+    let dotted_dir = temp
+        .path()
+        .join("actions")
+        .join("test.owner")
+        .join("test.repo.js")
+        .join("v1#tag");
+    tokio::fs::create_dir_all(&dotted_dir).await.unwrap();
+    tokio::fs::write(dotted_dir.join("action.tar.gz"), b"dotted-tar-content")
+        .await
+        .unwrap();
+
     // 1. Successful cache hit, with the signed ticket the server mints
     let expires_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4343,6 +4511,113 @@ async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert_eq!(bytes.as_ref(), b"dummy-tar-content");
 
+    // 1b. Successful cache hit for dotted repo name and special character in tag
+    let dotted_sig = state.sign_action_ticket("test.owner", "test.repo.js", "v1#tag", expires_at);
+    let enc_ref = percent_encode_path_segment("v1#tag");
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/api/v1/actions/download/test.owner/test.repo.js/{enc_ref}?exp={expires_at}&sig={dotted_sig}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"dotted-tar-content"
+    );
+
+    // 1c. Ref containing literal % (e.g. v1%tag)
+    let pct_dir = temp
+        .path()
+        .join("actions")
+        .join("test-owner")
+        .join("test-repo")
+        .join("v1%tag");
+    tokio::fs::create_dir_all(&pct_dir).await.unwrap();
+    tokio::fs::write(pct_dir.join("action.tar.gz"), b"pct-tar-content")
+        .await
+        .unwrap();
+    let pct_sig = state.sign_action_ticket("test-owner", "test-repo", "v1%tag", expires_at);
+    let enc_pct_ref = percent_encode_path_segment("v1%tag"); // "v1%25tag"
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/api/v1/actions/download/test-owner/test-repo/{enc_pct_ref}?exp={expires_at}&sig={pct_sig}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // 1d. Cache miss with special ref (v1#beta) correctly percent-encodes outbound fetch
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", api_listener.local_addr().unwrap());
+    let mock = axum::Router::new().route(
+        "/repos/:owner/:repo/tarball/:git_ref",
+        axum::routing::get(
+            |axum::extract::Path((_owner, _repo, git_ref)): axum::extract::Path<(
+                String,
+                String,
+                String,
+            )>| async move {
+                assert_eq!(
+                    git_ref, "v1#beta",
+                    "outbound fetch must preserve exact tag without fragment stripping"
+                );
+                axum::response::Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from("fetched-tar-content"))
+                    .unwrap()
+            },
+        ),
+    );
+    tokio::spawn(async move {
+        axum::serve(api_listener, mock).await.unwrap();
+    });
+    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+
+    let miss_temp = tempfile::tempdir().unwrap();
+    let miss_state = AppState::new(miss_temp.path().to_path_buf()).await.unwrap();
+    let miss_app = crate::routes::app(miss_state.clone(), CancellationToken::new());
+    let miss_sig = miss_state.sign_action_ticket("test-owner", "test-repo", "v1#beta", expires_at);
+    let enc_hash_ref = percent_encode_path_segment("v1#beta");
+    let response = miss_app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/api/v1/actions/download/test-owner/test-repo/{enc_hash_ref}?exp={expires_at}&sig={miss_sig}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"fetched-tar-content"
+    );
+
     // 2. Reject path traversal
     let response = app
         .clone()
@@ -4358,6 +4633,7 @@ async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method(Method::GET)
@@ -4368,6 +4644,28 @@ async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // 2b. Reject absolute paths and leading slashes in ref
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/actions/download/test-owner/test-repo/%2Ftmp%2Fescape")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // action_download_ticket returns None for absolute refs
+    assert!(crate::actions::action_download_ticket(
+        &state,
+        "test-owner/test-repo@/tmp/escape",
+        None
+    )
+    .is_none());
 }
 
 #[tokio::test]
