@@ -42,6 +42,20 @@
         "protocol-sync",
         "dependencies"
       ]
+    },
+    {
+      "matchDatasources": [
+        "node-version"
+      ],
+      "matchDepNames": [
+        "node20",
+        "node24"
+      ],
+      "description": "Node externals bumps track nodejs.org dist; gated by supply-chain.yml OSV/SBOM checks. Never auto-merge — the supply-chain workflow must pass first.",
+      "labels": [
+        "dependencies"
+      ],
+      "automerge": false
     }
   ],
   "customManagers": [
@@ -72,6 +86,32 @@
       "datasourceTemplate": "github-releases",
       "versioningTemplate": "semver",
       "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "customType": "regex",
+      "description": "Node 20 externals pin in versions.toml. Tracks nodejs.org dist (node-version datasource) for the Node.js bundled with the runner externals; bumps are gated by supply-chain.yml (OSV + SBOM) and must not auto-merge.",
+      "fileMatch": [
+        "^versions\\.toml$"
+      ],
+      "matchStrings": [
+        "node20_externals_version\\s*=\\s*\"(?<currentValue>[^\"]+)\""
+      ],
+      "depNameTemplate": "node20",
+      "datasourceTemplate": "node-version",
+      "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "description": "Node 24 externals pin in versions.toml. Tracks nodejs.org dist (node-version datasource) for the Node.js bundled with the runner externals; bumps are gated by supply-chain.yml (OSV + SBOM) and must not auto-merge.",
+      "fileMatch": [
+        "^versions\\.toml$"
+      ],
+      "matchStrings": [
+        "node24_externals_version\\s*=\\s*\"(?<currentValue>[^\"]+)\""
+      ],
+      "depNameTemplate": "node24",
+      "datasourceTemplate": "node-version",
+      "versioningTemplate": "semver"
     }
   ]
 }

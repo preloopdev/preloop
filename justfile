@@ -57,10 +57,16 @@ test-ci: fmt-check clippy zizmor
     just conform
     @echo CI: all checks passed
 
-# Supply-chain gate: dependency version-change policing (vet), RustSec
-# advisories (audit), and license/ban/source policy (deny). Local runs are on
-# trusted code; CI (supply-chain.yml) additionally drops any PR-shipped
-# .cargo/config.toml and rejects PRs that touch the policy files.
+# Supply-chain gate: cargo vet (supply-chain/audits.toml), cargo audit (RustSec),
+# and cargo deny check all (licenses/bans/sources). Local runs are on trusted
+# code. CI gate is .github/workflows/supply-chain.yml (runs-on: ubuntu-latest;
+# triggers: pull_request, push to main, weekly schedule) — it drops any
+# PR-shipped .cargo/config.toml, rejects PRs that touch policy files
+# (deny.toml, .cargo/audit.toml, supply-chain/*), runs the Node externals
+# OSV+SBOM audit (scripts/audit-node-externals.sh), and the
+# check-node-pin-parity job that verifies versions.toml pins against upstream
+# actions/runner src/Misc/externals.sh. Use `just supply-chain` locally; CI
+# runs the same checks via the workflow on GitHub-hosted runners.
 supply-chain:
     cargo vet
     cargo audit
