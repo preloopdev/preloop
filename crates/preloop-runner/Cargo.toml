@@ -21,6 +21,7 @@ preloop-gha-expressions = { path = "../preloop-gha-expressions" }
 preloop-gha-parser = { path = "../preloop-gha-parser" }
 preloop-dap = { path = "../preloop-dap" }
 
+cap-std = { workspace = true }
 anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true

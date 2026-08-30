@@ -78,9 +78,15 @@ pub async fn download_action(
 }
 
 /// Extract a `.tar.gz` tarball to `dest`, stripping the top-level directory.
+///
+/// Uses `cap_std` capability-based filesystem sandboxing to ensure extracted entries
+/// cannot escape `dest` via path traversal (`..`), absolute paths, or malicious symlinks.
 pub fn extract_tarball(bytes: &[u8], dest: &Path) -> Result<()> {
     std::fs::create_dir_all(dest)
         .with_context(|| format!("creating action dir {}", dest.display()))?;
+
+    let dest_dir = cap_std::fs::Dir::open_ambient_dir(dest, cap_std::ambient_authority())
+        .with_context(|| format!("opening capability sandbox for {}", dest.display()))?;
 
     let decoder = flate2::read::GzDecoder::new(bytes);
     let mut archive = tar::Archive::new(decoder);
@@ -92,10 +98,25 @@ pub fn extract_tarball(bytes: &[u8], dest: &Path) -> Result<()> {
         if stripped.components().count() == 0 {
             continue;
         }
-        let target = dest.join(&stripped);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
+        if stripped.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        }) {
+            anyhow::bail!(
+                "malicious archive entry escapes sandbox: {}",
+                path.display()
+            );
         }
+        if let Some(parent) = stripped.parent() {
+            if parent.components().count() > 0 {
+                dest_dir.create_dir_all(parent)?;
+            }
+        }
+        let target = dest.join(&stripped);
         entry.unpack(&target)?;
     }
 
@@ -126,4 +147,58 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn create_test_tarball(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        {
+            let mut tar = tar::Builder::new(&mut enc);
+            for (path, content) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(content.len() as u64);
+                header.set_mode(0o644);
+                header.as_mut_bytes()[..path.len()].copy_from_slice(path.as_bytes());
+                header.set_cksum();
+                tar.append(&header, *content).unwrap();
+            }
+            tar.finish().unwrap();
+        }
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn extract_tarball_unpacks_safely_inside_sandbox() {
+        let temp = TempDir::new().unwrap();
+        let dest = temp.path().join("action_dest");
+
+        let tar_bytes = create_test_tarball(&[
+            ("checkout-v4/action.yml", b"name: Checkout\n"),
+            ("checkout-v4/dist/index.js", b"console.log('hello');\n"),
+        ]);
+
+        extract_tarball(&tar_bytes, &dest).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dest.join("action.yml")).unwrap(),
+            "name: Checkout\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("dist/index.js")).unwrap(),
+            "console.log('hello');\n"
+        );
+    }
+
+    #[test]
+    fn extract_tarball_rejects_path_traversal() {
+        let temp = TempDir::new().unwrap();
+        let dest = temp.path().join("action_dest");
+
+        let tar_bytes = create_test_tarball(&[("root/../../escape.txt", b"evil")]);
+        let result = extract_tarball(&tar_bytes, &dest);
+        assert!(result.is_err());
+    }
 }
