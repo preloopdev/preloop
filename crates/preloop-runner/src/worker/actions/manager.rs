@@ -71,7 +71,32 @@ pub async fn download_action(
         "Action archive {owner}/{repo}@{git_ref}: {} bytes",
         bytes.len()
     );
-    extract_tarball(&bytes, &dest)?;
+
+    let parent_dir = dest
+        .parent()
+        .context("action destination must have parent directory")?;
+    std::fs::create_dir_all(parent_dir)
+        .with_context(|| format!("creating parent dir {}", parent_dir.display()))?;
+
+    let staging = tempfile::Builder::new()
+        .prefix(".action_tmp_")
+        .tempdir_in(parent_dir)
+        .with_context(|| format!("creating staging dir in {}", parent_dir.display()))?;
+
+    extract_tarball(&bytes, staging.path())?;
+
+    let staging_path = staging.keep();
+    if !dest.exists() {
+        if let Err(err) = std::fs::rename(&staging_path, &dest) {
+            let _ = std::fs::remove_dir_all(&staging_path);
+            if !dest.exists() {
+                return Err(err)
+                    .with_context(|| format!("moving extracted action to {}", dest.display()));
+            }
+        }
+    } else {
+        let _ = std::fs::remove_dir_all(&staging_path);
+    }
 
     info!("Extracted action to {}", dest.display());
     Ok(dest)
@@ -341,5 +366,71 @@ mod tests {
         assert!(result.is_err());
         // Verify outside file was untouched
         assert_eq!(std::fs::read_to_string(&outside_file).unwrap(), "initial");
+    }
+
+    #[tokio::test]
+    async fn download_action_atomic_cleanup_on_error() {
+        use axum::{routing::get, Router};
+        let evil_tar = create_test_tarball(&[("root/../../escape.txt", b"evil")]);
+
+        let app = Router::new().route("/tarball", get(|| async move { evil_tar }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let temp = TempDir::new().unwrap();
+        let actions_dir = temp.path().join("actions");
+
+        let url = format!("http://{addr}/tarball");
+        let result = download_action("owner", "repo", "v1", &actions_dir, Some(&url), None).await;
+
+        assert!(result.is_err());
+        let dest = actions_dir.join("owner").join("repo").join("v1");
+        assert!(
+            !dest.exists(),
+            "failed download must not leave dest directory behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_action_atomic_success_and_cache_hit() {
+        use axum::{routing::get, Router};
+        let valid_tar = create_test_tarball(&[("checkout-v4/action.yml", b"name: Checkout\n")]);
+
+        let app = Router::new().route("/tarball", get(|| async move { valid_tar }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let temp = TempDir::new().unwrap();
+        let actions_dir = temp.path().join("actions");
+
+        let url = format!("http://{addr}/tarball");
+        let res = download_action("owner", "repo", "v1", &actions_dir, Some(&url), None)
+            .await
+            .unwrap();
+
+        assert!(res.exists());
+        assert_eq!(
+            std::fs::read_to_string(res.join("action.yml")).unwrap(),
+            "name: Checkout\n"
+        );
+
+        // Second call hits the cache without reaching the server
+        let cached_res = download_action(
+            "owner",
+            "repo",
+            "v1",
+            &actions_dir,
+            Some("http://127.0.0.1:1/unreachable"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(cached_res, res);
     }
 }
