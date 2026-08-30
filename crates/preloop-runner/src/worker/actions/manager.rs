@@ -102,6 +102,45 @@ pub async fn download_action(
     Ok(dest)
 }
 
+/// Check whether a relative symlink target, resolved against the symlink's parent directory,
+/// normalizes safely within the root directory (never escapes above root).
+fn is_safe_relative_symlink(link_parent: Option<&Path>, link_target: &Path) -> bool {
+    if link_target.is_absolute() || link_target.starts_with("/") || link_target.starts_with("\\") {
+        return false;
+    }
+
+    let mut stack: Vec<&std::ffi::OsStr> = Vec::new();
+    if let Some(parent) = link_parent {
+        for component in parent.components() {
+            match component {
+                std::path::Component::Normal(c) => stack.push(c),
+                std::path::Component::ParentDir => {
+                    if stack.pop().is_none() {
+                        return false;
+                    }
+                }
+                std::path::Component::CurDir => {}
+                _ => return false,
+            }
+        }
+    }
+
+    for component in link_target.components() {
+        match component {
+            std::path::Component::Normal(c) => stack.push(c),
+            std::path::Component::ParentDir => {
+                if stack.pop().is_none() {
+                    return false;
+                }
+            }
+            std::path::Component::CurDir => {}
+            _ => return false,
+        }
+    }
+
+    true
+}
+
 /// Extract a `.tar.gz` tarball to `dest`, stripping the top-level directory.
 ///
 /// Uses `cap_std` capability-based filesystem sandboxing to ensure extracted entries
@@ -164,20 +203,14 @@ pub fn extract_tarball(bytes: &[u8], dest: &Path) -> Result<()> {
             }
         } else if entry_type.is_symlink() {
             if let Some(link_target) = entry.link_name()? {
-                if link_target.components().any(|c| {
-                    matches!(
-                        c,
-                        std::path::Component::ParentDir
-                            | std::path::Component::RootDir
-                            | std::path::Component::Prefix(_)
-                    )
-                }) {
+                let parent = stripped.parent();
+                if !is_safe_relative_symlink(parent, &link_target) {
                     anyhow::bail!(
                         "symlink with escaping or absolute target rejected: {}",
                         link_target.display()
                     );
                 }
-                if let Some(parent) = stripped.parent() {
+                if let Some(parent) = parent {
                     if parent.components().count() > 0 {
                         dest_dir.create_dir_all(parent)?;
                     }
@@ -232,24 +265,24 @@ pub fn copy_local_action(source: &Path, actions_dir: &Path, action_name: &str) -
 
 /// Recursively copy a directory.
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    copy_dir_recursive_inner(src, dst, src)
+}
+
+fn copy_dir_recursive_inner(src: &Path, dst: &Path, root_src: &Path) -> Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let ty = entry.file_type()?;
         let dest = dst.join(entry.file_name());
         if ty.is_symlink() {
-            let target = std::fs::read_link(entry.path())
-                .with_context(|| format!("reading symlink {}", entry.path().display()))?;
-            if target.is_absolute()
-                || target.components().any(|c| {
-                    matches!(
-                        c,
-                        std::path::Component::ParentDir
-                            | std::path::Component::RootDir
-                            | std::path::Component::Prefix(_)
-                    )
-                })
-            {
+            let entry_path = entry.path();
+            let target = std::fs::read_link(&entry_path)
+                .with_context(|| format!("reading symlink {}", entry_path.display()))?;
+            let rel_parent = entry_path
+                .strip_prefix(root_src)
+                .ok()
+                .and_then(|p| p.parent());
+            if !is_safe_relative_symlink(rel_parent, &target) {
                 anyhow::bail!(
                     "local action contains escaping or absolute symlink: {} -> {}",
                     entry.path().display(),
@@ -266,7 +299,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
                 std::os::windows::fs::symlink_file(&target, &dest)?;
             }
         } else if ty.is_dir() {
-            copy_dir_recursive(&entry.path(), &dest)?;
+            copy_dir_recursive_inner(&entry.path(), &dest, root_src)?;
         } else {
             std::fs::copy(entry.path(), &dest)?;
         }
@@ -441,6 +474,46 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn extract_tarball_allows_in_root_relative_symlinks() {
+        let temp = TempDir::new().unwrap();
+        let dest = temp.path().join("action_dest");
+
+        // Archive has:
+        // 1. regular file `lib/tool.js`
+        // 2. in-root relative symlink `bin/tool` -> `../lib/tool.js`
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        {
+            let mut tar = tar::Builder::new(&mut enc);
+            let mut file_header = tar::Header::new_gnu();
+            file_header.set_size(19);
+            file_header.set_mode(0o644);
+            file_header.set_entry_type(tar::EntryType::Regular);
+            file_header.as_mut_bytes()[.."root/lib/tool.js".len()]
+                .copy_from_slice(b"root/lib/tool.js");
+            file_header.set_cksum();
+            tar.append(&file_header, &b"console.log('tool')"[..])
+                .unwrap();
+
+            let mut link_header = tar::Header::new_gnu();
+            link_header.set_size(0);
+            link_header.set_mode(0o777);
+            link_header.set_entry_type(tar::EntryType::Symlink);
+            link_header.as_mut_bytes()[.."root/bin/tool".len()].copy_from_slice(b"root/bin/tool");
+            link_header.set_link_name("../lib/tool.js").unwrap();
+            link_header.set_cksum();
+            tar.append(&link_header, &b""[..]).unwrap();
+            tar.finish().unwrap();
+        }
+        let tar_bytes = enc.finish().unwrap();
+        extract_tarball(&tar_bytes, &dest).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dest.join("bin/tool")).unwrap(),
+            "console.log('tool')"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn extract_tarball_masks_special_permission_bits() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -570,6 +643,9 @@ mod tests {
 
         // Create safe internal symlink
         std::os::unix::fs::symlink("dist/index.js", source.join("main.js")).unwrap();
+        // Create safe in-root relative symlink spanning subdirectories
+        std::fs::write(source.join("dist/tool.js"), "tool_content").unwrap();
+        std::os::unix::fs::symlink("../dist/tool.js", source.join("bin/tool")).unwrap();
 
         let actions_dir = temp.path().join("actions");
         let dest = copy_local_action(&source, &actions_dir, "my-local-action").unwrap();
@@ -577,6 +653,10 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dest.join("main.js")).unwrap(),
             "console.log('hi');\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("bin/tool")).unwrap(),
+            "tool_content"
         );
     }
 }
