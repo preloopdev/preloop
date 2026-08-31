@@ -89,11 +89,15 @@ pub(crate) async fn patch_timeline_records(
         *current += 1;
         let new_id = *current;
 
-        inner
+        let events = inner
             .timeline_events
             .entry(run_id.unwrap_or_else(|| RunId(uuid::Uuid::nil())))
-            .or_default()
-            .extend(projected.clone());
+            .or_default();
+        for event in &projected {
+            if !events.contains(event) {
+                events.push(event.clone());
+            }
+        }
         trim_timeline_events(
             &mut inner,
             run_id.unwrap_or_else(|| RunId(uuid::Uuid::nil())),
@@ -804,40 +808,60 @@ mod tests {
              actions/setup-node@v3."
             .to_owned();
 
-        let job_record = azdo::TimelineRecord {
-            id: uuid::Uuid::new_v4(),
-            change_id: None,
-            parent_id: None,
-            name: Some("build".to_owned()),
-            display_name: Some("build".to_owned()),
-            record_type: Some(azdo::TimelineRecordType::Job),
-            state: Some(azdo::TimelineRecordState::InProgress),
-            result: None,
-            start_time: None,
-            finish_time: None,
-            issues: vec![azdo::Issue {
-                issue_type: azdo::IssueType::Warning,
-                category: None,
-                message: Some(node20_message.clone()),
-                data: BTreeMap::new(),
-                is_infrastructure_issue: None,
-            }],
-            variables: BTreeMap::new(),
-            current_operation: None,
-            percent_complete: None,
-            worker_name: None,
-            error_count: None,
-            warning_count: Some(1),
-            is_background: None,
-            background_control_type: None,
-            background_control_step_ids: Vec::new(),
-            parallel_group_id: None,
-            steps: Vec::new(),
-            last_modified: None,
-            log: None,
-        };
-        let record_id = job_record.id;
+        let job_record_id = uuid::Uuid::new_v4();
+        let child_task_id = uuid::Uuid::new_v4();
 
+        // Construct raw JSON wire payload with upstream "Task" and "Job" types to exercise serde wire decoding.
+        let raw_json_payload = serde_json::json!({
+                "count": 2,
+                "value": [
+                    {
+                        "id": job_record_id.to_string(),
+                        "parentId": null,
+                        "name": "build",
+                        "displayName": "build",
+                        "type": "Job",
+                        "state": "inProgress",
+                        "issues": [
+                            {
+                                "type": "warning",
+                                "message": node20_message
+        }
+                        ],
+                        "warningCount": 1
+                    },
+                    {
+                        "id": child_task_id.to_string(),
+                        "parentId": job_record_id.to_string(),
+                        "name": "Complete job",
+                        "displayName": "Complete job",
+                        "type": "Task",
+                        "state": "completed",
+                        "result": "succeededWithIssues",
+                        "issues": [
+                            {
+                                "type": "warning",
+                                "message": node20_message
+        }
+                        ]
+        }
+                ]
+            });
+
+        // Verify wire decoding from raw JSON
+        let wrapper: azdo::VssJsonCollectionWrapper<azdo::TimelineRecord> =
+            serde_json::from_value(raw_json_payload.clone()).expect("valid wire JSON payload");
+        assert_eq!(wrapper.value.len(), 2);
+        assert_eq!(
+            wrapper.value[0].record_type,
+            Some(azdo::TimelineRecordType::Job)
+        );
+        assert_eq!(
+            wrapper.value[1].record_type,
+            Some(azdo::TimelineRecordType::Task)
+        );
+
+        // PATCH timeline records (first call)
         let _ = patch_timeline_records(
             State(shared.clone()),
             Path((
@@ -846,10 +870,7 @@ mod tests {
                 plan_id.clone(),
                 timeline_id.to_string(),
             )),
-            Json(azdo::VssJsonCollectionWrapper {
-                count: 1,
-                value: vec![job_record],
-            }),
+            Json(wrapper),
         )
         .await;
 
@@ -859,9 +880,13 @@ mod tests {
             Path((
                 "scope".to_owned(),
                 "hub".to_owned(),
-                plan_id,
+                plan_id.clone(),
                 timeline_id.to_string(),
             )),
+            axum::extract::Query(TimelineQuery {
+                top: None,
+                skip: None,
+            }),
         )
         .await;
         let records = response
@@ -869,38 +894,83 @@ mod tests {
             .get("records")
             .and_then(|v| v.as_array())
             .expect("records array");
-        let stored = records
+        let stored_job = records
             .iter()
-            .find(|r| r["id"] == record_id.to_string())
+            .find(|r| r["id"] == job_record_id.to_string())
             .expect("job record persisted");
-        let issues = stored["issues"].as_array().expect("issues preserved");
-        assert_eq!(issues.len(), 1, "the Node 20 warning issue must survive");
-        assert_eq!(issues[0]["type"], "warning");
-        assert_eq!(issues[0]["message"], node20_message);
+        let job_issues = stored_job["issues"].as_array().expect("issues preserved");
+        assert_eq!(
+            job_issues.len(),
+            1,
+            "the Node 20 warning issue must survive on job record"
+        );
+        assert_eq!(job_issues[0]["type"], "warning");
+        assert_eq!(job_issues[0]["message"], node20_message);
 
-        // Projected as a job-level annotation (no step_id).
+        let stored_task = records
+            .iter()
+            .find(|r| r["id"] == child_task_id.to_string())
+            .expect("child task record persisted");
+        let task_issues = stored_task["issues"].as_array().expect("issues preserved");
+        assert_eq!(
+            task_issues.len(),
+            1,
+            "the Node 20 warning issue must survive on task record"
+        );
+
+        // Replaying/retrying the exact same PATCH call (Finding 3: deduplication check)
+        let wrapper_retry: azdo::VssJsonCollectionWrapper<azdo::TimelineRecord> =
+            serde_json::from_value(raw_json_payload).expect("valid wire JSON payload");
+        let _ = patch_timeline_records(
+            State(shared.clone()),
+            Path((
+                "scope".to_owned(),
+                "hub".to_owned(),
+                plan_id,
+                timeline_id.to_string(),
+            )),
+            Json(wrapper_retry),
+        )
+        .await;
+
         let inner = state.inner.lock().await;
         let events = inner
             .timeline_events
             .get(&run_id)
             .expect("timeline events recorded for the run");
-        let (level, message, step_id) = events
+
+        // Count projected annotations for the Node 20 message
+        let matching_annotations: Vec<_> = events
             .iter()
-            .find_map(|event| match event {
+            .filter_map(|event| match event {
                 NdjsonEvent::Annotation {
                     level,
                     message,
                     step_id,
                     ..
-                } => Some((*level, message.clone(), step_id.clone())),
+                } if message == &node20_message => Some((*level, step_id.clone())),
                 _ => None,
             })
-            .expect("Node 20 warning projected as an annotation");
-        assert!(matches!(level, AnnotationLevel::Warning));
-        assert_eq!(message, node20_message);
-        assert!(
-            step_id.is_none(),
-            "a job-level annotation must not carry a step_id"
+            .collect();
+
+        // Deduplication check: even after retrying PATCH, there should be exactly one annotation
+        // for the job record (step_id == None) and one for the child task record (step_id == Some(child_task_id)).
+        assert_eq!(
+            matching_annotations.len(),
+            2,
+            "annotations must be deduplicated across repeated PATCH calls"
         );
+
+        let job_ann = matching_annotations
+            .iter()
+            .find(|(_, step_id)| step_id.is_none())
+            .expect("parentless job record produces step_id == None annotation");
+        assert!(matches!(job_ann.0, AnnotationLevel::Warning));
+
+        let task_ann = matching_annotations
+            .iter()
+            .find(|(_, step_id)| step_id.as_deref() == Some(&child_task_id.to_string()))
+            .expect("child task record produces step_id == Some(task_id) annotation");
+        assert!(matches!(task_ann.0, AnnotationLevel::Warning));
     }
 }
