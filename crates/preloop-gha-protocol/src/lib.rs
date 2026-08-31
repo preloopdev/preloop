@@ -788,7 +788,7 @@ fn mask_annotation_strings(value: serde_json::Value, secrets: &[&str]) -> serde_
 }
 
 /// Machine-readable event emitted as NDJSON.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum NdjsonEvent {
     /// Run was accepted.
@@ -913,7 +913,7 @@ impl NdjsonEvent {
 }
 
 /// Annotation severity.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AnnotationLevel {
     /// Notice.

@@ -46,8 +46,8 @@ official_runner_image_base_arm64 = "ghcr.io/preloopdev/runner-images:ubuntu24-ar
 node_version = "22.23.1"
 rustup_version = "1.29.0"
 cargo_shear_version = "1.12.4"
-node20_externals_version = "20.19.0"
-node24_externals_version = "24.3.0"
+node20_externals_version = "20.20.2"
+node24_externals_version = "24.19.0"
 
 # GitHub-hosted parity bake list — exact versions from the official
 # ubuntu-24.04 runner image toolset named above. Baked into the golden at
