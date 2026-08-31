@@ -453,15 +453,7 @@ impl DapDebugger {
                 if req.raw.command == "configurationDone" {
                     // Send welcome output event after configurationDone
                     // (matches official runner ordering).
-                    let welcome = if core.override_welcome {
-                        core.welcome_message.clone()
-                    } else {
-                        Some(
-                            core.welcome_message
-                                .clone()
-                                .unwrap_or_else(default_welcome_message),
-                        )
-                    };
+                    let welcome = resolve_welcome_message(&core);
                     if let Some(mut msg) = welcome {
                         if !msg.is_empty() {
                             if !msg.ends_with('\n') {
@@ -740,6 +732,45 @@ async fn dispatch_one(core: &Arc<DebuggerCore>, req: &Request, seq: i64) -> Resp
 
 fn default_welcome_message() -> String {
     "Debugger attached. Use DAP continue/next/stepIn/stepOut to navigate steps.".to_string()
+}
+
+/// Resolve the welcome message shown after `configurationDone`.
+///
+/// The welcome message carried in [`DebuggerConfig::welcome_message`] is
+/// server-supplied and never rendered verbatim: secrets are masked and control
+/// characters stripped before it reaches the console. Only
+/// [`default_welcome_message`] is runner-controlled and therefore trusted.
+/// Mirrors `SanitizeConsoleText(MaskUserVisibleText(WelcomeMessage))` in
+/// `DapDebugger.cs` (actions/runner v2.337.0).
+fn resolve_welcome_message(core: &Arc<DebuggerCore>) -> Option<String> {
+    let sanitize_server = |msg: &str| {
+        let masks = core.masks.lock().clone();
+        sanitize_console_text(&dap_mask_closure(&masks)(msg))
+    };
+    if core.override_welcome {
+        core.welcome_message.as_deref().map(sanitize_server)
+    } else {
+        Some(
+            core.welcome_message
+                .as_deref()
+                .map(sanitize_server)
+                .unwrap_or_else(default_welcome_message),
+        )
+    }
+}
+
+/// Strip C0/C1 control characters (except tab, carriage return and line feed)
+/// so server-supplied text cannot inject ANSI escape sequences or terminal
+/// control codes into the DAP console.
+///
+/// Mirrors `DapDebugger.cs::SanitizeConsoleText` (actions/runner v2.337.0).
+/// `char::is_control` covers C0 (U+0000–U+001F), DEL (U+007F) and
+/// C1 (U+0080–U+009F); tab/LF/CR are the only whitespace controls preserved.
+fn sanitize_console_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| !c.is_control() || matches!(c, '\t' | '\n' | '\r'))
+        .collect()
 }
 
 fn which_devtunnel() -> Option<std::path::PathBuf> {
@@ -1136,5 +1167,45 @@ mod tests {
             Some(v) => std::env::set_var(crate::env_vars::DAP_CONNECTION_TIMEOUT, v),
             None => std::env::remove_var(crate::env_vars::DAP_CONNECTION_TIMEOUT),
         }
+    }
+
+    #[test]
+    fn sanitize_console_text_strips_control_chars_but_keeps_whitespace() {
+        // ESC (C0), a C1 control (U+0085), DEL and a NUL are stripped;
+        // tab/CR/LF and printable text (incl. non-ASCII) survive.
+        let raw = "a\x1b[31mb\u{0085}c\x7f\td\r\ne\0f";
+        assert_eq!(sanitize_console_text(raw), "a[31mbc\td\r\nef");
+        assert_eq!(sanitize_console_text("plain café ✓"), "plain café ✓");
+        assert_eq!(sanitize_console_text(""), "");
+    }
+
+    #[test]
+    fn override_welcome_message_is_masked_and_sanitized() {
+        // Server-supplied override message carrying a secret and an ANSI
+        // escape sequence must be both masked and control-char stripped.
+        let cfg = DebuggerConfig::new(
+            true,
+            Some(sample_tunnel()),
+            true,
+            Some("hi \x1b[2Jsuper-secret done".to_string()),
+        );
+        let dbg = DapDebugger::new(cfg);
+        dbg.update_context(
+            serde_json::json!({}),
+            std::collections::HashSet::from(["super-secret".to_string()]),
+        );
+        let out = resolve_welcome_message(&dbg.core).unwrap();
+        assert!(!out.contains("super-secret"), "secret leaked: {out}");
+        assert!(!out.contains('\x1b'), "control char leaked: {out}");
+        assert_eq!(out, "hi [2J*** done");
+    }
+
+    #[test]
+    fn default_welcome_message_used_without_server_text() {
+        let dbg = DapDebugger::new(sample_config());
+        assert_eq!(
+            resolve_welcome_message(&dbg.core),
+            Some(default_welcome_message())
+        );
     }
 }
