@@ -1201,6 +1201,7 @@ fn node_externals_at(runner_root: &str) -> Vec<Vec<String>> {
                 ACTUAL=$(shasum -a 256 \"$TMP_ARCHIVE\" 2>/dev/null | awk '{{print $1}}'); \
                 if [ -z \"$ACTUAL\" ]; then ACTUAL=$(sha256sum \"$TMP_ARCHIVE\" 2>/dev/null | awk '{{print $1}}'); fi; \
                 if [ -z \"$ACTUAL\" ]; then echo \"no sha256 tool available\" >&2; rm -f \"$TMP_ARCHIVE\"; rm -rf \"$TEMP\"; exit 1; fi; \
+                VERIFIED=0; \
                 case \"$NAME:$NODE_ARCH\" in \
                   node20:linux-arm64) PINNED=\"{pinned_n20_arm64}\";; \
                   node20:linux-x64) PINNED=\"{pinned_n20_x64}\";; \
@@ -1210,15 +1211,21 @@ fn node_externals_at(runner_root: &str) -> Vec<Vec<String>> {
                   node24:win-x64) PINNED=\"{pinned_n24_win_x64}\";; \
                   *) PINNED=\"\";; \
                 esac; \
-                if [ -n \"$PINNED\" ] && [ \"$ACTUAL\" != \"$PINNED\" ]; then echo \"ERROR: $NAME $VERSION pinned SHA256 mismatch (got $ACTUAL expected $PINNED)\" >&2; rm -f \"$TMP_ARCHIVE\"; rm -rf \"$TEMP\"; exit 1; fi; \
+                if [ -n \"$PINNED\" ]; then \
+                  if [ \"$ACTUAL\" != \"$PINNED\" ]; then echo \"ERROR: $NAME $VERSION pinned SHA256 mismatch (got $ACTUAL expected $PINNED)\" >&2; rm -f \"$TMP_ARCHIVE\"; rm -rf \"$TEMP\"; exit 1; fi; \
+                  VERIFIED=1; \
+                fi; \
                 SHASUMS_TMP=$(mktemp \"$RUNNER_EXTERNALS/.SHASUMS.XXXXXX\"); \
                 if curl -fsSL -o \"$SHASUMS_TMP\" \"$SHASUMS_URL\" 2>/dev/null; then \
                   EXPECTED_SHASUMS=$(grep -F \" $ARCHIVE\" \"$SHASUMS_TMP\" | awk '{{print $1}}'); \
                   if [ -n \"$EXPECTED_SHASUMS\" ] && [ \"$ACTUAL\" != \"$EXPECTED_SHASUMS\" ]; then echo \"ERROR: $NAME $VERSION SHASUMS256.txt mismatch (got $ACTUAL expected $EXPECTED_SHASUMS)\" >&2; rm -f \"$TMP_ARCHIVE\" \"$SHASUMS_TMP\"; rm -rf \"$TEMP\"; exit 1; fi; \
+                  if [ -n \"$EXPECTED_SHASUMS\" ]; then VERIFIED=1; fi; \
                   rm -f \"$SHASUMS_TMP\"; \
                 else \
                   rm -f \"$SHASUMS_TMP\"; \
-                  if [ -z \"$PINNED\" ]; then echo \"WARNING: no pinned SHA and SHASUMS unavailable for $ARCHIVE\" >&2; fi; \
+                fi; \
+                if [ \"$VERIFIED\" != 1 ]; then \
+                  echo \"ERROR: no trusted checksum found for $ARCHIVE (neither pinned SHA nor SHASUMS entry available)\" >&2; rm -f \"$TMP_ARCHIVE\"; rm -rf \"$TEMP\"; exit 1; \
                 fi; \
                 if ! tar -xzf \"$TMP_ARCHIVE\" --strip-components=1 -C \"$TEMP\"; then echo \"FAILED extracting $NAME\" >&2; rm -f \"$TMP_ARCHIVE\"; rm -rf \"$TEMP\"; exit 1; fi; \
                 rm -f \"$TMP_ARCHIVE\"; \
@@ -5127,8 +5134,7 @@ while [ "$#" -gt 0 ]; do
     *) url="$1"; shift;;
   esac
 done
-# SHASUMS fetch: simulate unavailable so pinned-only path is exercised (pinned empty -> warning -> proceed)
-case "$url" in *SHASUMS256.txt*) exit 22;; esac
+case "$url" in *SHASUMS256.txt*) printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  node-v20.19.0-linux-arm64.tar.gz\n371fc060d5dd4de565586c3cc70034956db67a8f3dae0f0e5724fa56147c472a  node-v24.3.0-linux-arm64.tar.gz\n8a4dbcdd8bccef3132d21e8543940557e55dcf44f00f0a99ba8a062f4552e722  node-v20.19.0-linux-x64.tar.gz\nbbeb5fb8113b44fc30f5a5887dbc0ab66af8e56139f5f9fbe7c7a1aa056246dc  node-v24.3.0-linux-x64.tar.gz\n" > "$out"; exit 0;; esac
 printf archive > "$out"
 "#,
         )
@@ -5139,7 +5145,10 @@ printf archive > "$out"
         std::fs::write(
             &shasum,
             r#"#!/bin/sh
-printf "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  dummy\n"
+case "$*" in
+  *node24*) printf "371fc060d5dd4de565586c3cc70034956db67a8f3dae0f0e5724fa56147c472a  dummy\n";;
+  *) printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  dummy\n";;
+esac
 "#,
         )
         .unwrap();
@@ -5149,7 +5158,10 @@ printf "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  dummy\
         std::fs::write(
             &sha256sum,
             r#"#!/bin/sh
-printf "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  dummy\n"
+case "$*" in
+  *node24*) printf "371fc060d5dd4de565586c3cc70034956db67a8f3dae0f0e5724fa56147c472a  dummy\n";;
+  *) printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  dummy\n";;
+esac
 "#,
         )
         .unwrap();
@@ -5202,7 +5214,15 @@ chmod +x "$dest/bin/node"
                 std::fs::read_to_string(root.join(format!("externals/{name}/preloop-node.json")))
                     .unwrap();
             assert!(manifest.contains("\"runtime\":\""), "{manifest}");
-            assert!(manifest.contains("\"archive_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""), "{manifest}");
+            assert!(manifest.contains("\"archive_sha256\":\""), "{manifest}");
+            assert!(
+                manifest.contains(if name == "node20" {
+                    "618e4294"
+                } else {
+                    "371fc060"
+                }),
+                "{manifest}"
+            );
         }
     }
 
@@ -5230,7 +5250,7 @@ while [ "$#" -gt 0 ]; do
     *) url="$1"; shift;;
   esac
 done
-case "$url" in *SHASUMS256.txt*) exit 22;; esac
+case "$url" in *SHASUMS256.txt*) printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  node-v20.19.0-linux-arm64.tar.gz\n371fc060d5dd4de565586c3cc70034956db67a8f3dae0f0e5724fa56147c472a  node-v24.3.0-linux-arm64.tar.gz\n8a4dbcdd8bccef3132d21e8543940557e55dcf44f00f0a99ba8a062f4552e722  node-v20.19.0-linux-x64.tar.gz\nbbeb5fb8113b44fc30f5a5887dbc0ab66af8e56139f5f9fbe7c7a1aa056246dc  node-v24.3.0-linux-x64.tar.gz\n" > "$out"; exit 0;; esac
 printf archive > "$out"
 "#,
         )
@@ -5240,7 +5260,10 @@ printf archive > "$out"
         std::fs::write(
             &shasum,
             r#"#!/bin/sh
-printf "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  dummy\n"
+case "$*" in
+  *node24*) printf "371fc060d5dd4de565586c3cc70034956db67a8f3dae0f0e5724fa56147c472a  dummy\n";;
+  *) printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  dummy\n";;
+esac
 "#,
         )
         .unwrap();
@@ -5249,7 +5272,10 @@ printf "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  dummy\
         std::fs::write(
             &sha256sum,
             r#"#!/bin/sh
-printf "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  dummy\n"
+case "$*" in
+  *node24*) printf "371fc060d5dd4de565586c3cc70034956db67a8f3dae0f0e5724fa56147c472a  dummy\n";;
+  *) printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  dummy\n";;
+esac
 "#,
         )
         .unwrap();

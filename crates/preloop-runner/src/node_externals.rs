@@ -127,15 +127,35 @@ pub fn is_valid_externals_dir(dir: &Path, runtime: &str, expected_version: &str)
     if !node_bin.is_file() {
         return false;
     }
-    let output = Command::new(&node_bin).arg("--version").output();
-    let Ok(output) = output else {
-        return false;
+
+    let host_os = if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(target_os = "windows") {
+        "win"
+    } else {
+        "linux"
     };
-    if !output.status.success() {
-        return false;
+
+    if manifest.platform.starts_with(host_os) {
+        let Ok(output) = Command::new(&node_bin).arg("--version").output() else {
+            return false;
+        };
+        if !output.status.success() {
+            return false;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        stdout == format!("v{expected}")
+    } else {
+        if let Ok(output) = Command::new(&node_bin).arg("--version").output() {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                return stdout == format!("v{expected}");
+            }
+        }
+        std::fs::metadata(&node_bin)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false)
     }
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    stdout == format!("v{expected}")
 }
 
 pub fn invalidate_if_stale(dir: &Path, expected_version: &str) -> bool {
@@ -178,6 +198,8 @@ pub fn verify_digest(
     shasums_content: Option<&str>,
 ) -> Result<(), String> {
     let digest_lc = digest_hex.to_ascii_lowercase();
+    let mut verified = false;
+
     if let Some(pinned) = pinned_sha {
         let pinned_lc = pinned.to_ascii_lowercase();
         if digest_lc != pinned_lc {
@@ -185,6 +207,7 @@ pub fn verify_digest(
                 "SHA256 mismatch for {archive_name}: got {digest_lc}, pinned {pinned_lc}"
             ));
         }
+        verified = true;
     }
     if let Some(shasums) = shasums_content {
         if let Some(expected) = parse_shasums(shasums, archive_name) {
@@ -193,7 +216,13 @@ pub fn verify_digest(
                     "SHA256 mismatch for {archive_name} vs SHASUMS256.txt: got {digest_lc}, expected {expected}"
                 ));
             }
+            verified = true;
         }
+    }
+    if !verified {
+        return Err(format!(
+            "No trusted checksum found for {archive_name} (neither pinned SHA nor SHASUMS entry available)"
+        ));
     }
     Ok(())
 }
@@ -216,6 +245,21 @@ mod tests {
             sha256_hex(b"hello"),
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
+    }
+
+    #[test]
+    fn verify_digest_fails_closed() {
+        let digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let pinned = Some(digest);
+        let shasums = format!("{digest}  node-v20.19.0-linux-arm64.tar.gz");
+        assert!(verify_digest(
+            digest,
+            "node-v20.19.0-linux-arm64.tar.gz",
+            pinned,
+            Some(&shasums)
+        )
+        .is_ok());
+        assert!(verify_digest(digest, "node-v20.19.0-linux-arm64.tar.gz", None, None).is_err());
     }
 
     #[test]

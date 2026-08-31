@@ -157,17 +157,40 @@ pub fn is_valid_externals_dir(dir: &Path, runtime: &str, expected_version: &str)
     if !node_bin.is_file() {
         return false;
     }
-    // Run `bin/node --version` and compare.
-    let output = Command::new(&node_bin).arg("--version").output();
-    let Ok(output) = output else {
-        return false;
+
+    let host_os = if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(target_os = "windows") {
+        "win"
+    } else {
+        "linux"
     };
-    if !output.status.success() {
-        return false;
+
+    if manifest.platform.starts_with(host_os) {
+        // Native binary: probe `bin/node --version` directly.
+        let Ok(output) = Command::new(&node_bin).arg("--version").output() else {
+            return false;
+        };
+        if !output.status.success() {
+            return false;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        stdout == format!("v{expected}")
+    } else {
+        // Non-native guest binary (e.g. linux-arm64 binary on macOS host).
+        // If the binary can be executed locally (e.g. shell scripts in test fixtures), verify version.
+        if let Ok(output) = Command::new(&node_bin).arg("--version").output() {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                return stdout == format!("v{expected}");
+            }
+        }
+        // Foreign ELF binary cannot be executed on macOS host without virtualization;
+        // validate via manifest provenance and non-empty binary file.
+        std::fs::metadata(&node_bin)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false)
     }
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    let expected_v = format!("v{expected}");
-    stdout == expected_v
 }
 
 /// Invalidate a single externals dir if its manifest version does not match expected.
@@ -224,13 +247,8 @@ pub fn parse_shasums(shasums: &str, archive_name: &str) -> Option<String> {
 }
 
 /// Verify a tarball digest against both the pinned table (authoritative) and SHASUMS (belt-and-braces).
-/// Returns the hex digest on success, error string on mismatch.
-///
-/// - If a pinned SHA exists for `key`, the digest MUST match it, else error.
-/// - If SHASUMS provides an entry for the archive, the digest MUST also match that.
-/// - At least one of the two must succeed? Requirement says verify against BOTH — so if pinned
-///   entry exists, both must match if SHASUMS also has entry; if pinned missing, SHASUMS must match
-///   when available; if neither available, verification passes with a warning (no authoritative source).
+/// Fails closed: returns an error if a mismatch is found or if neither a committed pin nor a
+/// SHASUMS entry is available to verify the archive.
 pub fn verify_digest(
     digest_hex: &str,
     archive_name: &str,
@@ -238,6 +256,8 @@ pub fn verify_digest(
     shasums_content: Option<&str>,
 ) -> Result<(), String> {
     let digest_lc = digest_hex.to_ascii_lowercase();
+    let mut verified = false;
+
     if let Some(pinned) = pinned_sha {
         let pinned_lc = pinned.to_ascii_lowercase();
         if digest_lc != pinned_lc {
@@ -245,6 +265,7 @@ pub fn verify_digest(
                 "SHA256 mismatch for {archive_name}: got {digest_lc}, pinned {pinned_lc}"
             ));
         }
+        verified = true;
     }
     if let Some(shasums) = shasums_content {
         if let Some(expected) = parse_shasums(shasums, archive_name) {
@@ -253,12 +274,13 @@ pub fn verify_digest(
                     "SHA256 mismatch for {archive_name} vs SHASUMS256.txt: got {digest_lc}, expected {expected}"
                 ));
             }
-        } else if pinned_sha.is_none() {
-            // No pinned and no SHASUMS entry — cannot verify. Treat as warning but allow?
-            // Requirement says pin is authoritative, SHASUMS is belt-and-braces, so if neither
-            // is available we cannot verify; for now pass ( caller can decide to fail ).
-            // We return Ok to not break offline tests; real download should fetch SHASUMS.
+            verified = true;
         }
+    }
+    if !verified {
+        return Err(format!(
+            "No trusted checksum found for {archive_name} (neither pinned SHA nor SHASUMS entry available)"
+        ));
     }
     Ok(())
 }
@@ -326,6 +348,9 @@ mod tests {
             Some(&shasums)
         )
         .is_err());
+
+        // Absent pin and absent shasums fails closed.
+        assert!(verify_digest(digest, "node-v20.19.0-linux-arm64.tar.gz", None, None).is_err());
     }
 
     #[test]

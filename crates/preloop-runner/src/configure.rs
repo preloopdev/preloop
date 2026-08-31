@@ -600,18 +600,28 @@ where
     F: Fn(&str) -> Fut + Sync,
     Fut: Future<Output = Result<bytes::Bytes>> + Send,
 {
-    // Versions from `versions.toml` (build-time pins with fallback).
     let node_versions = [
         ("node20", crate::NODE20_EXTERNALS_VERSION),
         ("node24", crate::NODE24_EXTERNALS_VERSION),
     ];
+    download_externals_with_runtimes_and_fetcher(fetcher, &node_versions, root).await
+}
 
+async fn download_externals_with_runtimes_and_fetcher<F, Fut>(
+    fetcher: F,
+    node_versions: &[(&str, &str)],
+    root: &std::path::Path,
+) -> Result<()>
+where
+    F: Fn(&str) -> Fut + Sync,
+    Fut: Future<Output = Result<bytes::Bytes>> + Send,
+{
     let externals_dir = root.join("externals");
     std::fs::create_dir_all(&externals_dir)?;
 
     let platform = node_externals::current_platform();
 
-    for (name, version) in &node_versions {
+    for (name, version) in node_versions {
         let version = version.trim();
         let version_v = if version.starts_with('v') {
             version.to_owned()
@@ -648,16 +658,13 @@ where
         let digest = node_externals::sha256_hex(bytes.as_ref());
         let pinned_key = node_externals::pinned_key(name, &version_v, &platform);
         let pinned = crate::node_externals_pinned_sha256(&pinned_key);
-        if let Err(e) =
-            node_externals::verify_digest(&digest, &archive_name, pinned, shasums.as_deref())
-        {
-            anyhow::bail!(
-                "checksum verification failed for {name} {version_v} ({archive_name}): {e}"
-            );
-        }
-        if pinned.is_none() && shasums.is_none() {
-            warn!("no pinned SHA and no SHASUMS for {archive_name}; proceeding without verification (offline test?)");
-        }
+        node_externals::verify_digest(&digest, &archive_name, pinned, shasums.as_deref()).map_err(
+            |e| {
+                anyhow::anyhow!(
+                    "checksum verification failed for {name} {version_v} ({archive_name}): {e}"
+                )
+            },
+        )?;
         // Extract into a temporary directory, then publish atomically. A
         // failed download or extraction must not leave a directory that a
         // later configure mistakenly treats as a complete external.
@@ -753,7 +760,7 @@ fn current_arch_label() -> &'static str {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod node_externals_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
@@ -852,7 +859,7 @@ mod node_externals_tests {
 
         // Prepare fetcher that returns correct tar for the expected version.
         let platform = node_externals::current_platform();
-        let expected_plain = expected.trim_start_matches('v');
+        let expected_plain = "24.99.0";
         let archive_name = node_externals::archive_name(&format!("v{expected_plain}"), &platform);
         let tar_bytes = fake_node_tar(expected_plain, &platform);
         let shasums = shasums_for(&tar_bytes, &archive_name);
@@ -875,21 +882,18 @@ mod node_externals_tests {
             }
         };
 
-        download_externals_with_fetcher(fetcher, root)
+        download_externals_with_runtimes_and_fetcher(fetcher, &[("node24", "24.99.0")], root)
             .await
             .unwrap();
         // After download, manifest should be updated to expected version.
         let new_manifest = node_externals::read_manifest(&externals_dir.join("node24")).unwrap();
-        assert_eq!(new_manifest.version, expected_plain);
+        assert_eq!(new_manifest.version, "24.99.0");
         // Binary should now report expected version.
         let out = std::process::Command::new(externals_dir.join("node24/bin/node"))
             .arg("--version")
             .output()
             .unwrap();
-        assert_eq!(
-            String::from_utf8_lossy(&out.stdout).trim(),
-            format!("v{expected_plain}")
-        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "v24.99.0");
     }
 
     #[tokio::test]
@@ -940,7 +944,9 @@ mod node_externals_tests {
             }
         };
 
-        let result = download_externals_with_fetcher(fetcher, root).await;
+        let result =
+            download_externals_with_runtimes_and_fetcher(fetcher, &[("node24", "24.99.0")], root)
+                .await;
         assert!(result.is_err(), "corrupted tarball should be rejected");
         // Ensure no directory was installed
         assert!(!externals_dir.join("node24/bin/node").exists());
@@ -993,5 +999,36 @@ mod node_externals_tests {
             mtime_before, mtime_after,
             "fresh cache should not be re-downloaded"
         );
+    }
+    #[tokio::test]
+    async fn missing_all_checksums_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let externals_dir = root.join("externals");
+        std::fs::create_dir_all(&externals_dir).unwrap();
+        let platform = node_externals::current_platform();
+        let archive_name = node_externals::archive_name("v24.99.0", &platform);
+        let tar_bytes = fake_node_tar("24.99.0", &platform);
+        // Fetcher provides tarball but fails SHASUMS request and version is unpinned
+        let fetcher = move |url: &str| {
+            let url = url.to_owned();
+            let tar = tar_bytes.clone();
+            let an = archive_name.clone();
+            async move {
+                if url.ends_with(&an) {
+                    Ok(bytes::Bytes::from(tar))
+                } else {
+                    anyhow::bail!("SHASUMS unavailable")
+                }
+            }
+        };
+        let result =
+            download_externals_with_runtimes_and_fetcher(fetcher, &[("node24", "24.99.0")], root)
+                .await;
+        assert!(
+            result.is_err(),
+            "missing all checksum sources must fail closed"
+        );
+        assert!(!externals_dir.join("node24/bin/node").exists());
     }
 }
