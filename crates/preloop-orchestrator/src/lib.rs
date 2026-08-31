@@ -5145,9 +5145,6 @@ printf archive > "$out"
         std::fs::write(
             &shasum,
             r#"#!/bin/sh
-case "$*" in
-  *node24*) printf "371fc060d5dd4de565586c3cc70034956db67a8f3dae0f0e5724fa56147c472a  dummy\n";;
-  *) printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  dummy\n";;
 arch=$(uname -m 2>/dev/null || echo unknown)
 case "$*" in
   *node24*|*.node24.*)
@@ -5186,9 +5183,6 @@ case "$*" in
     else
       printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  dummy\n"
     fi;;
-esac
-  *node24*) printf "371fc060d5dd4de565586c3cc70034956db67a8f3dae0f0e5724fa56147c472a  dummy\n";;
-  *) printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  dummy\n";;
 esac
 "#,
         )
@@ -5294,9 +5288,6 @@ printf archive > "$out"
         std::fs::write(
             &shasum,
             r#"#!/bin/sh
-case "$*" in
-  *node24*) printf "371fc060d5dd4de565586c3cc70034956db67a8f3dae0f0e5724fa56147c472a  dummy\n";;
-  *) printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  dummy\n";;
 arch=$(uname -m 2>/dev/null || echo unknown)
 case "$*" in
   *node24*|*.node24.*)
@@ -5316,6 +5307,7 @@ esac
         )
         .unwrap();
         std::fs::set_permissions(&shasum, std::fs::Permissions::from_mode(0o755)).unwrap();
+
         let sha256sum = bin.join("sha256sum");
         std::fs::write(
             &sha256sum,
@@ -5334,9 +5326,6 @@ case "$*" in
     else
       printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  dummy\n"
     fi;;
-esac
-  *node24*) printf "371fc060d5dd4de565586c3cc70034956db67a8f3dae0f0e5724fa56147c472a  dummy\n";;
-  *) printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  dummy\n";;
 esac
 "#,
         )
