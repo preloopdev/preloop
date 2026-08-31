@@ -138,6 +138,39 @@ fn expression_context(
                     .collect(),
             ),
         );
+        // GitHub evaluates strategy expressions with a `github` context that
+        // carries the triggering event; `github.event.inputs` mirrors the
+        // dispatch inputs for `workflow_dispatch`. Only the fields strategy
+        // expressions can legitimately reach are populated.
+        context.insert(
+            "github",
+            Value::Object(
+                [
+                    (
+                        "event".to_owned(),
+                        Value::Object(
+                            [(
+                                "inputs".to_owned(),
+                                Value::Object(
+                                    inputs
+                                        .iter()
+                                        .map(|(key, value)| (key.clone(), value.clone()))
+                                        .collect(),
+                                ),
+                            )]
+                            .into_iter()
+                            .collect(),
+                        ),
+                    ),
+                    (
+                        "event_name".to_owned(),
+                        Value::String("workflow_dispatch".to_owned()),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        );
     }
     context
 }
@@ -846,6 +879,25 @@ pub fn expand_jobs_with_reusables_and_shas(
     reusable_workflows: &BTreeMap<String, String>,
     reusable_workflow_shas: &BTreeMap<String, String>,
 ) -> Result<ExpandedWorkflows, ParserError> {
+    expand_jobs_with_reusables_and_shas_and_inputs(
+        workflow,
+        reusable_workflows,
+        reusable_workflow_shas,
+        None,
+    )
+}
+
+/// Expand jobs with workflow-dispatch inputs available to strategy
+/// expressions. GitHub evaluates `jobs.<id>.strategy.*` expressions with the
+/// `inputs` context populated from the dispatch (GitHub evaluates them
+/// server-side with the event's inputs), so the top-level expansion must see
+/// them too.
+pub fn expand_jobs_with_reusables_and_shas_and_inputs(
+    workflow: &Workflow,
+    reusable_workflows: &BTreeMap<String, String>,
+    reusable_workflow_shas: &BTreeMap<String, String>,
+    dispatch_inputs: Option<&BTreeMap<String, serde_json::Value>>,
+) -> Result<ExpandedWorkflows, ParserError> {
     let mut reusable_calls = BTreeMap::new();
     let mut plans = expand_jobs_with_reusables_internal(
         workflow,
@@ -853,7 +905,7 @@ pub fn expand_jobs_with_reusables_and_shas(
         reusable_workflow_shas,
         0,
         &mut reusable_calls,
-        None,
+        dispatch_inputs,
     )?;
 
     // Post-process: Rewrite needs to replace base job IDs of reusable calls with their expanded inner job IDs.

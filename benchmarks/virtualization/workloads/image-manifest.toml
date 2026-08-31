@@ -1,0 +1,14 @@
+# Inputs for the immutable guest image. The build job resolves every package
+# and archive to a digest/checksum before writing the campaign manifest.
+base = "mirror.gcr.io/library/ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90"
+runner_version = "2.336.0"
+node = "22.23.1"
+python = "3.12"
+go = "toolchain-pinned-by-campaign"
+rust = "toolchain-pinned-by-campaign"
+fio = "package-pinned-by-campaign"
+iperf3 = "package-pinned-by-campaign"
+docker = "package-pinned-by-campaign"
+user = "runner"
+uid = 1001
+gid = 1001

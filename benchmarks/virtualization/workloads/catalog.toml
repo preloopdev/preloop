@@ -1,0 +1,47 @@
+# Workload names are part of the benchmark contract. Implementations must
+# remain bounded and produce a deterministic SHA-256 result.
+workloads = [
+  "noop",
+  "cpu",
+  "memory",
+  "disk-seq",
+  "disk-rand",
+  "metadata",
+  "network",
+  "checkout-build",
+  "docker",
+  "service-container",
+]
+
+# Representative repositories are immutable inputs, not floating branches.
+# These are the previously recorded workflow slices; execution must still
+# verify that each path exists at its pinned commit before freezing a campaign.
+[real_workflows.ripgrep]
+repository = "BurntSushi/ripgrep"
+commit = "f9c05a949d1a0dc8e16dee28ca9605d38611faeb"
+workflow = ".github/workflows/ci.yml"
+job = "rustfmt"
+
+[real_workflows.flask]
+repository = "pallets/flask"
+commit = "36e4a824f340fdee7ed50937ba8e7f6bc7d17f81"
+workflow = ".github/workflows/pre-commit.yaml"
+job = "main"
+
+[real_workflows.vite]
+repository = "vitejs/vite"
+commit = "3ac77d9dd742968961af38a5a91ed6b061ceda7d"
+workflow = ".github/workflows/ci.yml"
+job = "lint"
+
+[real_workflows.chi]
+repository = "go-chi/chi"
+commit = "8b258c7bb28f97a5f2a856ff7ef962578fec9215"
+workflow = ".github/workflows/ci.yml"
+job = "test"
+
+[real_workflows.testcontainers_go]
+repository = "testcontainers/testcontainers-go"
+commit = "ea854ecb16425b6e77bc19e95080213fb69a6ac9"
+workflow = ".github/workflows/ci.yml"
+job = "detect-modules"

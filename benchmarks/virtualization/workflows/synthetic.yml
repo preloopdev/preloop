@@ -1,0 +1,44 @@
+name: virtualization-synthetic
+on: workflow_dispatch
+
+jobs:
+  noop:
+    runs-on: self-hosted
+    steps:
+      - run: python3 benchmarks/virtualization/workloads/run.py noop
+  cpu:
+    runs-on: self-hosted
+    steps:
+      - run: python3 benchmarks/virtualization/workloads/run.py cpu --iterations 10000
+  memory:
+    runs-on: self-hosted
+    steps:
+      - run: python3 benchmarks/virtualization/workloads/run.py memory --iterations 16
+  disk-seq:
+    runs-on: self-hosted
+    steps:
+      - run: python3 benchmarks/virtualization/workloads/run.py disk-seq --iterations 8
+  disk-rand:
+    runs-on: self-hosted
+    steps:
+      - run: python3 benchmarks/virtualization/workloads/run.py disk-rand --iterations 8
+  metadata:
+    runs-on: self-hosted
+    steps:
+      - run: python3 benchmarks/virtualization/workloads/run.py metadata --iterations 100
+  network:
+    runs-on: self-hosted
+    steps:
+      - run: python3 benchmarks/virtualization/workloads/run.py network
+  checkout-build:
+    runs-on: self-hosted
+    steps:
+      - run: python3 benchmarks/virtualization/workloads/run.py checkout-build
+  docker:
+    runs-on: self-hosted
+    steps:
+      - run: python3 benchmarks/virtualization/workloads/run.py docker
+  service-container:
+    runs-on: self-hosted
+    steps:
+      - run: python3 benchmarks/virtualization/workloads/run.py service-container

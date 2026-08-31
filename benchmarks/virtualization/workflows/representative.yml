@@ -1,0 +1,8 @@
+name: virtualization-representative
+on: workflow_dispatch
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - run: python3 -c "import hashlib; print(hashlib.sha256(b'preloop').hexdigest())"
+      - run: test -n "representative"

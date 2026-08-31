@@ -1,0 +1,78 @@
+# Safe example: copy to an isolated campaign directory before running.
+campaign_id = "smolvm-firecracker-20260817-example"
+created_utc = "2026-08-17T00:00:00Z"
+operator = "benchmark-operator"
+repository_commit = "e58b918d0750fbaeba2066f50424c3d62677b9f5"
+target_hostname = "main-benchmark-host"
+expected_host_fingerprint = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+[versions]
+smolvm = "1.8.2"
+hypeman_commit = "95db3fb917fa3caaf4cdd4655051ed7bdec975e2"
+firecracker = "1.14.2"
+runner = "2.336.0"
+guest_image_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+workload_revision = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+[isolation]
+benchmark_ports = [19090, 19091, 19092]
+bridge = "preloop-bench-br0"
+cidr = "172.31.240.0/24"
+cgroup_slice = "preloop-bench-smolvm-firecracker-20260817-example.slice"
+vm_prefix = "preloop-bench-smolvm-firecracker-20260817-example-"
+state_dir = "/var/lib/preloop-bench/smolvm-firecracker-20260817-example"
+runtime_dir = "/run/preloop-bench/smolvm-firecracker-20260817-example"
+production_service_policy = "must_remain_running"
+security_mode = "trusted-only"
+allow_destructive_bench_state_cleanup = true
+
+[limits]
+memory_ceiling_gib = 18
+disk_reserve_gib = 150
+root_free_min_gib = 100
+observe_interval_seconds = 1
+
+[preflight]
+# Read-only production queue observation. This is used only by preflight to
+# prove that the live control plane is idle; benchmark traffic never uses it.
+queue_endpoint = "http://127.0.0.1:9090/api/v1/runs?limit=100"
+
+[resources.tiny]
+vcpus = 1
+memory_mib = 1024
+writable_disk_gib = 10
+[resources.standard]
+vcpus = 2
+memory_mib = 4096
+writable_disk_gib = 20
+[resources.large]
+vcpus = 4
+memory_mib = 8192
+writable_disk_gib = 40
+
+[benchmark]
+repetitions = 10
+warmups = 2
+seed = 20260817
+timeout_seconds = 120
+cache_classes = ["image-cold", "image-warm-boot-cold", "snapshot-warm", "runner-warm", "dependency-cold", "dependency-warm"]
+workload_weights = { noop = 1, build = 1 }
+
+[supply_chain]
+files = [
+  "benchmarks/virtualization/workloads/catalog.toml",
+  "benchmarks/virtualization/workloads/image-manifest.toml",
+]
+workloads = [
+  "noop", "cpu", "memory", "disk-seq", "disk-rand",
+  "metadata", "network", "checkout-build", "docker", "service-container",
+]
+
+[slo]
+zero_mismatches = true
+infrastructure_success_rate = 0.999
+warm_provision_p95_seconds = 5
+cold_provision_p95_seconds = 15
+max_memory_peak_gib = 18
+root_free_min_gib = 100
+no_swap_io = true

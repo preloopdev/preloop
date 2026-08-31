@@ -366,10 +366,16 @@ pub(crate) async fn submit_run_inner(
             submission.event
         )));
     }
-    let expanded = preloop_gha_parser::expand_jobs_with_reusables_and_shas(
+    let dispatch_inputs_for_expand: BTreeMap<String, serde_json::Value> = submission
+        .dispatch_inputs
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let expanded = preloop_gha_parser::expand_jobs_with_reusables_and_shas_and_inputs(
         &workflow,
         &submission.reusable_workflows,
         &submission.reusable_workflow_shas,
+        Some(&dispatch_inputs_for_expand),
     )?;
     let mut jobs = expanded.jobs;
     let reusable_calls = expanded.reusable_calls;
