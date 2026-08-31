@@ -6,15 +6,21 @@
 //! routes the preloop server implements, and reports implemented-but-untested
 //! protocol surface.
 //!
+//! Both sides are reduced to `METHOD <canonical-path>` identities. Canonical
+//! paths run through the *same* transport-prefix stripping as
+//! [`crate::compare::normalize_path`] (via `strip_transport_prefixes`) so the
+//! server's compatibility aliases (`/runner/server/…`, `/{org}/_apis/…`) line
+//! up with the golden captures instead of showing as false gaps. Catch-all
+//! routes (`*wild`) match by prefix. HTTP methods are preserved so distinct
+//! operations on one path are not conflated.
+//!
 //! The verdict is advisory by default (`--strict` turns uncovered runner-facing
-//! routes into a hard failure) because route-parameter normalisation is
-//! best-effort: axum `:param`/`*wild` placeholders and golden `{n}`/`{guid}`
-//! tokens are both collapsed to `{p}`, and nested-router prefixes are not
-//! composed. An allowlist file suppresses routes that are intentionally
-//! untested.
+//! routes into a hard failure); an allowlist file suppresses routes that are
+//! intentionally untested.
 
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::LazyLock;
 
 use anyhow::{Context, Result};
 use regex::Regex;
@@ -39,26 +45,63 @@ pub const RUNNER_FACING_PREFIXES: &[&str] = &[
     "/.well-known",
 ];
 
-/// Outcome of a coverage comparison.
+/// HTTP method verbs recognised inside a route registration's handler chain.
+const METHOD_VERBS: &[&str] = &[
+    "get", "post", "put", "patch", "delete", "head", "options", "trace",
+];
+
+/// One implemented server route: an HTTP method (uppercase, or `*` when the
+/// handler chain exposes no recognisable verb), a canonical path, and whether
+/// the path was a catch-all (`*wild`) — in which case `path` is the fixed
+/// prefix and matching is by prefix rather than exact equality.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ImplRoute {
+    /// Uppercase HTTP method, or `*` for "any method".
+    pub method: String,
+    /// Canonical path (for catch-all routes, the fixed prefix).
+    pub path: String,
+    /// Whether this route was a `*wild` catch-all.
+    pub catch_all: bool,
+}
+
+impl ImplRoute {
+    /// `METHOD path` label for reports (catch-all shown with a trailing `/*`).
+    pub fn label(&self) -> String {
+        if self.catch_all {
+            format!("{} {}/*", self.method, self.path)
+        } else {
+            format!("{} {}", self.method, self.path)
+        }
+    }
+
+    /// Whether this route serves a golden `(method, path)` observation.
+    fn covers(&self, golden_method: &str, golden_path: &str) -> bool {
+        let method_ok = self.method == "*" || self.method == golden_method;
+        let path_ok = if self.catch_all {
+            golden_path == self.path || golden_path.starts_with(&format!("{}/", self.path))
+        } else {
+            golden_path == self.path
+        };
+        method_ok && path_ok
+    }
+}
+
+/// Outcome of a coverage comparison. Each entry is a `METHOD path` label.
 #[derive(Debug, Clone, Default)]
 pub struct CoverageReport {
     /// Runner-facing implemented routes exercised by at least one golden.
     pub covered: Vec<String>,
     /// Runner-facing implemented routes no golden exercises.
     pub uncovered_impl: Vec<String>,
-    /// Golden endpoints that match no implemented route (normalisation gaps or
-    /// genuinely missing routes — worth investigating either way).
+    /// Golden endpoints that match no implemented route (a real gap, or a
+    /// normalisation mismatch — worth investigating either way).
     pub golden_without_route: Vec<String>,
 }
 
-fn guid_re() -> &'static Regex {
-    use std::sync::LazyLock;
-    static RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
-            .expect("static regex")
-    });
-    &RE
-}
+static GUID_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+        .expect("static regex")
+});
 
 fn canon_segment(seg: &str) -> String {
     if seg.is_empty() {
@@ -68,21 +111,29 @@ fn canon_segment(seg: &str) -> String {
         || seg.starts_with('*')
         || (seg.starts_with('{') && seg.ends_with('}'));
     let is_num = seg.chars().all(|c| c.is_ascii_digit());
-    if is_param || is_num || guid_re().is_match(seg) {
+    if is_param || is_num || GUID_RE.is_match(seg) {
         "{p}".to_owned()
     } else {
         seg.to_owned()
     }
 }
 
-/// Collapse a route or golden path to a comparable canonical form: query string
-/// dropped, and every parameter / numeric / GUID segment mapped to `{p}`.
+/// Collapse a route or golden path to a comparable canonical form: query
+/// string dropped, transport prefixes (`/runner/server`, single random base
+/// before `/_apis/`) stripped exactly as [`crate::compare::normalize_path`]
+/// does, a leading org/base parameter before `/_apis/` removed, and every
+/// remaining parameter / numeric / GUID segment mapped to `{p}`.
 pub fn canonicalize(path: &str) -> String {
     let base = path.split('?').next().unwrap_or(path);
-    base.split('/')
-        .map(canon_segment)
-        .collect::<Vec<_>>()
-        .join("/")
+    let stripped = crate::compare::strip_transport_prefixes(base);
+    let mut segs: Vec<String> = stripped.split('/').map(canon_segment).collect();
+    // Drop a single leading base segment before `/_apis` (the GHES org prefix
+    // `/:org/_apis/…` on the route side; goldens already had their concrete
+    // base stripped by `strip_transport_prefixes`).
+    if segs.len() >= 3 && segs[2] == "_apis" && !segs[1].is_empty() && segs[1] != "_apis" {
+        segs.remove(1);
+    }
+    segs.join("/")
 }
 
 /// True when a canonical path belongs to the runner↔server protocol surface.
@@ -93,21 +144,146 @@ pub fn is_runner_facing(canonical: &str) -> bool {
             .any(|p| canonical.starts_with(p))
 }
 
-/// Extract the literal route paths registered in a server router source file.
-/// `&format!(...)`-built routes are intentionally skipped; in the preloop router
-/// those are all native `/api/v1/debug/...` admin routes, never runner-facing.
-pub fn implemented_routes(routes_src: &Path) -> Result<BTreeSet<String>> {
-    let text = std::fs::read_to_string(routes_src)
-        .with_context(|| format!("read {}", routes_src.display()))?;
-    let re = Regex::new(r#"\.route(?:_service)?\(\s*"([^"]+)""#).expect("static regex");
-    Ok(re
-        .captures_iter(&text)
-        .map(|c| canonicalize(&c[1]))
-        .collect())
+/// Reduce a route literal to its canonical path (or catch-all prefix) plus a
+/// flag for whether it was a catch-all.
+fn canonical_route(literal: &str) -> (String, bool) {
+    let base = literal.split('?').next().unwrap_or(literal);
+    let segs: Vec<&str> = base.split('/').collect();
+    if let Some(idx) = segs
+        .iter()
+        .position(|s| s.starts_with('*') || s.starts_with("{*"))
+    {
+        let prefix = segs[..idx].join("/");
+        let canon = canonicalize(&prefix);
+        let canon = if canon.is_empty() {
+            "/".to_owned()
+        } else {
+            canon
+        };
+        (canon, true)
+    } else {
+        (canonicalize(base), false)
+    }
 }
 
-/// Canonical set of endpoint paths the golden corpus for `version` exercises.
-pub fn golden_paths(golden_root: &Path, version: &str) -> Result<BTreeSet<String>> {
+/// The first `"…"` string literal in `text` (respecting `\"` escapes).
+fn first_string_literal(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let start = bytes.iter().position(|&b| b == b'"')?;
+    let mut out = String::new();
+    let mut esc = false;
+    for &b in &bytes[start + 1..] {
+        let c = b as char;
+        if esc {
+            out.push(c);
+            esc = false;
+        } else if c == '\\' {
+            esc = true;
+        } else if c == '"' {
+            return Some(out);
+        } else {
+            out.push(c);
+        }
+    }
+    None
+}
+
+/// Method verbs (uppercased) appearing as `verb(` in a route's handler chain.
+fn parse_methods(body: &str) -> Vec<String> {
+    let bytes = body.as_bytes();
+    let mut out = Vec::new();
+    for verb in METHOD_VERBS {
+        let needle = format!("{verb}(");
+        let mut from = 0;
+        while let Some(rel) = body[from..].find(&needle) {
+            let at = from + rel;
+            let boundary_ok = at == 0 || {
+                let prev = bytes[at - 1];
+                !prev.is_ascii_alphanumeric() && prev != b'_'
+            };
+            if boundary_ok {
+                out.push(verb.to_uppercase());
+                break;
+            }
+            from = at + needle.len();
+        }
+    }
+    out
+}
+
+/// Parse every `.route("…", …)` / `.route_service("…", …)` registration out of
+/// a router source file into `ImplRoute`s. `&format!(…)`-built routes (whose
+/// first literal does not start with `/`) are skipped — in the preloop router
+/// those are all native `/api/v1/debug/…` admin routes, never runner-facing.
+pub fn implemented_routes(routes_src: &Path) -> Result<BTreeSet<ImplRoute>> {
+    let text = std::fs::read_to_string(routes_src)
+        .with_context(|| format!("read {}", routes_src.display()))?;
+    let bytes = text.as_bytes();
+    let mut routes = BTreeSet::new();
+    for kw in [".route(", ".route_service("] {
+        let mut search = 0;
+        while let Some(rel) = text[search..].find(kw) {
+            let open = search + rel + kw.len() - 1; // index of '('
+            search = open + 1;
+            // Find the matching close paren, honouring string literals.
+            let mut depth = 0i32;
+            let mut end = None;
+            let mut in_str = false;
+            let mut esc = false;
+            for (i, &b) in bytes.iter().enumerate().skip(open) {
+                let c = b as char;
+                if in_str {
+                    if esc {
+                        esc = false;
+                    } else if c == '\\' {
+                        esc = true;
+                    } else if c == '"' {
+                        in_str = false;
+                    }
+                } else {
+                    match c {
+                        '"' => in_str = true,
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = Some(i);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let Some(end) = end else { break };
+            let inner = &text[open + 1..end];
+            let Some(literal) = first_string_literal(inner) else {
+                continue;
+            };
+            if !literal.starts_with('/') {
+                continue; // format!-built / non-literal route → native admin
+            }
+            let (path, catch_all) = canonical_route(&literal);
+            let methods = parse_methods(inner);
+            let methods = if methods.is_empty() {
+                vec!["*".to_owned()]
+            } else {
+                methods
+            };
+            for method in methods {
+                routes.insert(ImplRoute {
+                    method,
+                    path: path.clone(),
+                    catch_all,
+                });
+            }
+        }
+    }
+    Ok(routes)
+}
+
+/// Canonical `(METHOD, path)` set the golden corpus for `version` exercises.
+pub fn golden_endpoints(golden_root: &Path, version: &str) -> Result<BTreeSet<(String, String)>> {
     let dir = golden_root.join(format!("v{}", version.trim_start_matches('v')));
     let mut out = BTreeSet::new();
     if !dir.exists() {
@@ -119,9 +295,10 @@ pub fn golden_paths(golden_root: &Path, version: &str) -> Result<BTreeSet<String
             continue;
         }
         for key in crate::compare::load_endpoint_keys(&entry.path())? {
-            // keys are "METHOD /path"; coverage compares paths.
-            let path = key.split_once(' ').map(|(_, p)| p).unwrap_or(&key);
-            out.insert(canonicalize(path));
+            // keys are "METHOD /path".
+            if let Some((method, path)) = key.split_once(' ') {
+                out.insert((method.to_uppercase(), canonicalize(path)));
+            }
         }
     }
     Ok(out)
@@ -129,29 +306,39 @@ pub fn golden_paths(golden_root: &Path, version: &str) -> Result<BTreeSet<String
 
 /// Compute coverage of the runner-facing implemented routes by the golden corpus.
 pub fn compute(routes_src: &Path, golden_root: &Path, version: &str) -> Result<CoverageReport> {
-    let impl_all = implemented_routes(routes_src)?;
-    let impl_runner: BTreeSet<String> = impl_all
-        .iter()
-        .filter(|r| is_runner_facing(r))
-        .cloned()
-        .collect();
-    let golden = golden_paths(golden_root, version)?;
+    let impl_routes = implemented_routes(routes_src)?;
+    let golden = golden_endpoints(golden_root, version)?;
     // Goldens capture traffic to every host the runner touches (GitHub codeload,
     // package mirrors, git, blob storage). Restrict coverage to the runner↔server
     // protocol surface so those external calls don't drown the signal.
-    let golden_runner: BTreeSet<String> = golden
+    let golden_runner: Vec<(String, String)> = golden
         .iter()
-        .filter(|p| is_runner_facing(p))
+        .filter(|(_, p)| is_runner_facing(p))
         .cloned()
         .collect();
 
-    let covered = impl_runner.intersection(&golden_runner).cloned().collect();
-    let uncovered_impl = impl_runner.difference(&golden_runner).cloned().collect();
-    let golden_without_route = golden_runner.difference(&impl_all).cloned().collect();
+    let mut covered = BTreeSet::new();
+    let mut uncovered_impl = BTreeSet::new();
+    for r in impl_routes.iter().filter(|r| is_runner_facing(&r.path)) {
+        let hit = golden_runner.iter().any(|(gm, gp)| r.covers(gm, gp));
+        if hit {
+            covered.insert(r.label());
+        } else {
+            uncovered_impl.insert(r.label());
+        }
+    }
+
+    let mut golden_without_route = BTreeSet::new();
+    for (gm, gp) in &golden_runner {
+        if !impl_routes.iter().any(|r| r.covers(gm, gp)) {
+            golden_without_route.insert(format!("{gm} {gp}"));
+        }
+    }
+
     Ok(CoverageReport {
-        covered,
-        uncovered_impl,
-        golden_without_route,
+        covered: covered.into_iter().collect(),
+        uncovered_impl: uncovered_impl.into_iter().collect(),
+        golden_without_route: golden_without_route.into_iter().collect(),
     })
 }
 
@@ -214,16 +401,27 @@ mod tests {
             canonicalize("/_apis/pipelines/workflows/42/artifacts?foo=bar"),
             "/_apis/pipelines/workflows/{p}/artifacts"
         );
+    }
+
+    #[test]
+    fn canonicalize_unifies_transport_aliases() {
+        // /runner/server prefix and GHES org prefix both collapse to the bare
+        // /_apis form, matching golden normalization (finding #2 / review A1).
         assert_eq!(
-            canonicalize("/api/v1/actions/download/:owner/:repo/*git_ref"),
-            "/api/v1/actions/download/{p}/{p}/{p}"
+            canonicalize("/runner/server/_apis/v1/AgentPools"),
+            "/_apis/v1/AgentPools"
         );
+        assert_eq!(
+            canonicalize("/:org/_apis/v1/AgentPools"),
+            "/_apis/v1/AgentPools"
+        );
+        assert_eq!(canonicalize("/_apis/v1/AgentPools"), "/_apis/v1/AgentPools");
     }
 
     #[test]
     fn runner_facing_classification() {
         assert!(is_runner_facing("/broker/{p}/acquirejob"));
-        assert!(is_runner_facing("/{p}/_apis/v1/oauth2/token"));
+        assert!(is_runner_facing("/_apis/v1/oauth2/token"));
         assert!(is_runner_facing("/twirp/foo/Bar"));
         assert!(!is_runner_facing("/api/v1/runs/{p}"));
         assert!(!is_runner_facing("/healthz"));
@@ -231,49 +429,54 @@ mod tests {
     }
 
     #[test]
-    fn implemented_routes_extracts_literals_and_skips_format() {
-        let dir = std::env::temp_dir().join(format!(
-            "rw-cov-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+    fn implemented_routes_extracts_methods_and_skips_format() {
+        let dir = tmp_dir("cov-impl");
         let src = dir.join("routes.rs");
         std::fs::write(
             &src,
             r##"
             let r = Router::new()
-                .route("/broker/:runner_id/acquirejob", post(x))
-                .route("/_apis/v1/AgentPools", get(y))
+                .route("/_apis/artifactcache/cache", post(reserve))
+                .route("/_apis/artifactcache/cache", get(lookup))
+                .route("/broker/:runner_id/acquirejob", post(acquire))
+                .route("/replay/results/*path", put(replay))
                 .route(&format!("{DEBUG_SESSIONS_PATH}/:session_id"), get(z));
             "##,
         )
         .unwrap();
         let routes = implemented_routes(&src).unwrap();
-        assert!(routes.contains("/broker/{p}/acquirejob"));
-        assert!(routes.contains("/_apis/v1/AgentPools"));
-        // format!-built route is skipped (native admin, never runner-facing).
-        assert!(!routes.iter().any(|r| r.contains("session_id")));
+        assert!(routes.contains(&ImplRoute {
+            method: "POST".into(),
+            path: "/_apis/artifactcache/cache".into(),
+            catch_all: false
+        }));
+        assert!(routes.contains(&ImplRoute {
+            method: "GET".into(),
+            path: "/_apis/artifactcache/cache".into(),
+            catch_all: false
+        }));
+        assert!(routes.contains(&ImplRoute {
+            method: "PUT".into(),
+            path: "/replay/results".into(),
+            catch_all: true
+        }));
+        // format!-built route is skipped (native admin).
+        assert!(!routes.iter().any(|r| r.path.contains("session_id")));
     }
 
     #[test]
-    fn compute_flags_uncovered_and_unmatched() {
-        // Two implemented runner-facing routes; golden exercises only one, plus
-        // an endpoint with no matching route.
-        let dir = std::env::temp_dir().join(format!(
-            "rw-cov2-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+    fn compute_matches_method_alias_and_catchall() {
+        let dir = tmp_dir("cov-compute");
         let golden = dir.join("v9.9.9").join("01-scn");
         std::fs::create_dir_all(&golden).unwrap();
         std::fs::write(
             golden.join("flows.jsonl"),
-            "{\"method\":\"POST\",\"path\":\"/broker/1/acquirejob\"}\n\
+            // Runner uses the /runner/server alias (A1), one method of a
+            // two-method path (A2), a catch-all path (A3), and a genuinely
+            // unserved endpoint.
+            "{\"method\":\"GET\",\"path\":\"/runner/server/_apis/v1/AgentPools\"}\n\
+             {\"method\":\"GET\",\"path\":\"/_apis/artifactcache/cache\"}\n\
+             {\"method\":\"PUT\",\"path\":\"/replay/results/a/b/c\"}\n\
              {\"method\":\"GET\",\"path\":\"/_apis/mystery/endpoint\"}\n",
         )
         .unwrap();
@@ -282,20 +485,42 @@ mod tests {
             &src,
             r#"
             let r = Router::new()
-                .route("/broker/:runner_id/acquirejob", post(x))
-                .route("/_apis/v1/Message/:pool_id", get(y));
+                .route("/_apis/v1/AgentPools", get(pools))
+                .route("/_apis/artifactcache/cache", get(lookup))
+                .route("/_apis/artifactcache/cache", post(reserve))
+                .route("/replay/results/*path", put(replay));
             "#,
         )
         .unwrap();
         let report = compute(&src, &dir, "9.9.9").unwrap();
+        // A1: /runner/server alias matches the bare route.
         assert!(report
             .covered
-            .contains(&"/broker/{p}/acquirejob".to_owned()));
+            .contains(&"GET /_apis/v1/AgentPools".to_owned()));
+        // A2: GET on the cache path is covered, POST is not.
+        assert!(report
+            .covered
+            .contains(&"GET /_apis/artifactcache/cache".to_owned()));
         assert!(report
             .uncovered_impl
-            .contains(&"/_apis/v1/Message/{p}".to_owned()));
+            .contains(&"POST /_apis/artifactcache/cache".to_owned()));
+        // A3: multi-segment path under the catch-all is covered.
+        assert!(report.covered.contains(&"PUT /replay/results/*".to_owned()));
+        // Genuinely unserved endpoint is reported.
         assert!(report
             .golden_without_route
-            .contains(&"/_apis/mystery/endpoint".to_owned()));
+            .contains(&"GET /_apis/mystery/endpoint".to_owned()));
+    }
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rw-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }

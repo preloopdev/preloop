@@ -27,6 +27,34 @@ const IGNORED_HEADERS: &[&str] = &[
 
 // ── path normalisation ───────────────────────────────────────────────────────
 
+/// Strip transport prefixes that are not part of the logical endpoint: a
+/// leading `/runner/server`, and a single random base segment before `/_apis/`
+/// (e.g. `/BFN7BKz/_apis/…`). Shared by [`normalize_path`] (request URLs) and
+/// coverage route canonicalization so both sides land in one namespace.
+pub fn strip_transport_prefixes(path: &str) -> &str {
+    let path = if path.starts_with("/runner/server/") {
+        &path["/runner/server".len()..]
+    } else {
+        path
+    };
+    if let Some(rest) = path.strip_prefix('/') {
+        if let Some(slash) = rest.find('/') {
+            let seg = &rest[..slash];
+            let tail = &rest[slash..]; // starts with /
+                                       // Only strip if the tail continues with /_apis/ and the
+                                       // segment is purely alphanumeric+hyphen (no dots — avoids
+                                       // stripping hostnames).
+            if tail.starts_with("/_apis/")
+                && !seg.is_empty()
+                && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            {
+                return tail;
+            }
+        }
+    }
+    path
+}
+
 /// Normalise volatile parts of a URL path + query string for grouping.
 ///
 /// Matches the Python `normalize_path` function exactly:
@@ -36,36 +64,9 @@ const IGNORED_HEADERS: &[&str] = &[
 /// - replace all-digit path segments with `{n}`
 /// - replace all-digit or GUID-prefixed query values with `{n}` / `{guid}`
 pub fn normalize_path(path: &str) -> String {
-    // Strip /runner/server prefix when immediately followed by /.
-    let path = if path.starts_with("/runner/server/") {
-        &path["/runner/server".len()..]
-    } else {
-        path
-    };
-
-    // Strip single-segment random base before /_apis/
-    // e.g. /BFN7BKz.../_apis/... → /_apis/...
-    // Must be exactly one path segment (no embedded slashes).
-    let path = if let Some(rest) = path.strip_prefix('/') {
-        if let Some(slash) = rest.find('/') {
-            let seg = &rest[..slash];
-            let tail = &rest[slash..]; // starts with /
-                                       // Only strip if the tail continues with /_apis/ and the segment
-                                       // is purely alphanumeric+hyphen (no dots — avoids stripping hostnames).
-            if tail.starts_with("/_apis/")
-                && !seg.is_empty()
-                && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-            {
-                tail
-            } else {
-                path
-            }
-        } else {
-            path
-        }
-    } else {
-        path
-    };
+    // Strip transport prefixes (/runner/server, single random base before
+    // /_apis/) so the same logical endpoint groups regardless of URL form.
+    let path = strip_transport_prefixes(path);
 
     // Replace GUIDs (8-4-4-4-12 hex digits).
     let guid_re =
@@ -350,6 +351,19 @@ fn normalize_scalar(input: &str) -> String {
 pub fn normalize_value(v: &Value) -> Value {
     match v {
         Value::String(s) => Value::String(normalize_scalar(s)),
+        // Large integers are volatile ids/epochs (runner ids, unix-nanos,
+        // millisecond timestamps) that legitimately differ between the real
+        // service and the replay. The string rule (`\d{10,}`) never sees them
+        // because they arrive as JSON numbers, so collapse them here too — or
+        // `--value-gate-strict` reports a false `ValueMismatch`. Small numbers
+        // (counts, versions) are left intact so real regressions stay visible.
+        Value::Number(n)
+            if n.as_u64().is_some_and(|u| u >= 1_000_000_000)
+                || n.as_i64()
+                    .is_some_and(|i| i.unsigned_abs() >= 1_000_000_000) =>
+        {
+            Value::String("{n}".to_owned())
+        }
         Value::Array(a) => Value::Array(a.iter().map(normalize_value).collect()),
         Value::Object(m) => {
             let mut out = serde_json::Map::new();
@@ -1294,6 +1308,22 @@ mod tests {
         assert_eq!(n["id"], serde_json::json!("{guid}"));
         // Stable values survive so real regressions remain visible.
         assert_eq!(n["stable"], serde_json::json!("ubuntu-24.04"));
+    }
+
+    #[test]
+    fn normalize_value_collapses_large_numbers_keeps_small() {
+        let v = serde_json::json!({
+            "runnerId": 1784500123456i64,
+            "expiresAt": 1_000_000_000i64,
+            "count": 3,
+            "attempt": 1,
+        });
+        let n = normalize_value(&v);
+        assert_eq!(n["runnerId"], serde_json::json!("{n}"));
+        assert_eq!(n["expiresAt"], serde_json::json!("{n}"));
+        // Small numbers stay numbers so real value regressions still show.
+        assert_eq!(n["count"], serde_json::json!(3));
+        assert_eq!(n["attempt"], serde_json::json!(1));
     }
 
     #[test]

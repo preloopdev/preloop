@@ -749,14 +749,35 @@ fn extract_delta_entries(
 /// member (properties, fields, methods, enum members, record positional
 /// parameters). Members at file/namespace scope use `<module>` as the enclosing
 /// name, matching the old line-heuristic default.
+/// C# structural model extracted from one source file: declared types and
+/// their members, each with a 1-based line, used to diff API surface.
 #[derive(Default)]
 struct CsModel {
     types: Vec<(String, usize)>,
     members: Vec<(String, String, usize)>,
 }
 
+/// UTF-8 text of a tree-sitter node (empty on invalid UTF-8).
 fn node_text<'a>(node: tree_sitter::Node, src: &'a [u8]) -> &'a str {
     node.utf8_text(src).unwrap_or("")
+}
+
+/// A method's identity for delta detection: `name(paramType, …)`. Parameter
+/// types distinguish overloads so an added overload is not lost when members
+/// are keyed by `(type, name)`.
+fn method_signature(name: &str, node: tree_sitter::Node, src: &[u8]) -> String {
+    let mut types = Vec::new();
+    if let Some(params) = node.child_by_field_name("parameters") {
+        let mut cursor = params.walk();
+        for p in params.named_children(&mut cursor) {
+            if p.kind() == "parameter" {
+                if let Some(t) = p.child_by_field_name("type") {
+                    types.push(node_text(t, src).to_string());
+                }
+            }
+        }
+    }
+    format!("{name}({})", types.join(", "))
 }
 
 /// Parse `text` as C# and collect its structural model. Returns `None` only when
@@ -773,6 +794,9 @@ fn parse_csharp(text: &str) -> Option<CsModel> {
     Some(model)
 }
 
+/// Walk a C# syntax tree, recording type declarations and their members
+/// (properties, fields, enum members, record parameters, method signatures)
+/// into `model`, attributing members to their enclosing type.
 fn collect_csharp(node: tree_sitter::Node, enclosing: &str, src: &[u8], model: &mut CsModel) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -815,11 +839,24 @@ fn collect_csharp(node: tree_sitter::Node, enclosing: &str, src: &[u8], model: &
                     collect_csharp(body, &name, src, model);
                 }
             }
-            "property_declaration" | "method_declaration" | "enum_member_declaration" => {
+            "property_declaration" | "enum_member_declaration" => {
                 if let Some(n) = child.child_by_field_name("name") {
                     model.members.push((
                         enclosing.to_string(),
                         node_text(n, src).to_string(),
+                        child.start_position().row + 1,
+                    ));
+                }
+            }
+            // Methods are keyed by name + parameter types, so an added or
+            // removed overload produces a distinct member entry instead of
+            // collapsing onto the existing name (the `(structure, member)` map
+            // would otherwise hide it entirely).
+            "method_declaration" => {
+                if let Some(n) = child.child_by_field_name("name") {
+                    model.members.push((
+                        enclosing.to_string(),
+                        method_signature(node_text(n, src), child, src),
                         child.start_position().row + 1,
                     ));
                 }
@@ -861,6 +898,8 @@ fn csharp_type_decls(text: &str) -> Vec<(String, usize)> {
     }
 }
 
+/// `(type, member) -> 1-based line` for a C# file via tree-sitter, falling
+/// back to the line heuristic when the parser cannot produce a tree.
 fn extract_fields(text: &str) -> BTreeMap<(String, String), usize> {
     match parse_csharp(text) {
         Some(model) => {
@@ -2908,6 +2947,9 @@ async fn run_compare(
     })
 }
 
+/// `runner-watch coverage`: report golden coverage of the server's runner-facing
+/// routes, write markdown + JSON under `.runner-watch/coverage/`, and (with
+/// `--strict`) fail when uncovered routes remain after the allowlist.
 async fn coverage_cmd(config: &Config, args: &CoverageArgs) -> anyhow::Result<()> {
     let version = match &args.runner {
         Some(v) => v.clone(),
@@ -2941,7 +2983,7 @@ async fn coverage_cmd(config: &Config, args: &CoverageArgs) -> anyhow::Result<()
     println!(
         "coverage v{vtag}: {} runner-facing covered, {} uncovered, {} golden endpoint(s) without a matching route",
         report.covered.len(),
-        report.uncovered_impl.len(),
+        uncovered.len(),
         report.golden_without_route.len(),
     );
     for r in &uncovered {
@@ -2956,6 +2998,8 @@ async fn coverage_cmd(config: &Config, args: &CoverageArgs) -> anyhow::Result<()
     Ok(())
 }
 
+/// Read `.runner-watch/coverage-allow.txt` (one `METHOD path` label per line,
+/// `#` comments allowed) of routes intentionally left uncovered.
 fn read_coverage_allowlist() -> anyhow::Result<BTreeSet<String>> {
     let path = PathBuf::from(DEFAULT_ROOT).join("coverage-allow.txt");
     let mut set = BTreeSet::new();
@@ -3592,6 +3636,20 @@ mod tests {
                 && e.structure.as_deref() == Some("Config")
                 && e.fields == vec!["Foo"]),
             "plain field addition should be detected: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn treesitter_detects_added_method_overload() {
+        let old = "public class Api {\n    public void Send(int x) {}\n}";
+        let new =
+            "public class Api {\n    public void Send(int x) {}\n    public void Send(int x, string y) {}\n}";
+        let entries = extract_delta_entries("src/Api.cs", Some(old), Some(new));
+        assert!(
+            entries.iter().any(|e| e.change_type == "field_added"
+                && e.structure.as_deref() == Some("Api")
+                && e.fields == vec!["Send(int, string)"]),
+            "added method overload should be detected via its signature: {entries:?}"
         );
     }
 
