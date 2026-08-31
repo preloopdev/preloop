@@ -350,11 +350,20 @@ for p in details_dir.glob("*.json"):
 def is_high_or_critical(db_sev, cvss_scores):
     if db_sev in ("HIGH", "CRITICAL"):
         return True
-    # For CVE-only entries without database_specific.severity, try to infer from CVSS vector
-    # Heuristic: if any CVSS vector contains availability/integrity high and has no explicit severity, treat as HIGH?
-    # Safer: only count explicit HIGH/CRITICAL to avoid false positives from moderate CVSS.
-    # But for completeness, check if CVSS exists and no db_sev, downgrade to not-fail.
-    # The task's critical CVE-2026-59873 is covered via its GHSA alias (CRITICAL), so CVE alone missing is fine.
+    # When database_specific.severity is absent, inspect OSV severity[] array
+    for score_str in cvss_scores:
+        if not score_str:
+            continue
+        # If a numeric score is present
+        try:
+            val = float(score_str)
+            if val >= 7.0:
+                return True
+        except ValueError:
+            pass
+        # If a CVSS vector string is present (e.g., CVSS:3.1/.../C:H/I:H/A:H or CVSS:4.0/.../VA:H/SA:H)
+        if ":H" in score_str.upper() or "/C:H" in score_str.upper() or "/I:H" in score_str.upper() or "/A:H" in score_str.upper():
+            return True
     return False
 
 # Map package -> vulns

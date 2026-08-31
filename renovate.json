@@ -4,6 +4,7 @@
     "config:recommended",
     "helpers:pinGitHubActionDigests"
   ],
+  "minimumReleaseAge": "7 days",
   "dependencyDashboard": true,
   "packageRules": [
     {

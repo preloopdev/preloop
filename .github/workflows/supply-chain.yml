@@ -22,7 +22,7 @@ jobs:
           persist-credentials: false
 
       - name: Drop PR-shipped cargo config
-        run: rm -f .cargo/config.toml
+        run: rm -f .cargo/config .cargo/config.toml
 
       - name: Guard policy files
         if: github.event_name == 'pull_request'
@@ -70,11 +70,12 @@ jobs:
         run: bash scripts/audit-node-externals.sh
 
       - name: Upload SBOM artifact
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: sbom-node-externals
           path: sbom-node-externals.cdx.json
-          if-no-files-found: error
+          if-no-files-found: ignore
 
   check-node-pin-parity:
     runs-on: ubuntu-latest
