@@ -5148,6 +5148,20 @@ printf archive > "$out"
 case "$*" in
   *node24*) printf "371fc060d5dd4de565586c3cc70034956db67a8f3dae0f0e5724fa56147c472a  dummy\n";;
   *) printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  dummy\n";;
+arch=$(uname -m 2>/dev/null || echo unknown)
+case "$*" in
+  *node24*|*.node24.*)
+    if [ "$arch" = "x86_64" ]; then
+      printf "bbeb5fb8113b44fc30f5a5887dbc0ab66af8e56139f5f9fbe7c7a1aa056246dc  dummy\n"
+    else
+      printf "371fc060d5dd4de565586c3cc70034956db67a8f3dae0f0e5724fa56147c472a  dummy\n"
+    fi;;
+  *)
+    if [ "$arch" = "x86_64" ]; then
+      printf "8a4dbcdd8bccef3132d21e8543940557e55dcf44f00f0a99ba8a062f4552e722  dummy\n"
+    else
+      printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  dummy\n"
+    fi;;
 esac
 "#,
         )
@@ -5158,7 +5172,21 @@ esac
         std::fs::write(
             &sha256sum,
             r#"#!/bin/sh
+arch=$(uname -m 2>/dev/null || echo unknown)
 case "$*" in
+  *node24*|*.node24.*)
+    if [ "$arch" = "x86_64" ]; then
+      printf "bbeb5fb8113b44fc30f5a5887dbc0ab66af8e56139f5f9fbe7c7a1aa056246dc  dummy\n"
+    else
+      printf "371fc060d5dd4de565586c3cc70034956db67a8f3dae0f0e5724fa56147c472a  dummy\n"
+    fi;;
+  *)
+    if [ "$arch" = "x86_64" ]; then
+      printf "8a4dbcdd8bccef3132d21e8543940557e55dcf44f00f0a99ba8a062f4552e722  dummy\n"
+    else
+      printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  dummy\n"
+    fi;;
+esac
   *node24*) printf "371fc060d5dd4de565586c3cc70034956db67a8f3dae0f0e5724fa56147c472a  dummy\n";;
   *) printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  dummy\n";;
 esac
@@ -5215,14 +5243,20 @@ chmod +x "$dest/bin/node"
                     .unwrap();
             assert!(manifest.contains("\"runtime\":\""), "{manifest}");
             assert!(manifest.contains("\"archive_sha256\":\""), "{manifest}");
-            assert!(
-                manifest.contains(if name == "node20" {
+            let expected_sha = if name == "node20" {
+                if cfg!(target_arch = "x86_64") {
+                    "8a4dbcdd"
+                } else {
                     "618e4294"
+                }
+            } else {
+                if cfg!(target_arch = "x86_64") {
+                    "bbeb5fb8"
                 } else {
                     "371fc060"
-                }),
-                "{manifest}"
-            );
+                }
+            };
+            assert!(manifest.contains(expected_sha), "{manifest}");
         }
     }
 
@@ -5263,6 +5297,20 @@ printf archive > "$out"
 case "$*" in
   *node24*) printf "371fc060d5dd4de565586c3cc70034956db67a8f3dae0f0e5724fa56147c472a  dummy\n";;
   *) printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  dummy\n";;
+arch=$(uname -m 2>/dev/null || echo unknown)
+case "$*" in
+  *node24*|*.node24.*)
+    if [ "$arch" = "x86_64" ]; then
+      printf "bbeb5fb8113b44fc30f5a5887dbc0ab66af8e56139f5f9fbe7c7a1aa056246dc  dummy\n"
+    else
+      printf "371fc060d5dd4de565586c3cc70034956db67a8f3dae0f0e5724fa56147c472a  dummy\n"
+    fi;;
+  *)
+    if [ "$arch" = "x86_64" ]; then
+      printf "8a4dbcdd8bccef3132d21e8543940557e55dcf44f00f0a99ba8a062f4552e722  dummy\n"
+    else
+      printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  dummy\n"
+    fi;;
 esac
 "#,
         )
@@ -5272,7 +5320,21 @@ esac
         std::fs::write(
             &sha256sum,
             r#"#!/bin/sh
+arch=$(uname -m 2>/dev/null || echo unknown)
 case "$*" in
+  *node24*|*.node24.*)
+    if [ "$arch" = "x86_64" ]; then
+      printf "bbeb5fb8113b44fc30f5a5887dbc0ab66af8e56139f5f9fbe7c7a1aa056246dc  dummy\n"
+    else
+      printf "371fc060d5dd4de565586c3cc70034956db67a8f3dae0f0e5724fa56147c472a  dummy\n"
+    fi;;
+  *)
+    if [ "$arch" = "x86_64" ]; then
+      printf "8a4dbcdd8bccef3132d21e8543940557e55dcf44f00f0a99ba8a062f4552e722  dummy\n"
+    else
+      printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  dummy\n"
+    fi;;
+esac
   *node24*) printf "371fc060d5dd4de565586c3cc70034956db67a8f3dae0f0e5724fa56147c472a  dummy\n";;
   *) printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  dummy\n";;
 esac

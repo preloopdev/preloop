@@ -73,7 +73,7 @@ const DEFAULT_NODE_SHA256: &[(&str, &str)] = &[
     ),
     (
         "node20_20.20.2_win-x64",
-        "d5c5b1d56f7f9469830eb1f57efeec0a6a9078c0a9e88cd5b4b4b48f46c22069",
+        "dc3700fdd57a63eedb8fd7e3c7baaa32e6a740a1b904167ff4204bc68ed8bf77",
     ),
     (
         "node20_20.20.2_win-arm64",
@@ -97,7 +97,7 @@ const DEFAULT_NODE_SHA256: &[(&str, &str)] = &[
     ),
     (
         "node24_24.19.0_win-x64",
-        "8502f4a50b458d4cc38ed8f2001556c2cd239d464920f74017926ccb1e1c157f",
+        "57f71ab3652e797d84acddc79c81cc9ff1c6ddb2a1974cdb83f00fee9bff4c73",
     ),
     (
         "node24_24.19.0_win-arm64",
