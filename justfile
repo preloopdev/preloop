@@ -58,19 +58,17 @@ test-ci: fmt-check clippy zizmor
     @echo CI: all checks passed
 
 # Supply-chain gate: cargo vet (supply-chain/audits.toml), cargo audit (RustSec),
-# and cargo deny check all (licenses/bans/sources). Local runs are on trusted
-# code. CI gate is .github/workflows/supply-chain.yml (runs-on: ubuntu-latest;
-# triggers: pull_request, push to main, weekly schedule) — it drops any
-# PR-shipped .cargo/config.toml, rejects PRs that touch policy files
-# (deny.toml, .cargo/audit.toml, supply-chain/*), runs the Node externals
-# OSV+SBOM audit (scripts/audit-node-externals.sh), and the
-# check-node-pin-parity job that verifies versions.toml pins against upstream
-# actions/runner src/Misc/externals.sh. Use `just supply-chain` locally; CI
-# runs the same checks via the workflow on GitHub-hosted runners.
+# cargo deny check all (licenses/bans/sources), and Node externals OSV/SBOM audit.
+# Local runs are on trusted code (report-only for Node externals). CI gate is
+# .github/workflows/supply-chain.yml (runs-on: ubuntu-latest; triggers: pull_request,
+# push to main, weekly schedule) — it drops any PR-shipped .cargo/config*, rejects
+# mixed policy PRs, runs the Node externals OSV+SBOM audit, and enforces upstream
+# pin parity.
 supply-chain:
     cargo vet
     cargo audit
     cargo deny check all
+    ./scripts/audit-node-externals.sh --report-only
 
 #lint (ast-grep structural rules)
 

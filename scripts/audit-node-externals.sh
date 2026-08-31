@@ -105,6 +105,10 @@ download_and_verify() {
 
 enumerate_packages() {
   local version="$1"
+
+  # Record Node runtime itself for query & SBOM
+  printf 'node\t%s\truntime\n' "$version" >> "$PACKAGES_JSONL"
+
   local archive_path="$2"
   local extract_root="$TMPDIR/extract-${version}"
   mkdir -p "$extract_root"
@@ -455,7 +459,23 @@ now = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00",
 bom_serial = f"urn:uuid:{uuid.uuid4()}"
 
 components = []
+
+# Add top-level Node.js runtimes as platform components
+for node_ver in [node20, node24]:
+    purl = f"pkg:generic/node@{node_ver}"
+    components.append({
+        "type": "platform",
+        "name": "node",
+        "version": node_ver,
+        "purl": purl,
+        "bom-ref": purl,
+        "scope": "required",
+        "description": f"Node.js runtime distribution v{node_ver}"
+    })
+
 for name, ver in packages:
+    if name == "node":
+        continue
     # purl for npm: pkg:npm/<name>@<version>
     # Handle scoped packages @scope/name -> pkg:npm/%40scope/name
     purl_name = name.replace("@", "%40")

@@ -574,7 +574,7 @@ fn export_keypair(
 
 /// Download Node.js externals for running JS-based actions.
 async fn download_externals(http: &HttpClient, root: &std::path::Path) -> Result<()> {
-    // Node versions matching official runner v2.335.1 externals
+    // Node versions matching versions.toml pins (node20_externals_version / node24_externals_version)
     let node_versions = [("node20", "v20.19.0"), ("node24", "v24.3.0")];
 
     let externals_dir = root.join("externals");
