@@ -458,12 +458,24 @@ pub fn build_agent_job_message_with_normalized_context(
     // reaching action processes — moby's `DESTDIR` driving `docker buildx
     // bake` HCL variables is the canonical case — silently see empty values:
     // bake resolves `${DESTDIR}` to `""` and drops the target's output.
-    // Emit one plain object per variable; the runner's template-map reader
-    // accepts that shape (and the `{map: [{Key, Value}]}` form upstream
-    // sends).
+    // Emit one TemplateToken-shaped mapping per variable. The official
+    // runner deserializes `EnvironmentVariables` into `IList<TemplateToken>`
+    // via its Newtonsoft TemplateToken converter, which only understands the
+    // `{type: 2, map: [{Key: {type: 0, lit: K}, Value: ...}]}` wire shape; a
+    // plain JSON object deserializes to a token the schema evaluator rejects
+    // with "The template is not valid. Unexpected value ''". Values here are
+    // already resolved, so emit literal (type 0) scalar tokens.
     let environment_variables: Vec<serde_json::Value> = resolved_env
         .iter()
-        .map(|(k, v)| serde_json::json!({ k: v }))
+        .map(|(k, v)| {
+            serde_json::json!({
+                "type": 2,
+                "map": [{
+                    "Key": { "type": 0, "lit": k },
+                    "Value": { "type": 0, "lit": v }
+                }]
+            })
+        })
         .collect();
 
     // GitHub supplies baseline regexes in addition to value-derived secret masks.
@@ -1020,6 +1032,36 @@ jobs:
     /// Job/workflow-level `env:` must reach the wire as
     /// `environmentVariables` (the field the official runner materializes
     /// into step environments), not only as `variables`.
+    /// Flatten the TemplateToken-shaped `environmentVariables` entries back
+    /// into key/value pairs (mirror of what the official runner reads).
+    fn template_token_env_pairs(value: &serde_json::Value) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        if let Some(map) = value.get("map").and_then(|m| m.as_array()) {
+            for pair in map {
+                let key = pair
+                    .get("Key")
+                    .and_then(|k| k.get("lit"))
+                    .and_then(|l| l.as_str())
+                    .map(str::to_owned);
+                let val = pair
+                    .get("Value")
+                    .and_then(|v| v.get("lit"))
+                    .and_then(|l| l.as_str())
+                    .map(str::to_owned);
+                if let (Some(k), Some(v)) = (key, val) {
+                    out.push((k, v));
+                }
+            }
+        } else if let Some(obj) = value.as_object() {
+            for (k, v) in obj {
+                if let Some(v) = v.as_str() {
+                    out.push((k.clone(), v.to_owned()));
+                }
+            }
+        }
+        out
+    }
+
     #[test]
     fn job_env_is_exposed_on_environment_variables() {
         let workflow = parse_workflow(
@@ -1050,12 +1092,7 @@ jobs:
         let env: std::collections::BTreeMap<String, String> = message
             .environment_variables
             .iter()
-            .flat_map(|value| {
-                value.as_object().into_iter().flat_map(|obj| {
-                    obj.iter()
-                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
-                })
-            })
+            .flat_map(template_token_env_pairs)
             .collect();
         assert_eq!(env.get("DESTDIR").map(String::as_str), Some("./build"));
         assert_eq!(env.get("GLOBAL_VAR").map(String::as_str), Some("gv"));
@@ -1107,12 +1144,7 @@ jobs:
         let env: std::collections::BTreeMap<String, String> = message
             .environment_variables
             .iter()
-            .flat_map(|value| {
-                value.as_object().into_iter().flat_map(|obj| {
-                    obj.iter()
-                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
-                })
-            })
+            .flat_map(template_token_env_pairs)
             .collect();
         assert_eq!(
             env.get("ENABLED").map(String::as_str),
