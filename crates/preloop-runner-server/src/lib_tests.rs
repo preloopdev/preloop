@@ -3272,12 +3272,29 @@ async fn step_manifests_are_scoped_per_job_attempt() {
         (plan_id, agent_job_id.to_string(), step_id)
     };
 
-    // The first attempt keeps its own mapping.
+    // The run API — not an internal helper — must show the newest attempt's
+    // steps. Asserting through `workflow_step_ids` alone could not detect a
+    // stale projection, because it reads the same map the projection reads.
+    let run = get_run_json(&app, &run_id.to_string()).await;
+    let projected: Vec<&str> = run["jobs_list"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|detail| detail["job_id"] == "build")
+        .expect("build must be in the run record")["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|step| step["id"].as_str().unwrap_or_default())
+        .collect();
     assert_eq!(
-        workflow_step_ids(&state, run_id, "build").await,
-        vec![second_step_id.clone()],
-        "the run record follows the newest attempt"
+        projected,
+        vec![second_step_id.as_str()],
+        "the run record must project the newest attempt, not the first"
     );
+
+    // The earlier attempt keeps its own mapping, which is what makes its
+    // already-uploaded `step-<id>.txt` blobs still reachable.
     {
         let inner = state.inner.lock().await;
         let first_agent_job_id: uuid::Uuid = jobs[0].2.parse().unwrap();
