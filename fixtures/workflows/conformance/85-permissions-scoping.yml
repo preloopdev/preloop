@@ -1,0 +1,81 @@
+name: Permissions Scoping
+
+on:
+  workflow_dispatch:
+
+jobs:
+  full-permissions:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Verify full permissions token
+        run: |
+          echo "GITHUB_TOKEN available: ${{ secrets.GITHUB_TOKEN != '' }}"
+          TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          if [[ -n "$TOKEN" ]]; then
+            echo "✓ Token with write permissions available"
+          else
+            echo "✗ Token not available"
+            exit 1
+          fi
+
+  read-only-permissions:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Verify read-only token
+        run: |
+          echo "GITHUB_TOKEN available: ${{ secrets.GITHUB_TOKEN != '' }}"
+          TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          if [[ -n "$TOKEN" ]]; then
+            echo "✓ Token with read-only permissions available"
+          else
+            echo "✗ Token not available"
+            exit 1
+          fi
+
+      - name: Attempt write operation (should fail)
+        run: |
+          TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          REPO="${{ github.repository }}"
+          ISSUE_NUMBER="${{ github.event.number }}"
+          
+          echo "Attempting to create comment with read-only token..."
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X POST \
+            -H "Authorization: token $TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/$REPO/issues/$ISSUE_NUMBER/comments" \
+            -d '{"body":"Test comment"}' 2>/dev/null || echo "Request failed\n403")
+          
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          echo "HTTP response code: $HTTP_CODE"
+          
+          if [[ "$HTTP_CODE" == "403" ]] || [[ "$HTTP_CODE" == "401" ]] || [[ "$HTTP_CODE" == "422" ]]; then
+            echo "✓ Write operation correctly denied with $HTTP_CODE"
+          elif [[ "$HTTP_CODE" == "201" ]]; then
+            echo "✗ Write operation should have been denied but succeeded (403 expected)"
+            exit 1
+          else
+            echo "Note: Could not verify write restriction (HTTP $HTTP_CODE)"
+          fi
+        continue-on-error: true
+
+  no-permissions:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Verify no permissions
+        run: |
+          TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          if [[ -z "$TOKEN" ]]; then
+            echo "✓ No GITHUB_TOKEN available with empty permissions"
+          else
+            echo "Token available even with empty permissions: $TOKEN"
+          fi

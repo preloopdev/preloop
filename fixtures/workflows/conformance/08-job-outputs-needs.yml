@@ -1,0 +1,15 @@
+name: mitm job outputs
+on: workflow_dispatch
+jobs:
+  producer:
+    runs-on: [self-hosted, mitm]
+    outputs:
+      value: ${{ steps.gen.outputs.value }}
+    steps:
+      - id: gen
+        run: echo "value=42" >> "$GITHUB_OUTPUT"
+  consumer:
+    needs: producer
+    runs-on: [self-hosted, mitm]
+    steps:
+      - run: echo "got ${{ needs.producer.outputs.value }}"

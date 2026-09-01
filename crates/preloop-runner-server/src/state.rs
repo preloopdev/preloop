@@ -728,7 +728,16 @@ impl AppState {
                 if let Ok(map) = serde_json::from_str::<BTreeMap<String, ArtifactV2Entry>>(&content)
                 {
                     let max_id = map.values().map(|e| e.id).max().unwrap_or(0);
-                    (map, max_id)
+                    let mut migrated = BTreeMap::new();
+                    for (k, v) in map {
+                        let parts: Vec<&str> = k.split('/').collect();
+                        if parts.len() >= 3 {
+                            migrated.insert(format!("{}/{}", parts[0], parts[2..].join("/")), v);
+                        } else {
+                            migrated.insert(k, v);
+                        }
+                    }
+                    (migrated, max_id)
                 } else {
                     (BTreeMap::new(), 0)
                 }

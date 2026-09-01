@@ -237,6 +237,45 @@ deprecation warnings, job-level annotations, and background step control-flow.
 
 ---
 
+## 1. v2.337.0 live conformance campaign (2026-08-31)
+
+Four-cell campaign over 27 edge-case scenarios (201–227 in
+`benchmarks/real-world/results/v2337-conformance/`), official `actions/runner`
+v2.337.0 and `preloop-runner`, each against github.com (private capture repo)
+and the local preloop server — every runner process inside a dedicated smolvm
+microVM. Full report: `benchmarks/real-world/results/v2337-conformance/REPORT.md`.
+
+**Official vs preloop runner against github.com: 23/27 exact match** (run +
+per-job conclusions). Divergences:
+
+| Scenario | Divergence | Owner |
+|---|---|---|
+| 213-oidc-token-claims | preloop-runner does not populate `ACTIONS_ID_TOKEN_REQUEST_TOKEN/URL` against github.com servers | preloop-runner |
+| 216-summaries-env-cascade | preloop-runner spawns steps in `working-directory` before the workspace directory exists | preloop-runner |
+| 208-timeout-graceful-kill | timed-out job conclusion bookkeeping (cancelled vs failure) | preloop-runner |
+| 224-matrix-include-exclude | fail-fast cancellation race: in-flight shard allowed to finish | preloop-runner |
+
+Server-side gaps found by pointing the official runner at the local preloop
+server (fixed during the campaign, commits 5a36f431, 35acfe20, 2e358fc4):
+
+1. Strategy expressions could not see dispatch inputs (`inputs` /
+   `github.event.inputs` absent from top-level expansion contexts).
+2. `environmentVariables` wire shape must be TemplateToken maps
+   (`{type:2,map:[{Key,Value}]}`); plain JSON objects crash the official
+   runner's schema evaluator ("The template is not valid. Unexpected value '').
+3. `system.orchestrationId` must be an RFC product token — reusable-call job
+   ids contain `/`, which .NET's `ProductHeaderValue` rejects.
+4. Agent-lookup `authorization.clientId` must parse as `System.Guid`.
+
+New open server gap (found, not yet fixed): artifact
+`CreateArtifact`/`ListArtifacts` scoping uses per-job plan ids, so a build job's
+artifact is invisible to a consumer job in the same run ("Artifact not found
+for name: build-output" in scenario 206).
+
+Pre-existing on main (unrelated): preloop-orchestrator
+`published_node_externals_are_traversable_by_other_users` fails — its mock
+SHASUMS still pin node-v20.19.0 while the pin moved to v20.20.2 (48386439).
+
 ## 1a. v2.336.0 conformance replay status (2026-07-28)
 
 ### 1a.1 What the conformance replay proves

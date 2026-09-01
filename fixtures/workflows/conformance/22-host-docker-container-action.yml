@@ -1,0 +1,11 @@
+name: host-docker-container-action
+on: [push, workflow_dispatch]
+
+jobs:
+  action:
+    runs-on: self-hosted
+    steps:
+      - name: Run docker image action
+        uses: docker://alpine:3.20
+        with:
+          args: echo docker-action-ok

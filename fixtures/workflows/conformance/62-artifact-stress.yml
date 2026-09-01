@@ -1,0 +1,157 @@
+name: 62-artifact-stress
+on:
+  workflow_dispatch:
+  push:
+    paths: ['.github/workflows/62-artifact-stress.yml']
+
+jobs:
+  upload-artifacts:
+    runs-on: [self-hosted, cache-test]
+    timeout-minutes: 10
+    steps:
+      - name: Create varied artifacts
+        run: |
+          # Single text file
+          echo "Hello from aksh-runner $(date)" > single.txt
+
+          # Multiple files in a directory
+          mkdir -p multi-files
+          for i in $(seq 1 10); do
+            echo "File $i content: $(date +%s%N)" > "multi-files/file-$i.txt"
+          done
+
+          # Binary content
+          dd if=/dev/urandom of=binary.dat bs=1024 count=100 2>/dev/null
+
+          # Nested directory structure
+          mkdir -p nested/level1/level2/level3
+          echo "deep" > nested/level1/level2/level3/deep.txt
+          echo "mid" > nested/level1/mid.txt
+          echo "top" > nested/top.txt
+
+          # Record checksums
+          find . -name "*.txt" -o -name "*.dat" | sort | xargs sha256sum > checksums.txt
+          cat checksums.txt
+
+      - name: Upload single file artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: "single-file-${{ github.run_id }}"
+          path: single.txt
+          retention-days: 1
+
+      - name: Upload multi-file artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: "multi-files-${{ github.run_id }}"
+          path: multi-files/
+          retention-days: 1
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: "binary-${{ github.run_id }}"
+          path: binary.dat
+          retention-days: 1
+
+      - name: Upload nested artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: "nested-${{ github.run_id }}"
+          path: nested/
+          retention-days: 1
+
+      - name: Upload checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: "checksums-${{ github.run_id }}"
+          path: checksums.txt
+          retention-days: 1
+
+  download-artifacts:
+    runs-on: [self-hosted, cache-test]
+    needs: upload-artifacts
+    timeout-minutes: 10
+    steps:
+      - name: Download single file
+        uses: actions/download-artifact@v4
+        with:
+          name: "single-file-${{ github.run_id }}"
+          path: dl-single
+
+      - name: Download multi-files
+        uses: actions/download-artifact@v4
+        with:
+          name: "multi-files-${{ github.run_id }}"
+          path: dl-multi
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: "binary-${{ github.run_id }}"
+          path: dl-binary
+
+      - name: Download nested
+        uses: actions/download-artifact@v4
+        with:
+          name: "nested-${{ github.run_id }}"
+          path: dl-nested
+
+      - name: Verify all downloads
+        run: |
+          echo "=== Single file ==="
+          cat dl-single/single.txt && echo "PASS: single file"
+
+          echo "=== Multi files ==="
+          ls dl-multi/ | wc -l
+          if [ "$(ls dl-multi/ | wc -l)" -eq 10 ]; then
+            echo "PASS: all 10 multi-files downloaded"
+          else
+            echo "FAIL: expected 10 files, got $(ls dl-multi/ | wc -l)"
+            exit 1
+          fi
+
+          echo "=== Binary ==="
+          ls -la dl-binary/binary.dat
+          SIZE=$(stat -f%z dl-binary/binary.dat 2>/dev/null || stat -c%s dl-binary/binary.dat 2>/dev/null)
+          if [ "$SIZE" -eq 102400 ]; then
+            echo "PASS: binary artifact correct size (100KB)"
+          else
+            echo "FAIL: binary size $SIZE != 102400"
+            exit 1
+          fi
+
+          echo "=== Nested ==="
+          if [ -f dl-nested/level1/level2/level3/deep.txt ]; then
+            echo "PASS: nested directory structure preserved"
+          else
+            echo "FAIL: nested structure missing"
+            ls -lR dl-nested/
+            exit 1
+          fi
+
+          echo "PASS: All artifact round-trips successful"
+
+  download-all:
+    runs-on: [self-hosted, cache-test]
+    needs: upload-artifacts
+    timeout-minutes: 10
+    steps:
+      - name: Download all artifacts at once
+        uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts
+
+      - name: Verify bulk download
+        run: |
+          echo "=== All artifacts ==="
+          ls -la all-artifacts/
+          COUNT=$(ls -d all-artifacts/*/ 2>/dev/null | wc -l)
+          echo "Downloaded $COUNT artifact directories"
+          if [ "$COUNT" -ge 4 ]; then
+            echo "PASS: Bulk download got all artifacts"
+          else
+            echo "FAIL: Expected at least 4 artifact dirs, got $COUNT"
+            ls -lR all-artifacts/
+            exit 1
+          fi

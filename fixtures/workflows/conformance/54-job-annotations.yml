@@ -1,0 +1,32 @@
+name: 54-job-annotations
+on:
+  workflow_dispatch:
+  push:
+    paths: ['.github/workflows/54-job-annotations.yml']
+
+jobs:
+  # Job 1: A normal job that produces step-level annotations
+  annotated-job:
+    runs-on: [self-hosted, f048-test]
+    timeout-minutes: 5
+    steps:
+      - name: Produce step annotations
+        run: |
+          echo "::error title=Test Error::This is a test error annotation from F048"
+          echo "::warning title=Test Warning::This is a test warning annotation from F048"
+          echo "::notice title=Test Notice::This is a test notice annotation from F048"
+          echo "Step annotations produced"
+
+      - name: Verify annotations were collected
+        run: |
+          echo "PASS: Step annotations produced, job should complete with annotations in completejob body"
+
+  # Job 2: A job that deliberately fails to test job-level failure annotation
+  failing-job:
+    runs-on: [self-hosted, f048-test]
+    timeout-minutes: 5
+    if: false
+    steps:
+      - name: This job is skipped
+        run: echo "skipped"
+# official-test

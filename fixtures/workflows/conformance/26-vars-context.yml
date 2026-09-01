@@ -1,0 +1,9 @@
+name: mitm vars context
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: [self-hosted, mitm]
+    steps:
+      - run: echo "vars test"
+      - run: echo "my_var=${{ vars.MY_VAR }}"
+        if: ${{ vars.MY_VAR != '' }}

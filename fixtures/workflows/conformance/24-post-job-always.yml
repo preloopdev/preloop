@@ -1,0 +1,21 @@
+name: mitm post job always
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: [self-hosted, mitm]
+    steps:
+      - run: echo "main step"
+      - name: force-failure
+        run: exit 1
+      - name: always-step
+        if: always()
+        run: echo "always runs ${{ job.status }}"
+      - name: failure-step
+        if: failure()
+        run: echo "only on failure"
+      - name: cancelled-step
+        if: cancelled()
+        run: echo "only on cancel"
+      - name: success-step
+        if: success()
+        run: echo "only on success"

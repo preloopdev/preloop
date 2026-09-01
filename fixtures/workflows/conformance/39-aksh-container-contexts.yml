@@ -1,0 +1,43 @@
+name: "aksh: container-contexts"
+on: workflow_dispatch
+
+jobs:
+  container-contexts:
+    runs-on: [self-hosted]
+    container:
+      image: node:20-bookworm-slim
+    services:
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Check container context
+        run: |
+          echo "container.id=${{ job.container.id }}"
+          echo "container.network=${{ job.container.network }}"
+          # Verify they are not empty
+          test -n "${{ job.container.id }}" || { echo "FAIL: container.id is empty"; exit 1; }
+          test -n "${{ job.container.network }}" || { echo "FAIL: container.network is empty"; exit 1; }
+          echo "Container context OK"
+      - name: Check service context
+        run: |
+          echo "redis.id=${{ job.services.redis.id }}"
+          echo "redis.network=${{ job.services.redis.network }}"
+          # Verify redis service id is not empty
+          test -n "${{ job.services.redis.id }}" || { echo "FAIL: redis.id is empty"; exit 1; }
+          echo "Service context OK"
+      - name: Verify running inside container
+        run: |
+          node --version
+          echo "Running inside container"
+      - name: Test GITHUB_ENV from container
+        run: |
+          echo "MY_VAR=hello-from-container" >> "$GITHUB_ENV"
+      - name: Read GITHUB_ENV
+        run: |
+          test "$MY_VAR" = "hello-from-container" || { echo "FAIL: MY_VAR not set"; exit 1; }
+          echo "GITHUB_ENV works: MY_VAR=$MY_VAR"

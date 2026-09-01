@@ -1,0 +1,31 @@
+name: 57-runner-settings
+on:
+  workflow_dispatch:
+  push:
+    paths: ['.github/workflows/57-runner-settings.yml']
+
+jobs:
+  settings-test:
+    runs-on: [self-hosted, f052-test]
+    timeout-minutes: 5
+    steps:
+      - name: Verify runner registered and working
+        run: |
+          echo "Runner is running — settings were loaded correctly"
+          echo "If registration succeeded, the .runner file was parsed with all fields"
+
+      - name: Check runner version
+        run: |
+          echo "RUNNER_OS=$RUNNER_OS"
+          echo "RUNNER_ARCH=$RUNNER_ARCH"
+          echo "RUNNER_NAME=$RUNNER_NAME"
+          echo "RUNNER_TOOL_CACHE=$RUNNER_TOOL_CACHE"
+          echo "PASS: Runner environment variables present"
+
+      - name: Run multi-step to verify session stability
+        run: |
+          echo "Step 3 of 4 — session is stable"
+
+      - name: Final step
+        run: |
+          echo "PASS: All steps completed — runner settings working correctly"

@@ -1,0 +1,24 @@
+name: host-docker-service-ports
+on: [push, workflow_dispatch]
+
+jobs:
+  ports:
+    runs-on: self-hosted
+    services:
+      web:
+        image: nginx:1.27-alpine
+        ports:
+          - "18080:80"
+        options: >-
+          --health-cmd "curl -sfL http://localhost || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - name: Reach published service port
+        run: |
+          for i in $(seq 1 30); do
+            curl -sfL http://localhost:18080 && exit 0
+            sleep 1
+          done
+          exit 1

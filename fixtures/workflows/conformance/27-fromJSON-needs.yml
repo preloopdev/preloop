@@ -1,0 +1,19 @@
+name: mitm fromJSON needs
+on: workflow_dispatch
+jobs:
+  producer:
+    runs-on: [self-hosted, mitm]
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - id: gen
+        run: echo 'matrix={"os":["linux","macos"],"arch":["amd64","arm64"]}' >> "$GITHUB_OUTPUT"
+  consumer:
+    needs: producer
+    runs-on: [self-hosted, mitm]
+    strategy:
+      matrix:
+        os: ${{ fromJSON(needs.producer.outputs.matrix).os }}
+        arch: ${{ fromJSON(needs.producer.outputs.matrix).arch }}
+    steps:
+      - run: echo "os=${{ matrix.os }} arch=${{ matrix.arch }}"

@@ -1,0 +1,7 @@
+name: mitm request-ack
+on: workflow_dispatch
+jobs:
+  ack-test:
+    runs-on: [self-hosted, mitm]
+    steps:
+      - run: echo "ack flow test"

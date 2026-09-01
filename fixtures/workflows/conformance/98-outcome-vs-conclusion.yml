@@ -1,0 +1,51 @@
+name: 98-outcome-vs-conclusion
+on:
+  workflow_dispatch:
+jobs:
+  test-outcome-conclusion:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    steps:
+      - name: Successful step
+        id: success
+        run: echo "This step succeeds"
+
+      - name: Verify success step
+        run: |
+          if [ "${{ steps.success.outcome }}" != "success" ]; then
+            echo "ERROR: outcome should be success, got ${{ steps.success.outcome }}"
+            exit 1
+          fi
+          if [ "${{ steps.success.conclusion }}" != "success" ]; then
+            echo "ERROR: conclusion should be success, got ${{ steps.success.conclusion }}"
+            exit 1
+          fi
+          echo "Success step: outcome and conclusion both 'success'"
+
+      - name: Failing step with continue-on-error
+        id: failing
+        continue-on-error: true
+        run: exit 1
+
+      - name: Verify failing step with continue-on-error
+        run: |
+          if [ "${{ steps.failing.outcome }}" != "failure" ]; then
+            echo "ERROR: outcome should be failure, got ${{ steps.failing.outcome }}"
+            exit 1
+          fi
+          if [ "${{ steps.failing.conclusion }}" != "success" ]; then
+            echo "ERROR: conclusion should be success (due to continue-on-error), got ${{ steps.failing.conclusion }}"
+            exit 1
+          fi
+          echo "Failing step with continue-on-error: outcome=failure, conclusion=success"
+
+      - name: Failing step without continue-on-error
+        id: hardfail
+        continue-on-error: false
+        run: |
+          echo "This will fail"
+          exit 1
+
+      - name: This should not run
+        if: failure()
+        run: echo "Reached after hard failure - job should have stopped"

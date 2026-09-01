@@ -1,0 +1,91 @@
+name: 52-expression-features
+on:
+  workflow_dispatch:
+  push:
+    paths: ['.github/workflows/52-expression-features.yml']
+
+jobs:
+  bracket-access:
+    runs-on: [self-hosted, f027-test]
+    timeout-minutes: 5
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        include:
+          - os: ubuntu-latest
+            arch: arm64
+    steps:
+      # Test 1: Bracket notation on matrix context
+      - name: Bracket access on matrix
+        run: |
+          echo "matrix.os via bracket: $BRACKET_OS"
+          echo "matrix.arch via bracket: $BRACKET_ARCH"
+          if [ "$BRACKET_OS" != "ubuntu-latest" ]; then
+            echo "FAIL: bracket access on matrix['os']"
+            exit 1
+          fi
+          if [ "$BRACKET_ARCH" != "arm64" ]; then
+            echo "FAIL: bracket access on matrix['arch']"
+            exit 1
+          fi
+          echo "PASS: bracket notation works"
+        env:
+          BRACKET_OS: ${{ matrix['os'] }}
+          BRACKET_ARCH: ${{ matrix['arch'] }}
+
+      # Test 2: fromJSON + wildcard filter (.*)
+      - name: Wildcard filter on fromJSON
+        run: |
+          echo "Names: $NAMES"
+          if [ "$NAMES" != "alpha,beta,gamma" ]; then
+            echo "FAIL: wildcard filter got '$NAMES' expected 'alpha,beta,gamma'"
+            exit 1
+          fi
+          echo "PASS: wildcard filter works"
+        env:
+          NAMES: ${{ join(fromJSON('[{"name":"alpha","v":1},{"name":"beta","v":2},{"name":"gamma","v":3}]').*.name, ',') }}
+
+      # Test 3: contains() with array
+      - name: Contains with array
+        run: |
+          echo "contains(['a','b','c'], 'b') = $RESULT"
+          if [ "$RESULT" != "true" ]; then
+            echo "FAIL: contains() with array"
+            exit 1
+          fi
+          echo "PASS: contains() with array"
+        env:
+          RESULT: ${{ contains(fromJSON('["a","b","c"]'), 'b') }}
+
+      # Test 4: Nested bracket and dot access
+      - name: Nested bracket and dot access
+        run: |
+          echo "Deep bracket: $DEEP"
+          echo "Deep dot: $DOT"
+          if [ "$DEEP" != "deep" ]; then
+            echo "FAIL: nested bracket access got '$DEEP'"
+            exit 1
+          fi
+          if [ "$DOT" != "deep" ]; then
+            echo "FAIL: nested dot access got '$DOT'"
+            exit 1
+          fi
+          echo "PASS: nested access works"
+        env:
+          DEEP: ${{ fromJSON('{"a":{"b":{"c":"deep"}}}')['a']['b']['c'] }}
+          DOT: ${{ fromJSON('{"a":{"b":{"c":"deep"}}}').a.b.c }}
+
+      # Test 5: format() function
+      - name: Format function
+        run: |
+          echo "Formatted: $FMT"
+          if [ "$FMT" != "Hello World 42" ]; then
+            echo "FAIL: format() got '$FMT'"
+            exit 1
+          fi
+          echo "PASS: format() works"
+        env:
+          FMT: ${{ format('Hello {0} {1}', 'World', 42) }}
+# retest
+# debug3
+# v5

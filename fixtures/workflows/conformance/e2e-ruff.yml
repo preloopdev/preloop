@@ -1,0 +1,17 @@
+name: E2E ruff
+on: workflow_dispatch
+
+jobs:
+  build_and_test:
+    name: Build and Test Ruff
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: astral-sh/ruff
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build -p ruff_linter
+      - name: Test
+        run: cargo test -p ruff_linter

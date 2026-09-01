@@ -1,0 +1,92 @@
+name: Shell Exit Behavior and Pipefail
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-shell-exit-behavior:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    steps:
+      - name: Test bash with pipefail (default)
+        shell: bash
+        run: |
+          echo "Testing bash default behavior"
+          # bash has 'set -e' and 'set -o pipefail' by default in GitHub Actions
+          # This should fail because 'false' is first in pipeline
+          false | true
+          echo "If you see this, pipefail is NOT enabled"
+          exit 1
+
+      - name: Test bash pipefail failure handling
+        shell: bash
+        if: always()
+        run: |
+          set +e
+          false | true
+          EXIT_CODE=$?
+          set -e
+          
+          if [[ $EXIT_CODE -ne 0 ]]; then
+            echo "✓ bash pipefail is active (exit code: $EXIT_CODE)"
+          else
+            echo "✗ bash pipefail is NOT active (exit code: 0)"
+            exit 1
+          fi
+
+      - name: Test sh without pipefail
+        shell: sh
+        if: always()
+        run: |
+          echo "Testing sh behavior"
+          # sh may not have pipefail by default
+          false | true
+          echo "sh completed (pipefail may or may not be active)"
+
+      - name: Test set -e default in bash
+        shell: bash
+        if: always()
+        run: |
+          set +e
+          bash -c 'false; echo "After false"'
+          EXIT_CODE=$?
+          set -e
+          
+          if [[ $EXIT_CODE -ne 0 ]]; then
+            echo "✓ bash has set -e active by default"
+          else
+            echo "⚠ bash may not have set -e or it was overridden"
+          fi
+
+      - name: Test exit code propagation
+        shell: bash
+        if: always()
+        run: |
+          (exit 42)
+          EXIT_CODE=$?
+          if [[ $EXIT_CODE -eq 42 ]]; then
+            echo "✓ Subshell exit codes properly propagated"
+          else
+            echo "✗ Exit code not propagated correctly: $EXIT_CODE"
+          fi
+
+      - name: Test multiple command exit codes
+        shell: bash
+        if: always()
+        run: |
+          set +e
+          true
+          CODE1=$?
+          false
+          CODE2=$?
+          true
+          CODE3=$?
+          set -e
+          
+          echo "Command 1 exit code: $CODE1"
+          echo "Command 2 exit code: $CODE2"
+          echo "Command 3 exit code: $CODE3"
+          
+          if [[ $CODE1 -eq 0 ]] && [[ $CODE2 -ne 0 ]] && [[ $CODE3 -eq 0 ]]; then
+            echo "✓ Individual command exit codes correct"
+          fi

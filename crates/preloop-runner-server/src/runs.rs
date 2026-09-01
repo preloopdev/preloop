@@ -119,10 +119,49 @@ pub(crate) async fn metrics(State(shared): State<Arc<SharedState>>) -> impl Into
 /// the job display name ("Run tests with system wide configuration") would
 /// crash the worker with `FormatException`.
 fn orchestration_id(plan_id: &str, job_id: &str, matrix_index: Option<usize>) -> String {
+    // The official runner emits this value as a User-Agent product token
+    // (`ProductInfoHeaderValue("OrchestrationId", ...)`), so the whole string
+    // must be token-safe. Reusable-call job ids contain '/' ("ci/build"),
+    // which .NET rejects with FormatException. GitHub's own ids never carry
+    // those characters; map everything outside the token alphabet to '-'.
+    let job_id = sanitize_job_id_token(job_id);
     match matrix_index {
         Some(index) => format!("{plan_id}.{job_id}._{index}"),
         None => format!("{plan_id}.{job_id}.__default"),
     }
+}
+
+/// Replace every character that is not an RFC product-token character with
+/// '-' so the value passes .NET's `HeaderUtilities.CheckValidToken`.
+fn sanitize_job_id_token(job_id: &str) -> String {
+    job_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric()
+                || matches!(
+                    c,
+                    '!' | '#'
+                        | '$'
+                        | '%'
+                        | '&'
+                        | '\''
+                        | '*'
+                        | '+'
+                        | '-'
+                        | '.'
+                        | '^'
+                        | '_'
+                        | '`'
+                        | '|'
+                        | '~'
+                )
+            {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 /// Interpolate `${{ ... }}` expressions in a workflow run name.
@@ -366,10 +405,17 @@ pub(crate) async fn submit_run_inner(
             submission.event
         )));
     }
-    let expanded = preloop_gha_parser::expand_jobs_with_reusables_and_shas(
+    let dispatch_inputs_for_expand: BTreeMap<String, serde_json::Value> = submission
+        .dispatch_inputs
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let expanded = preloop_gha_parser::expand_jobs_with_reusables_and_shas_and_inputs_and_event(
         &workflow,
         &submission.reusable_workflows,
         &submission.reusable_workflow_shas,
+        (!dispatch_inputs_for_expand.is_empty()).then_some(&dispatch_inputs_for_expand),
+        Some(submission.event.as_str()),
     )?;
     let mut jobs = expanded.jobs;
     let reusable_calls = expanded.reusable_calls;

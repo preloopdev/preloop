@@ -1,0 +1,22 @@
+name: mitm step summary
+on: workflow_dispatch
+jobs:
+  summary:
+    runs-on: [self-hosted, mitm]
+    steps:
+      - name: Write summary
+        run: |
+          echo "## Test Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Test | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Unit | ✅ Pass |" >> $GITHUB_STEP_SUMMARY
+          echo "| Integration | ✅ Pass |" >> $GITHUB_STEP_SUMMARY
+      - name: Verify summary file exists
+        run: |
+          if [ -f "$GITHUB_STEP_SUMMARY" ]; then
+            echo "Summary file exists"
+            cat "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Summary file not found"
+          fi

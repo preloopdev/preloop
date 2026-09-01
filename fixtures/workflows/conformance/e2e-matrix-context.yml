@@ -1,0 +1,41 @@
+name: E2E matrix context
+on: workflow_dispatch
+
+jobs:
+  matrix-values:
+    name: "Build (${{ matrix.os }}, node=${{ matrix.node }})"
+    runs-on: [self-hosted, linux, x64]
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-22.04]
+        node: [18, 20]
+    steps:
+      - name: Print matrix values
+        run: |
+          echo "os=${{ matrix.os }}"
+          echo "node=${{ matrix.node }}"
+          test "${{ matrix.os }}" != ""
+          test "${{ matrix.node }}" != ""
+
+      - name: Matrix in env
+        env:
+          TARGET_OS: ${{ matrix.os }}
+          NODE_VERSION: ${{ matrix.node }}
+        run: |
+          echo "TARGET_OS=$TARGET_OS"
+          echo "NODE_VERSION=$NODE_VERSION"
+          test "$TARGET_OS" = "${{ matrix.os }}"
+          test "$NODE_VERSION" = "${{ matrix.node }}"
+
+      - name: Matrix in condition (only ubuntu-latest)
+        if: matrix.os == 'ubuntu-latest'
+        run: echo "only runs for ubuntu-latest, os=${{ matrix.os }}"
+
+      - name: Verify condition skipped for ubuntu-22.04
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          if [ "${{ matrix.os }}" != "ubuntu-latest" ]; then
+            echo "ERROR: step should have been skipped for ${{ matrix.os }}"
+            exit 1
+          fi
+          echo "condition correctly filtered to ubuntu-latest"

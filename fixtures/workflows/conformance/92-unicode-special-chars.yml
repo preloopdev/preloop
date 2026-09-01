@@ -1,0 +1,102 @@
+name: Unicode and Special Characters
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-unicode-special-chars:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    steps:
+      - name: Set environment with unicode and special chars
+        env:
+          EMOJI_VAR: "🚀 Rocket 🎉 Party 🔥"
+          CJK_VAR: "中文字符 日本語 한국어"
+          SPECIAL_VAR: "quote\"test' backslash\\ newline\ntest"
+          MATH_VAR: "∑∏∫ mathematical symbols"
+        run: |
+          echo "EMOJI_VAR=$EMOJI_VAR"
+          echo "CJK_VAR=$CJK_VAR"
+          echo "SPECIAL_VAR=$SPECIAL_VAR"
+          echo "MATH_VAR=$MATH_VAR"
+
+      - name: Test unicode in output variables
+        id: unicode_output
+        run: |
+          echo 'emoji_output<<EOF' >> $GITHUB_OUTPUT
+          echo '🌟 Success! ✅ All tests passed 🎯' >> $GITHUB_OUTPUT
+          echo 'EOF' >> $GITHUB_OUTPUT
+          
+          echo 'cjk_output<<EOF' >> $GITHUB_OUTPUT
+          echo '日本語のテスト: これは有効なテストです' >> $GITHUB_OUTPUT
+          echo 'EOF' >> $GITHUB_OUTPUT
+          
+          echo 'special_output<<EOF' >> $GITHUB_OUTPUT
+          echo 'Quotes: "double" and '"'"'single'"'"' and \backslash and \n and \t' >> $GITHUB_OUTPUT
+          echo 'EOF' >> $GITHUB_OUTPUT
+
+      - name: Retrieve and verify unicode outputs
+        run: |
+          EMOJI='${{ steps.unicode_output.outputs.emoji_output }}'
+          CJK='${{ steps.unicode_output.outputs.cjk_output }}'
+          SPECIAL='${{ steps.unicode_output.outputs.special_output }}'
+          
+          echo "Retrieved emoji output: $EMOJI"
+          echo "Retrieved CJK output: $CJK"
+          echo "Retrieved special output: $SPECIAL"
+          
+          if [[ "$EMOJI" == *"🌟"* ]] && [[ "$EMOJI" == *"✅"* ]]; then
+            echo "✓ Emoji preserved in output"
+          else
+            echo "✗ Emoji not preserved"
+            exit 1
+          fi
+          
+          if [[ "$CJK" == *"日本語"* ]]; then
+            echo "✓ CJK characters preserved"
+          else
+            echo "✗ CJK characters not preserved"
+            exit 1
+          fi
+
+      - name: Test file paths with spaces and unicode
+        run: |
+          mkdir -p "test dir with spaces"
+          mkdir -p "测试目录"
+          touch "test dir with spaces/file with spaces.txt"
+          touch "测试目录/文件.txt"
+          
+          echo "✓ Created directories and files with spaces and unicode"
+          ls -la "test dir with spaces/"
+          ls -la "测试目录/"
+
+      - name: Test env var with newlines
+        env:
+          MULTILINE_VAR: |
+            Line 1 with emoji 🎨
+            Line 2 with special chars: @#$%
+            Line 3 with unicode: Ñoño Schöne
+        run: |
+          echo "Multiline env var:"
+          echo "$MULTILINE_VAR"
+          
+          if [[ "$MULTILINE_VAR" == *"Line 1"* ]] && [[ "$MULTILINE_VAR" == *"🎨"* ]]; then
+            echo "✓ Multiline env var with unicode preserved"
+          fi
+
+      - name: Test hex escape sequences
+        id: hex_test
+        run: |
+          echo 'hex_output<<EOF' >> $GITHUB_OUTPUT
+          printf '%b' 'Line 1: \\x41\\x42\\x43\\n' >> $GITHUB_OUTPUT
+          printf '%b' 'Unicode: \\u00E9\\u00E8\\u00EA\\n' >> $GITHUB_OUTPUT
+          echo 'EOF' >> $GITHUB_OUTPUT
+
+      - name: Verify special character round-trip
+        run: |
+          HEX='${{ steps.hex_test.outputs.hex_output }}'
+          echo "Hex output: $HEX"
+          
+          if [[ -n "$HEX" ]]; then
+            echo "✓ Escape sequences handled"
+          fi

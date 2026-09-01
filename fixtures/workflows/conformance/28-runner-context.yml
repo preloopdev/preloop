@@ -1,0 +1,8 @@
+name: mitm runner context
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: [self-hosted, mitm]
+    steps:
+      - run: echo "name=${{ runner.name }} os=${{ runner.os }} arch=${{ runner.arch }} temp=${{ runner.temp }}"
+      - run: echo "tool_cache=${{ runner.tool_cache }}"

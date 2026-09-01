@@ -68,6 +68,12 @@ curl -fsS "$REPLAY_URL/healthz" >/dev/null ||
 # runner-watch's strict normalized endpoint/status/header/body-schema diff.
 cargo run --quiet -p runner-watch -- conform --runner "v$RUNNER_VERSION" \
   --preloop-url "$REPLAY_URL" --skip-cargo-test
+
+if [[ -d ".runner-watch/golden/v2.337.0/gh-official" ]]; then
+  cargo run --quiet -p runner-watch -- conform --runner "2.337.0/gh-official" \
+    --preloop-url "$REPLAY_URL" --skip-cargo-test
+fi
+
 kill "$SERVER_PID" >/dev/null 2>&1 || true
 wait "$SERVER_PID" >/dev/null 2>&1 || true
 SERVER_PID=""
