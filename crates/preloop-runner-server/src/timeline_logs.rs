@@ -174,6 +174,7 @@ pub(crate) async fn patch_timeline_records(
                     let observed = chrono::Utc::now();
 
                     if let Some(pos) = job_detail.steps.iter().position(|s| s.name == *name) {
+                        job_detail.steps[pos].id = Some(record.id.to_string());
                         job_detail.steps[pos].conclusion = conclusion_str.to_owned();
                         if let Some(started_at) = started_at {
                             job_detail.steps[pos].started_at = Some(started_at);
@@ -183,6 +184,7 @@ pub(crate) async fn patch_timeline_records(
                         }
                     } else {
                         job_detail.steps.push(StepRecord {
+                            id: Some(record.id.to_string()),
                             name: name.clone(),
                             conclusion: conclusion_str.to_owned(),
                             started_at: started_at.or(Some(observed)),
@@ -406,15 +408,24 @@ pub(crate) async fn console_log(
     )>,
     body: Bytes,
 ) -> StatusCode {
-    // Parse the body as a LiveLogFeedLinesWrapper and store/broadcast it.
+    // Resolve the callback to the run-scoped agent-job key. Falling back to
+    // the plan id preserves compatibility for callbacks that arrive before a
+    // request record exists.
     if let Ok(wrapper) = serde_json::from_slice::<LiveLogFeedLinesWrapper>(&body) {
-        let job_id = {
+        let resolved = {
             let inner = shared.state.inner.lock().await;
             resolve_callback_job(&inner, &plan_id, None, None)
-                .map(|(_, _, job_id)| job_id.0.clone())
-                .unwrap_or_else(|| plan_id.clone())
+                .map(|(_, run_id, job_id)| (run_id, job_id.0))
         };
-        record_live_log_wrapper(&shared, &job_id, wrapper).await;
+        match resolved {
+            Some((run_id, job_id)) => {
+                crate::live_logs::record_live_log_wrapper_for_run(
+                    &shared, run_id, &job_id, wrapper,
+                )
+                .await;
+            }
+            None => crate::live_logs::record_live_log_wrapper(&shared, &plan_id, wrapper).await,
+        }
     }
     StatusCode::OK
 }
