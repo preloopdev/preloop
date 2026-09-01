@@ -616,25 +616,43 @@ impl ConformanceReport {
 }
 
 fn body_comparison(lo: &[Value], ro: &[Value], field: &str, ll: &str, rl: &str) -> BodyComparison {
-    // Compare *every* occurrence in the endpoint group deterministically by
-    // index, not just the first — otherwise a later call that regresses its
+    // Compare *every* occurrence in the endpoint group, aligned by flow
+    // position, not just the first — otherwise a later call that regresses its
     // body slips through when the first bodies and all statuses match. (Per
-    // index rather than a deduped array: `to_schema_value` unions array element
-    // shapes, which would hide a drop that only affects a later occurrence.)
-    // Replay preserves request order, so index alignment holds; a cardinality
-    // difference compares the present body against an empty one.
-    let la: Vec<&Value> = lo.iter().filter_map(|f| f.get(field)).collect();
-    let ra: Vec<&Value> = ro.iter().filter_map(|f| f.get(field)).collect();
-    if la.is_empty() && ra.is_empty() {
+    // occurrence rather than a deduped array: `to_schema_value` unions array
+    // element shapes, which would hide a drop that only affects a later call.)
+    //
+    // A `null` or absent body is a "no body" slot: an omitted official body and
+    // a replayed `null` must not read as a mismatch, and keeping the slot (vs
+    // filtering it out) prevents occurrences at different indexes from being
+    // silently re-aligned. Only the shared min-count of occurrences is compared
+    // for schema/value; a cardinality difference (a skipped retry, an extra
+    // poll, or a flow dropped by the replay skip rules) is not folded into the
+    // body gate — the legacy gate compared only the first body per endpoint.
+    fn bodies(flows: &[Value], field: &str) -> Vec<Option<Value>> {
+        flows
+            .iter()
+            .map(|f| match f.get(field) {
+                Some(Value::Null) | None => None,
+                Some(v) => Some(v.clone()),
+            })
+            .collect()
+    }
+    let la = bodies(lo, field);
+    let ra = bodies(ro, field);
+    if la.iter().all(Option::is_none) && ra.iter().all(Option::is_none) {
         return BodyComparison::default();
     }
     let empty = Value::Object(Default::default());
     let mut value_diffs = Vec::new();
     let mut schema_diffs = Vec::new();
     let mut drops = false;
-    for i in 0..la.len().max(ra.len()) {
-        let a = la.get(i).copied().unwrap_or(&empty);
-        let b = ra.get(i).copied().unwrap_or(&empty);
+    for i in 0..la.len().min(ra.len()) {
+        if la[i].is_none() && ra[i].is_none() {
+            continue;
+        }
+        let a = la[i].as_ref().unwrap_or(&empty);
+        let b = ra[i].as_ref().unwrap_or(&empty);
         let vd = json_diff(&normalize_value(a), &normalize_value(b), ll, rl);
         if !vd.is_empty() {
             value_diffs.push(vd);
@@ -1412,6 +1430,28 @@ mod tests {
         assert!(
             fails.iter().any(|f| f.kind == FailureKind::ResponseSchema),
             "a field dropped in a later occurrence must be caught: {fails:?}"
+        );
+    }
+
+    #[test]
+    fn null_request_body_is_treated_as_absent() {
+        // Official omits the request body; replay records it as JSON null. The
+        // two must not read as a schema mismatch.
+        let official = serde_json::json!({
+            "method": "POST", "path": "/broker/1/acquirejob", "status": 200,
+            "response_body_json": {"job": {}}, "duration_ms": 1.0,
+        });
+        let replayed = serde_json::json!({
+            "method": "POST", "path": "/broker/1/acquirejob", "status": 200,
+            "request_body_json": Value::Null,
+            "response_body_json": {"job": {}}, "duration_ms": 1.0,
+        });
+        let l = tmp_capture("nbl", &[official]);
+        let r = tmp_capture("nbr", &[replayed]);
+        let fails = analyze_dirs(&l, &r).failures(&GatePolicy::default());
+        assert!(
+            !fails.iter().any(|f| f.kind == FailureKind::RequestSchema),
+            "a null replay body vs an omitted official body must not be a mismatch: {fails:?}"
         );
     }
 

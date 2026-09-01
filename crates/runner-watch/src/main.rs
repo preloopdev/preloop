@@ -780,8 +780,10 @@ fn method_signature(name: &str, node: tree_sitter::Node, src: &[u8]) -> String {
                 .count();
         }
     }
-    // Each parameter's modifiers + type = everything before the parameter name
-    // (e.g. `ref int`), which is signature-significant.
+    // Each parameter contributes its passing-mode modifiers + type (e.g.
+    // `ref int`), taken from the `type` field and the modifier tokens — never
+    // from the raw text, whose default value can contain the parameter name and
+    // truncate a text slice (`string s = "s"`).
     let mut params = Vec::new();
     if let Some(plist) = node.child_by_field_name("parameters") {
         let mut cursor = plist.walk();
@@ -789,22 +791,27 @@ fn method_signature(name: &str, node: tree_sitter::Node, src: &[u8]) -> String {
             if p.kind() != "parameter" {
                 continue;
             }
-            let ptext = node_text(p, src).trim();
-            let sig = match p.child_by_field_name("name") {
-                Some(n) => {
-                    let nt = node_text(n, src);
-                    match ptext.rfind(nt) {
-                        Some(idx) if idx > 0 => ptext[..idx].trim().to_string(),
-                        _ => ptext.to_string(),
-                    }
+            let mut mods = Vec::new();
+            let mut pc = p.walk();
+            for c in p.children(&mut pc) {
+                // tree-sitter-c-sharp wraps `ref`/`out`/`in`/`params`/… in a
+                // `modifier` node.
+                if c.kind() == "modifier" {
+                    mods.push(node_text(c, src).to_string());
                 }
-                None => ptext.to_string(),
+            }
+            let sig = match p.child_by_field_name("type") {
+                Some(t) if mods.is_empty() => node_text(t, src).to_string(),
+                Some(t) => format!("{} {}", mods.join(" "), node_text(t, src)),
+                // No type field (rare): fall back to text before any default.
+                None => node_text(p, src)
+                    .split('=')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
             };
-            params.push(if sig.is_empty() {
-                ptext.to_string()
-            } else {
-                sig
-            });
+            params.push(sig);
         }
     }
     let base = if arity > 0 {
@@ -3001,9 +3008,17 @@ async fn coverage_cmd(config: &Config, args: &CoverageArgs) -> anyhow::Result<()
     let out_dir = PathBuf::from(DEFAULT_ROOT).join("coverage");
     fs::create_dir_all(&out_dir)?;
     let vtag = version.trim_start_matches('v');
+    // Read the allowlist first (propagating real read errors) so the JSON
+    // artifact, the printed count, and the --strict gate all agree.
+    let allow = read_coverage_allowlist()?;
+    let uncovered: Vec<&String> = report
+        .uncovered_impl
+        .iter()
+        .filter(|r| !allow.contains(r.as_str()))
+        .collect();
     fs::write(
         out_dir.join(format!("v{vtag}.md")),
-        coverage::render_markdown(&report, &version),
+        coverage::render_markdown(&report, vtag),
     )?;
     fs::write(
         out_dir.join(format!("v{vtag}.json")),
@@ -3011,15 +3026,10 @@ async fn coverage_cmd(config: &Config, args: &CoverageArgs) -> anyhow::Result<()
             "version": version,
             "covered": report.covered,
             "uncovered_impl": report.uncovered_impl,
+            "uncovered_after_allowlist": uncovered,
             "golden_without_route": report.golden_without_route,
         }))?,
     )?;
-    let allow = read_coverage_allowlist()?;
-    let uncovered: Vec<&String> = report
-        .uncovered_impl
-        .iter()
-        .filter(|r| !allow.contains(r.as_str()))
-        .collect();
     println!(
         "coverage v{vtag}: {} runner-facing covered, {} uncovered, {} golden endpoint(s) without a matching route",
         report.covered.len(),
@@ -3042,17 +3052,20 @@ async fn coverage_cmd(config: &Config, args: &CoverageArgs) -> anyhow::Result<()
 /// `#` comments allowed) of routes intentionally left uncovered.
 fn read_coverage_allowlist() -> anyhow::Result<BTreeSet<String>> {
     let path = PathBuf::from(DEFAULT_ROOT).join("coverage-allow.txt");
-    let mut set = BTreeSet::new();
-    if let Ok(text) = fs::read_to_string(&path) {
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            set.insert(line.to_owned());
-        }
-    }
-    Ok(set)
+    // A missing file means "no allowlist"; any other read error (permissions,
+    // etc.) must propagate rather than silently discard every allowlisted route
+    // and produce a misleading --strict failure.
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect())
 }
 
 fn write_conformance_summary(
@@ -3717,6 +3730,20 @@ mod tests {
                 && e.structure.as_deref() == Some("Api")
                 && e.fields == vec!["Run<2>()"]),
             "a generic-arity overload should be a distinct signature: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn treesitter_method_signature_ignores_default_value() {
+        let old = "public class Api {\n    public void Run() {}\n}";
+        let new =
+            "public class Api {\n    public void Run() {}\n    public void Log(string s = \"s\") {}\n}";
+        let entries = extract_delta_entries("src/Api.cs", Some(old), Some(new));
+        assert!(
+            entries.iter().any(|e| e.change_type == "field_added"
+                && e.structure.as_deref() == Some("Api")
+                && e.fields == vec!["Log(string)"]),
+            "a default value must not truncate the method signature: {entries:?}"
         );
     }
 

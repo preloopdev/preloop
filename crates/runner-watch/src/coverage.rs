@@ -39,6 +39,10 @@ pub const RUNNER_FACING_PREFIXES: &[&str] = &[
     "/message",
     "/acknowledge",
     "/actions/build",
+    // Archive-ticket download the server hands to the runner (bearerless), so
+    // its coverage regressions are worth detecting even though it lives under
+    // the otherwise-native `/api/v1` prefix.
+    "/api/v1/actions",
     "/api/v3",
     "/replay",
     "/oidc",
@@ -132,10 +136,13 @@ pub fn canonicalize(path: &str) -> String {
     let base = path.split('?').next().unwrap_or(path);
     let stripped = crate::compare::strip_transport_prefixes(base);
     let mut segs: Vec<String> = stripped.split('/').map(canon_segment).collect();
-    // Drop a single leading base segment before `/_apis` (the GHES org prefix
-    // `/:org/_apis/…` on the route side; goldens already had their concrete
-    // base stripped by `strip_transport_prefixes`).
-    if segs.len() >= 3 && segs[2] == "_apis" && !segs[1].is_empty() && segs[1] != "_apis" {
+    // Drop a single leading *parameter* base segment before `/_apis` (the GHES
+    // org prefix `/:org/_apis/…` on the route side, canonicalized to `{p}`).
+    // Goldens already had their concrete base stripped by
+    // `strip_transport_prefixes`, so only the parameter form remains — a
+    // literal base (`/foo_bar/_apis/…`) is left intact rather than silently
+    // collapsed onto the bare `/_apis/…` route.
+    if segs.len() >= 3 && segs[2] == "_apis" && segs[1] == "{p}" {
         segs.remove(1);
     }
     segs.join("/")
@@ -350,19 +357,24 @@ pub fn compute(routes_src: &Path, golden_root: &Path, version: &str) -> Result<C
 /// Render a human-readable markdown coverage report.
 pub fn render_markdown(report: &CoverageReport, version: &str) -> String {
     let total = report.covered.len() + report.uncovered_impl.len();
-    let pct = if total == 0 {
-        100.0
+    // Avoid a misleading "100%" on an empty route set, and a "vv…" title when
+    // the caller passes an already-`v`-prefixed version.
+    let coverage = if total == 0 {
+        "0/0 (n/a)".to_owned()
     } else {
-        report.covered.len() as f64 * 100.0 / total as f64
+        format!(
+            "{}/{} ({:.0}%)",
+            report.covered.len(),
+            total,
+            report.covered.len() as f64 * 100.0 / total as f64
+        )
     };
     let mut s = String::new();
-    s.push_str(&format!("# Endpoint coverage: v{version}\n\n"));
     s.push_str(&format!(
-        "Runner-facing routes covered: **{}/{} ({:.0}%)**\n\n",
-        report.covered.len(),
-        total,
-        pct
+        "# Endpoint coverage: v{}\n\n",
+        version.trim_start_matches('v')
     ));
+    s.push_str(&format!("Runner-facing routes covered: **{coverage}**\n\n"));
     s.push_str("## Uncovered runner-facing routes (implemented, no golden)\n\n");
     if report.uncovered_impl.is_empty() {
         s.push_str("_None._\n\n");
