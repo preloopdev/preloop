@@ -177,22 +177,17 @@ pub async fn list_sessions(
 /// run` reports how many sessions are paused on the server without saying
 /// whose, and the pauses in the way are frequently an *earlier* run's — so the
 /// id a user has at hand matches nothing and the listing has to say why.
-/// Runner-generated lifecycle and host-hook steps are retained in the resolved
-/// list for retry fidelity, but they are not workflow steps from a user's
-/// perspective. The prefix checks keep older sessions readable before the
-/// explicit `is_internal` field was added to the wire summary.
-fn is_internal_step(step: &StepSummary) -> bool {
-    step.is_internal
-        || step.context_name.starts_with("__pre_")
-        || step.context_name.starts_with("__post_")
-        || step.context_name.starts_with("__hook_")
-}
-
+/// Runner-generated lifecycle and host-hook steps stay in the resolved list for
+/// retry fidelity, but they are not workflow steps from a user's perspective.
+///
+/// Classification is the runner's `synthetic` flag and nothing else. It is
+/// decided there by absence from the job request message's step list, which is
+/// authoritative. A prefix check on the context name cannot substitute:
+/// `job_builder` passes a user's `id:` through verbatim, so a workflow
+/// declaring `id: __post_build` would have its own step hidden from counts and
+/// from `--from` selection, and its failure mislabelled as a lifecycle failure.
 fn workflow_steps(session: &DebugSession) -> impl Iterator<Item = &StepSummary> {
-    session
-        .job_steps
-        .iter()
-        .filter(|step| !is_internal_step(step))
+    session.job_steps.iter().filter(|step| !step.synthetic)
 }
 
 /// Return the one-based workflow position for a resolved runner step.
@@ -211,7 +206,7 @@ fn step_position_label(session: &DebugSession, resolved_index: usize) -> String 
     if session
         .job_steps
         .iter()
-        .any(|step| step.index == resolved_index && is_internal_step(step))
+        .any(|step| step.index == resolved_index && step.synthetic)
     {
         return format!(
             "runner lifecycle step {}/{} (not a workflow step)",
@@ -484,14 +479,23 @@ fn parse_retry_from(
         anyhow::bail!("use either --from <step> or --from-start, not both");
     }
     if from_start {
-        if let Some(step) = workflow_steps(session).next() {
-            return Ok(Some(step.index));
-        }
         if session.job_steps.is_empty() {
             // Older sessions did not carry the resolved step summaries.
             return Ok(Some(0));
         }
-        anyhow::bail!("no workflow steps are available in this session");
+        // The first workflow step that has actually run. Retries cannot target
+        // a step after the failure, and when a leading synthetic step fails
+        // (a `Pre` hook, or a job-start host hook) the first workflow step is
+        // still ahead of it — the worker rejects that index and silently
+        // retries the synthetic step instead, executing something other than
+        // what the accepted command said.
+        if let Some(step) = workflow_steps_before_failure(session).first() {
+            return Ok(Some(step.index));
+        }
+        anyhow::bail!(
+            "no workflow step has started yet: {} failed before the first one",
+            step_position_label(session, session.step.index)
+        );
     }
     let Some(raw) = from else {
         return Ok(None);
@@ -536,7 +540,10 @@ fn parse_retry_from(
                     "no step matching '{raw}' (step names are unavailable in this session)"
                 );
             }
-            let available = workflow_steps(session)
+            // Only steps at or before the failure are accepted, so listing any
+            // later step would advertise input the retry path rejects.
+            let available = workflow_steps_before_failure(session)
+                .into_iter()
                 .enumerate()
                 .map(|(index, step)| format!("{}. {}", index + 1, step.display_name))
                 .collect::<Vec<_>>()
@@ -1487,13 +1494,13 @@ mod tests {
         index: usize,
         context_name: &str,
         display_name: &str,
-        is_internal: bool,
+        synthetic: bool,
     ) -> StepSummary {
         StepSummary {
             index,
             context_name: context_name.into(),
             display_name: display_name.into(),
-            is_internal,
+            synthetic,
         }
     }
 
@@ -1719,7 +1726,7 @@ mod tests {
                 index,
                 context_name: format!("step_{index}"),
                 display_name: format!("Step {index}"),
-                is_internal: false,
+                synthetic: false,
             })
             .collect();
 
@@ -1742,19 +1749,19 @@ mod tests {
                 index: 0,
                 context_name: "prepare".into(),
                 display_name: "Prepare".into(),
-                is_internal: false,
+                synthetic: false,
             },
             StepSummary {
                 index: 3,
                 context_name: "build".into(),
                 display_name: "Build".into(),
-                is_internal: false,
+                synthetic: false,
             },
             StepSummary {
                 index: 4,
                 context_name: "build_again".into(),
                 display_name: "Build again".into(),
-                is_internal: false,
+                synthetic: false,
             },
         ];
         assert!(parse_retry_from(&paused, Some("5"), false).is_err());

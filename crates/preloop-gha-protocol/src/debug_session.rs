@@ -182,10 +182,18 @@ pub struct StepSummary {
     pub context_name: String,
     /// Resolved human-readable name.
     pub display_name: String,
-    /// True for runner-generated lifecycle or job-hook steps. These remain in
-    /// the resolved list for retry/index fidelity but are not workflow steps.
+    /// Whether the runner generated this step rather than the workflow
+    /// declaring it: `Set up job`, `Pre`/`Post` action hooks, container
+    /// lifecycle, host hooks, `Complete job`.
+    ///
+    /// Decided by absence from the job request message's step list, not by any
+    /// name or id prefix — a workflow may legally declare `id: __post_build`.
+    /// Such steps stay in the resolved list for retry/index fidelity but are
+    /// not workflow steps, so they take no workflow-facing position.
+    ///
+    /// Named to match the server's `StepKind::Synthetic` for the same concept.
     #[serde(default, skip_serializing_if = "bool_is_false")]
-    pub is_internal: bool,
+    pub synthetic: bool,
 }
 
 /// One execution of a step. Retries append rather than overwrite, so the job
