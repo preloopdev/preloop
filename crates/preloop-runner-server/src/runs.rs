@@ -2619,16 +2619,15 @@ async fn append_step(
             merged.extend_from_slice(&contents);
             Ok(())
         }
-        JobLogs::Live(blocks) => {
-            let total = blocks.len();
-            let block = blocks.into_iter().nth(index).ok_or_else(|| {
-                ApiError::not_found(format!(
-                    "job `{job_label}` has {total} steps so far; step {step} is out of range"
-                ))
-            })?;
-            merged.extend_from_slice(&block);
-            Ok(())
-        }
+        // In-memory console blocks are keyed by the runner's numeric log id,
+        // which counts every record it opened — `Set up job` included — so
+        // indexing them returns setup output for `--step 1`. That is the
+        // numbering error this whole path exists to remove, so refuse instead
+        // of reproducing it for a job whose blobs have not landed yet.
+        JobLogs::Live(_) => Err(ApiError::conflict(format!(
+            "job `{job_label}` has not uploaded per-step logs yet, so step {step} cannot be \
+             identified; re-request without `step` for the output so far"
+        ))),
     }
 }
 

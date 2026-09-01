@@ -3217,15 +3217,17 @@ async fn log_run_logs_step_without_job_in_multi_job_run_is_ambiguous() {
 }
 
 #[tokio::test]
-async fn log_run_logs_step_filter_works_on_live_console_blocks() {
+async fn log_run_logs_step_filter_refuses_live_console_blocks() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
 
-    // Nothing on disk yet — a job still in flight streams numbered console
-    // blocks, one per step, and `--step` must work against those too.
-    for (log_id, body) in [("2", "live step two\n"), ("10", "live step ten\n")] {
+    // Nothing on disk yet: a job still in flight streams console blocks keyed
+    // by the runner's numeric log id. Those ids count every record the runner
+    // opened, `Set up job` among them, so they are not declared-step
+    // positions — block "2" is not step 1.
+    for (log_id, body) in [("2", "live block two\n"), ("10", "live block ten\n")] {
         let plan = &jobs[0].1;
         let response = app
             .clone()
@@ -3242,16 +3244,22 @@ async fn log_run_logs_step_filter_works_on_live_console_blocks() {
         assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
 
-    // Numeric console-log order, not lexicographic: 2 precedes 10.
+    // Refusing beats guessing: indexing these blocks is the same numbering
+    // error `--step` was fixed to remove for durable blobs.
     let (status, body) =
         get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=build&step=1")).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, b"live step two\n");
+    assert_eq!(status, StatusCode::CONFLICT);
+    let message = String::from_utf8_lossy(&body);
+    assert!(
+        message.contains("has not uploaded per-step logs yet"),
+        "the error must say why the step cannot be identified: {message}"
+    );
 
-    let (status, body) =
-        get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=build&step=2")).await;
+    // The whole-job read still serves the streamed output, in numeric console
+    // order rather than lexicographic: 2 precedes 10.
+    let (status, body) = get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=build")).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, b"live step ten\n");
+    assert_eq!(body, b"live block two\nlive block ten\n");
 }
 
 #[tokio::test]
