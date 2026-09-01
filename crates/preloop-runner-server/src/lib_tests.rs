@@ -3005,8 +3005,10 @@ jobs:
         inner.job_steps.len()
     };
 
-    // Finish `gen` with a matrix so the deferred node expands.
-    let _ = crate::distributed_task::complete_job_inner(
+    // Finish `gen` with a matrix so the deferred node expands. The result is
+    // propagated: swallowing it let this test pass without ever completing the
+    // job, checking orphans against a run that never expanded.
+    let _completed = crate::distributed_task::complete_job_inner(
         state.shared(),
         preloop_gha_protocol::JobCompletion {
             run_id,
@@ -3020,9 +3022,23 @@ jobs:
             step_results: Vec::new(),
         },
     )
-    .await;
+    .await
+    .expect("completing gen must succeed");
 
     let inner = state.inner.lock().await;
+    // The placeholder must actually be gone, replaced by one leg per matrix
+    // value. Without this the orphan check below could pass vacuously.
+    let legs: Vec<&str> = inner
+        .job_requests
+        .values()
+        .filter(|record| record.run_id == run_id && record.job_id.0.starts_with("fan"))
+        .map(|record| record.job_id.0.as_str())
+        .collect();
+    assert_eq!(
+        legs.len(),
+        2,
+        "the deferred node must expand into two legs, got {legs:?}"
+    );
     // Every retained manifest must belong to a request that still exists.
     let live: std::collections::BTreeSet<uuid::Uuid> = inner
         .job_requests

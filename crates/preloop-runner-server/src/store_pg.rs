@@ -272,6 +272,7 @@ impl PgStore {
         run_id: RunId,
         agent_job_id: uuid::Uuid,
         records: &[crate::models::StepRecord],
+        revision: u64,
     ) -> anyhow::Result<()> {
         for step in records {
             if step.id.is_empty() {
@@ -284,8 +285,8 @@ impl PgStore {
             tx.execute(
                 "INSERT INTO job_steps(run_id, agent_job_id, step_id, kind, workflow_index,
                                        runner_number, context_name, name_blob, conclusion,
-                                       started_at_us, finished_at_us)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                                       started_at_us, finished_at_us, revision)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                  ON CONFLICT(agent_job_id, step_id) DO UPDATE SET
                    kind = EXCLUDED.kind,
                    workflow_index = EXCLUDED.workflow_index,
@@ -294,7 +295,9 @@ impl PgStore {
                    name_blob = EXCLUDED.name_blob,
                    conclusion = EXCLUDED.conclusion,
                    started_at_us = EXCLUDED.started_at_us,
-                   finished_at_us = EXCLUDED.finished_at_us",
+                   finished_at_us = EXCLUDED.finished_at_us,
+                   revision = EXCLUDED.revision
+                 WHERE EXCLUDED.revision >= job_steps.revision",
                 &[
                     &run_id.to_string(),
                     &agent_job_id.to_string(),
@@ -307,6 +310,7 @@ impl PgStore {
                     &step.conclusion,
                     &step.started_at.map(unix_us),
                     &step.finished_at.map(unix_us),
+                    &(revision as i64),
                 ],
             )
             .await?;
@@ -423,10 +427,11 @@ impl Store for PgStore {
         run_id: RunId,
         agent_job_id: uuid::Uuid,
         records: &[crate::models::StepRecord],
+        revision: u64,
     ) -> anyhow::Result<()> {
         let mut client = self.connection.lock().await;
         let tx = client.transaction().await?;
-        self.write_job_steps_tx(&tx, run_id, agent_job_id, records)
+        self.write_job_steps_tx(&tx, run_id, agent_job_id, records, revision)
             .await?;
         tx.commit()
             .await
@@ -933,12 +938,12 @@ impl Store for PgStore {
         // Steps are keyed by attempt; the request records tie an attempt to
         // its run.
         for record in &snapshot.requests {
-            if let Some((_, steps)) = snapshot
+            if let Some((_, steps, revision)) = snapshot
                 .job_steps
                 .iter()
-                .find(|(agent_job_id, _)| *agent_job_id == record.agent_job_id)
+                .find(|(agent_job_id, _, _)| *agent_job_id == record.agent_job_id)
             {
-                self.write_job_steps_tx(&tx, record.run_id, record.agent_job_id, steps)
+                self.write_job_steps_tx(&tx, record.run_id, record.agent_job_id, steps, *revision)
                     .await?;
             }
         }
@@ -1283,6 +1288,9 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
           conclusion TEXT NOT NULL,
           started_at_us BIGINT,
           finished_at_us BIGINT,
+          -- See the SQLite twin: guards against two reports for one attempt
+          -- committing out of order.
+          revision BIGINT NOT NULL DEFAULT 0,
           PRIMARY KEY (agent_job_id, step_id)
         );
 

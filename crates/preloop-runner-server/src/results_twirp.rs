@@ -126,11 +126,18 @@ pub(crate) async fn twirp_workflow_steps_update(
     // reported. Best-effort, like the rest of the store — in-memory state is
     // authoritative and a failed write must not fail the runner's callback.
     let records = records.clone();
+    // Bumped under the same lock that mutated the manifest, so the write
+    // carries a revision strictly newer than any snapshot taken before it.
+    let revision = {
+        let counter = inner.job_steps_revision.entry(job_uuid).or_insert(0);
+        *counter += 1;
+        *counter
+    };
     drop(inner);
     if let Err(error) = shared
         .state
         .store
-        .store_job_steps(run_id, job_uuid, &records)
+        .store_job_steps(run_id, job_uuid, &records, revision)
         .await
     {
         tracing::warn!(?error, %run_id, "failed to persist step records");

@@ -1460,6 +1460,14 @@ pub(crate) struct InnerState {
     /// Seeded from the job request message at dispatch (every declared step,
     /// in workflow order); runner reports only reconcile into it.
     pub(crate) job_steps: BTreeMap<uuid::Uuid, Vec<crate::models::StepRecord>>,
+    /// Monotonic revision per attempt, bumped whenever `job_steps` changes.
+    ///
+    /// Reconciliation snapshots a manifest under this lock and writes it after
+    /// releasing it, so two reports for one attempt can commit out of order.
+    /// The revision travels with the write and the upsert refuses to move a
+    /// row backwards, so an older snapshot cannot overwrite newer conclusions.
+    /// In memory only: the persisted column is what it guards.
+    pub(crate) job_steps_revision: BTreeMap<uuid::Uuid, u64>,
     pub(crate) plan_requests: BTreeMap<String, i64>,
     pub(crate) agent_job_requests: BTreeMap<uuid::Uuid, i64>,
     pub(crate) timeline_requests: BTreeMap<uuid::Uuid, i64>,

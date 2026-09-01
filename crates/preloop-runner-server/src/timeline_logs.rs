@@ -82,7 +82,7 @@ pub(crate) async fn patch_timeline_records(
 
     // Set when this PATCH reconciled an attempt's step records, so they can be
     // persisted once the state lock is released.
-    let mut touched_attempt: Option<(RunId, uuid::Uuid, Vec<StepRecord>)> = None;
+    let mut touched_attempt: Option<(RunId, uuid::Uuid, Vec<StepRecord>, u64)> = None;
     let new_change_id = {
         let mut inner = shared.state.inner.lock().await;
         let current = inner
@@ -232,16 +232,22 @@ pub(crate) async fn patch_timeline_records(
                 // released. A PATCH that projects no job-status event emits
                 // nothing, so without this the reconciliation stays
                 // memory-only and a restart loses it.
-                touched_attempt = Some((run_id, agent_job_id, manifest.clone()));
+                let records = manifest.clone();
+                let revision = {
+                    let counter = inner.job_steps_revision.entry(agent_job_id).or_insert(0);
+                    *counter += 1;
+                    *counter
+                };
+                touched_attempt = Some((run_id, agent_job_id, records, revision));
             }
         }
         new_id
     };
-    if let Some((run_id, agent_job_id, records)) = touched_attempt {
+    if let Some((run_id, agent_job_id, records, revision)) = touched_attempt {
         if let Err(error) = shared
             .state
             .store
-            .store_job_steps(run_id, agent_job_id, &records)
+            .store_job_steps(run_id, agent_job_id, &records, revision)
             .await
         {
             warn!(?error, %run_id, "failed to persist timeline step records");

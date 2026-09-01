@@ -742,6 +742,7 @@ pub(crate) async fn complete_job_inner(
     // in-flight. When the caller could not resolve an attempt, the newest
     // request is the only defensible guess.
     let mut completed_attempt: Option<(uuid::Uuid, Vec<StepRecord>)> = None;
+    let mut completion_revision = 0_u64;
     if let Some(agent_job_id) = completion.agent_job_id.or_else(|| {
         inner
             .job_requests
@@ -775,6 +776,9 @@ pub(crate) async fn complete_job_inner(
                 }
             }
             completed_attempt = Some((agent_job_id, manifest.clone()));
+            let counter = inner.job_steps_revision.entry(agent_job_id).or_insert(0);
+            *counter += 1;
+            completion_revision = *counter;
         }
     }
     let cancelled_siblings = if effective_status == ExecutionStatus::Failure {
@@ -854,7 +858,12 @@ pub(crate) async fn complete_job_inner(
         if let Err(error) = shared
             .state
             .store
-            .store_job_steps(completion.run_id, agent_job_id, &records)
+            .store_job_steps(
+                completion.run_id,
+                agent_job_id,
+                &records,
+                completion_revision,
+            )
             .await
         {
             warn!(?error, run_id = %completion.run_id, "failed to persist completion step records");

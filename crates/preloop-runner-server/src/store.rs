@@ -55,6 +55,7 @@ pub(crate) trait Store: Send + Sync {
         run_id: RunId,
         agent_job_id: uuid::Uuid,
         records: &[crate::models::StepRecord],
+        revision: u64,
     ) -> anyhow::Result<()>;
     /// Persist the run-number allocator for one workflow path.
     async fn store_workflow_run_counter(
@@ -163,13 +164,14 @@ impl Store for InstrumentedStore {
         run_id: RunId,
         agent_job_id: uuid::Uuid,
         records: &[crate::models::StepRecord],
+        revision: u64,
     ) -> anyhow::Result<()> {
         let start = Instant::now();
         self.record(
             "store_job_steps",
             start,
             self.inner
-                .store_job_steps(run_id, agent_job_id, records)
+                .store_job_steps(run_id, agent_job_id, records, revision)
                 .await,
         )
     }
@@ -237,8 +239,8 @@ pub(crate) struct StoreSnapshot {
     pub(crate) session_active_requests: Vec<(String, i64)>,
     /// request_id → undelivered job message.
     pub(crate) broker_request_messages: Vec<(i64, azdo::AgentJobRequestMessage)>,
-    /// (agent_job_id, that attempt's step records).
-    pub(crate) job_steps: Vec<(uuid::Uuid, Vec<crate::models::StepRecord>)>,
+    /// (agent_job_id, that attempt's step records, its revision).
+    pub(crate) job_steps: Vec<(uuid::Uuid, Vec<crate::models::StepRecord>, u64)>,
     pub(crate) meta: MetaSnapshot,
 }
 
@@ -285,7 +287,14 @@ impl StoreSnapshot {
             job_steps: inner
                 .job_steps
                 .iter()
-                .map(|(agent_job_id, records)| (*agent_job_id, records.clone()))
+                .map(|(agent_job_id, records)| {
+                    let revision = inner
+                        .job_steps_revision
+                        .get(agent_job_id)
+                        .copied()
+                        .unwrap_or(0);
+                    (*agent_job_id, records.clone(), revision)
+                })
                 .collect(),
             meta: build_meta_snapshot(inner),
         }
@@ -1733,12 +1742,12 @@ impl SqliteStore {
         // Steps are keyed by attempt, and the request records are what tie an
         // attempt to its run.
         for record in &snapshot.requests {
-            if let Some((_, steps)) = snapshot
+            if let Some((_, steps, revision)) = snapshot
                 .job_steps
                 .iter()
-                .find(|(agent_job_id, _)| *agent_job_id == record.agent_job_id)
+                .find(|(agent_job_id, _, _)| *agent_job_id == record.agent_job_id)
             {
-                self.write_job_steps_tx(&tx, record.run_id, record.agent_job_id, steps)?;
+                self.write_job_steps_tx(&tx, record.run_id, record.agent_job_id, steps, *revision)?;
             }
         }
         self.write_claim_state_tx(
@@ -1808,10 +1817,11 @@ impl SqliteStore {
         run_id: RunId,
         agent_job_id: uuid::Uuid,
         records: &[crate::models::StepRecord],
+        revision: u64,
     ) -> anyhow::Result<()> {
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let tx = connection.transaction()?;
-        self.write_job_steps_tx(&tx, run_id, agent_job_id, records)?;
+        self.write_job_steps_tx(&tx, run_id, agent_job_id, records, revision)?;
         tx.commit()
             .map_err(|error| anyhow::anyhow!("committing job steps: {error}"))?;
         self.maybe_checkpoint_wal(&connection)?;
@@ -1927,6 +1937,7 @@ impl SqliteStore {
         run_id: RunId,
         agent_job_id: uuid::Uuid,
         records: &[crate::models::StepRecord],
+        revision: u64,
     ) -> anyhow::Result<()> {
         {
             for step in records {
@@ -1936,8 +1947,8 @@ impl SqliteStore {
                 tx.execute(
                     "INSERT INTO job_steps(run_id, agent_job_id, step_id, kind, workflow_index,
                                            runner_number, context_name, name_blob, conclusion,
-                                           started_at_us, finished_at_us)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                                           started_at_us, finished_at_us, revision)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                      ON CONFLICT(agent_job_id, step_id) DO UPDATE SET
                        kind = excluded.kind,
                        workflow_index = excluded.workflow_index,
@@ -1946,7 +1957,9 @@ impl SqliteStore {
                        name_blob = excluded.name_blob,
                        conclusion = excluded.conclusion,
                        started_at_us = excluded.started_at_us,
-                       finished_at_us = excluded.finished_at_us",
+                       finished_at_us = excluded.finished_at_us,
+                       revision = excluded.revision
+                     WHERE excluded.revision >= job_steps.revision",
                     params![
                         run_id.to_string(),
                         agent_job_id.to_string(),
@@ -1959,6 +1972,7 @@ impl SqliteStore {
                         step.conclusion,
                         step.started_at.map(unix_us),
                         step.finished_at.map(unix_us),
+                        revision as i64,
                     ],
                 )?;
             }
@@ -2119,12 +2133,15 @@ impl Store for SqliteStore {
         run_id: RunId,
         agent_job_id: uuid::Uuid,
         records: &[crate::models::StepRecord],
+        revision: u64,
     ) -> anyhow::Result<()> {
         let store = self.clone();
         let records = records.to_vec();
-        tokio::task::spawn_blocking(move || store.store_job_steps(run_id, agent_job_id, &records))
-            .await
-            .map_err(|error| anyhow::anyhow!("store job-steps task panicked: {error}"))?
+        tokio::task::spawn_blocking(move || {
+            store.store_job_steps(run_id, agent_job_id, &records, revision)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("store job-steps task panicked: {error}"))?
     }
 
     async fn store_workflow_run_counter(
@@ -2398,6 +2415,12 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
           conclusion TEXT NOT NULL,
           started_at_us INTEGER,
           finished_at_us INTEGER,
+          -- Monotonic per attempt, bumped on every in-memory mutation. Two
+          -- reports for one attempt snapshot under the lock and then commit
+          -- outside it, so they can commit out of order; the upsert refuses to
+          -- move a row backwards rather than letting the older snapshot
+          -- overwrite the newer conclusions.
+          revision INTEGER NOT NULL DEFAULT 0,
           PRIMARY KEY (agent_job_id, step_id)
         ) STRICT, WITHOUT ROWID;
 
