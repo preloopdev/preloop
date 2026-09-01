@@ -386,7 +386,7 @@ fn get_run_logs() {}
         ("job" = Option<String>, Query, description = "Workflow job key or agent job UUID; required when the run has multiple jobs")
     ),
     responses(
-        (status = 200, content_type = "text/event-stream", description = "Live log events; the stream closes when the selected job and run are terminal", body = String),
+        (status = 200, content_type = "text/event-stream", description = "Live log events; the stream closes when the selected job is terminal", body = String),
         (status = 400, description = "Job is required when the run has multiple jobs", body = ApiErrorResponse),
         (status = 404, description = "Run or job not found", body = ApiErrorResponse)
     ),

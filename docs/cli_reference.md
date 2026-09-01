@@ -79,7 +79,7 @@ No flags.
 |---|---|
 | `--job <JOB>` | Narrow to one job: the workflow job key (`build`) or its agent job UUID |
 | `--step <STEP>` | Narrow to one 1-based step within the job, in execution order |
-| `-f`, `--follow` | Stream output as it arrives and exit when the run reaches a terminal state |
+| `-f`, `--follow` | Stream one job's output and exit when that job finishes |
 
 Without flags, every job's log is merged in job-request order.
 
@@ -90,9 +90,10 @@ boundaries; asking for a step there fails with `409` rather than returning the
 whole job under a step's name.
 
 `--follow` tracks one job's live console feed, so it needs `--job` unless the
-run has exactly one job. It replays the retained buffer before going live, so a
-late follower still sees earlier output, and it cannot be combined with
-`--step` (the feed carries whole steps as they stream).
+run has exactly one job. It replays the retained buffer before going live, then
+exits when that selected job completes. If the job is already complete, it
+returns the available durable log instead. It cannot be combined with `--step`
+(the feed carries whole steps as they stream).
 
 ```bash
 preloop logs                          # whole latest run

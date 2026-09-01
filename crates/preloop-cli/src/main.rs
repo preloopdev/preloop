@@ -3530,29 +3530,6 @@ async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Fetch a run's overall execution status.
-///
-/// `None` when the field is absent or unrecognized, which callers treat as
-/// "keep following" rather than a reason to stop.
-async fn run_status(
-    client: &reqwest::Client,
-    url: &str,
-    run_id: &str,
-) -> anyhow::Result<Option<preloop_gha_protocol::ExecutionStatus>> {
-    let mut request = client.get(format!("{url}/api/v1/runs/{run_id}"));
-    if let Some(token) = api_token() {
-        request = request.bearer_auth(token);
-    }
-    let response = request.send().await?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("server returned {status}: {body}");
-    }
-    let record: serde_json::Value = response.json().await?;
-    Ok(serde_json::from_value(record["status"].clone()).ok())
-}
-
 /// Fetch one job's durable log through the native logs endpoint.
 async fn fetch_run_job_logs(
     client: &reqwest::Client,
@@ -3576,31 +3553,12 @@ async fn fetch_run_job_logs(
     Ok(response.text().await?)
 }
 
-/// Wait for the selected run to reach a terminal state after its job feed
-/// closes. A job can finish before a sibling, so SSE EOF alone is not enough.
-async fn wait_for_run_terminal(
-    client: &reqwest::Client,
-    url: &str,
-    run_id: &str,
-) -> anyhow::Result<()> {
-    loop {
-        if run_status(client, url, run_id)
-            .await?
-            .is_some_and(|status| status.is_terminal())
-        {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-}
-
-/// Stream one job's live console feed, then wait for the run to finish.
+/// Stream one job's live console feed and exit when that job finishes.
 ///
 /// The server closes the selected job's feed when that job completes. The
-/// client therefore drains every queued SSE frame before checking run status;
-/// if a sibling is still active, it waits rather than returning early. When a
-/// completed job has no retained in-memory snapshot (for example after a
-/// server restart), the durable job-log endpoint supplies the missing output.
+/// client drains every queued SSE frame before returning; if a completed job
+/// has no retained in-memory snapshot (for example after a server restart),
+/// the durable job-log endpoint supplies the missing output.
 async fn follow_run_logs(
     client: &reqwest::Client,
     url: &str,
@@ -3648,7 +3606,7 @@ async fn follow_run_logs(
         let body = fetch_run_job_logs(client, url, run_id, job).await?;
         print!("{body}");
     }
-    wait_for_run_terminal(client, url, run_id).await
+    Ok(())
 }
 
 /// Return the first complete SSE frame delimiter and its byte length.
