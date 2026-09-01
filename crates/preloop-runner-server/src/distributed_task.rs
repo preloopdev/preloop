@@ -741,6 +741,7 @@ pub(crate) async fn complete_job_inner(
     // attempt's steps while the run view still projected the newer one as
     // in-flight. When the caller could not resolve an attempt, the newest
     // request is the only defensible guess.
+    let mut completed_attempt: Option<(uuid::Uuid, Vec<StepRecord>)> = None;
     if let Some(agent_job_id) = completion.agent_job_id.or_else(|| {
         inner
             .job_requests
@@ -773,6 +774,7 @@ pub(crate) async fn complete_job_inner(
                     step.finished_at = step.finished_at.or(Some(chrono::Utc::now()));
                 }
             }
+            completed_attempt = Some((agent_job_id, manifest.clone()));
         }
     }
     let cancelled_siblings = if effective_status == ExecutionStatus::Failure {
@@ -845,6 +847,19 @@ pub(crate) async fn complete_job_inner(
     inner.dap_ports.remove(&completion.run_id);
     let queue_nonempty = !inner.queue.is_empty() || !inner.cancellation_queue.is_empty();
     drop(inner);
+    // Best-effort, outside the lock: the completion's own step conclusions
+    // must survive a restart, and the run-event projection deliberately no
+    // longer carries step rows.
+    if let Some((agent_job_id, records)) = completed_attempt {
+        if let Err(error) = shared
+            .state
+            .store
+            .store_job_steps(completion.run_id, agent_job_id, &records)
+            .await
+        {
+            warn!(?error, run_id = %completion.run_id, "failed to persist completion step records");
+        }
+    }
 
     // Any reusable-caller or dynamic-matrix node the sweep above unblocked was
     // deferred rather than expanded under the lock. Build those subtrees now

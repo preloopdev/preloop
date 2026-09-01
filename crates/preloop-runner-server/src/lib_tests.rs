@@ -2843,12 +2843,16 @@ async fn log_run_logs_unknown_job_is_404_not_whole_run() {
     );
 }
 
-/// Step manifests survive a restart, so `--step` still resolves.
+/// A runner report persists the attempt, so a restart keeps step state.
 ///
-/// They deliberately do not ride in `runs.record_blob` (which reseals the
-/// workflow YAML and event payload on every run event) nor in `MetaSnapshot`
-/// (every field of which is sealed on each `store_meta_only`), so this proves
-/// the `job_steps` table actually round-trips them.
+/// Step records deliberately do not ride in `runs.record_blob` (which reseals
+/// the workflow YAML and event payload on every run event) nor in
+/// `MetaSnapshot` (every field of which is sealed on each `store_meta_only`),
+/// and the run-event projection no longer carries them at all. The only thing
+/// that persists them is `store_job_steps`, called from the reconciliation
+/// paths — so this drives a real `WorkflowStepsUpdate` rather than forcing a
+/// snapshot, which is what makes it a regression test for losing step
+/// conclusions across a restart.
 #[tokio::test]
 async fn step_manifests_survive_a_restart() {
     let temp = tempfile::tempdir().unwrap();
@@ -2858,14 +2862,27 @@ async fn step_manifests_survive_a_restart() {
         let (run_id, jobs) = three_step_run_for_log_filters(&app, &state).await;
         let ids = workflow_step_ids(&state, run_id, "build").await;
         assert_eq!(ids.len(), 3);
-        // Force the full snapshot so the rows exist regardless of which run
-        // events happened to fire during submission.
-        let snapshot = {
-            let inner = state.inner.lock().await;
-            crate::store::StoreSnapshot::from_inner(&inner)
-        };
-        state.store.store_inner(&snapshot).await.unwrap();
-        (run_id, jobs[0].1.clone(), jobs[0].2.clone(), ids)
+        let (plan_id, agent_job_id) = (jobs[0].1.clone(), jobs[0].2.clone());
+
+        let response = request_json(
+            &app,
+            Method::POST,
+            "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",
+            json!({
+                "workflow_run_backend_id": plan_id,
+                "workflow_job_run_backend_id": agent_job_id,
+                "steps": [{
+                    "external_id": ids[1],
+                    "number": 3,
+                    "name": "Run echo two",
+                    "status": 6,
+                    "conclusion": 2
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(response["ok"], true);
+        (run_id, plan_id, agent_job_id, ids)
     };
 
     // A fresh AppState over the same state dir is the restart.
@@ -2876,6 +2893,18 @@ async fn step_manifests_survive_a_restart() {
         restored, ids,
         "declared step ids and their order must come back intact"
     );
+
+    // The reported conclusion came back too, not just the identities.
+    {
+        let inner = state.inner.lock().await;
+        let records = &inner.job_steps[&agent_job_id.parse::<uuid::Uuid>().unwrap()];
+        let reported = records
+            .iter()
+            .find(|step| step.id == ids[1])
+            .expect("the reported step must be restored");
+        assert_eq!(reported.conclusion, "success");
+        assert_eq!(reported.runner_number, Some(3));
+    }
 
     write_step_job_logs(
         &temp,

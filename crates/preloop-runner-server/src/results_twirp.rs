@@ -121,6 +121,21 @@ pub(crate) async fn twirp_workflow_steps_update(
         }
     }
 
+    // Persist the attempt that changed, after releasing the lock: without this
+    // a restart before job completion loses every step conclusion the runner
+    // reported. Best-effort, like the rest of the store — in-memory state is
+    // authoritative and a failed write must not fail the runner's callback.
+    let records = records.clone();
+    drop(inner);
+    if let Err(error) = shared
+        .state
+        .store
+        .store_job_steps(run_id, job_uuid, &records)
+        .await
+    {
+        tracing::warn!(?error, %run_id, "failed to persist step records");
+    }
+
     Ok(Json(json!({"ok": true})))
 }
 

@@ -43,6 +43,19 @@ pub(crate) trait Store: Send + Sync {
     async fn store_meta_only(&self, meta: &MetaSnapshot) -> anyhow::Result<()>;
     /// Persist one run's mutable projection plus a control event.
     async fn store_run_event(&self, projection: RunProjection) -> anyhow::Result<()>;
+    /// Persist one attempt's step records.
+    ///
+    /// Separate from [`Store::store_run_event`] on purpose. Steps change far
+    /// more often than anything else in a run, and a run-scoped projection
+    /// would rewrite every attempt's rows on each transition — quadratic in
+    /// the width of a matrix, against a single-writer backend. This writes the
+    /// one attempt that changed.
+    async fn store_job_steps(
+        &self,
+        run_id: RunId,
+        agent_job_id: uuid::Uuid,
+        records: &[crate::models::StepRecord],
+    ) -> anyhow::Result<()>;
     /// Persist the run-number allocator for one workflow path.
     async fn store_workflow_run_counter(
         &self,
@@ -142,6 +155,22 @@ impl Store for InstrumentedStore {
             "store_run_event",
             start,
             self.inner.store_run_event(projection).await,
+        )
+    }
+
+    async fn store_job_steps(
+        &self,
+        run_id: RunId,
+        agent_job_id: uuid::Uuid,
+        records: &[crate::models::StepRecord],
+    ) -> anyhow::Result<()> {
+        let start = Instant::now();
+        self.record(
+            "store_job_steps",
+            start,
+            self.inner
+                .store_job_steps(run_id, agent_job_id, records)
+                .await,
         )
     }
 
@@ -277,8 +306,6 @@ pub(crate) struct RunProjection {
     pub(crate) session_active_requests: Vec<(String, i64)>,
     pub(crate) inflight: Vec<(String, i64, azdo::TaskAgentMessage)>,
     pub(crate) broker_request_messages: Vec<(i64, azdo::AgentJobRequestMessage)>,
-    /// (agent_job_id, step records) for this run's attempts only.
-    pub(crate) job_steps: Vec<(uuid::Uuid, Vec<crate::models::StepRecord>)>,
     pub(crate) event: NdjsonEvent,
 }
 
@@ -321,20 +348,6 @@ impl RunProjection {
                 .broker_messages
                 .iter()
                 .map(|(id, message)| (*id, message.clone()))
-                .collect(),
-            // Only this run's attempts: `job_steps` is global, and rewriting
-            // every run's steps on one run's event is the amplification this
-            // table exists to avoid.
-            job_steps: inner
-                .job_requests
-                .values()
-                .filter(|record| record.run_id == run_id)
-                .filter_map(|record| {
-                    inner
-                        .job_steps
-                        .get(&record.agent_job_id)
-                        .map(|records| (record.agent_job_id, records.clone()))
-                })
                 .collect(),
             event,
         })
@@ -1764,9 +1777,11 @@ impl SqliteStore {
         for record in &projection.requests {
             self.insert_request_tx(&tx, record)?;
         }
-        for (agent_job_id, steps) in &projection.job_steps {
-            self.write_job_steps_tx(&tx, run_id, *agent_job_id, steps)?;
-        }
+        // Steps are not part of this projection: they change far more often
+        // than the rest of a run, and rewriting every attempt's rows on each
+        // transition is quadratic in matrix width against a single writer.
+        // `store_job_steps` persists the one attempt that changed instead.
+        //
         // The claim state must land in the same transaction as the queue
         // rewrite above: a job that was claimed (dequeued, message handed to a
         // session) but not yet acked would otherwise have neither its queue
@@ -1783,6 +1798,22 @@ impl SqliteStore {
         // Same rationale as the full-snapshot path: bound the WAL so a
         // runner-event burst cannot stall a later commit behind a giant
         // checkpoint sync — periodically, not on every event.
+        self.maybe_checkpoint_wal(&connection)?;
+        Ok(())
+    }
+
+    /// Persist one attempt's step rows in their own transaction.
+    pub(crate) fn store_job_steps(
+        &self,
+        run_id: RunId,
+        agent_job_id: uuid::Uuid,
+        records: &[crate::models::StepRecord],
+    ) -> anyhow::Result<()> {
+        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let tx = connection.transaction()?;
+        self.write_job_steps_tx(&tx, run_id, agent_job_id, records)?;
+        tx.commit()
+            .map_err(|error| anyhow::anyhow!("committing job steps: {error}"))?;
         self.maybe_checkpoint_wal(&connection)?;
         Ok(())
     }
@@ -2081,6 +2112,19 @@ impl Store for SqliteStore {
         tokio::task::spawn_blocking(move || store.store_run_event(&projection))
             .await
             .map_err(|error| anyhow::anyhow!("store run-event task panicked: {error}"))?
+    }
+
+    async fn store_job_steps(
+        &self,
+        run_id: RunId,
+        agent_job_id: uuid::Uuid,
+        records: &[crate::models::StepRecord],
+    ) -> anyhow::Result<()> {
+        let store = self.clone();
+        let records = records.to_vec();
+        tokio::task::spawn_blocking(move || store.store_job_steps(run_id, agent_job_id, &records))
+            .await
+            .map_err(|error| anyhow::anyhow!("store job-steps task panicked: {error}"))?
     }
 
     async fn store_workflow_run_counter(

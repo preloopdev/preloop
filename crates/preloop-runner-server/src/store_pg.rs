@@ -418,6 +418,22 @@ impl PgStore {
 
 #[async_trait]
 impl Store for PgStore {
+    async fn store_job_steps(
+        &self,
+        run_id: RunId,
+        agent_job_id: uuid::Uuid,
+        records: &[crate::models::StepRecord],
+    ) -> anyhow::Result<()> {
+        let mut client = self.connection.lock().await;
+        let tx = client.transaction().await?;
+        self.write_job_steps_tx(&tx, run_id, agent_job_id, records)
+            .await?;
+        tx.commit()
+            .await
+            .map_err(|error| anyhow::anyhow!("committing job steps: {error}"))?;
+        Ok(())
+    }
+
     async fn load_into(&self, inner: &mut InnerState) -> anyhow::Result<()> {
         let client = self.connection.lock().await;
         let rows = client
@@ -968,10 +984,8 @@ impl Store for PgStore {
         for record in &projection.requests {
             self.insert_request_tx(&tx, record).await?;
         }
-        for (agent_job_id, steps) in &projection.job_steps {
-            self.write_job_steps_tx(&tx, run_id, *agent_job_id, steps)
-                .await?;
-        }
+        // Steps are persisted per attempt by `store_job_steps`, not here: see
+        // the SQLite twin for why a run-scoped rewrite is quadratic.
         // Claim state must land in the same transaction as the queue rewrite
         // (see the SQLite twin).
         self.write_claim_state_tx(
