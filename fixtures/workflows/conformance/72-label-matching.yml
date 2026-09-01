@@ -1,0 +1,39 @@
+name: "golden: label-matching"
+on: workflow_dispatch
+jobs:
+  ubuntu-latest-job:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify ubuntu runner
+        run: |
+          echo "Runner: ${{ runner.name }}"
+          echo "OS: ${{ runner.os }}"
+          echo "Arch: ${{ runner.arch }}"
+          if [[ "${{ runner.os }}" != "Linux" ]]; then
+            echo "FAIL: expected Linux"
+            exit 1
+          fi
+          echo "PASS: ubuntu-latest dispatched to Linux runner"
+
+  self-hosted-job:
+    runs-on: [self-hosted]
+    steps:
+      - name: Verify self-hosted runner
+        run: |
+          echo "Runner: ${{ runner.name }}"
+          echo "OS: ${{ runner.os }}"
+          echo "Labels: self-hosted"
+          echo "PASS: self-hosted job dispatched correctly"
+
+  labeled-job:
+    runs-on: [self-hosted, Linux]
+    steps:
+      - name: Verify labeled runner
+        run: |
+          echo "Runner: ${{ runner.name }}"
+          echo "OS: ${{ runner.os }}"
+          if [[ "${{ runner.os }}" != "Linux" ]]; then
+            echo "FAIL: expected Linux for [self-hosted, Linux]"
+            exit 1
+          fi
+          echo "PASS: [self-hosted, Linux] dispatched to Linux runner"

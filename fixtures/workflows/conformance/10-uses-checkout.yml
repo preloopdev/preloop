@@ -1,0 +1,8 @@
+name: mitm checkout
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: [self-hosted, mitm]
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo checked-out

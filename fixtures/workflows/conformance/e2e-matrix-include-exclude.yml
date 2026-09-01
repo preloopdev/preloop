@@ -1,0 +1,38 @@
+name: E2E matrix include/exclude
+on: workflow_dispatch
+
+jobs:
+  build:
+    name: "job-${{ matrix.n }}"
+    runs-on: [self-hosted, linux, x64]
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        n: [1, 2, 3, 4]
+        flag: [false]
+        include:
+          - n: 5
+            flag: true
+            extra: bonus
+        exclude:
+          - n: 4
+    steps:
+      - name: Show matrix
+        run: |
+          echo "n=${{ matrix.n }}"
+          echo "flag=${{ matrix.flag }}"
+          echo "extra=${{ matrix.extra }}"
+
+      - name: Verify n=4 is excluded (should never run)
+        run: |
+          if [ "${{ matrix.n }}" = "4" ]; then
+            echo "ERROR: n=4 should have been excluded"
+            exit 1
+          fi
+
+      - name: Extra field only on n=5
+        if: matrix.extra == 'bonus'
+        run: |
+          echo "extra bonus field present: ${{ matrix.extra }}"
+          test "${{ matrix.n }}" = "5"

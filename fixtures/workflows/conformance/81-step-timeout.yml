@@ -1,0 +1,47 @@
+name: Step Timeout
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-step-timeout:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    steps:
+      - name: Fast completing step
+        timeout-minutes: 1
+        run: |
+          echo "This step completes quickly"
+          sleep 1
+          echo "✓ Step completed before timeout"
+
+      - name: Step that exceeds timeout
+        id: timeout-step
+        timeout-minutes: 1
+        run: |
+          echo "Starting long-running step (120s sleep)"
+          sleep 120
+          echo "This should not print - timeout should kill this"
+        continue-on-error: true
+
+      - name: Verify timed-out step failed
+        if: always()
+        run: |
+          TIMEOUT_STEP_OUTCOME="${{ steps.timeout-step.outcome }}"
+          echo "Timed-out step outcome: $TIMEOUT_STEP_OUTCOME"
+          if [[ "$TIMEOUT_STEP_OUTCOME" == "failure" ]]; then
+            echo "✓ Step timeout correctly caused failure"
+          else
+            echo "✗ Step timeout did not cause failure"
+            exit 1
+          fi
+
+      - name: Subsequent step runs with if always
+        if: always()
+        run: |
+          echo "✓ Subsequent step with if: always() executed after timeout"
+
+      - name: Another step with always condition
+        if: always()
+        run: |
+          echo "✓ Multiple steps with if: always() all execute"

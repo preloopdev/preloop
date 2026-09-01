@@ -1,0 +1,16 @@
+name: mitm step ids
+on: workflow_dispatch
+jobs:
+  ids:
+    runs-on: [self-hosted, mitm]
+    steps:
+      - run: echo "first script step (should be __run)"
+      - run: echo "second script step (should be __run_2)"
+      - id: named
+        run: echo "named step"
+      - run: echo "fourth script step (should be __run_3)"
+      - name: Step with outputs
+        id: output_step
+        run: echo "value=hello" >> $GITHUB_OUTPUT
+      - run: |
+          echo "Output from output_step: ${{ steps.output_step.outputs.value }}"

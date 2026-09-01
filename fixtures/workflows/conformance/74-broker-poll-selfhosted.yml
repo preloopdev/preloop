@@ -1,0 +1,16 @@
+name: "verify: broker-poll (self-hosted)"
+on: workflow_dispatch
+jobs:
+  fast-job:
+    runs-on: [self-hosted]
+    steps:
+      - name: Quick step
+        run: |
+          echo "Start: $(date +%s%N)"
+          echo "This job should complete and the runner should exit promptly"
+          echo "End: $(date +%s%N)"
+
+      - name: Verify fast completion
+        run: |
+          echo "If the broker poll is 200ms (not 50s), this job completes fast"
+          echo "PASS: job completed"

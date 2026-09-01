@@ -1,0 +1,45 @@
+name: "golden: defaults-run-working-dir"
+on: workflow_dispatch
+defaults:
+  run:
+    working-directory: subdir
+    shell: bash
+jobs:
+  test-defaults:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create subdir with marker
+        working-directory: .
+        run: |
+          mkdir -p subdir
+          echo "MARKER_VALUE=from-subdir" > subdir/marker.txt
+          echo "Created marker in subdir"
+
+      - name: Verify defaults.run.working-directory works
+        run: |
+          echo "PWD is: $PWD"
+          if [[ "$PWD" != *"/subdir" ]]; then
+            echo "FAIL: expected PWD to end with /subdir, got $PWD"
+            exit 1
+          fi
+          echo "PASS: working directory is subdir"
+
+      - name: Read file from default working dir
+        run: |
+          cat marker.txt
+          source marker.txt
+          if [[ "$MARKER_VALUE" != "from-subdir" ]]; then
+            echo "FAIL: marker not found"
+            exit 1
+          fi
+          echo "PASS: marker read from subdir"
+
+      - name: Step override takes precedence
+        working-directory: .
+        run: |
+          echo "PWD is: $PWD"
+          if [[ "$PWD" == *"/subdir" ]]; then
+            echo "FAIL: step override should have overridden defaults"
+            exit 1
+          fi
+          echo "PASS: step-level working-directory overrides defaults"

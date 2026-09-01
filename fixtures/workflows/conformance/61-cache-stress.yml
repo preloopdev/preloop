@@ -1,0 +1,95 @@
+name: 61-cache-stress
+on:
+  workflow_dispatch:
+  push:
+    paths: ['.github/workflows/61-cache-stress.yml']
+
+jobs:
+  cache-save:
+    runs-on: [self-hosted, cache-test]
+    timeout-minutes: 10
+    steps:
+      - name: Create large cache payload
+        run: |
+          mkdir -p .cache-data
+          # Create multiple files of varying sizes
+          dd if=/dev/urandom of=.cache-data/small.bin bs=1024 count=10 2>/dev/null
+          dd if=/dev/urandom of=.cache-data/medium.bin bs=1024 count=500 2>/dev/null
+          dd if=/dev/urandom of=.cache-data/large.bin bs=1024 count=2000 2>/dev/null
+          echo "test-content-$(date +%s)" > .cache-data/text.txt
+          mkdir -p .cache-data/nested/deep
+          echo "nested-file" > .cache-data/nested/deep/inner.txt
+          ls -lhR .cache-data/
+          # Record checksums for verification
+          find .cache-data -type f | sort | xargs sha256sum > /tmp/cache-checksums.txt
+          cat /tmp/cache-checksums.txt
+
+      - name: Save cache with unique key
+        uses: actions/cache/save@v4
+        with:
+          path: .cache-data
+          key: "stress-${{ github.run_id }}-${{ github.run_attempt }}"
+
+      - name: Verify ACTIONS_CACHE_URL is set
+        run: |
+          if [ -n "$ACTIONS_CACHE_URL" ]; then
+            echo "PASS: ACTIONS_CACHE_URL=$ACTIONS_CACHE_URL"
+          else
+            echo "WARN: ACTIONS_CACHE_URL not set"
+          fi
+          if [ "$ACTIONS_CACHE_SERVICE_V2" = "true" ]; then
+            echo "PASS: Cache service V2 enabled"
+          else
+            echo "WARN: ACTIONS_CACHE_SERVICE_V2=$ACTIONS_CACHE_SERVICE_V2"
+          fi
+
+  cache-restore:
+    runs-on: [self-hosted, cache-test]
+    needs: cache-save
+    timeout-minutes: 10
+    steps:
+      - name: Restore cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache-data
+          key: "stress-${{ github.run_id }}-${{ github.run_attempt }}"
+
+      - name: Verify restored files
+        run: |
+          echo "=== Restored files ==="
+          ls -lhR .cache-data/
+          if [ -f .cache-data/small.bin ] && [ -f .cache-data/medium.bin ] && [ -f .cache-data/large.bin ]; then
+            echo "PASS: All binary files restored"
+          else
+            echo "FAIL: Missing binary files"
+            exit 1
+          fi
+          if [ -f .cache-data/nested/deep/inner.txt ]; then
+            echo "PASS: Nested directory structure preserved"
+          else
+            echo "FAIL: Nested structure missing"
+            exit 1
+          fi
+          echo "PASS: Cache round-trip successful"
+
+  cache-fallback:
+    runs-on: [self-hosted, cache-test]
+    needs: cache-save
+    timeout-minutes: 10
+    steps:
+      - name: Restore with prefix fallback
+        id: cache-hit
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache-data
+          key: "stress-${{ github.run_id }}-nonexistent"
+          restore-keys: |
+            stress-${{ github.run_id }}-
+
+      - name: Verify fallback restore
+        run: |
+          if [ -f .cache-data/small.bin ]; then
+            echo "PASS: Prefix fallback restore worked"
+          else
+            echo "INFO: Prefix fallback did not find cache (may be expected)"
+          fi

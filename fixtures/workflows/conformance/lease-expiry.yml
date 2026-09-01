@@ -1,0 +1,44 @@
+name: lease-expiry
+
+on:
+  workflow_dispatch:
+
+jobs:
+  kill-listener:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baseline
+        run: ps -eo pid,comm | grep -E "Runner\.(Listener|Worker)" || true
+      - name: Kill lease holder and worker
+        run: |
+          date -u +"kill-time: %Y-%m-%dT%H:%M:%SZ"
+          sudo pkill -9 -x Runner.Listener || true
+          sudo pkill -9 -x Runner.Worker || true
+      - name: Never reached
+        run: echo survived
+
+  kill-worker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baseline
+        run: ps -eo pid,comm | grep -E "Runner\.(Listener|Worker)" || true
+      - name: Kill worker only, listener survives
+        run: |
+          date -u +"kill-time: %Y-%m-%dT%H:%M:%SZ"
+          sudo pkill -9 -x Runner.Worker || true
+          sleep 5
+          echo "listeners left: $(pgrep -cx Runner.Listener || true)"
+      - name: After worker death
+        run: echo "this step may or may not run"
+
+  reboot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baseline
+        run: echo alive
+      - name: Reboot the VM mid-job
+        run: |
+          date -u +"reboot-time: %Y-%m-%dT%H:%M:%SZ"
+          sudo reboot
+      - name: Never reached
+        run: echo survived

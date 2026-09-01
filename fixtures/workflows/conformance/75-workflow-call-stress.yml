@@ -1,0 +1,20 @@
+name: workflow_call stress E2E
+on:
+  workflow_dispatch:
+
+jobs:
+  call_reusable:
+    uses: preloopdev/aksh-conformance-sample/.github/workflows/reusable-stress.yml@main
+    with:
+      username: "Alice"
+      enable_feature: "true"
+      max_retries: "42"
+    secrets:
+      api_key: ${{ secrets.MY_API_KEY }}
+
+  consumer:
+    needs: call_reusable
+    runs-on: [self-hosted, mitm]
+    steps:
+      - run: |
+          echo "Got result from reusable call: ${{ needs.call_reusable.outputs.result }}"

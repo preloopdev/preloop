@@ -1,0 +1,53 @@
+name: 56-problem-matcher-frompath
+on:
+  workflow_dispatch:
+  push:
+    paths: ['.github/workflows/56-problem-matcher-frompath.yml', '.github/matchers/**']
+
+jobs:
+  matcher-test:
+    runs-on: [self-hosted, f051-test]
+    timeout-minutes: 5
+    steps:
+      - name: Create test matcher with fromPath
+        run: |
+          mkdir -p /tmp/matchers
+          cat > /tmp/matchers/test-matcher.json << 'EOF'
+          {
+            "problemMatcher": [
+              {
+                "owner": "test-frompath",
+                "fromPath": "/tmp/src/project",
+                "pattern": [
+                  {
+                    "regexp": "^(.+):(\\d+):(\\d+): (error|warning): (.+)$",
+                    "file": 1,
+                    "line": 2,
+                    "column": 3,
+                    "severity": 4,
+                    "message": 5
+                  }
+                ]
+              }
+            ]
+          }
+          EOF
+          echo "Matcher file created"
+
+      - name: Register matcher
+        run: |
+          echo "::add-matcher::/tmp/matchers/test-matcher.json"
+          echo "Matcher registered"
+
+      - name: Emit errors with relative paths
+        run: |
+          # These should be resolved against fromPath (/tmp/src/project)
+          echo "lib/utils.rs:42:5: error: unused variable 'x'"
+          echo "src/main.rs:10:1: warning: dead code detected"
+          echo "PASS: Problem matcher lines emitted"
+
+      - name: Remove matcher
+        run: |
+          echo "::remove-matcher owner=test-frompath::"
+          echo "PASS: Matcher removed"
+# official

@@ -1,0 +1,35 @@
+name: host-docker-node-services
+on: [push, workflow_dispatch]
+
+jobs:
+  test:
+    runs-on: self-hosted
+    container: node:24-bookworm
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: app_test
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - name: Show Node version
+        run: node --version
+      - name: Install database clients
+        run: apt-get update && apt-get install -y --no-install-recommends postgresql-client redis-tools
+      - name: Connect to Postgres by service alias
+        run: PGPASSWORD=postgres psql -h postgres -U postgres -d app_test -c 'select 1'
+      - name: Connect to Redis by service alias
+        run: redis-cli -h redis ping

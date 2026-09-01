@@ -1,0 +1,22 @@
+name: mitm env inheritance
+on: workflow_dispatch
+env:
+  TOP: top-value
+jobs:
+  producer:
+    runs-on: [self-hosted, mitm]
+    env:
+      JOB: job-value
+    steps:
+      - name: show env
+        run: echo "top=$TOP job=$JOB step=$STEP"
+        env:
+          STEP: step-value
+      - name: write env
+        run: echo "DYNAMIC=from-github-env" >> "$GITHUB_ENV"
+  consumer:
+    needs: producer
+    runs-on: [self-hosted, mitm]
+    steps:
+      - run: echo "top=$TOP"
+      - run: echo "dynamic=$DYNAMIC"

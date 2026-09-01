@@ -1,0 +1,23 @@
+name: E2E hyperfine (GitHub)
+on: workflow_dispatch
+
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: sharkdp/hyperfine
+      - run: cargo fmt -- --check
+
+  test:
+    name: Test
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: sharkdp/hyperfine
+      - run: cargo test --locked

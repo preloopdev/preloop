@@ -1,0 +1,12 @@
+name: mitm oidc
+on: workflow_dispatch
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  build:
+    runs-on: [self-hosted, mitm]
+    steps:
+      - run: |
+          curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://aksh"

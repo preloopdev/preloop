@@ -1,0 +1,39 @@
+name: Reusable Callee With Outputs
+on:
+  workflow_call:
+    inputs:
+      greeting:
+        type: string
+        required: true
+      count:
+        type: number
+        required: true
+    outputs:
+      result:
+        description: "Processed greeting"
+        value: ${{ jobs.process.outputs.processed }}
+      computed:
+        description: "Doubled count"
+        value: ${{ jobs.process.outputs.doubled }}
+
+jobs:
+  process:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    outputs:
+      processed: ${{ steps.transform.outputs.processed }}
+      doubled: ${{ steps.compute.outputs.doubled }}
+    steps:
+      - name: Transform greeting
+        id: transform
+        run: |
+          echo "Input greeting: ${{ inputs.greeting }}"
+          echo "processed=processed-${{ inputs.greeting }}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute doubled count
+        id: compute
+        run: |
+          INPUT_COUNT=${{ inputs.count }}
+          DOUBLED=$((INPUT_COUNT * 2))
+          echo "Input count: $INPUT_COUNT, doubled: $DOUBLED"
+          echo "doubled=$DOUBLED" >> "$GITHUB_OUTPUT"

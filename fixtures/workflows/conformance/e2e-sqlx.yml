@@ -1,0 +1,17 @@
+name: E2E sqlx
+on: workflow_dispatch
+
+jobs:
+  build_and_test:
+    name: Build and Test SQLx
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: launchbadge/sqlx
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check core
+        run: cargo check -p sqlx-core
+      - name: Test core
+        run: cargo test -p sqlx-core

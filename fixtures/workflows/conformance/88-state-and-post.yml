@@ -1,0 +1,45 @@
+name: State and Post Step Behavior
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-state-and-post:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    steps:
+      - name: Set state for post step
+        id: main_step
+        run: |
+          # Save state value for use in post step
+          echo 'STATE_test_value=hello_from_main' >> $GITHUB_STATE
+          echo 'STATE_counter=42' >> $GITHUB_STATE
+          echo "State variables written"
+
+      - name: Verify main step ran
+        run: echo "Main workflow step executed"
+
+      - name: Post step that reads state
+        if: always()
+        run: |
+          # State should be available as environment variables in post steps
+          # Note: Direct access to $GITHUB_STATE file may vary by runner
+          STATE_VAL="${STATE_test_value}"
+          COUNTER="${STATE_counter}"
+          
+          if [[ -n "$STATE_VAL" ]]; then
+            echo "✓ State test_value retrieved: $STATE_VAL"
+          else
+            echo "State variable STATE_test_value not directly accessible from shell"
+            echo "This may be expected behavior depending on runner implementation"
+          fi
+          
+          if [[ -n "$COUNTER" ]]; then
+            echo "✓ State counter retrieved: $COUNTER"
+          else
+            echo "State variable STATE_counter not directly accessible from shell"
+          fi
+
+      - name: Explicit post cleanup
+        if: always()
+        run: echo "Post step cleanup complete"

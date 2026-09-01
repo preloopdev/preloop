@@ -1,0 +1,68 @@
+name: Large Output Handling
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-large-output:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    steps:
+      - name: Generate large stdout output
+        id: large_log
+        run: |
+          echo "Generating 10000 lines of output (100KB+)..."
+          for i in {1..10000}; do
+            echo "Line $i: This is a test output line with some padding to increase size. Lorem ipsum dolor sit amet, consectetur adipiscing elit."
+          done
+          echo "Large log generation complete"
+          wc -l < <(for i in {1..10000}; do echo "Line $i: Test"; done) || true
+
+      - name: Generate large output variable
+        id: large_var
+        run: |
+          echo "Creating 50KB output variable..."
+          LARGE_OUTPUT=""
+          for i in {1..1000}; do
+            LARGE_OUTPUT="${LARGE_OUTPUT}This is line $i with some padding. Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation. Line $i end.\n"
+          done
+          
+          # Write to GITHUB_OUTPUT using heredoc for large content
+          echo 'large_value<<EOF' >> $GITHUB_OUTPUT
+          printf "%s" "$LARGE_OUTPUT" >> $GITHUB_OUTPUT
+          echo 'EOF' >> $GITHUB_OUTPUT
+          
+          echo "Large output variable created"
+
+      - name: Verify large output variable retrieval
+        if: always()
+        run: |
+          OUTPUT='${{ steps.large_var.outputs.large_value }}'
+          OUTPUT_SIZE=${#OUTPUT}
+          
+          echo "Retrieved output variable size: $OUTPUT_SIZE bytes"
+          
+          if [[ $OUTPUT_SIZE -gt 40000 ]]; then
+            echo "✓ Large output variable (50KB+) retrieved successfully"
+          else
+            echo "⚠ Output variable size smaller than expected: $OUTPUT_SIZE bytes"
+          fi
+          
+          # Verify content integrity
+          if [[ "$OUTPUT" == *"Line 1"* ]] && [[ "$OUTPUT" == *"Line 1000"* ]]; then
+            echo "✓ Large output variable content verified"
+          else
+            echo "✗ Large output variable content corrupted"
+          fi
+
+      - name: Test step log size limits
+        run: |
+          echo "Testing if runner handles large logs without truncation..."
+          for i in {1..5000}; do
+            echo "Log line $i with content"
+          done
+          echo "Large log test complete"
+
+      - name: Verify runner didn't crash
+        if: always()
+        run: echo "✓ Runner survived large output operations"

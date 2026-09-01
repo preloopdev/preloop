@@ -1,0 +1,18 @@
+name: mitm cancel semantics
+on: workflow_dispatch
+jobs:
+  cancel-test:
+    runs-on: [self-hosted, mitm]
+    timeout-minutes: 1
+    steps:
+      - run: echo "Step 1 - will run"
+      - run: |
+          echo "Step 2 - long sleep (will be cancelled)"
+          sleep 120
+      - run: echo "Step 3 - default condition, should be skipped"
+      - if: always()
+        run: echo "Step 4 - always(), should run even after cancel"
+      - if: cancelled()
+        run: echo "Step 5 - cancelled(), should run after cancel"
+      - if: failure()
+        run: echo "Step 6 - failure(), should be skipped on cancel"

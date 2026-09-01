@@ -1,0 +1,31 @@
+name: 94-action-pinning
+on:
+  workflow_dispatch:
+jobs:
+  test-action-resolution:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    steps:
+      - name: Test checkout with tag
+        uses: actions/checkout@v4
+        with:
+          repository: actions/checkout
+          ref: v4.0.0
+
+      - name: Echo checkout tag version
+        run: echo "Tested tag-based action resolution (v4)"
+
+      - name: Test checkout with SHA pin
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Echo checkout SHA version
+        run: echo "Tested SHA-pinned action resolution"
+
+      - name: Test checkout with branch
+        uses: actions/checkout@main
+
+      - name: Echo checkout branch version
+        run: echo "Tested branch-based action resolution (main)"
+
+      - name: Verify all three resolution methods succeeded
+        run: echo "All action pinning methods completed successfully"

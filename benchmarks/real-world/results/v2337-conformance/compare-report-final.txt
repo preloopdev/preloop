@@ -1,0 +1,83 @@
+MATCH 201-expression-edge-cases (4 cells: gh-official, gh-preloop, pl-official, pl-preloop)
+DIFF 202-dynamic-matrix-dataflow:
+  run conclusion gh-official=success vs pl-official=failure
+  job[build] gh-official=success vs pl-official=failure
+  job[report] gh-official=success vs pl-preloop=in_progress
+DIFF 203-needs-dag-deep-chain:
+  job[coverage] gh-official=success vs pl-official=in_progress
+  job[publish] gh-official=success vs pl-official=in_progress
+  job[test-integration] gh-official=success vs pl-official=in_progress
+  job[test-unit] gh-official=success vs pl-official=in_progress
+  job[coverage] gh-official=success vs pl-preloop=in_progress
+  job[publish] gh-official=success vs pl-preloop=in_progress
+  job[test-integration] gh-official=success vs pl-preloop=in_progress
+MATCH 204-composite-with-outputs-ifs (4 cells: gh-official, gh-preloop, pl-official, pl-preloop)
+DIFF 205-reusable-workflow-chain:
+  run conclusion gh-official=success vs pl-official=failure
+  job[ci / build] gh-official=success vs pl-official=failure
+  job[post] gh-official=success vs pl-official=skipped
+  run conclusion gh-official=success vs pl-preloop=failure
+  job[ci / build] gh-official=success vs pl-preloop=failure
+  job[post] gh-official=success vs pl-preloop=skipped
+DIFF 206-cache-artifact-roundtrip:
+  job[consume] gh-official=success vs pl-official=in_progress
+  job[consume] gh-official=success vs pl-preloop=in_progress
+MATCH 207-masking-secrets-vars (4 cells: gh-official, gh-preloop, pl-official, pl-preloop)
+DIFF 208-timeout-graceful-kill:
+  run conclusion gh-official=failure vs gh-preloop=cancelled
+  job[quick] gh-official=failure vs gh-preloop=success
+  job[slow] gh-official=cancelled vs pl-official=failure
+  run conclusion gh-official=failure vs pl-preloop=success
+  job[quick] gh-official=failure vs pl-preloop=in_progress
+  job[slow] gh-official=cancelled vs pl-preloop=success
+DIFF 209-continue-on-error-cascade:
+  run conclusion gh-official=failure vs pl-preloop=success
+  job[cone] gh-official=failure vs pl-preloop=success
+  job[cstep] gh-official=failure vs pl-preloop=in_progress
+MATCH 210-service-containers-health (4 cells: gh-official, gh-preloop, pl-official, pl-preloop)
+DIFF 211-job-container-volumes:
+  job[default-container-env] gh-official=failure vs pl-preloop=in_progress
+MATCH 212-docker-action (4 cells: gh-official, gh-preloop, pl-official, pl-preloop)
+DIFF 213-oidc-token-claims:
+  run conclusion gh-official=success vs gh-preloop=failure
+  job[oidc] gh-official=success vs gh-preloop=failure
+  run conclusion gh-official=success vs pl-official=failure
+  job[oidc] gh-official=success vs pl-official=failure
+  run conclusion gh-official=success vs pl-preloop=failure
+  job[oidc] gh-official=success vs pl-preloop=failure
+MATCH 214-checkout-repo-inspect (4 cells: gh-official, gh-preloop, pl-official, pl-preloop)
+DIFF 215-concurrency-cancel-in-progress:
+  run conclusion gh-official=success vs pl-official=failure
+  job[worker] gh-official=success vs pl-official=failure
+DIFF 216-summaries-env-cascade:
+  run conclusion gh-official=success vs gh-preloop=failure
+  job[summary] gh-official=success vs gh-preloop=failure
+MATCH 217-shell-variants (4 cells: gh-official, gh-preloop, pl-official, pl-preloop)
+DIFF 218-node-migration:
+  job[forced-node24] gh-official=failure vs pl-preloop=in_progress
+MATCH 219-env-state-files (4 cells: gh-official, gh-preloop, pl-official, pl-preloop)
+DIFF 220-label-routing:
+  job[single-label] gh-official=success vs pl-official=in_progress
+  job[single-label] gh-official=success vs pl-preloop=in_progress
+DIFF 221-failure-reporting:
+  job[reporter] gh-official=success vs pl-official=in_progress
+  job[reporter] gh-official=success vs pl-preloop=in_progress
+MATCH 222-dispatch-inputs-typed (4 cells: gh-official, gh-preloop, pl-official, pl-preloop)
+DIFF 223-tojson-contexts:
+  run conclusion gh-official=failure vs pl-preloop=success
+  job[contexts] gh-official=failure vs pl-preloop=success
+DIFF 224-matrix-include-exclude:
+  run conclusion gh-official=failure vs pl-official=success
+  job[fail-fast-matrix] gh-official=success vs pl-official=in_progress
+  run conclusion gh-official=failure vs pl-preloop=success
+  job[fail-fast-matrix] gh-official=success vs pl-preloop=in_progress
+MATCH 225-docker-build-run (4 cells: gh-official, gh-preloop, pl-official, pl-preloop)
+DIFF 226-multiline-outputs:
+  run conclusion gh-official=success vs pl-official=failure
+  job[consumer] gh-official=success vs pl-official=in_progress
+  job[outputs] gh-official=success vs pl-official=failure
+  job[consumer] gh-official=success vs pl-preloop=in_progress
+DIFF 227-composite-pre-post:
+  job[post-even-on-fail] gh-official=failure vs pl-preloop=in_progress
+
+=== summary: 10 match, 17 diff, 0 missing (<2 cells) ===

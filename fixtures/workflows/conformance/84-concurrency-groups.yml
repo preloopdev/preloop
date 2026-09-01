@@ -1,0 +1,40 @@
+name: Concurrency Groups
+
+on:
+  workflow_dispatch:
+
+jobs:
+  slow-job:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    concurrency:
+      group: test-concurrency-group
+      cancel-in-progress: true
+    steps:
+      - name: Long-running task
+        run: |
+          echo "Starting slow job (60s)"
+          for i in {1..60}; do
+            echo "Slow job iteration $i"
+            sleep 1
+          done
+          echo "✓ Slow job completed"
+
+  fast-job:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    concurrency:
+      group: test-concurrency-group
+      cancel-in-progress: true
+    steps:
+      - name: Quick task
+        run: |
+          echo "Starting fast job"
+          sleep 2
+          echo "✓ Fast job completed"
+
+      - name: Verify concurrency behavior
+        run: |
+          echo "If fast job ran after slow job started,"
+          echo "the slow job should have been cancelled"
+          echo "due to cancel-in-progress: true"

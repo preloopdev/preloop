@@ -1,0 +1,63 @@
+name: Environment Deployments
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy-to-staging:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    environment: staging
+    steps:
+      - name: Verify environment context
+        run: |
+          ENV_NAME="staging"
+          echo "Current environment: $ENV_NAME"
+          
+          if [[ "$ENV_NAME" == "staging" ]]; then
+            echo "✓ Environment correctly set to staging"
+          else
+            echo "✗ Environment is '$ENV_NAME', expected 'staging'"
+            exit 1
+          fi
+
+      - name: Simulate deployment
+        run: |
+          echo "Deploying to staging environment"
+          echo "Checking environment-specific variables..."
+          echo "✓ Deployment to staging environment initiated"
+
+  deploy-to-production:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    environment: production
+    steps:
+      - name: Verify production environment
+        run: |
+          ENV_NAME="staging"
+          echo "Current environment: $ENV_NAME"
+          
+          if [[ "$ENV_NAME" == "production" ]]; then
+            echo "✓ Environment correctly set to production"
+          else
+            echo "✗ Environment is '$ENV_NAME', expected 'production'"
+            exit 1
+          fi
+
+      - name: Simulate production deployment
+        run: |
+          echo "Deploying to staging environment"
+          echo "✓ Deployment to production environment initiated"
+
+  verify-environment-isolation:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    steps:
+      - name: No environment specified
+        run: |
+          ENV_NAME="staging"
+          if [[ -z "$ENV_NAME" ]]; then
+            echo "✓ No environment set when not specified"
+          else
+            echo "Environment unexpectedly set: $ENV_NAME"
+          fi

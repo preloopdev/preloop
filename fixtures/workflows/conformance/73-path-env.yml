@@ -1,0 +1,68 @@
+name: "golden: path-env-interaction"
+on: workflow_dispatch
+jobs:
+  test-github-path:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Record initial PATH
+        run: |
+          echo "Initial PATH: $PATH"
+          echo "INITIAL_PATH=$PATH" >> "$GITHUB_ENV"
+
+      - name: Add to GITHUB_PATH
+        run: |
+          echo "/tmp/custom-bin-1" >> "$GITHUB_PATH"
+          echo "Added /tmp/custom-bin-1 to GITHUB_PATH"
+
+      - name: Verify GITHUB_PATH prepended
+        run: |
+          echo "PATH now: $PATH"
+          if [[ "$PATH" != /tmp/custom-bin-1:* ]]; then
+            echo "FAIL: /tmp/custom-bin-1 should be at start of PATH"
+            exit 1
+          fi
+          echo "PASS: GITHUB_PATH entry prepended"
+
+      - name: Add second GITHUB_PATH entry
+        run: |
+          echo "/tmp/custom-bin-2" >> "$GITHUB_PATH"
+
+      - name: Verify both PATH entries present in correct order
+        run: |
+          echo "PATH: $PATH"
+          if [[ "$PATH" != /tmp/custom-bin-2:*/tmp/custom-bin-1:* ]]; then
+            echo "FAIL: expected /tmp/custom-bin-2 before /tmp/custom-bin-1"
+            exit 1
+          fi
+          echo "PASS: multiple GITHUB_PATH entries in correct order"
+
+  test-env-path-base:
+    runs-on: ubuntu-latest
+    env:
+      PATH: /usr/local/custom:/usr/bin:/bin
+    steps:
+      - name: Verify job-level env PATH is base
+        run: |
+          echo "PATH: $PATH"
+          if [[ "$PATH" != *"/usr/local/custom"* ]]; then
+            echo "FAIL: job-level env.PATH should be in PATH"
+            exit 1
+          fi
+          echo "PASS: job-level env.PATH used as base"
+
+      - name: Add GITHUB_PATH on top of env.PATH
+        run: |
+          echo "/tmp/over-env-path" >> "$GITHUB_PATH"
+
+      - name: Verify GITHUB_PATH prepended to env.PATH base
+        run: |
+          echo "PATH: $PATH"
+          if [[ "$PATH" != /tmp/over-env-path:* ]]; then
+            echo "FAIL: GITHUB_PATH should be prepended"
+            exit 1
+          fi
+          if [[ "$PATH" != *"/usr/local/custom"* ]]; then
+            echo "FAIL: env.PATH base should still be present"
+            exit 1
+          fi
+          echo "PASS: GITHUB_PATH prepended to env.PATH base"

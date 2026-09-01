@@ -1,0 +1,10 @@
+name: mitm annotations
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: [self-hosted, mitm]
+    steps:
+      - run: |
+          echo "::warning title=w::a warning"
+          echo "::error title=e::an error"
+          exit 1

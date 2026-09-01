@@ -1,0 +1,67 @@
+name: 100-tool-cache
+on:
+  workflow_dispatch:
+jobs:
+  test-tool-cache:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    steps:
+      - name: Verify runner.tool_cache is set
+        run: |
+          TOOL_CACHE="${{ runner.tool_cache }}"
+          if [ -z "$TOOL_CACHE" ]; then
+            echo "ERROR: runner.tool_cache is not set"
+            exit 1
+          fi
+          echo "runner.tool_cache=$TOOL_CACHE"
+
+      - name: Verify tool_cache directory exists
+        run: |
+          TOOL_CACHE="${{ runner.tool_cache }}"
+          if [ ! -d "$TOOL_CACHE" ]; then
+            echo "ERROR: runner.tool_cache directory does not exist: $TOOL_CACHE"
+            exit 1
+          fi
+          echo "Tool cache directory exists: $TOOL_CACHE"
+
+      - name: Setup Node.js via tool cache
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+
+      - name: Verify Node.js is on PATH
+        run: |
+          which node
+          NODE_PATH=$(which node)
+          if [ -z "$NODE_PATH" ]; then
+            echo "ERROR: node not found on PATH"
+            exit 1
+          fi
+          echo "Node.js found on PATH: $NODE_PATH"
+
+      - name: Verify Node.js version
+        run: |
+          NODE_VERSION=$(node --version)
+          echo "Node.js version: $NODE_VERSION"
+          if [[ ! "$NODE_VERSION" =~ ^v20\. ]]; then
+            echo "ERROR: Expected Node v20.x, got $NODE_VERSION"
+            exit 1
+          fi
+          echo "Node.js version verified"
+
+      - name: Verify node is in tool cache
+        run: |
+          TOOL_CACHE="${{ runner.tool_cache }}"
+          NODE_PATH=$(which node)
+          if [[ "$NODE_PATH" != "$TOOL_CACHE"* ]]; then
+            echo "WARNING: node path $NODE_PATH is not under tool cache $TOOL_CACHE"
+            echo "This may be expected if using system node"
+          else
+            echo "Node.js is installed in tool cache"
+          fi
+
+      - name: Test npm is available
+        run: |
+          which npm
+          npm --version
+          echo "npm is available from tool cache setup"

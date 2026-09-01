@@ -1,0 +1,23 @@
+name: "aksh rocketmq"
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: [self-hosted, campaign-rocketmq]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: apache/rocketmq
+          path: project
+          fetch-depth: 1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Check project
+        working-directory: project
+        run: |
+          echo "Project: rocketmq"
+          echo "Directory contents:"
+          ls -la
+          echo "Git log:"
+          git log --oneline -3

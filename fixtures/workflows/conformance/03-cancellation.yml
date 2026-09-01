@@ -1,0 +1,7 @@
+name: mitm cancellation
+on: workflow_dispatch
+jobs:
+  slow:
+    runs-on: [self-hosted, mitm]
+    steps:
+      - run: sleep 60

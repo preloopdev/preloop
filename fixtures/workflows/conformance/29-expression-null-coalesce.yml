@@ -1,0 +1,14 @@
+name: mitm expression scalars
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: [self-hosted, mitm]
+    continue-on-error: ${{ false }}
+    strategy:
+      fail-fast: ${{ true }}
+      matrix:
+        n: [1, 2]
+    steps:
+      - run: echo "step run with expr scalars"
+      - run: echo "job_continue_on_error=${{ job.continue-on-error }}, matrix_n=${{ matrix.n }}"
+        if: always()

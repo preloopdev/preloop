@@ -1,0 +1,13 @@
+name: mitm matrix
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: [self-hosted, mitm]
+    strategy:
+      fail-fast: true
+      matrix:
+        n: [1, 2, 3]
+    steps:
+      - run: |
+          if [ "${{ matrix.n }}" = "1" ]; then exit 1; fi
+          sleep 20
