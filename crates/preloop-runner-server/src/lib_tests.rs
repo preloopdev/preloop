@@ -2843,6 +2843,56 @@ async fn log_run_logs_unknown_job_is_404_not_whole_run() {
     );
 }
 
+/// Step manifests survive a restart, so `--step` still resolves.
+///
+/// They deliberately do not ride in `runs.record_blob` (which reseals the
+/// workflow YAML and event payload on every run event) nor in `MetaSnapshot`
+/// (every field of which is sealed on each `store_meta_only`), so this proves
+/// the `job_steps` table actually round-trips them.
+#[tokio::test]
+async fn step_manifests_survive_a_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let (run_id, plan_id, agent_job_id, ids) = {
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+        let (run_id, jobs) = three_step_run_for_log_filters(&app, &state).await;
+        let ids = workflow_step_ids(&state, run_id, "build").await;
+        assert_eq!(ids.len(), 3);
+        // Force the full snapshot so the rows exist regardless of which run
+        // events happened to fire during submission.
+        let snapshot = {
+            let inner = state.inner.lock().await;
+            crate::store::StoreSnapshot::from_inner(&inner)
+        };
+        state.store.store_inner(&snapshot).await.unwrap();
+        (run_id, jobs[0].1.clone(), jobs[0].2.clone(), ids)
+    };
+
+    // A fresh AppState over the same state dir is the restart.
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let restored = workflow_step_ids(&state, run_id, "build").await;
+    assert_eq!(
+        restored, ids,
+        "declared step ids and their order must come back intact"
+    );
+
+    write_step_job_logs(
+        &temp,
+        &plan_id,
+        &agent_job_id,
+        &[(ids[1].as_str(), "second step\n")],
+    )
+    .await;
+    let (status, body) =
+        get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=build&step=2")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body, b"second step\n",
+        "`--step` must still resolve after a restart"
+    );
+}
+
 /// A second dispatch of the same job gets its own manifest.
 ///
 /// `build_task_step` mints a fresh `TaskStep` id per build, so a job-scoped

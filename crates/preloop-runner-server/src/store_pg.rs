@@ -264,6 +264,56 @@ impl PgStore {
         Ok(())
     }
 
+    /// Upsert one attempt's step rows (see the SQLite twin: keyed upsert, no
+    /// per-run delete, so a step transition writes only the changed rows).
+    async fn write_job_steps_tx(
+        &self,
+        tx: &tokio_postgres::Transaction<'_>,
+        run_id: RunId,
+        agent_job_id: uuid::Uuid,
+        records: &[crate::models::StepRecord],
+    ) -> anyhow::Result<()> {
+        for step in records {
+            if step.id.is_empty() {
+                continue;
+            }
+            let kind = match step.kind {
+                crate::models::StepKind::Workflow => "workflow",
+                crate::models::StepKind::Synthetic => "synthetic",
+            };
+            tx.execute(
+                "INSERT INTO job_steps(run_id, agent_job_id, step_id, kind, workflow_index,
+                                       runner_number, context_name, name_blob, conclusion,
+                                       started_at_us, finished_at_us)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                 ON CONFLICT(agent_job_id, step_id) DO UPDATE SET
+                   kind = EXCLUDED.kind,
+                   workflow_index = EXCLUDED.workflow_index,
+                   runner_number = EXCLUDED.runner_number,
+                   context_name = EXCLUDED.context_name,
+                   name_blob = EXCLUDED.name_blob,
+                   conclusion = EXCLUDED.conclusion,
+                   started_at_us = EXCLUDED.started_at_us,
+                   finished_at_us = EXCLUDED.finished_at_us",
+                &[
+                    &run_id.to_string(),
+                    &agent_job_id.to_string(),
+                    &step.id,
+                    &kind,
+                    &step.workflow_index.map(|index| index as i64),
+                    &step.runner_number.map(|number| number as i64),
+                    &step.context_name,
+                    &self.cipher.seal(step.name.as_bytes())?,
+                    &step.conclusion,
+                    &step.started_at.map(unix_us),
+                    &step.finished_at.map(unix_us),
+                ],
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Rewrite the claim/message tables from the captured projections (see the
     /// SQLite twin for the rationale).
     async fn write_claim_state_tx(
@@ -567,6 +617,58 @@ impl Store for PgStore {
                 }
             }
         }
+        // Step manifests, ordered so `--step` positions come back exactly as
+        // recorded (see the SQLite twin).
+        let rows = client
+            .query(
+                "SELECT agent_job_id, step_id, kind, workflow_index, runner_number,
+                        context_name, name_blob, conclusion, started_at_us, finished_at_us
+                 FROM job_steps
+                 ORDER BY agent_job_id, kind, workflow_index, step_id",
+                &[],
+            )
+            .await?;
+        for row in rows {
+            let agent_job_id: String = row.get(0);
+            let Ok(agent_job_id) = agent_job_id.parse::<uuid::Uuid>() else {
+                tracing::warn!(%agent_job_id, "dropping step row with an unparseable attempt id");
+                continue;
+            };
+            let step_id: String = row.get(1);
+            let kind: String = row.get(2);
+            let workflow_index: Option<i64> = row.get(3);
+            let runner_number: Option<i64> = row.get(4);
+            let context_name: Option<String> = row.get(5);
+            let name_blob: Vec<u8> = row.get(6);
+            let conclusion: String = row.get(7);
+            let started_at_us: Option<i64> = row.get(8);
+            let finished_at_us: Option<i64> = row.get(9);
+            let name = match self.cipher.unseal(&name_blob) {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(error) => {
+                    tracing::warn!(%error, %step_id, "dropping step row with an unreadable name");
+                    continue;
+                }
+            };
+            inner
+                .job_steps
+                .entry(agent_job_id)
+                .or_default()
+                .push(crate::models::StepRecord {
+                    id: step_id,
+                    kind: match kind.as_str() {
+                        "workflow" => crate::models::StepKind::Workflow,
+                        _ => crate::models::StepKind::Synthetic,
+                    },
+                    workflow_index: workflow_index.map(|index| index as usize),
+                    runner_number: runner_number.map(|number| number as u32),
+                    context_name,
+                    name,
+                    conclusion,
+                    started_at: started_at_us.and_then(chrono::DateTime::from_timestamp_micros),
+                    finished_at: finished_at_us.and_then(chrono::DateTime::from_timestamp_micros),
+                });
+        }
         let rows = client
             .query("SELECT request_id, request_blob FROM job_requests", &[])
             .await?;
@@ -660,6 +762,7 @@ impl Store for PgStore {
         let mut client = self.connection.lock().await;
         let tx = client.transaction().await?;
         for table in [
+            "job_steps",
             "broker_messages",
             "job_request_messages",
             "session_active_requests",
@@ -810,6 +913,18 @@ impl Store for PgStore {
         for record in &snapshot.requests {
             self.insert_request_tx(&tx, record).await?;
         }
+        // Steps are keyed by attempt; the request records tie an attempt to
+        // its run.
+        for record in &snapshot.requests {
+            if let Some((_, steps)) = snapshot
+                .job_steps
+                .iter()
+                .find(|(agent_job_id, _)| *agent_job_id == record.agent_job_id)
+            {
+                self.write_job_steps_tx(&tx, record.run_id, record.agent_job_id, steps)
+                    .await?;
+            }
+        }
         self.write_claim_state_tx(
             &tx,
             &snapshot.session_active_requests,
@@ -851,6 +966,10 @@ impl Store for PgStore {
         .await?;
         for record in &projection.requests {
             self.insert_request_tx(&tx, record).await?;
+        }
+        for (agent_job_id, steps) in &projection.job_steps {
+            self.write_job_steps_tx(&tx, run_id, *agent_job_id, steps)
+                .await?;
         }
         // Claim state must land in the same transaction as the queue rewrite
         // (see the SQLite twin).
@@ -1127,6 +1246,33 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
           payload_json TEXT NOT NULL,
           written_at_us BIGINT NOT NULL
         );
+        "#,
+    ),
+    (
+        4,
+        "job-steps-table",
+        // See the SQLite twin: steps live outside `runs.record_blob` so a step
+        // transition upserts one small row instead of resealing the whole run
+        // record, and are keyed by attempt because a re-dispatch mints fresh
+        // step ids.
+        r#"
+        CREATE TABLE IF NOT EXISTS job_steps (
+          run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+          agent_job_id TEXT NOT NULL,
+          step_id TEXT NOT NULL,
+          kind TEXT NOT NULL CHECK (kind IN ('workflow','synthetic')),
+          workflow_index BIGINT,
+          runner_number BIGINT,
+          context_name TEXT,
+          name_blob BYTEA NOT NULL,
+          conclusion TEXT NOT NULL,
+          started_at_us BIGINT,
+          finished_at_us BIGINT,
+          PRIMARY KEY (agent_job_id, step_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS job_steps_order_idx
+          ON job_steps (agent_job_id, kind, workflow_index);
         "#,
     ),
 ];

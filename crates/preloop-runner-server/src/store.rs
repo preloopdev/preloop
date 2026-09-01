@@ -208,6 +208,8 @@ pub(crate) struct StoreSnapshot {
     pub(crate) session_active_requests: Vec<(String, i64)>,
     /// request_id → undelivered job message.
     pub(crate) broker_request_messages: Vec<(i64, azdo::AgentJobRequestMessage)>,
+    /// (agent_job_id, that attempt's step records).
+    pub(crate) job_steps: Vec<(uuid::Uuid, Vec<crate::models::StepRecord>)>,
     pub(crate) meta: MetaSnapshot,
 }
 
@@ -251,6 +253,11 @@ impl StoreSnapshot {
                 .iter()
                 .map(|(id, message)| (*id, message.clone()))
                 .collect(),
+            job_steps: inner
+                .job_steps
+                .iter()
+                .map(|(agent_job_id, records)| (*agent_job_id, records.clone()))
+                .collect(),
             meta: build_meta_snapshot(inner),
         }
     }
@@ -270,6 +277,8 @@ pub(crate) struct RunProjection {
     pub(crate) session_active_requests: Vec<(String, i64)>,
     pub(crate) inflight: Vec<(String, i64, azdo::TaskAgentMessage)>,
     pub(crate) broker_request_messages: Vec<(i64, azdo::AgentJobRequestMessage)>,
+    /// (agent_job_id, step records) for this run's attempts only.
+    pub(crate) job_steps: Vec<(uuid::Uuid, Vec<crate::models::StepRecord>)>,
     pub(crate) event: NdjsonEvent,
 }
 
@@ -312,6 +321,20 @@ impl RunProjection {
                 .broker_messages
                 .iter()
                 .map(|(id, message)| (*id, message.clone()))
+                .collect(),
+            // Only this run's attempts: `job_steps` is global, and rewriting
+            // every run's steps on one run's event is the amplification this
+            // table exists to avoid.
+            job_steps: inner
+                .job_requests
+                .values()
+                .filter(|record| record.run_id == run_id)
+                .filter_map(|record| {
+                    inner
+                        .job_steps
+                        .get(&record.agent_job_id)
+                        .map(|records| (record.agent_job_id, records.clone()))
+                })
                 .collect(),
             event,
         })
@@ -1395,6 +1418,72 @@ impl SqliteStore {
                 .workflow_run_counters
                 .insert(workflow_path, next_run_number.saturating_sub(1));
         }
+        // Step manifests, ordered so a workflow step's `--step` position is
+        // rebuilt exactly as it was recorded. Without this a restart leaves
+        // `--step` unable to identify anything and it refuses rather than
+        // guessing, so the run's step history has to come back here.
+        let mut step_stmt = connection.prepare(
+            "SELECT agent_job_id, step_id, kind, workflow_index, runner_number,
+                    context_name, name_blob, conclusion, started_at_us, finished_at_us
+             FROM job_steps
+             ORDER BY agent_job_id, kind, workflow_index, step_id",
+        )?;
+        for row in step_stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Vec<u8>>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+            ))
+        })? {
+            let (
+                agent_job_id,
+                step_id,
+                kind,
+                workflow_index,
+                runner_number,
+                context_name,
+                name_blob,
+                conclusion,
+                started_at_us,
+                finished_at_us,
+            ) = row?;
+            let Ok(agent_job_id) = agent_job_id.parse::<uuid::Uuid>() else {
+                tracing::warn!(%agent_job_id, "dropping step row with an unparseable attempt id");
+                continue;
+            };
+            let name = match self.cipher.unseal(&name_blob) {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(error) => {
+                    tracing::warn!(%error, %step_id, "dropping step row with an unreadable name");
+                    continue;
+                }
+            };
+            inner
+                .job_steps
+                .entry(agent_job_id)
+                .or_default()
+                .push(crate::models::StepRecord {
+                    id: step_id,
+                    kind: match kind.as_str() {
+                        "workflow" => crate::models::StepKind::Workflow,
+                        _ => crate::models::StepKind::Synthetic,
+                    },
+                    workflow_index: workflow_index.map(|index| index as usize),
+                    runner_number: runner_number.map(|number| number as u32),
+                    context_name,
+                    name,
+                    conclusion,
+                    started_at: started_at_us.and_then(chrono::DateTime::from_timestamp_micros),
+                    finished_at: finished_at_us.and_then(chrono::DateTime::from_timestamp_micros),
+                });
+        }
         // Log bytes live in their own table; rebuild the in-memory buffers
         // from ordered chunks. Failing to do this leaves the post-restart
         // server unable to serve GET /logs/<id> for in-flight jobs.
@@ -1627,6 +1716,17 @@ impl SqliteStore {
         for record in &snapshot.requests {
             self.insert_request_tx(&tx, record)?;
         }
+        // Steps are keyed by attempt, and the request records are what tie an
+        // attempt to its run.
+        for record in &snapshot.requests {
+            if let Some((_, steps)) = snapshot
+                .job_steps
+                .iter()
+                .find(|(agent_job_id, _)| *agent_job_id == record.agent_job_id)
+            {
+                self.write_job_steps_tx(&tx, record.run_id, record.agent_job_id, steps)?;
+            }
+        }
         self.write_claim_state_tx(
             &tx,
             &snapshot.session_active_requests,
@@ -1662,6 +1762,9 @@ impl SqliteStore {
         )?;
         for record in &projection.requests {
             self.insert_request_tx(&tx, record)?;
+        }
+        for (agent_job_id, steps) in &projection.job_steps {
+            self.write_job_steps_tx(&tx, run_id, *agent_job_id, steps)?;
         }
         // The claim state must land in the same transaction as the queue
         // rewrite above: a job that was claimed (dequeued, message handed to a
@@ -1766,6 +1869,68 @@ impl SqliteStore {
                 self.cipher.seal(&serde_json::to_vec(&snapshot)?)?,
             ],
         )?;
+        Ok(())
+    }
+
+    /// The stored spelling of a step's kind.
+    ///
+    /// Plaintext and constrained by a `CHECK`, because `--step` filters on it.
+    fn step_kind_str(kind: crate::models::StepKind) -> &'static str {
+        match kind {
+            crate::models::StepKind::Workflow => "workflow",
+            crate::models::StepKind::Synthetic => "synthetic",
+        }
+    }
+
+    /// Upsert one run's attempt step rows.
+    ///
+    /// Deliberately no `DELETE ... WHERE run_id` first: manifests only grow or
+    /// have fields updated, so a keyed upsert writes just the changed rows.
+    /// Deleting and re-inserting per run event would reintroduce the very
+    /// write amplification this table exists to avoid. Rows go away with their
+    /// run, through the `runs` foreign key.
+    fn write_job_steps_tx(
+        &self,
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        agent_job_id: uuid::Uuid,
+        records: &[crate::models::StepRecord],
+    ) -> anyhow::Result<()> {
+        {
+            for step in records {
+                if step.id.is_empty() {
+                    continue;
+                }
+                tx.execute(
+                    "INSERT INTO job_steps(run_id, agent_job_id, step_id, kind, workflow_index,
+                                           runner_number, context_name, name_blob, conclusion,
+                                           started_at_us, finished_at_us)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                     ON CONFLICT(agent_job_id, step_id) DO UPDATE SET
+                       kind = excluded.kind,
+                       workflow_index = excluded.workflow_index,
+                       runner_number = excluded.runner_number,
+                       context_name = excluded.context_name,
+                       name_blob = excluded.name_blob,
+                       conclusion = excluded.conclusion,
+                       started_at_us = excluded.started_at_us,
+                       finished_at_us = excluded.finished_at_us",
+                    params![
+                        run_id.to_string(),
+                        agent_job_id.to_string(),
+                        step.id,
+                        Self::step_kind_str(step.kind),
+                        step.workflow_index.map(|index| index as i64),
+                        step.runner_number.map(|number| number as i64),
+                        step.context_name,
+                        self.cipher.seal(step.name.as_bytes())?,
+                        step.conclusion,
+                        step.started_at.map(unix_us),
+                        step.finished_at.map(unix_us),
+                    ],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -2155,6 +2320,44 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
           payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
           written_at_us INTEGER NOT NULL
         ) STRICT;
+        "#,
+    ),
+    (
+        4,
+        "job-steps-table",
+        // Step records get their own table rather than riding in
+        // `runs.record_blob`: that blob carries the workflow YAML, the event
+        // payload and the github context, and `store_run_event` reseals all of
+        // it on every run event. Rows here are upserted individually, so a
+        // step transition writes one small row instead of re-encrypting the
+        // whole run. `MetaSnapshot` is not an option either — every field in
+        // it is cloned and sealed on each `store_meta_only` call.
+        //
+        // Keyed by `agent_job_id` (the attempt), because a re-dispatch mints
+        // fresh step ids and must not overwrite the mapping the previous
+        // attempt's `step-<id>.txt` blobs are named after.
+        //
+        // `kind` and `workflow_index` stay plaintext so `--step` can resolve
+        // through an indexed query; only the display name is sealed, since it
+        // comes from user YAML.
+        r#"
+        CREATE TABLE IF NOT EXISTS job_steps (
+          run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+          agent_job_id TEXT NOT NULL,
+          step_id TEXT NOT NULL,
+          kind TEXT NOT NULL CHECK (kind IN ('workflow','synthetic')),
+          workflow_index INTEGER,
+          runner_number INTEGER,
+          context_name TEXT,
+          name_blob BLOB NOT NULL,
+          conclusion TEXT NOT NULL,
+          started_at_us INTEGER,
+          finished_at_us INTEGER,
+          PRIMARY KEY (agent_job_id, step_id)
+        ) STRICT, WITHOUT ROWID;
+
+        CREATE INDEX IF NOT EXISTS job_steps_order_idx
+          ON job_steps (agent_job_id, kind, workflow_index);
         "#,
     ),
 ];
