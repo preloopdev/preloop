@@ -3532,7 +3532,7 @@ async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
 
 /// Fetch a run's overall execution status.
 ///
-/// `None` when the field is absent or unrecognized, which the caller treats as
+/// `None` when the field is absent or unrecognized, which callers treat as
 /// "keep following" rather than a reason to stop.
 async fn run_status(
     client: &reqwest::Client,
@@ -3553,13 +3553,54 @@ async fn run_status(
     Ok(serde_json::from_value(record["status"].clone()).ok())
 }
 
-/// Stream one job's live console feed until the run reaches a terminal state.
+/// Fetch one job's durable log through the native logs endpoint.
+async fn fetch_run_job_logs(
+    client: &reqwest::Client,
+    url: &str,
+    run_id: &str,
+    job: Option<&str>,
+) -> anyhow::Result<String> {
+    let mut request = client.get(format!("{url}/api/v1/runs/{run_id}/logs"));
+    if let Some(job) = job {
+        request = request.query(&[("job", job)]);
+    }
+    if let Some(token) = api_token() {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("server returned {status}: {body}");
+    }
+    Ok(response.text().await?)
+}
+
+/// Wait for the selected run to reach a terminal state after its job feed
+/// closes. A job can finish before a sibling, so SSE EOF alone is not enough.
+async fn wait_for_run_terminal(
+    client: &reqwest::Client,
+    url: &str,
+    run_id: &str,
+) -> anyhow::Result<()> {
+    loop {
+        if run_status(client, url, run_id)
+            .await?
+            .is_some_and(|status| status.is_terminal())
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// Stream one job's live console feed, then wait for the run to finish.
 ///
-/// Consumes the server's SSE feed rather than polling the whole log and
-/// diffing: the feed replays the retained snapshot before going live, so a late
-/// follower still sees earlier output. Job selection is the server's job — it
-/// defaults a single-job run and names the candidates otherwise, so the rule
-/// matches the one behind `?job=` on the non-streaming route.
+/// The server closes the selected job's feed when that job completes. The
+/// client therefore drains every queued SSE frame before checking run status;
+/// if a sibling is still active, it waits rather than returning early. When a
+/// completed job has no retained in-memory snapshot (for example after a
+/// server restart), the durable job-log endpoint supplies the missing output.
 async fn follow_run_logs(
     client: &reqwest::Client,
     url: &str,
@@ -3583,57 +3624,83 @@ async fn follow_run_logs(
     }
 
     let mut stream = response.bytes_stream();
-    let mut buffer = String::new();
-    // The feed stays open with keep-alive comments after a job ends, so the
-    // run's own status is what decides when following is done.
-    let mut status_poll = tokio::time::interval(Duration::from_secs(3));
-    status_poll.tick().await;
-
-    loop {
-        tokio::select! {
-            chunk = stream.next() => match chunk {
-                Some(Ok(bytes)) => {
-                    buffer.push_str(&String::from_utf8_lossy(&bytes));
-                    // SSE frames are separated by a blank line.
-                    while let Some(split) = buffer.find("\n\n") {
-                        let frame = buffer[..split].to_owned();
-                        buffer.drain(..split + 2);
-                        print_live_log_frame(&frame);
-                    }
-                }
-                Some(Err(error)) => anyhow::bail!("live log stream failed: {error}"),
-                None => break,
-            },
-            _ = status_poll.tick() => {
-                if let Ok(Some(status)) = run_status(client, url, run_id).await {
-                    if status.is_terminal() {
-                        break;
-                    }
-                }
-            }
+    let mut buffer = Vec::new();
+    let mut emitted_data = false;
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|error| anyhow::anyhow!("live log stream failed: {error}"))?;
+        buffer.extend_from_slice(&bytes);
+        while let Some((frame_end, delimiter_len)) = next_sse_frame(&buffer) {
+            let frame: Vec<u8> = buffer.drain(..frame_end).collect();
+            buffer.drain(..delimiter_len);
+            emitted_data |= print_live_log_frame_bytes(&frame)?;
         }
     }
-    Ok(())
+    // A well-formed SSE server terminates every event with a blank line, but
+    // process a final complete-looking frame rather than silently dropping it.
+    if !buffer.is_empty() {
+        emitted_data |= print_live_log_frame_bytes(&buffer)?;
+    }
+
+    if !emitted_data {
+        // The live buffer is intentionally in-memory. A late follower after a
+        // restart still gets the durable output instead of a successful empty
+        // follow.
+        let body = fetch_run_job_logs(client, url, run_id, job).await?;
+        print!("{body}");
+    }
+    wait_for_run_terminal(client, url, run_id).await
 }
 
-/// Print the console lines carried by one SSE frame.
+/// Return the first complete SSE frame delimiter and its byte length.
+fn next_sse_frame(buffer: &[u8]) -> Option<(usize, usize)> {
+    for index in 0..buffer.len().saturating_sub(1) {
+        if buffer[index..].starts_with(b"\n\n") {
+            return Some((index, 2));
+        }
+        if index + 4 <= buffer.len() && buffer[index..].starts_with(b"\r\n\r\n") {
+            return Some((index, 4));
+        }
+        if buffer[index..].starts_with(b"\r\r") {
+            return Some((index, 2));
+        }
+    }
+    None
+}
+
+/// Print console lines carried by one complete, UTF-8 SSE frame.
 ///
-/// Non-`data:` lines (keep-alive comments, the `event:` name) carry no output.
-/// An unparseable payload is skipped rather than aborting a long follow.
-fn print_live_log_frame(frame: &str) {
-    for line in frame.lines() {
+/// Raw bytes are decoded only after the frame boundary is known, so an HTTP
+/// chunk split in the middle of a multibyte character cannot corrupt JSON.
+/// Keep-alive/comment frames and malformed JSON remain non-fatal.
+fn print_live_log_frame_bytes(frame: &[u8]) -> anyhow::Result<bool> {
+    let frame = std::str::from_utf8(frame).context("live log SSE frame was not UTF-8")?;
+    let mut data_lines = Vec::new();
+    for line in frame.split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
         let Some(payload) = line.strip_prefix("data:") else {
             continue;
         };
-        let payload = payload.trim_start();
-        if let Ok(wrapper) =
-            serde_json::from_str::<preloop_gha_protocol::LiveLogFeedLinesWrapper>(payload)
-        {
-            for console_line in wrapper.value {
-                println!("{console_line}");
-            }
-        }
+        data_lines.push(payload.strip_prefix(' ').unwrap_or(payload));
     }
+    if data_lines.is_empty() {
+        return Ok(false);
+    }
+    let payload = data_lines.join("\n");
+    let Ok(wrapper) =
+        serde_json::from_str::<preloop_gha_protocol::LiveLogFeedLinesWrapper>(&payload)
+    else {
+        return Ok(false);
+    };
+    for console_line in &wrapper.value {
+        println!("{console_line}");
+    }
+    Ok(!wrapper.value.is_empty())
+}
+
+/// Print one SSE frame for callers/tests that already have valid UTF-8 text.
+#[cfg(test)]
+fn print_live_log_frame(frame: &str) {
+    let _ = print_live_log_frame_bytes(frame.as_bytes());
 }
 
 async fn cmd_cancel(args: CancelArgs) -> anyhow::Result<()> {
