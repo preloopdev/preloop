@@ -1111,6 +1111,10 @@ criteria = "safe-to-deploy"
 version = "1.2.1"
 criteria = "safe-to-deploy"
 
+[[exemptions.streaming-iterator]]
+version = "0.1.9"
+criteria = "safe-to-deploy"
+
 [[exemptions.stringprep]]
 version = "0.1.5"
 criteria = "safe-to-deploy"
@@ -1177,10 +1181,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.time-macros]]
 version = "0.2.32"
-criteria = "safe-to-deploy"
-
-[[exemptions.streaming-iterator]]
-version = "0.1.9"
 criteria = "safe-to-deploy"
 
 [[exemptions.tinystr]]
@@ -1291,18 +1291,6 @@ criteria = "safe-to-deploy"
 version = "0.3.23"
 criteria = "safe-to-deploy"
 
-[[exemptions.try-lock]]
-version = "0.2.5"
-criteria = "safe-to-deploy"
-
-[[exemptions.tungstenite]]
-version = "0.23.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.tungstenite]]
-version = "0.24.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.tree-sitter]]
 version = "0.25.10"
 criteria = "safe-to-deploy"
@@ -1313,6 +1301,18 @@ criteria = "safe-to-deploy"
 
 [[exemptions.tree-sitter-language]]
 version = "0.1.8"
+criteria = "safe-to-deploy"
+
+[[exemptions.try-lock]]
+version = "0.2.5"
+criteria = "safe-to-deploy"
+
+[[exemptions.tungstenite]]
+version = "0.23.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.tungstenite]]
+version = "0.24.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.typenum]]
