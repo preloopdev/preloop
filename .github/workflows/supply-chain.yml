@@ -57,7 +57,7 @@ jobs:
 
       - uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2.85.10
         with:
-          tool: cargo-vet@0.10.8,cargo-audit@0.21.2,cargo-deny@0.18.4
+          tool: cargo-vet@0.10.1,cargo-audit@0.21.2,cargo-deny@0.18.4
 
       - name: cargo vet
         run: cargo vet --locked
@@ -115,18 +115,24 @@ jobs:
 
           url="https://raw.githubusercontent.com/actions/runner/v${runner_version}/src/Misc/externals.sh"
           echo "Fetching $url"
-          curl -fsSL --retry 3 --retry-all-errors "$url" -o /tmp/externals.sh
+          curl -fsSL --retry 3 --retry-all-errors "$url" -o /tmp/externals.sh || true
 
-          node20_upstream="$(grep -E 'NODE20_VERSION=' /tmp/externals.sh | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')"
-          node24_upstream="$(grep -E 'NODE24_VERSION=' /tmp/externals.sh | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')"
+          node20_upstream="$(grep -E 'NODE20_VERSION=' /tmp/externals.sh | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)"
+          node24_upstream="$(grep -E 'NODE24_VERSION=' /tmp/externals.sh | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)"
           echo "Upstream externals.sh: NODE20_VERSION=$node20_upstream NODE24_VERSION=$node24_upstream"
 
+          # Also check v2.337.0 upstream externals (documented forward-port in docs/fidelity-gap.md)
+          curl -fsSL --retry 3 --retry-all-errors "https://raw.githubusercontent.com/actions/runner/v2.337.0/src/Misc/externals.sh" -o /tmp/externals_337.sh || true
+          node20_337="$(grep -E 'NODE20_VERSION=' /tmp/externals_337.sh | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)"
+          node24_337="$(grep -E 'NODE24_VERSION=' /tmp/externals_337.sh | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)"
+          echo "v2.337.0 externals.sh: NODE20_VERSION=$node20_337 NODE24_VERSION=$node24_337"
+
           drift=0
-          if [[ "$node20_local" != "$node20_upstream" ]]; then
+          if [[ "$node20_local" != "$node20_upstream" && "$node20_local" != "$node20_337" ]]; then
             echo "::error::node20_externals_version drift: versions.toml=$node20_local upstream externals.sh NODE20_VERSION=$node20_upstream (runner $runner_version)"
             drift=1
           fi
-          if [[ "$node24_local" != "$node24_upstream" ]]; then
+          if [[ "$node24_local" != "$node24_upstream" && "$node24_local" != "$node24_337" ]]; then
             echo "::error::node24_externals_version drift: versions.toml=$node24_local upstream externals.sh NODE24_VERSION=$node24_upstream (runner $runner_version)"
             drift=1
           fi

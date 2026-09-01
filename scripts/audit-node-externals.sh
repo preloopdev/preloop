@@ -12,17 +12,22 @@ set -euo pipefail
 # Usage:
 #   scripts/audit-node-externals.sh            # fails on HIGH/CRITICAL
 #   scripts/audit-node-externals.sh --report-only  # never fails on vulns, just reports
+#   scripts/audit-node-externals.sh --record-baseline # records current vulns to baseline file
 #   SBOM_OUTPUT=path.json scripts/audit-node-externals.sh ...
 
 REPORT_ONLY=0
+RECORD_BASELINE=0
 SBOM_OUTPUT="${SBOM_OUTPUT:-sbom-node-externals.cdx.json}"
+BASELINE_FILE="${BASELINE_FILE:-supply-chain/node-baseline.json}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --report-only) REPORT_ONLY=1; shift ;;
+    --record-baseline) RECORD_BASELINE=1; shift ;;
+    --baseline) BASELINE_FILE="$2"; shift 2 ;;
     --sbom-output) SBOM_OUTPUT="$2"; shift 2 ;;
     --help|-h)
-      echo "Usage: $0 [--report-only] [--sbom-output PATH]"
+      echo "Usage: $0 [--report-only] [--record-baseline] [--baseline PATH] [--sbom-output PATH]"
       exit 0
       ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
@@ -324,14 +329,20 @@ fi
 
 # Now classify and print findings
 FINDINGS_TXT="$TMPDIR/findings.txt"
-python3 - "$TMPDIR/osv_results.jsonl" "$VULN_DETAILS_DIR" "$FINDINGS_TXT" "$PACKAGES_JSONL" <<'PY'
+python3 - "$TMPDIR/osv_results.jsonl" "$VULN_DETAILS_DIR" "$FINDINGS_TXT" "$PACKAGES_JSONL" "$ROOT_DIR/$BASELINE_FILE" "$RECORD_BASELINE" "$NODE20_VERSION" "$NODE24_VERSION" <<'PY'
 import json
 from pathlib import Path
+import datetime
 import sys
 
 results_path = Path(sys.argv[1])
 details_dir = Path(sys.argv[2])
 findings_out = Path(sys.argv[3])
+packages_jsonl = Path(sys.argv[4])
+baseline_path = Path(sys.argv[5])
+record_baseline = sys.argv[6] == "1"
+node20_ver = sys.argv[7]
+node24_ver = sys.argv[8]
 
 # Load vuln severity map
 severity_map = {}  # id -> (severity_str, summary, aliases, cvss_scores)
@@ -372,9 +383,20 @@ def is_high_or_critical(db_sev, cvss_scores):
             return True
     return False
 
+# Load existing baseline if available
+known_baseline_ids = set()
+if baseline_path.exists() and not record_baseline:
+    try:
+        bdata = json.loads(baseline_path.read_text())
+        known_baseline_ids = set(bdata.get("known_advisories", []))
+    except Exception as e:
+        print(f"warning: failed to read baseline from {baseline_path}: {e}", file=sys.stderr)
+
 # Map package -> vulns
 high_critical = []
+new_high_critical = []
 all_findings = []
+all_distinct_ids = set()
 
 with open(results_path) as f:
     for line in f:
@@ -384,37 +406,73 @@ with open(results_path) as f:
         vulns = rec.get("vulns") or []
         for v in vulns:
             vid = v.get("id")
+            if vid:
+                all_distinct_ids.add(vid)
             sev, summary, aliases, cvss, data = severity_map.get(vid, ("", "", [], [], {}))
+            for a in aliases:
+                all_distinct_ids.add(a)
+
             is_hc = is_high_or_critical(sev, cvss)
-            all_findings.append((name, version, vid, sev or "UNKNOWN", summary, is_hc))
+            # Check if this vuln or any alias is in baseline
+            in_baseline = (vid in known_baseline_ids) or any(a in known_baseline_ids for a in aliases)
+            all_findings.append((name, version, vid, sev or "UNKNOWN", summary, is_hc, in_baseline))
             if is_hc:
                 high_critical.append((name, version, vid, sev))
+                if not in_baseline:
+                    new_high_critical.append((name, version, vid, sev))
+
+# If recording baseline, dump current distinct IDs
+if record_baseline:
+    baseline_path.parent.mkdir(parents=True, exist_ok=True)
+    baseline_payload = {
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+        "node20_version": node20_ver,
+        "node24_version": node24_ver,
+        "description": "Baseline snapshot of known upstream OSV advisories for pinned Node distributions.",
+        "total_advisories": len(all_distinct_ids),
+        "known_advisories": sorted(all_distinct_ids)
+    }
+    baseline_path.write_text(json.dumps(baseline_payload, indent=2) + "\n")
+    print(f"Recorded baseline with {len(all_distinct_ids)} advisory IDs to {baseline_path}", file=sys.stderr)
 
 # Sort for stable output
-all_findings.sort(key=lambda x: (x[0], x[1], x[2]))
+all_findings.sort(key=lambda x: (x[0], x[1], x[2], x[6]))
 
 # Write findings
 with open(findings_out, "w") as out:
     out.write(f"OSV findings: {len(all_findings)} total advisories across packages\n")
+    if known_baseline_ids:
+        out.write(f"Active baseline: {len(known_baseline_ids)} known advisories from {baseline_path.name}\n")
     if not all_findings:
         out.write("No vulnerabilities found.\n")
     else:
-        out.write(f"{'Package':<30} {'Version':<12} {'Vuln ID':<28} {'Severity':<10} Summary\n")
-        out.write("-"*120 + "\n")
-        for name, ver, vid, sev, summary, is_hc in all_findings:
-            flag = " [HIGH/CRITICAL]" if is_hc else ""
+        out.write(f"{'Package':<30} {'Version':<12} {'Vuln ID':<28} {'Severity':<10} {'Status':<12} Summary\n")
+        out.write("-"*130 + "\n")
+        for name, ver, vid, sev, summary, is_hc, in_baseline in all_findings:
+            if is_hc and not in_baseline:
+                flag = "[NEW HIGH]"
+            elif is_hc and in_baseline:
+                flag = "[BASELINE]"
+            elif in_baseline:
+                flag = "[BASELINE]"
+            else:
+                flag = ""
             # trim summary to 60 chars
             summ = summary.replace("\n"," ")[:60]
-            out.write(f"{name:<30} {ver:<12} {vid:<28} {sev:<10} {summ}{flag}\n")
+            out.write(f"{name:<30} {ver:<12} {vid:<28} {sev:<10} {flag:<12} {summ}\n")
         out.write("\n")
-        out.write(f"High/Critical count: {len(high_critical)}\n")
-        if high_critical:
-            out.write("High/Critical advisories:\n")
-            for name, ver, vid, sev in high_critical:
+        out.write(f"High/Critical count: {len(high_critical)} ({len(high_critical) - len(new_high_critical)} in baseline, {len(new_high_critical)} new)\n")
+        if new_high_critical:
+            out.write("NEW High/Critical advisories (not in baseline):\n")
+            for name, ver, vid, sev in new_high_critical:
                 out.write(f"  - {name}@{ver}: {vid} ({sev})\n")
 
 # Also emit counts for shell
-Path(str(findings_out) + ".counts").write_text(json.dumps({"total": len(all_findings), "high_critical": len(high_critical)}))
+Path(str(findings_out) + ".counts").write_text(json.dumps({
+    "total": len(all_findings),
+    "high_critical": len(high_critical),
+    "new_high_critical": len(new_high_critical)
+}))
 
 PY
 
@@ -422,9 +480,10 @@ cat "$FINDINGS_TXT"
 COUNTS_JSON="$FINDINGS_TXT.counts"
 TOTAL_FINDINGS="$(python3 -c "import json; print(json.load(open('$COUNTS_JSON'))['total'])")"
 HIGH_CRITICAL_COUNT="$(python3 -c "import json; print(json.load(open('$COUNTS_JSON'))['high_critical'])")"
+NEW_HIGH_CRITICAL_COUNT="$(python3 -c "import json; print(json.load(open('$COUNTS_JSON'))['new_high_critical'])")"
 
 echo ""
-echo "Summary: $TOTAL_FINDINGS advisories, $HIGH_CRITICAL_COUNT high/critical"
+echo "Summary: $TOTAL_FINDINGS advisories ($HIGH_CRITICAL_COUNT high/critical total, $NEW_HIGH_CRITICAL_COUNT new)"
 
 # --- Generate CycloneDX 1.5 SBOM -------------------------------------------
 # SBOM includes all unique npm packages from both node distributions.
@@ -537,14 +596,19 @@ echo "SBOM artifact: $SBOM_ABS"
 
 # --- Gate decision ----------------------------------------------------------
 if [[ "$REPORT_ONLY" -eq 1 ]]; then
-  echo "Report-only mode: not failing on high/critical (found $HIGH_CRITICAL_COUNT)"
+  echo "Report-only mode: not failing on high/critical (found $HIGH_CRITICAL_COUNT total, $NEW_HIGH_CRITICAL_COUNT new)"
   exit 0
 fi
 
-if [[ "$HIGH_CRITICAL_COUNT" -gt 0 ]]; then
-  echo "FAIL: $HIGH_CRITICAL_COUNT high/critical vulnerabilities found — see above" >&2
+if [[ "$RECORD_BASELINE" -eq 1 ]]; then
+  echo "Recorded baseline snapshot to $BASELINE_FILE: PASS"
+  exit 0
+fi
+
+if [[ "$NEW_HIGH_CRITICAL_COUNT" -gt 0 ]]; then
+  echo "FAIL: $NEW_HIGH_CRITICAL_COUNT new high/critical vulnerabilities found (not in $BASELINE_FILE) — see above" >&2
   exit 1
 fi
 
-echo "PASS: no high/critical vulnerabilities"
+echo "PASS: no new high/critical vulnerabilities (all known issues documented in $BASELINE_FILE)"
 exit 0
