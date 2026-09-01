@@ -183,6 +183,19 @@ pub async fn run_node_action(
         anyhow::bail!("action entry point not found: {}", entry_point.display());
     }
 
+    // Validate that the canonical entry point path stays within the action directory
+    if let (Ok(canonical_dir), Ok(canonical_entry)) =
+        (action_dir.canonicalize(), entry_point.canonicalize())
+    {
+        if !canonical_entry.starts_with(&canonical_dir) {
+            anyhow::bail!(
+                "action entry point {} escapes action directory {}",
+                entry_point.display(),
+                action_dir.display()
+            );
+        }
+    }
+
     // Resolve node binary and apply the runner's Node 20 migration policy.
     let runs_using = manifest.runs_using.as_str();
     if runs_using == "node12" || runs_using == "node16" {
@@ -215,6 +228,15 @@ pub async fn run_node_action(
         ctx.log(&format!("::warning::{warning}"));
     }
     let node_version = selection.version;
+    // v2.337.0: Node 20 runtime is deprecated for actions. Emit a one-time
+    // per-job warning via the job log and tracing, without failing the step
+    // or altering the selected Node binary.
+    const NODE20_DEPRECATION_WARNING: &str =
+        "Node 20 actions are deprecated and support ends soon; migrate actions to node24.";
+    if node_version.starts_with("node20") && ctx.job.emit_node20_deprecation_warning() {
+        tracing::warn!("{}", NODE20_DEPRECATION_WARNING);
+        ctx.log(&format!("::warning::{NODE20_DEPRECATION_WARNING}"));
+    }
     if runs_using == "node20" {
         if let Some(name) = action_name {
             if node_version == "node24" {
@@ -675,5 +697,202 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("missing runs.main"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn escaping_entry_point_symlink_errors() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let action_dir = temp.path().join("action");
+        std::fs::create_dir_all(&action_dir).unwrap();
+
+        let outside_dir = temp.path().join("outside");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let outside_script = outside_dir.join("payload.js");
+        std::fs::write(&outside_script, "console.log('evil');").unwrap();
+
+        std::os::unix::fs::symlink(&outside_script, action_dir.join("index.js")).unwrap();
+
+        let manifest = node_manifest("index.js");
+        let mut job = crate::worker::contexts::JobContext::new(
+            "job".into(),
+            "job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let mut ctx = StepContext::new(&mut job, "step1".into(), "Step".into());
+        let (_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        let err = run_node_action(
+            &manifest,
+            &action_dir,
+            &serde_json::json!({}),
+            action_dir.to_str().unwrap(),
+            &mut ctx,
+            cancel_rx,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("escapes action directory"));
+    }
+
+    const NODE20_WARNING_SUBSTR: &str =
+        "Node 20 actions are deprecated and support ends soon; migrate actions to node24.";
+
+    fn setup_externals_with_shim(root: &std::path::Path) {
+        for version in ["node20", "node24"] {
+            let bin_dir = root.join("externals").join(version).join("bin");
+            std::fs::create_dir_all(&bin_dir).unwrap();
+            let node_path = bin_dir.join("node");
+            // Minimal shim that exits 0; handler checks is_file() and executes it.
+            std::fs::write(&node_path, "#!/bin/sh\nexit 0\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&node_path).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&node_path, perms).unwrap();
+            }
+            // Also create windows variant for completeness; handler is cfg-gated at runtime
+            // but the test suite runs on linux/darwin, so the unix shim is what matters.
+            let win_path = root.join("externals").join(version).join("node.exe");
+            if !win_path.exists() {
+                std::fs::write(&win_path, "#!/bin/sh\nexit 0\n").unwrap();
+            }
+        }
+    }
+
+    fn assert_deprecation_warning_count(ctx: &StepContext<'_>, expected: usize) {
+        let log_count = ctx
+            .log_lines
+            .iter()
+            .filter(|line| line.contains(NODE20_WARNING_SUBSTR))
+            .count();
+        let annotation_count = ctx
+            .annotations
+            .iter()
+            .filter(|a| a.message.contains(NODE20_WARNING_SUBSTR))
+            .count();
+        // ::warning:: is parsed into an annotation plus a ##[warning] log line;
+        // both contain the message, so we take the max to avoid double-counting.
+        let total = std::cmp::max(log_count, annotation_count);
+        assert_eq!(
+            total, expected,
+            "expected {expected} deprecation warning(s), log_lines={:?} annotations={:?}",
+            ctx.log_lines, ctx.annotations
+        );
+    }
+
+    #[tokio::test]
+    async fn node20_action_emits_deprecation_warning_once_per_job() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup_externals_with_shim(tmp.path());
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let action_dir = tmp.path().join("action");
+        std::fs::create_dir_all(&action_dir).unwrap();
+        std::fs::write(action_dir.join("index.js"), "console.log('hello')").unwrap();
+
+        let manifest20 = ActionManifest {
+            name: "test".into(),
+            description: String::new(),
+            runs_using: "node20".into(),
+            runs_main: Some("index.js".into()),
+            runs_pre: None,
+            runs_pre_if: None,
+            runs_post: None,
+            runs_post_if: None,
+            runs_steps: None,
+            runs_image: None,
+            runs_entrypoint: None,
+            runs_args: None,
+            runs_env: None,
+            inputs: None,
+            outputs: None,
+        };
+
+        let mut job = crate::worker::contexts::JobContext::new(
+            "job".into(),
+            "job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        // First node20 step should emit the warning.
+        {
+            let mut ctx = StepContext::new(&mut job, "step1".into(), "Step 1".into());
+            let (_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            run_node_action(
+                &manifest20,
+                &action_dir,
+                &serde_json::json!({}),
+                workspace.to_str().unwrap(),
+                &mut ctx,
+                cancel_rx,
+                Some("actions/checkout@v3"),
+            )
+            .await
+            .expect("first node20 action should succeed");
+            assert_deprecation_warning_count(&ctx, 1);
+            assert!(
+                ctx.job.node20_warning_emitted,
+                "job flag must be set after first warning"
+            );
+        }
+
+        // Second node20 step in the same job must NOT emit again.
+        {
+            let mut ctx = StepContext::new(&mut job, "step2".into(), "Step 2".into());
+            let (_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            run_node_action(
+                &manifest20,
+                &action_dir,
+                &serde_json::json!({}),
+                workspace.to_str().unwrap(),
+                &mut ctx,
+                cancel_rx,
+                Some("actions/setup-node@v3"),
+            )
+            .await
+            .expect("second node20 action should succeed");
+            assert_deprecation_warning_count(&ctx, 0);
+        }
+        assert!(job.node20_warning_emitted);
+    }
+
+    #[tokio::test]
+    async fn node24_action_emits_no_deprecation_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup_externals_with_shim(tmp.path());
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let action_dir = tmp.path().join("action");
+        std::fs::create_dir_all(&action_dir).unwrap();
+        std::fs::write(action_dir.join("index.js"), "console.log('hello')").unwrap();
+
+        let mut manifest24 = node_manifest("index.js");
+        manifest24.runs_using = "node24".into();
+
+        let mut job = crate::worker::contexts::JobContext::new(
+            "job".into(),
+            "job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let mut ctx = StepContext::new(&mut job, "step1".into(), "Step 1".into());
+        let (_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        run_node_action(
+            &manifest24,
+            &action_dir,
+            &serde_json::json!({}),
+            workspace.to_str().unwrap(),
+            &mut ctx,
+            cancel_rx,
+            Some("actions/checkout@v4"),
+        )
+        .await
+        .expect("node24 action should succeed");
+        assert_deprecation_warning_count(&ctx, 0);
+        assert!(!ctx.job.node20_warning_emitted);
     }
 }

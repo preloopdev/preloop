@@ -21,6 +21,7 @@ preloop-gha-expressions = { path = "../preloop-gha-expressions" }
 preloop-gha-parser = { path = "../preloop-gha-parser" }
 preloop-dap = { path = "../preloop-dap" }
 
+cap-std = { workspace = true }
 anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true
@@ -47,6 +48,7 @@ glob.workspace = true
 hostname.workspace = true
 bytes.workspace = true
 serde_yaml.workspace = true
+hex.workspace = true
 regex.workspace = true
 zip.workspace = true
 

@@ -23,6 +23,11 @@ pub mod cli;
 pub mod client;
 pub mod configure;
 pub mod control_bridge;
+
+include!(concat!(env!("OUT_DIR"), "/pins.rs"));
+
+pub mod node_externals;
+
 pub mod listener;
 pub mod process;
 pub mod settings;

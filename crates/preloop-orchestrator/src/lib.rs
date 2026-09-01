@@ -1,9 +1,10 @@
 //! SmolVM-backed ephemeral runner pool for Preloop CI.
 
+include!(concat!(env!("OUT_DIR"), "/pins.rs"));
+
 pub mod environment;
 mod keys;
-
-include!(concat!(env!("OUT_DIR"), "/pins.rs"));
+pub mod node_externals;
 
 use crate::environment::{
     curated_toolchains, is_stock_base_image, EnvironmentSpec, ToolchainLayer,
@@ -120,19 +121,24 @@ fn runner_volumes(
     volumes
 }
 
-/// Populate the host-side externals directory once, so every VM can mount
-/// `node20`/`node24` instead of baking or downloading them per machine.
+/// Populate the host-side externals directory, validating the manifest and
+/// binary version (R2) for each runtime instead of merely checking for a file.
 ///
-/// Reuses the same shell routine the golden bake used — it is pure
-/// `curl | tar` plus an atomic temp-dir publish, so it runs identically on
-/// the host. Skips the download when the external is already present, so a
-/// concurrent engine start or an operator-provided directory keeps its
-/// contents. Permissions are still normalized on every call: the download is
-/// what gets skipped, not the repair, or a host that published its externals
-/// before the guest runner went non-root would stay broken forever.
+/// Reuses the same shell routine the golden bake uses — now with temp-file
+/// download, SHA256 verification (pinned + SHASUMS), and manifest emission —
+/// so it runs identically on the host and in the guest. A directory is only
+/// re-downloaded when its `preloop-node.json` is missing, its version is stale,
+/// or `bin/node --version` disagrees. Permissions are still normalized on every
+/// call.
 fn ensure_host_externals(config: &RunnerPoolConfig) -> Result<(), OrchestratorError> {
     let externals = config.externals_dir.join("externals");
-    if !externals.join("node24").join("bin").join("node").is_file() {
+    let needs_host = crate::node_externals::expected_runtimes()
+        .iter()
+        .any(|(runtime, version)| {
+            let plain = version.trim_start_matches('v');
+            !crate::node_externals::is_valid_externals_dir(&externals.join(runtime), runtime, plain)
+        });
+    if needs_host {
         std::fs::create_dir_all(&externals).map_err(|error| {
             OrchestratorError::Config(format!(
                 "failed to create externals directory {}: {error}",
@@ -175,13 +181,32 @@ fn ensure_host_externals(config: &RunnerPoolConfig) -> Result<(), OrchestratorEr
     // the engine runs unprivileged, and the deploy step materializes the
     // externals in that case.
     let bundle_externals = config.runner_bundle.join("externals");
-    if !bundle_externals
-        .join("node24")
-        .join("bin")
-        .join("node")
-        .is_file()
-    {
+    let needs_bundle =
+        crate::node_externals::expected_runtimes()
+            .iter()
+            .any(|(runtime, version)| {
+                let plain = version.trim_start_matches('v');
+                !crate::node_externals::is_valid_externals_dir(
+                    &bundle_externals.join(runtime),
+                    runtime,
+                    plain,
+                )
+            });
+    if needs_bundle {
+        // Ensure bundle parent exists before copy.
+        let _ = std::fs::create_dir_all(&bundle_externals);
         let copy = std::fs::create_dir_all(&bundle_externals).and_then(|()| {
+            // For stale manifests, remove the stale runtime dirs in the bundle first
+            // so `cp -a` does not leave a mix of stale/new.
+            for (runtime, version) in crate::node_externals::expected_runtimes() {
+                let plain = version.trim_start_matches('v');
+                let dest = bundle_externals.join(runtime);
+                if !crate::node_externals::is_valid_externals_dir(&dest, runtime, plain)
+                    && dest.exists()
+                {
+                    let _ = std::fs::remove_dir_all(&dest);
+                }
+            }
             std::process::Command::new("cp")
                 .arg("-a")
                 .arg(externals.join("."))
@@ -1128,6 +1153,25 @@ pub fn loopback_hosts() -> &'static str {
 }
 
 fn node_externals_at(runner_root: &str) -> Vec<Vec<String>> {
+    // Pinned SHA per runtime+platform, derived from versions.toml via build.rs.
+    // Empty string means no pinned entry — SHASUMS verification still applies.
+    let n20_plain = NODE20_EXTERNALS_VERSION.trim_start_matches('v');
+    let n24_plain = NODE24_EXTERNALS_VERSION.trim_start_matches('v');
+    let pinned_n20_arm64 =
+        crate::node_externals_pinned_sha256(&format!("node20_{n20_plain}_linux-arm64"))
+            .unwrap_or("");
+    let pinned_n20_x64 =
+        crate::node_externals_pinned_sha256(&format!("node20_{n20_plain}_linux-x64")).unwrap_or("");
+    let pinned_n24_arm64 =
+        crate::node_externals_pinned_sha256(&format!("node24_{n24_plain}_linux-arm64"))
+            .unwrap_or("");
+    let pinned_n24_x64 =
+        crate::node_externals_pinned_sha256(&format!("node24_{n24_plain}_linux-x64")).unwrap_or("");
+    // For Windows cases (not used on Linux golden but keep for completeness via host externals on Windows).
+    let pinned_n20_win_x64 =
+        crate::node_externals_pinned_sha256(&format!("node20_{n20_plain}_win-x64")).unwrap_or("");
+    let pinned_n24_win_x64 =
+        crate::node_externals_pinned_sha256(&format!("node24_{n24_plain}_win-x64")).unwrap_or("");
     [vec![
         "sh".to_owned(),
         "-c".to_owned(),
@@ -1138,21 +1182,58 @@ fn node_externals_at(runner_root: &str) -> Vec<Vec<String>> {
                set -- $entry; \
                NAME=$1; VERSION=$2; \
                DEST=$RUNNER_EXTERNALS/$NAME; \
-               if [ -f \"$DEST/bin/node\" ]; then \
-                 chmod 755 \"$DEST\"; \
-                 echo \"$NAME already present, skipping\"; continue; \
+               VERSION_PLAIN=${{VERSION#v}}; \
+               if [ -f \"$DEST/preloop-node.json\" ] && grep -q \"\\\"version\\\":\\\"$VERSION_PLAIN\\\"\" \"$DEST/preloop-node.json\" 2>/dev/null && [ \"$(\"$DEST/bin/node\" --version 2>/dev/null)\" = \"$VERSION\" ]; then \
+                 echo \"$NAME $VERSION already valid, skipping\"; \
+                 chmod 755 \"$DEST\" 2>/dev/null || true; \
+                 continue; \
                fi; \
                echo \"Installing $NAME $VERSION into golden...\"; \
                TEMP=$(mktemp -d \"$RUNNER_EXTERNALS/.$NAME.XXXXXX\") && \
                 chmod 755 \"$TEMP\" && \
                 ARCH=$(uname -m); \
                 if [ \"$ARCH\" = \"aarch64\" ] || [ \"$ARCH\" = \"arm64\" ]; then NODE_ARCH=linux-arm64; else NODE_ARCH=linux-x64; fi; \
-                curl -fsSL \"https://nodejs.org/dist/$VERSION/node-$VERSION-$NODE_ARCH.tar.gz\" | \
-                 tar -xz --strip-components=1 -C \"$TEMP\" && \
+                ARCHIVE=\"node-$VERSION-$NODE_ARCH.tar.gz\"; \
+                URL=\"https://nodejs.org/dist/$VERSION/$ARCHIVE\"; \
+                SHASUMS_URL=\"https://nodejs.org/dist/$VERSION/SHASUMS256.txt\"; \
+                TMP_ARCHIVE=$(mktemp \"$RUNNER_EXTERNALS/.$NAME.archive.XXXXXX.tar.gz\"); \
+                if ! curl -fsSL -o \"$TMP_ARCHIVE\" \"$URL\"; then echo \"FAILED fetching $NAME $VERSION\" >&2; rm -f \"$TMP_ARCHIVE\"; rm -rf \"$TEMP\"; exit 1; fi; \
+                ACTUAL=$(shasum -a 256 \"$TMP_ARCHIVE\" 2>/dev/null | awk '{{print $1}}'); \
+                if [ -z \"$ACTUAL\" ]; then ACTUAL=$(sha256sum \"$TMP_ARCHIVE\" 2>/dev/null | awk '{{print $1}}'); fi; \
+                if [ -z \"$ACTUAL\" ]; then echo \"no sha256 tool available\" >&2; rm -f \"$TMP_ARCHIVE\"; rm -rf \"$TEMP\"; exit 1; fi; \
+                VERIFIED=0; \
+                case \"$NAME:$NODE_ARCH\" in \
+                  node20:linux-arm64) PINNED=\"{pinned_n20_arm64}\";; \
+                  node20:linux-x64) PINNED=\"{pinned_n20_x64}\";; \
+                  node24:linux-arm64) PINNED=\"{pinned_n24_arm64}\";; \
+                  node24:linux-x64) PINNED=\"{pinned_n24_x64}\";; \
+                  node20:win-x64) PINNED=\"{pinned_n20_win_x64}\";; \
+                  node24:win-x64) PINNED=\"{pinned_n24_win_x64}\";; \
+                  *) PINNED=\"\";; \
+                esac; \
+                if [ -n \"$PINNED\" ]; then \
+                  if [ \"$ACTUAL\" != \"$PINNED\" ]; then echo \"ERROR: $NAME $VERSION pinned SHA256 mismatch (got $ACTUAL expected $PINNED)\" >&2; rm -f \"$TMP_ARCHIVE\"; rm -rf \"$TEMP\"; exit 1; fi; \
+                  VERIFIED=1; \
+                fi; \
+                SHASUMS_TMP=$(mktemp \"$RUNNER_EXTERNALS/.SHASUMS.XXXXXX\"); \
+                if curl -fsSL -o \"$SHASUMS_TMP\" \"$SHASUMS_URL\" 2>/dev/null; then \
+                  EXPECTED_SHASUMS=$(grep -F \" $ARCHIVE\" \"$SHASUMS_TMP\" | awk '{{print $1}}'); \
+                  if [ -n \"$EXPECTED_SHASUMS\" ] && [ \"$ACTUAL\" != \"$EXPECTED_SHASUMS\" ]; then echo \"ERROR: $NAME $VERSION SHASUMS256.txt mismatch (got $ACTUAL expected $EXPECTED_SHASUMS)\" >&2; rm -f \"$TMP_ARCHIVE\" \"$SHASUMS_TMP\"; rm -rf \"$TEMP\"; exit 1; fi; \
+                  if [ -n \"$EXPECTED_SHASUMS\" ]; then VERIFIED=1; fi; \
+                  rm -f \"$SHASUMS_TMP\"; \
+                else \
+                  rm -f \"$SHASUMS_TMP\"; \
+                fi; \
+                if [ \"$VERIFIED\" != 1 ]; then \
+                  echo \"ERROR: no trusted checksum found for $ARCHIVE (neither pinned SHA nor SHASUMS entry available)\" >&2; rm -f \"$TMP_ARCHIVE\"; rm -rf \"$TEMP\"; exit 1; \
+                fi; \
+                if ! tar -xzf \"$TMP_ARCHIVE\" --strip-components=1 -C \"$TEMP\"; then echo \"FAILED extracting $NAME\" >&2; rm -f \"$TMP_ARCHIVE\"; rm -rf \"$TEMP\"; exit 1; fi; \
+                rm -f \"$TMP_ARCHIVE\"; \
                if [ ! -f \"$TEMP/bin/node\" ]; then \
                  echo \"ERROR: $NAME tarball missing bin/node\" >&2; \
                  rm -rf \"$TEMP\"; exit 1; \
                fi && \
+               printf '{{\"runtime\":\"%s\",\"version\":\"%s\",\"platform\":\"%s\",\"archive_sha256\":\"%s\",\"source\":\"%s\"}}\\n' \"$NAME\" \"$VERSION_PLAIN\" \"$NODE_ARCH\" \"$ACTUAL\" \"$URL\" > \"$TEMP/preloop-node.json\" && \
                [ -d \"$DEST\" ] && rm -rf \"$DEST\"; \
                mv \"$TEMP\" \"$DEST\" && \
                echo \"$NAME $VERSION baked\" || \
@@ -5041,25 +5122,92 @@ mod lifecycle_tests {
         std::fs::create_dir_all(&bin).unwrap();
 
         let curl = bin.join("curl");
-        std::fs::write(&curl, "#!/bin/sh\nprintf archive\n").unwrap();
+        std::fs::write(
+            &curl,
+            r#"#!/bin/sh
+out=""
+url=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2;;
+    -*) shift;;
+    *) url="$1"; shift;;
+  esac
+done
+case "$url" in *SHASUMS256.txt*) printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  node-v20.19.0-linux-arm64.tar.gz\n371fc060d5dd4de565586c3cc70034956db67a8f3dae0f0e5724fa56147c472a  node-v24.3.0-linux-arm64.tar.gz\n8a4dbcdd8bccef3132d21e8543940557e55dcf44f00f0a99ba8a062f4552e722  node-v20.19.0-linux-x64.tar.gz\nbbeb5fb8113b44fc30f5a5887dbc0ab66af8e56139f5f9fbe7c7a1aa056246dc  node-v24.3.0-linux-x64.tar.gz\n" > "$out"; exit 0;; esac
+printf archive > "$out"
+"#,
+        )
+        .unwrap();
         std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let shasum = bin.join("shasum");
+        std::fs::write(
+            &shasum,
+            r#"#!/bin/sh
+arch=$(uname -m 2>/dev/null || echo unknown)
+case "$*" in
+  *node24*|*.node24.*)
+    if [ "$arch" = "x86_64" ]; then
+      printf "bbeb5fb8113b44fc30f5a5887dbc0ab66af8e56139f5f9fbe7c7a1aa056246dc  dummy\n"
+    else
+      printf "371fc060d5dd4de565586c3cc70034956db67a8f3dae0f0e5724fa56147c472a  dummy\n"
+    fi;;
+  *)
+    if [ "$arch" = "x86_64" ]; then
+      printf "8a4dbcdd8bccef3132d21e8543940557e55dcf44f00f0a99ba8a062f4552e722  dummy\n"
+    else
+      printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  dummy\n"
+    fi;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&shasum, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let sha256sum = bin.join("sha256sum");
+        std::fs::write(
+            &sha256sum,
+            r#"#!/bin/sh
+arch=$(uname -m 2>/dev/null || echo unknown)
+case "$*" in
+  *node24*|*.node24.*)
+    if [ "$arch" = "x86_64" ]; then
+      printf "bbeb5fb8113b44fc30f5a5887dbc0ab66af8e56139f5f9fbe7c7a1aa056246dc  dummy\n"
+    else
+      printf "371fc060d5dd4de565586c3cc70034956db67a8f3dae0f0e5724fa56147c472a  dummy\n"
+    fi;;
+  *)
+    if [ "$arch" = "x86_64" ]; then
+      printf "8a4dbcdd8bccef3132d21e8543940557e55dcf44f00f0a99ba8a062f4552e722  dummy\n"
+    else
+      printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  dummy\n"
+    fi;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&sha256sum, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let tar = bin.join("tar");
         std::fs::write(
             &tar,
             r#"#!/bin/sh
-input=$(cat)
-[ "$input" = archive ] || exit 41
+archive=""
+dest=""
 while [ "$#" -gt 0 ]; do
-  if [ "$1" = -C ]; then
-    shift
-    destination=$1
-  fi
-  shift
+  case "$1" in
+    -xzf) archive="$2"; shift 2;;
+    -C) dest="$2"; shift 2;;
+    *) shift;;
+  esac
 done
-mkdir -p "$destination/bin"
-printf '#!/bin/sh\nexit 0\n' > "$destination/bin/node"
-chmod +x "$destination/bin/node"
+if [ ! -f "$archive" ]; then exit 41; fi
+content=$(cat "$archive")
+[ "$content" = archive ] || exit 42
+mkdir -p "$dest/bin"
+printf '#!/bin/sh\nexit 0\n' > "$dest/bin/node"
+chmod +x "$dest/bin/node"
 "#,
         )
         .unwrap();
@@ -5082,6 +5230,28 @@ chmod +x "$destination/bin/node"
         assert!(status.success());
         assert!(root.join("externals/node20/bin/node").is_file());
         assert!(root.join("externals/node24/bin/node").is_file());
+        // Manifests must be written with correct version and SHA.
+        for name in ["node20", "node24"] {
+            let manifest =
+                std::fs::read_to_string(root.join(format!("externals/{name}/preloop-node.json")))
+                    .unwrap();
+            assert!(manifest.contains("\"runtime\":\""), "{manifest}");
+            assert!(manifest.contains("\"archive_sha256\":\""), "{manifest}");
+            let expected_sha = if name == "node20" {
+                if cfg!(target_arch = "x86_64") {
+                    "8a4dbcdd"
+                } else {
+                    "618e4294"
+                }
+            } else {
+                if cfg!(target_arch = "x86_64") {
+                    "bbeb5fb8"
+                } else {
+                    "371fc060"
+                }
+            };
+            assert!(manifest.contains(expected_sha), "{manifest}");
+        }
     }
 
     /// The guest runner drops to uid 1001, so a 0700 `node24/` hides a
@@ -5096,25 +5266,91 @@ chmod +x "$destination/bin/node"
         std::fs::create_dir_all(&bin).unwrap();
 
         let curl = bin.join("curl");
-        std::fs::write(&curl, "#!/bin/sh\nprintf archive\n").unwrap();
+        std::fs::write(
+            &curl,
+            r#"#!/bin/sh
+out=""
+url=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2;;
+    -*) shift;;
+    *) url="$1"; shift;;
+  esac
+done
+case "$url" in *SHASUMS256.txt*) printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  node-v20.19.0-linux-arm64.tar.gz\n371fc060d5dd4de565586c3cc70034956db67a8f3dae0f0e5724fa56147c472a  node-v24.3.0-linux-arm64.tar.gz\n8a4dbcdd8bccef3132d21e8543940557e55dcf44f00f0a99ba8a062f4552e722  node-v20.19.0-linux-x64.tar.gz\nbbeb5fb8113b44fc30f5a5887dbc0ab66af8e56139f5f9fbe7c7a1aa056246dc  node-v24.3.0-linux-x64.tar.gz\n" > "$out"; exit 0;; esac
+printf archive > "$out"
+"#,
+        )
+        .unwrap();
         std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let shasum = bin.join("shasum");
+        std::fs::write(
+            &shasum,
+            r#"#!/bin/sh
+arch=$(uname -m 2>/dev/null || echo unknown)
+case "$*" in
+  *node24*|*.node24.*)
+    if [ "$arch" = "x86_64" ]; then
+      printf "bbeb5fb8113b44fc30f5a5887dbc0ab66af8e56139f5f9fbe7c7a1aa056246dc  dummy\n"
+    else
+      printf "371fc060d5dd4de565586c3cc70034956db67a8f3dae0f0e5724fa56147c472a  dummy\n"
+    fi;;
+  *)
+    if [ "$arch" = "x86_64" ]; then
+      printf "8a4dbcdd8bccef3132d21e8543940557e55dcf44f00f0a99ba8a062f4552e722  dummy\n"
+    else
+      printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  dummy\n"
+    fi;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&shasum, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let sha256sum = bin.join("sha256sum");
+        std::fs::write(
+            &sha256sum,
+            r#"#!/bin/sh
+arch=$(uname -m 2>/dev/null || echo unknown)
+case "$*" in
+  *node24*|*.node24.*)
+    if [ "$arch" = "x86_64" ]; then
+      printf "bbeb5fb8113b44fc30f5a5887dbc0ab66af8e56139f5f9fbe7c7a1aa056246dc  dummy\n"
+    else
+      printf "371fc060d5dd4de565586c3cc70034956db67a8f3dae0f0e5724fa56147c472a  dummy\n"
+    fi;;
+  *)
+    if [ "$arch" = "x86_64" ]; then
+      printf "8a4dbcdd8bccef3132d21e8543940557e55dcf44f00f0a99ba8a062f4552e722  dummy\n"
+    else
+      printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  dummy\n"
+    fi;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&sha256sum, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let tar = bin.join("tar");
         std::fs::write(
             &tar,
             r#"#!/bin/sh
-input=$(cat)
-[ "$input" = archive ] || exit 41
+archive=""
+dest=""
 while [ "$#" -gt 0 ]; do
-  if [ "$1" = -C ]; then
-    shift
-    destination=$1
-  fi
-  shift
+  case "$1" in
+    -xzf) archive="$2"; shift 2;;
+    -C) dest="$2"; shift 2;;
+    *) shift;;
+  esac
 done
-mkdir -p "$destination/bin"
-printf '#!/bin/sh\nexit 0\n' > "$destination/bin/node"
-chmod +x "$destination/bin/node"
+if [ ! -f "$archive" ]; then exit 41; fi
+content=$(cat "$archive")
+[ "$content" = archive ] || exit 42
+mkdir -p "$dest/bin"
+printf '#!/bin/sh\nexit 0\n' > "$dest/bin/node"
+chmod +x "$dest/bin/node"
 "#,
         )
         .unwrap();
