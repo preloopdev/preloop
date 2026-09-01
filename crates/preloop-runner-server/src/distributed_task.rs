@@ -639,46 +639,22 @@ pub(crate) async fn complete_job_inner(
         };
         run.jobs.insert(completion.job_id.clone(), effective);
         let job_name = completion.job_id.0.clone();
-        if let Some(pos) = run.jobs_list.iter().position(|j| j.name == job_name) {
-            run.jobs_list[pos].conclusion = format!("{:?}", effective).to_lowercase();
-            // A worker can terminate through ForceFailJob before it sends the
-            // final WorkflowStepsUpdate. Do not leave the last reported step
-            // in_progress after its job is terminal.
-            //
-            // The official runner carries the authoritative per-step
-            // conclusions in CompleteJob.stepResults (status=TimelineRecordState,
-            // conclusion=TaskResult); apply them first. A crashed worker sends
-            // none, and any step still in_progress after that is reconciled to
-            // the job's effective status — the same view GitHub's server
-            // presents for orphaned steps.
-            for step in &mut run.jobs_list[pos].steps {
-                let Some(wire) = completion
-                    .step_results
-                    .iter()
-                    .find(|result| result.name.as_deref() == Some(step.name.as_str()))
-                else {
-                    continue;
-                };
-                if let Some(conclusion) = completion_step_conclusion(wire) {
-                    step.conclusion = conclusion;
-                }
-            }
-            let step_conclusion = status_string(effective);
-            for step in &mut run.jobs_list[pos].steps {
-                if step.conclusion == "in_progress" {
-                    step.conclusion = step_conclusion.clone();
-                    step.finished_at = step.finished_at.or(Some(chrono::Utc::now()));
-                }
-            }
+        // Masked up front: `mask_completion_annotations` reads the run's
+        // secrets, which cannot be borrowed while a job detail inside the same
+        // run is held mutably.
+        let annotations = mask_completion_annotations(run, &completion);
+        if let Some(detail) = JobDetail::find(&mut run.jobs_list, &job_name) {
+            detail.conclusion = format!("{:?}", effective).to_lowercase();
             if !completion.annotations.is_empty() {
-                run.jobs_list[pos].annotations = mask_completion_annotations(run, &completion);
+                detail.annotations = annotations;
             }
         } else {
             run.jobs_list.push(JobDetail {
+                job_id: job_name.clone(),
                 name: job_name,
                 conclusion: format!("{:?}", effective).to_lowercase(),
                 steps: Vec::new(),
-                annotations: mask_completion_annotations(run, &completion),
+                annotations,
             });
         }
         run.job_outputs.insert(
@@ -725,6 +701,46 @@ pub(crate) async fn complete_job_inner(
         .get(&completion.run_id)
         .and_then(|r| r.jobs.get(&completion.job_id).copied())
         .unwrap_or(completion.status);
+    // Reconcile the attempt's step manifest against the completion report.
+    //
+    // The official runner carries the authoritative per-step conclusions in
+    // `CompleteJob.stepResults` (status=TimelineRecordState,
+    // conclusion=TaskResult) keyed by `external_id` — the same identity the
+    // manifest uses, so this no longer matches on display names. A crashed
+    // worker sends none, and any step left `in_progress` afterwards is
+    // reconciled to the job's effective status, the view GitHub presents for
+    // orphaned steps. A step still `pending` was never reached, which stays
+    // truthful rather than inheriting the job's failure.
+    if let Some(agent_job_id) = inner
+        .job_requests
+        .values()
+        .find(|record| record.run_id == completion.run_id && record.job_id == completion.job_id)
+        .map(|record| record.agent_job_id)
+    {
+        if let Some(manifest) = inner.job_steps.get_mut(&agent_job_id) {
+            for wire in &completion.step_results {
+                let Some(external_id) = wire.external_id.as_deref() else {
+                    continue;
+                };
+                let Some(pos) = StepRecord::find_by_id(manifest, external_id) else {
+                    continue;
+                };
+                if let Some(conclusion) = completion_step_conclusion(wire) {
+                    manifest[pos].conclusion = conclusion;
+                }
+                if let Some(number) = wire.number.and_then(|n| u32::try_from(n).ok()) {
+                    manifest[pos].runner_number = Some(number);
+                }
+            }
+            let orphan_conclusion = status_string(effective_status);
+            for step in manifest.iter_mut() {
+                if step.conclusion == "in_progress" {
+                    step.conclusion = orphan_conclusion.clone();
+                    step.finished_at = step.finished_at.or(Some(chrono::Utc::now()));
+                }
+            }
+        }
+    }
     let cancelled_siblings = if effective_status == ExecutionStatus::Failure {
         apply_matrix_fail_fast(&mut inner, completion.run_id, &completion.job_id)
     } else {

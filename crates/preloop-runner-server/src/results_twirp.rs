@@ -14,6 +14,14 @@ pub(crate) struct StepLogsSignedBlobUrlRequest {
     pub(crate) workflow_run_backend_id: String,
 }
 
+/// Reconcile a runner's step report into that attempt's manifest.
+///
+/// This never decides a job's step *structure* — the manifest seeded from the
+/// job request message owns that. A report whose `external_id` is in the
+/// manifest updates that entry in place; anything else is runner bookkeeping
+/// ("Set up job", `Pre`/`Post` hooks, container lifecycle, "Complete job") and
+/// is appended as a synthetic record, so it owns its logs without shifting the
+/// numbering `--step` reads off the workflow.
 pub(crate) async fn twirp_workflow_steps_update(
     State(shared): State<Arc<SharedState>>,
     Json(payload): Json<serde_json::Value>,
@@ -25,139 +33,91 @@ pub(crate) async fn twirp_workflow_steps_update(
         .as_str()
         .unwrap_or("");
 
-    if let (Some(plan_uuid), Some(job_uuid)) = (
+    let (Some(plan_uuid), Some(job_uuid)) = (
         uuid::Uuid::parse_str(plan_id).ok(),
         uuid::Uuid::parse_str(agent_job_id_str).ok(),
-    ) {
-        if let Some((_, run_id, job_id)) =
-            resolve_callback_job(&inner, &plan_uuid.to_string(), None, Some(job_uuid))
-        {
-            // Find the step names by external_id and clone them to release the borrow on inner
-            let request_id = inner.agent_job_requests.get(&job_uuid).copied();
-            let step_names: std::collections::HashMap<uuid::Uuid, String> = request_id
-                .and_then(|id| inner.broker_messages.get(&id))
-                .map(|msg| {
-                    msg.steps
-                        .iter()
-                        .map(|s| {
-                            (
-                                s.id,
-                                s.display_name
-                                    .clone()
-                                    .or_else(|| s.name.clone())
-                                    .unwrap_or_default(),
-                            )
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+    ) else {
+        return Ok(Json(json!({"ok": true})));
+    };
+    let Some((_, run_id, job_id)) =
+        resolve_callback_job(&inner, &plan_uuid.to_string(), None, Some(job_uuid))
+    else {
+        return Ok(Json(json!({"ok": true})));
+    };
+    let Some(steps) = payload["steps"].as_array().cloned() else {
+        return Ok(Json(json!({"ok": true})));
+    };
 
-            if let Some(run) = inner.runs.get_mut(&run_id) {
-                let job_name = job_id.0.clone();
-                let job_detail =
-                    if let Some(pos) = run.jobs_list.iter().position(|j| j.name == job_name) {
-                        &mut run.jobs_list[pos]
-                    } else {
-                        run.jobs_list.push(JobDetail {
-                            name: job_name,
-                            // A step update means the job started; the run
-                            // record's final conclusion comes from the job
-                            // status map (projected in the runs GET). Default
-                            // to the truthful in-flight state, never "success".
-                            conclusion: "in_progress".to_owned(),
-                            steps: Vec::new(),
-                            annotations: Vec::new(),
-                        });
-                        run.jobs_list.last_mut().unwrap()
-                    };
+    let job_status = inner
+        .runs
+        .get(&run_id)
+        .and_then(|run| run.jobs.get(&job_id).copied());
+    let observed = chrono::Utc::now();
+    let records = inner.job_steps.entry(job_uuid).or_default();
 
-                if let Some(status) = run.jobs.get(&job_id) {
-                    job_detail.conclusion = format!("{:?}", status).to_lowercase();
+    for step in &steps {
+        let external_id = step["external_id"].as_str().unwrap_or("");
+        if external_id.is_empty() {
+            // With no identity there is nothing to reconcile against, and
+            // guessing by display name is exactly what merged two distinct
+            // same-named steps and lost one from the run.
+            tracing::warn!(
+                %run_id, job = %job_id.0,
+                "dropping step report with no external_id"
+            );
+            continue;
+        }
+
+        let conclusion_num = step["conclusion"].as_u64().unwrap_or(0);
+        let status_num = step["status"].as_u64().unwrap_or(0);
+        let terminal = status_num == 6;
+        let conclusion = if terminal {
+            match conclusion_num {
+                2 => "success",
+                3 if job_status == Some(ExecutionStatus::Cancelled) => "cancelled",
+                3 => "failure",
+                7 => "skipped",
+                _ => "success",
+            }
+        } else {
+            "in_progress"
+        };
+        // The runner reports the rendered display name ("Run actions/checkout@v4"),
+        // the same string GitHub's UI shows, so it wins over the message's name:
+        // the server leaves that empty for steps without an explicit `name:`.
+        let reported_name = step["name"].as_str().filter(|name| !name.is_empty());
+        let runner_number = step["number"].as_u64().and_then(|n| u32::try_from(n).ok());
+
+        match StepRecord::find_by_id(records, external_id) {
+            Some(pos) => {
+                let record = &mut records[pos];
+                record.conclusion = conclusion.to_owned();
+                record.runner_number = runner_number.or(record.runner_number);
+                if let Some(name) = reported_name {
+                    record.name = name.to_owned();
                 }
-                if let Some(steps) = payload["steps"].as_array() {
-                    for step in steps {
-                        let external_id_str = step["external_id"].as_str().unwrap_or("");
-                        let step_uuid = uuid::Uuid::parse_str(external_id_str).ok();
-
-                        // The runner reports the rendered display name in the
-                        // update payload ("Run actions/checkout@v4", "Set up
-                        // job") — the same string GitHub's UI shows. Prefer it
-                        // over the broker-message name, which the server
-                        // leaves empty for steps without an explicit `name:`
-                        // (an empty lookup result previously won and steps
-                        // showed as `''` in run records).
-                        let name = step["name"]
-                            .as_str()
-                            .filter(|name| !name.is_empty())
-                            .map(str::to_owned)
-                            .or_else(|| step_uuid.and_then(|suuid| step_names.get(&suuid).cloned()))
-                            .unwrap_or_default();
-                        let duplicate_name = !name.is_empty()
-                            && steps
-                                .iter()
-                                .filter(|candidate| candidate["name"].as_str() == Some(&name))
-                                .count()
-                                > 1;
-
-                        let conclusion_num = step["conclusion"].as_u64().unwrap_or(0);
-                        let status_num = step["status"].as_u64().unwrap_or(0);
-
-                        let job_status = run.jobs.get(&job_id).copied();
-                        let conclusion_str = if status_num == 6 {
-                            match conclusion_num {
-                                2 => "success",
-                                3 => {
-                                    if job_status == Some(ExecutionStatus::Cancelled) {
-                                        "cancelled"
-                                    } else {
-                                        "failure"
-                                    }
-                                }
-                                7 => "skipped",
-                                _ => "success",
-                            }
-                        } else {
-                            "in_progress"
-                        };
-                        let terminal = status_num == 6;
-                        let observed = chrono::Utc::now();
-
-                        if let Some(pos) = StepRecord::find_matching_index(
-                            &job_detail.steps,
-                            external_id_str,
-                            &name,
-                            !duplicate_name,
-                        ) {
-                            if !external_id_str.is_empty() {
-                                job_detail.steps[pos].id = Some(external_id_str.to_owned());
-                            }
-                            job_detail.steps[pos].conclusion = conclusion_str.to_owned();
-                            // First non-terminal sighting is the start signal.
-                            if !terminal && job_detail.steps[pos].started_at.is_none() {
-                                job_detail.steps[pos].started_at = Some(observed);
-                            }
-                            if terminal && job_detail.steps[pos].finished_at.is_none() {
-                                job_detail.steps[pos].finished_at = Some(observed);
-                            }
-                        } else {
-                            // First time we hear about this step:
-                            // - in_progress → record started_at only
-                            // - already terminal → record finished_at only
-                            //   (do not invent started_at == finished_at, which
-                            //   forces duration 0 for fast steps that complete
-                            //   before any in-progress update is processed)
-                            job_detail.steps.push(StepRecord {
-                                id: (!external_id_str.is_empty())
-                                    .then(|| external_id_str.to_owned()),
-                                name,
-                                conclusion: conclusion_str.to_owned(),
-                                started_at: (!terminal).then_some(observed),
-                                finished_at: terminal.then_some(observed),
-                            });
-                        }
-                    }
+                // First non-terminal sighting is the start signal.
+                if !terminal && record.started_at.is_none() {
+                    record.started_at = Some(observed);
+                }
+                if terminal && record.finished_at.is_none() {
+                    record.finished_at = Some(observed);
                 }
             }
+            None => records.push(StepRecord {
+                id: external_id.to_owned(),
+                kind: StepKind::Synthetic,
+                workflow_index: None,
+                runner_number,
+                context_name: None,
+                name: reported_name.unwrap_or_default().to_owned(),
+                conclusion: conclusion.to_owned(),
+                // Do not invent `started_at == finished_at`, which forces
+                // duration 0 for a step that completed before any in-progress
+                // update was processed.
+                started_at: (!terminal).then_some(observed),
+                finished_at: terminal.then_some(observed),
+            }),
         }
     }
 

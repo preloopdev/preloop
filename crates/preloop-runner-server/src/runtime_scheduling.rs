@@ -2408,6 +2408,13 @@ fn register_expanded_jobs(
         inner
             .timeline_requests
             .insert(job_request.timeline_id, job_request.request_id);
+        // A reusable callee or dynamic matrix leg only exists once its gate
+        // passes, so its manifest is seeded here rather than at submission.
+        // Every concrete attempt gets one before dispatch either way.
+        inner.job_steps.insert(
+            job_request.agent_job_id,
+            crate::models::StepRecord::manifest(&artifacts.agent_msg.steps),
+        );
         // Per-inner-job, so a wide matrix logs this once per leg: a 12k-leg
         // callee emitted 12k warnings for the ordinary no-GitHub-App setup and
         // buried every real diagnostic. Absence of a token request is the

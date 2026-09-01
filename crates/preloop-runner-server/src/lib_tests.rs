@@ -2650,6 +2650,76 @@ jobs:
     (run_id, jobs)
 }
 
+/// Build a run whose `build` job declares three steps.
+///
+/// Step-filter tests need more than one declared step to prove `--step N`
+/// selects the right one.
+async fn three_step_run_for_log_filters(
+    app: &axum::Router,
+    state: &AppState,
+) -> (RunId, Vec<(String, String, String)>) {
+    let accepted = submit_yaml(
+        app,
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo one
+      - run: echo two
+      - run: echo three
+"#,
+        "owner/repo",
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let jobs = {
+        let inner = state.inner.lock().await;
+        inner
+            .job_requests
+            .values()
+            .filter(|request| request.run_id == run_id)
+            .map(|request| {
+                (
+                    request.job_id.0.clone(),
+                    request.plan_id.clone(),
+                    request.agent_job_id.to_string(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(jobs.len(), 1, "fixture must produce one job");
+    (run_id, jobs)
+}
+
+/// The declared workflow step ids of a job's latest attempt, in workflow order.
+///
+/// Tests must name their `step-<id>.txt` blobs with these ids and report them
+/// as `external_id`: that is what the official runner does (verified in
+/// `.runner-watch/golden/v2.336.0/06-multi-step`), and the server resolves
+/// `?step=` through this manifest rather than through anything on disk.
+async fn workflow_step_ids(state: &AppState, run_id: RunId, job: &str) -> Vec<String> {
+    let inner = state.inner.lock().await;
+    let agent_job_id = inner
+        .job_requests
+        .values()
+        .filter(|request| request.run_id == run_id && request.job_id.0 == job)
+        .max_by_key(|request| request.request_id)
+        .map(|request| request.agent_job_id)
+        .expect("job must have been dispatched");
+    inner
+        .job_steps
+        .get(&agent_job_id)
+        .map(|records| {
+            crate::models::StepRecord::workflow_steps(records)
+                .into_iter()
+                .map(|step| step.id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 async fn get_logs(app: &axum::Router, uri: String) -> (StatusCode, Vec<u8>) {
     let response = app
         .clone()
@@ -2773,20 +2843,109 @@ async fn log_run_logs_unknown_job_is_404_not_whole_run() {
     );
 }
 
+/// A second dispatch of the same job gets its own manifest.
+///
+/// `build_task_step` mints a fresh `TaskStep` id per build, so a job-scoped
+/// manifest would overwrite the mapping the first attempt's `step-<id>.txt`
+/// blobs are named after, and that attempt's logs would become unreachable.
+/// Keying by `agent_job_id` keeps both attempts resolvable.
+#[tokio::test]
+async fn step_manifests_are_scoped_per_job_attempt() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let first_ids = workflow_step_ids(&state, run_id, "build").await;
+    assert_eq!(first_ids.len(), 1);
+
+    // Simulate a re-dispatch: a new attempt with a new agent job id and new
+    // step ids, exactly as a fresh `build_job_artifacts` would produce.
+    let (second_plan_id, second_agent_job_id, second_step_id) = {
+        let mut inner = state.inner.lock().await;
+        let mut record = inner
+            .job_requests
+            .values()
+            .find(|request| request.run_id == run_id && request.job_id.0 == "build")
+            .cloned()
+            .expect("first attempt must exist");
+        let request_id = inner.job_requests.keys().copied().max().unwrap_or(0) + 1;
+        let agent_job_id = uuid::Uuid::new_v4();
+        record.request_id = request_id;
+        record.agent_job_id = agent_job_id;
+        record.plan_id = uuid::Uuid::new_v4().to_string();
+        let step_id = uuid::Uuid::new_v4().to_string();
+        inner.job_steps.insert(
+            agent_job_id,
+            vec![crate::models::StepRecord::workflow(
+                step_id.clone(),
+                0,
+                "Run echo build".to_owned(),
+                Some("__run".to_owned()),
+            )],
+        );
+        let plan_id = record.plan_id.clone();
+        inner.agent_job_requests.insert(agent_job_id, request_id);
+        inner.job_requests.insert(request_id, record);
+        (plan_id, agent_job_id.to_string(), step_id)
+    };
+
+    // The first attempt keeps its own mapping.
+    assert_eq!(
+        workflow_step_ids(&state, run_id, "build").await,
+        vec![second_step_id.clone()],
+        "the run record follows the newest attempt"
+    );
+    {
+        let inner = state.inner.lock().await;
+        let first_agent_job_id: uuid::Uuid = jobs[0].2.parse().unwrap();
+        let retained = inner
+            .job_steps
+            .get(&first_agent_job_id)
+            .expect("the earlier attempt's manifest must survive the re-dispatch");
+        assert_eq!(retained[0].id, first_ids[0]);
+    }
+
+    // Both attempts' logs resolve, each through its own manifest.
+    write_step_job_logs(
+        &temp,
+        &jobs[0].1,
+        &jobs[0].2,
+        &[(first_ids[0].as_str(), "first attempt\n")],
+    )
+    .await;
+    write_step_job_logs(
+        &temp,
+        &second_plan_id,
+        &second_agent_job_id,
+        &[(second_step_id.as_str(), "second attempt\n")],
+    )
+    .await;
+    let (status, body) =
+        get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=build&step=1")).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("first attempt") && text.contains("second attempt"),
+        "each attempt resolves step 1 through its own manifest: {text}"
+    );
+}
+
 #[tokio::test]
 async fn log_run_logs_step_filter_selects_one_step() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
-    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let (run_id, jobs) = three_step_run_for_log_filters(&app, &state).await;
+    let ids = workflow_step_ids(&state, run_id, "build").await;
+    assert_eq!(ids.len(), 3, "manifest must carry the three declared steps");
     write_step_job_logs(
         &temp,
         &jobs[0].1,
         &jobs[0].2,
         &[
-            ("a", "step one\n"),
-            ("b", "step two\n"),
-            ("c", "step three\n"),
+            (ids[0].as_str(), "step one\n"),
+            (ids[1].as_str(), "step two\n"),
+            (ids[2].as_str(), "step three\n"),
         ],
     )
     .await;
@@ -2808,38 +2967,19 @@ async fn log_run_logs_step_filter_uses_workflow_step_ids() {
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
-    let workflow_step_id = {
-        let mut inner = state.inner.lock().await;
-        let message = inner
-            .queue
-            .iter()
-            .find(|job| job.run_id == run_id && job.job_id.0 == "build")
-            .or_else(|| {
-                inner
-                    .pending_jobs
-                    .iter()
-                    .find(|job| job.run_id == run_id && job.job_id.0 == "build")
-            })
-            .map(|job| job.message.clone())
-            .expect("fixture must carry a queued build job");
-        let step_id = message
-            .steps
-            .first()
-            .map(|step| step.id.to_string())
-            .expect("fixture must carry a broker step id");
-        inner.broker_messages.insert(message.request_id, message);
-        step_id
-    };
+    let ids = workflow_step_ids(&state, run_id, "build").await;
+    let workflow_step_id = ids.first().expect("manifest must carry the declared step");
 
-    // The synthetic file sorts first by upload time, but `step=1` must follow
-    // the workflow metadata and select the user step's external id.
+    // A synthetic runner step ("Set up job") uploads a blob too, and sorts
+    // ahead of the user step by both name and upload time. `step=1` must still
+    // resolve through the manifest and pick the declared step.
     write_step_job_logs(
         &temp,
         &jobs[0].1,
         &jobs[0].2,
         &[
-            ("synthetic-setup", "setup output\n"),
-            (&workflow_step_id, "user step output\n"),
+            ("00000000-0000-0000-0000-000000000000", "setup output\n"),
+            (workflow_step_id.as_str(), "user step output\n"),
         ],
     )
     .await;
@@ -2848,6 +2988,15 @@ async fn log_run_logs_step_filter_uses_workflow_step_ids() {
         get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=build&step=1")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, b"user step output\n");
+
+    // The declared step is the only one `--step` can address; the synthetic
+    // blob never occupies a slot of its own.
+    let (status, _) = get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=build&step=2")).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a synthetic upload must not become step 2"
+    );
 }
 
 #[tokio::test]
@@ -2855,12 +3004,16 @@ async fn log_run_logs_step_out_of_range_is_404() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
-    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let (run_id, jobs) = three_step_run_for_log_filters(&app, &state).await;
+    let ids = workflow_step_ids(&state, run_id, "build").await;
     write_step_job_logs(
         &temp,
         &jobs[0].1,
         &jobs[0].2,
-        &[("a", "step one\n"), ("b", "step two\n")],
+        &[
+            (ids[0].as_str(), "step one\n"),
+            (ids[1].as_str(), "step two\n"),
+        ],
     )
     .await;
 
@@ -2869,8 +3022,8 @@ async fn log_run_logs_step_out_of_range_is_404() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     let message = String::from_utf8_lossy(&body);
     assert!(
-        message.contains('2'),
-        "error should report how many steps exist: {message}"
+        message.contains('3'),
+        "error should report how many declared steps exist: {message}"
     );
 }
 
@@ -12868,6 +13021,12 @@ async fn completion_step_results_are_authoritative_over_inference() {
             .unwrap();
         (request.plan_id.clone(), request.agent_job_id.to_string())
     };
+    // The step update and the completion report describe the same step, so
+    // both carry the manifest's id — that shared identity is what makes
+    // `stepResults` authoritative over the job-status inference.
+    let step_id = workflow_step_ids(&state, run_id.parse().unwrap(), "build")
+        .await
+        .remove(0);
     request_json(
         &app,
         Method::POST,
@@ -12876,7 +13035,7 @@ async fn completion_step_results_are_authoritative_over_inference() {
             "workflow_run_backend_id": plan_id,
             "workflow_job_run_backend_id": agent_job_id,
             "steps": [{
-                "external_id": uuid::Uuid::new_v4().to_string(),
+                "external_id": step_id,
                 "number": 2,
                 "name": "Test",
                 "status": 3,
@@ -12895,7 +13054,7 @@ async fn completion_step_results_are_authoritative_over_inference() {
             "status": "failure",
             "outputs": {},
             "step_results": [{
-                "external_id": uuid::Uuid::new_v4().to_string(),
+                "external_id": step_id,
                 "number": 2,
                 "name": "Test",
                 "status": "completed",
@@ -13009,7 +13168,9 @@ async fn workflow_steps_update_prefers_runner_reported_step_names() {
             "workflow_run_backend_id": plan_id,
             "workflow_job_run_backend_id": agent_job_id,
             "steps": [{
-                "external_id": uuid::Uuid::new_v4().to_string(),
+                "external_id": workflow_step_ids(&state, run_id.parse().unwrap(), "build")
+                    .await
+                    .remove(0),
                 "number": 2,
                 "name": "Run echo hi",
                 "status": 6,
@@ -13060,8 +13221,13 @@ async fn workflow_steps_update_preserves_duplicate_names_after_restart() {
             request.request_id,
         )
     };
-    let first_id = uuid::Uuid::new_v4().to_string();
-    let second_id = uuid::Uuid::new_v4().to_string();
+    // The runner echoes the request message's step ids back as `external_id`
+    // (verified in `.runner-watch/golden/v2.336.0/06-multi-step`), so the two
+    // same-named steps are distinguished by identity, not by their names.
+    let ids = workflow_step_ids(&state, run_id.parse().unwrap(), "build").await;
+    assert_eq!(ids.len(), 2, "both declared steps must be in the manifest");
+    let first_id = ids[0].clone();
+    let second_id = ids[1].clone();
 
     let response = request_json(
         &app,
@@ -13209,6 +13375,12 @@ async fn workflow_steps_update_records_start_on_in_progress_then_finish() {
         (request.plan_id.clone(), request.agent_job_id.to_string())
     };
 
+    // One step, reported twice: a real runner keeps the same `external_id`
+    // across the in-progress and terminal updates, which is what lets the
+    // second report land on the first one's record.
+    let step_id = workflow_step_ids(&state, run_id.parse().unwrap(), "build")
+        .await
+        .remove(0);
     request_json(
         &app,
         Method::POST,
@@ -13217,7 +13389,7 @@ async fn workflow_steps_update_records_start_on_in_progress_then_finish() {
             "workflow_run_backend_id": plan_id,
             "workflow_job_run_backend_id": agent_job_id,
             "steps": [{
-                "external_id": uuid::Uuid::new_v4().to_string(),
+                "external_id": step_id,
                 "number": 2,
                 "name": "Run echo hi",
                 "status": 3,
@@ -13234,7 +13406,7 @@ async fn workflow_steps_update_records_start_on_in_progress_then_finish() {
             "workflow_run_backend_id": plan_id,
             "workflow_job_run_backend_id": agent_job_id,
             "steps": [{
-                "external_id": uuid::Uuid::new_v4().to_string(),
+                "external_id": step_id,
                 "number": 2,
                 "name": "Run echo hi",
                 "status": 6,

@@ -34,14 +34,57 @@ pub(crate) struct DapPortRegistration {
     pub(crate) job_id: JobId,
 }
 
+/// How a step came to exist, which decides whether `--step N` counts it.
+///
+/// `Workflow` records are built from the job request message before the runner
+/// starts, so their order is the workflow's declared order. `Synthetic` records
+/// are runner bookkeeping discovered at execution time ("Set up job", `Pre`/
+/// `Post` action hooks, container lifecycle, "Complete job"): they own real
+/// logs, but must never shift the numbering a user reads off their YAML.
+///
+/// Verified against the official runner
+/// (`.runner-watch/golden/v2.336.0/06-multi-step`): the three declared steps
+/// echo the message ids back unchanged as `external_id`, while "Set up job"
+/// and "Complete job" carry runner-minted ids absent from the message.
+/// Membership in the manifest is therefore the classifier — never the id's
+/// shape, and never the display name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StepKind {
+    /// Declared in the workflow and present in the job request message.
+    Workflow,
+    /// Reported by the runner with no manifest entry. This is the default so a
+    /// run record written before manifests existed answers `--step` with an
+    /// explicit "no workflow manifest" error instead of a guessed blob.
+    #[default]
+    Synthetic,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct StepRecord {
-    /// Runner/timeline identity used to match a durable `step-*.txt` blob.
-    ///
-    /// Old persisted run records may not have this field, so log retrieval
-    /// falls back to the order available from the filesystem when it is absent.
+    /// Stable protocol identity: `TaskStep.id` in the job request message,
+    /// echoed as `external_id` in `WorkflowStepsUpdate`, and the name of the
+    /// durable `step-<id>.txt` blob. Empty only for a record restored from a
+    /// pre-manifest run, which resolution refuses rather than guesses.
+    #[serde(default)]
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) kind: StepKind,
+    /// 0-based position among the job's declared workflow steps. `Some`
+    /// exactly when `kind` is `Workflow`; this is what `--step N` indexes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) id: Option<String>,
+    pub(crate) workflow_index: Option<usize>,
+    /// The runner's own 1-based timeline position, which counts synthetic
+    /// steps too — the golden capture reports declared step 1 as `number: 2`
+    /// because "Set up job" takes 1. Presentation and protocol fidelity only;
+    /// never an input to `--step`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) runner_number: Option<u32>,
+    /// Expression-context key (`compile`, `__run_2`). Unlike `id`, this is
+    /// derived from the YAML and so is stable across runs of the same
+    /// workflow, which is what lets one step be correlated over time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) context_name: Option<String>,
     pub(crate) name: String,
     pub(crate) conclusion: String,
     /// Server-side observation of when the step first appeared (started) and
@@ -53,29 +96,75 @@ pub(crate) struct StepRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) finished_at: Option<chrono::DateTime<chrono::Utc>>,
 }
-impl StepRecord {
-    /// Match a step by stable runner identity, falling back to a unique name.
-    pub(crate) fn find_matching_index(
-        steps: &[Self],
-        id: &str,
-        name: &str,
-        allow_name_fallback: bool,
-    ) -> Option<usize> {
-        if !id.is_empty() {
-            if let Some(index) = steps.iter().position(|step| step.id.as_deref() == Some(id)) {
-                return Some(index);
-            }
-        }
-        if !allow_name_fallback {
-            return None;
-        }
 
-        let mut matches = steps
+impl StepRecord {
+    /// A manifest entry for a declared workflow step, built from the job
+    /// request message before the runner has reported anything.
+    pub(crate) fn workflow(
+        id: String,
+        workflow_index: usize,
+        name: String,
+        context_name: Option<String>,
+    ) -> Self {
+        Self {
+            id,
+            kind: StepKind::Workflow,
+            workflow_index: Some(workflow_index),
+            runner_number: None,
+            context_name,
+            name,
+            conclusion: "pending".to_owned(),
+            started_at: None,
+            finished_at: None,
+        }
+    }
+
+    /// Build one job attempt's manifest from its request message's steps.
+    ///
+    /// The message's `steps` vector *is* the declared workflow order, so the
+    /// index is the order and `TaskStep.id` is the identity. Nothing here
+    /// inspects the filesystem or sorts ids: a v4 UUID sorts randomly, and an
+    /// upload timestamp records when a blob landed, not when a step ran.
+    pub(crate) fn manifest(steps: &[azdo::TaskStep]) -> Vec<Self> {
+        steps
             .iter()
             .enumerate()
-            .filter(|(_, step)| step.name == name);
-        let first = matches.next()?;
-        matches.next().is_none().then_some(first.0)
+            .map(|(index, step)| {
+                Self::workflow(
+                    step.id.to_string(),
+                    index,
+                    step.display_name
+                        .clone()
+                        .or_else(|| step.name.clone())
+                        .unwrap_or_default(),
+                    step.context_name.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// Locate a step by stable identity, and by nothing else.
+    ///
+    /// Display names repeat legitimately — two steps may both be named `Test`
+    /// — so matching on them merged distinct steps and lost one from the run.
+    pub(crate) fn find_by_id(steps: &[Self], id: &str) -> Option<usize> {
+        if id.is_empty() {
+            return None;
+        }
+        steps.iter().position(|step| step.id == id)
+    }
+
+    /// The declared workflow steps, in declared order.
+    ///
+    /// Synthetic steps are excluded, so `Set up job` and `Post <action>` never
+    /// shift what `--step N` selects.
+    pub(crate) fn workflow_steps(steps: &[Self]) -> Vec<&Self> {
+        let mut workflow: Vec<&Self> = steps
+            .iter()
+            .filter(|step| step.kind == StepKind::Workflow)
+            .collect();
+        workflow.sort_by_key(|step| step.workflow_index.unwrap_or(usize::MAX));
+        workflow
     }
 }
 
@@ -92,6 +181,15 @@ pub(crate) struct SnapshotTiming {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct JobDetail {
+    /// Stable workflow job key (`build`, `build (ubuntu-latest)`).
+    ///
+    /// Separate from `name` because the run projection overwrites `name` with
+    /// the evaluated GitHub display name, so `name` cannot identify the job it
+    /// belongs to. Empty only for a detail restored from a run written before
+    /// this field existed.
+    #[serde(default)]
+    pub(crate) job_id: String,
+    /// GitHub display name, as shown in a run's job list.
     pub(crate) name: String,
     pub(crate) conclusion: String,
     pub(crate) steps: Vec<StepRecord>,
@@ -99,6 +197,24 @@ pub(crate) struct JobDetail {
     /// infrastructure failures). Kept as raw wire values.
     #[serde(default)]
     pub(crate) annotations: Vec<serde_json::Value>,
+}
+
+impl JobDetail {
+    /// Locate a job's detail by its stable key.
+    ///
+    /// Falls back to the display name only for details restored without a
+    /// `job_id`; new details always carry one.
+    pub(crate) fn find<'a>(details: &'a mut [Self], job_id: &str) -> Option<&'a mut Self> {
+        let index = details
+            .iter()
+            .position(|detail| detail.job_id == job_id)
+            .or_else(|| {
+                details
+                    .iter()
+                    .position(|detail| detail.job_id.is_empty() && detail.name == job_id)
+            })?;
+        details.get_mut(index)
+    }
 }
 
 /// Metadata tracked per log file for results-service Twirp retrieval.

@@ -1184,6 +1184,14 @@ pub(crate) async fn submit_run_inner(
                 inner
                     .timeline_requests
                     .insert(job_request.timeline_id, pb.request_id);
+                // Seed the attempt's step manifest before the runner can
+                // report anything, so step identity and order come from the
+                // message we just built rather than from whatever order the
+                // runner's log blobs happen to land in.
+                inner.job_steps.insert(
+                    job_request.agent_job_id,
+                    StepRecord::manifest(&agent_msg.steps),
+                );
                 inner.job_requests.insert(pb.request_id, job_request);
                 if let Some(request) = pb.github_token_request {
                     inner.github_token_requests.insert(pb.request_id, request);
@@ -2185,6 +2193,25 @@ pub(crate) fn build_job_artifacts(
     })
 }
 
+/// The step records of a job's most recent attempt.
+///
+/// Attempts are ordered by `request_id`, which is a monotonic allocation, so
+/// the highest one is the newest dispatch. `None` when the job was never
+/// dispatched (skipped or cancelled before a request was built).
+pub(crate) fn latest_attempt_steps(
+    inner: &crate::state::InnerState,
+    run_id: RunId,
+    job_id: &JobId,
+) -> Option<Vec<StepRecord>> {
+    let agent_job_id = inner
+        .job_requests
+        .values()
+        .filter(|request| request.run_id == run_id && request.job_id == *job_id)
+        .max_by_key(|request| request.request_id)
+        .map(|request| request.agent_job_id)?;
+    inner.job_steps.get(&agent_job_id).cloned()
+}
+
 pub(crate) async fn get_run(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
@@ -2210,8 +2237,9 @@ pub(crate) async fn get_run(
         .retain(|job_id, _| !expanded_callers.contains(job_id.0.as_str()));
 
     // Project with GitHub display names (evaluated `name:`, `caller / callee`
-    // separator). Results/timeline updates only create details for dispatched
-    // jobs; jobs skipped or cancelled before dispatch get an empty step list.
+    // separator), and hydrate each job's steps from its latest attempt's
+    // manifest. A job skipped or cancelled before dispatch never got a
+    // request message, so it has no manifest and shows an empty step list.
     let existing = std::mem::take(&mut run.jobs_list);
     run.jobs_list = run
         .jobs
@@ -2224,17 +2252,29 @@ pub(crate) async fn get_run(
                 .unwrap_or_else(|| job_id.0.clone());
             let mut detail = existing
                 .iter()
-                .find(|detail| detail.name == job_id.0 || detail.name == name)
+                .find(|detail| {
+                    detail.job_id == job_id.0
+                        || (detail.job_id.is_empty()
+                            && (detail.name == job_id.0 || detail.name == name))
+                })
                 .cloned()
                 .unwrap_or(JobDetail {
+                    job_id: job_id.0.clone(),
                     name: name.clone(),
                     conclusion: status_string(*status),
                     steps: Vec::new(),
                     annotations: Vec::new(),
                 });
+            detail.job_id = job_id.0.clone();
             detail.name = name;
             if let Some(stored) = run.jobs.get(job_id) {
                 detail.conclusion = status_string(*stored);
+            }
+            // Steps live in the attempt-scoped manifest, so the run record
+            // shows the newest attempt: a retry supersedes what the previous
+            // dispatch reported.
+            if let Some(manifest) = latest_attempt_steps(&inner, run_id, job_id) {
+                detail.steps = manifest;
             }
             detail
         })
@@ -2376,10 +2416,11 @@ pub(crate) struct RunLogsQuery {
 
 /// Files uploaded for one job's individual steps.
 ///
-/// `all` preserves upload order for an unfiltered request. `workflow` maps the
-/// user-visible workflow-step order to those files; an entry is `None` when a
-/// step produced no log blob. Keeping both views matters because synthetic
-/// setup/cleanup records can be uploaded alongside user steps.
+/// `all` is every uploaded step blob, for an unfiltered whole-job read.
+/// `workflow` is the manifest's declared steps in workflow order, each mapped
+/// to its blob (`None` when that step produced no log). Synthetic runner steps
+/// appear in `all` but never in `workflow`, which is what keeps "Set up job"
+/// and `Post <action>` out of `--step` numbering.
 struct StepLogs {
     all: Vec<std::path::PathBuf>,
     workflow: Option<Vec<Option<std::path::PathBuf>>>,
@@ -2407,6 +2448,12 @@ enum JobLogs {
 /// authoritative whole-job representation. A step-filtered request prefers
 /// individual step blobs when both are present; the merged upload has no
 /// recoverable boundaries and is only used to produce the explicit 409.
+///
+/// `workflow_step_ids` is the attempt's declared-step order, taken from the
+/// manifest built out of the job request message. There is deliberately no
+/// filesystem fallback: modification time records when a blob landed, not when
+/// a step ran, so ordering by it returned the wrong step for out-of-order or
+/// same-timestamp uploads.
 async fn resolve_job_logs(
     results_dir: &std::path::Path,
     fallback_blocks: Vec<Vec<u8>>,
@@ -2429,7 +2476,7 @@ async fn resolve_job_logs(
         }
     }
 
-    let mut step_files = Vec::new();
+    let mut step_files: Vec<(String, std::path::PathBuf)> = Vec::new();
     match tokio::fs::read_dir(results_dir).await {
         Ok(mut entries) => {
             while let Some(entry) = entries.next_entry().await.map_err(|error| {
@@ -2440,9 +2487,13 @@ async fn resolve_job_logs(
             })? {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if !name.starts_with("step-") || !name.ends_with(".txt") {
+                let Some(step_id) = name
+                    .strip_prefix("step-")
+                    .and_then(|name| name.strip_suffix(".txt"))
+                else {
                     continue;
-                }
+                };
+                let step_id = step_id.to_owned();
                 let metadata = entry.metadata().await.map_err(|error| {
                     ApiError::internal(format!(
                         "failed to inspect result log `{}`: {error}",
@@ -2452,13 +2503,7 @@ async fn resolve_job_logs(
                 if !metadata.is_file() {
                     continue;
                 }
-                let step_id = name
-                    .strip_prefix("step-")
-                    .and_then(|name| name.strip_suffix(".txt"))
-                    .unwrap_or_default()
-                    .to_owned();
-                let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
-                step_files.push((modified, name.into_owned(), step_id, entry.path()));
+                step_files.push((step_id, entry.path()));
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -2469,7 +2514,9 @@ async fn resolve_job_logs(
             )));
         }
     }
-    step_files.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    // Only for the unfiltered read, where this is a concatenation order and
+    // not a step selector. `--step` goes through `workflow` below.
+    step_files.sort_by(|left, right| left.0.cmp(&right.0));
 
     if !step_files.is_empty() {
         let workflow = workflow_step_ids.filter(|ids| !ids.is_empty()).map(|ids| {
@@ -2477,13 +2524,13 @@ async fn resolve_job_logs(
                 .map(|id| {
                     step_files
                         .iter()
-                        .find(|(_, _, file_id, _)| file_id == id)
-                        .map(|(_, _, _, path)| path.clone())
+                        .find(|(file_id, _)| file_id == id)
+                        .map(|(_, path)| path.clone())
                 })
                 .collect()
         });
         return Ok(JobLogs::Steps(StepLogs {
-            all: step_files.into_iter().map(|(_, _, _, path)| path).collect(),
+            all: step_files.into_iter().map(|(_, path)| path).collect(),
             workflow,
         }));
     }
@@ -2541,16 +2588,19 @@ async fn append_step(
              boundaries; re-request without `step` for the whole job log"
         ))),
         JobLogs::Steps(step_logs) => {
-            let (total, path) = match step_logs.workflow {
-                Some(workflow) => {
-                    let total = workflow.len();
-                    (total, workflow.get(index).cloned().flatten())
-                }
-                None => {
-                    let total = step_logs.all.len();
-                    (total, step_logs.all.get(index).cloned())
-                }
+            // No manifest means no declared-step order to index. The uploads
+            // on disk are not a substitute: they include synthetic runner
+            // steps and arrive in upload order, so indexing them returned a
+            // neighbouring step's log under the requested step's name.
+            let Some(workflow) = step_logs.workflow else {
+                return Err(ApiError::conflict(format!(
+                    "job `{job_label}` has no recorded workflow-step order, so step \
+                     {step} cannot be identified; re-request without `step` for the \
+                     whole job log"
+                )));
             };
+            let total = workflow.len();
+            let path = workflow.get(index).cloned().flatten();
             let Some(path) = path else {
                 if index < total {
                     // A valid workflow step is allowed to have no log blob.
@@ -2645,32 +2695,22 @@ pub(crate) async fn get_run_logs(
                         (Err(_), Err(_)) => left.cmp(right),
                     }
                 });
+                // The attempt's own manifest, keyed by the agent job id that
+                // also names this request's results directory. Declared steps
+                // only: a synthetic "Set up job" record must not occupy a
+                // `--step` slot. The broker message is deliberately not
+                // consulted — it is broker delivery state that a restart or a
+                // retirement can drop, while the manifest is run state.
                 let workflow_step_ids = inner
-                    .broker_messages
-                    .get(&request.request_id)
-                    .map(|message| {
-                        message
-                            .steps
-                            .iter()
-                            .map(|step| step.id.to_string())
+                    .job_steps
+                    .get(&request.agent_job_id)
+                    .map(|records| {
+                        StepRecord::workflow_steps(records)
+                            .into_iter()
+                            .map(|step| step.id.clone())
                             .collect::<Vec<_>>()
                     })
-                    .filter(|ids| !ids.is_empty())
-                    .or_else(|| {
-                        inner.runs.get(&run_id).and_then(|run| {
-                            run.jobs_list
-                                .iter()
-                                .find(|detail| detail.name == request.job_id.0)
-                                .map(|detail| {
-                                    detail
-                                        .steps
-                                        .iter()
-                                        .filter_map(|step| step.id.clone())
-                                        .collect::<Vec<_>>()
-                                })
-                                .filter(|ids| !ids.is_empty())
-                        })
-                    });
+                    .filter(|ids| !ids.is_empty());
                 (
                     request.plan_id.clone(),
                     request.agent_job_id.to_string(),

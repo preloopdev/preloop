@@ -1413,6 +1413,16 @@ pub(crate) struct InnerState {
     pub(crate) live_log_closed: std::collections::BTreeSet<String>,
     pub(crate) inflight_requests: BTreeMap<i64, (RunId, JobId)>,
     pub(crate) job_requests: BTreeMap<i64, TaskAgentJobRequestRecord>,
+    /// Step records per job attempt, keyed by `agent_job_id`.
+    ///
+    /// Authoritative for both the run record's step projection and `--step`
+    /// log selection. Keyed by attempt, not by job: a re-dispatch mints fresh
+    /// `TaskStep` ids, so a job-scoped map would overwrite the mapping the
+    /// previous attempt's `step-<id>.txt` blobs are still named after.
+    ///
+    /// Seeded from the job request message at dispatch (every declared step,
+    /// in workflow order); runner reports only reconcile into it.
+    pub(crate) job_steps: BTreeMap<uuid::Uuid, Vec<crate::models::StepRecord>>,
     pub(crate) plan_requests: BTreeMap<String, i64>,
     pub(crate) agent_job_requests: BTreeMap<uuid::Uuid, i64>,
     pub(crate) timeline_requests: BTreeMap<uuid::Uuid, i64>,
