@@ -354,6 +354,8 @@ for p in details_dir.glob("*.json"):
 def is_high_or_critical(db_sev, cvss_scores):
     if db_sev in ("HIGH", "CRITICAL"):
         return True
+    if db_sev in ("LOW", "MODERATE"):
+        return False
     # When database_specific.severity is absent, inspect OSV severity[] array
     for score_str in cvss_scores:
         if not score_str:
