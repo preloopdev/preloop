@@ -85,6 +85,7 @@ fn range_retry_clears_state_and_annotations_for_every_replayed_step() {
             index,
             context_name: format!("step_{index}"),
             display_name: format!("Step {index}"),
+            is_internal: false,
         })
         .collect::<Vec<_>>();
     for summary in &summaries {
