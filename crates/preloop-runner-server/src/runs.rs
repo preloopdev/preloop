@@ -1189,11 +1189,11 @@ pub(crate) async fn submit_run_inner(
                 // message we just built rather than from whatever order the
                 // runner's log blobs happen to land in.
                 //
-                // Not persisted here. The first runner report for this attempt
-                // writes the whole manifest through `store_job_steps`, so the
-                // only attempt without durable rows is one that was dispatched
-                // and never reported — which has no logs to select either, and
-                // whose `--step` correctly answers 409 after a restart.
+                // Not persisted here. Only a runner report writes rows, and an
+                // attempt that was dispatched but never reported has its
+                // manifest rebuilt at startup from the persisted request
+                // message — the same source it was built from — so a restart
+                // in that window keeps its declared steps.
                 inner.job_steps.insert(
                     job_request.agent_job_id,
                     StepRecord::manifest(&agent_msg.steps),

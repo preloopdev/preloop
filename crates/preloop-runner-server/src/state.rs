@@ -764,6 +764,43 @@ impl AppState {
         let store = crate::store::open_store(store_url, &state_dir, &local_jwt_key).await?;
         let mut recovered = inner;
         store.load_into(&mut recovered).await?;
+        // An attempt dispatched but not yet reported has no persisted step
+        // rows: seeding happens in memory, and only a runner report writes
+        // them. The request message it was built from *is* persisted, so
+        // rebuild from that rather than leaving the run with no declared steps
+        // and `--step` answering 409 for logs that are on disk.
+        //
+        // Two homes, depending on how far the job got: `broker_messages` once
+        // a runner claimed it, and the queue row's own copy before that.
+        let rebuilt: Vec<(uuid::Uuid, Vec<crate::models::StepRecord>)> = recovered
+            .job_requests
+            .values()
+            .filter(|record| !recovered.job_steps.contains_key(&record.agent_job_id))
+            .filter_map(|record| {
+                let steps = recovered
+                    .broker_messages
+                    .get(&record.request_id)
+                    .map(|message| message.steps.as_slice())
+                    .or_else(|| {
+                        recovered
+                            .queue
+                            .iter()
+                            .chain(recovered.pending_jobs.iter())
+                            .chain(recovered.concurrency_blocked.iter())
+                            .find(|job| job.run_id == record.run_id && job.job_id == record.job_id)
+                            .map(|job| job.message.steps.as_slice())
+                    })?;
+                let manifest = crate::models::StepRecord::manifest(steps);
+                (!manifest.is_empty()).then_some((record.agent_job_id, manifest))
+            })
+            .collect();
+        if !rebuilt.is_empty() {
+            tracing::info!(
+                attempts = rebuilt.len(),
+                "rebuilt step manifests from persisted job request messages"
+            );
+        }
+        recovered.job_steps.extend(rebuilt);
         let next_request_id = recovered
             .job_requests
             .keys()

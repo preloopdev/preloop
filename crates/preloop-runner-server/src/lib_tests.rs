@@ -2843,6 +2843,49 @@ async fn log_run_logs_unknown_job_is_404_not_whole_run() {
     );
 }
 
+/// A restart before the first step report keeps the declared steps.
+///
+/// Only a runner report writes step rows, so an attempt dispatched and then
+/// interrupted has none. Its request message is persisted, and that message is
+/// what the manifest was built from, so startup rebuilds it — otherwise the
+/// run loses its declared steps and `--step` answers 409 for blobs that are
+/// sitting on disk.
+#[tokio::test]
+async fn dispatched_but_unreported_manifests_are_rebuilt_on_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let (run_id, plan_id, agent_job_id, ids) = {
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+        let (run_id, jobs) = three_step_run_for_log_filters(&app, &state).await;
+        let ids = workflow_step_ids(&state, run_id, "build").await;
+        // Deliberately no forced snapshot: `store_inner` writes step rows,
+        // which would persist the manifest and make the rebuild moot. The real
+        // window is a submission persisted only by its run events, which carry
+        // the run, the requests and the broker message but never steps.
+        (run_id, jobs[0].1.clone(), jobs[0].2.clone(), ids)
+    };
+
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    assert_eq!(
+        workflow_step_ids(&state, run_id, "build").await,
+        ids,
+        "declared steps must be rebuilt from the persisted request message"
+    );
+
+    write_step_job_logs(
+        &temp,
+        &plan_id,
+        &agent_job_id,
+        &[(ids[2].as_str(), "third step\n")],
+    )
+    .await;
+    let (status, body) =
+        get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=build&step=3")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"third step\n", "`--step` must resolve after restart");
+}
+
 /// The AzDO timeline path orders synthetic steps and ignores the job record.
 ///
 /// `TimelineRecord` carries no ordinal, so a synthetic step reported this way
