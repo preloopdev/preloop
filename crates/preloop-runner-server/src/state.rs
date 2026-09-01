@@ -243,6 +243,19 @@ pub struct SharedState {
     pub shutdown: CancellationToken,
 }
 
+#[cfg(test)]
+impl AppState {
+    /// Wrap this state in a `SharedState` for tests that call handlers taking
+    /// `&Arc<SharedState>` directly. Each call makes a fresh token; tests that
+    /// need shutdown coordination build the struct explicitly.
+    pub(crate) fn shared(&self) -> std::sync::Arc<SharedState> {
+        std::sync::Arc::new(SharedState {
+            state: self.clone(),
+            shutdown: CancellationToken::new(),
+        })
+    }
+}
+
 /// Who may register a runner with the control plane.
 ///
 /// `Strict` is the default and the only safe choice for a deployment reachable
@@ -1384,6 +1397,11 @@ pub(crate) struct InnerState {
     pub(crate) timeline_records: BTreeMap<String, BTreeMap<uuid::Uuid, azdo::TimelineRecord>>,
     pub(crate) live_log_lines: BTreeMap<String, Arc<tokio::sync::Mutex<LiveLogBuffer>>>,
     pub(crate) live_log_tx: BTreeMap<String, broadcast::Sender<LiveLogFeedLinesWrapper>>,
+    /// Live-log keys whose job has reached a terminal state. A follower that
+    /// connects at or after completion serves the retained snapshot and then
+    /// ends, instead of subscribing to a channel that will never speak again.
+    /// Cleared if the same key ingests fresh lines (a retry reusing the job).
+    pub(crate) live_log_closed: std::collections::BTreeSet<String>,
     pub(crate) inflight_requests: BTreeMap<i64, (RunId, JobId)>,
     pub(crate) job_requests: BTreeMap<i64, TaskAgentJobRequestRecord>,
     pub(crate) plan_requests: BTreeMap<String, i64>,

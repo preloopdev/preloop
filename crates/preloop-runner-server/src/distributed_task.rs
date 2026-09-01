@@ -710,6 +710,15 @@ pub(crate) async fn complete_job_inner(
             newly_terminal_success = run.status == ExecutionStatus::Success;
         }
     }
+    // Close only after the run and job were validated and the completion was
+    // projected. Invalid callbacks must not terminate another job's feed.
+    let live_log_key = inner
+        .job_requests
+        .values()
+        .find(|record| record.run_id == completion.run_id && record.job_id == completion.job_id)
+        .map(|record| record.agent_job_id.to_string())
+        .unwrap_or_else(|| completion.job_id.0.clone());
+    crate::live_logs::close_live_log(&mut inner, &live_log_key);
     // Use the status actually stored (may differ from completion if terminal-locked).
     let effective_status = inner
         .runs
@@ -782,17 +791,6 @@ pub(crate) async fn complete_job_inner(
         // terminal without reaching either site; the record leaks but is
         // unreachable — the job is out of every dispatchable collection.
         inner.github_token_requests.remove(request_id);
-    }
-    // Evict live-log state for this job to prevent unbounded memory growth.
-    // The durable step-log blob has already been uploaded by the runner.
-    if let Some(agent_key) = inner
-        .job_requests
-        .values()
-        .find(|r| r.run_id == completion.run_id && r.job_id == completion.job_id)
-        .map(|r| r.agent_job_id.to_string())
-    {
-        inner.live_log_lines.remove(&agent_key);
-        inner.live_log_tx.remove(&agent_key);
     }
     inner.dap_ports.remove(&completion.run_id);
     let queue_nonempty = !inner.queue.is_empty() || !inner.cancellation_queue.is_empty();

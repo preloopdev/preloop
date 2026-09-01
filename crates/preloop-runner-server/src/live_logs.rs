@@ -61,6 +61,12 @@ impl LiveLogBuffer {
         self.compact_if_wasteful();
         true
     }
+    /// Discard a completed attempt's retained tail before a retry reuses the
+    /// same agent-job key, without changing the configured byte budget.
+    pub(crate) fn clear(&mut self) {
+        self.lines.clear();
+        self.bytes = 0;
+    }
 
     /// Reclaim `VecDeque` backing-buffer slack after evictions. `pop_front`
     /// never shrinks the allocation, so a batch of evictions can leave
@@ -104,29 +110,109 @@ pub(crate) async fn live_logs_sse(
     State(shared): State<Arc<SharedState>>,
     Path((run_id, job_id)): Path<(RunId, String)>,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
-    // Grab per-job handles under the global lock, then drop it immediately.
-    let (job_lines, rx) = {
+    live_log_stream(&shared, run_id, &job_id).await
+}
+
+/// Job selector for the native live-log route.
+///
+/// Mirrors `RunLogsQuery::job` so `--job` means the same thing whether the
+/// caller is reading a finished log or following a running one.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct LiveLogsQuery {
+    #[serde(default)]
+    job: Option<String>,
+}
+
+/// Native-bearer live console feed for one job of a run.
+///
+/// The runner-protocol route above is reachable only with a runner or job
+/// token, which the CLI does not hold. This exposes the same feed to the
+/// native API principal — no new information, since that principal can already
+/// read the whole log through `GET /api/v1/runs/:run_id/logs`.
+///
+/// `job` may be omitted when the run has exactly one job; with more, the
+/// candidates are named rather than one being chosen arbitrarily.
+pub(crate) async fn live_run_logs_sse(
+    State(shared): State<Arc<SharedState>>,
+    Path(run_id): Path<RunId>,
+    Query(query): Query<LiveLogsQuery>,
+) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
+    let job_id = match query.job {
+        Some(job) => job,
+        None => {
+            let inner = shared.state.inner.lock().await;
+            let run = inner
+                .runs
+                .get(&run_id)
+                .ok_or_else(|| ApiError::not_found("run not found"))?;
+            let mut jobs: Vec<String> = run.jobs.keys().map(|job_id| job_id.0.clone()).collect();
+            jobs.extend(
+                inner
+                    .job_requests
+                    .values()
+                    .filter(|request| request.run_id == run_id)
+                    .map(|request| request.job_id.0.clone()),
+            );
+            jobs.sort_unstable();
+            jobs.dedup();
+            match jobs.len() {
+                0 => return Err(ApiError::not_found("run has no jobs to follow")),
+                1 => jobs.pop().expect("one job was counted"),
+                _ => {
+                    return Err(ApiError::bad_request(format!(
+                        "`job` needs a value when a run has {} jobs: {}",
+                        jobs.len(),
+                        jobs.join(", ")
+                    )));
+                }
+            }
+        }
+    };
+    live_log_stream(&shared, run_id, &job_id).await
+}
+
+/// Replay the retained per-job buffer, then follow the live broadcast.
+///
+/// Snapshotting and subscribing happen while the global lock and the
+/// per-job lock are both held. Ingestion takes the same locks in that order,
+/// so a wrapper is observed either in the snapshot or in the receiver, never
+/// both.
+async fn live_log_stream(
+    shared: &Arc<SharedState>,
+    run_id: RunId,
+    job_id: &str,
+) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
+    let (snapshot, subscription) = {
         let mut inner = shared.state.inner.lock().await;
-        let key = live_log_key_for_job(&inner, run_id, &job_id)
+        let key = live_log_key_for_job(&inner, run_id, job_id)
             .ok_or_else(|| ApiError::not_found("job not found"))?;
         let lines_arc = inner.live_log_lines.entry(key.clone()).or_default().clone();
-        let tx = live_log_sender(&mut inner, &key);
-        (lines_arc, tx.subscribe())
+        let lines = lines_arc.lock().await;
+        let snapshot = lines.clone();
+        let subscription = if live_log_is_closed(&inner, run_id, job_id, &key) {
+            None
+        } else {
+            Some(live_log_sender(&mut inner, &key).subscribe())
+        };
+        // Keep the guard alive through subscription creation; this explicit
+        // binding makes the lock ordering above visible to future edits.
+        drop(lines);
+        (snapshot, subscription)
     };
-    // Snapshot under per-job lock only — does not block global state.
-    let snapshot = job_lines.lock().await.clone();
 
     let snapshot_stream = stream::iter(
         snapshot
             .into_iter()
             .map(|wrapper| Ok(live_log_sse_event(&wrapper))),
     );
-    let live_stream = stream::unfold(rx, |mut rx| async move {
+    let live_stream = stream::unfold(subscription, |subscription| async move {
+        // A closed job has no subscription: the snapshot is the whole stream.
+        let mut rx = subscription?;
         loop {
             match rx.recv().await {
                 Ok(wrapper) => {
                     let event = live_log_sse_event(&wrapper);
-                    return Some((Ok(event), rx));
+                    return Some((Ok(event), Some(rx)));
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => return None,
@@ -147,16 +233,37 @@ pub(crate) fn live_log_key_for_job(
     run_id: RunId,
     job_id: &str,
 ) -> Option<String> {
-    inner.runs.get(&run_id)?;
-    inner
-        .job_requests
-        .values()
-        .find(|record| {
-            record.run_id == run_id
-                && (record.job_id.0 == job_id || record.agent_job_id.to_string() == job_id)
-        })
-        .map(|record| record.agent_job_id.to_string())
-        .or_else(|| Some(job_id.to_string()).filter(|key| inner.live_log_lines.contains_key(key)))
+    let run = inner.runs.get(&run_id)?;
+    if let Some(record) = inner.job_requests.values().find(|record| {
+        record.run_id == run_id
+            && (record.job_id.0 == job_id || record.agent_job_id.to_string() == job_id)
+    }) {
+        return Some(record.agent_job_id.to_string());
+    }
+    // A logical job key is valid without a request only when it belongs to
+    // this run. Never accept an arbitrary globally present live-log key:
+    // UUIDs are only scoped by their job request and otherwise could leak a
+    // different run's output.
+    run.jobs
+        .contains_key(&JobId(job_id.to_owned()))
+        .then(|| job_id.to_owned())
+}
+
+/// Whether a live stream for this run/job must end after its snapshot.
+fn live_log_is_closed(inner: &InnerState, run_id: RunId, job_id: &str, key: &str) -> bool {
+    if inner.live_log_closed.contains(key) {
+        return true;
+    }
+    let run_terminal = inner
+        .runs
+        .get(&run_id)
+        .is_some_and(|run| run.status.is_terminal());
+    let logical_job_terminal = inner
+        .runs
+        .get(&run_id)
+        .and_then(|run| run.jobs.get(&JobId(job_id.to_owned())))
+        .is_some_and(|status| status.is_terminal());
+    run_terminal || logical_job_terminal
 }
 
 pub(crate) fn live_log_sender(
@@ -171,6 +278,21 @@ pub(crate) fn live_log_sender(
             tx
         })
         .clone()
+}
+
+/// Mark a job's live-log feed complete and drop its broadcast sender.
+///
+/// Dropping the last sender makes every current follower's `recv()` return
+/// `Closed`, so their streams end and `preloop logs -f` exits — no status
+/// polling. The `live_log_closed` mark is what handles a follower that arrives
+/// *after* completion: `live_log_stream` serves the retained snapshot and does
+/// not resubscribe, instead of `live_log_sender` lazily minting a fresh
+/// channel that would never speak again.
+///
+/// Idempotent, and safe to call for a job that never streamed a line.
+pub(crate) fn close_live_log(inner: &mut InnerState, key: &str) {
+    inner.live_log_closed.insert(key.to_string());
+    inner.live_log_tx.remove(key);
 }
 
 pub(crate) async fn ws_live_logs(
@@ -220,35 +342,57 @@ pub(crate) async fn handle_live_log_socket(
         }
     }
 }
-
+/// Record one live-log wrapper under a canonical run/job key.
+///
+/// The global and per-job locks are acquired in that order and held through
+/// the retained-buffer push and broadcast. `live_log_stream` uses the same
+/// ordering for its snapshot/subscription pair, which makes the handoff
+/// atomic from a follower's perspective.
 pub(crate) async fn record_live_log_wrapper(
     shared: &Arc<SharedState>,
     job_id: &str,
     wrapper: LiveLogFeedLinesWrapper,
 ) {
-    // Grab per-job Arc and broadcast sender under the global lock, then release it.
-    let (job_lines, tx) = {
-        let mut inner = shared.state.inner.lock().await;
-        let lines_arc = inner
-            .live_log_lines
-            .entry(job_id.to_string())
-            .or_default()
-            .clone();
-        let tx = live_log_sender(&mut inner, job_id);
-        (lines_arc, tx)
-    };
-    // Hold the per-job lock across both the buffer push and the broadcast send
-    // so concurrent ingestion cannot reorder live fan-out relative to the
+    let mut inner = shared.state.inner.lock().await;
+    // Fresh lines for a key we had marked complete mean the job is producing
+    // again (a retry reusing the same agent job). Reopen it and replace the
+    // prior attempt's retained tail before broadcasting.
+    let reopened = inner.live_log_closed.remove(job_id);
+    let lines_arc = inner
+        .live_log_lines
+        .entry(job_id.to_string())
+        .or_default()
+        .clone();
+    let tx = live_log_sender(&mut inner, job_id);
+    let mut lines = lines_arc.lock().await;
+    if reopened {
+        lines.clear();
+    }
+    // Hold the per-job lock across both the buffer push and the broadcast so
+    // concurrent ingestion cannot reorder live fan-out relative to the
     // retained tail. Reject oversized batches before cloning, then drop them
     // from both the retained buffer and the live fan-out so one pathological
     // frame cannot evict the tail or amplify across subscribers.
-    let mut lines = job_lines.lock().await;
     if lines.fits(&wrapper) {
         lines.push(wrapper.clone());
         let _ = tx.send(wrapper);
     } else {
         warn!(%job_id, "dropping live log batch exceeding per-job buffer cap");
     }
+}
+
+/// Resolve a logical job key to its run-scoped live-log key before recording.
+pub(crate) async fn record_live_log_wrapper_for_run(
+    shared: &Arc<SharedState>,
+    run_id: RunId,
+    job_id: &str,
+    wrapper: LiveLogFeedLinesWrapper,
+) {
+    let key = {
+        let inner = shared.state.inner.lock().await;
+        live_log_key_for_job(&inner, run_id, job_id).unwrap_or_else(|| job_id.to_owned())
+    };
+    record_live_log_wrapper(shared, &key, wrapper).await;
 }
 
 #[cfg(test)]

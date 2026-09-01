@@ -36,6 +36,12 @@ pub(crate) struct DapPortRegistration {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct StepRecord {
+    /// Runner/timeline identity used to match a durable `step-*.txt` blob.
+    ///
+    /// Old persisted run records may not have this field, so log retrieval
+    /// falls back to the order available from the filesystem when it is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) id: Option<String>,
     pub(crate) name: String,
     pub(crate) conclusion: String,
     /// Server-side observation of when the step first appeared (started) and
@@ -46,6 +52,31 @@ pub(crate) struct StepRecord {
     pub(crate) started_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) finished_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+impl StepRecord {
+    /// Match a step by stable runner identity, falling back to a unique name.
+    pub(crate) fn find_matching_index(
+        steps: &[Self],
+        id: &str,
+        name: &str,
+        allow_name_fallback: bool,
+    ) -> Option<usize> {
+        if !id.is_empty() {
+            if let Some(index) = steps.iter().position(|step| step.id.as_deref() == Some(id)) {
+                return Some(index);
+            }
+        }
+        if !allow_name_fallback {
+            return None;
+        }
+
+        let mut matches = steps
+            .iter()
+            .enumerate()
+            .filter(|(_, step)| step.name == name);
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first.0)
+    }
 }
 
 /// Server-side timing for the workspace snapshot created at submission.

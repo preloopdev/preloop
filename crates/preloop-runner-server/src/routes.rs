@@ -455,6 +455,13 @@ pub(crate) fn build_app(
             )),
         )
         .route(
+            "/api/v1/runs/:run_id/logs/live",
+            get(crate::live_logs::live_run_logs_sse).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
+        .route(
             "/api/v1/runs/:run_id/cancel",
             post(cancel_run).route_layer(middleware::from_fn_with_state(
                 shared.clone(),

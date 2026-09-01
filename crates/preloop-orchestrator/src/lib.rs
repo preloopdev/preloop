@@ -5134,7 +5134,7 @@ while [ "$#" -gt 0 ]; do
     *) url="$1"; shift;;
   esac
 done
-case "$url" in *SHASUMS256.txt*) printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  node-v20.19.0-linux-arm64.tar.gz\n371fc060d5dd4de565586c3cc70034956db67a8f3dae0f0e5724fa56147c472a  node-v24.3.0-linux-arm64.tar.gz\n8a4dbcdd8bccef3132d21e8543940557e55dcf44f00f0a99ba8a062f4552e722  node-v20.19.0-linux-x64.tar.gz\nbbeb5fb8113b44fc30f5a5887dbc0ab66af8e56139f5f9fbe7c7a1aa056246dc  node-v24.3.0-linux-x64.tar.gz\n" > "$out"; exit 0;; esac
+case "$url" in *SHASUMS256.txt*) printf "47ef73d543ecf6eb19435f6c03a0ac4809b3bf0dd6b26c7c571efc2a6572a74d  node-v20.20.2-linux-arm64.tar.gz\nd28c8a5bf0a808f0ed434a1dce8c54ae98f0371c0bd86ac58abc613f73e6643f  node-v24.19.0-linux-arm64.tar.gz\n19e56f0825510207dd904f087fe52faa0a4eb6b2aab5f0ea7a33830d04888b8b  node-v20.20.2-linux-x64.tar.gz\nf625d97cd707df4ff96254916fbc5ff014f09c09effe5a1e0ca8f6d41a8789d4  node-v24.19.0-linux-x64.tar.gz\n" > "$out"; exit 0;; esac
 printf archive > "$out"
 "#,
         )
@@ -5151,13 +5151,13 @@ case "$*" in
     if [ "$arch" = "x86_64" ]; then
       printf "bbeb5fb8113b44fc30f5a5887dbc0ab66af8e56139f5f9fbe7c7a1aa056246dc  dummy\n"
     else
-      printf "371fc060d5dd4de565586c3cc70034956db67a8f3dae0f0e5724fa56147c472a  dummy\n"
+      printf "d28c8a5bf0a808f0ed434a1dce8c54ae98f0371c0bd86ac58abc613f73e6643f  dummy\n"
     fi;;
   *)
     if [ "$arch" = "x86_64" ]; then
-      printf "8a4dbcdd8bccef3132d21e8543940557e55dcf44f00f0a99ba8a062f4552e722  dummy\n"
+      printf "19e56f0825510207dd904f087fe52faa0a4eb6b2aab5f0ea7a33830d04888b8b  dummy\n"
     else
-      printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  dummy\n"
+      printf "47ef73d543ecf6eb19435f6c03a0ac4809b3bf0dd6b26c7c571efc2a6572a74d  dummy\n"
     fi;;
 esac
 "#,
@@ -5175,13 +5175,13 @@ case "$*" in
     if [ "$arch" = "x86_64" ]; then
       printf "bbeb5fb8113b44fc30f5a5887dbc0ab66af8e56139f5f9fbe7c7a1aa056246dc  dummy\n"
     else
-      printf "371fc060d5dd4de565586c3cc70034956db67a8f3dae0f0e5724fa56147c472a  dummy\n"
+      printf "d28c8a5bf0a808f0ed434a1dce8c54ae98f0371c0bd86ac58abc613f73e6643f  dummy\n"
     fi;;
   *)
     if [ "$arch" = "x86_64" ]; then
-      printf "8a4dbcdd8bccef3132d21e8543940557e55dcf44f00f0a99ba8a062f4552e722  dummy\n"
+      printf "19e56f0825510207dd904f087fe52faa0a4eb6b2aab5f0ea7a33830d04888b8b  dummy\n"
     else
-      printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  dummy\n"
+      printf "47ef73d543ecf6eb19435f6c03a0ac4809b3bf0dd6b26c7c571efc2a6572a74d  dummy\n"
     fi;;
 esac
 "#,
@@ -5241,13 +5241,13 @@ chmod +x "$dest/bin/node"
                 if cfg!(target_arch = "x86_64") {
                     "8a4dbcdd"
                 } else {
-                    "618e4294"
+                    "47ef73d5"
                 }
             } else {
                 if cfg!(target_arch = "x86_64") {
                     "bbeb5fb8"
                 } else {
-                    "371fc060"
+                    "d28c8a5b"
                 }
             };
             assert!(manifest.contains(expected_sha), "{manifest}");
@@ -5278,7 +5278,7 @@ while [ "$#" -gt 0 ]; do
     *) url="$1"; shift;;
   esac
 done
-case "$url" in *SHASUMS256.txt*) printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  node-v20.19.0-linux-arm64.tar.gz\n371fc060d5dd4de565586c3cc70034956db67a8f3dae0f0e5724fa56147c472a  node-v24.3.0-linux-arm64.tar.gz\n8a4dbcdd8bccef3132d21e8543940557e55dcf44f00f0a99ba8a062f4552e722  node-v20.19.0-linux-x64.tar.gz\nbbeb5fb8113b44fc30f5a5887dbc0ab66af8e56139f5f9fbe7c7a1aa056246dc  node-v24.3.0-linux-x64.tar.gz\n" > "$out"; exit 0;; esac
+case "$url" in *SHASUMS256.txt*) printf "47ef73d543ecf6eb19435f6c03a0ac4809b3bf0dd6b26c7c571efc2a6572a74d  node-v20.20.2-linux-arm64.tar.gz\nd28c8a5bf0a808f0ed434a1dce8c54ae98f0371c0bd86ac58abc613f73e6643f  node-v24.19.0-linux-arm64.tar.gz\n19e56f0825510207dd904f087fe52faa0a4eb6b2aab5f0ea7a33830d04888b8b  node-v20.20.2-linux-x64.tar.gz\nf625d97cd707df4ff96254916fbc5ff014f09c09effe5a1e0ca8f6d41a8789d4  node-v24.19.0-linux-x64.tar.gz\n" > "$out"; exit 0;; esac
 printf archive > "$out"
 "#,
         )
@@ -5294,13 +5294,13 @@ case "$*" in
     if [ "$arch" = "x86_64" ]; then
       printf "bbeb5fb8113b44fc30f5a5887dbc0ab66af8e56139f5f9fbe7c7a1aa056246dc  dummy\n"
     else
-      printf "371fc060d5dd4de565586c3cc70034956db67a8f3dae0f0e5724fa56147c472a  dummy\n"
+      printf "d28c8a5bf0a808f0ed434a1dce8c54ae98f0371c0bd86ac58abc613f73e6643f  dummy\n"
     fi;;
   *)
     if [ "$arch" = "x86_64" ]; then
-      printf "8a4dbcdd8bccef3132d21e8543940557e55dcf44f00f0a99ba8a062f4552e722  dummy\n"
+      printf "19e56f0825510207dd904f087fe52faa0a4eb6b2aab5f0ea7a33830d04888b8b  dummy\n"
     else
-      printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  dummy\n"
+      printf "47ef73d543ecf6eb19435f6c03a0ac4809b3bf0dd6b26c7c571efc2a6572a74d  dummy\n"
     fi;;
 esac
 "#,
@@ -5318,13 +5318,13 @@ case "$*" in
     if [ "$arch" = "x86_64" ]; then
       printf "bbeb5fb8113b44fc30f5a5887dbc0ab66af8e56139f5f9fbe7c7a1aa056246dc  dummy\n"
     else
-      printf "371fc060d5dd4de565586c3cc70034956db67a8f3dae0f0e5724fa56147c472a  dummy\n"
+      printf "d28c8a5bf0a808f0ed434a1dce8c54ae98f0371c0bd86ac58abc613f73e6643f  dummy\n"
     fi;;
   *)
     if [ "$arch" = "x86_64" ]; then
-      printf "8a4dbcdd8bccef3132d21e8543940557e55dcf44f00f0a99ba8a062f4552e722  dummy\n"
+      printf "19e56f0825510207dd904f087fe52faa0a4eb6b2aab5f0ea7a33830d04888b8b  dummy\n"
     else
-      printf "618e4294602b78e97118a39050116b70d088b16197cd3819bba1fc18b473dfc4  dummy\n"
+      printf "47ef73d543ecf6eb19435f6c03a0ac4809b3bf0dd6b26c7c571efc2a6572a74d  dummy\n"
     fi;;
 esac
 "#,
