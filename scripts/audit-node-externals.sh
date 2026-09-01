@@ -13,6 +13,7 @@ set -euo pipefail
 #   scripts/audit-node-externals.sh            # fails on HIGH/CRITICAL
 #   scripts/audit-node-externals.sh --report-only  # never fails on vulns, just reports
 #   scripts/audit-node-externals.sh --record-baseline # records current vulns to baseline file
+#   scripts/audit-node-externals.sh --test     # runs self-test unit tests
 #   SBOM_OUTPUT=path.json scripts/audit-node-externals.sh ...
 
 REPORT_ONLY=0
@@ -26,8 +27,116 @@ while [[ $# -gt 0 ]]; do
     --record-baseline) RECORD_BASELINE=1; shift ;;
     --baseline) BASELINE_FILE="$2"; shift 2 ;;
     --sbom-output) SBOM_OUTPUT="$2"; shift 2 ;;
+    --test)
+      python3 - <<'PY'
+import math, sys
+
+def parse_cvss3_base_score(vector_str):
+    if not isinstance(vector_str, str) or not vector_str.startswith("CVSS:3."):
+        return None
+    parts = vector_str.split("/")
+    metrics = {}
+    for part in parts[1:]:
+        if ":" in part:
+            k, v = part.split(":", 1)
+            metrics[k] = v
+    required = ["AV", "AC", "PR", "UI", "S", "C", "I", "A"]
+    if not all(k in metrics for k in required):
+        return None
+    av_map = {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2}
+    ac_map = {"L": 0.77, "H": 0.44}
+    ui_map = {"N": 0.85, "R": 0.62}
+    s_val = metrics["S"]
+    if s_val == "U":
+        pr_map = {"N": 0.85, "L": 0.62, "H": 0.27}
+    elif s_val == "C":
+        pr_map = {"N": 0.85, "L": 0.68, "H": 0.50}
+    else:
+        return None
+    cia_map = {"N": 0.0, "L": 0.22, "H": 0.56}
+    av = av_map.get(metrics["AV"])
+    ac = ac_map.get(metrics["AC"])
+    pr = pr_map.get(metrics["PR"])
+    ui = ui_map.get(metrics["UI"])
+    c = cia_map.get(metrics["C"])
+    i = cia_map.get(metrics["I"])
+    a = cia_map.get(metrics["A"])
+    if any(x is None for x in [av, ac, pr, ui, c, i, a]):
+        return None
+    iss = 1.0 - ((1.0 - c) * (1.0 - i) * (1.0 - a))
+    if s_val == "U":
+        impact = 6.42 * iss
+    else:
+        impact = 7.52 * (iss - 0.029) - 3.25 * ((iss - 0.02) ** 15)
+    exploitability = 8.22 * av * ac * pr * ui
+    if impact <= 0:
+        return 0.0
+    int_val = round((impact + exploitability if s_val == "U" else 1.08 * (impact + exploitability)) * 100000)
+    if int_val > 1000000:
+        return 10.0
+    if int_val % 10000 == 0:
+        return int_val / 100000.0
+    else:
+        return (math.floor(int_val / 10000) + 1) / 10.0
+
+def parse_cvss_score(score_entry):
+    if not score_entry:
+        return None
+    if isinstance(score_entry, (int, float)):
+        return float(score_entry)
+    if isinstance(score_entry, dict):
+        return parse_cvss_score(score_entry.get("score"))
+    if isinstance(score_entry, str):
+        try:
+            return float(score_entry)
+        except ValueError:
+            pass
+        if score_entry.startswith("CVSS:3."):
+            return parse_cvss3_base_score(score_entry)
+    return None
+
+def is_high_or_critical(db_sev, cvss_scores):
+    db_sev = (db_sev or "").upper()
+    if db_sev in ("HIGH", "CRITICAL"):
+        return True
+    if db_sev in ("LOW", "MODERATE", "MEDIUM"):
+        return False
+    for entry in cvss_scores:
+        score = parse_cvss_score(entry)
+        if score is not None:
+            if score >= 7.0:
+                return True
+        else:
+            if isinstance(entry, str) and (entry.startswith("CVSS:") or entry.startswith("AV:")):
+                return True
+            if isinstance(entry, dict) and isinstance(entry.get("score"), str):
+                s = entry.get("score", "")
+                if s.startswith("CVSS:") or s.startswith("AV:"):
+                    return True
+    return False
+
+# 1. High-scoring vector without H metrics (base score 7.3)
+assert is_high_or_critical("", ["CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:L"]) is True, "High without H failed"
+# 2. Low-scoring vector with H metric (base score 3.8)
+assert is_high_or_critical("", ["CVSS:3.1/AV:P/AC:H/PR:H/UI:R/S:U/C:H/I:N/A:N"]) is False, "Low with H failed"
+# 3. Medium-scoring vector with H metric (base score 4.2)
+assert is_high_or_critical("", ["CVSS:3.1/AV:L/AC:H/PR:H/UI:R/S:U/C:H/I:N/A:N"]) is False, "Medium with H failed"
+# 4. Medium-scoring vector with A:H (base score 4.4)
+assert is_high_or_critical("", ["CVSS:3.1/AV:N/AC:H/PR:H/UI:N/S:U/C:N/I:N/A:H"]) is False, "Medium with A:H failed"
+# 5. Direct numeric scores
+assert is_high_or_critical("", [8.5]) is True, "Direct score >= 7.0 failed"
+assert is_high_or_critical("", [4.5]) is False, "Direct score < 7.0 failed"
+# 6. Explicit database_specific overrides
+assert is_high_or_critical("HIGH", ["CVSS:3.1/AV:P/AC:H/PR:H/UI:R/S:U/C:N/I:N/A:N"]) is True, "db_sev HIGH override failed"
+assert is_high_or_critical("LOW", ["CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"]) is False, "db_sev LOW override failed"
+# 7. Fail closed on unparseable CVSS strings
+assert is_high_or_critical("", ["CVSS:unknown_future_format"]) is True, "Fail closed failed"
+print("audit-node-externals.sh self-test: ALL CVSS TESTS PASSED")
+PY
+      exit 0
+      ;;
     --help|-h)
-      echo "Usage: $0 [--report-only] [--record-baseline] [--baseline PATH] [--sbom-output PATH]"
+      echo "Usage: $0 [--report-only] [--record-baseline] [--baseline PATH] [--sbom-output PATH] [--test]"
       exit 0
       ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
@@ -333,6 +442,7 @@ python3 - "$TMPDIR/osv_results.jsonl" "$VULN_DETAILS_DIR" "$FINDINGS_TXT" "$PACK
 import json
 from pathlib import Path
 import datetime
+import math
 import sys
 
 results_path = Path(sys.argv[1])
@@ -362,25 +472,92 @@ for p in details_dir.glob("*.json"):
         print(f"failed to parse {p}: {e}", file=sys.stderr)
         sys.exit(1)
 
-def is_high_or_critical(db_sev, cvss_scores):
-    if db_sev in ("HIGH", "CRITICAL"):
-        return True
-    if db_sev in ("LOW", "MODERATE"):
-        return False
-    # When database_specific.severity is absent, inspect OSV severity[] array
-    for score_str in cvss_scores:
-        if not score_str:
-            continue
-        # If a numeric score is present
+def parse_cvss3_base_score(vector_str):
+    """Computes CVSS v3.0 / v3.1 base score from vector string (returns float 0.0 to 10.0)."""
+    if not isinstance(vector_str, str) or not vector_str.startswith("CVSS:3."):
+        return None
+    parts = vector_str.split("/")
+    metrics = {}
+    for part in parts[1:]:
+        if ":" in part:
+            k, v = part.split(":", 1)
+            metrics[k] = v
+    required = ["AV", "AC", "PR", "UI", "S", "C", "I", "A"]
+    if not all(k in metrics for k in required):
+        return None
+    av_map = {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2}
+    ac_map = {"L": 0.77, "H": 0.44}
+    ui_map = {"N": 0.85, "R": 0.62}
+    s_val = metrics["S"]
+    if s_val == "U":
+        pr_map = {"N": 0.85, "L": 0.62, "H": 0.27}
+    elif s_val == "C":
+        pr_map = {"N": 0.85, "L": 0.68, "H": 0.50}
+    else:
+        return None
+    cia_map = {"N": 0.0, "L": 0.22, "H": 0.56}
+    av = av_map.get(metrics["AV"])
+    ac = ac_map.get(metrics["AC"])
+    pr = pr_map.get(metrics["PR"])
+    ui = ui_map.get(metrics["UI"])
+    c = cia_map.get(metrics["C"])
+    i = cia_map.get(metrics["I"])
+    a = cia_map.get(metrics["A"])
+    if any(x is None for x in [av, ac, pr, ui, c, i, a]):
+        return None
+    iss = 1.0 - ((1.0 - c) * (1.0 - i) * (1.0 - a))
+    if s_val == "U":
+        impact = 6.42 * iss
+    else:
+        impact = 7.52 * (iss - 0.029) - 3.25 * ((iss - 0.02) ** 15)
+    exploitability = 8.22 * av * ac * pr * ui
+    if impact <= 0:
+        return 0.0
+    int_val = round((impact + exploitability if s_val == "U" else 1.08 * (impact + exploitability)) * 100000)
+    if int_val > 1000000:
+        return 10.0
+    if int_val % 10000 == 0:
+        return int_val / 100000.0
+    else:
+        return (math.floor(int_val / 10000) + 1) / 10.0
+
+def parse_cvss_score(score_entry):
+    """Extracts or calculates numeric CVSS score from an OSV entry (returns float or None)."""
+    if not score_entry:
+        return None
+    if isinstance(score_entry, (int, float)):
+        return float(score_entry)
+    if isinstance(score_entry, dict):
+        return parse_cvss_score(score_entry.get("score"))
+    if isinstance(score_entry, str):
         try:
-            val = float(score_str)
-            if val >= 7.0:
-                return True
+            return float(score_entry)
         except ValueError:
             pass
-        # If a CVSS vector string is present (e.g., CVSS:3.1/.../C:H/I:H/A:H or CVSS:4.0/.../VA:H/SA:H)
-        if ":H" in score_str.upper() or "/C:H" in score_str.upper() or "/I:H" in score_str.upper() or "/A:H" in score_str.upper():
-            return True
+        if score_entry.startswith("CVSS:3."):
+            return parse_cvss3_base_score(score_entry)
+    return None
+
+def is_high_or_critical(db_sev, cvss_scores):
+    db_sev = (db_sev or "").upper()
+    if db_sev in ("HIGH", "CRITICAL"):
+        return True
+    if db_sev in ("LOW", "MODERATE", "MEDIUM"):
+        return False
+    # When database_specific.severity is absent, inspect and compute CVSS scores
+    for entry in cvss_scores:
+        score = parse_cvss_score(entry)
+        if score is not None:
+            if score >= 7.0:
+                return True
+        else:
+            # Fail closed on unrecognized/unparseable CVSS string vectors
+            if isinstance(entry, str) and (entry.startswith("CVSS:") or entry.startswith("AV:")):
+                return True
+            if isinstance(entry, dict) and isinstance(entry.get("score"), str):
+                s = entry.get("score", "")
+                if s.startswith("CVSS:") or s.startswith("AV:"):
+                    return True
     return False
 
 # Load existing baseline if available
