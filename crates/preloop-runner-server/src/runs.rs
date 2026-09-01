@@ -2221,29 +2221,27 @@ pub(crate) fn latest_attempt_steps(
     Some(steps)
 }
 
-pub(crate) async fn get_run(
-    State(shared): State<Arc<SharedState>>,
-    Path(run_id): Path<RunId>,
-) -> Result<Json<RunRecord>, ApiError> {
-    let inner = shared.state.inner.lock().await;
-    let mut run = inner
-        .runs
-        .get(&run_id)
-        .cloned()
-        .ok_or_else(|| ApiError::not_found("run not found"))?;
+/// Project a stored run into its API shape.
+///
+/// Shared by the single-run and list endpoints. Step records live in the
+/// attempt-scoped manifest rather than in the stored run, so a caller that
+/// clones `inner.runs` directly returns empty step arrays — which is exactly
+/// what the list endpoint did.
+pub(crate) fn project_run(inner: &crate::state::InnerState, mut run: RunRecord) -> RunRecord {
+    let run_id = run.run_id;
 
     // GitHub's run record shows a gate-passed reusable caller only as its
     // callee jobs: once the subtree is materialized, the caller entry leaves
     // the visible job set. Gate-failed callers never materialize and stay as
     // exactly one (skipped) entry.
-    let expanded_callers: std::collections::BTreeSet<&str> = run
+    let expanded_callers: std::collections::BTreeSet<String> = run
         .reusable_calls
         .iter()
         .filter(|(_, call)| !call.inner_job_ids.is_empty())
-        .map(|(caller_id, _)| caller_id.as_str())
+        .map(|(caller_id, _)| caller_id.clone())
         .collect();
     run.jobs
-        .retain(|job_id, _| !expanded_callers.contains(job_id.0.as_str()));
+        .retain(|job_id, _| !expanded_callers.contains(&job_id.0));
 
     // Project with GitHub display names (evaluated `name:`, `caller / callee`
     // separator), and hydrate each job's steps from its latest attempt's
@@ -2261,11 +2259,7 @@ pub(crate) async fn get_run(
                 .unwrap_or_else(|| job_id.0.clone());
             let mut detail = existing
                 .iter()
-                .find(|detail| {
-                    detail.job_id == job_id.0
-                        || (detail.job_id.is_empty()
-                            && (detail.name == job_id.0 || detail.name == name))
-                })
+                .find(|detail| detail.job_id == job_id.0)
                 .cloned()
                 .unwrap_or(JobDetail {
                     job_id: job_id.0.clone(),
@@ -2276,20 +2270,31 @@ pub(crate) async fn get_run(
                 });
             detail.job_id = job_id.0.clone();
             detail.name = name;
-            if let Some(stored) = run.jobs.get(job_id) {
-                detail.conclusion = status_string(*stored);
-            }
+            detail.conclusion = status_string(*status);
             // Steps live in the attempt-scoped manifest, so the run record
             // shows the newest attempt: a retry supersedes what the previous
             // dispatch reported.
-            if let Some(manifest) = latest_attempt_steps(&inner, run_id, job_id) {
+            if let Some(manifest) = latest_attempt_steps(inner, run_id, job_id) {
                 detail.steps = manifest;
             }
             detail
         })
         .collect();
 
-    Ok(Json(run))
+    run
+}
+
+pub(crate) async fn get_run(
+    State(shared): State<Arc<SharedState>>,
+    Path(run_id): Path<RunId>,
+) -> Result<Json<RunRecord>, ApiError> {
+    let inner = shared.state.inner.lock().await;
+    let run = inner
+        .runs
+        .get(&run_id)
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("run not found"))?;
+    Ok(Json(project_run(&inner, run)))
 }
 
 /// Browser-safe status page linked from GitHub Check Runs.
@@ -2402,6 +2407,10 @@ pub(crate) async fn list_runs(
         })
         .take(limit)
         .cloned()
+        // Same projection as the single-run endpoint: steps live in the
+        // attempt manifest, so cloning the stored run alone returns empty
+        // step arrays.
+        .map(|run| project_run(&inner, run))
         .collect();
 
     Ok(Json(runs))

@@ -2843,6 +2843,55 @@ async fn log_run_logs_unknown_job_is_404_not_whole_run() {
     );
 }
 
+/// The list endpoint projects steps like the single-run endpoint.
+///
+/// Step records live in the attempt manifest, not in the stored run, so a
+/// handler that clones `inner.runs` directly returns empty step arrays even
+/// though `GET /api/v1/runs/{id}` has the current ones.
+#[tokio::test]
+async fn list_runs_projects_step_records() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = three_step_run_for_log_filters(&app, &state).await;
+    let ids = workflow_step_ids(&state, run_id, "build").await;
+
+    let response = request_json(
+        &app,
+        Method::POST,
+        "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",
+        json!({
+            "workflow_run_backend_id": jobs[0].1,
+            "workflow_job_run_backend_id": jobs[0].2,
+            "steps": [{
+                "external_id": ids[0],
+                "number": 2,
+                "name": "Run echo one",
+                "status": 6,
+                "conclusion": 2
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(response["ok"], true);
+
+    let listed = request_json(&app, Method::GET, "/api/v1/runs", json!(null)).await;
+    let run = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["run_id"] == run_id.to_string())
+        .expect("the submitted run must be listed");
+    let steps = run["jobs_list"][0]["steps"].as_array().unwrap();
+    assert_eq!(
+        steps.len(),
+        3,
+        "the list endpoint must carry the declared steps: {steps:?}"
+    );
+    assert_eq!(steps[0]["conclusion"], "success");
+    assert_eq!(steps[0]["name"], "Run echo one");
+}
+
 /// A runner report persists the attempt, so a restart keeps step state.
 ///
 /// Step records deliberately do not ride in `runs.record_blob` (which reseals
