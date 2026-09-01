@@ -31,9 +31,9 @@ jobs:
           base="${{ github.event.pull_request.base.sha }}"
           # Ensure base is fetched for diff (fail closed on network/fetch error)
           git fetch --no-tags --depth=1 origin "$base"
-          diff_files="$(git diff --name-only "$base"...HEAD)"
+          diff_files="$(git diff --name-only "$base" HEAD)"
 
-          policy_files="$(echo "$diff_files" | grep -E '^(deny\.toml|\.cargo/audit\.toml|supply-chain/)' || true)"
+          policy_files="$(echo "$diff_files" | grep -E '^(deny\.toml|\.cargo/audit\.toml|supply-chain/|\.github/workflows/supply-chain\.yml)' || true)"
           non_policy_files="$(echo "$diff_files" | grep -vE '^(deny\.toml|\.cargo/audit\.toml|supply-chain/)' | grep -v '^$' || true)"
 
           if [[ -n "$policy_files" && -n "$non_policy_files" ]]; then
