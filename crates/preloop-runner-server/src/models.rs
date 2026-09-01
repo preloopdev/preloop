@@ -36,6 +36,12 @@ pub(crate) struct DapPortRegistration {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct StepRecord {
+    /// Runner/timeline identity used to match a durable `step-*.txt` blob.
+    ///
+    /// Old persisted run records may not have this field, so log retrieval
+    /// falls back to the order available from the filesystem when it is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) id: Option<String>,
     pub(crate) name: String,
     pub(crate) conclusion: String,
     /// Server-side observation of when the step first appeared (started) and

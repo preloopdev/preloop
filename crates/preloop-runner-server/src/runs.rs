@@ -2269,6 +2269,17 @@ pub(crate) struct RunLogsQuery {
     step: Option<usize>,
 }
 
+/// Files uploaded for one job's individual steps.
+///
+/// `all` preserves upload order for an unfiltered request. `workflow` maps the
+/// user-visible workflow-step order to those files; an entry is `None` when a
+/// step produced no log blob. Keeping both views matters because synthetic
+/// setup/cleanup records can be uploaded alongside user steps.
+struct StepLogs {
+    all: Vec<std::path::PathBuf>,
+    workflow: Option<Vec<Option<std::path::PathBuf>>>,
+}
+
 /// One job's log material, in execution order.
 ///
 /// The variants are the three tiers `get_run_logs` already resolved inline;
@@ -2278,32 +2289,42 @@ enum JobLogs {
     /// The runner uploaded one merged log. Step boundaries are not recoverable
     /// from it, so `?step=` cannot be honored.
     Merged(Vec<u8>),
-    /// Per-step log files, ordered as they ran.
-    Steps(Vec<std::path::PathBuf>),
+    /// Per-step log files, with a workflow-order view for `?step=`.
+    Steps(StepLogs),
     /// Nothing on disk yet: in-memory console blocks for a job still running,
     /// already ordered by numeric console log id (one per step).
     Live(Vec<Vec<u8>>),
 }
 
-/// Resolve one job's logs through the tier fallback: merged upload, then
-/// per-step uploads, then the in-memory console feed.
+/// Resolve one job's logs through the tier fallback.
+///
+/// Unfiltered requests prefer the merged upload because it is the runner's
+/// authoritative whole-job representation. A step-filtered request prefers
+/// individual step blobs when both are present; the merged upload has no
+/// recoverable boundaries and is only used to produce the explicit 409.
 async fn resolve_job_logs(
     results_dir: &std::path::Path,
     fallback_blocks: Vec<Vec<u8>>,
+    workflow_step_ids: Option<&[String]>,
+    prefer_steps: bool,
 ) -> Result<JobLogs, ApiError> {
-    let results_log = results_dir.join("job-logs.txt");
-    match tokio::fs::read(&results_log).await {
-        Ok(contents) => return Ok(JobLogs::Merged(contents)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+    let merged = match tokio::fs::read(results_dir.join("job-logs.txt")).await {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
             return Err(ApiError::internal(format!(
                 "failed to read run log `{}`: {error}",
-                results_log.display()
+                results_dir.join("job-logs.txt").display()
             )));
+        }
+    };
+    if !prefer_steps {
+        if let Some(contents) = merged {
+            return Ok(JobLogs::Merged(contents));
         }
     }
 
-    let mut step_logs = Vec::new();
+    let mut step_files = Vec::new();
     match tokio::fs::read_dir(results_dir).await {
         Ok(mut entries) => {
             while let Some(entry) = entries.next_entry().await.map_err(|error| {
@@ -2326,8 +2347,13 @@ async fn resolve_job_logs(
                 if !metadata.is_file() {
                     continue;
                 }
+                let step_id = name
+                    .strip_prefix("step-")
+                    .and_then(|name| name.strip_suffix(".txt"))
+                    .unwrap_or_default()
+                    .to_owned();
                 let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
-                step_logs.push((modified, name.into_owned(), entry.path()));
+                step_files.push((modified, name.into_owned(), step_id, entry.path()));
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -2338,23 +2364,39 @@ async fn resolve_job_logs(
             )));
         }
     }
-    step_logs.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    step_files.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
 
-    if step_logs.is_empty() {
-        Ok(JobLogs::Live(fallback_blocks))
-    } else {
-        Ok(JobLogs::Steps(
-            step_logs.into_iter().map(|(_, _, path)| path).collect(),
-        ))
+    if !step_files.is_empty() {
+        let workflow = workflow_step_ids.filter(|ids| !ids.is_empty()).map(|ids| {
+            ids.iter()
+                .map(|id| {
+                    step_files
+                        .iter()
+                        .find(|(_, _, file_id, _)| file_id == id)
+                        .map(|(_, _, _, path)| path.clone())
+                })
+                .collect()
+        });
+        return Ok(JobLogs::Steps(StepLogs {
+            all: step_files.into_iter().map(|(_, _, _, path)| path).collect(),
+            workflow,
+        }));
     }
+
+    // A step query with only a merged upload must be rejected by append_step;
+    // do not silently turn it into a whole-job response.
+    if let Some(contents) = merged {
+        return Ok(JobLogs::Merged(contents));
+    }
+    Ok(JobLogs::Live(fallback_blocks))
 }
 
-/// Append every step of a job, in order.
+/// Append every step of a job, in upload/execution order.
 async fn append_all(logs: JobLogs, merged: &mut Vec<u8>) -> Result<(), ApiError> {
     match logs {
         JobLogs::Merged(contents) => merged.extend_from_slice(&contents),
-        JobLogs::Steps(paths) => {
-            for path in paths {
+        JobLogs::Steps(step_logs) => {
+            for path in step_logs.all {
                 let contents = tokio::fs::read(&path).await.map_err(|error| {
                     ApiError::internal(format!(
                         "failed to read result log `{}`: {error}",
@@ -2373,7 +2415,7 @@ async fn append_all(logs: JobLogs, merged: &mut Vec<u8>) -> Result<(), ApiError>
     Ok(())
 }
 
-/// Append exactly the `step`th (1-based) step of a job.
+/// Append exactly the `step`th (1-based) workflow step of a job.
 async fn append_step(
     logs: JobLogs,
     step: usize,
@@ -2393,13 +2435,26 @@ async fn append_step(
             "job `{job_label}` reported one merged log, which carries no step \
              boundaries; re-request without `step` for the whole job log"
         ))),
-        JobLogs::Steps(paths) => {
-            let total = paths.len();
-            let path = paths.into_iter().nth(index).ok_or_else(|| {
-                ApiError::not_found(format!(
+        JobLogs::Steps(step_logs) => {
+            let (total, path) = match step_logs.workflow {
+                Some(workflow) => {
+                    let total = workflow.len();
+                    (total, workflow.get(index).cloned().flatten())
+                }
+                None => {
+                    let total = step_logs.all.len();
+                    (total, step_logs.all.get(index).cloned())
+                }
+            };
+            let Some(path) = path else {
+                if index < total {
+                    // A valid workflow step is allowed to have no log blob.
+                    return Ok(());
+                }
+                return Err(ApiError::not_found(format!(
                     "job `{job_label}` has {total} steps; step {step} is out of range"
-                ))
-            })?;
+                )));
+            };
             let contents = tokio::fs::read(&path).await.map_err(|error| {
                 ApiError::internal(format!(
                     "failed to read result log `{}`: {error}",
@@ -2485,6 +2540,32 @@ pub(crate) async fn get_run_logs(
                         (Err(_), Err(_)) => left.cmp(right),
                     }
                 });
+                let workflow_step_ids = inner
+                    .broker_messages
+                    .get(&request.request_id)
+                    .map(|message| {
+                        message
+                            .steps
+                            .iter()
+                            .map(|step| step.id.to_string())
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|ids| !ids.is_empty())
+                    .or_else(|| {
+                        inner.runs.get(&run_id).and_then(|run| {
+                            run.jobs_list
+                                .iter()
+                                .find(|detail| detail.name == request.job_id.0)
+                                .map(|detail| {
+                                    detail
+                                        .steps
+                                        .iter()
+                                        .filter_map(|step| step.id.clone())
+                                        .collect::<Vec<_>>()
+                                })
+                                .filter(|ids| !ids.is_empty())
+                        })
+                    });
                 (
                     request.plan_id.clone(),
                     request.agent_job_id.to_string(),
@@ -2493,6 +2574,7 @@ pub(crate) async fn get_run_logs(
                         .into_iter()
                         .map(|(_, block)| block.to_vec())
                         .collect::<Vec<_>>(),
+                    workflow_step_ids,
                 )
             })
             .collect::<Vec<_>>();
@@ -2500,13 +2582,19 @@ pub(crate) async fn get_run_logs(
     };
 
     let mut merged = Vec::new();
-    for (plan_id, agent_job_id, job_label, fallback_blocks) in sources {
+    for (plan_id, agent_job_id, job_label, fallback_blocks, workflow_step_ids) in sources {
         let results_dir = state_dir
             .join("replay")
             .join("results")
             .join(plan_id)
             .join(agent_job_id);
-        let logs = resolve_job_logs(&results_dir, fallback_blocks).await?;
+        let logs = resolve_job_logs(
+            &results_dir,
+            fallback_blocks,
+            workflow_step_ids.as_deref(),
+            query.step.is_some(),
+        )
+        .await?;
         match query.step {
             Some(step) => append_step(logs, step, &job_label, &mut merged).await?,
             None => append_all(logs, &mut merged).await?,

@@ -117,6 +117,9 @@ pub(crate) async fn twirp_workflow_steps_update(
                         let observed = chrono::Utc::now();
 
                         if let Some(pos) = job_detail.steps.iter().position(|s| s.name == name) {
+                            if !external_id_str.is_empty() {
+                                job_detail.steps[pos].id = Some(external_id_str.to_owned());
+                            }
                             job_detail.steps[pos].conclusion = conclusion_str.to_owned();
                             // First non-terminal sighting is the start signal.
                             if !terminal && job_detail.steps[pos].started_at.is_none() {
@@ -131,8 +134,9 @@ pub(crate) async fn twirp_workflow_steps_update(
                             // - already terminal → record finished_at only
                             //   (do not invent started_at == finished_at, which
                             //   forces duration 0 for fast steps that complete
-                            //   before any in-progress update is processed)
                             job_detail.steps.push(StepRecord {
+                                id: (!external_id_str.is_empty())
+                                    .then(|| external_id_str.to_owned()),
                                 name,
                                 conclusion: conclusion_str.to_owned(),
                                 started_at: (!terminal).then_some(observed),
