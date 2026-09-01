@@ -284,6 +284,9 @@ pub(crate) async fn complete_job_compat(
         JobCompletion {
             run_id,
             job_id: JobId(job_id),
+            // The compat route is addressed by logical job only, so the
+            // server resolves the newest attempt itself.
+            agent_job_id: None,
             status,
             outputs: Default::default(),
             annotations: Vec::new(),
@@ -392,6 +395,11 @@ pub(crate) async fn agent_request_patch(
                 Some(JobCompletion {
                     run_id,
                     job_id,
+                    // The patched request is the attempt that reported.
+                    agent_job_id: inner
+                        .job_requests
+                        .get(&request_id)
+                        .map(|record| record.agent_job_id),
                     status: new_status,
                     outputs: Default::default(),
                     annotations: Vec::new(),
@@ -688,11 +696,24 @@ pub(crate) async fn complete_job_inner(
     }
     // Close only after the run and job were validated and the completion was
     // projected. Invalid callbacks must not terminate another job's feed.
-    let live_log_key = inner
-        .job_requests
-        .values()
-        .find(|record| record.run_id == completion.run_id && record.job_id == completion.job_id)
-        .map(|record| record.agent_job_id.to_string())
+    //
+    // Same attempt selection as the manifest reconciliation below: a
+    // re-dispatched job has several matching requests, and closing the oldest
+    // one's feed leaves the attempt that actually finished streaming forever
+    // while a follower on the dead key waits for output that never comes.
+    let live_log_key = completion
+        .agent_job_id
+        .or_else(|| {
+            inner
+                .job_requests
+                .values()
+                .filter(|record| {
+                    record.run_id == completion.run_id && record.job_id == completion.job_id
+                })
+                .max_by_key(|record| record.request_id)
+                .map(|record| record.agent_job_id)
+        })
+        .map(|agent_job_id| agent_job_id.to_string())
         .unwrap_or_else(|| completion.job_id.0.clone());
     crate::live_logs::close_live_log(&mut inner, &live_log_key);
     // Use the status actually stored (may differ from completion if terminal-locked).
@@ -711,12 +732,25 @@ pub(crate) async fn complete_job_inner(
     // reconciled to the job's effective status, the view GitHub presents for
     // orphaned steps. A step still `pending` was never reached, which stays
     // truthful rather than inheriting the job's failure.
-    if let Some(agent_job_id) = inner
-        .job_requests
-        .values()
-        .find(|record| record.run_id == completion.run_id && record.job_id == completion.job_id)
-        .map(|record| record.agent_job_id)
-    {
+    //
+    // The attempt comes from the callback itself. Deriving it from
+    // `(run_id, job_id)` picked whichever request the map yielded first, and
+    // `job_requests` is keyed by monotonic request id — so a re-dispatched job
+    // reconciled the *newest* attempt's report into the *oldest* attempt's
+    // manifest, where its ids match nothing, and terminalized that older
+    // attempt's steps while the run view still projected the newer one as
+    // in-flight. When the caller could not resolve an attempt, the newest
+    // request is the only defensible guess.
+    if let Some(agent_job_id) = completion.agent_job_id.or_else(|| {
+        inner
+            .job_requests
+            .values()
+            .filter(|record| {
+                record.run_id == completion.run_id && record.job_id == completion.job_id
+            })
+            .max_by_key(|record| record.request_id)
+            .map(|record| record.agent_job_id)
+    }) {
         if let Some(manifest) = inner.job_steps.get_mut(&agent_job_id) {
             for wire in &completion.step_results {
                 let Some(external_id) = wire.external_id.as_deref() else {

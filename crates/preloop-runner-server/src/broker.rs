@@ -1111,6 +1111,13 @@ async fn fail_unclaimable_request(shared: &Arc<SharedState>, request_id: i64) {
         let completion = JobCompletion {
             run_id,
             job_id,
+            agent_job_id: {
+                let inner = shared.state.inner.lock().await;
+                inner
+                    .job_requests
+                    .get(&request_id)
+                    .map(|record| record.agent_job_id)
+            },
             status: ExecutionStatus::Failure,
             outputs: preloop_gha_protocol::OutputMap::new(),
             annotations: Vec::new(),
@@ -1435,6 +1442,12 @@ pub(crate) async fn broker_complete_job(
                 Some(JobCompletion {
                     run_id,
                     job_id,
+                    // This request *is* the attempt that finished, so the
+                    // server never has to guess which dispatch reported.
+                    agent_job_id: inner
+                        .job_requests
+                        .get(&request_id)
+                        .map(|record| record.agent_job_id),
                     status,
                     outputs,
                     annotations: request.annotations.clone(),

@@ -490,6 +490,11 @@ pub(crate) async fn finish_job(
             Some(JobCompletion {
                 run_id,
                 job_id,
+                // Resolved from the callback's own request record.
+                agent_job_id: inner
+                    .job_requests
+                    .get(&request_id)
+                    .map(|record| record.agent_job_id),
                 status,
                 outputs,
                 annotations: Vec::new(),
@@ -678,6 +683,11 @@ pub(crate) async fn finish_job_plan(
             Some(JobCompletion {
                 run_id,
                 job_id,
+                // Resolved from the callback's own request record.
+                agent_job_id: inner
+                    .job_requests
+                    .get(&request_id)
+                    .map(|record| record.agent_job_id),
                 status,
                 outputs,
                 annotations: Vec::new(),

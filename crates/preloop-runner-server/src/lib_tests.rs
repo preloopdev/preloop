@@ -2893,6 +2893,90 @@ async fn step_manifests_survive_a_restart() {
     );
 }
 
+/// A completion reconciles the attempt that actually reported.
+///
+/// `job_requests` is keyed by monotonic request id, so picking the first match
+/// for `(run_id, job_id)` selects the *oldest* dispatch. A re-dispatched job
+/// then applied the new attempt's `external_id`s to the previous attempt's
+/// manifest — matching nothing — and terminalized that older attempt's steps
+/// while the run view still projected the newer one as in-flight.
+#[tokio::test]
+async fn completion_reconciles_the_reporting_attempt_not_the_oldest() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, _) = two_job_run_for_log_filters(&app, &state).await;
+    let first_ids = workflow_step_ids(&state, run_id, "build").await;
+    let first_step_id = first_ids[0].clone();
+
+    // Re-dispatch: a newer request, its own agent job id, its own step ids.
+    let (first_agent_job_id, second_agent_job_id, second_step_id) = {
+        let mut inner = state.inner.lock().await;
+        let mut record = inner
+            .job_requests
+            .values()
+            .find(|request| request.run_id == run_id && request.job_id.0 == "build")
+            .cloned()
+            .expect("first attempt must exist");
+        let first_agent_job_id = record.agent_job_id;
+        let request_id = inner.job_requests.keys().copied().max().unwrap_or(0) + 1;
+        let agent_job_id = uuid::Uuid::new_v4();
+        record.request_id = request_id;
+        record.agent_job_id = agent_job_id;
+        record.plan_id = uuid::Uuid::new_v4().to_string();
+        record.result = None;
+        let step_id = uuid::Uuid::new_v4().to_string();
+        inner.job_steps.insert(
+            agent_job_id,
+            vec![crate::models::StepRecord::workflow(
+                step_id.clone(),
+                0,
+                "Run echo build".to_owned(),
+                Some("__run".to_owned()),
+            )],
+        );
+        inner.agent_job_requests.insert(agent_job_id, request_id);
+        inner.job_requests.insert(request_id, record);
+        (first_agent_job_id, agent_job_id, step_id)
+    };
+
+    let _ = crate::distributed_task::complete_job_inner(
+        state.shared(),
+        preloop_gha_protocol::JobCompletion {
+            run_id,
+            job_id: preloop_gha_protocol::JobId("build".to_owned()),
+            agent_job_id: Some(second_agent_job_id),
+            status: ExecutionStatus::Success,
+            outputs: Default::default(),
+            annotations: Vec::new(),
+            step_results: vec![preloop_gha_protocol::CompletionStepResult {
+                external_id: Some(second_step_id.clone()),
+                number: Some(2),
+                name: Some("Run echo build".to_owned()),
+                status: Some(serde_json::json!("completed")),
+                conclusion: Some(serde_json::json!("skipped")),
+            }],
+        },
+    )
+    .await;
+
+    let inner = state.inner.lock().await;
+    let reporting = &inner.job_steps[&second_agent_job_id];
+    assert_eq!(
+        reporting[0].conclusion, "skipped",
+        "the reporting attempt takes the completion's step conclusion"
+    );
+    let earlier = &inner.job_steps[&first_agent_job_id];
+    assert_eq!(
+        earlier[0].id, first_step_id,
+        "the earlier attempt keeps its own step identity"
+    );
+    assert_eq!(
+        earlier[0].conclusion, "pending",
+        "a completion for one attempt must not terminalize another's steps"
+    );
+}
+
 /// A second dispatch of the same job gets its own manifest.
 ///
 /// `build_task_step` mints a fresh `TaskStep` id per build, so a job-scoped
@@ -3300,6 +3384,7 @@ async fn complete_job(state: &AppState, run_id: RunId, job_id: &str, status: Exe
         preloop_gha_protocol::JobCompletion {
             run_id,
             job_id: preloop_gha_protocol::JobId(job_id.to_owned()),
+            agent_job_id: None,
             status,
             outputs: Default::default(),
             annotations: Vec::new(),
