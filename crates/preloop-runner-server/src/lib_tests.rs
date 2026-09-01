@@ -2843,6 +2843,84 @@ async fn log_run_logs_unknown_job_is_404_not_whole_run() {
     );
 }
 
+/// Expansion does not leave the placeholder's manifest behind.
+///
+/// A deferred-matrix node is dispatched as a placeholder, gets a manifest
+/// seeded, and is purged when expansion replaces it with real legs. Without
+/// cleanup every dynamic expansion accumulates an entry no run projection can
+/// reach.
+#[tokio::test]
+async fn expansion_purges_the_placeholder_step_manifest() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = submit_yaml(
+        &app,
+        r#"
+on: push
+jobs:
+  gen:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+    steps:
+      - id: build
+        run: echo matrix
+  fan:
+    needs: [gen]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.gen.outputs.matrix) }}
+    steps:
+      - run: echo leg
+"#,
+        "owner/repo",
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    let before = {
+        let inner = state.inner.lock().await;
+        inner.job_steps.len()
+    };
+
+    // Finish `gen` with a matrix so the deferred node expands.
+    let _ = crate::distributed_task::complete_job_inner(
+        state.shared(),
+        preloop_gha_protocol::JobCompletion {
+            run_id,
+            job_id: preloop_gha_protocol::JobId("gen".to_owned()),
+            agent_job_id: None,
+            status: ExecutionStatus::Success,
+            outputs: [("matrix".to_owned(), serde_json::json!("{\"leg\":[1,2]}"))]
+                .into_iter()
+                .collect(),
+            annotations: Vec::new(),
+            step_results: Vec::new(),
+        },
+    )
+    .await;
+
+    let inner = state.inner.lock().await;
+    // Every retained manifest must belong to a request that still exists.
+    let live: std::collections::BTreeSet<uuid::Uuid> = inner
+        .job_requests
+        .values()
+        .map(|record| record.agent_job_id)
+        .collect();
+    let orphans: Vec<&uuid::Uuid> = inner
+        .job_steps
+        .keys()
+        .filter(|agent_job_id| !live.contains(agent_job_id))
+        .collect();
+    assert!(
+        orphans.is_empty(),
+        "expansion left {} unreachable manifest(s) (had {before} before)",
+        orphans.len()
+    );
+}
+
 /// The list endpoint projects steps like the single-run endpoint.
 ///
 /// Step records live in the attempt manifest, not in the stored run, so a
