@@ -112,11 +112,21 @@ No flags.
 
 Without flags, every job's log is merged in job-request order.
 
-`--step` counts user-visible steps from 1, matching `preloop debug --from`. It
-needs `--job` when a run has more than one job, because numbering restarts per
-job. A job whose runner uploaded a single merged log has no recoverable step
-boundaries; asking for a step there fails with `409` rather than returning the
-whole job under a step's name.
+`--step` counts the steps *declared in the workflow* from 1, matching
+`preloop debug --from`. It needs `--job` when a run has more than one job,
+because numbering restarts per job.
+
+Numbering comes from the step list in the job's request message, recorded when
+the job was dispatched. Steps the runner adds on its own — `Set up job`,
+`Pre`/`Post` action hooks, container setup and teardown, `Complete job` — own
+their logs and appear in the whole-job output, but never take a `--step`
+position. Two steps sharing a `name:` stay distinct, because a step is
+identified by its stable id rather than its display name.
+
+Asking for a step fails with `409` rather than guessing when the order cannot
+be recovered: a job whose runner uploaded a single merged log has no step
+boundaries, and a job dispatched before its step list was recorded has no
+declared order to index.
 
 `--follow` tracks one job's live console feed, so it needs `--job` unless the
 run has exactly one job. It replays the retained buffer before going live, then
