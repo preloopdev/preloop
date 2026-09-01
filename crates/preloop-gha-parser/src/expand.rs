@@ -29,7 +29,7 @@ fn resolved_job_name(
     inputs: Option<&BTreeMap<String, Value>>,
 ) -> String {
     match name {
-        Some(raw) => crate::eval::resolve_string(raw, &expression_context(matrix, inputs))
+        Some(raw) => crate::eval::resolve_string(raw, &expression_context(matrix, inputs, None))
             .unwrap_or_else(|_| raw.to_owned()),
         None => expanded_id.to_owned(),
     }
@@ -49,7 +49,7 @@ fn resolved_runs_on(
     matrix: &IndexMap<String, Value>,
     inputs: Option<&BTreeMap<String, Value>>,
 ) -> Vec<String> {
-    let context = expression_context(matrix, inputs);
+    let context = expression_context(matrix, inputs, None);
     labels
         .into_iter()
         .map(|label| {
@@ -117,6 +117,7 @@ fn resolved_continue_on_error(
 fn expression_context(
     matrix: &IndexMap<String, Value>,
     inputs: Option<&BTreeMap<String, Value>>,
+    event_name: Option<&str>,
 ) -> Context {
     let mut context = Context::default();
     context.insert(
@@ -128,6 +129,16 @@ fn expression_context(
                 .collect(),
         ),
     );
+    let actual_event = event_name.unwrap_or(if inputs.is_some() && !inputs.unwrap().is_empty() {
+        "workflow_dispatch"
+    } else {
+        "push"
+    });
+    let mut github_map = serde_json::Map::new();
+    github_map.insert(
+        "event_name".to_owned(),
+        Value::String(actual_event.to_owned()),
+    );
     if let Some(inputs) = inputs {
         context.insert(
             "inputs",
@@ -138,7 +149,24 @@ fn expression_context(
                     .collect(),
             ),
         );
+        let stringified: serde_json::Map<String, Value> = inputs
+            .iter()
+            .map(|(k, v)| {
+                let s = match v {
+                    Value::String(s) => s.clone(),
+                    Value::Bool(b) => b.to_string(),
+                    Value::Number(n) => n.to_string(),
+                    Value::Null => String::new(),
+                    other => serde_json::to_string(other).unwrap_or_default(),
+                };
+                (k.clone(), Value::String(s))
+            })
+            .collect();
+        let mut event_map = serde_json::Map::new();
+        event_map.insert("inputs".to_owned(), Value::Object(stringified));
+        github_map.insert("event".to_owned(), Value::Object(event_map));
     }
+    context.insert("github", Value::Object(github_map));
     context
 }
 
@@ -154,7 +182,7 @@ fn resolve_deferred_bool(
     match value {
         DeferredBool::Literal(value) => Ok(*value),
         DeferredBool::Expression(expression) => {
-            let result = eval_expression(expression, &expression_context(matrix, inputs))
+            let result = eval_expression(expression, &expression_context(matrix, inputs, None))
                 .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
             result.as_bool().ok_or_else(|| {
                 ParserError::InvalidExpression(format!(
@@ -174,7 +202,7 @@ fn resolve_deferred_number(
     match value {
         DeferredNumber::Literal(value) => Ok(Some(*value)),
         DeferredNumber::Expression(expression) => {
-            let result = eval_expression(expression, &expression_context(matrix, inputs))
+            let result = eval_expression(expression, &expression_context(matrix, inputs, None))
                 .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
             result.as_u64().map(Some).ok_or_else(|| {
                 ParserError::InvalidExpression(format!(
@@ -355,7 +383,7 @@ pub fn expand_jobs(workflow: &Workflow) -> Result<Vec<JobPlan>, ParserError> {
     let global_env = workflow.env.clone().into_strings();
     for (job_id, job) in &workflow.jobs {
         let (matrixes, deferred_matrix) =
-            expand_matrix(job_id, job.strategy.matrix.as_ref(), None)?.into_cells();
+            expand_matrix(job_id, job.strategy.matrix.as_ref(), None, None)?.into_cells();
         let matrix_deferred = deferred_matrix.is_some();
         let matrix_count = matrixes.len();
         for (matrix_index, matrix) in matrixes.into_iter().enumerate() {
@@ -587,6 +615,7 @@ fn expand_jobs_with_reusables_internal(
     depth: usize,
     reusable_calls: &mut BTreeMap<String, ReusableCallMetadata>,
     inputs: Option<&BTreeMap<String, Value>>,
+    event_name: Option<&str>,
 ) -> Result<Vec<JobPlan>, ParserError> {
     let mut plans = Vec::new();
     let global_env = workflow.env.clone().into_strings();
@@ -699,9 +728,13 @@ fn expand_jobs_with_reusables_internal(
                 .map(|(k, v)| (k.clone(), v.value.clone()))
                 .collect();
 
-            let (matrices, deferred_matrix) =
-                expand_matrix(job_id, job.strategy.matrix.as_ref(), Some(&resolved_inputs))?
-                    .into_cells();
+            let (matrices, deferred_matrix) = expand_matrix(
+                job_id,
+                job.strategy.matrix.as_ref(),
+                Some(&resolved_inputs),
+                event_name,
+            )?
+            .into_cells();
             let matrix_count = matrices.len();
             for (matrix_index, matrix) in matrices.into_iter().enumerate() {
                 let expanded_job_id = matrix_expand::expanded_job_id(job_id, &matrix);
@@ -804,7 +837,7 @@ fn expand_jobs_with_reusables_internal(
         // rather than as zero cells. The job keeps one un-suffixed DAG node
         // (and its `if:` gating) until the runtime fan-out replaces it.
         let (matrix_cells, deferred_matrix) =
-            expand_matrix(job_id, job.strategy.matrix.as_ref(), inputs)?.into_cells();
+            expand_matrix(job_id, job.strategy.matrix.as_ref(), inputs, event_name)?.into_cells();
         let matrix_deferred = deferred_matrix.is_some();
         let matrix_count = matrix_cells.len();
         for (matrix_index, matrix) in matrix_cells.into_iter().enumerate() {
@@ -846,6 +879,40 @@ pub fn expand_jobs_with_reusables_and_shas(
     reusable_workflows: &BTreeMap<String, String>,
     reusable_workflow_shas: &BTreeMap<String, String>,
 ) -> Result<ExpandedWorkflows, ParserError> {
+    expand_jobs_with_reusables_and_shas_and_inputs(
+        workflow,
+        reusable_workflows,
+        reusable_workflow_shas,
+        None,
+    )
+}
+
+/// Expand jobs with workflow-dispatch inputs available to strategy
+/// expressions. GitHub evaluates `jobs.<id>.strategy.*` expressions with the
+/// `inputs` context populated from the dispatch, so the top-level expansion
+/// must see them too.
+pub fn expand_jobs_with_reusables_and_shas_and_inputs(
+    workflow: &Workflow,
+    reusable_workflows: &BTreeMap<String, String>,
+    reusable_workflow_shas: &BTreeMap<String, String>,
+    dispatch_inputs: Option<&BTreeMap<String, serde_json::Value>>,
+) -> Result<ExpandedWorkflows, ParserError> {
+    expand_jobs_with_reusables_and_shas_and_inputs_and_event(
+        workflow,
+        reusable_workflows,
+        reusable_workflow_shas,
+        dispatch_inputs,
+        None,
+    )
+}
+
+pub fn expand_jobs_with_reusables_and_shas_and_inputs_and_event(
+    workflow: &Workflow,
+    reusable_workflows: &BTreeMap<String, String>,
+    reusable_workflow_shas: &BTreeMap<String, String>,
+    dispatch_inputs: Option<&BTreeMap<String, serde_json::Value>>,
+    event_name: Option<&str>,
+) -> Result<ExpandedWorkflows, ParserError> {
     let mut reusable_calls = BTreeMap::new();
     let mut plans = expand_jobs_with_reusables_internal(
         workflow,
@@ -853,7 +920,8 @@ pub fn expand_jobs_with_reusables_and_shas(
         reusable_workflow_shas,
         0,
         &mut reusable_calls,
-        None,
+        dispatch_inputs,
+        event_name,
     )?;
 
     // Post-process: Rewrite needs to replace base job IDs of reusable calls with their expanded inner job IDs.
@@ -942,6 +1010,7 @@ pub fn expand_reusable_call(
         call.depth,
         &mut reusable_calls,
         Some(&caller_plan.inputs),
+        None,
     )?;
 
     let caller_id = caller_plan.id.0.clone();
@@ -1110,6 +1179,7 @@ fn expand_matrix(
     job_id: &str,
     matrix: Option<&MatrixValue>,
     inputs: Option<&BTreeMap<String, Value>>,
+    event_name: Option<&str>,
 ) -> Result<MatrixExpansion, ParserError> {
     let Some(matrix) = matrix else {
         return Ok(MatrixExpansion::Combinations(vec![IndexMap::new()]));
@@ -1118,8 +1188,11 @@ fn expand_matrix(
     let mut matrix = match matrix {
         MatrixValue::Static(matrix) => matrix.clone(),
         MatrixValue::Expression(expression) => {
-            let value = eval_expression(expression, &expression_context(&IndexMap::new(), inputs))
-                .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
+            let value = eval_expression(
+                expression,
+                &expression_context(&IndexMap::new(), inputs, event_name),
+            )
+            .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
             if value.is_null() {
                 if expression.contains("needs.") || expression.contains("needs[") {
                     return Ok(MatrixExpansion::Deferred(expression.clone()));
@@ -1141,9 +1214,11 @@ fn expand_matrix(
     ] {
         if values.len() == 1 {
             if let Value::String(expression) = &values[0] {
-                let resolved =
-                    eval_expression(expression, &expression_context(&IndexMap::new(), inputs))
-                        .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
+                let resolved = eval_expression(
+                    expression,
+                    &expression_context(&IndexMap::new(), inputs, event_name),
+                )
+                .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
                 if resolved.is_null() {
                     return Ok(MatrixExpansion::Combinations(vec![IndexMap::new()]));
                 }

@@ -1977,16 +1977,32 @@ fn normalize_version_dir(runner: &str) -> String {
 fn scenario_dirs(root: &Path, only: Option<&str>) -> anyhow::Result<Vec<PathBuf>> {
     let mut dirs = Vec::new();
     if let Some(name) = only {
-        let dir = root.join(name);
-        if !dir.join("flows.jsonl").exists() {
-            bail!("scenario flows not found: {}", dir.display());
+        let direct = root.join(name);
+        if direct.join("flows.jsonl").exists() {
+            return Ok(vec![direct]);
         }
-        return Ok(vec![dir]);
+        let nested = root.join("gh-official").join(name);
+        if nested.join("flows.jsonl").exists() {
+            return Ok(vec![nested]);
+        }
+        bail!(
+            "scenario flows not found for {name} under {}",
+            root.display()
+        );
     }
     for entry in fs::read_dir(root)? {
         let path = entry?.path();
-        if path.is_dir() && path.join("flows.jsonl").exists() {
-            dirs.push(path);
+        if path.is_dir() {
+            if path.join("flows.jsonl").exists() {
+                dirs.push(path);
+            } else if path.file_name().and_then(|n| n.to_str()) == Some("gh-official") {
+                for sub in fs::read_dir(&path)? {
+                    let sub_path = sub?.path();
+                    if sub_path.is_dir() && sub_path.join("flows.jsonl").exists() {
+                        dirs.push(sub_path);
+                    }
+                }
+            }
         }
     }
     dirs.sort();

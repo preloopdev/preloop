@@ -915,7 +915,16 @@ pub(crate) fn apply_meta_snapshot(inner: &mut InnerState, meta: MetaSnapshot) {
     inner.cache_v2_pending = meta.cache_v2_pending.into_iter().collect();
     inner.cache_v2_dl_tokens = meta.cache_v2_dl_tokens.into_iter().collect();
     inner.artifact_v2_pending = meta.artifact_v2_pending.into_iter().collect();
-    inner.artifact_v2_registry = meta.artifact_v2_registry.into_iter().collect();
+    let mut migrated_registry = std::collections::BTreeMap::new();
+    for (k, v) in meta.artifact_v2_registry {
+        let parts: Vec<&str> = k.split('/').collect();
+        if parts.len() >= 3 {
+            migrated_registry.insert(format!("{}/{}", parts[0], parts[2..].join("/")), v);
+        } else {
+            migrated_registry.insert(k, v);
+        }
+    }
+    inner.artifact_v2_registry = migrated_registry;
     // Rebuild in-memory order queues for FIFO eviction and apply caps so a
     // restart doesn't reload unbounded history that was pending before the
     // caps shipped.

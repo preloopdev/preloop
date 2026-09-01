@@ -296,12 +296,22 @@ pub fn implemented_routes(routes_src: &Path) -> Result<BTreeSet<ImplRoute>> {
 
 /// Canonical `(METHOD, path)` set the golden corpus for `version` exercises.
 pub fn golden_endpoints(golden_root: &Path, version: &str) -> Result<BTreeSet<(String, String)>> {
-    let dir = golden_root.join(format!("v{}", version.trim_start_matches('v')));
+    let mut dir = golden_root.join(format!("v{}", version.trim_start_matches('v')));
+    if !dir.exists() {
+        dir = golden_root.join(version);
+    }
     let mut out = BTreeSet::new();
     if !dir.exists() {
         return Ok(out);
     }
-    for entry in std::fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
+    let target_dir = if dir.join("gh-official").exists() {
+        dir.join("gh-official")
+    } else {
+        dir
+    };
+    for entry in
+        std::fs::read_dir(&target_dir).with_context(|| format!("read {}", target_dir.display()))?
+    {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
             continue;
