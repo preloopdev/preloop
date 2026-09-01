@@ -1111,6 +1111,10 @@ criteria = "safe-to-deploy"
 version = "1.2.1"
 criteria = "safe-to-deploy"
 
+[[exemptions.streaming-iterator]]
+version = "0.1.9"
+criteria = "safe-to-deploy"
+
 [[exemptions.stringprep]]
 version = "0.1.5"
 criteria = "safe-to-deploy"
@@ -1285,6 +1289,18 @@ criteria = "safe-to-deploy"
 
 [[exemptions.tracing-subscriber]]
 version = "0.3.23"
+criteria = "safe-to-deploy"
+
+[[exemptions.tree-sitter]]
+version = "0.25.10"
+criteria = "safe-to-deploy"
+
+[[exemptions.tree-sitter-c-sharp]]
+version = "0.23.5"
+criteria = "safe-to-deploy"
+
+[[exemptions.tree-sitter-language]]
+version = "0.1.8"
 criteria = "safe-to-deploy"
 
 [[exemptions.try-lock]]
