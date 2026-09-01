@@ -2893,6 +2893,99 @@ async fn step_manifests_survive_a_restart() {
     );
 }
 
+/// Every surface showing a whole step list uses execution order.
+///
+/// The stored manifest is seeded with declared steps and then appends
+/// synthetic ones as the runner reports them, so its raw order puts
+/// `Set up job` last despite it running first. A step id is a v4 UUID, so it
+/// cannot supply the order either.
+#[tokio::test]
+async fn step_lists_and_job_logs_follow_execution_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = three_step_run_for_log_filters(&app, &state).await;
+    let ids = workflow_step_ids(&state, run_id, "build").await;
+    let (plan_id, agent_job_id) = (jobs[0].1.clone(), jobs[0].2.clone());
+
+    // The runner reports `Set up job` first, then the declared steps at the
+    // offset positions the golden capture shows (declared step 1 is number 2).
+    let setup_id = uuid::Uuid::new_v4().to_string();
+    let report = |external_id: &str, number: u64, name: &str| {
+        serde_json::json!({
+            "external_id": external_id,
+            "number": number,
+            "name": name,
+            "status": 6,
+            "conclusion": 2
+        })
+    };
+    let response = request_json(
+        &app,
+        Method::POST,
+        "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",
+        json!({
+            "workflow_run_backend_id": plan_id,
+            "workflow_job_run_backend_id": agent_job_id,
+            "steps": [
+                report(&setup_id, 1, "Set up job"),
+                report(&ids[0], 2, "Run echo one"),
+                report(&ids[1], 3, "Run echo two"),
+                report(&ids[2], 4, "Run echo three"),
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(response["ok"], true);
+
+    // The run record lists the synthetic setup step first.
+    let run = get_run_json(&app, &run_id.to_string()).await;
+    let names: Vec<&str> = run["jobs_list"][0]["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|step| step["name"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "Set up job",
+            "Run echo one",
+            "Run echo two",
+            "Run echo three"
+        ],
+        "the run record must show execution order, not seeded-then-appended"
+    );
+
+    // The whole-job log concatenates in the same order, even though the ids
+    // sort differently.
+    write_step_job_logs(
+        &temp,
+        &plan_id,
+        &agent_job_id,
+        &[
+            (ids[2].as_str(), "three\n"),
+            (ids[0].as_str(), "one\n"),
+            (setup_id.as_str(), "setup\n"),
+            (ids[1].as_str(), "two\n"),
+        ],
+    )
+    .await;
+    let (status, body) = get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=build")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        String::from_utf8_lossy(&body),
+        "setup\none\ntwo\nthree\n",
+        "whole-job output must follow execution order"
+    );
+
+    // `--step` still counts declared steps only, so setup takes no slot.
+    let (status, body) =
+        get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=build&step=1")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"one\n");
+}
+
 /// A completion reconciles the attempt that actually reported.
 ///
 /// `job_requests` is keyed by monotonic request id, so picking the first match

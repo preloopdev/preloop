@@ -143,6 +143,36 @@ impl StepRecord {
             .collect()
     }
 
+    /// Sort key placing a step in execution order.
+    ///
+    /// `runner_number` is the runner's own 1-based timeline position and counts
+    /// every step it ran, so it is the truth once reported. Until then a
+    /// declared step falls back to its manifest position, biased past any
+    /// reported number so freshly seeded steps trail what has actually run.
+    /// A step id is a v4 UUID and sorts randomly, so it is only the final
+    /// tie-break for determinism.
+    fn execution_key(&self) -> (u32, usize, &str) {
+        match self.runner_number {
+            Some(number) => (number, 0, self.id.as_str()),
+            None => (
+                u32::MAX,
+                self.workflow_index.unwrap_or(usize::MAX),
+                self.id.as_str(),
+            ),
+        }
+    }
+
+    /// Order records as the job executed them.
+    ///
+    /// The in-memory manifest is seeded with declared steps and then appends
+    /// synthetic ones as the runner reports them, so its raw order puts
+    /// `Set up job` after the workflow steps despite it running first. A
+    /// restore adds a third order again. Every surface that shows a whole
+    /// step list goes through this instead.
+    pub(crate) fn sort_execution_order(steps: &mut [Self]) {
+        steps.sort_by(|left, right| left.execution_key().cmp(&right.execution_key()));
+    }
+
     /// Locate a step by stable identity, and by nothing else.
     ///
     /// Display names repeat legitimately — two steps may both be named `Test`

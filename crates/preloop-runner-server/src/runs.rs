@@ -2209,7 +2209,10 @@ pub(crate) fn latest_attempt_steps(
         .filter(|request| request.run_id == run_id && request.job_id == *job_id)
         .max_by_key(|request| request.request_id)
         .map(|request| request.agent_job_id)?;
-    inner.job_steps.get(&agent_job_id).cloned()
+    let mut steps = inner.job_steps.get(&agent_job_id).cloned()?;
+    // The stored vector is seeded-then-appended, so it is not execution order.
+    StepRecord::sort_execution_order(&mut steps);
+    Some(steps)
 }
 
 pub(crate) async fn get_run(
@@ -2458,6 +2461,9 @@ async fn resolve_job_logs(
     results_dir: &std::path::Path,
     fallback_blocks: Vec<Vec<u8>>,
     workflow_step_ids: Option<&[String]>,
+    // Every id the attempt's manifest knows, in execution order, used only to
+    // order the whole-job concatenation.
+    execution_step_ids: Option<&[String]>,
     prefer_steps: bool,
 ) -> Result<JobLogs, ApiError> {
     let merged = match tokio::fs::read(results_dir.join("job-logs.txt")).await {
@@ -2514,9 +2520,19 @@ async fn resolve_job_logs(
             )));
         }
     }
-    // Only for the unfiltered read, where this is a concatenation order and
-    // not a step selector. `--step` goes through `workflow` below.
-    step_files.sort_by(|left, right| left.0.cmp(&right.0));
+    // Concatenation order comes from the manifest, which knows what ran when.
+    // A step id is a v4 UUID, so sorting by it emitted the whole-job log in
+    // random order; blobs the manifest does not know keep a stable tail.
+    let position = |id: &str| {
+        execution_step_ids
+            .and_then(|ids| ids.iter().position(|known| known == id))
+            .unwrap_or(usize::MAX)
+    };
+    step_files.sort_by(|left, right| {
+        position(&left.0)
+            .cmp(&position(&right.0))
+            .then_with(|| left.0.cmp(&right.0))
+    });
 
     if !step_files.is_empty() {
         let workflow = workflow_step_ids.filter(|ids| !ids.is_empty()).map(|ids| {
@@ -2695,19 +2711,29 @@ pub(crate) async fn get_run_logs(
                     }
                 });
                 // The attempt's own manifest, keyed by the agent job id that
-                // also names this request's results directory. Declared steps
-                // only: a synthetic "Set up job" record must not occupy a
-                // `--step` slot. The broker message is deliberately not
-                // consulted — it is broker delivery state that a restart or a
-                // retirement can drop, while the manifest is run state.
-                let workflow_step_ids = inner
-                    .job_steps
-                    .get(&request.agent_job_id)
+                // also names this request's results directory. The broker
+                // message is deliberately not consulted — it is broker
+                // delivery state that a restart or a retirement can drop,
+                // while the manifest is run state.
+                //
+                // Two views: declared steps in workflow order decide `--step`,
+                // because a synthetic "Set up job" record must not occupy a
+                // slot; every id in execution order decides the whole-job
+                // concatenation, where synthetic output belongs in place.
+                let manifest = inner.job_steps.get(&request.agent_job_id);
+                let workflow_step_ids = manifest
                     .map(|records| {
                         StepRecord::workflow_steps(records)
                             .into_iter()
                             .map(|step| step.id.clone())
                             .collect::<Vec<_>>()
+                    })
+                    .filter(|ids| !ids.is_empty());
+                let execution_step_ids = manifest
+                    .map(|records| {
+                        let mut ordered = records.clone();
+                        StepRecord::sort_execution_order(&mut ordered);
+                        ordered.into_iter().map(|step| step.id).collect::<Vec<_>>()
                     })
                     .filter(|ids| !ids.is_empty());
                 (
@@ -2719,6 +2745,7 @@ pub(crate) async fn get_run_logs(
                         .map(|(_, block)| block.to_vec())
                         .collect::<Vec<_>>(),
                     workflow_step_ids,
+                    execution_step_ids,
                 )
             })
             .collect::<Vec<_>>();
@@ -2726,7 +2753,15 @@ pub(crate) async fn get_run_logs(
     };
 
     let mut merged = Vec::new();
-    for (plan_id, agent_job_id, job_label, fallback_blocks, workflow_step_ids) in sources {
+    for (
+        plan_id,
+        agent_job_id,
+        job_label,
+        fallback_blocks,
+        workflow_step_ids,
+        execution_step_ids,
+    ) in sources
+    {
         let results_dir = state_dir
             .join("replay")
             .join("results")
@@ -2736,6 +2771,7 @@ pub(crate) async fn get_run_logs(
             &results_dir,
             fallback_blocks,
             workflow_step_ids.as_deref(),
+            execution_step_ids.as_deref(),
             query.step.is_some(),
         )
         .await?;

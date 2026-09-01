@@ -1426,7 +1426,8 @@ impl SqliteStore {
             "SELECT agent_job_id, step_id, kind, workflow_index, runner_number,
                     context_name, name_blob, conclusion, started_at_us, finished_at_us
              FROM job_steps
-             ORDER BY agent_job_id, kind, workflow_index, step_id",
+             ORDER BY agent_job_id, COALESCE(runner_number, 2147483647),
+                      COALESCE(workflow_index, 2147483647), step_id",
         )?;
         for row in step_stmt.query_map([], |row| {
             Ok((
