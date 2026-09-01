@@ -145,17 +145,33 @@ impl StepRecord {
 
     /// Sort key placing a step in execution order.
     ///
-    /// `runner_number` is the runner's own 1-based timeline position and counts
-    /// every step it ran, so it is the truth once reported. Until then a
-    /// declared step falls back to its manifest position, biased past any
-    /// reported number so freshly seeded steps trail what has actually run.
-    /// A step id is a v4 UUID and sorts randomly, so it is only the final
+    /// Three tiers, because the two reporting paths carry different evidence:
+    ///
+    /// 1. `runner_number` — the runner's own 1-based timeline position, which
+    ///    counts every step it ran. The broker path reports it, and it is the
+    ///    truth once present.
+    /// 2. `started_at` — when the server first saw the step run. The AzDO
+    ///    timeline path carries no ordinal (`TimelineRecord` has no `order`
+    ///    field), so a synthetic step there has no number; without this tier
+    ///    `Set up job` sorted after every declared step on that path, which is
+    ///    the defect this ordering exists to prevent.
+    /// 3. `workflow_index` — a declared step that has not run yet, ordered as
+    ///    the workflow declares and placed after everything that has run.
+    ///
+    /// A step id is a v4 UUID and sorts randomly, so it is only ever the final
     /// tie-break for determinism.
-    fn execution_key(&self) -> (u32, usize, &str) {
-        match self.runner_number {
-            Some(number) => (number, 0, self.id.as_str()),
-            None => (
-                u32::MAX,
+    fn execution_key(&self) -> (u8, i64, usize, &str) {
+        match (self.runner_number, self.started_at) {
+            (Some(number), _) => (0, i64::from(number), 0, self.id.as_str()),
+            (None, Some(started_at)) => (
+                1,
+                started_at.timestamp_micros(),
+                self.workflow_index.unwrap_or(usize::MAX),
+                self.id.as_str(),
+            ),
+            (None, None) => (
+                2,
+                0,
                 self.workflow_index.unwrap_or(usize::MAX),
                 self.id.as_str(),
             ),

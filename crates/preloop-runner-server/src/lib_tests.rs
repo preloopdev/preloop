@@ -2843,6 +2843,83 @@ async fn log_run_logs_unknown_job_is_404_not_whole_run() {
     );
 }
 
+/// The AzDO timeline path orders synthetic steps and ignores the job record.
+///
+/// `TimelineRecord` carries no ordinal, so a synthetic step reported this way
+/// has no `runner_number` and must be ordered by when it started — otherwise
+/// `Set up job` sorts after every declared step. The PATCH also carries the
+/// job's own record, whose UUID never equals the workflow job key, so it was
+/// reconciled in as an extra step named after the job.
+#[tokio::test]
+async fn timeline_path_orders_synthetic_steps_and_skips_the_job_record() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, _) = three_step_run_for_log_filters(&app, &state).await;
+    let ids = workflow_step_ids(&state, run_id, "build").await;
+    let (plan_id, timeline_id) = {
+        let inner = state.inner.lock().await;
+        let request = inner
+            .job_requests
+            .values()
+            .find(|request| request.run_id == run_id)
+            .expect("dispatched request");
+        (request.plan_id.clone(), request.timeline_id.to_string())
+    };
+
+    // Setup started before the declared steps, and the job record is sent
+    // alongside them exactly as the official runner does.
+    let setup_id = uuid::Uuid::new_v4().to_string();
+    let record = |id: &str, kind: &str, name: &str, start: &str| {
+        json!({
+            "id": id,
+            "type": kind,
+            "name": name,
+            "displayName": name,
+            "state": "completed",
+            "result": "succeeded",
+            "startTime": start,
+        })
+    };
+    let response = request_json(
+        &app,
+        Method::PATCH,
+        &format!("/_apis/v1/Timeline/scope/actions/{plan_id}/{timeline_id}"),
+        json!({"count": 5, "value": [
+            record(&uuid::Uuid::new_v4().to_string(), "Job", "build", "2026-01-01T00:00:00Z"),
+            record(&ids[0], "Task", "Run echo one", "2026-01-01T00:00:02Z"),
+            record(&ids[1], "Task", "Run echo two", "2026-01-01T00:00:03Z"),
+            record(&ids[2], "Task", "Run echo three", "2026-01-01T00:00:04Z"),
+            record(&setup_id, "Task", "Set up job", "2026-01-01T00:00:01Z"),
+        ]}),
+    )
+    .await;
+    assert_eq!(response["count"], 5);
+
+    let run = get_run_json(&app, &run_id.to_string()).await;
+    let names: Vec<&str> = run["jobs_list"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|detail| detail["job_id"] == "build")
+        .expect("build detail")["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|step| step["name"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "Set up job",
+            "Run echo one",
+            "Run echo two",
+            "Run echo three"
+        ],
+        "synthetic setup must lead, and the job record must not become a step"
+    );
+}
+
 /// Expansion does not leave the placeholder's manifest behind.
 ///
 /// A deferred-matrix node is dispatched as a placeholder, gets a manifest

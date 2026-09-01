@@ -156,6 +156,15 @@ pub(crate) async fn patch_timeline_records(
                     let Some(name) = &record.display_name else {
                         continue;
                     };
+                    // A PATCH carries the job's own record alongside its
+                    // steps. Its id is a UUID and `job_id.0` is the workflow
+                    // job key, so the id comparison below never matched it and
+                    // the job was reconciled in as a synthetic step — showing
+                    // up in run projections as an extra step named after the
+                    // job, and persisted there. Only task records are steps.
+                    if !matches!(record.record_type, Some(azdo::TimelineRecordType::Task)) {
+                        continue;
+                    }
                     if record.id.to_string() == job_id.0 {
                         continue;
                     }
