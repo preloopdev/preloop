@@ -616,21 +616,42 @@ impl ConformanceReport {
 }
 
 fn body_comparison(lo: &[Value], ro: &[Value], field: &str, ll: &str, rl: &str) -> BodyComparison {
-    let l = lo.first().and_then(|f| f.get(field));
-    let r = ro.first().and_then(|f| f.get(field));
-    if l.is_none() && r.is_none() {
+    // Compare *every* occurrence in the endpoint group deterministically by
+    // index, not just the first — otherwise a later call that regresses its
+    // body slips through when the first bodies and all statuses match. (Per
+    // index rather than a deduped array: `to_schema_value` unions array element
+    // shapes, which would hide a drop that only affects a later occurrence.)
+    // Replay preserves request order, so index alignment holds; a cardinality
+    // difference compares the present body against an empty one.
+    let la: Vec<&Value> = lo.iter().filter_map(|f| f.get(field)).collect();
+    let ra: Vec<&Value> = ro.iter().filter_map(|f| f.get(field)).collect();
+    if la.is_empty() && ra.is_empty() {
         return BodyComparison::default();
     }
     let empty = Value::Object(Default::default());
-    let a = l.unwrap_or(&empty);
-    let b = r.unwrap_or(&empty);
-    let na = normalize_value(a);
-    let nb = normalize_value(b);
+    let mut value_diffs = Vec::new();
+    let mut schema_diffs = Vec::new();
+    let mut drops = false;
+    for i in 0..la.len().max(ra.len()) {
+        let a = la.get(i).copied().unwrap_or(&empty);
+        let b = ra.get(i).copied().unwrap_or(&empty);
+        let vd = json_diff(&normalize_value(a), &normalize_value(b), ll, rl);
+        if !vd.is_empty() {
+            value_diffs.push(vd);
+        }
+        let sd = json_schema_diff(a, b, ll, rl);
+        if !sd.is_empty() {
+            schema_diffs.push(sd);
+        }
+        if schema_drops_fields(&to_schema_value(a), &to_schema_value(b)) {
+            drops = true;
+        }
+    }
     BodyComparison {
         present: true,
-        normalized_value_diff: redact_report(&json_diff(&na, &nb, ll, rl)),
-        schema_diff: json_schema_diff(a, b, ll, rl),
-        schema_drops_fields: schema_drops_fields(&to_schema_value(a), &to_schema_value(b)),
+        normalized_value_diff: redact_report(&value_diffs.join("\n")),
+        schema_diff: schema_diffs.join("\n"),
+        schema_drops_fields: drops,
     }
 }
 
@@ -1374,6 +1395,24 @@ mod tests {
         );
         let fails = analyze_dirs(&l, &r).failures(&GatePolicy::default());
         assert!(fails.iter().any(|f| f.kind == FailureKind::ResponseSchema));
+    }
+
+    #[test]
+    fn gate_catches_regression_in_a_later_flow() {
+        let ok = serde_json::json!({"job": {"id": "g", "steps": ["a"]}});
+        let dropped = serde_json::json!({"job": {"id": "g"}});
+        // Reference: two identical acquire responses; candidate: first matches,
+        // second drops `steps`. The gate must not pass on the first alone.
+        let l = tmp_capture(
+            "mfl",
+            &[acquire_flow(200, ok.clone()), acquire_flow(200, ok.clone())],
+        );
+        let r = tmp_capture("mfr", &[acquire_flow(200, ok), acquire_flow(200, dropped)]);
+        let fails = analyze_dirs(&l, &r).failures(&GatePolicy::default());
+        assert!(
+            fails.iter().any(|f| f.kind == FailureKind::ResponseSchema),
+            "a field dropped in a later occurrence must be caught: {fails:?}"
+        );
     }
 
     #[test]

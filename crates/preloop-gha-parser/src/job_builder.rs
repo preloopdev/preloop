@@ -463,8 +463,12 @@ pub fn build_agent_job_message_with_normalized_context(
     // via its Newtonsoft TemplateToken converter, which only understands the
     // `{type: 2, map: [{Key: {type: 0, lit: K}, Value: ...}]}` wire shape; a
     // plain JSON object deserializes to a token the schema evaluator rejects
-    // with "The template is not valid. Unexpected value ''". Values here are
-    // already resolved, so emit literal (type 0) scalar tokens.
+    // with "The template is not valid. Unexpected value ''". Most values here
+    // are already resolved literals, but runtime-only ones (e.g.
+    // `${{ github.workspace }}/bin`, preserved above) are still templates the
+    // runner must evaluate at step time — so serialize the value through
+    // `template_string_token`, which emits a literal (type 0) for plain text
+    // and an expression/format token for anything containing `${{ … }}`.
     let environment_variables: Vec<serde_json::Value> = resolved_env
         .iter()
         .map(|(k, v)| {
@@ -472,7 +476,7 @@ pub fn build_agent_job_message_with_normalized_context(
                 "type": 2,
                 "map": [{
                     "Key": { "type": 0, "lit": k },
-                    "Value": { "type": 0, "lit": v }
+                    "Value": template_string_token(v)
                 }]
             })
         })
@@ -1096,6 +1100,28 @@ jobs:
             .collect();
         assert_eq!(env.get("DESTDIR").map(String::as_str), Some("./build"));
         assert_eq!(env.get("GLOBAL_VAR").map(String::as_str), Some("gv"));
+        // The wire shape must be the TemplateToken map the official runner's
+        // converter accepts (type 2 map of literal Key/Value tokens), not a
+        // plain object — otherwise the runner rejects it as "not valid".
+        for entry in &message.environment_variables {
+            assert_eq!(
+                entry["type"],
+                serde_json::json!(2),
+                "env entry must be a TemplateToken map: {entry}"
+            );
+            let map = entry["map"].as_array().expect("map array");
+            assert_eq!(map.len(), 1, "one Key/Value pair per entry: {entry}");
+            let pair = &map[0];
+            assert_eq!(pair["Key"]["type"], serde_json::json!(0));
+            assert!(
+                pair["Key"]["lit"].is_string(),
+                "Key must be a literal token"
+            );
+            assert!(
+                pair["Value"].get("type").is_some(),
+                "Value must be a token: {entry}"
+            );
+        }
         assert_eq!(
             message
                 .variables
@@ -1152,6 +1178,63 @@ jobs:
             "the ref_name comparison must resolve to a boolean literal"
         );
         assert_eq!(env.get("PLAIN").map(String::as_str), Some("hello"));
+    }
+
+    /// Runtime-only expressions (`github.workspace` is filled in by the runner)
+    /// must reach the runner as an expression token to evaluate, not as a raw
+    /// literal of the template text.
+    #[test]
+    fn job_env_runtime_expression_values_reach_the_runner_as_tokens() {
+        let workflow = parse_workflow(
+            r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      BIN_DIR: ${{ github.workspace }}/bin
+    steps:
+      - run: echo hi
+"#,
+        )
+        .unwrap();
+        let plan = &crate::expand_jobs(&workflow).unwrap()[0];
+        let message = build_agent_job_message(
+            plan,
+            &serde_json::json!({"event_name": "push"}),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let value = message
+            .environment_variables
+            .iter()
+            .find_map(|entry| {
+                let pair = entry.get("map")?.as_array()?.first()?;
+                if pair.get("Key")?.get("lit")?.as_str()? == "BIN_DIR" {
+                    Some(pair.get("Value")?.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("BIN_DIR must be present on the wire");
+        assert_ne!(
+            value["type"],
+            serde_json::json!(0),
+            "a runtime expression must not be shipped as a raw literal: {value}"
+        );
+        assert!(
+            value.get("lit").is_none(),
+            "expression value must not carry a raw lit: {value}"
+        );
+        assert!(
+            value["expr"]
+                .as_str()
+                .unwrap_or("")
+                .contains("github.workspace"),
+            "the value token must reference github.workspace: {value}"
+        );
     }
 
     #[test]

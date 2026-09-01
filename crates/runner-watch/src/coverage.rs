@@ -78,7 +78,12 @@ impl ImplRoute {
     fn covers(&self, golden_method: &str, golden_path: &str) -> bool {
         let method_ok = self.method == "*" || self.method == golden_method;
         let path_ok = if self.catch_all {
-            golden_path == self.path || golden_path.starts_with(&format!("{}/", self.path))
+            // A root catch-all (`/{*path}` → prefix "/") matches everything;
+            // otherwise match the prefix itself or any descendant, without
+            // building a "//" prefix.
+            self.path == "/"
+                || golden_path == self.path
+                || golden_path.starts_with(&format!("{}/", self.path))
         } else {
             golden_path == self.path
         };
@@ -416,6 +421,19 @@ mod tests {
             "/_apis/v1/AgentPools"
         );
         assert_eq!(canonicalize("/_apis/v1/AgentPools"), "/_apis/v1/AgentPools");
+    }
+
+    #[test]
+    fn root_catch_all_matches_descendants() {
+        let r = ImplRoute {
+            method: "GET".into(),
+            path: "/".into(),
+            catch_all: true,
+        };
+        assert!(r.covers("GET", "/anything"));
+        assert!(r.covers("GET", "/a/b/c"));
+        // Method is still enforced.
+        assert!(!r.covers("POST", "/anything"));
     }
 
     #[test]

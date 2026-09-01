@@ -762,22 +762,57 @@ fn node_text<'a>(node: tree_sitter::Node, src: &'a [u8]) -> &'a str {
     node.utf8_text(src).unwrap_or("")
 }
 
-/// A method's identity for delta detection: `name(paramType, …)`. Parameter
-/// types distinguish overloads so an added overload is not lost when members
-/// are keyed by `(type, name)`.
+/// A method's identity for delta detection: `name<arity>(mod type, …)`. Generic
+/// arity and each parameter's passing mode + type are all part of a C# method
+/// signature, so overloads that differ only by `ref`/`out`/`in` or by type-
+/// parameter count produce distinct keys and are not lost when members are keyed
+/// by `(type, name)`.
 fn method_signature(name: &str, node: tree_sitter::Node, src: &[u8]) -> String {
-    let mut types = Vec::new();
-    if let Some(params) = node.child_by_field_name("parameters") {
-        let mut cursor = params.walk();
-        for p in params.named_children(&mut cursor) {
-            if p.kind() == "parameter" {
-                if let Some(t) = p.child_by_field_name("type") {
-                    types.push(node_text(t, src).to_string());
-                }
-            }
+    // Generic arity: `M<T>` and `M<T, U>` are distinct signatures.
+    let mut arity = 0usize;
+    let mut top = node.walk();
+    for child in node.named_children(&mut top) {
+        if child.kind() == "type_parameter_list" {
+            let mut c = child.walk();
+            arity = child
+                .named_children(&mut c)
+                .filter(|n| n.kind() == "type_parameter")
+                .count();
         }
     }
-    format!("{name}({})", types.join(", "))
+    // Each parameter's modifiers + type = everything before the parameter name
+    // (e.g. `ref int`), which is signature-significant.
+    let mut params = Vec::new();
+    if let Some(plist) = node.child_by_field_name("parameters") {
+        let mut cursor = plist.walk();
+        for p in plist.named_children(&mut cursor) {
+            if p.kind() != "parameter" {
+                continue;
+            }
+            let ptext = node_text(p, src).trim();
+            let sig = match p.child_by_field_name("name") {
+                Some(n) => {
+                    let nt = node_text(n, src);
+                    match ptext.rfind(nt) {
+                        Some(idx) if idx > 0 => ptext[..idx].trim().to_string(),
+                        _ => ptext.to_string(),
+                    }
+                }
+                None => ptext.to_string(),
+            };
+            params.push(if sig.is_empty() {
+                ptext.to_string()
+            } else {
+                sig
+            });
+        }
+    }
+    let base = if arity > 0 {
+        format!("{name}<{arity}>")
+    } else {
+        name.to_string()
+    };
+    format!("{base}({})", params.join(", "))
 }
 
 /// Parse `text` as C# and collect its structural model. Returns `None` only when
@@ -789,6 +824,11 @@ fn parse_csharp(text: &str) -> Option<CsModel> {
         .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
         .ok()?;
     let tree = parser.parse(text, None)?;
+    // A recovery tree with syntax errors would yield an incomplete model and
+    // silently skip declarations; fall back to the line heuristic instead.
+    if tree.root_node().has_error() {
+        return None;
+    }
     let mut model = CsModel::default();
     collect_csharp(tree.root_node(), "<module>", text.as_bytes(), &mut model);
     Some(model)
@@ -3650,6 +3690,33 @@ mod tests {
                 && e.structure.as_deref() == Some("Api")
                 && e.fields == vec!["Send(int, string)"]),
             "added method overload should be detected via its signature: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn treesitter_detects_ref_modifier_overload() {
+        let old = "public class Api {\n    public void Send(int x) {}\n}";
+        let new = "public class Api {\n    public void Send(int x) {}\n    public void Send(ref int x) {}\n}";
+        let entries = extract_delta_entries("src/Api.cs", Some(old), Some(new));
+        assert!(
+            entries.iter().any(|e| e.change_type == "field_added"
+                && e.structure.as_deref() == Some("Api")
+                && e.fields == vec!["Send(ref int)"]),
+            "a ref-modifier overload should be a distinct signature: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn treesitter_detects_generic_arity_overload() {
+        let old = "public class Api {\n    public void Run<T>() {}\n}";
+        let new =
+            "public class Api {\n    public void Run<T>() {}\n    public void Run<T, U>() {}\n}";
+        let entries = extract_delta_entries("src/Api.cs", Some(old), Some(new));
+        assert!(
+            entries.iter().any(|e| e.change_type == "field_added"
+                && e.structure.as_deref() == Some("Api")
+                && e.fields == vec!["Run<2>()"]),
+            "a generic-arity overload should be a distinct signature: {entries:?}"
         );
     }
 
