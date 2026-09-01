@@ -4382,15 +4382,10 @@ mod tests {
     fn live_log_frame_prints_only_console_lines() {
         let frame = "event: live-log\ndata: {\"stepId\":\"s1\",\"startLine\":1,\"count\":2,\
                      \"value\":[\"first\",\"second\"]}";
-        // Captured behavior: the payload's `value` lines are the output, and the
-        // `event:` name is not.
-        let wrapper: preloop_gha_protocol::LiveLogFeedLinesWrapper = frame
-            .lines()
-            .find_map(|line| line.strip_prefix("data:"))
-            .map(|payload| serde_json::from_str(payload.trim_start()).unwrap())
-            .expect("frame carries a data payload");
-        assert_eq!(wrapper.value, vec!["first", "second"]);
-        assert_eq!(wrapper.step_id, "s1");
+        // The production parser reports whether this frame emitted console
+        // lines; the `event:` line itself carries no output.
+        assert!(print_live_log_frame_bytes(frame.as_bytes()).unwrap());
+        assert!(!print_live_log_frame_bytes(b"event: live-log").unwrap());
     }
 
     #[test]
