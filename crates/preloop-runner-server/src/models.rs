@@ -53,6 +53,31 @@ pub(crate) struct StepRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) finished_at: Option<chrono::DateTime<chrono::Utc>>,
 }
+impl StepRecord {
+    /// Match a step by stable runner identity, falling back to a unique name.
+    pub(crate) fn find_matching_index(
+        steps: &[Self],
+        id: &str,
+        name: &str,
+        allow_name_fallback: bool,
+    ) -> Option<usize> {
+        if !id.is_empty() {
+            if let Some(index) = steps.iter().position(|step| step.id.as_deref() == Some(id)) {
+                return Some(index);
+            }
+        }
+        if !allow_name_fallback {
+            return None;
+        }
+
+        let mut matches = steps
+            .iter()
+            .enumerate()
+            .filter(|(_, step)| step.name == name);
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first.0)
+    }
+}
 
 /// Server-side timing for the workspace snapshot created at submission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

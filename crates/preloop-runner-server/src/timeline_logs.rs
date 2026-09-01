@@ -173,8 +173,12 @@ pub(crate) async fn patch_timeline_records(
                         .map(|t| t.with_timezone(&chrono::Utc));
                     let observed = chrono::Utc::now();
 
-                    if let Some(pos) = job_detail.steps.iter().position(|s| s.name == *name) {
-                        job_detail.steps[pos].id = Some(record.id.to_string());
+                    if let Some(pos) = StepRecord::find_matching_index(
+                        &job_detail.steps,
+                        &record.id.to_string(),
+                        name,
+                        true,
+                    ) {
                         job_detail.steps[pos].conclusion = conclusion_str.to_owned();
                         if let Some(started_at) = started_at {
                             job_detail.steps[pos].started_at = Some(started_at);

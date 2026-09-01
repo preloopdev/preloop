@@ -92,6 +92,12 @@ pub(crate) async fn twirp_workflow_steps_update(
                             .map(str::to_owned)
                             .or_else(|| step_uuid.and_then(|suuid| step_names.get(&suuid).cloned()))
                             .unwrap_or_default();
+                        let duplicate_name = !name.is_empty()
+                            && steps
+                                .iter()
+                                .filter(|candidate| candidate["name"].as_str() == Some(&name))
+                                .count()
+                                > 1;
 
                         let conclusion_num = step["conclusion"].as_u64().unwrap_or(0);
                         let status_num = step["status"].as_u64().unwrap_or(0);
@@ -116,7 +122,12 @@ pub(crate) async fn twirp_workflow_steps_update(
                         let terminal = status_num == 6;
                         let observed = chrono::Utc::now();
 
-                        if let Some(pos) = job_detail.steps.iter().position(|s| s.name == name) {
+                        if let Some(pos) = StepRecord::find_matching_index(
+                            &job_detail.steps,
+                            external_id_str,
+                            &name,
+                            !duplicate_name,
+                        ) {
                             if !external_id_str.is_empty() {
                                 job_detail.steps[pos].id = Some(external_id_str.to_owned());
                             }
@@ -134,6 +145,7 @@ pub(crate) async fn twirp_workflow_steps_update(
                             // - already terminal → record finished_at only
                             //   (do not invent started_at == finished_at, which
                             //   forces duration 0 for fast steps that complete
+                            //   before any in-progress update is processed)
                             job_detail.steps.push(StepRecord {
                                 id: (!external_id_str.is_empty())
                                     .then(|| external_id_str.to_owned()),

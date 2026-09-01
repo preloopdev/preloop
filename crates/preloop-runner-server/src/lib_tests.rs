@@ -13035,6 +13035,98 @@ async fn workflow_steps_update_prefers_runner_reported_step_names() {
 }
 
 #[tokio::test]
+async fn workflow_steps_update_preserves_duplicate_names_after_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = submit_yaml(
+        &app,
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - name: Test\n        run: cargo test --lib\n      - name: Test\n        run: cargo test --integration\n",
+        "local/preloop",
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+    let (plan_id, agent_job_id, request_id) = {
+        let inner = state.inner.lock().await;
+        let request = inner
+            .job_requests
+            .values()
+            .find(|request| request.run_id.0.to_string() == run_id)
+            .expect("submitted run must have a job request");
+        (
+            request.plan_id.clone(),
+            request.agent_job_id.to_string(),
+            request.request_id,
+        )
+    };
+    let first_id = uuid::Uuid::new_v4().to_string();
+    let second_id = uuid::Uuid::new_v4().to_string();
+
+    let response = request_json(
+        &app,
+        Method::POST,
+        "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",
+        json!({
+            "workflow_run_backend_id": plan_id,
+            "workflow_job_run_backend_id": agent_job_id,
+            "steps": [
+                {
+                    "external_id": first_id,
+                    "number": 1,
+                    "name": "Test",
+                    "status": 6,
+                    "conclusion": 2
+                },
+                {
+                    "external_id": second_id,
+                    "number": 2,
+                    "name": "Test",
+                    "status": 6,
+                    "conclusion": 2
+                }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(response["ok"], true);
+
+    {
+        let mut inner = state.inner.lock().await;
+        inner.broker_messages.remove(&request_id);
+    }
+    let run = get_run_json(&app, &run_id).await;
+    let steps = run["jobs_list"][0]["steps"].as_array().unwrap();
+    assert_eq!(
+        steps.len(),
+        2,
+        "duplicate names must remain separate: {steps:?}"
+    );
+    assert_eq!(steps[0]["id"], first_id);
+    assert_eq!(steps[1]["id"], second_id);
+
+    write_step_job_logs(
+        &temp,
+        &plan_id,
+        &agent_job_id,
+        &[
+            (&first_id, "first duplicate\n"),
+            (&second_id, "second duplicate\n"),
+        ],
+    )
+    .await;
+    for (step, expected) in [(1, "first duplicate\n"), (2, "second duplicate\n")] {
+        let (status, body) = get_logs(
+            &app,
+            format!("/api/v1/runs/{run_id}/logs?job=build&step={step}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, expected.as_bytes());
+    }
+}
+
+#[tokio::test]
 async fn workflow_steps_update_terminal_first_sighting_does_not_fake_zero_duration() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
