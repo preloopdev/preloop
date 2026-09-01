@@ -57,7 +57,7 @@ jobs:
 
       - uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2.85.10
         with:
-          tool: cargo-vet@0.10.1,cargo-audit@0.22.2,cargo-deny@0.18.4
+          tool: cargo-vet@0.10.1,cargo-audit@0.22.2,cargo-deny@0.20.2
 
       - name: cargo vet
         run: cargo vet --locked
