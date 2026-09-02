@@ -2207,7 +2207,7 @@ jobs:
         &app,
         Method::PATCH,
         &format!("/_apis/v1/Timeline/scope/actions/{run_id}/timeline-1"),
-        json!({"count": 1, "value": [{
+        json!({"count": 2, "value": [{
             "id": "00000000-0000-0000-0000-000000000001",
             "name": "build",
             "type": "job",
@@ -2217,6 +2217,19 @@ jobs:
                 "type": "error",
                 "message": "boom",
                 "data": {"file": "src/lib.rs", "line": "42"}
+            }]
+        }, {
+            // A typed step with no `parentId`. The manifest path counts this as
+            // a step, so the annotation path must scope its issue to the step
+            // rather than reporting it against the job.
+            "id": "00000000-0000-0000-0000-000000000002",
+            "name": "Run echo one",
+            "type": "Task",
+            "state": "completed",
+            "result": "failed",
+            "issues": [{
+                "type": "error",
+                "message": "step boom"
             }]
         }]}),
     )
@@ -2239,6 +2252,76 @@ jobs:
     assert!(events.contains("\"type\":\"annotation\""));
     assert!(events.contains("\"message\":\"boom\""));
     assert!(events.contains("\"status\":\"failure\""));
+
+    // The step's issue is scoped to the step; the job's stays job-level. Both
+    // paths deciding "is this a step" differently is what put a record in the
+    // manifest while its annotation pointed at the job.
+    let step_annotation = events
+        .lines()
+        .find(|line| line.contains("\"step boom\""))
+        .expect("the step's annotation must be projected");
+    assert!(
+        step_annotation.contains("\"step_id\":\"00000000-0000-0000-0000-000000000002\""),
+        "a typed step's issue must carry its step id: {step_annotation}"
+    );
+    let job_annotation = events
+        .lines()
+        .find(|line| line.contains("\"boom\"") && !line.contains("\"step boom\""))
+        .expect("the job's annotation must be projected");
+    assert!(
+        !job_annotation.contains("\"step_id\""),
+        "the job record's issue must stay job-level: {job_annotation}"
+    );
+}
+
+/// Following a re-dispatched job streams the current attempt, not the first.
+///
+/// `job_requests` is keyed by monotonic request id, so selecting with `find`
+/// returned the oldest attempt: after a retry, following the logical job key
+/// subscribed to the dead attempt's feed, which never speaks again.
+#[tokio::test]
+async fn live_log_key_follows_the_newest_attempt() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, _) = three_step_run_for_log_filters(&app, &state).await;
+
+    // A re-dispatch: a second request for the same logical job, with a higher
+    // request id and its own agent job id.
+    let (first_attempt, second_attempt) = {
+        let mut inner = state.inner.lock().await;
+        let (first_id, first) = inner
+            .job_requests
+            .iter()
+            .find(|(_, record)| record.run_id == run_id && record.job_id.0 == "build")
+            .map(|(id, record)| (*id, record.clone()))
+            .expect("the dispatched attempt");
+        let mut retry = first.clone();
+        retry.request_id = first_id + 1;
+        retry.agent_job_id = uuid::Uuid::new_v4();
+        let second = retry.agent_job_id;
+        inner.job_requests.insert(retry.request_id, retry);
+        (first.agent_job_id, second)
+    };
+    assert_ne!(first_attempt, second_attempt);
+
+    let inner = state.inner.lock().await;
+    let key = crate::live_logs::live_log_key_for_job(&inner, run_id, "build")
+        .expect("a logical job key must resolve");
+    assert_eq!(
+        key,
+        second_attempt.to_string(),
+        "the logical job key must follow the current attempt, not the first"
+    );
+
+    // An explicit agent job id still addresses exactly that attempt, so an
+    // older feed stays reachable when asked for by name.
+    assert_eq!(
+        crate::live_logs::live_log_key_for_job(&inner, run_id, &first_attempt.to_string())
+            .expect("an explicit attempt id must resolve"),
+        first_attempt.to_string(),
+        "an explicit agent job id must not be redirected to another attempt"
+    );
 }
 
 #[tokio::test]

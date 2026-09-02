@@ -2,6 +2,29 @@ use super::*;
 
 // Timeline, logs, completion
 
+/// Whether a timeline record describes a step rather than a container.
+///
+/// Shared by the annotation projection and the manifest reconciliation below,
+/// which disagreed: one keyed on `Step`-or-parent and the other whitelisted
+/// `Task`, so a typed `Task` with no parent was stored as a step while its
+/// issues were reported against the job.
+///
+/// Excluding containers rather than whitelisting a step type is deliberate.
+/// `type` is optional on the wire and the official runner sends `Task` where
+/// preloop's sends `Step`, so an allow-list silently drops real conclusions.
+fn is_step_record(record: &azdo::TimelineRecord) -> bool {
+    match record.record_type {
+        Some(azdo::TimelineRecordType::Task | azdo::TimelineRecordType::Step) => true,
+        Some(
+            azdo::TimelineRecordType::Job
+            | azdo::TimelineRecordType::Phase
+            | azdo::TimelineRecordType::Stage,
+        ) => false,
+        // Untyped: a step always hangs off its job record.
+        None => record.parent_id.is_some(),
+    }
+}
+
 /// PATCH timeline records — runner updates step/job state.
 pub(crate) async fn patch_timeline_records(
     State(shared): State<Arc<SharedState>>,
@@ -42,13 +65,7 @@ pub(crate) async fn patch_timeline_records(
         }
         if let Some(run_id) = run_id {
             for issue in &record.issues {
-                let step_id = if record.record_type == Some(azdo::TimelineRecordType::Step)
-                    || record.parent_id.is_some()
-                {
-                    Some(record.id.to_string())
-                } else {
-                    None
-                };
+                let step_id = is_step_record(record).then(|| record.id.to_string());
                 projected.push(NdjsonEvent::Annotation {
                     run_id,
                     job_id: logical_job_id
@@ -156,27 +173,7 @@ pub(crate) async fn patch_timeline_records(
                     let Some(name) = &record.display_name else {
                         continue;
                     };
-                    // A PATCH carries the job's own record alongside its steps,
-                    // and reconciling that record in produced a phantom step
-                    // named after the job. Exclude container records rather
-                    // than whitelisting one step type: `type` is optional on
-                    // the wire, the official runner sends `Task` and this file
-                    // already treats `Step` as a step above, so an allow-list
-                    // silently drops real conclusions.
-                    let is_step = match record.record_type {
-                        Some(azdo::TimelineRecordType::Task | azdo::TimelineRecordType::Step) => {
-                            true
-                        }
-                        Some(
-                            azdo::TimelineRecordType::Job
-                            | azdo::TimelineRecordType::Phase
-                            | azdo::TimelineRecordType::Stage,
-                        ) => false,
-                        // Untyped: a step always hangs off the job record, which
-                        // is the same signal the annotation path above uses.
-                        None => record.parent_id.is_some(),
-                    };
-                    if !is_step {
+                    if !is_step_record(record) {
                         continue;
                     }
 

@@ -2439,11 +2439,48 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         // after releasing it, so two reports for one attempt can commit out of
         // order; the upsert compares this and refuses to move a row backwards.
         //
-        // Its own version rather than an edit to 4: a database already at 4
-        // from an earlier build of this branch would skip the change entirely
-        // and fail every step write with an undefined column.
+        // A rebuild rather than `ALTER TABLE ADD COLUMN`, because two different
+        // version-4 schemas exist: an earlier build of this branch declared
+        // `revision` inside migration 4 before it moved here, so an unqualified
+        // ADD COLUMN raises `duplicate column name` on those databases and
+        // aborts startup. SQLite has no `ADD COLUMN IF NOT EXISTS`, and copying
+        // only the columns both shapes share converges them either way.
+        //
+        // Revisions are not carried over. Zero is the safe floor: the guard
+        // admits equal-or-newer, and the counter reseeds from these rows.
         r#"
-        ALTER TABLE job_steps ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;
+        CREATE TABLE job_steps_v5 (
+          run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+          agent_job_id TEXT NOT NULL,
+          step_id TEXT NOT NULL,
+          kind TEXT NOT NULL CHECK (kind IN ('workflow','synthetic')),
+          workflow_index INTEGER,
+          runner_number INTEGER,
+          context_name TEXT,
+          name_blob BLOB NOT NULL,
+          conclusion TEXT NOT NULL,
+          started_at_us INTEGER,
+          finished_at_us INTEGER,
+          revision INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY (agent_job_id, step_id)
+        ) STRICT, WITHOUT ROWID;
+
+        INSERT INTO job_steps_v5(run_id, agent_job_id, step_id, kind,
+                                 workflow_index, runner_number, context_name,
+                                 name_blob, conclusion, started_at_us,
+                                 finished_at_us)
+          SELECT run_id, agent_job_id, step_id, kind,
+                 workflow_index, runner_number, context_name,
+                 name_blob, conclusion, started_at_us,
+                 finished_at_us
+          FROM job_steps;
+
+        DROP TABLE job_steps;
+
+        ALTER TABLE job_steps_v5 RENAME TO job_steps;
+
+        CREATE INDEX IF NOT EXISTS job_steps_order_idx
+          ON job_steps (agent_job_id, kind, workflow_index);
         "#,
     ),
 ];
@@ -2598,6 +2635,68 @@ mod tests {
                 envelope.unseal(&tampered).is_err(),
                 "tampered envelope at byte {index} must not unseal"
             );
+        }
+    }
+
+    /// Migration 5 converges both version-4 schemas.
+    ///
+    /// An earlier build of this branch declared `revision` inside migration 4
+    /// before it moved to its own version, so two different v4 schemas exist:
+    /// one with the column and one without. Migration 5 has to upgrade either
+    /// without aborting startup.
+    #[test]
+    fn job_steps_revision_migration_handles_both_v4_schemas() {
+        // Every migration up to and including 4, which is where the two
+        // shapes diverge.
+        let up_to_v4 = |connection: &Connection| {
+            for (version, _, sql) in MIGRATIONS {
+                if *version > 4 {
+                    break;
+                }
+                connection.execute_batch(sql).unwrap();
+            }
+            connection.execute_batch("PRAGMA user_version = 4").unwrap();
+        };
+
+        for already_had_column in [false, true] {
+            let connection = Connection::open_in_memory().unwrap();
+            up_to_v4(&connection);
+            if already_had_column {
+                // Exactly what the intermediate build's migration 4 produced.
+                connection
+                    .execute_batch(
+                        "ALTER TABLE job_steps
+                           ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;",
+                    )
+                    .unwrap();
+            }
+            connection
+                .execute_batch(
+                    // The row only has to survive the rebuild's copy, so the
+                    // parent run is skipped rather than fully constructed.
+                    "PRAGMA foreign_keys = OFF;
+                     INSERT INTO job_steps(run_id, agent_job_id, step_id, kind,
+                                           name_blob, conclusion)
+                     VALUES ('11111111-1111-4111-8111-111111111111',
+                             '22222222-2222-4222-8222-222222222222',
+                             'step-1', 'workflow', x'00', 'success');",
+                )
+                .unwrap();
+
+            SqliteStore::migrate(&connection).unwrap_or_else(|error| {
+                panic!("migrating a v4 schema (revision present: {already_had_column}): {error}")
+            });
+
+            let revision: i64 = connection
+                .query_row("SELECT revision FROM job_steps", [], |row| row.get(0))
+                .unwrap_or_else(|error| {
+                    panic!("reading revision (present at v4: {already_had_column}): {error}")
+                });
+            assert_eq!(revision, 0, "existing rows take the zero floor");
+            let version: i64 = connection
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert!(version >= 5, "migration 5 must be recorded, got {version}");
         }
     }
 }
