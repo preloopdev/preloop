@@ -394,11 +394,15 @@ pub(crate) async fn submit_run_inner(
             }
             M::EventNotDeclared { .. } => String::new(),
             M::ActivityTypeMissing { accepted } | M::ActivityTypeRejected { accepted, .. } => {
-                let first = accepted.first().map(String::as_str).unwrap_or("opened");
-                format!(
-                    " Supply one with `--payload` containing {{\"action\": \"{first}\"}}, or pick \
-                     an activity type the workflow accepts."
-                )
+                if accepted.is_empty() {
+                    " The workflow declares an empty `types` list and accepts no activity types for this event.".to_owned()
+                } else {
+                    let first = accepted.first().map(String::as_str).unwrap_or("opened");
+                    format!(
+                        " Supply one with `--payload` containing {{\"action\": \"{first}\"}}, or pick \
+                         an activity type the workflow accepts."
+                    )
+                }
             }
             M::RefFiltered { .. } => " Check out a matching branch or tag, or pass `--base <REF>` \
                  for pull_request events (the branch filter applies to the PR's target branch)."
@@ -435,13 +439,24 @@ pub(crate) async fn submit_run_inner(
             .map(str::to_owned)
     });
     let activity_type = activity_owned.as_deref();
+    let mut upstream_names = submission.workflow_run_upstream_names.clone();
+    if upstream_names.is_empty() {
+        if let Some(name) = submission
+            .payload
+            .get("workflow_run")
+            .and_then(|wr| wr.get("name"))
+            .and_then(|v| v.as_str())
+        {
+            upstream_names.push(name.to_owned());
+        }
+    }
     if let Err(reason) = workflow.on.match_event(
         &submission.event,
         branch.as_deref(),
         tag.as_deref(),
         &changed_paths,
         activity_type,
-        &submission.workflow_run_upstream_names,
+        &upstream_names,
     ) {
         return Err(ApiError::trigger_mismatch(format!(
             "workflow does not run for event `{}`: {reason}.{}",

@@ -84,6 +84,24 @@ impl std::fmt::Display for TriggerMismatch {
                 tag,
                 filters,
             } => {
+                let is_branch_only = filters
+                    .iter()
+                    .all(|(label, _)| label.starts_with("branches"));
+                let is_tag_only = filters.iter().all(|(label, _)| label.starts_with("tags"));
+                if branch.is_none() && tag.is_some() && is_branch_only {
+                    let tag_name = tag.as_deref().unwrap_or("tag");
+                    return write!(
+                        f,
+                        "the workflow declares only branch filters; tag `{tag_name}` cannot match `branches`"
+                    );
+                }
+                if tag.is_none() && branch.is_some() && is_tag_only {
+                    let branch_name = branch.as_deref().unwrap_or("branch");
+                    return write!(
+                        f,
+                        "the workflow declares only tag filters; branch `{branch_name}` cannot match `tags`"
+                    );
+                }
                 let subject = match (branch, tag) {
                     (Some(branch), _) => format!("branch `{branch}`"),
                     (None, Some(tag)) => format!("tag `{tag}`"),
@@ -132,6 +150,14 @@ fn filter_patterns(filter: &Value) -> Vec<String> {
     }
 }
 
+fn normalize_activity_type(activity_type: &str) -> &str {
+    if activity_type == "synchronized" {
+        "synchronize"
+    } else {
+        activity_type
+    }
+}
+
 /// Apply an event's default activity-type list.
 fn check_activity_type(
     activity_type: Option<&str>,
@@ -140,7 +166,8 @@ fn check_activity_type(
     let accepted = defaults.iter().map(|t| (*t).to_owned()).collect();
     match activity_type {
         Some(activity_type) => {
-            if defaults.contains(&activity_type) {
+            let normalized = normalize_activity_type(activity_type);
+            if defaults.contains(&normalized) || defaults.contains(&activity_type) {
                 Ok(())
             } else {
                 Err(TriggerMismatch::ActivityTypeRejected {
@@ -224,7 +251,7 @@ impl Trigger {
         upstream_workflow_paths: &[String],
     ) -> Result<(), TriggerMismatch> {
         // Default PR activity types per MessageController.cs:1259-1268.
-        const PR_DEFAULT_TYPES: &[&str] = &["opened", "synchronize", "synchronized", "reopened"];
+        const PR_DEFAULT_TYPES: &[&str] = &["opened", "synchronize", "reopened"];
 
         let not_declared = || TriggerMismatch::EventNotDeclared {
             declared: self.declared_events(),
@@ -267,7 +294,8 @@ impl Trigger {
             let accepted = filter_patterns(types);
             match activity_type {
                 Some(activity_type) => {
-                    if !matches_filter(types, activity_type) {
+                    let normalized = normalize_activity_type(activity_type);
+                    if !matches_filter(types, activity_type) && !matches_filter(types, normalized) {
                         return Err(TriggerMismatch::ActivityTypeRejected {
                             got: activity_type.to_owned(),
                             accepted,

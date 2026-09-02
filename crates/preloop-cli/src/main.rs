@@ -2006,19 +2006,77 @@ fn event_carries_changed_files(event: &str) -> bool {
     )
 }
 
+#[allow(dead_code)]
+fn unquote_git_path(raw: &str) -> String {
+    let s = raw.trim();
+    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+        let inner = &s[1..s.len() - 1];
+        let mut bytes = Vec::new();
+        let mut chars = inner.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.peek() {
+                    Some('\\') => {
+                        chars.next();
+                        bytes.push(b'\\');
+                    }
+                    Some('"') => {
+                        chars.next();
+                        bytes.push(b'"');
+                    }
+                    Some('n') => {
+                        chars.next();
+                        bytes.push(b'\n');
+                    }
+                    Some('t') => {
+                        chars.next();
+                        bytes.push(b'\t');
+                    }
+                    Some('r') => {
+                        chars.next();
+                        bytes.push(b'\r');
+                    }
+                    Some('0'..='7') => {
+                        let mut octal_val = 0u8;
+                        let mut count = 0;
+                        while count < 3 && chars.peek().is_some_and(|ch| ('0'..='7').contains(ch)) {
+                            octal_val = (octal_val << 3) + (chars.next().unwrap() as u8 - b'0');
+                            count += 1;
+                        }
+                        bytes.push(octal_val);
+                    }
+                    _ => {
+                        if let Some(next_c) = chars.next() {
+                            let mut b = [0u8; 4];
+                            bytes.extend_from_slice(next_c.encode_utf8(&mut b).as_bytes());
+                        }
+                    }
+                }
+            } else {
+                let mut b = [0u8; 4];
+                bytes.extend_from_slice(c.encode_utf8(&mut b).as_bytes());
+            }
+        }
+        String::from_utf8(bytes).unwrap_or_else(|_| inner.to_owned())
+    } else {
+        s.to_string()
+    }
+}
+
 /// Extract the path from one `git status --porcelain` line.
 ///
 /// Layout is two status columns, a space, then the path; renames read
 /// `R  old -> new`, where only the destination exists now. Quoted paths (set
 /// by `core.quotePath`) keep their quotes stripped so they match the
 /// repository-relative names a workflow filter is written against.
+#[allow(dead_code)]
 fn porcelain_path(line: &str) -> Option<String> {
     let rest = line.get(3..)?.trim();
     if rest.is_empty() {
         return None;
     }
     let path = rest.rsplit(" -> ").next().unwrap_or(rest);
-    Some(path.trim_matches('"').to_owned())
+    Some(unquote_git_path(path))
 }
 
 /// Whether `base` can actually be diffed against `HEAD`.
@@ -2093,6 +2151,42 @@ fn resolve_local_diff_base(explicit: Option<&str>) -> Option<String> {
         .find(|candidate| usable_diff_base(candidate))
 }
 
+fn git_uncommitted_paths() -> anyhow::Result<Vec<String>> {
+    let output = std::process::Command::new("git")
+        .args(["status", "-z", "--porcelain=v1"])
+        .output()
+        .context("git status")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let mut paths = Vec::new();
+    let mut iter = output.stdout.split(|&b| b == 0);
+    while let Some(item) = iter.next() {
+        if item.is_empty() {
+            continue;
+        }
+        let item_str = String::from_utf8_lossy(item);
+        if item_str.len() < 3 {
+            continue;
+        }
+        let status_code = &item_str[..2];
+        let path_part = &item_str[3..];
+        if (status_code.starts_with('R') || status_code.starts_with('C')) && iter.size_hint().0 > 0
+        {
+            if let Some(target) = iter.next() {
+                let target_str = String::from_utf8_lossy(target).to_string();
+                paths.push(target_str);
+                continue;
+            }
+        }
+        paths.push(path_part.to_string());
+    }
+    Ok(paths)
+}
+
 /// Changed files for a local run: the merge-base diff against `base`, plus
 /// anything uncommitted.
 ///
@@ -2101,7 +2195,7 @@ fn resolve_local_diff_base(explicit: Option<&str>) -> Option<String> {
 /// the very edit the user is testing.
 fn local_changed_paths(base: &str) -> anyhow::Result<Vec<String>> {
     let output = std::process::Command::new("git")
-        .args(["diff", "--name-only", &format!("{base}...HEAD")])
+        .args(["diff", "-z", "--name-only", &format!("{base}...HEAD")])
         .output()
         .context("git diff")?;
     if !output.status.success() {
@@ -2110,17 +2204,13 @@ fn local_changed_paths(base: &str) -> anyhow::Result<Vec<String>> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let mut paths: Vec<String> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_owned)
+    let mut paths: Vec<String> = output
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|slice| !slice.is_empty())
+        .map(|slice| String::from_utf8_lossy(slice).to_string())
         .collect();
-    paths.extend(
-        git_porcelain()?
-            .iter()
-            .filter_map(|line| porcelain_path(line)),
-    );
+    paths.extend(git_uncommitted_paths()?);
     paths.sort();
     paths.dedup();
     Ok(paths)
@@ -2143,6 +2233,24 @@ fn default_local_changed_paths(
     }
     let base = resolve_local_diff_base(base)?;
     local_changed_paths(&base).ok()
+}
+
+fn strip_branch_prefix(raw: &str) -> &str {
+    if let Some(rest) = raw.strip_prefix("refs/heads/") {
+        return rest;
+    }
+    if let Some(rest) = raw.strip_prefix("refs/remotes/") {
+        if let Some((_remote, branch)) = rest.split_once('/') {
+            return branch;
+        }
+        return rest;
+    }
+    for remote in ["origin/", "upstream/"] {
+        if let Some(rest) = raw.strip_prefix(remote) {
+            return rest;
+        }
+    }
+    raw
 }
 
 /// Branch a `pull_request` run should be filtered against.
@@ -2176,11 +2284,8 @@ fn default_local_filter_branch(
         None => resolve_local_diff_base(None)?,
     };
     // Filters are written against branch names (`main`), not remote-qualified
-    // refs (`origin/main`).
-    let name = base
-        .rsplit_once('/')
-        .map_or(base.as_str(), |(_, name)| name)
-        .to_owned();
+    // refs (`origin/main`), but branches can contain slashes (`feature/auth`).
+    let name = strip_branch_prefix(&base).to_owned();
     (!name.is_empty()).then_some(name)
 }
 
@@ -4388,6 +4493,10 @@ mod tests {
             porcelain_path("?? \"src/späte.rs\"").as_deref(),
             Some("src/späte.rs")
         );
+        assert_eq!(
+            porcelain_path("?? \"src/sp\\303\\244te.rs\"").as_deref(),
+            Some("src/späte.rs")
+        );
         assert_eq!(porcelain_path(""), None);
         assert_eq!(porcelain_path("   "), None);
     }
@@ -4448,6 +4557,25 @@ mod tests {
             )
             .as_deref(),
             Some("release-2")
+        );
+        // Slashes within branch names must be preserved
+        assert_eq!(
+            default_local_filter_branch(
+                "pull_request",
+                Some("origin/feature/auth"),
+                &serde_json::json!({})
+            )
+            .as_deref(),
+            Some("feature/auth")
+        );
+        assert_eq!(
+            default_local_filter_branch(
+                "pull_request",
+                Some("release/v1.0"),
+                &serde_json::json!({})
+            )
+            .as_deref(),
+            Some("release/v1.0")
         );
         // A payload that already carries the base ref wins.
         assert_eq!(

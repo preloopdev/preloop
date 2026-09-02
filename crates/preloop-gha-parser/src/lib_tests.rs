@@ -201,8 +201,14 @@ fn match_event_reports_default_pr_activity_types() {
         .expect_err("default types still require an activity type");
     match error {
         TriggerMismatch::ActivityTypeMissing { accepted } => {
-            assert!(accepted.contains(&"opened".to_owned()), "{accepted:?}");
-            assert!(accepted.contains(&"synchronize".to_owned()), "{accepted:?}");
+            assert_eq!(
+                accepted,
+                vec![
+                    "opened".to_owned(),
+                    "synchronize".to_owned(),
+                    "reopened".to_owned(),
+                ]
+            );
         }
         other => panic!("expected ActivityTypeMissing, got {other:?}"),
     }
