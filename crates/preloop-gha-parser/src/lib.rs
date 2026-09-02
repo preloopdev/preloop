@@ -18,7 +18,9 @@ mod yaml;
 pub use expand::{
     effective_token_permissions, expand_deferred_matrix_job, expand_deferred_reusable_call,
     expand_jobs, expand_jobs_with_reusables, expand_jobs_with_reusables_and_shas,
-    expand_reusable_call, DEFAULT_TOKEN_PERMISSIONS, PERMISSION_SCOPES,
+    expand_jobs_with_reusables_and_shas_and_inputs,
+    expand_jobs_with_reusables_and_shas_and_inputs_and_event, expand_reusable_call,
+    DEFAULT_TOKEN_PERMISSIONS, PERMISSION_SCOPES,
 };
 pub use models::*;
 pub use yaml::{parse_action_metadata, parse_workflow};

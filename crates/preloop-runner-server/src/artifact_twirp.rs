@@ -44,8 +44,31 @@ pub(crate) struct ArtifactV2DeleteRequest {
     pub(crate) name: String,
 }
 
-pub(crate) fn artifact_v2_registry_key(run_id: &str, job_id: &str, name: &str) -> String {
-    format!("{run_id}/{job_id}/{name}")
+pub(crate) fn artifact_v2_registry_key(run_id: &str, name: &str) -> String {
+    format!("{run_id}/{name}")
+}
+
+/// Resolve the run-scoped registry namespace for an artifact request.
+///
+/// The official runner addresses artifacts with
+/// `workflow_run_backend_id = plan_id`, and preloop mints one plan id per job
+/// (the job builder defaults `plan.plan_id` to the job's own id). A build job
+/// and a consumer job of the same run therefore present different plan ids —
+/// scoping the registry by the raw request value would make the build job's
+/// uploads invisible to the consumer (found via scenario 206). Map the plan id
+/// to the recorded run id when it is known; fall back to the request value for
+/// unknown plans (control-plane callers, tests).
+pub(crate) fn canonical_artifact_scope(
+    inner: &InnerState,
+    plan_id: &str,
+    fallback: &str,
+) -> String {
+    if let Some(request_id) = inner.plan_requests.get(plan_id) {
+        if let Some(record) = inner.job_requests.get(request_id) {
+            return record.run_id.to_string();
+        }
+    }
+    fallback.to_owned()
 }
 
 pub(crate) async fn save_artifact_v2_registry(
@@ -67,11 +90,15 @@ pub(crate) async fn twirp_artifact_v2_create(
     validate_artifact_name(&request.name)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let token = uuid::Uuid::new_v4().to_string();
-    let registry_key = artifact_v2_registry_key(
-        &request.workflow_run_backend_id,
-        &request.workflow_job_run_backend_id,
-        &request.name,
-    );
+    let canonical_run = {
+        let inner = shared.state.inner.lock().await;
+        canonical_artifact_scope(
+            &inner,
+            &request.workflow_run_backend_id,
+            &request.workflow_run_backend_id,
+        )
+    };
+    let registry_key = artifact_v2_registry_key(&canonical_run, &request.name);
     // F7: the job is taken from the signed runtime token scope, not the
     // request body, so a runner cannot evade its per-job pending cap by
     // inventing other job ids. Control-plane callers (no job token) reserve
@@ -88,6 +115,25 @@ pub(crate) async fn twirp_artifact_v2_create(
         .map_err(|e| ApiError::internal(format!("failed to create artifact stage dir: {e}")))?;
     {
         let mut inner = shared.state.inner.lock().await;
+        if inner.artifact_v2_registry.contains_key(&registry_key) {
+            let _ = tokio::fs::remove_dir_all(&stage_dir).await;
+            return Err(ApiError::conflict(format!(
+                "Artifact name '{}' already exists in this workflow run. Artifacts are immutable once uploaded.",
+                request.name
+            )));
+        }
+        if inner
+            .artifact_v2_pending
+            .values()
+            .any(|p| p.registry_key == registry_key)
+        {
+            let _ = tokio::fs::remove_dir_all(&stage_dir).await;
+            return Err(ApiError::conflict(format!(
+                "An upload for artifact name '{}' is already in progress in this workflow run.",
+                request.name
+            )));
+        }
+
         if let Some(job_id) = &job_backend_id {
             let pending = inner
                 .artifact_v2_pending
@@ -130,11 +176,15 @@ pub(crate) async fn twirp_artifact_v2_finalize(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<ArtifactV2FinalizeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let registry_key = artifact_v2_registry_key(
-        &request.workflow_run_backend_id,
-        &request.workflow_job_run_backend_id,
-        &request.name,
-    );
+    let canonical_run = {
+        let inner = shared.state.inner.lock().await;
+        canonical_artifact_scope(
+            &inner,
+            &request.workflow_run_backend_id,
+            &request.workflow_run_backend_id,
+        )
+    };
+    let registry_key = artifact_v2_registry_key(&canonical_run, &request.name);
     let token = {
         let inner = shared.state.inner.lock().await;
         inner
@@ -234,12 +284,21 @@ pub(crate) async fn twirp_artifact_v2_list(
         _ => None,
     });
 
+    let canonical_run = canonical_artifact_scope(
+        &inner,
+        &request.workflow_run_backend_id,
+        &request.workflow_run_backend_id,
+    );
+
     let artifacts: Vec<serde_json::Value> = inner
         .artifact_v2_registry
         .values()
         .filter(|e| {
-            e.workflow_run_backend_id == request.workflow_run_backend_id
-                && e.workflow_job_run_backend_id == request.workflow_job_run_backend_id
+            canonical_artifact_scope(
+                &inner,
+                &e.workflow_run_backend_id,
+                &e.workflow_run_backend_id,
+            ) == canonical_run
         })
         .filter(|e| name_filter.as_deref().map(|f| e.name == f).unwrap_or(true))
         .filter(|e| id_filter.map(|id| e.id == id).unwrap_or(true))
@@ -262,11 +321,15 @@ pub(crate) async fn twirp_artifact_v2_get_signed_url(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<ArtifactV2GetSignedUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let registry_key = artifact_v2_registry_key(
-        &request.workflow_run_backend_id,
-        &request.workflow_job_run_backend_id,
-        &request.name,
-    );
+    let canonical_run = {
+        let inner = shared.state.inner.lock().await;
+        canonical_artifact_scope(
+            &inner,
+            &request.workflow_run_backend_id,
+            &request.workflow_run_backend_id,
+        )
+    };
+    let registry_key = artifact_v2_registry_key(&canonical_run, &request.name);
     let blob_token = {
         let inner = shared.state.inner.lock().await;
         inner
@@ -285,11 +348,15 @@ pub(crate) async fn twirp_artifact_v2_delete(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<ArtifactV2DeleteRequest>,
 ) -> Json<serde_json::Value> {
-    let registry_key = artifact_v2_registry_key(
-        &request.workflow_run_backend_id,
-        &request.workflow_job_run_backend_id,
-        &request.name,
-    );
+    let canonical_run = {
+        let inner = shared.state.inner.lock().await;
+        canonical_artifact_scope(
+            &inner,
+            &request.workflow_run_backend_id,
+            &request.workflow_run_backend_id,
+        )
+    };
+    let registry_key = artifact_v2_registry_key(&canonical_run, &request.name);
     let removed = {
         let mut inner = shared.state.inner.lock().await;
         inner.artifact_v2_registry.remove(&registry_key)
