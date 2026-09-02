@@ -292,6 +292,16 @@ The conformance gate checks:
 
 Body-value diffs (different URLs, IDs, tokens) are expected and not gated.
 
+> **Stale as of 2026-09-02.** CI's `server-light` job reports
+> `conformance failed for 6 scenario(s)` on this replay. Verified as
+> pre-existing rather than a regression: `main` at `c9a6d89e` and
+> `Bnjoroge/step-manifest` at `110266ec` fail the same job with the same
+> count. The failing scenario names are only in the run's preserved
+> artifacts, which live in the ephemeral runner VM and are gone by the time
+> the job reports, so they are not yet identified here — that artifact
+> retention is itself worth fixing, since a conformance failure currently
+> cannot be diagnosed after the fact from the log alone.
+
 ### 1a.2 Scenario coverage
 
 
