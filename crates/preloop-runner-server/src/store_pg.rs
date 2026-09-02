@@ -168,6 +168,28 @@ impl PgStore {
             )
             .await?
             .get(0);
+        // See the SQLite twin: a database stamped 4 by an intermediate build of
+        // this branch lacks `job_steps.revision` and would fail deep in the
+        // step queries instead of here. Deletable once the branch merges.
+        if current >= 4 {
+            let has_revision: bool = client
+                .query_one(
+                    "SELECT EXISTS (
+                       SELECT 1 FROM information_schema.columns
+                       WHERE table_name = 'job_steps' AND column_name = 'revision'
+                     )",
+                    &[],
+                )
+                .await?
+                .get(0);
+            anyhow::ensure!(
+                has_revision,
+                "schema version {current} predates the `job_steps.revision` column. This only \
+                 happens on a development database created by an earlier build of the \
+                 step-manifest branch; drop and recreate it."
+            );
+        }
+
         for (version, name, sql) in MIGRATIONS {
             if *version as i64 <= current {
                 continue;
@@ -1294,23 +1316,14 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
           conclusion TEXT NOT NULL,
           started_at_us BIGINT,
           finished_at_us BIGINT,
+          -- See the SQLite twin: guards two reports for one attempt
+          -- committing out of order.
+          revision BIGINT NOT NULL DEFAULT 0,
           PRIMARY KEY (agent_job_id, step_id)
         );
 
         CREATE INDEX IF NOT EXISTS job_steps_order_idx
           ON job_steps (agent_job_id, kind, workflow_index);
-        "#,
-    ),
-    (
-        5,
-        "job-steps-revision",
-        // See the SQLite twin: guards two reports for one attempt committing
-        // out of order. Its own version rather than an edit to 4, because a
-        // database already at 4 from an earlier build of this branch would
-        // skip the change and fail every step write on an undefined column.
-        r#"
-        ALTER TABLE job_steps
-          ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0;
         "#,
     ),
 ];
