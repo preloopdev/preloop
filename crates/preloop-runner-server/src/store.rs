@@ -1185,10 +1185,18 @@ impl SqliteStore {
         // on `main`, so nothing released can land here. Delete this once the
         // branch merges.
         if current_version >= 4 {
+            // Ask the catalogue rather than probing with a SELECT. A failed
+            // prepare cannot distinguish an absent column from `database is
+            // locked` or an I/O error, and telling an operator to delete their
+            // state directory over a transient lock is worse than the bug this
+            // guards. Real failures propagate.
+            let has_revision: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('job_steps') WHERE name = 'revision'",
+                [],
+                |row| row.get(0),
+            )?;
             anyhow::ensure!(
-                connection
-                    .prepare("SELECT revision FROM job_steps LIMIT 0")
-                    .is_ok(),
+                has_revision > 0,
                 "schema version {current_version} predates the `job_steps.revision` column. \
                  This only happens on a development database created by an earlier build of \
                  the step-manifest branch; delete the state directory to recreate it."

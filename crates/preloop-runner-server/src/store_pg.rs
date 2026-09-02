@@ -174,9 +174,15 @@ impl PgStore {
         if current >= 4 {
             let has_revision: bool = client
                 .query_one(
+                    // Scoped to the active schema: the migrations and step
+                    // queries are unqualified, so a `job_steps` sitting in
+                    // another schema on the search path would otherwise vouch
+                    // for a table they never touch.
                     "SELECT EXISTS (
                        SELECT 1 FROM information_schema.columns
-                       WHERE table_name = 'job_steps' AND column_name = 'revision'
+                       WHERE table_schema = current_schema()
+                         AND table_name = 'job_steps'
+                         AND column_name = 'revision'
                      )",
                     &[],
                 )
