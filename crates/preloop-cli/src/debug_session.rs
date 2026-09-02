@@ -19,7 +19,8 @@ use std::io::{IsTerminal, Write};
 
 use anyhow::{Context, Result};
 use preloop_gha_protocol::debug_session::{
-    ChangeCategory, DebugSession, RevertPolicy, Verdict, VerdictRequest, WorkspaceChange,
+    ChangeCategory, DebugSession, RevertPolicy, StepSummary, Verdict, VerdictRequest,
+    WorkspaceChange,
 };
 
 /// `preloop debug [session]`.
@@ -176,14 +177,63 @@ pub async fn list_sessions(
 /// run` reports how many sessions are paused on the server without saying
 /// whose, and the pauses in the way are frequently an *earlier* run's — so the
 /// id a user has at hand matches nothing and the listing has to say why.
+/// Runner-generated lifecycle and host-hook steps stay in the resolved list for
+/// retry fidelity, but they are not workflow steps from a user's perspective.
+///
+/// Classification is the runner's `synthetic` flag and nothing else. It is
+/// decided there by absence from the job request message's step list, which is
+/// authoritative. A prefix check on the context name cannot substitute:
+/// `job_builder` passes a user's `id:` through verbatim, so a workflow
+/// declaring `id: __post_build` would have its own step hidden from counts and
+/// from `--from` selection, and its failure mislabelled as a lifecycle failure.
+fn workflow_steps(session: &DebugSession) -> impl Iterator<Item = &StepSummary> {
+    session.job_steps.iter().filter(|step| !step.synthetic)
+}
+
+/// Return the one-based workflow position for a resolved runner step.
+fn workflow_position(session: &DebugSession, resolved_index: usize) -> Option<(usize, usize)> {
+    let total = workflow_steps(session).count();
+    let position = workflow_steps(session).position(|step| step.index == resolved_index)?;
+    Some((position + 1, total))
+}
+
+/// Explain a step position without exposing synthetic cleanup as a workflow
+/// step. If an old server omitted `job_steps`, retain a truthful fallback.
+fn step_position_label(session: &DebugSession, resolved_index: usize) -> String {
+    if let Some((position, total)) = workflow_position(session, resolved_index) {
+        return format!("workflow step {position}/{total}");
+    }
+    if session
+        .job_steps
+        .iter()
+        .any(|step| step.index == resolved_index && step.synthetic)
+    {
+        return format!(
+            "runner lifecycle step {}/{} (not a workflow step)",
+            resolved_index + 1,
+            session.step.total
+        );
+    }
+    format!(
+        "resolved runner step {}/{}",
+        resolved_index + 1,
+        session.step.total
+    )
+}
+
+fn workflow_steps_before_failure(session: &DebugSession) -> Vec<&StepSummary> {
+    workflow_steps(session)
+        .filter(|step| step.index <= session.step.index)
+        .collect()
+}
+
 fn session_line(session: &DebugSession) -> String {
     format!(
-        "  {}  {}  run {}  step {}/{} {}",
+        "  {}  {}  run {}  {} {}",
         session.session_id,
         session.job_name,
         short_run(session.run_id),
-        session.step.index + 1,
-        session.step.total,
+        step_position_label(session, session.step.index),
         session.step.display_name
     )
 }
@@ -306,7 +356,10 @@ pub async fn prompt_at_failure(
                     None,
                 )
                 .await?;
-                println!("  ⟳ retrying step {}", session.step.index + 1);
+                println!(
+                    "  ⟳ retrying {}",
+                    step_position_label(&session, session.step.index)
+                );
                 return Ok(true);
             }
             "s" => {
@@ -325,7 +378,10 @@ pub async fn prompt_at_failure(
                     None,
                 )
                 .await?;
-                println!("  ⟳ retrying step {}", session.step.index + 1);
+                println!(
+                    "  ⟳ retrying {}",
+                    step_position_label(&session, session.step.index)
+                );
                 return Ok(true);
             }
             "a" => {
@@ -423,27 +479,55 @@ fn parse_retry_from(
         anyhow::bail!("use either --from <step> or --from-start, not both");
     }
     if from_start {
-        return Ok(Some(0));
+        if session.job_steps.is_empty() {
+            // Older sessions did not carry the resolved step summaries.
+            return Ok(Some(0));
+        }
+        // The first workflow step that has actually run. Retries cannot target
+        // a step after the failure, and when a leading synthetic step fails
+        // (a `Pre` hook, or a job-start host hook) the first workflow step is
+        // still ahead of it — the worker rejects that index and silently
+        // retries the synthetic step instead, executing something other than
+        // what the accepted command said.
+        if let Some(step) = workflow_steps_before_failure(session).first() {
+            return Ok(Some(step.index));
+        }
+        anyhow::bail!(
+            "no workflow step has started yet: {} failed before the first one",
+            step_position_label(session, session.step.index)
+        );
     }
     let Some(raw) = from else {
         return Ok(None);
     };
     if raw.is_empty() {
-        anyhow::bail!("--from requires a step number or name");
+        anyhow::bail!("--from requires a workflow step number or name");
     }
 
     if let Ok(number) = raw.parse::<usize>() {
-        let max = session.step.index + 1;
-        if number == 0 || number > max {
-            anyhow::bail!("step number out of range (1..{max})");
+        if session.job_steps.is_empty() {
+            // Preserve the old resolved-index behavior for sessions created by
+            // a server that predates job step summaries.
+            let max = session.step.index + 1;
+            if number == 0 || number > max {
+                anyhow::bail!("step number out of range (1..{max})");
+            }
+            return Ok(Some(number - 1));
         }
-        return Ok(Some(number - 1));
+
+        let available = workflow_steps_before_failure(session);
+        let max = available.len();
+        if max == 0 {
+            anyhow::bail!("no workflow steps are available before the failed step");
+        }
+        if number == 0 || number > max {
+            anyhow::bail!("workflow step number out of range (1..{max})");
+        }
+        return Ok(Some(available[number - 1].index));
     }
 
     let needle = raw.to_ascii_lowercase();
-    let matches: Vec<_> = session
-        .job_steps
-        .iter()
+    let matches: Vec<_> = workflow_steps(session)
         .filter(|step| {
             step.display_name.to_ascii_lowercase().contains(&needle)
                 || step.context_name.to_ascii_lowercase().contains(&needle)
@@ -456,24 +540,31 @@ fn parse_retry_from(
                     "no step matching '{raw}' (step names are unavailable in this session)"
                 );
             }
-            let available = session
-                .job_steps
-                .iter()
-                .map(|step| format!("{}. {}", step.index + 1, step.display_name))
+            // Only steps at or before the failure are accepted, so listing any
+            // later step would advertise input the retry path rejects.
+            let available = workflow_steps_before_failure(session)
+                .into_iter()
+                .enumerate()
+                .map(|(index, step)| format!("{}. {}", index + 1, step.display_name))
                 .collect::<Vec<_>>()
                 .join(", ");
-            anyhow::bail!("no step matching '{raw}'; available steps: {available}");
+            anyhow::bail!("no workflow step matching '{raw}'; available steps: {available}");
         }
         [step] if step.index <= session.step.index => Ok(Some(step.index)),
         [step] => anyhow::bail!(
-            "step {} is after the failed step {}",
-            step.index + 1,
-            session.step.index + 1
+            "{} is after {}",
+            step_position_label(session, step.index),
+            step_position_label(session, session.step.index)
         ),
         _ => {
             let names = matches
                 .iter()
-                .map(|step| format!("{}. {}", step.index + 1, step.display_name))
+                .map(|step| {
+                    let position = workflow_position(session, step.index)
+                        .map(|(position, _)| position.to_string())
+                        .unwrap_or_else(|| "?".to_owned());
+                    format!("{position}. {}", step.display_name)
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             anyhow::bail!("'{raw}' is ambiguous: {names}");
@@ -529,7 +620,7 @@ pub fn render_banner(session: &DebugSession) -> String {
     if let Some(code) = step.exit_code {
         out.push_str(&format!("  exit      {code}\n"));
     }
-    out.push_str(&format!("  step      {}/{}\n", step.index + 1, step.total));
+    out.push_str(&format!("  {}\n", step_position_label(session, step.index)));
     if let Some(cwd) = &step.working_directory {
         out.push_str(&format!("  cwd       {cwd}\n"));
     }
@@ -690,20 +781,19 @@ async fn repl(ctx: &Api, mut session: DebugSession) -> Result<ReplOutcome> {
                 if let Some(from) = retry_from {
                     let name = session
                         .job_steps
-                        .get(from)
-                        .map(|s| s.display_name.as_str())
+                        .iter()
+                        .find(|step| step.index == from)
+                        .map(|step| step.display_name.as_str())
                         .unwrap_or("?");
                     println!(
-                        "  ⟳ retrying from step {}/{} ({})",
-                        from + 1,
-                        session.step.total,
+                        "  ⟳ retrying from {} ({})",
+                        step_position_label(&session, from),
                         name,
                     );
                 } else {
                     println!(
-                        "  ⟳ retrying step {}/{}",
-                        session.step.index + 1,
-                        session.step.total
+                        "  ⟳ retrying {}",
+                        step_position_label(&session, session.step.index)
                     );
                 }
                 println!("  The job resumes. Watch it with: preloop status");
@@ -1400,6 +1490,52 @@ mod tests {
         }
     }
 
+    fn summary(
+        index: usize,
+        context_name: &str,
+        display_name: &str,
+        synthetic: bool,
+    ) -> StepSummary {
+        StepSummary {
+            index,
+            context_name: context_name.into(),
+            display_name: display_name.into(),
+            synthetic,
+        }
+    }
+
+    fn session_with_lifecycle_steps() -> DebugSession {
+        let mut session = session();
+        session.step.index = 3;
+        session.step.total = 6;
+        session.step.context_name = "__run".into();
+        session.step.display_name = "Run zizmor".into();
+        session.job_steps = vec![
+            summary(
+                0,
+                "__pre___actions_checkout",
+                "Pre Check out repository",
+                true,
+            ),
+            summary(1, "__actions_checkout", "Check out repository", false),
+            summary(2, "__astral-sh_setup-uv", "Install uv", false),
+            summary(3, "__run", "Run zizmor", false),
+            summary(
+                4,
+                "__run_2",
+                "Verify action pin comments match their SHAs",
+                false,
+            ),
+            summary(
+                5,
+                "__post___actions_checkout",
+                "Post Check out repository",
+                true,
+            ),
+        ];
+        session
+    }
+
     #[test]
     fn banner_prefers_diagnostics_over_the_log_excerpt() {
         let rendered = render_banner(&session());
@@ -1465,6 +1601,51 @@ mod tests {
         assert!(line.contains("build"));
         assert!(line.contains(&short_run(session.run_id)));
         assert!(line.contains("step 4/6"), "1-based step index: {line}");
+    }
+
+    #[test]
+    fn workflow_positions_hide_runner_lifecycle_steps() {
+        let session = session_with_lifecycle_steps();
+        assert_eq!(workflow_position(&session, 3), Some((3, 4)));
+        assert_eq!(step_position_label(&session, 3), "workflow step 3/4");
+
+        let line = session_line(&session);
+        assert!(line.contains("workflow step 3/4"));
+        assert!(!line.contains("3/6"));
+
+        let banner = render_banner(&session);
+        assert!(banner.contains("workflow step 3/4"));
+        assert!(!banner.contains("step      3/6"));
+    }
+
+    #[test]
+    fn retry_from_numbers_use_workflow_positions() {
+        let session = session_with_lifecycle_steps();
+        assert_eq!(
+            parse_retry_from(&session, None, true).unwrap(),
+            Some(1),
+            "from-start skips the synthetic pre step"
+        );
+        assert_eq!(
+            parse_retry_from(&session, Some("1"), false).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            parse_retry_from(&session, Some("3"), false).unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            parse_retry_from(&session, Some("Run zizmor"), false).unwrap(),
+            Some(3)
+        );
+        assert!(
+            parse_retry_from(&session, Some("4"), false).is_err(),
+            "future workflow steps cannot be selected"
+        );
+        assert!(
+            parse_retry_from(&session, Some("Post Check out repository"), false).is_err(),
+            "synthetic cleanup is not a workflow step"
+        );
     }
 
     #[test]
@@ -1545,6 +1726,7 @@ mod tests {
                 index,
                 context_name: format!("step_{index}"),
                 display_name: format!("Step {index}"),
+                synthetic: false,
             })
             .collect();
 
@@ -1567,16 +1749,19 @@ mod tests {
                 index: 0,
                 context_name: "prepare".into(),
                 display_name: "Prepare".into(),
+                synthetic: false,
             },
             StepSummary {
                 index: 3,
                 context_name: "build".into(),
                 display_name: "Build".into(),
+                synthetic: false,
             },
             StepSummary {
                 index: 4,
                 context_name: "build_again".into(),
                 display_name: "Build again".into(),
+                synthetic: false,
             },
         ];
         assert!(parse_retry_from(&paused, Some("5"), false).is_err());

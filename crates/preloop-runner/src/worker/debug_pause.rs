@@ -94,8 +94,9 @@ pub struct Decision {
     pub revert: RevertPolicy,
     /// Source revision the next attempt runs against.
     pub source_revision: Option<String>,
-    /// When set, re-execute from this step index instead of only the failed
-    /// step. The worker must jump the outer step loop back to this index.
+    /// When set, re-execute from this resolved runner-step index instead of
+    /// only the failed step. The worker jumps the outer step loop to this
+    /// index; the CLI maps workflow-facing numbers to it.
     pub retry_from_step: Option<usize>,
     /// Fresh snapshot checkout credential supplied with a retry verdict.
     ///

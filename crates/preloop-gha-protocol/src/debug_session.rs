@@ -139,9 +139,11 @@ pub struct Diagnostic {
 /// The step that failed, as the controller needs to see it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FailedStep {
-    /// Zero-based index into the resolved step list.
+    /// Zero-based index into the resolved runner step list. This includes
+    /// synthetic action lifecycle steps; user-facing clients should derive
+    /// workflow positions from `job_steps`.
     pub index: usize,
-    /// Total steps in the job, for `4/6`-style display.
+    /// Total resolved runner steps, including synthetic lifecycle steps.
     pub total: usize,
     /// Expression-context key (`__run_2`, or the user's `id:`).
     pub context_name: String,
@@ -166,16 +168,32 @@ pub struct FailedStep {
     pub log_excerpt: Option<String>,
 }
 
+fn bool_is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Compact summary of a job step, sent with the session so a controller can
-/// display a numbered list and accept `--from <name>` without guessing.
+/// display workflow-facing numbers and accept `--from <name>` without guessing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepSummary {
-    /// Zero-based index in the resolved step list.
+    /// Zero-based index in the resolved runner step list.
     pub index: usize,
-    /// Expression-context key (`__run_2`, or the user's `id:`).
+    /// Expression context key (`__run_2`, or the user's `id:`).
     pub context_name: String,
     /// Resolved human-readable name.
     pub display_name: String,
+    /// Whether the runner generated this step rather than the workflow
+    /// declaring it: `Set up job`, `Pre`/`Post` action hooks, container
+    /// lifecycle, host hooks, `Complete job`.
+    ///
+    /// Decided by absence from the job request message's step list, not by any
+    /// name or id prefix — a workflow may legally declare `id: __post_build`.
+    /// Such steps stay in the resolved list for retry/index fidelity but are
+    /// not workflow steps, so they take no workflow-facing position.
+    ///
+    /// Named to match the server's `StepKind::Synthetic` for the same concept.
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub synthetic: bool,
 }
 
 /// One execution of a step. Retries append rather than overwrite, so the job
