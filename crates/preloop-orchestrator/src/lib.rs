@@ -5105,6 +5105,78 @@ mod lifecycle_tests {
         let _ = watch.await;
     }
 
+    /// The pinned digests for the Linux node tarballs the provisioning script
+    /// installs, read from the same generated table the script verifies
+    /// against.
+    ///
+    /// These used to be written out by hand, once per architecture. Bumping
+    /// node refreshed the arm64 copies and left the x64 ones on the previous
+    /// release, so the checksum step failed on x86_64 only — invisible to
+    /// anyone developing on arm64, and it sat red in CI. Deriving them means a
+    /// version bump cannot desynchronise the fixture from the pin again.
+    fn pinned_linux_node_sha256() -> (&'static str, &'static str) {
+        let arch = if cfg!(target_arch = "x86_64") {
+            "x64"
+        } else {
+            "arm64"
+        };
+        let pin = |runtime: &str, version: &str| {
+            let key = format!("{runtime}_{version}_linux-{arch}");
+            node_externals_pinned_sha256(&key)
+                .unwrap_or_else(|| panic!("no pinned sha256 for {key}"))
+        };
+        (
+            pin("node20", NODE20_EXTERNALS_VERSION),
+            pin("node24", NODE24_EXTERNALS_VERSION),
+        )
+    }
+
+    /// `curl` stub: serves the pinned SHASUMS for this architecture, and a
+    /// one-word body for any archive download.
+    fn curl_stub_script() -> String {
+        let (node20, node24) = pinned_linux_node_sha256();
+        let arch = if cfg!(target_arch = "x86_64") {
+            "x64"
+        } else {
+            "arm64"
+        };
+        let v20 = NODE20_EXTERNALS_VERSION;
+        let v24 = NODE24_EXTERNALS_VERSION;
+        let shasums = format!(
+            "{node20}  node-v{v20}-linux-{arch}.tar.gz\\n{node24}  node-v{v24}-linux-{arch}.tar.gz\\n"
+        );
+        format!(
+            r#"#!/bin/sh
+out=""
+url=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2;;
+    -*) shift;;
+    *) url="$1"; shift;;
+  esac
+done
+case "$url" in *SHASUMS256.txt*) printf "{shasums}" > "$out"; exit 0;; esac
+printf archive > "$out"
+"#
+        )
+    }
+
+    /// `shasum`/`sha256sum` stub: reports the pinned digest for whichever
+    /// runtime the caller is verifying. No `uname` branch — the Rust side
+    /// already resolved the architecture when it looked the pin up.
+    fn digest_stub_script() -> String {
+        let (node20, node24) = pinned_linux_node_sha256();
+        format!(
+            r#"#!/bin/sh
+case "$*" in
+  *node24*|*.node24.*) printf "{node24}  dummy\n";;
+  *) printf "{node20}  dummy\n";;
+esac
+"#
+        )
+    }
+
     fn test_output() -> ExecOutput {
         ExecOutput {
             exit_code: 0,
@@ -5122,71 +5194,15 @@ mod lifecycle_tests {
         std::fs::create_dir_all(&bin).unwrap();
 
         let curl = bin.join("curl");
-        std::fs::write(
-            &curl,
-            r#"#!/bin/sh
-out=""
-url=""
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    -o) out="$2"; shift 2;;
-    -*) shift;;
-    *) url="$1"; shift;;
-  esac
-done
-case "$url" in *SHASUMS256.txt*) printf "47ef73d543ecf6eb19435f6c03a0ac4809b3bf0dd6b26c7c571efc2a6572a74d  node-v20.20.2-linux-arm64.tar.gz\nd28c8a5bf0a808f0ed434a1dce8c54ae98f0371c0bd86ac58abc613f73e6643f  node-v24.19.0-linux-arm64.tar.gz\n19e56f0825510207dd904f087fe52faa0a4eb6b2aab5f0ea7a33830d04888b8b  node-v20.20.2-linux-x64.tar.gz\nf625d97cd707df4ff96254916fbc5ff014f09c09effe5a1e0ca8f6d41a8789d4  node-v24.19.0-linux-x64.tar.gz\n" > "$out"; exit 0;; esac
-printf archive > "$out"
-"#,
-        )
-        .unwrap();
+        std::fs::write(&curl, curl_stub_script()).unwrap();
         std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let shasum = bin.join("shasum");
-        std::fs::write(
-            &shasum,
-            r#"#!/bin/sh
-arch=$(uname -m 2>/dev/null || echo unknown)
-case "$*" in
-  *node24*|*.node24.*)
-    if [ "$arch" = "x86_64" ]; then
-      printf "bbeb5fb8113b44fc30f5a5887dbc0ab66af8e56139f5f9fbe7c7a1aa056246dc  dummy\n"
-    else
-      printf "d28c8a5bf0a808f0ed434a1dce8c54ae98f0371c0bd86ac58abc613f73e6643f  dummy\n"
-    fi;;
-  *)
-    if [ "$arch" = "x86_64" ]; then
-      printf "19e56f0825510207dd904f087fe52faa0a4eb6b2aab5f0ea7a33830d04888b8b  dummy\n"
-    else
-      printf "47ef73d543ecf6eb19435f6c03a0ac4809b3bf0dd6b26c7c571efc2a6572a74d  dummy\n"
-    fi;;
-esac
-"#,
-        )
-        .unwrap();
+        std::fs::write(&shasum, digest_stub_script()).unwrap();
         std::fs::set_permissions(&shasum, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let sha256sum = bin.join("sha256sum");
-        std::fs::write(
-            &sha256sum,
-            r#"#!/bin/sh
-arch=$(uname -m 2>/dev/null || echo unknown)
-case "$*" in
-  *node24*|*.node24.*)
-    if [ "$arch" = "x86_64" ]; then
-      printf "bbeb5fb8113b44fc30f5a5887dbc0ab66af8e56139f5f9fbe7c7a1aa056246dc  dummy\n"
-    else
-      printf "d28c8a5bf0a808f0ed434a1dce8c54ae98f0371c0bd86ac58abc613f73e6643f  dummy\n"
-    fi;;
-  *)
-    if [ "$arch" = "x86_64" ]; then
-      printf "19e56f0825510207dd904f087fe52faa0a4eb6b2aab5f0ea7a33830d04888b8b  dummy\n"
-    else
-      printf "47ef73d543ecf6eb19435f6c03a0ac4809b3bf0dd6b26c7c571efc2a6572a74d  dummy\n"
-    fi;;
-esac
-"#,
-        )
-        .unwrap();
+        std::fs::write(&sha256sum, digest_stub_script()).unwrap();
         std::fs::set_permissions(&sha256sum, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let tar = bin.join("tar");
@@ -5231,6 +5247,7 @@ chmod +x "$dest/bin/node"
         assert!(root.join("externals/node20/bin/node").is_file());
         assert!(root.join("externals/node24/bin/node").is_file());
         // Manifests must be written with correct version and SHA.
+        let (node20_sha, node24_sha) = pinned_linux_node_sha256();
         for name in ["node20", "node24"] {
             let manifest =
                 std::fs::read_to_string(root.join(format!("externals/{name}/preloop-node.json")))
@@ -5238,19 +5255,14 @@ chmod +x "$dest/bin/node"
             assert!(manifest.contains("\"runtime\":\""), "{manifest}");
             assert!(manifest.contains("\"archive_sha256\":\""), "{manifest}");
             let expected_sha = if name == "node20" {
-                if cfg!(target_arch = "x86_64") {
-                    "8a4dbcdd"
-                } else {
-                    "47ef73d5"
-                }
+                node20_sha
             } else {
-                if cfg!(target_arch = "x86_64") {
-                    "bbeb5fb8"
-                } else {
-                    "d28c8a5b"
-                }
+                node24_sha
             };
-            assert!(manifest.contains(expected_sha), "{manifest}");
+            assert!(
+                manifest.contains(expected_sha),
+                "{name} manifest must record the pinned digest {expected_sha}: {manifest}"
+            );
         }
     }
 
@@ -5266,70 +5278,14 @@ chmod +x "$dest/bin/node"
         std::fs::create_dir_all(&bin).unwrap();
 
         let curl = bin.join("curl");
-        std::fs::write(
-            &curl,
-            r#"#!/bin/sh
-out=""
-url=""
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    -o) out="$2"; shift 2;;
-    -*) shift;;
-    *) url="$1"; shift;;
-  esac
-done
-case "$url" in *SHASUMS256.txt*) printf "47ef73d543ecf6eb19435f6c03a0ac4809b3bf0dd6b26c7c571efc2a6572a74d  node-v20.20.2-linux-arm64.tar.gz\nd28c8a5bf0a808f0ed434a1dce8c54ae98f0371c0bd86ac58abc613f73e6643f  node-v24.19.0-linux-arm64.tar.gz\n19e56f0825510207dd904f087fe52faa0a4eb6b2aab5f0ea7a33830d04888b8b  node-v20.20.2-linux-x64.tar.gz\nf625d97cd707df4ff96254916fbc5ff014f09c09effe5a1e0ca8f6d41a8789d4  node-v24.19.0-linux-x64.tar.gz\n" > "$out"; exit 0;; esac
-printf archive > "$out"
-"#,
-        )
-        .unwrap();
+        std::fs::write(&curl, curl_stub_script()).unwrap();
         std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
         let shasum = bin.join("shasum");
-        std::fs::write(
-            &shasum,
-            r#"#!/bin/sh
-arch=$(uname -m 2>/dev/null || echo unknown)
-case "$*" in
-  *node24*|*.node24.*)
-    if [ "$arch" = "x86_64" ]; then
-      printf "bbeb5fb8113b44fc30f5a5887dbc0ab66af8e56139f5f9fbe7c7a1aa056246dc  dummy\n"
-    else
-      printf "d28c8a5bf0a808f0ed434a1dce8c54ae98f0371c0bd86ac58abc613f73e6643f  dummy\n"
-    fi;;
-  *)
-    if [ "$arch" = "x86_64" ]; then
-      printf "19e56f0825510207dd904f087fe52faa0a4eb6b2aab5f0ea7a33830d04888b8b  dummy\n"
-    else
-      printf "47ef73d543ecf6eb19435f6c03a0ac4809b3bf0dd6b26c7c571efc2a6572a74d  dummy\n"
-    fi;;
-esac
-"#,
-        )
-        .unwrap();
+        std::fs::write(&shasum, digest_stub_script()).unwrap();
         std::fs::set_permissions(&shasum, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let sha256sum = bin.join("sha256sum");
-        std::fs::write(
-            &sha256sum,
-            r#"#!/bin/sh
-arch=$(uname -m 2>/dev/null || echo unknown)
-case "$*" in
-  *node24*|*.node24.*)
-    if [ "$arch" = "x86_64" ]; then
-      printf "bbeb5fb8113b44fc30f5a5887dbc0ab66af8e56139f5f9fbe7c7a1aa056246dc  dummy\n"
-    else
-      printf "d28c8a5bf0a808f0ed434a1dce8c54ae98f0371c0bd86ac58abc613f73e6643f  dummy\n"
-    fi;;
-  *)
-    if [ "$arch" = "x86_64" ]; then
-      printf "19e56f0825510207dd904f087fe52faa0a4eb6b2aab5f0ea7a33830d04888b8b  dummy\n"
-    else
-      printf "47ef73d543ecf6eb19435f6c03a0ac4809b3bf0dd6b26c7c571efc2a6572a74d  dummy\n"
-    fi;;
-esac
-"#,
-        )
-        .unwrap();
+        std::fs::write(&sha256sum, digest_stub_script()).unwrap();
         std::fs::set_permissions(&sha256sum, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let tar = bin.join("tar");
