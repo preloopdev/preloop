@@ -9,6 +9,90 @@ Releases before v0.27.0 predate the changelog.
 
 ## [Unreleased]
 
+## [0.32.5] - 2026-09-02
+
+### Added
+
+- `preloop logs` gained working `--job`/`--step` selection and `--follow`.
+  Step selection resolves through the job's step manifest rather than the
+  order log blobs happen to land in, so `--step N` names the step a user can
+  point at in their YAML. A job still streaming has no durable per-step
+  blobs, so `--step` against a live job now answers 409 instead of guessing
+  from raw console blocks; the whole-job read still serves the stream.
+- Conformance coverage for `actions/runner` v2.337.0: golden captures, the
+  server wire-compatibility fixes they exposed, and a second five-repo
+  real-world campaign.
+- A supply-chain gate in CI: `cargo vet`, `cargo audit`, `cargo deny`, Node
+  externals OSV scanning with SBOM emission, and action-pin parity checks.
+  Renovate now enforces a seven-day `minimumReleaseAge` and every action pin
+  is resolvable, with a `zizmor` check that pin comments match their SHAs.
+- Batch `ActionDownloadInfo` resolution with bearer-token codeload auth.
+- `runner-watch` gained a structured gate, value normalizers, a coverage map,
+  and tree-sitter-based deltas.
+
+### Changed
+
+- The runner warns on node20 usage ahead of deprecation, and the node
+  externals pins moved to current releases.
+
+### Fixed
+
+- Step identity and order now come from the job request message, which is
+  the only record of what the server actually dispatched. Previously the
+  server inferred both from whatever the runner reported, so a job's step
+  list depended on report arrival order and a re-dispatch could overwrite the
+  mapping the previous attempt's `step-<id>.txt` blobs are named after. Step
+  records live in a dedicated per-attempt table keyed by `agent_job_id`, are
+  seeded at dispatch in workflow order, and reconcile — rather than
+  rebuild — as reports arrive.
+
+  Several consequences were fixed with it: a completion is reconciled against
+  the attempt that reported it instead of the oldest matching one; one
+  ordering rule (the runner's reported position, else declared position)
+  replaced three inconsistent ones across the run projection, whole-job log
+  concatenation and both restore queries; step rows persist per attempt from
+  the paths that change them, instead of every run event resealing the whole
+  run; `GET /api/v1/runs` hydrates step records instead of returning empty
+  arrays; a manifest left behind by a purged deferred-matrix placeholder is
+  removed with its request; and an attempt dispatched but never reported has
+  its manifest rebuilt at startup from the persisted request message, so a
+  restart in that window no longer loses the job's declared steps.
+
+- `preloop debug` reported step positions a user could not find in their
+  workflow, because runner-generated steps — `Set up job`, action pre/post
+  hooks, container lifecycle, host hooks, `Complete job` — were counted as
+  workflow steps, and `--from N` selected the wrong one. A step is now
+  classified as synthetic exactly when its id is absent from the job request
+  message's step list, which is decidable rather than inferred from name
+  prefixes. `--from-start` past the failing step is rejected with an explicit
+  message instead of advertising an unreachable step.
+
+- Node externals are validated on install: manifest shape and archive
+  checksum are verified, with refresh hooks when either is stale. The test
+  fixtures now derive their expected digests from the same pinned table the
+  installer verifies against, so bumping a node version cannot leave the
+  fixture asserting a previous release's checksum on one architecture only.
+
+- The orchestrator no longer runs its starvation sweep while warm-pool
+  runners are still booting, which cancelled work that had not had a chance
+  to start.
+
+- Snapshot fetch honours the `Git-Protocol` v2 header.
+
+- `cargo audit` respects an explicitly configured LOW/MODERATE database
+  severity instead of overriding it.
+
+### Security
+
+- Action archives are extracted through `cap-std` capability handles, so a
+  crafted archive cannot escape the extraction root by path traversal.
+- Debugger welcome text supplied by the server is masked and sanitized
+  before display.
+- Authenticated-runner sinks are memory-bound, so a registered runner cannot
+  drive unbounded server-side allocation.
+- CVSS v3 base scores are computed to the standard, with a fail-closed
+  fallback when a vector cannot be parsed.
+
 ## [0.32.0] - 2026-08-28
 
 <!-- preloop:skip-golden -->
@@ -627,7 +711,8 @@ live-logs (8), and golden (8).
 Bootstrap the cargo-dist release pipeline for `preloop-cli` (binary
 installers for macOS and Linux).
 
-[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.30.3...HEAD
+[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.32.5...HEAD
+[0.32.5]: https://github.com/preloopdev/preloop/compare/v0.32.0...v0.32.5
 [0.30.3]: https://github.com/preloopdev/preloop/compare/v0.30.2...v0.30.3
 [0.29.8]: https://github.com/preloopdev/preloop/compare/v0.29.7...v0.29.8
 [0.29.7]: https://github.com/preloopdev/preloop/compare/v0.29.6...v0.29.7
