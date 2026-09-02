@@ -726,13 +726,24 @@ struct LogsArgs {
     /// Run ID. Defaults to the most recent run.
     run_id: Option<String>,
 
-    /// Filter by job ID.
+    /// Filter by job: the workflow job key (`build`) or its agent job UUID.
     #[arg(long)]
     job: Option<String>,
 
-    /// Filter by step number.
+    /// Filter by 1-based step number within the job, in execution order.
+    ///
+    /// Needs `--job` when the run has more than one job, because step
+    /// numbering restarts per job.
     #[arg(long)]
-    step: Option<u32>,
+    step: Option<usize>,
+
+    /// Stream output as it arrives, like `tail -f`, and exit when the run
+    /// reaches a terminal state.
+    ///
+    /// Follows one job's live console feed, so it needs `--job` unless the run
+    /// has exactly one job. Cannot be combined with `--step`.
+    #[arg(short = 'f', long)]
+    follow: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -1982,6 +1993,302 @@ fn default_local_activity_type(event: &str, payload: &serde_json::Value) -> Opti
     }
 }
 
+/// Events for which GitHub supplies a changed-file list, so a local run can
+/// stand in for one by deriving the same list from git.
+///
+/// Everything else (`workflow_dispatch`, `schedule`, …) has no file list on
+/// GitHub either, so deriving one would invent a contract the real event does
+/// not have.
+fn event_carries_changed_files(event: &str) -> bool {
+    matches!(
+        event,
+        "push" | "pull_request" | "pull_request_target" | "pull_request_review" | "merge_group"
+    )
+}
+
+#[allow(dead_code)]
+fn unquote_git_path(raw: &str) -> String {
+    let s = raw.trim();
+    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+        let inner = &s[1..s.len() - 1];
+        let mut bytes = Vec::new();
+        let mut chars = inner.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.peek() {
+                    Some('\\') => {
+                        chars.next();
+                        bytes.push(b'\\');
+                    }
+                    Some('"') => {
+                        chars.next();
+                        bytes.push(b'"');
+                    }
+                    Some('n') => {
+                        chars.next();
+                        bytes.push(b'\n');
+                    }
+                    Some('t') => {
+                        chars.next();
+                        bytes.push(b'\t');
+                    }
+                    Some('r') => {
+                        chars.next();
+                        bytes.push(b'\r');
+                    }
+                    Some('0'..='7') => {
+                        let mut octal_val = 0u8;
+                        let mut count = 0;
+                        while count < 3 && chars.peek().is_some_and(|ch| ('0'..='7').contains(ch)) {
+                            octal_val = (octal_val << 3) + (chars.next().unwrap() as u8 - b'0');
+                            count += 1;
+                        }
+                        bytes.push(octal_val);
+                    }
+                    _ => {
+                        if let Some(next_c) = chars.next() {
+                            let mut b = [0u8; 4];
+                            bytes.extend_from_slice(next_c.encode_utf8(&mut b).as_bytes());
+                        }
+                    }
+                }
+            } else {
+                let mut b = [0u8; 4];
+                bytes.extend_from_slice(c.encode_utf8(&mut b).as_bytes());
+            }
+        }
+        String::from_utf8(bytes).unwrap_or_else(|_| inner.to_owned())
+    } else {
+        s.to_string()
+    }
+}
+
+/// Extract the path from one `git status --porcelain` line.
+///
+/// Layout is two status columns, a space, then the path; renames read
+/// `R  old -> new`, where only the destination exists now. Quoted paths (set
+/// by `core.quotePath`) keep their quotes stripped so they match the
+/// repository-relative names a workflow filter is written against.
+#[allow(dead_code)]
+fn porcelain_path(line: &str) -> Option<String> {
+    let rest = line.get(3..)?.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let path = rest.rsplit(" -> ").next().unwrap_or(rest);
+    Some(unquote_git_path(path))
+}
+
+/// Whether `base` can actually be diffed against `HEAD`.
+///
+/// Resolving is not enough. A fork remote (`origin` pointing at someone
+/// else's copy) resolves fine but can share no history, and `git diff
+/// base...HEAD` then fails with "no merge base". Checking here keeps that
+/// failure out of the derived change set.
+fn usable_diff_base(base: &str) -> bool {
+    if git_rev_parse(base).is_err() {
+        return false;
+    }
+    std::process::Command::new("git")
+        .args(["merge-base", base, "HEAD"])
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+/// Remotes configured for this repository, in git's order.
+fn git_remotes() -> Vec<String> {
+    std::process::Command::new("git")
+        .arg("remote")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Resolve the ref a local run should diff against.
+///
+/// `--base` wins. Otherwise prefer the branch's own tracking ref — the most
+/// reliable statement of "where this branch came from" — then each remote's
+/// default, then local `main`/`master`. Every candidate must share history
+/// with `HEAD`, so a fork remote cannot be picked and then fail to diff.
+///
+/// Returns `None` when nothing usable is found, so the caller leaves
+/// `changed_paths_known` false rather than claiming an empty change set — an
+/// empty *known* list would make every `paths:` filter reject the run.
+fn resolve_local_diff_base(explicit: Option<&str>) -> Option<String> {
+    if let Some(base) = explicit {
+        return usable_diff_base(base).then(|| base.to_owned());
+    }
+    let mut candidates: Vec<String> = Vec::new();
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "@{upstream}"])
+        .output()
+    {
+        if output.status.success() {
+            let tracking = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if !tracking.is_empty() {
+                candidates.push(tracking);
+            }
+        }
+    }
+    for remote in git_remotes() {
+        candidates.push(format!("{remote}/HEAD"));
+        candidates.push(format!("{remote}/main"));
+        candidates.push(format!("{remote}/master"));
+    }
+    candidates.push("main".to_owned());
+    candidates.push("master".to_owned());
+    candidates
+        .into_iter()
+        .find(|candidate| usable_diff_base(candidate))
+}
+
+fn git_uncommitted_paths() -> anyhow::Result<Vec<String>> {
+    let output = std::process::Command::new("git")
+        .args(["status", "-z", "--porcelain=v1"])
+        .output()
+        .context("git status")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let mut paths = Vec::new();
+    let mut iter = output.stdout.split(|&b| b == 0);
+    while let Some(item) = iter.next() {
+        if item.is_empty() {
+            continue;
+        }
+        let item_str = String::from_utf8_lossy(item);
+        if item_str.len() < 3 {
+            continue;
+        }
+        let status_code = &item_str[..2];
+        let path_part = &item_str[3..];
+        if (status_code.starts_with('R') || status_code.starts_with('C')) && iter.size_hint().0 > 0
+        {
+            if let Some(target) = iter.next() {
+                let target_str = String::from_utf8_lossy(target).to_string();
+                paths.push(target_str);
+                continue;
+            }
+        }
+        paths.push(path_part.to_string());
+    }
+    Ok(paths)
+}
+
+/// Changed files for a local run: the merge-base diff against `base`, plus
+/// anything uncommitted.
+///
+/// Uncommitted files count because the server snapshots the working tree, not
+/// `HEAD` — a `paths:` filter judged only on committed history would ignore
+/// the very edit the user is testing.
+fn local_changed_paths(base: &str) -> anyhow::Result<Vec<String>> {
+    let output = std::process::Command::new("git")
+        .args(["diff", "-z", "--name-only", &format!("{base}...HEAD")])
+        .output()
+        .context("git diff")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git diff against `{base}` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let mut paths: Vec<String> = output
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|slice| !slice.is_empty())
+        .map(|slice| String::from_utf8_lossy(slice).to_string())
+        .collect();
+    paths.extend(git_uncommitted_paths()?);
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+/// Derive the changed-file list for a local run, or `None` to leave it unknown.
+///
+/// An explicit `--payload` carrying `paths` or `commits` wins: the caller
+/// stated the change set and must not be second-guessed.
+fn default_local_changed_paths(
+    event: &str,
+    base: Option<&str>,
+    payload: &serde_json::Value,
+) -> Option<Vec<String>> {
+    if !event_carries_changed_files(event) {
+        return None;
+    }
+    if payload.get("paths").is_some() || payload.get("commits").is_some() {
+        return None;
+    }
+    let base = resolve_local_diff_base(base)?;
+    local_changed_paths(&base).ok()
+}
+
+fn strip_branch_prefix(raw: &str) -> &str {
+    if let Some(rest) = raw.strip_prefix("refs/heads/") {
+        return rest;
+    }
+    if let Some(rest) = raw.strip_prefix("refs/remotes/") {
+        if let Some((_remote, branch)) = rest.split_once('/') {
+            return branch;
+        }
+        return rest;
+    }
+    for remote in ["origin/", "upstream/"] {
+        if let Some(rest) = raw.strip_prefix(remote) {
+            return rest;
+        }
+    }
+    raw
+}
+
+/// Branch a `pull_request` run should be filtered against.
+///
+/// GitHub applies `on.pull_request.branches` to the PR's *target* branch, not
+/// the head branch. Without this a local PR run filters on the checked-out
+/// branch and a workflow gated to `branches: [main]` never matches. Only
+/// derived when the payload does not already carry a base ref.
+fn default_local_filter_branch(
+    event: &str,
+    base: Option<&str>,
+    payload: &serde_json::Value,
+) -> Option<String> {
+    if !matches!(event, "pull_request" | "pull_request_target") {
+        return None;
+    }
+    if payload
+        .get("pull_request")
+        .and_then(|pr| pr.get("base"))
+        .and_then(|base| base.get("ref"))
+        .is_some()
+    {
+        return None;
+    }
+    // An explicit `--base` is the user's stated PR target and names the branch
+    // filters apply to whether or not the ref exists locally — shallow clones
+    // and un-fetched bases are normal. Only the fallback needs a real ref,
+    // because it has nothing else to go on.
+    let base = match base {
+        Some(base) => base.to_owned(),
+        None => resolve_local_diff_base(None)?,
+    };
+    // Filters are written against branch names (`main`), not remote-qualified
+    // refs (`origin/main`), but branches can contain slashes (`feature/auth`).
+    let name = strip_branch_prefix(&base).to_owned();
+    (!name.is_empty()).then_some(name)
+}
+
 fn collect_local_reusable_workflows(
     workflow_path: &std::path::Path,
 ) -> anyhow::Result<BTreeMap<String, String>> {
@@ -2035,6 +2342,11 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         None => serde_json::json!({}),
     };
     let activity_type = default_local_activity_type(event, &payload);
+    // A local run stands in for a webhook delivery, so supply the parts of that
+    // delivery git can answer for. Anything git cannot know (PR number, actor,
+    // labels, upstream run) stays absent rather than invented.
+    let derived_changed_paths = default_local_changed_paths(event, args.base.as_deref(), &payload);
+    let derived_filter_branch = default_local_filter_branch(event, args.base.as_deref(), &payload);
 
     let mut secrets = preloop_gha_protocol::SecretMap::default();
     for secret in &args.secrets {
@@ -2078,6 +2390,9 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         selected_jobs: args.job.into_iter().collect(),
         base_ref: args.base,
         activity_type,
+        changed_paths: derived_changed_paths.clone().unwrap_or_default(),
+        changed_paths_known: derived_changed_paths.is_some(),
+        filter_branch: derived_filter_branch,
         // On by default where it can be acted on: a paused job blocks until a
         // controller answers, so pausing a piped or detached run would hang
         // something with no way to respond. `--preserve-on-failure` is the
@@ -3463,6 +3778,21 @@ fn condition_action(code: &str) -> &'static str {
     }
 }
 
+/// Build the `?job=&step=` pairs for a filtered log request.
+///
+/// Split out so a test can assert the wire query without a live server: these
+/// pairs silently going missing is exactly the bug this replaced.
+fn logs_query(job: Option<&str>, step: Option<usize>) -> Vec<(&'static str, String)> {
+    let mut query = Vec::new();
+    if let Some(job) = job {
+        query.push(("job", job.to_owned()));
+    }
+    if let Some(step) = step {
+        query.push(("step", step.to_string()));
+    }
+    query
+}
+
 async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
     let client = build_client();
     let url = server_url();
@@ -3472,7 +3802,24 @@ async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
             .await?
             .ok_or_else(|| anyhow::anyhow!("no runs found"))?,
     };
+
+    if args.follow {
+        // The live feed carries whole steps as they stream; it has no notion of
+        // "just step N". Refuse instead of quietly ignoring one of the flags.
+        if args.step.is_some() {
+            anyhow::bail!(
+                "`--step` cannot be combined with `--follow`: the live feed is per job, not \
+                 per step. Follow the job, or drop `--follow` to read one finished step."
+            );
+        }
+        return follow_run_logs(&client, &url, &run_id, args.job.as_deref()).await;
+    }
+
     let mut request = client.get(format!("{url}/api/v1/runs/{run_id}/logs"));
+    let query = logs_query(args.job.as_deref(), args.step);
+    if !query.is_empty() {
+        request = request.query(&query);
+    }
     if let Some(token) = api_token() {
         request = request.bearer_auth(token);
     }
@@ -3485,6 +3832,137 @@ async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
     let body = response.text().await?;
     print!("{body}");
     Ok(())
+}
+
+/// Fetch one job's durable log through the native logs endpoint.
+async fn fetch_run_job_logs(
+    client: &reqwest::Client,
+    url: &str,
+    run_id: &str,
+    job: Option<&str>,
+) -> anyhow::Result<String> {
+    let mut request = client.get(format!("{url}/api/v1/runs/{run_id}/logs"));
+    if let Some(job) = job {
+        request = request.query(&[("job", job)]);
+    }
+    if let Some(token) = api_token() {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("server returned {status}: {body}");
+    }
+    Ok(response.text().await?)
+}
+
+/// Stream one job's live console feed and exit when that job finishes.
+///
+/// The server closes the selected job's feed when that job completes. The
+/// client drains every queued SSE frame before returning; if a completed job
+/// has no retained in-memory snapshot (for example after a server restart),
+/// the durable job-log endpoint supplies the missing output.
+async fn follow_run_logs(
+    client: &reqwest::Client,
+    url: &str,
+    run_id: &str,
+    job: Option<&str>,
+) -> anyhow::Result<()> {
+    use futures_util::StreamExt as _;
+
+    let mut request = client.get(format!("{url}/api/v1/runs/{run_id}/logs/live"));
+    if let Some(job) = job {
+        request = request.query(&[("job", job)]);
+    }
+    if let Some(token) = api_token() {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("server returned {status}: {body}");
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut buffer = Vec::new();
+    let mut emitted_data = false;
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|error| anyhow::anyhow!("live log stream failed: {error}"))?;
+        buffer.extend_from_slice(&bytes);
+        while let Some((frame_end, delimiter_len)) = next_sse_frame(&buffer) {
+            let frame: Vec<u8> = buffer.drain(..frame_end).collect();
+            buffer.drain(..delimiter_len);
+            emitted_data |= print_live_log_frame_bytes(&frame)?;
+        }
+    }
+    // A well-formed SSE server terminates every event with a blank line, but
+    // process a final complete-looking frame rather than silently dropping it.
+    if !buffer.is_empty() {
+        emitted_data |= print_live_log_frame_bytes(&buffer)?;
+    }
+
+    if !emitted_data {
+        // The live buffer is intentionally in-memory. A late follower after a
+        // restart still gets the durable output instead of a successful empty
+        // follow.
+        let body = fetch_run_job_logs(client, url, run_id, job).await?;
+        print!("{body}");
+    }
+    Ok(())
+}
+
+/// Return the first complete SSE frame delimiter and its byte length.
+fn next_sse_frame(buffer: &[u8]) -> Option<(usize, usize)> {
+    for index in 0..buffer.len().saturating_sub(1) {
+        if buffer[index..].starts_with(b"\n\n") {
+            return Some((index, 2));
+        }
+        if index + 4 <= buffer.len() && buffer[index..].starts_with(b"\r\n\r\n") {
+            return Some((index, 4));
+        }
+        if buffer[index..].starts_with(b"\r\r") {
+            return Some((index, 2));
+        }
+    }
+    None
+}
+
+/// Print console lines carried by one complete, UTF-8 SSE frame.
+///
+/// Raw bytes are decoded only after the frame boundary is known, so an HTTP
+/// chunk split in the middle of a multibyte character cannot corrupt JSON.
+/// Keep-alive/comment frames and malformed JSON remain non-fatal.
+fn print_live_log_frame_bytes(frame: &[u8]) -> anyhow::Result<bool> {
+    let frame = std::str::from_utf8(frame).context("live log SSE frame was not UTF-8")?;
+    let mut data_lines = Vec::new();
+    for line in frame.split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let Some(payload) = line.strip_prefix("data:") else {
+            continue;
+        };
+        data_lines.push(payload.strip_prefix(' ').unwrap_or(payload));
+    }
+    if data_lines.is_empty() {
+        return Ok(false);
+    }
+    let payload = data_lines.join("\n");
+    let Ok(wrapper) =
+        serde_json::from_str::<preloop_gha_protocol::LiveLogFeedLinesWrapper>(&payload)
+    else {
+        return Ok(false);
+    };
+    for console_line in &wrapper.value {
+        println!("{console_line}");
+    }
+    Ok(!wrapper.value.is_empty())
+}
+
+/// Print one SSE frame for callers/tests that already have valid UTF-8 text.
+#[cfg(test)]
+fn print_live_log_frame(frame: &str) {
+    let _ = print_live_log_frame_bytes(frame.as_bytes());
 }
 
 async fn cmd_cancel(args: CancelArgs) -> anyhow::Result<()> {
@@ -3998,6 +4476,124 @@ mod tests {
     }
 
     #[test]
+    fn porcelain_path_handles_status_columns_renames_and_quotes() {
+        assert_eq!(
+            porcelain_path(" M src/lib.rs").as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(porcelain_path("?? new.rs").as_deref(), Some("new.rs"));
+        assert_eq!(porcelain_path("A  added.rs").as_deref(), Some("added.rs"));
+        // Only the destination of a rename exists in the tree now.
+        assert_eq!(
+            porcelain_path("R  old.rs -> new.rs").as_deref(),
+            Some("new.rs")
+        );
+        // `core.quotePath` wraps non-ASCII names; filters are written unquoted.
+        assert_eq!(
+            porcelain_path("?? \"src/späte.rs\"").as_deref(),
+            Some("src/späte.rs")
+        );
+        assert_eq!(
+            porcelain_path("?? \"src/sp\\303\\244te.rs\"").as_deref(),
+            Some("src/späte.rs")
+        );
+        assert_eq!(porcelain_path(""), None);
+        assert_eq!(porcelain_path("   "), None);
+    }
+
+    #[test]
+    fn only_file_list_events_derive_changed_paths() {
+        for event in [
+            "push",
+            "pull_request",
+            "pull_request_target",
+            "pull_request_review",
+            "merge_group",
+        ] {
+            assert!(event_carries_changed_files(event), "{event}");
+        }
+        // GitHub sends no file list for these, so deriving one would invent a
+        // contract the real event does not have.
+        for event in ["workflow_dispatch", "schedule", "release", "issue_comment"] {
+            assert!(!event_carries_changed_files(event), "{event}");
+        }
+    }
+
+    /// An explicit payload states the change set; derivation must not override
+    /// it, or `--payload` would silently stop working.
+    #[test]
+    fn explicit_payload_paths_suppress_derivation() {
+        assert!(
+            default_local_changed_paths("push", None, &serde_json::json!({"paths": ["a.rs"]}))
+                .is_none()
+        );
+        assert!(default_local_changed_paths(
+            "push",
+            None,
+            &serde_json::json!({"commits": [{"modified": ["a.rs"]}]})
+        )
+        .is_none());
+        // Events without a file list never derive, payload or not.
+        assert!(
+            default_local_changed_paths("workflow_dispatch", None, &serde_json::json!({}))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn filter_branch_derives_pr_target_not_head() {
+        // GitHub filters a PR on its target branch; `--base` names it.
+        assert_eq!(
+            default_local_filter_branch("pull_request", Some("main"), &serde_json::json!({}))
+                .as_deref(),
+            Some("main")
+        );
+        // Remote-qualified refs are reduced to the branch name filters use.
+        assert_eq!(
+            default_local_filter_branch(
+                "pull_request",
+                Some("origin/release-2"),
+                &serde_json::json!({})
+            )
+            .as_deref(),
+            Some("release-2")
+        );
+        // Slashes within branch names must be preserved
+        assert_eq!(
+            default_local_filter_branch(
+                "pull_request",
+                Some("origin/feature/auth"),
+                &serde_json::json!({})
+            )
+            .as_deref(),
+            Some("feature/auth")
+        );
+        assert_eq!(
+            default_local_filter_branch(
+                "pull_request",
+                Some("release/v1.0"),
+                &serde_json::json!({})
+            )
+            .as_deref(),
+            Some("release/v1.0")
+        );
+        // A payload that already carries the base ref wins.
+        assert_eq!(
+            default_local_filter_branch(
+                "pull_request",
+                Some("main"),
+                &serde_json::json!({"pull_request": {"base": {"ref": "develop"}}})
+            ),
+            None
+        );
+        // Only PR-family events have a target branch.
+        assert_eq!(
+            default_local_filter_branch("push", Some("main"), &serde_json::json!({})),
+            None
+        );
+    }
+
+    #[test]
     fn run_push_flags() {
         let draft = |args: &[&str]| {
             let cli = parse(args).unwrap();
@@ -4118,6 +4714,66 @@ mod tests {
         };
         assert_eq!(args.job.unwrap(), "build");
         assert_eq!(args.step.unwrap(), 3);
+    }
+
+    /// The flags used to parse and then be dropped on the floor. Assert the
+    /// wire query itself, not just that clap accepted the argument.
+    #[test]
+    fn logs_filters_reach_the_query_string() {
+        assert_eq!(
+            logs_query(Some("build"), Some(3)),
+            vec![("job", "build".to_owned()), ("step", "3".to_owned())]
+        );
+    }
+
+    #[test]
+    fn logs_query_omits_absent_filters() {
+        assert!(logs_query(None, None).is_empty());
+        assert_eq!(
+            logs_query(Some("test"), None),
+            vec![("job", "test".to_owned())]
+        );
+        assert_eq!(logs_query(None, Some(2)), vec![("step", "2".to_owned())]);
+    }
+
+    #[test]
+    fn logs_follow_flag_parses_short_and_long() {
+        for argv in [vec!["logs", "-f"], vec!["logs", "--follow"]] {
+            let cli = parse(&argv).unwrap();
+            let Command::Logs(args) = cli.command else {
+                panic!("expected Logs");
+            };
+            assert!(args.follow, "{argv:?} should enable follow");
+        }
+    }
+
+    #[test]
+    fn logs_defaults_to_no_follow_and_no_filters() {
+        let cli = parse(&["logs"]).unwrap();
+        let Command::Logs(args) = cli.command else {
+            panic!("expected Logs");
+        };
+        assert!(!args.follow);
+        assert!(args.job.is_none());
+        assert!(args.step.is_none());
+    }
+
+    #[test]
+    fn live_log_frame_prints_only_console_lines() {
+        let frame = "event: live-log\ndata: {\"stepId\":\"s1\",\"startLine\":1,\"count\":2,\
+                     \"value\":[\"first\",\"second\"]}";
+        // The production parser reports whether this frame emitted console
+        // lines; the `event:` line itself carries no output.
+        assert!(print_live_log_frame_bytes(frame.as_bytes()).unwrap());
+        assert!(!print_live_log_frame_bytes(b"event: live-log").unwrap());
+    }
+
+    #[test]
+    fn live_log_frame_tolerates_keepalive_and_garbage() {
+        // Keep-alive comments and unparseable payloads must not abort a follow.
+        print_live_log_frame(":");
+        print_live_log_frame("event: live-log\ndata: not-json");
+        print_live_log_frame("");
     }
 
     #[test]

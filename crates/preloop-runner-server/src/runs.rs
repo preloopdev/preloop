@@ -378,10 +378,57 @@ pub(crate) async fn submit_run_inner(
     } else {
         changed_paths_from_payload(&submission.payload)
     };
+    // The reason names the axis; this names the flag that changes it, because
+    // "does not match" without a next action is the whole complaint being
+    // fixed here.
+    fn trigger_mismatch_hint(reason: &preloop_gha_parser::TriggerMismatch) -> String {
+        use preloop_gha_parser::TriggerMismatch as M;
+        match reason {
+            M::EventNotDeclared { declared } if !declared.is_empty() => {
+                let list = declared
+                    .iter()
+                    .map(|event| format!("`--event {event}`"))
+                    .collect::<Vec<_>>()
+                    .join(" or ");
+                format!(" Pass {list}.")
+            }
+            M::EventNotDeclared { .. } => String::new(),
+            M::ActivityTypeMissing { accepted } | M::ActivityTypeRejected { accepted, .. } => {
+                if accepted.is_empty() {
+                    " The workflow declares an empty `types` list and accepts no activity types for this event.".to_owned()
+                } else {
+                    let first = accepted.first().map(String::as_str).unwrap_or("opened");
+                    format!(
+                        " Supply one with `--payload` containing {{\"action\": \"{first}\"}}, or pick \
+                         an activity type the workflow accepts."
+                    )
+                }
+            }
+            M::RefFiltered { .. } => " Check out a matching branch or tag, or pass `--base <REF>` \
+                 for pull_request events (the branch filter applies to the PR's target branch)."
+                .to_owned(),
+            M::PathsUnmatched { .. } | M::PathsAllIgnored { .. } => {
+                " Change a file the filter selects, or pass `--base <REF>` to diff against a \
+                 different base."
+                    .to_owned()
+            }
+            M::UpstreamWorkflowUnmatched { .. } => {
+                " A `workflow_run` trigger needs the upstream workflow's display name; supply it \
+                 with `--payload` containing {\"workflow_run\": {\"name\": \"<NAME>\"}}."
+                    .to_owned()
+            }
+        }
+    }
+
     if !changed_paths_known && workflow.on.has_path_filters(&submission.event) {
-        return Err(ApiError::bad_request(
-            "workflow path filters require a complete changed-file list".to_owned(),
-        ));
+        return Err(ApiError::bad_request(format!(
+            "`on.{}` filters by path, so the run needs the complete list of changed files and \
+             none was supplied. `preloop run` derives it from git, so this usually means the \
+             workspace is not a git repository or no base ref could be resolved — pass `--base \
+             <REF>` (for example `--base main`). An API caller must send `changed_paths` with \
+             `changed_paths_known: true`, or a payload carrying `paths` or `commits`.",
+            submission.event
+        )));
     }
     // Activity type from explicit field (set by dispatcher) or payload.action fallback.
     let activity_owned: Option<String> = submission.activity_type.clone().or_else(|| {
@@ -392,17 +439,29 @@ pub(crate) async fn submit_run_inner(
             .map(str::to_owned)
     });
     let activity_type = activity_owned.as_deref();
-    if !workflow.on.matches_with_context(
+    let mut upstream_names = submission.workflow_run_upstream_names.clone();
+    if upstream_names.is_empty() {
+        if let Some(name) = submission
+            .payload
+            .get("workflow_run")
+            .and_then(|wr| wr.get("name"))
+            .and_then(|v| v.as_str())
+        {
+            upstream_names.push(name.to_owned());
+        }
+    }
+    if let Err(reason) = workflow.on.match_event(
         &submission.event,
         branch.as_deref(),
         tag.as_deref(),
         &changed_paths,
         activity_type,
-        &submission.workflow_run_upstream_names,
+        &upstream_names,
     ) {
         return Err(ApiError::trigger_mismatch(format!(
-            "workflow does not match event `{}`",
-            submission.event
+            "workflow does not run for event `{}`: {reason}.{}",
+            submission.event,
+            trigger_mismatch_hint(&reason)
         )));
     }
     let dispatch_inputs_for_expand: BTreeMap<String, serde_json::Value> = submission
@@ -2299,9 +2358,234 @@ pub(crate) async fn list_runs(
     Ok(Json(runs))
 }
 
+/// Optional filters for `GET /api/v1/runs/:run_id/logs`.
+///
+/// Both are absent for the historical whole-run behavior, so an unfiltered
+/// request still returns every job's log merged in request order.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RunLogsQuery {
+    /// Workflow job key (`job_id`) or the agent job UUID. Matched exactly as
+    /// the live-log feed matches it, so the same value works for both.
+    #[serde(default)]
+    job: Option<String>,
+    /// 1-based index into the job's step logs, in execution order. Mirrors
+    /// `preloop debug --from`, which also counts user-visible steps from 1.
+    #[serde(default)]
+    step: Option<usize>,
+}
+
+/// Files uploaded for one job's individual steps.
+///
+/// `all` preserves upload order for an unfiltered request. `workflow` maps the
+/// user-visible workflow-step order to those files; an entry is `None` when a
+/// step produced no log blob. Keeping both views matters because synthetic
+/// setup/cleanup records can be uploaded alongside user steps.
+struct StepLogs {
+    all: Vec<std::path::PathBuf>,
+    workflow: Option<Vec<Option<std::path::PathBuf>>>,
+}
+
+/// One job's log material, in execution order.
+///
+/// The variants are the three tiers `get_run_logs` already resolved inline;
+/// naming them is what lets `?step=` reject the one tier that cannot answer
+/// it instead of silently returning the whole job.
+enum JobLogs {
+    /// The runner uploaded one merged log. Step boundaries are not recoverable
+    /// from it, so `?step=` cannot be honored.
+    Merged(Vec<u8>),
+    /// Per-step log files, with a workflow-order view for `?step=`.
+    Steps(StepLogs),
+    /// Nothing on disk yet: in-memory console blocks for a job still running,
+    /// already ordered by numeric console log id (one per step).
+    Live(Vec<Vec<u8>>),
+}
+
+/// Resolve one job's logs through the tier fallback.
+///
+/// Unfiltered requests prefer the merged upload because it is the runner's
+/// authoritative whole-job representation. A step-filtered request prefers
+/// individual step blobs when both are present; the merged upload has no
+/// recoverable boundaries and is only used to produce the explicit 409.
+async fn resolve_job_logs(
+    results_dir: &std::path::Path,
+    fallback_blocks: Vec<Vec<u8>>,
+    workflow_step_ids: Option<&[String]>,
+    prefer_steps: bool,
+) -> Result<JobLogs, ApiError> {
+    let merged = match tokio::fs::read(results_dir.join("job-logs.txt")).await {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(ApiError::internal(format!(
+                "failed to read run log `{}`: {error}",
+                results_dir.join("job-logs.txt").display()
+            )));
+        }
+    };
+    if !prefer_steps {
+        if let Some(contents) = merged {
+            return Ok(JobLogs::Merged(contents));
+        }
+    }
+
+    let mut step_files = Vec::new();
+    match tokio::fs::read_dir(results_dir).await {
+        Ok(mut entries) => {
+            while let Some(entry) = entries.next_entry().await.map_err(|error| {
+                ApiError::internal(format!(
+                    "failed to enumerate result logs `{}`: {error}",
+                    results_dir.display()
+                ))
+            })? {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !name.starts_with("step-") || !name.ends_with(".txt") {
+                    continue;
+                }
+                let metadata = entry.metadata().await.map_err(|error| {
+                    ApiError::internal(format!(
+                        "failed to inspect result log `{}`: {error}",
+                        entry.path().display()
+                    ))
+                })?;
+                if !metadata.is_file() {
+                    continue;
+                }
+                let step_id = name
+                    .strip_prefix("step-")
+                    .and_then(|name| name.strip_suffix(".txt"))
+                    .unwrap_or_default()
+                    .to_owned();
+                let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+                step_files.push((modified, name.into_owned(), step_id, entry.path()));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(ApiError::internal(format!(
+                "failed to enumerate result logs `{}`: {error}",
+                results_dir.display()
+            )));
+        }
+    }
+    step_files.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+
+    if !step_files.is_empty() {
+        let workflow = workflow_step_ids.filter(|ids| !ids.is_empty()).map(|ids| {
+            ids.iter()
+                .map(|id| {
+                    step_files
+                        .iter()
+                        .find(|(_, _, file_id, _)| file_id == id)
+                        .map(|(_, _, _, path)| path.clone())
+                })
+                .collect()
+        });
+        return Ok(JobLogs::Steps(StepLogs {
+            all: step_files.into_iter().map(|(_, _, _, path)| path).collect(),
+            workflow,
+        }));
+    }
+
+    // A step query with only a merged upload must be rejected by append_step;
+    // do not silently turn it into a whole-job response.
+    if let Some(contents) = merged {
+        return Ok(JobLogs::Merged(contents));
+    }
+    Ok(JobLogs::Live(fallback_blocks))
+}
+
+/// Append every step of a job, in upload/execution order.
+async fn append_all(logs: JobLogs, merged: &mut Vec<u8>) -> Result<(), ApiError> {
+    match logs {
+        JobLogs::Merged(contents) => merged.extend_from_slice(&contents),
+        JobLogs::Steps(step_logs) => {
+            for path in step_logs.all {
+                let contents = tokio::fs::read(&path).await.map_err(|error| {
+                    ApiError::internal(format!(
+                        "failed to read result log `{}`: {error}",
+                        path.display()
+                    ))
+                })?;
+                merged.extend_from_slice(&contents);
+            }
+        }
+        JobLogs::Live(blocks) => {
+            for block in blocks {
+                merged.extend_from_slice(&block);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Append exactly the `step`th (1-based) workflow step of a job.
+async fn append_step(
+    logs: JobLogs,
+    step: usize,
+    job_label: &str,
+    merged: &mut Vec<u8>,
+) -> Result<(), ApiError> {
+    if step == 0 {
+        return Err(ApiError::bad_request(
+            "step is 1-based; use `--step 1` for the first step",
+        ));
+    }
+    let index = step - 1;
+    match logs {
+        // Refusing beats guessing: the merged upload has no step boundaries,
+        // so any answer here would be the whole job wearing a step's name.
+        JobLogs::Merged(_) => Err(ApiError::conflict(format!(
+            "job `{job_label}` reported one merged log, which carries no step \
+             boundaries; re-request without `step` for the whole job log"
+        ))),
+        JobLogs::Steps(step_logs) => {
+            let (total, path) = match step_logs.workflow {
+                Some(workflow) => {
+                    let total = workflow.len();
+                    (total, workflow.get(index).cloned().flatten())
+                }
+                None => {
+                    let total = step_logs.all.len();
+                    (total, step_logs.all.get(index).cloned())
+                }
+            };
+            let Some(path) = path else {
+                if index < total {
+                    // A valid workflow step is allowed to have no log blob.
+                    return Ok(());
+                }
+                return Err(ApiError::not_found(format!(
+                    "job `{job_label}` has {total} steps; step {step} is out of range"
+                )));
+            };
+            let contents = tokio::fs::read(&path).await.map_err(|error| {
+                ApiError::internal(format!(
+                    "failed to read result log `{}`: {error}",
+                    path.display()
+                ))
+            })?;
+            merged.extend_from_slice(&contents);
+            Ok(())
+        }
+        JobLogs::Live(blocks) => {
+            let total = blocks.len();
+            let block = blocks.into_iter().nth(index).ok_or_else(|| {
+                ApiError::not_found(format!(
+                    "job `{job_label}` has {total} steps so far; step {step} is out of range"
+                ))
+            })?;
+            merged.extend_from_slice(&block);
+            Ok(())
+        }
+    }
+}
+
 pub(crate) async fn get_run_logs(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
+    Query(query): Query<RunLogsQuery>,
 ) -> Result<Response, ApiError> {
     let (state_dir, sources) = {
         let inner = shared.state.inner.lock().await;
@@ -2315,6 +2599,32 @@ pub(crate) async fn get_run_logs(
             .filter(|request| request.run_id == run_id)
             .collect();
         requests.sort_by_key(|request| request.request_id);
+
+        if let Some(job) = &query.job {
+            // Same matching rule as the live-log feed: workflow job key or
+            // agent job UUID, so one value works across both surfaces.
+            requests.retain(|request| {
+                request.job_id.0 == *job || request.agent_job_id.to_string() == *job
+            });
+            if requests.is_empty() {
+                return Err(ApiError::not_found(format!(
+                    "job `{job}` not found in this run"
+                )));
+            }
+        } else if query.step.is_some() && requests.len() > 1 {
+            // Numbering restarts per job, so an unqualified step in a
+            // multi-job run names more than one thing.
+            let jobs: Vec<&str> = requests
+                .iter()
+                .map(|request| request.job_id.0.as_str())
+                .collect();
+            return Err(ApiError::bad_request(format!(
+                "`step` needs `job` when a run has {} jobs: {}",
+                jobs.len(),
+                jobs.join(", ")
+            )));
+        }
+
         let sources = requests
             .into_iter()
             .map(|request| {
@@ -2335,13 +2645,41 @@ pub(crate) async fn get_run_logs(
                         (Err(_), Err(_)) => left.cmp(right),
                     }
                 });
+                let workflow_step_ids = inner
+                    .broker_messages
+                    .get(&request.request_id)
+                    .map(|message| {
+                        message
+                            .steps
+                            .iter()
+                            .map(|step| step.id.to_string())
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|ids| !ids.is_empty())
+                    .or_else(|| {
+                        inner.runs.get(&run_id).and_then(|run| {
+                            run.jobs_list
+                                .iter()
+                                .find(|detail| detail.name == request.job_id.0)
+                                .map(|detail| {
+                                    detail
+                                        .steps
+                                        .iter()
+                                        .filter_map(|step| step.id.clone())
+                                        .collect::<Vec<_>>()
+                                })
+                                .filter(|ids| !ids.is_empty())
+                        })
+                    });
                 (
                     request.plan_id.clone(),
                     request.agent_job_id.to_string(),
+                    request.job_id.0.clone(),
                     blocks
                         .into_iter()
                         .map(|(_, block)| block.to_vec())
                         .collect::<Vec<_>>(),
+                    workflow_step_ids,
                 )
             })
             .collect::<Vec<_>>();
@@ -2349,75 +2687,22 @@ pub(crate) async fn get_run_logs(
     };
 
     let mut merged = Vec::new();
-    for (plan_id, agent_job_id, fallback_blocks) in sources {
+    for (plan_id, agent_job_id, job_label, fallback_blocks, workflow_step_ids) in sources {
         let results_dir = state_dir
             .join("replay")
             .join("results")
             .join(plan_id)
             .join(agent_job_id);
-        let results_log = results_dir.join("job-logs.txt");
-        match tokio::fs::read(&results_log).await {
-            Ok(contents) => merged.extend_from_slice(&contents),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let mut step_logs = Vec::new();
-                match tokio::fs::read_dir(&results_dir).await {
-                    Ok(mut entries) => {
-                        while let Some(entry) = entries.next_entry().await.map_err(|error| {
-                            ApiError::internal(format!(
-                                "failed to enumerate result logs `{}`: {error}",
-                                results_dir.display()
-                            ))
-                        })? {
-                            let name = entry.file_name();
-                            let name = name.to_string_lossy();
-                            if !name.starts_with("step-") || !name.ends_with(".txt") {
-                                continue;
-                            }
-                            let metadata = entry.metadata().await.map_err(|error| {
-                                ApiError::internal(format!(
-                                    "failed to inspect result log `{}`: {error}",
-                                    entry.path().display()
-                                ))
-                            })?;
-                            if !metadata.is_file() {
-                                continue;
-                            }
-                            let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
-                            step_logs.push((modified, name.into_owned(), entry.path()));
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(ApiError::internal(format!(
-                            "failed to enumerate result logs `{}`: {error}",
-                            results_dir.display()
-                        )));
-                    }
-                }
-                step_logs
-                    .sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-                if step_logs.is_empty() {
-                    for block in fallback_blocks {
-                        merged.extend_from_slice(&block);
-                    }
-                } else {
-                    for (_, _, path) in step_logs {
-                        let contents = tokio::fs::read(&path).await.map_err(|error| {
-                            ApiError::internal(format!(
-                                "failed to read result log `{}`: {error}",
-                                path.display()
-                            ))
-                        })?;
-                        merged.extend_from_slice(&contents);
-                    }
-                }
-            }
-            Err(error) => {
-                return Err(ApiError::internal(format!(
-                    "failed to read run log `{}`: {error}",
-                    results_log.display()
-                )));
-            }
+        let logs = resolve_job_logs(
+            &results_dir,
+            fallback_blocks,
+            workflow_step_ids.as_deref(),
+            query.step.is_some(),
+        )
+        .await?;
+        match query.step {
+            Some(step) => append_step(logs, step, &job_label, &mut merged).await?,
+            None => append_all(logs, &mut merged).await?,
         }
     }
 

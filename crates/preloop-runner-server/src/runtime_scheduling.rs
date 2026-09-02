@@ -2670,6 +2670,7 @@ pub(crate) fn retire_node_requests(
                 let agent_key = record.agent_job_id.to_string();
                 inner.live_log_lines.remove(&agent_key);
                 inner.live_log_tx.remove(&agent_key);
+                inner.live_log_closed.remove(&agent_key);
             }
         }
     }

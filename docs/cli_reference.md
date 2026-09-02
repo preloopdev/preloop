@@ -54,6 +54,35 @@ Behavior notes:
   changes included) — the run never depends on what was pushed.
 - Local reusable workflows (`uses: ./.github/workflows/…`) are uploaded with
   the submission automatically.
+- **Simulated event context**: a local run stands in for a webhook delivery, so
+  the CLI fills in the parts of that delivery git can answer for. Nothing else
+  is invented — see below.
+
+### What a local run derives
+
+GitHub sends a webhook body; `preloop run` has git instead. These are derived
+automatically, and an explicit `--payload` field always wins:
+
+| Field | Derived from | Why it is safe |
+|---|---|---|
+| changed files (`paths` / `paths-ignore` filters) | `git diff --name-only <base>...HEAD` plus uncommitted changes | The run tests the working tree, so the filter should judge the same files |
+| PR activity type (`types:` filters) | defaults to `synchronize` | One of GitHub's default `pull_request` types |
+| target branch (`branches:` filters on `pull_request`) | `--base`, else the branch's tracking ref | GitHub applies PR branch filters to the **target** branch, not the head branch |
+| branch / tag | the current checkout | It is the ref being tested |
+
+The base for the diff is `--base` when given, otherwise the branch's tracking
+ref, then each remote's default branch, then local `main`/`master`. A candidate
+is only used if it shares history with `HEAD`, so a fork remote with unrelated
+history is skipped rather than picked and then failing to diff.
+
+Nothing else is synthesized. PR number, actor, labels, review state, and
+`workflow_run` upstream results have no local truth, and guessing them would
+flip `if:` conditions on fabricated data — pass `--payload` when a workflow
+needs them.
+
+If no usable base is found, the change set stays *unknown* rather than empty:
+an empty known list would make every `paths:` filter reject the run. Path-
+filtered workflows then fail with an error naming what to pass.
 
 ## `preloop plan [OPTIONS]`
 
@@ -77,8 +106,30 @@ No flags.
 
 | Flag | Description |
 |---|---|
-| `--job <JOB>` | Filter by job ID |
-| `--step <STEP>` | Filter by step number |
+| `--job <JOB>` | Narrow to one job: the workflow job key (`build`) or its agent job UUID |
+| `--step <STEP>` | Narrow to one 1-based step within the job, in execution order |
+| `-f`, `--follow` | Stream one job's output and exit when that job finishes |
+
+Without flags, every job's log is merged in job-request order.
+
+`--step` counts user-visible steps from 1, matching `preloop debug --from`. It
+needs `--job` when a run has more than one job, because numbering restarts per
+job. A job whose runner uploaded a single merged log has no recoverable step
+boundaries; asking for a step there fails with `409` rather than returning the
+whole job under a step's name.
+
+`--follow` tracks one job's live console feed, so it needs `--job` unless the
+run has exactly one job. It replays the retained buffer before going live, then
+exits when that selected job completes. If the job is already complete, it
+returns the available durable log instead. It cannot be combined with `--step`
+(the feed carries whole steps as they stream).
+
+```bash
+preloop logs                          # whole latest run
+preloop logs --job test               # just the `test` job
+preloop logs --job test --step 3      # just that job's third step
+preloop logs -f --job test            # tail it live
+```
 
 ## `preloop cancel [RUN_ID]`
 

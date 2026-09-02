@@ -906,8 +906,13 @@ pub fn expand_jobs_with_reusables_and_shas_and_inputs(
     )
 }
 
-/// Expand jobs with workflow-dispatch inputs and actual event name available to
-/// strategy and matrix expressions.
+/// Expand jobs with the triggering event name and dispatch inputs available
+/// to strategy and matrix expressions.
+///
+/// The widest form of this family, and the one the others delegate to.
+/// `github.event_name` gates job- and step-level `if` conditions, so an
+/// expansion that cannot see it evaluates those conditions against an empty
+/// event and can keep or drop the wrong jobs.
 pub fn expand_jobs_with_reusables_and_shas_and_inputs_and_event(
     workflow: &Workflow,
     reusable_workflows: &BTreeMap<String, String>,
