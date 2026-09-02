@@ -787,7 +787,13 @@ impl AppState {
                             .iter()
                             .chain(recovered.pending_jobs.iter())
                             .chain(recovered.concurrency_blocked.iter())
-                            .find(|job| job.run_id == record.run_id && job.job_id == record.job_id)
+                            // Keyed by request id, not by (run, job): a
+                            // re-dispatch leaves several requests for one
+                            // logical job, and matching the pair attaches the
+                            // newest queued message to an older attempt —
+                            // rebuilding it with the wrong `TaskStep` ids, so
+                            // its `step-<id>.txt` blobs stop resolving.
+                            .find(|job| job.message.request_id == record.request_id)
                             .map(|job| job.message.steps.as_slice())
                     })?;
                 let manifest = crate::models::StepRecord::manifest(steps);

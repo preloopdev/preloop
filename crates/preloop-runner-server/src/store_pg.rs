@@ -643,7 +643,8 @@ impl Store for PgStore {
         let rows = client
             .query(
                 "SELECT agent_job_id, step_id, kind, workflow_index, runner_number,
-                        context_name, name_blob, conclusion, started_at_us, finished_at_us
+                        context_name, name_blob, conclusion, started_at_us, finished_at_us,
+                        revision
                  FROM job_steps
                  ORDER BY agent_job_id, COALESCE(runner_number, 2147483647),
                           COALESCE(workflow_index, 2147483647), step_id",
@@ -665,6 +666,7 @@ impl Store for PgStore {
             let conclusion: String = row.get(7);
             let started_at_us: Option<i64> = row.get(8);
             let finished_at_us: Option<i64> = row.get(9);
+            let revision: i64 = row.get(10);
             let name = match self.cipher.unseal(&name_blob) {
                 Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
                 Err(error) => {
@@ -672,6 +674,10 @@ impl Store for PgStore {
                     continue;
                 }
             };
+            // See the SQLite twin: the counter must resume above the
+            // persisted revision or the guard discards post-restart writes.
+            let seen = inner.job_steps_revision.entry(agent_job_id).or_insert(0);
+            *seen = (*seen).max(revision.max(0) as u64);
             inner
                 .job_steps
                 .entry(agent_job_id)
@@ -1288,14 +1294,23 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
           conclusion TEXT NOT NULL,
           started_at_us BIGINT,
           finished_at_us BIGINT,
-          -- See the SQLite twin: guards against two reports for one attempt
-          -- committing out of order.
-          revision BIGINT NOT NULL DEFAULT 0,
           PRIMARY KEY (agent_job_id, step_id)
         );
 
         CREATE INDEX IF NOT EXISTS job_steps_order_idx
           ON job_steps (agent_job_id, kind, workflow_index);
+        "#,
+    ),
+    (
+        5,
+        "job-steps-revision",
+        // See the SQLite twin: guards two reports for one attempt committing
+        // out of order. Its own version rather than an edit to 4, because a
+        // database already at 4 from an earlier build of this branch would
+        // skip the change and fail every step write on an undefined column.
+        r#"
+        ALTER TABLE job_steps
+          ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0;
         "#,
     ),
 ];

@@ -1446,7 +1446,8 @@ impl SqliteStore {
         // guessing, so the run's step history has to come back here.
         let mut step_stmt = connection.prepare(
             "SELECT agent_job_id, step_id, kind, workflow_index, runner_number,
-                    context_name, name_blob, conclusion, started_at_us, finished_at_us
+                    context_name, name_blob, conclusion, started_at_us, finished_at_us,
+                    revision
              FROM job_steps
              ORDER BY agent_job_id, COALESCE(runner_number, 2147483647),
                       COALESCE(workflow_index, 2147483647), step_id",
@@ -1463,6 +1464,7 @@ impl SqliteStore {
                 row.get::<_, String>(7)?,
                 row.get::<_, Option<i64>>(8)?,
                 row.get::<_, Option<i64>>(9)?,
+                row.get::<_, i64>(10)?,
             ))
         })? {
             let (
@@ -1476,6 +1478,7 @@ impl SqliteStore {
                 conclusion,
                 started_at_us,
                 finished_at_us,
+                revision,
             ) = row?;
             let Ok(agent_job_id) = agent_job_id.parse::<uuid::Uuid>() else {
                 tracing::warn!(%agent_job_id, "dropping step row with an unparseable attempt id");
@@ -1488,6 +1491,12 @@ impl SqliteStore {
                     continue;
                 }
             };
+            // The guard compares against the persisted revision, so the
+            // counter has to resume above it. Left at zero, the first writes
+            // after a restart carry revisions the rows already exceed and are
+            // silently discarded.
+            let seen = inner.job_steps_revision.entry(agent_job_id).or_insert(0);
+            *seen = (*seen).max(revision.max(0) as u64);
             inner
                 .job_steps
                 .entry(agent_job_id)
@@ -2415,17 +2424,26 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
           conclusion TEXT NOT NULL,
           started_at_us INTEGER,
           finished_at_us INTEGER,
-          -- Monotonic per attempt, bumped on every in-memory mutation. Two
-          -- reports for one attempt snapshot under the lock and then commit
-          -- outside it, so they can commit out of order; the upsert refuses to
-          -- move a row backwards rather than letting the older snapshot
-          -- overwrite the newer conclusions.
-          revision INTEGER NOT NULL DEFAULT 0,
           PRIMARY KEY (agent_job_id, step_id)
         ) STRICT, WITHOUT ROWID;
 
         CREATE INDEX IF NOT EXISTS job_steps_order_idx
           ON job_steps (agent_job_id, kind, workflow_index);
+        "#,
+    ),
+    (
+        5,
+        "job-steps-revision",
+        // Monotonic per attempt, bumped on every in-memory mutation of the
+        // manifest. Reconciliation snapshots under the state lock and writes
+        // after releasing it, so two reports for one attempt can commit out of
+        // order; the upsert compares this and refuses to move a row backwards.
+        //
+        // Its own version rather than an edit to 4: a database already at 4
+        // from an earlier build of this branch would skip the change entirely
+        // and fail every step write with an undefined column.
+        r#"
+        ALTER TABLE job_steps ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;
         "#,
     ),
 ];

@@ -2912,28 +2912,40 @@ async fn timeline_path_orders_synthetic_steps_and_skips_the_job_record() {
 
     // Setup started before the declared steps, and the job record is sent
     // alongside them exactly as the official runner does.
+    //
+    // The three step records deliberately use the three shapes that appear on
+    // the wire: `Task` (official runner), `Step` (which this file's annotation
+    // path already recognises), and no `type` at all (the field is optional).
+    // An allow-list of one type passes a test that only sends that type while
+    // silently dropping the others' conclusions.
     let setup_id = uuid::Uuid::new_v4().to_string();
-    let record = |id: &str, kind: &str, name: &str, start: &str| {
-        json!({
+    let job_record_id = uuid::Uuid::new_v4().to_string();
+    let record = |id: &str, kind: Option<&str>, name: &str, start: &str| {
+        let mut value = json!({
             "id": id,
-            "type": kind,
             "name": name,
             "displayName": name,
             "state": "completed",
             "result": "succeeded",
             "startTime": start,
-        })
+        });
+        match kind {
+            Some(kind) => value["type"] = json!(kind),
+            // Untyped records are identified as steps by their parent.
+            None => value["parentId"] = json!(job_record_id),
+        }
+        value
     };
     let response = request_json(
         &app,
         Method::PATCH,
         &format!("/_apis/v1/Timeline/scope/actions/{plan_id}/{timeline_id}"),
         json!({"count": 5, "value": [
-            record(&uuid::Uuid::new_v4().to_string(), "Job", "build", "2026-01-01T00:00:00Z"),
-            record(&ids[0], "Task", "Run echo one", "2026-01-01T00:00:02Z"),
-            record(&ids[1], "Task", "Run echo two", "2026-01-01T00:00:03Z"),
-            record(&ids[2], "Task", "Run echo three", "2026-01-01T00:00:04Z"),
-            record(&setup_id, "Task", "Set up job", "2026-01-01T00:00:01Z"),
+            record(&job_record_id, Some("Job"), "build", "2026-01-01T00:00:00Z"),
+            record(&ids[0], Some("Task"), "Run echo one", "2026-01-01T00:00:02Z"),
+            record(&ids[1], Some("Step"), "Run echo two", "2026-01-01T00:00:03Z"),
+            record(&ids[2], None, "Run echo three", "2026-01-01T00:00:04Z"),
+            record(&setup_id, Some("Task"), "Set up job", "2026-01-01T00:00:01Z"),
         ]}),
     )
     .await;
@@ -3183,6 +3195,92 @@ async fn step_manifests_survive_a_restart() {
         body, b"second step\n",
         "`--step` must still resolve after a restart"
     );
+}
+
+/// A step report made after a restart is still persisted.
+///
+/// The out-of-order write guard compares an in-memory revision against the
+/// persisted one, so the counter has to resume above what is on disk. Left at
+/// zero it hands every post-restart write a revision the stored rows already
+/// exceed, and the upsert discards them — invisibly, because memory stays
+/// authoritative until the next restart drops the conclusion.
+#[tokio::test]
+async fn step_reports_after_a_restart_are_persisted() {
+    let temp = tempfile::tempdir().unwrap();
+    let report = |app: axum::Router, plan_id: String, agent_job_id: String, id: String, n: i64| async move {
+        let response = request_json(
+            &app,
+            Method::POST,
+            "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",
+            json!({
+                "workflow_run_backend_id": plan_id,
+                "workflow_job_run_backend_id": agent_job_id,
+                "steps": [{
+                    "external_id": id,
+                    "number": n,
+                    "name": "Run echo one",
+                    "status": 6,
+                    "conclusion": 2
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(response["ok"], true);
+    };
+
+    let (plan_id, agent_job_id, ids) = {
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+        let (run_id, jobs) = three_step_run_for_log_filters(&app, &state).await;
+        let ids = workflow_step_ids(&state, run_id, "build").await;
+        let (plan_id, agent_job_id) = (jobs[0].1.clone(), jobs[0].2.clone());
+        // Two reports before the restart, so the persisted revision is above
+        // the value a fresh counter would hand out first.
+        report(
+            app.clone(),
+            plan_id.clone(),
+            agent_job_id.clone(),
+            ids[0].clone(),
+            2,
+        )
+        .await;
+        report(
+            app.clone(),
+            plan_id.clone(),
+            agent_job_id.clone(),
+            ids[1].clone(),
+            3,
+        )
+        .await;
+        (plan_id, agent_job_id, ids)
+    };
+
+    {
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+        report(
+            app,
+            plan_id.clone(),
+            agent_job_id.clone(),
+            ids[2].clone(),
+            4,
+        )
+        .await;
+    }
+
+    // Only a second restart can tell whether that write reached the store.
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let inner = state.inner.lock().await;
+    let records = &inner.job_steps[&agent_job_id.parse::<uuid::Uuid>().unwrap()];
+    let reported = records
+        .iter()
+        .find(|step| step.id == ids[2])
+        .expect("the post-restart step must be restored");
+    assert_eq!(
+        reported.conclusion, "success",
+        "a report made after a restart must survive the next one"
+    );
+    assert_eq!(reported.runner_number, Some(4));
 }
 
 /// Every surface showing a whole step list uses execution order.

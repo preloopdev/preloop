@@ -1189,11 +1189,13 @@ pub(crate) async fn submit_run_inner(
                 // message we just built rather than from whatever order the
                 // runner's log blobs happen to land in.
                 //
-                // Not persisted here. Only a runner report writes rows, and an
-                // attempt that was dispatched but never reported has its
-                // manifest rebuilt at startup from the persisted request
-                // message — the same source it was built from — so a restart
-                // in that window keeps its declared steps.
+                // Not persisted here. Rows are written by a runner report, a
+                // job completion, or a full snapshot that happens to flush
+                // them; none of those has necessarily run when a dispatched
+                // attempt is interrupted, so its manifest is rebuilt at startup
+                // from the persisted request message — the same source it was
+                // built from — and a restart in that window keeps its declared
+                // steps.
                 inner.job_steps.insert(
                     job_request.agent_job_id,
                     StepRecord::manifest(&agent_msg.steps),

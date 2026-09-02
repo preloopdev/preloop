@@ -156,16 +156,27 @@ pub(crate) async fn patch_timeline_records(
                     let Some(name) = &record.display_name else {
                         continue;
                     };
-                    // A PATCH carries the job's own record alongside its
-                    // steps. Its id is a UUID and `job_id.0` is the workflow
-                    // job key, so the id comparison below never matched it and
-                    // the job was reconciled in as a synthetic step — showing
-                    // up in run projections as an extra step named after the
-                    // job, and persisted there. Only task records are steps.
-                    if !matches!(record.record_type, Some(azdo::TimelineRecordType::Task)) {
-                        continue;
-                    }
-                    if record.id.to_string() == job_id.0 {
+                    // A PATCH carries the job's own record alongside its steps,
+                    // and reconciling that record in produced a phantom step
+                    // named after the job. Exclude container records rather
+                    // than whitelisting one step type: `type` is optional on
+                    // the wire, the official runner sends `Task` and this file
+                    // already treats `Step` as a step above, so an allow-list
+                    // silently drops real conclusions.
+                    let is_step = match record.record_type {
+                        Some(azdo::TimelineRecordType::Task | azdo::TimelineRecordType::Step) => {
+                            true
+                        }
+                        Some(
+                            azdo::TimelineRecordType::Job
+                            | azdo::TimelineRecordType::Phase
+                            | azdo::TimelineRecordType::Stage,
+                        ) => false,
+                        // Untyped: a step always hangs off the job record, which
+                        // is the same signal the annotation path above uses.
+                        None => record.parent_id.is_some(),
+                    };
+                    if !is_step {
                         continue;
                     }
 
