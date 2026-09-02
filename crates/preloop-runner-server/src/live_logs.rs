@@ -234,10 +234,19 @@ pub(crate) fn live_log_key_for_job(
     job_id: &str,
 ) -> Option<String> {
     let run = inner.runs.get(&run_id)?;
-    if let Some(record) = inner.job_requests.values().find(|record| {
-        record.run_id == run_id
-            && (record.job_id.0 == job_id || record.agent_job_id.to_string() == job_id)
-    }) {
+    // `job_requests` is keyed by monotonic request id, so `find` would return
+    // the oldest attempt and follow a dead feed after a re-dispatch. A logical
+    // job key means "the current attempt"; an explicit agent job id matches one
+    // record either way.
+    if let Some(record) = inner
+        .job_requests
+        .values()
+        .filter(|record| {
+            record.run_id == run_id
+                && (record.job_id.0 == job_id || record.agent_job_id.to_string() == job_id)
+        })
+        .max_by_key(|record| record.request_id)
+    {
         return Some(record.agent_job_id.to_string());
     }
     // A logical job key is valid without a request only when it belongs to
