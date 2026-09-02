@@ -1,0 +1,44 @@
+name: P0 Failure Conditions Verification
+on: workflow_dispatch
+jobs:
+  failure-and-always:
+    runs-on: [self-hosted, p0-test]
+    steps:
+      # 1. Intentional failure
+      - name: Intentional failure
+        id: failing
+        run: |
+          echo "About to fail"
+          exit 1
+
+      # 2. success() — should be SKIPPED
+      - name: Should be skipped (success)
+        if: success()
+        run: |
+          echo "BUG: this should not have run"
+          exit 1
+
+      # 3. failure() — should RUN
+      - name: Runs on failure
+        if: failure()
+        run: echo "failure-condition-ran"
+
+      # 4. always() — should RUN
+      - name: Runs always
+        if: always()
+        run: echo "always-condition-ran"
+
+      # 5. Verify steps context
+      - name: Verify failing step outcome
+        if: always()
+        run: |
+          echo "failing.outcome=${{ steps.failing.outcome }}"
+          echo "failing.conclusion=${{ steps.failing.conclusion }}"
+          test "${{ steps.failing.outcome }}" = "failure"
+          test "${{ steps.failing.conclusion }}" = "failure"
+          echo "Steps context verified"
+
+      # 6. Final marker
+      - name: Final marker
+        if: always()
+        run: echo "ALL_P0_FAILURE_CONDITION_CHECKS_PASSED"

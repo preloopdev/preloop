@@ -1,0 +1,32 @@
+name: Reusable Output Propagation Stress
+on:
+  workflow_dispatch:
+
+jobs:
+  call-reusable:
+    uses: ./.github/workflows/83-reusable-callee-outputs.yml
+    with:
+      greeting: "Hello from caller"
+      count: 42
+
+  consumer:
+    needs: call-reusable
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    steps:
+      - name: Verify propagated output
+        run: |
+          echo "Received result: ${{ needs.call-reusable.outputs.result }}"
+          echo "Received computed: ${{ needs.call-reusable.outputs.computed }}"
+          if [[ "${{ needs.call-reusable.outputs.result }}" == "processed-Hello from caller" ]]; then
+            echo "PASS: result output propagated correctly"
+          else
+            echo "FAIL: expected 'processed-Hello from caller', got '${{ needs.call-reusable.outputs.result }}'"
+            exit 1
+          fi
+          if [[ "${{ needs.call-reusable.outputs.computed }}" == "84" ]]; then
+            echo "PASS: computed output propagated correctly"
+          else
+            echo "FAIL: expected '84', got '${{ needs.call-reusable.outputs.computed }}'"
+            exit 1
+          fi

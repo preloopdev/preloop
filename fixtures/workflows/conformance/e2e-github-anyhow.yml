@@ -1,0 +1,13 @@
+name: E2E anyhow (GitHub)
+on: workflow_dispatch
+
+jobs:
+  test:
+    name: Test
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: dtolnay/anyhow
+      - run: cargo test

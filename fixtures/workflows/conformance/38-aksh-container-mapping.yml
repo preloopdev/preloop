@@ -1,0 +1,24 @@
+name: "aksh: container-mapping"
+on: workflow_dispatch
+
+jobs:
+  container-mapping:
+    runs-on: [self-hosted, aksh-container]
+    container:
+      image: alpine:3.20
+      env:
+        TEST_VAR: hello
+      options: --cpus 1
+    services:
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Check container
+        run: |
+          echo "TEST_VAR=$TEST_VAR"
+          cat /etc/alpine-release

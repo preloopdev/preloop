@@ -1,0 +1,33 @@
+name: E2E just (GitHub)
+on: workflow_dispatch
+
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: casey/just
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: casey/just
+      - run: cargo clippy --all --all-targets
+
+  test:
+    name: Test
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: casey/just
+      - run: cargo test --all

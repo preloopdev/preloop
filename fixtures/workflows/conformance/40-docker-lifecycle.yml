@@ -1,0 +1,28 @@
+name: 40-docker-lifecycle
+on:
+  workflow_dispatch:
+  push:
+    paths: ['.github/workflows/40-docker-lifecycle.yml', '.github/actions/docker-lifecycle/**']
+
+jobs:
+  docker-lifecycle:
+    runs-on: [self-hosted, f046-test]
+    timeout-minutes: 10
+    steps:
+      # NOTE: No cleanup step here — pre-entrypoint runs BEFORE all main steps,
+      # so any cleanup between would wipe the pre output.
+
+      - name: Docker action with pre/main/post lifecycle
+        uses: preloopdev/aksh-conformance-sample/.github/actions/docker-lifecycle@main
+        with:
+          test-arg: alpha
+          test-env: beta
+
+      - name: Assert pre/main ran (post runs after this step)
+        run: |
+          echo "=== lifecycle.log ==="
+          cat /github/workspace/.fidelity/lifecycle.log || cat .fidelity/lifecycle.log
+          echo "=== Checking ==="
+          LOG=$(cat /github/workspace/.fidelity/lifecycle.log 2>/dev/null || cat .fidelity/lifecycle.log)
+          echo "$LOG" | grep -F 'pre|env=beta|arg=alpha' && echo "PRE OK"
+          echo "$LOG" | grep -F 'main|env=beta|arg=alpha' && echo "MAIN OK"

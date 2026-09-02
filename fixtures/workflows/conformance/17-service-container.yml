@@ -1,0 +1,19 @@
+name: mitm service container
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: [self-hosted, mitm]
+    services:
+      db:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - run: echo up

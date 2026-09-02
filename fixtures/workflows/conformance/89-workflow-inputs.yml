@@ -1,0 +1,89 @@
+name: Workflow Dispatch with Typed Inputs
+
+on:
+  workflow_dispatch:
+    inputs:
+      name_string:
+        description: 'A string input'
+        required: false
+        default: 'test_default'
+        type: string
+      enable_feature:
+        description: 'Enable a feature (boolean)'
+        required: false
+        default: true
+        type: boolean
+      environment_choice:
+        description: 'Select environment'
+        required: false
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      release_env:
+        description: 'Release environment'
+        required: false
+        type: environment
+
+jobs:
+  test-workflow-inputs:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    steps:
+      - name: Display all inputs
+        run: |
+          echo "=== Workflow Inputs ==="
+          echo "name_string: ${{ inputs.name_string }}"
+          echo "enable_feature: ${{ inputs.enable_feature }}"
+          echo "environment_choice: ${{ inputs.environment_choice }}"
+          echo "release_env: ${{ inputs.release_env }}"
+
+      - name: Verify string input type
+        run: |
+          INPUT='${{ inputs.name_string }}'
+          if [[ -z "$INPUT" ]]; then
+            echo "✗ String input is empty"
+            exit 1
+          fi
+          echo "✓ String input received: $INPUT"
+
+      - name: Verify boolean input type
+        run: |
+          BOOL_INPUT='${{ inputs.enable_feature }}'
+          if [[ "$BOOL_INPUT" == "true" ]] || [[ "$BOOL_INPUT" == "false" ]]; then
+            echo "✓ Boolean input is valid: $BOOL_INPUT (type: string representation)"
+          else
+            echo "✗ Boolean input invalid: $BOOL_INPUT"
+            exit 1
+          fi
+
+      - name: Verify choice input
+        run: |
+          CHOICE='${{ inputs.environment_choice }}'
+          if [[ "$CHOICE" =~ ^(dev|staging|prod)$ ]]; then
+            echo "✓ Choice input valid: $CHOICE"
+          else
+            echo "✗ Choice input not in allowed values: $CHOICE"
+            exit 1
+          fi
+
+      - name: Verify environment input (if provided)
+        run: |
+          ENV_INPUT='${{ inputs.release_env }}'
+          if [[ -z "$ENV_INPUT" ]]; then
+            echo "ⓘ Environment input not provided (optional)"
+          else
+            echo "✓ Environment input: $ENV_INPUT"
+          fi
+
+      - name: Test input in condition
+        if: ${{ inputs.enable_feature == 'true' }}
+        run: echo "✓ Boolean input works in workflow conditions"
+
+      - name: Test input with string operations
+        run: |
+          INPUT='${{ inputs.name_string }}'
+          if [[ "$INPUT" == *"test"* ]]; then
+            echo "✓ String input preserves content in conditionals"
+          fi

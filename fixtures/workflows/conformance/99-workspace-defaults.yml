@@ -1,0 +1,75 @@
+name: 99-workspace-defaults
+on:
+  workflow_dispatch:
+jobs:
+  test-workspace:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify GITHUB_WORKSPACE is set
+        run: |
+          if [ -z "$GITHUB_WORKSPACE" ]; then
+            echo "ERROR: GITHUB_WORKSPACE not set"
+            exit 1
+          fi
+          echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
+
+      - name: Verify workspace is checkout root
+        run: |
+          CURRENT_PWD=$(pwd)
+          if [ "$CURRENT_PWD" != "$GITHUB_WORKSPACE" ]; then
+            echo "ERROR: Current directory $CURRENT_PWD != GITHUB_WORKSPACE $GITHUB_WORKSPACE"
+            exit 1
+          fi
+          echo "Current directory matches GITHUB_WORKSPACE"
+
+      - name: Verify runner.workspace context
+        run: |
+          RUNNER_WORKSPACE="$RUNNER_WORKSPACE"
+          if [ -z "$RUNNER_WORKSPACE" ]; then
+            echo "ERROR: runner.workspace is empty"
+            exit 1
+          fi
+          echo "runner.workspace=$RUNNER_WORKSPACE"
+
+      - name: Test working-directory override
+        working-directory: ${{ github.workspace }}
+        run: |
+          CURRENT_PWD=$(pwd)
+          if [ "$CURRENT_PWD" != "$GITHUB_WORKSPACE" ]; then
+            echo "ERROR: working-directory override did not change cwd"
+            exit 1
+          fi
+          echo "working-directory override verified"
+
+      - name: Create test subdirectory
+        run: |
+          mkdir -p test-subdir
+          echo "test file" > test-subdir/testfile.txt
+
+      - name: Test working-directory to subdirectory
+        working-directory: ${{ github.workspace }}/test-subdir
+        run: |
+          CURRENT_PWD=$(pwd)
+          if [ ! -f "testfile.txt" ]; then
+            echo "ERROR: testfile.txt not found in subdirectory"
+            exit 1
+          fi
+          echo "working-directory to subdirectory verified"
+
+      - name: Test invalid working-directory
+        id: invalid-workdir
+        working-directory: /nonexistent/path
+        continue-on-error: true
+        run: echo "This should fail due to missing directory"
+
+      - name: Verify invalid working-directory caused failure
+        run: |
+          if [ "${{ steps.invalid-workdir.outcome }}" = "success" ]; then
+            echo "ERROR: Invalid working-directory should have failed"
+            exit 1
+          fi
+          echo "Invalid working-directory correctly caused failure"

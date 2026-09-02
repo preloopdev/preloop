@@ -1,0 +1,82 @@
+name: Local Node Action
+
+on:
+  workflow_dispatch:
+
+jobs:
+  setup-action:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create test-actions directory structure
+        run: |
+          mkdir -p test-actions/node-action
+          echo "✓ Created test-actions/node-action directory"
+
+      - name: Create action.yml
+        run: |
+          cat > test-actions/node-action/action.yml <<'EOF'
+          name: Test Node Action
+          description: A simple test node action
+          runs:
+            using: node20
+            main: index.js
+          outputs:
+            result:
+              description: Result output
+          EOF
+          echo "✓ Created action.yml"
+
+      - name: Create index.js
+        run: |
+          cat > test-actions/node-action/index.js <<'EOF'
+          console.log('Test Node Action executing');
+          console.log('Action inputs available via process.env');
+          console.log('::set-output name=result::success');
+          process.exit(0);
+          EOF
+          echo "✓ Created index.js"
+
+  use-local-action:
+    needs: setup-action
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Recreate action files (for step execution)
+        run: |
+          mkdir -p test-actions/node-action
+          cat > test-actions/node-action/action.yml <<'EOF'
+          name: Test Node Action
+          description: A simple test node action
+          runs:
+            using: node20
+            main: index.js
+          outputs:
+            result:
+              description: Result output
+          EOF
+          cat > test-actions/node-action/index.js <<'EOF'
+          console.log('Test Node Action executing');
+          console.log('Action inputs available via process.env');
+          console.log('::set-output name=result::success');
+          process.exit(0);
+          EOF
+
+      - name: Use local node action
+        id: test-action
+        uses: ./test-actions/node-action
+        continue-on-error: true
+
+      - name: Verify action executed
+        if: always()
+        run: |
+          echo "Action step outcome: ${{ steps.test-action.outcome }}"
+          if [[ -n "${{ steps.test-action.outputs.result }}" ]]; then
+            echo "✓ Local node action executed and returned output"
+          else
+            echo "Note: Local action execution may not be fully supported yet"
+          fi

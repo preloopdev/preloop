@@ -414,7 +414,9 @@ if [[ "$DISTINCT_COUNT" -gt 0 ]]; then
   python3 - "$DISTINCT_IDS_FILE" "$VULN_DETAILS_DIR" <<'PY'
 import json
 from pathlib import Path
-import subprocess
+import time
+import urllib.request
+import urllib.error
 import sys
 
 ids = [l.strip() for l in Path(sys.argv[1]).read_text().splitlines() if l.strip()]
@@ -422,14 +424,19 @@ outdir = Path(sys.argv[2])
 
 for vid in ids:
     out = outdir / f"{vid}.json"
-    # Try curl with retries
-    try:
-        subprocess.check_call([
-            "curl", "-fsSL", "--retry", "3", "--retry-all-errors",
-            f"https://api.osv.dev/v1/vulns/{vid}"
-        ], stdout=open(out, "wb"))
-    except subprocess.CalledProcessError as e:
-        print(f"failed to fetch vuln {vid}: {e}", file=sys.stderr)
+    url = f"https://api.osv.dev/v1/vulns/{vid}"
+    fetched = False
+    for attempt in range(5):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "preloop-audit/1.0"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                out.write_bytes(resp.read())
+            fetched = True
+            break
+        except Exception as e:
+            time.sleep(1.5 * (attempt + 1))
+    if not fetched:
+        print(f"ERROR: failed to fetch vulnerability details for {vid} from OSV after 5 attempts; failing closed for supply-chain safety", file=sys.stderr)
         sys.exit(1)
 
 print(f"Fetched {len(ids)} vuln details", file=sys.stderr)

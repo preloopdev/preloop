@@ -1,0 +1,157 @@
+name: Empty and Null Values
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-empty-null-values:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    steps:
+      - name: Set empty string output
+        id: empty_output
+        run: |
+          echo 'empty_var=' >> $GITHUB_OUTPUT
+          echo "Empty output set"
+
+      - name: Verify empty string output
+        run: |
+          EMPTY='${{ steps.empty_output.outputs.empty_var }}'
+          
+          if [[ "$EMPTY" == "" ]]; then
+            echo "✓ Empty string output correctly retrieved"
+          else
+            echo "✗ Empty string output is not empty: '$EMPTY'"
+            exit 1
+          fi
+
+      - name: Test empty string comparison
+        run: |
+          EMPTY='${{ steps.empty_output.outputs.empty_var }}'
+          
+          if [[ -z "$EMPTY" ]]; then
+            echo "✓ Empty string identified with -z test"
+          else
+            echo "✗ Empty string not recognized"
+            exit 1
+          fi
+          
+          if [[ "$EMPTY" == '' ]]; then
+            echo "✓ Comparison with empty string works"
+          else
+            echo "✗ Empty string comparison failed"
+            exit 1
+          fi
+
+      - name: Test unset env var reference
+        run: |
+          # Unset env var should be empty/null
+          UNSET_VAR="${NONEXISTENT_VAR}"
+          
+          if [[ -z "$UNSET_VAR" ]]; then
+            echo "✓ Unset env var reference is empty"
+          else
+            echo "✗ Unset env var is not empty: '$UNSET_VAR'"
+            exit 1
+          fi
+          
+          # Test in conditional
+          if [[ "$NONEXISTENT_VAR" == "" ]]; then
+            echo "✓ Unset var comparison works"
+          else
+            echo "✗ Unset var comparison failed"
+          fi
+
+      - name: Test step output that is never set
+        id: never_set
+        run: |
+          # Intentionally don't set never_set_var
+          echo "Step executed but output variable never defined"
+
+      - name: Access undefined step output
+        run: |
+          UNDEFINED='${{ steps.never_set.outputs.never_set_var }}'
+          
+          if [[ -z "$UNDEFINED" ]]; then
+            echo "✓ Undefined step output is empty string"
+          else
+            echo "✗ Undefined step output is not empty: '$UNDEFINED'"
+            exit 1
+          fi
+
+      - name: Test empty string in matrix (simulated)
+        run: |
+          # Simulate matrix with empty value
+          MATRIX_VALUES=("value1" "" "value3")
+          
+          for i in "${!MATRIX_VALUES[@]}"; do
+            VAL="${MATRIX_VALUES[$i]}"
+            if [[ -z "$VAL" ]]; then
+              echo "✓ Empty value in array index $i correctly identified"
+            fi
+          done
+
+      - name: Test empty string vs null handling
+        env:
+          EXPLICIT_EMPTY: ""
+          UNSET_VAR_REF: $NONEXISTENT
+        run: |
+          if [[ "$EXPLICIT_EMPTY" == "" ]]; then
+            echo "✓ Explicit empty string handled correctly"
+          fi
+          
+          if [[ -z "$UNSET_VAR_REF" ]]; then
+            echo "✓ Unset variable reference is empty"
+          fi
+
+      - name: Test default value with empty
+        run: |
+          EMPTY_VAR=""
+          DEFAULT_VALUE="${EMPTY_VAR:-default}"
+          
+          if [[ "$DEFAULT_VALUE" == "default" ]]; then
+            echo "✓ Default value expansion works with empty var"
+          else
+            echo "✗ Default value not applied: '$DEFAULT_VALUE'"
+            exit 1
+          fi
+
+      - name: Test empty string in conditions
+        run: |
+          EMPTY=""
+          
+          if [[ -n "$EMPTY" ]]; then
+            echo "✗ Non-empty test failed on empty string"
+            exit 1
+          else
+            echo "✓ Non-empty test correctly fails on empty string"
+          fi
+          
+          if [[ -z "$EMPTY" ]]; then
+            echo "✓ Empty test correctly passes on empty string"
+          else
+            echo "✗ Empty test failed"
+            exit 1
+          fi
+
+      - name: Test null output field access
+        id: test_null
+        run: |
+          # Set one output but not another
+          echo 'defined_field=has_value' >> $GITHUB_OUTPUT
+
+      - name: Access defined and undefined outputs
+        run: |
+          DEFINED='${{ steps.test_null.outputs.defined_field }}'
+          UNDEFINED='${{ steps.test_null.outputs.undefined_field }}'
+          
+          if [[ "$DEFINED" == "has_value" ]]; then
+            echo "✓ Defined output correctly retrieved"
+          fi
+          
+          if [[ "$UNDEFINED" == "" ]]; then
+            echo "✓ Undefined output field is empty string"
+          else
+            echo "✗ Undefined output field not empty: '$UNDEFINED'"
+            exit 1
+          fi

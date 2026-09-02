@@ -1,0 +1,30 @@
+name: E2E matrix continue-on-error
+on: workflow_dispatch
+
+jobs:
+  experimental:
+    name: "Test (${{ matrix.version }}, experimental=${{ matrix.experimental }})"
+    runs-on: [self-hosted, linux, x64]
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        version: [stable, nightly]
+        include:
+          - version: stable
+            experimental: false
+          - version: nightly
+            experimental: true
+    steps:
+      - name: Print context
+        run: |
+          echo "version=${{ matrix.version }}"
+          echo "experimental=${{ matrix.experimental }}"
+
+      - name: Fail on nightly
+        run: |
+          if [ "${{ matrix.version }}" = "nightly" ]; then
+            echo "nightly intentionally failing"
+            exit 1
+          fi
+          echo "stable succeeded"

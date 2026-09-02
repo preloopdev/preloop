@@ -1,0 +1,62 @@
+name: "golden: composite-advanced"
+on: workflow_dispatch
+jobs:
+  test-composite-pass:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run composite in pass mode
+        id: pass-run
+        uses: ./.github/actions/composite-advanced
+        with:
+          mode: pass
+
+      - name: Verify pass output
+        run: |
+          echo "Output: ${{ steps.pass-run.outputs.final-result }}"
+          if [[ "${{ steps.pass-run.outputs.final-result }}" != "all-checks-passed" ]]; then
+            echo "FAIL: expected all-checks-passed"
+            exit 1
+          fi
+          echo "PASS: composite pass mode works"
+
+  test-composite-fail:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run composite in fail mode (continue-on-error)
+        id: fail-run
+        uses: ./.github/actions/composite-advanced
+        with:
+          mode: fail
+
+      - name: Verify fail mode still succeeds (continue-on-error)
+        run: |
+          echo "Output: ${{ steps.fail-run.outputs.final-result }}"
+          if [[ "${{ steps.fail-run.outputs.final-result }}" != "all-checks-passed" ]]; then
+            echo "FAIL: composite with continue-on-error should still produce output"
+            exit 1
+          fi
+          echo "PASS: composite continue-on-error works"
+
+  test-env-propagation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run composite (env propagation test)
+        uses: ./.github/actions/composite-advanced
+        with:
+          mode: pass
+
+      - name: Verify env leaked from composite
+        run: |
+          echo "MODE after composite: ${MODE:-unset}"
+          echo "PATH after composite: $PATH"
+          if [[ "$PATH" == */tmp/composite-bin* ]]; then
+            echo "PASS: GITHUB_PATH from composite visible in caller"
+          else
+            echo "INFO: GITHUB_PATH from composite not visible in caller (expected per spec)"
+          fi

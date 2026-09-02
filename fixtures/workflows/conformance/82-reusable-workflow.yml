@@ -1,0 +1,10 @@
+name: Reusable Workflow Caller
+on:
+  workflow_dispatch:
+jobs:
+  call-reusable:
+    uses: ./.github/workflows/82-reusable-callee.yml
+    with:
+      message: "Hello from caller"
+      enable-feature: true
+    secrets: inherit

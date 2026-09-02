@@ -1,0 +1,7 @@
+name: mitm trivial
+on: workflow_dispatch
+jobs:
+  hello:
+    runs-on: [self-hosted, mitm]
+    steps:
+      - run: echo hello

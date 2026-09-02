@@ -1,0 +1,23 @@
+name: host-docker-container-files
+on: [push, workflow_dispatch]
+
+jobs:
+  files:
+    runs-on: self-hosted
+    container:
+      image: alpine:3.20
+      options: --cpus 1
+    steps:
+      - name: Write file-command values
+        id: write_files
+        run: |
+          echo "HELLO_FROM_CONTAINER=1" >> "$GITHUB_ENV"
+          echo "container-output=ok" >> "$GITHUB_OUTPUT"
+      - name: Read environment file value
+        run: test "$HELLO_FROM_CONTAINER" = "1"
+      - name: Check workspace and temp mounts
+        run: |
+          test -d "$GITHUB_WORKSPACE"
+          test -d "$RUNNER_TEMP"
+      - name: Read output value
+        run: test "${{ steps.write_files.outputs['container-output'] }}" = "ok"
