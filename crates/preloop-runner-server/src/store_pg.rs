@@ -168,6 +168,34 @@ impl PgStore {
             )
             .await?
             .get(0);
+        // See the SQLite twin: a database stamped 4 by an intermediate build of
+        // this branch lacks `job_steps.revision` and would fail deep in the
+        // step queries instead of here. Deletable once the branch merges.
+        if current >= 4 {
+            let has_revision: bool = client
+                .query_one(
+                    // Scoped to the active schema: the migrations and step
+                    // queries are unqualified, so a `job_steps` sitting in
+                    // another schema on the search path would otherwise vouch
+                    // for a table they never touch.
+                    "SELECT EXISTS (
+                       SELECT 1 FROM information_schema.columns
+                       WHERE table_schema = current_schema()
+                         AND table_name = 'job_steps'
+                         AND column_name = 'revision'
+                     )",
+                    &[],
+                )
+                .await?
+                .get(0);
+            anyhow::ensure!(
+                has_revision,
+                "schema version {current} predates the `job_steps.revision` column. This only \
+                 happens on a development database created by an earlier build of the \
+                 step-manifest branch; drop and recreate it."
+            );
+        }
+
         for (version, name, sql) in MIGRATIONS {
             if *version as i64 <= current {
                 continue;
@@ -261,6 +289,60 @@ impl PgStore {
             &[&(SNAPSHOT_FORMAT as i64), &blob, &now_us()],
         )
         .await?;
+        Ok(())
+    }
+
+    /// Upsert one attempt's step rows (see the SQLite twin: keyed upsert, no
+    /// per-run delete, so a step transition writes only the changed rows).
+    async fn write_job_steps_tx(
+        &self,
+        tx: &tokio_postgres::Transaction<'_>,
+        run_id: RunId,
+        agent_job_id: uuid::Uuid,
+        records: &[crate::models::StepRecord],
+        revision: u64,
+    ) -> anyhow::Result<()> {
+        for step in records {
+            if step.id.is_empty() {
+                continue;
+            }
+            let kind = match step.kind {
+                crate::models::StepKind::Workflow => "workflow",
+                crate::models::StepKind::Synthetic => "synthetic",
+            };
+            tx.execute(
+                "INSERT INTO job_steps(run_id, agent_job_id, step_id, kind, workflow_index,
+                                       runner_number, context_name, name_blob, conclusion,
+                                       started_at_us, finished_at_us, revision)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                 ON CONFLICT(agent_job_id, step_id) DO UPDATE SET
+                   kind = EXCLUDED.kind,
+                   workflow_index = EXCLUDED.workflow_index,
+                   runner_number = EXCLUDED.runner_number,
+                   context_name = EXCLUDED.context_name,
+                   name_blob = EXCLUDED.name_blob,
+                   conclusion = EXCLUDED.conclusion,
+                   started_at_us = EXCLUDED.started_at_us,
+                   finished_at_us = EXCLUDED.finished_at_us,
+                   revision = EXCLUDED.revision
+                 WHERE EXCLUDED.revision >= job_steps.revision",
+                &[
+                    &run_id.to_string(),
+                    &agent_job_id.to_string(),
+                    &step.id,
+                    &kind,
+                    &step.workflow_index.map(|index| index as i64),
+                    &step.runner_number.map(|number| number as i64),
+                    &step.context_name,
+                    &self.cipher.seal(step.name.as_bytes())?,
+                    &step.conclusion,
+                    &step.started_at.map(unix_us),
+                    &step.finished_at.map(unix_us),
+                    &(revision as i64),
+                ],
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -368,6 +450,23 @@ impl PgStore {
 
 #[async_trait]
 impl Store for PgStore {
+    async fn store_job_steps(
+        &self,
+        run_id: RunId,
+        agent_job_id: uuid::Uuid,
+        records: &[crate::models::StepRecord],
+        revision: u64,
+    ) -> anyhow::Result<()> {
+        let mut client = self.connection.lock().await;
+        let tx = client.transaction().await?;
+        self.write_job_steps_tx(&tx, run_id, agent_job_id, records, revision)
+            .await?;
+        tx.commit()
+            .await
+            .map_err(|error| anyhow::anyhow!("committing job steps: {error}"))?;
+        Ok(())
+    }
+
     async fn load_into(&self, inner: &mut InnerState) -> anyhow::Result<()> {
         let client = self.connection.lock().await;
         let rows = client
@@ -567,6 +666,65 @@ impl Store for PgStore {
                 }
             }
         }
+        // Step manifests, ordered so `--step` positions come back exactly as
+        // recorded (see the SQLite twin).
+        let rows = client
+            .query(
+                "SELECT agent_job_id, step_id, kind, workflow_index, runner_number,
+                        context_name, name_blob, conclusion, started_at_us, finished_at_us,
+                        revision
+                 FROM job_steps
+                 ORDER BY agent_job_id, COALESCE(runner_number, 2147483647),
+                          COALESCE(workflow_index, 2147483647), step_id",
+                &[],
+            )
+            .await?;
+        for row in rows {
+            let agent_job_id: String = row.get(0);
+            let Ok(agent_job_id) = agent_job_id.parse::<uuid::Uuid>() else {
+                tracing::warn!(%agent_job_id, "dropping step row with an unparseable attempt id");
+                continue;
+            };
+            let step_id: String = row.get(1);
+            let kind: String = row.get(2);
+            let workflow_index: Option<i64> = row.get(3);
+            let runner_number: Option<i64> = row.get(4);
+            let context_name: Option<String> = row.get(5);
+            let name_blob: Vec<u8> = row.get(6);
+            let conclusion: String = row.get(7);
+            let started_at_us: Option<i64> = row.get(8);
+            let finished_at_us: Option<i64> = row.get(9);
+            let revision: i64 = row.get(10);
+            let name = match self.cipher.unseal(&name_blob) {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(error) => {
+                    tracing::warn!(%error, %step_id, "dropping step row with an unreadable name");
+                    continue;
+                }
+            };
+            // See the SQLite twin: the counter must resume above the
+            // persisted revision or the guard discards post-restart writes.
+            let seen = inner.job_steps_revision.entry(agent_job_id).or_insert(0);
+            *seen = (*seen).max(revision.max(0) as u64);
+            inner
+                .job_steps
+                .entry(agent_job_id)
+                .or_default()
+                .push(crate::models::StepRecord {
+                    id: step_id,
+                    kind: match kind.as_str() {
+                        "workflow" => crate::models::StepKind::Workflow,
+                        _ => crate::models::StepKind::Synthetic,
+                    },
+                    workflow_index: workflow_index.map(|index| index as usize),
+                    runner_number: runner_number.map(|number| number as u32),
+                    context_name,
+                    name,
+                    conclusion,
+                    started_at: started_at_us.and_then(chrono::DateTime::from_timestamp_micros),
+                    finished_at: finished_at_us.and_then(chrono::DateTime::from_timestamp_micros),
+                });
+        }
         let rows = client
             .query("SELECT request_id, request_blob FROM job_requests", &[])
             .await?;
@@ -660,6 +818,7 @@ impl Store for PgStore {
         let mut client = self.connection.lock().await;
         let tx = client.transaction().await?;
         for table in [
+            "job_steps",
             "broker_messages",
             "job_request_messages",
             "session_active_requests",
@@ -810,6 +969,18 @@ impl Store for PgStore {
         for record in &snapshot.requests {
             self.insert_request_tx(&tx, record).await?;
         }
+        // Steps are keyed by attempt; the request records tie an attempt to
+        // its run.
+        for record in &snapshot.requests {
+            if let Some((_, steps, revision)) = snapshot
+                .job_steps
+                .iter()
+                .find(|(agent_job_id, _, _)| *agent_job_id == record.agent_job_id)
+            {
+                self.write_job_steps_tx(&tx, record.run_id, record.agent_job_id, steps, *revision)
+                    .await?;
+            }
+        }
         self.write_claim_state_tx(
             &tx,
             &snapshot.session_active_requests,
@@ -852,6 +1023,8 @@ impl Store for PgStore {
         for record in &projection.requests {
             self.insert_request_tx(&tx, record).await?;
         }
+        // Steps are persisted per attempt by `store_job_steps`, not here: see
+        // the SQLite twin for why a run-scoped rewrite is quadratic.
         // Claim state must land in the same transaction as the queue rewrite
         // (see the SQLite twin).
         self.write_claim_state_tx(
@@ -1127,6 +1300,36 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
           payload_json TEXT NOT NULL,
           written_at_us BIGINT NOT NULL
         );
+        "#,
+    ),
+    (
+        4,
+        "job-steps-table",
+        // See the SQLite twin: steps live outside `runs.record_blob` so a step
+        // transition upserts one small row instead of resealing the whole run
+        // record, and are keyed by attempt because a re-dispatch mints fresh
+        // step ids.
+        r#"
+        CREATE TABLE IF NOT EXISTS job_steps (
+          run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+          agent_job_id TEXT NOT NULL,
+          step_id TEXT NOT NULL,
+          kind TEXT NOT NULL CHECK (kind IN ('workflow','synthetic')),
+          workflow_index BIGINT,
+          runner_number BIGINT,
+          context_name TEXT,
+          name_blob BYTEA NOT NULL,
+          conclusion TEXT NOT NULL,
+          started_at_us BIGINT,
+          finished_at_us BIGINT,
+          -- See the SQLite twin: guards two reports for one attempt
+          -- committing out of order.
+          revision BIGINT NOT NULL DEFAULT 0,
+          PRIMARY KEY (agent_job_id, step_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS job_steps_order_idx
+          ON job_steps (agent_job_id, kind, workflow_index);
         "#,
     ),
 ];

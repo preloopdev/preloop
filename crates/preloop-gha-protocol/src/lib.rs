@@ -696,6 +696,15 @@ pub struct JobCompletion {
     pub run_id: RunId,
     /// Job id.
     pub job_id: JobId,
+    /// The attempt this completion belongs to, when the caller resolved one.
+    ///
+    /// A job can be dispatched more than once, and each dispatch mints its own
+    /// step ids. `(run_id, job_id)` names the logical job, not the attempt, so
+    /// it cannot decide which attempt's step records a report belongs to.
+    /// Callers that already hold the request record supply this; the server
+    /// falls back to the newest attempt when it is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_job_id: Option<uuid::Uuid>,
     /// Final status.
     pub status: ExecutionStatus,
     /// Outputs captured by the runner.

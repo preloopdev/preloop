@@ -284,6 +284,9 @@ pub(crate) async fn complete_job_compat(
         JobCompletion {
             run_id,
             job_id: JobId(job_id),
+            // The compat route is addressed by logical job only, so the
+            // server resolves the newest attempt itself.
+            agent_job_id: None,
             status,
             outputs: Default::default(),
             annotations: Vec::new(),
@@ -392,6 +395,11 @@ pub(crate) async fn agent_request_patch(
                 Some(JobCompletion {
                     run_id,
                     job_id,
+                    // The patched request is the attempt that reported.
+                    agent_job_id: inner
+                        .job_requests
+                        .get(&request_id)
+                        .map(|record| record.agent_job_id),
                     status: new_status,
                     outputs: Default::default(),
                     annotations: Vec::new(),
@@ -639,46 +647,22 @@ pub(crate) async fn complete_job_inner(
         };
         run.jobs.insert(completion.job_id.clone(), effective);
         let job_name = completion.job_id.0.clone();
-        if let Some(pos) = run.jobs_list.iter().position(|j| j.name == job_name) {
-            run.jobs_list[pos].conclusion = format!("{:?}", effective).to_lowercase();
-            // A worker can terminate through ForceFailJob before it sends the
-            // final WorkflowStepsUpdate. Do not leave the last reported step
-            // in_progress after its job is terminal.
-            //
-            // The official runner carries the authoritative per-step
-            // conclusions in CompleteJob.stepResults (status=TimelineRecordState,
-            // conclusion=TaskResult); apply them first. A crashed worker sends
-            // none, and any step still in_progress after that is reconciled to
-            // the job's effective status — the same view GitHub's server
-            // presents for orphaned steps.
-            for step in &mut run.jobs_list[pos].steps {
-                let Some(wire) = completion
-                    .step_results
-                    .iter()
-                    .find(|result| result.name.as_deref() == Some(step.name.as_str()))
-                else {
-                    continue;
-                };
-                if let Some(conclusion) = completion_step_conclusion(wire) {
-                    step.conclusion = conclusion;
-                }
-            }
-            let step_conclusion = status_string(effective);
-            for step in &mut run.jobs_list[pos].steps {
-                if step.conclusion == "in_progress" {
-                    step.conclusion = step_conclusion.clone();
-                    step.finished_at = step.finished_at.or(Some(chrono::Utc::now()));
-                }
-            }
+        // Masked up front: `mask_completion_annotations` reads the run's
+        // secrets, which cannot be borrowed while a job detail inside the same
+        // run is held mutably.
+        let annotations = mask_completion_annotations(run, &completion);
+        if let Some(detail) = JobDetail::find(&mut run.jobs_list, &job_name) {
+            detail.conclusion = format!("{:?}", effective).to_lowercase();
             if !completion.annotations.is_empty() {
-                run.jobs_list[pos].annotations = mask_completion_annotations(run, &completion);
+                detail.annotations = annotations;
             }
         } else {
             run.jobs_list.push(JobDetail {
+                job_id: job_name.clone(),
                 name: job_name,
                 conclusion: format!("{:?}", effective).to_lowercase(),
                 steps: Vec::new(),
-                annotations: mask_completion_annotations(run, &completion),
+                annotations,
             });
         }
         run.job_outputs.insert(
@@ -712,11 +696,24 @@ pub(crate) async fn complete_job_inner(
     }
     // Close only after the run and job were validated and the completion was
     // projected. Invalid callbacks must not terminate another job's feed.
-    let live_log_key = inner
-        .job_requests
-        .values()
-        .find(|record| record.run_id == completion.run_id && record.job_id == completion.job_id)
-        .map(|record| record.agent_job_id.to_string())
+    //
+    // Same attempt selection as the manifest reconciliation below: a
+    // re-dispatched job has several matching requests, and closing the oldest
+    // one's feed leaves the attempt that actually finished streaming forever
+    // while a follower on the dead key waits for output that never comes.
+    let live_log_key = completion
+        .agent_job_id
+        .or_else(|| {
+            inner
+                .job_requests
+                .values()
+                .filter(|record| {
+                    record.run_id == completion.run_id && record.job_id == completion.job_id
+                })
+                .max_by_key(|record| record.request_id)
+                .map(|record| record.agent_job_id)
+        })
+        .map(|agent_job_id| agent_job_id.to_string())
         .unwrap_or_else(|| completion.job_id.0.clone());
     crate::live_logs::close_live_log(&mut inner, &live_log_key);
     // Use the status actually stored (may differ from completion if terminal-locked).
@@ -725,6 +722,65 @@ pub(crate) async fn complete_job_inner(
         .get(&completion.run_id)
         .and_then(|r| r.jobs.get(&completion.job_id).copied())
         .unwrap_or(completion.status);
+    // Reconcile the attempt's step manifest against the completion report.
+    //
+    // The official runner carries the authoritative per-step conclusions in
+    // `CompleteJob.stepResults` (status=TimelineRecordState,
+    // conclusion=TaskResult) keyed by `external_id` — the same identity the
+    // manifest uses, so this no longer matches on display names. A crashed
+    // worker sends none, and any step left `in_progress` afterwards is
+    // reconciled to the job's effective status, the view GitHub presents for
+    // orphaned steps. A step still `pending` was never reached, which stays
+    // truthful rather than inheriting the job's failure.
+    //
+    // The attempt comes from the callback itself. Deriving it from
+    // `(run_id, job_id)` picked whichever request the map yielded first, and
+    // `job_requests` is keyed by monotonic request id — so a re-dispatched job
+    // reconciled the *newest* attempt's report into the *oldest* attempt's
+    // manifest, where its ids match nothing, and terminalized that older
+    // attempt's steps while the run view still projected the newer one as
+    // in-flight. When the caller could not resolve an attempt, the newest
+    // request is the only defensible guess.
+    let mut completed_attempt: Option<(uuid::Uuid, Vec<StepRecord>)> = None;
+    let mut completion_revision = 0_u64;
+    if let Some(agent_job_id) = completion.agent_job_id.or_else(|| {
+        inner
+            .job_requests
+            .values()
+            .filter(|record| {
+                record.run_id == completion.run_id && record.job_id == completion.job_id
+            })
+            .max_by_key(|record| record.request_id)
+            .map(|record| record.agent_job_id)
+    }) {
+        if let Some(manifest) = inner.job_steps.get_mut(&agent_job_id) {
+            for wire in &completion.step_results {
+                let Some(external_id) = wire.external_id.as_deref() else {
+                    continue;
+                };
+                let Some(pos) = StepRecord::find_by_id(manifest, external_id) else {
+                    continue;
+                };
+                if let Some(conclusion) = completion_step_conclusion(wire) {
+                    manifest[pos].conclusion = conclusion;
+                }
+                if let Some(number) = wire.number.and_then(|n| u32::try_from(n).ok()) {
+                    manifest[pos].runner_number = Some(number);
+                }
+            }
+            let orphan_conclusion = status_string(effective_status);
+            for step in manifest.iter_mut() {
+                if step.conclusion == "in_progress" {
+                    step.conclusion = orphan_conclusion.clone();
+                    step.finished_at = step.finished_at.or(Some(chrono::Utc::now()));
+                }
+            }
+            completed_attempt = Some((agent_job_id, manifest.clone()));
+            let counter = inner.job_steps_revision.entry(agent_job_id).or_insert(0);
+            *counter += 1;
+            completion_revision = *counter;
+        }
+    }
     let cancelled_siblings = if effective_status == ExecutionStatus::Failure {
         apply_matrix_fail_fast(&mut inner, completion.run_id, &completion.job_id)
     } else {
@@ -795,6 +851,24 @@ pub(crate) async fn complete_job_inner(
     inner.dap_ports.remove(&completion.run_id);
     let queue_nonempty = !inner.queue.is_empty() || !inner.cancellation_queue.is_empty();
     drop(inner);
+    // Best-effort, outside the lock: the completion's own step conclusions
+    // must survive a restart, and the run-event projection deliberately no
+    // longer carries step rows.
+    if let Some((agent_job_id, records)) = completed_attempt {
+        if let Err(error) = shared
+            .state
+            .store
+            .store_job_steps(
+                completion.run_id,
+                agent_job_id,
+                &records,
+                completion_revision,
+            )
+            .await
+        {
+            warn!(?error, run_id = %completion.run_id, "failed to persist completion step records");
+        }
+    }
 
     // Any reusable-caller or dynamic-matrix node the sweep above unblocked was
     // deferred rather than expanded under the lock. Build those subtrees now

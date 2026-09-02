@@ -2408,6 +2408,13 @@ fn register_expanded_jobs(
         inner
             .timeline_requests
             .insert(job_request.timeline_id, job_request.request_id);
+        // A reusable callee or dynamic matrix leg only exists once its gate
+        // passes, so its manifest is seeded here rather than at submission.
+        // Every concrete attempt gets one before dispatch either way.
+        inner.job_steps.insert(
+            job_request.agent_job_id,
+            crate::models::StepRecord::manifest(&artifacts.agent_msg.steps),
+        );
         // Per-inner-job, so a wide matrix logs this once per leg: a 12k-leg
         // callee emitted 12k warnings for the ordinary no-GitHub-App setup and
         // buried every real diagnostic. Absence of a token request is the
@@ -2671,6 +2678,17 @@ pub(crate) fn retire_node_requests(
                 inner.live_log_lines.remove(&agent_key);
                 inner.live_log_tx.remove(&agent_key);
                 inner.live_log_closed.remove(&agent_key);
+                // The step manifest is attempt-scoped, so it belongs to the
+                // request being purged. A deferred-matrix placeholder gets one
+                // seeded at dispatch and is then purged when expansion
+                // replaces it, so without this every dynamic expansion leaves
+                // an entry no run projection can reach.
+                //
+                // Durable rows cannot leak the same way: seeding is not
+                // persisted, and a placeholder never reports, so it never
+                // reaches `store_job_steps`. Rows for attempts that did report
+                // are removed with their run through the `runs` foreign key.
+                inner.job_steps.remove(&record.agent_job_id);
             }
         }
     }

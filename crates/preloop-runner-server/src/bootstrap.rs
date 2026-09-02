@@ -397,6 +397,11 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
                     JobCompletion {
                         run_id,
                         job_id: job_id.clone(),
+                        // The lease that expired names the attempt exactly.
+                        agent_job_id: inner
+                            .job_requests
+                            .get(&request_id)
+                            .map(|record| record.agent_job_id),
                         status: ExecutionStatus::Failure,
                         outputs: Default::default(),
                         annotations: Vec::new(),

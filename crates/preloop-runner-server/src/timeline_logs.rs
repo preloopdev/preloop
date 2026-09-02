@@ -2,6 +2,29 @@ use super::*;
 
 // Timeline, logs, completion
 
+/// Whether a timeline record describes a step rather than a container.
+///
+/// Shared by the annotation projection and the manifest reconciliation below,
+/// which disagreed: one keyed on `Step`-or-parent and the other whitelisted
+/// `Task`, so a typed `Task` with no parent was stored as a step while its
+/// issues were reported against the job.
+///
+/// Excluding containers rather than whitelisting a step type is deliberate.
+/// `type` is optional on the wire and the official runner sends `Task` where
+/// preloop's sends `Step`, so an allow-list silently drops real conclusions.
+fn is_step_record(record: &azdo::TimelineRecord) -> bool {
+    match record.record_type {
+        Some(azdo::TimelineRecordType::Task | azdo::TimelineRecordType::Step) => true,
+        Some(
+            azdo::TimelineRecordType::Job
+            | azdo::TimelineRecordType::Phase
+            | azdo::TimelineRecordType::Stage,
+        ) => false,
+        // Untyped: a step always hangs off its job record.
+        None => record.parent_id.is_some(),
+    }
+}
+
 /// PATCH timeline records — runner updates step/job state.
 pub(crate) async fn patch_timeline_records(
     State(shared): State<Arc<SharedState>>,
@@ -42,13 +65,7 @@ pub(crate) async fn patch_timeline_records(
         }
         if let Some(run_id) = run_id {
             for issue in &record.issues {
-                let step_id = if record.record_type == Some(azdo::TimelineRecordType::Step)
-                    || record.parent_id.is_some()
-                {
-                    Some(record.id.to_string())
-                } else {
-                    None
-                };
+                let step_id = is_step_record(record).then(|| record.id.to_string());
                 projected.push(NdjsonEvent::Annotation {
                     run_id,
                     job_id: logical_job_id
@@ -80,6 +97,9 @@ pub(crate) async fn patch_timeline_records(
         }
     }
 
+    // Set when this PATCH reconciled an attempt's step records, so they can be
+    // persisted once the state lock is released.
+    let mut touched_attempt: Option<(RunId, uuid::Uuid, Vec<StepRecord>, u64)> = None;
     let new_change_id = {
         let mut inner = shared.state.inner.lock().await;
         let current = inner
@@ -104,14 +124,25 @@ pub(crate) async fn patch_timeline_records(
         );
 
         if let (Some(run_id), Some(job_id)) = (run_id, &logical_job_id) {
+            // The manifest is attempt-scoped, so reconciliation needs the
+            // agent job id — the workflow job key alone cannot distinguish
+            // one dispatch of a job from a later re-dispatch.
+            let agent_job_id = callback_job
+                .as_ref()
+                .and_then(|(request_id, _, _)| inner.job_requests.get(request_id))
+                .map(|request| request.agent_job_id);
+            let job_status = inner
+                .runs
+                .get(&run_id)
+                .and_then(|run| run.jobs.get(job_id).copied());
+
             if let Some(run) = inner.runs.get_mut(&run_id) {
-                let job_name = job_id.0.clone();
-                let job_detail =
-                    if let Some(pos) = run.jobs_list.iter().position(|j| j.name == job_name) {
-                        &mut run.jobs_list[pos]
-                    } else {
+                let detail = match JobDetail::find(&mut run.jobs_list, &job_id.0) {
+                    Some(detail) => detail,
+                    None => {
                         run.jobs_list.push(JobDetail {
-                            name: job_name,
+                            job_id: job_id.0.clone(),
+                            name: job_id.0.clone(),
                             // A timeline update means the job started; the run
                             // record's final conclusion comes from the job
                             // status map (projected in the runs GET). Default
@@ -120,25 +151,29 @@ pub(crate) async fn patch_timeline_records(
                             steps: Vec::new(),
                             annotations: Vec::new(),
                         });
-                        run.jobs_list.last_mut().unwrap()
-                    };
-
-                if let Some(status) = run.jobs.get(job_id) {
-                    // The status map is authoritative for terminal states
-                    // only. Its in-flight projection ("inprogress" from the
-                    // raw Debug spelling, or "success" from the run-level
-                    // status_string) lies about a job that is still running —
-                    // keep the truthful "in_progress" default set above.
-                    if *status != ExecutionStatus::InProgress {
-                        job_detail.conclusion = format!("{:?}", status).to_lowercase();
+                        run.jobs_list.last_mut().expect("just pushed")
+                    }
+                };
+                // The status map is authoritative for terminal states only.
+                // Its in-flight projection ("inprogress" from the raw Debug
+                // spelling, or "success" from the run-level status_string)
+                // lies about a job that is still running — keep the truthful
+                // "in_progress" default set above.
+                if let Some(status) = job_status {
+                    if status != ExecutionStatus::InProgress {
+                        detail.conclusion = format!("{:?}", status).to_lowercase();
                     }
                 }
+            }
 
+            if let Some(agent_job_id) = agent_job_id {
+                let observed = chrono::Utc::now();
+                let manifest = inner.job_steps.entry(agent_job_id).or_default();
                 for record in &records {
                     let Some(name) = &record.display_name else {
                         continue;
                     };
-                    if record.id.to_string() == job_id.0 {
+                    if !is_step_record(record) {
                         continue;
                     }
 
@@ -147,7 +182,7 @@ pub(crate) async fn patch_timeline_records(
                             azdo::TaskResult::Succeeded | azdo::TaskResult::SucceededWithIssues,
                         ) => "success",
                         Some(azdo::TaskResult::Failed) => {
-                            if run.jobs.get(job_id) == Some(&ExecutionStatus::Cancelled) {
+                            if job_status == Some(ExecutionStatus::Cancelled) {
                                 "cancelled"
                             } else {
                                 "failure"
@@ -171,35 +206,61 @@ pub(crate) async fn patch_timeline_records(
                         .as_deref()
                         .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
                         .map(|t| t.with_timezone(&chrono::Utc));
-                    let observed = chrono::Utc::now();
+                    let record_id = record.id.to_string();
 
-                    if let Some(pos) = StepRecord::find_matching_index(
-                        &job_detail.steps,
-                        &record.id.to_string(),
-                        name,
-                        true,
-                    ) {
-                        job_detail.steps[pos].conclusion = conclusion_str.to_owned();
-                        if let Some(started_at) = started_at {
-                            job_detail.steps[pos].started_at = Some(started_at);
+                    match StepRecord::find_by_id(manifest, &record_id) {
+                        Some(pos) => {
+                            manifest[pos].conclusion = conclusion_str.to_owned();
+                            if let Some(started_at) = started_at {
+                                manifest[pos].started_at = Some(started_at);
+                            }
+                            if let Some(finished_at) = finished_at {
+                                manifest[pos].finished_at = Some(finished_at);
+                            }
+                            manifest[pos].name = name.clone();
                         }
-                        if let Some(finished_at) = finished_at {
-                            job_detail.steps[pos].finished_at = Some(finished_at);
-                        }
-                    } else {
-                        job_detail.steps.push(StepRecord {
-                            id: Some(record.id.to_string()),
+                        // A timeline record with no manifest entry is runner
+                        // bookkeeping, not a workflow step. `TimelineRecord`
+                        // carries no ordinal, so `runner_number` stays unset
+                        // on this path.
+                        None => manifest.push(StepRecord {
+                            id: record_id,
+                            kind: StepKind::Synthetic,
+                            workflow_index: None,
+                            runner_number: None,
+                            context_name: None,
                             name: name.clone(),
                             conclusion: conclusion_str.to_owned(),
                             started_at: started_at.or(Some(observed)),
                             finished_at,
-                        });
+                        }),
                     }
                 }
+                // Captured so the attempt can be persisted after the lock is
+                // released. A PATCH that projects no job-status event emits
+                // nothing, so without this the reconciliation stays
+                // memory-only and a restart loses it.
+                let records = manifest.clone();
+                let revision = {
+                    let counter = inner.job_steps_revision.entry(agent_job_id).or_insert(0);
+                    *counter += 1;
+                    *counter
+                };
+                touched_attempt = Some((run_id, agent_job_id, records, revision));
             }
         }
         new_id
     };
+    if let Some((run_id, agent_job_id, records, revision)) = touched_attempt {
+        if let Err(error) = shared
+            .state
+            .store
+            .store_job_steps(run_id, agent_job_id, &records, revision)
+            .await
+        {
+            warn!(?error, %run_id, "failed to persist timeline step records");
+        }
+    }
     for event in projected {
         shared.state.emit(event).await;
     }
@@ -470,6 +531,11 @@ pub(crate) async fn finish_job(
             Some(JobCompletion {
                 run_id,
                 job_id,
+                // Resolved from the callback's own request record.
+                agent_job_id: inner
+                    .job_requests
+                    .get(&request_id)
+                    .map(|record| record.agent_job_id),
                 status,
                 outputs,
                 annotations: Vec::new(),
@@ -658,6 +724,11 @@ pub(crate) async fn finish_job_plan(
             Some(JobCompletion {
                 run_id,
                 job_id,
+                // Resolved from the callback's own request record.
+                agent_job_id: inner
+                    .job_requests
+                    .get(&request_id)
+                    .map(|record| record.agent_job_id),
                 status,
                 outputs,
                 annotations: Vec::new(),

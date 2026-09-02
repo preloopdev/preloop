@@ -43,6 +43,20 @@ pub(crate) trait Store: Send + Sync {
     async fn store_meta_only(&self, meta: &MetaSnapshot) -> anyhow::Result<()>;
     /// Persist one run's mutable projection plus a control event.
     async fn store_run_event(&self, projection: RunProjection) -> anyhow::Result<()>;
+    /// Persist one attempt's step records.
+    ///
+    /// Separate from [`Store::store_run_event`] on purpose. Steps change far
+    /// more often than anything else in a run, and a run-scoped projection
+    /// would rewrite every attempt's rows on each transition — quadratic in
+    /// the width of a matrix, against a single-writer backend. This writes the
+    /// one attempt that changed.
+    async fn store_job_steps(
+        &self,
+        run_id: RunId,
+        agent_job_id: uuid::Uuid,
+        records: &[crate::models::StepRecord],
+        revision: u64,
+    ) -> anyhow::Result<()>;
     /// Persist the run-number allocator for one workflow path.
     async fn store_workflow_run_counter(
         &self,
@@ -145,6 +159,23 @@ impl Store for InstrumentedStore {
         )
     }
 
+    async fn store_job_steps(
+        &self,
+        run_id: RunId,
+        agent_job_id: uuid::Uuid,
+        records: &[crate::models::StepRecord],
+        revision: u64,
+    ) -> anyhow::Result<()> {
+        let start = Instant::now();
+        self.record(
+            "store_job_steps",
+            start,
+            self.inner
+                .store_job_steps(run_id, agent_job_id, records, revision)
+                .await,
+        )
+    }
+
     async fn store_workflow_run_counter(
         &self,
         workflow_path: &str,
@@ -208,6 +239,8 @@ pub(crate) struct StoreSnapshot {
     pub(crate) session_active_requests: Vec<(String, i64)>,
     /// request_id → undelivered job message.
     pub(crate) broker_request_messages: Vec<(i64, azdo::AgentJobRequestMessage)>,
+    /// (agent_job_id, that attempt's step records, its revision).
+    pub(crate) job_steps: Vec<(uuid::Uuid, Vec<crate::models::StepRecord>, u64)>,
     pub(crate) meta: MetaSnapshot,
 }
 
@@ -250,6 +283,18 @@ impl StoreSnapshot {
                 .broker_messages
                 .iter()
                 .map(|(id, message)| (*id, message.clone()))
+                .collect(),
+            job_steps: inner
+                .job_steps
+                .iter()
+                .map(|(agent_job_id, records)| {
+                    let revision = inner
+                        .job_steps_revision
+                        .get(agent_job_id)
+                        .copied()
+                        .unwrap_or(0);
+                    (*agent_job_id, records.clone(), revision)
+                })
                 .collect(),
             meta: build_meta_snapshot(inner),
         }
@@ -1129,6 +1174,35 @@ impl SqliteStore {
         let current_version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap_or(0);
+        // `job_steps.revision` moved between migration versions twice while
+        // this branch was in review before settling inside the table
+        // definition. A database stamped 4 by one of those intermediate builds
+        // skips the migration below and then fails deep inside the step
+        // queries with `no such column`, which reads like corruption. Say what
+        // it actually is.
+        //
+        // Only reachable on a development database: version 4 does not exist
+        // on `main`, so nothing released can land here. Delete this once the
+        // branch merges.
+        if current_version >= 4 {
+            // Ask the catalogue rather than probing with a SELECT. A failed
+            // prepare cannot distinguish an absent column from `database is
+            // locked` or an I/O error, and telling an operator to delete their
+            // state directory over a transient lock is worse than the bug this
+            // guards. Real failures propagate.
+            let has_revision: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('job_steps') WHERE name = 'revision'",
+                [],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(
+                has_revision > 0,
+                "schema version {current_version} predates the `job_steps.revision` column. \
+                 This only happens on a development database created by an earlier build of \
+                 the step-manifest branch; delete the state directory to recreate it."
+            );
+        }
+
         for (version, name, sql) in MIGRATIONS {
             if *version as i64 <= current_version {
                 continue;
@@ -1395,6 +1469,82 @@ impl SqliteStore {
                 .workflow_run_counters
                 .insert(workflow_path, next_run_number.saturating_sub(1));
         }
+        // Step manifests, ordered so a workflow step's `--step` position is
+        // rebuilt exactly as it was recorded. Without this a restart leaves
+        // `--step` unable to identify anything and it refuses rather than
+        // guessing, so the run's step history has to come back here.
+        let mut step_stmt = connection.prepare(
+            "SELECT agent_job_id, step_id, kind, workflow_index, runner_number,
+                    context_name, name_blob, conclusion, started_at_us, finished_at_us,
+                    revision
+             FROM job_steps
+             ORDER BY agent_job_id, COALESCE(runner_number, 2147483647),
+                      COALESCE(workflow_index, 2147483647), step_id",
+        )?;
+        for row in step_stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Vec<u8>>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+                row.get::<_, i64>(10)?,
+            ))
+        })? {
+            let (
+                agent_job_id,
+                step_id,
+                kind,
+                workflow_index,
+                runner_number,
+                context_name,
+                name_blob,
+                conclusion,
+                started_at_us,
+                finished_at_us,
+                revision,
+            ) = row?;
+            let Ok(agent_job_id) = agent_job_id.parse::<uuid::Uuid>() else {
+                tracing::warn!(%agent_job_id, "dropping step row with an unparseable attempt id");
+                continue;
+            };
+            let name = match self.cipher.unseal(&name_blob) {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(error) => {
+                    tracing::warn!(%error, %step_id, "dropping step row with an unreadable name");
+                    continue;
+                }
+            };
+            // The guard compares against the persisted revision, so the
+            // counter has to resume above it. Left at zero, the first writes
+            // after a restart carry revisions the rows already exceed and are
+            // silently discarded.
+            let seen = inner.job_steps_revision.entry(agent_job_id).or_insert(0);
+            *seen = (*seen).max(revision.max(0) as u64);
+            inner
+                .job_steps
+                .entry(agent_job_id)
+                .or_default()
+                .push(crate::models::StepRecord {
+                    id: step_id,
+                    kind: match kind.as_str() {
+                        "workflow" => crate::models::StepKind::Workflow,
+                        _ => crate::models::StepKind::Synthetic,
+                    },
+                    workflow_index: workflow_index.map(|index| index as usize),
+                    runner_number: runner_number.map(|number| number as u32),
+                    context_name,
+                    name,
+                    conclusion,
+                    started_at: started_at_us.and_then(chrono::DateTime::from_timestamp_micros),
+                    finished_at: finished_at_us.and_then(chrono::DateTime::from_timestamp_micros),
+                });
+        }
         // Log bytes live in their own table; rebuild the in-memory buffers
         // from ordered chunks. Failing to do this leaves the post-restart
         // server unable to serve GET /logs/<id> for in-flight jobs.
@@ -1627,6 +1777,17 @@ impl SqliteStore {
         for record in &snapshot.requests {
             self.insert_request_tx(&tx, record)?;
         }
+        // Steps are keyed by attempt, and the request records are what tie an
+        // attempt to its run.
+        for record in &snapshot.requests {
+            if let Some((_, steps, revision)) = snapshot
+                .job_steps
+                .iter()
+                .find(|(agent_job_id, _, _)| *agent_job_id == record.agent_job_id)
+            {
+                self.write_job_steps_tx(&tx, record.run_id, record.agent_job_id, steps, *revision)?;
+            }
+        }
         self.write_claim_state_tx(
             &tx,
             &snapshot.session_active_requests,
@@ -1663,6 +1824,11 @@ impl SqliteStore {
         for record in &projection.requests {
             self.insert_request_tx(&tx, record)?;
         }
+        // Steps are not part of this projection: they change far more often
+        // than the rest of a run, and rewriting every attempt's rows on each
+        // transition is quadratic in matrix width against a single writer.
+        // `store_job_steps` persists the one attempt that changed instead.
+        //
         // The claim state must land in the same transaction as the queue
         // rewrite above: a job that was claimed (dequeued, message handed to a
         // session) but not yet acked would otherwise have neither its queue
@@ -1679,6 +1845,23 @@ impl SqliteStore {
         // Same rationale as the full-snapshot path: bound the WAL so a
         // runner-event burst cannot stall a later commit behind a giant
         // checkpoint sync — periodically, not on every event.
+        self.maybe_checkpoint_wal(&connection)?;
+        Ok(())
+    }
+
+    /// Persist one attempt's step rows in their own transaction.
+    pub(crate) fn store_job_steps(
+        &self,
+        run_id: RunId,
+        agent_job_id: uuid::Uuid,
+        records: &[crate::models::StepRecord],
+        revision: u64,
+    ) -> anyhow::Result<()> {
+        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let tx = connection.transaction()?;
+        self.write_job_steps_tx(&tx, run_id, agent_job_id, records, revision)?;
+        tx.commit()
+            .map_err(|error| anyhow::anyhow!("committing job steps: {error}"))?;
         self.maybe_checkpoint_wal(&connection)?;
         Ok(())
     }
@@ -1766,6 +1949,72 @@ impl SqliteStore {
                 self.cipher.seal(&serde_json::to_vec(&snapshot)?)?,
             ],
         )?;
+        Ok(())
+    }
+
+    /// The stored spelling of a step's kind.
+    ///
+    /// Plaintext and constrained by a `CHECK`, because `--step` filters on it.
+    fn step_kind_str(kind: crate::models::StepKind) -> &'static str {
+        match kind {
+            crate::models::StepKind::Workflow => "workflow",
+            crate::models::StepKind::Synthetic => "synthetic",
+        }
+    }
+
+    /// Upsert one run's attempt step rows.
+    ///
+    /// Deliberately no `DELETE ... WHERE run_id` first: manifests only grow or
+    /// have fields updated, so a keyed upsert writes just the changed rows.
+    /// Deleting and re-inserting per run event would reintroduce the very
+    /// write amplification this table exists to avoid. Rows go away with their
+    /// run, through the `runs` foreign key.
+    fn write_job_steps_tx(
+        &self,
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        agent_job_id: uuid::Uuid,
+        records: &[crate::models::StepRecord],
+        revision: u64,
+    ) -> anyhow::Result<()> {
+        {
+            for step in records {
+                if step.id.is_empty() {
+                    continue;
+                }
+                tx.execute(
+                    "INSERT INTO job_steps(run_id, agent_job_id, step_id, kind, workflow_index,
+                                           runner_number, context_name, name_blob, conclusion,
+                                           started_at_us, finished_at_us, revision)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                     ON CONFLICT(agent_job_id, step_id) DO UPDATE SET
+                       kind = excluded.kind,
+                       workflow_index = excluded.workflow_index,
+                       runner_number = excluded.runner_number,
+                       context_name = excluded.context_name,
+                       name_blob = excluded.name_blob,
+                       conclusion = excluded.conclusion,
+                       started_at_us = excluded.started_at_us,
+                       finished_at_us = excluded.finished_at_us,
+                       revision = excluded.revision
+                     WHERE excluded.revision >= job_steps.revision",
+                    params![
+                        run_id.to_string(),
+                        agent_job_id.to_string(),
+                        step.id,
+                        Self::step_kind_str(step.kind),
+                        step.workflow_index.map(|index| index as i64),
+                        step.runner_number.map(|number| number as i64),
+                        step.context_name,
+                        self.cipher.seal(step.name.as_bytes())?,
+                        step.conclusion,
+                        step.started_at.map(unix_us),
+                        step.finished_at.map(unix_us),
+                        revision as i64,
+                    ],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -1915,6 +2164,22 @@ impl Store for SqliteStore {
         tokio::task::spawn_blocking(move || store.store_run_event(&projection))
             .await
             .map_err(|error| anyhow::anyhow!("store run-event task panicked: {error}"))?
+    }
+
+    async fn store_job_steps(
+        &self,
+        run_id: RunId,
+        agent_job_id: uuid::Uuid,
+        records: &[crate::models::StepRecord],
+        revision: u64,
+    ) -> anyhow::Result<()> {
+        let store = self.clone();
+        let records = records.to_vec();
+        tokio::task::spawn_blocking(move || {
+            store.store_job_steps(run_id, agent_job_id, &records, revision)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("store job-steps task panicked: {error}"))?
     }
 
     async fn store_workflow_run_counter(
@@ -2157,6 +2422,50 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         ) STRICT;
         "#,
     ),
+    (
+        4,
+        "job-steps-table",
+        // Step records get their own table rather than riding in
+        // `runs.record_blob`: that blob carries the workflow YAML, the event
+        // payload and the github context, and `store_run_event` reseals all of
+        // it on every run event. Rows here are upserted individually, so a
+        // step transition writes one small row instead of re-encrypting the
+        // whole run. `MetaSnapshot` is not an option either — every field in
+        // it is cloned and sealed on each `store_meta_only` call.
+        //
+        // Keyed by `agent_job_id` (the attempt), because a re-dispatch mints
+        // fresh step ids and must not overwrite the mapping the previous
+        // attempt's `step-<id>.txt` blobs are named after.
+        //
+        // `kind` and `workflow_index` stay plaintext so `--step` can resolve
+        // through an indexed query; only the display name is sealed, since it
+        // comes from user YAML.
+        r#"
+        CREATE TABLE IF NOT EXISTS job_steps (
+          run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+          agent_job_id TEXT NOT NULL,
+          step_id TEXT NOT NULL,
+          kind TEXT NOT NULL CHECK (kind IN ('workflow','synthetic')),
+          workflow_index INTEGER,
+          runner_number INTEGER,
+          context_name TEXT,
+          name_blob BLOB NOT NULL,
+          conclusion TEXT NOT NULL,
+          started_at_us INTEGER,
+          finished_at_us INTEGER,
+          -- Monotonic per attempt, bumped on every in-memory mutation of the
+          -- manifest. Reconciliation snapshots under the state lock and writes
+          -- after releasing it, so two reports for one attempt can commit out
+          -- of order; the upsert compares this and refuses to move a row
+          -- backwards rather than letting the older snapshot win.
+          revision INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY (agent_job_id, step_id)
+        ) STRICT, WITHOUT ROWID;
+
+        CREATE INDEX IF NOT EXISTS job_steps_order_idx
+          ON job_steps (agent_job_id, kind, workflow_index);
+        "#,
+    ),
 ];
 
 pub(crate) fn now_us() -> i64 {
@@ -2310,5 +2619,62 @@ mod tests {
                 "tampered envelope at byte {index} must not unseal"
             );
         }
+    }
+
+    /// A fresh database gets `job_steps.revision`, and a stale one says so.
+    ///
+    /// `revision` moved between migration versions twice during review before
+    /// settling inside migration 4's table definition. Version 4 does not
+    /// exist on `main`, so collapsing it is safe for anything released — but a
+    /// development database stamped 4 by an intermediate build skips the
+    /// migration, and that has to be an actionable error rather than a
+    /// `no such column` from somewhere deep in the step queries.
+    #[test]
+    fn job_steps_revision_is_created_and_stale_schemas_are_rejected() {
+        let fresh = Connection::open_in_memory().unwrap();
+        SqliteStore::migrate(&fresh).expect("a fresh database must migrate");
+        assert!(
+            fresh
+                .prepare("SELECT revision FROM job_steps LIMIT 0")
+                .is_ok(),
+            "migration 4 must create the revision column"
+        );
+
+        // Exactly what an intermediate build left behind: version 4 stamped,
+        // table without the column.
+        let stale = Connection::open_in_memory().unwrap();
+        for (version, _, sql) in MIGRATIONS {
+            if *version >= 4 {
+                break;
+            }
+            stale.execute_batch(sql).unwrap();
+        }
+        stale
+            .execute_batch(
+                "CREATE TABLE job_steps (
+                   run_id TEXT NOT NULL,
+                   agent_job_id TEXT NOT NULL,
+                   step_id TEXT NOT NULL,
+                   kind TEXT NOT NULL,
+                   workflow_index INTEGER,
+                   runner_number INTEGER,
+                   context_name TEXT,
+                   name_blob BLOB NOT NULL,
+                   conclusion TEXT NOT NULL,
+                   started_at_us INTEGER,
+                   finished_at_us INTEGER,
+                   PRIMARY KEY (agent_job_id, step_id)
+                 ) STRICT, WITHOUT ROWID;
+                 PRAGMA user_version = 4;",
+            )
+            .unwrap();
+
+        let error = SqliteStore::migrate(&stale)
+            .expect_err("a version-4 database without the column must be rejected")
+            .to_string();
+        assert!(
+            error.contains("predates the `job_steps.revision` column"),
+            "the error must name the cause and the fix, got: {error}"
+        );
     }
 }

@@ -764,6 +764,49 @@ impl AppState {
         let store = crate::store::open_store(store_url, &state_dir, &local_jwt_key).await?;
         let mut recovered = inner;
         store.load_into(&mut recovered).await?;
+        // An attempt dispatched but not yet reported has no persisted step
+        // rows: seeding happens in memory, and only a runner report writes
+        // them. The request message it was built from *is* persisted, so
+        // rebuild from that rather than leaving the run with no declared steps
+        // and `--step` answering 409 for logs that are on disk.
+        //
+        // Two homes, depending on how far the job got: `broker_messages` once
+        // a runner claimed it, and the queue row's own copy before that.
+        let rebuilt: Vec<(uuid::Uuid, Vec<crate::models::StepRecord>)> = recovered
+            .job_requests
+            .values()
+            .filter(|record| !recovered.job_steps.contains_key(&record.agent_job_id))
+            .filter_map(|record| {
+                let steps = recovered
+                    .broker_messages
+                    .get(&record.request_id)
+                    .map(|message| message.steps.as_slice())
+                    .or_else(|| {
+                        recovered
+                            .queue
+                            .iter()
+                            .chain(recovered.pending_jobs.iter())
+                            .chain(recovered.concurrency_blocked.iter())
+                            // Keyed by request id, not by (run, job): a
+                            // re-dispatch leaves several requests for one
+                            // logical job, and matching the pair attaches the
+                            // newest queued message to an older attempt —
+                            // rebuilding it with the wrong `TaskStep` ids, so
+                            // its `step-<id>.txt` blobs stop resolving.
+                            .find(|job| job.message.request_id == record.request_id)
+                            .map(|job| job.message.steps.as_slice())
+                    })?;
+                let manifest = crate::models::StepRecord::manifest(steps);
+                (!manifest.is_empty()).then_some((record.agent_job_id, manifest))
+            })
+            .collect();
+        if !rebuilt.is_empty() {
+            tracing::info!(
+                attempts = rebuilt.len(),
+                "rebuilt step manifests from persisted job request messages"
+            );
+        }
+        recovered.job_steps.extend(rebuilt);
         let next_request_id = recovered
             .job_requests
             .keys()
@@ -1413,6 +1456,24 @@ pub(crate) struct InnerState {
     pub(crate) live_log_closed: std::collections::BTreeSet<String>,
     pub(crate) inflight_requests: BTreeMap<i64, (RunId, JobId)>,
     pub(crate) job_requests: BTreeMap<i64, TaskAgentJobRequestRecord>,
+    /// Step records per job attempt, keyed by `agent_job_id`.
+    ///
+    /// Authoritative for both the run record's step projection and `--step`
+    /// log selection. Keyed by attempt, not by job: a re-dispatch mints fresh
+    /// `TaskStep` ids, so a job-scoped map would overwrite the mapping the
+    /// previous attempt's `step-<id>.txt` blobs are still named after.
+    ///
+    /// Seeded from the job request message at dispatch (every declared step,
+    /// in workflow order); runner reports only reconcile into it.
+    pub(crate) job_steps: BTreeMap<uuid::Uuid, Vec<crate::models::StepRecord>>,
+    /// Monotonic revision per attempt, bumped whenever `job_steps` changes.
+    ///
+    /// Reconciliation snapshots a manifest under this lock and writes it after
+    /// releasing it, so two reports for one attempt can commit out of order.
+    /// The revision travels with the write and the upsert refuses to move a
+    /// row backwards, so an older snapshot cannot overwrite newer conclusions.
+    /// In memory only: the persisted column is what it guards.
+    pub(crate) job_steps_revision: BTreeMap<uuid::Uuid, u64>,
     pub(crate) plan_requests: BTreeMap<String, i64>,
     pub(crate) agent_job_requests: BTreeMap<uuid::Uuid, i64>,
     pub(crate) timeline_requests: BTreeMap<uuid::Uuid, i64>,
