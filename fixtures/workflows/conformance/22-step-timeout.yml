@@ -1,0 +1,11 @@
+name: mitm step timeout
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: [self-hosted, mitm]
+    steps:
+      - run: echo "before timeout"
+      - name: will-timeout
+        timeout-minutes: 1
+        run: sleep 120
+      - run: echo "after timeout"

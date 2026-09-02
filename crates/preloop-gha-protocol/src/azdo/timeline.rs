@@ -93,9 +93,15 @@ pub struct TimelineRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TimelineRecordType {
+    #[serde(alias = "Job", alias = "job")]
     Job,
+    #[serde(alias = "Step", alias = "step")]
     Step,
+    #[serde(alias = "Task", alias = "task")]
+    Task,
+    #[serde(alias = "Phase", alias = "phase")]
     Phase,
+    #[serde(alias = "Stage", alias = "stage")]
     Stage,
 }
 

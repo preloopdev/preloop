@@ -1,0 +1,36 @@
+name: "bench: container-lifecycle"
+on: workflow_dispatch
+
+jobs:
+  lifecycle:
+    runs-on: [self-hosted, aksh-container]
+    container:
+      image: python:3.12-slim
+      env:
+        PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Verify python version
+        run: python3 --version
+      - name: Install pip package
+        run: pip install httpx
+      - name: Run python script
+        run: |
+          python3 -c "
+          import httpx
+          import sys
+          print(f'Python {sys.version}')
+          print(f'httpx {httpx.__version__}')
+          print('Container lifecycle OK')
+          "
+      - name: Test job.container context
+        run: |
+          echo "container.id=${{ job.container.id }}"
+          echo "container.network=${{ job.container.network }}"
+      - name: Failing step (continue-on-error)
+        continue-on-error: true
+        run: exit 1
+      - name: Step after continue-on-error
+        run: echo "This should still run"
+      - name: Conditional step
+        if: success()
+        run: echo "Previous step succeeded or was continue-on-error"

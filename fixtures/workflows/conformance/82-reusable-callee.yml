@@ -1,0 +1,62 @@
+name: Reusable Workflow Callee
+
+on:
+  workflow_call:
+    inputs:
+      message:
+        description: "Message to echo"
+        required: true
+        type: string
+      enable-feature:
+        description: "Enable optional feature"
+        required: false
+        type: boolean
+    outputs:
+      result:
+        description: "Result of the workflow"
+        value: ${{ jobs.reusable-job.outputs.result }}
+    secrets:
+      secret-token:
+        description: "Secret token"
+        required: false
+
+jobs:
+  reusable-job:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    outputs:
+      result: ${{ steps.set-output.outputs.result }}
+    steps:
+      - name: Use input message
+        run: |
+          echo "Received message: ${{ inputs.message }}"
+          if [[ "${{ inputs.message }}" == "Hello from caller" ]]; then
+            echo "✓ Input message correctly received"
+          else
+            echo "✗ Input message incorrect"
+            exit 1
+          fi
+
+      - name: Check boolean input
+        run: |
+          if [[ "${{ inputs.enable-feature }}" == "true" ]]; then
+            echo "✓ Feature flag enabled: true"
+          else
+            echo "✗ Feature flag not correctly set"
+            exit 1
+          fi
+
+      - name: Verify secret is passed
+        run: |
+          if [[ -n "${{ secrets.secret-token }}" ]]; then
+            echo "✓ Secret token was received"
+          else
+            echo "✗ Secret token was not received"
+            exit 1
+          fi
+
+      - name: Set output
+        id: set-output
+        run: |
+          echo "result=success" >> $GITHUB_OUTPUT
+          echo "✓ Output set successfully"

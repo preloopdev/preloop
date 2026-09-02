@@ -1,0 +1,18 @@
+name: mitm boolean if
+on: workflow_dispatch
+jobs:
+  skipped-job:
+    if: false
+    runs-on: [self-hosted, mitm]
+    steps:
+      - run: echo "should not run"
+  active-job:
+    runs-on: [self-hosted, mitm]
+    steps:
+      - run: echo "always runs"
+      - name: skipped-step
+        if: false
+        run: echo "this should be skipped"
+      - name: expression-step
+        if: ${{ true }}
+        run: echo "expression true runs"

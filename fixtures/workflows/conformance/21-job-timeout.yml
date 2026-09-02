@@ -1,0 +1,13 @@
+name: mitm job timeout
+on: workflow_dispatch
+jobs:
+  timeout-test:
+    runs-on: [self-hosted, mitm]
+    timeout-minutes: 1
+    steps:
+      - run: echo "Starting long step..."
+      - run: |
+          echo "Sleeping for 120 seconds (should be cancelled by 1-min timeout)"
+          sleep 120
+          echo "This should never print"
+      - run: echo "This should also never print"

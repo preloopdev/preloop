@@ -119,6 +119,8 @@ pub(crate) async fn run(args: UpdateArgs) -> anyhow::Result<()> {
         Ok(()) => println!("installed Linux runner bundle"),
         Err(error) => println!("warning: Linux runner bundle not updated: {error:#}"),
     }
+    #[cfg(target_os = "macos")]
+    invalidate_managed_externals();
 
     // The engine cannot provision VMs without a compatible smolvm. Checking
     // only `--mount-socket` accepted 1.7.5 on macOS even though its libkrun
@@ -190,6 +192,7 @@ pub(crate) async fn run(args: UpdateArgs) -> anyhow::Result<()> {
                     std::env::current_exe().context("locate running preloop executable")?;
                 self_replace::self_replace(&staged.binary_path)
                     .with_context(|| format!("atomically replace {}", executable.display()))?;
+                invalidate_managed_externals();
                 println!("installed preloop {}", remote_version);
                 restart_systemd_service().await?;
                 return Ok(());
@@ -224,6 +227,7 @@ pub(crate) async fn run(args: UpdateArgs) -> anyhow::Result<()> {
     self_replace::self_replace(&staged.binary_path)
         .with_context(|| format!("atomically replace {}", executable.display()))?;
 
+    invalidate_managed_externals();
     println!("installed preloop {}", remote_version);
     restart_systemd_service().await?;
     Ok(())
@@ -264,6 +268,8 @@ async fn update_linux_runner_bundle(client: &Client, release: &Release) -> anyho
         .await
         .with_context(|| format!("install {}", destination.display()))?;
     set_executable_permissions(&destination)?;
+    // Invalidate stale externals in the freshly installed bundle so the next engine start re-materializes.
+    invalidate_stale_externals_at(&destination_dir.join("externals"));
     Ok(())
 }
 
@@ -988,6 +994,61 @@ impl UpdateLock {
 impl Drop for UpdateLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn invalidate_stale_externals_at(externals_root: &Path) {
+    let runtimes = [
+        ("node20", NODE20_EXTERNALS_VERSION),
+        ("node24", NODE24_EXTERNALS_VERSION),
+    ];
+    for (runtime, expected) in runtimes {
+        let plain = expected.trim_start_matches('v');
+        let dir = externals_root.join(runtime);
+        let manifest_path = dir.join("preloop-node.json");
+        let Ok(data) = std::fs::read_to_string(&manifest_path) else {
+            continue;
+        };
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&data) else {
+            let _ = std::fs::remove_file(&manifest_path);
+            continue;
+        };
+        let version = val.get("version").and_then(|v| v.as_str()).unwrap_or("");
+        if version.trim_start_matches('v') != plain {
+            let _ = std::fs::remove_file(&manifest_path);
+            tracing::info!(
+                externals = %externals_root.display(),
+                runtime,
+                expected = plain,
+                found = version,
+                "invalidated stale node externals manifest"
+            );
+        }
+    }
+}
+
+fn invalidate_managed_externals() {
+    if let Some(dir) = std::env::var_os("PRELOOP_RUNNER_EXTERNALS").map(PathBuf::from) {
+        invalidate_stale_externals_at(&dir.join("externals"));
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        invalidate_stale_externals_at(&home.join("externals").join("externals"));
+        invalidate_stale_externals_at(&home.join("externals"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(prefix) = exe.parent().and_then(|d| d.parent()) {
+            let runner_dir = prefix.join("lib/preloop/runner");
+            if let Ok(entries) = std::fs::read_dir(&runner_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        invalidate_stale_externals_at(&path.join("externals"));
+                    }
+                }
+            }
+            let triple = crate::linux_guest_triple();
+            invalidate_stale_externals_at(&runner_dir.join(triple).join("externals"));
+        }
     }
 }
 

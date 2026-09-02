@@ -1,0 +1,23 @@
+name: E2E mdBook (GitHub)
+on: workflow_dispatch
+
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: rust-lang/mdBook
+      - run: cargo fmt --all -- --check
+
+  test:
+    name: Test
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: rust-lang/mdBook
+      - run: cargo test --workspace

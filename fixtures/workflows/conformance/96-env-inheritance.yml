@@ -1,0 +1,49 @@
+name: 96-env-inheritance
+on:
+  workflow_dispatch:
+env:
+  TEST_VAR: workflow-level
+jobs:
+  test-env-job-1:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    env:
+      TEST_VAR: job-level
+    steps:
+      - name: Step should use job-level env
+        run: |
+          if [ "$TEST_VAR" != "job-level" ]; then
+            echo "ERROR: Expected job-level, got $TEST_VAR"
+            exit 1
+          fi
+          echo "Job-level env override verified"
+
+      - name: Step with step-level override
+        env:
+          TEST_VAR: step-level
+        run: |
+          if [ "$TEST_VAR" != "step-level" ]; then
+            echo "ERROR: Expected step-level, got $TEST_VAR"
+            exit 1
+          fi
+          echo "Step-level env override verified"
+
+  test-env-job-2:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    steps:
+      - name: Job2 should see workflow-level only
+        run: |
+          if [ "$TEST_VAR" != "workflow-level" ]; then
+            echo "ERROR: Expected workflow-level, got $TEST_VAR"
+            exit 1
+          fi
+          echo "Env isolation between jobs verified"
+
+      - name: Verify TEST_VAR is not from job-1
+        run: |
+          if [ "$TEST_VAR" = "job-level" ]; then
+            echo "ERROR: Job-1 env leaked to job-2"
+            exit 1
+          fi
+          echo "No env leakage between jobs"

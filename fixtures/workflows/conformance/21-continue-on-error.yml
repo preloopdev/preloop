@@ -1,0 +1,13 @@
+name: mitm continue on error
+on: workflow_dispatch
+jobs:
+  failing:
+    runs-on: [self-hosted, mitm]
+    continue-on-error: true
+    steps:
+      - run: exit 1
+  downstream:
+    needs: failing
+    runs-on: [self-hosted, mitm]
+    steps:
+      - run: echo "still runs despite upstream failure ${{ needs.failing.result }}"

@@ -60,6 +60,9 @@ pub struct JobContext {
     pub upgraded_node24_actions: Vec<String>,
     /// Actions still using deprecated node20 (for warning).
     pub deprecated_node20_actions: Vec<String>,
+    /// Whether the Node 20 deprecation warning has already been emitted for this job.
+    /// Guard for one-time per-job warning via the node handler; not per step.
+    pub node20_warning_emitted: bool,
     /// v2.336.0 (#4527): Job-scoped artifact subjects from $GITHUB_ARTIFACTS.
     /// Keyed by canonical subject name; value is (digest, kind).
     pub artifact_subjects: IndexMap<String, ArtifactSubject>,
@@ -166,6 +169,7 @@ impl JobContext {
             debugger_telemetry: Vec::new(),
             upgraded_node24_actions: Vec::new(),
             deprecated_node20_actions: Vec::new(),
+            node20_warning_emitted: false,
             artifact_subjects: IndexMap::new(),
         }
     }
@@ -182,6 +186,16 @@ impl JobContext {
         if !self.deprecated_node20_actions.iter().any(|n| n == name) {
             self.deprecated_node20_actions.push(name.to_string());
         }
+    }
+
+    /// Emit the one-time per-job Node 20 deprecation warning if not already emitted.
+    /// Returns true if a warning was emitted.
+    pub fn emit_node20_deprecation_warning(&mut self) -> bool {
+        if self.node20_warning_emitted {
+            return false;
+        }
+        self.node20_warning_emitted = true;
+        true
     }
 
     /// Get the value of a variable by key. Supports case-insensitive lookup.

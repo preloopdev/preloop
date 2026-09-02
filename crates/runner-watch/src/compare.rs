@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
+use std::sync::LazyLock;
 
 use anyhow::{bail, Context, Result};
 use regex::Regex;
@@ -26,6 +27,34 @@ const IGNORED_HEADERS: &[&str] = &[
 
 // ── path normalisation ───────────────────────────────────────────────────────
 
+/// Strip transport prefixes that are not part of the logical endpoint: a
+/// leading `/runner/server`, and a single random base segment before `/_apis/`
+/// (e.g. `/BFN7BKz/_apis/…`). Shared by [`normalize_path`] (request URLs) and
+/// coverage route canonicalization so both sides land in one namespace.
+pub fn strip_transport_prefixes(path: &str) -> &str {
+    let path = if path.starts_with("/runner/server/") {
+        &path["/runner/server".len()..]
+    } else {
+        path
+    };
+    if let Some(rest) = path.strip_prefix('/') {
+        if let Some(slash) = rest.find('/') {
+            let seg = &rest[..slash];
+            let tail = &rest[slash..]; // starts with /
+                                       // Only strip if the tail continues with /_apis/ and the
+                                       // segment is purely alphanumeric+hyphen (no dots — avoids
+                                       // stripping hostnames).
+            if tail.starts_with("/_apis/")
+                && !seg.is_empty()
+                && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            {
+                return tail;
+            }
+        }
+    }
+    path
+}
+
 /// Normalise volatile parts of a URL path + query string for grouping.
 ///
 /// Matches the Python `normalize_path` function exactly:
@@ -35,36 +64,9 @@ const IGNORED_HEADERS: &[&str] = &[
 /// - replace all-digit path segments with `{n}`
 /// - replace all-digit or GUID-prefixed query values with `{n}` / `{guid}`
 pub fn normalize_path(path: &str) -> String {
-    // Strip /runner/server prefix when immediately followed by /.
-    let path = if path.starts_with("/runner/server/") {
-        &path["/runner/server".len()..]
-    } else {
-        path
-    };
-
-    // Strip single-segment random base before /_apis/
-    // e.g. /BFN7BKz.../_apis/... → /_apis/...
-    // Must be exactly one path segment (no embedded slashes).
-    let path = if let Some(rest) = path.strip_prefix('/') {
-        if let Some(slash) = rest.find('/') {
-            let seg = &rest[..slash];
-            let tail = &rest[slash..]; // starts with /
-                                       // Only strip if the tail continues with /_apis/ and the segment
-                                       // is purely alphanumeric+hyphen (no dots — avoids stripping hostnames).
-            if tail.starts_with("/_apis/")
-                && !seg.is_empty()
-                && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-            {
-                tail
-            } else {
-                path
-            }
-        } else {
-            path
-        }
-    } else {
-        path
-    };
+    // Strip transport prefixes (/runner/server, single random base before
+    // /_apis/) so the same logical endpoint groups regardless of URL form.
+    let path = strip_transport_prefixes(path);
 
     // Replace GUIDs (8-4-4-4-12 hex digits).
     let guid_re =
@@ -282,6 +284,482 @@ fn json_schema_diff(a: &Value, b: &Value, left_label: &str, right_label: &str) -
     let schema_a = to_schema_value(a);
     let schema_b = to_schema_value(b);
     json_diff(&schema_a, &schema_b, left_label, right_label)
+}
+
+// ── value normalisation (finding #4) ─────────────────────────────────────────
+
+static SIMPLE_NORM_RULES: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
+    vec![
+        (
+            Regex::new(r"gh[sopur]_[A-Za-z0-9_.-]{8,}|github_pat_[A-Za-z0-9_]{15,}")
+                .expect("static regex"),
+            "{token}",
+        ),
+        (
+            Regex::new(r"eyJ[A-Za-z0-9_-]{8,}(\.[A-Za-z0-9_-]{8,})+").expect("static regex"),
+            "{jwt}",
+        ),
+        (
+            Regex::new(
+                r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            )
+            .expect("static regex"),
+            "{guid}",
+        ),
+        (
+            Regex::new(r#"https?://[^\s"']+"#).expect("static regex"),
+            "{url}",
+        ),
+        (
+            Regex::new(r"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:?\d{2})?")
+                .expect("static regex"),
+            "{timestamp}",
+        ),
+        (Regex::new(r"\b\d{10,}\b").expect("static regex"), "{n}"),
+    ]
+});
+
+static ENTROPY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[A-Za-z0-9_]{30,}").expect("static regex"));
+
+/// Collapse a single scalar string's volatile substrings to stable placeholders.
+fn normalize_scalar(input: &str) -> String {
+    let mut s = input.to_owned();
+    for (re, replacement) in SIMPLE_NORM_RULES.iter() {
+        s = re.replace_all(&s, *replacement).into_owned();
+    }
+    ENTROPY_RE
+        .replace_all(&s, |caps: &regex::Captures| {
+            let m = &caps[0];
+            let unique: HashSet<char> = m.chars().collect();
+            if unique.len() > 6 {
+                "{opaque}".to_owned()
+            } else {
+                m.to_owned()
+            }
+        })
+        .into_owned()
+}
+
+/// Recursively normalise volatile scalar values so two bodies can be compared
+/// for *semantic* equality without volatile-by-design fields (tokens, GUIDs,
+/// signed URLs, timestamps, high-entropy ids) producing false diffs.
+///
+/// Unlike [`to_schema_value`], which erases every value to its type, this keeps
+/// stable values (enum strings, field contents, script text) intact so a real
+/// value regression is still visible after normalisation.
+pub fn normalize_value(v: &Value) -> Value {
+    match v {
+        Value::String(s) => Value::String(normalize_scalar(s)),
+        // Large integers are volatile ids/epochs (runner ids, unix-nanos,
+        // millisecond timestamps) that legitimately differ between the real
+        // service and the replay. The string rule (`\d{10,}`) never sees them
+        // because they arrive as JSON numbers, so collapse them here too — or
+        // `--value-gate-strict` reports a false `ValueMismatch`. Small numbers
+        // (counts, versions) are left intact so real regressions stay visible.
+        Value::Number(n)
+            if n.as_u64().is_some_and(|u| u >= 1_000_000_000)
+                || n.as_i64()
+                    .is_some_and(|i| i.unsigned_abs() >= 1_000_000_000) =>
+        {
+            Value::String("{n}".to_owned())
+        }
+        Value::Array(a) => Value::Array(a.iter().map(normalize_value).collect()),
+        Value::Object(m) => {
+            let mut out = serde_json::Map::new();
+            for (k, val) in m {
+                out.insert(k.clone(), normalize_value(val));
+            }
+            Value::Object(out)
+        }
+        other => other.clone(),
+    }
+}
+
+/// True when the left (reference) schema has object keys, array shapes, or
+/// scalar types the right (candidate) schema lacks or changes. Additions on the
+/// right are tolerated. Inputs must already be [`to_schema_value`] shapes.
+fn schema_drops_fields(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Object(l), Value::Object(r)) => l.iter().any(|(k, lv)| match r.get(k) {
+            None => true,
+            Some(rv) => schema_drops_fields(lv, rv),
+        }),
+        (Value::Object(_), _) => true,
+        (Value::Array(l), Value::Array(r)) => l
+            .iter()
+            .any(|lv| !r.iter().any(|rv| !schema_drops_fields(lv, rv))),
+        (Value::Array(_), _) => true,
+        (a, b) => a != b,
+    }
+}
+
+// ── structured conformance report (findings #1 / #4) ─────────────────────────
+
+/// Comparison of one request or response body across the two captures.
+#[derive(Debug, Clone, Default)]
+pub struct BodyComparison {
+    /// Whether either side carried a body for this endpoint.
+    pub present: bool,
+    /// Value diff after volatile-field normalisation (#4); empty when identical.
+    pub normalized_value_diff: String,
+    /// Value-agnostic schema diff; empty when identical.
+    pub schema_diff: String,
+    /// Whether the candidate dropped/changed a field the reference has.
+    pub schema_drops_fields: bool,
+}
+
+/// One endpoint's cross-capture comparison.
+#[derive(Debug, Clone)]
+pub struct EndpointReport {
+    /// Normalised `"METHOD /path"` key.
+    pub key: String,
+    /// Flow count on the reference side.
+    pub left_count: usize,
+    /// Flow count on the candidate side.
+    pub right_count: usize,
+    /// Sorted reference status codes.
+    pub left_statuses: Vec<String>,
+    /// Sorted candidate status codes.
+    pub right_statuses: Vec<String>,
+    /// Request-body comparison.
+    pub request: BodyComparison,
+    /// Response-body comparison.
+    pub response: BodyComparison,
+}
+
+impl EndpointReport {
+    /// True when both captures exercised this endpoint (a fair comparison).
+    pub fn is_shared(&self) -> bool {
+        self.left_count > 0 && self.right_count > 0
+    }
+}
+
+/// Structured result of comparing two capture directories. Replaces the old
+/// scrape-the-markdown gate: the verdict is computed from this value.
+#[derive(Debug, Clone)]
+pub struct ConformanceReport {
+    /// Scenario name.
+    pub scenario: String,
+    /// Reference total flow count.
+    pub left_flow_count: usize,
+    /// Candidate total flow count.
+    pub right_flow_count: usize,
+    /// Endpoints exercised only by the reference (candidate served none).
+    pub left_only_endpoints: Vec<String>,
+    /// Endpoints exercised only by the candidate.
+    pub right_only_endpoints: Vec<String>,
+    /// Per-endpoint comparisons (shared and single-sided).
+    pub endpoints: Vec<EndpointReport>,
+}
+
+/// How aggressively response *values* are gated (finding #4).
+#[derive(Debug, Clone)]
+pub enum ValueGate {
+    /// Values are reported but never gated (default; preserves legacy semantics).
+    Off,
+    /// Gate normalised response-value equality for every shared endpoint whose
+    /// key does not contain one of these substrings.
+    AllExcept(Vec<String>),
+}
+
+/// Declarative gate configuration.
+#[derive(Debug, Clone)]
+pub struct GatePolicy {
+    /// Endpoint substrings whose status mismatches are ignored (un-replayable).
+    pub status_ignore: Vec<String>,
+    /// Endpoint substrings whose response-schema removals are gated (acquirejob).
+    pub response_schema_gate: Vec<String>,
+    /// Value-gate mode (finding #4).
+    pub value_gate: ValueGate,
+}
+
+impl Default for GatePolicy {
+    fn default() -> Self {
+        Self {
+            status_ignore: vec!["/oauth2/token".to_owned(), "/messages".to_owned()],
+            response_schema_gate: vec!["/broker/{n}/acquirejob".to_owned()],
+            value_gate: ValueGate::Off,
+        }
+    }
+}
+
+/// Why one endpoint failed the gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// Reference exercised an endpoint the candidate never served.
+    MissingEndpoint,
+    /// Status-code sets differ.
+    StatusMismatch,
+    /// Request-body schema differs (replay corruption).
+    RequestSchema,
+    /// Response body dropped/changed a reference field on a gated endpoint.
+    ResponseSchema,
+    /// Normalised response value differs on a value-gated endpoint.
+    ValueMismatch,
+}
+
+impl FailureKind {
+    /// Stable machine-readable identifier.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FailureKind::MissingEndpoint => "missing_endpoint",
+            FailureKind::StatusMismatch => "status_mismatch",
+            FailureKind::RequestSchema => "request_schema",
+            FailureKind::ResponseSchema => "response_schema",
+            FailureKind::ValueMismatch => "value_mismatch",
+        }
+    }
+}
+
+/// One gate failure.
+#[derive(Debug, Clone)]
+pub struct Failure {
+    /// Endpoint key.
+    pub endpoint: String,
+    /// Failure classification.
+    pub kind: FailureKind,
+    /// Human-readable detail.
+    pub detail: String,
+}
+
+impl ConformanceReport {
+    /// Compute the gate verdict. An empty vec means the scenario conforms.
+    pub fn failures(&self, policy: &GatePolicy) -> Vec<Failure> {
+        let mut out = Vec::new();
+        // An endpoint the reference exercised but the candidate never served:
+        // the runner would get no route. Candidate-only endpoints are tolerated,
+        // matching the legacy gate.
+        for ep in &self.left_only_endpoints {
+            out.push(Failure {
+                endpoint: ep.clone(),
+                kind: FailureKind::MissingEndpoint,
+                detail: "present only in reference capture".to_owned(),
+            });
+        }
+        for e in self.endpoints.iter().filter(|e| e.is_shared()) {
+            let status_ignored = policy
+                .status_ignore
+                .iter()
+                .any(|s| e.key.contains(s.as_str()));
+            if !status_ignored && e.left_statuses != e.right_statuses {
+                out.push(Failure {
+                    endpoint: e.key.clone(),
+                    kind: FailureKind::StatusMismatch,
+                    detail: format!(
+                        "[{}] vs [{}]",
+                        e.left_statuses.join(", "),
+                        e.right_statuses.join(", ")
+                    ),
+                });
+            }
+            if e.request.present && !e.request.schema_diff.is_empty() {
+                out.push(Failure {
+                    endpoint: e.key.clone(),
+                    kind: FailureKind::RequestSchema,
+                    detail: "request body schema differs".to_owned(),
+                });
+            }
+            if e.response.present
+                && e.response.schema_drops_fields
+                && policy
+                    .response_schema_gate
+                    .iter()
+                    .any(|s| e.key.contains(s.as_str()))
+            {
+                out.push(Failure {
+                    endpoint: e.key.clone(),
+                    kind: FailureKind::ResponseSchema,
+                    detail: "response body drops/changes reference fields".to_owned(),
+                });
+            }
+            let value_gated = match &policy.value_gate {
+                ValueGate::Off => false,
+                ValueGate::AllExcept(ignore) => !ignore.iter().any(|s| e.key.contains(s.as_str())),
+            };
+            if value_gated && e.response.present && !e.response.normalized_value_diff.is_empty() {
+                out.push(Failure {
+                    endpoint: e.key.clone(),
+                    kind: FailureKind::ValueMismatch,
+                    detail: "response value differs after normalization".to_owned(),
+                });
+            }
+        }
+        out
+    }
+
+    /// Machine-readable summary (redacted) for the conformance-result artifact.
+    pub fn to_json(&self, policy: &GatePolicy) -> Value {
+        let failures = self.failures(policy);
+        serde_json::json!({
+            "scenario": self.scenario,
+            "left_flow_count": self.left_flow_count,
+            "right_flow_count": self.right_flow_count,
+            "left_only_endpoints": self.left_only_endpoints,
+            "right_only_endpoints": self.right_only_endpoints,
+            "endpoints": self.endpoints.iter().filter(|e| e.is_shared()).map(|e| serde_json::json!({
+                "key": e.key,
+                "left_statuses": e.left_statuses,
+                "right_statuses": e.right_statuses,
+                "request_schema_differs": e.request.present && !e.request.schema_diff.is_empty(),
+                "response_schema_drops_fields": e.response.present && e.response.schema_drops_fields,
+                "response_value_differs_normalized": e.response.present && !e.response.normalized_value_diff.is_empty(),
+            })).collect::<Vec<_>>(),
+            "failures": failures.iter().map(|f| serde_json::json!({
+                "endpoint": f.endpoint,
+                "kind": f.kind.as_str(),
+                "detail": f.detail,
+            })).collect::<Vec<_>>(),
+            "passed": failures.is_empty(),
+        })
+    }
+}
+
+fn body_comparison(lo: &[Value], ro: &[Value], field: &str, ll: &str, rl: &str) -> BodyComparison {
+    // Compare *every* occurrence in the endpoint group, aligned by flow
+    // position, not just the first — otherwise a later call that regresses its
+    // body slips through when the first bodies and all statuses match. (Per
+    // occurrence rather than a deduped array: `to_schema_value` unions array
+    // element shapes, which would hide a drop that only affects a later call.)
+    //
+    // A `null` or absent body is a "no body" slot: an omitted official body and
+    // a replayed `null` must not read as a mismatch, and keeping the slot (vs
+    // filtering it out) prevents occurrences at different indexes from being
+    // silently re-aligned. Only the shared min-count of occurrences is compared
+    // for schema/value; a cardinality difference (a skipped retry, an extra
+    // poll, or a flow dropped by the replay skip rules) is not folded into the
+    // body gate — the legacy gate compared only the first body per endpoint.
+    fn bodies(flows: &[Value], field: &str) -> Vec<Option<Value>> {
+        flows
+            .iter()
+            .map(|f| match f.get(field) {
+                Some(Value::Null) | None => None,
+                Some(v) => Some(v.clone()),
+            })
+            .collect()
+    }
+    let la = bodies(lo, field);
+    let ra = bodies(ro, field);
+    if la.iter().all(Option::is_none) && ra.iter().all(Option::is_none) {
+        return BodyComparison::default();
+    }
+    let empty = Value::Object(Default::default());
+    let mut value_diffs = Vec::new();
+    let mut schema_diffs = Vec::new();
+    let mut drops = false;
+    for i in 0..la.len().min(ra.len()) {
+        if la[i].is_none() && ra[i].is_none() {
+            continue;
+        }
+        let a = la[i].as_ref().unwrap_or(&empty);
+        let b = ra[i].as_ref().unwrap_or(&empty);
+        let vd = json_diff(&normalize_value(a), &normalize_value(b), ll, rl);
+        if !vd.is_empty() {
+            value_diffs.push(vd);
+        }
+        let sd = json_schema_diff(a, b, ll, rl);
+        if !sd.is_empty() {
+            schema_diffs.push(sd);
+        }
+        if schema_drops_fields(&to_schema_value(a), &to_schema_value(b)) {
+            drops = true;
+        }
+    }
+    BodyComparison {
+        present: true,
+        normalized_value_diff: redact_report(&value_diffs.join("\n")),
+        schema_diff: schema_diffs.join("\n"),
+        schema_drops_fields: drops,
+    }
+}
+
+/// Compute the structured comparison between two capture directories. This is
+/// the source of truth for the gate; [`render_report`] is a view over the same
+/// captures for humans.
+pub fn analyze(args: &Args) -> Result<ConformanceReport> {
+    let left_flows = load_flows(args.left_dir)?;
+    let right_flows = load_flows(args.right_dir)?;
+    if !left_flows.is_empty() && right_flows.is_empty() {
+        bail!(
+            "{} has {} flows but {} has none — cannot compare",
+            args.left_label,
+            left_flows.len(),
+            args.right_label,
+        );
+    }
+    if !right_flows.is_empty() && left_flows.is_empty() {
+        bail!(
+            "{} has {} flows but {} has none — cannot compare",
+            args.right_label,
+            right_flows.len(),
+            args.left_label,
+        );
+    }
+    let l_groups = group_flows(&left_flows);
+    let r_groups = group_flows(&right_flows);
+    let all_keys: BTreeSet<String> = l_groups.keys().chain(r_groups.keys()).cloned().collect();
+    let left_only: Vec<String> = l_groups
+        .keys()
+        .filter(|k| !r_groups.contains_key(*k))
+        .cloned()
+        .collect();
+    let right_only: Vec<String> = r_groups
+        .keys()
+        .filter(|k| !l_groups.contains_key(*k))
+        .cloned()
+        .collect();
+
+    let mut endpoints = Vec::new();
+    for key in &all_keys {
+        let lo = l_groups.get(key).map(Vec::as_slice).unwrap_or(&[]);
+        let ro = r_groups.get(key).map(Vec::as_slice).unwrap_or(&[]);
+        let shared = !lo.is_empty() && !ro.is_empty();
+        let (request, response) = if shared {
+            (
+                body_comparison(
+                    lo,
+                    ro,
+                    "request_body_json",
+                    args.left_label,
+                    args.right_label,
+                ),
+                body_comparison(
+                    lo,
+                    ro,
+                    "response_body_json",
+                    args.left_label,
+                    args.right_label,
+                ),
+            )
+        } else {
+            (BodyComparison::default(), BodyComparison::default())
+        };
+        endpoints.push(EndpointReport {
+            key: key.clone(),
+            left_count: lo.len(),
+            right_count: ro.len(),
+            left_statuses: statuses_sorted(lo),
+            right_statuses: statuses_sorted(ro),
+            request,
+            response,
+        });
+    }
+
+    Ok(ConformanceReport {
+        scenario: args.scenario.to_owned(),
+        left_flow_count: left_flows.len(),
+        right_flow_count: right_flows.len(),
+        left_only_endpoints: left_only,
+        right_only_endpoints: right_only,
+        endpoints,
+    })
+}
+
+/// Union of normalised `"METHOD /path"` endpoint keys a capture exercised.
+/// Used by coverage analysis (finding #2).
+pub fn load_endpoint_keys(dir: &Path) -> Result<BTreeSet<String>> {
+    let flows = load_flows(dir)?;
+    Ok(group_flows(&flows).into_keys().collect())
 }
 
 // ── header key collection ────────────────────────────────────────────────────
@@ -810,5 +1288,214 @@ mod tests {
                 {"key": "string", "value": {"source": "string"}},
             ])
         );
+    }
+
+    // ── structured report / gate (findings #1 & #4) ──────────────────────────
+
+    fn tmp_capture(name: &str, flows: &[Value]) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rw-cmp-{name}-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut body = String::new();
+        for f in flows {
+            body.push_str(&serde_json::to_string(f).unwrap());
+            body.push('\n');
+        }
+        std::fs::write(dir.join("flows.jsonl"), body).unwrap();
+        dir
+    }
+
+    fn acquire_flow(status: i64, response: Value) -> Value {
+        serde_json::json!({
+            "method": "POST",
+            "path": "/broker/1/acquirejob",
+            "status": status,
+            "request_body_json": {"runnerId": 7},
+            "response_body_json": response,
+            "duration_ms": 1.0,
+        })
+    }
+
+    fn analyze_dirs(left: &std::path::Path, right: &std::path::Path) -> ConformanceReport {
+        analyze(&Args {
+            scenario: "t",
+            left_dir: left,
+            right_dir: right,
+            output: std::path::Path::new("/dev/null"),
+            left_label: "official",
+            right_label: "preloop",
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn normalize_value_collapses_volatile_scalars() {
+        let v = serde_json::json!({
+            "token": "ghs_abcdefghijklmnop",
+            "url": "https://pipelines.actions.githubusercontent.com/abc/def",
+            "when": "2026-07-20T15:08:23Z",
+            "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+            "stable": "ubuntu-24.04",
+        });
+        let n = normalize_value(&v);
+        assert_eq!(n["token"], serde_json::json!("{token}"));
+        assert_eq!(n["url"], serde_json::json!("{url}"));
+        assert_eq!(n["when"], serde_json::json!("{timestamp}"));
+        assert_eq!(n["id"], serde_json::json!("{guid}"));
+        // Stable values survive so real regressions remain visible.
+        assert_eq!(n["stable"], serde_json::json!("ubuntu-24.04"));
+    }
+
+    #[test]
+    fn normalize_value_collapses_large_numbers_keeps_small() {
+        let v = serde_json::json!({
+            "runnerId": 1784500123456i64,
+            "expiresAt": 1_000_000_000i64,
+            "count": 3,
+            "attempt": 1,
+        });
+        let n = normalize_value(&v);
+        assert_eq!(n["runnerId"], serde_json::json!("{n}"));
+        assert_eq!(n["expiresAt"], serde_json::json!("{n}"));
+        // Small numbers stay numbers so real value regressions still show.
+        assert_eq!(n["count"], serde_json::json!(3));
+        assert_eq!(n["attempt"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn schema_drops_flags_removals_and_type_changes_not_additions() {
+        let left = to_schema_value(&serde_json::json!({"a": 1, "b": "x"}));
+        // Right drops `b`.
+        let drop = to_schema_value(&serde_json::json!({"a": 1}));
+        assert!(schema_drops_fields(&left, &drop));
+        // Right adds `c` but keeps a/b → tolerated.
+        let add = to_schema_value(&serde_json::json!({"a": 1, "b": "x", "c": true}));
+        assert!(!schema_drops_fields(&left, &add));
+        // Right changes `a` from number to object → flagged.
+        let changed = to_schema_value(&serde_json::json!({"a": {"n": 1}, "b": "x"}));
+        assert!(schema_drops_fields(&left, &changed));
+    }
+
+    #[test]
+    fn identical_captures_conform() {
+        let resp = serde_json::json!({"job": {"id": "g", "steps": ["a"]}});
+        let l = tmp_capture("idl", &[acquire_flow(200, resp.clone())]);
+        let r = tmp_capture("idr", &[acquire_flow(200, resp)]);
+        let report = analyze_dirs(&l, &r);
+        assert!(report.failures(&GatePolicy::default()).is_empty());
+    }
+
+    #[test]
+    fn gate_catches_status_mismatch() {
+        let resp = serde_json::json!({"job": {"id": "g"}});
+        let l = tmp_capture("stl", &[acquire_flow(200, resp.clone())]);
+        let r = tmp_capture("str", &[acquire_flow(500, resp)]);
+        let fails = analyze_dirs(&l, &r).failures(&GatePolicy::default());
+        assert!(fails.iter().any(|f| f.kind == FailureKind::StatusMismatch));
+    }
+
+    #[test]
+    fn gate_catches_acquirejob_response_field_drop() {
+        let l = tmp_capture(
+            "drl",
+            &[acquire_flow(
+                200,
+                serde_json::json!({"job": {"id": "g", "steps": ["a"]}}),
+            )],
+        );
+        // Candidate drops the `steps` field the reference has.
+        let r = tmp_capture(
+            "drr",
+            &[acquire_flow(200, serde_json::json!({"job": {"id": "g"}}))],
+        );
+        let fails = analyze_dirs(&l, &r).failures(&GatePolicy::default());
+        assert!(fails.iter().any(|f| f.kind == FailureKind::ResponseSchema));
+    }
+
+    #[test]
+    fn gate_catches_regression_in_a_later_flow() {
+        let ok = serde_json::json!({"job": {"id": "g", "steps": ["a"]}});
+        let dropped = serde_json::json!({"job": {"id": "g"}});
+        // Reference: two identical acquire responses; candidate: first matches,
+        // second drops `steps`. The gate must not pass on the first alone.
+        let l = tmp_capture(
+            "mfl",
+            &[acquire_flow(200, ok.clone()), acquire_flow(200, ok.clone())],
+        );
+        let r = tmp_capture("mfr", &[acquire_flow(200, ok), acquire_flow(200, dropped)]);
+        let fails = analyze_dirs(&l, &r).failures(&GatePolicy::default());
+        assert!(
+            fails.iter().any(|f| f.kind == FailureKind::ResponseSchema),
+            "a field dropped in a later occurrence must be caught: {fails:?}"
+        );
+    }
+
+    #[test]
+    fn null_request_body_is_treated_as_absent() {
+        // Official omits the request body; replay records it as JSON null. The
+        // two must not read as a schema mismatch.
+        let official = serde_json::json!({
+            "method": "POST", "path": "/broker/1/acquirejob", "status": 200,
+            "response_body_json": {"job": {}}, "duration_ms": 1.0,
+        });
+        let replayed = serde_json::json!({
+            "method": "POST", "path": "/broker/1/acquirejob", "status": 200,
+            "request_body_json": Value::Null,
+            "response_body_json": {"job": {}}, "duration_ms": 1.0,
+        });
+        let l = tmp_capture("nbl", &[official]);
+        let r = tmp_capture("nbr", &[replayed]);
+        let fails = analyze_dirs(&l, &r).failures(&GatePolicy::default());
+        assert!(
+            !fails.iter().any(|f| f.kind == FailureKind::RequestSchema),
+            "a null replay body vs an omitted official body must not be a mismatch: {fails:?}"
+        );
+    }
+
+    #[test]
+    fn value_gate_ignores_volatile_but_catches_real_value_regressions() {
+        let left = serde_json::json!({"job": {"env": "prod", "url": "https://github.com/a"}});
+        // Only the URL differs → normalized away → no value failure under Only-gate.
+        let right_ok =
+            serde_json::json!({"job": {"env": "prod", "url": "https://127.0.0.1:9090/b"}});
+        let policy = GatePolicy {
+            value_gate: ValueGate::AllExcept(vec![]),
+            ..GatePolicy::default()
+        };
+        let l = tmp_capture("vgl", &[acquire_flow(200, left.clone())]);
+        let r_ok = tmp_capture("vgok", &[acquire_flow(200, right_ok)]);
+        assert!(
+            !analyze_dirs(&l, &r_ok)
+                .failures(&policy)
+                .iter()
+                .any(|f| f.kind == FailureKind::ValueMismatch),
+            "volatile-only differences must not trip the value gate"
+        );
+        // A stable field regresses → value gate fires.
+        let right_bad = serde_json::json!({"job": {"env": "staging", "url": "https://x/b"}});
+        let r_bad = tmp_capture("vgbad", &[acquire_flow(200, right_bad)]);
+        assert!(
+            analyze_dirs(&l, &r_bad)
+                .failures(&policy)
+                .iter()
+                .any(|f| f.kind == FailureKind::ValueMismatch),
+            "a real value regression must trip the value gate"
+        );
+    }
+
+    #[test]
+    fn gate_flags_endpoint_missing_from_candidate() {
+        let l = tmp_capture("mel", &[acquire_flow(200, serde_json::json!({"job": {}}))]);
+        // Candidate served a different endpoint entirely.
+        let other = serde_json::json!({
+            "method": "GET", "path": "/healthz", "status": 200,
+            "response_body_json": {"ok": true}, "duration_ms": 1.0,
+        });
+        let r = tmp_capture("mer", &[other]);
+        let fails = analyze_dirs(&l, &r).failures(&GatePolicy::default());
+        assert!(fails.iter().any(|f| f.kind == FailureKind::MissingEndpoint));
     }
 }

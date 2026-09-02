@@ -516,37 +516,49 @@ pub(crate) async fn agent_lookup(
     Path(_pool_id): Path<i64>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
-    let agent_name = params.get("agentName").cloned().unwrap_or_default();
-    let inner = shared.state.inner.lock().await;
-    for runner in inner.runners.values() {
-        if runner.name == agent_name {
-            return Json(json!({"count": 1, "value": [{
-                "id": runner.id,
-                "name": runner.name,
-                "version": "2.335.1",
-                "osDescription": "Linux",
-                "enabled": true,
-                "status": "online",
-                "ephemeral": runner.ephemeral,
-                "maxParallelism": 1,
-                "currentParallelism": 0,
-                "disableUpdate": false,
-                "isElastic": false,
-                "isVirtual": false,
-                "provisioningState": "Provisioned",
-                "queueName": format!("taskagent-{}", runner.id),
-                "runnerGroupId": runner.runner_group_id.unwrap_or(1),
-                "runnerGroupName": runner.runner_group_name.clone(),
-                "owningTenant": null,
-                "createdOn": "2026-01-01T00:00:00Z",
-                "lastConnectedOn": "2026-01-01T00:00:00",
-                "labels": runner.labels.iter().enumerate().map(|(i, l)| json!({"id": i + 1, "name": l, "type": "user"})).collect::<Vec<_>>(),
-                "authorization": {
-                    "clientId": "",
-                    "publicKey": {"exponent": "AQAB", "modulus": ""}
-                }
-            }]}));
-        }
+    let Some(agent_name) = params.get("agentName") else {
+        return Json(json!({"count": 0, "value": []}));
+    };
+    let mut inner = shared.state.inner.lock().await;
+    let found = inner
+        .runners
+        .values()
+        .find(|r| &r.name == agent_name)
+        .cloned();
+    if let Some(runner) = found {
+        let client_id = inner
+            .runner_client_ids
+            .iter()
+            .find(|(_, &id)| id == runner.id)
+            .map(|(k, _)| k.clone())
+            .unwrap_or_else(|| format!("{:08x}-0000-4000-8000-000000000000", runner.id as u32));
+        inner.runner_client_ids.insert(client_id.clone(), runner.id);
+        return Json(json!({"count": 1, "value": [{
+            "id": runner.id,
+            "name": runner.name,
+            "version": "2.335.1",
+            "osDescription": "Linux",
+            "enabled": true,
+            "status": "online",
+            "ephemeral": runner.ephemeral,
+            "maxParallelism": 1,
+            "currentParallelism": 0,
+            "disableUpdate": false,
+            "isElastic": false,
+            "isVirtual": false,
+            "provisioningState": "Provisioned",
+            "queueName": format!("taskagent-{}", runner.id),
+            "runnerGroupId": runner.runner_group_id.unwrap_or(1),
+            "runnerGroupName": runner.runner_group_name.clone(),
+            "owningTenant": null,
+            "createdOn": "2026-01-01T00:00:00Z",
+            "lastConnectedOn": "2026-01-01T00:00:00",
+            "labels": runner.labels.iter().enumerate().map(|(i, l)| json!({"id": i + 1, "name": l, "type": "user"})).collect::<Vec<_>>(),
+            "authorization": {
+                "clientId": client_id,
+                "publicKey": {"exponent": "AQAB", "modulus": ""}
+            }
+        }]}));
     }
     // Return empty collection (not 404) — runner expects VssJsonCollectionWrapper format
     Json(json!({"count": 0, "value": []}))

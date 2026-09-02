@@ -48,6 +48,7 @@ glob.workspace = true
 hostname.workspace = true
 bytes.workspace = true
 serde_yaml.workspace = true
+hex.workspace = true
 regex.workspace = true
 zip.workspace = true
 

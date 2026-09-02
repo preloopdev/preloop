@@ -1,0 +1,80 @@
+name: Custom Shells
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-python-shell:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    steps:
+      - name: Run Python inline script
+        shell: python
+        run: |
+          print("Testing Python shell execution")
+          result = 2 + 2
+          print(f"Result: {result}")
+          if result == 4:
+            print("✓ Python arithmetic correct")
+          else:
+            print("✗ Python arithmetic failed")
+            exit(1)
+
+      - name: Verify Python exit code propagation
+        shell: python
+        run: |
+          import sys
+          print("Testing exit code")
+          sys.exit(0)
+
+  test-sh-shell:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    steps:
+      - name: Run POSIX sh script
+        shell: sh
+        run: |
+          echo "Testing POSIX sh execution"
+          RESULT=$((2 + 2))
+          echo "Result: $RESULT"
+          if [ "$RESULT" -eq 4 ]; then
+            echo "✓ sh arithmetic correct"
+          else
+            echo "✗ sh arithmetic failed"
+            exit 1
+          fi
+
+      - name: Verify sh exit code propagation
+        shell: sh
+        run: |
+          echo "Testing exit code in sh"
+          exit 0
+
+  test-shell-exit-codes:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    steps:
+      - name: Python exit with non-zero
+        id: python-nonzero
+        shell: python
+        run: |
+          print("Testing non-zero exit")
+          exit(42)
+        continue-on-error: true
+
+      - name: Verify Python exit code was non-zero
+        run: |
+          if [ ${{ steps.python-nonzero.outcome }} == "failure" ]; then
+            echo "✓ Python non-zero exit detected as failure"
+          else
+            echo "✗ Python non-zero exit not detected"
+            exit 1
+          fi
+        continue-on-error: true
+
+      - name: sh with non-zero exit
+        shell: sh
+        run: |
+          echo "Testing non-zero exit from sh"
+          exit 7
+        continue-on-error: true

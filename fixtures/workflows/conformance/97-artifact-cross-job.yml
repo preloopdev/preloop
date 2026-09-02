@@ -1,0 +1,44 @@
+name: 97-artifact-cross-job
+on:
+  workflow_dispatch:
+jobs:
+  upload-artifact:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    steps:
+      - name: Create test file
+        run: |
+          mkdir -p artifact-test
+          echo "test-artifact-content-12345" > artifact-test/test.txt
+          echo "File created with content: $(cat artifact-test/test.txt)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-artifact
+          path: artifact-test/test.txt
+
+  download-artifact:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    needs: upload-artifact
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: test-artifact
+          path: downloaded-artifact
+
+      - name: Verify artifact contents
+        run: |
+          if [ ! -f "downloaded-artifact/test.txt" ]; then
+            echo "ERROR: Downloaded file not found"
+            exit 1
+          fi
+          CONTENT=$(cat downloaded-artifact/test.txt)
+          echo "Downloaded file content: $CONTENT"
+          if [ "$CONTENT" != "test-artifact-content-12345" ]; then
+            echo "ERROR: Content mismatch"
+            exit 1
+          fi
+          echo "Artifact cross-job transfer verified"

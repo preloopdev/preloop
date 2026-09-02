@@ -747,6 +747,8 @@ async fn openapi_document_lists_native_surface_and_excludes_runner_protocol() {
     let document: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let paths = document["paths"].as_object().unwrap();
     assert!(paths.contains_key("/api/v1/runs"));
+    assert!(paths.contains_key("/api/v1/runs/{run_id}/logs"));
+    assert!(paths.contains_key("/api/v1/runs/{run_id}/logs/live"));
     assert!(paths.contains_key("/api/v1/debug/sessions"));
     assert!(!paths.keys().any(|path| path.starts_with("/_apis/")));
     assert!(!paths.keys().any(|path| path.starts_with("/broker/")));
@@ -2599,6 +2601,665 @@ async fn log_get_run_logs_returns_404_for_unknown_run() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// Build a two-job run and return `(run_id, [(job_id, plan_id, agent_job_id)])`
+/// ordered by request id, so filter tests can address either job.
+async fn two_job_run_for_log_filters(
+    app: &axum::Router,
+    state: &AppState,
+) -> (RunId, Vec<(String, String, String)>) {
+    let accepted = submit_yaml(
+        app,
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test
+"#,
+        "owner/repo",
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let jobs = {
+        let inner = state.inner.lock().await;
+        let mut requests: Vec<_> = inner
+            .job_requests
+            .values()
+            .filter(|request| request.run_id == run_id)
+            .collect();
+        requests.sort_by_key(|request| request.request_id);
+        requests
+            .into_iter()
+            .map(|request| {
+                (
+                    request.job_id.0.clone(),
+                    request.plan_id.clone(),
+                    request.agent_job_id.to_string(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(jobs.len(), 2, "fixture must produce two jobs");
+    (run_id, jobs)
+}
+
+async fn get_logs(app: &axum::Router, uri: String) -> (StatusCode, Vec<u8>) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, body.to_vec())
+}
+
+/// Write `job-logs.txt` for one job.
+async fn write_merged_job_log(temp: &tempfile::TempDir, plan: &str, agent: &str, body: &str) {
+    let dir = temp
+        .path()
+        .join("replay")
+        .join("results")
+        .join(plan)
+        .join(agent);
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    tokio::fs::write(dir.join("job-logs.txt"), body.as_bytes())
+        .await
+        .unwrap();
+}
+
+/// Write ordered per-step logs for one job. Mtimes are spaced so the handler's
+/// (mtime, name) ordering is deterministic.
+async fn write_step_job_logs(
+    temp: &tempfile::TempDir,
+    plan: &str,
+    agent: &str,
+    steps: &[(&str, &str)],
+) {
+    let dir = temp
+        .path()
+        .join("replay")
+        .join("results")
+        .join(plan)
+        .join(agent);
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    for (name, body) in steps {
+        tokio::fs::write(dir.join(format!("step-{name}.txt")), body.as_bytes())
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn log_run_logs_job_filter_returns_only_that_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    write_merged_job_log(&temp, &jobs[0].1, &jobs[0].2, "build output\n").await;
+    write_merged_job_log(&temp, &jobs[1].1, &jobs[1].2, "test output\n").await;
+
+    // Unfiltered still merges every job, in request order.
+    let (status, body) = get_logs(&app, format!("/api/v1/runs/{run_id}/logs")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"build output\ntest output\n");
+
+    // Filtering by the workflow job key returns only that job.
+    let (status, body) = get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=test")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body, b"test output\n",
+        "job filter must exclude the other job"
+    );
+
+    let (status, body) = get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=build")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"build output\n");
+}
+
+#[tokio::test]
+async fn log_run_logs_job_filter_accepts_agent_job_uuid() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    write_merged_job_log(&temp, &jobs[0].1, &jobs[0].2, "build output\n").await;
+    write_merged_job_log(&temp, &jobs[1].1, &jobs[1].2, "test output\n").await;
+
+    // The live-log feed accepts either identifier; so must this.
+    let agent_uuid = &jobs[1].2;
+    let (status, body) =
+        get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job={agent_uuid}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"test output\n");
+}
+
+#[tokio::test]
+async fn log_run_logs_unknown_job_is_404_not_whole_run() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    write_merged_job_log(&temp, &jobs[0].1, &jobs[0].2, "build output\n").await;
+
+    let (status, body) = get_logs(
+        &app,
+        format!("/api/v1/runs/{run_id}/logs?job=does-not-exist"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a bogus job must fail loudly, never fall back to the full run"
+    );
+    assert!(
+        !String::from_utf8_lossy(&body).contains("build output"),
+        "404 body must not leak the unfiltered log"
+    );
+}
+
+#[tokio::test]
+async fn log_run_logs_step_filter_selects_one_step() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    write_step_job_logs(
+        &temp,
+        &jobs[0].1,
+        &jobs[0].2,
+        &[
+            ("a", "step one\n"),
+            ("b", "step two\n"),
+            ("c", "step three\n"),
+        ],
+    )
+    .await;
+
+    for (step, expected) in [(1, "step one\n"), (2, "step two\n"), (3, "step three\n")] {
+        let (status, body) = get_logs(
+            &app,
+            format!("/api/v1/runs/{run_id}/logs?job=build&step={step}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "step {step}");
+        assert_eq!(body, expected.as_bytes(), "step {step} content");
+    }
+}
+
+#[tokio::test]
+async fn log_run_logs_step_filter_uses_workflow_step_ids() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let workflow_step_id = {
+        let mut inner = state.inner.lock().await;
+        let message = inner
+            .queue
+            .iter()
+            .find(|job| job.run_id == run_id && job.job_id.0 == "build")
+            .or_else(|| {
+                inner
+                    .pending_jobs
+                    .iter()
+                    .find(|job| job.run_id == run_id && job.job_id.0 == "build")
+            })
+            .map(|job| job.message.clone())
+            .expect("fixture must carry a queued build job");
+        let step_id = message
+            .steps
+            .first()
+            .map(|step| step.id.to_string())
+            .expect("fixture must carry a broker step id");
+        inner.broker_messages.insert(message.request_id, message);
+        step_id
+    };
+
+    // The synthetic file sorts first by upload time, but `step=1` must follow
+    // the workflow metadata and select the user step's external id.
+    write_step_job_logs(
+        &temp,
+        &jobs[0].1,
+        &jobs[0].2,
+        &[
+            ("synthetic-setup", "setup output\n"),
+            (&workflow_step_id, "user step output\n"),
+        ],
+    )
+    .await;
+
+    let (status, body) =
+        get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=build&step=1")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"user step output\n");
+}
+
+#[tokio::test]
+async fn log_run_logs_step_out_of_range_is_404() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    write_step_job_logs(
+        &temp,
+        &jobs[0].1,
+        &jobs[0].2,
+        &[("a", "step one\n"), ("b", "step two\n")],
+    )
+    .await;
+
+    let (status, body) =
+        get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=build&step=9")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let message = String::from_utf8_lossy(&body);
+    assert!(
+        message.contains('2'),
+        "error should report how many steps exist: {message}"
+    );
+}
+
+#[tokio::test]
+async fn log_run_logs_step_zero_is_rejected_as_one_based() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    write_step_job_logs(&temp, &jobs[0].1, &jobs[0].2, &[("a", "step one\n")]).await;
+
+    let (status, _) = get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=build&step=0")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn log_run_logs_step_on_merged_upload_is_conflict() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    // A merged job log carries no step boundaries.
+    write_merged_job_log(&temp, &jobs[0].1, &jobs[0].2, "everything\n").await;
+
+    let (status, body) =
+        get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=build&step=1")).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "must refuse rather than pass the whole job off as one step"
+    );
+    assert!(
+        !String::from_utf8_lossy(&body).contains("everything"),
+        "conflict body must not return the unsplit log"
+    );
+}
+
+#[tokio::test]
+async fn log_run_logs_step_without_job_in_multi_job_run_is_ambiguous() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    write_step_job_logs(&temp, &jobs[0].1, &jobs[0].2, &[("a", "step one\n")]).await;
+
+    let (status, body) = get_logs(&app, format!("/api/v1/runs/{run_id}/logs?step=1")).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "step numbering restarts per job, so this names two things"
+    );
+    let message = String::from_utf8_lossy(&body);
+    assert!(
+        message.contains("build") && message.contains("test"),
+        "error should name the candidate jobs: {message}"
+    );
+}
+
+#[tokio::test]
+async fn log_run_logs_step_filter_works_on_live_console_blocks() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+
+    // Nothing on disk yet — a job still in flight streams numbered console
+    // blocks, one per step, and `--step` must work against those too.
+    for (log_id, body) in [("2", "live step two\n"), ("10", "live step ten\n")] {
+        let plan = &jobs[0].1;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/_apis/v1/Logfiles/scope/actions/{plan}/{log_id}"))
+                    .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    // Numeric console-log order, not lexicographic: 2 precedes 10.
+    let (status, body) =
+        get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=build&step=1")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"live step two\n");
+
+    let (status, body) =
+        get_logs(&app, format!("/api/v1/runs/{run_id}/logs?job=build&step=2")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"live step ten\n");
+}
+
+#[tokio::test]
+async fn live_run_logs_native_route_requires_job_when_ambiguous() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, _jobs) = two_job_run_for_log_filters(&app, &state).await;
+
+    let (status, body) = get_logs(&app, format!("/api/v1/runs/{run_id}/logs/live")).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "two jobs cannot be followed on one stream"
+    );
+    let message = String::from_utf8_lossy(&body);
+    assert!(
+        message.contains("build") && message.contains("test"),
+        "error should name the candidate jobs: {message}"
+    );
+}
+
+#[tokio::test]
+async fn live_run_logs_native_route_rejects_unknown_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, _jobs) = two_job_run_for_log_filters(&app, &state).await;
+
+    let (status, _) = get_logs(&app, format!("/api/v1/runs/{run_id}/logs/live?job=nope")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn live_run_logs_native_route_rejects_uuid_from_other_run() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (_foreign_run_id, foreign_jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let (run_id, _jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let foreign_job_uuid = foreign_jobs[0].2.clone();
+
+    // Leave a globally keyed buffer behind, then ask for that UUID through a
+    // different run. A live-log key is not a sufficient authorization to read
+    // another run's output.
+    crate::live_logs::record_live_log_wrapper(
+        &state.shared(),
+        &foreign_job_uuid,
+        preloop_gha_protocol::LiveLogFeedLinesWrapper {
+            step_id: "foreign".into(),
+            start_line: 1,
+            count: 1,
+            value: vec!["must stay private".into()],
+        },
+    )
+    .await;
+
+    let (status, body) = get_logs(
+        &app,
+        format!("/api/v1/runs/{run_id}/logs/live?job={foreign_job_uuid}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        !String::from_utf8_lossy(&body).contains("must stay private"),
+        "cross-run UUID lookup must not expose the foreign buffer"
+    );
+}
+
+#[tokio::test]
+async fn live_run_logs_native_route_defaults_single_job_run() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let accepted = submit_yaml(
+        &app,
+        "on: push\njobs:\n  only:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        "owner/repo",
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    // One job means no ambiguity, so omitting `job` must stream rather than 400.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/v1/runs/{run_id}/logs/live"))
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/event-stream"
+    );
+}
+
+#[tokio::test]
+async fn live_run_logs_native_route_rejects_unauthenticated() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, _jobs) = two_job_run_for_log_filters(&app, &state).await;
+
+    // The runner-protocol twin of this route is unreachable with a native
+    // bearer; this one must still refuse an anonymous caller.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/v1/runs/{run_id}/logs/live?job=build"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Drive one job of a run to a terminal status through the same path every
+/// completion funnels through (`complete_job_inner`).
+async fn complete_job(state: &AppState, run_id: RunId, job_id: &str, status: ExecutionStatus) {
+    let _ = crate::distributed_task::complete_job_inner(
+        state.shared(),
+        preloop_gha_protocol::JobCompletion {
+            run_id,
+            job_id: preloop_gha_protocol::JobId(job_id.to_owned()),
+            status,
+            outputs: Default::default(),
+            annotations: Vec::new(),
+            step_results: Vec::new(),
+        },
+    )
+    .await
+    .expect("completion should succeed");
+}
+
+/// Read an SSE response body to its end, failing (rather than hanging the test
+/// run) if the stream does not close within a short window. A live-log stream
+/// that never ends is exactly the bug these tests guard against.
+async fn read_sse_to_end(response: Response) -> String {
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("live-log stream must close, not hang")
+    .expect("body readable");
+    String::from_utf8_lossy(&body).into_owned()
+}
+
+async fn open_live(app: &axum::Router, uri: String) -> Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn live_log_stream_ends_when_job_completes() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let build_uuid = jobs[0].2.clone();
+
+    // Emit a line so a follower has something, then open the stream.
+    crate::live_logs::record_live_log_wrapper(
+        &state.shared(),
+        &build_uuid,
+        preloop_gha_protocol::LiveLogFeedLinesWrapper {
+            step_id: "s1".into(),
+            start_line: 1,
+            count: 1,
+            value: vec!["building...".into()],
+        },
+    )
+    .await;
+
+    let response = open_live(&app, format!("/api/v1/runs/{run_id}/logs/live?job=build")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Complete the job on another task; the open stream must then end on its
+    // own, carrying the line that was already buffered.
+    let completer = {
+        let state = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            complete_job(&state, run_id, "build", ExecutionStatus::Success).await;
+        })
+    };
+    let body = read_sse_to_end(response).await;
+    completer.await.unwrap();
+    assert!(
+        body.contains("building..."),
+        "the buffered line must survive the close: {body}"
+    );
+}
+
+#[tokio::test]
+async fn live_log_stream_for_already_completed_job_serves_snapshot_and_ends() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let build_uuid = jobs[0].2.clone();
+
+    crate::live_logs::record_live_log_wrapper(
+        &state.shared(),
+        &build_uuid,
+        preloop_gha_protocol::LiveLogFeedLinesWrapper {
+            step_id: "s1".into(),
+            start_line: 1,
+            count: 1,
+            value: vec!["already done".into()],
+        },
+    )
+    .await;
+    // Complete BEFORE anyone connects — the late follower must still get the
+    // retained snapshot and then a clean end, never a hang.
+    complete_job(&state, run_id, "build", ExecutionStatus::Success).await;
+
+    let response = open_live(&app, format!("/api/v1/runs/{run_id}/logs/live?job=build")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_sse_to_end(response).await;
+    assert!(
+        body.contains("already done"),
+        "a late follower still gets the snapshot: {body}"
+    );
+}
+
+#[tokio::test]
+async fn live_log_stream_ends_on_cancellation() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, _jobs) = two_job_run_for_log_filters(&app, &state).await;
+
+    let response = open_live(&app, format!("/api/v1/runs/{run_id}/logs/live?job=build")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let completer = {
+        let state = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Cancellation is a terminal status and must close the feed too.
+            complete_job(&state, run_id, "build", ExecutionStatus::Cancelled).await;
+        })
+    };
+    // Completes only because the cancel closed the stream.
+    let _ = read_sse_to_end(response).await;
+    completer.await.unwrap();
+}
+
+#[tokio::test]
+async fn live_log_reopens_when_a_completed_job_streams_again() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let build_uuid = jobs[0].2.clone();
+
+    complete_job(&state, run_id, "build", ExecutionStatus::Failure).await;
+    // A retry reuses the agent job and streams fresh lines: the feed must
+    // reopen so a follower attaching now subscribes instead of ending early.
+    crate::live_logs::record_live_log_wrapper(
+        &state.shared(),
+        &build_uuid,
+        preloop_gha_protocol::LiveLogFeedLinesWrapper {
+            step_id: "retry".into(),
+            start_line: 1,
+            count: 1,
+            value: vec!["second attempt".into()],
+        },
+    )
+    .await;
+
+    {
+        let inner = state.inner.lock().await;
+        assert!(
+            !inner.live_log_closed.contains(&build_uuid),
+            "fresh ingest must clear the closed mark"
+        );
+    }
 }
 
 #[tokio::test]
@@ -12371,6 +13032,98 @@ async fn workflow_steps_update_prefers_runner_reported_step_names() {
             .all(|step| !step["name"].as_str().unwrap_or("").is_empty()),
         "no step may have an empty name in the run record: {steps:?}"
     );
+}
+
+#[tokio::test]
+async fn workflow_steps_update_preserves_duplicate_names_after_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = submit_yaml(
+        &app,
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - name: Test\n        run: cargo test --lib\n      - name: Test\n        run: cargo test --integration\n",
+        "local/preloop",
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+    let (plan_id, agent_job_id, request_id) = {
+        let inner = state.inner.lock().await;
+        let request = inner
+            .job_requests
+            .values()
+            .find(|request| request.run_id.0.to_string() == run_id)
+            .expect("submitted run must have a job request");
+        (
+            request.plan_id.clone(),
+            request.agent_job_id.to_string(),
+            request.request_id,
+        )
+    };
+    let first_id = uuid::Uuid::new_v4().to_string();
+    let second_id = uuid::Uuid::new_v4().to_string();
+
+    let response = request_json(
+        &app,
+        Method::POST,
+        "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",
+        json!({
+            "workflow_run_backend_id": plan_id,
+            "workflow_job_run_backend_id": agent_job_id,
+            "steps": [
+                {
+                    "external_id": first_id,
+                    "number": 1,
+                    "name": "Test",
+                    "status": 6,
+                    "conclusion": 2
+                },
+                {
+                    "external_id": second_id,
+                    "number": 2,
+                    "name": "Test",
+                    "status": 6,
+                    "conclusion": 2
+                }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(response["ok"], true);
+
+    {
+        let mut inner = state.inner.lock().await;
+        inner.broker_messages.remove(&request_id);
+    }
+    let run = get_run_json(&app, &run_id).await;
+    let steps = run["jobs_list"][0]["steps"].as_array().unwrap();
+    assert_eq!(
+        steps.len(),
+        2,
+        "duplicate names must remain separate: {steps:?}"
+    );
+    assert_eq!(steps[0]["id"], first_id);
+    assert_eq!(steps[1]["id"], second_id);
+
+    write_step_job_logs(
+        &temp,
+        &plan_id,
+        &agent_job_id,
+        &[
+            (&first_id, "first duplicate\n"),
+            (&second_id, "second duplicate\n"),
+        ],
+    )
+    .await;
+    for (step, expected) in [(1, "first duplicate\n"), (2, "second duplicate\n")] {
+        let (status, body) = get_logs(
+            &app,
+            format!("/api/v1/runs/{run_id}/logs?job=build&step={step}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, expected.as_bytes());
+    }
 }
 
 #[tokio::test]

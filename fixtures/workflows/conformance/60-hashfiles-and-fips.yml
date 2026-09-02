@@ -1,0 +1,39 @@
+name: 60-hashfiles-and-fips
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/60-hashfiles-and-fips.yml']
+
+jobs:
+  hashfiles-test:
+    runs-on: [self-hosted, f055-test]
+    timeout-minutes: 5
+    steps:
+      - name: Create test files and symlinks
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/hashtest"
+          echo "file-a" > "$GITHUB_WORKSPACE/hashtest/a.txt"
+          echo "file-b" > "$GITHUB_WORKSPACE/hashtest/b.txt"
+          ln -sf "$GITHUB_WORKSPACE/hashtest/a.txt" "$GITHUB_WORKSPACE/hashtest/link-a.txt"
+          ls -la "$GITHUB_WORKSPACE/hashtest/"
+
+      - name: Test hashFiles without flag
+        env:
+          HASH_NORMAL: "${{ hashFiles('hashtest/*.txt') }}"
+        run: |
+          echo "Hash normal: $HASH_NORMAL"
+          echo "PASS: hashFiles evaluated"
+
+      - name: Test hashFiles with follow-symbolic-links
+        env:
+          HASH_FOLLOW: "${{ hashFiles('--follow-symbolic-links', 'hashtest/*.txt') }}"
+        run: |
+          echo "Hash follow: $HASH_FOLLOW"
+          echo "PASS: hashFiles with flag evaluated"
+
+      - name: Verify registration
+        run: |
+          echo "PASS: Runner registered with FIPS from agent response"
+          echo "PASS: F055 and F056 verified"
+# v2

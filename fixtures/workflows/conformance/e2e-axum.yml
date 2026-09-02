@@ -1,0 +1,55 @@
+name: E2E axum
+on: workflow_dispatch
+
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: tokio-rs/axum
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: tokio-rs/axum
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    name: Test
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: tokio-rs/axum
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace --all-features
+        env:
+          RUST_BACKTRACE: 1
+
+  doc:
+    name: Documentation
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: tokio-rs/axum
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo doc --workspace --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -Dwarnings

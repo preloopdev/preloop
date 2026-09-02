@@ -1,0 +1,14 @@
+name: mitm defaults run
+on: workflow_dispatch
+defaults:
+  run:
+    shell: bash
+    working-directory: /tmp
+jobs:
+  build:
+    runs-on: [self-hosted, mitm]
+    steps:
+      - run: pwd
+      - run: echo "shell=$0"
+      - run: echo "outside default dir"
+        working-directory: /

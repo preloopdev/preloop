@@ -458,12 +458,28 @@ pub fn build_agent_job_message_with_normalized_context(
     // reaching action processes — moby's `DESTDIR` driving `docker buildx
     // bake` HCL variables is the canonical case — silently see empty values:
     // bake resolves `${DESTDIR}` to `""` and drops the target's output.
-    // Emit one plain object per variable; the runner's template-map reader
-    // accepts that shape (and the `{map: [{Key, Value}]}` form upstream
-    // sends).
+    // Emit one TemplateToken-shaped mapping per variable. The official
+    // runner deserializes `EnvironmentVariables` into `IList<TemplateToken>`
+    // via its Newtonsoft TemplateToken converter, which only understands the
+    // `{type: 2, map: [{Key: {type: 0, lit: K}, Value: ...}]}` wire shape; a
+    // plain JSON object deserializes to a token the schema evaluator rejects
+    // with "The template is not valid. Unexpected value ''". Most values here
+    // are already resolved literals, but runtime-only ones (e.g.
+    // `${{ github.workspace }}/bin`, preserved above) are still templates the
+    // runner must evaluate at step time — so serialize the value through
+    // `template_string_token`, which emits a literal (type 0) for plain text
+    // and an expression/format token for anything containing `${{ … }}`.
     let environment_variables: Vec<serde_json::Value> = resolved_env
         .iter()
-        .map(|(k, v)| serde_json::json!({ k: v }))
+        .map(|(k, v)| {
+            serde_json::json!({
+                "type": 2,
+                "map": [{
+                    "Key": { "type": 0, "lit": k },
+                    "Value": template_string_token(v)
+                }]
+            })
+        })
         .collect();
 
     // GitHub supplies baseline regexes in addition to value-derived secret masks.
@@ -1020,6 +1036,36 @@ jobs:
     /// Job/workflow-level `env:` must reach the wire as
     /// `environmentVariables` (the field the official runner materializes
     /// into step environments), not only as `variables`.
+    /// Flatten the TemplateToken-shaped `environmentVariables` entries back
+    /// into key/value pairs (mirror of what the official runner reads).
+    fn template_token_env_pairs(value: &serde_json::Value) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        if let Some(map) = value.get("map").and_then(|m| m.as_array()) {
+            for pair in map {
+                let key = pair
+                    .get("Key")
+                    .and_then(|k| k.get("lit"))
+                    .and_then(|l| l.as_str())
+                    .map(str::to_owned);
+                let val = pair
+                    .get("Value")
+                    .and_then(|v| v.get("lit"))
+                    .and_then(|l| l.as_str())
+                    .map(str::to_owned);
+                if let (Some(k), Some(v)) = (key, val) {
+                    out.push((k, v));
+                }
+            }
+        } else if let Some(obj) = value.as_object() {
+            for (k, v) in obj {
+                if let Some(v) = v.as_str() {
+                    out.push((k.clone(), v.to_owned()));
+                }
+            }
+        }
+        out
+    }
+
     #[test]
     fn job_env_is_exposed_on_environment_variables() {
         let workflow = parse_workflow(
@@ -1050,15 +1096,32 @@ jobs:
         let env: std::collections::BTreeMap<String, String> = message
             .environment_variables
             .iter()
-            .flat_map(|value| {
-                value.as_object().into_iter().flat_map(|obj| {
-                    obj.iter()
-                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
-                })
-            })
+            .flat_map(template_token_env_pairs)
             .collect();
         assert_eq!(env.get("DESTDIR").map(String::as_str), Some("./build"));
         assert_eq!(env.get("GLOBAL_VAR").map(String::as_str), Some("gv"));
+        // The wire shape must be the TemplateToken map the official runner's
+        // converter accepts (type 2 map of literal Key/Value tokens), not a
+        // plain object — otherwise the runner rejects it as "not valid".
+        for entry in &message.environment_variables {
+            assert_eq!(
+                entry["type"],
+                serde_json::json!(2),
+                "env entry must be a TemplateToken map: {entry}"
+            );
+            let map = entry["map"].as_array().expect("map array");
+            assert_eq!(map.len(), 1, "one Key/Value pair per entry: {entry}");
+            let pair = &map[0];
+            assert_eq!(pair["Key"]["type"], serde_json::json!(0));
+            assert!(
+                pair["Key"]["lit"].is_string(),
+                "Key must be a literal token"
+            );
+            assert!(
+                pair["Value"].get("type").is_some(),
+                "Value must be a token: {entry}"
+            );
+        }
         assert_eq!(
             message
                 .variables
@@ -1107,12 +1170,7 @@ jobs:
         let env: std::collections::BTreeMap<String, String> = message
             .environment_variables
             .iter()
-            .flat_map(|value| {
-                value.as_object().into_iter().flat_map(|obj| {
-                    obj.iter()
-                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
-                })
-            })
+            .flat_map(template_token_env_pairs)
             .collect();
         assert_eq!(
             env.get("ENABLED").map(String::as_str),
@@ -1120,6 +1178,63 @@ jobs:
             "the ref_name comparison must resolve to a boolean literal"
         );
         assert_eq!(env.get("PLAIN").map(String::as_str), Some("hello"));
+    }
+
+    /// Runtime-only expressions (`github.workspace` is filled in by the runner)
+    /// must reach the runner as an expression token to evaluate, not as a raw
+    /// literal of the template text.
+    #[test]
+    fn job_env_runtime_expression_values_reach_the_runner_as_tokens() {
+        let workflow = parse_workflow(
+            r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      BIN_DIR: ${{ github.workspace }}/bin
+    steps:
+      - run: echo hi
+"#,
+        )
+        .unwrap();
+        let plan = &crate::expand_jobs(&workflow).unwrap()[0];
+        let message = build_agent_job_message(
+            plan,
+            &serde_json::json!({"event_name": "push"}),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let value = message
+            .environment_variables
+            .iter()
+            .find_map(|entry| {
+                let pair = entry.get("map")?.as_array()?.first()?;
+                if pair.get("Key")?.get("lit")?.as_str()? == "BIN_DIR" {
+                    Some(pair.get("Value")?.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("BIN_DIR must be present on the wire");
+        assert_ne!(
+            value["type"],
+            serde_json::json!(0),
+            "a runtime expression must not be shipped as a raw literal: {value}"
+        );
+        assert!(
+            value.get("lit").is_none(),
+            "expression value must not carry a raw lit: {value}"
+        );
+        assert!(
+            value["expr"]
+                .as_str()
+                .unwrap_or("")
+                .contains("github.workspace"),
+            "the value token must reference github.workspace: {value}"
+        );
     }
 
     #[test]

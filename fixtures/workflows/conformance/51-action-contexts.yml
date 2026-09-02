@@ -1,0 +1,30 @@
+name: 51-action-contexts
+on:
+  workflow_dispatch:
+  push:
+    paths: ['.github/workflows/51-action-contexts.yml']
+
+jobs:
+  action-contexts:
+    runs-on: [self-hosted, f044-test]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assert action contexts after checkout
+        run: |
+          echo "=== github context after actions/checkout ==="
+          echo "action_repository=${{ github.action_repository }}"
+          echo "action_ref=${{ github.action_ref }}"
+          echo "action=${{ github.action }}"
+          echo "action_path=${{ github.action_path }}"
+
+          if [ "${{ github.action_repository }}" != "actions/checkout" ]; then
+            echo "FAIL: action_repository='${{ github.action_repository }}' expected 'actions/checkout'"
+            exit 1
+          fi
+          if [ -z "${{ github.action_ref }}" ]; then
+            echo "FAIL: action_ref is empty"
+            exit 1
+          fi
+          echo "PASS: action_repository and action_ref are set correctly"

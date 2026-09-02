@@ -6,6 +6,7 @@
 //! and draft PR creation.
 
 mod compare;
+mod coverage;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::OsStr;
@@ -61,6 +62,8 @@ enum Commands {
     Run(RunArgs),
     /// Write default config and surface map.
     Init(InitArgs),
+    /// Report golden coverage of implemented runner-facing routes (finding #2).
+    Coverage(CoverageArgs),
 }
 
 #[derive(Debug, Args)]
@@ -130,6 +133,12 @@ struct ConformArgs {
     /// Skip cargo test --workspace before replay.
     #[arg(long)]
     skip_cargo_test: bool,
+    /// Also gate normalized response *values* (finding #4) for every shared
+    /// endpoint except known-volatile ones (tokens, OIDC, signed blob URLs,
+    /// connectionData). Off by default: the default gate preserves the legacy
+    /// status + schema semantics and only *reports* value diffs.
+    #[arg(long)]
+    value_gate_strict: bool,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -167,6 +176,21 @@ struct InitArgs {
     /// Overwrite existing config/surface map.
     #[arg(long)]
     force: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+struct CoverageArgs {
+    /// Runner version whose golden corpus to measure. Defaults to the last
+    /// reconciled version recorded in `.runner-watch/state.json`.
+    #[arg(long)]
+    runner: Option<String>,
+    /// Server router source to scrape for implemented routes.
+    #[arg(long, default_value = "crates/preloop-runner-server/src/routes.rs")]
+    routes_src: PathBuf,
+    /// Fail when any runner-facing route has no golden coverage (minus the
+    /// `.runner-watch/coverage-allow.txt` allowlist).
+    #[arg(long)]
+    strict: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -399,6 +423,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Pr(args) => pr(&config, &args).await,
         Commands::Run(args) => run_all(&config, &args).await,
         Commands::Init(args) => init_files(&config, &args).await,
+        Commands::Coverage(args) => coverage_cmd(&config, &args).await,
     }
 }
 
@@ -718,7 +743,226 @@ fn extract_delta_entries(
     out
 }
 
+/// Structural model of a C# source file collected from the tree-sitter parse
+/// tree. `types` holds `(type_name, 1-based line)` for every type declaration;
+/// `members` holds `(enclosing_type_name, member_name, 1-based line)` for every
+/// member (properties, fields, methods, enum members, record positional
+/// parameters). Members at file/namespace scope use `<module>` as the enclosing
+/// name, matching the old line-heuristic default.
+/// C# structural model extracted from one source file: declared types and
+/// their members, each with a 1-based line, used to diff API surface.
+#[derive(Default)]
+struct CsModel {
+    types: Vec<(String, usize)>,
+    members: Vec<(String, String, usize)>,
+}
+
+/// UTF-8 text of a tree-sitter node (empty on invalid UTF-8).
+fn node_text<'a>(node: tree_sitter::Node, src: &'a [u8]) -> &'a str {
+    node.utf8_text(src).unwrap_or("")
+}
+
+/// A method's identity for delta detection: `name<arity>(mod type, …)`. Generic
+/// arity and each parameter's passing mode + type are all part of a C# method
+/// signature, so overloads that differ only by `ref`/`out`/`in` or by type-
+/// parameter count produce distinct keys and are not lost when members are keyed
+/// by `(type, name)`.
+fn method_signature(name: &str, node: tree_sitter::Node, src: &[u8]) -> String {
+    // Generic arity: `M<T>` and `M<T, U>` are distinct signatures.
+    let mut arity = 0usize;
+    let mut top = node.walk();
+    for child in node.named_children(&mut top) {
+        if child.kind() == "type_parameter_list" {
+            let mut c = child.walk();
+            arity = child
+                .named_children(&mut c)
+                .filter(|n| n.kind() == "type_parameter")
+                .count();
+        }
+    }
+    // Each parameter contributes its passing-mode modifiers + type (e.g.
+    // `ref int`), taken from the `type` field and the modifier tokens — never
+    // from the raw text, whose default value can contain the parameter name and
+    // truncate a text slice (`string s = "s"`).
+    let mut params = Vec::new();
+    if let Some(plist) = node.child_by_field_name("parameters") {
+        let mut cursor = plist.walk();
+        for p in plist.named_children(&mut cursor) {
+            if p.kind() != "parameter" {
+                continue;
+            }
+            let mut mods = Vec::new();
+            let mut pc = p.walk();
+            for c in p.children(&mut pc) {
+                // tree-sitter-c-sharp wraps `ref`/`out`/`in`/`params`/… in a
+                // `modifier` node.
+                if c.kind() == "modifier" {
+                    mods.push(node_text(c, src).to_string());
+                }
+            }
+            let sig = match p.child_by_field_name("type") {
+                Some(t) if mods.is_empty() => node_text(t, src).to_string(),
+                Some(t) => format!("{} {}", mods.join(" "), node_text(t, src)),
+                // No type field (rare): fall back to text before any default.
+                None => node_text(p, src)
+                    .split('=')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+            };
+            params.push(sig);
+        }
+    }
+    let base = if arity > 0 {
+        format!("{name}<{arity}>")
+    } else {
+        name.to_string()
+    };
+    format!("{base}({})", params.join(", "))
+}
+
+/// Parse `text` as C# and collect its structural model. Returns `None` only when
+/// tree-sitter cannot produce a tree at all, in which case callers fall back to
+/// the line-heuristic path so extraction never regresses to empty output.
+fn parse_csharp(text: &str) -> Option<CsModel> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(text, None)?;
+    // A recovery tree with syntax errors would yield an incomplete model and
+    // silently skip declarations; fall back to the line heuristic instead.
+    if tree.root_node().has_error() {
+        return None;
+    }
+    let mut model = CsModel::default();
+    collect_csharp(tree.root_node(), "<module>", text.as_bytes(), &mut model);
+    Some(model)
+}
+
+/// Walk a C# syntax tree, recording type declarations and their members
+/// (properties, fields, enum members, record parameters, method signatures)
+/// into `model`, attributing members to their enclosing type.
+fn collect_csharp(node: tree_sitter::Node, enclosing: &str, src: &[u8], model: &mut CsModel) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "class_declaration"
+            | "struct_declaration"
+            | "record_declaration"
+            | "enum_declaration"
+            | "interface_declaration" => {
+                let name = child
+                    .child_by_field_name("name")
+                    .map(|n| node_text(n, src).to_string())
+                    .unwrap_or_default();
+                if !name.is_empty() {
+                    model
+                        .types
+                        .push((name.clone(), child.start_position().row + 1));
+                }
+                // Record positional parameters are members of the record type.
+                if child.kind() == "record_declaration" {
+                    let mut c2 = child.walk();
+                    for gc in child.named_children(&mut c2) {
+                        if gc.kind() == "parameter_list" {
+                            let mut c3 = gc.walk();
+                            for p in gc.named_children(&mut c3) {
+                                if p.kind() == "parameter" {
+                                    if let Some(pn) = p.child_by_field_name("name") {
+                                        model.members.push((
+                                            name.clone(),
+                                            node_text(pn, src).to_string(),
+                                            p.start_position().row + 1,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(body) = child.child_by_field_name("body") {
+                    collect_csharp(body, &name, src, model);
+                }
+            }
+            "property_declaration" | "enum_member_declaration" => {
+                if let Some(n) = child.child_by_field_name("name") {
+                    model.members.push((
+                        enclosing.to_string(),
+                        node_text(n, src).to_string(),
+                        child.start_position().row + 1,
+                    ));
+                }
+            }
+            // Methods are keyed by name + parameter types, so an added or
+            // removed overload produces a distinct member entry instead of
+            // collapsing onto the existing name (the `(structure, member)` map
+            // would otherwise hide it entirely).
+            "method_declaration" => {
+                if let Some(n) = child.child_by_field_name("name") {
+                    model.members.push((
+                        enclosing.to_string(),
+                        method_signature(node_text(n, src), child, src),
+                        child.start_position().row + 1,
+                    ));
+                }
+            }
+            "field_declaration" => {
+                let mut c2 = child.walk();
+                for gc in child.named_children(&mut c2) {
+                    if gc.kind() == "variable_declaration" {
+                        let mut c3 = gc.walk();
+                        for vd in gc.named_children(&mut c3) {
+                            if vd.kind() == "variable_declarator" {
+                                if let Some(n) = vd.child_by_field_name("name") {
+                                    model.members.push((
+                                        enclosing.to_string(),
+                                        node_text(n, src).to_string(),
+                                        child.start_position().row + 1,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => collect_csharp(child, enclosing, src, model),
+        }
+    }
+}
+
+/// Type declarations `(name, 1-based line)` for a file, via tree-sitter with a
+/// line-heuristic fallback when the parser cannot produce a tree.
+fn csharp_type_decls(text: &str) -> Vec<(String, usize)> {
+    match parse_csharp(text) {
+        Some(model) => model.types,
+        None => text
+            .lines()
+            .enumerate()
+            .filter_map(|(idx, line)| class_or_struct_name(line.trim()).map(|n| (n, idx + 1)))
+            .collect(),
+    }
+}
+
+/// `(type, member) -> 1-based line` for a C# file via tree-sitter, falling
+/// back to the line heuristic when the parser cannot produce a tree.
 fn extract_fields(text: &str) -> BTreeMap<(String, String), usize> {
+    match parse_csharp(text) {
+        Some(model) => {
+            let mut fields = BTreeMap::new();
+            for (structure, member, line) in model.members {
+                fields.insert((structure, member), line);
+            }
+            fields
+        }
+        None => extract_fields_heuristic(text),
+    }
+}
+
+/// Line-heuristic fallback used when tree-sitter cannot parse a file. Only
+/// recognizes auto-properties attributed to the nearest class/struct/enum line.
+fn extract_fields_heuristic(text: &str) -> BTreeMap<(String, String), usize> {
     let mut fields = BTreeMap::new();
     let mut current = "<module>".to_string();
     for (idx, line) in text.lines().enumerate() {
@@ -854,45 +1098,36 @@ fn extract_tokens(line: &str) -> Vec<String> {
 }
 
 fn extract_symbol_additions(rel: &str, change_type: &str, text: &str) -> Vec<DeltaEntry> {
-    text.lines()
-        .enumerate()
-        .filter_map(|(idx, line)| {
-            let name = class_or_struct_name(line.trim())?;
-            if !(name.ends_with("Message") || name.ends_with("Ref")) {
-                return None;
-            }
-            Some(DeltaEntry {
-                file: rel.to_string(),
-                structure: Some(name.clone()),
-                change_type: change_type.to_string(),
-                fields: vec![name],
-                snippet: context_for(text, idx + 1),
-            })
+    csharp_type_decls(text)
+        .into_iter()
+        .filter(|(name, _)| name.ends_with("Message") || name.ends_with("Ref"))
+        .map(|(name, line)| DeltaEntry {
+            file: rel.to_string(),
+            structure: Some(name.clone()),
+            change_type: change_type.to_string(),
+            fields: vec![name],
+            snippet: context_for(text, line),
         })
         .collect()
 }
 
 fn extract_message_type_changes(rel: &str, older: &str, newer: &str) -> Vec<DeltaEntry> {
-    let old: BTreeSet<String> = older
-        .lines()
-        .filter_map(|l| class_or_struct_name(l.trim()))
+    let old: BTreeSet<String> = csharp_type_decls(older)
+        .into_iter()
+        .map(|(name, _)| name)
         .filter(|n| n.ends_with("Message") || n.ends_with("Ref"))
         .collect();
-    newer
-        .lines()
-        .enumerate()
-        .filter_map(|(idx, line)| {
-            let name = class_or_struct_name(line.trim())?;
-            if !(name.ends_with("Message") || name.ends_with("Ref")) || old.contains(&name) {
-                return None;
-            }
-            Some(DeltaEntry {
-                file: rel.to_string(),
-                structure: Some(name.clone()),
-                change_type: "message_type_added".to_string(),
-                fields: vec![name],
-                snippet: context_for(newer, idx + 1),
-            })
+    csharp_type_decls(newer)
+        .into_iter()
+        .filter(|(name, _)| {
+            (name.ends_with("Message") || name.ends_with("Ref")) && !old.contains(name)
+        })
+        .map(|(name, line)| DeltaEntry {
+            file: rel.to_string(),
+            structure: Some(name.clone()),
+            change_type: "message_type_added".to_string(),
+            fields: vec![name],
+            snippet: context_for(newer, line),
         })
         .collect()
 }
@@ -1639,6 +1874,26 @@ async fn conform(config: &Config, args: &ConformArgs) -> anyhow::Result<()> {
     fs::create_dir_all(&report_root)?;
     let mut failures = Vec::new();
     let mut reports = Vec::new();
+    // The gate is computed from a structured comparison (finding #1), not by
+    // scraping the markdown report. `--value-gate-strict` additionally gates
+    // normalized response values (finding #4).
+    let policy = compare::GatePolicy {
+        value_gate: if args.value_gate_strict {
+            compare::ValueGate::AllExcept(vec![
+                "/oauth2".to_owned(),
+                "/messages".to_owned(),
+                "/connectionData".to_owned(),
+                "registration".to_owned(),
+                "SignedBlobURL".to_owned(),
+                "/idtoken".to_owned(),
+                "oidctoken".to_owned(),
+            ])
+        } else {
+            compare::ValueGate::Off
+        },
+        ..compare::GatePolicy::default()
+    };
+    let mut results: Vec<serde_json::Value> = Vec::new();
     for golden in scenarios {
         let scenario = golden
             .file_name()
@@ -1656,20 +1911,43 @@ async fn conform(config: &Config, args: &ConformArgs) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("replay scenario {scenario}"))?;
         let report = report_root.join(format!("{scenario}.md"));
+        // Human-readable artifact (no longer parsed for the verdict).
         run_compare(config, &scenario, &baseline_dir, &replay_dir, &report).await?;
-        let text = fs::read_to_string(&report).unwrap_or_default();
-        if text.contains("official only")
-            && !text.contains("_No endpoints present only in official._")
-            || text.contains("Status codes:")
-                && text.contains("official:")
-                && text.contains("preloop:")
-                && status_mismatch_in_report(&text)
-            || schema_mismatch_in_report(&text)
-        {
-            failures.push((scenario.clone(), report.display().to_string()));
+        // Structured verdict — the source of truth for pass/fail.
+        let analysis = compare::analyze(&compare::Args {
+            scenario: &scenario,
+            left_dir: &baseline_dir,
+            right_dir: &replay_dir,
+            output: &report,
+            left_label: "official",
+            right_label: "preloop",
+        })
+        .with_context(|| format!("analyze scenario {scenario}"))?;
+        let scenario_failures = analysis.failures(&policy);
+        let result_json = analysis.to_json(&policy);
+        fs::write(
+            report_root.join(format!("{scenario}.json")),
+            serde_json::to_string_pretty(&result_json)?,
+        )?;
+        if !scenario_failures.is_empty() {
+            let detail = scenario_failures
+                .iter()
+                .map(|f| format!("{} {} ({})", f.endpoint, f.kind.as_str(), f.detail))
+                .collect::<Vec<_>>()
+                .join("; ");
+            failures.push((scenario.clone(), format!("{} — {detail}", report.display())));
         }
+        results.push(result_json);
         reports.push(report);
     }
+    fs::write(
+        report_root.join("conformance-result.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "scenarios": results,
+            "passed": failures.is_empty(),
+            "failed_scenarios": failures.iter().map(|(s, _)| s.clone()).collect::<Vec<_>>(),
+        }))?,
+    )?;
     write_conformance_summary(&report_root, &reports, &failures)?;
     if !failures.is_empty() {
         write_conformance_fail(&failures)?;
@@ -1699,16 +1977,32 @@ fn normalize_version_dir(runner: &str) -> String {
 fn scenario_dirs(root: &Path, only: Option<&str>) -> anyhow::Result<Vec<PathBuf>> {
     let mut dirs = Vec::new();
     if let Some(name) = only {
-        let dir = root.join(name);
-        if !dir.join("flows.jsonl").exists() {
-            bail!("scenario flows not found: {}", dir.display());
+        let direct = root.join(name);
+        if direct.join("flows.jsonl").exists() {
+            return Ok(vec![direct]);
         }
-        return Ok(vec![dir]);
+        let nested = root.join("gh-official").join(name);
+        if nested.join("flows.jsonl").exists() {
+            return Ok(vec![nested]);
+        }
+        bail!(
+            "scenario flows not found for {name} under {}",
+            root.display()
+        );
     }
     for entry in fs::read_dir(root)? {
         let path = entry?.path();
-        if path.is_dir() && path.join("flows.jsonl").exists() {
-            dirs.push(path);
+        if path.is_dir() {
+            if path.join("flows.jsonl").exists() {
+                dirs.push(path);
+            } else if path.file_name().and_then(|n| n.to_str()) == Some("gh-official") {
+                for sub in fs::read_dir(&path)? {
+                    let sub_path = sub?.path();
+                    if sub_path.is_dir() && sub_path.join("flows.jsonl").exists() {
+                        dirs.push(sub_path);
+                    }
+                }
+            }
         }
     }
     dirs.sort();
@@ -2716,83 +3010,78 @@ async fn run_compare(
     })
 }
 
-fn status_mismatch_in_report(text: &str) -> bool {
-    // Track the current endpoint section so we can skip known un-replayable paths.
-    // oauth2/token: official validates PSA256 client assertions; preloop cannot replay
-    //   job-scoped credentials that were issued by the official JIT broker.
-    // messages endpoint: broker session lifecycle (session invalidation timing) is
-    //   driven by out-of-band state that isn't reproducible in golden replay.
-    let mut current_section = String::new();
-    for line in text.lines() {
-        if line.starts_with("### `") {
-            current_section = line.to_string();
-        }
-        if line.starts_with("**Status codes:**") {
-            if current_section.contains("/oauth2/token") || current_section.contains("/messages") {
-                continue;
-            }
-            let Some((left, right)) = line.split_once(" | ") else {
-                continue;
-            };
-            if bracketed_statuses(left) != bracketed_statuses(right) {
-                return true;
-            }
-        }
+/// `runner-watch coverage`: report golden coverage of the server's runner-facing
+/// routes, write markdown + JSON under `.runner-watch/coverage/`, and (with
+/// `--strict`) fail when uncovered routes remain after the allowlist.
+async fn coverage_cmd(config: &Config, args: &CoverageArgs) -> anyhow::Result<()> {
+    let version = match &args.runner {
+        Some(v) => v.clone(),
+        None => read_state()?
+            .to
+            .context("no --runner given and no reconciled version in .runner-watch/state.json")?,
+    };
+    let report = coverage::compute(&args.routes_src, &config.general.golden_dir, &version)?;
+    let out_dir = PathBuf::from(DEFAULT_ROOT).join("coverage");
+    fs::create_dir_all(&out_dir)?;
+    let vtag = version.trim_start_matches('v');
+    // Read the allowlist first (propagating real read errors) so the JSON
+    // artifact, the printed count, and the --strict gate all agree.
+    let allow = read_coverage_allowlist()?;
+    let uncovered: Vec<&String> = report
+        .uncovered_impl
+        .iter()
+        .filter(|r| !allow.contains(r.as_str()))
+        .collect();
+    fs::write(
+        out_dir.join(format!("v{vtag}.md")),
+        coverage::render_markdown(&report, vtag),
+    )?;
+    fs::write(
+        out_dir.join(format!("v{vtag}.json")),
+        serde_json::to_string_pretty(&json!({
+            "version": version,
+            "covered": report.covered,
+            "uncovered_impl": report.uncovered_impl,
+            "uncovered_after_allowlist": uncovered,
+            "golden_without_route": report.golden_without_route,
+        }))?,
+    )?;
+    println!(
+        "coverage v{vtag}: {} runner-facing covered, {} uncovered, {} golden endpoint(s) without a matching route",
+        report.covered.len(),
+        uncovered.len(),
+        report.golden_without_route.len(),
+    );
+    for r in &uncovered {
+        println!("  uncovered: {r}");
     }
-    false
-}
-
-fn bracketed_statuses(text: &str) -> Option<&str> {
-    let start = text.find('[')?;
-    let end = text[start..].find(']')? + start;
-    Some(text[start..=end].trim())
-}
-
-fn schema_mismatch_in_report(text: &str) -> bool {
-    let mut lines = text.lines().peekable();
-    let mut current_section = "";
-    while let Some(line) = lines.next() {
-        if line.starts_with("### `") {
-            current_section = line;
-            continue;
-        }
-        let is_request = line == "**Request body schema diff:**";
-        let is_acquire_response = line == "**Response body schema diff:**"
-            && current_section.contains("/broker/{n}/acquirejob");
-        if !is_request && !is_acquire_response {
-            continue;
-        }
-        while lines.peek().is_some_and(|line| line.trim().is_empty()) {
-            lines.next();
-        }
-        let Some(first) = lines.next() else {
-            continue;
-        };
-        if first == "_identical_" {
-            continue;
-        }
-        if is_request || schema_diff_removes_official_fields(first, &mut lines) {
-            return true;
-        }
+    if args.strict && !uncovered.is_empty() {
+        bail!(
+            "{} runner-facing route(s) have no golden coverage",
+            uncovered.len()
+        );
     }
-    false
+    Ok(())
 }
 
-fn schema_diff_removes_official_fields<'a>(
-    first: &'a str,
-    lines: &mut impl Iterator<Item = &'a str>,
-) -> bool {
-    std::iter::once(first)
-        .chain(lines.by_ref().take_while(|line| *line != "```"))
-        .any(|line| {
-            line.starts_with('-')
-                && !line.starts_with("---")
-                && !line.contains("\"k\":")
-                && !line.contains("\"v\":")
-                && !line.starts_with("-  ")
-                && !line.starts_with("-        {")
-                && !line.starts_with("-        }")
-        })
+/// Read `.runner-watch/coverage-allow.txt` (one `METHOD path` label per line,
+/// `#` comments allowed) of routes intentionally left uncovered.
+fn read_coverage_allowlist() -> anyhow::Result<BTreeSet<String>> {
+    let path = PathBuf::from(DEFAULT_ROOT).join("coverage-allow.txt");
+    // A missing file means "no allowlist"; any other read error (permissions,
+    // etc.) must propagate rather than silently discard every allowlisted route
+    // and produce a misleading --strict failure.
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect())
 }
 
 fn write_conformance_summary(
@@ -3259,6 +3548,7 @@ async fn run_all(config: &Config, args: &RunArgs) -> anyhow::Result<()> {
                 preloop_url: preloop_url.clone(),
                 scenario: None,
                 skip_cargo_test: args.skip_cargo_test,
+                value_gate_strict: false,
             },
         )
         .await?;
@@ -3403,6 +3693,113 @@ mod tests {
         assert!(entries
             .iter()
             .any(|e| e.change_type == "field_added" && e.fields == vec!["IsBackground"]));
+    }
+
+    #[test]
+    fn treesitter_detects_added_plain_field() {
+        let old = "public class Config {\n    public int Timeout;\n}";
+        let new = "public class Config {\n    public int Timeout;\n    public string Foo;\n}";
+        let entries = extract_delta_entries("src/Config.cs", Some(old), Some(new));
+        assert!(
+            entries.iter().any(|e| e.change_type == "field_added"
+                && e.structure.as_deref() == Some("Config")
+                && e.fields == vec!["Foo"]),
+            "plain field addition should be detected: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn treesitter_detects_added_method_overload() {
+        let old = "public class Api {\n    public void Send(int x) {}\n}";
+        let new =
+            "public class Api {\n    public void Send(int x) {}\n    public void Send(int x, string y) {}\n}";
+        let entries = extract_delta_entries("src/Api.cs", Some(old), Some(new));
+        assert!(
+            entries.iter().any(|e| e.change_type == "field_added"
+                && e.structure.as_deref() == Some("Api")
+                && e.fields == vec!["Send(int, string)"]),
+            "added method overload should be detected via its signature: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn treesitter_detects_ref_modifier_overload() {
+        let old = "public class Api {\n    public void Send(int x) {}\n}";
+        let new = "public class Api {\n    public void Send(int x) {}\n    public void Send(ref int x) {}\n}";
+        let entries = extract_delta_entries("src/Api.cs", Some(old), Some(new));
+        assert!(
+            entries.iter().any(|e| e.change_type == "field_added"
+                && e.structure.as_deref() == Some("Api")
+                && e.fields == vec!["Send(ref int)"]),
+            "a ref-modifier overload should be a distinct signature: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn treesitter_detects_generic_arity_overload() {
+        let old = "public class Api {\n    public void Run<T>() {}\n}";
+        let new =
+            "public class Api {\n    public void Run<T>() {}\n    public void Run<T, U>() {}\n}";
+        let entries = extract_delta_entries("src/Api.cs", Some(old), Some(new));
+        assert!(
+            entries.iter().any(|e| e.change_type == "field_added"
+                && e.structure.as_deref() == Some("Api")
+                && e.fields == vec!["Run<2>()"]),
+            "a generic-arity overload should be a distinct signature: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn treesitter_method_signature_ignores_default_value() {
+        let old = "public class Api {\n    public void Run() {}\n}";
+        let new =
+            "public class Api {\n    public void Run() {}\n    public void Log(string s = \"s\") {}\n}";
+        let entries = extract_delta_entries("src/Api.cs", Some(old), Some(new));
+        assert!(
+            entries.iter().any(|e| e.change_type == "field_added"
+                && e.structure.as_deref() == Some("Api")
+                && e.fields == vec!["Log(string)"]),
+            "a default value must not truncate the method signature: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn treesitter_detects_added_record_positional_parameter() {
+        let old = "public record Msg(int Id);";
+        let new = "public record Msg(int Id, string Payload);";
+        let entries = extract_delta_entries("src/Msg.cs", Some(old), Some(new));
+        assert!(
+            entries.iter().any(|e| e.change_type == "field_added"
+                && e.structure.as_deref() == Some("Msg")
+                && e.fields == vec!["Payload"]),
+            "record positional parameter addition should be detected: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn treesitter_detects_added_enum_member() {
+        let old = "public enum Status {\n    Ok,\n    Failed,\n}";
+        let new = "public enum Status {\n    Ok,\n    Failed,\n    Cancelled,\n}";
+        let entries = extract_delta_entries("src/Status.cs", Some(old), Some(new));
+        assert!(
+            entries.iter().any(|e| e.change_type == "field_added"
+                && e.structure.as_deref() == Some("Status")
+                && e.fields == vec!["Cancelled"]),
+            "enum member addition should be detected: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn treesitter_detects_added_expression_bodied_property() {
+        let old = "public class Calc {\n    public int Base => 1;\n}";
+        let new = "public class Calc {\n    public int Base => 1;\n    public int Bar => 3;\n}";
+        let entries = extract_delta_entries("src/Calc.cs", Some(old), Some(new));
+        assert!(
+            entries.iter().any(|e| e.change_type == "field_added"
+                && e.structure.as_deref() == Some("Calc")
+                && e.fields == vec!["Bar"]),
+            "expression-bodied property addition should be detected: {entries:?}"
+        );
     }
 
     #[test]
@@ -3649,73 +4046,6 @@ mod tests {
             error.to_string().contains("read replay scenario manifest"),
             "unexpected missing-metadata error: {error:#}"
         );
-    }
-
-    #[test]
-    fn schema_mismatch_detects_acquirejob_response_schema_difference() {
-        let report = concat!(
-            "### `POST /broker/{n}/acquirejob`\n\n",
-            "**Request body diff:**\n\n_identical_\n\n",
-            "**Request body schema diff:**\n\n_identical_\n\n",
-            "**Response body diff:**\n\n```diff\n@@\n-{\"count\": 1}\n+{\"count\": 1, \"items\": []}\n```\n\n",
-            "**Response body schema diff:**\n\n```diff\n@@\n-{\"count\": \"number\"}\n+{\"count\": \"number\", \"items\": []}\n```\n"
-        );
-
-        assert!(schema_mismatch_in_report(report));
-    }
-
-    #[test]
-    fn schema_mismatch_accepts_additive_acquirejob_response_fields() {
-        let report = concat!(
-            "### `POST /broker/{n}/acquirejob`\n\n",
-            "**Response body schema diff:**\n\n",
-            "```diff\n",
-            "--- official\n",
-            "+++ preloop\n",
-            "@@\n",
-            " {\n",
-            "   \"jobId\": \"string\",\n",
-            "+  \"runnerSettings\": {\"isHostedServer\": \"boolean\"}\n",
-            " }\n",
-            "```\n"
-        );
-
-        assert!(!schema_mismatch_in_report(report));
-    }
-
-    #[test]
-    fn schema_mismatch_ignores_unrelated_response_schema_difference() {
-        let report = concat!(
-            "### `POST /repos/{n}/dispatches`\n\n",
-            "**Response body diff:**\n\n```diff\n@@\n-{}\n+{\"items\": []}\n```\n\n",
-            "**Response body schema diff:**\n\n```diff\n@@\n-{}\n+{\"items\": []}\n```\n"
-        );
-
-        assert!(!schema_mismatch_in_report(report));
-    }
-
-    #[test]
-    fn schema_mismatch_detects_request_schema_difference_globally() {
-        let report = concat!(
-            "### `POST /repos/{n}/dispatches`\n\n",
-            "**Request body diff:**\n\n```diff\n@@\n-{}\n+{\"ref\": \"main\"}\n```\n\n",
-            "**Request body schema diff:**\n\n```diff\n@@\n-{}\n+{\"ref\": \"string\"}\n```\n"
-        );
-
-        assert!(schema_mismatch_in_report(report));
-    }
-
-    #[test]
-    fn schema_mismatch_accepts_identical_request_and_response_schemas() {
-        let report = concat!(
-            "### `POST /broker/{n}/acquirejob`\n\n",
-            "**Request body diff:**\n\n```diff\n@@\n-{\"count\": 1}\n+{\"count\": 2}\n```\n\n",
-            "**Request body schema diff:**\n\n_identical_\n\n",
-            "**Response body diff:**\n\n```diff\n@@\n-{\"status\": \"queued\"}\n+{\"status\": \"running\"}\n```\n\n",
-            "**Response body schema diff:**\n\n_identical_\n"
-        );
-
-        assert!(!schema_mismatch_in_report(report));
     }
 
     /// Minimal isolated temp directory (runner-watch has no tempfile dev-dep;

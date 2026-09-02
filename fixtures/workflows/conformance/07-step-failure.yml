@@ -1,0 +1,11 @@
+name: mitm step failure
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: [self-hosted, mitm]
+    steps:
+      - run: exit 1
+      - run: echo ran-on-failure
+        if: failure()
+      - run: echo never
+        if: success()

@@ -151,6 +151,7 @@ pub(crate) struct RunResponse {
         list_runs,
         get_run,
         get_run_logs,
+        live_run_logs,
         cancel_run,
         rerun_run,
         run_events,
@@ -358,17 +359,40 @@ fn list_runs() {}
 )]
 fn get_run() {}
 
-/// Get formatted run logs (HTML).
+/// Get run logs as plain text, optionally narrowed to one job or step.
 #[utoipa::path(
     get, path = "/api/v1/runs/{run_id}/logs", tag = "Runs",
-    params(("run_id" = String, Path, description = "Run UUID")),
+    params(
+        ("run_id" = String, Path, description = "Run UUID"),
+        ("job" = Option<String>, Query, description = "Workflow job key or agent job UUID; omit for every job"),
+        ("step" = Option<usize>, Query, description = "1-based step index within the job, in execution order")
+    ),
     responses(
-        (status = 200, content_type = "text/html", description = "Rendered log page", body = String),
-        (status = 404, description = "Run not found", body = ApiErrorResponse)
+        (status = 200, content_type = "text/plain", description = "Merged log text", body = String),
+        (status = 400, description = "`step` given without `job` in a multi-job run", body = ApiErrorResponse),
+        (status = 404, description = "Run, job, or step not found", body = ApiErrorResponse),
+        (status = 409, description = "Job reported one merged log, which has no step boundaries", body = ApiErrorResponse)
     ),
     security(("native_bearer" = []))
 )]
+
 fn get_run_logs() {}
+
+/// Follow one job's live console output as server-sent events.
+#[utoipa::path(
+    get, path = "/api/v1/runs/{run_id}/logs/live", tag = "Runs",
+    params(
+        ("run_id" = String, Path, description = "Run UUID"),
+        ("job" = Option<String>, Query, description = "Workflow job key or agent job UUID; required when the run has multiple jobs")
+    ),
+    responses(
+        (status = 200, content_type = "text/event-stream", description = "Live log events; the stream closes when the selected job is terminal", body = String),
+        (status = 400, description = "Job is required when the run has multiple jobs", body = ApiErrorResponse),
+        (status = 404, description = "Run or job not found", body = ApiErrorResponse)
+    ),
+    security(("native_bearer" = []))
+)]
+fn live_run_logs() {}
 
 /// Cancel a running workflow.
 #[utoipa::path(

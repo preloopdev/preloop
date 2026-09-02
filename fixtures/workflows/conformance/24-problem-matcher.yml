@@ -1,0 +1,33 @@
+name: mitm problem matcher
+on: workflow_dispatch
+jobs:
+  matcher-test:
+    runs-on: [self-hosted, mitm]
+    steps:
+      - name: Create matcher file
+        run: |
+          cat > /tmp/eslint-matcher.json << 'MATCHEREOF'
+          {
+            "problemMatcher": [
+              {
+                "owner": "eslint-compact",
+                "pattern": [
+                  {
+                    "regexp": "^(.+):\\s+line\\s+(\\d+),\\s+col\\s+(\\d+),\\s+(Error|Warning)\\s+-\\s+(.+)$",
+                    "file": 1,
+                    "line": 2,
+                    "column": 3,
+                    "severity": 4,
+                    "message": 5
+                  }
+                ]
+              }
+            ]
+          }
+          MATCHEREOF
+          echo "::add-matcher::/tmp/eslint-matcher.json"
+      - name: Emit matching error lines
+        run: |
+          echo "src/app.ts: line 10, col 5, Error - Unexpected var, use let or const instead"
+          echo "src/util.ts: line 42, col 1, Warning - Missing semicolon"
+          echo "This line should not match"

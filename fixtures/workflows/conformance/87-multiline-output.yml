@@ -1,0 +1,43 @@
+name: Multiline Output via Heredoc
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-multiline-output:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    steps:
+      - name: Set multiline output using heredoc
+        id: set_json
+        run: |
+          echo 'json_data<<EOF' >> $GITHUB_OUTPUT
+          echo '{"key": "value", "nested": {"prop": "test"}}' >> $GITHUB_OUTPUT
+          echo 'EOF' >> $GITHUB_OUTPUT
+          echo "Output written to GITHUB_OUTPUT"
+
+      - name: Read and verify multiline output
+        run: |
+          OUTPUT='${{ steps.set_json.outputs.json_data }}'
+          echo "Retrieved output:"
+          echo "$OUTPUT"
+          if [[ "$OUTPUT" == *"key"* ]] && [[ "$OUTPUT" == *"value"* ]]; then
+            echo "✓ Multiline output correctly preserved"
+          else
+            echo "✗ Multiline output not preserved"
+            exit 1
+          fi
+
+      - name: Verify JSON structure
+        run: |
+          OUTPUT='${{ steps.set_json.outputs.json_data }}'
+          # Try to extract a field if jq is available
+          if command -v jq &> /dev/null; then
+            KEY=$(echo "$OUTPUT" | jq -r '.key')
+            if [[ "$KEY" == "value" ]]; then
+              echo "✓ JSON structure valid and parseable"
+            else
+              echo "✗ JSON structure invalid"
+              exit 1
+            fi
+          fi

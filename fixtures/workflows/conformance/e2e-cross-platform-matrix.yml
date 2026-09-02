@@ -1,0 +1,112 @@
+name: E2E cross-platform matrix (blog pattern)
+# Mirrors the structure from ahmedjama.com/blog/2025/12/cross-platform-rust-pipeline-github-actions/
+# Build steps are stubbed — we're testing the workflow mechanics, not actual compilation.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'e2e-release-v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build - ${{ matrix.platform.target }}
+    runs-on: [self-hosted, linux, x64]
+
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: Linux ARM64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            binary_ext: ""
+            use_cross: true
+
+          - name: Linux ARMv7
+            os: ubuntu-latest
+            target: armv7-unknown-linux-gnueabihf
+            binary_ext: ""
+            use_cross: true
+
+          - name: Linux x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary_ext: ""
+            use_cross: false
+
+          - name: Windows x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary_ext: ".exe"
+            use_cross: false
+
+    steps:
+      - name: Print platform context
+        run: |
+          echo "name=${{ matrix.platform.name }}"
+          echo "os=${{ matrix.platform.os }}"
+          echo "target=${{ matrix.platform.target }}"
+          echo "binary_ext=${{ matrix.platform.binary_ext }}"
+          echo "use_cross=${{ matrix.platform.use_cross }}"
+
+      - name: Verify nested property access
+        run: |
+          test "${{ matrix.platform.target }}" != ""
+          test "${{ matrix.platform.name }}"   != ""
+
+      - name: Install cross-compilation tool (stub)
+        if: matrix.platform.use_cross
+        run: echo "would install cross for ${{ matrix.platform.target }}"
+
+      - name: Setup OpenSSL for native builds (stub)
+        if: ${{ !matrix.platform.use_cross && matrix.platform.os == 'ubuntu-latest' }}
+        run: echo "would install libssl-dev for native ${{ matrix.platform.target }}"
+
+      - name: Build with cross (stub)
+        if: matrix.platform.use_cross
+        run: |
+          echo "cross build --release --target ${{ matrix.platform.target }}"
+          mkdir -p target/${{ matrix.platform.target }}/release
+          echo "stub-binary" > target/${{ matrix.platform.target }}/release/myapp${{ matrix.platform.binary_ext }}
+
+      - name: Build natively (stub)
+        if: ${{ !matrix.platform.use_cross }}
+        run: |
+          echo "cargo build --release --target ${{ matrix.platform.target }}"
+          mkdir -p target/${{ matrix.platform.target }}/release
+          echo "stub-binary" > target/${{ matrix.platform.target }}/release/myapp${{ matrix.platform.binary_ext }}
+
+      - name: Get binary name
+        id: binary_name
+        run: |
+          BINARY_NAME=myapp
+          echo "name=$BINARY_NAME" >> $GITHUB_OUTPUT
+
+      - name: Package binary
+        run: |
+          BINARY_NAME="${{ steps.binary_name.outputs.name }}"
+          ARCHIVE_NAME="${BINARY_NAME}-${{ matrix.platform.target }}"
+          mkdir -p dist
+          tar -czf "dist/${ARCHIVE_NAME}.tar.gz" \
+            -C "target/${{ matrix.platform.target }}/release" \
+            "${BINARY_NAME}${{ matrix.platform.binary_ext }}"
+          echo "packaged: dist/${ARCHIVE_NAME}.tar.gz"
+          ls -lh dist/
+
+      - name: Verify output propagation
+        run: |
+          test "${{ steps.binary_name.outputs.name }}" = "myapp"
+          echo "output propagated correctly: ${{ steps.binary_name.outputs.name }}"
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: [self-hosted, linux, x64]
+    if: startsWith(github.ref, 'refs/tags/e2e-release-v')
+
+    steps:
+      - name: Would publish release
+        run: echo "releasing to GitHub for ref ${{ github.ref }}"

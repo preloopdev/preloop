@@ -89,11 +89,15 @@ pub(crate) async fn patch_timeline_records(
         *current += 1;
         let new_id = *current;
 
-        inner
+        let events = inner
             .timeline_events
             .entry(run_id.unwrap_or_else(|| RunId(uuid::Uuid::nil())))
-            .or_default()
-            .extend(projected.clone());
+            .or_default();
+        for event in &projected {
+            if !events.contains(event) {
+                events.push(event.clone());
+            }
+        }
         trim_timeline_events(
             &mut inner,
             run_id.unwrap_or_else(|| RunId(uuid::Uuid::nil())),
@@ -169,7 +173,12 @@ pub(crate) async fn patch_timeline_records(
                         .map(|t| t.with_timezone(&chrono::Utc));
                     let observed = chrono::Utc::now();
 
-                    if let Some(pos) = job_detail.steps.iter().position(|s| s.name == *name) {
+                    if let Some(pos) = StepRecord::find_matching_index(
+                        &job_detail.steps,
+                        &record.id.to_string(),
+                        name,
+                        true,
+                    ) {
                         job_detail.steps[pos].conclusion = conclusion_str.to_owned();
                         if let Some(started_at) = started_at {
                             job_detail.steps[pos].started_at = Some(started_at);
@@ -179,6 +188,7 @@ pub(crate) async fn patch_timeline_records(
                         }
                     } else {
                         job_detail.steps.push(StepRecord {
+                            id: Some(record.id.to_string()),
                             name: name.clone(),
                             conclusion: conclusion_str.to_owned(),
                             started_at: started_at.or(Some(observed)),
@@ -402,15 +412,24 @@ pub(crate) async fn console_log(
     )>,
     body: Bytes,
 ) -> StatusCode {
-    // Parse the body as a LiveLogFeedLinesWrapper and store/broadcast it.
+    // Resolve the callback to the run-scoped agent-job key. Falling back to
+    // the plan id preserves compatibility for callbacks that arrive before a
+    // request record exists.
     if let Ok(wrapper) = serde_json::from_slice::<LiveLogFeedLinesWrapper>(&body) {
-        let job_id = {
+        let resolved = {
             let inner = shared.state.inner.lock().await;
             resolve_callback_job(&inner, &plan_id, None, None)
-                .map(|(_, _, job_id)| job_id.0.clone())
-                .unwrap_or_else(|| plan_id.clone())
+                .map(|(_, run_id, job_id)| (run_id, job_id.0))
         };
-        record_live_log_wrapper(&shared, &job_id, wrapper).await;
+        match resolved {
+            Some((run_id, job_id)) => {
+                crate::live_logs::record_live_log_wrapper_for_run(
+                    &shared, run_id, &job_id, wrapper,
+                )
+                .await;
+            }
+            None => crate::live_logs::record_live_log_wrapper(&shared, &plan_id, wrapper).await,
+        }
     }
     StatusCode::OK
 }
@@ -663,12 +682,17 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    /// A timeline PATCH for an in-flight job must keep the truthful
-    /// "in_progress" conclusion. The raw Debug spelling ("inprogress") and
-    /// the run-level status_string projection ("success") both lie about a
-    /// job that is still running.
-    #[tokio::test]
-    async fn timeline_patch_keeps_in_progress_conclusion_for_in_flight_job() {
+    /// Seed a single in-flight run with one job, its plan→request mapping, and
+    /// timeline id. Returns the owned `TempDir` (keeps the store file alive for
+    /// the test's lifetime) alongside the handles tests assert against.
+    async fn seed_inflight_run() -> (
+        tempfile::TempDir,
+        Arc<SharedState>,
+        RunId,
+        JobId,
+        String,
+        uuid::Uuid,
+    ) {
         let temp = tempfile::tempdir().unwrap();
         let state = crate::AppState::new(temp.path().to_path_buf())
             .await
@@ -744,6 +768,17 @@ mod tests {
                 },
             );
         }
+        (temp, shared, run_id, job_id, plan_id, timeline_id)
+    }
+
+    /// A timeline PATCH for an in-flight job must keep the truthful
+    /// "in_progress" conclusion. The raw Debug spelling ("inprogress") and
+    /// the run-level status_string projection ("success") both lie about a
+    /// job that is still running.
+    #[tokio::test]
+    async fn timeline_patch_keeps_in_progress_conclusion_for_in_flight_job() {
+        let (_temp, shared, run_id, _job_id, plan_id, timeline_id) = seed_inflight_run().await;
+        let state = shared.state.clone();
 
         let _ = patch_timeline_records(
             State(shared),
@@ -771,5 +806,186 @@ mod tests {
             detail.conclusion, "in_progress",
             "an in-flight job must not read as 'success' or 'inprogress'"
         );
+    }
+
+    /// A job-level Node.js 20 deprecation warning arrives from the runner as a
+    /// `Warning` issue on the job timeline record. The server must preserve it
+    /// on read-back and project it as a job-level annotation (no `step_id`).
+    /// Preloop never synthesizes this warning itself — it only surfaces what
+    /// the runner sends.
+    #[tokio::test]
+    async fn timeline_patch_preserves_node20_deprecation_warning() {
+        let (_temp, shared, run_id, _job_id, plan_id, timeline_id) = seed_inflight_run().await;
+        let state = shared.state.clone();
+
+        let node20_message = "Node.js 20 actions are deprecated. The following actions are \
+             running on Node.js 20 and may not work as expected: actions/checkout@v3, \
+             actions/setup-node@v3."
+            .to_owned();
+
+        let job_record_id = uuid::Uuid::new_v4();
+        let child_task_id = uuid::Uuid::new_v4();
+
+        // Construct raw JSON wire payload with upstream "Task" and "Job" types to exercise serde wire decoding.
+        let raw_json_payload = serde_json::json!({
+                "count": 2,
+                "value": [
+                    {
+                        "id": job_record_id.to_string(),
+                        "parentId": null,
+                        "name": "build",
+                        "displayName": "build",
+                        "type": "Job",
+                        "state": "inProgress",
+                        "issues": [
+                            {
+                                "type": "warning",
+                                "message": node20_message
+        }
+                        ],
+                        "warningCount": 1
+                    },
+                    {
+                        "id": child_task_id.to_string(),
+                        "parentId": job_record_id.to_string(),
+                        "name": "Complete job",
+                        "displayName": "Complete job",
+                        "type": "Task",
+                        "state": "completed",
+                        "result": "succeededWithIssues",
+                        "issues": [
+                            {
+                                "type": "warning",
+                                "message": node20_message
+        }
+                        ]
+        }
+                ]
+            });
+
+        // Verify wire decoding from raw JSON
+        let wrapper: azdo::VssJsonCollectionWrapper<azdo::TimelineRecord> =
+            serde_json::from_value(raw_json_payload.clone()).expect("valid wire JSON payload");
+        assert_eq!(wrapper.value.len(), 2);
+        assert_eq!(
+            wrapper.value[0].record_type,
+            Some(azdo::TimelineRecordType::Job)
+        );
+        assert_eq!(
+            wrapper.value[1].record_type,
+            Some(azdo::TimelineRecordType::Task)
+        );
+
+        // PATCH timeline records (first call)
+        let _ = patch_timeline_records(
+            State(shared.clone()),
+            Path((
+                "scope".to_owned(),
+                "hub".to_owned(),
+                plan_id.clone(),
+                timeline_id.to_string(),
+            )),
+            Json(wrapper),
+        )
+        .await;
+
+        // Preserved on read-back.
+        let response = get_timeline_records(
+            State(shared.clone()),
+            Path((
+                "scope".to_owned(),
+                "hub".to_owned(),
+                plan_id.clone(),
+                timeline_id.to_string(),
+            )),
+            axum::extract::Query(TimelineQuery {
+                top: None,
+                skip: None,
+            }),
+        )
+        .await;
+        let records = response
+            .0
+            .get("records")
+            .and_then(|v| v.as_array())
+            .expect("records array");
+        let stored_job = records
+            .iter()
+            .find(|r| r["id"] == job_record_id.to_string())
+            .expect("job record persisted");
+        let job_issues = stored_job["issues"].as_array().expect("issues preserved");
+        assert_eq!(
+            job_issues.len(),
+            1,
+            "the Node 20 warning issue must survive on job record"
+        );
+        assert_eq!(job_issues[0]["type"], "warning");
+        assert_eq!(job_issues[0]["message"], node20_message);
+
+        let stored_task = records
+            .iter()
+            .find(|r| r["id"] == child_task_id.to_string())
+            .expect("child task record persisted");
+        let task_issues = stored_task["issues"].as_array().expect("issues preserved");
+        assert_eq!(
+            task_issues.len(),
+            1,
+            "the Node 20 warning issue must survive on task record"
+        );
+
+        // Replaying/retrying the exact same PATCH call (Finding 3: deduplication check)
+        let wrapper_retry: azdo::VssJsonCollectionWrapper<azdo::TimelineRecord> =
+            serde_json::from_value(raw_json_payload).expect("valid wire JSON payload");
+        let _ = patch_timeline_records(
+            State(shared.clone()),
+            Path((
+                "scope".to_owned(),
+                "hub".to_owned(),
+                plan_id,
+                timeline_id.to_string(),
+            )),
+            Json(wrapper_retry),
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        let events = inner
+            .timeline_events
+            .get(&run_id)
+            .expect("timeline events recorded for the run");
+
+        // Count projected annotations for the Node 20 message
+        let matching_annotations: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                NdjsonEvent::Annotation {
+                    level,
+                    message,
+                    step_id,
+                    ..
+                } if message == &node20_message => Some((*level, step_id.clone())),
+                _ => None,
+            })
+            .collect();
+
+        // Deduplication check: even after retrying PATCH, there should be exactly one annotation
+        // for the job record (step_id == None) and one for the child task record (step_id == Some(child_task_id)).
+        assert_eq!(
+            matching_annotations.len(),
+            2,
+            "annotations must be deduplicated across repeated PATCH calls"
+        );
+
+        let job_ann = matching_annotations
+            .iter()
+            .find(|(_, step_id)| step_id.is_none())
+            .expect("parentless job record produces step_id == None annotation");
+        assert!(matches!(job_ann.0, AnnotationLevel::Warning));
+
+        let task_ann = matching_annotations
+            .iter()
+            .find(|(_, step_id)| step_id.as_deref() == Some(&child_task_id.to_string()))
+            .expect("child task record produces step_id == Some(task_id) annotation");
+        assert!(matches!(task_ann.0, AnnotationLevel::Warning));
     }
 }

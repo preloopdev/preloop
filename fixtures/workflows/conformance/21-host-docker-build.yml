@@ -1,0 +1,18 @@
+name: host-docker-build
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+      - name: Create Dockerfile
+        run: |
+          cat > Dockerfile <<'EOF'
+          FROM alpine:3.20
+          RUN echo built > /built.txt
+          CMD ["cat", "/built.txt"]
+          EOF
+      - name: Build image
+        run: docker build -t aksh-host-docker-smoke .
+      - name: Run image
+        run: test "$(docker run --rm aksh-host-docker-smoke)" = "built"

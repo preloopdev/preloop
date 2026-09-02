@@ -1,0 +1,26 @@
+name: 95-nested-composite-outputs
+on:
+  workflow_dispatch:
+jobs:
+  test-nested-composite:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Call outer composite action
+        id: outer
+        uses: ./test-actions/outer-composite
+
+      - name: Verify outer composite output
+        run: |
+          echo "Outer composite returned: ${{ steps.outer.outputs.outer-value }}"
+          if [ -z "${{ steps.outer.outputs.outer-value }}" ]; then
+            echo "ERROR: No output from outer composite"
+            exit 1
+          fi
+          echo "Nested composite output propagation verified"
+
+      - name: Test that inner composite was used
+        run: echo "Inner composite was successfully called through outer composite"

@@ -1,0 +1,57 @@
+name: E2E bat
+on: workflow_dispatch
+
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: sharkdp/bat
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  build:
+    name: Build
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: sharkdp/bat
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --locked
+
+  clippy:
+    name: Clippy
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: sharkdp/bat
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+  test:
+    name: Test
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: sharkdp/bat
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked
+        env:
+          RUST_BACKTRACE: 1

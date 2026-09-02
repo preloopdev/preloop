@@ -1,0 +1,18 @@
+name: mitm context fields
+on: workflow_dispatch
+jobs:
+  context-test:
+    runs-on: [self-hosted, mitm]
+    steps:
+      - name: Validate runner context
+        run: |
+          echo "runner.name=${{ runner.name }}"
+          echo "runner.os=${{ runner.os }}"
+          echo "runner.arch=${{ runner.arch }}"
+          echo "runner.temp=${{ runner.temp }}"
+          echo "runner.tool_cache=${{ runner.tool_cache }}"
+          echo "runner.workspace=${{ runner.workspace }}"
+      - name: Validate job context
+        run: |
+          echo "job.status=${{ job.status }}"
+          echo "job=${{ toJSON(job) }}"
