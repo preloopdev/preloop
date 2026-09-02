@@ -378,10 +378,57 @@ pub(crate) async fn submit_run_inner(
     } else {
         changed_paths_from_payload(&submission.payload)
     };
+    // The reason names the axis; this names the flag that changes it, because
+    // "does not match" without a next action is the whole complaint being
+    // fixed here.
+    fn trigger_mismatch_hint(reason: &preloop_gha_parser::TriggerMismatch) -> String {
+        use preloop_gha_parser::TriggerMismatch as M;
+        match reason {
+            M::EventNotDeclared { declared } if !declared.is_empty() => {
+                let list = declared
+                    .iter()
+                    .map(|event| format!("`--event {event}`"))
+                    .collect::<Vec<_>>()
+                    .join(" or ");
+                format!(" Pass {list}.")
+            }
+            M::EventNotDeclared { .. } => String::new(),
+            M::ActivityTypeMissing { accepted } | M::ActivityTypeRejected { accepted, .. } => {
+                if accepted.is_empty() {
+                    " The workflow declares an empty `types` list and accepts no activity types for this event.".to_owned()
+                } else {
+                    let first = accepted.first().map(String::as_str).unwrap_or("opened");
+                    format!(
+                        " Supply one with `--payload` containing {{\"action\": \"{first}\"}}, or pick \
+                         an activity type the workflow accepts."
+                    )
+                }
+            }
+            M::RefFiltered { .. } => " Check out a matching branch or tag, or pass `--base <REF>` \
+                 for pull_request events (the branch filter applies to the PR's target branch)."
+                .to_owned(),
+            M::PathsUnmatched { .. } | M::PathsAllIgnored { .. } => {
+                " Change a file the filter selects, or pass `--base <REF>` to diff against a \
+                 different base."
+                    .to_owned()
+            }
+            M::UpstreamWorkflowUnmatched { .. } => {
+                " A `workflow_run` trigger needs the upstream workflow's display name; supply it \
+                 with `--payload` containing {\"workflow_run\": {\"name\": \"<NAME>\"}}."
+                    .to_owned()
+            }
+        }
+    }
+
     if !changed_paths_known && workflow.on.has_path_filters(&submission.event) {
-        return Err(ApiError::bad_request(
-            "workflow path filters require a complete changed-file list".to_owned(),
-        ));
+        return Err(ApiError::bad_request(format!(
+            "`on.{}` filters by path, so the run needs the complete list of changed files and \
+             none was supplied. `preloop run` derives it from git, so this usually means the \
+             workspace is not a git repository or no base ref could be resolved — pass `--base \
+             <REF>` (for example `--base main`). An API caller must send `changed_paths` with \
+             `changed_paths_known: true`, or a payload carrying `paths` or `commits`.",
+            submission.event
+        )));
     }
     // Activity type from explicit field (set by dispatcher) or payload.action fallback.
     let activity_owned: Option<String> = submission.activity_type.clone().or_else(|| {
@@ -392,17 +439,29 @@ pub(crate) async fn submit_run_inner(
             .map(str::to_owned)
     });
     let activity_type = activity_owned.as_deref();
-    if !workflow.on.matches_with_context(
+    let mut upstream_names = submission.workflow_run_upstream_names.clone();
+    if upstream_names.is_empty() {
+        if let Some(name) = submission
+            .payload
+            .get("workflow_run")
+            .and_then(|wr| wr.get("name"))
+            .and_then(|v| v.as_str())
+        {
+            upstream_names.push(name.to_owned());
+        }
+    }
+    if let Err(reason) = workflow.on.match_event(
         &submission.event,
         branch.as_deref(),
         tag.as_deref(),
         &changed_paths,
         activity_type,
-        &submission.workflow_run_upstream_names,
+        &upstream_names,
     ) {
         return Err(ApiError::trigger_mismatch(format!(
-            "workflow does not match event `{}`",
-            submission.event
+            "workflow does not run for event `{}`: {reason}.{}",
+            submission.event,
+            trigger_mismatch_hint(&reason)
         )));
     }
     let dispatch_inputs_for_expand: BTreeMap<String, serde_json::Value> = submission

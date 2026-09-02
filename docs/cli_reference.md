@@ -54,6 +54,35 @@ Behavior notes:
   changes included) — the run never depends on what was pushed.
 - Local reusable workflows (`uses: ./.github/workflows/…`) are uploaded with
   the submission automatically.
+- **Simulated event context**: a local run stands in for a webhook delivery, so
+  the CLI fills in the parts of that delivery git can answer for. Nothing else
+  is invented — see below.
+
+### What a local run derives
+
+GitHub sends a webhook body; `preloop run` has git instead. These are derived
+automatically, and an explicit `--payload` field always wins:
+
+| Field | Derived from | Why it is safe |
+|---|---|---|
+| changed files (`paths` / `paths-ignore` filters) | `git diff --name-only <base>...HEAD` plus uncommitted changes | The run tests the working tree, so the filter should judge the same files |
+| PR activity type (`types:` filters) | defaults to `synchronize` | One of GitHub's default `pull_request` types |
+| target branch (`branches:` filters on `pull_request`) | `--base`, else the branch's tracking ref | GitHub applies PR branch filters to the **target** branch, not the head branch |
+| branch / tag | the current checkout | It is the ref being tested |
+
+The base for the diff is `--base` when given, otherwise the branch's tracking
+ref, then each remote's default branch, then local `main`/`master`. A candidate
+is only used if it shares history with `HEAD`, so a fork remote with unrelated
+history is skipped rather than picked and then failing to diff.
+
+Nothing else is synthesized. PR number, actor, labels, review state, and
+`workflow_run` upstream results have no local truth, and guessing them would
+flip `if:` conditions on fabricated data — pass `--payload` when a workflow
+needs them.
+
+If no usable base is found, the change set stays *unknown* rather than empty:
+an empty known list would make every `paths:` filter reject the run. Path-
+filtered workflows then fail with an error naming what to pass.
 
 ## `preloop plan [OPTIONS]`
 

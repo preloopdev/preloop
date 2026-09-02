@@ -14,6 +14,363 @@ fn glob_match_handles_multiple_wildcards() {
     assert!(glob_match("src/**", "src/bin/main.rs"));
 }
 
+/// `**` matches "zero or more of any character", so a literal `/` written
+/// after it still has to match a real separator. GitHub documents `**.md` —
+/// not `**/*.md` — as "any file in the repository with the .md extension",
+/// and the difference decides whether a root-level file is filtered.
+///
+/// Pinned because a `paths-ignore: ["**/*.md"]` that silently stopped
+/// covering (or started covering) `README.md` would change which workflows
+/// run on a docs-only change, with nothing else failing.
+#[test]
+fn glob_match_double_star_requires_a_real_separator_before_a_literal_slash() {
+    // `**/` needs at least one directory: a root-level file has no `/`.
+    assert!(
+        !glob_match("**/*.md", "README.md"),
+        "`**/*.md` must not match a root-level file"
+    );
+    assert!(
+        glob_match("**/*.md", "docs/cli_reference.md"),
+        "`**/*.md` matches inside a directory"
+    );
+    assert!(
+        glob_match("**/*.md", "docs/adr/0001-title.md"),
+        "`**` spans multiple directories"
+    );
+
+    // `**.md` is the documented "any .md anywhere" form and covers both.
+    assert!(
+        glob_match("**.md", "README.md"),
+        "`**.md` must match a root-level file"
+    );
+    assert!(
+        glob_match("**.md", "docs/cli_reference.md"),
+        "`**.md` must match a nested file"
+    );
+
+    // A non-`.md` path is unaffected by either form.
+    assert!(!glob_match("**.md", "crates/preloop-cli/src/main.rs"));
+    assert!(!glob_match("**/*.md", "crates/preloop-cli/src/main.rs"));
+}
+
+/// A single `*` stops at a separator; `**` crosses it.
+#[test]
+fn glob_match_single_star_does_not_cross_separators() {
+    assert!(glob_match("*.md", "README.md"));
+    assert!(!glob_match("*.md", "docs/cli_reference.md"));
+    assert!(glob_match("docs/*.md", "docs/cli_reference.md"));
+    assert!(!glob_match("docs/*.md", "docs/adr/0001-title.md"));
+    assert!(glob_match("docs/**", "docs/adr/0001-title.md"));
+}
+
+/// `match_event` is the single source of truth; `matches_with_context` is its
+/// boolean face. Pin that so a future change to one cannot silently diverge.
+#[test]
+fn match_event_agrees_with_matches_with_context() {
+    let workflow = parse_workflow(
+        r#"
+on:
+  push:
+    branches: [main]
+    paths: ["src/**"]
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+    let cases: &[(&str, Option<&str>, &[&str])] = &[
+        ("push", Some("main"), &["src/lib.rs"]),
+        ("push", Some("main"), &["docs/x.md"]),
+        ("push", Some("other"), &["src/lib.rs"]),
+        ("pull_request", Some("main"), &["src/lib.rs"]),
+    ];
+    for (event, branch, paths) in cases {
+        let paths: Vec<String> = paths.iter().map(|p| (*p).to_owned()).collect();
+        let boolean = workflow
+            .on
+            .matches_with_context(event, *branch, None, &paths, None, &[]);
+        let structured = workflow
+            .on
+            .match_event(event, *branch, None, &paths, None, &[])
+            .is_ok();
+        assert_eq!(boolean, structured, "{event} {branch:?} {paths:?}");
+    }
+}
+
+#[test]
+fn match_event_reports_undeclared_event_with_the_declared_list() {
+    let workflow = parse_workflow(
+        r#"
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+    let error = workflow
+        .on
+        .match_event("pull_request", Some("main"), None, &[], None, &[])
+        .expect_err("pull_request is not declared");
+    match &error {
+        TriggerMismatch::EventNotDeclared { declared } => {
+            assert_eq!(
+                declared,
+                &["push".to_owned(), "workflow_dispatch".to_owned()]
+            );
+        }
+        other => panic!("expected EventNotDeclared, got {other:?}"),
+    }
+    // The rendered text must name what to pass instead.
+    let rendered = error.to_string();
+    assert!(rendered.contains("push"), "{rendered}");
+    assert!(rendered.contains("workflow_dispatch"), "{rendered}");
+}
+
+#[test]
+fn match_event_reports_missing_and_rejected_activity_types() {
+    let workflow = parse_workflow(
+        r#"
+on:
+  pull_request:
+    types: [opened, reopened]
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+    let missing = workflow
+        .on
+        .match_event("pull_request", Some("main"), None, &[], None, &[])
+        .expect_err("no activity type supplied");
+    assert_eq!(
+        missing,
+        TriggerMismatch::ActivityTypeMissing {
+            accepted: vec!["opened".to_owned(), "reopened".to_owned()]
+        }
+    );
+
+    let rejected = workflow
+        .on
+        .match_event(
+            "pull_request",
+            Some("main"),
+            None,
+            &[],
+            Some("synchronize"),
+            &[],
+        )
+        .expect_err("synchronize is not in types");
+    assert_eq!(
+        rejected,
+        TriggerMismatch::ActivityTypeRejected {
+            got: "synchronize".to_owned(),
+            accepted: vec!["opened".to_owned(), "reopened".to_owned()]
+        }
+    );
+
+    // An accepted type still matches.
+    assert!(workflow
+        .on
+        .match_event("pull_request", Some("main"), None, &[], Some("opened"), &[])
+        .is_ok());
+}
+
+/// A bare `pull_request:` still applies GitHub's default activity types, so a
+/// caller that supplies none gets a reason naming them.
+#[test]
+fn match_event_reports_default_pr_activity_types() {
+    let workflow = parse_workflow(
+        "on:\n  pull_request:\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+    )
+    .unwrap();
+    let error = workflow
+        .on
+        .match_event("pull_request", Some("main"), None, &[], None, &[])
+        .expect_err("default types still require an activity type");
+    match error {
+        TriggerMismatch::ActivityTypeMissing { accepted } => {
+            assert_eq!(
+                accepted,
+                vec![
+                    "opened".to_owned(),
+                    "synchronize".to_owned(),
+                    "reopened".to_owned(),
+                ]
+            );
+        }
+        other => panic!("expected ActivityTypeMissing, got {other:?}"),
+    }
+}
+
+#[test]
+fn match_event_reports_ref_and_path_filters() {
+    let workflow = parse_workflow(
+        r#"
+on:
+  push:
+    branches: [main]
+    paths: ["src/**"]
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+
+    let ref_filtered = workflow
+        .on
+        .match_event(
+            "push",
+            Some("feature/x"),
+            None,
+            &["src/lib.rs".to_owned()],
+            None,
+            &[],
+        )
+        .expect_err("branch is filtered out");
+    match &ref_filtered {
+        TriggerMismatch::RefFiltered {
+            branch, filters, ..
+        } => {
+            assert_eq!(branch.as_deref(), Some("feature/x"));
+            assert_eq!(filters, &[("branches".to_owned(), vec!["main".to_owned()])]);
+        }
+        other => panic!("expected RefFiltered, got {other:?}"),
+    }
+    assert!(ref_filtered.to_string().contains("feature/x"));
+
+    let unmatched = workflow
+        .on
+        .match_event(
+            "push",
+            Some("main"),
+            None,
+            &["docs/readme.md".to_owned()],
+            None,
+            &[],
+        )
+        .expect_err("no changed path matches src/**");
+    assert_eq!(
+        unmatched,
+        TriggerMismatch::PathsUnmatched {
+            changed: 1,
+            filters: vec!["src/**".to_owned()]
+        }
+    );
+    assert!(unmatched.to_string().contains("src/**"));
+}
+
+#[test]
+fn match_event_reports_all_paths_ignored() {
+    let workflow = parse_workflow(
+        r#"
+on:
+  pull_request:
+    types: [synchronize]
+    paths-ignore: ["**.md"]
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+    let error = workflow
+        .on
+        .match_event(
+            "pull_request",
+            Some("main"),
+            None,
+            &["README.md".to_owned(), "docs/a.md".to_owned()],
+            Some("synchronize"),
+            &[],
+        )
+        .expect_err("every changed file is ignored");
+    assert_eq!(
+        error,
+        TriggerMismatch::PathsAllIgnored {
+            changed: 2,
+            filters: vec!["**.md".to_owned()]
+        }
+    );
+
+    // A mixed change set still runs — paths-ignore only suppresses when all
+    // changed files are ignored.
+    assert!(workflow
+        .on
+        .match_event(
+            "pull_request",
+            Some("main"),
+            None,
+            &["README.md".to_owned(), "src/lib.rs".to_owned()],
+            Some("synchronize"),
+            &[],
+        )
+        .is_ok());
+}
+
+#[test]
+fn match_event_reports_unmatched_upstream_workflow() {
+    let workflow = parse_workflow(
+        r#"
+on:
+  workflow_run:
+    types: [completed]
+    workflows: ["CI"]
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+    let error = workflow
+        .on
+        .match_event(
+            "workflow_run",
+            Some("main"),
+            None,
+            &[],
+            Some("completed"),
+            &[],
+        )
+        .expect_err("no upstream workflow name supplied");
+    assert_eq!(
+        error,
+        TriggerMismatch::UpstreamWorkflowUnmatched {
+            filters: vec!["CI".to_owned()]
+        }
+    );
+
+    assert!(workflow
+        .on
+        .match_event(
+            "workflow_run",
+            Some("main"),
+            None,
+            &[],
+            Some("completed"),
+            &["CI".to_owned()],
+        )
+        .is_ok());
+}
+
 #[test]
 fn parses_workflow_run_name() {
     let workflow = parse_workflow(
