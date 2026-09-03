@@ -1266,65 +1266,129 @@ fn migrate_legacy_github_credentials(
 ) -> anyhow::Result<bool> {
     use preloop_runner_server::credential_store::{github_reference, SecretString};
 
-    if store.available().is_err() {
+    let has_legacy = config
+        .github
+        .legacy_app_pem
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some()
+        || config
+            .github
+            .legacy_pat
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_some()
+        || config
+            .github
+            .legacy_webhook_secret
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_some()
+        || config.github.apps.iter().any(|app| {
+            !app.legacy_pem.trim().is_empty()
+                || app
+                    .legacy_webhook_secret
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .is_some()
+        });
+
+    if !has_legacy {
         return Ok(false);
     }
+
+    if let Err(error) = store.available() {
+        tracing::warn!(
+            %error,
+            "config contains inline GitHub credentials but no credential store is reachable; \
+             leaving inline credentials active"
+        );
+        return Ok(false);
+    }
+
     let mut migrated = false;
     let app_id = config.github.app_id.clone();
 
-    if config.github.legacy_app_pem.is_some() {
-        match app_id.as_deref() {
-            Some(app_id) => {
-                let value = config.github.legacy_app_pem.take().expect("checked above");
-                let reference = github_reference("app-pem", Some(app_id))?;
-                store.set(&reference, &SecretString::new(value))?;
-                config.github.app_pem_ref = Some(reference.as_str().to_owned());
-                migrated = true;
+    if let Some(value) = config.github.legacy_app_pem.take() {
+        let value = value.trim();
+        if !value.is_empty() {
+            match app_id.as_deref() {
+                Some(app_id) => {
+                    let reference = github_reference("app-pem", Some(app_id))?;
+                    if store.get(&reference)?.is_none() {
+                        store.set(&reference, &SecretString::new(value))?;
+                    }
+                    config.github.app_pem_ref = Some(reference.as_str().to_owned());
+                    migrated = true;
+                }
+                None => {
+                    config.github.legacy_app_pem = Some(value.to_owned());
+                    eprintln!(
+                        "[preloop] leaving the inline GitHub App key in config.toml: \
+                         github.app_id is not set, so it cannot be namespaced"
+                    );
+                }
             }
-            None => eprintln!(
-                "[preloop] leaving the inline GitHub App key in config.toml: \
-                 github.app_id is not set, so it cannot be namespaced"
-            ),
         }
     }
     if let Some(value) = config.github.legacy_pat.take() {
-        let reference = github_reference("pat", None)?;
-        store.set(&reference, &SecretString::new(value))?;
-        config.github.pat_ref = Some(reference.as_str().to_owned());
-        migrated = true;
-    }
-    if config.github.legacy_webhook_secret.is_some() {
-        match app_id.as_deref() {
-            Some(app_id) => {
-                let value = config
-                    .github
-                    .legacy_webhook_secret
-                    .take()
-                    .expect("checked above");
-                let reference = github_reference("webhook", Some(app_id))?;
+        let value = value.trim();
+        if !value.is_empty() {
+            let reference = github_reference("pat", None)?;
+            if store.get(&reference)?.is_none() {
                 store.set(&reference, &SecretString::new(value))?;
-                config.github.webhook_secret_ref = Some(reference.as_str().to_owned());
-                migrated = true;
             }
-            None => eprintln!(
-                "[preloop] leaving the inline webhook secret in config.toml: \
-                 github.app_id is not set, so it cannot be namespaced"
-            ),
+            config.github.pat_ref = Some(reference.as_str().to_owned());
+            migrated = true;
+        }
+    }
+    if let Some(value) = config.github.legacy_webhook_secret.take() {
+        let value = value.trim();
+        if !value.is_empty() {
+            match app_id.as_deref() {
+                Some(app_id) => {
+                    let reference = github_reference("webhook", Some(app_id))?;
+                    if store.get(&reference)?.is_none() {
+                        store.set(&reference, &SecretString::new(value))?;
+                    }
+                    config.github.webhook_secret_ref = Some(reference.as_str().to_owned());
+                    migrated = true;
+                }
+                None => {
+                    config.github.legacy_webhook_secret = Some(value.to_owned());
+                    eprintln!(
+                        "[preloop] leaving the inline webhook secret in config.toml: \
+                         github.app_id is not set, so it cannot be namespaced"
+                    );
+                }
+            }
         }
     }
     for app in &mut config.github.apps {
-        if !app.legacy_pem.is_empty() {
+        let pem = app.legacy_pem.trim().to_owned();
+        if !pem.is_empty() {
             let reference = github_reference("app-pem", Some(&app.app_id))?;
-            store.set(&reference, &SecretString::new(&app.legacy_pem))?;
+            if store.get(&reference)?.is_none() {
+                store.set(&reference, &SecretString::new(&pem))?;
+            }
             app.legacy_pem.clear();
             app.pem_ref = Some(reference.as_str().to_owned());
             migrated = true;
         }
         if let Some(value) = app.legacy_webhook_secret.take() {
-            let reference = github_reference("webhook", Some(&app.app_id))?;
-            store.set(&reference, &SecretString::new(value))?;
-            app.webhook_secret_ref = Some(reference.as_str().to_owned());
-            migrated = true;
+            let value = value.trim();
+            if !value.is_empty() {
+                let reference = github_reference("webhook", Some(&app.app_id))?;
+                if store.get(&reference)?.is_none() {
+                    store.set(&reference, &SecretString::new(value))?;
+                }
+                app.webhook_secret_ref = Some(reference.as_str().to_owned());
+                migrated = true;
+            }
         }
     }
     Ok(migrated)
