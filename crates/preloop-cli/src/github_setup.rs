@@ -126,7 +126,7 @@ fn redacted(present: bool) -> impl std::fmt::Debug {
     Marker(present)
 }
 
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Via {
     App,
     Pat,
@@ -251,25 +251,46 @@ async fn cmd_setup_github(args: GithubSetupArgs) -> anyhow::Result<()> {
     // App *creation* still wins: GitHub generates the secret it will sign
     // with, and nothing local can override that.
     if let Some(secret) = args.webhook_secret.as_deref() {
-        let store = OsCredentialStore;
-        let mut config = preloop_runner_server::config::load_config()?;
-        // A webhook secret can precede App registration, in which case there
-        // is no App id to namespace it under; the legacy inline field stays
-        // the only home until `save_app_credentials` moves it.
-        match config.github.app_id.as_deref() {
-            Some(app_id) => {
-                let reference = github_reference("webhook", Some(app_id))?;
-                store.set(&reference, &SecretString::new(secret))?;
-                config.github.legacy_webhook_secret = None;
-                config.github.webhook_secret_ref = Some(reference.as_str().to_owned());
-                let path = write_config(&config)?;
-                println!(
-                    "Webhook secret stored in the operating-system credential store \
-                     (referenced from {}).",
-                    path.display()
-                );
-            }
-            None => {
+        // If `--via app` is chosen with an explicit `--app-id` or `--pem-file`,
+        // `setup_app` / `save_app_credentials` will bind the secret directly to
+        // that target App. Otherwise, configure it here.
+        if !(via == Via::App && args.app_id.is_some()) {
+            let store = OsCredentialStore;
+            let mut config = preloop_runner_server::config::load_config()?;
+            let target_app_id = args.app_id.as_deref().or(config.github.app_id.as_deref());
+            if let Some(app_id) = target_app_id {
+                if store.available().is_ok() {
+                    let reference = github_reference("webhook", Some(app_id))?;
+                    store.set(&reference, &SecretString::new(secret))?;
+                    if let Some(existing) = config.github.apps.iter_mut().find(|a| a.app_id == app_id) {
+                        existing.legacy_webhook_secret = None;
+                        existing.webhook_secret_ref = Some(reference.as_str().to_owned());
+                    } else {
+                        config.github.legacy_webhook_secret = None;
+                        config.github.webhook_secret_ref = Some(reference.as_str().to_owned());
+                    }
+                    let path = write_config(&config)?;
+                    println!(
+                        "Webhook secret stored in the operating-system credential store \
+                         (referenced from {}).",
+                        path.display()
+                    );
+                } else {
+                    println!(
+                        "warning: operating-system credential store is unavailable (headless environment); \
+                         storing webhook secret inline in config.toml (mode 0600)."
+                    );
+                    if let Some(existing) = config.github.apps.iter_mut().find(|a| a.app_id == app_id) {
+                        existing.legacy_webhook_secret = Some(secret.to_owned());
+                        existing.webhook_secret_ref = None;
+                    } else {
+                        config.github.legacy_webhook_secret = Some(secret.to_owned());
+                        config.github.webhook_secret_ref = None;
+                    }
+                    let path = write_config(&config)?;
+                    println!("Webhook secret stored in {}.", path.display());
+                }
+            } else {
                 config.github.legacy_webhook_secret = Some(secret.to_owned());
                 config.github.webhook_secret_ref = None;
                 let path = write_config(&config)?;
@@ -338,7 +359,7 @@ async fn setup_app(args: &GithubSetupArgs) -> anyhow::Result<()> {
         (Some(app_id), Some(pem_path)) => {
             let pem = std::fs::read_to_string(pem_path)
                 .with_context(|| format!("reading App private key {}", pem_path.display()))?;
-            (app_id.to_owned(), pem, None)
+            (app_id.to_owned(), pem, args.webhook_secret.clone())
         }
         (Some(_), None) => anyhow::bail!(
             "--pem-file is required alongside --app-id (omit both to create the App in a browser)"
@@ -379,14 +400,24 @@ fn save_app_credentials(
     webhook_secret: Option<String>,
 ) -> anyhow::Result<PathBuf> {
     let store = OsCredentialStore;
-    let pem_ref = github_reference("app-pem", Some(app_id))?;
-    store.set(&pem_ref, &SecretString::new(pem))?;
-    let webhook_ref = if let Some(secret) = webhook_secret {
-        let reference = github_reference("webhook", Some(app_id))?;
-        store.set(&reference, &SecretString::new(&secret))?;
-        Some(reference.as_str().to_owned())
+    let store_available = store.available().is_ok();
+    let (pem_ref, webhook_ref) = if store_available {
+        let pem_ref = github_reference("app-pem", Some(app_id))?;
+        store.set(&pem_ref, &SecretString::new(pem))?;
+        let webhook_ref = if let Some(secret) = &webhook_secret {
+            let reference = github_reference("webhook", Some(app_id))?;
+            store.set(&reference, &SecretString::new(secret))?;
+            Some(reference.as_str().to_owned())
+        } else {
+            None
+        };
+        (Some(pem_ref.as_str().to_owned()), webhook_ref)
     } else {
-        None
+        println!(
+            "warning: operating-system credential store is unavailable (headless environment); \
+             storing credentials inline in config.toml (mode 0600)."
+        );
+        (None, None)
     };
 
     let mut config = load_config()?;
@@ -395,51 +426,91 @@ fn save_app_credentials(
     }
     if let Some(existing_primary) = &config.github.app_id {
         if existing_primary == app_id {
-            config.github.legacy_app_pem = None;
-            config.github.app_pem_ref = Some(pem_ref.as_str().to_owned());
-            if webhook_ref.is_some() {
-                config.github.legacy_webhook_secret = None;
-                config.github.webhook_secret_ref = webhook_ref;
+            if store_available {
+                config.github.legacy_app_pem = None;
+                config.github.app_pem_ref = pem_ref;
+                if webhook_ref.is_some() {
+                    config.github.legacy_webhook_secret = None;
+                    config.github.webhook_secret_ref = webhook_ref;
+                }
+            } else {
+                config.github.legacy_app_pem = Some(pem.to_owned());
+                config.github.app_pem_ref = None;
+                if let Some(secret) = webhook_secret {
+                    config.github.legacy_webhook_secret = Some(secret);
+                    config.github.webhook_secret_ref = None;
+                }
             }
             return write_config(&config);
         }
     }
     if let Some(existing) = config.github.apps.iter_mut().find(|a| a.app_id == app_id) {
-        existing.legacy_pem.clear();
-        existing.pem_ref = Some(pem_ref.as_str().to_owned());
-        if webhook_ref.is_some() {
-            existing.legacy_webhook_secret = None;
-            existing.webhook_secret_ref = webhook_ref;
+        if store_available {
+            existing.legacy_pem.clear();
+            existing.pem_ref = pem_ref;
+            if webhook_ref.is_some() {
+                existing.legacy_webhook_secret = None;
+                existing.webhook_secret_ref = webhook_ref;
+            }
+        } else {
+            existing.legacy_pem = pem.to_owned();
+            existing.pem_ref = None;
+            if let Some(secret) = webhook_secret {
+                existing.legacy_webhook_secret = Some(secret);
+                existing.webhook_secret_ref = None;
+            }
         }
         return write_config(&config);
     }
     if config.github.app_id.is_none() && config.github.apps.is_empty() {
         config.github.app_id = Some(app_id.to_owned());
-        config.github.legacy_app_pem = None;
-        config.github.app_pem_ref = Some(pem_ref.as_str().to_owned());
-        // An App id now exists, so a secret parked inline by
-        // `--webhook-secret` can finally be namespaced and moved.
-        if webhook_ref.is_some() {
-            config.github.legacy_webhook_secret = None;
-            config.github.webhook_secret_ref = webhook_ref;
-        } else if let Some(secret) = config.github.legacy_webhook_secret.take() {
-            let reference = github_reference("webhook", Some(app_id))?;
-            store.set(&reference, &SecretString::new(&secret))?;
-            config.github.webhook_secret_ref = Some(reference.as_str().to_owned());
+        if store_available {
+            config.github.legacy_app_pem = None;
+            config.github.app_pem_ref = pem_ref;
+            // An App id now exists, so a secret parked inline by
+            // `--webhook-secret` can finally be namespaced and moved.
+            if webhook_ref.is_some() {
+                config.github.legacy_webhook_secret = None;
+                config.github.webhook_secret_ref = webhook_ref;
+            } else if let Some(secret) = config.github.legacy_webhook_secret.take() {
+                let reference = github_reference("webhook", Some(app_id))?;
+                store.set(&reference, &SecretString::new(&secret))?;
+                config.github.webhook_secret_ref = Some(reference.as_str().to_owned());
+            }
+        } else {
+            config.github.legacy_app_pem = Some(pem.to_owned());
+            config.github.app_pem_ref = None;
+            if let Some(secret) = webhook_secret {
+                config.github.legacy_webhook_secret = Some(secret);
+                config.github.webhook_secret_ref = None;
+            }
         }
         return write_config(&config);
     }
-    config
-        .github
-        .apps
-        .push(preloop_runner_server::config::AppConfig {
-            app_id: app_id.to_owned(),
-            pem_ref: Some(pem_ref.as_str().to_owned()),
-            webhook_secret_ref: webhook_ref,
-            ..Default::default()
-        });
+    if store_available {
+        config
+            .github
+            .apps
+            .push(preloop_runner_server::config::AppConfig {
+                app_id: app_id.to_owned(),
+                pem_ref,
+                webhook_secret_ref: webhook_ref,
+                ..Default::default()
+            });
+    } else {
+        config
+            .github
+            .apps
+            .push(preloop_runner_server::config::AppConfig {
+                app_id: app_id.to_owned(),
+                legacy_pem: pem.to_owned(),
+                legacy_webhook_secret: webhook_secret,
+                ..Default::default()
+            });
+    }
     write_config(&config)
 }
+
 
 /// Create the App through GitHub's manifest flow and store what comes back.
 async fn setup_app_via_browser(args: &GithubSetupArgs) -> anyhow::Result<()> {
@@ -503,19 +574,33 @@ async fn enable_webhooks(
     preloop_runner_server::github_app::set_app_webhook_config(app_id, pem, &hook_url, &secret)
         .await?;
     let store = OsCredentialStore;
-    let webhook_ref = github_reference("webhook", Some(app_id))?;
-    store.set(&webhook_ref, &SecretString::new(&secret))?;
     let mut config = load_config()?;
-    if let Some(existing) = config.github.apps.iter_mut().find(|a| a.app_id == app_id) {
-        existing.legacy_webhook_secret = None;
-        existing.webhook_secret_ref = Some(webhook_ref.as_str().to_owned());
+    if store.available().is_ok() {
+        let webhook_ref = github_reference("webhook", Some(app_id))?;
+        store.set(&webhook_ref, &SecretString::new(&secret))?;
+        if let Some(existing) = config.github.apps.iter_mut().find(|a| a.app_id == app_id) {
+            existing.legacy_webhook_secret = None;
+            existing.webhook_secret_ref = Some(webhook_ref.as_str().to_owned());
+        } else {
+            config.github.legacy_webhook_secret = None;
+            config.github.webhook_secret_ref = Some(webhook_ref.as_str().to_owned());
+        }
+        println!("Secret stored in the operating-system credential store.");
     } else {
-        config.github.legacy_webhook_secret = None;
-        config.github.webhook_secret_ref = Some(webhook_ref.as_str().to_owned());
+        println!(
+            "warning: operating-system credential store is unavailable (headless environment); \
+             storing webhook secret inline in config.toml (mode 0600)."
+        );
+        if let Some(existing) = config.github.apps.iter_mut().find(|a| a.app_id == app_id) {
+            existing.legacy_webhook_secret = Some(secret.clone());
+            existing.webhook_secret_ref = None;
+        } else {
+            config.github.legacy_webhook_secret = Some(secret.clone());
+            config.github.webhook_secret_ref = None;
+        }
     }
     write_config(&config)?;
     println!("App {app_id} webhook now delivers to {hook_url}");
-    println!("Secret stored in the operating-system credential store.");
     println!(
         "If deliveries do not arrive, tick **Active** under Webhook in the App's\n\
          settings — GitHub's API cannot set that flag, and an App created\n\
@@ -616,16 +701,24 @@ async fn setup_pat(args: &GithubSetupArgs) -> anyhow::Result<()> {
     }
 
     let store = OsCredentialStore;
-    let pat_ref = github_reference("pat", None)?;
-    store.set(&pat_ref, &SecretString::new(&token))?;
     let mut config = load_config()?;
-    config.github.legacy_pat = None;
-    config.github.pat_ref = Some(pat_ref.as_str().to_owned());
+    if store.available().is_ok() {
+        let pat_ref = github_reference("pat", None)?;
+        store.set(&pat_ref, &SecretString::new(&token))?;
+        config.github.legacy_pat = None;
+        config.github.pat_ref = Some(pat_ref.as_str().to_owned());
+        println!("Stored PAT in the operating-system credential store.");
+    } else {
+        println!(
+            "warning: operating-system credential store is unavailable (headless environment); \
+             storing PAT inline in config.toml (mode 0600)."
+        );
+        config.github.legacy_pat = Some(token.clone());
+        config.github.pat_ref = None;
+    }
     config.github.mint_failure = Some("pat".into());
     write_config(&config)?;
-    println!("Stored PAT in the operating-system credential store.");
     println!("Restart the engine (`preloop serve`) to pick up the config.");
-
     if args.repos.is_empty() {
         println!("Tip: verify with `preloop doctor --repo owner/name`.");
         return Ok(());
