@@ -1264,7 +1264,7 @@ fn migrate_legacy_github_credentials(
     config: &mut preloop_runner_server::config::ConfigFile,
     store: &impl preloop_runner_server::credential_store::CredentialStore,
 ) -> anyhow::Result<bool> {
-    use preloop_runner_server::credential_store::{github_reference, SecretString};
+    use preloop_runner_server::credential_store::{github_reference_with_host, SecretString};
 
     let has_legacy = config
         .github
@@ -1312,13 +1312,14 @@ fn migrate_legacy_github_credentials(
 
     let mut migrated = false;
     let app_id = config.github.app_id.clone();
+    let host = config.github.server_url.as_deref();
 
     if let Some(value) = config.github.legacy_app_pem.take() {
         let value = value.trim();
         if !value.is_empty() {
             match app_id.as_deref() {
                 Some(app_id) => {
-                    let reference = github_reference("app-pem", Some(app_id))?;
+                    let reference = github_reference_with_host("app-pem", host, Some(app_id))?;
                     if store.get(&reference)?.is_none() {
                         store.set(&reference, &SecretString::new(value))?;
                     }
@@ -1338,7 +1339,7 @@ fn migrate_legacy_github_credentials(
     if let Some(value) = config.github.legacy_pat.take() {
         let value = value.trim();
         if !value.is_empty() {
-            let reference = github_reference("pat", None)?;
+            let reference = github_reference_with_host("pat", host, None)?;
             if store.get(&reference)?.is_none() {
                 store.set(&reference, &SecretString::new(value))?;
             }
@@ -1351,7 +1352,7 @@ fn migrate_legacy_github_credentials(
         if !value.is_empty() {
             match app_id.as_deref() {
                 Some(app_id) => {
-                    let reference = github_reference("webhook", Some(app_id))?;
+                    let reference = github_reference_with_host("webhook", host, Some(app_id))?;
                     if store.get(&reference)?.is_none() {
                         store.set(&reference, &SecretString::new(value))?;
                     }
@@ -1371,7 +1372,7 @@ fn migrate_legacy_github_credentials(
     for app in &mut config.github.apps {
         let pem = app.legacy_pem.trim().to_owned();
         if !pem.is_empty() {
-            let reference = github_reference("app-pem", Some(&app.app_id))?;
+            let reference = github_reference_with_host("app-pem", host, Some(&app.app_id))?;
             if store.get(&reference)?.is_none() {
                 store.set(&reference, &SecretString::new(&pem))?;
             }
@@ -1382,7 +1383,7 @@ fn migrate_legacy_github_credentials(
         if let Some(value) = app.legacy_webhook_secret.take() {
             let value = value.trim();
             if !value.is_empty() {
-                let reference = github_reference("webhook", Some(&app.app_id))?;
+                let reference = github_reference_with_host("webhook", host, Some(&app.app_id))?;
                 if store.get(&reference)?.is_none() {
                     store.set(&reference, &SecretString::new(value))?;
                 }
@@ -4397,6 +4398,100 @@ mod tests {
                 Some("REGISTRY-PEM")
             );
             assert!(!migrate_legacy_github_credentials(&mut config, &store).unwrap());
+        }
+
+        #[test]
+        fn rotation_preserves_existing_store_credentials() {
+            let store = MemoryCredentialStore::default();
+            let pat_ref = github_reference("pat", None).unwrap();
+            store
+                .set(
+                    &pat_ref,
+                    &preloop_runner_server::credential_store::SecretString::new("ROTATED-PAT"),
+                )
+                .unwrap();
+
+            let mut config = ConfigFile {
+                github: GitHubConfig {
+                    legacy_pat: Some("stale_legacy_pat".into()),
+                    pat_ref: Some(pat_ref.as_str().to_owned()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            assert!(migrate_legacy_github_credentials(&mut config, &store).unwrap());
+            assert_eq!(config.github.legacy_pat, None);
+            assert_eq!(
+                store.get(&pat_ref).unwrap().as_ref().map(|s| s.expose()),
+                Some("ROTATED-PAT"),
+                "migration must not overwrite rotated store value with stale legacy value"
+            );
+        }
+
+        #[test]
+        fn empty_legacy_values_do_not_fail_migration() {
+            let store = MemoryCredentialStore::default();
+            let mut config = ConfigFile {
+                github: GitHubConfig {
+                    app_id: Some("123".into()),
+                    legacy_app_pem: Some("  ".into()),
+                    legacy_pat: Some("".into()),
+                    legacy_webhook_secret: Some("".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert!(!migrate_legacy_github_credentials(&mut config, &store).unwrap());
+        }
+
+        #[test]
+        fn distinct_hosts_with_identical_app_ids_do_not_collide_in_store() {
+            let store = MemoryCredentialStore::default();
+            let mut config_cloud = ConfigFile {
+                github: GitHubConfig {
+                    app_id: Some("999".into()),
+                    server_url: Some("https://github.com".into()),
+                    legacy_app_pem: Some("CLOUD-PEM".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut config_ghes = ConfigFile {
+                github: GitHubConfig {
+                    app_id: Some("999".into()),
+                    server_url: Some("https://ghe.corp.internal".into()),
+                    legacy_app_pem: Some("GHES-PEM".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            assert!(migrate_legacy_github_credentials(&mut config_cloud, &store).unwrap());
+            assert!(migrate_legacy_github_credentials(&mut config_ghes, &store).unwrap());
+
+            let cloud_ref = preloop_runner_server::credential_store::github_reference_with_host(
+                "app-pem",
+                Some("https://github.com"),
+                Some("999"),
+            )
+            .unwrap();
+            let ghes_ref = preloop_runner_server::credential_store::github_reference_with_host(
+                "app-pem",
+                Some("https://ghe.corp.internal"),
+                Some("999"),
+            )
+            .unwrap();
+
+            assert_ne!(cloud_ref.as_str(), ghes_ref.as_str());
+            assert_eq!(
+                store.get(&cloud_ref).unwrap().as_ref().map(|s| s.expose()),
+                Some("CLOUD-PEM")
+            );
+            assert_eq!(
+                store.get(&ghes_ref).unwrap().as_ref().map(|s| s.expose()),
+                Some("GHES-PEM")
+            );
         }
     }
 

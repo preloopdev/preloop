@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 pub struct CredentialRef(String);
 
 impl CredentialRef {
+    /// Create and validate a new credential reference.
     pub fn new(value: impl Into<String>) -> Result<Self> {
         let value = value.into();
         if value.is_empty() || value.len() > 255 {
@@ -29,11 +30,11 @@ impl CredentialRef {
         Ok(Self(value))
     }
 
+    /// Return the underlying reference string.
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
-
 impl fmt::Debug for CredentialRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("CredentialRef").field(&self.0).finish()
@@ -61,7 +62,12 @@ pub fn github_reference_with_host(
         }
     }
     let host_prefix = match host {
-        Some(h) if !h.is_empty() && h != "github.com" && h != "https://github.com" && h != "http://github.com" => {
+        Some(h)
+            if !h.is_empty()
+                && h != "github.com"
+                && h != "https://github.com"
+                && h != "http://github.com" =>
+        {
             let clean = h
                 .trim_start_matches("https://")
                 .trim_start_matches("http://")
@@ -73,7 +79,13 @@ pub fn github_reference_with_host(
                 .unwrap_or(h);
             let sanitized: String = clean
                 .chars()
-                .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '-' })
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
                 .collect();
             if sanitized.is_empty() {
                 String::new()
@@ -94,11 +106,14 @@ pub fn github_reference_with_host(
 
 /// Secret storage backend. Implementations must never log values.
 pub trait CredentialStore: Send + Sync {
+    /// Retrieve a secret by reference from the store.
     fn get(&self, reference: &CredentialRef) -> Result<Option<SecretString>>;
+    /// Write or overwrite a secret by reference in the store.
     fn set(&self, reference: &CredentialRef, value: &SecretString) -> Result<()>;
+    /// Delete a secret by reference from the store.
     fn delete(&self, reference: &CredentialRef) -> Result<()>;
+    /// Human-readable name of the backend for diagnostics.
     fn name(&self) -> &'static str;
-
     /// Whether the backend can be reached at all.
     ///
     /// Distinct from a missing entry: a headless Linux host has no
@@ -146,7 +161,6 @@ impl CredentialStore for OsCredentialStore {
             Err(error) => Err(error).context("delete credential from OS store"),
         }
     }
-
 
     fn name(&self) -> &'static str {
         "operating-system credential store"
@@ -254,9 +268,7 @@ mod tests {
         let store = MemoryCredentialStore::default();
         let reference = CredentialRef::new("github-pat").unwrap();
         assert_eq!(store.get(&reference).unwrap(), None);
-        store
-            .set(&reference, &SecretString::new("secret"))
-            .unwrap();
+        store.set(&reference, &SecretString::new("secret")).unwrap();
         assert_eq!(
             store.get(&reference).unwrap().as_ref().map(|s| s.expose()),
             Some("secret")

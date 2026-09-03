@@ -701,10 +701,16 @@ mod tests {
         let pem_ref = github_reference("app-pem", Some("123")).unwrap();
         let pat_ref = github_reference("pat", None).unwrap();
         store
-            .set(&pem_ref, &preloop_gha_protocol::SecretString::new("STORED-PEM"))
+            .set(
+                &pem_ref,
+                &preloop_gha_protocol::SecretString::new("STORED-PEM"),
+            )
             .unwrap();
         store
-            .set(&pat_ref, &preloop_gha_protocol::SecretString::new("STORED-PAT"))
+            .set(
+                &pat_ref,
+                &preloop_gha_protocol::SecretString::new("STORED-PAT"),
+            )
             .unwrap();
         ConfigFile {
             github: GitHubConfig {
@@ -790,7 +796,10 @@ mod tests {
         let store = MemoryCredentialStore::default();
         let pem_ref = github_reference("app-pem", Some("456")).unwrap();
         store
-            .set(&pem_ref, &preloop_gha_protocol::SecretString::new("STORED-PEM"))
+            .set(
+                &pem_ref,
+                &preloop_gha_protocol::SecretString::new("STORED-PEM"),
+            )
             .unwrap();
         let mut config = ConfigFile {
             github: GitHubConfig {
@@ -806,6 +815,48 @@ mod tests {
         };
         resolve_credential_references(&mut config, &store).unwrap();
         assert_eq!(config.github.apps[0].pem(), "STORED-PEM");
+    }
+    #[test]
+    fn unreachable_store_degrades_registry_apps_to_empty() {
+        let mut config = ConfigFile {
+            github: GitHubConfig {
+                apps: vec![AppConfig {
+                    app_id: "456".into(),
+                    pem_ref: Some("github-app-pem-456".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        resolve_credential_references(&mut config, &UnavailableCredentialStore).unwrap();
+        assert_eq!(config.github.apps[0].pem(), "");
+    }
+
+    #[test]
+    fn host_scoped_credential_references_resolve() {
+        let store = MemoryCredentialStore::default();
+        let pat_ref = crate::credential_store::github_reference_with_host(
+            "pat",
+            Some("https://ghe.internal"),
+            None,
+        )
+        .unwrap();
+        store
+            .set(
+                &pat_ref,
+                &preloop_gha_protocol::SecretString::new("GHE-PAT"),
+            )
+            .unwrap();
+        let mut config = ConfigFile {
+            github: GitHubConfig {
+                pat_ref: Some(pat_ref.as_str().to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        resolve_credential_references(&mut config, &store).unwrap();
+        assert_eq!(config.github.pat(), Some("GHE-PAT"));
     }
 
     /// A `debug!(?config)` must never disclose the PAT or the private key.

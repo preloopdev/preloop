@@ -10,7 +10,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use preloop_runner_server::config::{load_config, store_memory, write_config};
 use preloop_runner_server::credential_store::{
-    github_reference, CredentialStore, OsCredentialStore, SecretString,
+    github_reference, github_reference_with_host, CredentialStore, OsCredentialStore, SecretString,
 };
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
@@ -260,9 +260,15 @@ async fn cmd_setup_github(args: GithubSetupArgs) -> anyhow::Result<()> {
             let target_app_id = args.app_id.as_deref().or(config.github.app_id.as_deref());
             if let Some(app_id) = target_app_id {
                 if store.available().is_ok() {
-                    let reference = github_reference("webhook", Some(app_id))?;
+                    let reference = github_reference_with_host(
+                        "webhook",
+                        config.github.server_url.as_deref(),
+                        Some(app_id),
+                    )?;
                     store.set(&reference, &SecretString::new(secret))?;
-                    if let Some(existing) = config.github.apps.iter_mut().find(|a| a.app_id == app_id) {
+                    if let Some(existing) =
+                        config.github.apps.iter_mut().find(|a| a.app_id == app_id)
+                    {
                         existing.legacy_webhook_secret = None;
                         existing.webhook_secret_ref = Some(reference.as_str().to_owned());
                     } else {
@@ -280,7 +286,9 @@ async fn cmd_setup_github(args: GithubSetupArgs) -> anyhow::Result<()> {
                         "warning: operating-system credential store is unavailable (headless environment); \
                          storing webhook secret inline in config.toml (mode 0600)."
                     );
-                    if let Some(existing) = config.github.apps.iter_mut().find(|a| a.app_id == app_id) {
+                    if let Some(existing) =
+                        config.github.apps.iter_mut().find(|a| a.app_id == app_id)
+                    {
                         existing.legacy_webhook_secret = Some(secret.to_owned());
                         existing.webhook_secret_ref = None;
                     } else {
@@ -401,11 +409,14 @@ fn save_app_credentials(
 ) -> anyhow::Result<PathBuf> {
     let store = OsCredentialStore;
     let store_available = store.available().is_ok();
+    let mut config = load_config()?;
+    let host = config.github.server_url.as_deref();
+
     let (pem_ref, webhook_ref) = if store_available {
-        let pem_ref = github_reference("app-pem", Some(app_id))?;
+        let pem_ref = github_reference_with_host("app-pem", host, Some(app_id))?;
         store.set(&pem_ref, &SecretString::new(pem))?;
         let webhook_ref = if let Some(secret) = &webhook_secret {
-            let reference = github_reference("webhook", Some(app_id))?;
+            let reference = github_reference_with_host("webhook", host, Some(app_id))?;
             store.set(&reference, &SecretString::new(secret))?;
             Some(reference.as_str().to_owned())
         } else {
@@ -420,7 +431,6 @@ fn save_app_credentials(
         (None, None)
     };
 
-    let mut config = load_config()?;
     if config.github.mint_failure.is_none() {
         config.github.mint_failure = Some("local".into());
     }
@@ -511,7 +521,6 @@ fn save_app_credentials(
     write_config(&config)
 }
 
-
 /// Create the App through GitHub's manifest flow and store what comes back.
 async fn setup_app_via_browser(args: &GithubSetupArgs) -> anyhow::Result<()> {
     let registration = crate::app_manifest::register(
@@ -576,7 +585,11 @@ async fn enable_webhooks(
     let store = OsCredentialStore;
     let mut config = load_config()?;
     if store.available().is_ok() {
-        let webhook_ref = github_reference("webhook", Some(app_id))?;
+        let webhook_ref = github_reference_with_host(
+            "webhook",
+            config.github.server_url.as_deref(),
+            Some(app_id),
+        )?;
         store.set(&webhook_ref, &SecretString::new(&secret))?;
         if let Some(existing) = config.github.apps.iter_mut().find(|a| a.app_id == app_id) {
             existing.legacy_webhook_secret = None;
@@ -703,7 +716,7 @@ async fn setup_pat(args: &GithubSetupArgs) -> anyhow::Result<()> {
     let store = OsCredentialStore;
     let mut config = load_config()?;
     if store.available().is_ok() {
-        let pat_ref = github_reference("pat", None)?;
+        let pat_ref = github_reference_with_host("pat", config.github.server_url.as_deref(), None)?;
         store.set(&pat_ref, &SecretString::new(&token))?;
         config.github.legacy_pat = None;
         config.github.pat_ref = Some(pat_ref.as_str().to_owned());
