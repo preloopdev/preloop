@@ -10,6 +10,7 @@
 //! is written with mode 0600 and never echoed back by `preloop secret list`
 //! or `preloop doctor`.
 
+use crate::credential_store::{CredentialRef, CredentialStore, OsCredentialStore};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -27,21 +28,45 @@ pub struct GitHubConfig {
     /// GitHub App ID.
     #[serde(default)]
     pub app_id: Option<String>,
-    /// GitHub App private key PEM (inline).
+    /// GitHub App private key PEM, stored inline (legacy).
+    ///
+    /// Read from disk and migrated into the OS credential store on the next
+    /// `preloop serve`; never populated from the credential store, so a
+    /// load/write round-trip can neither lose an unmigrated credential nor
+    /// reintroduce plaintext for a migrated one. Use [`GitHubConfig::app_pem`]
+    /// to read the effective value.
+    #[serde(default, rename = "app_pem")]
+    pub legacy_app_pem: Option<String>,
+    /// OS credential-store reference for the App private key.
     #[serde(default)]
-    pub app_pem: Option<String>,
+    pub app_pem_ref: Option<String>,
+    /// Value behind [`Self::app_pem_ref`], resolved at load. Never persisted.
+    #[serde(skip)]
+    pub resolved_app_pem: Option<String>,
     /// Mint-failure policy: `local`, `error`, or `pat`.
     #[serde(default)]
     pub mint_failure: Option<String>,
     /// PAT used as the fallback when App minting fails under the `pat`
     /// policy. Also the credential for the `--via pat` setup path.
+    /// Stored inline (legacy); see [`Self::legacy_app_pem`].
+    #[serde(default, rename = "pat")]
+    pub legacy_pat: Option<String>,
+    /// OS credential-store reference for the PAT.
     #[serde(default)]
-    pub pat: Option<String>,
+    pub pat_ref: Option<String>,
+    /// Value behind [`Self::pat_ref`], resolved at load. Never persisted.
+    #[serde(skip)]
+    pub resolved_pat: Option<String>,
     /// Shared secret for `X-Hub-Signature-256` webhook verification.
-    /// Written by the App-manifest setup flow, which receives it from
-    /// GitHub. Env: `PRELOOP_WEBHOOK_SECRET`.
+    /// Stored inline (legacy); see [`Self::legacy_app_pem`].
+    #[serde(default, rename = "webhook_secret")]
+    pub legacy_webhook_secret: Option<String>,
+    /// OS credential-store reference for the webhook secret.
     #[serde(default)]
-    pub webhook_secret: Option<String>,
+    pub webhook_secret_ref: Option<String>,
+    /// Value behind [`Self::webhook_secret_ref`], resolved at load. Never persisted.
+    #[serde(skip)]
+    pub resolved_webhook_secret: Option<String>,
     /// GitHub server URL exposed to workflows as `github.server_url` /
     /// `GITHUB_SERVER_URL`. Defaults to `https://github.com`; point it at a
     /// GHES-style host when the engine fronts one. Env: `PRELOOP_GITHUB_SERVER_URL`.
@@ -69,6 +94,28 @@ pub struct GitHubConfig {
     pub pr: PrConfig,
 }
 
+impl GitHubConfig {
+    /// Effective App private key: the credential store wins, the inline
+    /// legacy value is the pre-migration fallback.
+    pub fn app_pem(&self) -> Option<&str> {
+        self.resolved_app_pem
+            .as_deref()
+            .or(self.legacy_app_pem.as_deref())
+    }
+
+    /// Effective PAT. See [`Self::app_pem`].
+    pub fn pat(&self) -> Option<&str> {
+        self.resolved_pat.as_deref().or(self.legacy_pat.as_deref())
+    }
+
+    /// Effective webhook secret. See [`Self::app_pem`].
+    pub fn webhook_secret(&self) -> Option<&str> {
+        self.resolved_webhook_secret
+            .as_deref()
+            .or(self.legacy_webhook_secret.as_deref())
+    }
+}
+
 /// One additional GitHub App in the multi-App registry (`github.apps`).
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -78,17 +125,45 @@ pub struct AppConfig {
     /// hand, so `app_id: 12345` and `app_id: "12345"` must both load.
     #[serde(deserialize_with = "de_string_or_integer")]
     pub app_id: String,
-    /// App private key PEM (inline).
-    pub pem: String,
+    /// App private key PEM, stored inline (legacy). See
+    /// [`GitHubConfig::legacy_app_pem`]; read via [`AppConfig::pem`].
+    #[serde(default, rename = "pem")]
+    pub legacy_pem: String,
+    /// OS credential-store reference for the App private key.
+    #[serde(default)]
+    pub pem_ref: Option<String>,
+    /// Value behind [`Self::pem_ref`], resolved at load. Never persisted.
+    #[serde(skip)]
+    pub resolved_pem: Option<String>,
     /// Webhook secret for `X-Hub-Signature-256` verification, when the App
     /// has its own (the legacy `PRELOOP_WEBHOOK_SECRET` covers the default
-    /// App).
+    /// App). Stored inline (legacy); read via [`AppConfig::webhook_secret`].
+    #[serde(default, rename = "webhook_secret")]
+    pub legacy_webhook_secret: Option<String>,
+    /// OS credential-store reference for the App webhook secret.
     #[serde(default)]
-    pub webhook_secret: Option<String>,
+    pub webhook_secret_ref: Option<String>,
+    /// Value behind [`Self::webhook_secret_ref`], resolved at load. Never persisted.
+    #[serde(skip)]
+    pub resolved_webhook_secret: Option<String>,
     /// Explicit installation id, bypassing installation discovery for
     /// single-installation deployments of this App.
     #[serde(default)]
     pub installation_id: Option<u64>,
+}
+
+impl AppConfig {
+    /// Effective App private key. See [`GitHubConfig::app_pem`].
+    pub fn pem(&self) -> &str {
+        self.resolved_pem.as_deref().unwrap_or(&self.legacy_pem)
+    }
+
+    /// Effective webhook secret. See [`GitHubConfig::app_pem`].
+    pub fn webhook_secret(&self) -> Option<&str> {
+        self.resolved_webhook_secret
+            .as_deref()
+            .or(self.legacy_webhook_secret.as_deref())
+    }
 }
 
 /// Accept a string or integer for the numeric `app_id`, normalizing to a
@@ -196,15 +271,16 @@ fn redacted(present: bool) -> impl std::fmt::Debug {
 
 /// Manual `Debug`: this struct carries a PAT and an RSA private key, so the
 /// derived impl would disclose both on a single `debug!(?config)`. Presence
-/// only — `Serialize` still emits real values for the 0600 TOML file.
+/// only — `Serialize` still emits the inline legacy values for the 0600 TOML
+/// file, but never the credential-store-resolved ones.
 impl std::fmt::Debug for GitHubConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GitHubConfig")
             .field("app_id", &self.app_id)
-            .field("app_pem", &redacted(self.app_pem.is_some()))
+            .field("app_pem", &redacted(self.app_pem().is_some()))
             .field("mint_failure", &self.mint_failure)
-            .field("pat", &redacted(self.pat.is_some()))
-            .field("webhook_secret", &redacted(self.webhook_secret.is_some()))
+            .field("pat", &redacted(self.pat().is_some()))
+            .field("webhook_secret", &redacted(self.webhook_secret().is_some()))
             .field("apps", &self.apps.len())
             .field("pr", &self.pr)
             .finish()
@@ -381,6 +457,72 @@ pub fn load_config() -> anyhow::Result<ConfigFile> {
     load_config_from(&config_path())
 }
 
+/// Populate the `resolved_*` fields from the credential store.
+///
+/// Only the `*_ref` fields are consulted and only the non-persisted
+/// `resolved_*` fields are written, so this is invisible to a subsequent
+/// [`write_config`]: an unmigrated inline credential survives a load/write
+/// round-trip untouched, and a migrated one is never written back as
+/// plaintext.
+///
+/// A backend that cannot be reached at all (a headless Linux host with no
+/// secret-service daemon) is a warning, not an error: the engine still has
+/// the `PRELOOP_GITHUB_*` environment variables as its escape hatch, and
+/// failing the load would take `preloop secret` and server startup down with
+/// it. A reachable backend that fails an individual read is still an error.
+pub(crate) fn resolve_credential_references(
+    config: &mut ConfigFile,
+    store: &impl CredentialStore,
+) -> anyhow::Result<()> {
+    let references_present = config.github.app_pem_ref.is_some()
+        || config.github.pat_ref.is_some()
+        || config.github.webhook_secret_ref.is_some()
+        || config
+            .github
+            .apps
+            .iter()
+            .any(|app| app.pem_ref.is_some() || app.webhook_secret_ref.is_some());
+    if !references_present {
+        return Ok(());
+    }
+    if let Err(error) = store.available() {
+        tracing::warn!(
+            %error,
+            "config references stored credentials but no credential store is reachable; \
+             falling back to inline values and PRELOOP_GITHUB_* environment variables"
+        );
+        return Ok(());
+    }
+    if let Some(reference) = &config.github.app_pem_ref {
+        config.github.resolved_app_pem = read_credential(store, reference)?;
+    }
+    if let Some(reference) = &config.github.pat_ref {
+        config.github.resolved_pat = read_credential(store, reference)?;
+    }
+    if let Some(reference) = &config.github.webhook_secret_ref {
+        config.github.resolved_webhook_secret = read_credential(store, reference)?;
+    }
+    for app in &mut config.github.apps {
+        if let Some(reference) = &app.pem_ref {
+            app.resolved_pem = read_credential(store, reference)?;
+        }
+        if let Some(reference) = &app.webhook_secret_ref {
+            app.resolved_webhook_secret = read_credential(store, reference)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_credential(
+    store: &impl CredentialStore,
+    reference: &str,
+) -> anyhow::Result<Option<String>> {
+    let reference = CredentialRef::new(reference.to_owned())?;
+    store
+        .get(&reference)
+        .with_context(|| format!("reading credential reference {reference:?}"))
+}
+
 /// Load the config file at `path`. A missing or empty file yields the default
 /// config; a malformed file is an error.
 pub fn load_config_from(path: &Path) -> anyhow::Result<ConfigFile> {
@@ -391,8 +533,9 @@ pub fn load_config_from(path: &Path) -> anyhow::Result<ConfigFile> {
         }
         Err(error) => return Err(error).context(format!("reading config {}", path.display())),
     };
-    let config: ConfigFile =
+    let mut config: ConfigFile =
         toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
+    resolve_credential_references(&mut config, &OsCredentialStore)?;
     Ok(config)
 }
 
@@ -474,17 +617,12 @@ mod tests {
         ConfigFile {
             github: GitHubConfig {
                 app_id: Some("123".into()),
-                app_pem: Some(
+                legacy_app_pem: Some(
                     "-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----\n".into(),
                 ),
                 mint_failure: Some("pat".into()),
-                pat: Some("ghp_secret".into()),
-                webhook_secret: None,
-                server_url: None,
-                api_url: None,
-                graphql_url: None,
-                apps: vec![],
-                pr: PrConfig::default(),
+                legacy_pat: Some("ghp_secret".into()),
+                ..Default::default()
             },
             secrets: BTreeMap::from([("DOCKERHUB_TOKEN".into(), "abc123".into())]),
             repo_secrets: BTreeMap::from([(
@@ -523,7 +661,7 @@ mod tests {
         }
         let loaded = load_config_from(&path).unwrap();
         assert_eq!(loaded.github.app_id.as_deref(), Some("123"));
-        assert_eq!(loaded.github.pat.as_deref(), Some("ghp_secret"));
+        assert_eq!(loaded.github.pat(), Some("ghp_secret"));
         assert_eq!(
             loaded.secrets.get("DOCKERHUB_TOKEN").map(String::as_str),
             Some("abc123")
@@ -544,6 +682,115 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "not [ valid toml ==").unwrap();
         assert!(load_config_from(&path).is_err());
+    }
+
+    use crate::credential_store::{
+        github_reference, MemoryCredentialStore, UnavailableCredentialStore,
+    };
+
+    fn config_with_refs(store: &MemoryCredentialStore) -> ConfigFile {
+        let pem_ref = github_reference("app-pem", Some("123")).unwrap();
+        let pat_ref = github_reference("pat", None).unwrap();
+        store.set(&pem_ref, "STORED-PEM").unwrap();
+        store.set(&pat_ref, "STORED-PAT").unwrap();
+        ConfigFile {
+            github: GitHubConfig {
+                app_id: Some("123".into()),
+                app_pem_ref: Some(pem_ref.as_str().to_owned()),
+                pat_ref: Some(pat_ref.as_str().to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// The regression that motivated splitting `legacy_*` from `resolved_*`:
+    /// resolving used to overwrite the inline fields, so the next
+    /// `write_config` serialized the credential store's plaintext straight
+    /// back into config.toml — which every `preloop secret set` does.
+    #[test]
+    fn resolved_credentials_are_never_written_back_as_plaintext() {
+        let store = MemoryCredentialStore::default();
+        let mut config = config_with_refs(&store);
+        resolve_credential_references(&mut config, &store).unwrap();
+        assert_eq!(config.github.app_pem(), Some("STORED-PEM"));
+        assert_eq!(config.github.pat(), Some("STORED-PAT"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_config_to(&path, &config).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("STORED-PEM"), "PEM written back: {text}");
+        assert!(!text.contains("STORED-PAT"), "PAT written back: {text}");
+        assert!(text.contains("app_pem_ref"), "reference dropped: {text}");
+        assert!(text.contains("pat_ref"), "reference dropped: {text}");
+    }
+
+    /// An operator who has not migrated yet must not silently lose their
+    /// credential when an unrelated command rewrites the file.
+    #[test]
+    fn unmigrated_inline_credentials_survive_a_round_trip() {
+        let store = MemoryCredentialStore::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = ConfigFile {
+            github: GitHubConfig {
+                app_id: Some("123".into()),
+                legacy_pat: Some("ghp_inline".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        resolve_credential_references(&mut config, &store).unwrap();
+        write_config_to(&path, &config).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("ghp_inline"), "inline PAT lost: {text}");
+        assert_eq!(
+            load_config_from(&path).unwrap().github.pat(),
+            Some("ghp_inline")
+        );
+    }
+
+    /// A headless host has no secret-service daemon. Failing the load there
+    /// would take `preloop secret` and server startup down with it, even
+    /// though `PRELOOP_GITHUB_*` could still supply the credentials.
+    #[test]
+    fn an_unreachable_store_degrades_instead_of_failing_the_load() {
+        let mut config = config_with_refs(&MemoryCredentialStore::default());
+        resolve_credential_references(&mut config, &UnavailableCredentialStore).unwrap();
+        assert_eq!(config.github.app_pem(), None);
+        assert_eq!(config.github.pat(), None);
+    }
+
+    /// No references means no reason to touch the backend at all.
+    #[test]
+    fn a_config_without_references_never_consults_the_store() {
+        let mut config = ConfigFile::default();
+        resolve_credential_references(&mut config, &UnavailableCredentialStore).unwrap();
+        assert_eq!(config.github.app_pem(), None);
+    }
+
+    /// Registry entries resolve too, and the store wins over a stale inline
+    /// value left behind by a partial migration.
+    #[test]
+    fn registry_entries_prefer_the_store_over_inline_values() {
+        let store = MemoryCredentialStore::default();
+        let pem_ref = github_reference("app-pem", Some("456")).unwrap();
+        store.set(&pem_ref, "STORED-PEM").unwrap();
+        let mut config = ConfigFile {
+            github: GitHubConfig {
+                apps: vec![AppConfig {
+                    app_id: "456".into(),
+                    legacy_pem: "INLINE-PEM".into(),
+                    pem_ref: Some(pem_ref.as_str().to_owned()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        resolve_credential_references(&mut config, &store).unwrap();
+        assert_eq!(config.github.apps[0].pem(), "STORED-PEM");
     }
 
     /// A `debug!(?config)` must never disclose the PAT or the private key.

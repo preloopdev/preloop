@@ -74,8 +74,9 @@ preloop setup github --via app
 The command binds a single-use listener on loopback, opens it in your
 browser, and uses it as the manifest's redirect target. You click **Create on
 GitHub**; GitHub redirects back with a one-time code, and the CLI converts it
-into the App id, private key, and webhook secret and writes them to
-`~/.preloop/config.toml` (mode 0600). The browser then lands on the
+into the App id, private key, and webhook secret and stores the secrets in the
+operating-system credential store. The config file retains only non-secret
+credential references (and remains mode 0600). The browser then lands on the
 installation page, pick the repositories you run, and the CLI reports the
 installation id and exits.
 
@@ -127,9 +128,9 @@ Point the webhook at the stable hostname once:
 preloop setup github --via app --public-url https://ci.example.com
 ```
 
-That updates the existing App's webhook URL and secret through GitHub's API
 (`PATCH /app/hook/config`) instead of creating a second App, and stores the
-secret so deliveries verify. GitHub exposes no API for the webhook **Active**
+secret in the operating-system credential store so deliveries verify. GitHub
+exposes no API for the webhook **Active**
 checkbox, so an App created without `--public-url` needs that ticked once in
 its settings.
 
@@ -268,19 +269,31 @@ not hold plaintext at rest, two options:
 ## Config file
 
 Everything lives in `~/.preloop/config.toml` (mode 0600; `PRELOOP_CONFIG`
-overrides the path, `PRELOOP_HOME` the default directory). A missing or
-empty file is fine (everything defaults); a malformed one fails startup, so
-a typo is caught before a mint or a job hits it. `preloop setup github`
+overrides the path, `PRELOOP_HOME` the default directory). GitHub App keys,
+PATs, and webhook secrets are held in the operating-system credential store
+(Keychain on macOS, Credential Manager on Windows, Secret Service on Linux);
+the config file keeps only a `*_ref` name pointing at each one. Credentials
+still stored inline are migrated on the next `preloop serve`, which rewrites
+the config to reference them instead. A missing or empty file is fine
+(everything defaults); a malformed one fails startup, so a typo is caught
+before a mint or a job hits it. `preloop setup github`
 writes the `[github]` section; `preloop secret` writes the secret tables.
+
+On a host with no reachable credential store — a headless Linux box without a
+Secret Service daemon, for example — startup logs a warning and falls back to
+any inline values plus the `PRELOOP_GITHUB_*` environment variables, which
+always take precedence. Nothing is migrated there, so the config is left
+exactly as written.
+
 Fields:
 
 ```toml
 [github]
 app_id = "123456"
-app_pem = "-----BEGIN RSA PRIVATE KEY-----…"
+app_pem_ref = "github-app-pem-123456"   # written by setup; key lives in the OS store
 mint_failure = "pat"        # "local" | "error" | "pat"
-pat = "github_pat_…"        # fallback under `pat` policy; `--via pat` credential
-webhook_secret = "…"        # written by `setup github --via app`
+pat_ref = "github-pat"      # fallback under `pat` policy; `--via pat` credential
+webhook_secret_ref = "github-app-webhook-123456"  # written by `setup github --via app`
 server_url = "https://github.com"          # GHES: point at your host
 api_url = "https://api.github.com"         # GHES: REST base
 graphql_url = "https://api.github.com/graphql"

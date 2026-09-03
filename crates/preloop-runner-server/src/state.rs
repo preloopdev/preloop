@@ -866,16 +866,22 @@ impl AppState {
             .or_else(|| {
                 config
                     .github
-                    .webhook_secret
-                    .clone()
+                    .webhook_secret()
                     .filter(|secret| !secret.is_empty())
+                    .map(str::to_owned)
             });
         // Env wins over the config file, matching every other `PRELOOP_GITHUB_*`
         // override. An empty value in either source counts as unset.
         let github_pat = env::var("PRELOOP_GITHUB_TOKEN")
             .ok()
             .filter(|pat| !pat.is_empty())
-            .or_else(|| config.github.pat.clone().filter(|pat| !pat.is_empty()))
+            .or_else(|| {
+                config
+                    .github
+                    .pat()
+                    .filter(|pat| !pat.is_empty())
+                    .map(str::to_owned)
+            })
             .map(preloop_gha_protocol::SecretString::new);
         // Env wins over the config file, matching every other `PRELOOP_GITHUB_*`
         // override; an empty value in either source counts as unset.

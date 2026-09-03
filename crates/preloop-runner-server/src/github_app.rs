@@ -428,7 +428,7 @@ pub(crate) fn load_from(
     let pat_fallback = std::env::var("PRELOOP_GITHUB_TOKEN")
         .ok()
         .filter(|value| !value.is_empty())
-        .or_else(|| file_config.github.pat.clone());
+        .or_else(|| file_config.github.pat().map(str::to_owned));
 
     let mut apps: Vec<GitHubAppCredentials> = Vec::new();
     // The default entry is index 0 because the legacy App, when present, is
@@ -446,9 +446,8 @@ pub(crate) fn load_from(
         .or_else(|| {
             file_config
                 .github
-                .app_pem
-                .as_ref()
-                .map(|pem| ("config github.app_pem", false, pem.clone()))
+                .app_pem()
+                .map(|pem| ("config github.app_pem", false, pem.to_owned()))
         });
     match (app_id, key_source) {
         (Some(app_id), Some((source, is_path, value))) => {
@@ -509,8 +508,9 @@ pub(crate) fn load_from(
         None => file_config.github.apps.clone(),
     };
     for app in extra {
-        let private_key = parse_private_key(&app.pem)
+        let private_key = parse_private_key(app.pem())
             .with_context(|| format!("parsing the private key for GitHub App {}", app.app_id))?;
+        let webhook_secret = app.webhook_secret().map(str::to_owned);
         info!(
             app_id = %app.app_id,
             "registered additional GitHub App"
@@ -522,7 +522,7 @@ pub(crate) fn load_from(
             pat_fallback: pat_fallback.clone(),
             installation_cache: Arc::new(RwLock::new(HashMap::new())),
             mint_ledger: Arc::new(MintLedger::default()),
-            webhook_secret: app.webhook_secret,
+            webhook_secret,
             installation_id: app.installation_id,
             verified_installation_owners: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         });
