@@ -72,9 +72,17 @@ pub(crate) async fn create_session_compat_org_pool_only(
 }
 pub(crate) async fn delete_session_org(
     State(shared): State<Arc<SharedState>>,
+    headers: HeaderMap,
+    identity: Option<axum::Extension<RunnerIdentity>>,
     Path((_org, pool_id, session_id)): Path<(String, i64, String)>,
-) -> StatusCode {
-    delete_session(State(shared), Path((pool_id, session_id))).await
+) -> Result<StatusCode, ApiError> {
+    delete_session(
+        State(shared),
+        headers,
+        identity,
+        Path((pool_id, session_id)),
+    )
+    .await
 }
 
 pub(crate) async fn next_message_compat_org(

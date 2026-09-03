@@ -347,10 +347,29 @@ pub(crate) async fn create_session_disttask(
 
 pub(crate) async fn delete_session(
     State(shared): State<Arc<SharedState>>,
+    headers: HeaderMap,
+    identity: Option<axum::Extension<RunnerIdentity>>,
     Path((_pool_id, session_id)): Path<(i64, String)>,
-) -> StatusCode {
+) -> Result<StatusCode, ApiError> {
+    let caller = crate::auth::admin_caller(
+        &shared.state,
+        &headers,
+        identity.as_ref().map(|axum::Extension(id)| id),
+    )?;
     let snapshot = {
         let mut inner = shared.state.inner.lock().await;
+        if let crate::auth::AdminCaller::Runner(runner_id) = caller {
+            match inner.runner_id_for_session(&session_id) {
+                Some(owner) if owner == runner_id => {}
+                // Ending another runner's session strands its in-flight job
+                // until the lease reaper notices.
+                Some(_) => {
+                    return Err(ApiError::forbidden("session belongs to another runner"));
+                }
+                // Unknown session: nothing to strand, stay idempotent.
+                None => return Ok(StatusCode::NO_CONTENT),
+            }
+        }
         inner.sessions.remove(&session_id);
         inner.broker_session_runners.remove(&session_id);
         crate::store::StoreSnapshot::from_inner(&inner)
@@ -358,7 +377,7 @@ pub(crate) async fn delete_session(
     if let Err(error) = shared.state.store.store_inner(&snapshot).await {
         tracing::warn!(?error, "failed to persist deleted runner session");
     }
-    StatusCode::NO_CONTENT
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// DELETE /runner/server/_apis/distributedtask/pools/:pool_id/agents/:agent_id
@@ -371,10 +390,24 @@ pub(crate) async fn delete_session(
 /// Returns null response body in JSON to match official.
 pub(crate) async fn delete_agent(
     State(shared): State<Arc<SharedState>>,
-    Path((_pool_id, _agent_id)): Path<(i64, i64)>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    purge_runner_identity(&shared, _agent_id).await;
-    (StatusCode::NO_CONTENT, Json(serde_json::Value::Null))
+    headers: HeaderMap,
+    identity: Option<axum::Extension<RunnerIdentity>>,
+    Path((_pool_id, agent_id)): Path<(i64, i64)>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    // A runner may deregister itself and nothing else; the system token may
+    // deregister anything. Purging another runner revokes its listen tokens
+    // and requeues its work, so this is a live denial-of-service otherwise.
+    if let crate::auth::AdminCaller::Runner(runner_id) = crate::auth::admin_caller(
+        &shared.state,
+        &headers,
+        identity.as_ref().map(|axum::Extension(id)| id),
+    )? {
+        if runner_id != agent_id {
+            return Err(ApiError::forbidden("a runner may only deregister itself"));
+        }
+    }
+    purge_runner_identity(&shared, agent_id).await;
+    Ok((StatusCode::NO_CONTENT, Json(serde_json::Value::Null)))
 }
 
 /// Remove every trace of a runner identity: keys, client ids, sessions and

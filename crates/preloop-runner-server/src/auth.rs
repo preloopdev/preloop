@@ -82,13 +82,90 @@ pub(crate) async fn require_test_api_token(
     Ok(next.run(request).await)
 }
 
+fn system_bearer_authorized(shared: &Arc<SharedState>, request: &Request) -> bool {
+    bearer_token(request).is_some_and(|token| token == shared.state.system_token)
+}
+
+/// Who a session/agent administration request acts as.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdminCaller {
+    /// The native API administrator credential may act on any runner.
+    System,
+    /// A registered runner's own listen token may act only on itself.
+    Runner(i64),
+}
+
+/// Guard for runner/session/agent administration.
+///
+/// these routes used to sit behind [`require_protocol_bearer`], which
+/// accepts *any* valid local JWT — including a job's `ACTIONS_RUNTIME_TOKEN`,
+/// which the runner exports to every step. Arbitrary workflow code could
+/// therefore deregister runners and delete other runners' sessions.
+///
+/// System-token-only would close that, but it would also break the runner:
+/// the AzDO listener deletes its own session on shutdown
+/// (`crates/preloop-runner/src/client/azdo.rs::delete_session`) and
+/// [`crate::runner_lifecycle::delete_agent`] is documented as the call the
+/// runner makes on clean exit — and a configured runner holds nothing but its
+/// listen token. So admit the system token *or* a registered runner's listen
+/// token here, reject job runtime tokens, and let the handlers enforce
+/// self-ownership via [`admin_caller`].
+pub(crate) async fn require_runner_admin_bearer(
+    State(shared): State<Arc<SharedState>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    if system_bearer_authorized(&shared, &request) {
+        return Ok(next.run(request).await);
+    }
+    // `resolve_runner_identity` is an outer layer, so the extension is
+    // already present here. Reuse it instead of re-deriving the runner from
+    // the token: it also resolves mock-flow subjects
+    // (`preloop-runner-listen-mock-{client_id}`) and drops the identity when
+    // the registration behind the token is gone.
+    let verified = request
+        .extensions()
+        .get::<RunnerIdentity>()
+        .and_then(|identity| identity.runner_id)
+        .is_some();
+    if verified {
+        Ok(next.run(request).await)
+    } else {
+        Err(ApiError::unauthorized(
+            "runner administration requires the system token or a runner listen token",
+        ))
+    }
+}
+
+/// Resolve the [`AdminCaller`] behind a request that passed
+/// [`require_runner_admin_bearer`].
+///
+/// Fail-closed: anything that is neither the system token nor a verified
+/// runner identity is an error, never silently treated as the administrator.
+pub(crate) fn admin_caller(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    identity: Option<&RunnerIdentity>,
+) -> Result<AdminCaller, ApiError> {
+    if bearer_from_headers(headers).is_some_and(|token| token == state.system_token) {
+        return Ok(AdminCaller::System);
+    }
+    identity
+        .and_then(|identity| identity.runner_id)
+        .map(AdminCaller::Runner)
+        .ok_or_else(|| {
+            ApiError::unauthorized(
+                "runner administration requires the system token or a runner listen token",
+            )
+        })
+}
+
 pub(crate) async fn require_native_bearer(
     State(shared): State<Arc<SharedState>>,
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    let authorized = bearer_token(&request).is_some_and(|token| token == shared.state.system_token);
-    if authorized {
+    if system_bearer_authorized(&shared, &request) {
         Ok(next.run(request).await)
     } else {
         Err(ApiError::unauthorized(
