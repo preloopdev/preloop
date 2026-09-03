@@ -1,5 +1,96 @@
 use super::*;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RunnerAuthSource {
+    RunnerListenToken,
+    RuntimeJwt,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedRunnerId {
+    pub(crate) runner_id: i64,
+    pub(crate) auth_source: RunnerAuthSource,
+}
+
+///
+/// The two are deliberately separate counters. `Lifecycle` records a
+/// credential fencing carrier assumes cannot occur, so its count
+/// is the dogfood gate and must stay at zero. `Acquire` records the
+/// Listener's own `acquirejob`, where the listen token is the only credential
+/// the runner has folding it into one counter (as the first cut of this
+/// probe did, together with every message claim) makes a zero-gate
+/// unreachable and the whole experiment unfalsifiable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ListenerTokenProbe {
+    Lifecycle,
+    Acquire,
+}
+
+pub(crate) fn record_listener_token_use(
+    state: &AppState,
+    probe: ListenerTokenProbe,
+    route: &'static str,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    match probe {
+        ListenerTokenProbe::Lifecycle => {
+            let count = state.listener_token_lifecycle_calls.fetch_add(1, Relaxed) + 1;
+            tracing::warn!(
+                count,
+                route,
+                auth = "runner_listen_token",
+                "job lifecycle call used the bare listener token; Plan 004's fencing carrier \
+                 cannot ride the job runtime token"
+            );
+        }
+        ListenerTokenProbe::Acquire => {
+            let count = state.listener_token_acquire_calls.fetch_add(1, Relaxed) + 1;
+            tracing::debug!(
+                count,
+                route,
+                auth = "runner_listen_token",
+                "acquirejob used the listener token (expected: the Listener holds no job token)"
+            );
+        }
+    }
+}
+
+pub(crate) fn authenticated_runner_id_with_source(
+    shared: &Arc<SharedState>,
+    headers: &HeaderMap,
+    expected_runner_id: Option<i64>,
+) -> Result<AuthenticatedRunnerId, ApiError> {
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or_else(|| ApiError::unauthorized("runner listen token required"))?;
+    // Accept runner listen tokens (normal path) or job runtime tokens
+    // (worker uses the SystemVssConnection AccessToken for renewjob/completejob).
+    if let Some(runner_id) = shared.state.runner_id_from_token(bearer) {
+        if expected_runner_id.is_some_and(|expected| expected != runner_id) {
+            return Err(ApiError::forbidden(
+                "runner token does not match broker path",
+            ));
+        }
+        return Ok(AuthenticatedRunnerId {
+            runner_id,
+            auth_source: RunnerAuthSource::RunnerListenToken,
+        });
+    }
+    // Fall back: accept runtime tokens (Actions.Results scope). These don't
+    // carry a runner_id, so we trust the path parameter.
+    if shared.state.verify_local_jwt_claims(bearer).is_some() {
+        let runner_id =
+            expected_runner_id.ok_or_else(|| ApiError::unauthorized("runner id required"))?;
+        return Ok(AuthenticatedRunnerId {
+            runner_id,
+            auth_source: RunnerAuthSource::RuntimeJwt,
+        });
+    }
+    Err(ApiError::unauthorized("runner listen token required"))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BrokerAcquireJobRequest {
@@ -491,27 +582,7 @@ pub(crate) fn authenticated_runner_id(
     headers: &HeaderMap,
     expected_runner_id: Option<i64>,
 ) -> Result<i64, ApiError> {
-    let bearer = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .ok_or_else(|| ApiError::unauthorized("runner listen token required"))?;
-    // Accept runner listen tokens (normal path) or job runtime tokens
-    // (worker uses the SystemVssConnection AccessToken for renewjob/completejob).
-    if let Some(runner_id) = shared.state.runner_id_from_token(bearer) {
-        if expected_runner_id.is_some_and(|expected| expected != runner_id) {
-            return Err(ApiError::forbidden(
-                "runner token does not match broker path",
-            ));
-        }
-        return Ok(runner_id);
-    }
-    // Fall back: accept runtime tokens (Actions.Results scope). These don't
-    // carry a runner_id, so we trust the path parameter.
-    if shared.state.verify_local_jwt_claims(bearer).is_some() {
-        return expected_runner_id.ok_or_else(|| ApiError::unauthorized("runner id required"));
-    }
-    Err(ApiError::unauthorized("runner listen token required"))
+    Ok(authenticated_runner_id_with_source(shared, headers, expected_runner_id)?.runner_id)
 }
 
 pub(crate) fn ensure_broker_request_owner(
@@ -691,7 +762,15 @@ pub(crate) async fn broker_acquire_job(
     headers: HeaderMap,
     Json(request): Json<BrokerAcquireJobRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authenticated_runner_id(&shared, &headers, Some(runner_id))?;
+    let auth = authenticated_runner_id_with_source(&shared, &headers, Some(runner_id))?;
+    if auth.auth_source == RunnerAuthSource::RunnerListenToken {
+        record_listener_token_use(
+            &shared.state,
+            ListenerTokenProbe::Acquire,
+            "broker.acquirejob",
+        );
+    }
+
     let (request_id, mut message, github_token_request, id_token_granted) = {
         let inner = shared.state.inner.lock().await;
         let request_id = inner
@@ -1367,7 +1446,15 @@ pub(crate) async fn broker_renew_job(
     headers: HeaderMap,
     Json(request): Json<BrokerRenewJobRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authenticated_runner_id(&shared, &headers, Some(runner_id))?;
+    let auth = authenticated_runner_id_with_source(&shared, &headers, Some(runner_id))?;
+    if auth.auth_source == RunnerAuthSource::RunnerListenToken {
+        record_listener_token_use(
+            &shared.state,
+            ListenerTokenProbe::Lifecycle,
+            "broker.renewjob",
+        );
+    }
+
     let mut inner = shared.state.inner.lock().await;
     let request_id = inner
         .agent_job_requests
@@ -1390,7 +1477,15 @@ pub(crate) async fn broker_complete_job(
     headers: HeaderMap,
     Json(request): Json<BrokerRenewJobRequest>,
 ) -> Result<StatusCode, ApiError> {
-    authenticated_runner_id(&shared, &headers, Some(runner_id))?;
+    let auth = authenticated_runner_id_with_source(&shared, &headers, Some(runner_id))?;
+    if auth.auth_source == RunnerAuthSource::RunnerListenToken {
+        record_listener_token_use(
+            &shared.state,
+            ListenerTokenProbe::Lifecycle,
+            "broker.completejob",
+        );
+    }
+
     let status = match request.conclusion.as_deref() {
         Some(conclusion) => execution_status_from_runner_result(conclusion).ok_or_else(|| {
             ApiError::bad_request(format!("unknown broker conclusion `{conclusion}`"))
