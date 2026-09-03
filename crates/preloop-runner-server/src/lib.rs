@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 pub mod concurrency;
 pub mod config;
+pub mod credential_store;
 mod errors;
 pub mod events;
 pub mod github;
