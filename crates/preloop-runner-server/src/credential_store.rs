@@ -1,6 +1,5 @@
-//! Platform credential storage used for local operator credentials.
-
 use anyhow::{Context, Result};
+pub use preloop_gha_protocol::SecretString;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -41,21 +40,53 @@ impl fmt::Debug for CredentialRef {
     }
 }
 
-/// Build a stable local reference for a GitHub credential.
+/// Build a stable local reference for a GitHub credential on default github.com.
+pub fn github_reference(kind: &str, app_id: Option<&str>) -> Result<CredentialRef> {
+    github_reference_with_host(kind, None, app_id)
+}
+
+/// Build a stable local reference for a GitHub credential, optionally scoped to a host.
 ///
 /// `app_id` is operator-supplied (`github.apps[].app_id` is hand-editable and
-/// accepts a bare integer), so it is validated rather than trusted: without
-/// this, an id like `1-webhook-2` could collide with another kind's namespace.
-pub fn github_reference(kind: &str, app_id: Option<&str>) -> Result<CredentialRef> {
+/// accepts a bare integer), so it is validated as numeric for safety and to
+/// enforce canonical identifiers.
+pub fn github_reference_with_host(
+    kind: &str,
+    host: Option<&str>,
+    app_id: Option<&str>,
+) -> Result<CredentialRef> {
     if let Some(app_id) = app_id {
         if app_id.is_empty() || !app_id.chars().all(|c| c.is_ascii_digit()) {
             anyhow::bail!("GitHub App id must be numeric, got {app_id:?}");
         }
     }
+    let host_prefix = match host {
+        Some(h) if !h.is_empty() && h != "github.com" && h != "https://github.com" && h != "http://github.com" => {
+            let clean = h
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .split('/')
+                .next()
+                .unwrap_or(h)
+                .split(':')
+                .next()
+                .unwrap_or(h);
+            let sanitized: String = clean
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '-' })
+                .collect();
+            if sanitized.is_empty() {
+                String::new()
+            } else {
+                format!("{sanitized}-")
+            }
+        }
+        _ => String::new(),
+    };
     let value = match (kind, app_id) {
-        ("pat", None) => "github-pat".to_owned(),
-        ("app-pem", Some(app_id)) => format!("github-app-pem-{app_id}"),
-        ("webhook", Some(app_id)) => format!("github-app-webhook-{app_id}"),
+        ("pat", None) => format!("github-{host_prefix}pat"),
+        ("app-pem", Some(app_id)) => format!("github-{host_prefix}app-pem-{app_id}"),
+        ("webhook", Some(app_id)) => format!("github-{host_prefix}app-webhook-{app_id}"),
         _ => anyhow::bail!("invalid GitHub credential reference"),
     };
     CredentialRef::new(value)
@@ -63,8 +94,8 @@ pub fn github_reference(kind: &str, app_id: Option<&str>) -> Result<CredentialRe
 
 /// Secret storage backend. Implementations must never log values.
 pub trait CredentialStore: Send + Sync {
-    fn get(&self, reference: &CredentialRef) -> Result<Option<String>>;
-    fn set(&self, reference: &CredentialRef, value: &str) -> Result<()>;
+    fn get(&self, reference: &CredentialRef) -> Result<Option<SecretString>>;
+    fn set(&self, reference: &CredentialRef, value: &SecretString) -> Result<()>;
     fn delete(&self, reference: &CredentialRef) -> Result<()>;
     fn name(&self) -> &'static str;
 
@@ -90,20 +121,20 @@ impl OsCredentialStore {
 }
 
 impl CredentialStore for OsCredentialStore {
-    fn get(&self, reference: &CredentialRef) -> Result<Option<String>> {
+    fn get(&self, reference: &CredentialRef) -> Result<Option<SecretString>> {
         match Self::entry(reference)?.get_password() {
-            Ok(value) => Ok(Some(value)),
+            Ok(value) => Ok(Some(SecretString::new(value))),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(error) => Err(error).context("read credential from OS store"),
         }
     }
 
-    fn set(&self, reference: &CredentialRef, value: &str) -> Result<()> {
-        if value.is_empty() {
+    fn set(&self, reference: &CredentialRef, value: &SecretString) -> Result<()> {
+        if value.expose().is_empty() {
             anyhow::bail!("refusing to store an empty credential");
         }
         Self::entry(reference)?
-            .set_password(value)
+            .set_password(value.expose())
             .context("write credential to OS store")?;
         Ok(())
     }
@@ -115,6 +146,7 @@ impl CredentialStore for OsCredentialStore {
             Err(error) => Err(error).context("delete credential from OS store"),
         }
     }
+
 
     fn name(&self) -> &'static str {
         "operating-system credential store"
@@ -136,11 +168,11 @@ impl CredentialStore for OsCredentialStore {
 /// In-memory backend for deterministic tests and embedders.
 #[derive(Clone, Default)]
 pub struct MemoryCredentialStore {
-    values: Arc<Mutex<HashMap<CredentialRef, String>>>,
+    values: Arc<Mutex<HashMap<CredentialRef, SecretString>>>,
 }
 
 impl CredentialStore for MemoryCredentialStore {
-    fn get(&self, reference: &CredentialRef) -> Result<Option<String>> {
+    fn get(&self, reference: &CredentialRef) -> Result<Option<SecretString>> {
         Ok(self
             .values
             .lock()
@@ -149,14 +181,14 @@ impl CredentialStore for MemoryCredentialStore {
             .cloned())
     }
 
-    fn set(&self, reference: &CredentialRef, value: &str) -> Result<()> {
-        if value.is_empty() {
+    fn set(&self, reference: &CredentialRef, value: &SecretString) -> Result<()> {
+        if value.expose().is_empty() {
             anyhow::bail!("refusing to store an empty credential");
         }
         self.values
             .lock()
             .expect("credential store lock poisoned")
-            .insert(reference.clone(), value.to_owned());
+            .insert(reference.clone(), value.clone());
         Ok(())
     }
 
@@ -180,11 +212,11 @@ pub(crate) struct UnavailableCredentialStore;
 
 #[cfg(test)]
 impl CredentialStore for UnavailableCredentialStore {
-    fn get(&self, _reference: &CredentialRef) -> Result<Option<String>> {
+    fn get(&self, _reference: &CredentialRef) -> Result<Option<SecretString>> {
         anyhow::bail!("credential store unavailable")
     }
 
-    fn set(&self, _reference: &CredentialRef, _value: &str) -> Result<()> {
+    fn set(&self, _reference: &CredentialRef, _value: &SecretString) -> Result<()> {
         anyhow::bail!("credential store unavailable")
     }
 
@@ -222,8 +254,13 @@ mod tests {
         let store = MemoryCredentialStore::default();
         let reference = CredentialRef::new("github-pat").unwrap();
         assert_eq!(store.get(&reference).unwrap(), None);
-        store.set(&reference, "secret").unwrap();
-        assert_eq!(store.get(&reference).unwrap().as_deref(), Some("secret"));
+        store
+            .set(&reference, &SecretString::new("secret"))
+            .unwrap();
+        assert_eq!(
+            store.get(&reference).unwrap().as_ref().map(|s| s.expose()),
+            Some("secret")
+        );
         store.delete(&reference).unwrap();
         assert_eq!(store.get(&reference).unwrap(), None);
     }
@@ -232,14 +269,12 @@ mod tests {
     fn memory_store_rejects_empty_values() {
         let store = MemoryCredentialStore::default();
         let reference = CredentialRef::new("github-pat").unwrap();
-        assert!(store.set(&reference, "").is_err());
+        assert!(store.set(&reference, &SecretString::new("")).is_err());
     }
 
-    /// A non-numeric App id must not be able to reach across namespaces:
-    /// `app-pem` for id `webhook-9` would otherwise mint the same reference
-    /// as `webhook` for id `9`.
+    /// App IDs are validated as numeric for safety and to enforce canonical identifiers.
     #[test]
-    fn app_ids_are_validated_so_namespaces_cannot_collide() {
+    fn app_ids_are_validated_and_canonical() {
         assert!(github_reference("app-pem", Some("webhook-9")).is_err());
         assert!(github_reference("app-pem", Some("")).is_err());
         assert!(github_reference("app-pem", Some("../etc")).is_err());
@@ -256,6 +291,18 @@ mod tests {
         assert_eq!(
             github_reference("pat", None).unwrap().as_str(),
             "github-pat"
+        );
+        assert_eq!(
+            github_reference_with_host("pat", Some("https://ghe.example.com"), None)
+                .unwrap()
+                .as_str(),
+            "github-ghe.example.com-pat"
+        );
+        assert_eq!(
+            github_reference_with_host("app-pem", Some("ghe.example.com"), Some("12345"))
+                .unwrap()
+                .as_str(),
+            "github-ghe.example.com-app-pem-12345"
         );
     }
 }

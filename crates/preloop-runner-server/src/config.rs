@@ -10,7 +10,7 @@
 //! is written with mode 0600 and never echoed back by `preloop secret list`
 //! or `preloop doctor`.
 
-use crate::credential_store::{CredentialRef, CredentialStore, OsCredentialStore};
+use crate::credential_store::{CredentialRef, CredentialStore, OsCredentialStore, SecretString};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -42,7 +42,7 @@ pub struct GitHubConfig {
     pub app_pem_ref: Option<String>,
     /// Value behind [`Self::app_pem_ref`], resolved at load. Never persisted.
     #[serde(skip)]
-    pub resolved_app_pem: Option<String>,
+    pub resolved_app_pem: Option<SecretString>,
     /// Mint-failure policy: `local`, `error`, or `pat`.
     #[serde(default)]
     pub mint_failure: Option<String>,
@@ -56,7 +56,7 @@ pub struct GitHubConfig {
     pub pat_ref: Option<String>,
     /// Value behind [`Self::pat_ref`], resolved at load. Never persisted.
     #[serde(skip)]
-    pub resolved_pat: Option<String>,
+    pub resolved_pat: Option<SecretString>,
     /// Shared secret for `X-Hub-Signature-256` webhook verification.
     /// Stored inline (legacy); see [`Self::legacy_app_pem`].
     #[serde(default, rename = "webhook_secret")]
@@ -66,7 +66,7 @@ pub struct GitHubConfig {
     pub webhook_secret_ref: Option<String>,
     /// Value behind [`Self::webhook_secret_ref`], resolved at load. Never persisted.
     #[serde(skip)]
-    pub resolved_webhook_secret: Option<String>,
+    pub resolved_webhook_secret: Option<SecretString>,
     /// GitHub server URL exposed to workflows as `github.server_url` /
     /// `GITHUB_SERVER_URL`. Defaults to `https://github.com`; point it at a
     /// GHES-style host when the engine fronts one. Env: `PRELOOP_GITHUB_SERVER_URL`.
@@ -99,19 +99,24 @@ impl GitHubConfig {
     /// legacy value is the pre-migration fallback.
     pub fn app_pem(&self) -> Option<&str> {
         self.resolved_app_pem
-            .as_deref()
+            .as_ref()
+            .map(|s| s.expose())
             .or(self.legacy_app_pem.as_deref())
     }
 
     /// Effective PAT. See [`Self::app_pem`].
     pub fn pat(&self) -> Option<&str> {
-        self.resolved_pat.as_deref().or(self.legacy_pat.as_deref())
+        self.resolved_pat
+            .as_ref()
+            .map(|s| s.expose())
+            .or(self.legacy_pat.as_deref())
     }
 
     /// Effective webhook secret. See [`Self::app_pem`].
     pub fn webhook_secret(&self) -> Option<&str> {
         self.resolved_webhook_secret
-            .as_deref()
+            .as_ref()
+            .map(|s| s.expose())
             .or(self.legacy_webhook_secret.as_deref())
     }
 }
@@ -134,7 +139,7 @@ pub struct AppConfig {
     pub pem_ref: Option<String>,
     /// Value behind [`Self::pem_ref`], resolved at load. Never persisted.
     #[serde(skip)]
-    pub resolved_pem: Option<String>,
+    pub resolved_pem: Option<SecretString>,
     /// Webhook secret for `X-Hub-Signature-256` verification, when the App
     /// has its own (the legacy `PRELOOP_WEBHOOK_SECRET` covers the default
     /// App). Stored inline (legacy); read via [`AppConfig::webhook_secret`].
@@ -145,7 +150,7 @@ pub struct AppConfig {
     pub webhook_secret_ref: Option<String>,
     /// Value behind [`Self::webhook_secret_ref`], resolved at load. Never persisted.
     #[serde(skip)]
-    pub resolved_webhook_secret: Option<String>,
+    pub resolved_webhook_secret: Option<SecretString>,
     /// Explicit installation id, bypassing installation discovery for
     /// single-installation deployments of this App.
     #[serde(default)]
@@ -155,13 +160,17 @@ pub struct AppConfig {
 impl AppConfig {
     /// Effective App private key. See [`GitHubConfig::app_pem`].
     pub fn pem(&self) -> &str {
-        self.resolved_pem.as_deref().unwrap_or(&self.legacy_pem)
+        self.resolved_pem
+            .as_ref()
+            .map(|s| s.expose())
+            .unwrap_or(&self.legacy_pem)
     }
 
     /// Effective webhook secret. See [`GitHubConfig::app_pem`].
     pub fn webhook_secret(&self) -> Option<&str> {
         self.resolved_webhook_secret
-            .as_deref()
+            .as_ref()
+            .map(|s| s.expose())
             .or(self.legacy_webhook_secret.as_deref())
     }
 }
@@ -516,7 +525,7 @@ pub(crate) fn resolve_credential_references(
 fn read_credential(
     store: &impl CredentialStore,
     reference: &str,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<SecretString>> {
     let reference = CredentialRef::new(reference.to_owned())?;
     store
         .get(&reference)
@@ -691,8 +700,12 @@ mod tests {
     fn config_with_refs(store: &MemoryCredentialStore) -> ConfigFile {
         let pem_ref = github_reference("app-pem", Some("123")).unwrap();
         let pat_ref = github_reference("pat", None).unwrap();
-        store.set(&pem_ref, "STORED-PEM").unwrap();
-        store.set(&pat_ref, "STORED-PAT").unwrap();
+        store
+            .set(&pem_ref, &preloop_gha_protocol::SecretString::new("STORED-PEM"))
+            .unwrap();
+        store
+            .set(&pat_ref, &preloop_gha_protocol::SecretString::new("STORED-PAT"))
+            .unwrap();
         ConfigFile {
             github: GitHubConfig {
                 app_id: Some("123".into()),
@@ -776,7 +789,9 @@ mod tests {
     fn registry_entries_prefer_the_store_over_inline_values() {
         let store = MemoryCredentialStore::default();
         let pem_ref = github_reference("app-pem", Some("456")).unwrap();
-        store.set(&pem_ref, "STORED-PEM").unwrap();
+        store
+            .set(&pem_ref, &preloop_gha_protocol::SecretString::new("STORED-PEM"))
+            .unwrap();
         let mut config = ConfigFile {
             github: GitHubConfig {
                 apps: vec![AppConfig {

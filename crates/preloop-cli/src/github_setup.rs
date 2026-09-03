@@ -10,7 +10,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use preloop_runner_server::config::{load_config, store_memory, write_config};
 use preloop_runner_server::credential_store::{
-    github_reference, CredentialStore, OsCredentialStore,
+    github_reference, CredentialStore, OsCredentialStore, SecretString,
 };
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
@@ -259,7 +259,7 @@ async fn cmd_setup_github(args: GithubSetupArgs) -> anyhow::Result<()> {
         match config.github.app_id.as_deref() {
             Some(app_id) => {
                 let reference = github_reference("webhook", Some(app_id))?;
-                store.set(&reference, secret)?;
+                store.set(&reference, &SecretString::new(secret))?;
                 config.github.legacy_webhook_secret = None;
                 config.github.webhook_secret_ref = Some(reference.as_str().to_owned());
                 let path = write_config(&config)?;
@@ -380,10 +380,10 @@ fn save_app_credentials(
 ) -> anyhow::Result<PathBuf> {
     let store = OsCredentialStore;
     let pem_ref = github_reference("app-pem", Some(app_id))?;
-    store.set(&pem_ref, pem)?;
+    store.set(&pem_ref, &SecretString::new(pem))?;
     let webhook_ref = if let Some(secret) = webhook_secret {
         let reference = github_reference("webhook", Some(app_id))?;
-        store.set(&reference, &secret)?;
+        store.set(&reference, &SecretString::new(&secret))?;
         Some(reference.as_str().to_owned())
     } else {
         None
@@ -424,7 +424,7 @@ fn save_app_credentials(
             config.github.webhook_secret_ref = webhook_ref;
         } else if let Some(secret) = config.github.legacy_webhook_secret.take() {
             let reference = github_reference("webhook", Some(app_id))?;
-            store.set(&reference, &secret)?;
+            store.set(&reference, &SecretString::new(&secret))?;
             config.github.webhook_secret_ref = Some(reference.as_str().to_owned());
         }
         return write_config(&config);
@@ -504,7 +504,7 @@ async fn enable_webhooks(
         .await?;
     let store = OsCredentialStore;
     let webhook_ref = github_reference("webhook", Some(app_id))?;
-    store.set(&webhook_ref, &secret)?;
+    store.set(&webhook_ref, &SecretString::new(&secret))?;
     let mut config = load_config()?;
     if let Some(existing) = config.github.apps.iter_mut().find(|a| a.app_id == app_id) {
         existing.legacy_webhook_secret = None;
@@ -617,7 +617,7 @@ async fn setup_pat(args: &GithubSetupArgs) -> anyhow::Result<()> {
 
     let store = OsCredentialStore;
     let pat_ref = github_reference("pat", None)?;
-    store.set(&pat_ref, &token)?;
+    store.set(&pat_ref, &SecretString::new(&token))?;
     let mut config = load_config()?;
     config.github.legacy_pat = None;
     config.github.pat_ref = Some(pat_ref.as_str().to_owned());

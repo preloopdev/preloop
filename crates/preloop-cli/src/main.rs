@@ -1264,7 +1264,7 @@ fn migrate_legacy_github_credentials(
     config: &mut preloop_runner_server::config::ConfigFile,
     store: &impl preloop_runner_server::credential_store::CredentialStore,
 ) -> anyhow::Result<bool> {
-    use preloop_runner_server::credential_store::github_reference;
+    use preloop_runner_server::credential_store::{github_reference, SecretString};
 
     if store.available().is_err() {
         return Ok(false);
@@ -1277,7 +1277,7 @@ fn migrate_legacy_github_credentials(
             Some(app_id) => {
                 let value = config.github.legacy_app_pem.take().expect("checked above");
                 let reference = github_reference("app-pem", Some(app_id))?;
-                store.set(&reference, &value)?;
+                store.set(&reference, &SecretString::new(value))?;
                 config.github.app_pem_ref = Some(reference.as_str().to_owned());
                 migrated = true;
             }
@@ -1289,7 +1289,7 @@ fn migrate_legacy_github_credentials(
     }
     if let Some(value) = config.github.legacy_pat.take() {
         let reference = github_reference("pat", None)?;
-        store.set(&reference, &value)?;
+        store.set(&reference, &SecretString::new(value))?;
         config.github.pat_ref = Some(reference.as_str().to_owned());
         migrated = true;
     }
@@ -1302,7 +1302,7 @@ fn migrate_legacy_github_credentials(
                     .take()
                     .expect("checked above");
                 let reference = github_reference("webhook", Some(app_id))?;
-                store.set(&reference, &value)?;
+                store.set(&reference, &SecretString::new(value))?;
                 config.github.webhook_secret_ref = Some(reference.as_str().to_owned());
                 migrated = true;
             }
@@ -1315,14 +1315,14 @@ fn migrate_legacy_github_credentials(
     for app in &mut config.github.apps {
         if !app.legacy_pem.is_empty() {
             let reference = github_reference("app-pem", Some(&app.app_id))?;
-            store.set(&reference, &app.legacy_pem)?;
+            store.set(&reference, &SecretString::new(&app.legacy_pem))?;
             app.legacy_pem.clear();
             app.pem_ref = Some(reference.as_str().to_owned());
             migrated = true;
         }
         if let Some(value) = app.legacy_webhook_secret.take() {
             let reference = github_reference("webhook", Some(&app.app_id))?;
-            store.set(&reference, &value)?;
+            store.set(&reference, &SecretString::new(value))?;
             app.webhook_secret_ref = Some(reference.as_str().to_owned());
             migrated = true;
         }
@@ -4262,11 +4262,16 @@ mod tests {
                 Some("github-app-pem-123")
             );
             let pem_ref = github_reference("app-pem", Some("123")).unwrap();
-            assert_eq!(store.get(&pem_ref).unwrap().as_deref(), Some("INLINE-PEM"));
+            assert_eq!(
+                store.get(&pem_ref).unwrap().as_ref().map(|s| s.expose()),
+                Some("INLINE-PEM")
+            );
             let pat_ref = github_reference("pat", None).unwrap();
-            assert_eq!(store.get(&pat_ref).unwrap().as_deref(), Some("ghp_inline"));
+            assert_eq!(
+                store.get(&pat_ref).unwrap().as_ref().map(|s| s.expose()),
+                Some("ghp_inline")
+            );
         }
-
         /// The regression: migration used to inspect fields that the loader
         /// had just populated from the credential store, so it reported a
         /// migration and rewrote config.toml on every single startup.
@@ -4324,7 +4329,7 @@ mod tests {
             assert_eq!(config.github.apps[0].legacy_webhook_secret, None);
             let pem_ref = github_reference("app-pem", Some("456")).unwrap();
             assert_eq!(
-                store.get(&pem_ref).unwrap().as_deref(),
+                store.get(&pem_ref).unwrap().as_ref().map(|s| s.expose()),
                 Some("REGISTRY-PEM")
             );
             assert!(!migrate_legacy_github_credentials(&mut config, &store).unwrap());
