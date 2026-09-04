@@ -19,7 +19,7 @@ pub(crate) async fn require_protocol_bearer(
 
 pub(crate) async fn require_results_bearer(
     State(shared): State<Arc<SharedState>>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
     let path = request.uri().path();
@@ -44,23 +44,16 @@ pub(crate) async fn require_results_bearer(
     if !path.starts_with("/twirp/") {
         return Ok(next.run(request).await);
     }
-    let authorized = bearer_token(&request).is_some_and(|token| {
-        token == shared.state.system_token
-            || shared
-                .state
-                .verify_local_jwt_claims(token)
-                .is_some_and(|claims| {
-                    claims
-                        .get("scp")
-                        .and_then(|value| value.as_str())
-                        .is_some_and(|scope| scope.starts_with("Actions.Results:"))
-                })
-    });
-    if authorized {
-        Ok(next.run(request).await)
-    } else {
-        Err(ApiError::unauthorized("results-service job token required"))
-    }
+    let Some(identity) =
+        bearer_token(&request).and_then(|token| results_identity(&shared.state, token))
+    else {
+        return Err(ApiError::unauthorized("results-service job token required"));
+    };
+    // The typed identity is authenticated before body extraction. Handlers
+    // then compare decoded plan/job ids against this same identity instead of
+    // re-parsing a bearer string independently.
+    request.extensions_mut().insert(identity);
+    Ok(next.run(request).await)
 }
 
 pub(crate) async fn require_test_api_token(
@@ -345,36 +338,80 @@ impl Clone for SocketSurface {
     }
 }
 
-/// Whether a caller may mint replay blob URLs for this exact plan/job pair.
+/// The authenticated identity carried by a Results bearer is used by every
+/// Results handler, including signed-URL minting and metadata mutation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResultsJobIdentity {
+    pub(crate) plan_id: String,
+    pub(crate) job_id: uuid::Uuid,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ResultsIdentity {
+    /// The engine credential is allowed to address every Results target.
+    System,
+    /// A runtime credential is bound to one plan/job pair.
+    Job(ResultsJobIdentity),
+}
+
+/// Parse the Results bearer into the identity handlers must authorize against.
 ///
-/// The engine token may mint for any job (it is the administrator credential).
-/// A job runtime token is weaker — the runner exports it to steps as
-/// `ACTIONS_RUNTIME_TOKEN` — so it must only mint for the one job it names:
-/// both the subject and the `Actions.Results:{plan}:{job}` scope have to
-/// match the requested backend ids. Without this, workflow code holding its
-/// own runtime token could ask the mint handler for *another* job's signed
-/// URL and then overwrite that job's logs through it.
-pub(crate) fn results_token_binds_job(
-    state: &AppState,
-    bearer: Option<&str>,
+/// Requiring both the `sub` and the full Results scope to agree prevents a
+/// valid local JWT minted for one protocol surface from being repurposed as a
+/// different job's Results credential.
+pub(crate) fn results_identity(state: &AppState, bearer: &str) -> Option<ResultsIdentity> {
+    if bearer == state.system_token {
+        return Some(ResultsIdentity::System);
+    }
+
+    let claims = state.verify_local_jwt_claims(bearer)?;
+    let subject_job = claims
+        .get("sub")
+        .and_then(|value| value.as_str())
+        .and_then(|subject| subject.strip_prefix("preloop-job-"))
+        .and_then(|job| job.parse::<uuid::Uuid>().ok())?;
+    let scope = claims
+        .get("scp")
+        .and_then(|value| value.as_str())
+        .and_then(|scope| scope.strip_prefix("Actions.Results:"))?;
+    let (plan_id, scope_job) = scope.split_once(':')?;
+    if plan_id.is_empty() || scope_job.parse::<uuid::Uuid>().ok()? != subject_job {
+        return None;
+    }
+    Some(ResultsIdentity::Job(ResultsJobIdentity {
+        plan_id: plan_id.to_owned(),
+        job_id: subject_job,
+    }))
+}
+
+pub(crate) fn results_identity_binds_job(
+    identity: &ResultsIdentity,
     plan_id: &str,
     job_id: &str,
 ) -> bool {
-    match bearer {
-        Some(token) if token == state.system_token => true,
-        Some(token) => state.verify_local_jwt_claims(token).is_some_and(|claims| {
-            let subject_job = claims
-                .get("sub")
-                .and_then(|value| value.as_str())
-                .and_then(|subject| subject.strip_prefix("preloop-job-"))
-                .unwrap_or("");
-            let scope = claims
-                .get("scp")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            subject_job == job_id && scope == format!("Actions.Results:{plan_id}:{job_id}")
-        }),
-        None => false,
+    match identity {
+        ResultsIdentity::System => true,
+        ResultsIdentity::Job(identity) => {
+            identity.plan_id == plan_id
+                && job_id
+                    .parse::<uuid::Uuid>()
+                    .is_ok_and(|job| job == identity.job_id)
+        }
+    }
+}
+
+/// Require the typed Results identity to name the exact plan/job target.
+pub(crate) fn require_results_job(
+    identity: &ResultsIdentity,
+    plan_id: &str,
+    job_id: &str,
+) -> Result<(), ApiError> {
+    if results_identity_binds_job(identity, plan_id, job_id) {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden(
+            "results-service token is not bound to that job",
+        ))
     }
 }
 
