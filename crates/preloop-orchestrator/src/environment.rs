@@ -173,8 +173,12 @@ impl ToolchainLayer {
                     // Run steps execute with `bash --noprofile --norc`, so
                     // profile.d PATH exports are never sourced. Symlink the
                     // cargo binaries into /usr/local/bin so they are on the
-                    // default system PATH for every step shell.
-                    "ln -sf $HOME/.cargo/bin/cargo /usr/local/bin/cargo; ln -sf $HOME/.cargo/bin/rustc /usr/local/bin/rustc; ln -sf $HOME/.cargo/bin/rustup /usr/local/bin/rustup".into(),
+                    // default system PATH for every step shell. `rustdoc` is
+                    // included because `cargo test` spawns it by bare name for
+                    // doctests: without it on PATH the whole workspace test
+                    // step dies with `could not execute process rustdoc`
+                    // after every real test has already passed.
+                    "ln -sf $HOME/.cargo/bin/cargo /usr/local/bin/cargo; ln -sf $HOME/.cargo/bin/rustc /usr/local/bin/rustc; ln -sf $HOME/.cargo/bin/rustdoc /usr/local/bin/rustdoc; ln -sf $HOME/.cargo/bin/rustup /usr/local/bin/rustup".into(),
                 ],
             ],
             Self::Python(version) => {
@@ -536,6 +540,22 @@ mod tests {
         assert!(script.contains("--profile minimal"));
         assert!(script.contains("--default-toolchain stable"));
         assert!(!script.contains("sh.rustup.rs"));
+    }
+
+    /// `cargo test --workspace` spawns `rustdoc` by bare name for doctests, so
+    /// the interpreter must be on the default PATH of a `bash --noprofile
+    /// --norc` step shell. Without the symlink the workspace test step fails
+    /// with `could not execute process rustdoc` after every real test passed.
+    #[test]
+    fn rust_layer_puts_rustdoc_on_default_path() {
+        let commands = ToolchainLayer::Rust("stable".into()).install_commands();
+        let script = commands[1].join(" ");
+        for binary in ["cargo", "rustc", "rustdoc", "rustup"] {
+            assert!(
+                script.contains(&format!("/usr/local/bin/{binary}")),
+                "{binary} must be linked onto the default PATH: {script}"
+            );
+        }
     }
 
     #[test]
