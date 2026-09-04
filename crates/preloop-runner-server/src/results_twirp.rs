@@ -169,11 +169,12 @@ pub(crate) async fn twirp_get_job_logs_signed_blob_url(
         "/replay/results/{}/{}/job-logs.txt",
         request.workflow_run_backend_id, request.workflow_job_run_backend_id
     );
-    let sig = crate::auth::sign_replay_upload_ticket(&shared.state, &path);
+    let expires_at = crate::auth::replay_ticket_expiry();
+    let sig = crate::auth::sign_replay_upload_ticket(&shared.state, &path, expires_at);
     Ok(Json(json!({
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
         "logs_url": format!(
-            "{}{}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig={sig}",
+            "{}{}?sv=2021-08-06&se={expires_at}&sr=c&sp=rw&sig={sig}",
             runner_base_url(), path
         )
     })))
@@ -210,11 +211,12 @@ pub(crate) async fn twirp_get_step_logs_signed_blob_url(
         request.workflow_job_run_backend_id,
         request.step_backend_id
     );
-    let sig = crate::auth::sign_replay_upload_ticket(&shared.state, &path);
+    let expires_at = crate::auth::replay_ticket_expiry();
+    let sig = crate::auth::sign_replay_upload_ticket(&shared.state, &path, expires_at);
     Ok(Json(json!({
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
         "logs_url": format!(
-            "{}{}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig={sig}",
+            "{}{}?sv=2021-08-06&se={expires_at}&sr=c&sp=rw&sig={sig}",
             runner_base_url(), path
         ),
         "soft_size_limit": "1048576"
@@ -249,11 +251,12 @@ pub(crate) async fn twirp_get_step_summary_signed_blob_url(
         request.workflow_job_run_backend_id,
         request.step_backend_id
     );
-    let sig = crate::auth::sign_replay_upload_ticket(&shared.state, &path);
+    let expires_at = crate::auth::replay_ticket_expiry();
+    let sig = crate::auth::sign_replay_upload_ticket(&shared.state, &path, expires_at);
     Ok(Json(json!({
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
         "summary_url": format!(
-            "{}{}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig={sig}",
+            "{}{}?sv=2021-08-06&se={expires_at}&sr=c&sp=rw&sig={sig}",
             runner_base_url(), path
         ),
         "soft_size_limit": "1048576"

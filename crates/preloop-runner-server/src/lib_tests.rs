@@ -20179,14 +20179,15 @@ async fn control_socket_surface_denies_native_and_test_apis() {
         StatusCode::UNAUTHORIZED,
         "an unsigned upload must be refused once it reaches the auth layer"
     );
-    let sig = crate::auth::sign_replay_upload_ticket(&state, replay_path);
+    let expires_at = crate::auth::replay_ticket_expiry();
+    let sig = crate::auth::sign_replay_upload_ticket(&state, replay_path, expires_at);
     let replay = socket_app
         .clone()
         .oneshot(
             Request::builder()
                 .method(Method::PUT)
                 .uri(format!(
-                    "{replay_path}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig={sig}"
+                    "{replay_path}?sv=2021-08-06&se={expires_at}&sr=c&sp=rw&sig={sig}"
                 ))
                 .body(Body::from("log bytes"))
                 .unwrap(),
@@ -20240,14 +20241,15 @@ async fn replay_blob_uploads_require_a_ticket_bound_to_the_exact_path() {
     // A ticket minted for a different path must not authorise this one —
     // this is the cross-job overwrite the signature binds away.
     let other_path = format!("/replay/results/{plan}/{job}/job-logs.txt");
-    let other_sig = crate::auth::sign_replay_upload_ticket(&state, &other_path);
+    let expires_at = crate::auth::replay_ticket_expiry();
+    let other_sig = crate::auth::sign_replay_upload_ticket(&state, &other_path, expires_at);
     let mismatched = app
         .clone()
         .oneshot(
             Request::builder()
                 .method(Method::PUT)
                 .uri(format!(
-                    "{path}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig={other_sig}"
+                    "{path}?sv=2021-08-06&se={expires_at}&sr=c&sp=rw&sig={other_sig}"
                 ))
                 .body(Body::from("overwrite attempt"))
                 .unwrap(),
@@ -20255,16 +20257,37 @@ async fn replay_blob_uploads_require_a_ticket_bound_to_the_exact_path() {
         .await
         .unwrap();
     assert_eq!(mismatched.status(), StatusCode::UNAUTHORIZED);
+    let expired_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .saturating_sub(1);
+    let expired_sig = crate::auth::sign_replay_upload_ticket(&state, &path, expired_at);
+    let expired = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(format!(
+                    "{path}?sv=2021-08-06&se={expired_at}&sr=c&sp=rw&sig={expired_sig}"
+                ))
+                .body(Body::from("expired upload"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(expired.status(), StatusCode::UNAUTHORIZED);
 
     // The runner's own flow: a ticket for the exact path lands the blob.
-    let sig = crate::auth::sign_replay_upload_ticket(&state, &path);
+    let expires_at = crate::auth::replay_ticket_expiry();
+    let sig = crate::auth::sign_replay_upload_ticket(&state, &path, expires_at);
     let uploaded = app
         .clone()
         .oneshot(
             Request::builder()
                 .method(Method::PUT)
                 .uri(format!(
-                    "{path}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig={sig}"
+                    "{path}?sv=2021-08-06&se={expires_at}&sr=c&sp=rw&sig={sig}"
                 ))
                 .body(Body::from("log bytes"))
                 .unwrap(),
@@ -20349,14 +20372,15 @@ jobs:
         .zip([first_log.as_str(), second_log.as_str()])
     {
         let path = format!("/replay/results/{plan}/{job}/job-logs.txt");
-        let sig = crate::auth::sign_replay_upload_ticket(&state, &path);
+        let expires_at = crate::auth::replay_ticket_expiry();
+        let sig = crate::auth::sign_replay_upload_ticket(&state, &path, expires_at);
         let response = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::PUT)
                     .uri(format!(
-                        "{path}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig={sig}"
+                        "{path}?sv=2021-08-06&se={expires_at}&sr=c&sp=rw&sig={sig}"
                     ))
                     .body(Body::from(body.to_owned()))
                     .unwrap(),

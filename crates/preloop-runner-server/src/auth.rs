@@ -86,11 +86,24 @@ fn system_bearer_authorized(shared: &Arc<SharedState>, request: &Request) -> boo
     bearer_token(request).is_some_and(|token| token == shared.state.system_token)
 }
 
+pub(crate) async fn require_system_bearer(
+    State(shared): State<Arc<SharedState>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    if system_bearer_authorized(&shared, &request) {
+        Ok(next.run(request).await)
+    } else {
+        Err(ApiError::unauthorized("missing or invalid system token"))
+    }
+}
+
 /// Who a session/agent administration request acts as.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AdminCaller {
-    /// The native API administrator credential may act on any runner.
     System,
+    /// A runner-registration credential used by configure/replace.
+    RunnerManager,
     /// A registered runner's own listen token may act only on itself.
     Runner(i64),
 }
@@ -116,6 +129,22 @@ pub(crate) async fn require_runner_admin_bearer(
     next: Next,
 ) -> Result<Response, ApiError> {
     if system_bearer_authorized(&shared, &request) {
+        return Ok(next.run(request).await);
+    }
+    let manager_token = bearer_token(&request)
+        .and_then(|token| shared.state.verify_local_jwt_claims(token))
+        .and_then(|claims| {
+            claims
+                .get("scp")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        })
+        .is_some_and(|scope| {
+            scope
+                .split_whitespace()
+                .any(|value| value == "ActionsRuntime.RunnerManage")
+        });
+    if manager_token {
         return Ok(next.run(request).await);
     }
     // `resolve_runner_identity` is an outer layer, so the extension is
@@ -147,8 +176,29 @@ pub(crate) fn admin_caller(
     headers: &axum::http::HeaderMap,
     identity: Option<&RunnerIdentity>,
 ) -> Result<AdminCaller, ApiError> {
-    if bearer_from_headers(headers).is_some_and(|token| token == state.system_token) {
+    let Some(token) = bearer_from_headers(headers) else {
+        return Err(ApiError::unauthorized(
+            "runner administration requires a bearer token",
+        ));
+    };
+    if token == state.system_token {
         return Ok(AdminCaller::System);
+    }
+    if state
+        .verify_local_jwt_claims(token)
+        .and_then(|claims| {
+            claims
+                .get("scp")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        })
+        .is_some_and(|scope| {
+            scope
+                .split_whitespace()
+                .any(|value| value == "ActionsRuntime.RunnerManage")
+        })
+    {
+        return Ok(AdminCaller::RunnerManager);
     }
     identity
         .and_then(|identity| identity.runner_id)
@@ -219,24 +269,34 @@ async fn runner_registered(shared: &Arc<SharedState>, runner_id: i64) -> bool {
         .contains_key(&runner_id)
 }
 
+/// Signed replay blob upload tickets expire after one hour.
+pub(crate) const REPLAY_TICKET_TTL_SECS: u64 = 3600;
+
+pub(crate) fn replay_ticket_expiry() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .saturating_add(REPLAY_TICKET_TTL_SECS)
+}
+
 /// Sign a replay blob upload URL for `path` (e.g. `/replay/results/{plan}/{job}/step-1.txt`).
 ///
 /// The upload route is deliberately bearerless — the runner PUTs bytes to the
 /// URL its own Twirp handler returned — and it is reachable from inside every
 /// runner VM, where workflow code runs. Unsigned, the route let a guest
 /// overwrite another job's stored logs and summaries by guessing the URL
-/// shape. Binding the signature to the exact path makes a URL minted for one
-/// job worthless against any other, and only holders of the per-instance HMAC
-/// key (the mint handlers, gated on a job-scoped token) can produce one.
-pub(crate) fn sign_replay_upload_ticket(state: &AppState, path: &str) -> String {
+/// shape. Binding the signature to the exact path and expiry makes a URL
+/// minted for one job worthless against any other, or after its lifetime.
+pub(crate) fn sign_replay_upload_ticket(state: &AppState, path: &str, expires_at: u64) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(&state.local_jwt_key)
         .expect("HMAC accepts keys of any length");
-    mac.update(replay_ticket_payload(path).as_bytes());
+    mac.update(replay_ticket_payload(path, expires_at).as_bytes());
     URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
 }
 
 /// Whether the `sig` query parameter of `uri` authorises an upload to exactly
-/// that replay path. Constant-time comparison via `verify_slice`.
+/// that replay path before the signed Unix expiry (`se`).
 pub(crate) fn verify_replay_upload_ticket(state: &AppState, uri: &axum::http::Uri) -> bool {
     let Some(query) = uri.query() else {
         return false;
@@ -246,18 +306,28 @@ pub(crate) fn verify_replay_upload_ticket(state: &AppState, uri: &axum::http::Ur
     let Some(signature) = params.get("sig").map(String::as_str) else {
         return false;
     };
+    let Some(expires_at) = params.get("se").and_then(|value| value.parse::<u64>().ok()) else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if now >= expires_at {
+        return false;
+    }
     let Ok(provided) = URL_SAFE_NO_PAD.decode(signature) else {
         return false;
     };
     let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(&state.local_jwt_key) else {
         return false;
     };
-    mac.update(replay_ticket_payload(uri.path()).as_bytes());
+    mac.update(replay_ticket_payload(uri.path(), expires_at).as_bytes());
     mac.verify_slice(&provided).is_ok()
 }
 
-fn replay_ticket_payload(path: &str) -> String {
-    format!("replay-blob\n{path}")
+fn replay_ticket_payload(path: &str, expires_at: u64) -> String {
+    format!("replay-blob\n{expires_at}\n{path}")
 }
 
 /// Marker extension: the request arrived through the mounted control socket.

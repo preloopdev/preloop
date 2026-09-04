@@ -92,29 +92,15 @@ pub(crate) fn canonical_artifact_scope(
 /// jobs. `workflow_job_run_backend_id` is consequently *not* an authorization
 /// input here; it is recorded as attribution only.
 fn artifact_v2_canonical_run_scope(
-    state: &AppState,
     inner: &InnerState,
-    headers: &HeaderMap,
     workflow_run_backend_id: &str,
+    job: Option<uuid::Uuid>,
 ) -> Result<String, ApiError> {
     let canonical_run =
         canonical_artifact_scope(inner, workflow_run_backend_id, workflow_run_backend_id);
-    let Some(token) = crate::auth::bearer_from_headers(headers) else {
-        return Err(ApiError::unauthorized(
-            "artifact access requires a bearer token",
-        ));
-    };
-    // The engine token is the administrator credential (control-plane
-    // callers, conformance replays); it may address any run.
-    if token == state.system_token {
+    let Some(job) = job else {
         return Ok(canonical_run);
-    }
-    let job = state
-        .job_uuid_from_token(token)
-        .ok_or_else(|| ApiError::unauthorized("artifact access requires a valid job token"))?;
-    // Fail closed when the job is no longer resolvable (retired or purged
-    // request): a token whose job the server cannot place must not be able to
-    // fall back to whatever run the body names.
+    };
     let forbidden =
         || ApiError::forbidden("artifact access requires a token for that workflow run");
     let request_id = inner
@@ -129,6 +115,24 @@ fn artifact_v2_canonical_run_scope(
     Ok(canonical_run)
 }
 
+fn artifact_v2_job_from_headers(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Option<uuid::Uuid>, ApiError> {
+    let Some(token) = crate::auth::bearer_from_headers(headers) else {
+        return Err(ApiError::unauthorized(
+            "artifact access requires a bearer token",
+        ));
+    };
+    if token == state.system_token {
+        return Ok(None);
+    }
+    state
+        .job_uuid_from_token(token)
+        .map(Some)
+        .ok_or_else(|| ApiError::unauthorized("artifact access requires a valid job token"))
+}
+
 pub(crate) async fn save_artifact_v2_registry(
     shared: &Arc<SharedState>,
 ) -> Result<(), std::io::Error> {
@@ -140,19 +144,17 @@ pub(crate) async fn save_artifact_v2_registry(
     tokio::fs::write(&registry_path, serialized.as_bytes()).await?;
     Ok(())
 }
+
 pub(crate) async fn twirp_artifact_v2_create(
     State(shared): State<Arc<SharedState>>,
     headers: HeaderMap,
     Json(request): Json<ArtifactV2CreateRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Validate the JWT signature and claims before taking the global state lock.
+    let job = artifact_v2_job_from_headers(&shared.state, &headers)?;
     let canonical_run = {
         let inner = shared.state.inner.lock().await;
-        artifact_v2_canonical_run_scope(
-            &shared.state,
-            &inner,
-            &headers,
-            &request.workflow_run_backend_id,
-        )?
+        artifact_v2_canonical_run_scope(&inner, &request.workflow_run_backend_id, job)?
     };
     validate_artifact_name(&request.name)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
@@ -236,14 +238,10 @@ pub(crate) async fn twirp_artifact_v2_finalize(
     headers: HeaderMap,
     Json(request): Json<ArtifactV2FinalizeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let job = artifact_v2_job_from_headers(&shared.state, &headers)?;
     let canonical_run = {
         let inner = shared.state.inner.lock().await;
-        artifact_v2_canonical_run_scope(
-            &shared.state,
-            &inner,
-            &headers,
-            &request.workflow_run_backend_id,
-        )?
+        artifact_v2_canonical_run_scope(&inner, &request.workflow_run_backend_id, job)?
     };
     let registry_key = artifact_v2_registry_key(&canonical_run, &request.name);
     let token = {
@@ -326,13 +324,10 @@ pub(crate) async fn twirp_artifact_v2_list(
     headers: HeaderMap,
     Json(request): Json<ArtifactV2ListRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let job = artifact_v2_job_from_headers(&shared.state, &headers)?;
     let inner = shared.state.inner.lock().await;
-    let canonical_run = artifact_v2_canonical_run_scope(
-        &shared.state,
-        &inner,
-        &headers,
-        &request.workflow_run_backend_id,
-    )?;
+    let canonical_run =
+        artifact_v2_canonical_run_scope(&inner, &request.workflow_run_backend_id, job)?;
 
     let name_filter: Option<String> = request.name_filter.and_then(|v| match v {
         serde_json::Value::String(s) => Some(s),
@@ -384,14 +379,10 @@ pub(crate) async fn twirp_artifact_v2_get_signed_url(
     headers: HeaderMap,
     Json(request): Json<ArtifactV2GetSignedUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let job = artifact_v2_job_from_headers(&shared.state, &headers)?;
     let canonical_run = {
         let inner = shared.state.inner.lock().await;
-        artifact_v2_canonical_run_scope(
-            &shared.state,
-            &inner,
-            &headers,
-            &request.workflow_run_backend_id,
-        )?
+        artifact_v2_canonical_run_scope(&inner, &request.workflow_run_backend_id, job)?
     };
     let registry_key = artifact_v2_registry_key(&canonical_run, &request.name);
     let blob_token = {
@@ -413,14 +404,10 @@ pub(crate) async fn twirp_artifact_v2_delete(
     headers: HeaderMap,
     Json(request): Json<ArtifactV2DeleteRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let job = artifact_v2_job_from_headers(&shared.state, &headers)?;
     let canonical_run = {
         let inner = shared.state.inner.lock().await;
-        artifact_v2_canonical_run_scope(
-            &shared.state,
-            &inner,
-            &headers,
-            &request.workflow_run_backend_id,
-        )?
+        artifact_v2_canonical_run_scope(&inner, &request.workflow_run_backend_id, job)?
     };
     let registry_key = artifact_v2_registry_key(&canonical_run, &request.name);
     let removed = {
