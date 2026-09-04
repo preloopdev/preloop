@@ -383,6 +383,16 @@ impl EnvironmentSpec {
             // host-class change re-preps the golden once instead of adopting
             // a base built for the other class.
             "rosetta_libs": cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
+            // The packed artifact's baked runner resolves node through the
+            // bundle mount at the pins it was built against. A pin bump that
+            // left the fingerprint untouched would keep an artifact whose
+            // runner demands the previous version, so every JS action step
+            // fails with `bundled nodeXX is missing` against a bundle that is
+            // itself perfectly valid at the new pin.
+            "node_externals": crate::node_externals::expected_runtimes()
+                .iter()
+                .map(|(runtime, version)| format!("{runtime}={version}"))
+                .collect::<Vec<_>>(),
         });
         let bytes =
             serde_json::to_vec(&normalized).expect("normalized environment is serializable");
@@ -559,6 +569,36 @@ mod tests {
         assert_eq!(rebased.base, "ubuntu:22.04");
         assert_eq!(rebased.toolchains, spec.toolchains);
         assert_ne!(rebased.fingerprint, original_fingerprint);
+    }
+
+    /// The artifact filename is keyed by this fingerprint, and the artifact's
+    /// baked runner resolves node at the pins it was compiled against. A pin
+    /// bump must therefore invalidate the fingerprint, or the pool keeps
+    /// serving an artifact whose runner demands a version no longer shipped.
+    #[test]
+    fn fingerprint_covers_the_node_externals_pins() {
+        let spec = EnvironmentSpec::for_base("ubuntu:24.04".into());
+        let pins: Vec<String> = crate::node_externals::expected_runtimes()
+            .iter()
+            .map(|(runtime, version)| format!("{runtime}={version}"))
+            .collect();
+        assert!(!pins.is_empty(), "node pins must be compiled in");
+
+        // Recompute the digest with a bumped pin: it must not collide.
+        let bumped: Vec<String> = pins.iter().map(|pin| format!("{pin}-bumped")).collect();
+        let normalized = serde_json::json!({
+            "base": "ubuntu:24.04",
+            "toolchains": &spec.toolchains,
+            "curated": spec.curated,
+            "bake": if spec.curated { crate::base_install_script() } else { String::new() },
+            "rosetta_libs": cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
+            "node_externals": bumped,
+        });
+        let bumped_fingerprint = hex_digest(&serde_json::to_vec(&normalized).unwrap());
+        assert_ne!(
+            spec.fingerprint, bumped_fingerprint,
+            "a node pin bump must change the fingerprint"
+        );
     }
 
     /// Stock bases get Preloop's curated toolchain bake; a custom base is

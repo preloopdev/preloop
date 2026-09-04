@@ -78,7 +78,7 @@ fn runner_volumes(
     mount_externals: bool,
 ) -> Vec<VolumeMount> {
     let mut volumes = vec![VolumeMount {
-        host: config.runner_bundle.clone(),
+        host: effective_runner_bundle(config),
         guest: PathBuf::from("/opt/preloop/bin"),
         read_only: true,
     }];
@@ -177,24 +177,16 @@ fn ensure_host_externals(config: &RunnerPoolConfig) -> Result<(), OrchestratorEr
     // host symlink: virtiofs exports a symlink node verbatim and the guest
     // kernel then resolves its target in the GUEST namespace, where
     // `/var/lib/preloop/externals` does not exist — node would be missing.
-    // Best-effort copy: the bundle lives in a root-owned release dir when
-    // the engine runs unprivileged, and the deploy step materializes the
-    // externals in that case.
+    // The copy is attempted in place first; when the release directory is not
+    // writable by this engine (unprivileged engine, root-owned release dir) an
+    // engine-owned mirror bundle is published instead — see
+    // `materialize_mirror_bundle`. Either way the pool refuses to start with
+    // externals the guest cannot resolve, because every JS action step would
+    // otherwise fail with `bundled nodeXX is missing` after the pool reports
+    // itself ready.
     let bundle_externals = config.runner_bundle.join("externals");
-    let needs_bundle =
-        crate::node_externals::expected_runtimes()
-            .iter()
-            .any(|(runtime, version)| {
-                let plain = version.trim_start_matches('v');
-                !crate::node_externals::is_valid_externals_dir(
-                    &bundle_externals.join(runtime),
-                    runtime,
-                    plain,
-                )
-            });
-    if needs_bundle {
+    if !externals_complete(&bundle_externals) {
         // Ensure bundle parent exists before copy.
-        let _ = std::fs::create_dir_all(&bundle_externals);
         let copy = std::fs::create_dir_all(&bundle_externals).and_then(|()| {
             // For stale manifests, remove the stale runtime dirs in the bundle first
             // so `cp -a` does not leave a mix of stale/new.
@@ -221,19 +213,140 @@ fn ensure_host_externals(config: &RunnerPoolConfig) -> Result<(), OrchestratorEr
             Ok(output) => warn!(
                 status = %output.status,
                 bundle = %bundle_externals.display(),
-                "Could not materialize bundle externals (deploy step should copy them)"
+                "Could not materialize bundle externals in place; publishing an engine-owned mirror bundle"
             ),
             Err(error) => warn!(
                 %error,
                 bundle = %bundle_externals.display(),
-                "Could not materialize bundle externals (deploy step should copy them)"
+                "Could not materialize bundle externals in place; publishing an engine-owned mirror bundle"
             ),
         }
     }
     // `cp -a` preserves the source mode, so the bundle copy needs the same
     // repair as the host directory.
     relax_externals_permissions(&bundle_externals);
+    if externals_complete(&bundle_externals) {
+        return Ok(());
+    }
+    materialize_mirror_bundle(config, &externals)
+}
+
+/// Whether `externals_root` carries every expected runtime at its pinned
+/// version, validated through the manifest and `bin/node --version`.
+fn externals_complete(externals_root: &Path) -> bool {
+    crate::node_externals::expected_runtimes()
+        .iter()
+        .all(|(runtime, version)| {
+            let plain = version.trim_start_matches('v');
+            crate::node_externals::is_valid_externals_dir(
+                &externals_root.join(runtime),
+                runtime,
+                plain,
+            )
+        })
+}
+
+/// Engine-owned mirror of the runner bundle.
+///
+/// Lives beside the other engine state, so it is writable whenever the engine
+/// can run at all — unlike the release directory, which is root-owned when the
+/// engine runs unprivileged.
+fn mirror_bundle_dir(config: &RunnerPoolConfig) -> PathBuf {
+    config.externals_dir.join("runner-bundle")
+}
+
+/// The bundle directory actually mounted into guests at `/opt/preloop/bin`.
+///
+/// Prefers the release directory and falls back to the engine-owned mirror,
+/// which `materialize_mirror_bundle` only leaves in place when it is complete.
+fn effective_runner_bundle(config: &RunnerPoolConfig) -> PathBuf {
+    if externals_complete(&config.runner_bundle.join("externals")) {
+        return config.runner_bundle.clone();
+    }
+    let mirror = mirror_bundle_dir(config);
+    if mirror.join(&config.runner_binary_name).is_file()
+        && externals_complete(&mirror.join("externals"))
+    {
+        return mirror;
+    }
+    config.runner_bundle.clone()
+}
+
+/// Publish an engine-owned bundle carrying the runner binary and the validated
+/// host externals, for the case where the release directory cannot be written.
+///
+/// Fails when the mirror still does not validate: a pool that starts without
+/// resolvable externals reports itself ready and then fails every JS action
+/// step, which is far more expensive to diagnose than a refused startup.
+fn materialize_mirror_bundle(
+    config: &RunnerPoolConfig,
+    host_externals: &Path,
+) -> Result<(), OrchestratorError> {
+    let mirror = mirror_bundle_dir(config);
+    let mirror_externals = mirror.join("externals");
+    let runner_source = config.runner_bundle.join(&config.runner_binary_name);
+    let runner_target = mirror.join(&config.runner_binary_name);
+    let published = std::fs::create_dir_all(&mirror_externals).and_then(|()| {
+        for (runtime, version) in crate::node_externals::expected_runtimes() {
+            let plain = version.trim_start_matches('v');
+            let dest = mirror_externals.join(runtime);
+            if !crate::node_externals::is_valid_externals_dir(&dest, runtime, plain)
+                && dest.exists()
+            {
+                let _ = std::fs::remove_dir_all(&dest);
+            }
+        }
+        // `cp -a` for both halves: the runner binary must keep its exec bit and
+        // the externals must arrive as real directories, since virtiofs exports
+        // a symlink node verbatim and the guest would resolve it in its own
+        // namespace.
+        std::fs::copy(&runner_source, &runner_target)?;
+        std::process::Command::new("cp")
+            .arg("-a")
+            .arg(host_externals.join("."))
+            .arg(&mirror_externals)
+            .output()
+    });
+    if let Err(error) = published {
+        return Err(OrchestratorError::Config(format!(
+            "node externals are missing from the runner bundle {} and the \
+             engine-owned mirror {} could not be published: {error}",
+            config.runner_bundle.display(),
+            mirror.display()
+        )));
+    }
+    set_executable_bit(&runner_target);
+    relax_externals_permissions(&mirror_externals);
+    if !runner_target.is_file() || !externals_complete(&mirror_externals) {
+        return Err(OrchestratorError::Config(format!(
+            "node externals are still incomplete after publishing the \
+             engine-owned mirror bundle {}; every JS action step would fail \
+             with `bundled node is missing`. Check network egress to \
+             nodejs.org and the host externals at {}",
+            mirror.display(),
+            host_externals.display()
+        )));
+    }
+    info!(
+        bundle = %mirror.display(),
+        "Published engine-owned mirror bundle with node externals"
+    );
     Ok(())
+}
+
+/// Restore the exec bit on the mirrored runner binary.
+fn set_executable_bit(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(permissions.mode() | 0o755);
+            let _ = std::fs::set_permissions(path, permissions);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// Make published Node externals traversable by the unprivileged guest account.
@@ -5686,6 +5799,79 @@ chmod +x "$dest/bin/node"
         shutdown.cancel();
         slot.abort();
         let _ = slot.await;
+    }
+
+    /// Materialize a valid externals tree for every expected runtime.
+    fn write_valid_externals(externals_root: &std::path::Path) {
+        for (runtime, version) in crate::node_externals::expected_runtimes() {
+            let plain = version.trim_start_matches('v');
+            let runtime_dir = externals_root.join(runtime);
+            std::fs::create_dir_all(runtime_dir.join("bin")).unwrap();
+            let manifest = crate::node_externals::NodeManifest::new(
+                runtime,
+                plain,
+                "linux-arm64",
+                "abc",
+                "https://example.com",
+            );
+            crate::node_externals::write_manifest(&runtime_dir, &manifest).unwrap();
+            let node = runtime_dir.join("bin/node");
+            std::fs::write(&node, format!("#!/bin/sh\necho v{plain}\n")).unwrap();
+            std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// A release directory the engine cannot write must not strand the pool
+    /// without node: the engine publishes its own bundle and mounts that.
+    #[test]
+    fn mirror_bundle_is_published_when_the_release_bundle_lacks_externals() {
+        let home = tempfile::tempdir().unwrap();
+        let release = tempfile::tempdir().unwrap();
+        std::fs::write(release.path().join("runner"), b"#!/bin/sh\nexit 0\n").unwrap();
+        let host_externals = home.path().join("externals");
+        write_valid_externals(&host_externals);
+
+        let mut config = test_config(false);
+        config.runner_bundle = release.path().to_path_buf();
+        config.externals_dir = home.path().to_path_buf();
+
+        // The release bundle carries no externals, so the guest would resolve
+        // its baked symlink onto nothing.
+        assert_eq!(effective_runner_bundle(&config), release.path());
+
+        materialize_mirror_bundle(&config, &host_externals)
+            .expect("the engine-owned mirror is publishable");
+
+        let mirror = mirror_bundle_dir(&config);
+        assert!(externals_complete(&mirror.join("externals")));
+        assert!(mirror.join("runner").is_file());
+        // Every guest now mounts the mirror instead of the incomplete release.
+        assert_eq!(effective_runner_bundle(&config), mirror);
+    }
+
+    /// Starting a pool whose bundle cannot resolve node reports ready and then
+    /// fails every JS action step, so publishing must fail loudly instead.
+    #[test]
+    fn mirror_bundle_publication_fails_when_host_externals_are_incomplete() {
+        let home = tempfile::tempdir().unwrap();
+        let release = tempfile::tempdir().unwrap();
+        std::fs::write(release.path().join("runner"), b"#!/bin/sh\nexit 0\n").unwrap();
+        // Host cache is empty: nothing valid to mirror.
+        let host_externals = home.path().join("externals");
+        std::fs::create_dir_all(&host_externals).unwrap();
+
+        let mut config = test_config(false);
+        config.runner_bundle = release.path().to_path_buf();
+        config.externals_dir = home.path().to_path_buf();
+
+        let error = materialize_mirror_bundle(&config, &host_externals)
+            .expect_err("an unusable bundle must refuse to start the pool");
+        assert!(
+            format!("{error}").contains("incomplete"),
+            "unexpected error: {error}"
+        );
+        // The release bundle stays selected; no half-published mirror is mounted.
+        assert_eq!(effective_runner_bundle(&config), release.path());
     }
 
     fn test_config(control_socket: bool) -> RunnerPoolConfig {
