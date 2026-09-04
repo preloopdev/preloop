@@ -365,23 +365,8 @@ pub(crate) fn results_identity(state: &AppState, bearer: &str) -> Option<Results
     }
 
     let claims = state.verify_local_jwt_claims(bearer)?;
-    let subject_job = claims
-        .get("sub")
-        .and_then(|value| value.as_str())
-        .and_then(|subject| subject.strip_prefix("preloop-job-"))
-        .and_then(|job| job.parse::<uuid::Uuid>().ok())?;
-    let scope = claims
-        .get("scp")
-        .and_then(|value| value.as_str())
-        .and_then(|scope| scope.strip_prefix("Actions.Results:"))?;
-    let (plan_id, scope_job) = scope.split_once(':')?;
-    if plan_id.is_empty() || scope_job.parse::<uuid::Uuid>().ok()? != subject_job {
-        return None;
-    }
-    Some(ResultsIdentity::Job(ResultsJobIdentity {
-        plan_id: plan_id.to_owned(),
-        job_id: subject_job,
-    }))
+    let (plan_id, job_id) = AppState::results_job_from_payload(&claims)?;
+    Some(ResultsIdentity::Job(ResultsJobIdentity { plan_id, job_id }))
 }
 
 pub(crate) fn results_identity_binds_job(

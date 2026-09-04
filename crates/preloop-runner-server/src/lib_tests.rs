@@ -6398,6 +6398,150 @@ async fn all_twirp_api_routes_reject_missing_bearer_before_body_validation() {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{route}");
     }
 }
+#[tokio::test]
+async fn results_cache_and_artifact_routes_reject_inconsistent_bearers() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let subject_job = uuid::Uuid::new_v4();
+    let other_job = uuid::Uuid::new_v4();
+
+    let mismatched = state
+        .local_jwt(json!({
+            "sub": format!("preloop-job-{subject_job}"),
+            "scp": format!("Actions.Results:plan-{other_job}:{other_job}"),
+        }))
+        .unwrap();
+    let malformed = state
+        .local_jwt(json!({
+            "sub": format!("preloop-job-{subject_job}"),
+            "scp": "Actions.Results:plan",
+        }))
+        .unwrap();
+    let routes = [
+        (
+            "/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry",
+            json!({"key": "rejected-cache", "version": "v1"}),
+        ),
+        (
+            "/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact",
+            json!({
+                "workflow_run_backend_id": "rejected-plan",
+                "workflow_job_run_backend_id": subject_job.to_string(),
+                "name": "rejected-artifact",
+            }),
+        ),
+    ];
+
+    for (token, reason) in [
+        (&mismatched, "mismatched subject/scope"),
+        (&malformed, "malformed scope"),
+    ] {
+        for (uri, body) in &routes {
+            assert_eq!(
+                status_with_bearer(&app, token, Method::POST, uri, body.clone()).await,
+                StatusCode::UNAUTHORIZED,
+                "{reason} must be rejected by the Results bearer gate on {uri}"
+            );
+        }
+    }
+
+    // A regular runner token for a registered trusted run remains usable on
+    // the cache Results route and carries the same job identity the quota
+    // helper records. (Artifact creation additionally requires run scoping,
+    // and unregistered jobs fail closed on cache writes, so the cache route
+    // with a real job is the right place to prove gate-plus-quota.)
+    let trusted = crate::submit_run_inner(
+        &state.shared(),
+        preloop_gha_protocol::WorkflowSubmission {
+            workflow_yaml: "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+                .to_owned(),
+            event: "push".to_owned(),
+            payload: json!({"ref": "refs/heads/main", "commits": []}),
+            repository: "owner/repo".to_owned(),
+            git_ref: "refs/heads/main".to_owned(),
+            trust_tier: None,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("trusted submission accepted");
+    let (matching, subject_job) = {
+        let inner = state.inner.lock().await;
+        let message = queued_message_for(&inner, &trusted.run_id.to_string());
+        (
+            state.mint_runtime_token(&message.plan.plan_id, &message.job_id),
+            message.job_id,
+        )
+    };
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &matching,
+            Method::POST,
+            "/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry",
+            json!({"key": "runner-cache", "version": "v1"}),
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    // The administrator credential intentionally remains a cross-job Results
+    // credential and is not assigned to a per-job quota bucket.
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &state.system_token,
+            Method::POST,
+            "/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry",
+            json!({"key": "system-cache", "version": "v1"}),
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &state.system_token,
+            Method::POST,
+            "/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact",
+            json!({
+                "workflow_run_backend_id": "system-plan",
+                "workflow_job_run_backend_id": "system-job",
+                "name": "system-artifact",
+            }),
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    let subject_job = subject_job.to_string();
+    let inner = state.inner.lock().await;
+    assert_eq!(inner.cache_v2_pending.len(), 2);
+    let cache_job_ids = inner
+        .cache_v2_pending
+        .values()
+        .map(|pending| pending.job_backend_id.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        cache_job_ids.contains(&subject_job.as_str()),
+        "the runner token's reservation must carry its job quota identity"
+    );
+    assert!(
+        cache_job_ids.contains(&""),
+        "system Results credentials must not enter a job quota bucket"
+    );
+    let artifact_job_ids = inner
+        .artifact_v2_pending
+        .values()
+        .map(|pending| pending.job_backend_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        artifact_job_ids,
+        vec![""],
+        "only the unscoped system reservation reaches the artifact registry here"
+    );
+}
 
 #[tokio::test]
 async fn twirp_metadata_routes_persist_log_metadata() {

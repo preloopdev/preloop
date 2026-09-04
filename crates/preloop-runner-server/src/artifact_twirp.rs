@@ -76,8 +76,8 @@ pub(crate) fn canonical_artifact_scope(
 ///
 /// Every artifact-v2 request type carries `workflow_run_backend_id` and
 /// `workflow_job_run_backend_id` in its body, and the handlers key the
-/// registry off them. The results-service bearer guard only checks the
-/// `Actions.Results:` scope *prefix*, so trusting those body fields let a
+/// registry off them. The results-service bearer guard parses the bearer into
+/// a typed plan/job identity, so trusting those body fields would let a
 /// workflow step list, re-point, sign a URL for, or delete another run's
 /// artifacts just by sending different ids (SEC-02). The owning run is
 /// therefore taken from the caller's signed runtime token and the body ids
@@ -87,8 +87,8 @@ pub(crate) fn canonical_artifact_scope(
 /// run-scoped, and `actions/download-artifact` in a `needs:` job legitimately
 /// reads (and `DeleteArtifact` legitimately removes) artifacts uploaded by a
 /// sibling job of the same run. Binding to the token's job — the stricter
-/// rule [`crate::auth::results_token_binds_job`] applies to log/summary blob
-/// URLs, which really are per-job — would break artifact hand-off between
+/// rule [`crate::auth::results_identity_binds_job`] applies to log/summary
+/// blob URLs, which really are per-job — would break artifact hand-off
 /// jobs. `workflow_job_run_backend_id` is consequently *not* an authorization
 /// input here; it is recorded as attribution only.
 fn artifact_v2_canonical_run_scope(

@@ -153,31 +153,52 @@ impl AppState {
             .ok()
     }
 
-    /// Agent job UUID a runtime token was minted for.
+    /// Parsed identity of a verified Results runtime-token payload.
     ///
-    /// The counterpart to [`Self::runner_id_from_token`]: a job runtime token
-    /// names exactly one job, so any surface a worker calls can authorize
-    /// against the job rather than merely against token validity.
-    pub(crate) fn job_uuid_from_token(&self, token: &str) -> Option<uuid::Uuid> {
-        let payload = self.verify_local_jwt_claims(token)?;
-        // `scp` is `Actions.Results:{plan_id}:{job_id}`; `sub` is the job on
-        // its own. Require both to agree so a token minted for a different
-        // surface cannot be replayed here.
+    /// Pure so every consumer — route auth, signed-URL binding, quota
+    /// accounting, and fork-tier resolution — parses mounted claims one way.
+    /// In particular the scope must contain exactly one `:` separating a
+    /// non-empty plan id from the job id; a suffix-only split would accept
+    /// extra components the other callsites reject.
+    pub(crate) fn results_job_from_payload(
+        payload: &serde_json::Value,
+    ) -> Option<(String, uuid::Uuid)> {
         let subject_job = payload
             .get("sub")?
             .as_str()?
             .strip_prefix("preloop-job-")?
             .parse::<uuid::Uuid>()
             .ok()?;
-        let scope_job = payload
+        let scope = payload
             .get("scp")?
             .as_str()?
-            .strip_prefix("Actions.Results:")?
-            .rsplit(':')
-            .next()?
-            .parse::<uuid::Uuid>()
-            .ok()?;
-        (subject_job == scope_job).then_some(subject_job)
+            .strip_prefix("Actions.Results:")?;
+        let (plan_id, scope_job) = scope.split_once(':')?;
+        if plan_id.is_empty() {
+            return None;
+        }
+        let scope_job = scope_job.parse::<uuid::Uuid>().ok()?;
+        (subject_job == scope_job).then(|| (plan_id.to_owned(), subject_job))
+    }
+
+    /// Parsed identity of an authenticated Results runtime token.
+    ///
+    /// The `sub` claim and the job component of the exact
+    /// `Actions.Results:{plan_id}:{job_id}` scope must name the same job.
+    /// Returning the plan and job together keeps Results authorization and
+    /// quota accounting on one parser.
+    pub(crate) fn results_job_from_token(&self, token: &str) -> Option<(String, uuid::Uuid)> {
+        let payload = self.verify_local_jwt_claims(token)?;
+        Self::results_job_from_payload(&payload)
+    }
+
+    /// Agent job UUID a runtime token was minted for.
+    ///
+    /// The counterpart to [`Self::runner_id_from_token`]: a job runtime token
+    /// names exactly one job, so any surface a worker calls can authorize
+    /// against the job rather than merely against token validity.
+    pub(crate) fn job_uuid_from_token(&self, token: &str) -> Option<uuid::Uuid> {
+        self.results_job_from_token(token).map(|(_, job)| job)
     }
 
     /// Agent job UUID a debug-worker token was minted for.
@@ -1616,6 +1637,26 @@ mod tests {
         assert!(
             !state.verify_action_ticket("acme", "repo\nv1", "x", expires_at, &signature),
             "a ticket for one action must not validate for a newline-split twin"
+        );
+    }
+    /// The fork-tier resolver used to take the scope's last `:` component,
+    /// so `Actions.Results:{plan}:extra:{job}` parsed where the canonical
+    /// parser rejects. Both must agree: extra components are malformed.
+    #[test]
+    fn results_job_from_payload_rejects_extra_scope_components() {
+        let job = uuid::Uuid::new_v4();
+        let payload = serde_json::json!({
+            "sub": format!("preloop-job-{job}"),
+            "scp": format!("Actions.Results:plan:extra:{job}"),
+        });
+        assert_eq!(AppState::results_job_from_payload(&payload), None);
+        let payload = serde_json::json!({
+            "sub": format!("preloop-job-{job}"),
+            "scp": format!("Actions.Results:plan:{job}"),
+        });
+        assert_eq!(
+            AppState::results_job_from_payload(&payload),
+            Some(("plan".to_owned(), job))
         );
     }
 }

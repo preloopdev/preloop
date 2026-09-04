@@ -153,21 +153,11 @@ pub(crate) async fn fork_restricted_from_token(
     // to the control plane and keeps its existing access.
     let job_shaped = subject.is_some_and(|sub| sub.starts_with("preloop-job-"))
         && scope.is_some_and(|scope| scope.starts_with("Actions.Results:"));
-    // Same agreement rule as `AppState::job_uuid_from_token` — `sub` is the
-    // job, `scp` is `Actions.Results:{plan_id}:{job_id}`, both must name the
-    // same job — but derived from the payload we already verified, so the
-    // HMAC/expiry checks run once per cache write instead of twice.
-    let job = subject
-        .and_then(|sub| sub.strip_prefix("preloop-job-"))
-        .and_then(|sub| sub.parse::<uuid::Uuid>().ok())
-        .zip(
-            scope
-                .and_then(|scope| scope.strip_prefix("Actions.Results:"))
-                .and_then(|scope| scope.rsplit(':').next())
-                .and_then(|job| job.parse::<uuid::Uuid>().ok()),
-        )
-        .filter(|(subject_job, scope_job)| subject_job == scope_job)
-        .map(|(subject_job, _)| subject_job);
+    // Same agreement rule as `AppState::results_job_from_payload` — `sub` is
+    // the job, `scp` is exactly `Actions.Results:{plan_id}:{job_id}`, both
+    // must name the same job — derived from the payload we already verified,
+    // so the HMAC/expiry checks run once per cache write instead of twice.
+    let job = crate::state::AppState::results_job_from_payload(&payload).map(|(_, job)| job);
     let Some(job) = job else {
         // Signed like a job token but its subject/scope no longer parse to a
         // job: nothing left to prove it trusted, so refuse.
