@@ -36,7 +36,7 @@ pub(crate) fn build_app(
         state: state.clone(),
         shutdown: shutdown.clone(),
     });
-    let protected_apis = Router::new()
+    let protected_protocol_apis = Router::new()
         .route("/_apis/artifactcache/cache", post(cache_reserve))
         .route("/_apis/artifactcache/cache", get(cache_lookup))
         .route("/_apis/artifactcache/cache/:cache_id", patch(cache_upload))
@@ -62,33 +62,21 @@ pub(crate) fn build_app(
             get(agent_lookup).post(register_runner_compat_pool_only),
         )
         .route(
-            "/runner/server/_apis/distributedtask/pools/:pool_id/agents/:agent_id",
-            delete(delete_agent),
-        )
-        .route(
-            "/_apis/distributedtask/pools/:pool_id/agents/:agent_id",
-            delete(delete_agent),
-        )
-        .route(
             "/runner/server/_apis/distributedtask/pools/:pool_id/sessions",
-            post(create_session_disttask).delete(delete_sessions_for_pool),
+            post(create_session_disttask),
         )
         .route(
             "/_apis/distributedtask/pools/:pool_id/sessions",
-            post(create_session_disttask).delete(delete_sessions_for_pool),
-        )
-        .route(
-            "/runner/server/_apis/distributedtask/pools/:pool_id/sessions/:session_id",
-            delete(delete_session),
-        )
-        .route(
-            "/_apis/distributedtask/pools/:pool_id/sessions/:session_id",
-            delete(delete_session),
+            post(create_session_disttask),
         )
         .route(
             "/runner/server/_apis/distributedtask/pools/:pool_id/messages",
             get(next_message_disttask),
         )
+        // Paired with the GET above: a client that polls messages on the
+        // distributedtask prefix deletes them on the same prefix. Job-facing
+        // runner traffic, so it stays under the protocol guard — the
+        // system-only router below is for runner/session/agent administration.
         .route(
             "/runner/server/_apis/distributedtask/pools/:pool_id/messages/:message_id",
             delete(delete_pool_message),
@@ -206,6 +194,57 @@ pub(crate) fn build_app(
             require_protocol_bearer,
         ));
 
+    // Runner/session/agent administration. Split out of the protocol router
+    // because `require_protocol_bearer` accepts any valid local JWT — a job's
+    // own `ACTIONS_RUNTIME_TOKEN` included — which let workflow code
+    // deregister runners and delete other runners' sessions. The
+    // guard here admits only the system token or a registered runner's listen
+    // token, and each handler additionally requires self-ownership: the
+    // official runner deletes its own session and deregisters its own agent
+    // through these routes, so a system-token-only guard would 401 the
+    // runner's shutdown path.
+    let protected_admin_apis = Router::new()
+        .route(
+            "/runner/server/_apis/distributedtask/pools/:pool_id/agents/:agent_id",
+            delete(delete_agent),
+        )
+        .route(
+            "/_apis/distributedtask/pools/:pool_id/agents/:agent_id",
+            delete(delete_agent),
+        )
+        .route(
+            "/runner/server/_apis/distributedtask/pools/:pool_id/sessions",
+            delete(delete_sessions_for_pool),
+        )
+        .route(
+            "/_apis/distributedtask/pools/:pool_id/sessions",
+            delete(delete_sessions_for_pool),
+        )
+        .route(
+            "/runner/server/_apis/distributedtask/pools/:pool_id/sessions/:session_id",
+            delete(delete_session),
+        )
+        .route(
+            "/_apis/distributedtask/pools/:pool_id/sessions/:session_id",
+            delete(delete_session),
+        )
+        .route(
+            "/:org/_apis/v1/AgentSession/:pool_id/:session_id",
+            delete(delete_session_org),
+        )
+        .route(
+            "/runner/server/_apis/v1/AgentSession/:pool_id/:session_id",
+            delete(delete_session),
+        )
+        .route(
+            "/_apis/v1/AgentSession/:pool_id/:session_id",
+            delete(delete_session),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            shared.clone(),
+            require_runner_admin_bearer,
+        ));
+
     let results_metadata = Router::new()
         .route(
             "/twirp/results.services.receiver.Receiver/CreateStepSummaryMetadata",
@@ -300,10 +339,6 @@ pub(crate) fn build_app(
             post(create_session_compat_org_pool_only),
         )
         .route(
-            "/:org/_apis/v1/AgentSession/:pool_id/:session_id",
-            delete(delete_session_org),
-        )
-        .route(
             "/:org/_apis/v1/Message/:pool_id",
             get(next_message_compat_org),
         )
@@ -377,10 +412,6 @@ pub(crate) fn build_app(
         .route(
             "/runner/server/_apis/v1/AgentSession/:pool_id",
             post(create_session_compat_pool_only),
-        )
-        .route(
-            "/runner/server/_apis/v1/AgentSession/:pool_id/:session_id",
-            delete(delete_session),
         )
         .route(
             "/runner/server/_apis/v1/Message/:pool_id",
@@ -724,10 +755,6 @@ pub(crate) fn build_app(
             "/_apis/v1/AgentSession/:pool_id",
             post(create_session_compat_pool_only),
         )
-        .route(
-            "/_apis/v1/AgentSession/:pool_id/:session_id",
-            delete(delete_session),
-        )
         .route("/_apis/v1/Message/:pool_id", get(next_message_compat))
         .route(
             "/_apis/v1/Message/:pool_id/:message_id",
@@ -811,7 +838,8 @@ pub(crate) fn build_app(
             shared.clone(),
             require_results_bearer,
         ))
-        .merge(protected_apis)
+        .merge(protected_protocol_apis)
+        .merge(protected_admin_apis)
         .with_state(shared.clone())
         .merge(results_metadata)
         .fallback(errors::protocol_not_found)

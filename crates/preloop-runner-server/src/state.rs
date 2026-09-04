@@ -396,6 +396,22 @@ pub struct AppState {
     /// is claimed. A supervising runner pool reads it to decide whether the
     /// work already queued outruns the runners it has left.
     pub queue_depth: Arc<std::sync::atomic::AtomicUsize>,
+    /// Plan 000 step 4 probe — broker job-lifecycle calls (`renewjob`,
+    /// `completejob`) that authenticated with the bare runner *listen* token
+    /// instead of the job runtime token.
+    ///
+    /// Plan 004's fencing carrier mints the claim generation into the job
+    /// runtime token, so it only works if the worker never drives those two
+    /// routes with the listener credential. This counter is the gate: it must
+    /// stay at zero across a full official-runner dogfood. Per instance, not
+    /// process-global — a test binary or a multi-server host would otherwise
+    /// aggregate unrelated servers into one meaningless number.
+    pub(crate) listener_token_lifecycle_calls: Arc<std::sync::atomic::AtomicU64>,
+    /// Companion baseline: `acquirejob` calls on the listen token. The
+    /// Listener process owns that call and holds no job token yet, so this is
+    /// the *expected* credential there and is counted separately so it can
+    /// never mask [`Self::listener_token_lifecycle_calls`].
+    pub(crate) listener_token_acquire_calls: Arc<std::sync::atomic::AtomicU64>,
     /// Raised while a co-hosted runner pool is still preparing its machine
     /// image and cannot register a runner yet; see [`ServerConfig`]. The
     /// starvation sweep pauses the queued-job grace clock while it is set.
@@ -988,6 +1004,8 @@ impl AppState {
             // pool spawns against the right workload after restart.
             queue_depth: Arc::new(std::sync::atomic::AtomicUsize::new(recovered_queue_len)),
             pool_preparing: None,
+            listener_token_lifecycle_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            listener_token_acquire_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             next_job_runs_on: Arc::new(std::sync::RwLock::new(Vec::new())),
             cache,
             artifacts,
