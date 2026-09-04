@@ -915,7 +915,7 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
             "Linux".into(),
             std::env::consts::ARCH.into(),
         ],
-        cpus: RUNNER_CPUS,
+        cpus: runner_cpus(),
         memory_mib: runner_memory_mib(),
         storage_gib: args.storage_gib.unwrap_or_else(runner_storage_gib),
         overlay_gib: std::env::var("PRELOOP_RUNNER_OVERLAY_GB")
@@ -1240,6 +1240,161 @@ fn prepare_engine_token(
     Ok(token)
 }
 
+/// Move any inline GitHub credential in `config` into the OS credential
+/// store, returning whether anything moved.
+///
+/// Only the `legacy_*` fields are inspected, and those are populated purely
+/// from disk — [`resolve_credential_references`] fills the separate
+/// `resolved_*` fields instead. That is what makes this idempotent: once a
+/// credential has moved, its legacy field is empty on the next load and the
+/// migration is a no-op rather than a rewrite on every startup.
+///
+/// A credential that cannot be namespaced (an App key or webhook secret with
+/// no `github.app_id`) is left inline and reported. Failing here would take
+/// down `preloop serve` for a config `preloop setup github --webhook-secret`
+/// itself produces.
+///
+/// Mutates `config` only; the caller persists it, and does so once every
+/// credential has landed in the store. A failure partway leaves config.toml
+/// untouched, so the inline values are still there and the next startup
+/// retries the whole migration.
+///
+/// [`resolve_credential_references`]: preloop_runner_server::config
+fn migrate_legacy_github_credentials(
+    config: &mut preloop_runner_server::config::ConfigFile,
+    store: &impl preloop_runner_server::credential_store::CredentialStore,
+) -> anyhow::Result<bool> {
+    use preloop_runner_server::credential_store::{github_reference_with_host, SecretString};
+
+    let has_legacy = config
+        .github
+        .legacy_app_pem
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some()
+        || config
+            .github
+            .legacy_pat
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_some()
+        || config
+            .github
+            .legacy_webhook_secret
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_some()
+        || config.github.apps.iter().any(|app| {
+            !app.legacy_pem.trim().is_empty()
+                || app
+                    .legacy_webhook_secret
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .is_some()
+        });
+
+    if !has_legacy {
+        return Ok(false);
+    }
+
+    if let Err(error) = store.available() {
+        tracing::warn!(
+            %error,
+            "config contains inline GitHub credentials but no credential store is reachable; \
+             leaving inline credentials active"
+        );
+        return Ok(false);
+    }
+
+    let mut migrated = false;
+    let app_id = config.github.app_id.clone();
+    let host = config.github.server_url.as_deref();
+
+    if let Some(value) = config.github.legacy_app_pem.take() {
+        let value = value.trim();
+        if !value.is_empty() {
+            match app_id.as_deref() {
+                Some(app_id) => {
+                    let reference = github_reference_with_host("app-pem", host, Some(app_id))?;
+                    if store.get(&reference)?.is_none() {
+                        store.set(&reference, &SecretString::new(value))?;
+                    }
+                    config.github.app_pem_ref = Some(reference.as_str().to_owned());
+                    migrated = true;
+                }
+                None => {
+                    config.github.legacy_app_pem = Some(value.to_owned());
+                    eprintln!(
+                        "[preloop] leaving the inline GitHub App key in config.toml: \
+                         github.app_id is not set, so it cannot be namespaced"
+                    );
+                }
+            }
+        }
+    }
+    if let Some(value) = config.github.legacy_pat.take() {
+        let value = value.trim();
+        if !value.is_empty() {
+            let reference = github_reference_with_host("pat", host, None)?;
+            if store.get(&reference)?.is_none() {
+                store.set(&reference, &SecretString::new(value))?;
+            }
+            config.github.pat_ref = Some(reference.as_str().to_owned());
+            migrated = true;
+        }
+    }
+    if let Some(value) = config.github.legacy_webhook_secret.take() {
+        let value = value.trim();
+        if !value.is_empty() {
+            match app_id.as_deref() {
+                Some(app_id) => {
+                    let reference = github_reference_with_host("webhook", host, Some(app_id))?;
+                    if store.get(&reference)?.is_none() {
+                        store.set(&reference, &SecretString::new(value))?;
+                    }
+                    config.github.webhook_secret_ref = Some(reference.as_str().to_owned());
+                    migrated = true;
+                }
+                None => {
+                    config.github.legacy_webhook_secret = Some(value.to_owned());
+                    eprintln!(
+                        "[preloop] leaving the inline webhook secret in config.toml: \
+                         github.app_id is not set, so it cannot be namespaced"
+                    );
+                }
+            }
+        }
+    }
+    for app in &mut config.github.apps {
+        let pem = app.legacy_pem.trim().to_owned();
+        if !pem.is_empty() {
+            let reference = github_reference_with_host("app-pem", host, Some(&app.app_id))?;
+            if store.get(&reference)?.is_none() {
+                store.set(&reference, &SecretString::new(&pem))?;
+            }
+            app.legacy_pem.clear();
+            app.pem_ref = Some(reference.as_str().to_owned());
+            migrated = true;
+        }
+        if let Some(value) = app.legacy_webhook_secret.take() {
+            let value = value.trim();
+            if !value.is_empty() {
+                let reference = github_reference_with_host("webhook", host, Some(&app.app_id))?;
+                if store.get(&reference)?.is_none() {
+                    store.set(&reference, &SecretString::new(value))?;
+                }
+                app.webhook_secret_ref = Some(reference.as_str().to_owned());
+                migrated = true;
+            }
+        }
+    }
+    Ok(migrated)
+}
+
 /// Merge stored and command-line GitHub credentials into the environment the
 /// server reads, optionally persisting them, and report the effective state.
 ///
@@ -1272,13 +1427,23 @@ fn resolve_github_auth(args: &ServeArgs, state_dir: &std::path::Path) -> anyhow:
     // `preloop setup` stores credentials in config.toml's [github] section,
     // which is what the server itself loads at startup. Fill any gaps from
     // it so the startup report matches what the server will actually see.
-    let file_config = preloop_runner_server::config::load_config()?;
-    auth.fill_gaps(github_auth::StoredAuth {
-        app_id: file_config.github.app_id,
+    let mut file_config = preloop_runner_server::config::load_config()?;
+    let store = preloop_runner_server::credential_store::OsCredentialStore;
+    // Read before migrating: migration moves the inline values out of
+    // `config.github`, and the freshly stored ones are not re-resolved here.
+    let from_file = github_auth::StoredAuth {
+        app_id: file_config.github.app_id.clone(),
         installation_id: None,
-        private_key_pem: file_config.github.app_pem,
-        webhook_secret: file_config.github.webhook_secret,
-    });
+        private_key_pem: file_config.github.app_pem().map(str::to_owned),
+        webhook_secret: file_config.github.webhook_secret().map(str::to_owned),
+    };
+    if migrate_legacy_github_credentials(&mut file_config, &store)? {
+        preloop_runner_server::config::write_config(&file_config)?;
+        eprintln!(
+            "[preloop] migrated legacy GitHub credentials to the operating-system credential store"
+        );
+    }
+    auth.fill_gaps(from_file);
 
     if args.save {
         if !supplied {
@@ -1716,6 +1881,7 @@ fn local_runner_pool_config(
     // Compare on the plain `repository:tag`, so the digest-pinned defaults
     // (ubuntu:24.04@sha256:…) still count as stock Ubuntu images.
     let custom_base = !is_stock_base_image(&base_image);
+    let cpus = runner_cpus();
     Ok(RunnerPoolConfig {
         // Size zero is the deliberate low-memory mode: keep the local
         // supervisor alive, but build a runner only when a job is queued.
@@ -1723,7 +1889,7 @@ fn local_runner_pool_config(
             std::env::var("PRELOOP_RUNNER_POOL_SIZE")
                 .ok()
                 .and_then(|value| value.parse().ok())
-                .unwrap_or_else(|| host_runner_pool_size(RUNNER_CPUS))
+                .unwrap_or_else(|| host_runner_pool_size(cpus))
         } else {
             0
         },
@@ -1781,7 +1947,7 @@ fn local_runner_pool_config(
         dns: std::env::var("PRELOOP_RUNNER_DNS").ok(),
         registration_token_env: "PRELOOP_SYSTEM_TOKEN".into(),
         labels: runner_pool_labels(),
-        cpus: RUNNER_CPUS,
+        cpus,
         memory_mib: runner_memory_mib(),
         storage_gib: runner_storage_gib(),
         overlay_gib: std::env::var("PRELOOP_RUNNER_OVERLAY_GB")
@@ -1827,7 +1993,7 @@ fn runner_pool_labels() -> Vec<String> {
     labels
 }
 
-/// vCPUs given to each runner VM.
+/// vCPUs given to each runner VM, honouring `PRELOOP_RUNNER_CPUS`.
 const RUNNER_CPUS: u16 = 4;
 /// Low-memory on-demand provisioning is the default; opt into idle warm VMs.
 const DEFAULT_RUNNER_POOL_ENABLED: bool = false;
@@ -1859,7 +2025,18 @@ fn runner_memory_mib() -> u32 {
         .filter(|value| *value >= MIN_MEMORY_MIB)
         .unwrap_or(RUNNER_MEMORY_MIB)
 }
-
+/// vCPUs per runner VM, honouring `PRELOOP_RUNNER_CPUS`.
+///
+/// Invalid, zero, or out-of-range values fall back to the default. Keeping the
+/// value positive prevents invalid VM configurations and pool sizing division
+/// by zero.
+fn runner_cpus() -> u16 {
+    std::env::var("PRELOOP_RUNNER_CPUS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u16>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(RUNNER_CPUS)
+}
 /// Persistent storage for each runner VM, honouring
 /// `PRELOOP_RUNNER_STORAGE_GB`.
 fn runner_storage_gib() -> u32 {
@@ -4123,10 +4300,212 @@ mod tests {
 
     /// Serializes tests that mutate process-global env vars read by
     /// `local_runner_pool_config` (`PRELOOP_RUNNER_BUNDLE`,
-    /// `PRELOOP_RUNNER_BASE_IMAGE`, `PRELOOP_RUNNER_STORAGE_GB`): parallel
-    /// test threads would otherwise race each other's set_var/remove_var
-    /// pairs.
+    /// `PRELOOP_RUNNER_BASE_IMAGE`, `PRELOOP_RUNNER_CPUS`,
+    /// `PRELOOP_RUNNER_STORAGE_GB`): parallel test threads would otherwise
+    /// race each other's set_var/remove_var pairs.
     static TEST_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    mod github_credential_migration {
+        use super::super::migrate_legacy_github_credentials;
+        use preloop_runner_server::config::{AppConfig, ConfigFile, GitHubConfig};
+        use preloop_runner_server::credential_store::{
+            github_reference, CredentialStore, MemoryCredentialStore,
+        };
+
+        fn legacy_config() -> ConfigFile {
+            ConfigFile {
+                github: GitHubConfig {
+                    app_id: Some("123".into()),
+                    legacy_app_pem: Some("INLINE-PEM".into()),
+                    legacy_pat: Some("ghp_inline".into()),
+                    legacy_webhook_secret: Some("hook-secret".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn inline_credentials_move_into_the_store() {
+            let store = MemoryCredentialStore::default();
+            let mut config = legacy_config();
+            assert!(migrate_legacy_github_credentials(&mut config, &store).unwrap());
+
+            assert_eq!(config.github.legacy_app_pem, None);
+            assert_eq!(config.github.legacy_pat, None);
+            assert_eq!(config.github.legacy_webhook_secret, None);
+            assert_eq!(
+                config.github.app_pem_ref.as_deref(),
+                Some("github-app-pem-123")
+            );
+            let pem_ref = github_reference("app-pem", Some("123")).unwrap();
+            assert_eq!(
+                store.get(&pem_ref).unwrap().as_ref().map(|s| s.expose()),
+                Some("INLINE-PEM")
+            );
+            let pat_ref = github_reference("pat", None).unwrap();
+            assert_eq!(
+                store.get(&pat_ref).unwrap().as_ref().map(|s| s.expose()),
+                Some("ghp_inline")
+            );
+        }
+        /// The regression: migration used to inspect fields that the loader
+        /// had just populated from the credential store, so it reported a
+        /// migration and rewrote config.toml on every single startup.
+        #[test]
+        fn migration_is_idempotent() {
+            let store = MemoryCredentialStore::default();
+            let mut config = legacy_config();
+            assert!(migrate_legacy_github_credentials(&mut config, &store).unwrap());
+            assert!(
+                !migrate_legacy_github_credentials(&mut config, &store).unwrap(),
+                "second run must be a no-op"
+            );
+        }
+
+        /// `preloop setup github --webhook-secret` writes a secret with no
+        /// App id. Failing that config would refuse to start the server.
+        #[test]
+        fn a_missing_app_id_is_not_fatal() {
+            let store = MemoryCredentialStore::default();
+            let mut config = ConfigFile {
+                github: GitHubConfig {
+                    legacy_webhook_secret: Some("hook-secret".into()),
+                    legacy_pat: Some("ghp_inline".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            // The PAT needs no App id, so it still migrates.
+            assert!(migrate_legacy_github_credentials(&mut config, &store).unwrap());
+            assert_eq!(config.github.legacy_pat, None);
+            assert_eq!(
+                config.github.legacy_webhook_secret.as_deref(),
+                Some("hook-secret"),
+                "un-namespaceable secret must be left inline, not dropped"
+            );
+        }
+
+        #[test]
+        fn registry_entries_migrate_too() {
+            let store = MemoryCredentialStore::default();
+            let mut config = ConfigFile {
+                github: GitHubConfig {
+                    apps: vec![AppConfig {
+                        app_id: "456".into(),
+                        legacy_pem: "REGISTRY-PEM".into(),
+                        legacy_webhook_secret: Some("registry-hook".into()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert!(migrate_legacy_github_credentials(&mut config, &store).unwrap());
+            assert!(config.github.apps[0].legacy_pem.is_empty());
+            assert_eq!(config.github.apps[0].legacy_webhook_secret, None);
+            let pem_ref = github_reference("app-pem", Some("456")).unwrap();
+            assert_eq!(
+                store.get(&pem_ref).unwrap().as_ref().map(|s| s.expose()),
+                Some("REGISTRY-PEM")
+            );
+            assert!(!migrate_legacy_github_credentials(&mut config, &store).unwrap());
+        }
+
+        #[test]
+        fn rotation_preserves_existing_store_credentials() {
+            let store = MemoryCredentialStore::default();
+            let pat_ref = github_reference("pat", None).unwrap();
+            store
+                .set(
+                    &pat_ref,
+                    &preloop_runner_server::credential_store::SecretString::new("ROTATED-PAT"),
+                )
+                .unwrap();
+
+            let mut config = ConfigFile {
+                github: GitHubConfig {
+                    legacy_pat: Some("stale_legacy_pat".into()),
+                    pat_ref: Some(pat_ref.as_str().to_owned()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            assert!(migrate_legacy_github_credentials(&mut config, &store).unwrap());
+            assert_eq!(config.github.legacy_pat, None);
+            assert_eq!(
+                store.get(&pat_ref).unwrap().as_ref().map(|s| s.expose()),
+                Some("ROTATED-PAT"),
+                "migration must not overwrite rotated store value with stale legacy value"
+            );
+        }
+
+        #[test]
+        fn empty_legacy_values_do_not_fail_migration() {
+            let store = MemoryCredentialStore::default();
+            let mut config = ConfigFile {
+                github: GitHubConfig {
+                    app_id: Some("123".into()),
+                    legacy_app_pem: Some("  ".into()),
+                    legacy_pat: Some("".into()),
+                    legacy_webhook_secret: Some("".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert!(!migrate_legacy_github_credentials(&mut config, &store).unwrap());
+        }
+
+        #[test]
+        fn distinct_hosts_with_identical_app_ids_do_not_collide_in_store() {
+            let store = MemoryCredentialStore::default();
+            let mut config_cloud = ConfigFile {
+                github: GitHubConfig {
+                    app_id: Some("999".into()),
+                    server_url: Some("https://github.com".into()),
+                    legacy_app_pem: Some("CLOUD-PEM".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut config_ghes = ConfigFile {
+                github: GitHubConfig {
+                    app_id: Some("999".into()),
+                    server_url: Some("https://ghe.corp.internal".into()),
+                    legacy_app_pem: Some("GHES-PEM".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            assert!(migrate_legacy_github_credentials(&mut config_cloud, &store).unwrap());
+            assert!(migrate_legacy_github_credentials(&mut config_ghes, &store).unwrap());
+
+            let cloud_ref = preloop_runner_server::credential_store::github_reference_with_host(
+                "app-pem",
+                Some("https://github.com"),
+                Some("999"),
+            )
+            .unwrap();
+            let ghes_ref = preloop_runner_server::credential_store::github_reference_with_host(
+                "app-pem",
+                Some("https://ghe.corp.internal"),
+                Some("999"),
+            )
+            .unwrap();
+
+            assert_ne!(cloud_ref.as_str(), ghes_ref.as_str());
+            assert_eq!(
+                store.get(&cloud_ref).unwrap().as_ref().map(|s| s.expose()),
+                Some("CLOUD-PEM")
+            );
+            assert_eq!(
+                store.get(&ghes_ref).unwrap().as_ref().map(|s| s.expose()),
+                Some("GHES-PEM")
+            );
+        }
+    }
 
     #[test]
     fn truncate_reason_cuts_on_char_boundary() {
@@ -4211,6 +4590,28 @@ mod tests {
         assert!(require_digest_pinned_base("/tmp/preloop.smolmachine").is_ok());
         assert!(require_digest_pinned_base("ghcr.io/acme/base:latest").is_err());
         assert!(require_digest_pinned_base("ghcr.io/acme/base@sha256:not-a-digest").is_err());
+    }
+
+    #[test]
+    fn runner_cpus_honors_positive_values_and_rejects_invalid_values() {
+        let _env_guard = TEST_ENV_MUTEX.lock().unwrap();
+        for (value, expected) in [
+            ("1", 1),
+            (" 8 ", 8),
+            ("0", RUNNER_CPUS),
+            ("-1", RUNNER_CPUS),
+            ("not-a-number", RUNNER_CPUS),
+            ("65536", RUNNER_CPUS),
+        ] {
+            unsafe {
+                std::env::set_var("PRELOOP_RUNNER_CPUS", value);
+            }
+            assert_eq!(runner_cpus(), expected, "{value}");
+        }
+        unsafe {
+            std::env::remove_var("PRELOOP_RUNNER_CPUS");
+        }
+        assert_eq!(runner_cpus(), RUNNER_CPUS);
     }
 
     #[test]

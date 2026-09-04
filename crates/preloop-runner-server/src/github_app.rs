@@ -29,8 +29,8 @@ use serde_json::json;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use crate::credential_store::{CredentialRef, CredentialStore, OsCredentialStore};
 use crate::shared_http::CLIENT;
-
 /// Private-key environment variables, highest precedence first. The flag marks
 /// a variable that holds a path to a PEM file rather than the PEM itself.
 ///
@@ -428,7 +428,7 @@ pub(crate) fn load_from(
     let pat_fallback = std::env::var("PRELOOP_GITHUB_TOKEN")
         .ok()
         .filter(|value| !value.is_empty())
-        .or_else(|| file_config.github.pat.clone());
+        .or_else(|| file_config.github.pat().map(str::to_owned));
 
     let mut apps: Vec<GitHubAppCredentials> = Vec::new();
     // The default entry is index 0 because the legacy App, when present, is
@@ -446,9 +446,8 @@ pub(crate) fn load_from(
         .or_else(|| {
             file_config
                 .github
-                .app_pem
-                .as_ref()
-                .map(|pem| ("config github.app_pem", false, pem.clone()))
+                .app_pem()
+                .map(|pem| ("config github.app_pem", false, pem.to_owned()))
         });
     match (app_id, key_source) {
         (Some(app_id), Some((source, is_path, value))) => {
@@ -504,13 +503,42 @@ pub(crate) fn load_from(
         .filter(|raw| !raw.is_empty())
     {
         Some(raw) => {
-            serde_json::from_str(&raw).with_context(|| "parsing PRELOOP_GITHUB_APPS_JSON")?
+            let mut env_apps: Vec<crate::config::AppConfig> =
+                serde_json::from_str(&raw).with_context(|| "parsing PRELOOP_GITHUB_APPS_JSON")?;
+            let store = OsCredentialStore;
+            for app in &mut env_apps {
+                if let Some(reference) = &app.pem_ref {
+                    if let Ok(reference_ref) = CredentialRef::new(reference) {
+                        if let Ok(Some(secret)) = store.get(&reference_ref) {
+                            app.resolved_pem = Some(secret);
+                        }
+                    }
+                }
+                if let Some(reference) = &app.webhook_secret_ref {
+                    if let Ok(reference_ref) = CredentialRef::new(reference) {
+                        if let Ok(Some(secret)) = store.get(&reference_ref) {
+                            app.resolved_webhook_secret = Some(secret);
+                        }
+                    }
+                }
+            }
+            env_apps
         }
         None => file_config.github.apps.clone(),
     };
     for app in extra {
-        let private_key = parse_private_key(&app.pem)
+        let pem = app.pem().trim();
+        if pem.is_empty() {
+            warn!(
+                app_id = %app.app_id,
+                "GitHub App private key is not configured or its credential reference could not be resolved; \
+                 skipping registration for it"
+            );
+            continue;
+        }
+        let private_key = parse_private_key(pem)
             .with_context(|| format!("parsing the private key for GitHub App {}", app.app_id))?;
+        let webhook_secret = app.webhook_secret().map(str::to_owned);
         info!(
             app_id = %app.app_id,
             "registered additional GitHub App"
@@ -522,12 +550,11 @@ pub(crate) fn load_from(
             pat_fallback: pat_fallback.clone(),
             installation_cache: Arc::new(RwLock::new(HashMap::new())),
             mint_ledger: Arc::new(MintLedger::default()),
-            webhook_secret: app.webhook_secret,
+            webhook_secret,
             installation_id: app.installation_id,
             verified_installation_owners: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         });
     }
-
     if apps.is_empty() {
         return Ok(None);
     }

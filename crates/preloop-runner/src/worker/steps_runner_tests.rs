@@ -85,6 +85,7 @@ fn range_retry_clears_state_and_annotations_for_every_replayed_step() {
             index,
             context_name: format!("step_{index}"),
             display_name: format!("Step {index}"),
+            synthetic: false,
         })
         .collect::<Vec<_>>();
     for summary in &summaries {
@@ -105,6 +106,85 @@ fn range_retry_clears_state_and_annotations_for_every_replayed_step() {
     for index in [0, 4] {
         assert!(job.state.contains_key(&format!("step_{index}")));
         assert!(job.step_annotations.contains_key(&format!("step_{index}")));
+    }
+}
+
+/// Membership in the job request message decides `synthetic`, so every shape a
+/// lifecycle step can take is covered by one rule.
+///
+/// This is the regression for the original bug: `Set up job`, `Pre`/`Post`
+/// hooks and host hooks were counted as workflow steps, so a user asking for
+/// "step 2" got a neighbouring step. Prefix matching cannot replace this — the
+/// third case below is a *declared* step whose author chose `id: __post_build`,
+/// which every prefix list misclassifies, and the fourth is a lifecycle step
+/// whose id is a GUID with its marker only in `raw`.
+#[test]
+fn synthetic_classification_follows_declared_step_membership() {
+    use std::collections::HashSet;
+
+    let declared: HashSet<String> = ["main-1".to_owned(), "__post_build".to_owned()]
+        .into_iter()
+        .collect();
+
+    let step = |id: &str, context: &str, raw: serde_json::Value| Step {
+        id: id.to_owned(),
+        context_name: context.to_owned(),
+        display_name: format!("display {id}"),
+        step_type: StepType::Script {
+            script: "echo hi".to_owned(),
+            shell: None,
+            working_directory: None,
+        },
+        condition: None,
+        continue_on_error: false,
+        timeout_minutes: None,
+        env: Default::default(),
+        raw,
+        is_background: false,
+    };
+
+    for (case, id, context, raw, expected) in [
+        (
+            "declared script step",
+            "main-1",
+            "__run",
+            serde_json::json!({}),
+            false,
+        ),
+        (
+            "post hook generated from an action manifest",
+            "__post_main-1",
+            "__post___actions_checkout",
+            serde_json::json!({"__post": true}),
+            true,
+        ),
+        (
+            "declared step whose author wrote `id: __post_build`",
+            "__post_build",
+            "__post_build",
+            serde_json::json!({}),
+            false,
+        ),
+        (
+            "GUID-identified lifecycle step marked only in raw",
+            "1e1b0f4c-0000-4000-8000-000000000000",
+            "__pre___actions_setup_node",
+            serde_json::json!({"isPre": true}),
+            true,
+        ),
+        (
+            "host job-started hook",
+            "__hook_job_started",
+            "__hook_job_started",
+            serde_json::json!({}),
+            true,
+        ),
+    ] {
+        assert_eq!(
+            is_synthetic_step(&step(id, context, raw), &declared),
+            expected,
+            "{case}"
+        );
     }
 }
 

@@ -50,6 +50,14 @@ pub struct JobContext {
     /// Synthetic step IDs for "Set up job" and "Complete job" (generated in steps_runner, read in job_runner).
     pub setup_step_id: Option<String>,
     pub complete_step_id: Option<String>,
+    /// Ids of the steps the job request message declared.
+    ///
+    /// The authoritative list of what the workflow asked for, so steps the
+    /// runner synthesizes during setup (`Pre`/`Post` hooks discovered from
+    /// action manifests, container lifecycle, host hooks) can be told apart by
+    /// absence from it rather than by guessing at name prefixes. Empty when the
+    /// job carried no steps.
+    pub declared_step_ids: std::collections::HashSet<String>,
     /// DAP debugger for this job. `None` unless the acquire response set
     /// `enableDebugger=true` and provided a valid `DebuggerTunnelInfo`.
     /// Mirrors `GlobalContext.Debugger` in `actions/runner` v2.335.0+.
@@ -165,6 +173,7 @@ impl JobContext {
             live_logs: None,
             setup_step_id: None,
             complete_step_id: None,
+            declared_step_ids: std::collections::HashSet::new(),
             dap_debugger: None,
             debugger_telemetry: Vec::new(),
             upgraded_node24_actions: Vec::new(),

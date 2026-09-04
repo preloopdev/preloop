@@ -489,6 +489,7 @@ naming the official image version they were taken from.
 | `PRELOOP_GOLDEN_URL`                         | Override the packed golden URL; its optional checksum is fetched from the same URL plus `.sha256`                  |
 | `PRELOOP_USE_FORK`                           | Run the pool as host forks instead of booting microVMs (default true with a golden)                                |
 | `PRELOOP_RUNNER_POOL_SIZE`                   | Pool size (warm forks / VMs)                                                                                       |
+| `PRELOOP_RUNNER_CPUS`                        | vCPUs allocated to each runner VM (default 4)                                                                      |
 | `PRELOOP_WORKSPACE`                          | Workspace context for daemon deployments; it does not install packages or derive toolchains for a packed golden    |
 | `PRELOOP_RUNNER_BASE_IMAGE`                  | Override the base image at serve time (default: digest-pinned Ubuntu 24.04)                                        |
 | `PRELOOP_RUNNER_LABELS`                      | Extra `runs-on` labels the pool's runners declare (comma-separated)                                                |
