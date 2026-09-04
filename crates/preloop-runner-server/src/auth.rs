@@ -415,6 +415,24 @@ pub(crate) fn require_results_job(
     }
 }
 
+/// Authorize a Results plan/job target and return its storage representation.
+///
+/// Runtime job identities only pass UUID-parsable job ids, so alternate
+/// spellings collapse to the lower-case hyphenated form used by the runner's
+/// lookup path. The system identity keeps accepting opaque backend ids for
+/// compatibility, while still canonicalizing valid UUIDs.
+pub(crate) fn require_canonical_results_job_id(
+    identity: &ResultsIdentity,
+    plan_id: &str,
+    job_id: &str,
+) -> Result<String, ApiError> {
+    require_results_job(identity, plan_id, job_id)?;
+    Ok(job_id
+        .parse::<uuid::Uuid>()
+        .map(|job| job.to_string())
+        .unwrap_or_else(|_| job_id.to_owned()))
+}
+
 /// Runner identity proven by a listen token on this request.
 ///
 /// `runner_id` is `Some` only when the bearer verifies as a runner-listen JWT

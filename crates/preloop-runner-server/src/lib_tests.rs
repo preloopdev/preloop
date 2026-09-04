@@ -20514,6 +20514,422 @@ async fn replay_blob_urls_are_minted_only_for_the_callers_own_job() {
 }
 
 #[tokio::test]
+async fn results_uuid_spellings_use_canonical_paths_and_metadata_keys() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let plan = uuid::Uuid::parse_str("fedcba98-7654-4321-89ab-cdef01234567")
+        .unwrap()
+        .to_string();
+    let job = uuid::Uuid::parse_str("01234567-89ab-4cde-8fab-cdef01234567").unwrap();
+    let canonical = job.to_string();
+    let forms = [
+        canonical.clone(),
+        canonical.to_ascii_uppercase(),
+        format!("{{{canonical}}}"),
+        canonical.replace('-', ""),
+        format!("urn:uuid:{canonical}"),
+    ];
+    let token = state.mint_runtime_token(&plan, &job);
+
+    for form in &forms {
+        let requests = [
+            (
+                "/twirp/results.services.receiver.Receiver/GetJobLogsSignedBlobURL",
+                "logs_url",
+                format!("/replay/results/{plan}/{canonical}/job-logs.txt"),
+            ),
+            (
+                "/twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL",
+                "logs_url",
+                format!("/replay/results/{plan}/{canonical}/step-step-1.txt"),
+            ),
+            (
+                "/twirp/results.services.receiver.Receiver/GetStepSummarySignedBlobURL",
+                "summary_url",
+                format!("/replay/results/{plan}/{canonical}/step-step-1-summary.md"),
+            ),
+        ];
+        for (uri, field, expected_path) in requests {
+            let payload = request_json_with_bearer(
+                &app,
+                Method::POST,
+                uri,
+                json!({
+                    "workflow_run_backend_id": plan,
+                    "workflow_job_run_backend_id": form,
+                    "step_backend_id": "step-1",
+                }),
+                &token,
+            )
+            .await;
+            let url = payload[field].as_str().unwrap();
+            assert!(
+                url.contains(&expected_path),
+                "equivalent job spelling must use the canonical path: {url}"
+            );
+        }
+
+        let diag = request_json_with_bearer(
+            &app,
+            Method::POST,
+            "/twirp/results.services.receiver.Receiver/GetJobDiagLogsSignedBlobURL",
+            json!({
+                "workflow_run_backend_id": plan,
+                "workflow_job_run_backend_id": form,
+            }),
+            &token,
+        )
+        .await;
+        assert!(
+            diag["diag_logs_url"]
+                .as_str()
+                .is_some_and(|url| url.contains("/twirp-blob/diag/")),
+            "diagnostic URL must remain a token-only path"
+        );
+
+        let update = request_json_with_bearer(
+            &app,
+            Method::POST,
+            "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",
+            json!({
+                "workflow_run_backend_id": plan,
+                "workflow_job_run_backend_id": form,
+                "steps": [],
+            }),
+            &token,
+        )
+        .await;
+        assert_eq!(update["ok"], true);
+
+        request_json_with_bearer(
+            &app,
+            Method::POST,
+            "/twirp/results.services.receiver.Receiver/CreateStepSummaryMetadata",
+            json!({
+                "workflow_run_backend_id": plan,
+                "workflow_job_run_backend_id": form,
+                "step_backend_id": "step-1",
+                "size": 17,
+            }),
+            &token,
+        )
+        .await;
+        request_json_with_bearer(
+            &app,
+            Method::POST,
+            "/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata",
+            json!({
+                "workflow_run_backend_id": plan,
+                "workflow_job_run_backend_id": form,
+                "step_backend_id": "step-1",
+                "line_count": 3,
+            }),
+            &token,
+        )
+        .await;
+        request_json_with_bearer(
+            &app,
+            Method::POST,
+            "/twirp/results.services.receiver.Receiver/CreateJobLogsMetadata",
+            json!({
+                "workflow_run_backend_id": plan,
+                "workflow_job_run_backend_id": form,
+                "line_count": 5,
+            }),
+            &token,
+        )
+        .await;
+    }
+
+    let step_payload = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL",
+        json!({
+            "workflow_run_backend_id": plan,
+            "workflow_job_run_backend_id": format!("{{{canonical}}}"),
+            "step_backend_id": "step-1",
+        }),
+        &token,
+    )
+    .await;
+    let uploaded = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(step_payload["logs_url"].as_str().unwrap())
+                .body(Body::from("canonical path"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(uploaded.status(), StatusCode::CREATED);
+    assert_eq!(
+        tokio::fs::read_to_string(
+            temp.path()
+                .join("replay")
+                .join("results")
+                .join(&plan)
+                .join(&canonical)
+                .join("step-step-1.txt"),
+        )
+        .await
+        .unwrap(),
+        "canonical path"
+    );
+
+    let inner = state.inner.lock().await;
+    let expected_keys = [
+        format!("results:{plan}:{canonical}:summary:step-1"),
+        format!("results:{plan}:{canonical}:step:step-1"),
+        format!("results:{plan}:{canonical}:job:{canonical}"),
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let actual_keys = inner.log_metadata.keys().cloned().collect::<BTreeSet<_>>();
+    assert_eq!(
+        actual_keys, expected_keys,
+        "all accepted UUID spellings must share one metadata namespace"
+    );
+    assert_eq!(
+        inner
+            .log_metadata
+            .get(&format!("results:{plan}:{canonical}:summary:step-1"))
+            .map(|meta| (meta.byte_count, meta.line_count)),
+        Some((17, 0))
+    );
+    assert_eq!(
+        inner
+            .log_metadata
+            .get(&format!("results:{plan}:{canonical}:step:step-1"))
+            .map(|meta| (meta.byte_count, meta.line_count)),
+        Some((240, 3))
+    );
+    assert_eq!(
+        inner
+            .log_metadata
+            .get(&format!("results:{plan}:{canonical}:job:{canonical}"))
+            .map(|meta| (meta.byte_count, meta.line_count)),
+        Some((400, 5))
+    );
+}
+
+#[tokio::test]
+async fn alternate_results_job_spelling_preserves_canonical_log_lookup() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let (_, plan, canonical) = jobs
+        .iter()
+        .find(|(job, _, _)| job == "build")
+        .cloned()
+        .expect("build job must be present");
+    let job = canonical.parse::<uuid::Uuid>().unwrap();
+    let token = state.mint_runtime_token(&plan, &job);
+    let alternate = format!("{{{canonical}}}");
+
+    let payload = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/twirp/results.services.receiver.Receiver/GetJobLogsSignedBlobURL",
+        json!({
+            "workflow_run_backend_id": plan,
+            "workflow_job_run_backend_id": alternate,
+        }),
+        &token,
+    )
+    .await;
+    let uploaded = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(payload["logs_url"].as_str().unwrap())
+                .body(Body::from("lookup survives"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(uploaded.status(), StatusCode::CREATED);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/v1/runs/{run_id}/logs?job={canonical}"))
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"lookup survives"
+    );
+    assert!(
+        !temp
+            .path()
+            .join("replay")
+            .join("results")
+            .join(&plan)
+            .join(&alternate)
+            .exists(),
+        "alternate spelling must not create a second lookup directory"
+    );
+}
+
+#[tokio::test]
+async fn results_reject_cross_job_and_malformed_uuid_targets() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let plan = "plan-1";
+    let own_job = uuid::Uuid::parse_str("01234567-89ab-4cde-8fab-cdef01234567").unwrap();
+    let other_job = uuid::Uuid::parse_str("fedcba98-7654-4321-89ab-cdef01234567").unwrap();
+    let token = state.mint_runtime_token(plan, &own_job);
+    let targets = [
+        format!("{{{other_job}}}"),
+        other_job.to_string().to_ascii_uppercase(),
+        "not-a-uuid".to_owned(),
+    ];
+
+    for target in &targets {
+        for uri in [
+            "/twirp/results.services.receiver.Receiver/GetJobLogsSignedBlobURL",
+            "/twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL",
+            "/twirp/results.services.receiver.Receiver/GetStepSummarySignedBlobURL",
+            "/twirp/results.services.receiver.Receiver/GetJobDiagLogsSignedBlobURL",
+        ] {
+            assert_eq!(
+                status_with_bearer(
+                    &app,
+                    &token,
+                    Method::POST,
+                    uri,
+                    json!({
+                        "workflow_run_backend_id": plan,
+                        "workflow_job_run_backend_id": target,
+                        "step_backend_id": "step-1",
+                    }),
+                )
+                .await,
+                StatusCode::FORBIDDEN,
+                "Results target must stay bound to the token's job: {target}"
+            );
+        }
+
+        for (uri, body) in [
+            (
+                "/twirp/results.services.receiver.Receiver/CreateStepSummaryMetadata",
+                json!({
+                    "workflow_run_backend_id": plan,
+                    "workflow_job_run_backend_id": target,
+                    "step_backend_id": "step-1",
+                    "size": 99,
+                }),
+            ),
+            (
+                "/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata",
+                json!({
+                    "workflow_run_backend_id": plan,
+                    "workflow_job_run_backend_id": target,
+                    "step_backend_id": "step-1",
+                    "line_count": 99,
+                }),
+            ),
+            (
+                "/twirp/results.services.receiver.Receiver/CreateJobLogsMetadata",
+                json!({
+                    "workflow_run_backend_id": plan,
+                    "workflow_job_run_backend_id": target,
+                    "line_count": 99,
+                }),
+            ),
+        ] {
+            assert_eq!(
+                status_with_bearer(&app, &token, Method::POST, uri, body).await,
+                StatusCode::FORBIDDEN,
+                "metadata target must stay bound to the token's job: {target}"
+            );
+        }
+    }
+
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &token,
+            Method::POST,
+            "/twirp/results.services.receiver.Receiver/GetJobLogsSignedBlobURL",
+            json!({
+                "workflow_run_backend_id": "different-plan",
+                "workflow_job_run_backend_id": own_job.to_string(),
+            }),
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "a matching UUID under another plan is still a different Results target"
+    );
+
+    let inner = state.inner.lock().await;
+    assert!(
+        inner.log_metadata.is_empty(),
+        "rejected Results targets must not create metadata"
+    );
+}
+
+#[tokio::test]
+async fn system_results_token_preserves_opaque_identifier_compatibility() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let payload = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/twirp/results.services.receiver.Receiver/GetJobLogsSignedBlobURL",
+        json!({
+            "workflow_run_backend_id": "plan-opaque",
+            "workflow_job_run_backend_id": "job-opaque",
+        }),
+        DEFAULT_PRELOOP_SYSTEM_TOKEN,
+    )
+    .await;
+    assert!(
+        payload["logs_url"]
+            .as_str()
+            .is_some_and(|url| url.contains("/replay/results/plan-opaque/job-opaque/job-logs.txt")),
+        "system callers may continue to address opaque backend ids"
+    );
+
+    request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/twirp/results.services.receiver.Receiver/CreateJobLogsMetadata",
+        json!({
+            "workflow_run_backend_id": "plan-opaque",
+            "workflow_job_run_backend_id": "job-opaque",
+            "line_count": 2,
+        }),
+        DEFAULT_PRELOOP_SYSTEM_TOKEN,
+    )
+    .await;
+    let inner = state.inner.lock().await;
+    assert!(
+        inner
+            .log_metadata
+            .contains_key("results:plan-opaque:job-opaque:job:job-opaque"),
+        "opaque system-token metadata ids must retain their existing spelling"
+    );
+}
+
+#[tokio::test]
 async fn results_workflow_steps_require_the_calling_job() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();

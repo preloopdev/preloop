@@ -156,18 +156,14 @@ pub(crate) async fn twirp_get_job_logs_signed_blob_url(
     // bearerless route reachable from inside every runner VM. Only mint for
     // the plan/job the caller's token actually names, or workflow code could
     // ask for another job's URL and overwrite its logs.
-    if !crate::auth::results_identity_binds_job(
+    let job_id = crate::auth::require_canonical_results_job_id(
         &identity,
         &request.workflow_run_backend_id,
         &request.workflow_job_run_backend_id,
-    ) {
-        return Err(ApiError::forbidden(
-            "replay blob URL minting requires a token for that job",
-        ));
-    }
+    )?;
     let path = format!(
         "/replay/results/{}/{}/job-logs.txt",
-        request.workflow_run_backend_id, request.workflow_job_run_backend_id
+        request.workflow_run_backend_id, job_id
     );
     let expires_at = crate::auth::replay_ticket_expiry();
     let sig = crate::auth::sign_replay_upload_ticket(&shared.state, &path, expires_at);
@@ -201,20 +197,14 @@ pub(crate) async fn twirp_get_step_logs_signed_blob_url(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepLogsSignedBlobUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if !crate::auth::results_identity_binds_job(
+    let job_id = crate::auth::require_canonical_results_job_id(
         &identity,
         &request.workflow_run_backend_id,
         &request.workflow_job_run_backend_id,
-    ) {
-        return Err(ApiError::forbidden(
-            "replay blob URL minting requires a token for that job",
-        ));
-    }
+    )?;
     let path = format!(
         "/replay/results/{}/{}/step-{}.txt",
-        request.workflow_run_backend_id,
-        request.workflow_job_run_backend_id,
-        request.step_backend_id
+        request.workflow_run_backend_id, job_id, request.step_backend_id
     );
     let expires_at = crate::auth::replay_ticket_expiry();
     let sig = crate::auth::sign_replay_upload_ticket(&shared.state, &path, expires_at);
@@ -240,20 +230,14 @@ pub(crate) async fn twirp_get_step_summary_signed_blob_url(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepSummarySignedBlobUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if !crate::auth::results_identity_binds_job(
+    let job_id = crate::auth::require_canonical_results_job_id(
         &identity,
         &request.workflow_run_backend_id,
         &request.workflow_job_run_backend_id,
-    ) {
-        return Err(ApiError::forbidden(
-            "replay blob URL minting requires a token for that job",
-        ));
-    }
+    )?;
     let path = format!(
         "/replay/results/{}/{}/step-{}-summary.md",
-        request.workflow_run_backend_id,
-        request.workflow_job_run_backend_id,
-        request.step_backend_id
+        request.workflow_run_backend_id, job_id, request.step_backend_id
     );
     let expires_at = crate::auth::replay_ticket_expiry();
     let sig = crate::auth::sign_replay_upload_ticket(&shared.state, &path, expires_at);
@@ -307,7 +291,7 @@ pub(crate) async fn twirp_create_step_summary_metadata(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepSummaryMetadataRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    crate::auth::require_results_job(
+    let job_id = crate::auth::require_canonical_results_job_id(
         &identity,
         &request.workflow_run_backend_id,
         &request.workflow_job_run_backend_id,
@@ -318,7 +302,7 @@ pub(crate) async fn twirp_create_step_summary_metadata(
         results_metadata_key(
             "summary",
             Some(&request.workflow_run_backend_id),
-            Some(&request.workflow_job_run_backend_id),
+            Some(job_id.as_str()),
             Some(&request.step_backend_id),
         ),
         LogMetadata {
@@ -356,15 +340,24 @@ pub(crate) async fn twirp_create_step_logs_metadata(
     let Some(step_backend_id) = request.step_backend_id else {
         return Ok(Json(json!({"ok": true})));
     };
-    let plan_id = request.workflow_run_backend_id.as_deref();
-    let job_id = request.workflow_job_run_backend_id.as_deref();
-    crate::auth::require_results_job(&identity, plan_id.unwrap_or(""), job_id.unwrap_or(""))?;
+    let (Some(plan_id), Some(raw_job_id)) = (
+        request.workflow_run_backend_id.as_deref(),
+        request.workflow_job_run_backend_id.as_deref(),
+    ) else {
+        return Ok(Json(json!({"ok": true})));
+    };
+    let job_id = crate::auth::require_canonical_results_job_id(&identity, plan_id, raw_job_id)?;
     let line_count = request.line_count.unwrap_or_default();
     let line_count_usize = line_count.min(usize::MAX as u64) as usize;
     let byte_count = line_count.saturating_mul(80).min(usize::MAX as u64) as usize;
     let mut inner = shared.state.inner.lock().await;
     inner.log_metadata.insert(
-        results_metadata_key("step", plan_id, job_id, Some(&step_backend_id)),
+        results_metadata_key(
+            "step",
+            Some(plan_id),
+            Some(job_id.as_str()),
+            Some(&step_backend_id),
+        ),
         LogMetadata {
             byte_count,
             line_count: line_count_usize,
@@ -395,15 +388,13 @@ pub(crate) async fn twirp_create_job_logs_metadata(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<JobLogsMetadataRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let Some(workflow_job_run_backend_id) = request.workflow_job_run_backend_id else {
+    let Some(raw_job_id) = request.workflow_job_run_backend_id else {
         return Ok(Json(json!({"ok": true})));
     };
-    let plan_id = request.workflow_run_backend_id.as_deref();
-    crate::auth::require_results_job(
-        &identity,
-        plan_id.unwrap_or(""),
-        &workflow_job_run_backend_id,
-    )?;
+    let Some(plan_id) = request.workflow_run_backend_id.as_deref() else {
+        return Ok(Json(json!({"ok": true})));
+    };
+    let job_id = crate::auth::require_canonical_results_job_id(&identity, plan_id, &raw_job_id)?;
     let line_count = request.line_count.unwrap_or_default();
     let line_count_usize = line_count.min(usize::MAX as u64) as usize;
     let byte_count = line_count.saturating_mul(80).min(usize::MAX as u64) as usize;
@@ -411,9 +402,9 @@ pub(crate) async fn twirp_create_job_logs_metadata(
     inner.log_metadata.insert(
         results_metadata_key(
             "job",
-            plan_id,
-            Some(&workflow_job_run_backend_id),
-            Some(&workflow_job_run_backend_id),
+            Some(plan_id),
+            Some(job_id.as_str()),
+            Some(job_id.as_str()),
         ),
         LogMetadata {
             byte_count,
