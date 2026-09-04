@@ -15,6 +15,11 @@ SERVER_URL="http://127.0.0.1:${SERVER_PORT}"
 SERVER_BIN="$REPO_ROOT/target/release/preloop-server"
 RUNNER_BIN="$REPO_ROOT/target/aarch64-unknown-linux-musl/release/preloop-runner"
 MAX_JOBS="${MAX_JOBS:-3}"
+if [[ -z "${PRELOOP_SYSTEM_TOKEN:-}" ]]; then
+    export PRELOOP_SYSTEM_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+fi
+SYSTEM_TOKEN="$PRELOOP_SYSTEM_TOKEN"
+
 
 red()   { printf '\033[1;31m%s\033[0m\n' "$*"; }
 green() { printf '\033[1;32m%s\033[0m\n' "$*"; }
@@ -44,7 +49,7 @@ trap cleanup EXIT
 info "Starting preloop server on port $SERVER_PORT..."
 pkill -f "preloop-server.*${SERVER_PORT}" 2>/dev/null || true
 sleep 1
-RUST_LOG=info PRELOOP_PUBLIC_URL="$SERVER_URL" "$SERVER_BIN" serve --listen "0.0.0.0:${SERVER_PORT}" > /tmp/preloop-e2e-server.log 2>&1 &
+RUST_LOG=info PRELOOP_PUBLIC_URL="$SERVER_URL" PRELOOP_SYSTEM_TOKEN="$SYSTEM_TOKEN" "$SERVER_BIN" serve --listen "0.0.0.0:${SERVER_PORT}" > /tmp/preloop-e2e-server.log 2>&1 &
 sleep 2
 curl -sf "$SERVER_URL/healthz" > /dev/null || { red "Server failed to start"; exit 1; }
 info "Server running"
@@ -66,7 +71,7 @@ run_job_in_vm() {
     # Configure runner
     smolvm machine exec --name "$vm_name" -- /workspace/preloop-runner configure \
         --url "$SERVER_URL" \
-        --token preloop-system-token \
+        --token "$SYSTEM_TOKEN" \
         --name "$runner_name" \
         --labels self-hosted,Linux,ARM64 \
         --work /workspace/_work \
@@ -121,7 +126,7 @@ print(json.dumps({
 ")
 RESULT=$(curl -s -X POST "$SERVER_URL/api/v1/runs" \
     -H 'Content-Type: application/json' \
-    -H 'Authorization: Bearer preloop-system-token' \
+    -H "Authorization: Bearer $SYSTEM_TOKEN" \
     -d "$PAYLOAD")
 RUN_ID=$(echo "$RESULT" | python3 -c 'import sys,json; print(json.load(sys.stdin)["run_id"])')
 QUEUED=$(echo "$RESULT" | python3 -c 'import sys,json; print(json.load(sys.stdin)["queued_jobs"])')
@@ -134,7 +139,7 @@ done
 
 # Check final status
 FINAL=$(curl -s "$SERVER_URL/api/v1/runs/$RUN_ID" \
-    -H 'Authorization: Bearer preloop-system-token')
+    -H "Authorization: Bearer $SYSTEM_TOKEN")
 STATUS=$(echo "$FINAL" | python3 -c 'import sys,json; print(json.load(sys.stdin)["status"])')
 
 echo ""

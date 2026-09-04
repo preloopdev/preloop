@@ -16,7 +16,8 @@ pub struct DapArgs {
     #[arg(long)]
     pub url: Option<String>,
 
-    /// Native API token. Defaults to PRELOOP_TOKEN/PRELOOP_SYSTEM_TOKEN.
+    /// Native API token. Defaults to PRELOOP_TOKEN/PRELOOP_SYSTEM_TOKEN
+    /// or the managed engine credential.
     #[arg(long)]
     pub token: Option<String>,
 }

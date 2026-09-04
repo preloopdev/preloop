@@ -1,8 +1,16 @@
 use anyhow::{Context, Result};
 pub use preloop_gha_protocol::SecretString;
+use rand::RngCore;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+/// The private-file fallback for the per-engine administrator token.
+pub const ENGINE_TOKEN_FILE: &str = "engine.token";
+
+const ENGINE_TOKEN_REFERENCE_PREFIX: &str = "engine-token-";
 
 /// A validated, non-secret identifier for one stored credential.
 ///
@@ -178,6 +186,329 @@ impl CredentialStore for OsCredentialStore {
         }
     }
 }
+/// Resolve the storage directory used for the engine administrator token.
+///
+/// Managed engines set `PRELOOP_HOME` and use that engine home as the token
+/// storage scope; standalone servers use their state directory directly.
+pub fn engine_token_dir(state_dir: &Path) -> PathBuf {
+    std::env::var_os("PRELOOP_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state_dir.to_path_buf())
+}
+
+/// Build the OS-store reference for one engine instance.
+///
+/// The reference is scoped by the resolved storage path so two engine homes
+/// owned by one OS user do not share an administrator credential.
+pub fn engine_token_reference(storage_dir: &Path) -> Result<CredentialRef> {
+    let path = if storage_dir.is_absolute() {
+        storage_dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("resolve relative engine-token storage directory")?
+            .join(storage_dir)
+    };
+    let path = std::fs::canonicalize(&path).unwrap_or(path);
+    let digest = Sha256::digest(path.to_string_lossy().as_bytes());
+    CredentialRef::new(format!("{ENGINE_TOKEN_REFERENCE_PREFIX}{digest:x}"))
+}
+
+/// Load an existing engine token without creating or changing credentials.
+///
+/// The OS credential store is authoritative when available. A private
+/// `engine.token` file remains the fallback for headless/service environments.
+pub fn load_engine_token(storage_dir: &Path) -> Result<Option<String>> {
+    load_engine_token_with_store(storage_dir, &OsCredentialStore)
+}
+
+/// Resolve the engine token, generating and persisting one when absent.
+///
+/// An explicitly supplied token is validated and returned without copying it
+/// into another backend; externally managed secrets should not be duplicated.
+/// Generated or migrated tokens use the OS credential store when available and
+/// fall back to a private `engine.token` file when it is not.
+pub fn resolve_engine_token(storage_dir: &Path, configured: Option<String>) -> Result<String> {
+    resolve_engine_token_with_store(storage_dir, configured, &OsCredentialStore)
+}
+
+/// Resolve an engine token against a supplied backend.
+///
+/// This is public so embedders can provide a backend appropriate to their
+/// lifecycle, while tests can use [`MemoryCredentialStore`] without touching a
+/// user's keychain.
+pub fn resolve_engine_token_with_store(
+    storage_dir: &Path,
+    configured: Option<String>,
+    store: &dyn CredentialStore,
+) -> Result<String> {
+    std::fs::create_dir_all(storage_dir)
+        .with_context(|| format!("create engine-token directory {}", storage_dir.display()))?;
+    set_private_directory_permissions(storage_dir)?;
+
+    if let Some(configured) = configured {
+        return validate_engine_token(&configured, "PRELOOP_SYSTEM_TOKEN");
+    }
+
+    let reference = engine_token_reference(storage_dir)?;
+    let mut store_available = match store.available() {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                store = store.name(),
+                %error,
+                "engine token OS credential store unavailable; using private file fallback"
+            );
+            false
+        }
+    };
+
+    let token_path = storage_dir.join(ENGINE_TOKEN_FILE);
+    if store_available {
+        match store.get(&reference) {
+            Ok(Some(secret)) => {
+                let token = validate_engine_token(secret.expose(), store.name())?;
+                remove_engine_token_file(&token_path)?;
+                return Ok(token);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    store = store.name(),
+                    %error,
+                    "failed to read engine token from OS credential store; \
+                     using private file fallback"
+                );
+                store_available = false;
+            }
+        }
+    }
+
+    if let Some(token) = read_engine_token_file(&token_path)? {
+        if store_available {
+            match store.set(&reference, &SecretString::new(&token)) {
+                Ok(()) => match store.get(&reference) {
+                    Ok(Some(stored)) => {
+                        match validate_engine_token(stored.expose(), store.name()) {
+                            Ok(stored) if stored == token => {
+                                remove_engine_token_file(&token_path)?;
+                            }
+                            Ok(stored) => {
+                                tracing::warn!(
+                                    store = store.name(),
+                                    "OS credential store changed the migrated engine token; \
+                                 using the stored value"
+                                );
+                                remove_engine_token_file(&token_path)?;
+                                return Ok(stored);
+                            }
+                            Err(error) => tracing::warn!(
+                                store = store.name(),
+                                %error,
+                                "OS credential store returned an invalid migrated engine token; \
+                                 retaining private file fallback"
+                            ),
+                        }
+                    }
+                    Ok(None) => tracing::warn!(
+                        store = store.name(),
+                        "OS credential store did not return the migrated engine token; \
+                         retaining private file fallback"
+                    ),
+                    Err(error) => tracing::warn!(
+                        store = store.name(),
+                        %error,
+                        "OS credential store could not read back the migrated engine token; \
+                         retaining private file fallback"
+                    ),
+                },
+                Err(error) => tracing::warn!(
+                    store = store.name(),
+                    %error,
+                    "failed to migrate engine token into OS credential store; \
+                     retaining private file fallback"
+                ),
+            }
+        }
+        return Ok(token);
+    }
+
+    let mut bytes = [0_u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let token = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if store_available {
+        match store.set(&reference, &SecretString::new(&token)) {
+            Ok(()) => match store.get(&reference) {
+                Ok(Some(stored)) => match validate_engine_token(stored.expose(), store.name()) {
+                    Ok(stored) if stored == token => return Ok(token),
+                    Ok(stored) => {
+                        tracing::warn!(
+                            store = store.name(),
+                            "OS credential store changed the generated engine token; \
+                             using the stored value"
+                        );
+                        return Ok(stored);
+                    }
+                    Err(error) => tracing::warn!(
+                        store = store.name(),
+                        %error,
+                        "OS credential store returned an invalid generated engine token; \
+                         using private file fallback"
+                    ),
+                },
+                Ok(None) => tracing::warn!(
+                    store = store.name(),
+                    "OS credential store did not return the generated engine token; \
+                     using private file fallback"
+                ),
+                Err(error) => tracing::warn!(
+                    store = store.name(),
+                    %error,
+                    "OS credential store could not read back the generated engine token; \
+                     using private file fallback"
+                ),
+            },
+            Err(error) => {
+                tracing::warn!(
+                    store = store.name(),
+                    %error,
+                    "failed to persist generated engine token in OS credential store; \
+                     using private file fallback"
+                );
+            }
+        }
+    }
+    write_engine_token_file(&token_path, &token)?;
+    Ok(token)
+}
+
+fn load_engine_token_with_store(
+    storage_dir: &Path,
+    store: &dyn CredentialStore,
+) -> Result<Option<String>> {
+    let reference = engine_token_reference(storage_dir)?;
+    let store_available = match store.available() {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::debug!(
+                store = store.name(),
+                %error,
+                "engine token OS credential store unavailable while loading"
+            );
+            false
+        }
+    };
+    let token_path = storage_dir.join(ENGINE_TOKEN_FILE);
+
+    if store_available {
+        match store.get(&reference) {
+            Ok(Some(secret)) => {
+                return validate_engine_token(secret.expose(), store.name()).map(Some);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!(
+                    store = store.name(),
+                    %error,
+                    "failed to read engine token from OS credential store; trying private file fallback"
+                );
+            }
+        }
+    }
+    read_engine_token_file(&token_path)
+}
+
+fn validate_engine_token(value: &str, source: &str) -> Result<String> {
+    let token = value.trim();
+    anyhow::ensure!(!token.is_empty(), "{source} is empty");
+    Ok(token.to_owned())
+}
+
+fn read_engine_token_file(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(value) => {
+            set_private_file_permissions(path)?;
+            validate_engine_token(&value, &path.display().to_string()).map(Some)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+fn write_engine_token_file(path: &Path, token: &str) -> Result<()> {
+    use std::io::Write as _;
+
+    let parent = path
+        .parent()
+        .context("engine token file has no parent directory")?;
+    let temporary = parent.join(format!(
+        ".{ENGINE_TOKEN_FILE}.{:016x}.tmp",
+        rand::random::<u64>()
+    ));
+    let write_result = (|| -> Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temporary)
+            .with_context(|| format!("create {}", temporary.display()))?;
+        set_private_file_permissions(&temporary)?;
+        file.write_all(token.as_bytes())
+            .with_context(|| format!("write {}", temporary.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync {}", temporary.display()))?;
+        #[cfg(windows)]
+        if path.exists() {
+            std::fs::remove_file(path).with_context(|| format!("replace {}", path.display()))?;
+        }
+        std::fs::rename(&temporary, path).with_context(|| format!("replace {}", path.display()))?;
+        set_private_file_permissions(path)?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    write_result
+}
+
+fn remove_engine_token_file(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
+#[cfg(unix)]
+fn set_private_directory_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("protect {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_private_directory_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_file_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("protect {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_private_file_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
 
 /// In-memory backend for deterministic tests and embedders.
 #[derive(Clone, Default)]
@@ -244,6 +575,54 @@ impl CredentialStore for UnavailableCredentialStore {
 
     fn available(&self) -> Result<()> {
         anyhow::bail!("credential store unavailable")
+    }
+}
+
+/// A backend that reports successful writes without persisting them.
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+struct NonPersistingCredentialStore;
+
+#[cfg(test)]
+impl CredentialStore for NonPersistingCredentialStore {
+    fn get(&self, _reference: &CredentialRef) -> Result<Option<SecretString>> {
+        Ok(None)
+    }
+
+    fn set(&self, _reference: &CredentialRef, _value: &SecretString) -> Result<()> {
+        Ok(())
+    }
+
+    fn delete(&self, _reference: &CredentialRef) -> Result<()> {
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "non-persisting credential store"
+    }
+}
+
+/// A backend that accepts writes but cannot read them back.
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+struct WriteOnlyCredentialStore;
+
+#[cfg(test)]
+impl CredentialStore for WriteOnlyCredentialStore {
+    fn get(&self, _reference: &CredentialRef) -> Result<Option<SecretString>> {
+        anyhow::bail!("credential store readback unavailable")
+    }
+
+    fn set(&self, _reference: &CredentialRef, _value: &SecretString) -> Result<()> {
+        Ok(())
+    }
+
+    fn delete(&self, _reference: &CredentialRef) -> Result<()> {
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "write-only credential store"
     }
 }
 
@@ -316,5 +695,135 @@ mod tests {
                 .as_str(),
             "github-ghe.example.com-app-pem-12345"
         );
+    }
+    #[test]
+    fn engine_token_references_are_stable_and_scoped() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let first_ref = engine_token_reference(first.path()).unwrap();
+        let first_again = engine_token_reference(first.path()).unwrap();
+        let second_ref = engine_token_reference(second.path()).unwrap();
+
+        assert_eq!(first_ref, first_again);
+        assert_ne!(first_ref, second_ref);
+        assert!(first_ref.as_str().starts_with("engine-token-"));
+    }
+
+    #[test]
+    fn engine_token_uses_store_and_reuses_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryCredentialStore::default();
+        let first = resolve_engine_token_with_store(dir.path(), None, &store).unwrap();
+        let second = resolve_engine_token_with_store(dir.path(), None, &store).unwrap();
+        let reference = engine_token_reference(dir.path()).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(
+            store
+                .get(&reference)
+                .unwrap()
+                .as_ref()
+                .map(|value| value.expose()),
+            Some(first.as_str())
+        );
+        assert!(!dir.path().join(ENGINE_TOKEN_FILE).exists());
+    }
+    #[test]
+    fn engine_token_falls_back_when_store_readback_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WriteOnlyCredentialStore;
+        let token = resolve_engine_token_with_store(dir.path(), None, &store).unwrap();
+        let token_path = dir.path().join(ENGINE_TOKEN_FILE);
+
+        assert_eq!(std::fs::read_to_string(&token_path).unwrap(), token);
+        assert_eq!(
+            load_engine_token_with_store(dir.path(), &store).unwrap(),
+            Some(token)
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(token_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn engine_token_migration_keeps_file_without_verified_store_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let token_path = dir.path().join(ENGINE_TOKEN_FILE);
+        write_engine_token_file(&token_path, "existing-token").unwrap();
+        let store = NonPersistingCredentialStore;
+
+        let token = resolve_engine_token_with_store(dir.path(), None, &store).unwrap();
+
+        assert_eq!(token, "existing-token");
+        assert_eq!(
+            std::fs::read_to_string(&token_path).unwrap(),
+            "existing-token"
+        );
+    }
+
+    #[test]
+    fn engine_token_falls_back_to_private_file_and_migrates() {
+        let dir = tempfile::tempdir().unwrap();
+        let unavailable = UnavailableCredentialStore;
+        let first = resolve_engine_token_with_store(dir.path(), None, &unavailable).unwrap();
+        let token_path = dir.path().join(ENGINE_TOKEN_FILE);
+        assert_eq!(std::fs::read_to_string(&token_path).unwrap(), first);
+        assert_eq!(
+            load_engine_token_with_store(dir.path(), &unavailable).unwrap(),
+            Some(first.clone())
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&token_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        let store = MemoryCredentialStore::default();
+        let migrated = resolve_engine_token_with_store(dir.path(), None, &store).unwrap();
+        let reference = engine_token_reference(dir.path()).unwrap();
+        assert_eq!(migrated, first);
+        assert!(!token_path.exists());
+        assert_eq!(
+            store
+                .get(&reference)
+                .unwrap()
+                .as_ref()
+                .map(|value| value.expose()),
+            Some(first.as_str())
+        );
+        assert_eq!(
+            load_engine_token_with_store(dir.path(), &store).unwrap(),
+            Some(first)
+        );
+    }
+
+    #[test]
+    fn explicit_engine_token_is_validated_without_copying() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryCredentialStore::default();
+        let token = resolve_engine_token_with_store(
+            dir.path(),
+            Some("  configured-token  ".into()),
+            &store,
+        )
+        .unwrap();
+
+        assert_eq!(token, "configured-token");
+        assert!(store
+            .get(&engine_token_reference(dir.path()).unwrap())
+            .unwrap()
+            .is_none());
+        assert!(!dir.path().join(ENGINE_TOKEN_FILE).exists());
     }
 }

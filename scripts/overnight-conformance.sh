@@ -18,6 +18,10 @@ LOG="$RESULTS_DIR/run-$TIMESTAMP.log"
 SERVER_PID=""
 
 mkdir -p "$RESULTS_DIR"
+if [[ -z "${PRELOOP_SYSTEM_TOKEN:-}" ]]; then
+    export PRELOOP_SYSTEM_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+fi
+
 
 log() {
     echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG"

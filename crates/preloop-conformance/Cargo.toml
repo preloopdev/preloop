@@ -22,6 +22,7 @@ flate2.workspace = true
 tar.workspace = true
 serde_yaml.workspace = true
 
+uuid.workspace = true
 
 runner-watch = { path = "../runner-watch" }
 tempfile.workspace = true

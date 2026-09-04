@@ -191,10 +191,15 @@ jobs:
           SERVER_LOG="$STATE_DIR/server.log"
           REPLAY_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
           REPLAY_URL="http://127.0.0.1:$REPLAY_PORT"
+          if [[ -z "${PRELOOP_SYSTEM_TOKEN:-}" ]]; then
+            export PRELOOP_SYSTEM_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+          fi
+
           SERVER_PID=""
           cleanup() { [ -n "$SERVER_PID" ] && kill "$SERVER_PID" >/dev/null 2>&1 || true; }
           trap cleanup EXIT
           PRELOOP_PUBLIC_URL="$REPLAY_URL" \
+            PRELOOP_SYSTEM_TOKEN="$PRELOOP_SYSTEM_TOKEN" \
             PRELOOP_CONFIG="$STATE_DIR/config.toml" \
             PRELOOP_REGISTRATION_POLICY="permissive" \
             ./target/debug/preloop-server serve --listen "127.0.0.1:$REPLAY_PORT" \

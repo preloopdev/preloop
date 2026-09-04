@@ -7,8 +7,8 @@ use futures_util::StreamExt;
 use preloop_gha_protocol::{ExecutionStatus, NdjsonEvent, RunAccepted, RunId, WorkflowSubmission};
 use preloop_orchestrator::environment::{is_stock_base_image, DEFAULT_BASE_IMAGE};
 use preloop_orchestrator::{artifact_payload, RunnerPool, RunnerPoolConfig};
+use preloop_runner_server::credential_store::{CredentialStore, OsCredentialStore};
 use preloop_vm::SmolVmProvider;
-use rand::RngCore;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::io::Read;
@@ -357,10 +357,9 @@ pub(crate) fn api_token() -> Option<String> {
         .or_else(|_| std::env::var("PRELOOP_SYSTEM_TOKEN"))
         .ok()
         .or_else(|| {
-            std::fs::read_to_string(preloop_home().join("engine.token"))
+            preloop_runner_server::credential_store::load_engine_token(&preloop_home())
                 .ok()
-                .map(|token| token.trim().to_owned())
-                .filter(|token| !token.is_empty())
+                .flatten()
         })
 }
 
@@ -1099,26 +1098,18 @@ async fn ensure_engine_running() -> anyhow::Result<()> {
     eprintln!("[preloop] Starting local background engine...");
 
     let preloop_dir = preloop_home();
-
     let state_dir = preloop_dir.join("state");
     let pid_path = preloop_dir.join("preloop.pid");
-    let token_path = preloop_dir.join("engine.token");
 
     std::fs::create_dir_all(&state_dir)?;
     set_private_directory_permissions(&preloop_dir)?;
 
-    let token = if let Ok(existing) = std::fs::read_to_string(&token_path) {
-        existing.trim().to_owned()
-    } else {
-        let mut bytes = [0_u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
-        let token = bytes
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        write_private_file(&token_path, token.as_bytes())?;
-        token
-    };
+    let store = OsCredentialStore;
+    let token = prepare_engine_token(
+        &preloop_dir,
+        std::env::var("PRELOOP_SYSTEM_TOKEN").ok(),
+        &store,
+    )?;
 
     let engine_bin = std::env::current_exe().context("resolve preloop executable")?;
 
@@ -1212,32 +1203,11 @@ pub(crate) fn write_private_file(path: &std::path::Path, contents: &[u8]) -> any
 fn prepare_engine_token(
     home: &std::path::Path,
     configured: Option<String>,
+    store: &dyn CredentialStore,
 ) -> anyhow::Result<String> {
-    std::fs::create_dir_all(home)
-        .with_context(|| format!("create PRELOOP_HOME {}", home.display()))?;
-    set_private_directory_permissions(home)?;
-
-    let token_path = home.join("engine.token");
-    if let Some(token) = configured {
-        anyhow::ensure!(!token.trim().is_empty(), "PRELOOP_SYSTEM_TOKEN is empty");
-        write_private_file(&token_path, token.as_bytes())?;
-        return Ok(token);
-    }
-    if let Ok(existing) = std::fs::read_to_string(&token_path) {
-        let token = existing.trim().to_owned();
-        anyhow::ensure!(!token.is_empty(), "{} is empty", token_path.display());
-        set_private_file_permissions(&token_path)?;
-        return Ok(token);
-    }
-
-    let mut bytes = [0_u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    let token = bytes
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    write_private_file(&token_path, token.as_bytes())?;
-    Ok(token)
+    preloop_runner_server::credential_store::resolve_engine_token_with_store(
+        home, configured, store,
+    )
 }
 
 /// Move any inline GitHub credential in `config` into the OS credential
@@ -1469,8 +1439,10 @@ async fn cmd_engine(
     let state_dir = home.join("state");
     let socket = home.join("preloop.sock");
 
-    // Ensure PRELOOP_SYSTEM_TOKEN and engine.token stay synchronized.
-    let token = prepare_engine_token(&home, std::env::var("PRELOOP_SYSTEM_TOKEN").ok())?;
+    // Keep AppState's resolver on the same engine home as this CLI.
+    std::env::set_var("PRELOOP_HOME", &home);
+    let store = OsCredentialStore;
+    let token = prepare_engine_token(&home, std::env::var("PRELOOP_SYSTEM_TOKEN").ok(), &store)?;
     std::env::set_var("PRELOOP_SYSTEM_TOKEN", &token);
     let listen: std::net::SocketAddr = args
         .listen
@@ -4522,32 +4494,32 @@ mod tests {
     }
 
     #[test]
-    fn first_serve_token_creates_private_home_and_file() {
+    fn first_serve_token_creates_private_home_and_store_entry() {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("missing").join(".preloop");
         assert!(!home.exists());
+        let store = preloop_runner_server::credential_store::MemoryCredentialStore::default();
 
-        let token = prepare_engine_token(&home, None).unwrap();
+        let token = prepare_engine_token(&home, None, &store).unwrap();
 
         assert_eq!(token.len(), 64);
+        let reference =
+            preloop_runner_server::credential_store::engine_token_reference(&home).unwrap();
         assert_eq!(
-            std::fs::read_to_string(home.join("engine.token")).unwrap(),
-            token
+            store
+                .get(&reference)
+                .unwrap()
+                .as_ref()
+                .map(|value| value.expose()),
+            Some(token.as_str())
         );
+        assert!(!home.join("engine.token").exists());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             assert_eq!(
                 std::fs::metadata(&home).unwrap().permissions().mode() & 0o777,
                 0o700
-            );
-            assert_eq!(
-                std::fs::metadata(home.join("engine.token"))
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o600
             );
         }
     }

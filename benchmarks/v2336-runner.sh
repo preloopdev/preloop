@@ -3,6 +3,9 @@ set -euo pipefail
 CLIENT=/workspace/target/aarch64-unknown-linux-musl/release/preloop-runner-client
 RUNNER_SRC=/opt/runners/actions-runner
 OUTDIR=/workspace/benchmarks/v2336-official-vs-preloop
+SYSTEM_TOKEN="${PRELOOP_SYSTEM_TOKEN:?set PRELOOP_SYSTEM_TOKEN to the engine administrator token}"
+export PRELOOP_SYSTEM_TOKEN="$SYSTEM_TOKEN"
+
 
 RUNNER_DIR=$(mktemp -d)
 cp -r $RUNNER_SRC/* "$RUNNER_DIR/"
@@ -19,14 +22,14 @@ RPID=$!
 
 for i in $(seq 1 60); do
   sleep 2
-  STATUS=$(curl -s "http://127.0.0.1/api/v1/runs/$RUN_ID" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status','unknown'))" 2>/dev/null || echo error)
+  STATUS=$(curl -s -H "Authorization: Bearer $SYSTEM_TOKEN" "http://127.0.0.1/api/v1/runs/$RUN_ID" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status','unknown'))" 2>/dev/null || echo error)
   if [ "$STATUS" = completed ] || [ "$STATUS" = success ] || [ "$STATUS" = failed ]; then
     echo "Run: $STATUS"
     break
   fi
 done
 
-curl -s "http://127.0.0.1/api/v1/runs/$RUN_ID" > $OUTDIR/run-result.json
-curl -s "http://127.0.0.1/api/v1/runs/$RUN_ID/logs" > $OUTDIR/run-logs.txt
+curl -s -H "Authorization: Bearer $SYSTEM_TOKEN" "http://127.0.0.1/api/v1/runs/$RUN_ID" > $OUTDIR/run-result.json
+curl -s -H "Authorization: Bearer $SYSTEM_TOKEN" "http://127.0.0.1/api/v1/runs/$RUN_ID/logs" > $OUTDIR/run-logs.txt
 wait $RPID 2>/dev/null || true
 echo "DONE"

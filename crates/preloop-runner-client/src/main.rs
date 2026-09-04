@@ -88,8 +88,7 @@ enum Command {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
-    let native_api_token =
-        env::var("PRELOOP_SYSTEM_TOKEN").unwrap_or_else(|_| "preloop-system-token".to_owned());
+    let native_api_token = env::var("PRELOOP_SYSTEM_TOKEN").ok();
     let cli = Cli::parse();
     let timeout_seconds = env::var("PRELOOP_CLIENT_TIMEOUT_SECONDS")
         .ok()
@@ -115,6 +114,9 @@ async fn main() -> anyhow::Result<()> {
             debug,
             debugger_welcome_message,
         } => {
+            let native_api_token = native_api_token
+                .as_deref()
+                .context("PRELOOP_SYSTEM_TOKEN must be set for runner-client")?;
             let workflow_yaml = tokio::fs::read_to_string(&workflow)
                 .await
                 .with_context(|| format!("read workflow {}", workflow.display()))?;
@@ -158,7 +160,7 @@ async fn main() -> anyhow::Result<()> {
             };
             let mut request = http
                 .post(cli.server.join("/api/v1/runs")?)
-                .bearer_auth(&native_api_token);
+                .bearer_auth(native_api_token);
             // Hand the workspace to the server so it can snapshot the local
             // tree and redirect default-source checkout steps to the snapshot
             // (mirrors `preloop run`). Without this, `actions/checkout` with no
@@ -181,39 +183,51 @@ async fn main() -> anyhow::Result<()> {
             println!("{response}");
         }
         Command::Run { run_id } => {
+            let native_api_token = native_api_token
+                .as_deref()
+                .context("PRELOOP_SYSTEM_TOKEN must be set for runner-client")?;
             print_response(
                 http.get(cli.server.join(&format!("/api/v1/runs/{run_id}"))?)
-                    .bearer_auth(&native_api_token)
+                    .bearer_auth(native_api_token)
                     .send()
                     .await?,
             )
             .await?;
         }
         Command::Cancel { run_id } => {
+            let native_api_token = native_api_token
+                .as_deref()
+                .context("PRELOOP_SYSTEM_TOKEN must be set for runner-client")?;
             print_response(
                 http.post(cli.server.join(&format!("/api/v1/runs/{run_id}/cancel"))?)
-                    .bearer_auth(&native_api_token)
+                    .bearer_auth(native_api_token)
                     .send()
                     .await?,
             )
             .await?;
         }
         Command::Rerun { run_id } => {
+            let native_api_token = native_api_token
+                .as_deref()
+                .context("PRELOOP_SYSTEM_TOKEN must be set for runner-client")?;
             print_response(
                 http.post(cli.server.join(&format!("/api/v1/runs/{run_id}/rerun"))?)
-                    .bearer_auth(&native_api_token)
+                    .bearer_auth(native_api_token)
                     .send()
                     .await?,
             )
             .await?;
         }
         Command::Events { run_id } => {
+            let native_api_token = native_api_token
+                .as_deref()
+                .context("PRELOOP_SYSTEM_TOKEN must be set for runner-client")?;
             print_response(
                 http.get(
                     cli.server
                         .join(&format!("/api/v1/runs/{run_id}/events.ndjson"))?,
                 )
-                .bearer_auth(&native_api_token)
+                .bearer_auth(native_api_token)
                 .send()
                 .await?,
             )

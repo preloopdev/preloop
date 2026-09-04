@@ -25,7 +25,10 @@ CLIENT="${CLIENT:-http://127.0.0.1:$PRELOOP_PORT}"
 LOG_DIR="$REPO_ROOT/logs/e2e"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 LOG_FILE="$LOG_DIR/e2e-$TIMESTAMP.log"
-SYSTEM_TOKEN="${PRELOOP_SYSTEM_TOKEN:-preloop-system-token}"
+if [[ -z "${PRELOOP_SYSTEM_TOKEN:-}" ]]; then
+    export PRELOOP_SYSTEM_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+fi
+SYSTEM_TOKEN="$PRELOOP_SYSTEM_TOKEN"
 
 mkdir -p "$LOG_DIR"
 

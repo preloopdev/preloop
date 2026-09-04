@@ -2531,6 +2531,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
+ "uuid",
  "walkdir",
 ]
 

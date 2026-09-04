@@ -7,6 +7,10 @@ RUNNER_SRC=/opt/runners/actions-runner
 OUTDIR=/workspace/benchmarks/v2336-official-vs-preloop
 FLOWS=$OUTDIR/combined-flows.jsonl
 
+if [[ -z "${PRELOOP_SYSTEM_TOKEN:-}" ]]; then
+  export PRELOOP_SYSTEM_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+fi
+
 pkill -f "preloop-server.*:80" 2>/dev/null || true
 sleep 1
 
@@ -14,13 +18,13 @@ mkdir -p "$OUTDIR"
 chmod 777 "$OUTDIR"
 
 # Official runner strips non-default ports. Must listen on 80.
-PRELOOP_PUBLIC_URL=http://127.0.0.1 $SERVER serve --listen 127.0.0.1:80 --record-flows "$FLOWS" > /tmp/server.log 2>&1 &
+PRELOOP_PUBLIC_URL=http://127.0.0.1 PRELOOP_SYSTEM_TOKEN="$PRELOOP_SYSTEM_TOKEN" $SERVER serve --listen 127.0.0.1:80 --record-flows "$FLOWS" > /tmp/server.log 2>&1 &
 SERVER_PID=$!
 sleep 2
 
 curl -s http://127.0.0.1/ -o /dev/null -w "server: %{http_code}\n"
 
-su - ubuntu -c "
+su -m ubuntu -c "
 set -euo pipefail
 RUNNER_DIR=\$(mktemp -d)
 cp -r $RUNNER_SRC/* \"\$RUNNER_DIR/\"
@@ -37,15 +41,15 @@ RPID=\$!
 
 for i in \$(seq 1 60); do
   sleep 2
-  STATUS=\$(curl -s -H 'Authorization: Bearer preloop-system-token' http://127.0.0.1/api/v1/runs/\$RUN_ID | python3 -c \"import json,sys; print(json.load(sys.stdin).get('status','unknown'))\" 2>/dev/null || echo error)
+  STATUS=\$(curl -s -H 'Authorization: Bearer '\${PRELOOP_SYSTEM_TOKEN} http://127.0.0.1/api/v1/runs/\$RUN_ID | python3 -c \"import json,sys; print(json.load(sys.stdin).get('status','unknown'))\" 2>/dev/null || echo error)
   if [ \"\$STATUS\" = completed ] || [ \"\$STATUS\" = success ] || [ \"\$STATUS\" = failed ]; then
     echo \"Run: \$STATUS\"
     break
   fi
 done
 
-curl -s -H 'Authorization: Bearer preloop-system-token' http://127.0.0.1/api/v1/runs/\$RUN_ID > $OUTDIR/run-result.json
-curl -s -H 'Authorization: Bearer preloop-system-token' http://127.0.0.1/api/v1/runs/\$RUN_ID/logs > $OUTDIR/run-logs.txt
+curl -s -H 'Authorization: Bearer '\${PRELOOP_SYSTEM_TOKEN} http://127.0.0.1/api/v1/runs/\$RUN_ID > $OUTDIR/run-result.json
+curl -s -H 'Authorization: Bearer '\${PRELOOP_SYSTEM_TOKEN} http://127.0.0.1/api/v1/runs/\$RUN_ID/logs > $OUTDIR/run-logs.txt
 wait \$RPID 2>/dev/null || true
 echo 'Runner done'
 "

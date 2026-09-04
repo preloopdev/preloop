@@ -3,7 +3,7 @@
 # Usage: submit.sh [workflow.yml] [event] [payload.json]
 set -euo pipefail
 URL="${PRELOOP_URL:-http://127.0.0.1:9191}"
-TOKEN="${PRELOOP_TOKEN:-preloop-system-token}"
+TOKEN="${PRELOOP_TOKEN:-${PRELOOP_SYSTEM_TOKEN:?set PRELOOP_TOKEN or PRELOOP_SYSTEM_TOKEN}}"
 WF="${1:-/tmp/dapdemo/demo.yml}"
 EVENT="${2:-workflow_dispatch}"
 PAYLOAD="${3:-}"

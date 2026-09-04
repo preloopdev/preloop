@@ -21,7 +21,9 @@ TIMEOUT_SECONDS="${CONFORMANCE_TIMEOUT_SECONDS:-7200}"
 POOL_SIZE="${PRELOOP_RUNNER_POOL_SIZE:-1}"
 HOST_HOME="${HOME:-}"
 SMOLVM_PROCESS_HOME="${CONFORMANCE_SMOLVM_HOME:-$CAMPAIGN_HOME/smolvm-home}"
-export PRELOOP_SYSTEM_TOKEN="${PRELOOP_SYSTEM_TOKEN:-preloop-system-token}"
+if [[ -z "${PRELOOP_SYSTEM_TOKEN:-}" ]]; then
+  export PRELOOP_SYSTEM_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+fi
 export PRELOOP_CLIENT_TIMEOUT_SECONDS="${PRELOOP_CLIENT_TIMEOUT_SECONDS:-3600}"
 SERVER_BIN="${PRELOOP_BIN:-$ROOT/target/debug/preloop}"
 CLIENT_BIN="${PRELOOP_CLIENT_BIN:-$ROOT/target/debug/preloop-runner-client}"
@@ -184,12 +186,12 @@ trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
 run_status() {
   local run_id="$1"
-  curl -fsS --max-time 15 -H "Authorization: Bearer ${PRELOOP_SYSTEM_TOKEN:-preloop-system-token}" \
+  curl -fsS --max-time 15 -H "Authorization: Bearer $PRELOOP_SYSTEM_TOKEN" \
     "http://127.0.0.1:$PORT/api/v1/runs/$run_id" 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("status","unknown"))' 2>/dev/null || echo "unknown"
 }
 run_snapshot() {
   local run_id="$1" output="$2"
-  curl -fsS --max-time 15 -H "Authorization: Bearer ${PRELOOP_SYSTEM_TOKEN:-preloop-system-token}" \
+  curl -fsS --max-time 15 -H "Authorization: Bearer $PRELOOP_SYSTEM_TOKEN" \
     "http://127.0.0.1:$PORT/api/v1/runs/$run_id" >"$output" 2>/dev/null || printf '%s\n' '{}' >"$output"
 }
 write_push_payload() {

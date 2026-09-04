@@ -15,6 +15,11 @@ RESULTS_DIR="$REPO_ROOT/benchmarks/compatibility/server/behavior/${SCENARIO%.yml
 PROTOCOL_DIR="$REPO_ROOT/benchmarks/compatibility/server/protocol/captures/${SCENARIO%.yml}"
 MITM_PORT=18081
 GITHUB_ACTIONS_TOKEN="${PRELOOP_GITHUB_TOKEN:-}"
+if [[ -z "${PRELOOP_SYSTEM_TOKEN:-}" ]]; then
+    export PRELOOP_SYSTEM_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+fi
+SYSTEM_TOKEN="$PRELOOP_SYSTEM_TOKEN"
+
 
 red()   { printf '\033[1;31m%s\033[0m\n' "$*"; }
 green() { printf '\033[1;32m%s\033[0m\n' "$*"; }
@@ -248,7 +253,7 @@ print(json.dumps({
             bash -c '</dev/tcp/127.0.0.1/$MITM_PORT' 2>/dev/null && break; sleep .25
         done
         chmod +x /usr/local/bin/preloop-server
-        RUST_LOG=info PRELOOP_PUBLIC_URL=http://127.0.0.1 PRELOOP_GITHUB_TOKEN='$GITHUB_ACTIONS_TOKEN' preloop-server serve --listen 127.0.0.1:80 --state-dir /tmp/preloop-state > /tmp/server.log 2>&1 &
+        RUST_LOG=info PRELOOP_PUBLIC_URL=http://127.0.0.1 PRELOOP_GITHUB_TOKEN='$GITHUB_ACTIONS_TOKEN' PRELOOP_SYSTEM_TOKEN='$SYSTEM_TOKEN' preloop-server serve --listen 127.0.0.1:80 --state-dir /tmp/preloop-state > /tmp/server.log 2>&1 &
         server_pid=\$!
         sleep 2
         wget -qO- http://127.0.0.1/healthz >/dev/null || { echo 'healthz failed'; cat /tmp/server.log; cp /tmp/server.log $result_base/server.log || true; exit 1; }
@@ -265,7 +270,7 @@ print(json.dumps({
         esac
         RESULT=\$(wget -qO- --post-file=/workspace/benchmarks/compatibility/server/behavior/payload-${SCENARIO%.yml}.json \\
             --header='Content-Type: application/json' \\
-            --header='Authorization: Bearer preloop-system-token' \\
+            --header='Authorization: Bearer $SYSTEM_TOKEN' \\
             http://127.0.0.1/api/v1/runs 2>/dev/null)
         echo \"SUBMISSION: \$RESULT\"
         RUN_ID=\$(echo \"\$RESULT\" | python3 -c 'import sys,json; print(next(iter(json.load(sys.stdin).values())))')
@@ -286,7 +291,7 @@ print(json.dumps({
             rm -f \$RUNNER_DIR/.runner \$RUNNER_DIR/.credentials \$RUNNER_DIR/.credentials_rsaparams
             rm -rf \$RUNNER_DIR/_work \$RUNNER_DIR/_diag; mkdir -p \$RUNNER_DIR/_work
             cd \$RUNNER_DIR
-            ./config.sh --unattended --url 'http://127.0.0.1' --token 'preloop-system-token' \\
+            ./config.sh --unattended --url 'http://127.0.0.1' --token '$SYSTEM_TOKEN' \\
                 --name \"cmp-preloop-\$i-$$\" --labels 'self-hosted,linux,x64' --work _work --replace --ephemeral > /tmp/config-\$i.log 2>&1
             rm -rf _work; mkdir -p _work
         done
@@ -305,7 +310,7 @@ print(json.dumps({
             (
                 sleep 5
                 wget -qO /dev/null --post-data='' \
-                    --header='Authorization: Bearer preloop-system-token' \
+                    --header='Authorization: Bearer $SYSTEM_TOKEN' \
                     "http://127.0.0.1/api/v1/runs/\$RUN_ID/cancel"
             ) &
         fi
@@ -319,7 +324,7 @@ print(json.dumps({
 
         echo \"RUN_ID=\$RUN_ID\"
         sleep 2
-        wget -qO /tmp/status.json --header='Authorization: Bearer preloop-system-token' \\
+        wget -qO /tmp/status.json --header='Authorization: Bearer $SYSTEM_TOKEN' \\
             \"http://127.0.0.1/api/v1/runs/\$RUN_ID\" 2>/dev/null || true
 
         # Collect artifacts from all runners

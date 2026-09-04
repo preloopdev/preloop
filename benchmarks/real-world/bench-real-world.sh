@@ -13,6 +13,10 @@ REPO_DIR="/tmp/bench-repos/$REPO"
 BENCH_DIR="$(dirname "$(readlink -f "$0")")"
 RESULTS="/tmp/bench-results"
 AKSH="${AKSH:-/usr/local/bin}"
+if [[ -z "${PRELOOP_SYSTEM_TOKEN:-}" ]]; then
+  export PRELOOP_SYSTEM_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+fi
+
 OFFICIAL="$HOME/actions-runner"
 
 mkdir -p "$RESULTS"
@@ -41,7 +45,7 @@ start_fresh_server() {
   sleep 0.3
   export PRELOOP_PUBLIC_URL="http://127.0.0.1:$PORT"
   local t0=$(ms)
-  RUST_LOG=info "$AKSH/preloop-server" serve --listen "127.0.0.1:$PORT" \
+  RUST_LOG=info PRELOOP_SYSTEM_TOKEN="$PRELOOP_SYSTEM_TOKEN" "$AKSH/preloop-server" serve --listen "127.0.0.1:$PORT" \
     --state-dir "/tmp/bench-state-$$" > /tmp/bench-server.log 2>&1 &
   SERVER_PID=$!
   local ok=0
