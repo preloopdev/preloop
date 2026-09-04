@@ -7460,6 +7460,96 @@ async fn oidc_endpoint_mints_rs256_jwt_with_requested_audience() {
 }
 
 #[tokio::test]
+async fn results_surfaces_agree_on_alternate_uuid_scope_spelling() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\npermissions:\n  id-token: write\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps: [{ run: \"echo hi\" }]\n",
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+
+    let (plan_id, agent_job_id) = {
+        let inner = state.inner.lock().await;
+        inner
+            .queue
+            .front()
+            .map(|job| (job.message.plan.plan_id.clone(), job.message.job_id))
+            .unwrap()
+    };
+    let alternate_scope_token = state
+        .local_jwt(json!({
+            "sub": format!("preloop-job-{agent_job_id}"),
+            "scp": format!(
+                "Actions.Results:{plan_id}:{}",
+                agent_job_id.to_string().to_uppercase()
+            ),
+        }))
+        .unwrap();
+
+    // The trust-tier surface already accepts UUID spelling variants through
+    // the canonical Results payload parser.
+    assert_eq!(
+        crate::events::trust_tier::fork_restricted_from_token(&state, &alternate_scope_token).await,
+        Some(false)
+    );
+
+    let malformed_job_token = state
+        .local_jwt(json!({
+            "sub": "preloop-job-not-a-uuid",
+            "scp": format!("Actions.Results:{plan_id}:{agent_job_id}"),
+        }))
+        .unwrap();
+    assert_eq!(
+        crate::events::trust_tier::fork_restricted_from_token(&state, &malformed_job_token).await,
+        Some(true),
+        "job-shaped malformed claims must keep cache writes fail-closed"
+    );
+    // Before centralization, the OIDC surface compared the raw scope string,
+    // so this valid Results identity was rejected.
+    let oidc_status = status_with_bearer(
+        &app,
+        &alternate_scope_token,
+        Method::GET,
+        &format!(
+            "/runner/server/_apis/distributedtask/hubs/actions/plans/{plan_id}/jobs/{}/oidctoken",
+            agent_job_id.to_string().to_uppercase()
+        ),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        oidc_status,
+        StatusCode::OK,
+        "OIDC must accept the same typed identity as trust-tier checks"
+    );
+
+    let invalid_path_status = status_with_bearer(
+        &app,
+        &alternate_scope_token,
+        Method::GET,
+        &format!(
+            "/runner/server/_apis/distributedtask/hubs/actions/plans/{plan_id}/jobs/not-a-uuid/oidctoken"
+        ),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        invalid_path_status,
+        StatusCode::FORBIDDEN,
+        "an invalid job path remains an authorization failure for a job token"
+    );
+}
+
+#[tokio::test]
 async fn oidc_default_audience_is_owner_url() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
