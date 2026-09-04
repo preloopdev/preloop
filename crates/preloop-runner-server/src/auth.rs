@@ -44,17 +44,13 @@ pub(crate) async fn require_results_bearer(
     if !path.starts_with("/twirp/") {
         return Ok(next.run(request).await);
     }
+    // Results credentials are either the instance's administrator token or a
+    // locally signed runtime token with an exact, self-consistent
+    // `Actions.Results:{plan_id}:{job_id}` scope. A prefix-only check would
+    // authorize malformed scopes and let quota/authentication parse the same
+    // bearer differently.
     let authorized = bearer_token(&request).is_some_and(|token| {
-        token == shared.state.system_token
-            || shared
-                .state
-                .verify_local_jwt_claims(token)
-                .is_some_and(|claims| {
-                    claims
-                        .get("scp")
-                        .and_then(|value| value.as_str())
-                        .is_some_and(|scope| scope.starts_with("Actions.Results:"))
-                })
+        token == shared.state.system_token || shared.state.results_job_from_token(token).is_some()
     });
     if authorized {
         Ok(next.run(request).await)
@@ -350,10 +346,9 @@ impl Clone for SocketSurface {
 /// The engine token may mint for any job (it is the administrator credential).
 /// A job runtime token is weaker — the runner exports it to steps as
 /// `ACTIONS_RUNTIME_TOKEN` — so it must only mint for the one job it names:
-/// both the subject and the `Actions.Results:{plan}:{job}` scope have to
-/// match the requested backend ids. Without this, workflow code holding its
-/// own runtime token could ask the mint handler for *another* job's signed
-/// URL and then overwrite that job's logs through it.
+/// both the subject and the exact `Actions.Results:{plan}:{job}` scope have
+/// to match the requested backend ids. This reuses the same parser as the
+/// Results route gate and quota accounting.
 pub(crate) fn results_token_binds_job(
     state: &AppState,
     bearer: Option<&str>,
@@ -362,18 +357,16 @@ pub(crate) fn results_token_binds_job(
 ) -> bool {
     match bearer {
         Some(token) if token == state.system_token => true,
-        Some(token) => state.verify_local_jwt_claims(token).is_some_and(|claims| {
-            let subject_job = claims
-                .get("sub")
-                .and_then(|value| value.as_str())
-                .and_then(|subject| subject.strip_prefix("preloop-job-"))
-                .unwrap_or("");
-            let scope = claims
-                .get("scp")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            subject_job == job_id && scope == format!("Actions.Results:{plan_id}:{job_id}")
-        }),
+        Some(token) => {
+            state
+                .results_job_from_token(token)
+                .is_some_and(|(token_plan, token_job)| {
+                    token_plan == plan_id
+                        && job_id
+                            .parse::<uuid::Uuid>()
+                            .is_ok_and(|requested_job| requested_job == token_job)
+                })
+        }
         None => false,
     }
 }

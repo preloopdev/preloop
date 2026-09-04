@@ -112,22 +112,22 @@ pub(crate) fn now_unix() -> i64 {
 }
 
 /// Job backend id proven by a request's bearer token, if it is a job runtime
-/// token (`scp: Actions.Results:{plan}:{job}`). The engine token and runner
-/// listen tokens return `None` — those callers are not one job.
+/// token with an exact, self-consistent
+/// `Actions.Results:{plan}:{job}` scope. The engine token and runner listen
+/// tokens return `None` — those callers are not one job.
+///
+/// This delegates to the same verified Results parser used by route
+/// authentication and job-bound URL minting. Quota identity must never be
+/// recovered from only the scope suffix.
 pub(crate) fn job_backend_id_from_bearer(state: &AppState, headers: &HeaderMap) -> Option<String> {
     let token = bearer_from_headers(headers)?;
     if token == state.system_token {
         return None;
     }
-    let claims = state.verify_local_jwt_claims(token)?;
-    let scope = claims.get("scp")?.as_str()?;
-    scope
-        .strip_prefix("Actions.Results:")?
-        .rsplit(':')
-        .next()
-        .map(str::to_owned)
+    state
+        .results_job_from_token(token)
+        .map(|(_, job_id)| job_id.to_string())
 }
-
 // ─── Retention helpers ───────────────────────────────────────────────────────
 //
 // Called at every write site, so the maps can never drift above their caps for
@@ -729,5 +729,93 @@ mod tests {
         assert!(!inner.artifact_v2_pending.contains_key("stale-art"));
         assert!(inner.cache_v2_dl_tokens.contains_key("dl-fresh"));
         assert!(!inner.cache_v2_dl_tokens.contains_key("dl-old"));
+    }
+    #[tokio::test]
+    async fn job_backend_id_from_bearer_accepts_matching_runtime_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let job_id = uuid::Uuid::new_v4();
+        let token = state
+            .local_jwt(json!({
+                "sub": format!("preloop-job-{job_id}"),
+                "scp": format!("Actions.Results:plan-{job_id}:{job_id}"),
+            }))
+            .unwrap();
+        let headers = HeaderMap::from_iter([(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        )]);
+
+        assert_eq!(
+            job_backend_id_from_bearer(&state, &headers),
+            Some(job_id.to_string()),
+            "a normal runner Results token keeps its job quota identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn job_backend_id_from_bearer_rejects_mismatched_and_malformed_scopes() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let subject_job = uuid::Uuid::new_v4();
+        let other_job = uuid::Uuid::new_v4();
+        let cases = [
+            (
+                format!("preloop-job-{subject_job}"),
+                format!("Actions.Results:plan-{other_job}:{other_job}"),
+                "mismatched subject and scope job",
+            ),
+            (
+                format!("preloop-job-{subject_job}"),
+                "Actions.Results:plan".to_owned(),
+                "missing scope job",
+            ),
+            (
+                format!("preloop-job-{subject_job}"),
+                "Actions.Results::".to_owned(),
+                "empty plan and job",
+            ),
+            (
+                format!("preloop-job-{subject_job}"),
+                format!("Actions.Results:plan-{subject_job}:{subject_job}:extra"),
+                "extra scope component",
+            ),
+            (
+                format!("preloop-job-{subject_job}"),
+                "Actions.Results:plan:not-a-uuid".to_owned(),
+                "non-UUID scope job",
+            ),
+        ];
+
+        for (subject, scope, reason) in cases {
+            let token = state
+                .local_jwt(json!({ "sub": subject, "scp": scope }))
+                .unwrap();
+            let headers = HeaderMap::from_iter([(
+                header::AUTHORIZATION,
+                format!("Bearer {token}").parse().unwrap(),
+            )]);
+            assert_eq!(
+                job_backend_id_from_bearer(&state, &headers),
+                None,
+                "{reason} must not produce a quota identity"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn job_backend_id_from_bearer_leaves_system_credential_unscoped() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let headers = HeaderMap::from_iter([(
+            header::AUTHORIZATION,
+            format!("Bearer {}", state.system_token).parse().unwrap(),
+        )]);
+
+        assert_eq!(
+            job_backend_id_from_bearer(&state, &headers),
+            None,
+            "the administrator credential is intentionally not one job"
+        );
     }
 }

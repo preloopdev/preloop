@@ -6398,6 +6398,123 @@ async fn all_twirp_api_routes_reject_missing_bearer_before_body_validation() {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{route}");
     }
 }
+#[tokio::test]
+async fn results_cache_and_artifact_routes_reject_inconsistent_bearers() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let subject_job = uuid::Uuid::new_v4();
+    let other_job = uuid::Uuid::new_v4();
+
+    let mismatched = state
+        .local_jwt(json!({
+            "sub": format!("preloop-job-{subject_job}"),
+            "scp": format!("Actions.Results:plan-{other_job}:{other_job}"),
+        }))
+        .unwrap();
+    let malformed = state
+        .local_jwt(json!({
+            "sub": format!("preloop-job-{subject_job}"),
+            "scp": "Actions.Results:plan",
+        }))
+        .unwrap();
+    let routes = [
+        (
+            "/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry",
+            json!({"key": "rejected-cache", "version": "v1"}),
+        ),
+        (
+            "/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact",
+            json!({
+                "workflow_run_backend_id": "rejected-plan",
+                "workflow_job_run_backend_id": subject_job.to_string(),
+                "name": "rejected-artifact",
+            }),
+        ),
+    ];
+
+    for (token, reason) in [
+        (&mismatched, "mismatched subject/scope"),
+        (&malformed, "malformed scope"),
+    ] {
+        for (uri, body) in &routes {
+            assert_eq!(
+                status_with_bearer(&app, token, Method::POST, uri, body.clone()).await,
+                StatusCode::UNAUTHORIZED,
+                "{reason} must be rejected by the Results bearer gate on {uri}"
+            );
+        }
+    }
+
+    // A regular runner token remains usable on the artifact Results route and
+    // carries the same job identity the quota helper records.
+    let matching = state.mint_runtime_token("plan-normal", &subject_job);
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &matching,
+            Method::POST,
+            "/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact",
+            json!({
+                "workflow_run_backend_id": "plan-normal",
+                "workflow_job_run_backend_id": subject_job.to_string(),
+                "name": "runner-artifact",
+            }),
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    // The administrator credential intentionally remains a cross-job Results
+    // credential and is not assigned to a per-job quota bucket.
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &state.system_token,
+            Method::POST,
+            "/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry",
+            json!({"key": "system-cache", "version": "v1"}),
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &state.system_token,
+            Method::POST,
+            "/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact",
+            json!({
+                "workflow_run_backend_id": "system-plan",
+                "workflow_job_run_backend_id": "system-job",
+                "name": "system-artifact",
+            }),
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    let subject_job = subject_job.to_string();
+    let inner = state.inner.lock().await;
+    assert_eq!(inner.cache_v2_pending.len(), 1);
+    assert_eq!(
+        inner
+            .cache_v2_pending
+            .values()
+            .next()
+            .expect("system cache reservation")
+            .job_backend_id,
+        "",
+        "system Results credentials must not enter a job quota bucket"
+    );
+    let artifact_job_ids = inner
+        .artifact_v2_pending
+        .values()
+        .map(|pending| pending.job_backend_id.as_str())
+        .collect::<Vec<_>>();
+    assert!(artifact_job_ids.contains(&subject_job.as_str()));
+    assert!(artifact_job_ids.contains(&""));
+}
 
 #[tokio::test]
 async fn twirp_metadata_routes_persist_log_metadata() {

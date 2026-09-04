@@ -153,31 +153,39 @@ impl AppState {
             .ok()
     }
 
-    /// Agent job UUID a runtime token was minted for.
+    /// Parsed identity of an authenticated Results runtime token.
     ///
-    /// The counterpart to [`Self::runner_id_from_token`]: a job runtime token
-    /// names exactly one job, so any surface a worker calls can authorize
-    /// against the job rather than merely against token validity.
-    pub(crate) fn job_uuid_from_token(&self, token: &str) -> Option<uuid::Uuid> {
+    /// The `sub` claim and the job component of the exact
+    /// `Actions.Results:{plan_id}:{job_id}` scope must name the same job.
+    /// Returning the plan and job together keeps Results authorization and
+    /// quota accounting on one parser.
+    pub(crate) fn results_job_from_token(&self, token: &str) -> Option<(String, uuid::Uuid)> {
         let payload = self.verify_local_jwt_claims(token)?;
-        // `scp` is `Actions.Results:{plan_id}:{job_id}`; `sub` is the job on
-        // its own. Require both to agree so a token minted for a different
-        // surface cannot be replayed here.
         let subject_job = payload
             .get("sub")?
             .as_str()?
             .strip_prefix("preloop-job-")?
             .parse::<uuid::Uuid>()
             .ok()?;
-        let scope_job = payload
+        let scope = payload
             .get("scp")?
             .as_str()?
-            .strip_prefix("Actions.Results:")?
-            .rsplit(':')
-            .next()?
-            .parse::<uuid::Uuid>()
-            .ok()?;
-        (subject_job == scope_job).then_some(subject_job)
+            .strip_prefix("Actions.Results:")?;
+        let (plan_id, scope_job) = scope.split_once(':')?;
+        if plan_id.is_empty() {
+            return None;
+        }
+        let scope_job = scope_job.parse::<uuid::Uuid>().ok()?;
+        (subject_job == scope_job).then(|| (plan_id.to_owned(), subject_job))
+    }
+
+    /// Agent job UUID a runtime token was minted for.
+    ///
+    /// The counterpart to [`Self::runner_id_from_token`]: a job runtime token
+    /// names exactly one job, so any surface a worker calls can authorize
+    /// against the job rather than merely against token validity.
+    pub(crate) fn job_uuid_from_token(&self, token: &str) -> Option<uuid::Uuid> {
+        self.results_job_from_token(token).map(|(_, job)| job)
     }
 
     /// Agent job UUID a debug-worker token was minted for.
