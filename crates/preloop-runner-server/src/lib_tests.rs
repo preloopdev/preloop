@@ -6464,6 +6464,45 @@ async fn twirp_metadata_routes_persist_log_metadata() {
 }
 
 #[tokio::test]
+async fn twirp_step_metadata_rejects_missing_step_backend_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let requests = [
+        (
+            "/twirp/results.services.receiver.Receiver/CreateStepSummaryMetadata",
+            json!({
+                "workflow_job_run_backend_id": "job-1",
+                "workflow_run_backend_id": "run-1",
+                "size": 321,
+            }),
+        ),
+        (
+            "/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata",
+            json!({
+                "workflow_job_run_backend_id": "job-1",
+                "workflow_run_backend_id": "run-1",
+                "line_count": 7,
+            }),
+        ),
+    ];
+
+    for (uri, body) in requests {
+        let (status, payload) = request_json_status(&app, Method::POST, uri, body).await;
+        assert!(status.is_client_error(), "{uri} returned {status}");
+        assert!(
+            !matches!(payload.get("ok"), Some(Value::Bool(true))),
+            "{uri} must not report success"
+        );
+    }
+
+    assert!(
+        state.inner.lock().await.log_metadata.is_empty(),
+        "missing step ids must not create metadata"
+    );
+}
+
+#[tokio::test]
 async fn twirp_diag_route_rejects_runner_listen_scope() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
