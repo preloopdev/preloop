@@ -549,26 +549,81 @@ fn install_smolvm_from_archive(
     Ok(())
 }
 
-/// Extract a .tar.gz into `destination`, rejecting entries that escape it.
+/// Extract a `.tar.gz` into `destination`, rejecting entries that escape it.
+///
+/// Some SmolVM releases contain hard-link entries before the regular file they
+/// reference. `tar::Entry::unpack` requires the target to already exist, so
+/// defer hard links until the complete archive has been unpacked.
 fn extract_tar_gz(archive_path: &Path, destination: &Path) -> anyhow::Result<()> {
     let file = fs::File::open(archive_path)?;
     let mut archive = Archive::new(GzDecoder::new(file));
     fs::create_dir_all(destination)?;
+    let mut hard_links = Vec::new();
     for entry in archive.entries()? {
         let mut entry = entry?;
-        let path = entry.path()?;
-        let mut safe = PathBuf::new();
-        for component in path.components() {
-            match component {
-                Component::Normal(part) => safe.push(part),
-                Component::CurDir => {}
-                _ => bail!("unsafe path in smolvm archive: {}", path.display()),
-            }
-        }
-        if safe.as_os_str().is_empty() {
+        let path = safe_archive_path(&entry.path()?)?;
+        if entry.header().entry_type().is_hard_link() {
+            let target = entry
+                .link_name()?
+                .context("hard link entry has no target")?;
+            hard_links.push((path, safe_archive_path(&target)?));
             continue;
         }
-        entry.unpack(destination.join(safe))?;
+        entry.unpack(destination.join(path))?;
+    }
+    materialize_hard_links(destination, hard_links)?;
+    Ok(())
+}
+
+fn safe_archive_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let mut safe = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => safe.push(part),
+            Component::CurDir => {}
+            _ => bail!("unsafe path in smolvm archive: {}", path.display()),
+        }
+    }
+    if safe.as_os_str().is_empty() {
+        bail!("empty path in smolvm archive");
+    }
+    Ok(safe)
+}
+
+fn materialize_hard_links(
+    destination: &Path,
+    mut pending: Vec<(PathBuf, PathBuf)>,
+) -> anyhow::Result<()> {
+    while !pending.is_empty() {
+        let mut deferred = Vec::new();
+        let mut progress = false;
+        for (link, target) in pending {
+            let link_path = destination.join(&link);
+            let target_path = destination.join(&target);
+            if !target_path.exists() {
+                deferred.push((link, target));
+                continue;
+            }
+            if let Some(parent) = link_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::hard_link(&target_path, &link_path).with_context(|| {
+                format!(
+                    "materialize hard link {} -> {}",
+                    link_path.display(),
+                    target_path.display()
+                )
+            })?;
+            progress = true;
+        }
+        if !progress {
+            let unresolved = deferred
+                .first()
+                .map(|(link, target)| format!("{} -> {}", link.display(), target.display()))
+                .unwrap_or_else(|| "unknown hard link".to_owned());
+            bail!("unresolved hard link in smolvm archive: {unresolved}");
+        }
+        pending = deferred;
     }
     Ok(())
 }
@@ -1337,6 +1392,31 @@ mod tests {
                     "/bin/busybox",
                 )
                 .unwrap();
+
+            let mut hard_link_header = tar::Header::new_gnu();
+            hard_link_header.set_entry_type(tar::EntryType::Link);
+            hard_link_header.set_size(0);
+            hard_link_header.set_mode(0o644);
+            hard_link_header.set_cksum();
+            builder
+                .append_link(
+                    &mut hard_link_header,
+                    "smolvm-9.9.9-darwin-arm64/agent-rootfs/hardlink-before",
+                    "smolvm-9.9.9-darwin-arm64/agent-rootfs/hardlink-target",
+                )
+                .unwrap();
+            let mut target_header = tar::Header::new_gnu();
+            target_header.set_entry_type(tar::EntryType::Regular);
+            target_header.set_size(b"hardlink target".len() as u64);
+            target_header.set_mode(0o644);
+            target_header.set_cksum();
+            builder
+                .append_data(
+                    &mut target_header,
+                    "smolvm-9.9.9-darwin-arm64/agent-rootfs/hardlink-target",
+                    &b"hardlink target"[..],
+                )
+                .unwrap();
         }
         builder.into_inner().unwrap().finish().unwrap();
 
@@ -1398,6 +1478,10 @@ mod tests {
             assert_eq!(
                 std::fs::read_link(install.data_dir.join("agent-rootfs/sh")).unwrap(),
                 std::path::Path::new("/bin/busybox")
+            );
+            assert_eq!(
+                std::fs::read(install.data_dir.join("agent-rootfs/hardlink-before")).unwrap(),
+                b"hardlink target"
             );
         }
         #[cfg(target_os = "linux")]

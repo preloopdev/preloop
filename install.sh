@@ -1,5 +1,4 @@
 #!/bin/sh
-# Preloop installer — instant install from release binaries.
 #
 #   curl -fsSL https://raw.githubusercontent.com/preloopdev/preloop/main/install.sh | sh
 #
@@ -199,13 +198,11 @@ install_from_release() {
     done
     [ -x "$BIN_DIR/preloop" ] || return 1
 
-    # macOS installs execute workflows inside Linux microVMs, so the engine
-    # needs the Linux guest runner at the path it discovers
-    # (<prefix>/lib/preloop/runner/<linux-triple>/preloop-runner). Without it
-    # every job queues forever with "Linux runner bundle unavailable". A
-    # release missing the asset is a warning, not a failure — the engine's
-    # startup message explains the consequence.
-    if [ "$os" = "darwin" ]; then
+    # Both Linux and macOS execute workflows inside Linux microVMs, so the
+    # engine needs the Linux guest runner at the path it discovers
+    # (<prefix>/lib/preloop/runner/<linux-triple>/preloop-runner). The runner
+    # is a standalone release asset, not part of the host CLI archive.
+    if [ "$os" = "linux" ] || [ "$os" = "darwin" ]; then
         local runner_triple
         case "$arch" in
             x86_64) runner_triple="x86_64-unknown-linux-gnu" ;;
@@ -215,12 +212,33 @@ install_from_release() {
         local runner_url
         runner_url="$(printf '%s' "$json" | sed -n "s/.*\"browser_download_url\":[[:space:]]*\"\([^\"]*\/$runner_asset\)\".*/\1/p" | head -1)"
         if [ -n "$runner_url" ]; then
-            local runner_dest="$PREFIX/lib/preloop/runner/$runner_triple"
-            mkdir -p "$runner_dest"
-            curl -fsSL "$runner_url" -o "$runner_dest/preloop-runner" 2>/dev/null \
-                && chmod 0755 "$runner_dest/preloop-runner" \
-                && say "installed $runner_dest/preloop-runner" \
-                || say "warning: could not install Linux runner bundle — microVM jobs need it"
+            local runner_file="$tmp/$runner_asset"
+            local runner_expected runner_actual
+            if curl -fsSL "$runner_url" -o "$runner_file" 2>/dev/null \
+                && [ -s "$runner_file" ]; then
+                runner_expected="$(curl -fsSL "${runner_url}.sha256" 2>/dev/null | awk '{print $1}')"
+                if [ -z "$runner_expected" ]; then
+                    say "warning: no checksum for $runner_asset — microVM jobs need it"
+                elif command -v sha256sum >/dev/null 2>&1; then
+                    runner_actual="$(sha256sum "$runner_file" | awk '{print $1}')"
+                    [ "$runner_actual" = "$runner_expected" ] \
+                        || die "checksum mismatch for $runner_asset — refusing to install"
+                else
+                    runner_actual="$(shasum -a 256 "$runner_file" | awk '{print $1}')"
+                    [ "$runner_actual" = "$runner_expected" ] \
+                        || die "checksum mismatch for $runner_asset — refusing to install"
+                fi
+                local runner_dest="$PREFIX/lib/preloop/runner/$runner_triple"
+                mkdir -p "$runner_dest"
+                install -m 0755 "$runner_file" "$runner_dest/preloop-runner"
+                say "installed $runner_dest/preloop-runner"
+            elif [ "$os" = "linux" ]; then
+                die "could not download required $runner_asset"
+            else
+                say "warning: could not install Linux runner bundle — microVM jobs need it"
+            fi
+        elif [ "$os" = "linux" ]; then
+            die "release $tag has no required $runner_asset asset"
         else
             say "warning: release $tag has no $runner_asset asset — microVM jobs need it"
         fi

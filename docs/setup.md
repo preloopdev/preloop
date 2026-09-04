@@ -103,8 +103,8 @@ you*; everything outbound still works:
 | Check runs on the commit | published (outbound to GitHub) | same |
 
 So a laptop setup is a complete CI system you trigger yourself. When you later
-get a reachable address — soemthing like a tunnel is enough — point the App you already have
-at it:
+get a reachable address — something like a tunnel is enough — point the App you
+already have at it:
 
 ```sh
 cloudflared tunnel --url http://127.0.0.1:9090      # → https://xxx.trycloudflare.com

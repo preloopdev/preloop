@@ -50,15 +50,20 @@ access at all** — see option A.
 
 ## 3. Install
 
+For a Linux system service, install the CLI and SmolVM runtime in system
+locations. A user-local binary under `/home` cannot be traversed by the
+dedicated service account, and a user-local runtime is not visible to it:
+
 ```sh
-curl -fsSL https://raw.githubusercontent.com/preloopdev/preloop/main/install.sh | sh
-preloop setup github --via app --public-url https://ci.example.com
+sudo -H env PREFIX=/usr/local sh -c \
+  'curl -fsSL https://raw.githubusercontent.com/preloopdev/preloop/main/install.sh | sh'
+sudo /usr/local/bin/preloop setup github --via app --public-url https://ci.example.com
 ```
 
 Then install it as a supervised service — systemd on Linux, launchd on macOS:
 
 ```sh
-sudo preloop server install \
+sudo /usr/local/bin/preloop server install \
   --public-url https://ci.example.com \
   --github-app-id 123456 \
   --github-app-key /etc/preloop/app.pem \
@@ -156,12 +161,11 @@ Keep repository-specific software in workflow setup actions, install steps,
 or a job `container:`.
 
 ---
-
 ## 5. Exposure options
 
 Set `PRELOOP_PUBLIC_URL` to whatever address others actually reach.
 
-### A. No inbound access
+### A. No public inbound access
 
 The most locked-down option, and the only one with zero public attack surface.
 Bind to loopback or a private/VPN address:
@@ -181,11 +185,24 @@ preloop run --push --create-pr   # run CI first, then push and open a draft PR
 Both are outbound-only: check runs are still reported to GitHub. On a VPN such
 as Tailscale, bind the VPN address instead and restrict access with its ACLs —
 then `details_url` links resolve for exactly the people allowed to read logs.
+For a tailnet-only HTTPS URL while keeping Preloop on loopback, use Tailscale
+Serve:
+
+```sh
+tailscale serve --bg --https=443 http://127.0.0.1:9090
+PRELOOP_PUBLIC_URL=https://<host>.<tailnet>.ts.net
+```
+
+This URL is reachable only by tailnet members permitted by the Tailscale ACL.
+It is not a GitHub webhook endpoint; use a separate public, path-filtering
+ingress if GitHub must deliver webhooks.
 
 ### B. Tailscale Funnel
 
-Public HTTPS without opening a port or running a proxy. Traffic transits
-Tailscale's edge.
+Tailscale Funnel provides public HTTPS without opening a port or running a
+proxy. Do **not** point it directly at Preloop: Funnel would publish the
+unauthenticated runner-registration surface described in §6. Put a
+path-filtering proxy in front and publish only the webhook path.
 
 ```sh
 tailscale funnel --bg 9090
