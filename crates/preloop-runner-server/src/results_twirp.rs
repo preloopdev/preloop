@@ -356,15 +356,21 @@ pub(crate) async fn twirp_create_step_logs_metadata(
     let Some(step_backend_id) = request.step_backend_id else {
         return Ok(Json(json!({"ok": true})));
     };
-    let plan_id = request.workflow_run_backend_id.as_deref();
-    let job_id = request.workflow_job_run_backend_id.as_deref();
-    crate::auth::require_results_job(&identity, plan_id.unwrap_or(""), job_id.unwrap_or(""))?;
+    // Absent identifiers mean there is nothing to key or authorize against;
+    // stay compatible by succeeding without writing, as with a missing step id.
+    let (Some(plan_id), Some(job_id)) = (
+        request.workflow_run_backend_id.as_deref(),
+        request.workflow_job_run_backend_id.as_deref(),
+    ) else {
+        return Ok(Json(json!({"ok": true})));
+    };
+    crate::auth::require_results_job(&identity, plan_id, job_id)?;
     let line_count = request.line_count.unwrap_or_default();
     let line_count_usize = line_count.min(usize::MAX as u64) as usize;
     let byte_count = line_count.saturating_mul(80).min(usize::MAX as u64) as usize;
     let mut inner = shared.state.inner.lock().await;
     inner.log_metadata.insert(
-        results_metadata_key("step", plan_id, job_id, Some(&step_backend_id)),
+        results_metadata_key("step", Some(plan_id), Some(job_id), Some(&step_backend_id)),
         LogMetadata {
             byte_count,
             line_count: line_count_usize,
@@ -398,12 +404,12 @@ pub(crate) async fn twirp_create_job_logs_metadata(
     let Some(workflow_job_run_backend_id) = request.workflow_job_run_backend_id else {
         return Ok(Json(json!({"ok": true})));
     };
-    let plan_id = request.workflow_run_backend_id.as_deref();
-    crate::auth::require_results_job(
-        &identity,
-        plan_id.unwrap_or(""),
-        &workflow_job_run_backend_id,
-    )?;
+    // Absent plan means there is nothing to key or authorize against; stay
+    // compatible by succeeding without writing.
+    let Some(plan_id) = request.workflow_run_backend_id.as_deref() else {
+        return Ok(Json(json!({"ok": true})));
+    };
+    crate::auth::require_results_job(&identity, plan_id, &workflow_job_run_backend_id)?;
     let line_count = request.line_count.unwrap_or_default();
     let line_count_usize = line_count.min(usize::MAX as u64) as usize;
     let byte_count = line_count.saturating_mul(80).min(usize::MAX as u64) as usize;
@@ -411,7 +417,7 @@ pub(crate) async fn twirp_create_job_logs_metadata(
     inner.log_metadata.insert(
         results_metadata_key(
             "job",
-            plan_id,
+            Some(plan_id),
             Some(&workflow_job_run_backend_id),
             Some(&workflow_job_run_backend_id),
         ),

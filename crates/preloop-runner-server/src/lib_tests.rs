@@ -284,13 +284,13 @@ async fn sqlite_recovery_restores_post_restart_state() {
     let recovered = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let recovered_inner = recovered.inner.lock().await;
 
-    // C1: \session_keys restored.
+    // C1: session_keys restored.
     assert!(
         recovered_inner.session_keys.contains_key(&session_id),
         "session_keys must survive restart"
     );
 
-    // runner_rsa_public_keys restored.
+    // C2: runner_rsa_public_keys restored.
     assert_eq!(
         recovered_inner
             .runner_rsa_public_keys
@@ -300,7 +300,7 @@ async fn sqlite_recovery_restores_post_restart_state() {
         "RSA public key must survive restart"
     );
 
-    // cancellation of a queued job removes it from the queue and
+    // C5: cancellation of a queued job removes it from the queue and
     // marks the run Cancelled. `cancellation_queue` is reserved for
     // in-progress jobs that need a JobCancellation message sent; a queued
     // job is simply dropped. Assert the run status is restored.
@@ -6455,12 +6455,10 @@ async fn twirp_metadata_routes_persist_log_metadata() {
         .unwrap();
     assert_eq!(summary.byte_count, 321);
     assert_eq!(summary.line_count, 0);
-    let step = inner.log_metadata.get("step:step-logs").unwrap();
-    assert_eq!(step.byte_count, 560);
-    assert_eq!(step.line_count, 7);
-    let job = inner.log_metadata.get("job:job-logs").unwrap();
-    assert_eq!(job.byte_count, 720);
-    assert_eq!(job.line_count, 9);
+    // Requests without plan/job identifiers succeed without writing: there is
+    // nothing to key or authorize against.
+    assert!(!inner.log_metadata.contains_key("step:step-logs"));
+    assert!(!inner.log_metadata.contains_key("job:job-logs"));
 }
 
 #[tokio::test]
@@ -20519,8 +20517,16 @@ async fn results_workflow_steps_require_the_calling_job() {
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
-    let (_, plan_a, agent_a) = jobs[0].clone();
-    let (_, plan_b, agent_b) = jobs[1].clone();
+    let (_, plan_a, agent_a) = jobs
+        .iter()
+        .find(|(job, _, _)| job == "build")
+        .cloned()
+        .expect("build job must be present");
+    let (_, plan_b, agent_b) = jobs
+        .iter()
+        .find(|(job, _, _)| job == "test")
+        .cloned()
+        .expect("test job must be present");
     let a_job = agent_a.parse::<uuid::Uuid>().unwrap();
     let b_job = agent_b.parse::<uuid::Uuid>().unwrap();
     let a_step = workflow_step_ids(&state, run_id, "build")
@@ -20632,8 +20638,16 @@ async fn results_metadata_requires_the_calling_job() {
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
-    let (_, plan_a, agent_a) = jobs[0].clone();
-    let (_, plan_b, agent_b) = jobs[1].clone();
+    let (_, plan_a, agent_a) = jobs
+        .iter()
+        .find(|(job, _, _)| job == "build")
+        .cloned()
+        .expect("build job must be present");
+    let (_, plan_b, agent_b) = jobs
+        .iter()
+        .find(|(job, _, _)| job == "test")
+        .cloned()
+        .expect("test job must be present");
     let a_job = agent_a.parse::<uuid::Uuid>().unwrap();
     let b_step = workflow_step_ids(&state, run_id, "test")
         .await
