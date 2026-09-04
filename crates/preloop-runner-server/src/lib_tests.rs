@@ -6413,7 +6413,7 @@ async fn twirp_metadata_routes_persist_log_metadata() {
                 "workflow_run_backend_id": "run-1",
                 "size": 321,
             }),
-            "summary:step-summary",
+            "results:run-1:job-1:summary:step-summary",
         ),
         (
             "/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata",
@@ -6449,13 +6449,161 @@ async fn twirp_metadata_routes_persist_log_metadata() {
     }
 
     let inner = state.inner.lock().await;
-    let summary = inner.log_metadata.get("summary:step-summary").unwrap();
+    let summary = inner
+        .log_metadata
+        .get("results:run-1:job-1:summary:step-summary")
+        .unwrap();
     assert_eq!(summary.byte_count, 321);
     assert_eq!(summary.line_count, 0);
     let step = inner.log_metadata.get("step:step-logs").unwrap();
     assert_eq!(step.byte_count, 560);
     assert_eq!(step.line_count, 7);
     let job = inner.log_metadata.get("job:job-logs").unwrap();
+    assert_eq!(job.byte_count, 720);
+    assert_eq!(job.line_count, 9);
+}
+#[tokio::test]
+async fn job_results_metadata_cannot_overwrite_another_job_namespace() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let plan_a = uuid::Uuid::new_v4().to_string();
+    let plan_b = uuid::Uuid::new_v4().to_string();
+    let job_a = uuid::Uuid::new_v4();
+    let job_b = uuid::Uuid::new_v4();
+    let token_a = state.mint_runtime_token(&plan_a, &job_a);
+    let shared_step = "shared-step";
+    let keys = [
+        format!("summary:{shared_step}"),
+        format!("step:{shared_step}"),
+        format!("job:{job_b}"),
+    ];
+    {
+        let mut inner = state.inner.lock().await;
+        for (index, key) in keys.iter().enumerate() {
+            inner.log_metadata.insert(
+                key.clone(),
+                LogMetadata {
+                    byte_count: index + 1,
+                    line_count: index + 10,
+                },
+            );
+        }
+    }
+
+    let requests = [
+        (
+            "/twirp/results.services.receiver.Receiver/CreateStepSummaryMetadata",
+            json!({
+                "step_backend_id": shared_step,
+                "workflow_job_run_backend_id": job_b,
+                "workflow_run_backend_id": plan_b,
+                "size": 999
+            }),
+        ),
+        (
+            "/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata",
+            json!({
+                "step_backend_id": shared_step,
+                "workflow_job_run_backend_id": job_b,
+                "workflow_run_backend_id": plan_b,
+                "line_count": 999
+            }),
+        ),
+        (
+            "/twirp/results.services.receiver.Receiver/CreateJobLogsMetadata",
+            json!({
+                "workflow_job_run_backend_id": job_b,
+                "workflow_run_backend_id": plan_b,
+                "line_count": 999
+            }),
+        ),
+    ];
+    for (uri, body) in requests {
+        assert_eq!(
+            status_with_bearer(&app, &token_a, Method::POST, uri, body).await,
+            StatusCode::FORBIDDEN,
+            "{uri}"
+        );
+    }
+
+    let inner = state.inner.lock().await;
+    assert_eq!(
+        keys.iter()
+            .map(|key| {
+                inner
+                    .log_metadata
+                    .get(key)
+                    .map(|meta| (meta.byte_count, meta.line_count))
+            })
+            .collect::<Vec<_>>(),
+        vec![Some((1, 10)), Some((2, 11)), Some((3, 12))]
+    );
+    assert_eq!(inner.log_metadata.len(), keys.len());
+}
+
+#[tokio::test]
+async fn job_results_metadata_uses_authenticated_namespace_for_partial_ids() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let plan_id = uuid::Uuid::new_v4().to_string();
+    let job_id = uuid::Uuid::new_v4();
+    let token = state.mint_runtime_token(&plan_id, &job_id);
+    let requests = [
+        (
+            "/twirp/results.services.receiver.Receiver/CreateStepSummaryMetadata",
+            json!({
+                "step_backend_id": "own-summary",
+                "workflow_job_run_backend_id": job_id,
+                "workflow_run_backend_id": plan_id,
+                "size": 321
+            }),
+        ),
+        (
+            "/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata",
+            json!({
+                "step_backend_id": "own-step",
+                "line_count": 7
+            }),
+        ),
+        (
+            "/twirp/results.services.receiver.Receiver/CreateJobLogsMetadata",
+            json!({
+                "workflow_job_run_backend_id": job_id,
+                "line_count": 9
+            }),
+        ),
+    ];
+
+    for (uri, body) in requests {
+        assert_eq!(
+            status_with_bearer(&app, &token, Method::POST, uri, body).await,
+            StatusCode::OK,
+            "{uri}"
+        );
+    }
+
+    let inner = state.inner.lock().await;
+    assert!(!inner.log_metadata.contains_key("summary:own-summary"));
+    assert!(!inner.log_metadata.contains_key("step:own-step"));
+    assert!(!inner.log_metadata.contains_key(&format!("job:{job_id}")));
+    let summary = inner
+        .log_metadata
+        .get(&format!("results:{plan_id}:{job_id}:summary:own-summary"))
+        .unwrap();
+    assert_eq!(summary.byte_count, 321);
+    assert_eq!(summary.line_count, 0);
+    let step = inner
+        .log_metadata
+        .get(&format!("results:{plan_id}:{job_id}:step:own-step"))
+        .unwrap();
+    assert_eq!(step.byte_count, 560);
+    assert_eq!(step.line_count, 7);
+    let job = inner
+        .log_metadata
+        .get(&format!("results:{plan_id}:{job_id}:job:{job_id}"))
+        .unwrap();
     assert_eq!(job.byte_count, 720);
     assert_eq!(job.line_count, 9);
 }

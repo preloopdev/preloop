@@ -263,15 +263,18 @@ pub(crate) async fn twirp_get_step_summary_signed_blob_url(
     })))
 }
 
+fn results_metadata_key(kind: &str, scope: Option<&(String, String)>, resource_id: &str) -> String {
+    match scope {
+        Some((plan_id, job_id)) => format!("results:{plan_id}:{job_id}:{kind}:{resource_id}"),
+        None => format!("{kind}:{resource_id}"),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct StepSummaryMetadataRequest {
-    // serde: metadata is accepted for protocol compatibility; this identifies the summary.
+    // These backend identifiers identify the Results target job.
     pub(crate) step_backend_id: String,
-    // serde: metadata is accepted for protocol compatibility; field is not inspected.
-    #[allow(dead_code)]
     pub(crate) workflow_job_run_backend_id: String,
-    // serde: metadata is accepted for protocol compatibility; field is not inspected.
-    #[allow(dead_code)]
     pub(crate) workflow_run_backend_id: String,
     // serde: metadata is accepted for protocol compatibility; this records the summary size.
     pub(crate) size: Option<u64>,
@@ -282,34 +285,42 @@ pub(crate) struct StepSummaryMetadataRequest {
 
 pub(crate) async fn twirp_create_step_summary_metadata(
     State(shared): State<Arc<SharedState>>,
+    headers: HeaderMap,
     Json(request): Json<StepSummaryMetadataRequest>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let identity =
+        crate::auth::results_identity(&shared.state, crate::auth::bearer_from_headers(&headers))
+            .ok_or_else(|| ApiError::forbidden("results-service job identity required"))?;
+    let plan_id = (!request.workflow_run_backend_id.is_empty())
+        .then_some(request.workflow_run_backend_id.as_str());
+    let job_id = (!request.workflow_job_run_backend_id.is_empty())
+        .then_some(request.workflow_job_run_backend_id.as_str());
+    let scope = crate::auth::results_metadata_scope(&identity, plan_id, job_id)?;
+    let key = results_metadata_key("summary", scope.as_ref(), &request.step_backend_id);
     let byte_count = request.size.unwrap_or_default().min(usize::MAX as u64) as usize;
-    let mut inner = shared.state.inner.lock().await;
-    inner.log_metadata.insert(
-        format!("summary:{}", request.step_backend_id),
-        LogMetadata {
-            byte_count,
-            line_count: 0,
-        },
-    );
-    let meta = crate::store::build_meta_snapshot(&inner);
+    let meta = {
+        let mut inner = shared.state.inner.lock().await;
+        inner.log_metadata.insert(
+            key,
+            LogMetadata {
+                byte_count,
+                line_count: 0,
+            },
+        );
+        crate::store::build_meta_snapshot(&inner)
+    };
     if let Err(error) = shared.state.store.store_meta_only(&meta).await {
         tracing::warn!(?error, "failed to persist step summary metadata");
     }
 
-    Json(json!({"ok": true}))
+    Ok(Json(json!({"ok": true})))
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct StepLogsMetadataRequest {
-    // serde: metadata is accepted for protocol compatibility; this identifies the step.
+    // These backend identifiers identify the Results target job when present.
     pub(crate) step_backend_id: Option<String>,
-    // serde: metadata is accepted for protocol compatibility; field is not inspected.
-    #[allow(dead_code)]
     pub(crate) workflow_job_run_backend_id: Option<String>,
-    // serde: metadata is accepted for protocol compatibility; field is not inspected.
-    #[allow(dead_code)]
     pub(crate) workflow_run_backend_id: Option<String>,
     // serde: metadata is accepted for protocol compatibility; field is not inspected.
     #[allow(dead_code)]
@@ -321,35 +332,54 @@ pub(crate) struct StepLogsMetadataRequest {
 /// POST CreateStepLogsMetadata — runner calls this after uploading step logs.
 pub(crate) async fn twirp_create_step_logs_metadata(
     State(shared): State<Arc<SharedState>>,
+    headers: HeaderMap,
     Json(request): Json<StepLogsMetadataRequest>,
-) -> Json<serde_json::Value> {
-    if let Some(step_backend_id) = request.step_backend_id {
-        let line_count = request.line_count.unwrap_or_default();
-        let line_count_usize = line_count.min(usize::MAX as u64) as usize;
-        let byte_count = line_count.saturating_mul(80).min(usize::MAX as u64) as usize;
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let Some(step_backend_id) = request
+        .step_backend_id
+        .as_deref()
+        .filter(|step_backend_id| !step_backend_id.is_empty())
+    else {
+        return Ok(Json(json!({"ok": true})));
+    };
+    let identity =
+        crate::auth::results_identity(&shared.state, crate::auth::bearer_from_headers(&headers))
+            .ok_or_else(|| ApiError::forbidden("results-service job identity required"))?;
+    let plan_id = request
+        .workflow_run_backend_id
+        .as_deref()
+        .filter(|plan_id| !plan_id.is_empty());
+    let job_id = request
+        .workflow_job_run_backend_id
+        .as_deref()
+        .filter(|job_id| !job_id.is_empty());
+    let scope = crate::auth::results_metadata_scope(&identity, plan_id, job_id)?;
+    let line_count = request.line_count.unwrap_or_default();
+    let line_count_usize = line_count.min(usize::MAX as u64) as usize;
+    let byte_count = line_count.saturating_mul(80).min(usize::MAX as u64) as usize;
+    let key = results_metadata_key("step", scope.as_ref(), step_backend_id);
+    let meta = {
         let mut inner = shared.state.inner.lock().await;
         inner.log_metadata.insert(
-            format!("step:{step_backend_id}"),
+            key,
             LogMetadata {
                 byte_count,
                 line_count: line_count_usize,
             },
         );
-        let meta = crate::store::build_meta_snapshot(&inner);
-        if let Err(error) = shared.state.store.store_meta_only(&meta).await {
-            tracing::warn!(?error, "failed to persist step log metadata");
-        }
+        crate::store::build_meta_snapshot(&inner)
+    };
+    if let Err(error) = shared.state.store.store_meta_only(&meta).await {
+        tracing::warn!(?error, "failed to persist step log metadata");
     }
 
-    Json(json!({"ok": true}))
+    Ok(Json(json!({"ok": true})))
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct JobLogsMetadataRequest {
-    // serde: metadata is accepted for protocol compatibility; this identifies the job.
+    // These backend identifiers identify the Results target job when present.
     pub(crate) workflow_job_run_backend_id: Option<String>,
-    // serde: metadata is accepted for protocol compatibility; field is not inspected.
-    #[allow(dead_code)]
     pub(crate) workflow_run_backend_id: Option<String>,
     // serde: metadata is accepted for protocol compatibility; field is not inspected.
     #[allow(dead_code)]
@@ -361,27 +391,45 @@ pub(crate) struct JobLogsMetadataRequest {
 /// POST CreateJobLogsMetadata — runner calls this after uploading job logs.
 pub(crate) async fn twirp_create_job_logs_metadata(
     State(shared): State<Arc<SharedState>>,
+    headers: HeaderMap,
     Json(request): Json<JobLogsMetadataRequest>,
-) -> Json<serde_json::Value> {
-    if let Some(workflow_job_run_backend_id) = request.workflow_job_run_backend_id {
-        let line_count = request.line_count.unwrap_or_default();
-        let line_count_usize = line_count.min(usize::MAX as u64) as usize;
-        let byte_count = line_count.saturating_mul(80).min(usize::MAX as u64) as usize;
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let Some(workflow_job_run_backend_id) = request
+        .workflow_job_run_backend_id
+        .as_deref()
+        .filter(|job_id| !job_id.is_empty())
+    else {
+        return Ok(Json(json!({"ok": true})));
+    };
+    let identity =
+        crate::auth::results_identity(&shared.state, crate::auth::bearer_from_headers(&headers))
+            .ok_or_else(|| ApiError::forbidden("results-service job identity required"))?;
+    let plan_id = request
+        .workflow_run_backend_id
+        .as_deref()
+        .filter(|plan_id| !plan_id.is_empty());
+    let job_id = Some(workflow_job_run_backend_id);
+    let scope = crate::auth::results_metadata_scope(&identity, plan_id, job_id)?;
+    let line_count = request.line_count.unwrap_or_default();
+    let line_count_usize = line_count.min(usize::MAX as u64) as usize;
+    let byte_count = line_count.saturating_mul(80).min(usize::MAX as u64) as usize;
+    let key = results_metadata_key("job", scope.as_ref(), workflow_job_run_backend_id);
+    let meta = {
         let mut inner = shared.state.inner.lock().await;
         inner.log_metadata.insert(
-            format!("job:{workflow_job_run_backend_id}"),
+            key,
             LogMetadata {
                 byte_count,
                 line_count: line_count_usize,
             },
         );
-        let meta = crate::store::build_meta_snapshot(&inner);
-        if let Err(error) = shared.state.store.store_meta_only(&meta).await {
-            tracing::warn!(?error, "failed to persist job log metadata");
-        }
+        crate::store::build_meta_snapshot(&inner)
+    };
+    if let Err(error) = shared.state.store.store_meta_only(&meta).await {
+        tracing::warn!(?error, "failed to persist job log metadata");
     }
 
-    Json(json!({"ok": true}))
+    Ok(Json(json!({"ok": true})))
 }
 
 // ─── Cache v2 Twirp (github.actions.results.api.v1.CacheService) ─────────────
