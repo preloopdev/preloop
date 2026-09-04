@@ -345,6 +345,83 @@ impl Clone for SocketSurface {
     }
 }
 
+/// Identity carried by a Results-service bearer.
+///
+/// The system credential is intentionally unscoped. A runtime credential is
+/// bound to one plan/job pair by both its subject and its Results scope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ResultsIdentity {
+    System,
+    Job { plan_id: String, job_id: uuid::Uuid },
+}
+
+/// Parse and validate the identity carried by a Results bearer.
+///
+/// `require_results_bearer` only needs to reject unrelated protocol tokens.
+/// Handlers that mutate a target must use this stricter parser so a signed JWT
+/// with a merely Results-looking scope cannot choose a different job.
+pub(crate) fn results_identity(state: &AppState, bearer: Option<&str>) -> Option<ResultsIdentity> {
+    let bearer = bearer?;
+    if bearer == state.system_token {
+        return Some(ResultsIdentity::System);
+    }
+
+    let claims = state.verify_local_jwt_claims(bearer)?;
+    let subject_job = claims
+        .get("sub")
+        .and_then(|value| value.as_str())
+        .and_then(|subject| subject.strip_prefix("preloop-job-"))
+        .and_then(|job| job.parse::<uuid::Uuid>().ok())?;
+    let scope = claims
+        .get("scp")
+        .and_then(|value| value.as_str())
+        .and_then(|scope| scope.strip_prefix("Actions.Results:"))?;
+    let (plan_id, scope_job) = scope.split_once(':')?;
+    if plan_id.is_empty() || scope_job.parse::<uuid::Uuid>().ok()? != subject_job {
+        return None;
+    }
+
+    Some(ResultsIdentity::Job {
+        plan_id: plan_id.to_owned(),
+        job_id: subject_job,
+    })
+}
+
+/// Resolve optional metadata identifiers against the authenticated identity.
+///
+/// A job bearer supplies the missing plan/job fields from its signed scope and
+/// rejects any supplied field that disagrees. `None` is reserved for a trusted
+/// system bearer using the legacy partially populated request shape; no
+/// job-scoped bearer can reach that fallback.
+pub(crate) fn results_metadata_scope(
+    identity: &ResultsIdentity,
+    plan_id: Option<&str>,
+    job_id: Option<&str>,
+) -> Result<Option<(String, String)>, ApiError> {
+    match identity {
+        ResultsIdentity::System => Ok(plan_id
+            .zip(job_id)
+            .map(|(plan_id, job_id)| (plan_id.to_owned(), job_id.to_owned()))),
+        ResultsIdentity::Job {
+            plan_id: identity_plan,
+            job_id: identity_job,
+        } => {
+            let plan_matches = plan_id.is_none_or(|plan_id| plan_id == identity_plan);
+            let job_matches = job_id.is_none_or(|job_id| {
+                job_id
+                    .parse::<uuid::Uuid>()
+                    .is_ok_and(|job_id| job_id == *identity_job)
+            });
+            if !plan_matches || !job_matches {
+                return Err(ApiError::forbidden(
+                    "results-service token is not bound to that job",
+                ));
+            }
+            Ok(Some((identity_plan.clone(), identity_job.to_string())))
+        }
+    }
+}
+
 /// Whether a caller may mint replay blob URLs for this exact plan/job pair.
 ///
 /// The engine token may mint for any job (it is the administrator credential).
@@ -360,21 +437,15 @@ pub(crate) fn results_token_binds_job(
     plan_id: &str,
     job_id: &str,
 ) -> bool {
-    match bearer {
-        Some(token) if token == state.system_token => true,
-        Some(token) => state.verify_local_jwt_claims(token).is_some_and(|claims| {
-            let subject_job = claims
-                .get("sub")
-                .and_then(|value| value.as_str())
-                .and_then(|subject| subject.strip_prefix("preloop-job-"))
-                .unwrap_or("");
-            let scope = claims
-                .get("scp")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            subject_job == job_id && scope == format!("Actions.Results:{plan_id}:{job_id}")
-        }),
-        None => false,
+    let Some(identity) = results_identity(state, bearer) else {
+        return false;
+    };
+    match identity {
+        ResultsIdentity::System => true,
+        ResultsIdentity::Job {
+            plan_id: identity_plan,
+            job_id: identity_job,
+        } => identity_plan == plan_id && job_id == identity_job.to_string(),
     }
 }
 
