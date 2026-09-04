@@ -38,8 +38,9 @@ access at all** — see option A.
 - **Memory**: `PRELOOP_RUNNER_POOL_SIZE × PRELOOP_RUNNER_MEMORY_MIB`, plus a few
   GB for the control plane. Ceilings are ballooned, so idle runners hold far
   less than their ceiling — but concurrent heavy builds really do use it.
-- **CPU**: each runner VM gets 4 vCPUs. `pool_size × 4` well above your core
-  count means jobs contend and wall-clock-sensitive tests turn flaky.
+- **CPU**: each runner VM gets `PRELOOP_RUNNER_CPUS` vCPUs (default 4).
+  `pool_size × PRELOOP_RUNNER_CPUS` well above your core count means jobs
+  contend and wall-clock-sensitive tests turn flaky.
 - **Disk**: golden images (roughly 0.7–6 GB each, and superseded ones
   accumulate) plus the cache directory, which grows with every distinct key.
 - **GitHub App**: app id, private key PEM, installation id, and a webhook secret
@@ -130,6 +131,7 @@ Client-side (`preloop` CLI): `PRELOOP_URL` (default `http://127.0.0.1:9090`) and
 |---|---|---|
 | `PRELOOP_RUNNER_POOL_ENABLED` | off | Master switch for the microVM pool |
 | `PRELOOP_RUNNER_POOL_SIZE` | derived from host CPU/RAM | Warm machines; `0` forks on demand |
+| `PRELOOP_RUNNER_CPUS` | `4` | vCPUs allocated to each runner VM |
 | `PRELOOP_RUNNER_MEMORY_MIB` | `4096` | Memory ceiling per VM. Raise it for LTO release builds — rustc is `SIGKILL`ed at 4 GiB on large workspaces |
 | `PRELOOP_RUNNER_STORAGE_GB` | `20` | Writable guest disk. Raise to `80` or more for full hosted-image snapshots and large golden packs |
 | `PRELOOP_RUNNER_OVERLAY_GB` | — | Per-VM writable overlay size |
@@ -330,7 +332,7 @@ jobs are lost, not resumed — restart during a quiet period and re-run after.
 
 - Memory: `pool_size × PRELOOP_RUNNER_MEMORY_MIB` should fit with headroom.
   4 × 6 GiB on a 22 GiB host is already oversubscribed and relies on ballooning.
-- CPU: `pool_size × 4` vCPUs against your core count. Past roughly 2× the box
+- CPU: `pool_size × PRELOOP_RUNNER_CPUS` vCPUs against your core count. Past roughly 2× the box
   thrashes and timing-sensitive tests flake.
 - Disk: prune superseded golden directories and cap the cache directory.
 

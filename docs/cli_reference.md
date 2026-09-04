@@ -318,6 +318,7 @@ steps.
 | `PRELOOP_HOME` | State directory (default `~/.config/preloop`) |
 | `PRELOOP_RUNNER_POOL_ENABLED` | Enable the local microVM runner pool (default off) |
 | `PRELOOP_RUNNER_POOL_SIZE` | Pool size (warm forks/VMs) |
+| `PRELOOP_RUNNER_CPUS` | vCPUs allocated to each runner VM (default 4) |
 | `PRELOOP_USE_FORK` | Run the pool as forked microVMs (default true with a packed golden) |
 | `PRELOOP_USE_PACKED_GOLDEN` | Use a release or locally cached packed golden (default on; set `false` for cold OCI provisioning) |
 | `PRELOOP_GOLDEN_URL` | Override the packed golden URL; checksum URL is this value plus `.sha256` |
@@ -331,12 +332,12 @@ steps.
 | `PRELOOP_RUNNER_LABELS` | Extra `runs-on` labels the pool's runners declare |
 | `PRELOOP_RUNNER_USER` / `PRELOOP_RUNNER_UID` | Guest runner account (default `runner`/1001); `root` restores root; empty disables switching |
 | `PRELOOP_WORKSPACE` | Workspace context for daemon deployments; not a package or toolchain installation input |
-| `AKSH_URL` | Server URL for the client commands (default `http://127.0.0.1:9090`) |
-| `AKSH_SYSTEM_TOKEN` | Native API bearer token (also `AKSH_TOKEN`) |
-| `AKSH_PUBLIC_URL` | Public URL used in check-run details links |
-| `AKSH_GITHUB_TOKEN` | PAT fallback for GitHub API calls (check runs need the App) |
-| `AKSH_GITHUB_API_URL` | Override the GitHub API base (tests, GHES) |
-| `AKSH_WEBHOOK_SECRET` | Webhook signature secret (the server's only source of truth for repo hooks) |
+| `PRELOOP_URL` | Server URL for the client commands (default `http://127.0.0.1:9090`) |
+| `PRELOOP_SYSTEM_TOKEN` | Native API bearer token (also `PRELOOP_TOKEN`) |
+| `PRELOOP_PUBLIC_URL` | Public URL used in check-run details links |
+| `PRELOOP_GITHUB_TOKEN` | PAT fallback for GitHub API calls (check runs need the App) |
+| `PRELOOP_GITHUB_API_URL` | Override the GitHub API base (tests, GHES) |
+| `PRELOOP_WEBHOOK_SECRET` | Webhook signature secret (the server's only source of truth for repo hooks) |
 
 ## Quick examples
 

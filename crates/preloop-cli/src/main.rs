@@ -915,7 +915,7 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
             "Linux".into(),
             std::env::consts::ARCH.into(),
         ],
-        cpus: RUNNER_CPUS,
+        cpus: runner_cpus(),
         memory_mib: runner_memory_mib(),
         storage_gib: args.storage_gib.unwrap_or_else(runner_storage_gib),
         overlay_gib: std::env::var("PRELOOP_RUNNER_OVERLAY_GB")
@@ -1881,6 +1881,7 @@ fn local_runner_pool_config(
     // Compare on the plain `repository:tag`, so the digest-pinned defaults
     // (ubuntu:24.04@sha256:…) still count as stock Ubuntu images.
     let custom_base = !is_stock_base_image(&base_image);
+    let cpus = runner_cpus();
     Ok(RunnerPoolConfig {
         // Size zero is the deliberate low-memory mode: keep the local
         // supervisor alive, but build a runner only when a job is queued.
@@ -1888,7 +1889,7 @@ fn local_runner_pool_config(
             std::env::var("PRELOOP_RUNNER_POOL_SIZE")
                 .ok()
                 .and_then(|value| value.parse().ok())
-                .unwrap_or_else(|| host_runner_pool_size(RUNNER_CPUS))
+                .unwrap_or_else(|| host_runner_pool_size(cpus))
         } else {
             0
         },
@@ -1946,7 +1947,7 @@ fn local_runner_pool_config(
         dns: std::env::var("PRELOOP_RUNNER_DNS").ok(),
         registration_token_env: "PRELOOP_SYSTEM_TOKEN".into(),
         labels: runner_pool_labels(),
-        cpus: RUNNER_CPUS,
+        cpus,
         memory_mib: runner_memory_mib(),
         storage_gib: runner_storage_gib(),
         overlay_gib: std::env::var("PRELOOP_RUNNER_OVERLAY_GB")
@@ -1992,7 +1993,7 @@ fn runner_pool_labels() -> Vec<String> {
     labels
 }
 
-/// vCPUs given to each runner VM.
+/// vCPUs given to each runner VM, honouring `PRELOOP_RUNNER_CPUS`.
 const RUNNER_CPUS: u16 = 4;
 /// Low-memory on-demand provisioning is the default; opt into idle warm VMs.
 const DEFAULT_RUNNER_POOL_ENABLED: bool = false;
@@ -2024,7 +2025,18 @@ fn runner_memory_mib() -> u32 {
         .filter(|value| *value >= MIN_MEMORY_MIB)
         .unwrap_or(RUNNER_MEMORY_MIB)
 }
-
+/// vCPUs per runner VM, honouring `PRELOOP_RUNNER_CPUS`.
+///
+/// Invalid, zero, or out-of-range values fall back to the default. Keeping the
+/// value positive prevents invalid VM configurations and pool sizing division
+/// by zero.
+fn runner_cpus() -> u16 {
+    std::env::var("PRELOOP_RUNNER_CPUS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u16>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(RUNNER_CPUS)
+}
 /// Persistent storage for each runner VM, honouring
 /// `PRELOOP_RUNNER_STORAGE_GB`.
 fn runner_storage_gib() -> u32 {
@@ -4288,9 +4300,9 @@ mod tests {
 
     /// Serializes tests that mutate process-global env vars read by
     /// `local_runner_pool_config` (`PRELOOP_RUNNER_BUNDLE`,
-    /// `PRELOOP_RUNNER_BASE_IMAGE`, `PRELOOP_RUNNER_STORAGE_GB`): parallel
-    /// test threads would otherwise race each other's set_var/remove_var
-    /// pairs.
+    /// `PRELOOP_RUNNER_BASE_IMAGE`, `PRELOOP_RUNNER_CPUS`,
+    /// `PRELOOP_RUNNER_STORAGE_GB`): parallel test threads would otherwise
+    /// race each other's set_var/remove_var pairs.
     static TEST_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     mod github_credential_migration {
@@ -4578,6 +4590,28 @@ mod tests {
         assert!(require_digest_pinned_base("/tmp/preloop.smolmachine").is_ok());
         assert!(require_digest_pinned_base("ghcr.io/acme/base:latest").is_err());
         assert!(require_digest_pinned_base("ghcr.io/acme/base@sha256:not-a-digest").is_err());
+    }
+
+    #[test]
+    fn runner_cpus_honors_positive_values_and_rejects_invalid_values() {
+        let _env_guard = TEST_ENV_MUTEX.lock().unwrap();
+        for (value, expected) in [
+            ("1", 1),
+            (" 8 ", 8),
+            ("0", RUNNER_CPUS),
+            ("-1", RUNNER_CPUS),
+            ("not-a-number", RUNNER_CPUS),
+            ("65536", RUNNER_CPUS),
+        ] {
+            unsafe {
+                std::env::set_var("PRELOOP_RUNNER_CPUS", value);
+            }
+            assert_eq!(runner_cpus(), expected, "{value}");
+        }
+        unsafe {
+            std::env::remove_var("PRELOOP_RUNNER_CPUS");
+        }
+        assert_eq!(runner_cpus(), RUNNER_CPUS);
     }
 
     #[test]
