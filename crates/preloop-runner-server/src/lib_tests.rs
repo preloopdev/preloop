@@ -6609,6 +6609,66 @@ async fn job_results_metadata_uses_authenticated_namespace_for_partial_ids() {
 }
 
 #[tokio::test]
+async fn job_results_token_cannot_update_another_jobs_steps() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (_, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let (_, plan_id, own_agent_job_id) = jobs[0].clone();
+    let (_, _, other_agent_job_id) = jobs[1].clone();
+    let own_job_id = uuid::Uuid::parse_str(&own_agent_job_id).unwrap();
+    let token = state.mint_runtime_token(&plan_id, &own_job_id);
+    let uri = "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate";
+    let update = |job_id: &str, external_id: &str| {
+        json!({
+            "workflow_run_backend_id": plan_id,
+            "workflow_job_run_backend_id": job_id,
+            "steps": [{
+                "external_id": external_id,
+                "number": 1,
+                "name": "Run echo",
+                "status": 6,
+                "conclusion": 2
+            }]
+        })
+    };
+
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &token,
+            Method::POST,
+            uri,
+            update(&own_agent_job_id, "own-step")
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &token,
+            Method::POST,
+            uri,
+            update(&other_agent_job_id, "other-step")
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+
+    let inner = state.inner.lock().await;
+    assert!(inner
+        .job_steps
+        .get(&own_job_id)
+        .is_some_and(|steps| steps.iter().any(|step| step.id == "own-step")));
+    let other_job_id = uuid::Uuid::parse_str(&other_agent_job_id).unwrap();
+    assert!(!inner
+        .job_steps
+        .get(&other_job_id)
+        .is_some_and(|steps| steps.iter().any(|step| step.id == "other-step")));
+}
+
+#[tokio::test]
 async fn twirp_diag_route_rejects_runner_listen_scope() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();

@@ -445,12 +445,7 @@ pub(crate) fn results_token_binds_job(
         ResultsIdentity::Job {
             plan_id: identity_plan,
             job_id: identity_job,
-        } => {
-            identity_plan == plan_id
-                && job_id
-                    .parse::<uuid::Uuid>()
-                    .is_ok_and(|job_id| job_id == identity_job)
-        }
+        } => identity_plan == plan_id && job_id == identity_job.to_string(),
     }
 }
 

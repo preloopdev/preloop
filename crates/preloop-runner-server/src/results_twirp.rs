@@ -24,6 +24,7 @@ pub(crate) struct StepLogsSignedBlobUrlRequest {
 /// numbering `--step` reads off the workflow.
 pub(crate) async fn twirp_workflow_steps_update(
     State(shared): State<Arc<SharedState>>,
+    headers: HeaderMap,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let mut inner = shared.state.inner.lock().await;
@@ -32,6 +33,16 @@ pub(crate) async fn twirp_workflow_steps_update(
     let agent_job_id_str = payload["workflow_job_run_backend_id"]
         .as_str()
         .unwrap_or("");
+    if !crate::auth::results_token_binds_job(
+        &shared.state,
+        crate::auth::bearer_from_headers(&headers),
+        plan_id,
+        agent_job_id_str,
+    ) {
+        return Err(ApiError::forbidden(
+            "results-service token is not bound to that job",
+        ));
+    }
 
     let (Some(plan_uuid), Some(job_uuid)) = (
         uuid::Uuid::parse_str(plan_id).ok(),
