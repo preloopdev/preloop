@@ -13,7 +13,6 @@ PAYLOAD="$ROOT/benchmarks/compatibility/server/behavior/payload-$SCENARIO.json"
 if [[ -z "${PRELOOP_SYSTEM_TOKEN:-}" ]]; then
   export PRELOOP_SYSTEM_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
 fi
-SYSTEM_TOKEN="$PRELOOP_SYSTEM_TOKEN"
 
 mkdir -p "$RESULT/diag"
 SERVER="multi-server-${SCENARIO}-$$"
@@ -33,13 +32,13 @@ smolvm machine start --name "$SERVER" >/dev/null
 smolvm machine exec --name "$SERVER" -- bash -lc 'mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null || true; if [ -x /usr/bin/rosetta-wrapper ] && [ -x /mnt/rosetta/rosetta ]; then echo ":rosetta:M::\\x7fELF\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\x3e\\x00:\\xff\\xff\\xff\\xff\\xff\\xfe\\xfe\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff:/usr/bin/rosetta-wrapper:F" > /proc/sys/fs/binfmt_misc/register 2>/dev/null || true; fi' >/dev/null 2>&1 || true
 smolvm machine cp "$BIN" "$SERVER:/usr/local/bin/preloop-server" >/dev/null
 SERVER_IP=$(smolvm machine exec --name "$SERVER" -- bash -lc "hostname -I | cut -d' ' -f1")
-smolvm machine exec --name "$SERVER" -- bash -lc "
+smolvm machine exec --name "$SERVER" --secret-env PRELOOP_SYSTEM_TOKEN=PRELOOP_SYSTEM_TOKEN -- bash -lc "
   chmod +x /usr/local/bin/preloop-server
-  RUST_LOG=info PRELOOP_SYSTEM_TOKEN=$SYSTEM_TOKEN PRELOOP_PUBLIC_URL=http://$SERVER_IP preloop-server serve --listen 0.0.0.0:80 > /tmp/server.log 2>&1 &
+  RUST_LOG=info PRELOOP_PUBLIC_URL=http://$SERVER_IP preloop-server serve --listen 0.0.0.0:80 > /tmp/server.log 2>&1 &
   sleep 2
   wget -qO- http://127.0.0.1/healthz >/dev/null
   RESULT=\$(wget -qO- --post-file=/workspace/benchmarks/compatibility/server/behavior/payload-$SCENARIO.json \\
-    --header='Content-Type: application/json' --header='Authorization: Bearer $SYSTEM_TOKEN' \\
+    --header="Authorization: Bearer \$PRELOOP_SYSTEM_TOKEN" \\
     http://127.0.0.1/api/v1/runs)
   echo \"\$RESULT\" > /workspace/benchmarks/compatibility/server/behavior/$SCENARIO/preloop-multi/submission.json
   echo \$RESULT | python3 -c 'import sys,json; print(next(iter(json.load(sys.stdin).values())))' > /workspace/benchmarks/compatibility/server/behavior/$SCENARIO/preloop-multi/run-id
@@ -58,16 +57,16 @@ done
 
 for i in $(seq 1 "$RUNNERS"); do
   vm="${VMS[$((i-1))]}"
-  smolvm machine exec --name "$vm" -- bash -lc "
+  smolvm machine exec --name "$vm" --secret-env PRELOOP_SYSTEM_TOKEN=PRELOOP_SYSTEM_TOKEN -- bash -lc "
     set +e
     export RUNNER_ALLOW_RUNASROOT=1 ACTIONS_RUNNER_DEBUG=true RUNNER_DEBUG=1
     cp -a /opt/runners/actions-runner /tmp/runner
     rm -f /tmp/runner/.runner /tmp/runner/.credentials /tmp/runner/.credentials_rsaparams
     mkdir -p /tmp/runner/_work
     cd /tmp/runner
-    ./config.sh --unattended --url 'http://$SERVER_IP' --token '$SYSTEM_TOKEN' \\
+    ./config.sh --unattended --url 'http://$SERVER_IP' --token "\$PRELOOP_SYSTEM_TOKEN" \\
       --name 'multi-$SCENARIO-$i' --labels 'self-hosted,linux,x64' --work _work --replace --ephemeral > /tmp/config.log 2>&1
-    timeout 240 ./run.sh > /tmp/runner.log 2>&1
+    env -u PRELOOP_SYSTEM_TOKEN timeout 240 ./run.sh > /tmp/runner.log 2>&1
     rc=\$?
     mkdir -p /workspace/benchmarks/compatibility/server/behavior/$SCENARIO/preloop-multi/runner-$i
     cp /tmp/runner.log /workspace/benchmarks/compatibility/server/behavior/$SCENARIO/preloop-multi/runner-$i/official-runner.log
@@ -79,9 +78,9 @@ done
 wait || true
 
 RUN_ID=$(cat "$RESULT/run-id")
-smolvm machine exec --name "$SERVER" -- bash -lc "
+smolvm machine exec --name "$SERVER" --secret-env PRELOOP_SYSTEM_TOKEN=PRELOOP_SYSTEM_TOKEN -- bash -lc "
   sleep 2
-  wget -qO /tmp/status.json --header='Authorization: Bearer $SYSTEM_TOKEN' http://127.0.0.1/api/v1/runs/$RUN_ID || true
+  wget -qO /tmp/status.json --header="Authorization: Bearer \$PRELOOP_SYSTEM_TOKEN" http://127.0.0.1/api/v1/runs/$RUN_ID || true
   cp /tmp/status.json /workspace/benchmarks/compatibility/server/behavior/$SCENARIO/preloop-multi/status.json 2>/dev/null || true
   cp /tmp/server.log /workspace/benchmarks/compatibility/server/behavior/$SCENARIO/preloop-multi/server.log 2>/dev/null || true
 " >/dev/null 2>&1 || true

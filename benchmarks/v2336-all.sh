@@ -32,9 +32,8 @@ fi
 OUTDIR=/workspace/benchmarks/v2336-official-vs-preloop
 FLOWS=$OUTDIR/combined-flows.jsonl
 
-if [[ -z "${PRELOOP_SYSTEM_TOKEN:-}" ]]; then
-  export PRELOOP_SYSTEM_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
-fi
+SYSTEM_TOKEN="${PRELOOP_SYSTEM_TOKEN:-$(python3 -c 'import secrets; print(secrets.token_hex(32))')}"
+TOKEN_QUOTED=$(printf '%q' "$SYSTEM_TOKEN")
 
 pkill -f "preloop-server.*:80" 2>/dev/null || true
 sleep 1
@@ -43,18 +42,18 @@ mkdir -p "$OUTDIR"
 chmod 777 "$OUTDIR"
 
 # Official runner strips non-default ports. Must listen on 80.
-PRELOOP_PUBLIC_URL=http://127.0.0.1 PRELOOP_SYSTEM_TOKEN="$PRELOOP_SYSTEM_TOKEN" $SERVER serve --listen 127.0.0.1:80 --record-flows "$FLOWS" > /tmp/server.log 2>&1 &
+PRELOOP_PUBLIC_URL=http://127.0.0.1 PRELOOP_SYSTEM_TOKEN="$SYSTEM_TOKEN" $SERVER serve --listen 127.0.0.1:80 --record-flows "$FLOWS" > /tmp/server.log 2>&1 &
 SERVER_PID=$!
 sleep 2
 
 curl -s http://127.0.0.1/ -o /dev/null -w "server: %{http_code}\n"
 
-su -m ubuntu -c "
+su - ubuntu -c "
 set -euo pipefail
 RUNNER_DIR=\$(mktemp -d)
 cp -r $RUNNER_SRC/* \"\$RUNNER_DIR/\"
 cd \"\$RUNNER_DIR\"
-./config.sh --url http://127.0.0.1 --token dummy-token --name v2336-test --work _work --unattended --replace 2>&1 | tail -3
+env -u PRELOOP_SYSTEM_TOKEN ./config.sh --url http://127.0.0.1 --token dummy-token --name v2336-test --work _work --unattended --replace 2>&1 | tail -3
 
 # Helper to run a workflow and save results
 run_wf() {
@@ -62,15 +61,15 @@ run_wf() {
   local yaml=\$2
   
   echo \"=== Running Workflow \$num: \$yaml ===\"
-  $CLIENT --server http://127.0.0.1 submit -W /workspace/crates/preloop-conformance/fixtures/\$yaml > /tmp/submit.json
+  PRELOOP_SYSTEM_TOKEN=$TOKEN_QUOTED $CLIENT --server http://127.0.0.1 submit -W /workspace/crates/preloop-conformance/fixtures/\$yaml > /tmp/submit.json
   local run_id=\$(python3 -c \"import json; print(json.load(open('/tmp/submit.json'))['run_id'])\")
   echo \"RUN_ID=\$run_id\"
   
-  ./run.sh --once > $OUTDIR/runner-\$num.log 2>&1
+  env -u PRELOOP_SYSTEM_TOKEN ./run.sh --once > $OUTDIR/runner-\$num.log 2>&1
   
   mkdir -p $OUTDIR/preloop/\$num
-  curl -s -H 'Authorization: Bearer '\${PRELOOP_SYSTEM_TOKEN} http://127.0.0.1/api/v1/runs/\$run_id > $OUTDIR/preloop/\$num/run-result.json
-  curl -s -H 'Authorization: Bearer '\${PRELOOP_SYSTEM_TOKEN} http://127.0.0.1/api/v1/runs/\$run_id/logs > $OUTDIR/preloop/\$num/run-logs.txt
+  curl -s -H 'Authorization: Bearer '$TOKEN_QUOTED http://127.0.0.1/api/v1/runs/\$run_id > $OUTDIR/preloop/\$num/run-result.json
+  curl -s -H 'Authorization: Bearer '$TOKEN_QUOTED http://127.0.0.1/api/v1/runs/\$run_id/logs > $OUTDIR/preloop/\$num/run-logs.txt
 }
 
 run_wf 200 v2336-combined.yml

@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+preloop-runner-server = { path = "../preloop-runner-server" }
 preloop-gha-protocol = { path = "../preloop-gha-protocol" }
 preloop-gha-parser = { path = "../preloop-gha-parser" }
 reqwest.workspace = true

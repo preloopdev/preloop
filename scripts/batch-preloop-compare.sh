@@ -13,7 +13,6 @@ RESULTS_BASE="$REPO_ROOT/benchmarks/compatibility/server/behavior"
 if [[ -z "${PRELOOP_SYSTEM_TOKEN:-}" ]]; then
     export PRELOOP_SYSTEM_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
 fi
-SYSTEM_TOKEN="$PRELOOP_SYSTEM_TOKEN"
 
 
 red()   { printf '\033[1;31m%s\033[0m\n' "$*"; }
@@ -67,12 +66,12 @@ print(json.dumps({
     RESULT_BASE_VM="/workspace/benchmarks/compatibility/server/behavior/$scenario/preloop-server"
 
     # Run scenario in the persistent VM (each run: start server, run runners, stop server)
-    smolvm machine exec --name "$VM" -- bash -lc "
+    smolvm machine exec --name "$VM" --secret-env PRELOOP_SYSTEM_TOKEN=PRELOOP_SYSTEM_TOKEN -- bash -lc "
         set -u
         chmod +x /usr/local/bin/preloop-server
         
         # Start server
-        RUST_LOG=info PRELOOP_SYSTEM_TOKEN=$SYSTEM_TOKEN PRELOOP_PUBLIC_URL=http://127.0.0.1 preloop-server serve --listen 0.0.0.0:80 > /tmp/server.log 2>&1 &
+        RUST_LOG=info PRELOOP_PUBLIC_URL=http://127.0.0.1 preloop-server serve --listen 0.0.0.0:80 > /tmp/server.log 2>&1 &
         server_pid=\$!
         sleep 2
         wget -qO- http://127.0.0.1/healthz >/dev/null || { echo 'healthz failed'; kill \$server_pid 2>/dev/null; exit 1; }
@@ -80,7 +79,7 @@ print(json.dumps({
         # Submit workflow
         RESULT=\$(wget -qO- --post-file=/workspace/benchmarks/compatibility/server/behavior/payload-${scenario}.json \\
             --header='Content-Type: application/json' \
-            --header='Authorization: Bearer $SYSTEM_TOKEN' \
+            --header="Authorization: Bearer \$PRELOOP_SYSTEM_TOKEN" \
             http://127.0.0.1/api/v1/runs 2>/dev/null)
         RUN_ID=\$(echo \"\$RESULT\" | python3 -c 'import sys,json; print(next(iter(json.load(sys.stdin).values())))' 2>/dev/null)
         echo \"RUN_ID=\$RUN_ID\"
@@ -95,7 +94,7 @@ print(json.dumps({
             rm -f \$RUNNER_DIR/.runner \$RUNNER_DIR/.credentials \$RUNNER_DIR/.credentials_rsaparams
             rm -rf \$RUNNER_DIR/_work \$RUNNER_DIR/_diag; mkdir -p \$RUNNER_DIR/_work
             cd \$RUNNER_DIR
-            ./config.sh --unattended --url 'http://127.0.0.1' --token '$SYSTEM_TOKEN' \
+            ./config.sh --unattended --url 'http://127.0.0.1' --token "\$PRELOOP_SYSTEM_TOKEN" \
                 --name \"cmp-\$i\" --labels 'self-hosted,linux,x64' --work _work --replace --ephemeral > /tmp/config-\$i.log 2>&1
             rm -rf _work; mkdir -p _work
         done
@@ -104,14 +103,14 @@ print(json.dumps({
         RUNNER_PIDS=""
         for i in \$(seq 1 \$JOB_COUNT); do
             RUNNER_DIR=/tmp/runner-\$i
-            (cd \$RUNNER_DIR && timeout 120 ./run.sh > /tmp/runner-\$i.log 2>&1; echo \$? > /tmp/runner-\$i.rc) &
+            (cd \$RUNNER_DIR && env -u PRELOOP_SYSTEM_TOKEN timeout 120 ./run.sh > /tmp/runner-\$i.log 2>&1; echo \$? > /tmp/runner-\$i.rc) &
             RUNNER_PIDS=\"\$RUNNER_PIDS \$!\"
         done
         for pid in \$RUNNER_PIDS; do wait \$pid 2>/dev/null || true; done
 
         # Collect results
         sleep 1
-        wget -qO /tmp/status.json --header='Authorization: Bearer $SYSTEM_TOKEN' \
+        wget -qO /tmp/status.json --header="Authorization: Bearer \$PRELOOP_SYSTEM_TOKEN" \
             \"http://127.0.0.1/api/v1/runs/\$RUN_ID\" 2>/dev/null || true
 
         # Copy artifacts

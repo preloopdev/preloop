@@ -2736,6 +2736,7 @@ dependencies = [
  "clap",
  "preloop-gha-parser",
  "preloop-gha-protocol",
+ "preloop-runner-server",
  "reqwest",
  "serde",
  "serde_json",
