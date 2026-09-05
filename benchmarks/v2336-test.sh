@@ -7,6 +7,10 @@ RUNNER_SRC=/opt/runners/actions-runner
 OUTDIR=/workspace/benchmarks/v2336-official-vs-preloop
 FLOWS=$OUTDIR/combined-flows.jsonl
 
+SYSTEM_TOKEN="${PRELOOP_SYSTEM_TOKEN:-$(python3 -c 'import secrets; print(secrets.token_hex(32))')}"
+TOKEN_QUOTED=$(printf '%q' "$SYSTEM_TOKEN")
+
+
 pkill -f "preloop-server.*:80" 2>/dev/null || true
 sleep 1
 
@@ -14,7 +18,7 @@ mkdir -p "$OUTDIR"
 chmod 777 "$OUTDIR"
 
 # Official runner strips non-default ports. Must listen on 80.
-PRELOOP_PUBLIC_URL=http://127.0.0.1 $SERVER serve --listen 127.0.0.1:80 --record-flows "$FLOWS" > /tmp/server.log 2>&1 &
+PRELOOP_PUBLIC_URL=http://127.0.0.1 PRELOOP_SYSTEM_TOKEN="$SYSTEM_TOKEN" $SERVER serve --listen 127.0.0.1:80 --record-flows "$FLOWS" > /tmp/server.log 2>&1 &
 SERVER_PID=$!
 sleep 2
 
@@ -25,27 +29,27 @@ set -euo pipefail
 RUNNER_DIR=\$(mktemp -d)
 cp -r $RUNNER_SRC/* \"\$RUNNER_DIR/\"
 cd \"\$RUNNER_DIR\"
-./config.sh --url http://127.0.0.1 --token dummy-token --name v2336-test --work _work --unattended --replace 2>&1 | tail -3
+env -u PRELOOP_SYSTEM_TOKEN ./config.sh --url http://127.0.0.1 --token dummy-token --name v2336-test --work _work --unattended --replace 2>&1 | tail -3
 
-$CLIENT --server http://127.0.0.1 submit -W /workspace/crates/preloop-conformance/fixtures/v2336-combined.yml > /tmp/submit.json 2>&1
+PRELOOP_SYSTEM_TOKEN=$TOKEN_QUOTED $CLIENT --server http://127.0.0.1 submit -W /workspace/crates/preloop-conformance/fixtures/v2336-combined.yml > /tmp/submit.json 2>&1
 cat /tmp/submit.json
 RUN_ID=\$(python3 -c \"import json; print(json.load(open('/tmp/submit.json'))['run_id'])\")
 echo \"RUN_ID=\$RUN_ID\"
 
-./run.sh --once > $OUTDIR/official-runner.log 2>&1 &
+env -u PRELOOP_SYSTEM_TOKEN ./run.sh --once > $OUTDIR/official-runner.log 2>&1 &
 RPID=\$!
 
 for i in \$(seq 1 60); do
   sleep 2
-  STATUS=\$(curl -s -H 'Authorization: Bearer preloop-system-token' http://127.0.0.1/api/v1/runs/\$RUN_ID | python3 -c \"import json,sys; print(json.load(sys.stdin).get('status','unknown'))\" 2>/dev/null || echo error)
+  STATUS=\$(curl -s -H 'Authorization: Bearer '$TOKEN_QUOTED http://127.0.0.1/api/v1/runs/\$RUN_ID | python3 -c \"import json,sys; print(json.load(sys.stdin).get('status','unknown'))\" 2>/dev/null || echo error)
   if [ \"\$STATUS\" = completed ] || [ \"\$STATUS\" = success ] || [ \"\$STATUS\" = failed ]; then
     echo \"Run: \$STATUS\"
     break
   fi
 done
 
-curl -s -H 'Authorization: Bearer preloop-system-token' http://127.0.0.1/api/v1/runs/\$RUN_ID > $OUTDIR/run-result.json
-curl -s -H 'Authorization: Bearer preloop-system-token' http://127.0.0.1/api/v1/runs/\$RUN_ID/logs > $OUTDIR/run-logs.txt
+curl -s -H 'Authorization: Bearer '$TOKEN_QUOTED http://127.0.0.1/api/v1/runs/\$RUN_ID > $OUTDIR/run-result.json
+curl -s -H 'Authorization: Bearer '$TOKEN_QUOTED http://127.0.0.1/api/v1/runs/\$RUN_ID/logs > $OUTDIR/run-logs.txt
 wait \$RPID 2>/dev/null || true
 echo 'Runner done'
 "

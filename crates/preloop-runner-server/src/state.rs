@@ -753,8 +753,22 @@ impl AppState {
         let (keypair_result, oidc_result) = tokio::join!(keypair_handle, oidc_handle);
         let keypair = keypair_result??;
         let oidc_keypair = oidc_result??;
-        let system_token = env::var("PRELOOP_SYSTEM_TOKEN")
-            .unwrap_or_else(|_| DEFAULT_PRELOOP_SYSTEM_TOKEN.to_owned());
+        let token_dir = crate::credential_store::engine_token_dir(&state_dir);
+        let configured_token = env::var("PRELOOP_SYSTEM_TOKEN").ok();
+        #[cfg(test)]
+        let system_token = {
+            let configured_token =
+                configured_token.or_else(|| Some(DEFAULT_PRELOOP_SYSTEM_TOKEN.to_owned()));
+            let store = crate::credential_store::MemoryCredentialStore::default();
+            crate::credential_store::resolve_engine_token_with_store(
+                &token_dir,
+                configured_token,
+                &store,
+            )?
+        };
+        #[cfg(not(test))]
+        let system_token =
+            crate::credential_store::resolve_engine_token(&token_dir, configured_token)?;
         #[cfg(test)]
         let local_jwt_key = TEST_LOCAL_JWT_KEY.to_vec();
         #[cfg(not(test))]

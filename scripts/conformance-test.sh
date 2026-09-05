@@ -27,7 +27,10 @@ echo ""
 echo "Starting preloop server..."
 WEBHOOK_SECRET="conformance-test-secret"
 TEST_API_TOKEN="conformance-test-api-token"
+SYSTEM_TOKEN="${PRELOOP_SYSTEM_TOKEN:-$(python3 -c 'import secrets; print(secrets.token_hex(32))')}"
+
 PRELOOP_LOCAL_WORKSPACE="$TEMP_DIR/workspace" \
+PRELOOP_SYSTEM_TOKEN="$SYSTEM_TOKEN" \
 PRELOOP_WEBHOOK_SECRET="$WEBHOOK_SECRET" \
 "$PROJECT_ROOT/target/debug/preloop-server" serve \
   --listen 127.0.0.1:9199 \

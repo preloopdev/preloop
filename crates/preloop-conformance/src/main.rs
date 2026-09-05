@@ -561,6 +561,7 @@ async fn run_runner_e2e(
     std::fs::create_dir_all(&state_dir)?;
     std::fs::create_dir_all(&runner_root)?;
 
+    let system_token = format!("preloop-conformance-{}", uuid::Uuid::new_v4());
     // Pre-seed any private action references locally before starting the server
     preseed_private_actions(&workflow, &state_dir)?;
 
@@ -568,6 +569,7 @@ async fn run_runner_e2e(
     let mut server_cmd = Command::new(server_bin);
     server_cmd
         .env("PRELOOP_PUBLIC_URL", &server_url)
+        .env("PRELOOP_SYSTEM_TOKEN", &system_token)
         // The goldens carry real GitHub-issued registration tokens this
         // control plane cannot verify; the harness is the one sanctioned
         // consumer of the permissive policy.
@@ -645,6 +647,7 @@ async fn run_runner_e2e(
 
     // Submit workflow
     let submit_output = Command::new(client_bin)
+        .env("PRELOOP_SYSTEM_TOKEN", &system_token)
         .args(["--server", &server_url, "submit", "-W"])
         .arg(&submit_workflow_path)
         .output()
@@ -665,8 +668,7 @@ async fn run_runner_e2e(
     // Loop runner until the run reaches a terminal status (handles multi-job workflows).
     let terminal = ["completed", "success", "failed", "cancelled"];
     let run_status_url = format!("{server_url}/api/v1/runs/{run_id}");
-    let native_api_token =
-        std::env::var("PRELOOP_SYSTEM_TOKEN").unwrap_or_else(|_| "preloop-system-token".to_owned());
+    let native_api_token = &system_token;
     let mut run_status = "unknown".to_string();
     let mut last_runner_status = None::<bool>;
     for _ in 0..50 {
@@ -681,7 +683,7 @@ async fn run_runner_e2e(
         // Poll run status
         if let Ok(resp) = client
             .get(&run_status_url)
-            .bearer_auth(&native_api_token)
+            .bearer_auth(native_api_token)
             .send()
             .await
         {

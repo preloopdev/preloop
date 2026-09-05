@@ -13,6 +13,10 @@ OFFICIAL_RUNNER_HOST="${OFFICIAL_RUNNER_HOST:-$HOME/cachingv4}"
 PRELOOP_SERVER_BIN="$REPO_ROOT/target/aarch64-unknown-linux-musl/release/preloop-server"
 GH_REPO="${GH_REPO:-preloopdev/preloop-conformance-sample}"
 RESULTS_DIR="$REPO_ROOT/benchmarks/compatibility/server/behavior"
+if [[ -z "${PRELOOP_SYSTEM_TOKEN:-}" ]]; then
+    export PRELOOP_SYSTEM_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+fi
+
 
 red()   { printf '\033[1;31m%s\033[0m\n' "$*"; }
 green() { printf '\033[1;32m%s\033[0m\n' "$*"; }
@@ -47,7 +51,7 @@ run_scenario() {
     smolvm machine cp "$PRELOOP_SERVER_BIN" "$vm:/usr/local/bin/preloop-server" >/dev/null 2>&1
 
     local output
-    output=$(smolvm machine exec --name "$vm" -- bash -lc "
+    output=$(smolvm machine exec --name "$vm" --secret-env PRELOOP_SYSTEM_TOKEN=PRELOOP_SYSTEM_TOKEN -- bash -lc "
         set -u
         chmod +x /usr/local/bin/preloop-server
         RUST_LOG=info PRELOOP_PUBLIC_URL=http://127.0.0.1 preloop-server serve --listen 0.0.0.0:80 > /tmp/server.log 2>&1 &
@@ -61,7 +65,7 @@ run_scenario() {
 
         RESULT=\$(wget -qO- --post-file=/workspace/benchmarks/compatibility/server/behavior/payload-${scenario}.json \\
             --header='Content-Type: application/json' \
-            --header='Authorization: Bearer preloop-system-token' \
+            --header="Authorization: Bearer \$PRELOOP_SYSTEM_TOKEN" \
             http://127.0.0.1/api/v1/runs 2>/dev/null)
         echo "SUBMISSION: \$RESULT"
         RUN_ID=\$(echo "\$RESULT" | python3 -c 'import sys,json; print(json.load(sys.stdin)["run_id"])')
@@ -71,16 +75,16 @@ run_scenario() {
         rm -f /tmp/runner/.runner /tmp/runner/.credentials /tmp/runner/.credentials_rsaparams
         rm -rf /tmp/runner/_work; mkdir -p /tmp/runner/_work
         cd /tmp/runner
-        ./config.sh --unattended --url 'http://127.0.0.1' --token 'preloop-system-token' \
+        ./config.sh --unattended --url 'http://127.0.0.1' --token "\$PRELOOP_SYSTEM_TOKEN" \
             --name 'batch-test' --labels 'self-hosted,linux,x64' --work _work --replace --ephemeral > /tmp/config.log 2>&1
         rm -rf _work; mkdir -p _work
-        timeout 180 ./run.sh > /tmp/runner.log 2>&1
+        env -u PRELOOP_SYSTEM_TOKEN timeout 180 ./run.sh > /tmp/runner.log 2>&1
         runner_rc=\$?
         echo "RUNNER_EXIT: \$runner_rc"
         cat /tmp/runner.log
 
         echo '---RESULT---'
-        wget -qO /tmp/status.json --header='Authorization: Bearer preloop-system-token' \
+        wget -qO /tmp/status.json --header="Authorization: Bearer \$PRELOOP_SYSTEM_TOKEN" \
             "http://127.0.0.1/api/v1/runs/\$RUN_ID" 2>/dev/null
         cat /tmp/status.json | python3 -c '
 import sys, json

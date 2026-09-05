@@ -339,6 +339,16 @@ steps.
 | `PRELOOP_GITHUB_API_URL` | Override the GitHub API base (tests, GHES) |
 | `PRELOOP_WEBHOOK_SECRET` | Webhook signature secret (the server's only source of truth for repo hooks) |
 
+### Engine token storage
+
+The native API administrator token is generated on first engine startup when
+`PRELOOP_SYSTEM_TOKEN` is not set. Preloop stores it in the operating system's
+credential store, scoped to the engine home. On hosts without an available or
+readable OS credential service, it uses `$PRELOOP_HOME/engine.token` with private
+permissions instead. Managed CLI commands read this token automatically; do
+not commit or print the file. Set `PRELOOP_SYSTEM_TOKEN` explicitly for a
+separate client or service.
+
 ## Quick examples
 
 ```sh

@@ -2025,8 +2025,8 @@ async fn replay_flows_to_preloop(
         .parent()
         .unwrap_or(out_dir)
         .join("official-filtered");
-    let native_token =
-        std::env::var("PRELOOP_SYSTEM_TOKEN").unwrap_or_else(|_| "preloop-system-token".to_owned());
+    let native_token = std::env::var("PRELOOP_SYSTEM_TOKEN")
+        .context("PRELOOP_SYSTEM_TOKEN must be set for runner-watch replay")?;
     // Runs are submitted by materialize before the replay starts; they must
     // be cancelled on EVERY exit from here on — including a materialization
     // or replay error — or the next scenario's acquire picks up this
@@ -2759,8 +2759,8 @@ async fn materialize_replay_state(
         return Ok(());
     }
 
-    let native_api_token =
-        std::env::var("PRELOOP_SYSTEM_TOKEN").unwrap_or_else(|_| "preloop-system-token".to_owned());
+    let native_api_token = std::env::var("PRELOOP_SYSTEM_TOKEN")
+        .context("PRELOOP_SYSTEM_TOKEN must be set for runner-watch replay")?;
     let submissions = replay_workflow_submissions(golden_dir, scenario_root)?;
     // Idle scenarios have no submit_workflow steps — skip job creation.
     // The replay will use the golden capture's message responses directly.
@@ -4180,6 +4180,7 @@ mod tests {
     /// swallowed (`let _ =`), so queued runs cannot silently survive.
     #[tokio::test]
     async fn replay_surfaces_failed_cancellation_instead_of_silently_succeeding() {
+        std::env::set_var("PRELOOP_SYSTEM_TOKEN", "runner-watch-test-token");
         let temp = TestTemp::new("cancel-failure");
         let (golden, out, scenario_root) = replay_scenario_fixture(&temp, false);
         let cancels = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -4212,6 +4213,7 @@ mod tests {
     /// submissions: leftover queued runs contaminate the next scenario.
     #[tokio::test]
     async fn replay_cancels_runs_even_when_the_replay_errors() {
+        std::env::set_var("PRELOOP_SYSTEM_TOKEN", "runner-watch-test-token");
         let temp = TestTemp::new("cancel-on-error");
         let (golden, out, scenario_root) = replay_scenario_fixture(&temp, true);
         let cancels = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));

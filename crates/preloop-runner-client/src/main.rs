@@ -13,6 +13,29 @@ use serde_json::Value;
 
 const MAX_REUSABLE_WORKFLOW_DEPTH: usize = 4;
 
+fn resolve_native_api_token(server: &Url) -> anyhow::Result<String> {
+    if let Ok(token) = env::var("PRELOOP_SYSTEM_TOKEN") {
+        return Ok(token);
+    }
+
+    let is_local_server = matches!(server.host_str(), Some("127.0.0.1" | "localhost" | "::1"));
+    if is_local_server {
+        let storage_dir = env::var_os("PRELOOP_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(".preloop"));
+        if let Some(token) =
+            preloop_runner_server::credential_store::load_engine_token(&storage_dir)
+                .context("load local engine token")?
+        {
+            return Ok(token);
+        }
+    }
+
+    anyhow::bail!(
+        "PRELOOP_SYSTEM_TOKEN must be set for runner-client (automatic discovery is limited to local servers)"
+    );
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "preloop")]
 #[command(about = "Submit and manage local Preloop GitHub Actions runs")]
@@ -88,8 +111,6 @@ enum Command {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
-    let native_api_token =
-        env::var("PRELOOP_SYSTEM_TOKEN").unwrap_or_else(|_| "preloop-system-token".to_owned());
     let cli = Cli::parse();
     let timeout_seconds = env::var("PRELOOP_CLIENT_TIMEOUT_SECONDS")
         .ok()
@@ -115,6 +136,7 @@ async fn main() -> anyhow::Result<()> {
             debug,
             debugger_welcome_message,
         } => {
+            let native_api_token = resolve_native_api_token(&cli.server)?;
             let workflow_yaml = tokio::fs::read_to_string(&workflow)
                 .await
                 .with_context(|| format!("read workflow {}", workflow.display()))?;
@@ -158,7 +180,7 @@ async fn main() -> anyhow::Result<()> {
             };
             let mut request = http
                 .post(cli.server.join("/api/v1/runs")?)
-                .bearer_auth(&native_api_token);
+                .bearer_auth(native_api_token);
             // Hand the workspace to the server so it can snapshot the local
             // tree and redirect default-source checkout steps to the snapshot
             // (mirrors `preloop run`). Without this, `actions/checkout` with no
@@ -181,39 +203,43 @@ async fn main() -> anyhow::Result<()> {
             println!("{response}");
         }
         Command::Run { run_id } => {
+            let native_api_token = resolve_native_api_token(&cli.server)?;
             print_response(
                 http.get(cli.server.join(&format!("/api/v1/runs/{run_id}"))?)
-                    .bearer_auth(&native_api_token)
+                    .bearer_auth(native_api_token)
                     .send()
                     .await?,
             )
             .await?;
         }
         Command::Cancel { run_id } => {
+            let native_api_token = resolve_native_api_token(&cli.server)?;
             print_response(
                 http.post(cli.server.join(&format!("/api/v1/runs/{run_id}/cancel"))?)
-                    .bearer_auth(&native_api_token)
+                    .bearer_auth(native_api_token)
                     .send()
                     .await?,
             )
             .await?;
         }
         Command::Rerun { run_id } => {
+            let native_api_token = resolve_native_api_token(&cli.server)?;
             print_response(
                 http.post(cli.server.join(&format!("/api/v1/runs/{run_id}/rerun"))?)
-                    .bearer_auth(&native_api_token)
+                    .bearer_auth(native_api_token)
                     .send()
                     .await?,
             )
             .await?;
         }
         Command::Events { run_id } => {
+            let native_api_token = resolve_native_api_token(&cli.server)?;
             print_response(
                 http.get(
                     cli.server
                         .join(&format!("/api/v1/runs/{run_id}/events.ndjson"))?,
                 )
-                .bearer_auth(&native_api_token)
+                .bearer_auth(native_api_token)
                 .send()
                 .await?,
             )

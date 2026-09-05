@@ -11,6 +11,11 @@ RUNNER_DIR="/tmp/preloop-e2e-runner"
 RUNNER_BIN="$REPO_ROOT/target/release/preloop-runner"
 SERVER_BIN="$REPO_ROOT/target/release/preloop-server"
 VERBOSE="${2:-}"
+if [[ -z "${PRELOOP_SYSTEM_TOKEN:-}" ]]; then
+  export PRELOOP_SYSTEM_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+fi
+SYSTEM_TOKEN="$PRELOOP_SYSTEM_TOKEN"
+
 
 red()   { printf '\033[1;31m%s\033[0m\n' "$*"; }
 green() { printf '\033[1;32m%s\033[0m\n' "$*"; }
@@ -33,7 +38,7 @@ WORKFLOW_YAML=$(cat "$WORKFLOW_FILE")
 info "Starting server on port $SERVER_PORT..."
 pkill -f "preloop-server.*${SERVER_PORT}" 2>/dev/null || true
 sleep 1
-RUST_LOG=info PRELOOP_PUBLIC_URL="$SERVER_URL" "$SERVER_BIN" serve --listen "0.0.0.0:${SERVER_PORT}" > /tmp/preloop-e2e-server.log 2>&1 &
+RUST_LOG=info PRELOOP_PUBLIC_URL="$SERVER_URL" PRELOOP_SYSTEM_TOKEN="$SYSTEM_TOKEN" "$SERVER_BIN" serve --listen "0.0.0.0:${SERVER_PORT}" > /tmp/preloop-e2e-server.log 2>&1 &
 SERVER_PID=$!
 sleep 2
 
@@ -51,7 +56,7 @@ cd "$RUNNER_DIR"
 info "Configuring runner..."
 "$RUNNER_BIN" configure \
   --url "$SERVER_URL" \
-  --token preloop-system-token \
+  --token "$SYSTEM_TOKEN" \
   --name e2e-runner \
   --labels self-hosted,macOS,ARM64 \
   --work _work \
@@ -73,7 +78,7 @@ print(json.dumps({
 
 RESULT=$(curl -s -X POST "$SERVER_URL/api/v1/runs" \
   -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer preloop-system-token' \
+  -H "Authorization: Bearer $SYSTEM_TOKEN" \
   -d "$PAYLOAD")
 RUN_ID=$(echo "$RESULT" | python3 -c 'import sys,json; print(json.load(sys.stdin)["run_id"])')
 info "Run submitted: $RUN_ID"
@@ -88,7 +93,7 @@ RUST_LOG=$LOG_LEVEL perl -e 'alarm 120; exec @ARGV' -- "$RUNNER_BIN" run --once 
 
 # Check result
 FINAL=$(curl -s "$SERVER_URL/api/v1/runs/$RUN_ID" \
-  -H 'Authorization: Bearer preloop-system-token')
+  -H "Authorization: Bearer $SYSTEM_TOKEN")
 STATUS=$(echo "$FINAL" | python3 -c 'import sys,json; print(json.load(sys.stdin)["status"])')
 
 echo ""
