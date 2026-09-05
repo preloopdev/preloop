@@ -45,7 +45,7 @@ pub(crate) async fn require_results_bearer(
         return Ok(next.run(request).await);
     }
     let Some(identity) =
-        bearer_token(&request).and_then(|token| results_identity(&shared.state, token))
+        bearer_token(&request).and_then(|token| results_identity(&shared.state, token).ok())
     else {
         return Err(ApiError::unauthorized("results-service job token required"));
     };
@@ -354,19 +354,61 @@ pub(crate) enum ResultsIdentity {
     Job(ResultsJobIdentity),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResultsIdentityError {
+    /// The bearer is signed locally but does not identify a Results job.
+    NotJob,
+    /// A job-shaped bearer has a valid job subject but malformed Results claims.
+    MalformedJob,
+    /// A job-shaped bearer has an invalid job subject.
+    MalformedJobSubject,
+    /// A valid job subject is paired with a non-Results scope.
+    MalformedScope,
+    /// The bearer is not a valid local JWT.
+    Invalid,
+}
+
 /// Parse the Results bearer into the identity handlers must authorize against.
 ///
 /// Requiring both the `sub` and the full Results scope to agree prevents a
 /// valid local JWT minted for one protocol surface from being repurposed as a
-/// different job's Results credential.
-pub(crate) fn results_identity(state: &AppState, bearer: &str) -> Option<ResultsIdentity> {
+/// different job's Results credential. The error distinguishes a malformed
+/// job-shaped token so cache writes can retain their fail-closed behavior.
+pub(crate) fn results_identity(
+    state: &AppState,
+    bearer: &str,
+) -> Result<ResultsIdentity, ResultsIdentityError> {
     if bearer == state.system_token {
-        return Some(ResultsIdentity::System);
+        return Ok(ResultsIdentity::System);
     }
 
-    let claims = state.verify_local_jwt_claims(bearer)?;
-    let (plan_id, job_id) = AppState::results_job_from_payload(&claims)?;
-    Some(ResultsIdentity::Job(ResultsJobIdentity { plan_id, job_id }))
+    let claims = state
+        .verify_local_jwt_claims(bearer)
+        .ok_or(ResultsIdentityError::Invalid)?;
+    let job_shaped = claims
+        .get("sub")
+        .and_then(|value| value.as_str())
+        .is_some_and(|subject| subject.starts_with("preloop-job-"))
+        && claims
+            .get("scp")
+            .and_then(|value| value.as_str())
+            .is_some_and(|scope| scope.starts_with("Actions.Results:"));
+    let parsed = AppState::results_job_from_payload(&claims);
+    let Some((plan_id, job_id)) = parsed else {
+        let subject_is_job = claims
+            .get("sub")
+            .and_then(|value| value.as_str())
+            .and_then(|subject| subject.strip_prefix("preloop-job-"))
+            .and_then(|job| job.parse::<uuid::Uuid>().ok())
+            .is_some();
+        return Err(match (job_shaped, subject_is_job) {
+            (true, true) => ResultsIdentityError::MalformedJob,
+            (true, false) => ResultsIdentityError::MalformedJobSubject,
+            (false, true) => ResultsIdentityError::MalformedScope,
+            (false, false) => ResultsIdentityError::NotJob,
+        });
+    };
+    Ok(ResultsIdentity::Job(ResultsJobIdentity { plan_id, job_id }))
 }
 
 pub(crate) fn results_identity_binds_job(
