@@ -239,25 +239,29 @@ impl ToolchainLayer {
             Self::Go(_) => "go",
         }
     }
+
+    /// Shell predicate proving this exact layer is usable.
+    pub fn verify_command(&self) -> String {
+        match self {
+            Self::Rust(channel) => {
+                let channel = safe_component(channel);
+                format!(
+                    "command -v cargo >/dev/null && \
+                     rustup run {channel} rustc --version >/dev/null && \
+                     rustup run {channel} cargo-fmt --version >/dev/null && \
+                     rustup run {channel} cargo-clippy --version >/dev/null"
+                )
+            }
+            _ => format!("command -v {} >/dev/null", self.verify_binary()),
+        }
+    }
 }
 
-/// The fixed set of toolchains baked into every golden.
-///
-/// Deliberately not workspace-derived. The base install script already bakes
-/// the GitHub-hosted parity toolset (node/python/go toolcaches, git, git-lfs,
-/// docker, nvm, yarn — see `base_install_script`), so per-project version
-/// files add nothing there. Rust is the one toolchain the base bake lacks,
-/// so it is baked for everyone — pinned for CI-Bench reproducibility — and Go
-/// rides along at the corpus-pinned version so per-job VMs stay identical.
-/// `setup-*` actions download any other version a job asks for at job time —
-/// the same model GitHub-hosted runners use.
+/// Toolchains missing from the stock Ubuntu base and therefore baked once
+/// into the reusable golden instead of installed in every ephemeral job VM.
 pub fn curated_toolchains() -> Vec<ToolchainLayer> {
-    // CI-Bench pins its corpus toolchains: Rust 1.88.0 (the version every
-    // task was authored and validated against) and Go 1.26.x. Baking them
-    // into every golden keeps the per-job VMs identical instead of
-    // re-installing per job.
     vec![
-        ToolchainLayer::Rust("1.88.0".into()),
+        ToolchainLayer::Rust(crate::RUST_TOOLCHAIN_VERSION.into()),
         ToolchainLayer::Go("1.26".into()),
     ]
 }
@@ -269,10 +273,10 @@ pub fn curated_toolchains() -> Vec<ToolchainLayer> {
 /// reason anyone recorded. These pins are the provenance: bumping one is a
 /// deliberate, reviewable change. Digests are the registry manifest-list
 /// digests, valid for both x86_64 and arm64 guests.
-/// Digest-pinned base images, declared in `versions.toml` (build.rs compiles
-/// the pins into constants — see `UBUNTU_24_04_BASE`/`UBUNTU_22_04_BASE`).
 pub const UBUNTU_24_04_PIN: &str = crate::UBUNTU_24_04_BASE;
 pub const UBUNTU_22_04_PIN: &str = crate::UBUNTU_22_04_BASE;
+pub const OFFICIAL_RUNNER_IMAGE_AMD64_PIN: &str = crate::OFFICIAL_RUNNER_IMAGE_BASE_AMD64;
+pub const OFFICIAL_RUNNER_IMAGE_ARM64_PIN: &str = crate::OFFICIAL_RUNNER_IMAGE_BASE_ARM64;
 
 /// The default base image for GitHub-runner-labelled jobs.
 pub const DEFAULT_BASE_IMAGE: &str = UBUNTU_24_04_PIN;
@@ -283,10 +287,6 @@ pub fn base_name(image_ref: &str) -> &str {
 }
 
 /// Whether an image reference is one of Preloop's stock Ubuntu bases.
-///
-/// Stock bases can still switch between the digest-pinned 22.04 and 24.04
-/// images when a queued job's `runs-on` labels require it. A custom OCI image
-/// or packed artifact is deliberately used for every job instead.
 pub fn is_stock_base_image(image_ref: &str) -> bool {
     matches!(
         base_name(image_ref),
@@ -297,6 +297,15 @@ pub fn is_stock_base_image(image_ref: &str) -> bool {
     )
 }
 
+/// Whether an image is one of Preloop's official GitHub runner snapshots.
+pub fn is_official_runner_image(image_ref: &str) -> bool {
+    matches!(
+        base_name(image_ref),
+        "ghcr.io/preloopdev/runner-images:ubuntu24-runner-large-latest"
+            | "ghcr.io/preloopdev/runner-images:ubuntu24-arm64-runner-large-latest"
+    )
+}
+
 /// Resolved base image and toolchains for one job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentSpec {
@@ -304,11 +313,7 @@ pub struct EnvironmentSpec {
     pub base: String,
     /// Sorted, deduplicated toolchain layers.
     pub toolchains: Vec<ToolchainLayer>,
-    /// Whether Preloop's curated toolchain bake applies to this base.
-    ///
-    /// True only for the stock digest-pinned Ubuntu bases: those get the
-    /// GitHub-hosted parity toolset layered on top. A custom base image is
-    /// the operator's contract — it is used as-is, without the bake.
+    /// Whether Preloop's complete package bake applies to this base.
     pub curated: bool,
     /// SHA-256 hex digest of the normalized base and toolchain list.
     pub fingerprint: String,
@@ -316,21 +321,18 @@ pub struct EnvironmentSpec {
 
 impl EnvironmentSpec {
     /// Build a normalized environment specification and compute its fingerprint.
-    ///
-    /// Explicit constructions are curated: callers that want the bare
-    /// treatment for a custom base use [`Self::for_base`].
     pub fn new(base: String, toolchains: Vec<ToolchainLayer>) -> Self {
         Self::from_parts(base, toolchains, true)
     }
 
     /// Resolve the environment for a base image.
     ///
-    /// Stock digest-pinned Ubuntu bases get Preloop's curated toolchain
-    /// bake; a custom base image is used exactly as given — the operator
-    /// chose it, so layering our toolset on top would break the contract.
+    /// Stock Ubuntu bases receive the complete Preloop package bake. Official
+    /// runner snapshots already contain that package set, so they receive only
+    /// the repository-pinned toolchains. Other custom images are used as-is.
     pub fn for_base(base: String) -> Self {
         let curated = is_stock_base_image(&base);
-        let toolchains = if curated {
+        let toolchains = if curated || is_official_runner_image(&base) {
             curated_toolchains()
         } else {
             Vec::new()
@@ -624,13 +626,20 @@ mod tests {
         );
     }
 
-    /// Stock bases get Preloop's curated toolchain bake; a custom base is
-    /// the operator's contract and must be used as-is.
+    /// Stock bases get Preloop's complete bake, official runner snapshots get
+    /// only pinned toolchains, and arbitrary custom images stay untouched.
     #[test]
-    fn for_base_curates_stock_but_never_custom_bases() {
+    fn for_base_selects_only_required_layers() {
         let stock = EnvironmentSpec::for_base(UBUNTU_24_04_PIN.to_owned());
         assert!(stock.curated, "stock bases must carry the curated bake");
         assert!(!stock.toolchains.is_empty());
+
+        let official = EnvironmentSpec::for_base(OFFICIAL_RUNNER_IMAGE_AMD64_PIN.to_owned());
+        assert!(
+            !official.curated,
+            "official images already contain packages"
+        );
+        assert_eq!(official.toolchains, curated_toolchains());
 
         let custom = EnvironmentSpec::for_base("ghcr.io/acme/runner:latest".to_owned());
         assert!(!custom.curated, "custom bases must not be curated");
@@ -643,7 +652,6 @@ mod tests {
             "the bake decision must invalidate the golden fingerprint"
         );
 
-        // The stock 22.04 pin curates too.
         assert!(EnvironmentSpec::for_base(UBUNTU_22_04_PIN.to_owned()).curated);
     }
 
@@ -657,10 +665,10 @@ mod tests {
             first.len(),
             "no duplicate toolchains"
         );
-        // Rust is the one toolchain the base bake does not cover, so it is
-        // the deliberate member of the curated set (pinned for CI-Bench
-        // reproducibility; Go rides along).
-        assert!(first.contains(&ToolchainLayer::Rust("1.88.0".into())));
+        // The repository CI pin is compiled from versions.toml and baked into
+        // stock goldens; changing it therefore changes the environment
+        // fingerprint and forces a rebuild.
+        assert!(first.contains(&ToolchainLayer::Rust(crate::RUST_TOOLCHAIN_VERSION.into())));
         assert!(first.contains(&ToolchainLayer::Go("1.26".into())));
     }
 

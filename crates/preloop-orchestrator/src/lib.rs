@@ -7,7 +7,8 @@ mod keys;
 pub mod node_externals;
 
 use crate::environment::{
-    curated_toolchains, is_stock_base_image, EnvironmentSpec, ToolchainLayer,
+    curated_toolchains, is_official_runner_image, is_stock_base_image, EnvironmentSpec,
+    ToolchainLayer,
 };
 use crate::keys::{KeyPool, StagedKey};
 use preloop_gha_protocol::RUNNER_BUSY_SENTINEL;
@@ -2940,18 +2941,19 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         };
         self.provider.create(&spec).await?;
         self.provider.start(&name).await?;
-        // A custom base image is the operator's contract: use it as-is. Only
-        // the stock digest-pinned Ubuntu bases get the curated bake (the
-        // GitHub-hosted parity toolset — node/python/go toolcaches, git,
-        // docker, nvm, yarn — plus the Rust layer; `setup-*` actions download
-        // any other version a job asks for at job time).
-        if is_stock_base_image(&self.config.base_image) {
+        // Plain Ubuntu needs the hosted-runner package baseline. Official
+        // runner snapshots already contain it. Both receive the small,
+        // repository-pinned toolchain layer once while the artifact is built.
+        let stock_base = is_stock_base_image(&self.config.base_image);
+        let official_base = is_official_runner_image(&self.config.base_image);
+        if stock_base {
             if let Err(error) = install_base_dependencies(self.provider.as_ref(), &name).await {
                 let _ = self.provider.delete(&name).await;
                 return Err(error);
             }
-            let toolchains = curated_toolchains();
-            for layer in &toolchains {
+        }
+        if stock_base || official_base {
+            for layer in curated_toolchains() {
                 for command in layer.install_commands() {
                     if let Err(error) = self.provider.exec(&name, &command).await {
                         let _ = self.provider.delete(&name).await;
@@ -4823,9 +4825,7 @@ async fn verify_toolchain_installed<P: VmProvider>(
     name: &MachineName,
     layer: &ToolchainLayer,
 ) -> Result<(), OrchestratorError> {
-    let binary = layer.verify_binary();
-    let mut command = vec!["sh".to_owned(), "-c".to_owned()];
-    command.push(format!("command -v {binary}"));
+    let command = vec!["sh".to_owned(), "-c".to_owned(), layer.verify_command()];
     if let Err(error) = provider.exec(name, &command).await {
         return Err(OrchestratorError::Vm(error));
     }
@@ -6099,7 +6099,7 @@ chmod +x "$dest/bin/node"
             let mut absent = self.absent_binary.lock().await;
             if let Some(binary) = *absent {
                 let probe = format!("command -v {binary}");
-                if argv.contains(&probe) {
+                if argv.iter().any(|arg| arg.contains(&probe)) {
                     return Err(test_error("binary-not-found"));
                 }
                 // An install command that names the binary lands it on PATH.
