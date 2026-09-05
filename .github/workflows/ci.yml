@@ -30,7 +30,6 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-          lfs: true
       - name: Materialize conformance goldens
         run: |
           git lfs pull --include=".runner-watch/golden/**"
@@ -40,8 +39,6 @@ jobs:
             echo "LFS fixture was not materialized: $fixture" >&2
             exit 1
           fi
-
-
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - run: cargo fmt --all --check
@@ -60,7 +57,6 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-          lfs: true
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Verify concurrency_properties filter matches at least one test
@@ -157,7 +153,6 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-          lfs: true
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Verify concurrency_properties filter matches at least one test
