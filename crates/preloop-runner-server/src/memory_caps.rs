@@ -121,12 +121,10 @@ pub(crate) fn now_unix() -> i64 {
 /// recovered from only the scope suffix.
 pub(crate) fn job_backend_id_from_bearer(state: &AppState, headers: &HeaderMap) -> Option<String> {
     let token = bearer_from_headers(headers)?;
-    if token == state.system_token {
-        return None;
+    match results_identity(state, token).ok()? {
+        ResultsIdentity::System => None,
+        ResultsIdentity::Job(identity) => Some(identity.job_id.to_string()),
     }
-    state
-        .results_job_from_token(token)
-        .map(|(_, job_id)| job_id.to_string())
 }
 // ─── Retention helpers ───────────────────────────────────────────────────────
 //

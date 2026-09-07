@@ -124,18 +124,6 @@ impl AppState {
         mac.verify_slice(&provided).is_ok()
     }
 
-    pub(crate) fn verify_local_jwt_scope(&self, token: &str, expected_scope: &str) -> bool {
-        self.verify_local_jwt_claims(token)
-            .and_then(|payload| {
-                payload
-                    .get("scp")
-                    .and_then(|value| value.as_str())
-                    .map(str::to_owned)
-            })
-            .as_deref()
-            == Some(expected_scope)
-    }
-
     pub(crate) fn runner_id_from_token(&self, token: &str) -> Option<i64> {
         let payload = self.verify_local_jwt_claims(token)?;
         let scope = payload.get("scp")?.as_str()?;
