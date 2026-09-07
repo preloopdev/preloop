@@ -7514,14 +7514,16 @@ async fn results_surfaces_agree_on_alternate_uuid_scope_spelling() {
         "job-shaped malformed claims must keep cache writes fail-closed"
     );
     // Before centralization, the OIDC surface compared the raw scope string,
-    // so this valid Results identity was rejected.
+    // so this valid Results identity was rejected: the scope spells the job
+    // UUID uppercase while the path uses the canonical lowercase spelling.
+    // (Using the same spelling in both would compare equal pre-centralization
+    // and prove nothing.)
     let oidc_status = status_with_bearer(
         &app,
         &alternate_scope_token,
         Method::GET,
         &format!(
-            "/runner/server/_apis/distributedtask/hubs/actions/plans/{plan_id}/jobs/{}/oidctoken",
-            agent_job_id.to_string().to_uppercase()
+            "/runner/server/_apis/distributedtask/hubs/actions/plans/{plan_id}/jobs/{agent_job_id}/oidctoken"
         ),
         Value::Null,
     )
