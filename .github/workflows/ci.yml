@@ -32,6 +32,7 @@ jobs:
           persist-credentials: false
       - name: Materialize conformance goldens
         run: |
+          git lfs install --local
           git lfs pull --include=".runner-watch/golden/**"
           fixture=".runner-watch/golden/v2.335.1/06-multi-step/flows.jsonl"
           test -s "$fixture"
