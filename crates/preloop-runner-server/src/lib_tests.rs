@@ -5003,12 +5003,8 @@ async fn job_message_carries_github_token_as_a_secret() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
-    let runner_token = state
-        .local_jwt(json!({
-            "sub": "preloop-runner-listen-1",
-            "scp": "ActionsRuntime.RunnerListen",
-        }))
-        .unwrap();
+    let (_runner_id, runner_token) =
+        register_runner_with_token(&app, "runner-1", &["self-hosted"], None).await;
 
     let accepted = request_json(
         &app,
@@ -5097,12 +5093,8 @@ async fn environment_secrets_override_repo_and_global_per_job() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
-    let runner_token = state
-        .local_jwt(json!({
-            "sub": "preloop-runner-listen-1",
-            "scp": "ActionsRuntime.RunnerListen",
-        }))
-        .unwrap();
+    let (_runner_id, runner_token) =
+        register_runner_with_token(&app, "runner-1", &["self-hosted"], None).await;
 
     // Seed the three stored tiers with the same name so precedence is
     // observable, plus a name that exists only in the environment tier.
@@ -5306,6 +5298,13 @@ async fn current_service_broker_flow_uses_queued_job() {
             "scp": "ActionsRuntime.RunnerListen",
         }))
         .unwrap();
+    let _runner = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/Agent/1/0",
+        json!({"name": "runner-1", "version": "2.335.1"}),
+    )
+    .await;
 
     let workflow = "on:
   push:
@@ -5446,6 +5445,32 @@ jobs:
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let duplicate_completion = status_with_bearer(
+        &app,
+        &runner_token,
+        Method::POST,
+        "/broker/1/completejob",
+        json!({"jobId": runner_request_id, "planId": acquired["plan"]["planId"]}),
+    )
+    .await;
+    assert_eq!(
+        duplicate_completion,
+        StatusCode::NO_CONTENT,
+        "broker completion retries are idempotent"
+    );
+    let renew_after_completion = status_with_bearer(
+        &app,
+        &runner_token,
+        Method::POST,
+        "/broker/1/renewjob",
+        json!({"jobId": runner_request_id, "planId": acquired["plan"]["planId"]}),
+    )
+    .await;
+    assert_eq!(
+        renew_after_completion,
+        StatusCode::CONFLICT,
+        "completed broker requests cannot be renewed"
+    );
     let completed_run = request_json(
         &app,
         Method::GET,
@@ -7427,30 +7452,26 @@ async fn artifact_v2_ownership_is_enforced_by_runtime_token_scope() {
 async fn disttask_message_delete_stays_reachable_for_protocol_tokens() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
-    let runtime_token = state.mint_runtime_token("plan-ack", &uuid::Uuid::new_v4());
-    let app = app(state, CancellationToken::new());
-
+    let app = app(state.clone(), CancellationToken::new());
+    let (runner_id, listen_token) =
+        register_runner_with_token(&app, "message-ack-runner", &["self-hosted"], None).await;
+    let (_, session) = create_disttask_session(&app, &listen_token, runner_id).await;
+    assert!(session.get("sessionId").and_then(Value::as_str).is_some());
+    let session_id = session["sessionId"].as_str().unwrap();
     let status = status_with_bearer(
         &app,
-        &runtime_token,
+        &listen_token,
         Method::DELETE,
-        "/runner/server/_apis/distributedtask/pools/1/messages/7?sessionId=session-1",
+        &format!("/runner/server/_apis/distributedtask/pools/1/messages/7?sessionId={session_id}"),
         Value::Null,
     )
     .await;
     assert_eq!(
         status,
         StatusCode::NO_CONTENT,
-        "message ack must stay on the distributedtask prefix under the protocol guard"
+        "message ack must stay on the distributedtask prefix under the runner protocol guard"
     );
 }
-
-/// Plan 000 step 4 probe. The gate counter must move only when a *job
-/// lifecycle* call (renewjob/completejob) arrives on the bare listen token —
-/// the credential Plan 004's fencing carrier assumes cannot appear there.
-/// `acquirejob` and message claims use the listen token by construction, so
-/// counting them in the same place would make the "gate stays zero" check
-/// unfalsifiable.
 #[tokio::test]
 async fn listener_token_probe_gates_only_job_lifecycle_calls() {
     use std::sync::atomic::Ordering::Relaxed;
@@ -7458,12 +7479,8 @@ async fn listener_token_probe_gates_only_job_lifecycle_calls() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
-    let listen_token = state
-        .local_jwt(json!({
-            "sub": "preloop-runner-listen-1",
-            "scp": "ActionsRuntime.RunnerListen",
-        }))
-        .unwrap();
+    let (runner_id, listen_token) =
+        register_runner_with_token(&app, "runner-1", &["self-hosted"], None).await;
 
     let workflow =
         "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
@@ -7475,7 +7492,7 @@ async fn listener_token_probe_gates_only_job_lifecycle_calls() {
         Method::POST,
         "/runner/server/_apis/distributedtask/pools/1/sessions",
         json!({
-            "agent": {"id": 1, "name": "runner-1"},
+            "agent": {"id": runner_id, "name": "runner-1"},
             "ownerName": "owner",
             "sessionId": "00000000-0000-0000-0000-000000000000",
             "useFipsEncryption": false
@@ -7516,7 +7533,7 @@ async fn listener_token_probe_gates_only_job_lifecycle_calls() {
     let acquired = request_json_with_bearer(
         &app,
         Method::POST,
-        "/broker/1/acquirejob",
+        &format!("/broker/{runner_id}/acquirejob"),
         acquire,
         &listen_token,
     )
@@ -7537,7 +7554,7 @@ async fn listener_token_probe_gates_only_job_lifecycle_calls() {
     let renewed = request_json_with_bearer(
         &app,
         Method::POST,
-        "/broker/1/renewjob",
+        &format!("/broker/{runner_id}/renewjob"),
         renew.clone(),
         &runtime_token,
     )
@@ -7553,7 +7570,7 @@ async fn listener_token_probe_gates_only_job_lifecycle_calls() {
     let renewed = request_json_with_bearer(
         &app,
         Method::POST,
-        "/broker/1/renewjob",
+        &format!("/broker/{runner_id}/renewjob"),
         renew,
         &listen_token,
     )
@@ -7565,7 +7582,7 @@ async fn listener_token_probe_gates_only_job_lifecycle_calls() {
         &app,
         &listen_token,
         Method::POST,
-        "/broker/1/completejob",
+        &format!("/broker/{runner_id}/completejob"),
         json!({"jobId": agent_job_id.to_string(), "planId": plan_id, "conclusion": "succeeded"}),
     )
     .await;
@@ -7655,6 +7672,10 @@ async fn legacy_runner_aliases_require_registration_and_bound_runner_credentials
     .await;
     let manage = registration["token"].as_str().unwrap();
     let registration_paths = [
+        (
+            "/runner/server/_apis/distributedtask/pools/1/agents",
+            "distributedtask",
+        ),
         ("/runner/server/_apis/v1/Agent/1/0", "runner-server"),
         ("/_apis/v1/Agent/1/0", "root"),
         ("/contoso/_apis/v1/Agent/1/0", "org"),
@@ -7680,7 +7701,7 @@ async fn legacy_runner_aliases_require_registration_and_bound_runner_credentials
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/_apis/v1/Agent/1/0")
+                .uri("/runner/server/_apis/distributedtask/pools/1/agents")
                 .header("x-preloop-provision-token", "one-time-provision")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -19430,12 +19451,8 @@ jobs:
     let runner_request_id = broker_body["runner_request_id"]
         .as_str()
         .expect("broker message should identify the queued request");
-    let runner_token = state
-        .local_jwt(json!({
-            "sub": "preloop-runner-listen-1",
-            "scp": "ActionsRuntime.RunnerListen",
-        }))
-        .unwrap();
+    let (_runner_id, runner_token) =
+        register_runner_with_token(&app, "remint-runner", &["self-hosted"], None).await;
 
     let acquired = request_json_with_bearer(
         &app,
@@ -19699,12 +19716,8 @@ jobs:
     let runner_request_id = broker_body["runner_request_id"]
         .as_str()
         .expect("broker message should identify the queued request");
-    let runner_token = state
-        .local_jwt(json!({
-            "sub": "preloop-runner-listen-1",
-            "scp": "ActionsRuntime.RunnerListen",
-        }))
-        .unwrap();
+    let (_runner_id, runner_token) =
+        register_runner_with_token(&app, "snapshot-runner", &["self-hosted"], None).await;
     let acquired = request_json_with_bearer(
         &app,
         Method::POST,
@@ -24547,4 +24560,219 @@ async fn dirty_push_sync_verifies_the_branch_head_and_reports_checks_on_the_mate
 
     std::env::remove_var("PRELOOP_GITHUB_TOKEN");
     std::env::remove_var("PRELOOP_GITHUB_API_URL");
+}
+#[tokio::test]
+async fn broker_hybrid_poll_rejects_a_foreign_live_runner() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let runner_a = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/Agent/1/0",
+        json!({"name": "runner-a", "version": "2.335.1"}),
+    )
+    .await;
+    let runner_b = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/Agent/1/0",
+        json!({"name": "runner-b", "version": "2.335.1"}),
+    )
+    .await;
+    let runner_a_id = runner_a["id"].as_i64().unwrap();
+    let runner_b_id = runner_b["id"].as_i64().unwrap();
+    let token_a = state
+        .local_jwt(json!({
+            "sub": format!("preloop-runner-listen-{runner_a_id}"),
+            "scp": "ActionsRuntime.RunnerListen",
+        }))
+        .unwrap();
+    let token_b = state
+        .local_jwt(json!({
+            "sub": format!("preloop-runner-listen-{runner_b_id}"),
+            "scp": "ActionsRuntime.RunnerListen",
+        }))
+        .unwrap();
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo",
+        }),
+    )
+    .await;
+    let session = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/distributedtask/pools/1/sessions",
+        json!({
+            "agent": {"id": runner_a_id, "name": "runner-a"},
+            "ownerName": "runner-a",
+            "useFipsEncryption": false,
+        }),
+        &token_a,
+    )
+    .await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    let before = {
+        let inner = state.inner.lock().await;
+        (inner.queue.len(), inner.session_active_requests.clone())
+    };
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_id}&waitSeconds=0"
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {token_b}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let after = {
+        let inner = state.inner.lock().await;
+        (inner.queue.len(), inner.session_active_requests.clone())
+    };
+    assert_eq!(
+        after, before,
+        "a foreign poll must not consume queue work or bind an active request"
+    );
+}
+
+#[tokio::test]
+async fn purged_runner_listen_token_cannot_open_a_broker_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let runner = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/Agent/1/0",
+        json!({"name": "runner-revocation", "version": "2.335.1"}),
+    )
+    .await;
+    let runner_id = runner["id"].as_i64().unwrap();
+    let token = state
+        .local_jwt(json!({
+            "sub": format!("preloop-runner-listen-{runner_id}"),
+            "scp": "ActionsRuntime.RunnerListen",
+        }))
+        .unwrap();
+    request_json(
+        &app,
+        Method::DELETE,
+        &format!("/runner/server/_apis/distributedtask/pools/1/agents/{runner_id}"),
+        Value::Null,
+    )
+    .await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/runner/server/session")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn reporting_rejects_a_runtime_token_for_a_different_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let workflow = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo report\n";
+    for _ in 0..2 {
+        request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": workflow,
+                "event": "push",
+                "repository": "owner/repo",
+            }),
+        )
+        .await;
+    }
+    let mut requests: Vec<_> = state
+        .inner
+        .lock()
+        .await
+        .job_requests
+        .values()
+        .cloned()
+        .collect();
+    requests.sort_by_key(|request| request.request_id);
+    assert!(requests.len() >= 2);
+    let target = &requests[1];
+    let foreign_token = state.mint_runtime_token(&requests[0].plan_id, &requests[0].agent_job_id);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!(
+                    "/runner/server/_apis/v1/Timeline/scope/hub/{}/{}",
+                    target.plan_id, target.timeline_id
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {foreign_token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"count":0,"value":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn flow_recording_redacts_credentials() {
+    let temp = tempfile::tempdir().unwrap();
+    let flow_path = temp.path().join("flows.ndjson");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&flow_path)
+        .unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let system_token = state.system_token.clone();
+    state.inner.lock().await.flows_file = Some(file);
+    let app = app(state, CancellationToken::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/healthz")
+                .header(header::AUTHORIZATION, format!("Bearer {system_token}"))
+                .header("x-preloop-provision-token", "provision-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "status: {}",
+        response.status()
+    );
+    let flow = fs::read_to_string(flow_path).unwrap();
+    assert!(!flow.contains(&system_token));
+    assert!(!flow.contains("system-secret"));
+    assert!(!flow.contains("provision-secret"));
+    assert!(flow.matches("[REDACTED]").count() >= 2);
 }
