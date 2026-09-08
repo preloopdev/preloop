@@ -745,6 +745,148 @@ pub(crate) async fn finish_job_plan(
     Json(serde_json::Value::Null)
 }
 
+pub(crate) async fn authorize_reporting_callback(
+    shared: &Arc<SharedState>,
+    headers: &HeaderMap,
+    plan_id: &str,
+    timeline_id: Option<uuid::Uuid>,
+    agent_job_id: Option<uuid::Uuid>,
+) -> Result<(), ApiError> {
+    let request = {
+        let inner = shared.state.inner.lock().await;
+        let request_id = agent_job_id
+            .and_then(|id| inner.agent_job_requests.get(&id).copied())
+            .or_else(|| timeline_id.and_then(|id| inner.timeline_requests.get(&id).copied()))
+            .or_else(|| inner.plan_requests.get(plan_id).copied());
+        request_id
+            .and_then(|id| inner.job_requests.get(&id).cloned())
+            .filter(|request| request.plan_id == plan_id)
+    };
+    crate::auth::authorize_reporting_request(&shared.state, headers, request.as_ref())
+}
+
+pub(crate) async fn patch_timeline_records_authenticated(
+    State(shared): State<Arc<SharedState>>,
+    Path(path): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+    Json(wrapper): Json<azdo::VssJsonCollectionWrapper<azdo::TimelineRecord>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let timeline_id = path.3.parse().ok();
+    authorize_reporting_callback(&shared, &headers, &path.2, timeline_id, None).await?;
+    Ok(patch_timeline_records(State(shared), Path(path), Json(wrapper)).await)
+}
+
+pub(crate) async fn get_timeline_records_authenticated(
+    State(shared): State<Arc<SharedState>>,
+    Path(path): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+    Query(query): Query<TimelineQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let timeline_id = path.3.parse().ok();
+    authorize_reporting_callback(&shared, &headers, &path.2, timeline_id, None).await?;
+    Ok(get_timeline_records(State(shared), Path(path), Query(query)).await)
+}
+
+pub(crate) async fn create_log_authenticated(
+    State(shared): State<Arc<SharedState>>,
+    Path(path): Path<(String, String, String)>,
+    headers: HeaderMap,
+    Json(log): Json<azdo::TaskLog>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize_reporting_callback(&shared, &headers, &path.2, None, None).await?;
+    Ok(create_log(State(shared), Path(path), Json(log)).await)
+}
+
+pub(crate) async fn append_log_authenticated(
+    State(shared): State<Arc<SharedState>>,
+    Path(path): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    authorize_reporting_callback(&shared, &headers, &path.2, None, None).await?;
+    Ok(append_log(State(shared), Path(path), body).await)
+}
+
+pub(crate) async fn console_log_authenticated(
+    State(shared): State<Arc<SharedState>>,
+    Path(path): Path<(String, String, String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    let timeline_id = path.3.parse().ok();
+    authorize_reporting_callback(&shared, &headers, &path.2, timeline_id, None).await?;
+    Ok(console_log(State(shared), Path(path), body).await)
+}
+
+pub(crate) async fn finish_job_authenticated(
+    State(shared): State<Arc<SharedState>>,
+    Path(path): Path<(String, String, String)>,
+    headers: HeaderMap,
+    Json(event): Json<azdo::JobCompletedEvent>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize_reporting_callback(&shared, &headers, &path.2, None, Some(event.job_id)).await?;
+    Ok(finish_job(State(shared), Path(path), Json(event)).await)
+}
+
+pub(crate) async fn finish_job_plan_authenticated(
+    State(shared): State<Arc<SharedState>>,
+    Path(plan_id): Path<String>,
+    headers: HeaderMap,
+    Json(event): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let agent_job_id = event
+        .get("jobId")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.parse().ok());
+    authorize_reporting_callback(&shared, &headers, &plan_id, None, agent_job_id).await?;
+    Ok(finish_job_plan(State(shared), Path(plan_id), Json(event)).await)
+}
+
+pub(crate) async fn patch_timeline_records_plan_authenticated(
+    State(shared): State<Arc<SharedState>>,
+    Path((plan_id, timeline_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(wrapper): Json<azdo::VssJsonCollectionWrapper<azdo::TimelineRecord>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let timeline_uuid = timeline_id.parse().ok();
+    authorize_reporting_callback(&shared, &headers, &plan_id, timeline_uuid, None).await?;
+    Ok(
+        patch_timeline_records_plan(State(shared), Path((plan_id, timeline_id)), Json(wrapper))
+            .await,
+    )
+}
+
+pub(crate) async fn get_timeline_records_plan_authenticated(
+    State(shared): State<Arc<SharedState>>,
+    Path((plan_id, timeline_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Query(query): Query<TimelineQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let timeline_uuid = timeline_id.parse().ok();
+    authorize_reporting_callback(&shared, &headers, &plan_id, timeline_uuid, None).await?;
+    Ok(get_timeline_records_plan(State(shared), Path((plan_id, timeline_id)), Query(query)).await)
+}
+
+pub(crate) async fn create_log_plan_authenticated(
+    State(shared): State<Arc<SharedState>>,
+    Path(plan_id): Path<String>,
+    headers: HeaderMap,
+    Json(log): Json<azdo::TaskLog>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize_reporting_callback(&shared, &headers, &plan_id, None, None).await?;
+    Ok(create_log_plan(State(shared), Path(plan_id), Json(log)).await)
+}
+
+pub(crate) async fn append_log_plan_authenticated(
+    State(shared): State<Arc<SharedState>>,
+    Path((plan_id, log_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    authorize_reporting_callback(&shared, &headers, &plan_id, None, None).await?;
+    Ok(append_log_plan(State(shared), Path((plan_id, log_id)), body).await)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

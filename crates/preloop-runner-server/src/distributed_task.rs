@@ -34,19 +34,6 @@ pub(crate) async fn next_message(
             return (StatusCode::ACCEPTED, Json(Some(message)));
         }
 
-        if let Some(cancellation) = inner.cancellation_queue.pop_front() {
-            let body_json = concurrency::job_cancel_body(cancellation.agent_job_id);
-            match build_task_agent_message(
-                &mut inner,
-                &session_id,
-                azdo::message_type::JOB_CANCELLED,
-                body_json,
-            ) {
-                Ok(message) => return (StatusCode::OK, Json(Some(message))),
-                Err(_) => return (StatusCode::ACCEPTED, Json(None)),
-            }
-        }
-
         if let Some(request_id) = inner.session_active_requests.get(&session_id).copied() {
             let request_finished = inner
                 .job_requests
@@ -55,6 +42,28 @@ pub(crate) async fn next_message(
             if request_finished {
                 inner.session_active_requests.remove(&session_id);
             } else {
+                let cancellation_pos = inner.job_requests.get(&request_id).and_then(|request| {
+                    inner.cancellation_queue.iter().position(|cancellation| {
+                        cancellation.run_id == request.run_id
+                            && cancellation.job_id == request.job_id
+                    })
+                });
+                if let Some(pos) = cancellation_pos {
+                    let cancellation = inner
+                        .cancellation_queue
+                        .remove(pos)
+                        .expect("cancellation position was found in the queue");
+                    let body_json = concurrency::job_cancel_body(cancellation.agent_job_id);
+                    match build_task_agent_message(
+                        &mut inner,
+                        &session_id,
+                        azdo::message_type::JOB_CANCELLED,
+                        body_json,
+                    ) {
+                        Ok(message) => return (StatusCode::OK, Json(Some(message))),
+                        Err(_) => return (StatusCode::ACCEPTED, Json(None)),
+                    }
+                }
                 drop(inner);
                 if wait_seconds == 0 {
                     return (StatusCode::OK, Json(None));
@@ -311,6 +320,24 @@ pub(crate) async fn complete_job_compat(
         },
     )
     .await
+}
+pub(crate) async fn complete_job_compat_authenticated(
+    State(shared): State<Arc<SharedState>>,
+    Path(path): Path<(RunId, String)>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<RunRecord>, ApiError> {
+    let target = {
+        let inner = shared.state.inner.lock().await;
+        inner
+            .job_requests
+            .values()
+            .filter(|request| request.run_id == path.0 && request.job_id.0 == path.1)
+            .max_by_key(|request| request.request_id)
+            .cloned()
+    };
+    crate::auth::authorize_reporting_request(&shared.state, &headers, target.as_ref())?;
+    complete_job_compat(State(shared), Path(path), Json(body)).await
 }
 
 fn runner_owns_agent_request(inner: &InnerState, request_id: i64, runner_id: i64) -> bool {

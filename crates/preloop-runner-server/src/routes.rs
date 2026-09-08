@@ -58,16 +58,18 @@ pub(crate) fn build_app(
             get(runner_pools),
         )
         .route(
-            "/runner/server/_apis/distributedtask/pools/:pool_id/agents",
-            get(agent_lookup).post(register_runner_compat_pool_only),
-        )
-        .route(
             "/runner/server/_apis/distributedtask/pools/:pool_id/sessions",
-            post(create_session_disttask),
+            post(create_session_disttask).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_legacy_runner_bearer,
+            )),
         )
         .route(
             "/_apis/distributedtask/pools/:pool_id/sessions",
-            post(create_session_disttask),
+            post(create_session_disttask).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_legacy_runner_bearer,
+            )),
         )
         .route(
             "/runner/server/_apis/distributedtask/pools/:pool_id/messages",
@@ -89,7 +91,7 @@ pub(crate) fn build_app(
         )
         .route(
             "/runner/server/_apis/distributedtask/hubs/actions/plans/:run_id/jobs/:job_id",
-            patch(complete_job_compat),
+            patch(complete_job_compat_authenticated),
         )
         .route("/ws/live-logs/:job_id", get(ws_live_logs))
         .route("/broker/:runner_id/acquirejob", post(broker_acquire_job))
@@ -97,23 +99,23 @@ pub(crate) fn build_app(
         .route("/broker/:runner_id/completejob", post(broker_complete_job))
         .route(
             "/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id",
-            patch(patch_timeline_records).get(get_timeline_records),
+            patch(patch_timeline_records_authenticated).get(get_timeline_records_authenticated),
         )
         .route(
             "/_apis/v1/Logfiles/:scope/:hub/:plan_id",
-            post(create_log),
+            post(create_log_authenticated),
         )
         .route(
             "/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id",
-            post(append_log),
+            post(append_log_authenticated),
         )
         .route(
             "/_apis/v1/TimeLineWebConsoleLog/:scope/:hub/:plan_id/:timeline_id/:record_id",
-            post(console_log),
+            post(console_log_authenticated),
         )
         .route(
             "/_apis/v1/FinishJob/:scope/:hub/:plan_id",
-            post(finish_job),
+            post(finish_job_authenticated),
         )
         .route(
             "/runner/server/_apis/distributedtask/hubs/actions/plans/:plan_id/jobs/:job_id/oidctoken",
@@ -133,23 +135,23 @@ pub(crate) fn build_app(
         )
         .route(
             "/runner/server/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id",
-            patch(patch_timeline_records).get(get_timeline_records),
+            patch(patch_timeline_records_authenticated).get(get_timeline_records_authenticated),
         )
         .route(
             "/runner/server/_apis/v1/Logfiles/:scope/:hub/:plan_id",
-            post(create_log),
+            post(create_log_authenticated),
         )
         .route(
             "/runner/server/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id",
-            post(append_log),
+            post(append_log_authenticated),
         )
         .route(
             "/runner/server/_apis/v1/TimeLineWebConsoleLog/:scope/:hub/:plan_id/:timeline_id/:record_id",
-            post(console_log),
+            post(console_log_authenticated),
         )
         .route(
             "/runner/server/_apis/v1/FinishJob/:scope/:hub/:plan_id",
-            post(finish_job),
+            post(finish_job_authenticated),
         )
         .route(
             "/runner/server/_apis/v1/ActionDownloadInfo/:scope/:hub/:plan_id",
@@ -163,37 +165,37 @@ pub(crate) fn build_app(
         // These alias the scope/hub-prefixed handlers above so both URL forms work.
         .route(
             "/_apis/v1/plans/:plan_id/timelines/:timeline_id/records",
-            patch(patch_timeline_records_plan).get(get_timeline_records_plan),
+            patch(patch_timeline_records_plan_authenticated).get(get_timeline_records_plan_authenticated),
         )
         .route(
             "/_apis/v1/plans/:plan_id/logs",
-            post(create_log_plan),
+            post(create_log_plan_authenticated),
         )
         .route(
             "/_apis/v1/plans/:plan_id/logs/:log_id",
-            put(append_log_plan),
+            put(append_log_plan_authenticated),
         )
         .route(
             "/_apis/v1/plans/:plan_id/events",
-            post(finish_job_plan),
+            post(finish_job_plan_authenticated),
         )
         // F030: /runner/server/ aliases — runner uses the SystemVssConnection URL
         // which is http://…/runner/server so all plan-level AzDO calls land here.
         .route(
             "/runner/server/_apis/v1/plans/:plan_id/timelines/:timeline_id/records",
-            patch(patch_timeline_records_plan).get(get_timeline_records_plan),
+            patch(patch_timeline_records_plan_authenticated).get(get_timeline_records_plan_authenticated),
         )
         .route(
             "/runner/server/_apis/v1/plans/:plan_id/logs",
-            post(create_log_plan),
+            post(create_log_plan_authenticated),
         )
         .route(
             "/runner/server/_apis/v1/plans/:plan_id/logs/:log_id",
-            put(append_log_plan),
+            put(append_log_plan_authenticated),
         )
         .route(
             "/runner/server/_apis/v1/plans/:plan_id/events",
-            post(finish_job_plan),
+            post(finish_job_plan_authenticated),
         )
         .route_layer(middleware::from_fn_with_state(
             shared.clone(),
@@ -344,6 +346,7 @@ pub(crate) fn build_app(
             "/:org/_apis/v1/Agent/:pool_id/:agent_id",
             get(agent_lookup_by_id_org)
                 .post(register_runner_compat_org_2)
+                .put(replace_runner_compat_org_2)
                 .route_layer(middleware::from_fn_with_state(
                     shared.clone(),
                     require_runner_registration_bearer,
@@ -373,7 +376,6 @@ pub(crate) fn build_app(
             )),
         )
         .route(
-
             "/:org/_apis/v1/Message/:pool_id",
             get(next_message_compat_org).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
@@ -464,7 +466,7 @@ pub(crate) fn build_app(
             "/runner/server/_apis/v1/Agent/:pool_id/:agent_id",
             get(agent_lookup_by_id)
                 .post(register_runner_compat)
-                .put(register_runner_compat)
+                .put(replace_runner_compat)
                 .route_layer(middleware::from_fn_with_state(
                     shared.clone(),
                     require_runner_registration_bearer,
@@ -494,7 +496,6 @@ pub(crate) fn build_app(
             )),
         )
         .route(
-
             "/runner/server/_apis/v1/Message/:pool_id",
             get(next_message_compat).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
@@ -835,6 +836,7 @@ pub(crate) fn build_app(
             "/_apis/v1/Agent/:pool_id/:agent_id",
             get(agent_lookup_by_id)
                 .post(register_runner_compat)
+                .put(replace_runner_compat)
                 .route_layer(middleware::from_fn_with_state(
                     shared.clone(),
                     require_runner_registration_bearer,
@@ -863,7 +865,13 @@ pub(crate) fn build_app(
                 require_legacy_runner_bearer,
             )),
         )
-        .route("/_apis/v1/Message/:pool_id", get(next_message_compat))
+        .route(
+            "/_apis/v1/Message/:pool_id",
+            get(next_message_compat).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_legacy_runner_bearer,
+            )),
+        )
         .route(
             "/_apis/v1/Message/:pool_id/:message_id",
             delete(delete_pool_message).route_layer(middleware::from_fn_with_state(
@@ -953,6 +961,7 @@ pub(crate) fn build_app(
             shared.clone(),
             require_results_bearer,
         ))
+        .merge(distributedtask_registration)
         .merge(protected_protocol_apis)
         .merge(protected_admin_apis)
         .with_state(shared.clone())

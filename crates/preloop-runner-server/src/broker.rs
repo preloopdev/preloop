@@ -1,17 +1,5 @@
 use super::*;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RunnerAuthSource {
-    RunnerListenToken,
-    RuntimeJwt,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct AuthenticatedRunnerId {
-    pub(crate) runner_id: i64,
-    pub(crate) auth_source: RunnerAuthSource,
-}
-
 ///
 /// The two are deliberately separate counters. `Lifecycle` records a
 /// credential fencing carrier assumes cannot occur, so its count
@@ -53,42 +41,6 @@ pub(crate) fn record_listener_token_use(
             );
         }
     }
-}
-
-pub(crate) fn authenticated_runner_id_with_source(
-    shared: &Arc<SharedState>,
-    headers: &HeaderMap,
-    expected_runner_id: Option<i64>,
-) -> Result<AuthenticatedRunnerId, ApiError> {
-    let bearer = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .ok_or_else(|| ApiError::unauthorized("runner listen token required"))?;
-    // Accept runner listen tokens (normal path) or job runtime tokens
-    // (worker uses the SystemVssConnection AccessToken for renewjob/completejob).
-    if let Some(runner_id) = shared.state.runner_id_from_token(bearer) {
-        if expected_runner_id.is_some_and(|expected| expected != runner_id) {
-            return Err(ApiError::forbidden(
-                "runner token does not match broker path",
-            ));
-        }
-        return Ok(AuthenticatedRunnerId {
-            runner_id,
-            auth_source: RunnerAuthSource::RunnerListenToken,
-        });
-    }
-    // Fall back: accept runtime tokens (Actions.Results scope). These don't
-    // carry a runner_id, so we trust the path parameter.
-    if shared.state.verify_local_jwt_claims(bearer).is_some() {
-        let runner_id =
-            expected_runner_id.ok_or_else(|| ApiError::unauthorized("runner id required"))?;
-        return Ok(AuthenticatedRunnerId {
-            runner_id,
-            auth_source: RunnerAuthSource::RuntimeJwt,
-        });
-    }
-    Err(ApiError::unauthorized("runner listen token required"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -315,10 +267,19 @@ pub(crate) async fn next_message_broker_ref(
 
     loop {
         let mut inner = shared.state.inner.lock().await;
-        inner.mark_session_seen(&session_id);
         let runner_id = inner
             .runner_id_for_session(&session_id)
             .ok_or_else(|| ApiError::forbidden("broker session has no runner owner"))?;
+        if identity
+            .as_ref()
+            .and_then(|axum::Extension(identity)| identity.runner_id)
+            .is_some_and(|identity_runner| identity_runner != runner_id)
+        {
+            return Err(ApiError::forbidden(
+                "broker session belongs to another runner",
+            ));
+        }
+        inner.mark_session_seen(&session_id);
         if let Some(message) = inner
             .inflight_messages
             .get(&session_id)
@@ -462,7 +423,7 @@ pub(crate) async fn broker_session_root(
     State(shared): State<Arc<SharedState>>,
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    let runner_id = authenticated_runner_id(&shared, &headers, None)?;
+    let runner_id = authenticated_runner_id(&shared, &headers, None).await?;
     let session_id = uuid::Uuid::new_v4().to_string();
     {
         let mut inner = shared.state.inner.lock().await;
@@ -524,7 +485,7 @@ pub(crate) async fn broker_delete_session_root(
     Query(params): Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    let runner_id = authenticated_runner_id(&shared, &headers, None)?;
+    let runner_id = authenticated_runner_id(&shared, &headers, None).await?;
     let header_session = headers
         .get("x-actions-session")
         .and_then(|value| value.to_str().ok());
@@ -548,7 +509,7 @@ pub(crate) async fn broker_delete_session_by_path(
     Path(session_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    let runner_id = authenticated_runner_id(&shared, &headers, None)?;
+    let runner_id = authenticated_runner_id(&shared, &headers, None).await?;
     remove_broker_session(&shared, &session_id, runner_id).await?;
     shared
         .state
@@ -578,12 +539,90 @@ pub(crate) async fn remove_broker_session(
         None => Err(ApiError::not_found("broker session not found")),
     }
 }
-pub(crate) fn authenticated_runner_id(
+pub(crate) async fn authenticated_runner_id(
     shared: &Arc<SharedState>,
     headers: &HeaderMap,
     expected_runner_id: Option<i64>,
 ) -> Result<i64, ApiError> {
-    Ok(authenticated_runner_id_with_source(shared, headers, expected_runner_id)?.runner_id)
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or_else(|| ApiError::unauthorized("runner listen token required"))?;
+    let runner_id = crate::auth::registered_runner_id(shared, bearer)
+        .await
+        .ok_or_else(|| ApiError::unauthorized("runner listen token required"))?;
+    if expected_runner_id.is_some_and(|expected| expected != runner_id) {
+        return Err(ApiError::forbidden(
+            "runner token does not match broker path",
+        ));
+    }
+    Ok(runner_id)
+}
+
+/// Authenticate a broker renew/complete call with either the live runner
+/// listen credential or the runtime token for the exact agent job in the body.
+pub(crate) async fn authenticated_runner_id_for_job(
+    shared: &Arc<SharedState>,
+    headers: &HeaderMap,
+    expected_runner_id: i64,
+    job_id: uuid::Uuid,
+) -> Result<i64, ApiError> {
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or_else(|| ApiError::unauthorized("runner or job runtime token required"))?;
+    if let Some(runner_id) = crate::auth::registered_runner_id(shared, bearer).await {
+        if runner_id != expected_runner_id {
+            return Err(ApiError::forbidden(
+                "runner token does not match broker path",
+            ));
+        }
+        return Ok(runner_id);
+    }
+
+    let runtime_job = shared
+        .state
+        .job_uuid_from_token(bearer)
+        .ok_or_else(|| ApiError::unauthorized("runner or job runtime token required"))?;
+    if runtime_job != job_id {
+        return Err(ApiError::forbidden(
+            "job runtime token does not match broker job",
+        ));
+    }
+    let inner = shared.state.inner.lock().await;
+    if !inner.runners.contains_key(&expected_runner_id) {
+        return Err(ApiError::unauthorized(
+            "runner registration no longer exists",
+        ));
+    }
+    let request_id = inner
+        .agent_job_requests
+        .get(&job_id)
+        .copied()
+        .ok_or_else(|| ApiError::not_found("broker job request not found"))?;
+    let request = inner
+        .job_requests
+        .get(&request_id)
+        .ok_or_else(|| ApiError::not_found("broker job request not found"))?;
+    let exact_scope = format!("Actions.Results:{}:{}", request.plan_id, job_id);
+    let exact_runtime_scope = shared
+        .state
+        .verify_local_jwt_claims(bearer)
+        .and_then(|claims| {
+            claims
+                .get("scp")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+        })
+        .is_some_and(|scope| scope == exact_scope);
+    if request.owner_runner_id != Some(expected_runner_id) || !exact_runtime_scope {
+        return Err(ApiError::forbidden(
+            "job runtime token does not own broker request",
+        ));
+    }
+    Ok(expected_runner_id)
 }
 
 pub(crate) fn ensure_broker_request_owner(
@@ -644,7 +683,7 @@ pub(crate) async fn next_message_broker_ref_root(
     Query(params): Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let runner_id = authenticated_runner_id(&shared, &headers, None)?;
+    let runner_id = authenticated_runner_id(&shared, &headers, None).await?;
     if let Some(response) = runner_version_deprecated_response(&shared, &params) {
         return Ok(response);
     }
@@ -780,15 +819,12 @@ pub(crate) async fn broker_acquire_job(
     headers: HeaderMap,
     Json(request): Json<BrokerAcquireJobRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth = authenticated_runner_id_with_source(&shared, &headers, Some(runner_id))?;
-    if auth.auth_source == RunnerAuthSource::RunnerListenToken {
-        record_listener_token_use(
-            &shared.state,
-            ListenerTokenProbe::Acquire,
-            "broker.acquirejob",
-        );
-    }
-
+    authenticated_runner_id(&shared, &headers, Some(runner_id)).await?;
+    record_listener_token_use(
+        &shared.state,
+        ListenerTokenProbe::Acquire,
+        "broker.acquirejob",
+    );
     let (request_id, mut message, github_token_request, id_token_granted) = {
         let inner = shared.state.inner.lock().await;
         let request_id = inner
@@ -1464,15 +1500,20 @@ pub(crate) async fn broker_renew_job(
     headers: HeaderMap,
     Json(request): Json<BrokerRenewJobRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth = authenticated_runner_id_with_source(&shared, &headers, Some(runner_id))?;
-    if auth.auth_source == RunnerAuthSource::RunnerListenToken {
+    let listen_token = match crate::auth::bearer_from_headers(&headers) {
+        Some(token) => crate::auth::registered_runner_id(&shared, token)
+            .await
+            .is_some(),
+        None => false,
+    };
+    authenticated_runner_id_for_job(&shared, &headers, runner_id, request.job_id).await?;
+    if listen_token {
         record_listener_token_use(
             &shared.state,
             ListenerTokenProbe::Lifecycle,
             "broker.renewjob",
         );
     }
-
     let mut inner = shared.state.inner.lock().await;
     let request_id = inner
         .agent_job_requests
@@ -1480,6 +1521,13 @@ pub(crate) async fn broker_renew_job(
         .copied()
         .ok_or_else(|| ApiError::not_found("broker renew request not found"))?;
     ensure_broker_request_owner(&inner, request_id, runner_id)?;
+    if inner
+        .job_requests
+        .get(&request_id)
+        .is_some_and(|record| record.result.is_some())
+    {
+        return Err(ApiError::conflict("broker request already completed"));
+    }
     let record = inner
         .job_requests
         .get_mut(&request_id)
@@ -1495,15 +1543,20 @@ pub(crate) async fn broker_complete_job(
     headers: HeaderMap,
     Json(request): Json<BrokerRenewJobRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let auth = authenticated_runner_id_with_source(&shared, &headers, Some(runner_id))?;
-    if auth.auth_source == RunnerAuthSource::RunnerListenToken {
+    let listen_token = match crate::auth::bearer_from_headers(&headers) {
+        Some(token) => crate::auth::registered_runner_id(&shared, token)
+            .await
+            .is_some(),
+        None => false,
+    };
+    authenticated_runner_id_for_job(&shared, &headers, runner_id, request.job_id).await?;
+    if listen_token {
         record_listener_token_use(
             &shared.state,
             ListenerTokenProbe::Lifecycle,
             "broker.completejob",
         );
     }
-
     let status = match request.conclusion.as_deref() {
         Some(conclusion) => execution_status_from_runner_result(conclusion).ok_or_else(|| {
             ApiError::bad_request(format!("unknown broker conclusion `{conclusion}`"))
@@ -1536,43 +1589,52 @@ pub(crate) async fn broker_complete_job(
             .copied()
             .ok_or_else(|| ApiError::not_found("broker complete request not found"))?;
         ensure_broker_request_owner(&inner, request_id, runner_id)?;
-        debug!(request_id, job_id = %request.job_id, "broker complete: found request");
-        if let Some(record) = inner.job_requests.get_mut(&request_id) {
-            record.result = Some(status);
-            record.locked_until = agent_request_locked_until();
-        }
-        // Free the session so the next broker poll can take a new job immediately
-        // (otherwise the poll arm waits until it observes result.is_some()).
-        inner
-            .session_active_requests
-            .retain(|_, &mut rid| rid != request_id);
-        let run_job = inner.inflight_requests.remove(&request_id).or_else(|| {
-            job_request_tuple(&inner, request_id).map(|(_, run_id, job_id)| (run_id, job_id))
-        });
-        match run_job {
-            Some((run_id, job_id)) => {
-                info!(%run_id, %job_id, "broker complete: completing job");
-                Some(JobCompletion {
-                    run_id,
-                    job_id,
-                    // This request *is* the attempt that finished, so the
-                    // server never has to guess which dispatch reported.
-                    agent_job_id: inner
-                        .job_requests
-                        .get(&request_id)
-                        .map(|record| record.agent_job_id),
-                    status,
-                    outputs,
-                    annotations: request.annotations.clone(),
-                    step_results: request.step_results.clone(),
-                })
+        if inner
+            .job_requests
+            .get(&request_id)
+            .is_some_and(|record| record.result.is_some())
+        {
+            info!(request_id, "broker complete: ignoring duplicate completion");
+            None
+        } else {
+            debug!(request_id, job_id = %request.job_id, "broker complete: found request");
+            if let Some(record) = inner.job_requests.get_mut(&request_id) {
+                record.result = Some(status);
+                record.locked_until = agent_request_locked_until();
             }
-            None => {
-                warn!(
-                    request_id,
-                    "broker complete: no inflight_requests entry found"
-                );
-                None
+            // Free the session so the next broker poll can take a new job immediately
+            // (otherwise the poll arm waits until it observes result.is_some()).
+            inner
+                .session_active_requests
+                .retain(|_, &mut rid| rid != request_id);
+            let run_job = inner.inflight_requests.remove(&request_id).or_else(|| {
+                job_request_tuple(&inner, request_id).map(|(_, run_id, job_id)| (run_id, job_id))
+            });
+            match run_job {
+                Some((run_id, job_id)) => {
+                    info!(%run_id, %job_id, "broker complete: completing job");
+                    Some(JobCompletion {
+                        run_id,
+                        job_id,
+                        // This request *is* the attempt that finished, so the
+                        // server never has to guess which dispatch reported.
+                        agent_job_id: inner
+                            .job_requests
+                            .get(&request_id)
+                            .map(|record| record.agent_job_id),
+                        status,
+                        outputs,
+                        annotations: request.annotations.clone(),
+                        step_results: request.step_results.clone(),
+                    })
+                }
+                None => {
+                    warn!(
+                        request_id,
+                        "broker complete: no inflight_requests entry found"
+                    );
+                    None
+                }
             }
         }
     };

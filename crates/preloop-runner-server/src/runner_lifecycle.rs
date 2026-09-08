@@ -28,7 +28,10 @@ pub(crate) async fn register_runner(
     Json(request): Json<RunnerRegistrationRequest>,
 ) -> Result<Json<RegisteredRunner>, ApiError> {
     let runner = register_runner_inner(&shared, request).await?;
-    persist_full_state(&shared).await?;
+    if let Err(error) = persist_full_state(&shared).await {
+        purge_runner_identity(&shared, runner.id).await;
+        return Err(error);
+    }
     Ok(Json(runner))
 }
 
@@ -71,11 +74,11 @@ async fn register_runner_inner(
     Ok(runner)
 }
 
-/// Capture the full in-memory state under the lock and persist it after the
-/// lock is released. Registration is the one surface where a persistence
-/// failure rejects the request: a runner that disappears from the store after
-/// the client was told it registered would be worse than a retryable error.
+/// Capture and write a full in-memory snapshot under a process-wide write
+/// gate. The gate is acquired before `inner`, so concurrent callers cannot
+/// write an older snapshot after a newer mutation has already been persisted.
 async fn persist_full_state(shared: &Arc<SharedState>) -> Result<(), ApiError> {
+    let _store_guard = shared.state.store_mutation.lock().await;
     let snapshot = {
         let inner = shared.state.inner.lock().await;
         crate::store::StoreSnapshot::from_inner(&inner)
@@ -100,7 +103,10 @@ pub(crate) async fn register_runner_native(
         let mut inner = shared.state.inner.lock().await;
         crate::runtime_scheduling::pair_registered_runner(&mut inner, runner.id);
     }
-    persist_full_state(&shared).await?;
+    if let Err(error) = persist_full_state(&shared).await {
+        purge_runner_identity(&shared, runner.id).await;
+        return Err(error);
+    }
     Ok(Json(runner))
 }
 
@@ -190,7 +196,7 @@ pub(crate) async fn create_session(
     let key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key_bytes);
 
     // Store the session key for later message decryption
-    let snapshot = {
+    {
         let mut inner = shared.state.inner.lock().await;
         inner
             .session_keys
@@ -206,14 +212,8 @@ pub(crate) async fn create_session(
         inner
             .broker_session_runners
             .insert(session_id.to_string(), request.runner_id);
-        crate::store::StoreSnapshot::from_inner(&inner)
-    };
-    shared
-        .state
-        .store
-        .store_inner(&snapshot)
-        .await
-        .map_err(|error| ApiError::internal(format!("failed to persist session: {error}")))?;
+    }
+    persist_full_state(&shared).await?;
 
     info!(%session_id, runner_id = request.runner_id, encrypted, "session created with AES key");
 
@@ -282,7 +282,7 @@ pub(crate) async fn create_session_disttask(
         (session_enc.key.clone(), false)
     };
     let key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key_bytes);
-    let snapshot = {
+    {
         let mut inner = shared.state.inner.lock().await;
         inner
             .session_keys
@@ -310,21 +310,14 @@ pub(crate) async fn create_session_disttask(
         {
             inner.azdo_sessions.insert(session_id.to_string());
         }
-        crate::store::StoreSnapshot::from_inner(&inner)
-    };
-    shared
-        .state
-        .store
-        .store_inner(&snapshot)
-        .await
-        .map_err(|error| ApiError::internal(format!("failed to persist session: {error}")))?;
+    }
+    persist_full_state(&shared).await?;
 
     let owner_name = body
         .get("ownerName")
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-
     info!(%session_id, "AzDO session created (unencrypted key)");
 
     Ok((
@@ -356,7 +349,7 @@ pub(crate) async fn delete_session(
         &headers,
         identity.as_ref().map(|axum::Extension(id)| id),
     )?;
-    let snapshot = {
+    {
         let mut inner = shared.state.inner.lock().await;
         if let crate::auth::AdminCaller::Runner(runner_id) = caller {
             match inner.runner_id_for_session(&session_id) {
@@ -372,9 +365,8 @@ pub(crate) async fn delete_session(
         }
         inner.sessions.remove(&session_id);
         inner.broker_session_runners.remove(&session_id);
-        crate::store::StoreSnapshot::from_inner(&inner)
-    };
-    if let Err(error) = shared.state.store.store_inner(&snapshot).await {
+    }
+    if let Err(error) = persist_full_state(&shared).await {
         tracing::warn!(?error, "failed to persist deleted runner session");
     }
     Ok(StatusCode::NO_CONTENT)
@@ -506,6 +498,13 @@ pub(crate) async fn purge_runner_identity(shared: &Arc<SharedState>, runner_id: 
         .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
     runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
     drop(inner);
+    if let Err(error) = persist_full_state(shared).await {
+        tracing::warn!(
+            runner_id,
+            ?error,
+            "failed to persist purged runner identity"
+        );
+    }
     shared.state.message_notify.notify_waiters();
 }
 
@@ -738,16 +737,28 @@ pub(crate) async fn register_runner_compat(
         // for. Pairing is gated on the one-time provision token the pool
         // generated host-side for exactly this machine — a rogue process on
         // another machine cannot mint it, so it cannot steal pairings.
-        if let Some(token) = provision_token.filter(|_| provision_authorized) {
-            // Mirror into the consolidated pool handle so the sampler's
-            // pending-registration count drops with the consume.
-            shared.state.pool_status.remove_pending(&token);
-            crate::runtime_scheduling::pair_registered_runner(&mut inner, result.id);
+        if provision_authorized {
+            if let Some(token) = provision_token.as_deref() {
+                // Mirror into the consolidated pool handle so the sampler's
+                // pending-registration count drops with the consume.
+                shared.state.pool_status.remove_pending(token);
+                crate::runtime_scheduling::pair_registered_runner(&mut inner, result.id);
+            }
         }
     }
     // One persist after every identity-bearing mutation, so client_id and any
     // pairing land in the same transaction as the runner row.
-    persist_full_state(&shared).await?;
+    if let Err(error) = persist_full_state(&shared).await {
+        if let (Some(token), Some(issued_at)) = (provision_token.as_deref(), provision_issued_at) {
+            crate::auth::restore_pending_provision_token(&shared.state, token, issued_at);
+            shared
+                .state
+                .pool_status
+                .insert_pending(token.to_owned(), issued_at);
+        }
+        purge_runner_identity(&shared, result.id).await;
+        return Err(error);
+    }
     Ok(Json(json!({
         "id": result.id,
         "name": result.name,
@@ -780,6 +791,38 @@ pub(crate) async fn register_runner_compat(
             "UseV2Flow": {"$type": "System.Boolean", "$value": true}
         }
     })))
+}
+
+/// Compat handler for the official runner's PUT replacement flow. The old
+/// identity is purged before a fresh registration is created, so the PUT does
+/// not leave two live runners and the old listen token is revoked.
+pub(crate) async fn replace_runner_compat(
+    State(shared): State<Arc<SharedState>>,
+    Path((pool_id, agent_id)): Path<(i64, String)>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let old_id = agent_id
+        .parse::<i64>()
+        .map_err(|_| ApiError::bad_request("agent id must be numeric"))?;
+    let exists = shared
+        .state
+        .inner
+        .lock()
+        .await
+        .runners
+        .contains_key(&old_id);
+    if !exists {
+        return Err(ApiError::not_found("runner to replace not found"));
+    }
+    purge_runner_identity(&shared, old_id).await;
+    register_runner_compat(
+        State(shared),
+        Path((pool_id, "0".to_owned())),
+        headers,
+        Json(request),
+    )
+    .await
 }
 
 /// Compat handler: register runner via `/_apis/v1/Agent/:pool_id` (no agent_id in path).
