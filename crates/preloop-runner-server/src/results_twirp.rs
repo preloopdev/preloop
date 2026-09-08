@@ -321,7 +321,7 @@ pub(crate) async fn twirp_create_step_summary_metadata(
 #[derive(Debug, Deserialize)]
 pub(crate) struct StepLogsMetadataRequest {
     // The backend identifiers identify the target job for Results authorization.
-    pub(crate) step_backend_id: Option<String>,
+    pub(crate) step_backend_id: String,
     pub(crate) workflow_job_run_backend_id: Option<String>,
     pub(crate) workflow_run_backend_id: Option<String>,
     // serde: metadata is accepted for protocol compatibility; field is not inspected.
@@ -337,9 +337,6 @@ pub(crate) async fn twirp_create_step_logs_metadata(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepLogsMetadataRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let Some(step_backend_id) = request.step_backend_id else {
-        return Ok(Json(json!({"ok": true})));
-    };
     let (Some(plan_id), Some(raw_job_id)) = (
         request.workflow_run_backend_id.as_deref(),
         request.workflow_job_run_backend_id.as_deref(),
@@ -356,7 +353,7 @@ pub(crate) async fn twirp_create_step_logs_metadata(
             "step",
             Some(plan_id),
             Some(job_id.as_str()),
-            Some(&step_backend_id),
+            Some(&request.step_backend_id),
         ),
         LogMetadata {
             byte_count,
@@ -373,7 +370,7 @@ pub(crate) async fn twirp_create_step_logs_metadata(
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct JobLogsMetadataRequest {
-    // The backend identifiers identify the target job for Results authorization.
+    // Job-log metadata is job-scoped and intentionally has no step_backend_id.
     pub(crate) workflow_job_run_backend_id: Option<String>,
     pub(crate) workflow_run_backend_id: Option<String>,
     // serde: metadata is accepted for protocol compatibility; field is not inspected.
