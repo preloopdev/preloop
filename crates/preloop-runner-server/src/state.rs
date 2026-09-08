@@ -260,11 +260,11 @@ impl AppState {
 ///
 /// `Strict` is the default and the only safe choice for a deployment reachable
 /// over a network: it accepts exactly the system credential. `Permissive`
-/// accepts any non-empty credential — matching what GitHub itself cannot do
-/// for us (validate third-party registration tokens) but recreating the
-/// original "anyone who can reach the port can register a runner" hole, so it
-/// exists only for the conformance harness, which replays real GitHub-issued
-/// registration tokens this control plane could never have minted.
+/// accepts any non-empty credential on the TCP registration endpoint —
+/// matching what GitHub itself cannot do for us (validate third-party
+/// registration tokens) but recreating the original "anyone who can reach the
+/// port can register a runner" hole. The mounted socket remains strict even
+/// in permissive mode, so workflow code cannot mint a new runner identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegistrationPolicy {
     /// Only the system credential may register a runner.

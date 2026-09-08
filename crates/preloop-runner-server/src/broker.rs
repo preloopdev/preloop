@@ -301,6 +301,7 @@ pub(crate) async fn next_message_broker_ref(
             .session_active_requests
             .insert(session_id.clone(), request_id);
         if let Some(request) = inner.job_requests.get_mut(&request_id) {
+            request.owner_runner_id = Some(runner_id);
             request.started_at = Some(std::time::SystemTime::now());
             request.last_renewed_at = Some(std::time::SystemTime::now());
         }
@@ -519,6 +520,22 @@ pub(crate) fn ensure_broker_request_owner(
     request_id: i64,
     runner_id: i64,
 ) -> Result<(), ApiError> {
+    // Prefer the immutable owner recorded when the request was claimed. This
+    // survives session teardown/rebind and keeps late broker retries bound to
+    // the runner that actually received the job.
+    if let Some(owner) = inner
+        .job_requests
+        .get(&request_id)
+        .and_then(|request| request.owner_runner_id)
+    {
+        return if owner == runner_id {
+            Ok(())
+        } else {
+            Err(ApiError::forbidden(
+                "broker request belongs to another runner",
+            ))
+        };
+    }
     let session_id =
         inner
             .session_active_requests
@@ -640,6 +657,7 @@ pub(crate) async fn next_message_broker_ref_root(
                     }
                     let request_id = queued.message.request_id;
                     if let Some(request) = inner.job_requests.get_mut(&request_id) {
+                        request.owner_runner_id = Some(runner_id);
                         request.started_at = Some(std::time::SystemTime::now());
                         request.last_renewed_at = Some(std::time::SystemTime::now());
                     }

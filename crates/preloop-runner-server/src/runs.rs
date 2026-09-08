@@ -2175,6 +2175,7 @@ pub(crate) fn build_job_artifacts(
         timeline_id: agent_msg.timeline.id,
         result: None,
         locked_until: agent_request_locked_until(),
+        owner_runner_id: None,
         started_at: None,
         last_renewed_at: None,
         timeout_triggered: false,

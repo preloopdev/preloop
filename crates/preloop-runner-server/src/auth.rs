@@ -114,6 +114,143 @@ pub(crate) async fn require_runner_bearer(
         Err(ApiError::unauthorized("runner listen token required"))
     }
 }
+pub(crate) fn runner_registration_bearer_authorized(state: &AppState, token: &str) -> bool {
+    token == state.system_token.as_str()
+        || state.verify_local_jwt_claims(token).is_some_and(|claims| {
+            claims.get("sub").and_then(|value| value.as_str())
+                == Some("preloop-runner-registration")
+                && claims
+                    .get("scp")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|scope| {
+                        scope
+                            .split_whitespace()
+                            .any(|value| value == "ActionsRuntime.RunnerManage")
+                    })
+        })
+}
+
+/// Require the credential that is allowed to create a runner identity through
+/// the legacy AzDO registration aliases. The GitHub-compatible registration
+/// endpoint mints this local RunnerManage token; a pool provision token is the
+/// other supported path for the host-side configure flow.
+pub(crate) async fn require_runner_registration_bearer(
+    State(shared): State<Arc<SharedState>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let bearer_authorized = bearer_token(&request)
+        .is_some_and(|token| runner_registration_bearer_authorized(&shared.state, token));
+    let provision_authorized = request
+        .headers()
+        .get("x-preloop-provision-token")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|token| pending_provision_token(&shared.state, token));
+    if bearer_authorized || provision_authorized {
+        Ok(next.run(request).await)
+    } else {
+        Err(ApiError::unauthorized(
+            "runner registration credential required",
+        ))
+    }
+}
+
+/// Require a credential that identifies a registered runner on the legacy
+/// session/message surface. The system token remains valid for trusted
+/// control-plane tests and operators; runner traffic must prove a listen JWT.
+pub(crate) async fn require_legacy_runner_bearer(
+    State(shared): State<Arc<SharedState>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let Some(token) = bearer_token(&request) else {
+        return Err(ApiError::unauthorized("runner listen token required"));
+    };
+    if token == shared.state.system_token || legacy_runner_id(&shared, token).await.is_some() {
+        Ok(next.run(request).await)
+    } else {
+        Err(ApiError::unauthorized("runner listen token required"))
+    }
+}
+
+const PROVISION_TOKEN_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(600);
+
+fn pending_provision_token(state: &AppState, token: &str) -> bool {
+    state
+        .pending_registrations
+        .read()
+        .ok()
+        .and_then(|pending| pending.get(token).copied())
+        .is_some_and(provision_token_is_fresh)
+}
+
+fn provision_token_is_fresh(issued_at: std::time::SystemTime) -> bool {
+    std::time::SystemTime::now()
+        .duration_since(issued_at)
+        .is_ok_and(|age| age <= PROVISION_TOKEN_MAX_AGE)
+}
+
+/// Atomically consume a pool-issued registration credential. The middleware
+/// performs the fast authorization check; the handler consumes the token
+/// under the write lock so concurrent registration attempts cannot both pass.
+/// The issuance time is returned so a validation failure can restore the
+/// credential without extending its lifetime.
+pub(crate) fn consume_pending_provision_token(
+    state: &AppState,
+    token: &str,
+) -> Option<std::time::SystemTime> {
+    state
+        .pending_registrations
+        .write()
+        .ok()
+        .and_then(|mut pending| pending.remove(token))
+        .filter(|issued_at| provision_token_is_fresh(*issued_at))
+}
+
+pub(crate) fn restore_pending_provision_token(
+    state: &AppState,
+    token: &str,
+    issued_at: std::time::SystemTime,
+) {
+    if !provision_token_is_fresh(issued_at) {
+        return;
+    }
+    if let Ok(mut pending) = state.pending_registrations.write() {
+        pending.insert(token.to_owned(), issued_at);
+    }
+}
+
+/// Resolve both production listen JWTs and the local JSON-OAuth compatibility
+/// JWTs to a currently registered runner.
+pub(crate) async fn legacy_runner_id(shared: &Arc<SharedState>, token: &str) -> Option<i64> {
+    let runner_id = if let Some(runner_id) = shared.state.runner_id_from_token(token) {
+        Some(runner_id)
+    } else {
+        let client_id = shared
+            .state
+            .verify_local_jwt_claims(token)
+            .and_then(|claims| {
+                claims
+                    .get("sub")
+                    .and_then(|value| value.as_str())
+                    .and_then(|sub| sub.strip_prefix("preloop-runner-listen-mock-"))
+                    .map(str::to_owned)
+            });
+        let client_id = client_id?;
+        shared
+            .state
+            .inner
+            .lock()
+            .await
+            .runner_client_ids
+            .get(&client_id)
+            .copied()
+    };
+    let runner_id = runner_id?;
+    runner_registered(shared, runner_id)
+        .await
+        .then_some(runner_id)
+}
 
 pub(crate) fn bearer_token(request: &Request) -> Option<&str> {
     bearer_from_headers(request.headers())
@@ -361,18 +498,16 @@ pub(crate) async fn runner_surface_only(
         // control socket. `/replay/*` is the other half of the same class:
         // the in-VM runner uploads its step logs and summaries to the signed
         // blob URLs its own Twirp handlers minted. Every other native prefix
-        // stays off the guest surface except the worker half of live debugging:
-        // token exchange, session open, verdict poll, and close. Those routes
-        // authenticate a single active job and deliberately exclude the
-        // controller's list/read/verdict APIs.
-        // `/api/v3/*` mints runner-management JWTs (`RunnerManage` scope) for
-        // the GitHub-compatible registration flow — an engine-facing service
-        // that untrusted workflow code must never reach through the mounted
-        // control socket, or it could mint runner-management credentials. The
-        // one exception is the runner's own registration: the engine itself
-        // initiates it at provision time, and the handler now requires the
-        // system credential, which workflow code never holds — so the carve
-        // out cannot be used to mint anything.
+        // stays off the guest surface except the worker half of live
+        // debugging: token exchange, session open, verdict poll, and close.
+        // The mounted socket deliberately excludes `/api/v3/*`, which mints
+        // runner-management JWTs (`RunnerManage` scope) for the
+        // GitHub-compatible registration flow. That service is engine-facing;
+        // untrusted workflow code must not reach it through the socket because
+        // it could mint runner-management credentials. The one exception is
+        // the runner's own registration: its handler requires the system
+        // credential on this surface even when TCP registration is explicitly
+        // permissive, so workflow code cannot use the carve-out to mint anything.
         || (path.starts_with("/api/v3/") && path != "/api/v3/actions/runner-registration")
         || (path.starts_with("/api/v1/")
             && !path.starts_with("/api/v1/actions/")

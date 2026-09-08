@@ -344,6 +344,9 @@ pub(crate) struct TaskAgentJobRequestRecord {
     pub(crate) timeline_id: uuid::Uuid,
     pub(crate) result: Option<ExecutionStatus>,
     pub(crate) locked_until: String,
+    /// Runner identity that claimed this request. Kept after completion so
+    /// late AgentRequest reads and retries remain bound to the original owner.
+    pub(crate) owner_runner_id: Option<i64>,
     pub(crate) started_at: Option<std::time::SystemTime>,
     pub(crate) last_renewed_at: Option<std::time::SystemTime>,
     pub(crate) timeout_triggered: bool,

@@ -832,6 +832,7 @@ mod tests {
                     timeline_id,
                     result: None,
                     locked_until: String::new(),
+                    owner_runner_id: None,
                     started_at: None,
                     last_renewed_at: None,
                     timeout_triggered: false,

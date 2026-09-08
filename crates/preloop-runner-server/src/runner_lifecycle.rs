@@ -348,9 +348,16 @@ pub(crate) async fn create_session_disttask(
 pub(crate) async fn delete_session(
     State(shared): State<Arc<SharedState>>,
     Path((_pool_id, session_id)): Path<(i64, String)>,
+    identity: Option<axum::Extension<RunnerIdentity>>,
 ) -> StatusCode {
+    let verified = identity.and_then(|axum::Extension(id)| id.runner_id);
     let snapshot = {
         let mut inner = shared.state.inner.lock().await;
+        if let Some(runner_id) = verified {
+            if inner.runner_id_for_session(&session_id) != Some(runner_id) {
+                return StatusCode::FORBIDDEN;
+            }
+        }
         inner.sessions.remove(&session_id);
         inner.broker_session_runners.remove(&session_id);
         crate::store::StoreSnapshot::from_inner(&inner)
@@ -362,7 +369,8 @@ pub(crate) async fn delete_session(
 }
 
 /// DELETE /runner/server/_apis/distributedtask/pools/:pool_id/agents/:agent_id
-/// Idempotent agent deregistration — the runner calls this on clean exit.
+/// Agent deregistration is idempotent for the management credential; a live
+/// runner listen token may only purge its own identity.
 /// Purges everything the runner's identity was good for: OAuth client id,
 /// RSA key, sessions, and any job assignments it still held, so a stolen
 /// identity cannot mint tokens or receive work after the machine is gone.
@@ -371,10 +379,24 @@ pub(crate) async fn delete_session(
 /// Returns null response body in JSON to match official.
 pub(crate) async fn delete_agent(
     State(shared): State<Arc<SharedState>>,
-    Path((_pool_id, _agent_id)): Path<(i64, i64)>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    purge_runner_identity(&shared, _agent_id).await;
-    (StatusCode::NO_CONTENT, Json(serde_json::Value::Null))
+    Path((_pool_id, agent_id)): Path<(i64, i64)>,
+    headers: HeaderMap,
+    identity: Option<axum::Extension<RunnerIdentity>>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let bearer = crate::auth::bearer_from_headers(&headers);
+    let owner_matches = identity
+        .and_then(|axum::Extension(id)| id.runner_id)
+        .is_some_and(|runner_id| runner_id == agent_id);
+    let management_authorized = bearer.is_some_and(|token| {
+        crate::auth::runner_registration_bearer_authorized(&shared.state, token)
+    });
+    if !owner_matches && !management_authorized {
+        return Err(ApiError::forbidden(
+            "runner credential cannot delete another runner",
+        ));
+    }
+    purge_runner_identity(&shared, agent_id).await;
+    Ok((StatusCode::NO_CONTENT, Json(serde_json::Value::Null)))
 }
 
 /// Remove every trace of a runner identity: keys, client ids, sessions and
@@ -666,12 +688,34 @@ pub(crate) async fn register_runner_compat(
         runner_group_id,
         runner_group_name,
     };
-    let result = register_runner_inner(&shared, reg_request).await?;
-    let client_id = uuid::Uuid::new_v4().to_string();
     let provision_token = headers
         .get("x-preloop-provision-token")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
+    let bearer_authorized = crate::auth::bearer_from_headers(&headers).is_some_and(|token| {
+        crate::auth::runner_registration_bearer_authorized(&shared.state, token)
+    });
+    let provision_issued_at = provision_token
+        .as_deref()
+        .and_then(|token| crate::auth::consume_pending_provision_token(&shared.state, token));
+    let provision_authorized = provision_issued_at.is_some();
+    if !bearer_authorized && !provision_authorized {
+        return Err(ApiError::unauthorized(
+            "runner registration credential required",
+        ));
+    }
+    let result = match register_runner_inner(&shared, reg_request).await {
+        Ok(result) => result,
+        Err(error) => {
+            if let (Some(token), Some(issued_at)) =
+                (provision_token.as_deref(), provision_issued_at)
+            {
+                crate::auth::restore_pending_provision_token(&shared.state, token, issued_at);
+            }
+            return Err(error);
+        }
+    };
+    let client_id = uuid::Uuid::new_v4().to_string();
     {
         let mut inner = shared.state.inner.lock().await;
         // The OAuth client id must be in the store before it is persisted:
@@ -682,19 +726,11 @@ pub(crate) async fn register_runner_compat(
         // for. Pairing is gated on the one-time provision token the pool
         // generated host-side for exactly this machine — a rogue process on
         // another machine cannot mint it, so it cannot steal pairings.
-        if let Some(token) = provision_token {
-            let accepted = shared
-                .state
-                .pending_registrations
-                .write()
-                .map(|mut pending| pending.remove(&token).is_some())
-                .unwrap_or(false);
+        if let Some(token) = provision_token.filter(|_| provision_authorized) {
             // Mirror into the consolidated pool handle so the sampler's
             // pending-registration count drops with the consume.
             shared.state.pool_status.remove_pending(&token);
-            if accepted {
-                crate::runtime_scheduling::pair_registered_runner(&mut inner, result.id);
-            }
+            crate::runtime_scheduling::pair_registered_runner(&mut inner, result.id);
         }
     }
     // One persist after every identity-bearing mutation, so client_id and any
@@ -754,13 +790,31 @@ pub(crate) async fn register_runner_compat_pool_only(
 pub(crate) async fn create_session_compat(
     State(shared): State<Arc<SharedState>>,
     Path((_pool_id, _session_id)): Path<(i64, String)>,
+    headers: axum::http::HeaderMap,
+    identity: Option<axum::Extension<RunnerIdentity>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let runner_id = body
+    let requested_runner_id = body
         .get("agent")
         .and_then(|a| a.get("id"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(1);
+        .and_then(|v| v.as_i64());
+    let system_authorized =
+        crate::auth::bearer_from_headers(&headers) == Some(shared.state.system_token.as_str());
+    let runner_id = if system_authorized {
+        requested_runner_id.unwrap_or(1)
+    } else {
+        let verified = identity
+            .and_then(|axum::Extension(id)| id.runner_id)
+            .ok_or_else(|| ApiError::unauthorized("runner listen token required"))?;
+        if let Some(requested) = requested_runner_id {
+            if requested != verified {
+                return Err(ApiError::forbidden(format!(
+                    "listen token names runner {verified} but session body requests agent {requested}"
+                )));
+            }
+        }
+        verified
+    };
     let name = body
         .get("agent")
         .and_then(|a| a.get("name"))
