@@ -9,6 +9,16 @@ Releases before v0.27.0 predate the changelog.
 
 ## [Unreleased]
 
+### Fixed
+
+- Legacy runner compatibility aliases now require runner-management or
+  one-time provisioning credentials for registration in strict production mode,
+  bind sessions and message polling to the verified runner identity, and reject
+  unauthenticated reporting traffic. The JSON OAuth compatibility path now
+  requires the trusted system credential instead of treating a client id as
+  proof; permissive registration remains an explicit TCP-only conformance
+  opt-in, and the mounted socket stays strict.
+
 ## [0.32.5] - 2026-09-02
 
 ### Added

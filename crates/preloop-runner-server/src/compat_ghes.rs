@@ -42,33 +42,68 @@ pub(crate) async fn register_runner_compat_org_2(
     )
     .await
 }
+pub(crate) async fn replace_runner_compat_org_2(
+    State(shared): State<Arc<SharedState>>,
+    Path((_org, pool_id, agent_id)): Path<(String, i64, String)>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    replace_runner_compat(
+        State(shared),
+        Path((pool_id, agent_id)),
+        headers,
+        Json(request),
+    )
+    .await
+}
 
 pub(crate) async fn create_session_compat_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, pool_id, session_id)): Path<(String, i64, String)>,
+    headers: axum::http::HeaderMap,
+    identity: Option<axum::Extension<RunnerIdentity>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    create_session_compat(State(shared), Path((pool_id, session_id)), Json(body)).await
+    create_session_compat(
+        State(shared),
+        Path((pool_id, session_id)),
+        headers,
+        identity,
+        Json(body),
+    )
+    .await
 }
 
 /// Session creation with only pool_id in path (no session_id — server generates it).
 pub(crate) async fn create_session_compat_pool_only(
     State(shared): State<Arc<SharedState>>,
-    Path(_pool_id): Path<i64>,
+    Path(pool_id): Path<i64>,
+    headers: axum::http::HeaderMap,
+    identity: Option<axum::Extension<RunnerIdentity>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Generate a session_id since the runner doesn't provide one
     let session_id = uuid::Uuid::new_v4().to_string();
-    create_session_compat(State(shared), Path((_pool_id, session_id)), Json(body)).await
+    create_session_compat(
+        State(shared),
+        Path((pool_id, session_id)),
+        headers,
+        identity,
+        Json(body),
+    )
+    .await
 }
 
 /// Org-prefixed session creation with only pool_id in path.
 pub(crate) async fn create_session_compat_org_pool_only(
     State(shared): State<Arc<SharedState>>,
     Path((_org, pool_id)): Path<(String, i64)>,
+    headers: axum::http::HeaderMap,
+    identity: Option<axum::Extension<RunnerIdentity>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    create_session_compat_pool_only(State(shared), Path(pool_id), Json(body)).await
+    create_session_compat_pool_only(State(shared), Path(pool_id), headers, identity, Json(body))
+        .await
 }
 pub(crate) async fn delete_session_org(
     State(shared): State<Arc<SharedState>>,
@@ -97,72 +132,115 @@ pub(crate) async fn next_message_compat_org(
 pub(crate) async fn delete_pool_message_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, pool_id, message_id)): Path<(String, i64, i64)>,
+    identity: Option<axum::Extension<RunnerIdentity>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> StatusCode {
-    delete_pool_message(State(shared), Path((pool_id, message_id)), Query(params)).await
+    delete_pool_message(
+        State(shared),
+        Path((pool_id, message_id)),
+        identity,
+        Query(params),
+    )
+    .await
 }
 
 pub(crate) async fn agent_request_get_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, pool_id, request_id)): Path<(String, i64, i64)>,
+    identity: Option<axum::Extension<RunnerIdentity>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    agent_request_get(State(shared), Path((pool_id, request_id))).await
+    agent_request_get(State(shared), Path((pool_id, request_id)), identity).await
 }
 
 pub(crate) async fn agent_request_ack_org(
+    State(shared): State<Arc<SharedState>>,
     Path((_org, pool_id, request_id)): Path<(String, i64, i64)>,
-) -> StatusCode {
-    agent_request_ack(Path((pool_id, request_id))).await
+    identity: Option<axum::Extension<RunnerIdentity>>,
+) -> Result<StatusCode, ApiError> {
+    agent_request_ack(State(shared), Path((pool_id, request_id)), identity).await
 }
 
 pub(crate) async fn agent_request_patch_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, pool_id, request_id)): Path<(String, i64, i64)>,
+    identity: Option<axum::Extension<RunnerIdentity>>,
     Json(body): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
-    agent_request_patch(State(shared), Path((pool_id, request_id)), Json(body)).await
+) -> Result<Json<serde_json::Value>, ApiError> {
+    agent_request_patch(
+        State(shared),
+        Path((pool_id, request_id)),
+        identity,
+        Json(body),
+    )
+    .await
 }
 
 pub(crate) async fn patch_timeline_records_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, scope, hub, plan_id, timeline_id)): Path<(String, String, String, String, String)>,
+    headers: HeaderMap,
     Json(wrapper): Json<azdo::VssJsonCollectionWrapper<azdo::TimelineRecord>>,
-) -> Json<serde_json::Value> {
-    patch_timeline_records(
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let timeline_uuid = timeline_id.parse().ok();
+    crate::timeline_logs::authorize_reporting_callback(
+        &shared,
+        &headers,
+        &plan_id,
+        timeline_uuid,
+        None,
+    )
+    .await?;
+    Ok(patch_timeline_records(
         State(shared),
         Path((scope, hub, plan_id, timeline_id)),
         Json(wrapper),
     )
-    .await
+    .await)
 }
 
 pub(crate) async fn get_timeline_records_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, scope, hub, plan_id, timeline_id)): Path<(String, String, String, String, String)>,
+    headers: HeaderMap,
     Query(query): Query<crate::timeline_logs::TimelineQuery>,
-) -> Json<serde_json::Value> {
-    get_timeline_records(
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let timeline_uuid = timeline_id.parse().ok();
+    crate::timeline_logs::authorize_reporting_callback(
+        &shared,
+        &headers,
+        &plan_id,
+        timeline_uuid,
+        None,
+    )
+    .await?;
+    Ok(get_timeline_records(
         State(shared),
         Path((scope, hub, plan_id, timeline_id)),
         Query(query),
     )
-    .await
+    .await)
 }
 
 pub(crate) async fn create_log_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, scope, hub, plan_id)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
     Json(log): Json<azdo::TaskLog>,
-) -> Json<serde_json::Value> {
-    create_log(State(shared), Path((scope, hub, plan_id)), Json(log)).await
+) -> Result<Json<serde_json::Value>, ApiError> {
+    crate::timeline_logs::authorize_reporting_callback(&shared, &headers, &plan_id, None, None)
+        .await?;
+    Ok(create_log(State(shared), Path((scope, hub, plan_id)), Json(log)).await)
 }
 
 pub(crate) async fn append_log_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, scope, hub, plan_id, log_id)): Path<(String, String, String, String, String)>,
+    headers: HeaderMap,
     body: Bytes,
-) -> StatusCode {
-    append_log(State(shared), Path((scope, hub, plan_id, log_id)), body).await
+) -> Result<StatusCode, ApiError> {
+    crate::timeline_logs::authorize_reporting_callback(&shared, &headers, &plan_id, None, None)
+        .await?;
+    Ok(append_log(State(shared), Path((scope, hub, plan_id, log_id)), body).await)
 }
 
 pub(crate) async fn console_log_org(
@@ -175,22 +253,41 @@ pub(crate) async fn console_log_org(
         String,
         String,
     )>,
+    headers: HeaderMap,
     body: Bytes,
-) -> StatusCode {
-    console_log(
+) -> Result<StatusCode, ApiError> {
+    let timeline_uuid = timeline_id.parse().ok();
+    crate::timeline_logs::authorize_reporting_callback(
+        &shared,
+        &headers,
+        &plan_id,
+        timeline_uuid,
+        None,
+    )
+    .await?;
+    Ok(console_log(
         State(shared),
         Path((scope, hub, plan_id, timeline_id, record_id)),
         body,
     )
-    .await
+    .await)
 }
 
 pub(crate) async fn finish_job_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, scope, hub, plan_id)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
     Json(event): Json<azdo::JobCompletedEvent>,
-) -> Json<serde_json::Value> {
-    finish_job(State(shared), Path((scope, hub, plan_id)), Json(event)).await
+) -> Result<Json<serde_json::Value>, ApiError> {
+    crate::timeline_logs::authorize_reporting_callback(
+        &shared,
+        &headers,
+        &plan_id,
+        None,
+        Some(event.job_id),
+    )
+    .await?;
+    Ok(finish_job(State(shared), Path((scope, hub, plan_id)), Json(event)).await)
 }
 
 pub(crate) async fn action_download_info_org(

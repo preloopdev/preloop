@@ -3776,6 +3776,11 @@ async fn provision_slot<P: VmProvider + 'static>(
             })
         }
         Err(error) => {
+            // A configure failure can happen after the guest has already
+            // registered the runner. Purge by machine name before deleting
+            // the VM so that registration cannot outlive its provisioned
+            // host and retain a live listen credential.
+            notify_runner_gone(config, &name).await;
             if let Some(ps) = &config.pool_status {
                 ps.record_provision_failure();
             }
@@ -4637,6 +4642,7 @@ async fn provision_runner<P: VmProvider + 'static>(
     // guest cannot fabricate a pairing because only this exact configure
     // invocation ever sees the token value.
     let mut provision_token_file: Option<PathBuf> = None;
+    let mut provision_token_value: Option<String> = None;
     if let Some(pending) = &config.pending_registrations {
         let token = uuid::Uuid::new_v4().to_string();
         let dir = config
@@ -4649,13 +4655,14 @@ async fn provision_runner<P: VmProvider + 'static>(
         }) {
             Ok(path) => {
                 if let Ok(mut guard) = pending.write() {
-                    guard.insert(token.clone(), std::time::SystemTime::now());
+                    let issued_at = std::time::SystemTime::now();
+                    guard.insert(token.clone(), issued_at);
                     // Mirror the mint into the consolidated status handle so
                     // `PoolStatus::snapshot().pending_registrations` counts
                     // tokens issued after startup too. The server-side
                     // consume removes it from both stores.
                     if let Some(ps) = &config.pool_status {
-                        ps.insert_pending(token, std::time::SystemTime::now());
+                        ps.insert_pending(token.clone(), issued_at);
                         // Same 600s window as the legacy pending-map prune
                         // below, so stale tokens don't inflate
                         // `pending_registrations` forever.
@@ -4668,6 +4675,7 @@ async fn provision_runner<P: VmProvider + 'static>(
                             .unwrap_or(false)
                     });
                 }
+                provision_token_value = Some(token);
                 secrets.push((
                     "PRELOOP_PROVISION_TOKEN".to_owned(),
                     SecretSource::HostFile(path.clone()),
@@ -4690,13 +4698,26 @@ async fn provision_runner<P: VmProvider + 'static>(
             }
         }
     }
-    provider
+    let configure_result = provider
         .exec_with_secret_env(name, &as_runner_user(config, &configure), &secrets)
-        .await?;
+        .await;
     drop(staged);
-    if let Some(path) = provision_token_file {
+    if configure_result.is_err() {
+        if let Some(token) = provision_token_value.as_deref() {
+            if let Some(pending) = &config.pending_registrations {
+                if let Ok(mut guard) = pending.write() {
+                    guard.remove(token);
+                }
+            }
+            if let Some(ps) = &config.pool_status {
+                ps.remove_pending(token);
+            }
+        }
+    }
+    if let Some(path) = provision_token_file.take() {
         let _ = std::fs::remove_file(path);
     }
+    configure_result?;
 
     // Bring the container engine up before the runner accepts work, so a job
     // declaring `container:` or `services:` does not race the daemon. Failure

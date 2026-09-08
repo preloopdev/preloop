@@ -1065,6 +1065,11 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         );
         *state.status_snapshot.write() = init;
     }
+    if !config.listen.ip().is_loopback()
+        && state.registration_policy == RegistrationPolicy::Permissive
+    {
+        anyhow::bail!("PRELOOP_REGISTRATION_POLICY=permissive is only allowed on loopback");
+    }
     let oidc_issuer = normalize_oidc_issuer(
         config
             .oidc_issuer

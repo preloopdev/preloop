@@ -29,8 +29,13 @@ pub(crate) async fn github_registration_token(
     let accepted = match shared.state.registration_policy {
         RegistrationPolicy::Strict => trusted,
         // Conformance replays send a real GitHub-issued token this control
-        // plane cannot verify; the harness opts in explicitly.
-        RegistrationPolicy::Permissive => true,
+        // plane cannot verify; the harness opts in explicitly. Even then,
+        // workflow code reaching the mounted socket must not mint a new
+        // runner identity, so that surface keeps the strict credential gate.
+        RegistrationPolicy::Permissive => !request
+            .extensions()
+            .get::<crate::auth::SocketSurface>()
+            .is_some(),
     };
     if missing || !accepted {
         return Err(ApiError::unauthorized("invalid registration credential"));
@@ -112,34 +117,19 @@ pub(crate) async fn oauth2_token(
 ) -> Result<Json<TokenResponse>, ApiError> {
     // Try JSON first (mock flow from existing tests)
     if let Ok(req) = serde_json::from_slice::<JsonOAuth2Request>(&body) {
-        // The JSON shape carries no proof of key possession — `client_secret`
-        // is accepted for shape compatibility and never checked — so without a
-        // gate here the endpoint is an unauthenticated signing oracle handing
-        // runner-scoped JWTs to any caller. The real runner never takes this
-        // path; it presents a PS256 client assertion over the urlencoded form
-        // below.
-        //
-        // Authorize on either of the two things that make the request
-        // legitimate: a client id this server itself issued at registration
-        // (a v4 UUID the caller could only know by having registered), or the
-        // system token, which is how in-process harnesses and the local
-        // control plane drive the mock flow.
-        let authorized = {
-            let bearer = headers
-                .get(axum::http::header::AUTHORIZATION)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.strip_prefix("Bearer "));
-            bearer.is_some_and(|token| token == shared.state.system_token)
-                || shared
-                    .state
-                    .inner
-                    .lock()
-                    .await
-                    .runner_client_ids
-                    .contains_key(&req.client_id)
-        };
-        if !authorized {
-            return Err(ApiError::unauthorized("unknown OAuth client"));
+        // The JSON shape carries no proof of key possession. It is a local
+        // test/control-plane compatibility flow, so require the system
+        // credential rather than turning a known client id into a signing
+        // oracle. Production runners use the signed client_assertion form
+        // below, which proves possession of the registered private key.
+        let bearer = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "));
+        if bearer != Some(shared.state.system_token.as_str()) {
+            return Err(ApiError::unauthorized(
+                "system token required for compatibility OAuth",
+            ));
         }
         let token = shared.state.local_jwt(json!({
             "sub": format!("preloop-runner-listen-mock-{}", req.client_id),

@@ -566,6 +566,14 @@ pub(crate) mod http_sequences {
         let temp = tempfile::tempdir().unwrap();
         let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
         let app = make_app(state.clone(), CancellationToken::new());
+        let (status, value) = req(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/v1/Agent/1/0",
+            json!({"name": "runner-1", "version": "2.335.1"}),
+        )
+        .await;
+        assert!(status.is_success(), "runner registration failed: {value}");
 
         let yaml = "on: push\nconcurrency:\n  group: broker-promo\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
 

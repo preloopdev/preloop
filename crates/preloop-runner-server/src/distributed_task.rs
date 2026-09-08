@@ -9,6 +9,9 @@ pub(crate) async fn next_message(
         .get("sessionId")
         .cloned()
         .unwrap_or_else(|| "default".to_owned());
+    let verified = identity
+        .as_ref()
+        .and_then(|axum::Extension(id)| id.runner_id);
 
     let wait_seconds = params
         .get("waitSeconds")
@@ -17,6 +20,11 @@ pub(crate) async fn next_message(
 
     loop {
         let mut inner = shared.state.inner.lock().await;
+        if let Some(runner_id) = verified {
+            if inner.runner_id_for_session(&session_id) != Some(runner_id) {
+                return (StatusCode::FORBIDDEN, Json(None));
+            }
+        }
         inner.mark_session_seen(&session_id);
         if let Some(message) = inner
             .inflight_messages
@@ -24,19 +32,6 @@ pub(crate) async fn next_message(
             .and_then(|messages| messages.values().next().cloned())
         {
             return (StatusCode::ACCEPTED, Json(Some(message)));
-        }
-
-        if let Some(cancellation) = inner.cancellation_queue.pop_front() {
-            let body_json = concurrency::job_cancel_body(cancellation.agent_job_id);
-            match build_task_agent_message(
-                &mut inner,
-                &session_id,
-                azdo::message_type::JOB_CANCELLED,
-                body_json,
-            ) {
-                Ok(message) => return (StatusCode::OK, Json(Some(message))),
-                Err(_) => return (StatusCode::ACCEPTED, Json(None)),
-            }
         }
 
         if let Some(request_id) = inner.session_active_requests.get(&session_id).copied() {
@@ -47,6 +42,28 @@ pub(crate) async fn next_message(
             if request_finished {
                 inner.session_active_requests.remove(&session_id);
             } else {
+                let cancellation_pos = inner.job_requests.get(&request_id).and_then(|request| {
+                    inner.cancellation_queue.iter().position(|cancellation| {
+                        cancellation.run_id == request.run_id
+                            && cancellation.job_id == request.job_id
+                    })
+                });
+                if let Some(pos) = cancellation_pos {
+                    let cancellation = inner
+                        .cancellation_queue
+                        .remove(pos)
+                        .expect("cancellation position was found in the queue");
+                    let body_json = concurrency::job_cancel_body(cancellation.agent_job_id);
+                    match build_task_agent_message(
+                        &mut inner,
+                        &session_id,
+                        azdo::message_type::JOB_CANCELLED,
+                        body_json,
+                    ) {
+                        Ok(message) => return (StatusCode::OK, Json(Some(message))),
+                        Err(_) => return (StatusCode::ACCEPTED, Json(None)),
+                    }
+                }
                 drop(inner);
                 if wait_seconds == 0 {
                     return (StatusCode::OK, Json(None));
@@ -135,10 +152,12 @@ pub(crate) async fn next_message(
             Err(_) => return (StatusCode::ACCEPTED, Json(None)),
         };
         let request_id = queued.message.request_id;
+        let owner_runner_id = verified.or_else(|| inner.runner_id_for_session(&session_id));
         inner
             .session_active_requests
             .insert(session_id.clone(), request_id);
         if let Some(request) = inner.job_requests.get_mut(&request_id) {
+            request.owner_runner_id = owner_runner_id;
             request.started_at = Some(std::time::SystemTime::now());
         }
         let message = build_task_agent_message(
@@ -240,9 +259,16 @@ pub(crate) fn build_broker_plaintext_message(
 pub(crate) async fn delete_pool_message(
     State(shared): State<Arc<SharedState>>,
     Path((_pool_id, message_id)): Path<(i64, i64)>,
+    identity: Option<axum::Extension<RunnerIdentity>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> StatusCode {
     let session_id = params.get("sessionId").map(String::as_str).unwrap_or("");
+    if let Some(runner_id) = identity.and_then(|axum::Extension(id)| id.runner_id) {
+        let inner = shared.state.inner.lock().await;
+        if inner.runner_id_for_session(session_id) != Some(runner_id) {
+            return StatusCode::FORBIDDEN;
+        }
+    }
     ack_message(shared, session_id, message_id).await
 }
 
@@ -295,29 +321,85 @@ pub(crate) async fn complete_job_compat(
     )
     .await
 }
+pub(crate) async fn complete_job_compat_authenticated(
+    State(shared): State<Arc<SharedState>>,
+    Path(path): Path<(RunId, String)>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<RunRecord>, ApiError> {
+    let target = {
+        let inner = shared.state.inner.lock().await;
+        inner
+            .job_requests
+            .values()
+            .filter(|request| request.run_id == path.0 && request.job_id.0 == path.1)
+            .max_by_key(|request| request.request_id)
+            .cloned()
+    };
+    crate::auth::authorize_reporting_request(&shared.state, &headers, target.as_ref())?;
+    complete_job_compat(State(shared), Path(path), Json(body)).await
+}
+
+fn runner_owns_agent_request(inner: &InnerState, request_id: i64, runner_id: i64) -> bool {
+    if let Some(owner) = inner
+        .job_requests
+        .get(&request_id)
+        .and_then(|request| request.owner_runner_id)
+    {
+        return owner == runner_id;
+    }
+    inner
+        .session_active_requests
+        .iter()
+        .any(|(session_id, active_id)| {
+            *active_id == request_id && inner.runner_id_for_session(session_id) == Some(runner_id)
+        })
+}
 
 /// GET /_apis/v1/AgentRequest/:pool_id/:request_id to query a job request lease/result.
 ///
 /// The official listener calls this when another job arrives while the previous
 /// worker process may still be unwinding. Returning a completed `result` lets it
-/// safely move on; 404/405 makes it cancel the worker and can poison matrix runs.
+/// safely move on; the request's retained owner keeps this post-completion read
+/// bound to the runner that handled the attempt. 404/405 makes it cancel the
+/// worker and can poison matrix runs.
 pub(crate) async fn agent_request_get(
     State(shared): State<Arc<SharedState>>,
     Path((pool_id, request_id)): Path<(i64, i64)>,
+    identity: Option<axum::Extension<RunnerIdentity>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let inner = shared.state.inner.lock().await;
     let request = inner
         .job_requests
         .get(&request_id)
         .ok_or_else(|| ApiError::not_found("agent request not found"))?;
+    if let Some(runner_id) = identity.and_then(|axum::Extension(id)| id.runner_id) {
+        if !runner_owns_agent_request(&inner, request_id, runner_id) {
+            return Err(ApiError::forbidden(
+                "agent request belongs to another runner",
+            ));
+        }
+    }
     Ok(Json(agent_request_json(pool_id, request)))
 }
 
 /// POST /_apis/v1/AgentRequest/:pool_id/:request_id — best-effort request ack.
 pub(crate) async fn agent_request_ack(
-    Path((_pool_id, _request_id)): Path<(i64, i64)>,
-) -> StatusCode {
-    StatusCode::OK
+    State(shared): State<Arc<SharedState>>,
+    Path((_pool_id, request_id)): Path<(i64, i64)>,
+    identity: Option<axum::Extension<RunnerIdentity>>,
+) -> Result<StatusCode, ApiError> {
+    if let Some(runner_id) = identity.and_then(|axum::Extension(id)| id.runner_id) {
+        let inner = shared.state.inner.lock().await;
+        if inner.job_requests.contains_key(&request_id)
+            && !runner_owns_agent_request(&inner, request_id, runner_id)
+        {
+            return Err(ApiError::forbidden(
+                "agent request belongs to another runner",
+            ));
+        }
+    }
+    Ok(StatusCode::OK)
 }
 
 /// PATCH /_apis/v1/AgentRequest/:pool_id/:request_id — renew or complete job request.
@@ -325,8 +407,9 @@ pub(crate) async fn agent_request_ack(
 pub(crate) async fn agent_request_patch(
     State(shared): State<Arc<SharedState>>,
     Path((pool_id, request_id)): Path<(i64, i64)>,
+    identity: Option<axum::Extension<RunnerIdentity>>,
     Json(body): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     // `result` is untyped request content; never log it raw. Derive a fixed
     // label from the status mapping instead ("success"/"failure"/…, or
     // "unknown"/"renew").
@@ -353,6 +436,7 @@ pub(crate) async fn agent_request_patch(
     // If this is a completion (has result), delegate to complete_job_inner
     // so summarize_run, promote_ready_jobs, and notify_waiters all fire.
     // The result field is only present on the final PATCH; renewals have no result.
+    let verified_runner_id = identity.and_then(|axum::Extension(id)| id.runner_id);
     if let Some(result) = body.get("result").and_then(|v| v.as_str()) {
         let new_status = match execution_status_from_runner_result(result) {
             Some(status) => status,
@@ -362,71 +446,103 @@ pub(crate) async fn agent_request_patch(
                         result = %result_hint,
                         "unknown agent_request_patch result; skipping completion"
                 );
-                return Json(
+                return Ok(Json(
                     json!({ "requestId": request_id, "lockedUntil": agent_request_locked_until() }),
-                );
+                ));
             }
         };
         // Look up (run_id, job_id) under the inner lock, then drop it before calling
         // complete_job_inner which acquires the lock itself.
         let completion = {
             let mut inner = shared.state.inner.lock().await;
-            let mut already_completed = false;
-            if let Some(request) = inner.job_requests.get_mut(&request_id) {
-                already_completed = request.result.is_some();
-                request.result = Some(new_status);
-                request.locked_until = agent_request_locked_until();
+            if let Some(runner_id) = verified_runner_id {
+                if inner.job_requests.contains_key(&request_id)
+                    && !runner_owns_agent_request(&inner, request_id, runner_id)
+                {
+                    return Err(ApiError::forbidden(
+                        "agent request belongs to another runner",
+                    ));
+                }
             }
+            let already_completed = inner
+                .job_requests
+                .get(&request_id)
+                .is_some_and(|request| request.result.is_some());
             if already_completed {
-                inner.inflight_requests.remove(&request_id);
                 info!(
                     request_id,
                     result = %result_hint,
-                    "agent request already completed; refreshing result only"
+                    "agent request already completed; ignoring duplicate completion"
                 );
                 None
-            } else if let Some((run_id, job_id)) = inner.inflight_requests.remove(&request_id) {
-                info!(
-                    %run_id,
-                    %job_id,
-                    result = %result_hint,
-                    "job completed via agent_request_patch"
-                );
-                Some(JobCompletion {
-                    run_id,
-                    job_id,
-                    // The patched request is the attempt that reported.
-                    agent_job_id: inner
-                        .job_requests
-                        .get(&request_id)
-                        .map(|record| record.agent_job_id),
-                    status: new_status,
-                    outputs: Default::default(),
-                    annotations: Vec::new(),
-                    step_results: Vec::new(),
-                })
             } else {
-                info!(
-                    request_id,
-                    "no inflight job for request_id; ignoring result"
-                );
-                None
+                if let Some(request) = inner.job_requests.get_mut(&request_id) {
+                    request.result = Some(new_status);
+                    request.locked_until = agent_request_locked_until();
+                }
+                if let Some((run_id, job_id)) = inner.inflight_requests.remove(&request_id) {
+                    info!(
+                        %run_id,
+                        %job_id,
+                        result = %result_hint,
+                        "job completed via agent_request_patch"
+                    );
+                    Some(JobCompletion {
+                        run_id,
+                        job_id,
+                        // The patched request is the attempt that reported.
+                        agent_job_id: inner
+                            .job_requests
+                            .get(&request_id)
+                            .map(|record| record.agent_job_id),
+                        status: new_status,
+                        outputs: Default::default(),
+                        annotations: Vec::new(),
+                        step_results: Vec::new(),
+                    })
+                } else {
+                    info!(
+                        request_id,
+                        "no inflight job for request_id; ignoring result"
+                    );
+                    None
+                }
             }
         };
         if let Some(c) = completion {
             let _ = complete_job_inner(shared.clone(), c).await;
         }
-        return Json(agent_request_response(&shared, pool_id, request_id).await);
+        return Ok(Json(
+            agent_request_response(&shared, pool_id, request_id).await,
+        ));
     }
-    // Renewal — runner is still working; just extend the lock.
+    // Renewal — runner is still working; just extend the lock. Completed
+    // requests are immutable, so a late duplicate cannot rewrite their timing.
     {
         let mut inner = shared.state.inner.lock().await;
-        if let Some(request) = inner.job_requests.get_mut(&request_id) {
-            request.locked_until = agent_request_locked_until();
-            request.last_renewed_at = Some(std::time::SystemTime::now());
+        if let Some(runner_id) = verified_runner_id {
+            if inner.job_requests.contains_key(&request_id)
+                && !runner_owns_agent_request(&inner, request_id, runner_id)
+            {
+                return Err(ApiError::forbidden(
+                    "agent request belongs to another runner",
+                ));
+            }
+        }
+        let request_active = inner
+            .job_requests
+            .get(&request_id)
+            .is_some_and(|request| request.result.is_none());
+        if request_active {
+            if let Some(request) = inner.job_requests.get_mut(&request_id) {
+                request.locked_until = agent_request_locked_until();
+                request.last_renewed_at = Some(std::time::SystemTime::now());
+            }
         }
     }
-    Json(agent_request_response(&shared, pool_id, request_id).await)
+    Ok(Json(
+        agent_request_response(&shared, pool_id, request_id).await,
+    ))
 }
 
 pub(crate) async fn agent_request_response(

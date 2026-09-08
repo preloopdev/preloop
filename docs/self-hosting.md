@@ -107,8 +107,9 @@ All configuration is environment variables; CLI flags override them.
 | `PRELOOP_HOME` | `$HOME/.preloop` | State directory (database, blobs, cache, credentials) |
 | `PRELOOP_STORE_URL` | SQLite in the state dir | `sqlite://<path>`, a bare path, or `postgres://…?sslmode=require\|verify-full` |
 | `PRELOOP_UNIX_SOCKET` | — | Control socket path; mounted into runner VMs, serves the runner surface only |
-| `PRELOOP_SYSTEM_TOKEN` | generated and stored in the OS credential store; private `$PRELOOP_HOME/engine.token` fallback | Admin credential for `/api/v1/*`. Treat it as root for the control plane |
+| `PRELOOP_SYSTEM_TOKEN` | generated and stored in the OS credential store; private `$PRELOOP_HOME/engine.token` fallback | Admin credential for `/api/v1/*`. Treat it as root for the control plane; strict external runner registration also uses this credential |
 | `PRELOOP_TOKEN_TTL_SECS` | `2999` | Issued runner token lifetime |
+| `PRELOOP_REGISTRATION_POLICY` | `strict` | Registration policy. `strict` requires the system credential (or a fresh pool provision token on legacy registration); `permissive` accepts any non-empty upstream token on TCP for conformance replay only, while the mounted socket remains strict — never use it on an exposed listener |
 | `PRELOOP_CONFIG` | `$PRELOOP_HOME/config.toml` | Config file path |
 | `PRELOOP_SECRETS_STORE` | config file | Secrets backend selector |
 | `PRELOOP_RUNNER_URL` | loopback listen address | Origin handed to runners. Set automatically; override only for remote runners |
@@ -288,27 +289,39 @@ only reachable from the host. A generated native API token protects
 `/api/v1/*` even when you bind a private non-loopback address, but it does not
 protect the runner registration surface. Bind a private address or `0.0.0.0`
 behind a proxy or tunnel, and do not publish the registration endpoint to the
-internet.
+internet. `PRELOOP_REGISTRATION_POLICY=permissive` is rejected on non-loopback
+listeners.
 
 **Never publish the whole API surface.** Restrict your proxy or tunnel to
 `/api/v1/github/webhooks`, as every example above does.
 
 The reason is `POST /api/v3/actions/runner-registration`. The official GitHub
-runner authenticates there with a registration token **GitHub** issued and can
-therefore validate. A self-hosted control plane cannot validate a third-party
-credential, so it accepts any non-empty one over TCP. Anyone who can reach that
-endpoint can:
+runner authenticates there with a registration token **GitHub** issued, but a
+self-hosted control plane cannot validate a third-party credential. In the
+safe default (`PRELOOP_REGISTRATION_POLICY=strict`, or when unset), Preloop
+therefore requires its own system credential on TCP and on the mounted socket.
+The host-side pool can instead redeem a single-use provision token staged in
+the control plane for that machine on a legacy registration alias. The token
+expires after ten minutes and is consumed atomically.
+
+The explicit `PRELOOP_REGISTRATION_POLICY=permissive` mode accepts any
+non-empty registration credential on TCP solely for conformance replay of
+GitHub-issued tokens that Preloop cannot verify. The mounted socket still
+requires the system credential. **Never enable permissive mode on an exposed
+or production listener.**
+
+Without the strict gate, anyone who could reach the endpoint could:
 
 1. obtain a runner-management credential,
 2. register a runner with labels matching your jobs,
 3. receive a job message — which carries a freshly minted GitHub App
-   installation token and any secrets scoped to that job, and
-4. report fabricated job conclusions.
+  token and job secrets.
 
-Requests arriving on the mounted control socket are held to a stricter rule (the
-system credential is required), because untrusted workflow code can reach that
-socket. The TCP runner-registration surface has no equivalent gate, so
-**network reachability is the control**.
+In strict mode, the TCP and mounted-socket surfaces enforce the same
+registration credential boundary: the system credential is required. Workflow
+code is not given the system credential, so it cannot use the socket to mint a
+new runner identity. `PRELOOP_REGISTRATION_POLICY=permissive` is a
+conformance-only TCP exception and is allowed only on loopback.
 
 Also worth knowing:
 
