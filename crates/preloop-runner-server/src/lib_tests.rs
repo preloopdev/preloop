@@ -6544,6 +6544,44 @@ async fn results_cache_and_artifact_routes_reject_inconsistent_bearers() {
 }
 
 #[tokio::test]
+async fn results_metadata_noop_requests_require_strict_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    // The Results route guard validates typed identity before body extraction,
+    // so malformed identity tokens cannot take the metadata no-op path.
+    let loose_results_token = state
+        .local_jwt(json!({
+            "sub": "preloop-job-not-a-uuid",
+            "scp": "Actions.Results:plan:not-a-uuid",
+        }))
+        .unwrap();
+
+    for route in [
+        "/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata",
+        "/twirp/results.services.receiver.Receiver/CreateJobLogsMetadata",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(route)
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {loose_results_token}"),
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{route}");
+    }
+}
+
+#[tokio::test]
 async fn twirp_metadata_routes_persist_log_metadata() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -6603,6 +6641,149 @@ async fn twirp_metadata_routes_persist_log_metadata() {
     // nothing to key or authorize against.
     assert!(!inner.log_metadata.contains_key("step:step-logs"));
     assert!(!inner.log_metadata.contains_key("job:job-logs"));
+}
+#[tokio::test]
+async fn job_results_metadata_cannot_overwrite_another_job_namespace() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let plan_a = uuid::Uuid::new_v4().to_string();
+    let plan_b = uuid::Uuid::new_v4().to_string();
+    let job_a = uuid::Uuid::new_v4();
+    let job_b = uuid::Uuid::new_v4();
+    let token_a = state.mint_runtime_token(&plan_a, &job_a);
+    let shared_step = "shared-step";
+    let keys = [
+        format!("summary:{shared_step}"),
+        format!("step:{shared_step}"),
+        format!("job:{job_b}"),
+    ];
+    {
+        let mut inner = state.inner.lock().await;
+        for (index, key) in keys.iter().enumerate() {
+            inner.log_metadata.insert(
+                key.clone(),
+                LogMetadata {
+                    byte_count: index + 1,
+                    line_count: index + 10,
+                },
+            );
+        }
+    }
+
+    let requests = [
+        (
+            "/twirp/results.services.receiver.Receiver/CreateStepSummaryMetadata",
+            json!({
+                "step_backend_id": shared_step,
+                "workflow_job_run_backend_id": job_b,
+                "workflow_run_backend_id": plan_b,
+                "size": 999
+            }),
+        ),
+        (
+            "/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata",
+            json!({
+                "step_backend_id": shared_step,
+                "workflow_job_run_backend_id": job_b,
+                "workflow_run_backend_id": plan_b,
+                "line_count": 999
+            }),
+        ),
+        (
+            "/twirp/results.services.receiver.Receiver/CreateJobLogsMetadata",
+            json!({
+                "workflow_job_run_backend_id": job_b,
+                "workflow_run_backend_id": plan_b,
+                "line_count": 999
+            }),
+        ),
+    ];
+    for (uri, body) in requests {
+        assert_eq!(
+            status_with_bearer(&app, &token_a, Method::POST, uri, body).await,
+            StatusCode::FORBIDDEN,
+            "{uri}"
+        );
+    }
+
+    let inner = state.inner.lock().await;
+    assert_eq!(
+        keys.iter()
+            .map(|key| {
+                inner
+                    .log_metadata
+                    .get(key)
+                    .map(|meta| (meta.byte_count, meta.line_count))
+            })
+            .collect::<Vec<_>>(),
+        vec![Some((1, 10)), Some((2, 11)), Some((3, 12))]
+    );
+    assert_eq!(inner.log_metadata.len(), keys.len());
+}
+
+#[tokio::test]
+async fn job_results_token_cannot_update_another_jobs_steps() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (_, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let (_, plan_id, own_agent_job_id) = jobs[0].clone();
+    let (_, _, other_agent_job_id) = jobs[1].clone();
+    let own_job_id = uuid::Uuid::parse_str(&own_agent_job_id).unwrap();
+    let token = state.mint_runtime_token(&plan_id, &own_job_id);
+    let uri = "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate";
+    let update = |job_id: &str, external_id: &str| {
+        json!({
+            "workflow_run_backend_id": plan_id,
+            "workflow_job_run_backend_id": job_id,
+            "steps": [{
+                "external_id": external_id,
+                "number": 1,
+                "name": "Run echo",
+                "status": 6,
+                "conclusion": 2
+            }]
+        })
+    };
+
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &token,
+            Method::POST,
+            uri,
+            update(&own_agent_job_id, "own-step")
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &token,
+            Method::POST,
+            uri,
+            update(&other_agent_job_id, "other-step")
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+
+    let inner = state.inner.lock().await;
+    assert!(inner
+        .job_steps
+        .get(&own_job_id)
+        .is_some_and(|steps| steps.iter().any(|step| step.id == "own-step")));
+    assert!(!inner
+        .job_steps
+        .get(&own_job_id)
+        .is_some_and(|steps| steps.iter().any(|step| step.id == "other-step")));
+    let other_job_id = uuid::Uuid::parse_str(&other_agent_job_id).unwrap();
+    assert!(!inner
+        .job_steps
+        .get(&other_job_id)
+        .is_some_and(|steps| steps.iter().any(|step| step.id == "other-step")));
 }
 
 #[tokio::test]
