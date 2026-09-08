@@ -28,6 +28,9 @@ PRELOOP=${PRELOOP:-$HOME/preloop/target/debug/preloop}
 ENGINE_PORT=${PRELOOP_LISTEN:-127.0.0.1:9091}
 RESULT_DIR=benchmarks/real-world/results/conformance-4repos/$OUT/c
 
+# The native API token is deliberately explicit for this separate client.
+TOKEN="${PRELOOP_SYSTEM_TOKEN:?set PRELOOP_SYSTEM_TOKEN to the engine administrator token}"
+export PRELOOP_SYSTEM_TOKEN
 # The CLI otherwise falls back to its configured endpoint (unix socket or the
 # default port), where /api/v1/* is gated off and submission 404s.
 export PRELOOP_URL="http://$ENGINE_PORT"
@@ -52,7 +55,6 @@ fi
 RUN_ID=$(echo "$RUN_LINE" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
 echo "run: $RUN_ID"
 
-TOKEN=$(cat ~/.preloop/engine.token)
 for _ in $(seq 1 120); do
   sleep 15
   STATUS=$(curl -sf -H "Authorization: Bearer $TOKEN" \

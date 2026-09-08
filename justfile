@@ -93,21 +93,22 @@ bench-preloop-quick:
 
 # e2e redirect (one-time setup) 
 
-#serve
+# Local runner-client commands discover the persisted token in this same
+# engine home. Set PRELOOP_SYSTEM_TOKEN explicitly for a different server.
 
 serve:
-    PRELOOP_LOCAL_WORKSPACE="${PRELOOP_LOCAL_WORKSPACE:-$PWD}" cargo run --release -p preloop-runner-server -- serve --listen 127.0.0.1:9090
+    PRELOOP_HOME="${PRELOOP_HOME:-$PWD/.preloop}" PRELOOP_LOCAL_WORKSPACE="${PRELOOP_LOCAL_WORKSPACE:-$PWD}" cargo run --release -p preloop-runner-server -- serve --listen 127.0.0.1:9090
 
 serve-dev:
-    PRELOOP_LOCAL_WORKSPACE="${PRELOOP_LOCAL_WORKSPACE:-$PWD}" cargo run --release -p preloop-runner-server -- serve --listen 127.0.0.1:9090 --enable-test-api --test-api-token dev-token
+    PRELOOP_HOME="${PRELOOP_HOME:-$PWD/.preloop}" PRELOOP_LOCAL_WORKSPACE="${PRELOOP_LOCAL_WORKSPACE:-$PWD}" cargo run --release -p preloop-runner-server -- serve --listen 127.0.0.1:9090 --enable-test-api --test-api-token dev-token
 
-#submit 
+#submit
 
 submit-ci:
-    cargo run -p preloop-runner-client -- --server {{server}} submit -W .github/workflows/ci.yml --repository {{repo}}
+    PRELOOP_HOME="${PRELOOP_HOME:-$PWD/.preloop}" cargo run -p preloop-runner-client -- --server {{server}} submit -W .github/workflows/ci.yml --repository {{repo}}
 
 submit-dogfood:
-    cargo run -p preloop-runner-client -- --server {{server}} submit -W fixtures/workflows/dogfood.yml
+    PRELOOP_HOME="${PRELOOP_HOME:-$PWD/.preloop}" cargo run -p preloop-runner-client -- --server {{server}} submit -W fixtures/workflows/dogfood.yml
 
 #runner 
 

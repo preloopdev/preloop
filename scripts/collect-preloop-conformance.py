@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run each scenario through preloop infrastructure and collect results as JSONL."""
 
-import json, os, subprocess, time, tempfile
+import json, os, secrets, subprocess, time, tempfile
 from pathlib import Path
 
 SERVER_PORT = 9191
@@ -23,6 +23,9 @@ scenarios = [
     ("114-step-timeout-graceful-kill", "workflow_dispatch"),
     ("115-cache-v2-restore-fallback", "workflow_dispatch"),
 ]
+
+SYSTEM_TOKEN = os.environ.get("PRELOOP_SYSTEM_TOKEN") or secrets.token_hex(32)
+os.environ["PRELOOP_SYSTEM_TOKEN"] = SYSTEM_TOKEN
 
 records = []
 
@@ -56,7 +59,7 @@ for name, event in scenarios:
              "--state-dir", str(state_dir)],
             env={**os.environ,
                  "PRELOOP_PUBLIC_URL": f"http://127.0.0.1:{SERVER_PORT}",
-                 "PRELOOP_SYSTEM_TOKEN": "preloop-system-token"},
+                 "PRELOOP_SYSTEM_TOKEN": SYSTEM_TOKEN},
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
         time.sleep(3)
@@ -121,7 +124,7 @@ for name, event in scenarios:
             time.sleep(1)
             try:
                 g = subprocess.run(
-                    ["curl", "-s", "-H", "Authorization: Bearer preloop-system-token",
+                    ["curl", "-s", "-H", f"Authorization: Bearer {SYSTEM_TOKEN}",
                      f"http://127.0.0.1:{SERVER_PORT}/api/v1/runs/{run_id}"],
                     capture_output=True, text=True, timeout=5
                 )

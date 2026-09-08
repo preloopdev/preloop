@@ -2,14 +2,14 @@
 const { spawn, spawnSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
-
+const crypto = require("crypto");
 const REPO_ROOT = path.resolve(__dirname, "..");
 const MITM_DIR = path.resolve(REPO_ROOT, "../mitm-proxy/experiments/mitm");
 const MITMDUMP_BIN = path.resolve(MITM_DIR, ".venv/bin/mitmdump");
 const CAPTURES_DIR = path.resolve(REPO_ROOT, ".runner-watch/dap-captures");
 const OFFICIAL_RUNNER_DIR = path.resolve(MITM_DIR, ".cache/runner-official");
 const PRELOOP_RUNNER_DIR = path.resolve(REPO_ROOT, "target/release");
-const SYSTEM_TOKEN = process.env.PRELOOP_SYSTEM_TOKEN || "preloop-system-token";
+const SYSTEM_TOKEN = process.env.PRELOOP_SYSTEM_TOKEN || crypto.randomBytes(32).toString("hex");
 
 // Ensure capture directories exist
 fs.mkdirSync(CAPTURES_DIR, { recursive: true });

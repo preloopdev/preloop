@@ -15,7 +15,7 @@
 #
 # Environment:
 #   PRELOOP_URL          server base URL (default http://127.0.0.1:9090)
-#   PRELOOP_SYSTEM_TOKEN native bearer token (default preloop-system-token)
+#   PRELOOP_SYSTEM_TOKEN native bearer token (required unless the private fallback file exists)
 #
 # Emits the same JSON keys the poller captured, plus `snapshot_timing` and
 # per-step `started_at`/`finished_at`, so jq consumers can reuse it.
@@ -25,10 +25,13 @@ set -euo pipefail
 PRELOOP_URL="${PRELOOP_URL:-http://127.0.0.1:9090}"
 if [ -n "${PRELOOP_SYSTEM_TOKEN:-}" ]; then
     TOKEN="$PRELOOP_SYSTEM_TOKEN"
+elif [ -n "${PRELOOP_TOKEN:-}" ]; then
+    TOKEN="$PRELOOP_TOKEN"
 elif [ -f "${PRELOOP_HOME:-$HOME/.preloop}/engine.token" ]; then
     TOKEN="$(tr -d '[:space:]' < "${PRELOOP_HOME:-$HOME/.preloop}/engine.token")"
 else
-    TOKEN="preloop-system-token"
+    echo "ERROR: set PRELOOP_SYSTEM_TOKEN (or PRELOOP_TOKEN) for this client" >&2
+    exit 1
 fi
 RUN_ID="${1:-}"
 

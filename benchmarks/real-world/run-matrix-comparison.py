@@ -19,6 +19,7 @@ import subprocess
 import urllib.request
 import urllib.error
 from pathlib import Path
+import secrets
 from collections import defaultdict
 from dataclasses import dataclass, field
 
@@ -99,7 +100,7 @@ def wait_for_new_github_run(workflow_file: str, repo: str, known_ids: set[str], 
 def api_request(method: str, url: str, body: dict = None) -> dict:
     data = None if body is None else json.dumps(body).encode("utf-8")
     headers = {
-        "Authorization": "Bearer preloop-system-token",
+        "Authorization": f"Bearer {os.environ['PRELOOP_SYSTEM_TOKEN']}",
         "Content-Type": "application/json"
     }
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
@@ -328,7 +329,7 @@ def start_runner(runner_type: str, server_url: str, runner_dir: Path, state_dir:
         subprocess.run([
             str(runner_bin), "configure",
             "--url", server_url,
-            "--token", "preloop-system-token",
+            "--token", os.environ["PRELOOP_SYSTEM_TOKEN"],
             "--name", f"preloop-{int(time.time())}",
             "--labels", "self-hosted,fidelity-test",
             "--work", "_work",
@@ -428,7 +429,7 @@ def execute_local_scenario(scenario: str, server_url: str, state_dir: Path, out_
         log_text = ""
         try:
             req = urllib.request.Request(f"{server_url}/api/v1/runs/{run_id}/logs")
-            req.add_header("Authorization", "Bearer preloop-system-token")
+            req.add_header("Authorization", f"Bearer {os.environ['PRELOOP_SYSTEM_TOKEN']}")
             with urllib.request.urlopen(req) as response:
                 log_text = response.read().decode("utf-8", "replace")
         except Exception as e:
@@ -610,6 +611,9 @@ def main() -> int:
     env_name = f"{args.runner}-{args.server}"
     out_path = args.out_dir / env_name
     out_path.mkdir(parents=True, exist_ok=True)
+
+    if args.server == "preloop" and not os.environ.get("PRELOOP_SYSTEM_TOKEN"):
+        os.environ["PRELOOP_SYSTEM_TOKEN"] = secrets.token_hex(32)
 
     server_proc = None
     runner_proc = None
