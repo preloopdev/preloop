@@ -242,13 +242,16 @@ pub fn resolve_engine_token_with_store(
     configured: Option<String>,
     store: &dyn CredentialStore,
 ) -> Result<String> {
-    std::fs::create_dir_all(storage_dir)
-        .with_context(|| format!("create engine-token directory {}", storage_dir.display()))?;
-    set_private_directory_permissions(storage_dir)?;
-
+    // An explicitly configured token needs no storage: return it before
+    // touching the filesystem so a directory error cannot abort startup
+    // when there is nothing to persist.
     if let Some(configured) = configured {
         return validate_engine_token(&configured, "PRELOOP_SYSTEM_TOKEN");
     }
+
+    std::fs::create_dir_all(storage_dir)
+        .with_context(|| format!("create engine-token directory {}", storage_dir.display()))?;
+    set_private_directory_permissions(storage_dir)?;
 
     let reference = engine_token_reference(storage_dir)?;
     let mut store_available = match store.available() {
@@ -707,6 +710,23 @@ mod tests {
         assert_eq!(first_ref, first_again);
         assert_ne!(first_ref, second_ref);
         assert!(first_ref.as_str().starts_with("engine-token-"));
+    }
+
+    #[test]
+    fn configured_token_returns_without_touching_storage() {
+        let store = MemoryCredentialStore::default();
+        // Point at a directory that does not exist: an explicitly configured
+        // token must be validated and returned without creating anything.
+        let missing = tempfile::tempdir().unwrap().path().join("does-not-exist");
+        assert!(!missing.exists());
+        let token = resolve_engine_token_with_store(
+            &missing,
+            Some("  explicit-token  ".to_owned()),
+            &store,
+        )
+        .unwrap();
+        assert_eq!(token, "explicit-token");
+        assert!(!missing.exists());
     }
 
     #[test]

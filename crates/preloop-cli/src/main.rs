@@ -361,6 +361,20 @@ pub(crate) fn api_token() -> Option<String> {
                 .ok()
                 .flatten()
         })
+        .or_else(|| {
+            // Standalone `serve` without PRELOOP_HOME stores under its
+            // state dir (default `./.preloop` in the server's cwd), while
+            // preloop_home() prefers `$HOME/.preloop`. Try the cwd default
+            // so a CLI run from the same directory finds it.
+            let home = preloop_home();
+            let cwd_default = std::path::PathBuf::from(".preloop");
+            if home == cwd_default {
+                return None;
+            }
+            preloop_runner_server::credential_store::load_engine_token(&cwd_default)
+                .ok()
+                .flatten()
+        })
 }
 
 pub(crate) fn build_client() -> reqwest::Client {
