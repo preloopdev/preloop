@@ -145,34 +145,16 @@ pub(crate) async fn fork_restricted_from_token(
     state: &crate::state::AppState,
     token: &str,
 ) -> Option<bool> {
-    let payload = state.verify_local_jwt_claims(token)?;
-    let subject = payload.get("sub").and_then(|value| value.as_str());
-    let scope = payload.get("scp").and_then(|value| value.as_str());
-    // Only job runtime tokens carry the fork restriction. Anything not shaped
-    // like one (system token, runner-listen, debug-worker surfaces) belongs
-    // to the control plane and keeps its existing access.
-    let job_shaped = subject.is_some_and(|sub| sub.starts_with("preloop-job-"))
-        && scope.is_some_and(|scope| scope.starts_with("Actions.Results:"));
-    // Same agreement rule as `AppState::job_uuid_from_token` — `sub` is the
-    // job, `scp` is `Actions.Results:{plan_id}:{job_id}`, both must name the
-    // same job — but derived from the payload we already verified, so the
-    // HMAC/expiry checks run once per cache write instead of twice.
-    let job = subject
-        .and_then(|sub| sub.strip_prefix("preloop-job-"))
-        .and_then(|sub| sub.parse::<uuid::Uuid>().ok())
-        .zip(
-            scope
-                .and_then(|scope| scope.strip_prefix("Actions.Results:"))
-                .and_then(|scope| scope.rsplit(':').next())
-                .and_then(|job| job.parse::<uuid::Uuid>().ok()),
-        )
-        .filter(|(subject_job, scope_job)| subject_job == scope_job)
-        .map(|(subject_job, _)| subject_job);
-    let Some(job) = job else {
-        // Signed like a job token but its subject/scope no longer parse to a
-        // job: nothing left to prove it trusted, so refuse.
-        return job_shaped.then_some(true);
+    let identity = match crate::auth::results_identity(state, token) {
+        Ok(crate::auth::ResultsIdentity::Job(identity)) => identity,
+        Ok(crate::auth::ResultsIdentity::System)
+        | Err(crate::auth::ResultsIdentityError::NotJob)
+        | Err(crate::auth::ResultsIdentityError::MalformedScope)
+        | Err(crate::auth::ResultsIdentityError::Invalid) => return None,
+        Err(crate::auth::ResultsIdentityError::MalformedJob)
+        | Err(crate::auth::ResultsIdentityError::MalformedJobSubject) => return Some(true),
     };
+    let job = identity.job_id;
     let inner = state.inner.lock().await;
     // Every hop of the correlation must survive. When the job is retired or
     // purged mid-flight the worker still holds a valid JWT, and the missing

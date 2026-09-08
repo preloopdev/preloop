@@ -24,25 +24,15 @@ pub(crate) struct StepLogsSignedBlobUrlRequest {
 /// numbering `--step` reads off the workflow.
 pub(crate) async fn twirp_workflow_steps_update(
     State(shared): State<Arc<SharedState>>,
-    headers: HeaderMap,
+    axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let mut inner = shared.state.inner.lock().await;
-
     let plan_id = payload["workflow_run_backend_id"].as_str().unwrap_or("");
     let agent_job_id_str = payload["workflow_job_run_backend_id"]
         .as_str()
         .unwrap_or("");
-    if !crate::auth::results_token_binds_job(
-        &shared.state,
-        crate::auth::bearer_from_headers(&headers),
-        plan_id,
-        agent_job_id_str,
-    ) {
-        return Err(ApiError::forbidden(
-            "results-service token is not bound to that job",
-        ));
-    }
+    crate::auth::require_results_job(&identity, plan_id, agent_job_id_str)?;
+    let mut inner = shared.state.inner.lock().await;
 
     let (Some(plan_uuid), Some(job_uuid)) = (
         uuid::Uuid::parse_str(plan_id).ok(),
@@ -159,26 +149,21 @@ pub(crate) async fn twirp_workflow_steps_update(
 
 pub(crate) async fn twirp_get_job_logs_signed_blob_url(
     State(shared): State<Arc<SharedState>>,
-    headers: axum::http::HeaderMap,
+    axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<JobLogsSignedBlobUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // The signed URL is the upload credential for `/replay/results/*` — a
     // bearerless route reachable from inside every runner VM. Only mint for
     // the plan/job the caller's token actually names, or workflow code could
     // ask for another job's URL and overwrite its logs.
-    if !crate::auth::results_token_binds_job(
-        &shared.state,
-        crate::auth::bearer_from_headers(&headers),
+    let job_id = crate::auth::require_canonical_results_job_id(
+        &identity,
         &request.workflow_run_backend_id,
         &request.workflow_job_run_backend_id,
-    ) {
-        return Err(ApiError::forbidden(
-            "replay blob URL minting requires a token for that job",
-        ));
-    }
+    )?;
     let path = format!(
         "/replay/results/{}/{}/job-logs.txt",
-        request.workflow_run_backend_id, request.workflow_job_run_backend_id
+        request.workflow_run_backend_id, job_id
     );
     let expires_at = crate::auth::replay_ticket_expiry();
     let sig = crate::auth::sign_replay_upload_ticket(&shared.state, &path, expires_at);
@@ -192,35 +177,34 @@ pub(crate) async fn twirp_get_job_logs_signed_blob_url(
 }
 
 pub(crate) async fn twirp_get_job_diag_logs_signed_blob_url(
-    Json(_request): Json<JobLogsSignedBlobUrlRequest>,
-) -> Json<serde_json::Value> {
+    axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
+    Json(request): Json<JobLogsSignedBlobUrlRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    crate::auth::require_results_job(
+        &identity,
+        &request.workflow_run_backend_id,
+        &request.workflow_job_run_backend_id,
+    )?;
     let token = uuid::Uuid::new_v4();
-    Json(json!({
+    Ok(Json(json!({
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
         "diag_logs_url": format!("{}/twirp-blob/diag/{token}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig=dummy", runner_base_url()),
-    }))
+    })))
 }
 
 pub(crate) async fn twirp_get_step_logs_signed_blob_url(
     State(shared): State<Arc<SharedState>>,
-    headers: axum::http::HeaderMap,
+    axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepLogsSignedBlobUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if !crate::auth::results_token_binds_job(
-        &shared.state,
-        crate::auth::bearer_from_headers(&headers),
+    let job_id = crate::auth::require_canonical_results_job_id(
+        &identity,
         &request.workflow_run_backend_id,
         &request.workflow_job_run_backend_id,
-    ) {
-        return Err(ApiError::forbidden(
-            "replay blob URL minting requires a token for that job",
-        ));
-    }
+    )?;
     let path = format!(
         "/replay/results/{}/{}/step-{}.txt",
-        request.workflow_run_backend_id,
-        request.workflow_job_run_backend_id,
-        request.step_backend_id
+        request.workflow_run_backend_id, job_id, request.step_backend_id
     );
     let expires_at = crate::auth::replay_ticket_expiry();
     let sig = crate::auth::sign_replay_upload_ticket(&shared.state, &path, expires_at);
@@ -243,24 +227,17 @@ pub(crate) struct StepSummarySignedBlobUrlRequest {
 
 pub(crate) async fn twirp_get_step_summary_signed_blob_url(
     State(shared): State<Arc<SharedState>>,
-    headers: axum::http::HeaderMap,
+    axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepSummarySignedBlobUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if !crate::auth::results_token_binds_job(
-        &shared.state,
-        crate::auth::bearer_from_headers(&headers),
+    let job_id = crate::auth::require_canonical_results_job_id(
+        &identity,
         &request.workflow_run_backend_id,
         &request.workflow_job_run_backend_id,
-    ) {
-        return Err(ApiError::forbidden(
-            "replay blob URL minting requires a token for that job",
-        ));
-    }
+    )?;
     let path = format!(
         "/replay/results/{}/{}/step-{}-summary.md",
-        request.workflow_run_backend_id,
-        request.workflow_job_run_backend_id,
-        request.step_backend_id
+        request.workflow_run_backend_id, job_id, request.step_backend_id
     );
     let expires_at = crate::auth::replay_ticket_expiry();
     let sig = crate::auth::sign_replay_upload_ticket(&shared.state, &path, expires_at);
@@ -274,16 +251,31 @@ pub(crate) async fn twirp_get_step_summary_signed_blob_url(
     })))
 }
 
-fn results_metadata_key(kind: &str, scope: Option<&(String, String)>, resource_id: &str) -> String {
-    match scope {
-        Some((plan_id, job_id)) => format!("results:{plan_id}:{job_id}:{kind}:{resource_id}"),
-        None => format!("{kind}:{resource_id}"),
+/// Results metadata keys are scoped to the authenticated plan/job whenever
+/// those identifiers are present. Step ids are minted by the runner for
+/// setup/cleanup records before the first step report arrives, so ownership
+/// cannot be inferred from the manifest at metadata-ingest time.
+fn results_metadata_key(
+    kind: &str,
+    plan_id: Option<&str>,
+    job_id: Option<&str>,
+    resource_id: Option<&str>,
+) -> String {
+    if let (Some(plan_id), Some(job_id)) = (plan_id, job_id) {
+        return match resource_id {
+            Some(resource_id) => format!("results:{plan_id}:{job_id}:{kind}:{resource_id}"),
+            None => format!("results:{plan_id}:{job_id}:{kind}"),
+        };
+    }
+    match resource_id {
+        Some(resource_id) => format!("{kind}:{resource_id}"),
+        None => kind.to_owned(),
     }
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct StepSummaryMetadataRequest {
-    // These backend identifiers identify the Results target job.
+    // The backend identifiers identify the target job for Results authorization.
     pub(crate) step_backend_id: String,
     pub(crate) workflow_job_run_backend_id: String,
     pub(crate) workflow_run_backend_id: String,
@@ -296,30 +288,29 @@ pub(crate) struct StepSummaryMetadataRequest {
 
 pub(crate) async fn twirp_create_step_summary_metadata(
     State(shared): State<Arc<SharedState>>,
-    headers: HeaderMap,
+    axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepSummaryMetadataRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let identity =
-        crate::auth::results_identity(&shared.state, crate::auth::bearer_from_headers(&headers))
-            .ok_or_else(|| ApiError::forbidden("results-service job identity required"))?;
-    let plan_id = (!request.workflow_run_backend_id.is_empty())
-        .then_some(request.workflow_run_backend_id.as_str());
-    let job_id = (!request.workflow_job_run_backend_id.is_empty())
-        .then_some(request.workflow_job_run_backend_id.as_str());
-    let scope = crate::auth::results_metadata_scope(&identity, plan_id, job_id)?;
-    let key = results_metadata_key("summary", scope.as_ref(), &request.step_backend_id);
+    let job_id = crate::auth::require_canonical_results_job_id(
+        &identity,
+        &request.workflow_run_backend_id,
+        &request.workflow_job_run_backend_id,
+    )?;
     let byte_count = request.size.unwrap_or_default().min(usize::MAX as u64) as usize;
-    let meta = {
-        let mut inner = shared.state.inner.lock().await;
-        inner.log_metadata.insert(
-            key,
-            LogMetadata {
-                byte_count,
-                line_count: 0,
-            },
-        );
-        crate::store::build_meta_snapshot(&inner)
-    };
+    let mut inner = shared.state.inner.lock().await;
+    inner.log_metadata.insert(
+        results_metadata_key(
+            "summary",
+            Some(&request.workflow_run_backend_id),
+            Some(job_id.as_str()),
+            Some(&request.step_backend_id),
+        ),
+        LogMetadata {
+            byte_count,
+            line_count: 0,
+        },
+    );
+    let meta = crate::store::build_meta_snapshot(&inner);
     if let Err(error) = shared.state.store.store_meta_only(&meta).await {
         tracing::warn!(?error, "failed to persist step summary metadata");
     }
@@ -329,7 +320,7 @@ pub(crate) async fn twirp_create_step_summary_metadata(
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct StepLogsMetadataRequest {
-    // These backend identifiers identify the Results target job when present.
+    // The backend identifiers identify the target job for Results authorization.
     pub(crate) step_backend_id: Option<String>,
     pub(crate) workflow_job_run_backend_id: Option<String>,
     pub(crate) workflow_run_backend_id: Option<String>,
@@ -343,43 +334,36 @@ pub(crate) struct StepLogsMetadataRequest {
 /// POST CreateStepLogsMetadata — runner calls this after uploading step logs.
 pub(crate) async fn twirp_create_step_logs_metadata(
     State(shared): State<Arc<SharedState>>,
-    headers: HeaderMap,
+    axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepLogsMetadataRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let identity =
-        crate::auth::results_identity(&shared.state, crate::auth::bearer_from_headers(&headers))
-            .ok_or_else(|| ApiError::forbidden("results-service job identity required"))?;
-    let Some(step_backend_id) = request
-        .step_backend_id
-        .as_deref()
-        .filter(|step_backend_id| !step_backend_id.is_empty())
-    else {
+    let Some(step_backend_id) = request.step_backend_id else {
         return Ok(Json(json!({"ok": true})));
     };
-    let plan_id = request
-        .workflow_run_backend_id
-        .as_deref()
-        .filter(|plan_id| !plan_id.is_empty());
-    let job_id = request
-        .workflow_job_run_backend_id
-        .as_deref()
-        .filter(|job_id| !job_id.is_empty());
-    let scope = crate::auth::results_metadata_scope(&identity, plan_id, job_id)?;
+    let (Some(plan_id), Some(raw_job_id)) = (
+        request.workflow_run_backend_id.as_deref(),
+        request.workflow_job_run_backend_id.as_deref(),
+    ) else {
+        return Ok(Json(json!({"ok": true})));
+    };
+    let job_id = crate::auth::require_canonical_results_job_id(&identity, plan_id, raw_job_id)?;
     let line_count = request.line_count.unwrap_or_default();
     let line_count_usize = line_count.min(usize::MAX as u64) as usize;
     let byte_count = line_count.saturating_mul(80).min(usize::MAX as u64) as usize;
-    let key = results_metadata_key("step", scope.as_ref(), step_backend_id);
-    let meta = {
-        let mut inner = shared.state.inner.lock().await;
-        inner.log_metadata.insert(
-            key,
-            LogMetadata {
-                byte_count,
-                line_count: line_count_usize,
-            },
-        );
-        crate::store::build_meta_snapshot(&inner)
-    };
+    let mut inner = shared.state.inner.lock().await;
+    inner.log_metadata.insert(
+        results_metadata_key(
+            "step",
+            Some(plan_id),
+            Some(job_id.as_str()),
+            Some(&step_backend_id),
+        ),
+        LogMetadata {
+            byte_count,
+            line_count: line_count_usize,
+        },
+    );
+    let meta = crate::store::build_meta_snapshot(&inner);
     if let Err(error) = shared.state.store.store_meta_only(&meta).await {
         tracing::warn!(?error, "failed to persist step log metadata");
     }
@@ -389,7 +373,7 @@ pub(crate) async fn twirp_create_step_logs_metadata(
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct JobLogsMetadataRequest {
-    // These backend identifiers identify the Results target job when present.
+    // The backend identifiers identify the target job for Results authorization.
     pub(crate) workflow_job_run_backend_id: Option<String>,
     pub(crate) workflow_run_backend_id: Option<String>,
     // serde: metadata is accepted for protocol compatibility; field is not inspected.
@@ -399,43 +383,35 @@ pub(crate) struct JobLogsMetadataRequest {
     pub(crate) line_count: Option<u64>,
 }
 
-/// POST CreateJobLogsMetadata — runner calls this after uploading job logs.
 pub(crate) async fn twirp_create_job_logs_metadata(
     State(shared): State<Arc<SharedState>>,
-    headers: HeaderMap,
+    axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<JobLogsMetadataRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let identity =
-        crate::auth::results_identity(&shared.state, crate::auth::bearer_from_headers(&headers))
-            .ok_or_else(|| ApiError::forbidden("results-service job identity required"))?;
-    let Some(workflow_job_run_backend_id) = request
-        .workflow_job_run_backend_id
-        .as_deref()
-        .filter(|job_id| !job_id.is_empty())
-    else {
+    let Some(raw_job_id) = request.workflow_job_run_backend_id else {
         return Ok(Json(json!({"ok": true})));
     };
-    let plan_id = request
-        .workflow_run_backend_id
-        .as_deref()
-        .filter(|plan_id| !plan_id.is_empty());
-    let job_id = Some(workflow_job_run_backend_id);
-    let scope = crate::auth::results_metadata_scope(&identity, plan_id, job_id)?;
+    let Some(plan_id) = request.workflow_run_backend_id.as_deref() else {
+        return Ok(Json(json!({"ok": true})));
+    };
+    let job_id = crate::auth::require_canonical_results_job_id(&identity, plan_id, &raw_job_id)?;
     let line_count = request.line_count.unwrap_or_default();
     let line_count_usize = line_count.min(usize::MAX as u64) as usize;
     let byte_count = line_count.saturating_mul(80).min(usize::MAX as u64) as usize;
-    let key = results_metadata_key("job", scope.as_ref(), workflow_job_run_backend_id);
-    let meta = {
-        let mut inner = shared.state.inner.lock().await;
-        inner.log_metadata.insert(
-            key,
-            LogMetadata {
-                byte_count,
-                line_count: line_count_usize,
-            },
-        );
-        crate::store::build_meta_snapshot(&inner)
-    };
+    let mut inner = shared.state.inner.lock().await;
+    inner.log_metadata.insert(
+        results_metadata_key(
+            "job",
+            Some(plan_id),
+            Some(job_id.as_str()),
+            Some(job_id.as_str()),
+        ),
+        LogMetadata {
+            byte_count,
+            line_count: line_count_usize,
+        },
+    );
+    let meta = crate::store::build_meta_snapshot(&inner);
     if let Err(error) = shared.state.store.store_meta_only(&meta).await {
         tracing::warn!(?error, "failed to persist job log metadata");
     }

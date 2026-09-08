@@ -1977,33 +1977,38 @@ async fn authorize_snapshot_token(
     token: &str,
     run_id: RunId,
 ) -> Result<(), ApiError> {
-    let claims = state
-        .verify_local_jwt_claims(token)
-        .ok_or_else(|| ApiError::unauthorized("invalid snapshot Git token"))?;
-    let job_id = claims
-        .get("sub")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|subject| subject.strip_prefix("preloop-job-"))
-        .and_then(|value| uuid::Uuid::parse_str(value).ok())
-        .ok_or_else(|| ApiError::unauthorized("snapshot Git token is not a job token"))?;
-    let valid_scope = claims
-        .get("scp")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|scope| {
-            scope.starts_with("Actions.Results:") && scope.ends_with(&format!(":{job_id}"))
-        });
-    if !valid_scope {
-        return Err(ApiError::unauthorized(
-            "snapshot Git token lacks job result scope",
-        ));
-    }
+    let identity = match crate::auth::results_identity(state, token) {
+        Ok(crate::auth::ResultsIdentity::Job(identity)) => identity,
+        Ok(crate::auth::ResultsIdentity::System) => {
+            return Err(ApiError::unauthorized("invalid snapshot Git token"));
+        }
+        Err(crate::auth::ResultsIdentityError::NotJob)
+        | Err(crate::auth::ResultsIdentityError::MalformedJobSubject) => {
+            return Err(ApiError::unauthorized(
+                "snapshot Git token is not a job token",
+            ));
+        }
+        Err(crate::auth::ResultsIdentityError::MalformedJob)
+        | Err(crate::auth::ResultsIdentityError::MalformedScope) => {
+            return Err(ApiError::unauthorized(
+                "snapshot Git token lacks job result scope",
+            ));
+        }
+        Err(crate::auth::ResultsIdentityError::Invalid) => {
+            return Err(ApiError::unauthorized("invalid snapshot Git token"));
+        }
+    };
 
     let inner = state.inner.lock().await;
     let belongs_to_run = inner
         .agent_job_requests
-        .get(&job_id)
+        .get(&identity.job_id)
         .and_then(|request_id| inner.job_requests.get(request_id))
-        .is_some_and(|request| request.run_id == run_id);
+        .is_some_and(|request| {
+            request.run_id == run_id
+                && request.plan_id == identity.plan_id
+                && request.agent_job_id == identity.job_id
+        });
     if !belongs_to_run {
         return Err(ApiError::forbidden(
             "snapshot Git token does not belong to this run",
@@ -2030,7 +2035,7 @@ fn snapshot_authorization_token(value: &str) -> Option<String> {
 
 #[cfg(test)]
 mod auth_scoping_tests {
-    use super::github_auth_header_for_remote;
+    use super::*;
 
     #[test]
     fn github_remote_gets_scoped_basic_header() {
@@ -2045,6 +2050,45 @@ mod auth_scoping_tests {
             value,
             "AUTHORIZATION: basic eC1hY2Nlc3MtdG9rZW46Z2hvX3NlY3JldA=="
         );
+    }
+
+    #[tokio::test]
+    async fn results_snapshot_auth_preserves_malformed_claim_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let job_id = uuid::Uuid::new_v4();
+        let cases = [
+            (
+                "preloop-job-not-a-uuid".to_owned(),
+                format!("Actions.Results:plan:{job_id}"),
+                "snapshot Git token is not a job token",
+            ),
+            (
+                format!("preloop-job-{job_id}"),
+                "not-results".to_owned(),
+                "snapshot Git token lacks job result scope",
+            ),
+            (
+                format!("preloop-job-{job_id}"),
+                format!("Actions.Results:plan:extra:{job_id}"),
+                "snapshot Git token lacks job result scope",
+            ),
+        ];
+        let run_id = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+
+        for (subject, scope, expected_message) in cases {
+            let token = state
+                .local_jwt(json!({
+                    "sub": subject,
+                    "scp": scope,
+                }))
+                .unwrap();
+            let error = authorize_snapshot_token(&state, &token, run_id)
+                .await
+                .expect_err("malformed Results claims must be rejected");
+            assert_eq!(error.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(error.message(), expected_message);
+        }
     }
 
     #[test]

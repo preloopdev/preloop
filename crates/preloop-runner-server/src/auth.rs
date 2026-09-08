@@ -19,7 +19,7 @@ pub(crate) async fn require_protocol_bearer(
 
 pub(crate) async fn require_results_bearer(
     State(shared): State<Arc<SharedState>>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
     let path = request.uri().path();
@@ -44,23 +44,16 @@ pub(crate) async fn require_results_bearer(
     if !path.starts_with("/twirp/") {
         return Ok(next.run(request).await);
     }
-    let authorized = bearer_token(&request).is_some_and(|token| {
-        token == shared.state.system_token
-            || shared
-                .state
-                .verify_local_jwt_claims(token)
-                .is_some_and(|claims| {
-                    claims
-                        .get("scp")
-                        .and_then(|value| value.as_str())
-                        .is_some_and(|scope| scope.starts_with("Actions.Results:"))
-                })
-    });
-    if authorized {
-        Ok(next.run(request).await)
-    } else {
-        Err(ApiError::unauthorized("results-service job token required"))
-    }
+    let Some(identity) =
+        bearer_token(&request).and_then(|token| results_identity(&shared.state, token).ok())
+    else {
+        return Err(ApiError::unauthorized("results-service job token required"));
+    };
+    // The typed identity is authenticated before body extraction. Handlers
+    // then compare decoded plan/job ids against this same identity instead of
+    // re-parsing a bearer string independently.
+    request.extensions_mut().insert(identity);
+    Ok(next.run(request).await)
 }
 
 pub(crate) async fn require_test_api_token(
@@ -345,112 +338,126 @@ impl Clone for SocketSurface {
     }
 }
 
-/// Identity carried by a Results-service bearer.
-///
-/// The system credential is intentionally unscoped. A runtime credential is
-/// bound to one plan/job pair by both its subject and its Results scope.
+/// The authenticated identity carried by a Results bearer is used by every
+/// Results handler, including signed-URL minting and metadata mutation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResultsJobIdentity {
+    pub(crate) plan_id: String,
+    pub(crate) job_id: uuid::Uuid,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ResultsIdentity {
+    /// The engine credential is allowed to address every Results target.
     System,
-    Job { plan_id: String, job_id: uuid::Uuid },
+    /// A runtime credential is bound to one plan/job pair.
+    Job(ResultsJobIdentity),
 }
 
-/// Parse and validate the identity carried by a Results bearer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResultsIdentityError {
+    /// The bearer is signed locally but does not identify a Results job.
+    NotJob,
+    /// A job-shaped bearer has a valid job subject but malformed Results claims.
+    MalformedJob,
+    /// A job-shaped bearer has an invalid job subject.
+    MalformedJobSubject,
+    /// A valid job subject is paired with a non-Results scope.
+    MalformedScope,
+    /// The bearer is not a valid local JWT.
+    Invalid,
+}
+
+/// Parse the Results bearer into the identity handlers must authorize against.
 ///
-/// `require_results_bearer` only needs to reject unrelated protocol tokens.
-/// Handlers that mutate a target must use this stricter parser so a signed JWT
-/// with a merely Results-looking scope cannot choose a different job.
-pub(crate) fn results_identity(state: &AppState, bearer: Option<&str>) -> Option<ResultsIdentity> {
-    let bearer = bearer?;
+/// Requiring both the `sub` and the full Results scope to agree prevents a
+/// valid local JWT minted for one protocol surface from being repurposed as a
+/// different job's Results credential. The error distinguishes a malformed
+/// job-shaped token so cache writes can retain their fail-closed behavior.
+pub(crate) fn results_identity(
+    state: &AppState,
+    bearer: &str,
+) -> Result<ResultsIdentity, ResultsIdentityError> {
     if bearer == state.system_token {
-        return Some(ResultsIdentity::System);
+        return Ok(ResultsIdentity::System);
     }
 
-    let claims = state.verify_local_jwt_claims(bearer)?;
-    let subject_job = claims
+    let claims = state
+        .verify_local_jwt_claims(bearer)
+        .ok_or(ResultsIdentityError::Invalid)?;
+    let job_shaped = claims
         .get("sub")
         .and_then(|value| value.as_str())
-        .and_then(|subject| subject.strip_prefix("preloop-job-"))
-        .and_then(|job| job.parse::<uuid::Uuid>().ok())?;
-    let scope = claims
-        .get("scp")
-        .and_then(|value| value.as_str())
-        .and_then(|scope| scope.strip_prefix("Actions.Results:"))?;
-    let (plan_id, scope_job) = scope.split_once(':')?;
-    if plan_id.is_empty() || scope_job.parse::<uuid::Uuid>().ok()? != subject_job {
-        return None;
-    }
-
-    Some(ResultsIdentity::Job {
-        plan_id: plan_id.to_owned(),
-        job_id: subject_job,
-    })
+        .is_some_and(|subject| subject.starts_with("preloop-job-"))
+        && claims
+            .get("scp")
+            .and_then(|value| value.as_str())
+            .is_some_and(|scope| scope.starts_with("Actions.Results:"));
+    let parsed = AppState::results_job_from_payload(&claims);
+    let Some((plan_id, job_id)) = parsed else {
+        let subject_is_job = claims
+            .get("sub")
+            .and_then(|value| value.as_str())
+            .and_then(|subject| subject.strip_prefix("preloop-job-"))
+            .and_then(|job| job.parse::<uuid::Uuid>().ok())
+            .is_some();
+        return Err(match (job_shaped, subject_is_job) {
+            (true, true) => ResultsIdentityError::MalformedJob,
+            (true, false) => ResultsIdentityError::MalformedJobSubject,
+            (false, true) => ResultsIdentityError::MalformedScope,
+            (false, false) => ResultsIdentityError::NotJob,
+        });
+    };
+    Ok(ResultsIdentity::Job(ResultsJobIdentity { plan_id, job_id }))
 }
 
-/// Resolve optional metadata identifiers against the authenticated identity.
-///
-/// A job bearer supplies the missing plan/job fields from its signed scope and
-/// rejects any supplied field that disagrees. `None` is reserved for a trusted
-/// system bearer using the legacy partially populated request shape; no
-/// job-scoped bearer can reach that fallback.
-/// Job IDs must use UUID's canonical hyphenated spelling: the request value is
-/// also embedded in replay paths, so accepting alternate spellings would
-/// create aliases rather than one shared resource.
-fn results_job_id_matches(identity_job: &uuid::Uuid, requested_job_id: &str) -> bool {
-    requested_job_id == identity_job.to_string()
-}
-
-pub(crate) fn results_metadata_scope(
+pub(crate) fn results_identity_binds_job(
     identity: &ResultsIdentity,
-    plan_id: Option<&str>,
-    job_id: Option<&str>,
-) -> Result<Option<(String, String)>, ApiError> {
+    plan_id: &str,
+    job_id: &str,
+) -> bool {
     match identity {
-        ResultsIdentity::System => Ok(plan_id
-            .zip(job_id)
-            .map(|(plan_id, job_id)| (plan_id.to_owned(), job_id.to_owned()))),
-        ResultsIdentity::Job {
-            plan_id: identity_plan,
-            job_id: identity_job,
-        } => {
-            let plan_matches = plan_id.is_none_or(|plan_id| plan_id == identity_plan);
-            let job_matches =
-                job_id.is_none_or(|job_id| results_job_id_matches(identity_job, job_id));
-            if !plan_matches || !job_matches {
-                return Err(ApiError::forbidden(
-                    "results-service token is not bound to that job",
-                ));
-            }
-            Ok(Some((identity_plan.clone(), identity_job.to_string())))
+        ResultsIdentity::System => true,
+        ResultsIdentity::Job(identity) => {
+            identity.plan_id == plan_id
+                && job_id
+                    .parse::<uuid::Uuid>()
+                    .is_ok_and(|job| job == identity.job_id)
         }
     }
 }
 
-/// Whether a caller may mint replay blob URLs for this exact plan/job pair.
-///
-/// The engine token may mint for any job (it is the administrator credential).
-/// A job runtime token is weaker — the runner exports it to steps as
-/// `ACTIONS_RUNTIME_TOKEN` — so it must only mint for the one job it names:
-/// both the subject and the `Actions.Results:{plan}:{job}` scope have to
-/// match the requested backend ids. Without this, workflow code holding its
-/// own runtime token could ask the mint handler for *another* job's signed
-/// URL and then overwrite that job's logs through it.
-pub(crate) fn results_token_binds_job(
-    state: &AppState,
-    bearer: Option<&str>,
+/// Require the typed Results identity to name the exact plan/job target.
+pub(crate) fn require_results_job(
+    identity: &ResultsIdentity,
     plan_id: &str,
     job_id: &str,
-) -> bool {
-    let Some(identity) = results_identity(state, bearer) else {
-        return false;
-    };
-    match identity {
-        ResultsIdentity::System => true,
-        ResultsIdentity::Job {
-            plan_id: identity_plan,
-            job_id: identity_job,
-        } => identity_plan == plan_id && results_job_id_matches(&identity_job, job_id),
+) -> Result<(), ApiError> {
+    if results_identity_binds_job(identity, plan_id, job_id) {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden(
+            "results-service token is not bound to that job",
+        ))
     }
+}
+
+/// Authorize a Results plan/job target and return its storage representation.
+///
+/// Runtime job identities only pass UUID-parsable job ids, so alternate
+/// spellings collapse to the lower-case hyphenated form used by the runner's
+/// lookup path. The system identity keeps accepting opaque backend ids for
+/// compatibility, while still canonicalizing valid UUIDs.
+pub(crate) fn require_canonical_results_job_id(
+    identity: &ResultsIdentity,
+    plan_id: &str,
+    job_id: &str,
+) -> Result<String, ApiError> {
+    require_results_job(identity, plan_id, job_id)?;
+    Ok(job_id
+        .parse::<uuid::Uuid>()
+        .map(|job| job.to_string())
+        .unwrap_or_else(|_| job_id.to_owned()))
 }
 
 /// Runner identity proven by a listen token on this request.
