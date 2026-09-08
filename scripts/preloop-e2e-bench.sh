@@ -24,7 +24,10 @@ PRELOOP_BIN="$REPO_ROOT/target/release/preloop-server"
 RUNNER_DIR="${RUNNER_DIR:-$HOME/.cache/actions-runner/current}"
 PRELOOP_PORT="${PRELOOP_PORT:-9090}"
 CLIENT_URL="${CLIENT_URL:-http://127.0.0.1:$PRELOOP_PORT}"
-SYSTEM_TOKEN="${PRELOOP_SYSTEM_TOKEN:-preloop-system-token}"
+if [[ -z "${PRELOOP_SYSTEM_TOKEN:-}" ]]; then
+    export PRELOOP_SYSTEM_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+fi
+SYSTEM_TOKEN="$PRELOOP_SYSTEM_TOKEN"
 STATE_DIR="$(mktemp -d /tmp/preloop-bench-XXXXXX)"
 LOG="$STATE_DIR/preloop.log"
 PRELOOP_PID=""
@@ -66,6 +69,7 @@ lsof -i :"$PRELOOP_PORT" -sTCP:LISTEN >/dev/null 2>&1 \
 # ── start preloop ───────────────────────────────────────────────────────────────
 
 PRELOOP_PUBLIC_URL="$CLIENT_URL" PRELOOP_RUNNER_URL="$CLIENT_URL" \
+    PRELOOP_SYSTEM_TOKEN="$SYSTEM_TOKEN" \
     RUST_LOG=info "$PRELOOP_BIN" serve \
     --listen "127.0.0.1:${PRELOOP_PORT}" \
     --state-dir "$STATE_DIR/state" \

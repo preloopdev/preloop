@@ -19,7 +19,7 @@ RESULT_DIR=benchmarks/real-world/results/conformance-4repos/$OUT/c
 RUNNER_ROOT=/tmp/conformance-host-runner
 export PRELOOP_URL="http://$ENGINE_PORT"
 
-TOKEN=$(cat ~/.preloop/engine.token)
+TOKEN="${PRELOOP_SYSTEM_TOKEN:?set PRELOOP_SYSTEM_TOKEN to the engine administrator token}"
 
 # Configure the host runner once (labels match the rewritten runs-on).
 if [ ! -f "$RUNNER_ROOT/.runner" ]; then

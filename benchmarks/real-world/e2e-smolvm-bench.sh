@@ -15,6 +15,12 @@ HOST_CLIENT="$HOME/cachingv4/target/release/preloop-runner-client"
 GH_REPO="preloopdev/preloop-conformance-sample"
 RESULTS_DIR="$HOME/cachingv4/benchmarks/real-world/results"
 mkdir -p "$RESULTS_DIR"
+if [[ "$MODE" == "preloop" ]]; then
+  if [[ -z "${PRELOOP_SYSTEM_TOKEN:-}" ]]; then
+    export PRELOOP_SYSTEM_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+  fi
+fi
+
 
 ms() { python3 -c "import time; print(int(time.time()*1000))"; }
 
@@ -90,7 +96,7 @@ run_preloop_server() {
   local host_ip
   host_ip=$(ipconfig getifaddr en0 2>/dev/null || echo "127.0.0.1")
   export PRELOOP_PUBLIC_URL="http://${host_ip}:9191"
-  RUST_LOG=info "$HOST_SERVER" serve --listen "0.0.0.0:9191" --state-dir "/tmp/preloop-e2e-state-$$" > /tmp/preloop-e2e-server.log 2>&1 &
+  RUST_LOG=info PRELOOP_SYSTEM_TOKEN="$PRELOOP_SYSTEM_TOKEN" "$HOST_SERVER" serve --listen "0.0.0.0:9191" --state-dir "/tmp/preloop-e2e-state-$$" > /tmp/preloop-e2e-server.log 2>&1 &
   local server_pid=$!
   sleep 1
   curl -sf "http://127.0.0.1:9191/healthz" >/dev/null || { log "Server failed"; cat /tmp/preloop-e2e-server.log; exit 1; }

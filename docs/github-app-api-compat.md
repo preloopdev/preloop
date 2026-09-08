@@ -79,7 +79,7 @@ protected router. Auth is **mandatory** (github.com returns 401 without a token)
 accidentally denied — see M2.
 
 ### D2. Token validation chain (in order)
-1. **System bearer** (`preloop-system-token` style, existing native auth) — trusted operator; tier AdminManual.
+1. **System bearer** (the per-engine token from `PRELOOP_SYSTEM_TOKEN` or its secure store) — trusted operator; tier AdminManual.
 2. **PAT** (`PRELOOP_GITHUB_TOKEN`) — constant-time compare; tier AdminManual.
 3. **Own-App JWT** (RS256, `iss` = one of the registered App ids) — verify with that App's PEM; offline-safe; tier AdminManual.
 4. **Installation tokens** (any App, including third-party):

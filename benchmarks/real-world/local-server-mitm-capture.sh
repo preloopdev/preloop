@@ -18,7 +18,10 @@ PRELOOP_RUNNER="${PRELOOP_RUNNER:-/workspace/target/aarch64-unknown-linux-musl/r
 MITM_PORT="${MITM_PORT:-18081}"
 OUT_ROOT="${RESULTS_ROOT:-$ROOT/benchmarks/compatibility/runner/protocol-local}"
 WORKFLOW="$ROOT/benchmarks/real-world/overnight-workflows/$SCENARIO"
-SYSTEM_TOKEN="${PRELOOP_SYSTEM_TOKEN:-local-mitm-token}"
+if [[ -z "${PRELOOP_SYSTEM_TOKEN:-}" ]]; then
+  export PRELOOP_SYSTEM_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+fi
+SYSTEM_TOKEN="$PRELOOP_SYSTEM_TOKEN"
 
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 ensure_vms() {
@@ -81,7 +84,7 @@ run_one() {
   for p in "${pids[@]}"; do wait "$p" 2>/dev/null || true; done
   for i in $(seq 1 "$JOB_COUNT"); do smolvm machine exec --name "$VM_PREFIX-$i" -- pkill -x mitmdump >/dev/null 2>&1 || true; done
   python3 - "$out" "$kind" "$SCENARIO" "$run_id" <<'PY'
-import json,sys
+import json,os,sys
 from pathlib import Path
 r=Path(sys.argv[1]); flows=[]
 for p in r.glob('vm-*/vm-mitm/flows.jsonl'):
@@ -89,7 +92,7 @@ for p in r.glob('vm-*/vm-mitm/flows.jsonl'):
   if l.strip(): flows.append(json.loads(l))
 flows.sort(key=lambda x:(x.get('ts_request') or 0,x.get('flow_index') or 0)); (r/'flows.jsonl').write_text('\n'.join(json.dumps(x) for x in flows)+'\n')
 status='unknown'
-try: status=json.loads(__import__('subprocess').check_output(['curl','-sf','-H','Authorization: Bearer preloop-system-token',f'http://127.0.0.1:{sys.argv[1]}']))
+try: status=json.loads(__import__('subprocess').check_output(['curl','-sf','-H',f"Authorization: Bearer {os.environ['PRELOOP_SYSTEM_TOKEN']}",f'http://127.0.0.1:{sys.argv[1]}']))
 except: pass
 (r/'summary.json').write_text(json.dumps({'runner':sys.argv[2],'scenario':sys.argv[3],'run_id':sys.argv[4],'flows_count':len(flows)},indent=2))
 PY

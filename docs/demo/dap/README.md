@@ -47,12 +47,16 @@ the debugger), built binaries, `asciinema`, and `omp`.
 cargo build --release -p preloop-runner-server -p preloop-runner
 
 # 1. engine (permissive registration for the demo runner)
+# Set this same variable in every client terminal; do not print it.
+export PRELOOP_SYSTEM_TOKEN="${PRELOOP_SYSTEM_TOKEN:-$(python3 -c 'import secrets; print(secrets.token_hex(32))')}"
 PRELOOP_REGISTRATION_POLICY=permissive \
 PRELOOP_PUBLIC_URL=http://127.0.0.1:9191 \
 PRELOOP_CONFIG=/tmp/dapdemo/server-config.toml \
 target/release/preloop-server serve --listen 127.0.0.1:9191 \
   --state-dir /tmp/dapdemo/server-state --enable-test-api --test-api-token dev-token
+```
 
+```sh
 # 2. runner (30 min window to attach the debugger)
 mkdir -p /tmp/dapdemo/runner && cd /tmp/dapdemo/runner
 ACTIONS_RUNNER_DAP_CONNECTION_TIMEOUT=30 \
@@ -67,9 +71,10 @@ asciinema rec demo-again.cast --command \
   "omp --auto-approve --cwd . @agent-prompt.md"
 ```
 
-`agent-prompt.md` assumes the engine URL and token from the commands above;
-edit it if your port or token differ. The native API token defaults to
-`preloop-system-token` (env `PRELOOP_SYSTEM_TOKEN`).
+Run the client commands above in the shell that exported
+`PRELOOP_SYSTEM_TOKEN`, or export the same value in each client terminal.
+`agent-prompt.md` consumes the variable directly; it does not contain a
+credential.
 
 ## Files
 

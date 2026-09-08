@@ -24,7 +24,10 @@ SERVER_BIN="$REPO_ROOT/target/debug/preloop-server"
 PRELOOP_RUNNER="$REPO_ROOT/target/debug/preloop-runner"
 PORT_B="${PORT_B:-9191}"
 PORT_C="${PORT_C:-9193}"
-TOKEN="preloop-system-token"
+if [ -z "${PRELOOP_SYSTEM_TOKEN:-}" ]; then
+  export PRELOOP_SYSTEM_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+fi
+TOKEN="$PRELOOP_SYSTEM_TOKEN"
 mkdir -p "$OUT_ROOT"
 
 # repo -> (workspace dir, workflow path, event, git_ref)
@@ -94,7 +97,7 @@ start_server() {
   sleep 0.5
   rm -rf "$state"
   local public_port="${RUNNER_PORT:-$port}"
-  PRELOOP_GITHUB_TOKEN="$(gh auth token)" PRELOOP_PUBLIC_URL="http://127.0.0.1:$public_port" \
+  PRELOOP_SYSTEM_TOKEN="$TOKEN" PRELOOP_GITHUB_TOKEN="$(gh auth token)" PRELOOP_PUBLIC_URL="http://127.0.0.1:$public_port" \
     RUST_LOG=info,preloop=info "$SERVER_BIN" serve --listen "127.0.0.1:$port" --state-dir "$state" \
     > "$log" 2>&1 &
   local pid=$!

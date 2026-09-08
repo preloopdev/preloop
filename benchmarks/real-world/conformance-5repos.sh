@@ -27,7 +27,9 @@ TIMEOUT_SECONDS="${CONFORMANCE_TIMEOUT_SECONDS:-7200}"
 POOL_SIZE="${PRELOOP_RUNNER_POOL_SIZE:-1}"
 HOST_HOME="${HOME:-}"
 SMOLVM_PROCESS_HOME="${CONFORMANCE_SMOLVM_HOME:-$CAMPAIGN_HOME/smolvm-home}"
-export PRELOOP_SYSTEM_TOKEN="${PRELOOP_SYSTEM_TOKEN:-preloop-system-token}"
+if [[ -z "${PRELOOP_SYSTEM_TOKEN:-}" ]]; then
+  export PRELOOP_SYSTEM_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+fi
 export PRELOOP_CLIENT_TIMEOUT_SECONDS="${PRELOOP_CLIENT_TIMEOUT_SECONDS:-3600}"
 
 SERVER_BIN="${PRELOOP_BIN:-$ROOT/target/debug/preloop}"
@@ -270,7 +272,7 @@ trap 'cleanup; exit 143' TERM
 run_status() {
   # --max-time keeps a stalled status request from masking the deadline; a
   # dead server then surfaces as `unknown` and wait_run fails fast instead.
-  curl -fsS --max-time 15 -H "Authorization: Bearer ${PRELOOP_SYSTEM_TOKEN:-preloop-system-token}" \
+  curl -fsS --max-time 15 -H "Authorization: Bearer $PRELOOP_SYSTEM_TOKEN" \
     "http://127.0.0.1:$PORT/api/v1/runs/$1" 2>/dev/null \
     | python3 -c 'import json,sys; r=json.load(sys.stdin); print(r.get("status", "unknown"))' \
     || echo unknown
@@ -278,7 +280,7 @@ run_status() {
 
 run_snapshot() {
   local run_id="$1" output="$2"
-  curl -fsS --max-time 15 -H "Authorization: Bearer ${PRELOOP_SYSTEM_TOKEN:-preloop-system-token}" \
+  curl -fsS --max-time 15 -H "Authorization: Bearer $PRELOOP_SYSTEM_TOKEN" \
     "http://127.0.0.1:$PORT/api/v1/runs/$run_id" >"$output" 2>/dev/null || printf '%s\n' '{}' >"$output"
 }
 

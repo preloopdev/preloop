@@ -107,15 +107,17 @@ All configuration is environment variables; CLI flags override them.
 | `PRELOOP_HOME` | `$HOME/.preloop` | State directory (database, blobs, cache, credentials) |
 | `PRELOOP_STORE_URL` | SQLite in the state dir | `sqlite://<path>`, a bare path, or `postgres://…?sslmode=require\|verify-full` |
 | `PRELOOP_UNIX_SOCKET` | — | Control socket path; mounted into runner VMs, serves the runner surface only |
-| `PRELOOP_SYSTEM_TOKEN` | generated | Admin credential for `/api/v1/*`. Treat it as root for the control plane |
+| `PRELOOP_SYSTEM_TOKEN` | generated and stored in the OS credential store; private `$PRELOOP_HOME/engine.token` fallback | Admin credential for `/api/v1/*`. Treat it as root for the control plane |
 | `PRELOOP_TOKEN_TTL_SECS` | `2999` | Issued runner token lifetime |
 | `PRELOOP_CONFIG` | `$PRELOOP_HOME/config.toml` | Config file path |
 | `PRELOOP_SECRETS_STORE` | config file | Secrets backend selector |
 | `PRELOOP_RUNNER_URL` | loopback listen address | Origin handed to runners. Set automatically; override only for remote runners |
 | `PRELOOP_CONTROL_UPSTREAM` | — | LAN address remote runners use when loopback is not reachable |
 
-Client-side (`preloop` CLI): `PRELOOP_URL` (default `http://127.0.0.1:9090`) and
-`PRELOOP_TOKEN`.
+Managed engines read their generated token from the OS credential store (or
+`$PRELOOP_HOME/engine.token` when that store is unavailable or unreadable). For
+a separate client or service, set `PRELOOP_SYSTEM_TOKEN` explicitly; never print
+or commit the fallback file.
 
 ### GitHub
 
@@ -281,11 +283,12 @@ path exposes job logs.
 
 ## 6. Security: what must not be public
 
-**`PRELOOP_LISTEN` defaults to `127.0.0.1:9090`**, so a bare `preloop serve` is
-only reachable from the host. To expose the control plane (tunnels reach it via
-`127.0.0.1` anyway), bind a private address or `0.0.0.0` — and put a proxy in
-front. Publishing `0.0.0.0` on a host with a public IP exposes the API to the
-internet with no authentication on the queue path.
+`PRELOOP_LISTEN` defaults to `127.0.0.1:9090`, so a bare `preloop serve` is
+only reachable from the host. A generated native API token protects
+`/api/v1/*` even when you bind a private non-loopback address, but it does not
+protect the runner registration surface. Bind a private address or `0.0.0.0`
+behind a proxy or tunnel, and do not publish the registration endpoint to the
+internet.
 
 **Never publish the whole API surface.** Restrict your proxy or tunnel to
 `/api/v1/github/webhooks`, as every example above does.
@@ -304,8 +307,8 @@ endpoint can:
 
 Requests arriving on the mounted control socket are held to a stricter rule (the
 system credential is required), because untrusted workflow code can reach that
-socket. The TCP surface has no equivalent gate, so **network reachability is the
-control**.
+socket. The TCP runner-registration surface has no equivalent gate, so
+**network reachability is the control**.
 
 Also worth knowing:
 
@@ -333,6 +336,7 @@ Also worth knowing:
 | `state/blobs/`, `state/replay/` | Step logs and job artifacts |
 | `state/cache/` | Actions cache entries |
 | `vms/` | Golden images and per-machine state |
+| `engine.token` | Private fallback for the generated native API token when no OS credential service is available |
 
 Back up at least the database and `github-app.json`. Losing the database strands
 any check run GitHub is still waiting on; losing the key means re-keying the App.

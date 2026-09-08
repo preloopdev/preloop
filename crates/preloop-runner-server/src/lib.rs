@@ -137,7 +137,8 @@ use tokio::sync::{broadcast, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-/// Default local token used when `PRELOOP_SYSTEM_TOKEN` is not configured.
+#[cfg(test)]
+/// Deterministic administrator token used only by in-process tests.
 const DEFAULT_PRELOOP_SYSTEM_TOKEN: &str = "preloop-system-token";
 #[cfg(test)]
 const TEST_LOCAL_JWT_KEY: &[u8] = b"preloop-test-local-jwt-signing-key";

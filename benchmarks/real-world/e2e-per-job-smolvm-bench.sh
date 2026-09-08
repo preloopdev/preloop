@@ -14,6 +14,10 @@
 #
 # Workflows: serde | axum | bat | all
 set -euo pipefail
+if [[ -z "${PRELOOP_SYSTEM_TOKEN:-}" ]]; then
+  export PRELOOP_SYSTEM_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+fi
+
 
 # ── Config ──────────────────────────────────────────────────────────
 MODE="${1:?Usage: $0 <github-official|github-preloop|preloop-server> <serde|axum|bat|all>}"
@@ -216,7 +220,7 @@ run_preloop_server_mode() {
 
   # Start preloop-server on localhost only
   log "Starting preloop-server on 127.0.0.1:${server_internal_port}..."
-  PRELOOP_PUBLIC_URL="$server_url" RUST_LOG=info "$server_bin" serve \
+  PRELOOP_PUBLIC_URL="$server_url" PRELOOP_SYSTEM_TOKEN="$PRELOOP_SYSTEM_TOKEN" RUST_LOG=info "$server_bin" serve \
     --listen "127.0.0.1:${server_internal_port}" \
     --state-dir "$TMP_DIR/preloop-state" \
     > "$TMP_DIR/preloop-server.log" 2>&1 &
