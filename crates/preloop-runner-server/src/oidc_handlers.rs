@@ -42,13 +42,16 @@ pub(crate) async fn oidc_token(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .ok_or_else(|| ApiError::unauthorized("OIDC bearer token required"))?;
-    let expected_scope = format!("Actions.Results:{plan_id}:{job_id}");
-    let is_system_token = bearer == shared.state.system_token;
-    if !is_system_token && !shared.state.verify_local_jwt_scope(bearer, &expected_scope) {
+    let identity = crate::auth::results_identity(&shared.state, bearer)
+        .map_err(|_| ApiError::forbidden("OIDC runtime token is not bound to this job"))?;
+    if !crate::auth::results_identity_binds_job(&identity, &plan_id, &job_id) {
         return Err(ApiError::forbidden(
             "OIDC runtime token is not bound to this job",
         ));
     }
+    let requested_job_id = job_id
+        .parse::<uuid::Uuid>()
+        .map_err(|_| ApiError::not_found("OIDC: plan and job do not match"))?;
     let inner = shared.state.inner.lock().await;
     let request_id = inner
         .plan_requests
@@ -59,7 +62,7 @@ pub(crate) async fn oidc_token(
         .job_requests
         .get(&request_id)
         .ok_or_else(|| ApiError::not_found("OIDC: job request not found"))?;
-    if request.agent_job_id.to_string() != job_id {
+    if request.agent_job_id != requested_job_id {
         return Err(ApiError::not_found("OIDC: plan and job do not match"));
     }
     let run_id = request.run_id;

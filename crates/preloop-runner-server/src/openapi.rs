@@ -208,7 +208,8 @@ impl Modify for SecuritySchemes {
                 Http::builder()
                     .scheme(HttpAuthScheme::Bearer)
                     .description(Some(
-                        "System token (`PRELOOP_SYSTEM_TOKEN` or default `preloop-system-token`). \
+                        "System token (`PRELOOP_SYSTEM_TOKEN`, or a per-engine token generated \
+                         and stored in the OS credential store or private engine.token file). \
                          Used by CLI clients, agents, and operators.",
                     ))
                     .build(),

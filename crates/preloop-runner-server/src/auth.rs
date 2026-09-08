@@ -19,7 +19,7 @@ pub(crate) async fn require_protocol_bearer(
 
 pub(crate) async fn require_results_bearer(
     State(shared): State<Arc<SharedState>>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
     let path = request.uri().path();
@@ -44,23 +44,16 @@ pub(crate) async fn require_results_bearer(
     if !path.starts_with("/twirp/") {
         return Ok(next.run(request).await);
     }
-    let authorized = bearer_token(&request).is_some_and(|token| {
-        token == shared.state.system_token
-            || shared
-                .state
-                .verify_local_jwt_claims(token)
-                .is_some_and(|claims| {
-                    claims
-                        .get("scp")
-                        .and_then(|value| value.as_str())
-                        .is_some_and(|scope| scope.starts_with("Actions.Results:"))
-                })
-    });
-    if authorized {
-        Ok(next.run(request).await)
-    } else {
-        Err(ApiError::unauthorized("results-service job token required"))
-    }
+    let Some(identity) =
+        bearer_token(&request).and_then(|token| results_identity(&shared.state, token).ok())
+    else {
+        return Err(ApiError::unauthorized("results-service job token required"));
+    };
+    // The typed identity is authenticated before body extraction. Handlers
+    // then compare decoded plan/job ids against this same identity instead of
+    // re-parsing a bearer string independently.
+    request.extensions_mut().insert(identity);
+    Ok(next.run(request).await)
 }
 
 pub(crate) async fn require_test_api_token(
@@ -82,13 +75,140 @@ pub(crate) async fn require_test_api_token(
     Ok(next.run(request).await)
 }
 
+fn system_bearer_authorized(shared: &Arc<SharedState>, request: &Request) -> bool {
+    bearer_token(request).is_some_and(|token| token == shared.state.system_token)
+}
+
+pub(crate) async fn require_system_bearer(
+    State(shared): State<Arc<SharedState>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    if system_bearer_authorized(&shared, &request) {
+        Ok(next.run(request).await)
+    } else {
+        Err(ApiError::unauthorized("missing or invalid system token"))
+    }
+}
+
+/// Who a session/agent administration request acts as.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdminCaller {
+    System,
+    /// A runner-registration credential used by configure/replace.
+    RunnerManager,
+    /// A registered runner's own listen token may act only on itself.
+    Runner(i64),
+}
+
+/// Guard for runner/session/agent administration.
+///
+/// these routes used to sit behind [`require_protocol_bearer`], which
+/// accepts *any* valid local JWT — including a job's `ACTIONS_RUNTIME_TOKEN`,
+/// which the runner exports to every step. Arbitrary workflow code could
+/// therefore deregister runners and delete other runners' sessions.
+///
+/// System-token-only would close that, but it would also break the runner:
+/// the AzDO listener deletes its own session on shutdown
+/// (`crates/preloop-runner/src/client/azdo.rs::delete_session`) and
+/// [`crate::runner_lifecycle::delete_agent`] is documented as the call the
+/// runner makes on clean exit — and a configured runner holds nothing but its
+/// listen token. So admit the system token *or* a registered runner's listen
+/// token here, reject job runtime tokens, and let the handlers enforce
+/// self-ownership via [`admin_caller`].
+pub(crate) async fn require_runner_admin_bearer(
+    State(shared): State<Arc<SharedState>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    if system_bearer_authorized(&shared, &request) {
+        return Ok(next.run(request).await);
+    }
+    let manager_token = bearer_token(&request)
+        .and_then(|token| shared.state.verify_local_jwt_claims(token))
+        .and_then(|claims| {
+            claims
+                .get("scp")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        })
+        .is_some_and(|scope| {
+            scope
+                .split_whitespace()
+                .any(|value| value == "ActionsRuntime.RunnerManage")
+        });
+    if manager_token {
+        return Ok(next.run(request).await);
+    }
+    // `resolve_runner_identity` is an outer layer, so the extension is
+    // already present here. Reuse it instead of re-deriving the runner from
+    // the token: it also resolves mock-flow subjects
+    // (`preloop-runner-listen-mock-{client_id}`) and drops the identity when
+    // the registration behind the token is gone.
+    let verified = request
+        .extensions()
+        .get::<RunnerIdentity>()
+        .and_then(|identity| identity.runner_id)
+        .is_some();
+    if verified {
+        Ok(next.run(request).await)
+    } else {
+        Err(ApiError::unauthorized(
+            "runner administration requires the system token or a runner listen token",
+        ))
+    }
+}
+
+/// Resolve the [`AdminCaller`] behind a request that passed
+/// [`require_runner_admin_bearer`].
+///
+/// Fail-closed: anything that is neither the system token nor a verified
+/// runner identity is an error, never silently treated as the administrator.
+pub(crate) fn admin_caller(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    identity: Option<&RunnerIdentity>,
+) -> Result<AdminCaller, ApiError> {
+    let Some(token) = bearer_from_headers(headers) else {
+        return Err(ApiError::unauthorized(
+            "runner administration requires a bearer token",
+        ));
+    };
+    if token == state.system_token {
+        return Ok(AdminCaller::System);
+    }
+    if state
+        .verify_local_jwt_claims(token)
+        .and_then(|claims| {
+            claims
+                .get("scp")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        })
+        .is_some_and(|scope| {
+            scope
+                .split_whitespace()
+                .any(|value| value == "ActionsRuntime.RunnerManage")
+        })
+    {
+        return Ok(AdminCaller::RunnerManager);
+    }
+    identity
+        .and_then(|identity| identity.runner_id)
+        .map(AdminCaller::Runner)
+        .ok_or_else(|| {
+            ApiError::unauthorized(
+                "runner administration requires the system token or a runner listen token",
+            )
+        })
+}
+
 pub(crate) async fn require_native_bearer(
     State(shared): State<Arc<SharedState>>,
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    let authorized = bearer_token(&request).is_some_and(|token| token == shared.state.system_token);
-    if authorized {
+    if system_bearer_authorized(&shared, &request) {
         Ok(next.run(request).await)
     } else {
         Err(ApiError::unauthorized(
@@ -279,24 +399,34 @@ async fn runner_registered(shared: &Arc<SharedState>, runner_id: i64) -> bool {
         .contains_key(&runner_id)
 }
 
+/// Signed replay blob upload tickets expire after one hour.
+pub(crate) const REPLAY_TICKET_TTL_SECS: u64 = 3600;
+
+pub(crate) fn replay_ticket_expiry() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .saturating_add(REPLAY_TICKET_TTL_SECS)
+}
+
 /// Sign a replay blob upload URL for `path` (e.g. `/replay/results/{plan}/{job}/step-1.txt`).
 ///
 /// The upload route is deliberately bearerless — the runner PUTs bytes to the
 /// URL its own Twirp handler returned — and it is reachable from inside every
 /// runner VM, where workflow code runs. Unsigned, the route let a guest
 /// overwrite another job's stored logs and summaries by guessing the URL
-/// shape. Binding the signature to the exact path makes a URL minted for one
-/// job worthless against any other, and only holders of the per-instance HMAC
-/// key (the mint handlers, gated on a job-scoped token) can produce one.
-pub(crate) fn sign_replay_upload_ticket(state: &AppState, path: &str) -> String {
+/// shape. Binding the signature to the exact path and expiry makes a URL
+/// minted for one job worthless against any other, or after its lifetime.
+pub(crate) fn sign_replay_upload_ticket(state: &AppState, path: &str, expires_at: u64) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(&state.local_jwt_key)
         .expect("HMAC accepts keys of any length");
-    mac.update(replay_ticket_payload(path).as_bytes());
+    mac.update(replay_ticket_payload(path, expires_at).as_bytes());
     URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
 }
 
 /// Whether the `sig` query parameter of `uri` authorises an upload to exactly
-/// that replay path. Constant-time comparison via `verify_slice`.
+/// that replay path before the signed Unix expiry (`se`).
 pub(crate) fn verify_replay_upload_ticket(state: &AppState, uri: &axum::http::Uri) -> bool {
     let Some(query) = uri.query() else {
         return false;
@@ -306,18 +436,28 @@ pub(crate) fn verify_replay_upload_ticket(state: &AppState, uri: &axum::http::Ur
     let Some(signature) = params.get("sig").map(String::as_str) else {
         return false;
     };
+    let Some(expires_at) = params.get("se").and_then(|value| value.parse::<u64>().ok()) else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if now >= expires_at {
+        return false;
+    }
     let Ok(provided) = URL_SAFE_NO_PAD.decode(signature) else {
         return false;
     };
     let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(&state.local_jwt_key) else {
         return false;
     };
-    mac.update(replay_ticket_payload(uri.path()).as_bytes());
+    mac.update(replay_ticket_payload(uri.path(), expires_at).as_bytes());
     mac.verify_slice(&provided).is_ok()
 }
 
-fn replay_ticket_payload(path: &str) -> String {
-    format!("replay-blob\n{path}")
+fn replay_ticket_payload(path: &str, expires_at: u64) -> String {
+    format!("replay-blob\n{expires_at}\n{path}")
 }
 
 /// Marker extension: the request arrived through the mounted control socket.
@@ -335,37 +475,126 @@ impl Clone for SocketSurface {
     }
 }
 
-/// Whether a caller may mint replay blob URLs for this exact plan/job pair.
+/// The authenticated identity carried by a Results bearer is used by every
+/// Results handler, including signed-URL minting and metadata mutation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResultsJobIdentity {
+    pub(crate) plan_id: String,
+    pub(crate) job_id: uuid::Uuid,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ResultsIdentity {
+    /// The engine credential is allowed to address every Results target.
+    System,
+    /// A runtime credential is bound to one plan/job pair.
+    Job(ResultsJobIdentity),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResultsIdentityError {
+    /// The bearer is signed locally but does not identify a Results job.
+    NotJob,
+    /// A job-shaped bearer has a valid job subject but malformed Results claims.
+    MalformedJob,
+    /// A job-shaped bearer has an invalid job subject.
+    MalformedJobSubject,
+    /// A valid job subject is paired with a non-Results scope.
+    MalformedScope,
+    /// The bearer is not a valid local JWT.
+    Invalid,
+}
+
+/// Parse the Results bearer into the identity handlers must authorize against.
 ///
-/// The engine token may mint for any job (it is the administrator credential).
-/// A job runtime token is weaker — the runner exports it to steps as
-/// `ACTIONS_RUNTIME_TOKEN` — so it must only mint for the one job it names:
-/// both the subject and the `Actions.Results:{plan}:{job}` scope have to
-/// match the requested backend ids. Without this, workflow code holding its
-/// own runtime token could ask the mint handler for *another* job's signed
-/// URL and then overwrite that job's logs through it.
-pub(crate) fn results_token_binds_job(
+/// Requiring both the `sub` and the full Results scope to agree prevents a
+/// valid local JWT minted for one protocol surface from being repurposed as a
+/// different job's Results credential. The error distinguishes a malformed
+/// job-shaped token so cache writes can retain their fail-closed behavior.
+pub(crate) fn results_identity(
     state: &AppState,
-    bearer: Option<&str>,
+    bearer: &str,
+) -> Result<ResultsIdentity, ResultsIdentityError> {
+    if bearer == state.system_token {
+        return Ok(ResultsIdentity::System);
+    }
+
+    let claims = state
+        .verify_local_jwt_claims(bearer)
+        .ok_or(ResultsIdentityError::Invalid)?;
+    let job_shaped = claims
+        .get("sub")
+        .and_then(|value| value.as_str())
+        .is_some_and(|subject| subject.starts_with("preloop-job-"))
+        && claims
+            .get("scp")
+            .and_then(|value| value.as_str())
+            .is_some_and(|scope| scope.starts_with("Actions.Results:"));
+    let parsed = AppState::results_job_from_payload(&claims);
+    let Some((plan_id, job_id)) = parsed else {
+        let subject_is_job = claims
+            .get("sub")
+            .and_then(|value| value.as_str())
+            .and_then(|subject| subject.strip_prefix("preloop-job-"))
+            .and_then(|job| job.parse::<uuid::Uuid>().ok())
+            .is_some();
+        return Err(match (job_shaped, subject_is_job) {
+            (true, true) => ResultsIdentityError::MalformedJob,
+            (true, false) => ResultsIdentityError::MalformedJobSubject,
+            (false, true) => ResultsIdentityError::MalformedScope,
+            (false, false) => ResultsIdentityError::NotJob,
+        });
+    };
+    Ok(ResultsIdentity::Job(ResultsJobIdentity { plan_id, job_id }))
+}
+
+pub(crate) fn results_identity_binds_job(
+    identity: &ResultsIdentity,
     plan_id: &str,
     job_id: &str,
 ) -> bool {
-    match bearer {
-        Some(token) if token == state.system_token => true,
-        Some(token) => state.verify_local_jwt_claims(token).is_some_and(|claims| {
-            let subject_job = claims
-                .get("sub")
-                .and_then(|value| value.as_str())
-                .and_then(|subject| subject.strip_prefix("preloop-job-"))
-                .unwrap_or("");
-            let scope = claims
-                .get("scp")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            subject_job == job_id && scope == format!("Actions.Results:{plan_id}:{job_id}")
-        }),
-        None => false,
+    match identity {
+        ResultsIdentity::System => true,
+        ResultsIdentity::Job(identity) => {
+            identity.plan_id == plan_id
+                && job_id
+                    .parse::<uuid::Uuid>()
+                    .is_ok_and(|job| job == identity.job_id)
+        }
     }
+}
+
+/// Require the typed Results identity to name the exact plan/job target.
+pub(crate) fn require_results_job(
+    identity: &ResultsIdentity,
+    plan_id: &str,
+    job_id: &str,
+) -> Result<(), ApiError> {
+    if results_identity_binds_job(identity, plan_id, job_id) {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden(
+            "results-service token is not bound to that job",
+        ))
+    }
+}
+
+/// Authorize a Results plan/job target and return its storage representation.
+///
+/// Runtime job identities only pass UUID-parsable job ids, so alternate
+/// spellings collapse to the lower-case hyphenated form used by the runner's
+/// lookup path. The system identity keeps accepting opaque backend ids for
+/// compatibility, while still canonicalizing valid UUIDs.
+pub(crate) fn require_canonical_results_job_id(
+    identity: &ResultsIdentity,
+    plan_id: &str,
+    job_id: &str,
+) -> Result<String, ApiError> {
+    require_results_job(identity, plan_id, job_id)?;
+    Ok(job_id
+        .parse::<uuid::Uuid>()
+        .map(|job| job.to_string())
+        .unwrap_or_else(|_| job_id.to_owned()))
 }
 
 /// Runner identity proven by a listen token on this request.

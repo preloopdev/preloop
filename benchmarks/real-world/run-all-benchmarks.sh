@@ -13,6 +13,10 @@ esac
 export PATH="$HOME/.rustup/toolchains/$TC/bin:$HOME/.cargo/bin:$PATH"
 export CARGO_HOME="$HOME/.cargo"
 export RUSTUP_HOME="$HOME/.rustup"
+if [[ -z "${PRELOOP_SYSTEM_TOKEN:-}" ]]; then
+  export PRELOOP_SYSTEM_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+fi
+
 
 # Copy workflow
 mkdir -p /tmp/bench-repos/$REPO/.github/workflows
@@ -34,7 +38,7 @@ echo "--- BASELINE ---"
 echo ""
 echo "--- AKSH-RUNNER ---"
 sudo kill $(pgrep -f preloop-runner-server) 2>/dev/null || true; sleep 0.3
-sudo PRELOOP_PUBLIC_URL=http://127.0.0.1 RUST_LOG=info \
+sudo PRELOOP_PUBLIC_URL=http://127.0.0.1 PRELOOP_SYSTEM_TOKEN="$PRELOOP_SYSTEM_TOKEN" RUST_LOG=info \
   $HOME/preloop-runner/preloop-runner-server serve --listen 127.0.0.1:80 --state-dir /tmp/bs-$REPO \
   > /tmp/bs-$REPO.log 2>&1 &
 SPID=$!; sleep 1
@@ -61,7 +65,7 @@ grep -E "Running step|completed:" /tmp/${REPO}-preloop.log
 echo ""
 echo "--- OFFICIAL RUNNER ---"
 sudo kill $SPID 2>/dev/null; sleep 0.3
-sudo PRELOOP_PUBLIC_URL=http://127.0.0.1 RUST_LOG=info \
+sudo PRELOOP_PUBLIC_URL=http://127.0.0.1 PRELOOP_SYSTEM_TOKEN="$PRELOOP_SYSTEM_TOKEN" RUST_LOG=info \
   $HOME/preloop-runner/preloop-runner-server serve --listen 127.0.0.1:80 --state-dir /tmp/bs-${REPO}-off \
   > /tmp/bs-${REPO}-off.log 2>&1 &
 SPID=$!; sleep 1

@@ -49,7 +49,7 @@ use tower::ServiceExt;
 
 // ── constants ───────────────────────────────────────────────────────────────
 
-const SYSTEM_TOKEN: &str = "preloop-system-token";
+const SYSTEM_TOKEN: &str = "preloop-benchmark-explicit-token";
 
 const SIMPLE_WORKFLOW: &str = r#"
 on: push
@@ -1089,10 +1089,14 @@ fn emit_run_provenance(cfg: BenchConfig) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if std::env::var_os("PRELOOP_SYSTEM_TOKEN").is_none() {
+        // This benchmark uses an explicit in-process client; it does not
+        // exercise engine-token discovery.
+        std::env::set_var("PRELOOP_SYSTEM_TOKEN", SYSTEM_TOKEN);
+    }
     let args: Vec<String> = std::env::args().collect();
     let subcommand = args.get(1).map(String::as_str).unwrap_or("all");
     let cfg = BenchConfig::from_env()?;
-
     emit_run_provenance(cfg)?;
 
     match subcommand {

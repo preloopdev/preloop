@@ -15,6 +15,10 @@ RUNNER_DIR="$OUT/runner"
 LOG_DIR="$OUT/_process-logs"
 mkdir -p "$OUT" "$STATE_DIR" "$RUNNER_DIR" "$LOG_DIR"
 
+if [[ -z "${PRELOOP_SYSTEM_TOKEN:-}" ]]; then
+  export PRELOOP_SYSTEM_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+fi
+
 cleanup() {
   if [[ -n "${RPID:-}" ]]; then kill "$RPID" 2>/dev/null || true; fi
   if [[ -n "${SPID:-}" ]]; then kill "$SPID" 2>/dev/null || true; fi
@@ -26,7 +30,7 @@ echo "OUT=$OUT"
 pkill -f "preloop-server.*${PORT}" 2>/dev/null || true
 sleep 1
 
-RUST_LOG=info PRELOOP_PUBLIC_URL="$SERVER_URL" \
+RUST_LOG=info PRELOOP_PUBLIC_URL="$SERVER_URL" PRELOOP_SYSTEM_TOKEN="$PRELOOP_SYSTEM_TOKEN" \
   "$SERVER_BIN" serve --listen "127.0.0.1:${PORT}" --state-dir "$STATE_DIR" \
   >"$LOG_DIR/server.log" 2>&1 &
 SPID=$!
@@ -34,7 +38,7 @@ for i in $(seq 1 50); do curl -sf "$SERVER_URL/healthz" >/dev/null && break; sle
 curl -sf "$SERVER_URL/healthz" >/dev/null
 
 (cd "$RUNNER_DIR" && "$RUNNER_BIN" configure \
-  --url "$SERVER_URL" --token preloop-system-token \
+  --url "$SERVER_URL" --token "$PRELOOP_SYSTEM_TOKEN" \
   --name conc-cmp --labels self-hosted,ubuntu-latest,macOS,ARM64 \
   --work _work) >"$LOG_DIR/configure.log" 2>&1
 
@@ -42,7 +46,7 @@ curl -sf "$SERVER_URL/healthz" >/dev/null
 RPID=$!
 sleep 2
 
-export SERVER_URL OUT STATE_DIR LOG_DIR
+export SERVER_URL OUT STATE_DIR LOG_DIR PRELOOP_SYSTEM_TOKEN
 python3 - <<'PY'
 import json, os, time, urllib.request, pathlib, re, subprocess, urllib.error
 from pathlib import Path
@@ -50,7 +54,7 @@ from pathlib import Path
 SERVER = os.environ["SERVER_URL"]
 OUT = Path(os.environ["OUT"])
 STATE = Path(os.environ["STATE_DIR"])
-AUTH = {"Authorization": "Bearer preloop-system-token", "Content-Type": "application/json"}
+AUTH = {"Authorization": f"Bearer {os.environ['PRELOOP_SYSTEM_TOKEN']}", "Content-Type": "application/json"}
 
 def api(method, path, body=None):
     data = None if body is None else json.dumps(body).encode()

@@ -4,7 +4,7 @@ fix it, and re-run until the workflow is green.
 
 ## Environment
 
-- Preloop engine: http://127.0.0.1:9191  (native API token: preloop-system-token)
+- Preloop engine: http://127.0.0.1:9191  (native API token: `$PRELOOP_SYSTEM_TOKEN`)
 - Working directory: /tmp/dapdemo (all demo files are here)
 - The workflow under test: /tmp/dapdemo/demo.yml
 - Payload files: /tmp/dapdemo/payload-release.json, /tmp/dapdemo/payload-prod.json
@@ -17,13 +17,13 @@ fix it, and re-run until the workflow is green.
   within a reasonable time after submitting.
 - `dapctl` — DAP debug client for preloop:
   - Start the session daemon (background it, one per run):
-    `nohup dapctl daemon --url ws://127.0.0.1:9191/api/v1/runs/<RUN_ID>/debug --token preloop-system-token >/tmp/dapd.log 2>&1 &`
+    `nohup dapctl daemon --url ws://127.0.0.1:9191/api/v1/runs/<RUN_ID>/debug --token "$PRELOOP_SYSTEM_TOKEN" >/tmp/dapd.log 2>&1 &`
   - Then drive it: `dapctl init` (handshake), `dapctl ready`
     (configurationDone; the job starts), `dapctl wait 20` (next DAP event:
     `stopped` at job entry), `dapctl source`, `dapctl scopes`,
     `dapctl vars <ref>`, `dapctl eval <expr>`, `dapctl continue`
     (resume the job), `dapctl quit`.
-- REST API: `curl -H "Authorization: Bearer preloop-system-token" ...`
+- REST API: `curl -H "Authorization: Bearer $PRELOOP_SYSTEM_TOKEN" ...`
   - Run status/conclusion: GET http://127.0.0.1:9191/api/v1/runs/<RUN_ID>
   - Full log: GET http://127.0.0.1:9191/api/v1/runs/<RUN_ID>/logs
 

@@ -1065,11 +1065,6 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         );
         *state.status_snapshot.write() = init;
     }
-    if !config.listen.ip().is_loopback() && state.system_token == DEFAULT_PRELOOP_SYSTEM_TOKEN {
-        anyhow::bail!(
-            "PRELOOP_SYSTEM_TOKEN must be explicitly configured when listening beyond loopback"
-        );
-    }
     let oidc_issuer = normalize_oidc_issuer(
         config
             .oidc_issuer

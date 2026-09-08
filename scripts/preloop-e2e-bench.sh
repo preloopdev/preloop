@@ -24,7 +24,10 @@ PRELOOP_BIN="$REPO_ROOT/target/release/preloop-server"
 RUNNER_DIR="${RUNNER_DIR:-$HOME/.cache/actions-runner/current}"
 PRELOOP_PORT="${PRELOOP_PORT:-9090}"
 CLIENT_URL="${CLIENT_URL:-http://127.0.0.1:$PRELOOP_PORT}"
-SYSTEM_TOKEN="${PRELOOP_SYSTEM_TOKEN:-preloop-system-token}"
+if [[ -z "${PRELOOP_SYSTEM_TOKEN:-}" ]]; then
+    export PRELOOP_SYSTEM_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+fi
+SYSTEM_TOKEN="$PRELOOP_SYSTEM_TOKEN"
 STATE_DIR="$(mktemp -d /tmp/preloop-bench-XXXXXX)"
 LOG="$STATE_DIR/preloop.log"
 PRELOOP_PID=""
@@ -66,6 +69,7 @@ lsof -i :"$PRELOOP_PORT" -sTCP:LISTEN >/dev/null 2>&1 \
 # ── start preloop ───────────────────────────────────────────────────────────────
 
 PRELOOP_PUBLIC_URL="$CLIENT_URL" PRELOOP_RUNNER_URL="$CLIENT_URL" \
+    PRELOOP_SYSTEM_TOKEN="$SYSTEM_TOKEN" \
     RUST_LOG=info "$PRELOOP_BIN" serve \
     --listen "127.0.0.1:${PRELOOP_PORT}" \
     --state-dir "$STATE_DIR/state" \
@@ -190,6 +194,13 @@ while ! grep -Eq "Job .* completed with result:" "$LOG" 2>/dev/null; do
     [ "$now" -gt "$deadline" ] && { echo "runner timeout after 600s" >&2; exit 1; }
     sleep 0.2
 done
+# The real official runner is the integration probe for listener-token
+# lifecycle fencing. A warning here means the runner used its machine
+# credential for renew/complete instead of the job runtime token.
+if grep -q "job lifecycle call used the bare listener token" "$LOG" 2>/dev/null; then
+    die "official runner used the bare listener token for job lifecycle"
+fi
+
 
 T_END=$(python3 -c "import time; print(int(time.time() * 1000))")
 LATENCY_MS=$(( T_END - T_START ))

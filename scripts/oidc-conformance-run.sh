@@ -9,7 +9,10 @@ SERVER="$REPO/target/release/preloop-server"
 RUNNER="$REPO/target/release/preloop-runner"
 PORT=9192
 BASE="http://127.0.0.1:$PORT"
-SYSTEM_TOKEN="${PRELOOP_SYSTEM_TOKEN:-preloop-system-token}"
+if [[ -z "${PRELOOP_SYSTEM_TOKEN:-}" ]]; then
+    export PRELOOP_SYSTEM_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+fi
+SYSTEM_TOKEN="$PRELOOP_SYSTEM_TOKEN"
 NOW=$(date -u +%Y-%m-%dT%H-%M-%SZ)
 STATE=$(mktemp -d /tmp/preloop-oidc.XXXXXX)
 RESULTS="$REPO/benchmarks/real-world/results/runner-flow"
@@ -93,7 +96,7 @@ PYEOF
 
 # ── Start server ────────────────────────────────────────────────────
 echo -e "${BLUE}▸${NC} Starting server on $PORT..."
-PRELOOP_PUBLIC_URL="$BASE" "$SERVER" serve --listen "127.0.0.1:$PORT" --state-dir "$STATE" \
+PRELOOP_PUBLIC_URL="$BASE" PRELOOP_SYSTEM_TOKEN="$SYSTEM_TOKEN" "$SERVER" serve --listen "127.0.0.1:$PORT" --state-dir "$STATE" \
     > "$STATE/server.log" 2>&1 &
 SPID=$!
 for i in $(seq 1 30); do curl -sf --max-time 1 "$BASE/healthz" >/dev/null 2>&1 && break; sleep 0.5; done

@@ -124,18 +124,6 @@ impl AppState {
         mac.verify_slice(&provided).is_ok()
     }
 
-    pub(crate) fn verify_local_jwt_scope(&self, token: &str, expected_scope: &str) -> bool {
-        self.verify_local_jwt_claims(token)
-            .and_then(|payload| {
-                payload
-                    .get("scp")
-                    .and_then(|value| value.as_str())
-                    .map(str::to_owned)
-            })
-            .as_deref()
-            == Some(expected_scope)
-    }
-
     pub(crate) fn runner_id_from_token(&self, token: &str) -> Option<i64> {
         let payload = self.verify_local_jwt_claims(token)?;
         let scope = payload.get("scp")?.as_str()?;
@@ -153,31 +141,52 @@ impl AppState {
             .ok()
     }
 
-    /// Agent job UUID a runtime token was minted for.
+    /// Parsed identity of a verified Results runtime-token payload.
     ///
-    /// The counterpart to [`Self::runner_id_from_token`]: a job runtime token
-    /// names exactly one job, so any surface a worker calls can authorize
-    /// against the job rather than merely against token validity.
-    pub(crate) fn job_uuid_from_token(&self, token: &str) -> Option<uuid::Uuid> {
-        let payload = self.verify_local_jwt_claims(token)?;
-        // `scp` is `Actions.Results:{plan_id}:{job_id}`; `sub` is the job on
-        // its own. Require both to agree so a token minted for a different
-        // surface cannot be replayed here.
+    /// Pure so every consumer — route auth, signed-URL binding, quota
+    /// accounting, and fork-tier resolution — parses mounted claims one way.
+    /// In particular the scope must contain exactly one `:` separating a
+    /// non-empty plan id from the job id; a suffix-only split would accept
+    /// extra components the other callsites reject.
+    pub(crate) fn results_job_from_payload(
+        payload: &serde_json::Value,
+    ) -> Option<(String, uuid::Uuid)> {
         let subject_job = payload
             .get("sub")?
             .as_str()?
             .strip_prefix("preloop-job-")?
             .parse::<uuid::Uuid>()
             .ok()?;
-        let scope_job = payload
+        let scope = payload
             .get("scp")?
             .as_str()?
-            .strip_prefix("Actions.Results:")?
-            .rsplit(':')
-            .next()?
-            .parse::<uuid::Uuid>()
-            .ok()?;
-        (subject_job == scope_job).then_some(subject_job)
+            .strip_prefix("Actions.Results:")?;
+        let (plan_id, scope_job) = scope.split_once(':')?;
+        if plan_id.is_empty() {
+            return None;
+        }
+        let scope_job = scope_job.parse::<uuid::Uuid>().ok()?;
+        (subject_job == scope_job).then(|| (plan_id.to_owned(), subject_job))
+    }
+
+    /// Parsed identity of an authenticated Results runtime token.
+    ///
+    /// The `sub` claim and the job component of the exact
+    /// `Actions.Results:{plan_id}:{job_id}` scope must name the same job.
+    /// Returning the plan and job together keeps Results authorization and
+    /// quota accounting on one parser.
+    pub(crate) fn results_job_from_token(&self, token: &str) -> Option<(String, uuid::Uuid)> {
+        let payload = self.verify_local_jwt_claims(token)?;
+        Self::results_job_from_payload(&payload)
+    }
+
+    /// Agent job UUID a runtime token was minted for.
+    ///
+    /// The counterpart to [`Self::runner_id_from_token`]: a job runtime token
+    /// names exactly one job, so any surface a worker calls can authorize
+    /// against the job rather than merely against token validity.
+    pub(crate) fn job_uuid_from_token(&self, token: &str) -> Option<uuid::Uuid> {
+        self.results_job_from_token(token).map(|(_, job)| job)
     }
 
     /// Agent job UUID a debug-worker token was minted for.
@@ -396,6 +405,22 @@ pub struct AppState {
     /// is claimed. A supervising runner pool reads it to decide whether the
     /// work already queued outruns the runners it has left.
     pub queue_depth: Arc<std::sync::atomic::AtomicUsize>,
+    /// Plan 000 step 4 probe — broker job-lifecycle calls (`renewjob`,
+    /// `completejob`) that authenticated with the bare runner *listen* token
+    /// instead of the job runtime token.
+    ///
+    /// Plan 004's fencing carrier mints the claim generation into the job
+    /// runtime token, so it only works if the worker never drives those two
+    /// routes with the listener credential. This counter is the gate: it must
+    /// stay at zero across a full official-runner dogfood. Per instance, not
+    /// process-global — a test binary or a multi-server host would otherwise
+    /// aggregate unrelated servers into one meaningless number.
+    pub(crate) listener_token_lifecycle_calls: Arc<std::sync::atomic::AtomicU64>,
+    /// Companion baseline: `acquirejob` calls on the listen token. The
+    /// Listener process owns that call and holds no job token yet, so this is
+    /// the *expected* credential there and is counted separately so it can
+    /// never mask [`Self::listener_token_lifecycle_calls`].
+    pub(crate) listener_token_acquire_calls: Arc<std::sync::atomic::AtomicU64>,
     /// Raised while a co-hosted runner pool is still preparing its machine
     /// image and cannot register a runner yet; see [`ServerConfig`]. The
     /// starvation sweep pauses the queued-job grace clock while it is set.
@@ -716,8 +741,22 @@ impl AppState {
         let (keypair_result, oidc_result) = tokio::join!(keypair_handle, oidc_handle);
         let keypair = keypair_result??;
         let oidc_keypair = oidc_result??;
-        let system_token = env::var("PRELOOP_SYSTEM_TOKEN")
-            .unwrap_or_else(|_| DEFAULT_PRELOOP_SYSTEM_TOKEN.to_owned());
+        let token_dir = crate::credential_store::engine_token_dir(&state_dir);
+        let configured_token = env::var("PRELOOP_SYSTEM_TOKEN").ok();
+        #[cfg(test)]
+        let system_token = {
+            let configured_token =
+                configured_token.or_else(|| Some(DEFAULT_PRELOOP_SYSTEM_TOKEN.to_owned()));
+            let store = crate::credential_store::MemoryCredentialStore::default();
+            crate::credential_store::resolve_engine_token_with_store(
+                &token_dir,
+                configured_token,
+                &store,
+            )?
+        };
+        #[cfg(not(test))]
+        let system_token =
+            crate::credential_store::resolve_engine_token(&token_dir, configured_token)?;
         #[cfg(test)]
         let local_jwt_key = TEST_LOCAL_JWT_KEY.to_vec();
         #[cfg(not(test))]
@@ -988,6 +1027,8 @@ impl AppState {
             // pool spawns against the right workload after restart.
             queue_depth: Arc::new(std::sync::atomic::AtomicUsize::new(recovered_queue_len)),
             pool_preparing: None,
+            listener_token_lifecycle_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            listener_token_acquire_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             next_job_runs_on: Arc::new(std::sync::RwLock::new(Vec::new())),
             cache,
             artifacts,
@@ -1598,6 +1639,26 @@ mod tests {
         assert!(
             !state.verify_action_ticket("acme", "repo\nv1", "x", expires_at, &signature),
             "a ticket for one action must not validate for a newline-split twin"
+        );
+    }
+    /// The fork-tier resolver used to take the scope's last `:` component,
+    /// so `Actions.Results:{plan}:extra:{job}` parsed where the canonical
+    /// parser rejects. Both must agree: extra components are malformed.
+    #[test]
+    fn results_job_from_payload_rejects_extra_scope_components() {
+        let job = uuid::Uuid::new_v4();
+        let payload = serde_json::json!({
+            "sub": format!("preloop-job-{job}"),
+            "scp": format!("Actions.Results:plan:extra:{job}"),
+        });
+        assert_eq!(AppState::results_job_from_payload(&payload), None);
+        let payload = serde_json::json!({
+            "sub": format!("preloop-job-{job}"),
+            "scp": format!("Actions.Results:plan:{job}"),
+        });
+        assert_eq!(
+            AppState::results_job_from_payload(&payload),
+            Some(("plan".to_owned(), job))
         );
     }
 }
