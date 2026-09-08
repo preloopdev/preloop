@@ -393,6 +393,13 @@ pub(crate) fn results_identity(state: &AppState, bearer: Option<&str>) -> Option
 /// rejects any supplied field that disagrees. `None` is reserved for a trusted
 /// system bearer using the legacy partially populated request shape; no
 /// job-scoped bearer can reach that fallback.
+/// Job IDs must use UUID's canonical hyphenated spelling: the request value is
+/// also embedded in replay paths, so accepting alternate spellings would
+/// create aliases rather than one shared resource.
+fn results_job_id_matches(identity_job: &uuid::Uuid, requested_job_id: &str) -> bool {
+    requested_job_id == identity_job.to_string()
+}
+
 pub(crate) fn results_metadata_scope(
     identity: &ResultsIdentity,
     plan_id: Option<&str>,
@@ -407,11 +414,8 @@ pub(crate) fn results_metadata_scope(
             job_id: identity_job,
         } => {
             let plan_matches = plan_id.is_none_or(|plan_id| plan_id == identity_plan);
-            let job_matches = job_id.is_none_or(|job_id| {
-                job_id
-                    .parse::<uuid::Uuid>()
-                    .is_ok_and(|job_id| job_id == *identity_job)
-            });
+            let job_matches =
+                job_id.is_none_or(|job_id| results_job_id_matches(identity_job, job_id));
             if !plan_matches || !job_matches {
                 return Err(ApiError::forbidden(
                     "results-service token is not bound to that job",
@@ -445,7 +449,7 @@ pub(crate) fn results_token_binds_job(
         ResultsIdentity::Job {
             plan_id: identity_plan,
             job_id: identity_job,
-        } => identity_plan == plan_id && job_id == identity_job.to_string(),
+        } => identity_plan == plan_id && results_job_id_matches(&identity_job, job_id),
     }
 }
 

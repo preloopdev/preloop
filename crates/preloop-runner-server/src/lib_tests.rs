@@ -6400,6 +6400,44 @@ async fn all_twirp_api_routes_reject_missing_bearer_before_body_validation() {
 }
 
 #[tokio::test]
+async fn results_metadata_noop_requests_require_strict_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    // The Results route guard intentionally accepts this token by scope, but
+    // the mutating metadata handlers must still reject its invalid identity.
+    let loose_results_token = state
+        .local_jwt(json!({
+            "sub": "preloop-job-not-a-uuid",
+            "scp": "Actions.Results:plan:not-a-uuid",
+        }))
+        .unwrap();
+
+    for route in [
+        "/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata",
+        "/twirp/results.services.receiver.Receiver/CreateJobLogsMetadata",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(route)
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {loose_results_token}"),
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{route}");
+    }
+}
+
+#[tokio::test]
 async fn twirp_metadata_routes_persist_log_metadata() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -6584,6 +6622,24 @@ async fn job_results_metadata_uses_authenticated_namespace_for_partial_ids() {
         );
     }
 
+    let noncanonical_job_id = job_id.simple().to_string();
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &token,
+            Method::POST,
+            "/twirp/results.services.receiver.Receiver/CreateJobLogsMetadata",
+            json!({
+                "workflow_run_backend_id": plan_id,
+                "workflow_job_run_backend_id": noncanonical_job_id,
+                "line_count": 11
+            }),
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "metadata must use the canonical UUID spelling used by Results paths"
+    );
+
     let inner = state.inner.lock().await;
     assert!(!inner.log_metadata.contains_key("summary:own-summary"));
     assert!(!inner.log_metadata.contains_key("step:own-step"));
@@ -6661,6 +6717,10 @@ async fn job_results_token_cannot_update_another_jobs_steps() {
         .job_steps
         .get(&own_job_id)
         .is_some_and(|steps| steps.iter().any(|step| step.id == "own-step")));
+    assert!(!inner
+        .job_steps
+        .get(&own_job_id)
+        .is_some_and(|steps| steps.iter().any(|step| step.id == "other-step")));
     let other_job_id = uuid::Uuid::parse_str(&other_agent_job_id).unwrap();
     assert!(!inner
         .job_steps
@@ -20665,6 +20725,30 @@ async fn replay_blob_urls_are_minted_only_for_the_callers_own_job() {
         .await
         .unwrap();
     assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+
+    // The metadata and signed-URL paths use the same canonical UUID policy.
+    let noncanonical_job_id = my_job.simple().to_string();
+    let refused_noncanonical = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(mint_url)
+                .header(header::AUTHORIZATION, format!("Bearer {runtime_token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "workflow_run_backend_id": plan,
+                        "workflow_job_run_backend_id": noncanonical_job_id,
+                        "step_backend_id": "step-1",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused_noncanonical.status(), StatusCode::FORBIDDEN);
 
     // Minting for the caller's own job succeeds, and the returned URL is a
     // real ticket: uploading to it lands the blob.

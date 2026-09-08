@@ -346,6 +346,9 @@ pub(crate) async fn twirp_create_step_logs_metadata(
     headers: HeaderMap,
     Json(request): Json<StepLogsMetadataRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let identity =
+        crate::auth::results_identity(&shared.state, crate::auth::bearer_from_headers(&headers))
+            .ok_or_else(|| ApiError::forbidden("results-service job identity required"))?;
     let Some(step_backend_id) = request
         .step_backend_id
         .as_deref()
@@ -353,9 +356,6 @@ pub(crate) async fn twirp_create_step_logs_metadata(
     else {
         return Ok(Json(json!({"ok": true})));
     };
-    let identity =
-        crate::auth::results_identity(&shared.state, crate::auth::bearer_from_headers(&headers))
-            .ok_or_else(|| ApiError::forbidden("results-service job identity required"))?;
     let plan_id = request
         .workflow_run_backend_id
         .as_deref()
@@ -405,6 +405,9 @@ pub(crate) async fn twirp_create_job_logs_metadata(
     headers: HeaderMap,
     Json(request): Json<JobLogsMetadataRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let identity =
+        crate::auth::results_identity(&shared.state, crate::auth::bearer_from_headers(&headers))
+            .ok_or_else(|| ApiError::forbidden("results-service job identity required"))?;
     let Some(workflow_job_run_backend_id) = request
         .workflow_job_run_backend_id
         .as_deref()
@@ -412,9 +415,6 @@ pub(crate) async fn twirp_create_job_logs_metadata(
     else {
         return Ok(Json(json!({"ok": true})));
     };
-    let identity =
-        crate::auth::results_identity(&shared.state, crate::auth::bearer_from_headers(&headers))
-            .ok_or_else(|| ApiError::forbidden("results-service job identity required"))?;
     let plan_id = request
         .workflow_run_backend_id
         .as_deref()
