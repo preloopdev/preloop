@@ -1,4 +1,30 @@
 use super::*;
+fn is_sensitive_header(name: &axum::http::header::HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "set-cookie"
+            | "x-api-key"
+            | "x-github-token"
+            | "x-preloop-provision-token"
+            | "x-preloop-system-token"
+    )
+}
+
+fn recorded_header_value(
+    name: &axum::http::header::HeaderName,
+    value: &axum::http::HeaderValue,
+) -> Option<String> {
+    value.to_str().ok().map(|value| {
+        if is_sensitive_header(name) {
+            "[REDACTED]".to_owned()
+        } else {
+            value.to_owned()
+        }
+    })
+}
 
 pub(crate) async fn record_flows_middleware(
     State(state): State<AppState>,
@@ -30,8 +56,8 @@ pub(crate) async fn record_flows_middleware(
 
     let mut request_headers = Vec::new();
     for (name, value) in request.headers() {
-        if let Ok(val_str) = value.to_str() {
-            request_headers.push(vec![name.to_string(), val_str.to_string()]);
+        if let Some(val_str) = recorded_header_value(name, value) {
+            request_headers.push(vec![name.to_string(), val_str]);
         }
     }
 
@@ -54,8 +80,8 @@ pub(crate) async fn record_flows_middleware(
 
     let mut response_headers = Vec::new();
     for (name, value) in response.headers() {
-        if let Ok(val_str) = value.to_str() {
-            response_headers.push(vec![name.to_string(), val_str.to_string()]);
+        if let Some(val_str) = recorded_header_value(name, value) {
+            response_headers.push(vec![name.to_string(), val_str]);
         }
     }
 

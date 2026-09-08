@@ -16,6 +16,54 @@ pub(crate) async fn require_protocol_bearer(
         ))
     }
 }
+/// Require that a protocol reporting request is authenticated by the system
+/// credential or by the runtime token minted for the exact job request.
+///
+/// The generic protocol layer intentionally accepts several local JWT classes
+/// because it fronts both runner and results-service routes. Reporting is
+/// narrower: workflow code can read its own runtime token, and a listen or
+/// manage token must not be able to finish another job.
+pub(crate) fn authorize_reporting_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    request: Option<&TaskAgentJobRequestRecord>,
+) -> Result<(), ApiError> {
+    let token = bearer_from_headers(headers)
+        .ok_or_else(|| ApiError::unauthorized("runner or job protocol token required"))?;
+    if token == state.system_token {
+        return Ok(());
+    }
+
+    let Some(request) = request else {
+        return Err(ApiError::forbidden(
+            "job runtime token cannot resolve the reporting target",
+        ));
+    };
+    let authorized = state.verify_local_jwt_claims(token).is_some_and(|claims| {
+        let subject_job = claims
+            .get("sub")
+            .and_then(|value| value.as_str())
+            .and_then(|subject| subject.strip_prefix("preloop-job-"))
+            .unwrap_or("");
+        let scope = claims
+            .get("scp")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        subject_job == request.agent_job_id.to_string()
+            && scope
+                == format!(
+                    "Actions.Results:{}:{}",
+                    request.plan_id, request.agent_job_id
+                )
+    });
+    if authorized {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden(
+            "job runtime token does not own the reporting target",
+        ))
+    }
+}
 
 pub(crate) async fn require_results_bearer(
     State(shared): State<Arc<SharedState>>,
@@ -222,17 +270,12 @@ pub(crate) async fn require_runner_bearer(
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    let runner_id =
-        bearer_token(&request).and_then(|token| shared.state.runner_id_from_token(token));
-    let authorized = match runner_id {
-        Some(runner_id) => runner_registered(&shared, runner_id).await,
-        None => false,
-    };
-    if authorized {
-        Ok(next.run(request).await)
-    } else {
-        Err(ApiError::unauthorized("runner listen token required"))
+    if let Some(token) = bearer_token(&request) {
+        if registered_runner_id(&shared, token).await.is_some() {
+            return Ok(next.run(request).await);
+        }
     }
+    Err(ApiError::unauthorized("runner listen token required"))
 }
 pub(crate) fn runner_registration_bearer_authorized(state: &AppState, token: &str) -> bool {
     token == state.system_token.as_str()
@@ -286,7 +329,7 @@ pub(crate) async fn require_legacy_runner_bearer(
     let Some(token) = bearer_token(&request) else {
         return Err(ApiError::unauthorized("runner listen token required"));
     };
-    if token == shared.state.system_token || legacy_runner_id(&shared, token).await.is_some() {
+    if token == shared.state.system_token || registered_runner_id(&shared, token).await.is_some() {
         Ok(next.run(request).await)
     } else {
         Err(ApiError::unauthorized("runner listen token required"))
@@ -340,9 +383,12 @@ pub(crate) fn restore_pending_provision_token(
     }
 }
 
-/// Resolve both production listen JWTs and the local JSON-OAuth compatibility
-/// JWTs to a currently registered runner.
-pub(crate) async fn legacy_runner_id(shared: &Arc<SharedState>, token: &str) -> Option<i64> {
+/// Resolve a listen JWT to a currently registered runner.
+///
+/// Both production PS256 tokens and local JSON-OAuth compatibility tokens use
+/// this single mapping path. The request middleware and broker handlers call
+/// the same helper so token identity cannot drift between surfaces.
+pub(crate) async fn registered_runner_id(shared: &Arc<SharedState>, token: &str) -> Option<i64> {
     let runner_id = if let Some(runner_id) = shared.state.runner_id_from_token(token) {
         Some(runner_id)
     } else {
@@ -619,46 +665,10 @@ pub(crate) async fn resolve_runner_identity(
     next: Next,
 ) -> Result<Response, ApiError> {
     let bearer = bearer_token(&request).map(str::to_owned);
-    let mut runner_id = bearer
-        .as_deref()
-        .and_then(|token| shared.state.runner_id_from_token(token));
-    if runner_id.is_none() {
-        let client_id = bearer
-            .as_deref()
-            .and_then(|token| shared.state.verify_local_jwt_claims(token))
-            .and_then(|claims| {
-                claims
-                    .get("sub")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned)
-            })
-            .and_then(|sub| {
-                sub.strip_prefix("preloop-runner-listen-mock-")
-                    .map(str::to_owned)
-            });
-        if let Some(client_id) = client_id {
-            // Mock-token subjects name the client id instead of the runner
-            // id; resolve through the registration table so mock-flow clients
-            // get the same identity enforcement as real PS256 clients.
-            runner_id = shared
-                .state
-                .inner
-                .lock()
-                .await
-                .runner_client_ids
-                .get(&client_id)
-                .copied();
-        }
-    }
-    // A listen token is only as good as the registration that backs it:
-    // purge removes the runner entry, which revokes every token previously
-    // issued to it. An unregistered runner must not resolve to an identity,
-    // or a stolen token could keep creating verified sessions after teardown.
-    if let Some(id) = runner_id {
-        if !runner_registered(&shared, id).await {
-            runner_id = None;
-        }
-    }
+    let runner_id = match bearer.as_deref() {
+        Some(token) => registered_runner_id(&shared, token).await,
+        None => None,
+    };
     request
         .extensions_mut()
         .insert(RunnerIdentity { runner_id });

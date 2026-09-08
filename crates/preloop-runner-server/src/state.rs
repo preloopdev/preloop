@@ -498,6 +498,10 @@ pub struct AppState {
     /// global `inner` mutex, and never acquire `inner` while holding it —
     /// the secrets handlers touch neither ordering partner.
     pub(crate) secret_mutation: Arc<Mutex<()>>,
+    /// Serializes full-state snapshots with the snapshot capture. A snapshot
+    /// taken before another request mutates `inner` must not be allowed to
+    /// overwrite that newer mutation after an async store write completes.
+    pub(crate) store_mutation: Arc<Mutex<()>>,
     /// The config file this engine is pinned to, resolved once at startup.
     ///
     /// Every engine-side read and write of configuration goes through this
@@ -1042,6 +1046,7 @@ impl AppState {
             scheduler: None,
             secrets,
             secret_mutation: Arc::new(Mutex::new(())),
+            store_mutation: Arc::new(Mutex::new(())),
             github_app,
             github_apps,
             dispatch_token_cache: Arc::new(crate::dispatch_auth::InstallationTokenCache::default()),
