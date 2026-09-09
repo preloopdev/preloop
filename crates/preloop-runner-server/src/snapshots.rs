@@ -1790,7 +1790,8 @@ pub(crate) async fn snapshot_git_http(
     let valid_request = (method == axum::http::Method::GET
         && path == "info/refs"
         && query == "service=git-upload-pack")
-        || (method == axum::http::Method::POST && path == "git-upload-pack");
+        || (method == axum::http::Method::POST && path == "git-upload-pack")
+        || (method == axum::http::Method::POST && (path == "info/lfs/objects/batch" || path == ".git/info/lfs/objects/batch"));
     if !valid_request {
         return Err(ApiError::not_found("snapshot Git endpoint not found"));
     }
@@ -1815,6 +1816,16 @@ pub(crate) async fn snapshot_git_http(
     let request_body = to_bytes(request.into_body(), MAX_GIT_REQUEST_BYTES)
         .await
         .map_err(|error| ApiError::bad_request(format!("invalid Git request body: {error}")))?;
+    if path == "info/lfs/objects/batch" || path == ".git/info/lfs/objects/batch" {
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/vnd.git-lfs+json")
+            .body(Body::from(serde_json::json!({
+                "transfer": "basic",
+                "objects": []
+            }).to_string()))
+            .unwrap());
+    }
     {
         let prefix_len = std::cmp::min(200, request_body.len());
         let hex_prefix: String = request_body[..prefix_len]
