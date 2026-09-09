@@ -407,40 +407,62 @@ pub(crate) async fn delete_agent(
         &headers,
         identity.as_ref().map(|axum::Extension(id)| id),
     )?;
-    match caller {
-        crate::auth::AdminCaller::System => {}
-        crate::auth::AdminCaller::Runner(runner_id) => {
-            if runner_id != agent_id {
-                return Err(ApiError::forbidden("a runner may only deregister itself"));
+    purge_runner_identity_guarded(&shared, caller, agent_id).await?;
+    Ok((StatusCode::NO_CONTENT, Json(serde_json::Value::Null)))
+}
+
+pub(crate) async fn purge_runner_identity_guarded(
+    shared: &Arc<SharedState>,
+    caller: crate::auth::AdminCaller,
+    agent_id: i64,
+) -> Result<(), ApiError> {
+    let snapshot = {
+        let mut inner = shared.state.inner.lock().await;
+        match caller {
+            crate::auth::AdminCaller::System => {}
+            crate::auth::AdminCaller::Runner(runner_id) => {
+                if runner_id != agent_id {
+                    return Err(ApiError::forbidden("a runner may only deregister itself"));
+                }
+            }
+            crate::auth::AdminCaller::RunnerManager => {
+                let has_active_session = inner
+                    .sessions
+                    .values()
+                    .any(|session| session.runner_id == agent_id)
+                    || inner
+                        .broker_session_runners
+                        .values()
+                        .any(|runner_id| *runner_id == agent_id);
+                if has_active_session {
+                    return Err(ApiError::forbidden(
+                        "cannot delete an active runner using a registration token",
+                    ));
+                }
             }
         }
-        crate::auth::AdminCaller::RunnerManager => {
-            let inner = shared.state.inner.lock().await;
-            if inner
-                .sessions
-                .values()
-                .any(|session| session.runner_id == agent_id)
-            {
-                return Err(ApiError::forbidden(
-                    "cannot delete an active runner using a registration token",
-                ));
-            }
-        }
-    }
-    let snapshot = purge_runner_identity(&shared, agent_id).await;
+        purge_runner_identity_locked(&mut inner, &shared.state, agent_id);
+        crate::store::StoreSnapshot::from_inner(&inner)
+    };
+    shared.state.message_notify.notify_waiters();
     if let Err(error) = shared.state.store.store_inner(&snapshot).await {
         tracing::warn!(?error, "failed to persist deleted runner identity");
     }
-    Ok((StatusCode::NO_CONTENT, Json(serde_json::Value::Null)))
+    Ok(())
 }
 
 /// Remove every trace of a runner identity: keys, client ids, sessions and
 /// assignments. Shared by agent deregistration and pool machine teardown.
-pub(crate) async fn purge_runner_identity(
-    shared: &Arc<SharedState>,
+pub(crate) async fn purge_runner_identity(shared: &Arc<SharedState>, runner_id: i64) {
+    let _ =
+        purge_runner_identity_guarded(shared, crate::auth::AdminCaller::System, runner_id).await;
+}
+
+fn purge_runner_identity_locked(
+    inner: &mut crate::state::InnerState,
+    state: &AppState,
     runner_id: i64,
-) -> crate::store::StoreSnapshot {
-    let mut inner = shared.state.inner.lock().await;
+) {
     if inner.runners.remove(&runner_id).is_none()
         && inner.runner_client_ids.values().all(|id| *id != runner_id)
     {
@@ -494,7 +516,7 @@ pub(crate) async fn purge_runner_identity(
                             job_id = %job_id.0,
                             "requeuing job of purged runner"
                         );
-                        runtime_scheduling::on_job_enqueued(&mut inner, &job);
+                        runtime_scheduling::on_job_enqueued(inner, &job);
                         inner.queue.push_back(job);
                     }
                 }
@@ -510,7 +532,7 @@ pub(crate) async fn purge_runner_identity(
         .map(|(key, _)| key.clone())
         .collect();
     for key in orphaned {
-        if crate::runtime_scheduling::clear_assignment(&mut inner, key.0, &key.1)
+        if crate::runtime_scheduling::clear_assignment(inner, key.0, &key.1)
             && inner.pool_assignments_enabled
         {
             // Requeue at the *back* of the waitlist with a fresh mark: a job
@@ -526,15 +548,10 @@ pub(crate) async fn purge_runner_identity(
                 .or_insert_with(std::time::SystemTime::now);
         }
     }
-    shared
-        .state
+    state
         .queue_depth
         .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
-    runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
-    let snapshot = crate::store::StoreSnapshot::from_inner(&inner);
-    drop(inner);
-    shared.state.message_notify.notify_waiters();
-    snapshot
+    runtime_scheduling::sync_next_job_labels(inner, &state.next_job_runs_on);
 }
 
 /// DELETE /runner/server/_apis/distributedtask/pools/:pool_id/sessions (no session_id)
