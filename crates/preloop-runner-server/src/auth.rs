@@ -866,7 +866,6 @@ pub(crate) fn job_runtime_claims_from_headers(
     state.job_runtime_claims_from_token(token)
 }
 
-
 #[derive(Debug, Clone)]
 pub(crate) struct JobRuntimeClaims {
     pub(crate) plan_id: String,

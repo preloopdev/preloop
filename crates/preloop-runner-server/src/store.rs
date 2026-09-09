@@ -799,7 +799,10 @@ pub(crate) fn restore_request_snapshot(
 /// every backend so one code path defines what survives a restart.
 pub(crate) fn build_meta_snapshot(inner: &InnerState) -> MetaSnapshot {
     MetaSnapshot {
-        revision: inner.metadata_revision.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+        revision: inner
+            .metadata_revision
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1,
         workflow_run_counters: inner.workflow_run_counters.clone(),
         next_runner_id: inner.next_runner_id,
         next_cache_id: inner.next_cache_id,
@@ -931,7 +934,9 @@ pub(crate) fn apply_meta_snapshot(inner: &mut InnerState, meta: MetaSnapshot) {
     inner.next_runner_id = meta.next_runner_id;
     inner.next_cache_id = meta.next_cache_id;
     inner.next_message_id = meta.next_message_id;
-    inner.metadata_revision.store(meta.revision, std::sync::atomic::Ordering::Relaxed);
+    inner
+        .metadata_revision
+        .store(meta.revision, std::sync::atomic::Ordering::Relaxed);
     inner.next_log_id = meta.next_log_id;
     inner.next_artifact_v2_id = meta.next_artifact_v2_id;
     inner.azdo_sessions = meta.azdo_sessions;

@@ -215,7 +215,12 @@ pub(crate) async fn cache_commit(
     let entry = shared
         .state
         .cache
-        .put_scoped(&pending.namespace, &pending.key, &pending.version, &pending.bytes)
+        .put_scoped(
+            &pending.namespace,
+            &pending.key,
+            &pending.version,
+            &pending.bytes,
+        )
         .await?;
     Ok(Json(CacheLookupResponse {
         hit: true,
@@ -237,7 +242,12 @@ pub(crate) async fn cache_lookup(
     let response = shared
         .state
         .cache
-        .get_scoped(repository.as_deref().unwrap_or_default(), &key, &query.version, &restore_keys)
+        .get_scoped(
+            repository.as_deref().unwrap_or_default(),
+            &key,
+            &query.version,
+            &restore_keys,
+        )
         .await?;
     if let Some((entry, _bytes)) = response {
         Ok(Json(json!({
