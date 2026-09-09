@@ -188,6 +188,10 @@ impl AppState {
     pub(crate) fn job_uuid_from_token(&self, token: &str) -> Option<uuid::Uuid> {
         self.results_job_from_token(token).map(|(_, job)| job)
     }
+    pub(crate) fn job_runtime_claims_from_token(&self, token: &str) -> Option<crate::auth::JobRuntimeClaims> {
+        let (plan_id, job_id) = self.results_job_from_token(token)?;
+        Some(crate::auth::JobRuntimeClaims { plan_id, job_id })
+    }
 
     /// Agent job UUID a debug-worker token was minted for.
     ///

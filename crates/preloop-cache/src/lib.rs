@@ -69,8 +69,21 @@ impl CacheStore {
         version: &str,
         bytes: &[u8],
     ) -> Result<CacheEntry, CacheError> {
+        self.put_scoped("", key, version, bytes).await
+    }
+
+    /// Save an immutable archive in an isolated namespace. The namespace is
+    /// part of the filesystem identity, but is not counted against the
+    /// Actions cache key's 512 UTF-16-unit limit.
+    pub async fn put_scoped(
+        &self,
+        namespace: &str,
+        key: &str,
+        version: &str,
+        bytes: &[u8],
+    ) -> Result<CacheEntry, CacheError> {
         validate_key(key, "Cache")?;
-        let directory = self.entry_dir(key, version);
+        let directory = self.entry_dir_scoped(namespace, key, version);
         match fs::create_dir(&directory).await {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -89,6 +102,7 @@ impl CacheStore {
             .as_nanos()
             .to_string();
         if let Err(error) = async {
+            fs::write(directory.join("namespace"), namespace).await?;
             fs::write(directory.join("key"), key).await?;
             fs::write(directory.join("version"), version).await?;
             fs::write(directory.join("created_at"), created_at).await?;
@@ -117,6 +131,18 @@ impl CacheStore {
         version: &str,
         restore_keys: &[String],
     ) -> Result<Option<(CacheEntry, Vec<u8>)>, CacheError> {
+        self.get_scoped("", key, version, restore_keys).await
+    }
+
+    /// Restore a cache within one namespace. Exact and prefix matching never
+    /// crosses namespace boundaries.
+    pub async fn get_scoped(
+        &self,
+        namespace: &str,
+        key: &str,
+        version: &str,
+        restore_keys: &[String],
+    ) -> Result<Option<(CacheEntry, Vec<u8>)>, CacheError> {
         validate_key(key, "Cache")?;
         if restore_keys.len() > 10 {
             return Err(CacheError::InvalidKey(format!(
@@ -128,15 +154,15 @@ impl CacheStore {
             validate_key(restore_key, "Restore")?;
         }
 
-        let exact = self.path_for(key, version);
+        let exact = self.path_for_scoped(namespace, key, version);
         let exact_path = if fs::try_exists(&exact).await? {
             Some(exact)
-        } else if let Some(legacy) = self.legacy_path_for(key, version) {
-            if fs::try_exists(&legacy).await? {
-                Some(legacy)
-            } else {
-                None
-            }
+        } else if let Some(legacy) = namespace
+            .is_empty()
+            .then(|| self.legacy_path_for(key, version))
+            .flatten()
+        {
+            fs::try_exists(&legacy).await?.then_some(legacy)
         } else {
             None
         };
@@ -154,7 +180,7 @@ impl CacheStore {
         }
 
         for prefix in std::iter::once(key).chain(restore_keys.iter().map(String::as_str)) {
-            if let Some(entry) = self.find_prefix(prefix, version).await? {
+            if let Some(entry) = self.find_prefix_scoped(namespace, prefix, version).await? {
                 let bytes = fs::read(&entry.path).await?;
                 return Ok(Some((entry, bytes)));
             }
@@ -162,12 +188,18 @@ impl CacheStore {
         Ok(None)
     }
 
-    fn entry_dir(&self, key: &str, version: &str) -> PathBuf {
-        self.root.join(entry_id(key, version))
+    fn entry_dir_scoped(&self, namespace: &str, key: &str, version: &str) -> PathBuf {
+        self.root.join(entry_id_scoped(namespace, key, version))
     }
 
+    #[cfg(test)]
     fn path_for(&self, key: &str, version: &str) -> PathBuf {
-        self.entry_dir(key, version).join("archive.tzst")
+        self.path_for_scoped("", key, version)
+    }
+
+    fn path_for_scoped(&self, namespace: &str, key: &str, version: &str) -> PathBuf {
+        self.entry_dir_scoped(namespace, key, version)
+            .join("archive.tzst")
     }
     fn legacy_path_for(&self, key: &str, version: &str) -> Option<PathBuf> {
         let key_component = hex(key.as_bytes());
@@ -194,8 +226,9 @@ impl CacheStore {
         Some(self.root.join(component).join("archive.tzst"))
     }
 
-    async fn find_prefix(
+    async fn find_prefix_scoped(
         &self,
+        namespace: &str,
         prefix: &str,
         version: &str,
     ) -> Result<Option<CacheEntry>, CacheError> {
@@ -207,6 +240,11 @@ impl CacheStore {
             if !fs::try_exists(&path).await? {
                 continue;
             }
+            let stored_namespace = match fs::read_to_string(entry_dir.join("namespace")).await {
+                Ok(value) => value,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(error) => return Err(error.into()),
+            };
             let (Ok(key), Ok(stored_version), Ok(created_at)) = (
                 fs::read_to_string(entry_dir.join("key")).await,
                 fs::read_to_string(entry_dir.join("version")).await,
@@ -214,7 +252,10 @@ impl CacheStore {
             ) else {
                 continue;
             };
-            if stored_version != version || !key.starts_with(prefix) {
+            if stored_namespace != namespace
+                || stored_version != version
+                || !key.starts_with(prefix)
+            {
                 continue;
             }
             let Ok(created_at) = created_at.parse::<u128>() else {
@@ -256,6 +297,19 @@ fn entry_id(key: &str, version: &str) -> String {
     hasher.update(key.as_bytes());
     hasher.update(b"\0");
     hasher.update(version.as_bytes());
+    hex(hasher.finalize())
+}
+
+fn entry_id_scoped(namespace: &str, key: &str, version: &str) -> String {
+    if namespace.is_empty() {
+        return entry_id(key, version);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"preloop-cache-namespace-v1\0");
+    for component in [namespace, key, version] {
+        hasher.update((component.len() as u64).to_be_bytes());
+        hasher.update(component.as_bytes());
+    }
     hex(hasher.finalize())
 }
 
