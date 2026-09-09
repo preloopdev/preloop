@@ -6,8 +6,9 @@ This document records the design, build log, and interaction guide for the end-t
 
 ## 1. Webhook Architecture Overview
 
-The webhook system enables `preloop` to receive GitHub App webhook events
-directly from GitHub, fetch matching workflow files, and queue jobs for
+The webhook system enables `preloop` to receive GitHub App events, verify and
+commit each raw delivery to a durable queue, and acknowledge it with HTTP 202.
+An asynchronous worker fetches matching workflow files and queues jobs for
 self-hosted runners. It also integrates with the GitHub Checks API to report
 status back to the repository.
 
@@ -62,13 +63,13 @@ subscription to it warned forever.
 
 ```mermaid
 graph TD
-    GH[GitHub Webhook / API] -->|1. Event payload & Signatures| Wh[Webhook Receiver]
-    Wh -->|2. Event Type & SHAs| Auth[App Auth Client]
-    Auth -->|JWT / App Private Key| GH
-    GH -->|Installation Token| Fetch[Workflow Fetcher]
-    Fetch -->|3. Fetch .github/workflows/*.yml| AST[Workflow Evaluator]
-    AST -->|Matches? -> submit_run_inner| Core[preloop Control Plane]
-    Core -->|4. Job InProgress/Done| Report[Checks Reporter]
+    GH[GitHub Webhook / API] -->|1. Event payload & signature| Wh[Webhook Receiver]
+    Wh -->|2. Verify and durable enqueue| Queue[(webhook_deliveries)]
+    Queue -->|3. Lease and drain asynchronously| Worker[Webhook Worker]
+    Worker -->|4. App JWT / installation token| Auth[App Auth Client]
+    Auth -->|Workflow fetch| GH
+    Worker -->|5. Workflow evaluation| Core[preloop Control Plane]
+    Core -->|6. Job InProgress/Done| Report[Checks Reporter]
     Report -->|Checks API / Commit Status| GH
 ```
 
@@ -123,17 +124,20 @@ the YAML is fetched from the commit SHA so a branch update cannot select a
 different workflow during delivery.
 
 1. **Local Filesystem (Offline/Dev Mode)**:
- If `PRELOOP_LOCAL_WORKSPACE` is configured, `preloop` reads the
- `.github/workflows/` directory from the event's commit when that commit is
- present in the local repository. If an immutable event SHA is unavailable,
- delivery fails so GitHub can redeliver it; the current worktree is never used
- as a substitute. For a default
- `uses: actions/checkout@v4` step, submission also captures the worktree as
- an immutable synthetic Git commit and redirects the compiled checkout inputs
- to preloop's authenticated smart-HTTP endpoint. Tracked modifications,
- deletions, and untracked non-ignored files are included without modifying
- the user's index or workflow YAML. Explicit repository/ref/token/server
- checkout inputs retain their original remote behavior.
+   If `PRELOOP_LOCAL_WORKSPACE` is configured, `preloop` reads the
+   `.github/workflows/` directory from the event's commit when that commit is
+   present in the local repository. If an immutable event SHA is unavailable,
+   the accepted delivery is retained in the durable queue for internal retry;
+   the current worktree is never used as a substitute. If the durable enqueue
+   itself fails, GitHub does not automatically retry the non-2xx response, so
+   use GitHub's delivery redelivery action or API after the store recovers. For
+   a default `uses: actions/checkout@v4` step, submission also captures the
+   worktree as an immutable synthetic Git commit and redirects the compiled
+   checkout inputs to preloop's authenticated smart-HTTP endpoint. Tracked
+   modifications, deletions, and untracked non-ignored files are included
+   without modifying the user's index or workflow YAML. Explicit
+   repository/ref/token/server checkout inputs retain their original remote
+   behavior.
 2. **GitHub API (Remote/Production Mode)**:
  If `PRELOOP_LOCAL_WORKSPACE` is not configured, but
  `PRELOOP_GITHUB_TOKEN` or a configured GitHub App is available, `preloop`

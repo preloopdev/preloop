@@ -7,9 +7,12 @@ concurrency was sized by CPU only.
 
 ## Retry philosophy, in one line
 
-> **Server: retry-once-and-coordinate** — the control plane avoids in-process
-> retry loops almost entirely, leaning on GitHub redelivery, runner
-> long-polls (bounded by `waitSeconds`), and periodic reaper sweeps.
+> **Server: durable ingress and coordinate** — webhook requests are acknowledged
+> only after the raw delivery is committed to the queue; the worker retries
+> processing internally. A failed ingress commit is bounded and must be
+> redelivered manually because GitHub does not automatically retry non-2xx
+> webhook responses. Other control-plane paths use runner long-polls and
+> periodic reaper sweeps.
 > **Runner: mirror the official runner** — bounded 3-attempt exponential HTTP
 > retries, jittered session backoff (15–60 s) reset on success, bounded lease
 > renewal; listener/session loops and the container-health poll retry forever
@@ -34,8 +37,14 @@ concurrency was sized by CPU only.
 | `actions.rs` / `state.rs` | Action ref → SHA resolution | negative cached 60 s, positive 300 s; re-attempt after TTL | TTL-bounded |
 | `broker.rs` `broker_acquire_job` | Dispatch token mint refusal (error policy) | **deliberately no retry** — config fault, job failed terminally | n/a |
 
-GitHub webhooks are **not retried in-process**: the reservation is released
-on failure so GitHub's own redelivery is accepted (dedup window 300 s).
+GitHub webhooks are **durable and retried in-process** after a successful
+enqueue: the handler verifies the signature, commits the raw delivery to the
+`webhook_deliveries` store table within a bounded acknowledgement budget, and
+acks 202. Background workers drain the queue; transient failures retry
+internally with exponential backoff (1s → 5s → 15s → 30s), renew their
+processing lease, and retain terminal delivery IDs for a bounded deduplication
+window. If the enqueue itself fails, GitHub does not redeliver automatically;
+use GitHub's delivery redelivery action or API after the store recovers.
 
 ## Pool (`preloop-orchestrator`)
 

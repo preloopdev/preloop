@@ -140,21 +140,22 @@ Known limitations:
 ### `preloop-runner-server/src/`
 
 
-| Module                | Owns                                                                    |
-| --------------------- | ----------------------------------------------------------------------- |
-| `routes.rs`           | All axum route definitions and middleware wiring                        |
-| `auth.rs`             | Bearer token extraction and auth middleware                             |
-| `state.rs`            | `AppState`, `SharedState`, OIDC/HMAC key loading, runtime token minting |
-| `models.rs`           | `InnerState`, `QueuedJob`, run/job state                                |
-| `runs.rs`             | `/api/v1/runs` handlers: submit, get, cancel, rerun, events             |
-| `broker.rs`           | Broker protocol: session, message, acquire/renew/complete job           |
-| `distributed_task.rs` | AzDO `/_apis/distributedtask/` handlers                                 |
-| `oidc.rs`             | OIDC token minting, JWKS, discovery, certificate management             |
-| `concurrency.rs`      | Concurrency group evaluation and queue management                       |
-| `scheduler.rs`        | Cron/schedule-based workflow triggering                                 |
-| `errors.rs`           | `ApiError` type and error conversions                                   |
-| `bootstrap.rs`        | Server startup, TLS, GitHub App registration                            |
-
+| Module                  | Owns                                                                    |
+| ----------------------- | ----------------------------------------------------------------------- |
+| `routes.rs`             | All axum route definitions and middleware wiring                        |
+| `auth.rs`               | Bearer token extraction and auth middleware                             |
+| `state.rs`              | `AppState`, `SharedState`, OIDC/HMAC key loading, runtime token minting |
+| `models.rs`             | `InnerState`, `QueuedJob`, `WebhookDeliveryRecord`, run/job state       |
+| `runs.rs`               | `/api/v1/runs` handlers: submit, get, cancel, rerun, events             |
+| `github.rs`             | GitHub webhook receiver, durable queue worker, check runs               |
+| `runtime_scheduling.rs` | Job dispatch/pairing, claim eligibility, binding ceiling & reaper       |
+| `broker.rs`             | Broker protocol: session, message, acquire/renew/complete job           |
+| `distributed_task.rs`   | AzDO `/_apis/distributedtask/` handlers                                 |
+| `oidc.rs`               | OIDC token minting, JWKS, discovery, certificate management             |
+| `concurrency.rs`        | Concurrency group evaluation and queue management                       |
+| `scheduler.rs`          | Cron/schedule-based workflow triggering                                 |
+| `errors.rs`             | `ApiError` type and error conversions                                   |
+| `bootstrap.rs`          | Server startup, TLS, background reaper, status telemetry                |
 
 ### `preloop-runner/src/worker/`
 
