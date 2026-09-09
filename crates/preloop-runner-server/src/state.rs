@@ -1400,6 +1400,8 @@ impl InnerState {
 
 #[derive(Default)]
 pub(crate) struct InnerState {
+    /// Snapshot sequence allocated while the state mutex is held; restored from metadata.
+    pub(crate) metadata_revision: std::sync::atomic::AtomicU64,
     pub(crate) runs: BTreeMap<RunId, RunRecord>,
     pub(crate) workflow_run_counters: BTreeMap<String, u64>,
     pub(crate) queue: VecDeque<QueuedJob>,
