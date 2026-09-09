@@ -2923,6 +2923,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                 notify_runner_gone(&self.config, &name).await;
                 vm_telemetry_deregister(&self.config, &name);
                 if let Err(error) = self.provider.delete(&name).await {
+                    record_slot_failure(&self.config, "fork_base_cleanup");
                     warn!(machine = name.as_str(), %error, "failed to delete stale Preloop runner");
                 }
             }
@@ -3576,6 +3577,7 @@ async fn run_slot<P: VmProvider + 'static>(
                 {
                     Ok(runner) => runner,
                     Err(error) => {
+                        record_slot_failure(&config, "provision");
                         warn!(slot, %error, "provisioning runner failed; retrying");
                         tokio::select! {
                             _ = shutdown.cancelled() => break,
@@ -3613,6 +3615,7 @@ async fn run_slot<P: VmProvider + 'static>(
         spare = match successor {
             Ok(spare) => spare,
             Err(error) => {
+                record_slot_failure(&config, "guest_exit");
                 warn!(slot, %error, "ephemeral runner failed; replenishing slot");
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
@@ -4150,6 +4153,16 @@ fn vm_telemetry_register(
 fn vm_telemetry_deregister(config: &RunnerPoolConfig, name: &MachineName) {
     if let Some(observability) = &config.observability {
         observability.vm_registry().deregister(name.as_str());
+    }
+}
+
+/// Emit a runner-slot failure metric so guest crashes, provisioning errors,
+/// and un-recyclable fork bases are alertable — not just WARN log lines. A
+/// guest-internal OOM/`-1` exit has no host cgroup signal, so the WARN was the
+/// only trace; this makes `preloop.pool.slot_failures{reason}` the alert hook.
+fn record_slot_failure(config: &RunnerPoolConfig, reason: &str) {
+    if let Some(observability) = &config.observability {
+        observability.metrics().pool.record_slot_failure(reason);
     }
 }
 

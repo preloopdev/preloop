@@ -355,6 +355,11 @@ pub struct PoolMetrics {
     queue_claimable: Gauge<u64>,
     queue_unclaimable: Gauge<u64>,
     queue_dependency_blocked: Gauge<u64>,
+    /// Runner-slot provisioning/lifecycle failures, keyed by `reason`
+    /// (`provision`, `guest_exit`, `fork_base_cleanup`). A guest that OOMs or
+    /// exits non-zero, or a fork base that cannot be recycled, only surfaced
+    /// as a WARN log before this — invisible to metrics and un-alertable.
+    slot_failures: Counter<u64>,
 }
 
 impl std::fmt::Debug for PoolMetrics {
@@ -411,7 +416,19 @@ impl PoolMetrics {
                 .with_description("Jobs blocked on dependency")
                 .with_unit("{job}")
                 .build(),
+            slot_failures: meter
+                .u64_counter("preloop.pool.slot_failures")
+                .with_description("Runner slot provisioning/lifecycle failures by reason")
+                .with_unit("{failure}")
+                .build(),
         }
+    }
+
+    /// Record a runner-slot failure. `reason` is a low-cardinality label:
+    /// `provision`, `guest_exit`, or `fork_base_cleanup`.
+    pub fn record_slot_failure(&self, reason: &str) {
+        self.slot_failures
+            .add(1, &[KeyValue::new("reason", reason.to_string())]);
     }
 
     /// Record current pool/queue state from the sampler snapshot.
