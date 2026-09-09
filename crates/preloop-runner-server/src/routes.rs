@@ -203,6 +203,23 @@ pub(crate) fn build_app(
     // official runner deletes its own session and deregisters its own agent
     // through these routes, so a system-token-only guard would 401 the
     // runner's shutdown path.
+    // Pool-wide session deletion has no caller-owned target. Keep it
+    // administrator-only; runner listen tokens may delete only one of their
+    // own sessions through the per-session routes below.
+    let protected_system_apis = Router::new()
+        .route(
+            "/runner/server/_apis/distributedtask/pools/:pool_id/sessions",
+            delete(delete_sessions_for_pool),
+        )
+        .route(
+            "/_apis/distributedtask/pools/:pool_id/sessions",
+            delete(delete_sessions_for_pool),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            shared.clone(),
+            require_system_bearer,
+        ));
+
     let protected_admin_apis = Router::new()
         .route(
             "/runner/server/_apis/distributedtask/pools/:pool_id/agents/:agent_id",
@@ -211,14 +228,6 @@ pub(crate) fn build_app(
         .route(
             "/_apis/distributedtask/pools/:pool_id/agents/:agent_id",
             delete(delete_agent),
-        )
-        .route(
-            "/runner/server/_apis/distributedtask/pools/:pool_id/sessions",
-            delete(delete_sessions_for_pool),
-        )
-        .route(
-            "/_apis/distributedtask/pools/:pool_id/sessions",
-            delete(delete_sessions_for_pool),
         )
         .route(
             "/runner/server/_apis/distributedtask/pools/:pool_id/sessions/:session_id",
@@ -840,6 +849,7 @@ pub(crate) fn build_app(
         ))
         .merge(protected_protocol_apis)
         .merge(protected_admin_apis)
+        .merge(protected_system_apis)
         .with_state(shared.clone())
         .merge(results_metadata)
         .fallback(errors::protocol_not_found)

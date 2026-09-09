@@ -407,6 +407,9 @@ pub(crate) async fn delete_agent(
         }
     }
     purge_runner_identity(&shared, agent_id).await;
+    if let Err(error) = persist_full_state(&shared).await {
+        tracing::warn!(?error, "failed to persist deleted runner identity");
+    }
     Ok((StatusCode::NO_CONTENT, Json(serde_json::Value::Null)))
 }
 

@@ -763,6 +763,11 @@ pub(crate) async fn broker_acquire_job(
     Json(request): Json<BrokerAcquireJobRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let auth = authenticated_runner_id_with_source(&shared, &headers, Some(runner_id))?;
+    if auth.auth_source == RunnerAuthSource::RuntimeJwt {
+        return Err(ApiError::forbidden(
+            "acquirejob requires the runner listen token",
+        ));
+    }
     if auth.auth_source == RunnerAuthSource::RunnerListenToken {
         record_listener_token_use(
             &shared.state,
@@ -1447,6 +1452,16 @@ pub(crate) async fn broker_renew_job(
     Json(request): Json<BrokerRenewJobRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let auth = authenticated_runner_id_with_source(&shared, &headers, Some(runner_id))?;
+    if auth.auth_source == RunnerAuthSource::RuntimeJwt
+        && shared.state.job_uuid_from_token(
+            crate::auth::bearer_from_headers(&headers)
+                .expect("authenticated bearer must still be present"),
+        ) != Some(request.job_id)
+    {
+        return Err(ApiError::forbidden(
+            "runtime token does not match broker job",
+        ));
+    }
     if auth.auth_source == RunnerAuthSource::RunnerListenToken {
         record_listener_token_use(
             &shared.state,
@@ -1478,6 +1493,16 @@ pub(crate) async fn broker_complete_job(
     Json(request): Json<BrokerRenewJobRequest>,
 ) -> Result<StatusCode, ApiError> {
     let auth = authenticated_runner_id_with_source(&shared, &headers, Some(runner_id))?;
+    if auth.auth_source == RunnerAuthSource::RuntimeJwt
+        && shared.state.job_uuid_from_token(
+            crate::auth::bearer_from_headers(&headers)
+                .expect("authenticated bearer must still be present"),
+        ) != Some(request.job_id)
+    {
+        return Err(ApiError::forbidden(
+            "runtime token does not match broker job",
+        ));
+    }
     if auth.auth_source == RunnerAuthSource::RunnerListenToken {
         record_listener_token_use(
             &shared.state,
