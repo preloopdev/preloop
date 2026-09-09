@@ -1573,6 +1573,11 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
     ),
     (
         5,
+        "runtime-snapshot-revision",
+        "ALTER TABLE runtime_snapshots ADD COLUMN revision BIGINT NOT NULL DEFAULT 0;",
+    ),
+    (
+        6,
         "webhook-deliveries-table",
         r#"
         CREATE TABLE IF NOT EXISTS webhook_deliveries (
@@ -1591,10 +1596,8 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         "#,
     ),
     (
-        6,
+        7,
         "webhook-delivery-lease-fencing",
-        r#"
-        ALTER TABLE webhook_deliveries ADD COLUMN lease_token TEXT;
-        "#,
+        "ALTER TABLE webhook_deliveries ADD COLUMN lease_token TEXT;",
     ),
 ];

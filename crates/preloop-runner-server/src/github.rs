@@ -939,6 +939,7 @@ const WEBHOOK_ENQUEUE_ATTEMPTS: usize = 2;
 const WEBHOOK_LEASE_DURATION_SECS: u64 = 60;
 const WEBHOOK_LEASE_RENEW_INTERVAL_SECS: u64 = 20;
 const WEBHOOK_DELIVERY_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
+const WEBHOOK_MAX_ATTEMPTS: u32 = 6;
 const WEBHOOK_PRUNE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const WEBHOOK_PRUNE_BATCH_SIZE: usize = 256;
 
@@ -1351,6 +1352,14 @@ pub(crate) async fn process_one_delivery(
     };
     heartbeat.abort();
     let _ = heartbeat.await;
+    let outcome = match outcome {
+        WebhookOutcome::TransientError(error) if delivery.attempts >= WEBHOOK_MAX_ATTEMPTS => {
+            WebhookOutcome::Unreportable(format!(
+                "transient webhook failure exceeded {WEBHOOK_MAX_ATTEMPTS} attempts: {error}"
+            ))
+        }
+        outcome => outcome,
+    };
     match outcome {
         WebhookOutcome::Success => {
             match shared

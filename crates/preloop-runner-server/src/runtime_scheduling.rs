@@ -1778,7 +1778,7 @@ pub(crate) fn sweep_stale_bindings(inner: &mut InnerState, now: std::time::Syste
             .retain(|_, at| assignment_fresh(*at, now));
         swept += (initial_assignments - inner.job_assignments.len())
             + (initial_pending - inner.pool_pending.len());
-    } else if inner.pool_assignments_enabled {
+    } else {
         let dead: Vec<(RunId, JobId)> = inner
             .job_assignments
             .iter()
@@ -1799,7 +1799,9 @@ pub(crate) fn sweep_stale_bindings(inner: &mut InnerState, now: std::time::Syste
                         job_id = %key.1.0,
                         "stale binding released on timer; job requeued at back of pool waitlist"
                     );
-                    inner.pool_pending.insert(key, now);
+                    if inner.pool_assignments_enabled {
+                        inner.pool_pending.insert(key, now);
+                    }
                     inner.released_bindings_count = inner.released_bindings_count.saturating_add(1);
                     swept += 1;
                 }
