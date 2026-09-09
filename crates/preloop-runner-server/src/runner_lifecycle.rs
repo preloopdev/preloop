@@ -68,6 +68,9 @@ async fn register_runner_inner(
         inner.runner_rsa_public_keys.insert(runner_id, public_key);
     }
     inner.runners.insert(runner.id, runner.clone());
+    inner
+        .runner_registered_at
+        .insert(runner.id, std::time::Instant::now());
     Ok(runner)
 }
 
@@ -422,6 +425,7 @@ pub(crate) async fn purge_runner_identity(shared: &Arc<SharedState>, runner_id: 
     inner.runner_client_ids.retain(|_, id| *id != runner_id);
     inner.runner_public_keys.remove(&runner_id);
     inner.runner_rsa_public_keys.remove(&runner_id);
+    inner.runner_registered_at.remove(&runner_id);
     // Sessions claiming this runner: drop them so subsequent polls stop.
     let doomed_sessions: Vec<String> = inner
         .broker_session_runners
@@ -479,7 +483,7 @@ pub(crate) async fn purge_runner_identity(shared: &Arc<SharedState>, runner_id: 
     let orphaned: Vec<(RunId, JobId)> = inner
         .job_assignments
         .iter()
-        .filter(|(_, record)| record.runner_id == runner_id)
+        .filter(|(_, record)| record.runner_id == Some(runner_id))
         .map(|(key, _)| key.clone())
         .collect();
     for key in orphaned {

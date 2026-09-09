@@ -3937,6 +3937,7 @@ fn condition_action(code: &str) -> &'static str {
         "debug_audit_evicted" => "increase audit retention or flush audits",
         "telemetry_export_failure" => "check OTLP endpoint and credentials",
         "state_sampler_stale" | "task_stale" | "task_exited" => "check background task health",
+        "webhook_dead_letter" => "inspect dead-lettered webhook deliveries and last_error",
         _ => "see runbook for this condition",
     }
 }

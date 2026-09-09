@@ -259,8 +259,53 @@ fn submission_allows_secrets(submission: &WorkflowSubmission) -> bool {
 
 pub(crate) async fn submit_run_inner(
     shared: &Arc<SharedState>,
-    mut submission: WorkflowSubmission,
+    submission: WorkflowSubmission,
 ) -> Result<RunAccepted, ApiError> {
+    submit_run_inner_with_webhook_delivery(shared, submission, None).await
+}
+
+/// Submit a run originating from one durable webhook delivery.
+///
+/// The delivery worker is at-least-once: a process crash after run creation
+/// but before the queue row is marked done can replay the payload. Persisting
+/// the delivery ID on the run lets the replay return the existing run instead
+/// of creating a second one.
+pub(crate) async fn submit_run_inner_with_webhook_delivery(
+    shared: &Arc<SharedState>,
+    mut submission: WorkflowSubmission,
+    webhook_delivery_id: Option<&str>,
+) -> Result<RunAccepted, ApiError> {
+    let webhook_delivery_id = webhook_delivery_id.map(str::to_owned);
+    if let (Some(delivery_id), Some(workflow_path)) = (
+        webhook_delivery_id.as_deref(),
+        submission.workflow_path.as_deref(),
+    ) {
+        let existing = {
+            let inner = shared.state.inner.lock().await;
+            inner
+                .runs
+                .values()
+                .find(|run| {
+                    run.webhook_delivery_id.as_deref() == Some(delivery_id)
+                        && run.workflow_path_str == workflow_path
+                })
+                .map(|run| (run.run_id, run.run_number, run.jobs.len()))
+        };
+        if let Some((run_id, run_number, queued_jobs)) = existing {
+            tracing::info!(
+                %delivery_id,
+                %workflow_path,
+                %run_id,
+                "reusing run for replayed webhook delivery"
+            );
+            return Ok(RunAccepted {
+                run_id,
+                run_number,
+                queued_jobs,
+            });
+        }
+    }
+
     let workflow = parse_workflow(&submission.workflow_yaml)?;
     // GitHub rejects workflows whose `on.schedule` cron cannot parse (save
     // time); aksh rejects them at submit so a bad schedule is a hard error
@@ -1098,6 +1143,7 @@ pub(crate) async fn submit_run_inner(
                 run_id,
                 RunRecord {
                     run_id,
+                    webhook_delivery_id: webhook_delivery_id.clone(),
                     run_name,
                     submission: Arc::new(submission),
                     jobs: BTreeMap::new(),
@@ -1297,6 +1343,7 @@ pub(crate) async fn submit_run_inner(
                         run_id,
                         RunRecord {
                             run_id,
+                            webhook_delivery_id: webhook_delivery_id.clone(),
                             run_name,
                             submission: Arc::new(submission),
                             jobs: statuses,
@@ -1386,6 +1433,7 @@ pub(crate) async fn submit_run_inner(
                 run_id,
                 RunRecord {
                     run_id,
+                    webhook_delivery_id: webhook_delivery_id.clone(),
                     run_name,
                     submission: Arc::new(submission),
                     jobs: statuses,
@@ -1446,6 +1494,7 @@ pub(crate) async fn submit_run_inner(
             run_id,
             RunRecord {
                 run_id,
+                webhook_delivery_id: webhook_delivery_id.clone(),
                 run_name: run_name.clone(),
                 submission: Arc::new(submission.clone()),
                 jobs: statuses.clone(),
@@ -1608,6 +1657,7 @@ pub(crate) async fn submit_run_inner(
             run_id,
             RunRecord {
                 run_id,
+                webhook_delivery_id: webhook_delivery_id.clone(),
                 run_name,
                 submission: Arc::new(submission),
                 jobs: statuses,

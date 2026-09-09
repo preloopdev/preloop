@@ -126,6 +126,9 @@ pub struct PoolSnapshot {
     /// Pending provision token count (pool -> server).
     #[serde(default)]
     pub pending_registrations: u32,
+    /// Count of stale job bindings released back to the waitlist.
+    #[serde(default)]
+    pub released_bindings: u64,
 }
 
 impl Default for PoolSnapshot {
@@ -141,6 +144,7 @@ impl Default for PoolSnapshot {
             paused: 0,
             consecutive_provision_failures: 0,
             last_transition_at: None,
+            released_bindings: 0,
             queue_depth: 0,
             next_job_runs_on: Vec::new(),
             pending_registrations: 0,

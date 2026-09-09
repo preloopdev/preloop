@@ -14,6 +14,7 @@
 //! of the server sees, so a new database plugs in without touching callers.
 
 use super::*;
+use crate::models::{WebhookDeliveryRecord, WebhookDeliveryStatus};
 use async_trait::async_trait;
 use preloop_gha_protocol::SessionId;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -78,6 +79,54 @@ pub(crate) trait Store: Send + Sync {
     async fn delete_log(&self, key: &str) -> anyhow::Result<()>;
     /// Append a control event (`run_accepted` / `run_status` / `job_status`).
     async fn append_event(&self, event: &NdjsonEvent) -> anyhow::Result<()>;
+    /// Enqueue a webhook delivery atomically. Returns `Ok(true)` if newly inserted,
+    /// or `Ok(false)` if a row with this `delivery_id` already exists (deduplicated).
+    async fn enqueue_webhook_delivery(
+        &self,
+        delivery: &WebhookDeliveryRecord,
+    ) -> anyhow::Result<bool>;
+    /// Claim up to `limit` unleased/stale webhook deliveries in FIFO order (`received_at_us`).
+    async fn claim_webhook_deliveries(
+        &self,
+        limit: usize,
+        lease_duration_secs: u64,
+    ) -> anyhow::Result<Vec<WebhookDeliveryRecord>>;
+    /// Extend the lease for a delivery currently being processed.
+    /// Returns `Ok(true)` when this worker still owns the processing row.
+    async fn renew_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+        lease_duration_secs: u64,
+    ) -> anyhow::Result<bool>;
+    /// Mark a delivery as successfully processed (`state = 'done'`).
+    /// Returns `Ok(true)` when this worker still owned the lease.
+    async fn complete_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+    ) -> anyhow::Result<bool>;
+    /// Mark a delivery as failed. If `permanent` is false, it is reset to `received` with optional backoff.
+    /// Returns `Ok(true)` when this worker still owned the lease.
+    async fn fail_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+        error: &str,
+        permanent: bool,
+        retry_delay_secs: Option<u64>,
+    ) -> anyhow::Result<bool>;
+    /// Fetch a single webhook delivery record by ID (for inspection/testing).
+    async fn get_webhook_delivery(
+        &self,
+        delivery_id: &str,
+    ) -> anyhow::Result<Option<WebhookDeliveryRecord>>;
+    /// Count the number of dead-letter (permanently failed) webhook deliveries.
+    async fn count_dead_letter_webhook_deliveries(&self) -> anyhow::Result<u64>;
+    /// Recover stale webhook deliveries whose lease has expired back to `received`.
+    async fn recover_webhook_deliveries(&self) -> anyhow::Result<u64>;
+    /// Delete old terminal deliveries while retaining recent IDs for deduplication.
+    async fn prune_webhook_deliveries(&self, before_us: i64, limit: usize) -> anyhow::Result<u64>;
 }
 
 /// Decorator that records `preloop.store.operation.duration` for every
@@ -217,6 +266,118 @@ impl Store for InstrumentedStore {
     async fn delete_log(&self, key: &str) -> anyhow::Result<()> {
         let start = Instant::now();
         self.record("delete_log", start, self.inner.delete_log(key).await)
+    }
+    async fn enqueue_webhook_delivery(
+        &self,
+        delivery: &WebhookDeliveryRecord,
+    ) -> anyhow::Result<bool> {
+        let start = Instant::now();
+        self.record(
+            "enqueue_webhook_delivery",
+            start,
+            self.inner.enqueue_webhook_delivery(delivery).await,
+        )
+    }
+
+    async fn claim_webhook_deliveries(
+        &self,
+        limit: usize,
+        lease_duration_secs: u64,
+    ) -> anyhow::Result<Vec<WebhookDeliveryRecord>> {
+        let start = Instant::now();
+        self.record(
+            "claim_webhook_deliveries",
+            start,
+            self.inner
+                .claim_webhook_deliveries(limit, lease_duration_secs)
+                .await,
+        )
+    }
+    async fn renew_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+        lease_duration_secs: u64,
+    ) -> anyhow::Result<bool> {
+        let start = Instant::now();
+        self.record(
+            "renew_webhook_delivery",
+            start,
+            self.inner
+                .renew_webhook_delivery(delivery_id, lease_token, lease_duration_secs)
+                .await,
+        )
+    }
+
+    async fn complete_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+    ) -> anyhow::Result<bool> {
+        let start = Instant::now();
+        self.record(
+            "complete_webhook_delivery",
+            start,
+            self.inner
+                .complete_webhook_delivery(delivery_id, lease_token)
+                .await,
+        )
+    }
+
+    async fn fail_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+        error: &str,
+        permanent: bool,
+        retry_delay_secs: Option<u64>,
+    ) -> anyhow::Result<bool> {
+        let start = Instant::now();
+        self.record(
+            "fail_webhook_delivery",
+            start,
+            self.inner
+                .fail_webhook_delivery(delivery_id, lease_token, error, permanent, retry_delay_secs)
+                .await,
+        )
+    }
+
+    async fn get_webhook_delivery(
+        &self,
+        delivery_id: &str,
+    ) -> anyhow::Result<Option<WebhookDeliveryRecord>> {
+        let start = Instant::now();
+        self.record(
+            "get_webhook_delivery",
+            start,
+            self.inner.get_webhook_delivery(delivery_id).await,
+        )
+    }
+
+    async fn count_dead_letter_webhook_deliveries(&self) -> anyhow::Result<u64> {
+        let start = Instant::now();
+        self.record(
+            "count_dead_letter_webhook_deliveries",
+            start,
+            self.inner.count_dead_letter_webhook_deliveries().await,
+        )
+    }
+
+    async fn recover_webhook_deliveries(&self) -> anyhow::Result<u64> {
+        let start = Instant::now();
+        self.record(
+            "recover_webhook_deliveries",
+            start,
+            self.inner.recover_webhook_deliveries().await,
+        )
+    }
+    async fn prune_webhook_deliveries(&self, before_us: i64, limit: usize) -> anyhow::Result<u64> {
+        let start = Instant::now();
+        self.record(
+            "prune_webhook_deliveries",
+            start,
+            self.inner.prune_webhook_deliveries(before_us, limit).await,
+        )
     }
 }
 
@@ -603,7 +764,7 @@ pub(crate) struct MetaSnapshot {
     /// Job → runner assignments (strict-assignment mode), as
     /// (run_id, job_id, runner_id, at_us, first_at_us).
     #[serde(default)]
-    job_assignments: Vec<(String, String, i64, u64, u64)>,
+    job_assignments: Vec<(String, String, Option<i64>, u64, u64)>,
     /// Jobs waiting for a provisioned runner: (run_id, job_id, marked_at_us).
     #[serde(default)]
     pool_pending: Vec<(String, String, i64)>,
@@ -667,10 +828,10 @@ fn derive_keys(root: &[u8]) -> DerivedKeys {
 /// Serialize a run record for storage. The fields `#[serde(skip)]`-ped off
 /// the wire shape are injected as JSON so the persisted blob is
 /// self-contained: `submission` (through the sanctioned expose boundary),
-/// `job_needs`, and the expansion-only fields (`caller_plans`, `github`,
-/// `head_sha`, `workflow_ref`, `workspace_snapshot`) that the scheduler needs
-/// to materialize a deferred reusable-caller or matrix subtree after a
-/// restart.
+/// `job_needs`, the webhook delivery id, and the expansion-only fields
+/// (`caller_plans`, `github`, `head_sha`, `workflow_ref`, `workspace_snapshot`)
+/// that the scheduler needs to materialize a deferred reusable-caller or
+/// matrix subtree after a restart.
 pub(crate) fn run_record_value(run: &RunRecord) -> anyhow::Result<serde_json::Value> {
     let mut value = serde_json::to_value(run)?;
     if let Some(object) = value.as_object_mut() {
@@ -678,6 +839,10 @@ pub(crate) fn run_record_value(run: &RunRecord) -> anyhow::Result<serde_json::Va
         object.insert(
             "job_needs".to_owned(),
             serde_json::to_value(&run.job_needs)?,
+        );
+        object.insert(
+            "webhook_delivery_id".to_owned(),
+            serde_json::to_value(&run.webhook_delivery_id)?,
         );
         object.insert(
             "caller_plans".to_owned(),
@@ -2135,6 +2300,288 @@ impl SqliteStore {
         )?;
         Ok(())
     }
+    pub(crate) fn enqueue_webhook_delivery(
+        &self,
+        delivery: &WebhookDeliveryRecord,
+    ) -> anyhow::Result<bool> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sqlite lock poisoned"))?;
+        let tx = connection.transaction()?;
+        let sealed = self.cipher.seal(&delivery.payload)?;
+        let rows_affected = tx.execute(
+            "INSERT INTO webhook_deliveries (
+                 delivery_id, event, payload_blob, received_at_us, state, attempts,
+                 lease_until_us, lease_token, last_error
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(delivery_id) DO NOTHING",
+            params![
+                delivery.delivery_id,
+                delivery.event,
+                sealed,
+                delivery.received_at_us,
+                delivery.state.as_str(),
+                delivery.attempts as i64,
+                delivery.lease_until_us,
+                delivery.lease_token,
+                delivery.last_error,
+            ],
+        )?;
+        tx.commit()?;
+        self.maybe_checkpoint_wal(&connection)?;
+        Ok(rows_affected > 0)
+    }
+    pub(crate) fn claim_webhook_deliveries(
+        &self,
+        limit: usize,
+        lease_duration_secs: u64,
+    ) -> anyhow::Result<Vec<WebhookDeliveryRecord>> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sqlite lock poisoned"))?;
+        let tx = connection.transaction()?;
+        let now = now_us();
+        let lease_until = now + (lease_duration_secs as i64 * 1_000_000);
+
+        struct Row {
+            delivery_id: String,
+            event: String,
+            payload_blob: Vec<u8>,
+            received_at_us: i64,
+            state: String,
+            attempts: i64,
+            lease_until_us: Option<i64>,
+            last_error: Option<String>,
+        }
+
+        let mut stmt = tx.prepare(
+            "SELECT delivery_id, event, payload_blob, received_at_us, state, attempts, lease_until_us, last_error
+             FROM webhook_deliveries
+             WHERE (state = 'received' AND (lease_until_us IS NULL OR lease_until_us <= ?1))
+                OR (state = 'processing' AND lease_until_us IS NOT NULL AND lease_until_us < ?1)
+             ORDER BY received_at_us ASC
+             LIMIT ?2",
+        )?;
+
+        let rows: Vec<Row> = stmt
+            .query_map(params![now, limit as i64], |row| {
+                Ok(Row {
+                    delivery_id: row.get(0)?,
+                    event: row.get(1)?,
+                    payload_blob: row.get(2)?,
+                    received_at_us: row.get(3)?,
+                    state: row.get(4)?,
+                    attempts: row.get(5)?,
+                    lease_until_us: row.get(6)?,
+                    last_error: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        let mut records = Vec::with_capacity(rows.len());
+        for row in rows {
+            let payload = self.cipher.unseal(&row.payload_blob)?;
+            let new_attempts = (row.attempts as u32).saturating_add(1);
+            let lease_token = uuid::Uuid::new_v4().to_string();
+            tx.execute(
+                "UPDATE webhook_deliveries
+                 SET state = 'processing', lease_until_us = ?1, attempts = ?2, lease_token = ?3
+                 WHERE delivery_id = ?4",
+                params![
+                    lease_until,
+                    new_attempts as i64,
+                    lease_token,
+                    row.delivery_id
+                ],
+            )?;
+            records.push(WebhookDeliveryRecord {
+                delivery_id: row.delivery_id,
+                event: row.event,
+                payload,
+                received_at_us: row.received_at_us,
+                state: WebhookDeliveryStatus::Processing,
+                attempts: new_attempts,
+                lease_until_us: Some(lease_until),
+                lease_token: Some(lease_token),
+                last_error: row.last_error,
+            });
+        }
+        tx.commit()?;
+        self.maybe_checkpoint_wal(&connection)?;
+        Ok(records)
+    }
+
+    /// Renew a live webhook processing lease without changing its attempt.
+    pub(crate) fn renew_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+        lease_duration_secs: u64,
+    ) -> anyhow::Result<bool> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sqlite lock poisoned"))?;
+        let lease_until = now_us() + (lease_duration_secs as i64 * 1_000_000);
+        let rows_affected = connection.execute(
+            "UPDATE webhook_deliveries
+             SET lease_until_us = ?1
+             WHERE delivery_id = ?2 AND state = 'processing' AND lease_token = ?3",
+            params![lease_until, delivery_id, lease_token],
+        )?;
+        Ok(rows_affected > 0)
+    }
+    pub(crate) fn complete_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+    ) -> anyhow::Result<bool> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sqlite lock poisoned"))?;
+        let tx = connection.transaction()?;
+        let rows_affected = tx.execute(
+            "UPDATE webhook_deliveries
+             SET state = 'done', lease_until_us = NULL, lease_token = NULL, last_error = NULL
+             WHERE delivery_id = ?1 AND state = 'processing' AND lease_token = ?2",
+            params![delivery_id, lease_token],
+        )?;
+        tx.commit()?;
+        self.maybe_checkpoint_wal(&connection)?;
+        Ok(rows_affected > 0)
+    }
+
+    pub(crate) fn fail_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+        error: &str,
+        permanent: bool,
+        retry_delay_secs: Option<u64>,
+    ) -> anyhow::Result<bool> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sqlite lock poisoned"))?;
+        let tx = connection.transaction()?;
+        let rows_affected = if permanent {
+            tx.execute(
+                "UPDATE webhook_deliveries
+                 SET state = 'failed', lease_until_us = NULL, lease_token = NULL, last_error = ?2
+                 WHERE delivery_id = ?1 AND state = 'processing' AND lease_token = ?3",
+                params![delivery_id, error, lease_token],
+            )?
+        } else {
+            let lease_until = retry_delay_secs.map(|delay| now_us() + (delay as i64 * 1_000_000));
+            tx.execute(
+                "UPDATE webhook_deliveries
+                 SET state = 'received', lease_until_us = ?2, lease_token = NULL, last_error = ?3
+                 WHERE delivery_id = ?1 AND state = 'processing' AND lease_token = ?4",
+                params![delivery_id, lease_until, error, lease_token],
+            )?
+        };
+        tx.commit()?;
+        self.maybe_checkpoint_wal(&connection)?;
+        Ok(rows_affected > 0)
+    }
+
+    pub(crate) fn get_webhook_delivery(
+        &self,
+        delivery_id: &str,
+    ) -> anyhow::Result<Option<WebhookDeliveryRecord>> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sqlite lock poisoned"))?;
+        let mut stmt = connection.prepare(
+            "SELECT delivery_id, event, payload_blob, received_at_us, state, attempts,
+                    lease_until_us, lease_token, last_error
+             FROM webhook_deliveries WHERE delivery_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![delivery_id])?;
+        if let Some(row) = rows.next()? {
+            let payload_blob: Vec<u8> = row.get(2)?;
+            let payload = self.cipher.unseal(&payload_blob)?;
+            let state_str: String = row.get(4)?;
+            let state = WebhookDeliveryStatus::parse(&state_str)
+                .ok_or_else(|| anyhow::anyhow!("invalid webhook delivery state: {state_str}"))?;
+            let attempts: i64 = row.get(5)?;
+            Ok(Some(WebhookDeliveryRecord {
+                delivery_id: row.get(0)?,
+                event: row.get(1)?,
+                payload,
+                received_at_us: row.get(3)?,
+                state,
+                attempts: attempts as u32,
+                lease_until_us: row.get(6)?,
+                lease_token: row.get(7)?,
+                last_error: row.get(8)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(crate) fn count_dead_letter_webhook_deliveries(&self) -> anyhow::Result<u64> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sqlite lock poisoned"))?;
+        let count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM webhook_deliveries WHERE state = 'failed'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    pub(crate) fn recover_webhook_deliveries(&self) -> anyhow::Result<u64> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sqlite lock poisoned"))?;
+        let tx = connection.transaction()?;
+        let now = now_us();
+        let rows_affected = tx.execute(
+            "UPDATE webhook_deliveries
+             SET state = 'received', lease_until_us = NULL, lease_token = NULL
+             WHERE state = 'processing' AND lease_until_us IS NOT NULL AND lease_until_us < ?1",
+            params![now],
+        )?;
+        tx.commit()?;
+        self.maybe_checkpoint_wal(&connection)?;
+        Ok(rows_affected as u64)
+    }
+    /// Remove terminal rows older than the deduplication retention window.
+    pub(crate) fn prune_webhook_deliveries(
+        &self,
+        before_us: i64,
+        limit: usize,
+    ) -> anyhow::Result<u64> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sqlite lock poisoned"))?;
+        let tx = connection.transaction()?;
+        let rows_affected = tx.execute(
+            "DELETE FROM webhook_deliveries
+             WHERE delivery_id IN (
+                 SELECT delivery_id
+                 FROM webhook_deliveries
+                 WHERE state IN ('done', 'failed') AND received_at_us < ?1
+                 ORDER BY received_at_us ASC
+                 LIMIT ?2
+             )",
+            params![before_us, limit.min(i64::MAX as usize) as i64],
+        )?;
+        tx.commit()?;
+        self.maybe_checkpoint_wal(&connection)?;
+        Ok(rows_affected as u64)
+    }
 }
 
 #[async_trait]
@@ -2228,6 +2675,115 @@ impl Store for SqliteStore {
         tokio::task::spawn_blocking(move || store.append_event(&event))
             .await
             .map_err(|error| anyhow::anyhow!("store event task panicked: {error}"))?
+    }
+    async fn enqueue_webhook_delivery(
+        &self,
+        delivery: &WebhookDeliveryRecord,
+    ) -> anyhow::Result<bool> {
+        let store = self.clone();
+        let delivery = delivery.clone();
+        tokio::task::spawn_blocking(move || store.enqueue_webhook_delivery(&delivery))
+            .await
+            .map_err(|error| anyhow::anyhow!("enqueue webhook delivery task panicked: {error}"))?
+    }
+
+    async fn claim_webhook_deliveries(
+        &self,
+        limit: usize,
+        lease_duration_secs: u64,
+    ) -> anyhow::Result<Vec<WebhookDeliveryRecord>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.claim_webhook_deliveries(limit, lease_duration_secs)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("claim webhook deliveries task panicked: {error}"))?
+    }
+    async fn renew_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+        lease_duration_secs: u64,
+    ) -> anyhow::Result<bool> {
+        let store = self.clone();
+        let delivery_id = delivery_id.to_owned();
+        let lease_token = lease_token.to_owned();
+        tokio::task::spawn_blocking(move || {
+            store.renew_webhook_delivery(&delivery_id, &lease_token, lease_duration_secs)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("renew webhook delivery task panicked: {error}"))?
+    }
+
+    async fn complete_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+    ) -> anyhow::Result<bool> {
+        let store = self.clone();
+        let delivery_id = delivery_id.to_owned();
+        let lease_token = lease_token.to_owned();
+        tokio::task::spawn_blocking(move || {
+            store.complete_webhook_delivery(&delivery_id, &lease_token)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("complete webhook delivery task panicked: {error}"))?
+    }
+
+    async fn fail_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+        error: &str,
+        permanent: bool,
+        retry_delay_secs: Option<u64>,
+    ) -> anyhow::Result<bool> {
+        let store = self.clone();
+        let delivery_id = delivery_id.to_owned();
+        let lease_token = lease_token.to_owned();
+        let error = error.to_owned();
+        tokio::task::spawn_blocking(move || {
+            store.fail_webhook_delivery(
+                &delivery_id,
+                &lease_token,
+                &error,
+                permanent,
+                retry_delay_secs,
+            )
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("fail webhook delivery task panicked: {error}"))?
+    }
+
+    async fn get_webhook_delivery(
+        &self,
+        delivery_id: &str,
+    ) -> anyhow::Result<Option<WebhookDeliveryRecord>> {
+        let store = self.clone();
+        let delivery_id = delivery_id.to_owned();
+        tokio::task::spawn_blocking(move || store.get_webhook_delivery(&delivery_id))
+            .await
+            .map_err(|error| anyhow::anyhow!("get webhook delivery task panicked: {error}"))?
+    }
+
+    async fn count_dead_letter_webhook_deliveries(&self) -> anyhow::Result<u64> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.count_dead_letter_webhook_deliveries())
+            .await
+            .map_err(|error| anyhow::anyhow!("count dead letter webhooks task panicked: {error}"))?
+    }
+
+    async fn recover_webhook_deliveries(&self) -> anyhow::Result<u64> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.recover_webhook_deliveries())
+            .await
+            .map_err(|error| anyhow::anyhow!("recover webhook deliveries task panicked: {error}"))?
+    }
+    async fn prune_webhook_deliveries(&self, before_us: i64, limit: usize) -> anyhow::Result<u64> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.prune_webhook_deliveries(before_us, limit))
+            .await
+            .map_err(|error| anyhow::anyhow!("prune webhook deliveries task panicked: {error}"))?
     }
 }
 
@@ -2464,6 +3020,32 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
 
         CREATE INDEX IF NOT EXISTS job_steps_order_idx
           ON job_steps (agent_job_id, kind, workflow_index);
+        "#,
+    ),
+    (
+        5,
+        "webhook-deliveries-table",
+        r#"
+        CREATE TABLE IF NOT EXISTS webhook_deliveries (
+          delivery_id TEXT PRIMARY KEY,
+          event TEXT NOT NULL,
+          payload_blob BLOB NOT NULL,
+          received_at_us INTEGER NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('received', 'processing', 'done', 'failed')),
+          attempts INTEGER NOT NULL DEFAULT 0,
+          lease_until_us INTEGER,
+          last_error TEXT
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS webhook_deliveries_claim_idx
+          ON webhook_deliveries (state, received_at_us);
+        "#,
+    ),
+    (
+        6,
+        "webhook-delivery-lease-fencing",
+        r#"
+        ALTER TABLE webhook_deliveries ADD COLUMN lease_token TEXT;
         "#,
     ),
 ];

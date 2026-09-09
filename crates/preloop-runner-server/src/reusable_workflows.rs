@@ -163,6 +163,7 @@ mod tests {
         jobs.insert(JobId("outer/call".to_owned()), ExecutionStatus::InProgress);
         RunRecord {
             run_id: RunId::new(),
+            webhook_delivery_id: None,
             run_name: None,
             submission: Arc::new(WorkflowSubmission::default()),
             jobs,

@@ -230,6 +230,7 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
         .map(|(id, ..)| (*id, inner.debug_sessions.paused_for_request(*id, now)))
         .collect();
     crate::debug_sessions::sweep(&mut inner.debug_sessions, now, &active_request_ids);
+    crate::runtime_scheduling::sweep_stale_bindings(&mut inner, now);
 
     // Starvation sweep: a ready-queue job that no runner can ever claim must
     // not sit queued forever with no explanation. The pool is provisioned on
@@ -450,20 +451,39 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
     // the dead machine new jobs. Restored sessions from a restart have no
     // last-seen entry and are deliberately skipped here (the runner
     // re-registers and polls, or the lease reaper bounds them).
-    let stale_runners: std::collections::BTreeSet<i64> = {
+    let (stale_runners, phantom_runners) = {
         let inner = shared.state.inner.lock().await;
         let now = std::time::Instant::now();
-        inner
+        let stale: std::collections::BTreeSet<i64> = inner
             .session_last_seen
             .iter()
             .filter(|(_, seen)| now.duration_since(**seen) > inner.runner_liveness_timeout)
             .filter_map(|(session_id, _)| inner.runner_id_for_session(session_id))
-            .collect()
+            .collect();
+        // Fix 5: reap phantom registrations (runners registered with no active session
+        // or that never polled within the liveness timeout).
+        let phantom: std::collections::BTreeSet<i64> = inner
+            .runner_registered_at
+            .iter()
+            .filter(|(runner_id, registered_at)| {
+                now.duration_since(**registered_at) > inner.runner_liveness_timeout
+                    && !inner.sessions.values().any(|s| s.runner_id == **runner_id)
+            })
+            .map(|(runner_id, _)| *runner_id)
+            .collect();
+        (stale, phantom)
     };
     for runner_id in stale_runners {
         warn!(
             runner_id,
             "liveness sweep: reaping deaf runner (no poll within timeout)"
+        );
+        purge_runner_identity(shared, runner_id).await;
+    }
+    for runner_id in phantom_runners {
+        warn!(
+            runner_id,
+            "liveness sweep: reaping phantom registration (no session created within timeout)"
         );
         purge_runner_identity(shared, runner_id).await;
     }
@@ -551,6 +571,7 @@ struct SnapshotInputs {
     concurrency_groups_contended: u32,
     concurrency_pending_holders: u32,
     concurrency_deepest_group_pending: u32,
+    released_bindings: u64,
 }
 
 /// Collect [`SnapshotInputs`] from `inner` while the state lock is held.
@@ -680,12 +701,13 @@ fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
         concurrency_groups_contended,
         concurrency_pending_holders,
         concurrency_deepest_group_pending,
+        released_bindings: inner.released_bindings_count,
     }
 }
 
 fn build_operational_snapshot_sync(
     inputs: SnapshotInputs,
-    pool_snapshot: preloop_observability::status::PoolSnapshot,
+    mut pool_snapshot: preloop_observability::status::PoolSnapshot,
     observability: &preloop_observability::Observability,
     started_at: std::time::Instant,
     shutdown_requested: bool,
@@ -694,6 +716,7 @@ fn build_operational_snapshot_sync(
     storage_components: Vec<preloop_observability::status::StorageComponent>,
     github_configured: bool,
     store_backend: preloop_observability::status::StoreBackend,
+    dead_letters: u64,
 ) -> preloop_observability::status::OperationalSnapshot {
     use chrono::Utc;
     use preloop_observability::status::*;
@@ -728,6 +751,7 @@ fn build_operational_snapshot_sync(
     };
 
     let oldest_ready_seconds = None; // TODO: track queued_at
+    pool_snapshot.released_bindings = inputs.released_bindings;
 
     OperationalSnapshot {
         schema_version: 1,
@@ -818,7 +842,20 @@ fn build_operational_snapshot_sync(
             otlp_enabled: observability.otlp_enabled(),
             ..Default::default()
         },
-        conditions: Vec::new(),
+        conditions: {
+            let mut conds = Vec::new();
+            if dead_letters > 0 {
+                conds.push(Condition {
+                    code: "webhook_dead_letter".to_owned(),
+                    severity: "warning".to_owned(),
+                    message: format!(
+                        "{dead_letters} webhook deliveries failed with unreportable or permanent errors"
+                    ),
+                    exemplars: Vec::new(),
+                });
+            }
+            conds
+        },
     }
 }
 
@@ -865,6 +902,12 @@ async fn publish_snapshot(
         tokio::task::spawn_blocking(move || collect_storage_components(&state_dir_for_meta))
             .await
             .unwrap_or_default();
+    let dead_letters = shared
+        .state
+        .store
+        .count_dead_letter_webhook_deliveries()
+        .await
+        .unwrap_or(0);
     let snap = build_operational_snapshot_sync(
         inputs,
         pool_snapshot,
@@ -876,6 +919,7 @@ async fn publish_snapshot(
         storage_components,
         shared.state.github_app.is_some(),
         store_backend.clone(),
+        dead_letters,
     );
     *shared.state.status_snapshot.write() = snap;
 }
@@ -1062,6 +1106,11 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             collect_storage_components(&state.state_dir),
             state.github_app.is_some(),
             store_backend.clone(),
+            state
+                .store
+                .count_dead_letter_webhook_deliveries()
+                .await
+                .unwrap_or(0),
         );
         *state.status_snapshot.write() = init;
     }
@@ -1205,6 +1254,11 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     let checker_shared = shared.clone();
     tokio::spawn(async move {
         run_background_reaper(checker_shared).await;
+    });
+
+    let webhook_worker_shared = shared.clone();
+    tokio::spawn(async move {
+        crate::github::run_webhook_queue_worker(webhook_worker_shared).await;
     });
 
     // Claims held by machines the restart destroyed can never be completed by

@@ -10018,7 +10018,12 @@ async fn fork_pull_request_webhook_jobs_are_downgraded_and_secrets_denied() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+    crate::github::drain_webhook_queue(&shared).await.unwrap();
 
     let inner = state.inner.lock().await;
     let (_, run_record) = inner.runs.iter().next().unwrap();
@@ -12245,9 +12250,12 @@ jobs:
         )
         .await
         .unwrap();
-    assert_eq!(response_200.status(), StatusCode::OK);
-
-    // 6. Verify that a run was triggered and check runs are queued
+    assert_eq!(response_200.status(), StatusCode::ACCEPTED);
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+    crate::github::drain_webhook_queue(&shared).await.unwrap();
     let inner = state.inner.lock().await;
     assert_eq!(inner.runs.len(), 1);
     assert_eq!(
@@ -12369,8 +12377,12 @@ jobs:
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+    crate::github::drain_webhook_queue(&shared).await.unwrap();
     let inner = state.inner.lock().await;
     let run = inner.runs.values().next().expect("webhook created a run");
     assert_eq!(
@@ -12457,8 +12469,12 @@ jobs:
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+    crate::github::drain_webhook_queue(&shared).await.unwrap();
     let inner = state.inner.lock().await;
     assert!(
         inner.runs.is_empty(),
@@ -12540,8 +12556,12 @@ jobs:
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+    crate::github::drain_webhook_queue(&shared).await.unwrap();
     let inner = state.inner.lock().await;
     assert!(
         inner.runs.is_empty(),
@@ -12630,7 +12650,12 @@ jobs:
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let shared = Arc::new(SharedState {
+            state: state.clone(),
+            shutdown: CancellationToken::new(),
+        });
+        crate::github::drain_webhook_queue(&shared).await.unwrap();
 
         let inner = state.inner.lock().await;
         let (run_id, run) = inner.runs.iter().next().expect("webhook created a run");
@@ -12722,7 +12747,12 @@ async fn github_check_run_rerequest_resubmits_the_owning_run() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+    crate::github::drain_webhook_queue(&shared).await.unwrap();
 
     let inner = state.inner.lock().await;
     assert_eq!(inner.runs.len(), 2);
@@ -12825,6 +12855,13 @@ impl WebhookDedupFixture {
             .unwrap()
             .status()
     }
+    async fn drain(&self) -> usize {
+        let shared = Arc::new(SharedState {
+            state: self.state.clone(),
+            shutdown: CancellationToken::new(),
+        });
+        crate::github::drain_webhook_queue(&shared).await.unwrap()
+    }
 }
 
 #[tokio::test]
@@ -12836,17 +12873,17 @@ async fn github_webhook_same_delivery_is_deduped_but_new_delivery_creates_run() 
     // create a duplicate run; a genuinely new delivery creates another.
     assert_eq!(
         fixture.post("delivery-dup-1", Some("push")).await,
-        StatusCode::OK
+        StatusCode::ACCEPTED
     );
     assert_eq!(
         fixture.post("delivery-dup-1", Some("push")).await,
-        StatusCode::OK
+        StatusCode::ACCEPTED
     );
     assert_eq!(
         fixture.post("delivery-dup-2", Some("push")).await,
-        StatusCode::OK
+        StatusCode::ACCEPTED
     );
-
+    fixture.drain().await;
     let inner = fixture.state.inner.lock().await;
     assert_eq!(
         inner.runs.len(),
@@ -12877,8 +12914,9 @@ async fn github_webhook_failed_delivery_is_accepted_on_redelivery() {
     // rather than dropped as a duplicate.
     assert_eq!(
         fixture.post("delivery-retry", Some("push")).await,
-        StatusCode::OK
+        StatusCode::ACCEPTED
     );
+    fixture.drain().await;
     let inner = fixture.state.inner.lock().await;
     assert_eq!(
         inner.runs.len(),
@@ -12898,14 +12936,68 @@ async fn github_webhook_concurrent_duplicate_delivery_creates_one_run() {
         fixture.post("delivery-concurrent", Some("push")),
         fixture.post("delivery-concurrent", Some("push"))
     );
-    assert_eq!(first, StatusCode::OK);
-    assert_eq!(second, StatusCode::OK);
-
+    assert_eq!(first, StatusCode::ACCEPTED);
+    assert_eq!(second, StatusCode::ACCEPTED);
+    fixture.drain().await;
     let inner = fixture.state.inner.lock().await;
     assert_eq!(
         inner.runs.len(),
         1,
         "concurrent copies of one delivery must produce exactly one run"
+    );
+}
+#[tokio::test]
+async fn github_webhook_dedup_survives_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = WebhookDedupFixture::new(&temp).await;
+
+    assert_eq!(
+        fixture.post("delivery-restart", Some("push")).await,
+        StatusCode::ACCEPTED
+    );
+    fixture.drain().await;
+    {
+        let inner = fixture.state.inner.lock().await;
+        assert_eq!(inner.runs.len(), 1);
+    }
+
+    // Restart the server: new state instance on the same persisted database.
+    let mut restarted_state = AppState::new(temp.path().join("state").to_path_buf())
+        .await
+        .unwrap();
+    restarted_state.webhook_secret = Some("super-secret".to_owned());
+    restarted_state.local_workspace = Some(temp.path().join("ws"));
+    let restarted_app = app(restarted_state.clone(), CancellationToken::new());
+
+    // Redelivery arriving after restart must be deduplicated by the table.
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/github/webhooks")
+        .header("x-github-delivery", "delivery-restart")
+        .header("x-hub-signature-256", &fixture.signature_header)
+        .header("x-github-event", "push")
+        .header("content-type", "application/json");
+    let response = restarted_app
+        .oneshot(
+            request
+                .body(Body::from(fixture.payload_bytes.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let shared = Arc::new(SharedState {
+        state: restarted_state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+    crate::github::drain_webhook_queue(&shared).await.unwrap();
+
+    let inner = restarted_state.inner.lock().await;
+    assert_eq!(
+        inner.runs.len(),
+        1,
+        "a redelivery arriving after restart must be deduped rather than creating a second run"
     );
 }
 
@@ -13007,8 +13099,12 @@ jobs:
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+    crate::github::drain_webhook_queue(&shared).await.unwrap();
     // Verify triggered run
     let inner = state.inner.lock().await;
     assert_eq!(inner.runs.len(), 1);
@@ -14004,7 +14100,7 @@ async fn config_webhook_secret_verifies_signed_deliveries() {
         .unwrap();
     assert_eq!(
         response.status(),
-        StatusCode::OK,
+        StatusCode::ACCEPTED,
         "a correctly signed delivery is accepted with only the config file configured"
     );
 
@@ -19837,7 +19933,11 @@ async fn stolen_identity_cannot_pull_another_machines_job() {
     {
         let inner = state.inner.lock().await;
         assert_eq!(
-            inner.job_assignments.values().next().map(|r| r.runner_id),
+            inner
+                .job_assignments
+                .values()
+                .next()
+                .and_then(|r| r.runner_id),
             Some(runner_a),
             "registration pairing bound the job to machine A"
         );
@@ -20029,7 +20129,7 @@ async fn rebinding_churn_cannot_starve_an_established_runner() {
         for key in keys {
             if let Some(record) = inner.job_assignments.get_mut(&key) {
                 assert!(
-                    record.runner_id != established_id,
+                    record.runner_id != Some(established_id),
                     "churned machine, not the established runner, holds the pairing"
                 );
                 record.first_at = std::time::SystemTime::now()
@@ -20067,7 +20167,7 @@ async fn stale_binding_requeues_behind_newer_waits() {
         let inner = state.inner.lock().await;
         let key = inner.job_assignments.keys().next().cloned().unwrap();
         assert_eq!(
-            inner.job_assignments.get(&key).map(|r| r.runner_id),
+            inner.job_assignments.get(&key).and_then(|r| r.runner_id),
             Some(runner_a),
             "registration pairing bound job A to machine-a"
         );
@@ -20119,7 +20219,7 @@ async fn stale_binding_requeues_behind_newer_waits() {
             "the stale record is kept (its first_at rides the requeue), the newer wait still gets the machine"
         );
         assert_eq!(
-            inner.job_assignments.get(&key_b).map(|r| r.runner_id),
+            inner.job_assignments.get(&key_b).and_then(|r| r.runner_id),
             Some(runner_b),
             "the newer wait gets the machine before the re-queued dying job"
         );
@@ -20142,7 +20242,7 @@ async fn stale_binding_requeues_behind_newer_waits() {
     {
         let inner = state.inner.lock().await;
         assert_eq!(
-            inner.job_assignments.get(&key_a).map(|r| r.runner_id),
+            inner.job_assignments.get(&key_a).and_then(|r| r.runner_id),
             Some(runner_c),
             "released job is paired once it reaches the front of the waitlist"
         );
@@ -20184,13 +20284,16 @@ async fn stale_pending_mark_is_still_offered_to_a_registering_runner() {
     {
         let inner = state.inner.lock().await;
         assert_eq!(
-            inner.job_assignments.values().next().map(|r| r.runner_id),
+            inner
+                .job_assignments
+                .values()
+                .next()
+                .and_then(|r| r.runner_id),
             Some(runner_a),
             "stale pool-pending mark must still be offered to a registering runner"
         );
     }
 }
-
 #[tokio::test]
 async fn queue_time_assignment_prefers_idle_registered_runner() {
     let temp = tempfile::tempdir().unwrap();
@@ -20209,7 +20312,11 @@ async fn queue_time_assignment_prefers_idle_registered_runner() {
     {
         let inner = state.inner.lock().await;
         assert_eq!(
-            inner.job_assignments.values().next().map(|r| r.runner_id),
+            inner
+                .job_assignments
+                .values()
+                .next()
+                .and_then(|r| r.runner_id),
             Some(runner_id),
             "queued job should bind immediately to the idle runner"
         );
@@ -20270,7 +20377,11 @@ async fn provision_pairing_requires_the_token() {
     {
         let inner = state.inner.lock().await;
         assert_eq!(
-            inner.job_assignments.values().next().map(|r| r.runner_id),
+            inner
+                .job_assignments
+                .values()
+                .next()
+                .and_then(|r| r.runner_id),
             Some(runner_a)
         );
         // One-time: the token is consumed.
@@ -20328,12 +20439,11 @@ async fn strict_non_pool_mode_keeps_a_stale_binding_claimable() {
         let inner = state.inner.lock().await;
         let key = inner.job_assignments.keys().next().cloned().unwrap();
         assert_eq!(
-            inner.job_assignments.get(&key).map(|r| r.runner_id),
+            inner.job_assignments.get(&key).and_then(|r| r.runner_id),
             Some(runner_a),
             "queue-time binding assigned the job to the idle runner"
         );
     }
-
     // machine-a dies without claiming; the binding goes stale.
     {
         let mut inner = state.inner.lock().await;
@@ -20445,7 +20555,7 @@ async fn delete_agent_purges_identity_and_requeues_assignment() {
         inner
             .job_assignments
             .values()
-            .all(|r| r.runner_id != runner_a),
+            .all(|r| r.runner_id != Some(runner_a)),
         "purge drops the dead runner's assignment"
     );
     assert_eq!(
@@ -21780,7 +21890,11 @@ async fn stale_assignment_is_taken_over_by_the_next_verified_runner() {
     {
         let inner = state.inner.lock().await;
         assert_eq!(
-            inner.job_assignments.values().next().map(|r| r.runner_id),
+            inner
+                .job_assignments
+                .values()
+                .next()
+                .and_then(|r| r.runner_id),
             Some(runner_b),
             "replacement machine takes over the stale pairing"
         );
@@ -23318,7 +23432,7 @@ async fn store_recovery_preserves_pool_pairing_and_oauth_client_ids() {
             inner.job_assignments.insert(
                 (run_id, JobId("build".to_owned())),
                 AssignmentRecord {
-                    runner_id: 7,
+                    runner_id: Some(7),
                     at: now,
                     first_at: now,
                 },
@@ -23350,7 +23464,7 @@ async fn store_recovery_preserves_pool_pairing_and_oauth_client_ids() {
         .job_assignments
         .get(&(run_id, JobId("build".to_owned())))
         .expect("job assignment must survive restart");
-    assert_eq!(assignment.runner_id, 7);
+    assert_eq!(assignment.runner_id, Some(7));
     assert_eq!(assignment.at, now);
     assert_eq!(assignment.first_at, now);
     assert!(
@@ -23360,7 +23474,6 @@ async fn store_recovery_preserves_pool_pairing_and_oauth_client_ids() {
         "pending pairing must survive restart"
     );
 }
-
 /// `ServerConfig`'s Debug output must never print a Postgres password.
 #[test]
 fn server_config_debug_redacts_store_url_password() {

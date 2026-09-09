@@ -1058,12 +1058,12 @@ async fn webhook_receiver_accepts_any_registered_app_secret() {
     // Signed by the second registered App's secret → accepted.
     assert_eq!(
         deliver_webhook(&app, &payload, "second-secret").await,
-        StatusCode::OK
+        StatusCode::ACCEPTED
     );
     // Signed by the legacy App's secret → accepted.
     assert_eq!(
         deliver_webhook(&app, &payload, "legacy-secret").await,
-        StatusCode::OK
+        StatusCode::ACCEPTED
     );
     // Signed by nothing registered → 401.
     assert_eq!(

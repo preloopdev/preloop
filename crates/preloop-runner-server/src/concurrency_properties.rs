@@ -352,6 +352,7 @@ impl ProdState {
         }
         let record = RunRecord {
             run_id,
+            webhook_delivery_id: None,
             run_name: None,
             submission: Arc::new(WorkflowSubmission {
                 workflow_yaml: String::new(),

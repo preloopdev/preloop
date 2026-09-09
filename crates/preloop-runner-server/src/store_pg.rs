@@ -14,6 +14,7 @@
 //! `sslmode=disable` stay plaintext for loopback databases.
 
 use super::*;
+use crate::models::{WebhookDeliveryRecord, WebhookDeliveryStatus};
 use async_trait::async_trait;
 use postgres_rustls::MakeTlsConnector;
 use preloop_gha_protocol::SessionId;
@@ -1124,6 +1125,244 @@ impl Store for PgStore {
             .map_err(|error| anyhow::anyhow!("committing control event: {error}"))?;
         Ok(())
     }
+    async fn enqueue_webhook_delivery(
+        &self,
+        delivery: &WebhookDeliveryRecord,
+    ) -> anyhow::Result<bool> {
+        let client = self.connection.lock().await;
+        let sealed = self.cipher.seal(&delivery.payload)?;
+        let rows_affected = client
+            .execute(
+                "INSERT INTO webhook_deliveries (
+                     delivery_id, event, payload_blob, received_at_us, state, attempts,
+                     lease_until_us, lease_token, last_error
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 ON CONFLICT (delivery_id) DO NOTHING",
+                &[
+                    &delivery.delivery_id,
+                    &delivery.event,
+                    &sealed,
+                    &delivery.received_at_us,
+                    &delivery.state.as_str(),
+                    &(delivery.attempts as i64),
+                    &delivery.lease_until_us,
+                    &delivery.lease_token,
+                    &delivery.last_error,
+                ],
+            )
+            .await?;
+        Ok(rows_affected > 0)
+    }
+    async fn claim_webhook_deliveries(
+        &self,
+        limit: usize,
+        lease_duration_secs: u64,
+    ) -> anyhow::Result<Vec<WebhookDeliveryRecord>> {
+        let mut client = self.connection.lock().await;
+        let tx = client.transaction().await?;
+        let now = now_us();
+        let lease_until = now + (lease_duration_secs as i64 * 1_000_000);
+
+        let rows = tx
+            .query(
+                "SELECT delivery_id, event, payload_blob, received_at_us, state, attempts, lease_until_us, last_error
+                 FROM webhook_deliveries
+                 WHERE (state = 'received' AND (lease_until_us IS NULL OR lease_until_us <= $1))
+                    OR (state = 'processing' AND lease_until_us IS NOT NULL AND lease_until_us < $1)
+                 ORDER BY received_at_us ASC
+                 FOR UPDATE
+                 LIMIT $2",
+                &[&now, &(limit as i64)],
+            )
+            .await?;
+
+        let mut records = Vec::with_capacity(rows.len());
+        for row in rows {
+            let delivery_id: String = row.get(0);
+            let event: String = row.get(1);
+            let payload_blob: Vec<u8> = row.get(2);
+            let received_at_us: i64 = row.get(3);
+            let attempts: i64 = row.get(5);
+            let last_error: Option<String> = row.get(7);
+
+            let payload = self.cipher.unseal(&payload_blob)?;
+            let new_attempts = (attempts as u32).saturating_add(1);
+            let lease_token = uuid::Uuid::new_v4().to_string();
+
+            tx.execute(
+                "UPDATE webhook_deliveries
+                 SET state = 'processing', lease_until_us = $1, attempts = $2, lease_token = $3
+                 WHERE delivery_id = $4",
+                &[
+                    &lease_until,
+                    &(new_attempts as i64),
+                    &lease_token,
+                    &delivery_id,
+                ],
+            )
+            .await?;
+
+            records.push(WebhookDeliveryRecord {
+                delivery_id,
+                event,
+                payload,
+                received_at_us,
+                state: WebhookDeliveryStatus::Processing,
+                attempts: new_attempts,
+                lease_until_us: Some(lease_until),
+                lease_token: Some(lease_token),
+                last_error,
+            });
+        }
+        tx.commit().await?;
+        Ok(records)
+    }
+
+    async fn renew_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+        lease_duration_secs: u64,
+    ) -> anyhow::Result<bool> {
+        let client = self.connection.lock().await;
+        let lease_until = now_us() + (lease_duration_secs as i64 * 1_000_000);
+        let rows_affected = client
+            .execute(
+                "UPDATE webhook_deliveries
+                 SET lease_until_us = $1
+                 WHERE delivery_id = $2 AND state = 'processing' AND lease_token = $3",
+                &[&lease_until, &delivery_id, &lease_token],
+            )
+            .await?;
+        Ok(rows_affected > 0)
+    }
+    async fn complete_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+    ) -> anyhow::Result<bool> {
+        let client = self.connection.lock().await;
+        let rows_affected = client
+            .execute(
+                "UPDATE webhook_deliveries
+                 SET state = 'done', lease_until_us = NULL, lease_token = NULL, last_error = NULL
+                 WHERE delivery_id = $1 AND state = 'processing' AND lease_token = $2",
+                &[&delivery_id, &lease_token],
+            )
+            .await?;
+        Ok(rows_affected > 0)
+    }
+
+    async fn fail_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+        error: &str,
+        permanent: bool,
+        retry_delay_secs: Option<u64>,
+    ) -> anyhow::Result<bool> {
+        let client = self.connection.lock().await;
+        let rows_affected = if permanent {
+            client
+                .execute(
+                    "UPDATE webhook_deliveries
+                     SET state = 'failed', lease_until_us = NULL, lease_token = NULL, last_error = $2
+                     WHERE delivery_id = $1 AND state = 'processing' AND lease_token = $3",
+                    &[&delivery_id, &error, &lease_token],
+                )
+                .await?
+        } else {
+            let lease_until = retry_delay_secs.map(|delay| now_us() + (delay as i64 * 1_000_000));
+            client
+                .execute(
+                    "UPDATE webhook_deliveries
+                     SET state = 'received', lease_until_us = $2, lease_token = NULL, last_error = $3
+                     WHERE delivery_id = $1 AND state = 'processing' AND lease_token = $4",
+                    &[&delivery_id, &lease_until, &error, &lease_token],
+                )
+                .await?
+        };
+        Ok(rows_affected > 0)
+    }
+
+    async fn get_webhook_delivery(
+        &self,
+        delivery_id: &str,
+    ) -> anyhow::Result<Option<WebhookDeliveryRecord>> {
+        let client = self.connection.lock().await;
+        let row = client
+            .query_opt(
+                "SELECT delivery_id, event, payload_blob, received_at_us, state, attempts,
+                        lease_until_us, lease_token, last_error
+                 FROM webhook_deliveries WHERE delivery_id = $1",
+                &[&delivery_id],
+            )
+            .await?;
+        if let Some(row) = row {
+            let payload_blob: Vec<u8> = row.get(2);
+            let payload = self.cipher.unseal(&payload_blob)?;
+            let state_str: String = row.get(4);
+            let state = WebhookDeliveryStatus::parse(&state_str)
+                .ok_or_else(|| anyhow::anyhow!("invalid webhook delivery state: {state_str}"))?;
+            let attempts: i64 = row.get(5);
+            Ok(Some(WebhookDeliveryRecord {
+                delivery_id: row.get(0),
+                event: row.get(1),
+                payload,
+                received_at_us: row.get(3),
+                state,
+                attempts: attempts as u32,
+                lease_until_us: row.get(6),
+                lease_token: row.get(7),
+                last_error: row.get(8),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn count_dead_letter_webhook_deliveries(&self) -> anyhow::Result<u64> {
+        let client = self.connection.lock().await;
+        let row = client
+            .query_one(
+                "SELECT COUNT(*) FROM webhook_deliveries WHERE state = 'failed'",
+                &[],
+            )
+            .await?;
+        let count: i64 = row.get(0);
+        Ok(count as u64)
+    }
+
+    async fn recover_webhook_deliveries(&self) -> anyhow::Result<u64> {
+        let client = self.connection.lock().await;
+        let now = now_us();
+        let rows_affected = client
+            .execute(
+                "UPDATE webhook_deliveries
+                 SET state = 'received', lease_until_us = NULL, lease_token = NULL
+                 WHERE state = 'processing' AND lease_until_us IS NOT NULL AND lease_until_us < $1",
+                &[&now],
+            )
+            .await?;
+        Ok(rows_affected)
+    }
+    async fn prune_webhook_deliveries(&self, before_us: i64, limit: usize) -> anyhow::Result<u64> {
+        let client = self.connection.lock().await;
+        let rows_affected = client
+            .execute(
+                "DELETE FROM webhook_deliveries
+                 WHERE delivery_id IN (
+                     SELECT delivery_id
+                     FROM webhook_deliveries
+                     WHERE state IN ('done', 'failed') AND received_at_us < $1
+                     ORDER BY received_at_us ASC
+                     LIMIT $2
+                 )",
+                &[&before_us, &(limit.min(i64::MAX as usize) as i64)],
+            )
+            .await?;
+        Ok(rows_affected)
+    }
 }
 
 /// Postgres dialect of the control-plane schema. Same tables as the SQLite
@@ -1330,6 +1569,32 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
 
         CREATE INDEX IF NOT EXISTS job_steps_order_idx
           ON job_steps (agent_job_id, kind, workflow_index);
+        "#,
+    ),
+    (
+        5,
+        "webhook-deliveries-table",
+        r#"
+        CREATE TABLE IF NOT EXISTS webhook_deliveries (
+          delivery_id TEXT PRIMARY KEY,
+          event TEXT NOT NULL,
+          payload_blob BYTEA NOT NULL,
+          received_at_us BIGINT NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('received', 'processing', 'done', 'failed')),
+          attempts BIGINT NOT NULL DEFAULT 0,
+          lease_until_us BIGINT,
+          last_error TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS webhook_deliveries_claim_idx
+          ON webhook_deliveries (state, received_at_us);
+        "#,
+    ),
+    (
+        6,
+        "webhook-delivery-lease-fencing",
+        r#"
+        ALTER TABLE webhook_deliveries ADD COLUMN lease_token TEXT;
         "#,
     ),
 ];
