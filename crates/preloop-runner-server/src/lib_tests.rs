@@ -7172,6 +7172,17 @@ async fn listener_token_probe_gates_only_job_lifecycle_calls() {
         "billingOwnerId": "local",
         "runnerOS": "macOS",
     });
+    // A job runtime token cannot acquire jobs.
+    let acquire_runtime_status = status_with_bearer(
+        &app,
+        &runtime_token,
+        Method::POST,
+        "/broker/1/acquirejob",
+        acquire.clone(),
+    )
+    .await;
+    assert_eq!(acquire_runtime_status, StatusCode::FORBIDDEN);
+
     let acquired = request_json_with_bearer(
         &app,
         Method::POST,
@@ -7201,6 +7212,31 @@ async fn listener_token_probe_gates_only_job_lifecycle_calls() {
         &runtime_token,
     )
     .await;
+
+    let other_job_id = uuid::Uuid::new_v4();
+    let other_runtime_token = state.mint_runtime_token(&plan_id, &other_job_id);
+
+    // A runtime token for another job cannot renew this job.
+    let renew_wrong_status = status_with_bearer(
+        &app,
+        &other_runtime_token,
+        Method::POST,
+        "/broker/1/renewjob",
+        renew.clone(),
+    )
+    .await;
+    assert_eq!(renew_wrong_status, StatusCode::FORBIDDEN);
+
+    // A runtime token for another job cannot complete this job.
+    let complete_wrong_status = status_with_bearer(
+        &app,
+        &other_runtime_token,
+        Method::POST,
+        "/broker/1/completejob",
+        json!({"jobId": agent_job_id.to_string(), "planId": plan_id, "conclusion": "succeeded"}),
+    )
+    .await;
+    assert_eq!(complete_wrong_status, StatusCode::FORBIDDEN);
     assert!(renewed["lockedUntil"].is_string());
     assert_eq!(
         state.listener_token_lifecycle_calls.load(Relaxed),
@@ -7235,6 +7271,21 @@ async fn listener_token_probe_gates_only_job_lifecycle_calls() {
         1,
         "the baseline counter must not absorb lifecycle findings"
     );
+    let runner_manage_token = state
+        .local_jwt(json!({
+            "sub": "preloop-runner-registration",
+            "scp": "ActionsRuntime.RunnerManage",
+        }))
+        .unwrap();
+    let delete_session_status = status_with_bearer(
+        &app,
+        &runner_manage_token,
+        Method::DELETE,
+        &format!("/runner/server/_apis/distributedtask/pools/1/sessions/{session_id}"),
+        json!(null),
+    )
+    .await;
+    assert_eq!(delete_session_status, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -20309,12 +20360,13 @@ async fn replay_blob_uploads_require_a_ticket_bound_to_the_exact_path() {
 
     // A tampered signature must not authorise anything.
     let forged_sig = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 32]);
+    let forged_expires_at = crate::auth::replay_ticket_expiry();
     let forged = app
         .oneshot(
             Request::builder()
                 .method(Method::PUT)
                 .uri(format!(
-                    "{path}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig={forged_sig}"
+                    "{path}?sv=2021-08-06&se={forged_expires_at}&sr=c&sp=rw&sig={forged_sig}"
                 ))
                 .body(Body::from("overwrite attempt"))
                 .unwrap(),

@@ -2923,7 +2923,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                 notify_runner_gone(&self.config, &name).await;
                 vm_telemetry_deregister(&self.config, &name);
                 if let Err(error) = self.provider.delete(&name).await {
-                    record_slot_failure(&self.config, "fork_base_cleanup");
+                    record_slot_failure(&self.config, "stale_cleanup");
                     warn!(machine = name.as_str(), %error, "failed to delete stale Preloop runner");
                 }
             }
@@ -3577,7 +3577,6 @@ async fn run_slot<P: VmProvider + 'static>(
                 {
                     Ok(runner) => runner,
                     Err(error) => {
-                        record_slot_failure(&config, "provision");
                         warn!(slot, %error, "provisioning runner failed; retrying");
                         tokio::select! {
                             _ = shutdown.cancelled() => break,
@@ -3615,7 +3614,6 @@ async fn run_slot<P: VmProvider + 'static>(
         spare = match successor {
             Ok(spare) => spare,
             Err(error) => {
-                record_slot_failure(&config, "guest_exit");
                 warn!(slot, %error, "ephemeral runner failed; replenishing slot");
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
@@ -3647,7 +3645,13 @@ async fn provision_slot<P: VmProvider + 'static>(
     keys: &Arc<KeyPool>,
     environment: RunnerEnvironment,
 ) -> Result<ReadyRunner, OrchestratorError> {
-    let name = MachineName::new(format!("{}-{slot}-{generation}", config.name_prefix))?;
+    let name = match MachineName::new(format!("{}-{slot}-{generation}", config.name_prefix)) {
+        Ok(name) => name,
+        Err(error) => {
+            record_slot_failure(config, "provision");
+            return Err(error.into());
+        }
+    };
     match provision_runner(provider, config, &name, golden, keys, &environment).await {
         Ok(run) => {
             // A provision that made it (fork or direct create, configure,
@@ -3664,6 +3668,7 @@ async fn provision_slot<P: VmProvider + 'static>(
             })
         }
         Err(error) => {
+            record_slot_failure(config, "provision");
             if let Some(ps) = &config.pool_status {
                 ps.record_provision_failure();
             }
@@ -3896,11 +3901,17 @@ async fn run_one_runner<P: VmProvider + 'static>(
         } => {
             let result = match pair.0 {
                 Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => Err(OrchestratorError::Pool(error.to_string())),
+                Ok(Err(error)) => {
+                    record_slot_failure(config, "guest_exit");
+                    Err(OrchestratorError::Pool(error.to_string()))
+                }
                 // The runner task panicked (sender dropped without a value).
-                Err(_) => Err(OrchestratorError::Pool(
-                    "runner task ended without a result".into(),
-                )),
+                Err(_) => {
+                    record_slot_failure(config, "guest_exit");
+                    Err(OrchestratorError::Pool(
+                        "runner task ended without a result".into(),
+                    ))
+                }
             };
             (result, pair.1)
         },

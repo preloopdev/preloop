@@ -164,7 +164,7 @@ pub(crate) async fn twirp_artifact_v2_create(
     // request body, so a runner cannot evade its per-job pending cap by
     // inventing other job ids. Control-plane callers (no job token) reserve
     // without a per-job budget; the TTL sweep still bounds them by age.
-    let job_backend_id = job_backend_id_from_bearer(&shared.state, &headers);
+    let job_backend_id = job.map(|id| id.to_string());
     let stage_dir = shared
         .state
         .state_dir

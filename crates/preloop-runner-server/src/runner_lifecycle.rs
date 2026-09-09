@@ -356,6 +356,11 @@ pub(crate) async fn delete_session(
         &headers,
         identity.as_ref().map(|axum::Extension(id)| id),
     )?;
+    if caller == crate::auth::AdminCaller::RunnerManager {
+        return Err(ApiError::forbidden(
+            "registration tokens cannot delete sessions",
+        ));
+    }
     let snapshot = {
         let mut inner = shared.state.inner.lock().await;
         if let crate::auth::AdminCaller::Runner(runner_id) = caller {
@@ -397,17 +402,33 @@ pub(crate) async fn delete_agent(
     // A runner may deregister itself and nothing else; the system token may
     // deregister anything. Purging another runner revokes its listen tokens
     // and requeues its work, so this is a live denial-of-service otherwise.
-    if let crate::auth::AdminCaller::Runner(runner_id) = crate::auth::admin_caller(
+    let caller = crate::auth::admin_caller(
         &shared.state,
         &headers,
         identity.as_ref().map(|axum::Extension(id)| id),
-    )? {
-        if runner_id != agent_id {
-            return Err(ApiError::forbidden("a runner may only deregister itself"));
+    )?;
+    match caller {
+        crate::auth::AdminCaller::System => {}
+        crate::auth::AdminCaller::Runner(runner_id) => {
+            if runner_id != agent_id {
+                return Err(ApiError::forbidden("a runner may only deregister itself"));
+            }
+        }
+        crate::auth::AdminCaller::RunnerManager => {
+            let inner = shared.state.inner.lock().await;
+            if inner
+                .sessions
+                .values()
+                .any(|session| session.runner_id == agent_id)
+            {
+                return Err(ApiError::forbidden(
+                    "cannot delete an active runner using a registration token",
+                ));
+            }
         }
     }
-    purge_runner_identity(&shared, agent_id).await;
-    if let Err(error) = persist_full_state(&shared).await {
+    let snapshot = purge_runner_identity(&shared, agent_id).await;
+    if let Err(error) = shared.state.store.store_inner(&snapshot).await {
         tracing::warn!(?error, "failed to persist deleted runner identity");
     }
     Ok((StatusCode::NO_CONTENT, Json(serde_json::Value::Null)))
@@ -415,7 +436,10 @@ pub(crate) async fn delete_agent(
 
 /// Remove every trace of a runner identity: keys, client ids, sessions and
 /// assignments. Shared by agent deregistration and pool machine teardown.
-pub(crate) async fn purge_runner_identity(shared: &Arc<SharedState>, runner_id: i64) {
+pub(crate) async fn purge_runner_identity(
+    shared: &Arc<SharedState>,
+    runner_id: i64,
+) -> crate::store::StoreSnapshot {
     let mut inner = shared.state.inner.lock().await;
     if inner.runners.remove(&runner_id).is_none()
         && inner.runner_client_ids.values().all(|id| *id != runner_id)
@@ -507,8 +531,10 @@ pub(crate) async fn purge_runner_identity(shared: &Arc<SharedState>, runner_id: 
         .queue_depth
         .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
     runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
+    let snapshot = crate::store::StoreSnapshot::from_inner(&inner);
     drop(inner);
     shared.state.message_notify.notify_waiters();
+    snapshot
 }
 
 /// DELETE /runner/server/_apis/distributedtask/pools/:pool_id/sessions (no session_id)
