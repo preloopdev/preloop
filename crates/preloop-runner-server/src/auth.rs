@@ -123,7 +123,11 @@ pub(crate) async fn require_test_api_token(
     Ok(next.run(request).await)
 }
 
-fn system_bearer_authorized(shared: &Arc<SharedState>, request: &Request) -> bool {
+pub(crate) fn system_bearer_authorized(state: &AppState, headers: &HeaderMap) -> bool {
+    bearer_from_headers(headers).is_some_and(|token| token == state.system_token)
+}
+
+fn request_system_bearer_authorized(shared: &Arc<SharedState>, request: &Request) -> bool {
     bearer_token(request).is_some_and(|token| token == shared.state.system_token)
 }
 
@@ -132,7 +136,7 @@ pub(crate) async fn require_system_bearer(
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    if system_bearer_authorized(&shared, &request) {
+    if request_system_bearer_authorized(&shared, &request) {
         Ok(next.run(request).await)
     } else {
         Err(ApiError::unauthorized("missing or invalid system token"))
@@ -169,7 +173,7 @@ pub(crate) async fn require_runner_admin_bearer(
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    if system_bearer_authorized(&shared, &request) {
+    if request_system_bearer_authorized(&shared, &request) {
         return Ok(next.run(request).await);
     }
     let manager_token = bearer_token(&request)
@@ -256,7 +260,7 @@ pub(crate) async fn require_native_bearer(
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    if system_bearer_authorized(&shared, &request) {
+    if request_system_bearer_authorized(&shared, &request) {
         Ok(next.run(request).await)
     } else {
         Err(ApiError::unauthorized(
@@ -825,4 +829,45 @@ pub(crate) async fn require_job_runtime_bearer(
         }
         None => Err(ApiError::unauthorized("job runtime token required")),
     }
+}
+
+/// Resolve the repository authorized by a job runtime bearer.
+pub(crate) async fn job_repository_from_headers(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Option<String>, ApiError> {
+    let Some(token) = bearer_from_headers(headers) else {
+        return Err(ApiError::unauthorized("job runtime token required"));
+    };
+    if token == state.system_token.as_str() {
+        return Ok(None);
+    }
+    let job_id = state
+        .job_uuid_from_token(token)
+        .ok_or_else(|| ApiError::unauthorized("job runtime token required"))?;
+    let inner = state.inner.lock().await;
+    let repository = inner
+        .agent_job_requests
+        .get(&job_id)
+        .and_then(|request_id| inner.job_requests.get(request_id))
+        .and_then(|record| inner.runs.get(&record.run_id))
+        .map(|run| run.submission.repository.clone())
+        .ok_or_else(|| {
+            ApiError::forbidden("job runtime token is not bound to a live workflow run")
+        })?;
+    Ok(Some(repository))
+}
+
+pub(crate) fn job_runtime_claims_from_headers(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Option<JobRuntimeClaims> {
+    let token = bearer_from_headers(headers)?;
+    state.job_runtime_claims_from_token(token)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct JobRuntimeClaims {
+    pub(crate) plan_id: String,
+    pub(crate) job_id: uuid::Uuid,
 }

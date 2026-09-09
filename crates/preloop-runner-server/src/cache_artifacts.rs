@@ -119,6 +119,10 @@ pub(crate) async fn cache_reserve(
     Json(request): Json<CacheReserveRequest>,
 ) -> Result<Json<CacheReserveResponse>, ApiError> {
     crate::events::trust_tier::ensure_cache_write_allowed(&shared.state, &headers).await?;
+    let repository = auth::job_repository_from_headers(&shared.state, &headers).await?;
+    let job_backend_id = auth::job_runtime_claims_from_headers(&shared.state, &headers)
+        .map(|claims| claims.job_id.to_string())
+        .unwrap_or_default();
     let mut inner = shared.state.inner.lock().await;
     inner.next_cache_id += 1;
     let cache_id = inner.next_cache_id;
@@ -126,8 +130,10 @@ pub(crate) async fn cache_reserve(
         cache_id,
         PendingCache {
             key: request.key,
+            namespace: repository.unwrap_or_default(),
             version: request.version,
             bytes: Vec::new(),
+            job_backend_id,
         },
     );
     let meta = crate::store::build_meta_snapshot(&inner);
@@ -144,11 +150,19 @@ pub(crate) async fn cache_upload(
     bytes: Bytes,
 ) -> Result<StatusCode, ApiError> {
     crate::events::trust_tier::ensure_cache_write_allowed(&shared.state, &headers).await?;
+    let caller_job_id = auth::job_runtime_claims_from_headers(&shared.state, &headers)
+        .map(|claims| claims.job_id.to_string());
+    let system = auth::system_bearer_authorized(&shared.state, &headers);
     let mut inner = shared.state.inner.lock().await;
     let pending = inner
         .pending_caches
         .get_mut(&cache_id)
         .ok_or_else(|| ApiError::not_found("cache reservation not found"))?;
+    if !system && pending.job_backend_id != caller_job_id.unwrap_or_default() {
+        return Err(ApiError::forbidden(
+            "cache reservation belongs to another job",
+        ));
+    }
     pending.bytes.extend_from_slice(&bytes);
     // No write-through here on purpose: the in-flight payload is not durable
     // state (see `MetaSnapshot`), and snapshotting per chunk was quadratic in
@@ -164,8 +178,20 @@ pub(crate) async fn cache_commit(
     Json(request): Json<CacheCommitRequest>,
 ) -> Result<Json<CacheLookupResponse>, ApiError> {
     crate::events::trust_tier::ensure_cache_write_allowed(&shared.state, &headers).await?;
+    let caller_job_id = auth::job_runtime_claims_from_headers(&shared.state, &headers)
+        .map(|claims| claims.job_id.to_string());
+    let system = auth::system_bearer_authorized(&shared.state, &headers);
     let pending = {
         let mut inner = shared.state.inner.lock().await;
+        let pending = inner
+            .pending_caches
+            .get(&cache_id)
+            .ok_or_else(|| ApiError::not_found("cache reservation not found"))?;
+        if !system && pending.job_backend_id != caller_job_id.unwrap_or_default() {
+            return Err(ApiError::forbidden(
+                "cache reservation belongs to another job",
+            ));
+        }
         inner
             .pending_caches
             .remove(&cache_id)
@@ -189,7 +215,12 @@ pub(crate) async fn cache_commit(
     let entry = shared
         .state
         .cache
-        .put(&pending.key, &pending.version, &pending.bytes)
+        .put_scoped(
+            &pending.namespace,
+            &pending.key,
+            &pending.version,
+            &pending.bytes,
+        )
         .await?;
     Ok(Json(CacheLookupResponse {
         hit: true,
@@ -202,14 +233,21 @@ pub(crate) async fn cache_commit(
 
 pub(crate) async fn cache_lookup(
     State(shared): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
     Query(query): Query<CacheQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let key = query.key.unwrap_or_default();
+    let repository = auth::job_repository_from_headers(&shared.state, &headers).await?;
     let restore_keys = parse_restore_keys(query.keys.as_deref());
     let response = shared
         .state
         .cache
-        .get(&key, &query.version, &restore_keys)
+        .get_scoped(
+            repository.as_deref().unwrap_or_default(),
+            &key,
+            &query.version,
+            &restore_keys,
+        )
         .await?;
     if let Some((entry, _bytes)) = response {
         Ok(Json(json!({

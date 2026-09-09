@@ -188,6 +188,13 @@ impl AppState {
     pub(crate) fn job_uuid_from_token(&self, token: &str) -> Option<uuid::Uuid> {
         self.results_job_from_token(token).map(|(_, job)| job)
     }
+    pub(crate) fn job_runtime_claims_from_token(
+        &self,
+        token: &str,
+    ) -> Option<crate::auth::JobRuntimeClaims> {
+        let (plan_id, job_id) = self.results_job_from_token(token)?;
+        Some(crate::auth::JobRuntimeClaims { plan_id, job_id })
+    }
 
     /// Agent job UUID a debug-worker token was minted for.
     ///
@@ -1396,6 +1403,8 @@ impl InnerState {
 
 #[derive(Default)]
 pub(crate) struct InnerState {
+    /// Snapshot sequence allocated while the state mutex is held; restored from metadata.
+    pub(crate) metadata_revision: std::sync::atomic::AtomicU64,
     pub(crate) runs: BTreeMap<RunId, RunRecord>,
     pub(crate) workflow_run_counters: BTreeMap<String, u64>,
     pub(crate) queue: VecDeque<QueuedJob>,

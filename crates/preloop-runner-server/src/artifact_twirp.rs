@@ -245,11 +245,17 @@ pub(crate) async fn twirp_artifact_v2_finalize(
     };
     let registry_key = artifact_v2_registry_key(&canonical_run, &request.name);
     let token = {
+        let caller_job_str = job.map(|j| j.to_string());
         let inner = shared.state.inner.lock().await;
         inner
             .artifact_v2_pending
             .iter()
-            .find(|(_, p)| p.registry_key == registry_key)
+            .find(|(_, p)| {
+                p.registry_key == registry_key
+                    && caller_job_str
+                        .as_deref()
+                        .is_none_or(|job_id| p.job_backend_id == job_id)
+            })
             .map(|(k, _)| k.clone())
     }
     .ok_or_else(|| ApiError::not_found("no pending artifact upload for this name/run/job"))?;
@@ -274,7 +280,10 @@ pub(crate) async fn twirp_artifact_v2_finalize(
     let artifact_id;
     {
         let mut inner = shared.state.inner.lock().await;
-        inner.artifact_v2_pending.remove(&token);
+        inner
+            .artifact_v2_pending
+            .remove(&token)
+            .ok_or_else(|| ApiError::not_found("artifact upload already finalized"))?;
         inner.next_artifact_v2_id += 1;
         artifact_id = inner.next_artifact_v2_id;
         let digest = request.hash.and_then(|v| match v {

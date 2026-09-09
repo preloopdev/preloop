@@ -280,13 +280,15 @@ impl PgStore {
     ) -> anyhow::Result<()> {
         let blob = self.cipher.seal(&serde_json::to_vec(&meta)?)?;
         tx.execute(
-            "INSERT INTO runtime_snapshots(snapshot_id, format_version, meta_blob, written_at_us)
-             VALUES (1, $1, $2, $3)
+            "INSERT INTO runtime_snapshots(snapshot_id, format_version, meta_blob, written_at_us, revision)
+             VALUES (1, $1, $2, $3, $4)
              ON CONFLICT(snapshot_id) DO UPDATE SET
                format_version = EXCLUDED.format_version,
                meta_blob = EXCLUDED.meta_blob,
-               written_at_us = EXCLUDED.written_at_us",
-            &[&(SNAPSHOT_FORMAT as i64), &blob, &now_us()],
+               written_at_us = EXCLUDED.written_at_us,
+               revision = EXCLUDED.revision
+             WHERE EXCLUDED.revision > runtime_snapshots.revision",
+            &[&(SNAPSHOT_FORMAT as i64), &blob, &now_us(), &(meta.revision as i64)],
         )
         .await?;
         Ok(())
@@ -1331,5 +1333,10 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         CREATE INDEX IF NOT EXISTS job_steps_order_idx
           ON job_steps (agent_job_id, kind, workflow_index);
         "#,
+    ),
+    (
+        5,
+        "runtime-snapshot-revision",
+        "ALTER TABLE runtime_snapshots ADD COLUMN revision BIGINT NOT NULL DEFAULT 0;",
     ),
 ];

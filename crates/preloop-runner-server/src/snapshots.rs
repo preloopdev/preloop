@@ -830,6 +830,10 @@ async fn create_workspace_snapshot_inner(
     )
     .await?;
 
+    // Preserve any local Git LFS object store so `actions/checkout` with
+    // `lfs: true` can download through the snapshot Git HTTP endpoint.
+    copy_lfs_objects_into_snapshot(&common_dir, staging_repository).await?;
+
     tokio::fs::rename(staging_repository, final_repository)
         .await
         .map_err(|error| {
@@ -984,6 +988,175 @@ fn snapshot_git_command(
         .env("GIT_INDEX_FILE", index)
         .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", source_objects);
     command
+}
+
+/// Copy the workspace Git LFS object store into the staging snapshot repository.
+async fn copy_lfs_objects_into_snapshot(
+    source_common_dir: &FsPath,
+    staging_repository: &FsPath,
+) -> Result<(), ApiError> {
+    let source = source_common_dir.join("lfs");
+    if !source.is_dir() {
+        return Ok(());
+    }
+    let destination = staging_repository.join("lfs");
+    let source_owned = source.clone();
+    let destination_owned = destination.clone();
+    tokio::task::spawn_blocking(move || copy_dir_recursive(&source_owned, &destination_owned))
+        .await
+        .map_err(|error| ApiError::internal(format!("Git LFS copy task failed: {error}")))?
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "failed to copy Git LFS objects from {} into {}: {error}",
+                source.display(),
+                destination.display()
+            ))
+        })
+}
+
+fn copy_dir_recursive(source: &FsPath, destination: &FsPath) -> std::io::Result<()> {
+    std::fs::create_dir_all(destination)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let from = entry.path();
+        let to = destination.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if file_type.is_file() {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+fn lfs_object_oid_from_path(path: &str) -> Option<&str> {
+    let oid = path
+        .strip_prefix("info/lfs/objects/")
+        .or_else(|| path.strip_prefix(".git/info/lfs/objects/"))?;
+    is_valid_lfs_oid(oid).then_some(oid)
+}
+
+fn is_valid_lfs_oid(oid: &str) -> bool {
+    oid.len() == 64 && oid.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn lfs_object_path(repository: &FsPath, oid: &str) -> PathBuf {
+    repository
+        .join("lfs")
+        .join("objects")
+        .join(&oid[..2])
+        .join(&oid[2..4])
+        .join(oid)
+}
+
+#[derive(Debug, Deserialize)]
+struct LfsBatchRequest {
+    #[serde(default)]
+    operation: Option<String>,
+    #[serde(default)]
+    objects: Vec<LfsBatchObject>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LfsBatchObject {
+    oid: String,
+    #[serde(default)]
+    size: Option<u64>,
+}
+
+fn lfs_batch_response(
+    repository: &FsPath,
+    run_id: RunId,
+    authorization_header: Option<&str>,
+    body: &[u8],
+) -> Result<serde_json::Value, ApiError> {
+    let request: LfsBatchRequest = serde_json::from_slice(body)
+        .map_err(|error| ApiError::bad_request(format!("invalid Git LFS batch body: {error}")))?;
+    let operation = request.operation.as_deref().unwrap_or("download");
+    let base = runner_base_url();
+    let mut objects = Vec::with_capacity(request.objects.len());
+    for object in request.objects {
+        let requested_size = object.size.unwrap_or(0);
+        if !is_valid_lfs_oid(&object.oid) {
+            objects.push(serde_json::json!({
+                "oid": object.oid,
+                "size": requested_size,
+                "error": {
+                    "code": 422,
+                    "message": "invalid Git LFS object id"
+                }
+            }));
+            continue;
+        }
+        if operation != "download" {
+            objects.push(serde_json::json!({
+                "oid": object.oid,
+                "size": requested_size,
+                "error": {
+                    "code": 403,
+                    "message": "snapshot Git endpoint is read-only"
+                }
+            }));
+            continue;
+        }
+        let path = lfs_object_path(repository, &object.oid);
+        match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => {
+                let mut download = serde_json::json!({
+                    "href": format!("{base}/snapshots/{run_id}/info/lfs/objects/{}", object.oid),
+                });
+                if let Some(authorization) = authorization_header {
+                    download["header"] = serde_json::json!({
+                        "Authorization": authorization
+                    });
+                }
+                objects.push(serde_json::json!({
+                    "oid": object.oid,
+                    "size": metadata.len(),
+                    "authenticated": authorization_header.is_some(),
+                    "actions": {
+                        "download": download
+                    }
+                }));
+            }
+            _ => {
+                objects.push(serde_json::json!({
+                    "oid": object.oid,
+                    "size": requested_size,
+                    "error": {
+                        "code": 404,
+                        "message": "Git LFS object is not available in this workspace snapshot"
+                    }
+                }));
+            }
+        }
+    }
+    Ok(serde_json::json!({
+        "transfer": "basic",
+        "objects": objects,
+        "hash_algo": "sha256"
+    }))
+}
+
+async fn serve_lfs_object(repository: &FsPath, oid: &str) -> Result<Response<Body>, ApiError> {
+    let path = lfs_object_path(repository, oid);
+    let file = tokio::fs::File::open(&path).await.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ApiError::not_found("Git LFS object not found")
+        } else {
+            ApiError::internal(format!("failed to open Git LFS object: {error}"))
+        }
+    })?;
+    let metadata = file.metadata().await.map_err(|error| {
+        ApiError::internal(format!("failed to read Git LFS object metadata: {error}"))
+    })?;
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, metadata.len())
+        .body(Body::from_stream(ReaderStream::new(file)))
+        .unwrap())
 }
 
 /// Paths of gitlink (mode `160000`) entries in a `git ls-files --stage -z`
@@ -1762,10 +1935,13 @@ pub(crate) async fn snapshot_git_http(
     Path((run_id, path)): Path<(RunId, String)>,
     request: Request,
 ) -> Result<Response<Body>, ApiError> {
-    let token = request
+    let authorization_header = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let token = authorization_header
+        .as_deref()
         .and_then(snapshot_authorization_token);
     let authorization = match token {
         Some(token) => authorize_snapshot_token(&shared.state, &token, run_id).await,
@@ -1787,12 +1963,26 @@ pub(crate) async fn snapshot_git_http(
 
     let method = request.method().clone();
     let query = request.uri().query().unwrap_or_default().to_owned();
+    let lfs_object_oid = lfs_object_oid_from_path(&path);
     let valid_request = (method == axum::http::Method::GET
         && path == "info/refs"
         && query == "service=git-upload-pack")
-        || (method == axum::http::Method::POST && path == "git-upload-pack");
+        || (method == axum::http::Method::POST && path == "git-upload-pack")
+        || (method == axum::http::Method::POST
+            && (path == "info/lfs/objects/batch" || path == ".git/info/lfs/objects/batch"))
+        || (method == axum::http::Method::GET && lfs_object_oid.is_some());
     if !valid_request {
         return Err(ApiError::not_found("snapshot Git endpoint not found"));
+    }
+
+    let project_root = shared.state.state_dir.join("snapshots");
+    let repository = project_root.join(run_id.to_string());
+    if !repository.is_dir() {
+        return Err(ApiError::not_found("workspace snapshot not found"));
+    }
+
+    if let Some(oid) = lfs_object_oid {
+        return serve_lfs_object(&repository, oid).await;
     }
 
     let content_type = request
@@ -1815,6 +2005,19 @@ pub(crate) async fn snapshot_git_http(
     let request_body = to_bytes(request.into_body(), MAX_GIT_REQUEST_BYTES)
         .await
         .map_err(|error| ApiError::bad_request(format!("invalid Git request body: {error}")))?;
+    if path == "info/lfs/objects/batch" || path == ".git/info/lfs/objects/batch" {
+        let body = lfs_batch_response(
+            &repository,
+            run_id,
+            authorization_header.as_deref(),
+            &request_body,
+        )?;
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/vnd.git-lfs+json")
+            .body(Body::from(body.to_string()))
+            .unwrap());
+    }
     {
         let prefix_len = std::cmp::min(200, request_body.len());
         let hex_prefix: String = request_body[..prefix_len]
@@ -1834,12 +2037,6 @@ pub(crate) async fn snapshot_git_http(
             %text_prefix,
             "snapshot http-backend request"
         );
-    }
-
-    let project_root = shared.state.state_dir.join("snapshots");
-    let repository = project_root.join(run_id.to_string());
-    if !repository.is_dir() {
-        return Err(ApiError::not_found("workspace snapshot not found"));
     }
 
     let mut command = Command::new("git");
@@ -2339,5 +2536,87 @@ mod deepen_and_redirect_tests {
             1,
             "an empty ref is default-branch semantics"
         );
+    }
+}
+
+#[cfg(test)]
+mod lfs_batch_tests {
+    use super::*;
+
+    #[test]
+    fn lfs_batch_returns_download_action_for_present_objects() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("snapshot.git");
+        let oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let object_path = lfs_object_path(&repository, oid);
+        std::fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+        std::fs::write(&object_path, b"lfs-bytes").unwrap();
+        let run_id = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+
+        let body = serde_json::json!({
+            "operation": "download",
+            "objects": [{"oid": oid, "size": 9}]
+        })
+        .to_string();
+        let response = lfs_batch_response(
+            &repository,
+            run_id,
+            Some("Bearer job-token"),
+            body.as_bytes(),
+        )
+        .unwrap();
+
+        assert_eq!(response["transfer"], "basic");
+        assert_eq!(response["objects"][0]["oid"], oid);
+        assert_eq!(response["objects"][0]["size"], 9);
+        assert_eq!(
+            response["objects"][0]["actions"]["download"]["href"],
+            format!(
+                "{}/snapshots/{run_id}/info/lfs/objects/{oid}",
+                runner_base_url()
+            )
+        );
+        assert_eq!(
+            response["objects"][0]["actions"]["download"]["header"]["Authorization"],
+            "Bearer job-token"
+        );
+    }
+
+    #[test]
+    fn lfs_batch_returns_per_object_error_when_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("snapshot.git");
+        std::fs::create_dir_all(&repository).unwrap();
+        let oid = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let run_id = "00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let body = serde_json::json!({
+            "operation": "download",
+            "objects": [{"oid": oid, "size": 42}]
+        })
+        .to_string();
+
+        let response = lfs_batch_response(&repository, run_id, None, body.as_bytes()).unwrap();
+        assert_eq!(response["objects"][0]["error"]["code"], 404);
+        assert!(
+            response["objects"][0]["actions"].is_null()
+                || response["objects"][0].get("actions").is_none()
+        );
+    }
+
+    #[test]
+    fn lfs_batch_rejects_uploads_on_read_only_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("snapshot.git");
+        std::fs::create_dir_all(&repository).unwrap();
+        let oid = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let run_id = "00000000-0000-0000-0000-000000000003".parse().unwrap();
+        let body = serde_json::json!({
+            "operation": "upload",
+            "objects": [{"oid": oid, "size": 1}]
+        })
+        .to_string();
+
+        let response = lfs_batch_response(&repository, run_id, None, body.as_bytes()).unwrap();
+        assert_eq!(response["objects"][0]["error"]["code"], 403);
     }
 }

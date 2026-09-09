@@ -475,6 +475,10 @@ pub(crate) enum WebhookDeliveryState {
 pub(crate) struct PendingCache {
     pub(crate) key: String,
     pub(crate) version: String,
+    #[serde(default)]
+    pub(crate) namespace: String,
+    #[serde(default)]
+    pub(crate) job_backend_id: String,
     pub(crate) bytes: Vec<u8>,
 }
 

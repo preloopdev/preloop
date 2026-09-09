@@ -540,6 +540,8 @@ impl Envelope {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct MetaSnapshot {
+    #[serde(default)]
+    pub(crate) revision: u64,
     workflow_run_counters: BTreeMap<String, u64>,
     next_runner_id: i64,
     next_cache_id: i64,
@@ -797,6 +799,10 @@ pub(crate) fn restore_request_snapshot(
 /// every backend so one code path defines what survives a restart.
 pub(crate) fn build_meta_snapshot(inner: &InnerState) -> MetaSnapshot {
     MetaSnapshot {
+        revision: inner
+            .metadata_revision
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1,
         workflow_run_counters: inner.workflow_run_counters.clone(),
         next_runner_id: inner.next_runner_id,
         next_cache_id: inner.next_cache_id,
@@ -928,6 +934,9 @@ pub(crate) fn apply_meta_snapshot(inner: &mut InnerState, meta: MetaSnapshot) {
     inner.next_runner_id = meta.next_runner_id;
     inner.next_cache_id = meta.next_cache_id;
     inner.next_message_id = meta.next_message_id;
+    inner
+        .metadata_revision
+        .store(meta.revision, std::sync::atomic::Ordering::Relaxed);
     inner.next_log_id = meta.next_log_id;
     inner.next_artifact_v2_id = meta.next_artifact_v2_id;
     inner.azdo_sessions = meta.azdo_sessions;
@@ -2024,16 +2033,19 @@ impl SqliteStore {
 
     fn write_meta_tx(&self, tx: &Transaction<'_>, meta: &MetaSnapshot) -> anyhow::Result<()> {
         tx.execute(
-            "INSERT INTO runtime_snapshots(snapshot_id, format_version, meta_blob, written_at_us)
-             VALUES (1, ?1, ?2, ?3)
+            "INSERT INTO runtime_snapshots(snapshot_id, format_version, meta_blob, written_at_us, revision)
+             VALUES (1, ?1, ?2, ?3, ?4)
              ON CONFLICT(snapshot_id) DO UPDATE SET
                format_version = excluded.format_version,
                meta_blob = excluded.meta_blob,
-               written_at_us = excluded.written_at_us",
+               written_at_us = excluded.written_at_us,
+               revision = excluded.revision
+             WHERE excluded.revision > runtime_snapshots.revision",
             params![
                 SNAPSHOT_FORMAT as i64,
                 self.cipher.seal(&serde_json::to_vec(&meta)?)?,
-                now_us()
+                now_us(),
+                meta.revision as i64
             ],
         )?;
         Ok(())
@@ -2469,6 +2481,11 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         CREATE INDEX IF NOT EXISTS job_steps_order_idx
           ON job_steps (agent_job_id, kind, workflow_index);
         "#,
+    ),
+    (
+        5,
+        "runtime-snapshot-revision",
+        "ALTER TABLE runtime_snapshots ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;",
     ),
 ];
 
