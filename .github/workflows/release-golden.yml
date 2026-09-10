@@ -121,7 +121,8 @@ jobs:
   build-and-publish-golden:
     name: Build & Publish Golden MicroVM Artifact
     if: (github.event_name == 'workflow_dispatch' && !inputs.reuse_previous_goldens) || (github.event_name == 'release' && contains(github.event.release.body, '<!-- preloop:build-golden -->'))
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: [self-hosted, Linux, X64, smolvm-host]
+    timeout-minutes: 180
     env:
       CARGO_BUILD_JOBS: "1"
     permissions:
@@ -228,6 +229,10 @@ jobs:
           export PRELOOP_RUNNER_BASE_IMAGE="$IMAGE_TAR"
           export PRELOOP_RUNNER_STORAGE_GB=120
           export PRELOOP_RUNNER_OVERLAY_GB=120
+          # The runner-large base archive is ~17 GiB uncompressed, over
+          # smolvm's 8 GiB default local-archive cap. Without this the bake
+          # fails every attempt at `smolvm create` before extracting a byte.
+          export SMOLVM_MAX_IMAGE_BYTES=34359738368
           export PRELOOP_GOLDEN_NAME_PREFIX="preloop-release-golden-${GITHUB_RUN_ID}"
           builder="preloop-release-golden-${GITHUB_RUN_ID}-builder"
           need_mib=6144
@@ -345,7 +350,17 @@ jobs:
   build-and-publish-golden-macos:
     name: Build & Publish aarch64 Golden (macOS)
     if: (github.event_name == 'workflow_dispatch' && !inputs.reuse_previous_goldens) || (github.event_name == 'release' && contains(github.event.release.body, '<!-- preloop:build-golden -->'))
-    runs-on: [self-hosted, macOS, ARM64]
+    # Hosted Apple Silicon builds this golden (proved through v0.29.6);
+    # 7f18e8a0 repointed it at a self-hosted Mac that was never registered,
+    # so every run since sat unassigned until GitHub's 24h ceiling.
+    runs-on: macos-15
+    timeout-minutes: 180
+    env:
+      # GitHub's hosted macOS guests reject libkrun's virtio-net device under
+      # their virtualization boundary (krun_start_enter EINVAL). TSI keeps
+      # outbound access inside libkrun and is sufficient for this one-shot
+      # image build; job VMs still default to policy-enforced virtio-net.
+      PRELOOP_SMOLVM_NET_BACKEND: tsi
     permissions:
       contents: write
       id-token: write
@@ -457,6 +472,9 @@ jobs:
           export PRELOOP_RUNNER_BASE_IMAGE="$BASE_IMAGE"
           export PRELOOP_RUNNER_STORAGE_GB=120
           export PRELOOP_RUNNER_OVERLAY_GB=120
+          # See the x86_64 twin: the pinned runner-large base exceeds
+          # smolvm's 8 GiB default local-archive cap.
+          export SMOLVM_MAX_IMAGE_BYTES=34359738368
           ./target/release/preloop build-golden \
             --runner-bundle "target/$RUNNER_TARGET/release" \
             --output "dist/$GOLDEN_NAME"
