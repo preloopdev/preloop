@@ -12,7 +12,7 @@ on:
 
 jobs:
   cargo:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, preloop-cpane]
     timeout-minutes: 30
     permissions:
       contents: read
@@ -69,7 +69,7 @@ jobs:
         run: cargo deny check all
 
   node-externals:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, preloop-cpane]
     timeout-minutes: 30
     permissions:
       contents: read
@@ -90,7 +90,7 @@ jobs:
           if-no-files-found: ignore
 
   check-node-pin-parity:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, preloop-cpane]
     timeout-minutes: 10
     permissions:
       contents: read
