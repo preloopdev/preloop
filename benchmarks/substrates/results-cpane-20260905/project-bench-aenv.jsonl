@@ -1,0 +1,5 @@
+{"substrate":"aenv","project":"eslint","rep":1,"seconds":247.09734725952148,"exit":0,"conclusion":"success"}
+{"substrate":"aenv","project":"typescript","rep":1,"seconds":929.4200241565704,"exit":1,"conclusion":"failure"}
+{"substrate":"aenv","project":"pydantic-core","rep":1,"seconds":314.85044169425964,"exit":1,"conclusion":"failure"}
+{"substrate":"aenv","project":"cargo-mutants","rep":1,"seconds":622.7240967750549,"exit":1,"conclusion":"failure"}
+{"substrate":"aenv","project":"gobgp","rep":1,"seconds":224.20875430107117,"exit":0,"conclusion":"success"}

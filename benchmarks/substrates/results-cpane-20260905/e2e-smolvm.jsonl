@@ -1,0 +1,11 @@
+{"substrate":"smolvm","workflow":"__cold_start_to_pool_ready","rep":0,"seconds":782.196497164,"exit":0,"conclusion":"success","run_id":""}
+{"substrate":"smolvm","workflow":"bench-hello.yml","rep":1,"seconds":2.314674117,"exit":0,"conclusion":"success","run_id":"8756be79-e960-45d5-b745-840366a641dc"}
+{"substrate":"smolvm","workflow":"bench-io.yml","rep":1,"seconds":4.319942791,"exit":0,"conclusion":"success","run_id":"81e43f35-3165-459b-b652-680206f454fe"}
+{"substrate":"smolvm","workflow":"bench-checkout-rust.yml","rep":1,"seconds":4.617220638,"exit":1,"conclusion":"failure","run_id":"d843b71f-89a1-4b26-8ea6-47a88198a120"}
+{"substrate":"smolvm","workflow":"bench-node.yml","rep":1,"seconds":4.923526307,"exit":0,"conclusion":"success","run_id":"29d48eb9-ac61-4e9c-8eec-847769094102"}
+{"substrate":"smolvm","workflow":"bench-matrix8.yml","rep":1,"seconds":3.010587920,"exit":0,"conclusion":"success","run_id":"96174a32-db68-435f-bb52-63a1b9a38a77"}
+{"substrate":"smolvm","workflow":"bench-hello.yml","rep":2,"seconds":.611381747,"exit":0,"conclusion":"success","run_id":"0199a4aa-ab93-48c4-86f4-c13a552c39d9"}
+{"substrate":"smolvm","workflow":"bench-io.yml","rep":2,"seconds":2.015502022,"exit":0,"conclusion":"success","run_id":"3f6f2e72-97a9-44e0-97dc-5a0f10af527c"}
+{"substrate":"smolvm","workflow":"bench-checkout-rust.yml","rep":2,"seconds":1.414377678,"exit":1,"conclusion":"failure","run_id":"212fa27e-d5f5-4321-a064-13502016ee18"}
+{"substrate":"smolvm","workflow":"bench-node.yml","rep":2,"seconds":6.421356832,"exit":0,"conclusion":"success","run_id":"3a6e9f95-7018-453b-85c8-61495f1d2376"}
+{"substrate":"smolvm","workflow":"bench-matrix8.yml","rep":2,"seconds":4.413988117,"exit":0,"conclusion":"success","run_id":"6f595c61-bd42-49f2-adaf-f16cfeda6dd8"}
