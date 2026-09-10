@@ -35,7 +35,12 @@ just dogfood    # E2E with real runner
 - **State**: in-memory behind `Arc<Mutex<…>>` + `Notify`/broadcast. Secrets use `SecretString` — call `expose()` only at protocol boundaries.
 - **Wire compatibility**: `/_apis/…` is the source of truth. Validate protocol changes against the **official runner**, not only unit tests.
 - **Broker path only**: all work targets the modern broker + Twirp results-service protocol (v2.329.0+).
-- **ARM64 local target**: smolvm on Apple Silicon.
+- **VM substrates**: two backends behind `preloop_vm::VmProvider` — SmolVM
+  (libkrun; the only option on macOS/Apple Silicon) and AgentENV (Firecracker
+  over `/dev/kvm`; the default on a Linux host that has `aenv`). Selected by
+  `PRELOOP_VM_BACKEND`; capability differences are declared by
+  `VmProvider::capabilities()` and the orchestrator branches on them. See
+  `docs/vm-substrates.md` before touching pool or provider code.
 - **Store backends**: the `Store` trait (`store.rs`, async, object-safe) is the only surface the server sees; backends are SQLite (`store.rs`, default, `<state_dir>/preloop.db`) and Postgres (`store_pg.rs`), selected via `PRELOOP_STORE_URL` (`sqlite://<path>` / bare path / `postgres://…`). Both are single-writer: one connection behind a mutex. Two servers on the same SQLite file (or same PG database) still diverge in-memory — the DB is a restart source, not a shared bus.
 - **Store is best-effort**: in-memory state is the source of truth, the database is a restart source. Store failures are logged; the affected event is still broadcast (see `state.rs::emit`). Per-backend `MIGRATIONS` is the schema source of truth (SQLite: `PRAGMA user_version`; PG: `schema_migrations` version table).
 - **Encryption-at-rest is obfuscation, not security**: `<state_dir>/hmac-key.bin` and `preloop.db` sit in the same directory; the store key is HKDF-derived from the JWT HMAC key with domain separation. It stops a stolen DB file, not a compromised state dir. Key loss = unbootable state. The envelope is backend-independent (sealed blobs), so it applies to Postgres rows too — for remote PG, rely on TLS + DB auth instead.
