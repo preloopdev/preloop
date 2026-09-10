@@ -293,12 +293,12 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
             inner.queued_at.remove(&key);
             continue;
         }
-        let enqueued_at = (job.enqueued_at_unix_nanos > 0).then(|| {
-            SystemTime::UNIX_EPOCH + Duration::from_nanos(job.enqueued_at_unix_nanos as u64)
-        });
-        let enqueue_age_expired = enqueued_at
-            .and_then(|enqueued| now.duration_since(enqueued).ok())
-            .is_some_and(|age| age >= MAX_QUEUED_GRACE);
+        let enqueued_at =
+            SystemTime::UNIX_EPOCH + Duration::from_nanos(job.enqueued_at_unix_nanos as u64);
+        let enqueue_age_expired = now
+            .duration_since(enqueued_at)
+            .map(|age| age >= MAX_QUEUED_GRACE)
+            .unwrap_or(true);
         let grace = if pool_preparing {
             // The pool is warming or booting a runner that may serve this
             // job, so hold the grace window rather than failing a job whose
@@ -313,16 +313,13 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
             MAX_QUEUED_GRACE
         } else {
             // Seed the observation clock from the persisted ready-enqueue
-            // timestamp. Older snapshots have no timestamp; treat them as
-            // already past the grace window instead of granting fresh time at
-            // every restart.
-            let first_seen = *inner.queued_at.entry(key.clone()).or_insert_with(|| {
-                enqueued_at.unwrap_or_else(|| {
-                    now.checked_sub(QUEUED_JOB_GRACE)
-                        .unwrap_or(SystemTime::UNIX_EPOCH)
-                })
-            });
-            if now.duration_since(first_seen).unwrap_or_default() < QUEUED_JOB_GRACE {
+            // timestamp so restart does not grant a fresh grace window.
+            let first_seen = *inner.queued_at.entry(key.clone()).or_insert(enqueued_at);
+            if now
+                .duration_since(first_seen)
+                .map(|age| age < QUEUED_JOB_GRACE)
+                .unwrap_or(false)
+            {
                 continue;
             }
             QUEUED_JOB_GRACE

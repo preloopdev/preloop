@@ -349,6 +349,9 @@ pub(crate) struct TaskAgentJobRequestRecord {
     pub(crate) timeline_id: uuid::Uuid,
     pub(crate) result: Option<ExecutionStatus>,
     pub(crate) locked_until: String,
+    /// When a runner removed this job from the ready queue.
+    pub(crate) claimed_at: Option<std::time::SystemTime>,
+    /// When the runner request was handed to the session.
     pub(crate) started_at: Option<std::time::SystemTime>,
     pub(crate) last_renewed_at: Option<std::time::SystemTime>,
     pub(crate) timeout_triggered: bool,
@@ -386,10 +389,22 @@ pub(crate) struct QueuedJob {
     pub(crate) run_id: RunId,
     pub(crate) job_id: JobId,
     pub(crate) base_id: String,
-    /// Unix nanoseconds when the job entered the ready queue, used to
-    /// measure true queue latency at claim time. `0` means unknown (a
-    /// snapshot persisted before this field existed); such jobs are not
-    /// recorded, so a restart never fabricates a latency.
+    /// Unix nanoseconds when this job was created.
+    #[serde(default)]
+    pub(crate) created_at_unix_nanos: i64,
+    /// Unix nanoseconds when all `needs:` dependencies became satisfied.
+    #[serde(default)]
+    pub(crate) dependencies_ready_at_unix_nanos: Option<i64>,
+    /// Unix nanoseconds when this job first waited on a concurrency gate.
+    #[serde(default)]
+    pub(crate) concurrency_wait_started_at_unix_nanos: Option<i64>,
+    /// Unix nanoseconds when the first applicable concurrency gate admitted
+    /// this job.
+    #[serde(default)]
+    pub(crate) concurrency_acquired_at_unix_nanos: Option<i64>,
+    /// Unix nanoseconds when the job entered the ready queue. This is the
+    /// runner-wait clock, not the workflow or dependency creation time.
+    /// `0` is used only before the job first becomes ready.
     #[serde(default)]
     pub(crate) enqueued_at_unix_nanos: i64,
     pub(crate) needs: Vec<JobId>,

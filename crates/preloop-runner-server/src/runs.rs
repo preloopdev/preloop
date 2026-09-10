@@ -276,6 +276,27 @@ fn existing_webhook_run(
         })
 }
 
+async fn persist_workflow_run_counter(
+    shared: &Arc<SharedState>,
+    workflow_path: &str,
+    run_number: u64,
+) {
+    // The in-memory counter is authoritative; persistence is best effort and
+    // must happen after the state lock is released.
+    if let Err(error) = shared
+        .state
+        .store
+        .store_workflow_run_counter(workflow_path, run_number.saturating_add(1))
+        .await
+    {
+        tracing::warn!(
+            %error,
+            %workflow_path,
+            "failed to persist workflow run counter; next run number may repeat after restart"
+        );
+    }
+}
+
 pub(crate) async fn submit_run_inner(
     shared: &Arc<SharedState>,
     submission: WorkflowSubmission,
@@ -966,11 +987,23 @@ pub(crate) async fn submit_run_inner_with_webhook_delivery(
         }
     }
 
-    // Reserve the workflow run number before pre-building messages. The
-    // message builder consumes the GitHub context, so delaying this counter
-    // update until after pre-building would expose "1" for every run.
+    // Reserve the workflow run number only after rechecking the durable
+    // delivery identity under the same state lock used for run insertion.
+    // A competing replay therefore returns before advancing the counter.
+    let mut inner = shared.state.inner.lock().await;
+    if let Some(delivery_id) = webhook_delivery_id.as_deref() {
+        if let Some(existing) = existing_webhook_run(&inner, delivery_id, &workflow_path) {
+            tracing::info!(
+                %delivery_id,
+                %workflow_path,
+                run_id = %existing.run_id,
+                "reusing run after webhook reservation race"
+            );
+            drop(inner);
+            return Ok(existing);
+        }
+    }
     let run_number = {
-        let mut inner = shared.state.inner.lock().await;
         let counter = inner
             .workflow_run_counters
             .entry(workflow_path.clone())
@@ -978,22 +1011,6 @@ pub(crate) async fn submit_run_inner_with_webhook_delivery(
         *counter += 1;
         *counter
     };
-    // Best-effort, outside the lock: the in-memory counter is authoritative
-    // and the run has already been accepted. A failed write only means the
-    // next run number may repeat after a restart, which the store is allowed
-    // to lose (AGENTS.md: the DB is a restart source, not a shared bus).
-    if let Err(error) = shared
-        .state
-        .store
-        .store_workflow_run_counter(&workflow_path, run_number.saturating_add(1))
-        .await
-    {
-        tracing::warn!(
-            %error,
-            %workflow_path,
-            "failed to persist workflow run counter; next run number may repeat after restart"
-        );
-    }
     if let Some(object) = github.as_object_mut() {
         object.insert(
             "run_number".to_owned(),
@@ -1001,12 +1018,12 @@ pub(crate) async fn submit_run_inner_with_webhook_delivery(
         );
     }
 
-    // ── Pre-build job messages outside the lock ─────────────────────────
+    // ── Build job messages before the atomic insertion ───────────────────
     //
-    // Condition evaluation, build_agent_job_message, token minting, and
-    // snapshot redirect are all pure computations.  Moving them here
-    // shrinks the critical section from O(jobs × build_cost) to
-    // O(jobs × map_insert).
+    // Message construction allocates request IDs and token material, but it
+    // stays inside the state lock so a replay cannot reserve a run number
+    // while the winning delivery is still being built. The lock is released
+    // before persistence and notifications.
     let base_url = runner_base_url();
     let normalized_github = preloop_gha_parser::job_builder::normalize_github_context(&github);
     let secrets_exposed: BTreeMap<String, String> =
@@ -1127,26 +1144,6 @@ pub(crate) async fn submit_run_inner_with_webhook_delivery(
     }
 
     {
-        let mut inner = shared.state.inner.lock().await;
-        // The first lookup avoids rebuilding a replayed submission, but it
-        // cannot close the race between two workers that both pass that
-        // lookup. Recheck while holding the same lock as the insertion so
-        // run creation is one atomic state transition.
-        if let (Some(delivery_id), Some(workflow_path)) = (
-            webhook_delivery_id.as_deref(),
-            submission.workflow_path.as_deref(),
-        ) {
-            if let Some(existing) = existing_webhook_run(&inner, delivery_id, workflow_path) {
-                tracing::info!(
-                    %delivery_id,
-                    %workflow_path,
-                    run_id = %existing.run_id,
-                    "reusing run after webhook reservation race"
-                );
-                drop(inner);
-                return Ok(existing);
-            }
-        }
         let created_at = chrono::Utc::now();
         let event = submission.event.clone();
         let github = github;
@@ -1202,6 +1199,7 @@ pub(crate) async fn submit_run_inner_with_webhook_delivery(
                 },
             );
             drop(inner);
+            persist_workflow_run_counter(shared, &workflow_path, run_number).await;
             shared
                 .state
                 .emit(NdjsonEvent::RunAccepted {
@@ -1291,11 +1289,18 @@ pub(crate) async fn submit_run_inner_with_webhook_delivery(
                     );
                 }
             }
-
+            let created_at_unix_nanos = crate::models::now_unix_nanos();
             let queued_job = QueuedJob {
                 run_id,
                 job_id: job.id.clone(),
                 base_id: job.base_id.clone(),
+                created_at_unix_nanos,
+                dependencies_ready_at_unix_nanos: job
+                    .needs
+                    .is_empty()
+                    .then_some(created_at_unix_nanos),
+                concurrency_wait_started_at_unix_nanos: None,
+                concurrency_acquired_at_unix_nanos: None,
                 // Stamped when the job actually enters the ready queue (the
                 // promotion sites in runtime_scheduling), never at build
                 // time: dependency/concurrency delay is not queue wait.
@@ -1336,6 +1341,9 @@ pub(crate) async fn submit_run_inner_with_webhook_delivery(
                 *queue,
             ) {
                 Ok(true) => {
+                    for job in &mut built_jobs {
+                        runtime_scheduling::stamp_concurrency_acquired(job);
+                    }
                     shared
                         .state
                         .observability
@@ -1352,6 +1360,9 @@ pub(crate) async fn submit_run_inner_with_webhook_delivery(
                         .lifecycle
                         .record_concurrency_decision("workflow", "pending");
                     hold_entire_run = true;
+                    for job in &mut built_jobs {
+                        runtime_scheduling::stamp_concurrency_wait_started(job);
+                    }
                     inner.run_concurrency.insert(run_id, raw.clone());
                 }
                 Err(e) if e == "concurrency_queue_overflow" => {
@@ -1417,6 +1428,7 @@ pub(crate) async fn submit_run_inner_with_webhook_delivery(
                         }
                     }
                     drop(inner);
+                    persist_workflow_run_counter(shared, &workflow_path, run_number).await;
                     shared
                         .state
                         .emit(NdjsonEvent::RunAccepted {
@@ -1492,6 +1504,7 @@ pub(crate) async fn submit_run_inner_with_webhook_delivery(
                 },
             );
             drop(inner);
+            persist_workflow_run_counter(shared, &workflow_path, run_number).await;
             shared
                 .state
                 .emit(NdjsonEvent::RunAccepted {
@@ -1739,6 +1752,7 @@ pub(crate) async fn submit_run_inner_with_webhook_delivery(
         runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
         let cancel_count = inner.cancellation_queue.len();
         drop(inner);
+        persist_workflow_run_counter(shared, &workflow_path, run_number).await;
         // The sweep above only recorded the intent to expand; the subtree build
         // runs here with the lock released.
         let expansion = drain_expansions(shared).await;
@@ -2235,13 +2249,11 @@ pub(crate) fn build_job_artifacts(
             });
         }
     }
-
     let oidc_ctx = OidcJobContext {
         environment: job.oidc_environment.clone(),
         job_workflow_ref: job.oidc_job_workflow_ref.clone(),
         job_workflow_sha: job.workflow_sha.clone(),
     };
-
     let job_request = TaskAgentJobRequestRecord {
         request_id,
         run_id,
@@ -2252,6 +2264,7 @@ pub(crate) fn build_job_artifacts(
         timeline_id: agent_msg.timeline.id,
         result: None,
         locked_until: agent_request_locked_until(),
+        claimed_at: None,
         started_at: None,
         last_renewed_at: None,
         timeout_triggered: false,
@@ -3110,6 +3123,45 @@ mod tests {
         assert!(!orchestration_id("p", "j", Some(1)).contains(' '));
     }
 
+    #[tokio::test]
+    async fn concurrent_webhook_replay_does_not_consume_run_number() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let shared = state.shared();
+        let submission = preloop_gha_protocol::WorkflowSubmission {
+            workflow_yaml: "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n"
+                .to_owned(),
+            event: "push".to_owned(),
+            repository: "owner/repo".to_owned(),
+            workflow_path: Some(".github/workflows/build.yml".to_owned()),
+            sha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned(),
+            ..Default::default()
+        };
+
+        let first = submit_run_inner_with_webhook_delivery(
+            &shared,
+            submission.clone(),
+            Some("delivery-race"),
+        );
+        let second =
+            submit_run_inner_with_webhook_delivery(&shared, submission, Some("delivery-race"));
+        let (first, second) = tokio::join!(first, second);
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first.run_id, second.run_id);
+        assert_eq!(first.run_number, 1);
+        assert_eq!(second.run_number, 1);
+
+        let inner = state.inner.lock().await;
+        assert_eq!(inner.runs.len(), 1);
+        assert_eq!(
+            inner
+                .workflow_run_counters
+                .get(".github/workflows/build.yml"),
+            Some(&1),
+            "a replay that reused the run must not advance the counter"
+        );
+    }
     /// The broadcast channel fans out every run's events, so a stalled run's
     /// stream sees — and discards — traffic it must not treat as liveness.
     /// Before the deadline was hoisted out of the filtering loop, that traffic

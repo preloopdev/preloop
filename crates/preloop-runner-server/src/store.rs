@@ -782,6 +782,8 @@ pub(crate) struct RequestSnapshot {
     timeline_id: uuid::Uuid,
     result: Option<ExecutionStatus>,
     locked_until: String,
+    #[serde(default)]
+    claimed_at_us: Option<i64>,
     started_at_us: Option<i64>,
     last_renewed_at_us: Option<i64>,
     timeout_triggered: bool,
@@ -920,7 +922,6 @@ pub(crate) fn restore_run_record(cipher: &Envelope, blob: &[u8]) -> anyhow::Resu
     }
     Ok(run)
 }
-
 /// Project a job-request record into its persisted snapshot shape.
 pub(crate) fn request_snapshot(record: &TaskAgentJobRequestRecord) -> RequestSnapshot {
     RequestSnapshot {
@@ -933,13 +934,13 @@ pub(crate) fn request_snapshot(record: &TaskAgentJobRequestRecord) -> RequestSna
         timeline_id: record.timeline_id,
         result: record.result,
         locked_until: record.locked_until.clone(),
+        claimed_at_us: record.claimed_at.map(system_time_us),
         started_at_us: record.started_at.map(system_time_us),
         last_renewed_at_us: record.last_renewed_at.map(system_time_us),
         timeout_triggered: record.timeout_triggered,
         debug_token_issued: record.debug_token_issued,
     }
 }
-
 /// Unseal + parse a request blob written by [`request_snapshot`].
 pub(crate) fn restore_request_snapshot(
     cipher: &Envelope,
@@ -956,6 +957,7 @@ pub(crate) fn restore_request_snapshot(
         timeline_id: snapshot.timeline_id,
         result: snapshot.result,
         locked_until: snapshot.locked_until,
+        claimed_at: snapshot.claimed_at_us.map(system_time_from_us),
         started_at: snapshot.started_at_us.map(system_time_from_us),
         last_renewed_at: snapshot.last_renewed_at_us.map(system_time_from_us),
         timeout_triggered: snapshot.timeout_triggered,
@@ -3262,6 +3264,38 @@ mod tests {
                 "tampered envelope at byte {index} must not unseal"
             );
         }
+    }
+
+    #[test]
+    fn request_snapshot_round_trips_claim_and_start_times() {
+        let claimed_at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(11);
+        let started_at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(13);
+        let renewed_at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(17);
+        let record = TaskAgentJobRequestRecord {
+            request_id: 7,
+            run_id: RunId::new(),
+            job_id: JobId("build".to_owned()),
+            agent_job_id: uuid::Uuid::new_v4(),
+            plan_id: "plan".to_owned(),
+            plan_type: "build".to_owned(),
+            timeline_id: uuid::Uuid::new_v4(),
+            result: None,
+            locked_until: "locked".to_owned(),
+            claimed_at: Some(claimed_at),
+            started_at: Some(started_at),
+            last_renewed_at: Some(renewed_at),
+            timeout_triggered: false,
+            debug_token_issued: false,
+        };
+        let cipher = Envelope::new(b"snapshot-test-key");
+        let blob = cipher
+            .seal(&serde_json::to_vec(&request_snapshot(&record)).unwrap())
+            .unwrap();
+
+        let restored = restore_request_snapshot(&cipher, &blob).unwrap();
+        assert_eq!(restored.claimed_at, Some(claimed_at));
+        assert_eq!(restored.started_at, Some(started_at));
+        assert_eq!(restored.last_renewed_at, Some(renewed_at));
     }
 
     /// A fresh database gets `job_steps.revision`, and a stale one says so.

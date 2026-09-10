@@ -92,6 +92,7 @@ pub(crate) async fn next_message(
             continue;
         };
 
+        let claimed_at = std::time::SystemTime::now();
         // Update run status
         if let Some(run) = inner.runs.get_mut(&queued.run_id) {
             run.status = ExecutionStatus::InProgress;
@@ -139,6 +140,7 @@ pub(crate) async fn next_message(
             .session_active_requests
             .insert(session_id.clone(), request_id);
         if let Some(request) = inner.job_requests.get_mut(&request_id) {
+            request.claimed_at = Some(claimed_at);
             request.started_at = Some(std::time::SystemTime::now());
         }
         let message = build_task_agent_message(

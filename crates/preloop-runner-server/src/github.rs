@@ -1227,11 +1227,13 @@ async fn run_webhook_lease_heartbeat(
     shared: Arc<SharedState>,
     delivery_id: String,
     lease_token: String,
+    lease_until_us: i64,
     lease_lost: tokio_util::sync::CancellationToken,
 ) {
     let mut interval =
         tokio::time::interval(Duration::from_secs(WEBHOOK_LEASE_RENEW_INTERVAL_SECS));
-    let mut lease_deadline = Instant::now() + Duration::from_secs(WEBHOOK_LEASE_DURATION_SECS);
+    let remaining_us = lease_until_us.saturating_sub(crate::store::now_us()).max(0) as u64;
+    let mut lease_deadline = Instant::now() + Duration::from_micros(remaining_us);
     let mut deadline = Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(
         lease_deadline,
     )));
@@ -1251,8 +1253,15 @@ async fn run_webhook_lease_heartbeat(
                 return;
             }
             _ = interval.tick() => {
+                let renewal_timeout = lease_deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_secs(WEBHOOK_LEASE_RENEW_INTERVAL_SECS));
+                if renewal_timeout.is_zero() {
+                    lease_lost.cancel();
+                    return;
+                }
                 let renewal = tokio::time::timeout(
-                    Duration::from_secs(WEBHOOK_LEASE_RENEW_INTERVAL_SECS),
+                    renewal_timeout,
                     shared
                         .state
                         .store
@@ -1330,8 +1339,10 @@ pub(crate) async fn run_webhook_queue_worker(
         if shared.shutdown.is_cancelled() {
             break;
         }
-        if let Err(error) = drain_webhook_queue(&shared).await {
-            warn!(?error, "error draining webhook delivery queue");
+        if let Err(error) = drain_webhook_queue_with_heartbeat(&shared, &heartbeat).await {
+            if !shared.shutdown.is_cancelled() {
+                warn!(?error, "error draining webhook delivery queue");
+            }
         }
         if last_prune.elapsed() >= WEBHOOK_PRUNE_INTERVAL {
             last_prune = Instant::now();
@@ -1385,6 +1396,21 @@ pub(crate) async fn drain_webhook_queue(shared: &Arc<SharedState>) -> anyhow::Re
     Ok(total_processed)
 }
 
+async fn drain_webhook_queue_with_heartbeat(
+    shared: &Arc<SharedState>,
+    heartbeat: &preloop_observability::HeartbeatHandle,
+) -> anyhow::Result<usize> {
+    let mut drain = Box::pin(drain_webhook_queue(shared));
+    let mut ticker = tokio::time::interval(Duration::from_secs(5));
+    loop {
+        tokio::select! {
+            result = &mut drain => return result,
+            _ = ticker.tick() => heartbeat.beat(),
+            _ = shared.shutdown.cancelled() => return Ok(0),
+        }
+    }
+}
+
 /// Process one claimed delivery and update its state according to the failure taxonomy.
 pub(crate) async fn process_one_delivery(
     shared: &Arc<SharedState>,
@@ -1397,11 +1423,19 @@ pub(crate) async fn process_one_delivery(
         );
         return;
     };
+    let Some(lease_until_us) = delivery.lease_until_us else {
+        error!(
+            delivery_id = %delivery.delivery_id,
+            "claimed webhook delivery has no lease expiry"
+        );
+        return;
+    };
     let lease_lost = tokio_util::sync::CancellationToken::new();
     let heartbeat = tokio::spawn(run_webhook_lease_heartbeat(
         shared.clone(),
         delivery.delivery_id.clone(),
         lease_token.to_owned(),
+        lease_until_us,
         lease_lost.clone(),
     ));
     // Isolate payload processing so a panic cannot strand the heartbeat task
@@ -1409,8 +1443,14 @@ pub(crate) async fn process_one_delivery(
     // lease cancels this task before it can report external side effects.
     let processing_shared = shared.clone();
     let processing_delivery = delivery.clone();
+    let processing_lease_lost = lease_lost.clone();
     let mut processing = tokio::spawn(async move {
-        process_delivery_payload(&processing_shared, &processing_delivery).await
+        process_delivery_payload_with_lease(
+            &processing_shared,
+            &processing_delivery,
+            &processing_lease_lost,
+        )
+        .await
     });
     let outcome = tokio::select! {
         _ = lease_lost.cancelled() => {
@@ -1532,14 +1572,16 @@ pub(crate) async fn process_one_delivery(
                     return;
                 }
                 if let Some(sha) = &failure.sha {
-                    report_check_run_permanent_failure(
-                        shared,
-                        &repo,
-                        sha,
-                        &failure.check_name,
-                        &failure.error,
-                    )
-                    .await;
+                    tokio::select! {
+                        _ = lease_lost.cancelled() => return,
+                        _ = report_check_run_permanent_failure(
+                            shared,
+                            &repo,
+                            sha,
+                            &failure.check_name,
+                            &failure.error,
+                        ) => {}
+                    }
                 }
             }
             if lease_lost.is_cancelled() {
@@ -1594,6 +1636,15 @@ async fn process_delivery_payload(
     shared: &Arc<SharedState>,
     delivery: &WebhookDeliveryRecord,
 ) -> WebhookOutcome {
+    let lease_lost = tokio_util::sync::CancellationToken::new();
+    process_delivery_payload_with_lease(shared, delivery, &lease_lost).await
+}
+
+async fn process_delivery_payload_with_lease(
+    shared: &Arc<SharedState>,
+    delivery: &WebhookDeliveryRecord,
+    lease_lost: &tokio_util::sync::CancellationToken,
+) -> WebhookOutcome {
     let payload_val: Value = match serde_json::from_slice(&delivery.payload) {
         Ok(v) => v,
         Err(e) => {
@@ -1601,8 +1652,16 @@ async fn process_delivery_payload(
         }
     };
 
+    if lease_lost.is_cancelled() {
+        return WebhookOutcome::Success;
+    }
+
     if delivery.event == "check_run" {
-        match process_check_run_rerequest(shared, &payload_val).await {
+        let rerequest = tokio::select! {
+            _ = lease_lost.cancelled() => return WebhookOutcome::Success,
+            result = process_check_run_rerequest(shared, &payload_val) => result,
+        };
+        match rerequest {
             Ok(_) => return WebhookOutcome::Success,
             Err(status) if status.is_server_error() => {
                 return WebhookOutcome::TransientError(format!(
@@ -1690,8 +1749,12 @@ async fn process_delivery_payload(
     let mut unmatched_workflows: Vec<String> = Vec::new();
     let mut triggered_count = 0usize;
     let mut permanent_failures: Vec<WebhookFailure> = Vec::new();
+    let mut permanent_failure_keys: BTreeSet<(Option<String>, String)> = BTreeSet::new();
 
     for effective in &effective_events {
+        if lease_lost.is_cancelled() {
+            return WebhookOutcome::Success;
+        }
         if effective.skip {
             info!("Skipping event {} (skip flag set)", effective.event);
             continue;
@@ -1814,6 +1877,9 @@ async fn process_delivery_payload(
         }
 
         for (filename, content) in workflows {
+            if lease_lost.is_cancelled() {
+                return WebhookOutcome::Success;
+            }
             if is_github_owned_workflow(&filename, &github_owned_workflows) {
                 info!(
                     workflow = %filename,
@@ -1836,14 +1902,17 @@ async fn process_delivery_payload(
                 Err(e) => {
                     let error_msg = format!("Failed to parse workflow file {filename}: {e:?}");
                     warn!("{error_msg}");
-                    permanent_failures.push(WebhookFailure {
-                        sha: effective
-                            .status_check_sha
-                            .clone()
-                            .or_else(|| Some(resolved_sha.clone())),
-                        check_name: filename.clone(),
-                        error: error_msg,
-                    });
+                    let sha = effective
+                        .status_check_sha
+                        .clone()
+                        .or_else(|| Some(resolved_sha.clone()));
+                    if permanent_failure_keys.insert((sha.clone(), filename.clone())) {
+                        permanent_failures.push(WebhookFailure {
+                            sha,
+                            check_name: filename.clone(),
+                            error: error_msg,
+                        });
+                    }
                     // A malformed file must not prevent other workflows at
                     // the same commit from being evaluated and queued.
                     continue;
@@ -1954,14 +2023,19 @@ async fn process_delivery_payload(
                 continue;
             }
 
-            match submit_run_inner_with_webhook_delivery(
-                shared,
-                submission,
-                Some(&delivery.delivery_id),
-            )
-            .await
-            {
+            let submission_result = tokio::select! {
+                _ = lease_lost.cancelled() => return WebhookOutcome::Success,
+                result = submit_run_inner_with_webhook_delivery(
+                    shared,
+                    submission,
+                    Some(&delivery.delivery_id),
+                ) => result,
+            };
+            match submission_result {
                 Ok(accepted) => {
+                    if lease_lost.is_cancelled() {
+                        return WebhookOutcome::Success;
+                    }
                     let run_id = accepted.run_id;
                     let sha = effective
                         .status_check_sha
@@ -1976,17 +2050,31 @@ async fn process_delivery_payload(
                     };
                     if let Some(jobs) = jobs {
                         for job_id in jobs {
-                            report_check_run_queued(shared, &repo_full_name, &sha, &job_id, run_id)
-                                .await;
-                            let status = {
-                                let inner = shared.state.inner.lock().await;
-                                inner
-                                    .runs
-                                    .get(&run_id)
-                                    .and_then(|r| r.jobs.get(&job_id).copied())
+                            tokio::select! {
+                                _ = lease_lost.cancelled() => return WebhookOutcome::Success,
+                                _ = report_check_run_queued(
+                                    shared,
+                                    &repo_full_name,
+                                    &sha,
+                                    &job_id,
+                                    run_id,
+                                ) => {}
+                            }
+                            let status = tokio::select! {
+                                _ = lease_lost.cancelled() => return WebhookOutcome::Success,
+                                status = async {
+                                    let inner = shared.state.inner.lock().await;
+                                    inner
+                                        .runs
+                                        .get(&run_id)
+                                        .and_then(|r| r.jobs.get(&job_id).copied())
+                                } => status,
                             };
                             if let Some(status) = status.filter(|s| s.is_terminal()) {
-                                report_check_run_completed(shared, run_id, &job_id, status).await;
+                                tokio::select! {
+                                    _ = lease_lost.cancelled() => return WebhookOutcome::Success,
+                                    _ = report_check_run_completed(shared, run_id, &job_id, status) => {}
+                                }
                             }
                         }
                     }
@@ -2638,6 +2726,65 @@ mod tests {
         match outcome {
             WebhookOutcome::PermanentErrors { failures, .. } => {
                 assert_eq!(failures.len(), 1);
+                assert_eq!(failures[0].sha.as_deref(), Some("head-sha-456"));
+            }
+            other => panic!("malformed pull request workflow must be permanent: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_pull_request_workflow_failure_is_deduplicated() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = temp.path().join("ws");
+        std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
+        std::fs::write(
+            ws_dir.join(".github/workflows/a-malformed.yml"),
+            "on: [push\njobs:\n",
+        )
+        .unwrap();
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        let commit_sha = git_output(&fixture.workspace, &["rev-parse", "HEAD"]);
+        let payload = serde_json::json!({
+            "action": "opened",
+            "number": 7,
+            "repository": {
+                "full_name": "owner/repo",
+                "default_branch": "main"
+            },
+            "pull_request": {
+                "number": 7,
+                "base": { "ref": "main", "sha": commit_sha },
+                "head": {
+                    "ref": "feature",
+                    "sha": "head-sha-456",
+                    "repo": { "fork": false }
+                },
+                "merge_commit_sha": commit_sha
+            }
+        });
+        let shared = Arc::new(SharedState {
+            state: fixture.state.clone(),
+            shutdown: CancellationToken::new(),
+        });
+        let delivery = WebhookDeliveryRecord {
+            delivery_id: "delivery-pr-duplicate-failure".to_owned(),
+            event: "pull_request".to_owned(),
+            payload: serde_json::to_vec(&payload).unwrap(),
+            received_at_us: crate::store::now_us(),
+            state: WebhookDeliveryStatus::Processing,
+            attempts: 1,
+            lease_until_us: Some(crate::store::now_us() + 60_000_000),
+            lease_token: Some("test-lease".to_owned()),
+            last_error: None,
+        };
+
+        match process_delivery_payload(&shared, &delivery).await {
+            WebhookOutcome::PermanentErrors { failures, .. } => {
+                assert_eq!(
+                    failures.len(),
+                    1,
+                    "pull_request target and pull_request projections share one failure"
+                );
                 assert_eq!(failures[0].sha.as_deref(), Some("head-sha-456"));
             }
             other => panic!("malformed pull request workflow must be permanent: {other:?}"),

@@ -84,6 +84,9 @@ pub(crate) fn try_enqueue_with_job_concurrency(
 ) -> Result<bool, ()> {
     match try_acquire_job_gate(inner, github, submission, &queued_job) {
         JobGateOutcome::Proceed => {
+            if queued_job.concurrency.is_some() {
+                stamp_concurrency_acquired(&mut queued_job);
+            }
             statuses.insert(queued_job.job_id.clone(), ExecutionStatus::Queued);
             stamp_ready_enqueue(&mut queued_job);
             on_job_enqueued(inner, &queued_job);
@@ -91,6 +94,7 @@ pub(crate) fn try_enqueue_with_job_concurrency(
             Ok(true)
         }
         JobGateOutcome::Parked => {
+            stamp_concurrency_wait_started(&mut queued_job);
             statuses.insert(queued_job.job_id.clone(), ExecutionStatus::Pending);
             inner.concurrency_blocked.push_back(queued_job);
             Ok(false)
@@ -664,6 +668,7 @@ pub(crate) fn promote_next_from_group(
                         };
                         match gate_outcome {
                             JobGateOutcome::Proceed => {
+                                stamp_concurrency_acquired(&mut job);
                                 if let Some(run) = inner.runs.get_mut(&run_id) {
                                     hydrate_needs_context(&mut job, run);
                                 }
@@ -676,6 +681,7 @@ pub(crate) fn promote_next_from_group(
                                     run.jobs
                                         .insert(job.job_id.clone(), ExecutionStatus::Pending);
                                 }
+                                stamp_concurrency_wait_started(&mut job);
                                 inner.concurrency_blocked.push_back(job);
                             }
                             JobGateOutcome::Failed(status) => {
@@ -730,6 +736,7 @@ pub(crate) fn promote_next_from_group(
                 run.jobs.insert(job.job_id.clone(), ExecutionStatus::Queued);
                 hydrate_needs_context(&mut job, run);
             }
+            stamp_concurrency_acquired(&mut job);
             stamp_ready_enqueue(&mut job);
             on_job_enqueued(inner, &job);
             inner.queue.push_back(job);
@@ -766,6 +773,7 @@ pub(crate) fn promote_next_from_group(
                 }
             });
             for mut job in to_queue {
+                stamp_concurrency_acquired(&mut job);
                 if job.reusable_call.is_some() {
                     // Caller nodes terminate through their subtree, never
                     // through dispatch.
@@ -1000,6 +1008,9 @@ pub(crate) fn promote_ready_jobs(inner: &mut InnerState) -> SchedulingOutcome {
                 .get(&job.run_id)
                 .map(|run| dependency_decision(run, &job))
                 .unwrap_or(DependencyDecision::Wait);
+            if decision == DependencyDecision::Run {
+                stamp_dependencies_ready(&mut job);
+            }
             match decision {
                 DependencyDecision::Run if job.reusable_call.is_some() => {
                     // Deferred reusable caller: the `if:` gate passed. Acquire
@@ -1013,10 +1024,12 @@ pub(crate) fn promote_ready_jobs(inner: &mut InnerState) -> SchedulingOutcome {
                         job_ids: BTreeSet::from([job.job_id.clone()]),
                     };
                     let ready = inner.jobset_ready.remove(&set_id);
+                    let mut concurrency_acquired = ready;
                     if !ready {
                         if inner.jobset_admissions.contains_key(&set_id) {
                             // Still waiting on a gate; park until a release
                             // event routes it back via jobset_ready.
+                            stamp_concurrency_wait_started(&mut job);
                             inner.concurrency_blocked.push_back(job);
                             continue;
                         }
@@ -1039,8 +1052,11 @@ pub(crate) fn promote_ready_jobs(inner: &mut InnerState) -> SchedulingOutcome {
                                     },
                                 );
                                 match advance_jobset_admission(inner, &set_id, None) {
-                                    Ok(JobSetAdmissionResult::Ready) => {}
+                                    Ok(JobSetAdmissionResult::Ready) => {
+                                        concurrency_acquired = true;
+                                    }
                                     Ok(JobSetAdmissionResult::Blocked) => {
+                                        stamp_concurrency_wait_started(&mut job);
                                         inner.concurrency_blocked.push_back(job);
                                         continue;
                                     }
@@ -1062,6 +1078,9 @@ pub(crate) fn promote_ready_jobs(inner: &mut InnerState) -> SchedulingOutcome {
                             }
                             Ok(None) => {}
                         }
+                    }
+                    if concurrency_acquired {
+                        stamp_concurrency_acquired(&mut job);
                     }
                     // Gates are held. Building the callee subtree is heavy,
                     // so hand it to `drain_expansions` rather than doing it
@@ -1104,12 +1123,16 @@ pub(crate) fn promote_ready_jobs(inner: &mut InnerState) -> SchedulingOutcome {
                     };
                     match gate_outcome {
                         JobGateOutcome::Proceed => {
+                            if job.concurrency.is_some() {
+                                stamp_concurrency_acquired(&mut job);
+                            }
                             *promoted_by_base
                                 .entry((job.run_id, job.base_id.clone()))
                                 .or_default() += 1;
                             promoted.push(job);
                         }
                         JobGateOutcome::Parked => {
+                            stamp_concurrency_wait_started(&mut job);
                             if let Some(run) = inner.runs.get_mut(&job.run_id) {
                                 run.jobs
                                     .insert(job.job_id.clone(), ExecutionStatus::Pending);
@@ -1526,18 +1549,12 @@ fn claim_permitted(inner: &InnerState, job: &QueuedJob, verified_runner_id: Opti
     let key = (job.run_id, job.job_id.clone());
     let now = std::time::SystemTime::now();
 
-    // Older persisted jobs may not carry an enqueue timestamp. Treat that
-    // unknown age as already past the ceiling rather than resetting it to
-    // restart time and allowing strict-pool work to starve indefinitely.
-    let enqueue_ceiling_expired = if job.enqueued_at_unix_nanos > 0 {
-        let enqueued_at = std::time::UNIX_EPOCH
-            + std::time::Duration::from_nanos(job.enqueued_at_unix_nanos as u64);
-        now.duration_since(enqueued_at)
-            .map(|age| age >= CLAIM_BINDING_TTL)
-            .unwrap_or(false)
-    } else {
-        true
-    };
+    let enqueued_at =
+        std::time::UNIX_EPOCH + std::time::Duration::from_nanos(job.enqueued_at_unix_nanos as u64);
+    let enqueue_ceiling_expired = now
+        .duration_since(enqueued_at)
+        .map(|age| age >= CLAIM_BINDING_TTL)
+        .unwrap_or(true);
 
     if let Some(record) = inner.job_assignments.get(&key) {
         if !binding_fresh(record.first_at, now) || enqueue_ceiling_expired {
@@ -1643,6 +1660,28 @@ pub(crate) fn on_job_enqueued(inner: &mut InnerState, job: &QueuedJob) {
     }
 }
 
+/// Record the lifecycle transition where all `needs:` dependencies are
+/// satisfied. Jobs with no dependencies are stamped at construction time.
+pub(crate) fn stamp_dependencies_ready(job: &mut QueuedJob) {
+    if job.dependencies_ready_at_unix_nanos.is_none() {
+        job.dependencies_ready_at_unix_nanos = Some(crate::models::now_unix_nanos());
+    }
+}
+
+/// Record the first time a job waits behind a concurrency gate.
+pub(crate) fn stamp_concurrency_wait_started(job: &mut QueuedJob) {
+    if job.concurrency_wait_started_at_unix_nanos.is_none() {
+        job.concurrency_wait_started_at_unix_nanos = Some(crate::models::now_unix_nanos());
+    }
+}
+
+/// Record the first time an applicable concurrency gate admits this job.
+pub(crate) fn stamp_concurrency_acquired(job: &mut QueuedJob) {
+    if job.concurrency_acquired_at_unix_nanos.is_none() {
+        job.concurrency_acquired_at_unix_nanos = Some(crate::models::now_unix_nanos());
+    }
+}
+
 /// Stamp the instant a job actually enters the ready queue.
 ///
 /// `enqueued_at_unix_nanos` is deliberately not stamped at job construction:
@@ -1651,7 +1690,8 @@ pub(crate) fn on_job_enqueued(inner: &mut InnerState, job: &QueuedJob) {
 /// where the job is pushed into `inner.queue` — stamp it. Requeues (a claimed
 /// job bouncing off a purged runner) preserve the original stamp so total
 /// queue time is still measured.
-fn stamp_ready_enqueue(job: &mut QueuedJob) {
+pub(crate) fn stamp_ready_enqueue(job: &mut QueuedJob) {
+    stamp_dependencies_ready(job);
     job.enqueued_at_unix_nanos = crate::models::now_unix_nanos();
 }
 
@@ -2550,11 +2590,18 @@ fn register_expanded_jobs(
                 run.caller_plans.insert(plan.id.clone(), plan.clone());
             }
         }
-
+        let created_at_unix_nanos = crate::models::now_unix_nanos();
         queued.push(QueuedJob {
             run_id,
             job_id: plan.id.clone(),
             base_id: plan.base_id.clone(),
+            created_at_unix_nanos,
+            dependencies_ready_at_unix_nanos: plan
+                .needs
+                .is_empty()
+                .then_some(created_at_unix_nanos),
+            concurrency_wait_started_at_unix_nanos: None,
+            concurrency_acquired_at_unix_nanos: None,
             // Stamped by the promotion sites when the job enters the ready
             // queue, never here: a job delayed by needs, concurrency, or
             // max-parallel must not count dependency time as queue wait.
@@ -3116,10 +3163,15 @@ mod assignment_tests {
     }
 
     fn test_queued_job(job_id: &str) -> QueuedJob {
+        let created_at_unix_nanos = crate::models::now_unix_nanos();
         QueuedJob {
             run_id: RunId::new(),
             job_id: JobId(job_id.to_owned()),
             base_id: job_id.to_owned(),
+            created_at_unix_nanos,
+            dependencies_ready_at_unix_nanos: Some(created_at_unix_nanos),
+            concurrency_wait_started_at_unix_nanos: None,
+            concurrency_acquired_at_unix_nanos: None,
             enqueued_at_unix_nanos: 0,
             needs: Vec::new(),
             if_condition: None,
@@ -3144,6 +3196,46 @@ mod assignment_tests {
             deferred_matrix: None,
             reusable_call: None,
         }
+    }
+
+    #[test]
+    fn lifecycle_timestamps_record_and_round_trip() {
+        let mut job = test_queued_job("build");
+        assert!(job.created_at_unix_nanos > 0);
+        assert!(job.dependencies_ready_at_unix_nanos.is_some());
+        assert_eq!(job.concurrency_wait_started_at_unix_nanos, None);
+        assert_eq!(job.concurrency_acquired_at_unix_nanos, None);
+        assert_eq!(job.enqueued_at_unix_nanos, 0);
+
+        stamp_concurrency_wait_started(&mut job);
+        let wait_started = job.concurrency_wait_started_at_unix_nanos;
+        assert!(wait_started.is_some());
+
+        stamp_concurrency_acquired(&mut job);
+        let acquired = job.concurrency_acquired_at_unix_nanos;
+        assert!(acquired.is_some());
+
+        stamp_ready_enqueue(&mut job);
+        assert!(job.enqueued_at_unix_nanos > 0);
+        assert_eq!(job.concurrency_wait_started_at_unix_nanos, wait_started);
+        assert_eq!(job.concurrency_acquired_at_unix_nanos, acquired);
+
+        let restored: QueuedJob =
+            serde_json::from_slice(&serde_json::to_vec(&job).unwrap()).unwrap();
+        assert_eq!(restored.created_at_unix_nanos, job.created_at_unix_nanos);
+        assert_eq!(
+            restored.dependencies_ready_at_unix_nanos,
+            job.dependencies_ready_at_unix_nanos
+        );
+        assert_eq!(
+            restored.concurrency_wait_started_at_unix_nanos,
+            job.concurrency_wait_started_at_unix_nanos
+        );
+        assert_eq!(
+            restored.concurrency_acquired_at_unix_nanos,
+            job.concurrency_acquired_at_unix_nanos
+        );
+        assert_eq!(restored.enqueued_at_unix_nanos, job.enqueued_at_unix_nanos);
     }
 
     /// A restored concurrency group whose holder's run is terminal (or
