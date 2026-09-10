@@ -47,6 +47,16 @@ pub struct RunsSnapshot {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ActiveRunSnapshot {
+    pub run_id: String,
+    pub workflow: String,
+    pub status: String,
+    pub event: String,
+    pub started_at: Option<DateTime<Utc>>,
+    pub assigned_runners: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct JobsSnapshot {
     pub ready: u32,
     pub dependency_blocked: u32,
@@ -362,6 +372,7 @@ pub struct StorageSnapshot {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GithubSnapshot {
     pub configured: bool,
     pub last_webhook_at: Option<DateTime<Utc>>,
@@ -451,6 +462,8 @@ pub struct OperationalSnapshot {
     pub overall: Overall,
     pub service: ServiceSnapshot,
     pub runs: RunsSnapshot,
+    #[serde(default)]
+    pub active_runs: Vec<ActiveRunSnapshot>,
     pub jobs: JobsSnapshot,
     pub concurrency: ConcurrencySnapshot,
     pub scheduler: SchedulerSnapshot,
@@ -484,6 +497,7 @@ impl Default for OperationalSnapshot {
                 shutdown_requested: false,
             },
             runs: RunsSnapshot::default(),
+            active_runs: Vec::new(),
             jobs: JobsSnapshot::default(),
             concurrency: ConcurrencySnapshot::default(),
             scheduler: SchedulerSnapshot::default(),

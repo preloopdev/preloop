@@ -2382,10 +2382,9 @@ pub(crate) async fn list_runs(
     let inner = shared.state.inner.lock().await;
     let limit = query.limit.unwrap_or(50).min(200);
 
-    let runs: Vec<RunRecord> = inner
+    let mut runs: Vec<RunRecord> = inner
         .runs
         .values()
-        .rev()
         .filter(|run| {
             if let Some(workflow) = &query.workflow {
                 if !run.workflow_path_str.contains(workflow) {
@@ -2408,8 +2407,21 @@ pub(crate) async fn list_runs(
             }
             true
         })
-        .take(limit)
         .cloned()
+        .collect();
+    runs.sort_by(|a, b| {
+        a.status
+            .is_terminal()
+            .cmp(&b.status.is_terminal())
+            .then_with(|| {
+                let a_time = a.completed_at.or(a.started_at).unwrap_or(a.created_at);
+                let b_time = b.completed_at.or(b.started_at).unwrap_or(b.created_at);
+                b_time.cmp(&a_time)
+            })
+    });
+    runs.truncate(limit);
+    let runs = runs
+        .into_iter()
         // Same projection as the single-run endpoint: steps live in the
         // attempt manifest, so cloning the stored run alone returns empty
         // step arrays.

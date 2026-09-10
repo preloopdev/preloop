@@ -3908,6 +3908,7 @@ fn render_status_human(status: &serde_json::Value, runs: &[serde_json::Value], l
 fn condition_action(code: &str) -> &'static str {
     match code {
         "queue_no_registered_runner" => "register a runner or enable the pool",
+        "claimable_queue_stalled" => "inspect assignments; restart if bindings are stale",
         "queue_label_mismatch" => "add a runner with that label",
         "concurrency_queue_overflow" => "raise concurrency queue max or reduce parallelism",
         "concurrency_group_starved" => "check concurrency group that starves others",

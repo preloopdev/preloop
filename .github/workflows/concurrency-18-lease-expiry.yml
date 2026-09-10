@@ -3,7 +3,7 @@ permissions: {}
 on: workflow_dispatch
 jobs:
   lease-holder:
-    runs-on: self-hosted
+    runs-on: [self-hosted, preloop-cpane]
     timeout-minutes: 3
     concurrency:
       group: lease-expiry-18

@@ -160,16 +160,25 @@ pub(crate) fn github_api_base() -> String {
         .unwrap_or_else(|| "https://api.github.com".to_owned())
 }
 
+fn record_check_reporting(shared: &Arc<SharedState>, success: bool) {
+    let mut snapshot = shared.state.status_snapshot.write();
+    if success {
+        snapshot.github.last_check_success_at = Some(chrono::Utc::now());
+    } else {
+        snapshot.github.last_check_failure_at = Some(chrono::Utc::now());
+    }
+}
+
 async fn resolve_check_run_token(shared: &Arc<SharedState>, repo: &str) -> Option<String> {
-    if let Some(app_creds) = crate::github_app::select_app_for_repo(shared, repo).await {
+    let app_creds = crate::github_app::select_app_for_repo(shared, repo).await;
+    if let Some(app_creds) = app_creds.as_ref() {
         let mut permissions = std::collections::BTreeMap::new();
         permissions.insert("checks".to_owned(), "write".to_owned());
         // The App mint intermittently 422s while the installation grants are
         // being read; a single retry keeps a transient rejection from
-        // stranding the check run in `queued` (the fallback JWT cannot
-        // PATCH check runs and GitHub keeps showing them pending).
+        // stranding the check run in `queued`.
         for attempt in 0..2 {
-            match crate::github_app::get_or_mint_token(&app_creds, repo, &permissions).await {
+            match crate::github_app::get_or_mint_token(app_creds, repo, &permissions).await {
                 Ok(token) => return Some(token),
                 Err(error) if attempt == 0 => {
                     tracing::warn!(
@@ -179,14 +188,22 @@ async fn resolve_check_run_token(shared: &Arc<SharedState>, repo: &str) -> Optio
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
-                Err(_) => break,
+                Err(error) => {
+                    tracing::warn!(%repo, %error, "check run token mint failed");
+                    break;
+                }
             }
         }
     }
-    std::env::var("PRELOOP_GITHUB_TOKEN").ok()
+    let fallback = std::env::var("PRELOOP_GITHUB_TOKEN").ok();
+    if fallback.is_none() && app_creds.is_some() {
+        record_check_reporting(shared, false);
+    }
+    fallback
 }
 
 async fn send_github_check_request(
+    shared: &Arc<SharedState>,
     token: &str,
     repo: &str,
     method: reqwest::Method,
@@ -202,11 +219,19 @@ async fn send_github_check_request(
         .header("Accept", "application/vnd.github+json")
         .json(&body)
         .send()
-        .await?;
+        .await;
+    let res = match res {
+        Ok(response) => response,
+        Err(error) => {
+            record_check_reporting(shared, false);
+            return Err(error.into());
+        }
+    };
 
     if !res.status().is_success() {
         let status = res.status();
         let err_text = res.text().await.unwrap_or_default();
+        record_check_reporting(shared, false);
         return Err(anyhow::anyhow!(
             "GitHub Check API failed with status {}: {}",
             status,
@@ -214,6 +239,7 @@ async fn send_github_check_request(
         ));
     }
 
+    record_check_reporting(shared, true);
     let val = res.json().await.unwrap_or(Value::Null);
     Ok(val)
 }
@@ -238,17 +264,37 @@ pub(crate) async fn report_check_run_queued(
     if let Some(token) = &token {
         let details_url = run_details_url(run_id);
 
+        let job_name = {
+            let inner = shared.state.inner.lock().await;
+            inner
+                .runs
+                .get(&run_id)
+                .and_then(|run| run.job_names.get(job_id))
+                .cloned()
+                .unwrap_or_else(|| job_id.0.clone())
+        };
         let mut body = serde_json::json!({
-            "name": job_id.to_string(),
+            "name": job_name,
             "head_sha": sha,
             "status": "queued",
+            "output": {
+                "title": job_name,
+                "summary": "Waiting for a preloop runner."
+            }
         });
         if let Some(url) = details_url {
             body["details_url"] = serde_json::json!(url);
         }
 
-        match send_github_check_request(token, repo, reqwest::Method::POST, "check-runs", body)
-            .await
+        match send_github_check_request(
+            shared,
+            token,
+            repo,
+            reqwest::Method::POST,
+            "check-runs",
+            body,
+        )
+        .await
         {
             Ok(res) => {
                 if let Some(id) = res.get("id").and_then(|id| id.as_u64()) {
@@ -311,7 +357,8 @@ pub(crate) async fn report_existing_check_run_queued(
         }
         let path = format!("check-runs/{check_run_id}");
         if let Err(error) =
-            send_github_check_request(token, repo, reqwest::Method::PATCH, &path, body).await
+            send_github_check_request(shared, token, repo, reqwest::Method::PATCH, &path, body)
+                .await
         {
             warn!(
                 %run_id,
@@ -386,7 +433,7 @@ pub(crate) async fn report_check_run_in_progress(
     run_id: RunId,
     job_id: &JobId,
 ) {
-    let (repo, check_run_id) = {
+    let (repo, check_run_id, job_name) = {
         let inner = shared.state.inner.lock().await;
         let run = match inner.runs.get(&run_id) {
             Some(r) => r,
@@ -397,15 +444,26 @@ pub(crate) async fn report_check_run_in_progress(
             Some(id) => id,
             None => return,
         };
-        (repo, check_run_id)
+        let job_name = run
+            .job_names
+            .get(job_id)
+            .cloned()
+            .unwrap_or_else(|| job_id.0.clone());
+        (repo, check_run_id, job_name)
     };
 
     let token = resolve_check_run_token(shared, &repo).await;
     if let Some(token) = &token {
         let details_url = run_details_url(run_id);
 
+        let started_at = chrono::Utc::now().to_rfc3339();
         let mut body = serde_json::json!({
             "status": "in_progress",
+            "started_at": started_at,
+            "output": {
+                "title": job_name,
+                "summary": "Running in preloop."
+            }
         });
         if let Some(url) = details_url {
             body["details_url"] = serde_json::json!(url);
@@ -413,7 +471,8 @@ pub(crate) async fn report_check_run_in_progress(
 
         let path = format!("check-runs/{}", check_run_id);
         if let Err(e) =
-            send_github_check_request(token, &repo, reqwest::Method::PATCH, &path, body).await
+            send_github_check_request(shared, token, &repo, reqwest::Method::PATCH, &path, body)
+                .await
         {
             warn!(
                 %run_id,
@@ -428,6 +487,57 @@ pub(crate) async fn report_check_run_in_progress(
     }
 }
 
+fn markdown_cell(value: &str) -> String {
+    value.replace('|', "\\|").replace(['\r', '\n'], " ")
+}
+
+fn duration_text(
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    finished_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> String {
+    match (started_at, finished_at) {
+        (Some(start), Some(finish)) => {
+            let duration = finish
+                .signed_duration_since(start)
+                .num_milliseconds()
+                .max(0);
+            format!("{:.1}s", duration as f64 / 1000.0)
+        }
+        (Some(_), None) => "running".to_owned(),
+        _ => "-".to_owned(),
+    }
+}
+
+fn check_summary(
+    conclusion: &str,
+    steps: &[crate::models::StepRecord],
+    global_issues: &[String],
+) -> String {
+    let mut summary = format!("Job completed with status: **{conclusion}**");
+    if !steps.is_empty() {
+        summary.push_str("\n\n| Step | Conclusion | Duration |\n|---|---:|---:|");
+        for step in steps {
+            summary.push_str(&format!(
+                "\n| {} | {} | {} |",
+                markdown_cell(&step.name),
+                markdown_cell(&step.conclusion),
+                duration_text(step.started_at, step.finished_at)
+            ));
+        }
+        if let Some(failed) = steps.iter().find(|step| step.conclusion == "failure") {
+            summary.push_str(&format!(
+                "\n\n**Failed step:** `{}`",
+                markdown_cell(&failed.name)
+            ));
+        }
+    }
+    if !global_issues.is_empty() {
+        summary.push_str("\n\n### Failure details\n");
+        summary.push_str(&global_issues.join("\n"));
+    }
+    summary
+}
+
 /// Report check run status to completed on GitHub or simulate it locally.
 pub(crate) async fn report_check_run_completed(
     shared: &Arc<SharedState>,
@@ -435,10 +545,10 @@ pub(crate) async fn report_check_run_completed(
     job_id: &JobId,
     status: ExecutionStatus,
 ) {
-    let (repo, check_run_id, annotations, global_issues) = {
+    let (repo, check_run_id, job_name, steps, started_at, completed_at, annotations, global_issues) = {
         let inner = shared.state.inner.lock().await;
         let run = match inner.runs.get(&run_id) {
-            Some(r) => r,
+            Some(run) => run,
             None => return,
         };
         let repo = run.submission.repository.clone();
@@ -446,10 +556,32 @@ pub(crate) async fn report_check_run_completed(
             Some(id) => id,
             None => return,
         };
+        let projected = crate::runs::project_run(&inner, run.clone());
+        let detail = projected
+            .jobs_list
+            .iter()
+            .find(|detail| detail.job_id == job_id.0);
+        let job_name = detail
+            .map(|detail| detail.name.clone())
+            .or_else(|| run.job_names.get(job_id).cloned())
+            .unwrap_or_else(|| job_id.0.clone());
+        let steps = detail
+            .map(|detail| detail.steps.clone())
+            .unwrap_or_default();
+        let started_at = steps
+            .iter()
+            .filter_map(|step| step.started_at)
+            .min()
+            .or(run.started_at);
+        let completed_at = steps
+            .iter()
+            .filter_map(|step| step.finished_at)
+            .max()
+            .or(run.completed_at)
+            .unwrap_or_else(chrono::Utc::now);
 
         let mut annotations = Vec::new();
         let mut global_issues = Vec::new();
-
         if let Some(events) = inner.timeline_events.get(&run_id) {
             for event in events {
                 if let NdjsonEvent::Annotation {
@@ -487,12 +619,26 @@ pub(crate) async fn report_check_run_completed(
                 }
             }
         }
-
-        if annotations.len() > 50 {
-            annotations.truncate(50);
+        if let Some(detail) = detail {
+            for annotation in &detail.annotations {
+                let message = annotation
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| annotation.to_string());
+                global_issues.push(format!("- {}", markdown_cell(&message)));
+            }
         }
-
-        (repo, check_run_id, annotations, global_issues)
+        (
+            repo,
+            check_run_id,
+            job_name,
+            steps,
+            started_at,
+            completed_at,
+            annotations,
+            global_issues,
+        )
     };
 
     let conclusion = match status {
@@ -502,48 +648,51 @@ pub(crate) async fn report_check_run_completed(
         ExecutionStatus::Skipped => "skipped",
         _ => "failure",
     };
+    let summary = check_summary(conclusion, &steps, &global_issues);
 
     let token = resolve_check_run_token(shared, &repo).await;
     if let Some(token) = &token {
-        let details_url = run_details_url(run_id);
-
-        let summary = if global_issues.is_empty() {
-            format!("Job completed with status: {}", conclusion)
+        let path = format!("check-runs/{check_run_id}");
+        let chunks: Vec<&[Value]> = if annotations.is_empty() {
+            vec![&[]]
         } else {
-            format!(
-                "Job completed with status: {}\n\n### Global/Job-Level Issues:\n{}",
-                conclusion,
-                global_issues.join("\n")
-            )
+            annotations.chunks(50).collect()
         };
-
-        let mut body = serde_json::json!({
-            "status": "completed",
-            "conclusion": conclusion,
-        });
-        if let Some(url) = details_url {
-            body["details_url"] = serde_json::json!(url);
-        }
-
-        if !annotations.is_empty() || !global_issues.is_empty() {
-            body["output"] = serde_json::json!({
-                "title": format!("Job: {}", job_id.0),
-                "summary": summary,
-                "annotations": annotations,
+        for (index, chunk) in chunks.iter().enumerate() {
+            let last = index + 1 == chunks.len();
+            let mut body = serde_json::json!({
+                "output": {
+                    "title": job_name,
+                    "summary": summary,
+                    "annotations": chunk,
+                }
             });
-        }
-
-        let path = format!("check-runs/{}", check_run_id);
-        if let Err(e) =
-            send_github_check_request(token, &repo, reqwest::Method::PATCH, &path, body).await
-        {
-            warn!(
-                %run_id,
-                %job_id,
-                check_run_id,
-                error = %e,
-                "Failed to update GitHub check run to completed"
-            );
+            if last {
+                body["status"] = serde_json::json!("completed");
+                body["conclusion"] = serde_json::json!(conclusion);
+                body["completed_at"] = serde_json::json!(completed_at.to_rfc3339());
+                if let Some(started_at) = started_at {
+                    body["started_at"] = serde_json::json!(started_at.to_rfc3339());
+                }
+                if let Some(url) = run_details_url(run_id) {
+                    body["details_url"] = serde_json::json!(url);
+                }
+            }
+            if let Err(error) =
+                send_github_check_request(shared, token, &repo, reqwest::Method::PATCH, &path, body)
+                    .await
+            {
+                warn!(
+                    %run_id,
+                    %job_id,
+                    check_run_id,
+                    annotation_batch = index + 1,
+                    annotation_batches = chunks.len(),
+                    %error,
+                    "Failed to update GitHub check run"
+                );
+                return;
+            }
         }
     } else {
         info!(
@@ -1839,6 +1988,31 @@ mod tests {
             &configured
         ));
         assert!(!is_github_owned_workflow("ci.yml", &configured));
+    }
+
+    #[test]
+    fn completed_check_summary_names_the_failed_step_and_durations() {
+        let start = chrono::Utc::now();
+        let mut setup = crate::models::StepRecord::workflow(
+            "setup".to_owned(),
+            0,
+            "Set up | tools".to_owned(),
+            None,
+        );
+        setup.conclusion = "success".to_owned();
+        setup.started_at = Some(start);
+        setup.finished_at = Some(start + chrono::Duration::milliseconds(1250));
+        let mut test =
+            crate::models::StepRecord::workflow("test".to_owned(), 1, "Run tests".to_owned(), None);
+        test.conclusion = "failure".to_owned();
+        test.started_at = setup.finished_at;
+        test.finished_at = Some(start + chrono::Duration::milliseconds(3250));
+
+        let summary = check_summary("failure", &[setup, test], &["- exit code 1".to_owned()]);
+        assert!(summary.contains("| Set up \\| tools | success | 1.2s |"));
+        assert!(summary.contains("| Run tests | failure | 2.0s |"));
+        assert!(summary.contains("**Failed step:** `Run tests`"));
+        assert!(summary.contains("exit code 1"));
     }
 
     #[tokio::test]

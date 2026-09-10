@@ -21,7 +21,7 @@ permissions:
 jobs:
   prep:
     name: Prep runner sync (diff + triage)
-    runs-on: self-hosted
+    runs-on: [self-hosted, preloop-cpane]
     timeout-minutes: 30
     permissions:
       contents: read
@@ -110,7 +110,7 @@ jobs:
     name: Runner sync (record-golden + conform + tiered PRs)
     needs: prep
     if: vars.RUNNER_SYNC_HOST_WORKSPACE != ''
-    runs-on: [self-hosted, runner-sync]
+    runs-on: [self-hosted, runner-sync, preloop-cpane-host]
     timeout-minutes: 180
     permissions:
       contents: write

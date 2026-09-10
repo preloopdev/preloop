@@ -98,10 +98,16 @@ artifact. It defaults to the digest-pinned Ubuntu 24.04 image compiled from
 not currently change the packed artifact, install packages, or derive
 toolchains from `.nvmrc`, `rust-toolchain.toml`, or similar files.
 - `--output`: destination for the packed golden.
-- On releases, `release-golden.yml` builds this artifact and uploads it as
-`preloop-ubuntu-24.04-<arch>`. The pool looks for it at
-a base-image-specific path below `<preloop_home>/vms/` (`preloop_home` is
-`~/.config/preloop` unless `PRELOOP_HOME` says otherwise).
+- Release publication first seeds both architecture assets from the newest
+  complete release, so a newly tagged engine never points at missing goldens.
+  Every GitHub release then triggers `release-golden.yml`; release notes do not
+  carry an opt-in marker. The x86_64 refresh runs on the dedicated
+  `preloop-cpane-host`, while the aarch64 refresh is pinned to GitHub's
+  `macos-14` image. Successful refreshes replace the seeded
+  `preloop-ubuntu-24.04-<arch>` assets; failed refreshes stay visible without
+  removing the valid seeded pair. The pool stores the downloaded artifact at
+  a base-image-specific path below `<preloop_home>/vms/` (`preloop_home` is
+  `~/.config/preloop` unless `PRELOOP_HOME` says otherwise).
 - When the pool warms a golden, it also pre-pulls the `container:` /
 `services:` images declared by the current workspace's workflows.
 
@@ -384,10 +390,10 @@ latest-stable adoption of that release. `smolvm_min_version` is deliberately
 not auto-bumped: it is a capability floor, not a tracked release.
 
 The job runs on Renovate's `smolvm_golden_version` bump PRs (head branches
-`renovate/**`) and manual dispatches, and needs a `smolvm-host`-labeled
-self-hosted runner (KVM on Linux or Hypervisor.framework on macOS) with
-`SMOLVM_VERIFY_HOST_WORKSPACE` set on the repo; the host needs registry
-access for the pinned Ubuntu base. Renovate auto-merges smolvm golden bumps
+`renovate/**`) and manual dispatches, and targets the dedicated
+`smolvm-host,preloop-cpane-host` runner. That Linux host needs KVM, registry
+access for the pinned Ubuntu base, and `SMOLVM_VERIFY_HOST_WORKSPACE` set on
+the repo. Renovate auto-merges smolvm golden bumps
 once the verify check and `ci.yml` pass — the merge gate is Renovate's
 auto-merge, not branch protection.
 

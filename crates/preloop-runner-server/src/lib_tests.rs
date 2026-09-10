@@ -3201,6 +3201,40 @@ async fn list_runs_projects_step_records() {
     assert_eq!(steps[0]["name"], "Run echo one");
 }
 
+#[tokio::test]
+async fn list_runs_puts_active_work_before_newer_terminal_runs() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let first: RunId = submit_simple_run(&app).await["run_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let second: RunId = submit_simple_run(&app).await["run_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (active, terminal) = if first < second {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    {
+        let mut inner = state.inner.lock().await;
+        let completed = inner.runs.get_mut(&terminal).unwrap();
+        completed.status = ExecutionStatus::Success;
+        completed.completed_at = Some(chrono::Utc::now());
+    }
+
+    let listed = request_json(&app, Method::GET, "/api/v1/runs?limit=2", json!(null)).await;
+    let runs = listed.as_array().unwrap();
+    assert_eq!(runs[0]["run_id"], active.to_string());
+    assert_eq!(runs[0]["status"], "queued");
+    assert_eq!(runs[1]["run_id"], terminal.to_string());
+}
+
 /// A runner report persists the attempt, so a restart keeps step state.
 ///
 /// Step records deliberately do not ride in `runs.record_blob` (which reseals
@@ -8636,6 +8670,90 @@ async fn cancel_run_completes_github_checks_and_terminal_metadata() {
     assert_eq!(mine.len(), 1, "one cancel, one check-run completion");
     assert_eq!(mine[0]["status"], "completed");
     assert_eq!(mine[0]["conclusion"], "cancelled");
+}
+
+#[tokio::test]
+async fn completed_check_uploads_every_annotation_in_batches_of_fifty() {
+    const CHECK_RUN_ID: u64 = 7;
+    let patches = Arc::new(parking_lot::Mutex::new(Vec::<Value>::new()));
+    let mock_app = Router::new()
+        .route(
+            "/repos/owner/repo/check-runs",
+            post(|| async { Json(json!({"id": CHECK_RUN_ID})) }),
+        )
+        .route(
+            "/repos/owner/repo/check-runs/:id",
+            axum::routing::patch({
+                let patches = patches.clone();
+                move |Path(_id): Path<u64>, body: axum::extract::Json<Value>| {
+                    let patches = patches.clone();
+                    async move {
+                        patches.lock().push(body.0);
+                        Json(json!({"id": CHECK_RUN_ID}))
+                    }
+                }
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, mock_app).await.unwrap();
+    });
+
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _api_url =
+        crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}"));
+    let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "annotation-test-token");
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let accepted = submit_simple_run(&app).await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let job_id = JobId("build".to_owned());
+    {
+        let mut inner = state.inner.lock().await;
+        inner
+            .runs
+            .get_mut(&run_id)
+            .unwrap()
+            .job_check_run_ids
+            .insert(job_id.clone(), CHECK_RUN_ID);
+        let events = inner.timeline_events.entry(run_id).or_default();
+        for line in 1..=120 {
+            events.push(NdjsonEvent::Annotation {
+                run_id,
+                job_id: job_id.clone(),
+                level: AnnotationLevel::Warning,
+                message: format!("warning {line}"),
+                file: Some("src/lib.rs".to_owned()),
+                line: Some(line),
+                end_line: None,
+                col: None,
+                end_column: None,
+                title: None,
+                step_id: None,
+            });
+        }
+    }
+
+    request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/runs/{run_id}/cancel"),
+        Value::Null,
+    )
+    .await;
+
+    let patches = patches.lock();
+    assert_eq!(patches.len(), 3);
+    let batch_sizes: Vec<usize> = patches
+        .iter()
+        .map(|body| body["output"]["annotations"].as_array().unwrap().len())
+        .collect();
+    assert_eq!(batch_sizes, vec![50, 50, 20]);
+    assert!(patches[0].get("status").is_none());
+    assert_eq!(patches[2]["status"], "completed");
+    assert_eq!(patches[2]["conclusion"], "cancelled");
 }
 
 #[tokio::test]

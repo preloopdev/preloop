@@ -19,7 +19,7 @@ on:
 
 jobs:
   rust:
-    runs-on: self-hosted
+    runs-on: [self-hosted, preloop-cpane]
     timeout-minutes: 60
     env:
       CARGO_BUILD_JOBS: "2"
@@ -59,7 +59,7 @@ jobs:
           RUSTFLAGS: "-A warnings -C link-arg=-fuse-ld=lld"
 
   property-tests-fast:
-    runs-on: self-hosted
+    runs-on: [self-hosted, preloop-cpane]
     timeout-minutes: 30
     if: github.event_name != 'schedule'
     steps:
@@ -159,7 +159,7 @@ jobs:
           if-no-files-found: ignore
 
   property-tests-intensive:
-    runs-on: self-hosted
+    runs-on: [self-hosted, preloop-cpane]
     timeout-minutes: 120
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.profile == 'intensive')
     steps:

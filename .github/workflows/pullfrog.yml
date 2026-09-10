@@ -30,7 +30,7 @@ concurrency:
 jobs:
   pullfrog:
     if: github.actor != 'renovate[bot]' && github.actor != 'dependabot[bot]' && github.actor != 'pullfrog[bot]'
-    runs-on: self-hosted
+    runs-on: [self-hosted, preloop-cpane]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0

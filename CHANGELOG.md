@@ -9,9 +9,15 @@ Releases before v0.27.0 predate the changelog.
 
 ## [Unreleased]
 
-## [0.32.7] - 2026-09-10
+### Fixed
 
-<!-- preloop:build-golden -->
+- Runner teardown now releases stale job bindings immediately, status snapshots
+  expose active runs and stalled claimable queues, and GitHub Check Run updates
+  report every annotation in API-sized batches.
+- CI jobs target the cpane microVM pool; only release packaging and the
+  aarch64 golden bake use GitHub-hosted runners.
+
+## [0.32.7] - 2026-09-10
 
 ### Fixed
 

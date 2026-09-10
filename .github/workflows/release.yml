@@ -296,6 +296,31 @@ jobs:
         run: |
           # Remove the granular manifests
           rm -f artifacts/*-dist-manifest.json
+      # Engines resolve the golden at their own release tag. Seed the new
+      # release with the newest complete pair before publishing; the
+      # release-golden workflow then replaces each asset with a fresh bake.
+      # This keeps a failed or unsupported fresh bake visible without ever
+      # leaving the released engine on a guaranteed 404.
+      - name: Seed golden assets from the newest complete release
+        run: |
+          source_tag=""
+          golden_dir="$RUNNER_TEMP/release-goldens"
+          for tag in $(gh release list --limit 50 --json tagName,isDraft --jq '.[] | select(.isDraft == false) | .tagName'); do
+            rm -rf "$golden_dir"
+            mkdir -p "$golden_dir"
+            if gh release download "$tag" \
+                --pattern preloop-ubuntu-24.04-x86_64 \
+                --pattern preloop-ubuntu-24.04-aarch64 \
+                --dir "$golden_dir" &&
+              test -s "$golden_dir/preloop-ubuntu-24.04-x86_64" &&
+              test -s "$golden_dir/preloop-ubuntu-24.04-aarch64"; then
+              source_tag="$tag"
+              break
+            fi
+          done
+          test -n "$source_tag"
+          cp "$golden_dir"/preloop-ubuntu-24.04-{x86_64,aarch64} artifacts/
+          echo "Seeded golden assets from $source_tag"
       - name: Create GitHub Release
         env:
           # The org disables workflow write tokens, so GITHUB_TOKEN can never

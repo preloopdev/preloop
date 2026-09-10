@@ -120,8 +120,8 @@ jobs:
 
   build-and-publish-golden:
     name: Build & Publish Golden MicroVM Artifact
-    if: (github.event_name == 'workflow_dispatch' && !inputs.reuse_previous_goldens) || (github.event_name == 'release' && contains(github.event.release.body, '<!-- preloop:build-golden -->'))
-    runs-on: [self-hosted, Linux, X64, smolvm-host]
+    if: (github.event_name == 'workflow_dispatch' && !inputs.reuse_previous_goldens) || github.event_name == 'release'
+    runs-on: [self-hosted, Linux, X64, smolvm-host, preloop-cpane-host]
     timeout-minutes: 180
     env:
       CARGO_BUILD_JOBS: "1"
@@ -349,7 +349,7 @@ jobs:
 
   build-and-publish-golden-macos:
     name: Build & Publish aarch64 Golden (macOS)
-    if: (github.event_name == 'workflow_dispatch' && !inputs.reuse_previous_goldens) || (github.event_name == 'release' && contains(github.event.release.body, '<!-- preloop:build-golden -->'))
+    if: (github.event_name == 'workflow_dispatch' && !inputs.reuse_previous_goldens) || github.event_name == 'release'
     # Hosted Apple Silicon builds this golden: macos-14 produced the last
     # working aarch64 golden (v0.29.6, 2026-08-09). 7f18e8a0 then repointed
     # it at a self-hosted Mac that was never registered, so every run since
