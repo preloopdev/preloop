@@ -22,7 +22,7 @@ jobs:
   verify:
     name: Verify smolvm release on smolvm-host
     if: (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'renovate/')) && vars.SMOLVM_VERIFY_HOST_WORKSPACE != ''
-    runs-on: [self-hosted, smolvm-host, preloop-cpane-host]
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0

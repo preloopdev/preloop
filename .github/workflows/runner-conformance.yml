@@ -36,7 +36,7 @@ jobs:
   runner-deep:
     name: Runner deep conformance
     if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && vars.PRELOOP_CONFORMANCE_DEEP == '1'
-    runs-on: [self-hosted, Linux, X64, smolvm-host, preloop-cpane-host]
+    runs-on: ubuntu-24.04
     timeout-minutes: 180
     env:
       GH_REPO: ${{ vars.RUNNER_CONFORMANCE_REPO || 'preloopdev/preloop-conformance' }}

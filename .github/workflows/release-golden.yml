@@ -121,7 +121,7 @@ jobs:
   build-and-publish-golden:
     name: Build & Publish Golden MicroVM Artifact
     if: (github.event_name == 'workflow_dispatch' && !inputs.reuse_previous_goldens) || github.event_name == 'release'
-    runs-on: [self-hosted, Linux, X64, smolvm-host, preloop-cpane-host]
+    runs-on: ubuntu-24.04
     timeout-minutes: 180
     env:
       CARGO_BUILD_JOBS: "1"
