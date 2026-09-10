@@ -12,7 +12,7 @@ on:
 jobs:
   zizmor:
     name: GitHub Actions Security Analysis with zizmor
-    runs-on: [self-hosted, preloop-cpane]
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
