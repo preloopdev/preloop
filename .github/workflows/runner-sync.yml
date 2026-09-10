@@ -110,7 +110,7 @@ jobs:
     name: Runner sync (record-golden + conform + tiered PRs)
     needs: prep
     if: vars.RUNNER_SYNC_HOST_WORKSPACE != ''
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, runner-sync]
     timeout-minutes: 180
     permissions:
       contents: write
