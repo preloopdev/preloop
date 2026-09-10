@@ -716,6 +716,158 @@ fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
     }
 }
 
+/// Webhook-repair inputs for the operational snapshot.
+///
+/// Collected asynchronously (store + status locks) and handed to the
+/// synchronous builder, so the snapshot can report repair health without
+/// the builder learning how to read a database.
+#[derive(Debug, Default, Clone)]
+struct WebhookConditionInputs {
+    stats: crate::models::WebhookQueueStats,
+    watchdog: crate::webhook_status::WatchdogStatus,
+    reconciler: crate::webhook_status::ReconcilerStatus,
+    breaker: crate::github_breaker::BreakerSnapshot,
+    app_config: Vec<crate::webhook_status::AppWebhookConfigStatus>,
+}
+
+/// A queue whose oldest unprocessed delivery is older than this is not
+/// "busy", it is stuck: the worker retries with at most a 30s backoff.
+const WEBHOOK_QUEUE_STALL_SECONDS: f64 = 900.0;
+/// The watchdog polls every 5 minutes by default. Six missed polls is not a
+/// blip, and a watchdog that has stopped reading GitHub's delivery history
+/// looks exactly like a period with no failed deliveries.
+const WEBHOOK_WATCHDOG_STALE_SECONDS: f64 = 1800.0;
+
+/// Conditions derived from the webhook repair layers.
+fn webhook_conditions(
+    inputs: &WebhookConditionInputs,
+    now_us: i64,
+) -> Vec<preloop_observability::status::Condition> {
+    use preloop_observability::status::Condition;
+    let condition = |code: &str, severity: &str, message: String| Condition {
+        code: code.to_owned(),
+        severity: severity.to_owned(),
+        message,
+        exemplars: Vec::new(),
+    };
+    let mut conditions = Vec::new();
+    if inputs.stats.failed > 0 {
+        conditions.push(condition(
+            "webhook_dead_letter",
+            "warning",
+            format!(
+                "{} webhook deliveries failed with unreportable or permanent errors",
+                inputs.stats.failed
+            ),
+        ));
+    }
+    if let Some(oldest) = inputs.stats.oldest_pending_received_at_us {
+        let age = crate::webhook_status::age_seconds(oldest, now_us);
+        if age > WEBHOOK_QUEUE_STALL_SECONDS {
+            conditions.push(condition(
+                "webhook_queue_stalled",
+                "warning",
+                format!("oldest unprocessed webhook delivery is {age:.0}s old"),
+            ));
+        }
+    }
+    if inputs.breaker.open {
+        conditions.push(condition(
+            "github_unavailable",
+            "warning",
+            format!(
+                "GitHub calls are circuit-broken for another {}s ({}): queued deliveries are parked, not failing",
+                inputs.breaker.retry_in_seconds.unwrap_or_default(),
+                inputs
+                    .breaker
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "no detail".to_owned())
+            ),
+        ));
+    }
+    if inputs.watchdog.enabled {
+        let stale = match inputs.watchdog.last_success_at_us {
+            Some(last) => {
+                crate::webhook_status::age_seconds(last, now_us) > WEBHOOK_WATCHDOG_STALE_SECONDS
+            }
+            // Never succeeded: only alarming once the process has been up
+            // long enough for a poll to have happened and finished.
+            None => inputs.watchdog.last_poll_at_us.is_some(),
+        };
+        if stale {
+            conditions.push(condition(
+                "webhook_watchdog_stale",
+                "warning",
+                format!(
+                    "webhook delivery watchdog has not completed a poll recently ({}); \
+                     lost deliveries would go unnoticed",
+                    inputs
+                        .watchdog
+                        .last_error
+                        .clone()
+                        .unwrap_or_else(|| "no error recorded".to_owned())
+                ),
+            ));
+        }
+        if inputs.watchdog.open_repairs > 0 {
+            conditions.push(condition(
+                "webhook_repairs_pending",
+                "warning",
+                format!(
+                    "{} GitHub deliveries have been asked for redelivery and have not arrived",
+                    inputs.watchdog.open_repairs
+                ),
+            ));
+        }
+    }
+    for app in inputs.app_config.iter().filter(|app| !app.healthy()) {
+        let mut detail = Vec::new();
+        if app.url_drifted() {
+            detail.push(format!(
+                "delivery URL is {} but this server expects {}",
+                app.hook_url.clone().unwrap_or_else(|| "<none>".to_owned()),
+                app.expected_url
+                    .clone()
+                    .unwrap_or_else(|| "<unknown>".to_owned())
+            ));
+        }
+        if !app.missing_events.is_empty() {
+            detail.push(format!(
+                "not subscribed to {} (fix in App settings; GitHub has no API for it)",
+                app.missing_events.join(", ")
+            ));
+        }
+        if !app.missing_permissions.is_empty() {
+            detail.push(format!(
+                "missing permissions {}",
+                app.missing_permissions.join(", ")
+            ));
+        }
+        if let Some(error) = &app.error {
+            detail.push(error.clone());
+        }
+        conditions.push(condition(
+            "webhook_config_drift",
+            "warning",
+            format!("GitHub App {}: {}", app.app_id, detail.join("; ")),
+        ));
+    }
+    if let Some(error) = inputs
+        .reconciler
+        .enabled
+        .then_some(inputs.reconciler.last_error.as_ref())
+        .flatten()
+    {
+        conditions.push(condition(
+            "webhook_reconciler_failing",
+            "warning",
+            format!("source-state reconciler is failing: {error}"),
+        ));
+    }
+    conditions
+}
+
 fn build_operational_snapshot_sync(
     inputs: SnapshotInputs,
     mut pool_snapshot: preloop_observability::status::PoolSnapshot,
@@ -727,7 +879,7 @@ fn build_operational_snapshot_sync(
     storage_components: Vec<preloop_observability::status::StorageComponent>,
     github_configured: bool,
     store_backend: preloop_observability::status::StoreBackend,
-    dead_letters: u64,
+    webhook: WebhookConditionInputs,
 ) -> preloop_observability::status::OperationalSnapshot {
     use chrono::Utc;
     use preloop_observability::status::*;
@@ -853,20 +1005,7 @@ fn build_operational_snapshot_sync(
             otlp_enabled: observability.otlp_enabled(),
             ..Default::default()
         },
-        conditions: {
-            let mut conds = Vec::new();
-            if dead_letters > 0 {
-                conds.push(Condition {
-                    code: "webhook_dead_letter".to_owned(),
-                    severity: "warning".to_owned(),
-                    message: format!(
-                        "{dead_letters} webhook deliveries failed with unreportable or permanent errors"
-                    ),
-                    exemplars: Vec::new(),
-                });
-            }
-            conds
-        },
+        conditions: webhook_conditions(&webhook, crate::webhook_status::now_us()),
     }
 }
 
@@ -913,12 +1052,7 @@ async fn publish_snapshot(
         tokio::task::spawn_blocking(move || collect_storage_components(&state_dir_for_meta))
             .await
             .unwrap_or_default();
-    let dead_letters = shared
-        .state
-        .store
-        .count_dead_letter_webhook_deliveries()
-        .await
-        .unwrap_or(0);
+    let webhook = collect_webhook_condition_inputs(&shared.state).await;
     let snap = build_operational_snapshot_sync(
         inputs,
         pool_snapshot,
@@ -930,9 +1064,24 @@ async fn publish_snapshot(
         storage_components,
         shared.state.github_app.is_some(),
         store_backend.clone(),
-        dead_letters,
+        webhook,
     );
     *shared.state.status_snapshot.write() = snap;
+}
+
+/// Read the repair layers' published state plus the queue counters.
+///
+/// A store read that fails leaves the counters at zero rather than failing
+/// the snapshot: the snapshot is the thing an operator looks at when the
+/// store is misbehaving, so it must still render.
+async fn collect_webhook_condition_inputs(state: &AppState) -> WebhookConditionInputs {
+    WebhookConditionInputs {
+        stats: state.store.webhook_queue_stats().await.unwrap_or_default(),
+        watchdog: state.webhook_status.watchdog(),
+        reconciler: state.webhook_status.reconciler(),
+        breaker: state.github_breaker.snapshot(),
+        app_config: state.webhook_status.app_config(),
+    }
 }
 
 async fn run_state_sampler(
@@ -1117,11 +1266,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             collect_storage_components(&state.state_dir),
             state.github_app.is_some(),
             store_backend.clone(),
-            state
-                .store
-                .count_dead_letter_webhook_deliveries()
-                .await
-                .unwrap_or(0),
+            collect_webhook_condition_inputs(&state).await,
         );
         *state.status_snapshot.write() = init;
     }
@@ -1276,6 +1421,26 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     tokio::spawn(async move {
         crate::github::run_webhook_queue_worker(webhook_worker_shared, webhook_worker_handle).await;
     });
+
+    // Repair layers. None of them is on the request path, and each is
+    // independently disable-able, so they are best-effort tasks rather than
+    // critical heartbeats: a stalled watchdog must not fail `/readyz` while
+    // the queue itself is draining fine. Their staleness is reported through
+    // the operational snapshot instead.
+    let watchdog_shared = shared.clone();
+    tokio::spawn(async move {
+        crate::webhook_watchdog::run_webhook_watchdog(watchdog_shared).await;
+    });
+    let health_shared = shared.clone();
+    tokio::spawn(async move {
+        crate::webhook_health::run_webhook_health_monitor(health_shared).await;
+    });
+    if !crate::webhook_reconciler::reconciler_repositories().is_empty() {
+        let reconciler_shared = shared.clone();
+        tokio::spawn(async move {
+            crate::webhook_reconciler::run_webhook_reconciler(reconciler_shared).await;
+        });
+    }
 
     // Claims held by machines the restart destroyed can never be completed by
     // anyone; settle them before serving so the pool is not handed a queue of

@@ -257,6 +257,37 @@ Attach to a job paused at a failed step.
 | `--from <STEP>` | With `--verdict retry`: re-run from a 1-based step number or display name |
 | `--from-start` | With `--verdict retry`: re-run from the first user step in this job |
 
+
+## `preloop webhooks <COMMAND>`
+
+Inspect, replay and health-check the durable webhook queue. See
+[Webhook resilience](./webhook-resilience.md).
+
+### `preloop webhooks list [OPTIONS]`
+
+| Flag | Description |
+|---|---|
+| `--state <STATE>` | Only `received`, `processing`, `done` or `failed` deliveries |
+| `--limit <N>` | Rows to print (default 50, max 500) |
+| `--json` | Print the raw JSON document |
+
+### `preloop webhooks replay <DELIVERY_ID>`
+
+Requeue a delivery from its retained local payload. Retention is 30 days —
+ten times GitHub's redelivery window — and the replay needs no GitHub call.
+Processing is idempotent: the run is reused and existing check runs are
+patched, not duplicated.
+
+### `preloop webhooks health [OPTIONS]`
+
+Queue depth and oldest pending age, delivery-watchdog freshness (loudly
+flagged when stale or disabled), open repairs, GitHub circuit-breaker state,
+reconciler counters, and per-App webhook configuration drift.
+
+| Flag | Description |
+|---|---|
+| `--json` | Print the raw JSON document |
+
 ## `preloop update [OPTIONS]`
 
 Poll GitHub Releases and atomically install the matching binary.

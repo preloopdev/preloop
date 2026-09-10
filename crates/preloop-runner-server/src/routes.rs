@@ -471,6 +471,28 @@ pub(crate) fn build_app(
         )
         .route("/api/v1/github/register", get(github::github_register))
         .route("/api/v1/github/callback", get(github::github_callback))
+        // Operator surface over the durable queue: inspect it, replay from
+        // the retained local payload (which outlives GitHub's three-day
+        // redelivery window), and read one repair-health document.
+        .route(
+            "/api/v1/webhooks/deliveries",
+            get(crate::webhook_api::list_webhook_deliveries).route_layer(
+                middleware::from_fn_with_state(shared.clone(), require_native_bearer),
+            ),
+        )
+        .route(
+            "/api/v1/webhooks/deliveries/:delivery_id/replay",
+            post(crate::webhook_api::replay_webhook_delivery).route_layer(
+                middleware::from_fn_with_state(shared.clone(), require_native_bearer),
+            ),
+        )
+        .route(
+            "/api/v1/webhooks/health",
+            get(crate::webhook_api::webhook_health).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
         .route(
             "/api/v1/runs/:run_id",
             get(get_run).route_layer(middleware::from_fn_with_state(

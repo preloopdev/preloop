@@ -189,6 +189,7 @@ async fn resolve_check_run_token(shared: &Arc<SharedState>, repo: &str) -> Optio
 }
 
 async fn send_github_check_request(
+    breaker: &crate::github_breaker::GithubBreaker,
     token: &str,
     repo: &str,
     method: reqwest::Method,
@@ -197,14 +198,16 @@ async fn send_github_check_request(
 ) -> anyhow::Result<Value> {
     let client = crate::shared_http::CLIENT.clone();
     let url = format!("{}/repos/{}/{}", github_api_base(), repo, path);
-    let res = client
-        .request(method, &url)
-        .header("User-Agent", "preloop")
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Accept", "application/vnd.github+json")
-        .json(&body)
-        .send()
-        .await?;
+    let res = crate::github_breaker::send_observed(
+        breaker,
+        client
+            .request(method, &url)
+            .header("User-Agent", "preloop")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Accept", "application/vnd.github+json")
+            .json(&body),
+    )
+    .await?;
 
     if !res.status().is_success() {
         let status = res.status();
@@ -264,8 +267,15 @@ pub(crate) async fn report_check_run_queued(
             body["details_url"] = serde_json::json!(url);
         }
 
-        match send_github_check_request(token, repo, reqwest::Method::POST, "check-runs", body)
-            .await
+        match send_github_check_request(
+            &shared.state.github_breaker,
+            token,
+            repo,
+            reqwest::Method::POST,
+            "check-runs",
+            body,
+        )
+        .await
         {
             Ok(res) => {
                 if let Some(id) = res.get("id").and_then(|id| id.as_u64()) {
@@ -327,8 +337,15 @@ pub(crate) async fn report_existing_check_run_queued(
             body["details_url"] = serde_json::json!(url);
         }
         let path = format!("check-runs/{check_run_id}");
-        if let Err(error) =
-            send_github_check_request(token, repo, reqwest::Method::PATCH, &path, body).await
+        if let Err(error) = send_github_check_request(
+            &shared.state.github_breaker,
+            token,
+            repo,
+            reqwest::Method::PATCH,
+            &path,
+            body,
+        )
+        .await
         {
             warn!(
                 %run_id,
@@ -368,8 +385,15 @@ pub(crate) async fn report_check_run_permanent_failure(
                 "summary": summary,
             }
         });
-        if let Err(e) =
-            send_github_check_request(token, repo, reqwest::Method::POST, "check-runs", body).await
+        if let Err(e) = send_github_check_request(
+            &shared.state.github_breaker,
+            token,
+            repo,
+            reqwest::Method::POST,
+            "check-runs",
+            body,
+        )
+        .await
         {
             warn!(%repo, %name, error = %e, "Failed to create failed GitHub check run");
         }
@@ -459,8 +483,15 @@ pub(crate) async fn report_check_run_in_progress(
         }
 
         let path = format!("check-runs/{}", check_run_id);
-        if let Err(e) =
-            send_github_check_request(token, &repo, reqwest::Method::PATCH, &path, body).await
+        if let Err(e) = send_github_check_request(
+            &shared.state.github_breaker,
+            token,
+            &repo,
+            reqwest::Method::PATCH,
+            &path,
+            body,
+        )
+        .await
         {
             warn!(
                 %run_id,
@@ -581,8 +612,15 @@ pub(crate) async fn report_check_run_completed(
         }
 
         let path = format!("check-runs/{}", check_run_id);
-        if let Err(e) =
-            send_github_check_request(token, &repo, reqwest::Method::PATCH, &path, body).await
+        if let Err(e) = send_github_check_request(
+            &shared.state.github_breaker,
+            token,
+            &repo,
+            reqwest::Method::PATCH,
+            &path,
+            body,
+        )
+        .await
         {
             warn!(
                 %run_id,
@@ -718,7 +756,8 @@ pub(crate) async fn fetch_workflows_at(
             shared.state.static_github_pat()
         };
         if let Some(token) = &token {
-            fetch_remote_workflows(token, repo, git_ref, api_base).await
+            fetch_remote_workflows(&shared.state.github_breaker, token, repo, git_ref, api_base)
+                .await
         } else if !git_ref.is_empty() {
             anyhow::bail!(
                 "cannot fetch workflow revision {git_ref:?} without a local workspace or GitHub credentials"
@@ -748,6 +787,7 @@ pub(crate) async fn fetch_workflows_at(
 }
 
 async fn fetch_remote_workflows(
+    breaker: &crate::github_breaker::GithubBreaker,
     token: &str,
     repo: &str,
     git_ref: &str,
@@ -760,13 +800,15 @@ async fn fetch_remote_workflows(
         repo,
         git_ref
     );
-    let response = client
-        .get(&url)
-        .header("User-Agent", "preloop")
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await?;
+    let response = crate::github_breaker::send_observed(
+        breaker,
+        client
+            .get(&url)
+            .header("User-Agent", "preloop")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Accept", "application/vnd.github+json"),
+    )
+    .await?;
 
     if !response.status().is_success() {
         return Err(anyhow::anyhow!(
@@ -788,12 +830,14 @@ async fn fetch_remote_workflows(
     for item in &items {
         if item.r#type == "file" && (item.name.ends_with(".yml") || item.name.ends_with(".yaml")) {
             if let Some(download_url) = &item.download_url {
-                let file_res = client
-                    .get(download_url)
-                    .header("User-Agent", "preloop")
-                    .header("Authorization", format!("Bearer {}", token))
-                    .send()
-                    .await?;
+                let file_res = crate::github_breaker::send_observed(
+                    breaker,
+                    client
+                        .get(download_url)
+                        .header("User-Agent", "preloop")
+                        .header("Authorization", format!("Bearer {}", token)),
+                )
+                .await?;
                 if file_res.status().is_success() {
                     let content = file_res.text().await?;
                     workflows.insert(item.name.clone(), content);
@@ -850,16 +894,18 @@ pub(crate) async fn resolve_ref_sha(
         .strip_prefix("refs/heads/")
         .or_else(|| git_ref.strip_prefix("refs/tags/"))
         .unwrap_or(git_ref);
-    let response = crate::shared_http::CLIENT
-        .clone()
-        .get(format!(
-            "{api_base}/repos/{repository}/commits/{commit_ref}"
-        ))
-        .header("User-Agent", "preloop")
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await?;
+    let response = crate::github_breaker::send_observed(
+        &shared.state.github_breaker,
+        crate::shared_http::CLIENT
+            .clone()
+            .get(format!(
+                "{api_base}/repos/{repository}/commits/{commit_ref}"
+            ))
+            .header("User-Agent", "preloop")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json"),
+    )
+    .await?;
     if !response.status().is_success() {
         return Ok(None);
     }
@@ -868,6 +914,7 @@ pub(crate) async fn resolve_ref_sha(
 }
 
 async fn get_pr_changed_files(
+    breaker: &crate::github_breaker::GithubBreaker,
     token: &str,
     repo: &str,
     pr_number: u64,
@@ -890,13 +937,15 @@ async fn get_pr_changed_files(
             pr_number,
             page
         );
-        let response = client
-            .get(&url)
-            .header("User-Agent", "preloop")
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Accept", "application/vnd.github+json")
-            .send()
-            .await?;
+        let response = crate::github_breaker::send_observed(
+            breaker,
+            client
+                .get(&url)
+                .header("User-Agent", "preloop")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Accept", "application/vnd.github+json"),
+        )
+        .await?;
 
         if !response.status().is_success() {
             return Err(anyhow::anyhow!(
@@ -944,9 +993,15 @@ pub(crate) async fn resolve_pr_changed_files_at(
     let Some(token) = token else {
         return Ok(None);
     };
-    get_pr_changed_files(&token, repo, pr_number, api_base)
-        .await
-        .map(Some)
+    get_pr_changed_files(
+        &shared.state.github_breaker,
+        &token,
+        repo,
+        pr_number,
+        api_base,
+    )
+    .await
+    .map(Some)
 }
 
 const WEBHOOK_ACK_BUDGET: Duration = Duration::from_secs(8);
@@ -1209,6 +1264,14 @@ enum WebhookOutcome {
         failures: Vec<WebhookFailure>,
     },
     Unreportable(String),
+    /// GitHub itself is unreachable. Distinct from `TransientError` because
+    /// the delivery did nothing wrong: it is returned to the queue with its
+    /// attempt refunded and retried after the breaker's window, instead of
+    /// spending one of six attempts on an outage it cannot influence.
+    DependencyUnavailable {
+        error: String,
+        retry_after_secs: u64,
+    },
 }
 #[derive(Debug)]
 struct WebhookFailure {
@@ -1377,6 +1440,17 @@ pub(crate) async fn drain_webhook_queue(shared: &Arc<SharedState>) -> anyhow::Re
 
     let mut total_processed = 0;
     loop {
+        // A known GitHub outage means every claim here would charge an
+        // attempt and then fail on the same dependency. Not claiming is the
+        // difference between riding out an incident and dead-lettering every
+        // push that arrived during it.
+        if let Some(retry_after) = shared.state.github_breaker.retry_after() {
+            debug!(
+                retry_in_secs = retry_after.as_secs(),
+                "GitHub breaker open; deferring webhook queue drain"
+            );
+            break;
+        }
         let deliveries = shared
             .state
             .store
@@ -1484,11 +1558,26 @@ pub(crate) async fn process_one_delivery(
         );
         return;
     }
+    // Outage reclassification happens BEFORE the attempt cap: a delivery
+    // must never be dead-lettered for a dependency that was down. The
+    // breaker, not the delivery, is the authority on whether GitHub is the
+    // reason a step failed.
     let outcome = match outcome {
-        WebhookOutcome::TransientError(error) if delivery.attempts >= WEBHOOK_MAX_ATTEMPTS => {
-            WebhookOutcome::Unreportable(format!(
-                "transient webhook failure exceeded {WEBHOOK_MAX_ATTEMPTS} attempts: {error}"
-            ))
+        WebhookOutcome::TransientError(error) => {
+            match shared.state.github_breaker.retry_after() {
+                Some(retry_after) => WebhookOutcome::DependencyUnavailable {
+                    error,
+                    // Bounded: a long breaker window still gets re-examined
+                    // periodically, and a short one does not become a spin.
+                    retry_after_secs: retry_after.as_secs().clamp(5, 300),
+                },
+                None if delivery.attempts >= WEBHOOK_MAX_ATTEMPTS => {
+                    WebhookOutcome::Unreportable(format!(
+                        "transient webhook failure exceeded {WEBHOOK_MAX_ATTEMPTS} attempts: {error}"
+                    ))
+                }
+                None => WebhookOutcome::TransientError(error),
+            }
         }
         outcome => outcome,
     };
@@ -1509,6 +1598,35 @@ pub(crate) async fn process_one_delivery(
                     delivery_id = %delivery.delivery_id,
                     ?error,
                     "failed to mark webhook delivery completed"
+                ),
+            }
+        }
+        WebhookOutcome::DependencyUnavailable {
+            error,
+            retry_after_secs,
+        } => {
+            warn!(
+                delivery_id = %delivery.delivery_id,
+                attempts = delivery.attempts,
+                retry_after_secs,
+                error = %error,
+                "GitHub is unavailable; parking webhook delivery without spending an attempt"
+            );
+            match shared
+                .state
+                .store
+                .park_webhook_delivery(&delivery.delivery_id, lease_token, &error, retry_after_secs)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => warn!(
+                    delivery_id = %delivery.delivery_id,
+                    "lost webhook delivery lease before parking it"
+                ),
+                Err(error) => warn!(
+                    delivery_id = %delivery.delivery_id,
+                    ?error,
+                    "failed to park webhook delivery for a GitHub outage"
                 ),
             }
         }
@@ -2575,6 +2693,119 @@ mod tests {
             1,
             "internal retry must successfully create the run"
         );
+    }
+
+    /// Trip the shared breaker the way three consecutive 5xx responses would.
+    fn open_breaker(state: &AppState) {
+        for _ in 0..3 {
+            state.github_breaker.record_failure(
+                &crate::github_breaker::GithubFailureKind::Unavailable,
+                "GitHub responded 503",
+            );
+        }
+        assert!(state.github_breaker.is_open(), "breaker must be open");
+    }
+
+    /// A known GitHub outage must stop the queue from claiming: every claim
+    /// charges an attempt and would fail on the same dependency.
+    #[tokio::test]
+    async fn webhook_queue_stops_claiming_while_github_is_unavailable() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = WebhookFixture::new(&temp).await;
+        assert_eq!(
+            fixture.post("delivery-outage-gate", Some("push")).await,
+            StatusCode::ACCEPTED
+        );
+        open_breaker(&fixture.state);
+
+        assert_eq!(
+            fixture.drain().await,
+            0,
+            "no delivery may be claimed while GitHub is circuit-broken"
+        );
+
+        let record = fixture
+            .state
+            .store
+            .get_webhook_delivery("delivery-outage-gate")
+            .await
+            .unwrap()
+            .expect("delivery row must exist");
+        assert_eq!(record.state, WebhookDeliveryStatus::Received);
+        assert_eq!(
+            record.attempts, 0,
+            "an outage must not spend the delivery's retry budget"
+        );
+    }
+
+    /// A delivery that fails because GitHub is down is parked with its
+    /// attempt refunded — never dead-lettered, even past the attempt cap.
+    #[tokio::test]
+    async fn github_outage_parks_a_delivery_instead_of_dead_lettering_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = temp.path().join("ws");
+        std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
+        std::fs::write(
+            ws_dir.join(".github/workflows/build.yml"),
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
+        )
+        .unwrap();
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        // Make workflow evaluation fail the way an unreachable dependency
+        // would, and start from an attempt count already past the cap.
+        let hidden_ws = temp.path().join("hidden_ws");
+        std::fs::rename(&ws_dir, &hidden_ws).unwrap();
+        fixture
+            .state
+            .store
+            .enqueue_webhook_delivery(&WebhookDeliveryRecord {
+                delivery_id: "delivery-outage-park".to_owned(),
+                event: "push".to_owned(),
+                payload: fixture.payload_bytes.clone(),
+                received_at_us: crate::store::now_us(),
+                state: WebhookDeliveryStatus::Received,
+                attempts: WEBHOOK_MAX_ATTEMPTS,
+                lease_until_us: None,
+                lease_token: None,
+                last_error: None,
+            })
+            .await
+            .unwrap();
+        let shared = Arc::new(SharedState {
+            state: fixture.state.clone(),
+            shutdown: CancellationToken::new(),
+        });
+        let claimed = shared
+            .state
+            .store
+            .claim_webhook_deliveries(1, WEBHOOK_LEASE_DURATION_SECS)
+            .await
+            .unwrap();
+        let delivery = claimed.into_iter().next().expect("claimed the delivery");
+        assert_eq!(delivery.attempts, WEBHOOK_MAX_ATTEMPTS + 1);
+
+        open_breaker(&fixture.state);
+        process_one_delivery(&shared, &delivery).await;
+
+        let record = fixture
+            .state
+            .store
+            .get_webhook_delivery("delivery-outage-park")
+            .await
+            .unwrap()
+            .expect("delivery row must exist");
+        assert_eq!(
+            record.state,
+            WebhookDeliveryStatus::Received,
+            "a dependency outage must never dead-letter a delivery"
+        );
+        assert_eq!(
+            record.attempts, WEBHOOK_MAX_ATTEMPTS,
+            "parking refunds the attempt the claim charged"
+        );
+        assert!(record
+            .lease_until_us
+            .is_some_and(|lease_until| lease_until > crate::store::now_us()));
     }
 
     /// A delivery whose ref SHA cannot be resolved is retried internally rather than dropped.

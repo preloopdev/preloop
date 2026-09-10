@@ -14,7 +14,10 @@
 //! `sslmode=disable` stay plaintext for loopback databases.
 
 use super::*;
-use crate::models::{WebhookDeliveryRecord, WebhookDeliveryStatus};
+use crate::models::{
+    WebhookDeliveryRecord, WebhookDeliveryStatus, WebhookDeliverySummary, WebhookQueueStats,
+    WebhookRedeliveryRecord, WebhookRepairReason, WebhookWatchdogCursor,
+};
 use async_trait::async_trait;
 use postgres_rustls::MakeTlsConnector;
 use preloop_gha_protocol::SessionId;
@@ -1404,6 +1407,303 @@ impl Store for PgStore {
             .await?;
         Ok(rows_affected)
     }
+
+    async fn park_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+        error: &str,
+        retry_delay_secs: u64,
+    ) -> anyhow::Result<bool> {
+        let client = self.connection.lock().await;
+        let now = now_us();
+        let lease_until = now + (retry_delay_secs as i64 * 1_000_000);
+        let rows_affected = client
+            .execute(
+                "UPDATE webhook_deliveries
+                 SET state = 'received', lease_until_us = $2, lease_token = NULL,
+                     attempts = GREATEST(attempts - 1, 0), last_error = $3
+                 WHERE delivery_id = $1 AND state = 'processing' AND lease_token = $4
+                   AND lease_until_us IS NOT NULL AND lease_until_us > $5",
+                &[&delivery_id, &lease_until, &error, &lease_token, &now],
+            )
+            .await?;
+        Ok(rows_affected > 0)
+    }
+
+    async fn requeue_webhook_delivery(&self, delivery_id: &str) -> anyhow::Result<bool> {
+        let client = self.connection.lock().await;
+        let rows_affected = client
+            .execute(
+                "UPDATE webhook_deliveries
+                 SET state = 'received', attempts = 0, lease_until_us = NULL,
+                     lease_token = NULL, last_error = NULL
+                 WHERE delivery_id = $1 AND state IN ('done', 'failed')",
+                &[&delivery_id],
+            )
+            .await?;
+        Ok(rows_affected > 0)
+    }
+
+    async fn list_webhook_deliveries(
+        &self,
+        state: Option<WebhookDeliveryStatus>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<WebhookDeliverySummary>> {
+        let client = self.connection.lock().await;
+        let state = state.map(|state| state.as_str().to_owned());
+        let rows = client
+            .query(
+                "SELECT delivery_id, event, received_at_us, state, attempts,
+                        lease_until_us, last_error
+                 FROM webhook_deliveries
+                 WHERE ($1::text IS NULL OR state = $1)
+                 ORDER BY received_at_us DESC
+                 LIMIT $2",
+                &[&state, &(limit.min(i64::MAX as usize) as i64)],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                let state: String = row.get(3);
+                let attempts: i64 = row.get(4);
+                Ok(WebhookDeliverySummary {
+                    delivery_id: row.get(0),
+                    event: row.get(1),
+                    received_at_us: row.get(2),
+                    state: WebhookDeliveryStatus::parse(&state).ok_or_else(|| {
+                        anyhow::anyhow!("invalid webhook delivery state: {state}")
+                    })?,
+                    attempts: attempts.max(0) as u32,
+                    lease_until_us: row.get(5),
+                    last_error: row.get(6),
+                })
+            })
+            .collect()
+    }
+
+    async fn webhook_deliveries_present(
+        &self,
+        delivery_ids: &[String],
+    ) -> anyhow::Result<BTreeSet<String>> {
+        if delivery_ids.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let client = self.connection.lock().await;
+        let ids = delivery_ids.to_vec();
+        let rows = client
+            .query(
+                "SELECT delivery_id FROM webhook_deliveries WHERE delivery_id = ANY($1)",
+                &[&ids],
+            )
+            .await?;
+        Ok(rows.into_iter().map(|row| row.get(0)).collect())
+    }
+
+    async fn webhook_queue_stats(&self) -> anyhow::Result<WebhookQueueStats> {
+        let client = self.connection.lock().await;
+        let mut stats = WebhookQueueStats::default();
+        let rows = client
+            .query(
+                "SELECT state, COUNT(*) FROM webhook_deliveries GROUP BY state",
+                &[],
+            )
+            .await?;
+        for row in rows {
+            let state: String = row.get(0);
+            let count: i64 = row.get(1);
+            let count = count.max(0) as u64;
+            match WebhookDeliveryStatus::parse(&state) {
+                Some(WebhookDeliveryStatus::Received) => stats.received = count,
+                Some(WebhookDeliveryStatus::Processing) => stats.processing = count,
+                Some(WebhookDeliveryStatus::Done) => stats.done = count,
+                Some(WebhookDeliveryStatus::Failed) => stats.failed = count,
+                None => return Err(anyhow::anyhow!("invalid webhook delivery state: {state}")),
+            }
+        }
+        let oldest = client
+            .query_one(
+                "SELECT MIN(received_at_us) FROM webhook_deliveries
+                 WHERE state IN ('received', 'processing')",
+                &[],
+            )
+            .await?;
+        stats.oldest_pending_received_at_us = oldest.get(0);
+        Ok(stats)
+    }
+
+    async fn load_webhook_watchdog_cursor(
+        &self,
+        scope: &str,
+    ) -> anyhow::Result<Option<WebhookWatchdogCursor>> {
+        let client = self.connection.lock().await;
+        let row = client
+            .query_opt(
+                "SELECT scope, cursor_delivered_at_us, last_poll_at_us, last_success_at_us
+                 FROM webhook_watchdog WHERE scope = $1",
+                &[&scope],
+            )
+            .await?;
+        Ok(row.map(|row| WebhookWatchdogCursor {
+            scope: row.get(0),
+            cursor_delivered_at_us: row.get(1),
+            last_poll_at_us: row.get(2),
+            last_success_at_us: row.get(3),
+        }))
+    }
+
+    async fn store_webhook_watchdog_cursor(
+        &self,
+        cursor: &WebhookWatchdogCursor,
+    ) -> anyhow::Result<()> {
+        let client = self.connection.lock().await;
+        client
+            .execute(
+                "INSERT INTO webhook_watchdog (
+                     scope, cursor_delivered_at_us, last_poll_at_us, last_success_at_us
+                 ) VALUES ($1, $2, $3, $4)
+                 ON CONFLICT(scope) DO UPDATE SET
+                     cursor_delivered_at_us = EXCLUDED.cursor_delivered_at_us,
+                     last_poll_at_us = EXCLUDED.last_poll_at_us,
+                     last_success_at_us = EXCLUDED.last_success_at_us",
+                &[
+                    &cursor.scope,
+                    &cursor.cursor_delivered_at_us,
+                    &cursor.last_poll_at_us,
+                    &cursor.last_success_at_us,
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn upsert_webhook_redelivery(
+        &self,
+        record: &WebhookRedeliveryRecord,
+    ) -> anyhow::Result<()> {
+        let client = self.connection.lock().await;
+        client
+            .execute(
+                "INSERT INTO webhook_redeliveries (
+                     delivery_guid, github_delivery_id, app_id, reason, attempts,
+                     first_seen_at_us, last_attempt_at_us, resolved_at_us, last_error
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 ON CONFLICT(delivery_guid) DO UPDATE SET
+                     github_delivery_id = EXCLUDED.github_delivery_id,
+                     app_id = EXCLUDED.app_id,
+                     reason = EXCLUDED.reason,
+                     attempts = EXCLUDED.attempts,
+                     last_attempt_at_us = EXCLUDED.last_attempt_at_us,
+                     resolved_at_us = EXCLUDED.resolved_at_us,
+                     last_error = EXCLUDED.last_error",
+                &[
+                    &record.delivery_guid,
+                    &record.github_delivery_id,
+                    &record.app_id,
+                    &record.reason.as_str(),
+                    &(record.attempts as i64),
+                    &record.first_seen_at_us,
+                    &record.last_attempt_at_us,
+                    &record.resolved_at_us,
+                    &record.last_error,
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn load_webhook_redelivery(
+        &self,
+        delivery_guid: &str,
+    ) -> anyhow::Result<Option<WebhookRedeliveryRecord>> {
+        let client = self.connection.lock().await;
+        let row = client
+            .query_opt(
+                "SELECT delivery_guid, github_delivery_id, app_id, reason, attempts,
+                        first_seen_at_us, last_attempt_at_us, resolved_at_us, last_error
+                 FROM webhook_redeliveries WHERE delivery_guid = $1",
+                &[&delivery_guid],
+            )
+            .await?;
+        row.map(pg_redelivery_record).transpose()
+    }
+
+    async fn open_webhook_redeliveries(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<WebhookRedeliveryRecord>> {
+        let client = self.connection.lock().await;
+        let rows = client
+            .query(
+                "SELECT delivery_guid, github_delivery_id, app_id, reason, attempts,
+                        first_seen_at_us, last_attempt_at_us, resolved_at_us, last_error
+                 FROM webhook_redeliveries
+                 WHERE resolved_at_us IS NULL
+                 ORDER BY first_seen_at_us ASC
+                 LIMIT $1",
+                &[&(limit.min(i64::MAX as usize) as i64)],
+            )
+            .await?;
+        rows.into_iter().map(pg_redelivery_record).collect()
+    }
+
+    async fn resolve_webhook_redelivery(
+        &self,
+        delivery_guid: &str,
+        resolved_at_us: i64,
+    ) -> anyhow::Result<bool> {
+        let client = self.connection.lock().await;
+        let rows_affected = client
+            .execute(
+                "UPDATE webhook_redeliveries SET resolved_at_us = $2
+                 WHERE delivery_guid = $1 AND resolved_at_us IS NULL",
+                &[&delivery_guid, &resolved_at_us],
+            )
+            .await?;
+        Ok(rows_affected > 0)
+    }
+
+    async fn reserve_synthetic_webhook_event(
+        &self,
+        key: &str,
+        repository: &str,
+        event: &str,
+        git_ref: &str,
+        head_sha: &str,
+        now_us: i64,
+    ) -> anyhow::Result<bool> {
+        let client = self.connection.lock().await;
+        let rows_affected = client
+            .execute(
+                "INSERT INTO webhook_synthetic_events (
+                     idempotency_key, repository, event, git_ref, head_sha, created_at_us
+                 ) VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT(idempotency_key) DO NOTHING",
+                &[&key, &repository, &event, &git_ref, &head_sha, &now_us],
+            )
+            .await?;
+        Ok(rows_affected > 0)
+    }
+}
+
+/// Decode one `webhook_redeliveries` row. A `reason` the enum does not know
+/// means a row written by a newer schema; failing loudly beats silently
+/// dropping a repair that something else is counting on.
+fn pg_redelivery_record(row: tokio_postgres::Row) -> anyhow::Result<WebhookRedeliveryRecord> {
+    let reason: String = row.get(3);
+    let attempts: i64 = row.get(4);
+    Ok(WebhookRedeliveryRecord {
+        delivery_guid: row.get(0),
+        github_delivery_id: row.get(1),
+        app_id: row.get(2),
+        reason: WebhookRepairReason::parse(&reason)
+            .ok_or_else(|| anyhow::anyhow!("invalid webhook redelivery reason: {reason}"))?,
+        attempts: attempts.max(0) as u32,
+        first_seen_at_us: row.get(5),
+        last_attempt_at_us: row.get(6),
+        resolved_at_us: row.get(7),
+        last_error: row.get(8),
+    })
 }
 
 /// Postgres dialect of the control-plane schema. Same tables as the SQLite
@@ -1649,6 +1949,42 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         CREATE UNIQUE INDEX IF NOT EXISTS runs_webhook_delivery_workflow_idx
           ON runs (webhook_delivery_id, workflow_path)
           WHERE webhook_delivery_id IS NOT NULL;
+        "#,
+    ),
+    (
+        9,
+        "webhook-delivery-repair-state",
+        r#"
+        CREATE TABLE IF NOT EXISTS webhook_watchdog (
+          scope TEXT PRIMARY KEY,
+          cursor_delivered_at_us BIGINT,
+          last_poll_at_us BIGINT,
+          last_success_at_us BIGINT
+        );
+
+        CREATE TABLE IF NOT EXISTS webhook_redeliveries (
+          delivery_guid TEXT PRIMARY KEY,
+          github_delivery_id BIGINT NOT NULL,
+          app_id TEXT NOT NULL,
+          reason TEXT NOT NULL CHECK (reason IN ('remote_failure', 'phantom_ack')),
+          attempts BIGINT NOT NULL DEFAULT 0,
+          first_seen_at_us BIGINT NOT NULL,
+          last_attempt_at_us BIGINT,
+          resolved_at_us BIGINT,
+          last_error TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS webhook_redeliveries_open_idx
+          ON webhook_redeliveries (resolved_at_us, first_seen_at_us);
+
+        CREATE TABLE IF NOT EXISTS webhook_synthetic_events (
+          idempotency_key TEXT PRIMARY KEY,
+          repository TEXT NOT NULL,
+          event TEXT NOT NULL,
+          git_ref TEXT NOT NULL,
+          head_sha TEXT NOT NULL,
+          created_at_us BIGINT NOT NULL
+        );
         "#,
     ),
 ];

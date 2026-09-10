@@ -18,7 +18,7 @@
 //! `endpoint.authorization.parameters` stays the local HMAC JWT, because that
 //! credential authenticates the runner to *this* server, not to GitHub.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1590,6 +1590,79 @@ pub(crate) async fn read_app_subscription_at(
         events,
         permissions,
     })
+}
+
+/// What `GET /app/hook/config` reports about the App's delivery endpoint.
+///
+/// Note what is *not* here: GitHub exposes no `active` flag on this
+/// endpoint, and none on `GET /app` either. An App whose webhook checkbox
+/// was unticked in the settings UI looks identical to a healthy one from
+/// the API, so "webhook disabled" is only ever detectable as silence —
+/// which is exactly why the delivery watchdog's staleness signal matters.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AppHookConfig {
+    pub(crate) url: Option<String>,
+    pub(crate) content_type: Option<String>,
+    pub(crate) insecure_ssl: Option<String>,
+}
+
+/// Read an App's webhook delivery configuration via `GET /app/hook/config`.
+///
+/// Authenticates with the App JWT, the only credential the endpoint accepts.
+/// Failure is an error, never a default: a config that could not be read
+/// must not be reported as a healthy one.
+pub(crate) async fn read_app_hook_config_at(
+    api_base: &str,
+    app_id: &str,
+    private_key: &rsa::RsaPrivateKey,
+) -> anyhow::Result<AppHookConfig> {
+    let app_jwt = sign_app_jwt(app_id, private_key)?;
+    let response = CLIENT
+        .get(format!("{api_base}/app/hook/config"))
+        .header("User-Agent", "preloop")
+        .header("Authorization", format!("Bearer {app_jwt}"))
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .with_context(|| format!("GET {api_base}/app/hook/config"))?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!(
+            "GET /app/hook/config failed with {status}: {}",
+            body.chars().take(1024).collect::<String>()
+        );
+    }
+    let payload: serde_json::Value = serde_json::from_str(&body)
+        .with_context(|| "GET /app/hook/config returned a non-JSON body")?;
+    let field = |name: &str| {
+        payload
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    Ok(AppHookConfig {
+        url: field("url"),
+        content_type: field("content_type"),
+        insecure_ssl: field("insecure_ssl"),
+    })
+}
+
+/// Every distinct App this server is configured with.
+///
+/// The registry's default entry mirrors the legacy single-App field, so a
+/// naive concatenation would poll and warn about the same App twice.
+pub(crate) fn registered_apps(state: &crate::state::AppState) -> Vec<GitHubAppCredentials> {
+    let mut apps: Vec<GitHubAppCredentials> = Vec::new();
+    if let Some(registry) = state.github_apps.as_ref() {
+        apps.extend(registry.apps.iter().cloned());
+    }
+    if let Some(app) = state.github_app.as_ref() {
+        apps.push(app.clone());
+    }
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    apps.retain(|app| seen.insert(app.app_id.clone()));
+    apps
 }
 
 /// Build credentials from raw config pieces (no environment involved).

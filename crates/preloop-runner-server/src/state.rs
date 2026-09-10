@@ -383,6 +383,13 @@ pub struct AppState {
     pub(crate) events: broadcast::Sender<NdjsonEvent>,
     pub(crate) message_notify: Arc<Notify>,
     pub(crate) webhook_queue_notify: Arc<Notify>,
+    /// Circuit breaker shared by every GitHub-dependent call in the webhook
+    /// path. Per-`AppState` rather than global so parallel tests pointing at
+    /// stub APIs cannot trip each other.
+    pub(crate) github_breaker: Arc<crate::github_breaker::GithubBreaker>,
+    /// Live status published by the delivery watchdog, the source-state
+    /// reconciler and the App webhook health monitor.
+    pub(crate) webhook_status: Arc<crate::webhook_status::WebhookResilienceStatus>,
     /// Atomic counter for pre-allocating request IDs outside the dispatch
     /// lock.  Monotonically increases; the inner counter is no longer the
     /// source of truth once this is in use.
@@ -1017,6 +1024,8 @@ impl AppState {
             events,
             message_notify: Arc::new(Notify::new()),
             webhook_queue_notify: Arc::new(Notify::new()),
+            github_breaker: Arc::new(crate::github_breaker::GithubBreaker::default()),
+            webhook_status: Arc::new(crate::webhook_status::WebhookResilienceStatus::default()),
             next_request_id: Arc::new(std::sync::atomic::AtomicI64::new(next_request_id)),
             observability: preloop_observability::Observability::noop(),
             status_snapshot: Arc::new(parking_lot::RwLock::new(

@@ -14,7 +14,10 @@
 //! of the server sees, so a new database plugs in without touching callers.
 
 use super::*;
-use crate::models::{WebhookDeliveryRecord, WebhookDeliveryStatus};
+use crate::models::{
+    WebhookDeliveryRecord, WebhookDeliveryStatus, WebhookDeliverySummary, WebhookQueueStats,
+    WebhookRedeliveryRecord, WebhookRepairReason, WebhookWatchdogCursor,
+};
 use async_trait::async_trait;
 use preloop_gha_protocol::SessionId;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -128,6 +131,83 @@ pub(crate) trait Store: Send + Sync {
     async fn recover_webhook_deliveries(&self) -> anyhow::Result<u64>;
     /// Delete old terminal deliveries while retaining recent IDs for deduplication.
     async fn prune_webhook_deliveries(&self, before_us: i64, limit: usize) -> anyhow::Result<u64>;
+    /// Park a delivery whose processing is blocked on an unavailable GitHub.
+    ///
+    /// Same effect as a non-permanent [`Store::fail_webhook_delivery`] except
+    /// the attempt is refunded: a dependency outage must not spend the
+    /// delivery's retry budget, or a 30-minute GitHub incident dead-letters
+    /// every good push that arrived during it.
+    async fn park_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+        error: &str,
+        retry_delay_secs: u64,
+    ) -> anyhow::Result<bool>;
+    /// Requeue a terminal (`done`/`failed`) delivery from the retained local
+    /// payload. Local retention outlives GitHub's three-day redelivery
+    /// window, so this is the last repair that does not need GitHub at all.
+    /// Returns `Ok(false)` when no terminal row with that id exists.
+    async fn requeue_webhook_delivery(&self, delivery_id: &str) -> anyhow::Result<bool>;
+    /// Delivery rows without payloads, newest first, optionally one state.
+    async fn list_webhook_deliveries(
+        &self,
+        state: Option<WebhookDeliveryStatus>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<WebhookDeliverySummary>>;
+    /// Which of `delivery_ids` exist locally, in any state. The join that
+    /// turns GitHub's delivery history into a phantom-ack verdict.
+    async fn webhook_deliveries_present(
+        &self,
+        delivery_ids: &[String],
+    ) -> anyhow::Result<BTreeSet<String>>;
+    /// Aggregate queue counts plus the oldest unprocessed receipt time.
+    async fn webhook_queue_stats(&self) -> anyhow::Result<WebhookQueueStats>;
+    /// Persisted delivery-history high-water mark for one App.
+    async fn load_webhook_watchdog_cursor(
+        &self,
+        scope: &str,
+    ) -> anyhow::Result<Option<WebhookWatchdogCursor>>;
+    async fn store_webhook_watchdog_cursor(
+        &self,
+        cursor: &WebhookWatchdogCursor,
+    ) -> anyhow::Result<()>;
+    /// Insert or update a repair record, keyed by delivery GUID. Attempt
+    /// bookkeeping is the caller's: the row is the durable copy of it.
+    async fn upsert_webhook_redelivery(
+        &self,
+        record: &WebhookRedeliveryRecord,
+    ) -> anyhow::Result<()>;
+    async fn load_webhook_redelivery(
+        &self,
+        delivery_guid: &str,
+    ) -> anyhow::Result<Option<WebhookRedeliveryRecord>>;
+    /// Unresolved repairs, oldest first — the watchdog's retry list and the
+    /// backlog gauge.
+    async fn open_webhook_redeliveries(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<WebhookRedeliveryRecord>>;
+    /// Close a repair once the delivery landed locally.
+    async fn resolve_webhook_redelivery(
+        &self,
+        delivery_guid: &str,
+        resolved_at_us: i64,
+    ) -> anyhow::Result<bool>;
+    /// Reserve a synthesized source-state event under its canonical
+    /// idempotency key. `Ok(false)` means it was already reserved, which is
+    /// what stops the reconciler from racing a late real webhook into a
+    /// duplicate run. Reservations are never pruned: they are tiny, and
+    /// forgetting one re-fires CI for a head that already ran.
+    async fn reserve_synthetic_webhook_event(
+        &self,
+        key: &str,
+        repository: &str,
+        event: &str,
+        git_ref: &str,
+        head_sha: &str,
+        now_us: i64,
+    ) -> anyhow::Result<bool>;
 }
 
 /// Decorator that records `preloop.store.operation.duration` for every
@@ -378,6 +458,160 @@ impl Store for InstrumentedStore {
             "prune_webhook_deliveries",
             start,
             self.inner.prune_webhook_deliveries(before_us, limit).await,
+        )
+    }
+
+    async fn park_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+        error: &str,
+        retry_delay_secs: u64,
+    ) -> anyhow::Result<bool> {
+        let start = Instant::now();
+        self.record(
+            "park_webhook_delivery",
+            start,
+            self.inner
+                .park_webhook_delivery(delivery_id, lease_token, error, retry_delay_secs)
+                .await,
+        )
+    }
+
+    async fn requeue_webhook_delivery(&self, delivery_id: &str) -> anyhow::Result<bool> {
+        let start = Instant::now();
+        self.record(
+            "requeue_webhook_delivery",
+            start,
+            self.inner.requeue_webhook_delivery(delivery_id).await,
+        )
+    }
+
+    async fn list_webhook_deliveries(
+        &self,
+        state: Option<WebhookDeliveryStatus>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<WebhookDeliverySummary>> {
+        let start = Instant::now();
+        self.record(
+            "list_webhook_deliveries",
+            start,
+            self.inner.list_webhook_deliveries(state, limit).await,
+        )
+    }
+
+    async fn webhook_deliveries_present(
+        &self,
+        delivery_ids: &[String],
+    ) -> anyhow::Result<BTreeSet<String>> {
+        let start = Instant::now();
+        self.record(
+            "webhook_deliveries_present",
+            start,
+            self.inner.webhook_deliveries_present(delivery_ids).await,
+        )
+    }
+
+    async fn webhook_queue_stats(&self) -> anyhow::Result<WebhookQueueStats> {
+        let start = Instant::now();
+        self.record(
+            "webhook_queue_stats",
+            start,
+            self.inner.webhook_queue_stats().await,
+        )
+    }
+
+    async fn load_webhook_watchdog_cursor(
+        &self,
+        scope: &str,
+    ) -> anyhow::Result<Option<WebhookWatchdogCursor>> {
+        let start = Instant::now();
+        self.record(
+            "load_webhook_watchdog_cursor",
+            start,
+            self.inner.load_webhook_watchdog_cursor(scope).await,
+        )
+    }
+
+    async fn store_webhook_watchdog_cursor(
+        &self,
+        cursor: &WebhookWatchdogCursor,
+    ) -> anyhow::Result<()> {
+        let start = Instant::now();
+        self.record(
+            "store_webhook_watchdog_cursor",
+            start,
+            self.inner.store_webhook_watchdog_cursor(cursor).await,
+        )
+    }
+
+    async fn upsert_webhook_redelivery(
+        &self,
+        record: &WebhookRedeliveryRecord,
+    ) -> anyhow::Result<()> {
+        let start = Instant::now();
+        self.record(
+            "upsert_webhook_redelivery",
+            start,
+            self.inner.upsert_webhook_redelivery(record).await,
+        )
+    }
+
+    async fn load_webhook_redelivery(
+        &self,
+        delivery_guid: &str,
+    ) -> anyhow::Result<Option<WebhookRedeliveryRecord>> {
+        let start = Instant::now();
+        self.record(
+            "load_webhook_redelivery",
+            start,
+            self.inner.load_webhook_redelivery(delivery_guid).await,
+        )
+    }
+
+    async fn open_webhook_redeliveries(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<WebhookRedeliveryRecord>> {
+        let start = Instant::now();
+        self.record(
+            "open_webhook_redeliveries",
+            start,
+            self.inner.open_webhook_redeliveries(limit).await,
+        )
+    }
+
+    async fn resolve_webhook_redelivery(
+        &self,
+        delivery_guid: &str,
+        resolved_at_us: i64,
+    ) -> anyhow::Result<bool> {
+        let start = Instant::now();
+        self.record(
+            "resolve_webhook_redelivery",
+            start,
+            self.inner
+                .resolve_webhook_redelivery(delivery_guid, resolved_at_us)
+                .await,
+        )
+    }
+
+    async fn reserve_synthetic_webhook_event(
+        &self,
+        key: &str,
+        repository: &str,
+        event: &str,
+        git_ref: &str,
+        head_sha: &str,
+        now_us: i64,
+    ) -> anyhow::Result<bool> {
+        let start = Instant::now();
+        self.record(
+            "reserve_synthetic_webhook_event",
+            start,
+            self.inner
+                .reserve_synthetic_webhook_event(key, repository, event, git_ref, head_sha, now_us)
+                .await,
         )
     }
 }
@@ -2630,6 +2864,397 @@ impl SqliteStore {
         self.maybe_checkpoint_wal(&connection)?;
         Ok(rows_affected as u64)
     }
+
+    /// Return a parked delivery to `received` without spending its attempt.
+    ///
+    /// `claim_webhook_deliveries` charges an attempt at claim time, before
+    /// anyone knows whether the failure will be the payload's fault or
+    /// GitHub's. Refunding it here is what keeps a dependency outage from
+    /// consuming the retry budget of every delivery it touches.
+    pub(crate) fn park_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+        error: &str,
+        retry_delay_secs: u64,
+    ) -> anyhow::Result<bool> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sqlite lock poisoned"))?;
+        let tx = connection.transaction()?;
+        let now = now_us();
+        let lease_until = now + (retry_delay_secs as i64 * 1_000_000);
+        let rows_affected = tx.execute(
+            "UPDATE webhook_deliveries
+             SET state = 'received', lease_until_us = ?2, lease_token = NULL,
+                 attempts = MAX(attempts - 1, 0), last_error = ?3
+             WHERE delivery_id = ?1 AND state = 'processing' AND lease_token = ?4
+               AND lease_until_us IS NOT NULL AND lease_until_us > ?5",
+            params![delivery_id, lease_until, error, lease_token, now],
+        )?;
+        tx.commit()?;
+        self.maybe_checkpoint_wal(&connection)?;
+        Ok(rows_affected > 0)
+    }
+
+    pub(crate) fn requeue_webhook_delivery(&self, delivery_id: &str) -> anyhow::Result<bool> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sqlite lock poisoned"))?;
+        let tx = connection.transaction()?;
+        let rows_affected = tx.execute(
+            "UPDATE webhook_deliveries
+             SET state = 'received', attempts = 0, lease_until_us = NULL,
+                 lease_token = NULL, last_error = NULL
+             WHERE delivery_id = ?1 AND state IN ('done', 'failed')",
+            params![delivery_id],
+        )?;
+        tx.commit()?;
+        self.maybe_checkpoint_wal(&connection)?;
+        Ok(rows_affected > 0)
+    }
+
+    pub(crate) fn list_webhook_deliveries(
+        &self,
+        state: Option<WebhookDeliveryStatus>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<WebhookDeliverySummary>> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sqlite lock poisoned"))?;
+        let limit = limit.min(i64::MAX as usize) as i64;
+        let mut stmt = connection.prepare(
+            "SELECT delivery_id, event, received_at_us, state, attempts, lease_until_us, last_error
+             FROM webhook_deliveries
+             WHERE (?1 IS NULL OR state = ?1)
+             ORDER BY received_at_us DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![state.map(|state| state.as_str()), limit], |row| {
+                let state: String = row.get(3)?;
+                let attempts: i64 = row.get(4)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    state,
+                    attempts,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(
+                |(
+                    delivery_id,
+                    event,
+                    received_at_us,
+                    state,
+                    attempts,
+                    lease_until_us,
+                    last_error,
+                )| {
+                    Ok(WebhookDeliverySummary {
+                        delivery_id,
+                        event,
+                        received_at_us,
+                        state: WebhookDeliveryStatus::parse(&state).ok_or_else(|| {
+                            anyhow::anyhow!("invalid webhook delivery state: {state}")
+                        })?,
+                        attempts: attempts.max(0) as u32,
+                        lease_until_us,
+                        last_error,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    pub(crate) fn webhook_deliveries_present(
+        &self,
+        delivery_ids: &[String],
+    ) -> anyhow::Result<BTreeSet<String>> {
+        if delivery_ids.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sqlite lock poisoned"))?;
+        // One statement per call, parameterized by count: a delivery id is
+        // attacker-influenced (it is a request header), so it never reaches
+        // SQL as literal text.
+        let placeholders = (1..=delivery_ids.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut stmt = connection.prepare(&format!(
+            "SELECT delivery_id FROM webhook_deliveries WHERE delivery_id IN ({placeholders})"
+        ))?;
+        let params = rusqlite::params_from_iter(delivery_ids.iter());
+        let found = stmt
+            .query_map(params, |row| row.get::<_, String>(0))?
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        Ok(found)
+    }
+
+    pub(crate) fn webhook_queue_stats(&self) -> anyhow::Result<WebhookQueueStats> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sqlite lock poisoned"))?;
+        let mut stats = WebhookQueueStats::default();
+        let mut stmt =
+            connection.prepare("SELECT state, COUNT(*) FROM webhook_deliveries GROUP BY state")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (state, count) in rows {
+            let count = count.max(0) as u64;
+            match WebhookDeliveryStatus::parse(&state) {
+                Some(WebhookDeliveryStatus::Received) => stats.received = count,
+                Some(WebhookDeliveryStatus::Processing) => stats.processing = count,
+                Some(WebhookDeliveryStatus::Done) => stats.done = count,
+                Some(WebhookDeliveryStatus::Failed) => stats.failed = count,
+                None => return Err(anyhow::anyhow!("invalid webhook delivery state: {state}")),
+            }
+        }
+        stats.oldest_pending_received_at_us = connection.query_row(
+            "SELECT MIN(received_at_us) FROM webhook_deliveries
+             WHERE state IN ('received', 'processing')",
+            [],
+            |row| row.get::<_, Option<i64>>(0),
+        )?;
+        Ok(stats)
+    }
+
+    pub(crate) fn load_webhook_watchdog_cursor(
+        &self,
+        scope: &str,
+    ) -> anyhow::Result<Option<WebhookWatchdogCursor>> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sqlite lock poisoned"))?;
+        let cursor = connection
+            .query_row(
+                "SELECT scope, cursor_delivered_at_us, last_poll_at_us, last_success_at_us
+                 FROM webhook_watchdog WHERE scope = ?1",
+                params![scope],
+                |row| {
+                    Ok(WebhookWatchdogCursor {
+                        scope: row.get(0)?,
+                        cursor_delivered_at_us: row.get(1)?,
+                        last_poll_at_us: row.get(2)?,
+                        last_success_at_us: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(cursor)
+    }
+
+    pub(crate) fn store_webhook_watchdog_cursor(
+        &self,
+        cursor: &WebhookWatchdogCursor,
+    ) -> anyhow::Result<()> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sqlite lock poisoned"))?;
+        let tx = connection.transaction()?;
+        tx.execute(
+            "INSERT INTO webhook_watchdog (
+                 scope, cursor_delivered_at_us, last_poll_at_us, last_success_at_us
+             ) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(scope) DO UPDATE SET
+                 cursor_delivered_at_us = excluded.cursor_delivered_at_us,
+                 last_poll_at_us = excluded.last_poll_at_us,
+                 last_success_at_us = excluded.last_success_at_us",
+            params![
+                cursor.scope,
+                cursor.cursor_delivered_at_us,
+                cursor.last_poll_at_us,
+                cursor.last_success_at_us,
+            ],
+        )?;
+        tx.commit()?;
+        self.maybe_checkpoint_wal(&connection)?;
+        Ok(())
+    }
+
+    pub(crate) fn upsert_webhook_redelivery(
+        &self,
+        record: &WebhookRedeliveryRecord,
+    ) -> anyhow::Result<()> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sqlite lock poisoned"))?;
+        let tx = connection.transaction()?;
+        tx.execute(
+            "INSERT INTO webhook_redeliveries (
+                 delivery_guid, github_delivery_id, app_id, reason, attempts,
+                 first_seen_at_us, last_attempt_at_us, resolved_at_us, last_error
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(delivery_guid) DO UPDATE SET
+                 github_delivery_id = excluded.github_delivery_id,
+                 app_id = excluded.app_id,
+                 reason = excluded.reason,
+                 attempts = excluded.attempts,
+                 last_attempt_at_us = excluded.last_attempt_at_us,
+                 resolved_at_us = excluded.resolved_at_us,
+                 last_error = excluded.last_error",
+            params![
+                record.delivery_guid,
+                record.github_delivery_id,
+                record.app_id,
+                record.reason.as_str(),
+                record.attempts as i64,
+                record.first_seen_at_us,
+                record.last_attempt_at_us,
+                record.resolved_at_us,
+                record.last_error,
+            ],
+        )?;
+        tx.commit()?;
+        self.maybe_checkpoint_wal(&connection)?;
+        Ok(())
+    }
+
+    pub(crate) fn load_webhook_redelivery(
+        &self,
+        delivery_guid: &str,
+    ) -> anyhow::Result<Option<WebhookRedeliveryRecord>> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sqlite lock poisoned"))?;
+        let row = connection
+            .query_row(
+                "SELECT delivery_guid, github_delivery_id, app_id, reason, attempts,
+                        first_seen_at_us, last_attempt_at_us, resolved_at_us, last_error
+                 FROM webhook_redeliveries WHERE delivery_guid = ?1",
+                params![delivery_guid],
+                parse_redelivery_row,
+            )
+            .optional()?;
+        row.transpose()
+    }
+
+    pub(crate) fn open_webhook_redeliveries(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<WebhookRedeliveryRecord>> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sqlite lock poisoned"))?;
+        let mut stmt = connection.prepare(
+            "SELECT delivery_guid, github_delivery_id, app_id, reason, attempts,
+                    first_seen_at_us, last_attempt_at_us, resolved_at_us, last_error
+             FROM webhook_redeliveries
+             WHERE resolved_at_us IS NULL
+             ORDER BY first_seen_at_us ASC
+             LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![limit.min(i64::MAX as usize) as i64],
+                parse_redelivery_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().collect()
+    }
+
+    pub(crate) fn resolve_webhook_redelivery(
+        &self,
+        delivery_guid: &str,
+        resolved_at_us: i64,
+    ) -> anyhow::Result<bool> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sqlite lock poisoned"))?;
+        let tx = connection.transaction()?;
+        let rows_affected = tx.execute(
+            "UPDATE webhook_redeliveries SET resolved_at_us = ?2
+             WHERE delivery_guid = ?1 AND resolved_at_us IS NULL",
+            params![delivery_guid, resolved_at_us],
+        )?;
+        tx.commit()?;
+        self.maybe_checkpoint_wal(&connection)?;
+        Ok(rows_affected > 0)
+    }
+
+    pub(crate) fn reserve_synthetic_webhook_event(
+        &self,
+        key: &str,
+        repository: &str,
+        event: &str,
+        git_ref: &str,
+        head_sha: &str,
+        now_us: i64,
+    ) -> anyhow::Result<bool> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sqlite lock poisoned"))?;
+        let tx = connection.transaction()?;
+        let rows_affected = tx.execute(
+            "INSERT INTO webhook_synthetic_events (
+                 idempotency_key, repository, event, git_ref, head_sha, created_at_us
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(idempotency_key) DO NOTHING",
+            params![key, repository, event, git_ref, head_sha, now_us],
+        )?;
+        tx.commit()?;
+        self.maybe_checkpoint_wal(&connection)?;
+        Ok(rows_affected > 0)
+    }
+}
+
+/// Decode one `webhook_redeliveries` row.
+///
+/// The outer `rusqlite::Result` is column access; the inner `anyhow::Result`
+/// is the domain decode, which can fail only on a row written by a future
+/// (or corrupted) schema. Keeping them apart means a bad `reason` string
+/// surfaces as an error instead of a silently dropped repair.
+fn parse_redelivery_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<anyhow::Result<WebhookRedeliveryRecord>> {
+    let delivery_guid: String = row.get(0)?;
+    let github_delivery_id: i64 = row.get(1)?;
+    let app_id: String = row.get(2)?;
+    let reason: String = row.get(3)?;
+    let attempts: i64 = row.get(4)?;
+    let first_seen_at_us: i64 = row.get(5)?;
+    let last_attempt_at_us: Option<i64> = row.get(6)?;
+    let resolved_at_us: Option<i64> = row.get(7)?;
+    let last_error: Option<String> = row.get(8)?;
+    Ok(match WebhookRepairReason::parse(&reason) {
+        Some(reason) => Ok(WebhookRedeliveryRecord {
+            delivery_guid,
+            github_delivery_id,
+            app_id,
+            reason,
+            attempts: attempts.max(0) as u32,
+            first_seen_at_us,
+            last_attempt_at_us,
+            resolved_at_us,
+            last_error,
+        }),
+        None => Err(anyhow::anyhow!(
+            "invalid webhook redelivery reason: {reason}"
+        )),
+    })
 }
 
 #[async_trait]
@@ -2832,6 +3457,158 @@ impl Store for SqliteStore {
         tokio::task::spawn_blocking(move || store.prune_webhook_deliveries(before_us, limit))
             .await
             .map_err(|error| anyhow::anyhow!("prune webhook deliveries task panicked: {error}"))?
+    }
+
+    async fn park_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+        error: &str,
+        retry_delay_secs: u64,
+    ) -> anyhow::Result<bool> {
+        let store = self.clone();
+        let delivery_id = delivery_id.to_owned();
+        let lease_token = lease_token.to_owned();
+        let error = error.to_owned();
+        tokio::task::spawn_blocking(move || {
+            store.park_webhook_delivery(&delivery_id, &lease_token, &error, retry_delay_secs)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("park webhook delivery task panicked: {error}"))?
+    }
+
+    async fn requeue_webhook_delivery(&self, delivery_id: &str) -> anyhow::Result<bool> {
+        let store = self.clone();
+        let delivery_id = delivery_id.to_owned();
+        tokio::task::spawn_blocking(move || store.requeue_webhook_delivery(&delivery_id))
+            .await
+            .map_err(|error| anyhow::anyhow!("requeue webhook delivery task panicked: {error}"))?
+    }
+
+    async fn list_webhook_deliveries(
+        &self,
+        state: Option<WebhookDeliveryStatus>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<WebhookDeliverySummary>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.list_webhook_deliveries(state, limit))
+            .await
+            .map_err(|error| anyhow::anyhow!("list webhook deliveries task panicked: {error}"))?
+    }
+
+    async fn webhook_deliveries_present(
+        &self,
+        delivery_ids: &[String],
+    ) -> anyhow::Result<BTreeSet<String>> {
+        let store = self.clone();
+        let delivery_ids = delivery_ids.to_vec();
+        tokio::task::spawn_blocking(move || store.webhook_deliveries_present(&delivery_ids))
+            .await
+            .map_err(|error| anyhow::anyhow!("webhook delivery presence task panicked: {error}"))?
+    }
+
+    async fn webhook_queue_stats(&self) -> anyhow::Result<WebhookQueueStats> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.webhook_queue_stats())
+            .await
+            .map_err(|error| anyhow::anyhow!("webhook queue stats task panicked: {error}"))?
+    }
+
+    async fn load_webhook_watchdog_cursor(
+        &self,
+        scope: &str,
+    ) -> anyhow::Result<Option<WebhookWatchdogCursor>> {
+        let store = self.clone();
+        let scope = scope.to_owned();
+        tokio::task::spawn_blocking(move || store.load_webhook_watchdog_cursor(&scope))
+            .await
+            .map_err(|error| anyhow::anyhow!("load watchdog cursor task panicked: {error}"))?
+    }
+
+    async fn store_webhook_watchdog_cursor(
+        &self,
+        cursor: &WebhookWatchdogCursor,
+    ) -> anyhow::Result<()> {
+        let store = self.clone();
+        let cursor = cursor.clone();
+        tokio::task::spawn_blocking(move || store.store_webhook_watchdog_cursor(&cursor))
+            .await
+            .map_err(|error| anyhow::anyhow!("store watchdog cursor task panicked: {error}"))?
+    }
+
+    async fn upsert_webhook_redelivery(
+        &self,
+        record: &WebhookRedeliveryRecord,
+    ) -> anyhow::Result<()> {
+        let store = self.clone();
+        let record = record.clone();
+        tokio::task::spawn_blocking(move || store.upsert_webhook_redelivery(&record))
+            .await
+            .map_err(|error| anyhow::anyhow!("upsert webhook redelivery task panicked: {error}"))?
+    }
+
+    async fn load_webhook_redelivery(
+        &self,
+        delivery_guid: &str,
+    ) -> anyhow::Result<Option<WebhookRedeliveryRecord>> {
+        let store = self.clone();
+        let delivery_guid = delivery_guid.to_owned();
+        tokio::task::spawn_blocking(move || store.load_webhook_redelivery(&delivery_guid))
+            .await
+            .map_err(|error| anyhow::anyhow!("load webhook redelivery task panicked: {error}"))?
+    }
+
+    async fn open_webhook_redeliveries(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<WebhookRedeliveryRecord>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.open_webhook_redeliveries(limit))
+            .await
+            .map_err(|error| anyhow::anyhow!("open webhook redeliveries task panicked: {error}"))?
+    }
+
+    async fn resolve_webhook_redelivery(
+        &self,
+        delivery_guid: &str,
+        resolved_at_us: i64,
+    ) -> anyhow::Result<bool> {
+        let store = self.clone();
+        let delivery_guid = delivery_guid.to_owned();
+        tokio::task::spawn_blocking(move || {
+            store.resolve_webhook_redelivery(&delivery_guid, resolved_at_us)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("resolve webhook redelivery task panicked: {error}"))?
+    }
+
+    async fn reserve_synthetic_webhook_event(
+        &self,
+        key: &str,
+        repository: &str,
+        event: &str,
+        git_ref: &str,
+        head_sha: &str,
+        now_us: i64,
+    ) -> anyhow::Result<bool> {
+        let store = self.clone();
+        let key = key.to_owned();
+        let repository = repository.to_owned();
+        let event = event.to_owned();
+        let git_ref = git_ref.to_owned();
+        let head_sha = head_sha.to_owned();
+        tokio::task::spawn_blocking(move || {
+            store.reserve_synthetic_webhook_event(
+                &key,
+                &repository,
+                &event,
+                &git_ref,
+                &head_sha,
+                now_us,
+            )
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("reserve synthetic webhook task panicked: {error}"))?
     }
 }
 
@@ -3109,6 +3886,42 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         CREATE UNIQUE INDEX IF NOT EXISTS runs_webhook_delivery_workflow_idx
           ON runs (webhook_delivery_id, workflow_path)
           WHERE webhook_delivery_id IS NOT NULL;
+        "#,
+    ),
+    (
+        9,
+        "webhook-delivery-repair-state",
+        r#"
+        CREATE TABLE IF NOT EXISTS webhook_watchdog (
+          scope TEXT PRIMARY KEY,
+          cursor_delivered_at_us INTEGER,
+          last_poll_at_us INTEGER,
+          last_success_at_us INTEGER
+        ) STRICT;
+
+        CREATE TABLE IF NOT EXISTS webhook_redeliveries (
+          delivery_guid TEXT PRIMARY KEY,
+          github_delivery_id INTEGER NOT NULL,
+          app_id TEXT NOT NULL,
+          reason TEXT NOT NULL CHECK (reason IN ('remote_failure', 'phantom_ack')),
+          attempts INTEGER NOT NULL DEFAULT 0,
+          first_seen_at_us INTEGER NOT NULL,
+          last_attempt_at_us INTEGER,
+          resolved_at_us INTEGER,
+          last_error TEXT
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS webhook_redeliveries_open_idx
+          ON webhook_redeliveries (resolved_at_us, first_seen_at_us);
+
+        CREATE TABLE IF NOT EXISTS webhook_synthetic_events (
+          idempotency_key TEXT PRIMARY KEY,
+          repository TEXT NOT NULL,
+          event TEXT NOT NULL,
+          git_ref TEXT NOT NULL,
+          head_sha TEXT NOT NULL,
+          created_at_us INTEGER NOT NULL
+        ) STRICT;
         "#,
     ),
 ];

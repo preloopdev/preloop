@@ -523,6 +523,106 @@ pub(crate) struct WebhookDeliveryRecord {
     pub(crate) lease_token: Option<String>,
     pub(crate) last_error: Option<String>,
 }
+
+/// A webhook delivery row without its payload — the operator listing surface.
+///
+/// The payload is the one field that can reach 25 MiB, and no listing needs
+/// it; keeping it out of this type means a list endpoint cannot accidentally
+/// stream the whole queue's bodies (or their decrypted secrets) to a client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WebhookDeliverySummary {
+    pub(crate) delivery_id: String,
+    pub(crate) event: String,
+    pub(crate) received_at_us: i64,
+    pub(crate) state: WebhookDeliveryStatus,
+    pub(crate) attempts: u32,
+    pub(crate) lease_until_us: Option<i64>,
+    pub(crate) last_error: Option<String>,
+}
+
+/// Aggregate queue health, read by the status snapshot and the health API.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WebhookQueueStats {
+    pub(crate) received: u64,
+    pub(crate) processing: u64,
+    pub(crate) done: u64,
+    pub(crate) failed: u64,
+    /// Receipt time of the oldest row still awaiting a terminal state. A
+    /// growing age here is the only signal that separates "queue is quiet"
+    /// from "queue is stuck".
+    pub(crate) oldest_pending_received_at_us: Option<i64>,
+}
+
+/// Persisted high-water mark for one GitHub App's delivery-history poll.
+///
+/// GitHub keeps delivery history for three days and never resends on its
+/// own, so the watchdog's cursor is the difference between repairing a lost
+/// delivery and never learning it existed. It is persisted per App id: a
+/// restart must not rewind (duplicate work) or skip forward (silent gap).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WebhookWatchdogCursor {
+    /// GitHub App id the cursor belongs to.
+    pub(crate) scope: String,
+    /// Newest `delivered_at` the watchdog has fully examined. Never advanced
+    /// past the grace window, and never advanced on a failed poll.
+    pub(crate) cursor_delivered_at_us: Option<i64>,
+    /// When a poll was last attempted, successful or not.
+    pub(crate) last_poll_at_us: Option<i64>,
+    /// When a poll last completed without error. Staleness here is an alert:
+    /// a blind watchdog looks exactly like a quiet one.
+    pub(crate) last_success_at_us: Option<i64>,
+}
+
+/// Why the watchdog wants a delivery replayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WebhookRepairReason {
+    /// GitHub recorded a non-2xx (or no) response: the delivery never landed.
+    RemoteFailure,
+    /// GitHub recorded success but no local row exists — the phantom ack.
+    PhantomAck,
+}
+
+impl WebhookRepairReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::RemoteFailure => "remote_failure",
+            Self::PhantomAck => "phantom_ack",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "remote_failure" => Some(Self::RemoteFailure),
+            "phantom_ack" => Some(Self::PhantomAck),
+            _ => None,
+        }
+    }
+}
+
+/// One remote delivery the watchdog is repairing, and how hard it has tried.
+///
+/// Keyed by the GitHub delivery GUID — the same key the ingress deduplicates
+/// on — so a redelivery that finally lands is recognised as the repair of
+/// this row rather than as new work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WebhookRedeliveryRecord {
+    pub(crate) delivery_guid: String,
+    /// Numeric delivery id: `POST /app/hook/deliveries/{id}/attempts` takes
+    /// this, not the GUID.
+    pub(crate) github_delivery_id: i64,
+    /// App id that owns the delivery, so a multi-App deployment redelivers
+    /// with the right JWT.
+    pub(crate) app_id: String,
+    pub(crate) reason: WebhookRepairReason,
+    pub(crate) attempts: u32,
+    pub(crate) first_seen_at_us: i64,
+    pub(crate) last_attempt_at_us: Option<i64>,
+    /// Set once the delivery is present locally; a resolved row is history,
+    /// not backlog.
+    pub(crate) resolved_at_us: Option<i64>,
+    pub(crate) last_error: Option<String>,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PendingCache {
     pub(crate) key: String,

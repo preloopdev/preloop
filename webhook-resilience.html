@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Preloop — Webhook Failure Scenarios &amp; Remediation</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..900;1,9..144,300..900&family=Outfit:wght@300..800&family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
+<style>
+:root{
+  --ink:#0a0e14; --ink2:#0e141f; --panel:#111927; --panel2:#151f31;
+  --line:#233148; --line2:#2e405c;
+  --txt:#e8eef7; --dim:#93a3bd; --faint:#5b6b87;
+  --amber:#ffb224; --mint:#3ddc97; --red:#ff5d5d; --cyan:#6ee7ff; --violet:#b8a6ff;
+  --mono:'IBM Plex Mono',ui-monospace,monospace;
+  --disp:'Fraunces',Georgia,serif;
+  --body:'Outfit',system-ui,sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{
+  background:var(--ink); color:var(--txt); font-family:var(--body);
+  background-image:
+    linear-gradient(rgba(110,231,255,.045) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(110,231,255,.045) 1px,transparent 1px),
+    radial-gradient(1100px 500px at 80% -10%,rgba(255,178,36,.10),transparent 60%),
+    radial-gradient(900px 600px at 0% 20%,rgba(184,166,255,.08),transparent 60%);
+  background-size:44px 44px,44px 44px,auto,auto;
+  min-height:100vh;
+}
+.grain{position:fixed;inset:0;pointer-events:none;opacity:.5;mix-blend-mode:overlay;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='.14'/%3E%3C/svg%3E");}
+.wrap{max-width:1180px;margin:0 auto;padding:0 28px 120px}
+/* ---------- hero ---------- */
+.hero{padding:72px 0 18px;position:relative}
+.kicker{font-family:var(--mono);font-size:12px;letter-spacing:.22em;text-transform:uppercase;color:var(--amber);display:flex;align-items:center;gap:12px}
+.kicker::before{content:"";width:34px;height:2px;background:var(--amber);display:inline-block}
+h1{font-family:var(--disp);font-weight:560;font-size:clamp(38px,5.4vw,68px);line-height:.98;letter-spacing:-.02em;margin:18px 0 14px}
+h1 em{font-style:italic;color:var(--cyan);font-weight:400}
+.sub{color:var(--dim);font-size:17px;max-width:760px;line-height:1.6}
+.sub code{font-family:var(--mono);font-size:13px;color:var(--amber);background:rgba(255,178,36,.1);padding:1px 7px;border-radius:6px;border:1px solid rgba(255,178,36,.25)}
+.hero-meta{display:flex;flex-wrap:wrap;gap:10px;margin-top:22px}
+.pill{font-family:var(--mono);font-size:12px;padding:7px 12px;border-radius:999px;border:1px solid var(--line2);color:var(--dim);background:rgba(17,25,39,.7)}
+.pill b{color:var(--txt)}
+.pill.ok{border-color:rgba(61,220,151,.4);color:var(--mint)}
+.pill.warn{border-color:rgba(255,178,36,.45);color:var(--amber)}
+.pill.bad{border-color:rgba(255,93,93,.45);color:var(--red)}
+/* ---------- legend + toc ---------- */
+.deck{display:grid;grid-template-columns:1.2fr .8fr;gap:16px;margin:26px 0 8px}
+@media(max-width:900px){.deck{grid-template-columns:1fr}}
+.card{background:linear-gradient(180deg,var(--panel),var(--ink2));border:1px solid var(--line);border-radius:18px;padding:22px 24px;position:relative;overflow:hidden}
+.card::after{content:"";position:absolute;inset:0 0 auto 0;height:1px;background:linear-gradient(90deg,transparent,rgba(110,231,255,.4),transparent)}
+.legend h3,.keys h3{font-family:var(--mono);font-size:11px;letter-spacing:.2em;text-transform:uppercase;color:var(--faint);margin-bottom:14px}
+.lrow{display:flex;gap:10px;align-items:flex-start;margin:9px 0;font-size:14px;color:var(--dim);line-height:1.5}
+.dot{width:11px;height:11px;border-radius:3px;margin-top:4px;flex:none}
+.toc{position:sticky;top:0;z-index:30;background:rgba(10,14,20,.86);backdrop-filter:blur(14px);border-bottom:1px solid var(--line);margin:18px -28px 0;padding:12px 28px;display:flex;gap:8px;overflow-x:auto;scrollbar-width:none}
+.toc a{font-family:var(--mono);font-size:12px;color:var(--dim);text-decoration:none;border:1px solid var(--line);padding:7px 12px;border-radius:999px;white-space:nowrap;transition:.2s}
+.toc a:hover{color:var(--txt);border-color:var(--cyan)}
+.toc a.active{color:#08131a;background:var(--cyan);border-color:var(--cyan);font-weight:600}
+.filters{display:flex;gap:8px;margin:22px 0 6px;flex-wrap:wrap}
+.fbtn{font-family:var(--mono);font-size:12px;background:transparent;color:var(--dim);border:1px solid var(--line2);border-radius:999px;padding:8px 14px;cursor:pointer;transition:.2s}
+.fbtn.on{background:var(--amber);border-color:var(--amber);color:#1a1206;font-weight:600}
+/* ---------- scenario ---------- */
+.scn{margin:26px 0;border:1px solid var(--line);border-radius:22px;overflow:hidden;background:linear-gradient(180deg,rgba(21,31,49,.92),rgba(10,14,20,.96))}
+.scn.hide{display:none}
+.scn-head{display:grid;grid-template-columns:88px 1fr auto;gap:18px;padding:26px 28px 18px;align-items:start}
+.num{font-family:var(--disp);font-style:italic;font-size:52px;line-height:1;color:var(--amber);opacity:.95}
+.scn-head h2{font-family:var(--disp);font-size:clamp(22px,2.6vw,30px);font-weight:560;letter-spacing:-.01em;line-height:1.1}
+.scn-head h2 span{color:var(--faint);font-family:var(--mono);font-size:12px;letter-spacing:.18em;display:block;margin-bottom:8px;font-style:normal}
+.tag{font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;padding:7px 12px;border-radius:999px;border:1px solid;white-space:nowrap;margin-top:6px}
+.tag.have{color:var(--mint);border-color:rgba(61,220,151,.5);background:rgba(61,220,151,.08)}
+.tag.gap{color:var(--amber);border-color:rgba(255,178,36,.5);background:rgba(255,178,36,.08)}
+.tag.plan{color:var(--cyan);border-color:rgba(110,231,255,.5);background:rgba(110,231,255,.07)}
+.diagram{margin:0 28px;border:1px solid var(--line);border-radius:14px;background:#0b111c;padding:20px 18px;position:relative;overflow-x:auto}
+.dlabel{font-family:var(--mono);font-size:10px;letter-spacing:.2em;color:var(--faint);text-transform:uppercase;margin-bottom:14px;display:flex;justify-content:space-between;gap:10px}
+.dlabel i{font-style:normal;color:var(--cyan)}
+.flow{display:flex;align-items:stretch;gap:0;min-width:760px}
+.node{flex:1;border:1px solid var(--line2);border-radius:12px;padding:12px 13px;background:var(--panel2);position:relative;min-width:0}
+.node .t{font-family:var(--mono);font-size:12px;font-weight:600;margin-bottom:4px}
+.node .s{font-size:12.5px;color:var(--dim);line-height:1.5}
+.node .s code{font-family:var(--mono);font-size:11px;color:var(--cyan)}
+.node.gh{border-color:rgba(184,166,255,.5)} .node.gh .t{color:var(--violet)}
+.node.edge{border-color:rgba(110,231,255,.5)} .node.edge .t{color:var(--cyan)}
+.node.store{border-color:rgba(255,178,36,.55)} .node.store .t{color:var(--amber)}
+.node.work{border-color:rgba(61,220,151,.4)} .node.work .t{color:var(--mint)}
+.node.fail{border-color:rgba(255,93,93,.6);background:rgba(255,93,93,.07)} .node.fail .t{color:var(--red)}
+.node.okk{border-color:rgba(61,220,151,.6);background:rgba(61,220,151,.06)} .node.okk .t{color:var(--mint)}
+.node .badge{position:absolute;top:-9px;left:10px;font-family:var(--mono);font-size:10px;background:var(--ink);border:1px solid var(--line2);border-radius:999px;padding:1px 8px;color:var(--dim)}
+.conn{align-self:center;flex:none;width:44px;position:relative;height:2px;background:var(--line2);margin:0 2px}
+.conn::after{content:"▸";position:absolute;right:-7px;top:50%;transform:translateY(-58%);color:var(--faint);font-size:14px}
+.conn.lost{background:repeating-linear-gradient(90deg,var(--red) 0 6px,transparent 6px 11px)}
+.conn.lost::after{color:var(--red)}
+.conn.good{background:var(--mint)} .conn.good::after{color:var(--mint)}
+.conn.retry{background:repeating-linear-gradient(90deg,var(--amber) 0 6px,transparent 6px 11px)} .conn.retry::after{color:var(--amber);content:"↻"}
+.pulse{animation:pl 2s infinite}
+@keyframes pl{0%,100%{box-shadow:0 0 0 0 rgba(255,93,93,.0)}50%{box-shadow:0 0 0 5px rgba(255,93,93,.14)}}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:0;margin:0 28px 8px;border:1px solid var(--line);border-top:0;border-radius:0 0 14px 14px;overflow:hidden}
+@media(max-width:860px){.cols{grid-template-columns:1fr}.flow{min-width:640px}.scn-head{grid-template-columns:56px 1fr}.num{font-size:38px}.tag{display:none}}
+.col{padding:20px 22px}
+.col:first-child{border-right:1px solid var(--line);background:rgba(255,93,93,.03)}
+.col:last-child{background:rgba(61,220,151,.03)}
+.col h4{font-family:var(--mono);font-size:11px;letter-spacing:.2em;text-transform:uppercase;margin-bottom:12px}
+.col:first-child h4{color:var(--red)} .col:last-child h4{color:var(--mint)}
+.col ul{list-style:none}
+.col li{font-size:14px;color:var(--dim);line-height:1.6;padding:7px 0 7px 22px;position:relative;border-bottom:1px dashed rgba(35,49,72,.7)}
+.col li:last-child{border-bottom:0}
+.col li::before{content:"—";position:absolute;left:0;color:var(--faint)}
+.col li b{color:var(--txt);font-weight:600}
+.col li code,.foot code{font-family:var(--mono);font-size:12px;color:var(--cyan);background:rgba(110,231,255,.08);padding:1px 6px;border-radius:5px}
+.foot{display:flex;flex-wrap:wrap;gap:8px;padding:0 28px 24px}
+.snip{font-family:var(--mono);font-size:11.5px;color:var(--dim);border:1px solid var(--line);background:#0b111c;border-radius:9px;padding:8px 11px;display:flex;gap:10px;align-items:center}
+.snip b{color:var(--amber);font-weight:500}
+.snip button{background:transparent;border:1px solid var(--line2);color:var(--dim);border-radius:7px;font-family:var(--mono);font-size:11px;padding:4px 9px;cursor:pointer}
+.snip button:hover{color:var(--txt);border-color:var(--cyan)}
+/* stack table */
+.matrix{margin:0 28px 24px;border:1px solid var(--line);border-radius:14px;overflow:hidden}
+.mrow{display:grid;grid-template-columns:52px 1.1fr 1.4fr 1fr;gap:0;font-size:13.5px}
+.mrow>div{padding:13px 16px;border-bottom:1px solid var(--line);color:var(--dim);line-height:1.55}
+.mrow.head>div{font-family:var(--mono);font-size:10.5px;letter-spacing:.18em;text-transform:uppercase;color:var(--faint);background:rgba(110,231,255,.04)}
+.mrow>div:first-child{font-family:var(--disp);font-style:italic;font-size:22px;color:var(--amber)}
+.mrow b{color:var(--txt)}
+@media(max-width:860px){.mrow{grid-template-columns:40px 1fr 1fr}.mrow>div:nth-child(4){display:none}}
+footer{margin-top:34px;color:var(--faint);font-size:13px;line-height:1.7}
+footer a{color:var(--cyan)}
+.src{font-family:var(--mono);font-size:11px}
+</style>
+</head>
+<body>
+<div class="grain"></div>
+<div class="wrap">
+
+  <header class="hero">
+    <div class="kicker">Preloop control plane · webhook resilience</div>
+    <h1>What if GitHub <em>doesn't deliver?</em></h1>
+    <p class="sub">GitHub sends each webhook <b>once</b> and never auto-retries a failure. Preloop answers <code>202</code> only after the raw delivery is committed to the durable queue. Everything after that is our problem — and our repair surface. This page maps each failure to its flow and fix.</p>
+    <div class="hero-meta">
+      <span class="pill ok">● durable boundary = <b>&nbsp;202 after DB commit</b></span>
+      <span class="pill warn">● GitHub redelivery window <b>&nbsp;3 days, manual / API</b></span>
+      <span class="pill">HTTP <b>&nbsp;2xx ≤ 10s = success</b></span>
+      <span class="pill bad">● no automatic resend</span>
+    </div>
+  </header>
+
+  <nav class="toc" id="toc">
+    <a href="#happy">happy path</a><a href="#s1">1 · DB down pre-202</a><a href="#s2">2 · transient post-202</a><a href="#s3">3 · edge failure</a><a href="#s4">4 · acked, row lost</a><a href="#s5">5 · delayed / throttled</a><a href="#s6">6 · GitHub API outage</a><a href="#s7">7 · never attempted</a><a href="#s8">8 · config drift</a><a href="#stack">remediation stack</a>
+  </nav>
+
+  <div class="deck">
+    <div class="card legend">
+      <h3>How to read these diagrams</h3>
+      <div class="lrow"><span class="dot" style="background:#b8a6ff"></span><span><b style="color:#fff">violet</b> — GitHub side (event, delivery history, REST API).</span></div>
+      <div class="lrow"><span class="dot" style="background:#6ee7ff"></span><span><b style="color:#fff">cyan</b> — ingress / HTTP boundary (Funnel, proxy, 202/500).</span></div>
+      <div class="lrow"><span class="dot" style="background:#ffb224"></span><span><b style="color:#fff">amber</b> — durable store (<code style="font-family:var(--mono);font-size:12px;color:var(--amber)">webhook_deliveries</code>). The only thing GitHub's 202 is allowed to mean.</span></div>
+      <div class="lrow"><span class="dot" style="background:#3ddc97"></span><span><b style="color:#fff">green</b> — background worker (leases, retries, checks).</span></div>
+      <div class="lrow"><span class="dot" style="background:#ff5d5d"></span><span><b style="color:#fff">red dashed</b> — the failure edge. Everything left of it exists; everything right of it never happened.</span></div>
+    </div>
+    <div class="card keys">
+      <h3>Ground rules (already true)</h3>
+      <div class="lrow">✦&nbsp; Enqueue budget: <b style="color:#fff">8s, 2 attempts</b> — then 500, never a hung GitHub connection.</div>
+      <div class="lrow">✦&nbsp; Processing retry: <b style="color:#fff">1s → 5s → 15s → 30s</b>, max 6 attempts, 60s lease / 20s heartbeat.</div>
+      <div class="lrow">✦&nbsp; Redelivery key: <b style="color:#fff">X-GitHub-Delivery GUID</b> — active/done dedup, failed rows reopen.</div>
+      <div class="lrow">✦&nbsp; Payload ceiling: <b style="color:#fff">32 MiB</b> (above GitHub's 25 MiB) so real deliveries get a verdict, not a reset.</div>
+    </div>
+  </div>
+
+  <div class="filters">
+    <button class="fbtn on" data-f="all">all scenarios</button>
+    <button class="fbtn" data-f="have">protected today</button>
+    <button class="fbtn" data-f="gap">needs reconciler</button>
+  </div>
+
+  <!-- HAPPY -->
+  <section class="scn" id="happy" data-k="have">
+    <div class="scn-head"><div class="num">00</div><div><h2><span>BASELINE · THE DURABLE BOUNDARY</span>Happy path: commit, then acknowledge</h2></div><span class="tag have">● have now</span></div>
+    <div class="diagram"><div class="dlabel"><span>FLOW · push event → run + checks</span><i>github.rs:961–1095</i></div>
+      <div class="flow">
+        <div class="node gh"><span class="badge">1</span><div class="t">GitHub event</div><div class="s">push / PR · signs <code>X-Hub-Signature-256</code>, stamps <code>X-GitHub-Delivery</code></div></div><div class="conn"></div>
+        <div class="node edge"><span class="badge">2</span><div class="t">Verify + enqueue</div><div class="s">HMAC check → encrypt payload → <code>INSERT webhook_deliveries</code> in ≤8s</div></div><div class="conn good"></div>
+        <div class="node okk"><span class="badge">3</span><div class="t">202 Accepted</div><div class="s"><code>{"delivery_id","accepted"}</code> — GitHub marks success</div></div><div class="conn"></div>
+        <div class="node work"><span class="badge">4</span><div class="t">Worker drains</div><div class="s">claim 1 row · 60s lease · fetch workflows · submit run · report checks → <code>done</code></div></div>
+      </div>
+    </div>
+    <div class="cols"><div class="col"><h4>Why this ordering matters</h4><ul><li>GitHub's <b>10s / 2xx rule</b> means slow synchronous processing = recorded failure.</li><li>A <b>202 before commit</b> would be a lie: GitHub won't resend, and we'd have no copy.</li><li>Duplicates (GitHub double-fire, redelivery) return <b>202 duplicate</b>, no second run number.</li></ul></div>
+    <div class="col"><h4>Already handled</h4><ul><li>Duplicate GUIDs <b>deduplicate</b> before run-number allocation.</li><li>Replayed payloads <b>reuse the run</b> and PATCH the existing check instead of POSTing a second.</li><li>Crash between run creation and <code>done</code> is <b>at-least-once + idempotent</b>, not exactly-once.</li></ul></div></div>
+    <div class="foot"><span class="snip"><b>POST</b> /api/v1/github/webhooks → 202</span><span class="snip src">store.rs:2319 · claim_webhook_deliveries FIFO</span></div>
+  </section>
+
+  <!-- S1 -->
+  <section class="scn" id="s1" data-k="have">
+    <div class="scn-head"><div class="num">01</div><div><h2><span>SCENARIO 1 · PRE-ACK FAILURE</span>Database down before the 202 — we must refuse to ack</h2></div><span class="tag have">● have now</span></div>
+    <div class="diagram"><div class="dlabel"><span>FLOW · the payload exists only in request memory</span><i>2 attempts, then 500</i></div>
+      <div class="flow">
+        <div class="node gh"><span class="badge">1</span><div class="t">GitHub POSTs</div><div class="s">delivery <code>abc-123</code> · waits ≤10s</div></div><div class="conn"></div>
+        <div class="node edge"><span class="badge">2</span><div class="t">Signature OK</div><div class="s">body verified, record built</div></div><div class="conn"></div>
+        <div class="node fail pulse"><span class="badge">✕</span><div class="t">Store commit fails</div><div class="s">SQLite/PG down · lock contended · budget exhausted</div></div><div class="conn lost"></div>
+        <div class="node fail"><span class="badge">3</span><div class="t">500, no 202</div><div class="s">GitHub logs <code>failure</code> · <b>we hold no copy</b></div></div>
+      </div>
+    </div>
+    <div class="cols"><div class="col"><h4>If we got this wrong</h4><ul><li>Returning <b>202 without a commit</b> deletes the only copy: GitHub won't resend, we have nothing queued. Silent CI dark.</li><li>Hanging past <b>10s</b> is the same as a 500, minus the clear log line.</li></ul></div>
+    <div class="col"><h4>Correct handling</h4><ul><li>Retry the insert <b>twice inside 8s</b>, then return <b>500</b> with <code>Failed to commit … redelivery is manual</code>.</li><li>Operator: restore store → GitHub <b>Recent deliveries → Redeliver</b> (or <code>POST …/attempts</code>) within <b>3 days</b>.</li><li>Same GUID re-POSTs cleanly: failed rows <b>reopen</b>, completed rows dedup.</li></ul></div></div>
+    <div class="foot"><span class="snip"><b>POST</b> /app/hook/deliveries/{id}/attempts → 202 <button onclick="navigator.clipboard.writeText('curl -X POST -H &quot;Authorization: Bearer $APP_JWT&quot; -H &quot;Accept: application/vnd.github+json&quot; https://api.github.com/app/hook/deliveries/ID/attempts')">copy curl</button></span><span class="snip src">github.rs:1001–1095 · enqueue_webhook_delivery_with_budget</span></div>
+  </section>
+
+  <!-- S2 -->
+  <section class="scn" id="s2" data-k="have">
+    <div class="scn-head"><div class="num">02</div><div><h2><span>SCENARIO 2 · POST-ACK TRANSIENT</span>202 returned, then workflow fetch / SHA resolve fails</h2></div><span class="tag have">● have now</span></div>
+    <div class="diagram"><div class="dlabel"><span>FLOW · GitHub is done; the worker owns recovery</span><i>backoff 1 → 5 → 15 → 30s · ≤6 attempts</i></div>
+      <div class="flow">
+        <div class="node okk"><span class="badge">✓</span><div class="t">202 committed</div><div class="s">row = <code>received</code> · GitHub success</div></div><div class="conn"></div>
+        <div class="node work"><span class="badge">1</span><div class="t">Claim + lease</div><div class="s"><code>processing</code> · lease 60s · heartbeat 20s · fencing token</div></div><div class="conn"></div>
+        <div class="node fail"><span class="badge">✕</span><div class="t">Transient error</div><div class="s">contents API 5xx · ref unresolvable · token mint 422</div></div><div class="conn retry"></div>
+        <div class="node store"><span class="badge">2</span><div class="t">Back to received</div><div class="s">with <code>lease_until</code> backoff · crash-safe · retried internally</div></div>
+      </div>
+    </div>
+    <div class="cols"><div class="col"><h4>What breaks without this</h4><ul><li>A blip in <code>contents / commits / PR-files</code> APIs would <b>dead-letter a good push</b>.</li><li>Two workers could <b>double-submit</b> a long workflow fetch without lease renewal + fencing.</li></ul></div>
+    <div class="col"><h4>Correct handling</h4><ul><li>Classify GitHub-dependency errors as <b>TransientError</b>, never permanent.</li><li><b>Renew the lease</b> while fetching; abort and yield if fenced or expired.</li><li>After 6 attempts → <b>dead-letter + <code>webhook_dead_letter</code> warning</b> in the operational snapshot.</li></ul></div></div>
+    <div class="foot"><span class="snip src">github.rs:1320–1632 · process_one_delivery / lease heartbeat</span><span class="snip src">bootstrap.rs:858 — dead-letter condition surfaced</span></div>
+  </section>
+
+  <!-- S3 -->
+  <section class="scn" id="s3" data-k="gap">
+    <div class="scn-head"><div class="num">03</div><div><h2><span>SCENARIO 3 · EDGE FAILURE → DELIVERY WATCHDOG</span>Funnel down, host rebooting, 500s — GitHub holds the evidence</h2></div><span class="tag gap">○ needs reconciler</span></div>
+    <div class="diagram"><div class="dlabel"><span>FLOW · poll GitHub history, redeliver what failed</span><i>GET /app/hook/deliveries?status=failure</i></div>
+      <div class="flow">
+        <div class="node gh"><span class="badge">1</span><div class="t">GitHub attempts</div><div class="s">records <code>failure</code> + <code>status_code</code> + <code>throttled_at</code></div></div><div class="conn lost"></div>
+        <div class="node fail pulse"><span class="badge">✕</span><div class="t">Never reached us</div><div class="s">Funnel stale · proxy 502 · Preloop down · TLS/DNS</div></div><div class="conn"></div>
+        <div class="node edge"><span class="badge">2</span><div class="t">Watchdog polls</div><div class="s">App JWT · cursor/high-water mark · every few min</div></div><div class="conn good"></div>
+        <div class="node okk"><span class="badge">3</span><div class="t">Auto-redeliver</div><div class="s"><code>POST …/attempts</code> after store healthy · same GUID dedups</div></div>
+      </div>
+    </div>
+    <div class="cols"><div class="col"><h4>Why polling is required</h4><ul><li>GitHub <b>never retries on its own</b> — a dead host is just a red row in Recent deliveries.</li><li>The 3-day history is the <b>only other copy</b> of a delivery that never reached us.</li><li>Poll cadence must stay <b>well inside 3 days</b> with a persisted watermark.</li></ul></div>
+    <div class="col"><h4>Proposed watchdog</h4><ul><li>List <code>?status=failure</code>, fetch full payload via <b>delivery id</b>, <b>redeliver only when local store is healthy</b>.</li><li>Per-delivery <b>backoff</b>; re-check status after each redelivery (the API only <b>schedules</b> an attempt).</li><li>Alert when <b>last successful poll goes stale</b> — a blind watchdog is worse than none.</li></ul></div></div>
+    <div class="foot"><span class="snip"><b>GET</b> /app/hook/deliveries?status=failure&amp;per_page=100</span><span class="snip"><b>POST</b> /app/hook/deliveries/{id}/attempts</span></div>
+  </section>
+
+  <!-- S4 -->
+  <section class="scn" id="s4" data-k="gap">
+    <div class="scn-head"><div class="num">04</div><div><h2><span>SCENARIO 4 · THE PHANTOM ACK</span>GitHub says success, but we have no row — local loss after 202</h2></div><span class="tag gap">○ needs reconciler</span></div>
+    <div class="diagram"><div class="dlabel"><span>FLOW · correlate remote-success against local rows</span><i>guid ↔ delivery_id join</i></div>
+      <div class="flow">
+        <div class="node gh"><span class="badge">✓</span><div class="t">GitHub: success</div><div class="s"><code>guid abc-123 · 202 · delivered_at</code></div></div><div class="conn"></div>
+        <div class="node edge"><span class="badge">?</span><div class="t">Local lookup</div><div class="s"><code>SELECT … WHERE delivery_id</code> → <b>no row</b></div></div><div class="conn retry"></div>
+        <div class="node store"><span class="badge">✕</span><div class="t">Row lost</div><div class="s">DB restored from old snapshot · file deleted · corruption</div></div><div class="conn good"></div>
+        <div class="node work"><span class="badge">fix</span><div class="t">Redeliver by GUID</div><div class="s">original payload replays · dedup makes it safe</div></div>
+      </div>
+    </div>
+    <div class="cols"><div class="col"><h4>Why this is the scary one</h4><ul><li>Both sides look healthy: GitHub green, Preloop idle. <b>No failure row exists anywhere locally.</b></li><li>Only a <b>join between GitHub history and local rows</b> reveals the gap.</li></ul></div>
+    <div class="col"><h4>Correct handling</h4><ul><li>Watchdog pages <b>successful</b> deliveries too, compares GUIDs to local <code>webhook_deliveries</code>.</li><li>Missing-local → <b>redeliver the original GUID</b> (not a synthetic event) to preserve exact payload.</li><li>If the row committed but the response was lost, the same redelivery <b>dedups to 202 duplicate</b>.</li></ul></div></div>
+    <div class="foot"><span class="snip src">store.rs:2540 get_webhook_delivery · count_dead_letter for snapshot</span></div>
+  </section>
+
+  <!-- S5 -->
+  <section class="scn" id="s5" data-k="gap">
+    <div class="scn-head"><div class="num">05</div><div><h2><span>SCENARIO 5 · SLOW GITHUB</span>Delayed, throttled, or out-of-order deliveries</h2></div><span class="tag gap">○ needs grace period</span></div>
+    <div class="diagram"><div class="dlabel"><span>FLOW · wait, then verify — never synthesize eagerly</span><i>throttled_at is the tell</i></div>
+      <div class="flow">
+        <div class="node gh"><span class="badge">1</span><div class="t">Event occurs</div><div class="s">push lands · PR opened</div></div><div class="conn"></div>
+        <div class="node fail"><span class="badge">⏳</span><div class="t">Delivery lags</div><div class="s">minutes late · <code>throttled_at</code> set · order shuffled</div></div><div class="conn"></div>
+        <div class="node edge"><span class="badge">2</span><div class="t">Grace period</div><div class="s">don't declare missing for N minutes</div></div><div class="conn good"></div>
+        <div class="node work"><span class="badge">3</span><div class="t">Reconcile by time</div><div class="s">use payload timestamps, not arrival order</div></div>
+      </div>
+    </div>
+    <div class="cols"><div class="col"><h4>Traps</h4><ul><li>Treating “no webhook in 30s” as lost <b>creates duplicate runs</b> when the real one lands late.</li><li>Ordering by arrival breaks <b>push sequencing</b>; payload timestamps are authoritative.</li></ul></div>
+    <div class="col"><h4>Correct handling</h4><ul><li>Watchdog waits out a <b>grace window</b>, checks <code>delivered_at / throttled_at</code>.</li><li>Subscribe to <b>only needed events</b> to reduce throttle pressure.</li><li>Source-state repair (scenario 07) runs <b>after</b> the grace window, with idempotency keys.</li></ul></div></div>
+    <div class="foot"><span class="snip src">docs: troubleshooting-webhooks — “deliveries are not immediate”</span></div>
+  </section>
+
+  <!-- S6 -->
+  <section class="scn" id="s6" data-k="gap">
+    <div class="scn-head"><div class="num">06</div><div><h2><span>SCENARIO 6 · GITHUB IS DOWN</span>API 5xx / 429 / timeouts while we hold a 202'd delivery</h2></div><span class="tag gap">○ needs circuit breaker</span></div>
+    <div class="diagram"><div class="dlabel"><span>FLOW · park, don't dead-letter, a dependency outage</span><i>6 attempts today is too few for a real outage</i></div>
+      <div class="flow">
+        <div class="node okk"><span class="badge">✓</span><div class="t">202 held</div><div class="s">delivery queued locally</div></div><div class="conn"></div>
+        <div class="node fail pulse"><span class="badge">✕</span><div class="t">GitHub API fails</div><div class="s"><code>contents / commits / pulls</code> → 5xx · 429 · DNS/TLS</div></div><div class="conn"></div>
+        <div class="node edge"><span class="badge">fix</span><div class="t">Circuit breaker</div><div class="s">global breaker · honor <code>Retry-After</code> + <code>x-ratelimit-reset</code></div></div><div class="conn retry"></div>
+        <div class="node store"><span class="badge">park</span><div class="t">Long-horizon retry</div><div class="s">stay <code>received</code> · exp backoff · alert while open</div></div>
+      </div>
+    </div>
+    <div class="cols"><div class="col"><h4>Current gap</h4><ul><li>GitHub-dependency errors are transient, but the queue caps at <b>6 attempts</b> — a 30-minute GitHub incident can <b>dead-letter good pushes</b>.</li><li>Every queued delivery would <b>hammer GitHub independently</b> during recovery.</li></ul></div>
+    <div class="col"><h4>Correct handling</h4><ul><li>Split taxonomy: <b>bad payload → dead-letter fast</b>; <b>GitHub unavailable → park long</b>.</li><li>One <b>shared breaker</b> pauses GitHub-dependent claims; watermark never advances on failed polls.</li><li>Respect <b>rate-limit headers</b>; back off globally, not per-row.</li></ul></div></div>
+    <div class="foot"><span class="snip src">github.rs:1812–1826 fetch_workflows transient · needs outage horizon</span><span class="snip">x-ratelimit-reset / retry-after → sleep, don't spin</span></div>
+  </section>
+
+  <!-- S7 -->
+  <section class="scn" id="s7" data-k="gap">
+    <div class="scn-head"><div class="num">07</div><div><h2><span>SCENARIO 7 · NO DELIVERY EXISTS</span>GitHub never attempted it — the delivery API can't help</h2></div><span class="tag plan">◇ source-state net</span></div>
+    <div class="diagram"><div class="dlabel"><span>FLOW · compare branch/PR heads against runs we created</span><i>current-state backstop, not exact replay</i></div>
+      <div class="flow">
+        <div class="node gh"><span class="badge">∅</span><div class="t">No delivery row</div><div class="s">unsubscribed event · push-tag limit · never generated</div></div><div class="conn"></div>
+        <div class="node edge"><span class="badge">1</span><div class="t">Poll repo state</div><div class="s">branch heads · open PR heads · <code>/commits /pulls</code></div></div><div class="conn"></div>
+        <div class="node store"><span class="badge">2</span><div class="t">Diff vs runs</div><div class="s">head SHA without a run for that workflow+ref?</div></div><div class="conn good"></div>
+        <div class="node work"><span class="badge">3</span><div class="t">Synthesize once</div><div class="s">through existing adapters · canonical idempotency key</div></div>
+      </div>
+    </div>
+    <div class="cols"><div class="col"><h4>The race to avoid</h4><ul><li>Reconciler creates a run at <b>T+5m</b>; the delayed real webhook lands at <b>T+6m</b> with a different GUID → <b>duplicate run + duplicate checks</b>.</li><li>Delivery-ID dedup alone can't catch this — the synthetic run has <b>no delivery ID</b>.</li></ul></div>
+    <div class="col"><h4>Correct handling</h4><ul><li>Idempotency key: <b>repo + event + ref/PR + workflow path + head SHA</b>, persisted durably.</li><li>Feed synthesis through the <b>same event adapters</b> as webhooks (<code>dispatch.rs</code> pattern).</li><li>Accept approximation: REST state can't rebuild <b>multi-commit pushes or action-specific PR semantics</b> exactly.</li></ul></div></div>
+    <div class="foot"><span class="snip src">key = repo | event | ref | workflow | sha</span><span class="snip src">runs.rs:307 submit_run_inner_with_webhook_delivery — extend key</span></div>
+  </section>
+
+  <!-- S8 -->
+  <section class="scn" id="s8" data-k="have">
+    <div class="scn-head"><div class="num">08</div><div><h2><span>SCENARIO 8 · SILENT MISCONFIGURATION</span>Webhook inactive, narrowed, or pointed at a dead URL</h2></div><span class="tag have">● partial now</span></div>
+    <div class="diagram"><div class="dlabel"><span>FLOW · startup check → periodic health</span><i>bootstrap.rs:1179–1197 today</i></div>
+      <div class="flow">
+        <div class="node gh"><span class="badge">1</span><div class="t">GET /app</div><div class="s">read subscription + permissions at boot</div></div><div class="conn"></div>
+        <div class="node fail"><span class="badge">⚠</span><div class="t">Drift found</div><div class="s">missing trigger events · inactive hook · wrong URL</div></div><div class="conn"></div>
+        <div class="node edge"><span class="badge">2</span><div class="t">Warn loudly</div><div class="s">operator ticks events in App settings (API can't)</div></div><div class="conn good"></div>
+        <div class="node okk"><span class="badge">fix</span><div class="t">Periodic monitor</div><div class="s">config + last-poll age + queue age in snapshot</div></div>
+      </div>
+    </div>
+    <div class="cols"><div class="col"><h4>Why startup-only is insufficient</h4><ul><li>Someone narrows events on <b>day 40</b>; the boot warning from day 1 is long gone.</li><li>A dead <b>last-successful-poll timestamp</b> looks identical to “nothing happened”.</li></ul></div>
+    <div class="col"><h4>Correct handling</h4><ul><li>Promote the check to a <b>periodic health loop</b>: URL, active flag, events, perms.</li><li>Export <b>staleness signals</b>: last delivery poll, oldest unprocessed row, redelivery counts, rate-limit state.</li><li>GitHub can't change subscriptions via API — the monitor must <b>page a human</b>, not self-heal.</li></ul></div></div>
+    <div class="foot"><span class="snip"><b>GET</b> /app/hook/config · <b>GET</b> /app</span><span class="snip src">bootstrap.rs:916 count_dead_letter → snapshot condition</span></div>
+  </section>
+
+  <!-- STACK -->
+  <section class="scn" id="stack" data-k="gap">
+    <div class="scn-head"><div class="num">✦</div><div><h2><span>REMEDIATION STACK · BUILD ORDER</span>Cheapest certainty first, approximation last</h2></div><span class="tag plan">◇ proposal</span></div>
+    <div class="matrix">
+      <div class="mrow head"><div>#</div><div>Layer</div><div>Repairs</div><div>Key mechanism</div></div>
+      <div class="mrow"><div>1</div><div><b>Delivery watchdog</b></div><div>failed deliveries (03) + phantom acks (04)</div><div>App-JWT poll + <code>POST …/attempts</code>, same-GUID dedup</div></div>
+      <div class="mrow"><div>2</div><div><b>Local correlation</b></div><div>remote-success / local-missing join</div><div>persisted cursor, GUID ↔ row comparison</div></div>
+      <div class="mrow"><div>3</div><div><b>Outage breaker</b></div><div>GitHub down mid-processing (06), throttled (05)</div><div>shared breaker, Retry-After, long park horizon</div></div>
+      <div class="mrow"><div>4</div><div><b>State reconciler</b></div><div>never-attempted events (07)</div><div>branch/PR head diff + canonical idempotency key</div></div>
+      <div class="mrow"><div>5</div><div><b>Health monitor</b></div><div>config drift (08)</div><div>periodic /app read-back + staleness alerts</div></div>
+    </div>
+    <div class="cols" style="margin-bottom:24px"><div class="col"><h4>What each layer cannot do</h4><ul><li>Watchdog can't fix events with <b>no delivery record</b> — needs layer 4.</li><li>State repair can't <b>replay exact history</b> — the delivery payload stays authoritative.</li><li>Neither helps while <b>GitHub is fully down</b> — retain watermark, retry, don't advance.</li></ul></div>
+    <div class="col"><h4>Deliberately out of scope here</h4><ul><li><b>HA ingress gateway</b>: second durable queue buys host-downtime 2xx, costs another failure domain. Build only if “ack while Preloop is down” is required.</li><li><b>Active-active Preloop</b>: instances diverge in memory today — needs shared-bus refactor first.</li></ul></div></div>
+  </section>
+
+  <footer>
+    Code refs are to <span class="src">crates/preloop-runner-server/src/github.rs · store.rs · runs.rs · bootstrap.rs</span> on the async-webhook-queue worktree.
+    GitHub contracts: <a href="https://docs.github.com/en/webhooks/using-webhooks/handling-failed-webhook-deliveries">failed deliveries</a> ·
+    <a href="https://docs.github.com/en/webhooks/testing-and-troubleshooting-webhooks/redelivering-webhooks">redelivering</a> ·
+    <a href="https://docs.github.com/en/rest/apps/webhooks#list-deliveries-for-a-github-app">app delivery API</a> ·
+    <a href="https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api">rate limits</a>.
+  </footer>
+
+</div>
+<script>
+const toc=[...document.querySelectorAll('.toc a')];
+const secs=toc.map(a=>document.querySelector(a.getAttribute('href')));
+const spy=new IntersectionObserver(es=>{es.forEach(e=>{if(e.isIntersecting){toc.forEach(a=>a.classList.toggle('active',a.getAttribute('href')==='#'+e.target.id))}})},{rootMargin:'-40% 0px -55% 0px'});
+secs.forEach(s=>s&&spy.observe(s));
+const btns=[...document.querySelectorAll('.fbtn')];
+btns.forEach(b=>b.addEventListener('click',()=>{
+  btns.forEach(x=>x.classList.remove('on'));b.classList.add('on');
+  const f=b.dataset.f;
+  document.querySelectorAll('.scn[data-k]').forEach(s=>{
+    s.classList.toggle('hide', f!=='all' && s.dataset.k!==f && !(f==='gap'&&s.dataset.k==='gap'));
+  });
+}));
+</script>
+</body>
+</html>
