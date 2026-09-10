@@ -18667,6 +18667,7 @@ async fn snapshot_drops_unresolvable_gitlinks_but_keeps_registered_submodules() 
     fs::create_dir_all(&nested).unwrap();
     git_fixture_command(&nested, &["init", "-q", "-b", "main"]);
     git_fixture_command(&nested, &["config", "user.email", "nested@example.test"]);
+    git_fixture_command(&nested, &["config", "user.name", "Nested Test"]);
     fs::write(nested.join("payload.txt"), "nested\n").unwrap();
     git_fixture_command(&nested, &["add", "payload.txt"]);
     git_fixture_command(&nested, &["commit", "-qm", "nested"]);
@@ -18775,6 +18776,7 @@ async fn snapshot_gitlink_resolution_matches_git() {
         fs::create_dir_all(&nested).unwrap();
         git_fixture_command(&nested, &["init", "-q", "-b", "main"]);
         git_fixture_command(&nested, &["config", "user.email", "nested@example.test"]);
+        git_fixture_command(&nested, &["config", "user.name", "Nested Test"]);
         fs::write(nested.join("payload.txt"), format!("{path}\n")).unwrap();
         git_fixture_command(&nested, &["add", "payload.txt"]);
         git_fixture_command(&nested, &["commit", "-qm", path]);
