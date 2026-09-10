@@ -1052,7 +1052,7 @@ async fn publish_snapshot(
         tokio::task::spawn_blocking(move || collect_storage_components(&state_dir_for_meta))
             .await
             .unwrap_or_default();
-    let webhook = collect_webhook_condition_inputs(&shared.state).await;
+    let webhook = collect_webhook_condition_inputs(&shared.state);
     let snap = build_operational_snapshot_sync(
         inputs,
         pool_snapshot,
@@ -1071,12 +1071,13 @@ async fn publish_snapshot(
 
 /// Read the repair layers' published state plus the queue counters.
 ///
-/// A store read that fails leaves the counters at zero rather than failing
-/// the snapshot: the snapshot is the thing an operator looks at when the
-/// store is misbehaving, so it must still render.
-async fn collect_webhook_condition_inputs(state: &AppState) -> WebhookConditionInputs {
+/// A publisher that has not run yet leaves the counters absent rather than
+/// zero: the snapshot must not claim an empty queue (and so report no
+/// dead-letter warning) merely because nothing has read the store. The queue
+/// worker publishes them, so the 5s tick never takes the store's connection.
+fn collect_webhook_condition_inputs(state: &AppState) -> WebhookConditionInputs {
     WebhookConditionInputs {
-        stats: state.store.webhook_queue_stats().await.unwrap_or_default(),
+        stats: state.webhook_status.queue_stats().unwrap_or_default(),
         watchdog: state.webhook_status.watchdog(),
         reconciler: state.webhook_status.reconciler(),
         breaker: state.github_breaker.snapshot(),
@@ -1249,6 +1250,10 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     // next-job labels, pending registrations and preparing flag instead of
     // waiting for the first 5s tick to mirror them.
     {
+        // The queue counters are read from the store once here, so the seeded
+        // snapshot reports real webhook depth and the queue worker only has to
+        // keep the cache fresh from then on.
+        crate::github::refresh_webhook_queue_stats(&state).await;
         let inputs = {
             let inner = state.inner.lock().await;
             collect_snapshot_inputs(&inner)
@@ -1266,7 +1271,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             collect_storage_components(&state.state_dir),
             state.github_app.is_some(),
             store_backend.clone(),
-            collect_webhook_condition_inputs(&state).await,
+            collect_webhook_condition_inputs(&state),
         );
         *state.status_snapshot.write() = init;
     }

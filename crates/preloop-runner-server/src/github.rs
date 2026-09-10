@@ -1012,6 +1012,60 @@ const WEBHOOK_DELIVERY_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 const WEBHOOK_MAX_ATTEMPTS: u32 = 6;
 const WEBHOOK_PRUNE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const WEBHOOK_PRUNE_BATCH_SIZE: usize = 256;
+/// How stale the published queue counters may get while the worker has nothing
+/// to do. The worker refreshes them whenever it moves or prunes a row; this
+/// only covers changes it did not make — another engine on a shared store, or
+/// an operator replay through the native API.
+const WEBHOOK_STATS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Backoff ladder for transient webhook delivery failures, indexed by the
+/// delivery's attempt count (the final entry repeats).
+///
+/// The two cheap leading retries cover what this path actually sees: a
+/// workflow file momentarily unreadable, or a snapshot not yet visible. The
+/// rest stretches so a broken dependency is not hammered, and the attempt cap
+/// dead-letters a delivery long before the ladder could become a hot loop.
+pub(crate) const WEBHOOK_RETRY_BACKOFF: &[Duration] = &[
+    Duration::from_secs(1),
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+];
+
+/// Delay before the next attempt at a delivery that has now failed `attempts`
+/// times.
+///
+/// Takes the ladder as an argument rather than reading the constant so the
+/// retry path is driven by state: tests shorten it instead of sleeping through
+/// real tiers. An empty ladder falls back to the first tier, never to zero —
+/// "retry immediately" is the one answer this must not invent.
+fn webhook_retry_backoff(ladder: &[Duration], attempts: u32) -> Duration {
+    ladder
+        .get(attempts as usize)
+        .or_else(|| ladder.last())
+        .copied()
+        .unwrap_or_else(|| WEBHOOK_RETRY_BACKOFF[0])
+}
+
+/// Publish the queue counters the operational snapshot reads.
+///
+/// The sampler used to query the store on every tick to report these. The
+/// queue worker both mutates the queue and already talks to the store, so it
+/// hands over what it read and the snapshot reads memory instead of taking the
+/// store's single connection for a query that usually reports "unchanged".
+pub(crate) async fn refresh_webhook_queue_stats(state: &crate::state::AppState) -> bool {
+    match state.store.webhook_queue_stats().await {
+        Ok(stats) => {
+            state.webhook_status.set_queue_stats(stats);
+            true
+        }
+        Err(error) => {
+            debug!(?error, "failed to refresh webhook queue counters");
+            false
+        }
+    }
+}
 
 /// Commit the delivery row within the webhook acknowledgement budget.
 ///
@@ -1396,17 +1450,26 @@ pub(crate) async fn run_webhook_queue_worker(
         );
     }
     let mut last_prune = Instant::now();
+    let mut last_stats_refresh = Instant::now();
+    // Publish once before the first drain: the boot snapshot is built while
+    // this task is still starting, and every later snapshot reads the cache.
+    refresh_webhook_queue_stats(&shared.state).await;
 
     loop {
         heartbeat.beat();
         if shared.shutdown.is_cancelled() {
             break;
         }
-        if let Err(error) = drain_webhook_queue_with_heartbeat(&shared, &heartbeat).await {
-            if !shared.shutdown.is_cancelled() {
-                warn!(?error, "error draining webhook delivery queue");
+        let processed = match drain_webhook_queue_with_heartbeat(&shared, &heartbeat).await {
+            Ok(processed) => processed,
+            Err(error) => {
+                if !shared.shutdown.is_cancelled() {
+                    warn!(?error, "error draining webhook delivery queue");
+                }
+                0
             }
-        }
+        };
+        let mut pruned = 0u64;
         if last_prune.elapsed() >= WEBHOOK_PRUNE_INTERVAL {
             last_prune = Instant::now();
             let cutoff = crate::store::now_us()
@@ -1417,12 +1480,24 @@ pub(crate) async fn run_webhook_queue_worker(
                 .prune_webhook_deliveries(cutoff, WEBHOOK_PRUNE_BATCH_SIZE)
                 .await
             {
-                Ok(pruned) if pruned > 0 => {
-                    info!(pruned, "pruned terminal webhook deliveries");
+                Ok(count) => {
+                    if count > 0 {
+                        info!(pruned = count, "pruned terminal webhook deliveries");
+                    }
+                    pruned = count;
                 }
-                Ok(_) => {}
                 Err(error) => warn!(?error, "failed to prune terminal webhook deliveries"),
             }
+        }
+        // Every row this worker moved or pruned changed the counters, so the
+        // cache is refreshed then. The interval is the fallback for changes
+        // made elsewhere (a second engine on a shared store, an operator
+        // replay), and keeps a stuck queue visible instead of frozen at the
+        // last busy moment.
+        let counters_changed = processed > 0 || pruned > 0;
+        let refresh_due = last_stats_refresh.elapsed() >= WEBHOOK_STATS_REFRESH_INTERVAL;
+        if (counters_changed || refresh_due) && refresh_webhook_queue_stats(&shared.state).await {
+            last_stats_refresh = Instant::now();
         }
         tokio::select! {
             _ = shared.shutdown.cancelled() => break,
@@ -1631,16 +1706,12 @@ pub(crate) async fn process_one_delivery(
             }
         }
         WebhookOutcome::TransientError(err) => {
-            let backoff_secs = match delivery.attempts {
-                0 | 1 => 1,
-                2 => 5,
-                3 => 15,
-                _ => 30,
-            };
+            let backoff =
+                webhook_retry_backoff(&shared.state.webhook_retry_backoff, delivery.attempts);
             warn!(
                 delivery_id = %delivery.delivery_id,
                 attempts = delivery.attempts,
-                backoff_secs,
+                backoff_ms = backoff.as_millis() as u64,
                 error = %err,
                 "transient error processing webhook delivery; retrying internally"
             );
@@ -1652,7 +1723,7 @@ pub(crate) async fn process_one_delivery(
                     lease_token,
                     &err,
                     false,
-                    Some(backoff_secs),
+                    Some(backoff),
                 )
                 .await
             {
@@ -2626,6 +2697,17 @@ mod tests {
             });
             drain_webhook_queue(&shared).await.unwrap()
         }
+
+        /// Replace the retry ladder for this fixture.
+        ///
+        /// The real ladder opens at one second, so a test that exercises a
+        /// retry would otherwise have to sleep through it. The delay still has
+        /// to be non-zero: a zero-delay retry is immediately claimable, and
+        /// one drain pass would burn the whole attempt budget in a hot loop.
+        fn with_retry_backoff(mut self, ladder: Vec<Duration>) -> Self {
+            self.state.webhook_retry_backoff = ladder;
+            self
+        }
     }
 
     /// A delivery whose workflow inventory cannot be fetched fails internally
@@ -2640,7 +2722,12 @@ mod tests {
             "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
         )
         .unwrap();
-        let fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone())
+            .await
+            // One 40ms tier: the retry is still a real scheduled retry (the row
+            // is not claimable while its backoff is pending), but the test does
+            // not sleep through the production ladder.
+            .with_retry_backoff(vec![Duration::from_millis(40)]);
 
         // Hide workspace temporarily so workflow fetching fails transiently.
         let hidden_ws = temp.path().join("hidden_ws");
@@ -2677,7 +2764,8 @@ mod tests {
 
         // Restore the workspace: internal retry drains the queue and creates the run.
         std::fs::rename(&hidden_ws, &ws_dir).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        // Past the injected tier, so the retry is due rather than early.
+        tokio::time::sleep(Duration::from_millis(80)).await;
         fixture.drain().await;
         let record = fixture
             .state
@@ -3190,7 +3278,7 @@ mod tests {
                 lease_token,
                 "simulated crash",
                 false,
-                Some(0),
+                Some(Duration::ZERO),
             )
             .await
             .unwrap());
@@ -3499,7 +3587,7 @@ mod tests {
                     lease_token,
                     "stale failure",
                     false,
-                    Some(0),
+                    Some(Duration::ZERO),
                 )
                 .await
                 .unwrap(),

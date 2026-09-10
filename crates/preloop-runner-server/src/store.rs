@@ -112,13 +112,18 @@ pub(crate) trait Store: Send + Sync {
     ) -> anyhow::Result<bool>;
     /// Mark a delivery as failed. If `permanent` is false, it is reset to `received` with optional backoff.
     /// Returns `Ok(true)` when this worker still owned the lease.
+    ///
+    /// The retry delay is a `Duration` rather than whole seconds because the
+    /// retry ladder is configurable per state, and a shortened ladder (tests,
+    /// or a deployment that would rather retry fast) must be able to express
+    /// sub-second steps without rounding them up to a full second.
     async fn fail_webhook_delivery(
         &self,
         delivery_id: &str,
         lease_token: &str,
         error: &str,
         permanent: bool,
-        retry_delay_secs: Option<u64>,
+        retry_delay: Option<std::time::Duration>,
     ) -> anyhow::Result<bool>;
     /// Fetch a single webhook delivery record by ID (for inspection/testing).
     async fn get_webhook_delivery(
@@ -411,14 +416,14 @@ impl Store for InstrumentedStore {
         lease_token: &str,
         error: &str,
         permanent: bool,
-        retry_delay_secs: Option<u64>,
+        retry_delay: Option<std::time::Duration>,
     ) -> anyhow::Result<bool> {
         let start = Instant::now();
         self.record(
             "fail_webhook_delivery",
             start,
             self.inner
-                .fail_webhook_delivery(delivery_id, lease_token, error, permanent, retry_delay_secs)
+                .fail_webhook_delivery(delivery_id, lease_token, error, permanent, retry_delay)
                 .await,
         )
     }
@@ -2740,7 +2745,7 @@ impl SqliteStore {
         lease_token: &str,
         error: &str,
         permanent: bool,
-        retry_delay_secs: Option<u64>,
+        retry_delay: Option<std::time::Duration>,
     ) -> anyhow::Result<bool> {
         let mut connection = self
             .connection
@@ -2757,7 +2762,7 @@ impl SqliteStore {
                 params![delivery_id, error, lease_token, now],
             )?
         } else {
-            let lease_until = retry_delay_secs.map(|delay| now + (delay as i64 * 1_000_000));
+            let lease_until = retry_delay.map(|delay| retry_deadline_us(now, delay));
             tx.execute(
                 "UPDATE webhook_deliveries
                  SET state = 'received', lease_until_us = ?2, lease_token = NULL, last_error = ?3
@@ -3409,20 +3414,14 @@ impl Store for SqliteStore {
         lease_token: &str,
         error: &str,
         permanent: bool,
-        retry_delay_secs: Option<u64>,
+        retry_delay: Option<std::time::Duration>,
     ) -> anyhow::Result<bool> {
         let store = self.clone();
         let delivery_id = delivery_id.to_owned();
         let lease_token = lease_token.to_owned();
         let error = error.to_owned();
         tokio::task::spawn_blocking(move || {
-            store.fail_webhook_delivery(
-                &delivery_id,
-                &lease_token,
-                &error,
-                permanent,
-                retry_delay_secs,
-            )
+            store.fail_webhook_delivery(&delivery_id, &lease_token, &error, permanent, retry_delay)
         })
         .await
         .map_err(|error| anyhow::anyhow!("fail webhook delivery task panicked: {error}"))?
@@ -3932,6 +3931,18 @@ pub(crate) fn now_us() -> i64 {
         .unwrap_or_default()
         .as_micros()
         .min(i64::MAX as u128) as i64
+}
+
+/// The microsecond instant `delay` after `now_us`, saturating instead of
+/// wrapping.
+///
+/// The retry ladder is configurable per state, so a deployment (or a test) can
+/// hand this a duration long enough that the sum overflows the microsecond
+/// epoch. Wrapping there would turn a deliberate long backoff into a deadline
+/// in the past — an immediately claimable row, i.e. the hot retry loop the
+/// ladder exists to prevent.
+pub(crate) fn retry_deadline_us(now_us: i64, delay: std::time::Duration) -> i64 {
+    now_us.saturating_add(delay.as_micros().min(i64::MAX as u128) as i64)
 }
 
 pub(crate) fn unix_us(value: chrono::DateTime<chrono::Utc>) -> i64 {

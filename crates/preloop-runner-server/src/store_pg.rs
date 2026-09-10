@@ -1300,7 +1300,7 @@ impl Store for PgStore {
         lease_token: &str,
         error: &str,
         permanent: bool,
-        retry_delay_secs: Option<u64>,
+        retry_delay: Option<std::time::Duration>,
     ) -> anyhow::Result<bool> {
         let client = self.connection.lock().await;
         let now = now_us();
@@ -1315,7 +1315,7 @@ impl Store for PgStore {
                 )
                 .await?
         } else {
-            let lease_until = retry_delay_secs.map(|delay| now + (delay as i64 * 1_000_000));
+            let lease_until = retry_delay.map(|delay| crate::store::retry_deadline_us(now, delay));
             client
                 .execute(
                     "UPDATE webhook_deliveries

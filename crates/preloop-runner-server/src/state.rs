@@ -390,6 +390,11 @@ pub struct AppState {
     /// Live status published by the delivery watchdog, the source-state
     /// reconciler and the App webhook health monitor.
     pub(crate) webhook_status: Arc<crate::webhook_status::WebhookResilienceStatus>,
+    /// Backoff ladder for transient webhook delivery failures, indexed by the
+    /// delivery's attempt count (the last entry repeats). State rather than a
+    /// constant so tests can drive the retry path without sleeping through the
+    /// real tiers.
+    pub(crate) webhook_retry_backoff: Vec<std::time::Duration>,
     /// Atomic counter for pre-allocating request IDs outside the dispatch
     /// lock.  Monotonically increases; the inner counter is no longer the
     /// source of truth once this is in use.
@@ -1026,6 +1031,7 @@ impl AppState {
             webhook_queue_notify: Arc::new(Notify::new()),
             github_breaker: Arc::new(crate::github_breaker::GithubBreaker::default()),
             webhook_status: Arc::new(crate::webhook_status::WebhookResilienceStatus::default()),
+            webhook_retry_backoff: crate::github::WEBHOOK_RETRY_BACKOFF.to_vec(),
             next_request_id: Arc::new(std::sync::atomic::AtomicI64::new(next_request_id)),
             observability: preloop_observability::Observability::noop(),
             status_snapshot: Arc::new(parking_lot::RwLock::new(

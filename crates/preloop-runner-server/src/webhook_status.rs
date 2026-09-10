@@ -92,6 +92,14 @@ pub(crate) struct WebhookResilienceStatus {
     reconciler: parking_lot::RwLock<ReconcilerStatus>,
     app_config: parking_lot::RwLock<Vec<AppWebhookConfigStatus>>,
     config_checked_at_us: parking_lot::RwLock<Option<i64>>,
+    /// Queue counters as last published by the webhook queue worker.
+    ///
+    /// The status sampler reads these instead of the store: a quiet engine
+    /// would otherwise take the store's single connection every few seconds to
+    /// learn that nothing changed. `None` means no read has happened yet —
+    /// distinct from "the queue is empty", which is what a default would
+    /// silently claim.
+    queue_stats: parking_lot::RwLock<Option<crate::models::WebhookQueueStats>>,
 }
 
 impl WebhookResilienceStatus {
@@ -122,6 +130,15 @@ impl WebhookResilienceStatus {
     pub(crate) fn set_app_config(&self, statuses: Vec<AppWebhookConfigStatus>, checked_at_us: i64) {
         *self.app_config.write() = statuses;
         *self.config_checked_at_us.write() = Some(checked_at_us);
+    }
+
+    /// Last published queue counters, or `None` when nothing has read them.
+    pub(crate) fn queue_stats(&self) -> Option<crate::models::WebhookQueueStats> {
+        *self.queue_stats.read()
+    }
+
+    pub(crate) fn set_queue_stats(&self, stats: crate::models::WebhookQueueStats) {
+        *self.queue_stats.write() = Some(stats);
     }
 }
 
