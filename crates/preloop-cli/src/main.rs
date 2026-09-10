@@ -3909,6 +3909,7 @@ fn condition_action(code: &str) -> &'static str {
     match code {
         "queue_no_registered_runner" => "register a runner or enable the pool",
         "claimable_queue_stalled" => "inspect assignments; restart if bindings are stale",
+        "run_in_progress_without_execution" => "inspect the run; requeue or cancel it",
         "queue_label_mismatch" => "add a runner with that label",
         "concurrency_queue_overflow" => "raise concurrency queue max or reduce parallelism",
         "concurrency_group_starved" => "check concurrency group that starves others",

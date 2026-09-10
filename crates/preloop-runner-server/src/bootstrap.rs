@@ -528,6 +528,9 @@ struct SnapshotInputs {
     runs_in_progress: u32,
     runs_completed: u32,
     active_runs: Vec<preloop_observability::status::ActiveRunSnapshot>,
+    /// `in_progress` runs with no queued, claimed, or pending job and no
+    /// assigned runner — nothing is executing them.
+    orphaned_run_ids: Vec<String>,
     registered: u32,
     /// Distinct session ids across the modern broker map and the legacy map
     /// (every session creation path inserts into both, so the sum would
@@ -628,6 +631,28 @@ fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
             .cmp(&left.started_at)
             .then_with(|| right.run_id.cmp(&left.run_id))
     });
+    // A run can sit `in_progress` while nothing is executing it: its claim
+    // leaked, its machine died, or a restart dropped the pairing. Those runs
+    // are exactly what an operator hunts for during a stall, so name them
+    // instead of leaving the aggregate counts to imply progress.
+    let live_run_ids: std::collections::BTreeSet<RunId> = inner
+        .queue
+        .iter()
+        .map(|job| job.run_id)
+        .chain(inner.claimed_jobs.keys().map(|(run_id, _)| *run_id))
+        .chain(inner.pending_jobs.iter().map(|job| job.run_id))
+        .collect();
+    let orphaned_run_ids: Vec<String> = active_runs
+        .iter()
+        .filter(|run| run.status == "in_progress" && run.assigned_runners.is_empty())
+        .filter(|run| {
+            run.run_id
+                .parse::<uuid::Uuid>()
+                .map(RunId)
+                .is_ok_and(|run_id| !live_run_ids.contains(&run_id))
+        })
+        .map(|run| run.run_id.clone())
+        .collect();
     let now_unix_nanos = crate::models::now_unix_nanos();
     let oldest_ready = inner
         .queue
@@ -728,6 +753,7 @@ fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
         expanding_len: inner.expanding.len(),
         runs_queued,
         active_runs,
+        orphaned_run_ids,
         runs_in_progress,
         runs_completed,
         registered: inner.runners.len() as u32,
@@ -841,6 +867,28 @@ fn build_operational_snapshot_sync(
             exemplars: Vec::new(),
         });
     }
+    let runs_without_execution = !inputs.orphaned_run_ids.is_empty();
+    if runs_without_execution {
+        conditions.push(Condition {
+            code: "run_in_progress_without_execution".to_owned(),
+            severity: "error".to_owned(),
+            message: format!(
+                "{} run(s) are in_progress with no queued, claimed, or assigned work",
+                inputs.orphaned_run_ids.len()
+            ),
+            exemplars: inputs
+                .orphaned_run_ids
+                .iter()
+                .take(3)
+                .map(|run_id| ConditionExemplar {
+                    run_id: Some(run_id.clone()),
+                    job_id: None,
+                    runner_id: None,
+                    machine_name: None,
+                })
+                .collect(),
+        });
+    }
 
     OperationalSnapshot {
         schema_version: 2,
@@ -848,7 +896,7 @@ fn build_operational_snapshot_sync(
         snapshot_age_seconds: 0.0,
         overall: if shutdown_requested {
             Overall::ShuttingDown
-        } else if queue_stalled || check_reporting_failed {
+        } else if queue_stalled || check_reporting_failed || runs_without_execution {
             Overall::Degraded
         } else {
             Overall::Ok
@@ -1549,6 +1597,40 @@ mod tests {
         assert_eq!(
             snapshot.conditions[0].exemplars[0].run_id.as_deref(),
             Some("run-1")
+        );
+    }
+
+    #[test]
+    fn status_degrades_when_a_run_is_in_progress_with_nothing_executing_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let inputs = SnapshotInputs {
+            runs_in_progress: 1,
+            orphaned_run_ids: vec!["run-orphan".to_owned()],
+            ..Default::default()
+        };
+        let snapshot = build_operational_snapshot_sync(
+            inputs,
+            Default::default(),
+            &preloop_observability::Observability::noop(),
+            std::time::Instant::now(),
+            false,
+            true,
+            temp.path(),
+            Vec::new(),
+            Default::default(),
+            Default::default(),
+        );
+        assert_eq!(
+            snapshot.overall,
+            preloop_observability::status::Overall::Degraded
+        );
+        assert_eq!(
+            snapshot.conditions[0].code,
+            "run_in_progress_without_execution"
+        );
+        assert_eq!(
+            snapshot.conditions[0].exemplars[0].run_id.as_deref(),
+            Some("run-orphan")
         );
     }
     #[test]

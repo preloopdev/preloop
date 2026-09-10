@@ -16,6 +16,11 @@ Releases before v0.27.0 predate the changelog.
   report every annotation in API-sized batches.
 - CI jobs target the cpane microVM pool; only release packaging and the
   aarch64 golden bake use GitHub-hosted runners.
+- A restart no longer leaves the pool full of phantom capacity. Persisted
+  ephemeral runner identities are purged before the server accepts traffic,
+  their unfinished jobs are requeued, and a run left `in_progress` with
+  nothing executing it raises a `run_in_progress_without_execution` condition
+  instead of vanishing from the operator's view.
 
 ## [0.32.7] - 2026-09-10
 
