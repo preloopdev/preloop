@@ -508,6 +508,7 @@ fn arb_job() -> impl Strategy<Value = AgentJobRequestMessage> {
                 preloop_debug_run_id: None,
                 preloop_debug_transport: None,
                 preloop_preserve_on_failure: None,
+                preloop_debug_on_failure: None,
                 preloop_snapshot_commit: None,
                 preloop_snapshot_token_steps: None,
                 preloop_snapshot_origin_rewrite: None,

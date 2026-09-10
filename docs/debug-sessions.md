@@ -44,23 +44,44 @@ A repaired run is never reported as an ordinary pass. See §7.
 
 ### How a run opts in
 
-One flag on the wire — `preserve_on_failure` → `preloop_preserve_on_failure` —
-carries both "hold the VM" and "pause for a controller". They are the same
-request seen from two distances, so a second flag meaning nearly the same thing
-would only create states where they disagree.
+Two flags on the wire carry two different intents:
 
-What differs is whether anyone can answer:
+- `debug_on_failure` → `preloopDebugOnFailure`: open a debug session on
+  failure; the worker blocks until a controller decides.
+- `preserve_on_failure` → `preloopPreserveOnFailure`: hold the completed failed
+  VM for a later `preloop shell`, with no worker pause.
 
 | Invocation | Behavior on failure |
 |---|---|
-| `preloop run` at a terminal | pauses; attach with `preloop debug` |
-| `preloop run --no-debug` | tears down immediately |
-| `preloop run --detach`, or piped / CI | no pause — nobody could answer it |
-| `preloop run --detach --preserve-on-failure` | no pause, but the VM is held for a later `preloop shell` |
+| `preloop run --debug` | debug session; attach with `preloop debug` |
+| `preloop run --preserve-on-failure` | no pause; the VM is held for a later `preloop shell` |
+| `preloop run --detach --debug` | debug session; attach from another terminal |
+| `preloop run` (no flags) | failed jobs are cleaned up normally |
+| `preloop run` at a terminal, SmolVM | historical default retained: pauses; attach with `preloop debug` |
 
-A pause blocks the job until a controller decides, so pausing a detached or
-piped run would hang something with no way to respond. `--preserve-on-failure`
-is the explicit opt-in for that case: keep the machine, skip the prompt.
+Debugging is now explicit. The old terminal-attached default remains only on
+SmolVM for compatibility, so local macOS behavior is unchanged; on AgentENV —
+where an idle sandbox costs real money — a plain run tears down on failure and
+`--debug` is how you ask for a session.
+
+### Suspended debug VMs (AgentENV)
+
+An AgentENV sandbox parked for debugging costs money while it runs, so the
+orchestrator suspends it when nobody is attached and resumes it on demand:
+
+```text
+job paused, no controller   → suspend after 15 s   (aenv pause, 0.19 s)
+preloop debug / shell       → resume, then attach  (aenv resume, 0.09 s)
+controller detaches         → suspend again
+idle deadline expires       → delete
+```
+
+The backend declares `preserves_runtime_state_on_suspend` in
+`VmProvider::capabilities()`. Only a provider that restores the *same* live
+guest (runner process, workspace, caches) on resume may be parked
+mid-session — SmolVM's `stop` is a real shutdown, so it keeps the
+run-in-place behavior instead. The controller-attach marker is host-side
+precisely because a suspended guest cannot be probed.
 
 ---
 
