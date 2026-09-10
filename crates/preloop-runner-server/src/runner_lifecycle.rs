@@ -403,19 +403,17 @@ pub(crate) async fn delete_agent(
     Ok((StatusCode::NO_CONTENT, Json(serde_json::Value::Null)))
 }
 
-/// Remove every trace of a runner identity: keys, client ids, sessions and
-/// assignments. Shared by agent deregistration and pool machine teardown.
-pub(crate) async fn purge_runner_identity(shared: &Arc<SharedState>, runner_id: i64) {
-    let mut inner = shared.state.inner.lock().await;
+/// Remove every trace of a runner identity from in-memory state.
+fn purge_runner_identity_locked(inner: &mut InnerState, runner_id: i64) -> bool {
     if inner.runners.remove(&runner_id).is_none()
         && inner.runner_client_ids.values().all(|id| *id != runner_id)
     {
-        // Unknown runner — keep behavior idempotent.
+        return false;
     }
     inner.runner_client_ids.retain(|_, id| *id != runner_id);
     inner.runner_public_keys.remove(&runner_id);
     inner.runner_rsa_public_keys.remove(&runner_id);
-    // Sessions claiming this runner: drop them so subsequent polls stop.
+
     let doomed_sessions: Vec<String> = inner
         .broker_session_runners
         .iter()
@@ -446,27 +444,25 @@ pub(crate) async fn purge_runner_identity(shared: &Arc<SharedState>, runner_id: 
                 .filter(|request| request.result.is_none())
                 .map(|request| (request.run_id, request.job_id.clone()));
             if let Some((run_id, job_id)) = pending {
-                {
-                    let key = (run_id, job_id.clone());
-                    if let Some(job) = inner.claimed_jobs.remove(&key) {
-                        if let Some(run) = inner.runs.get_mut(&run_id) {
-                            run.jobs.insert(job_id.clone(), ExecutionStatus::Queued);
-                            run.status =
-                                runtime_scheduling::summarize_run(run.jobs.values().copied());
-                        }
-                        info!(
-                            runner_id,
-                            %run_id,
-                            job_id = %job_id.0,
-                            "requeuing job of purged runner"
-                        );
-                        runtime_scheduling::on_job_enqueued(&mut inner, &job);
-                        inner.queue.push_back(job);
+                let key = (run_id, job_id.clone());
+                if let Some(job) = inner.claimed_jobs.remove(&key) {
+                    if let Some(run) = inner.runs.get_mut(&run_id) {
+                        run.jobs.insert(job_id.clone(), ExecutionStatus::Queued);
+                        run.status = runtime_scheduling::summarize_run(run.jobs.values().copied());
                     }
+                    info!(
+                        runner_id,
+                        %run_id,
+                        job_id = %job_id.0,
+                        "requeuing job of purged runner"
+                    );
+                    runtime_scheduling::on_job_enqueued(inner, &job);
+                    inner.queue.push_back(job);
                 }
             }
         }
     }
+
     // Assignments it never claimed: release the jobs back to pool-pending so
     // a replacement machine can be provisioned for them.
     let orphaned: Vec<(RunId, JobId)> = inner
@@ -476,21 +472,24 @@ pub(crate) async fn purge_runner_identity(shared: &Arc<SharedState>, runner_id: 
         .map(|(key, _)| key.clone())
         .collect();
     for key in orphaned {
-        if crate::runtime_scheduling::clear_assignment(&mut inner, key.0, &key.1)
+        if crate::runtime_scheduling::clear_assignment(inner, key.0, &key.1)
             && inner.pool_assignments_enabled
         {
-            // Requeue at the *back* of the waitlist with a fresh mark: a job
-            // whose machines keep dying must not hold the front of the line
-            // forever. `clear_assignment` removed the old mark, so this is a
-            // fresh stamp (not the original one). The pairing path re-arms
-            // stale marks and `claim_permitted` opens the hold once a mark
-            // ages past the binding window, so a fresh mark cannot wedge the
-            // job — it simply waits its turn again.
             inner
                 .pool_pending
                 .entry(key)
                 .or_insert_with(std::time::SystemTime::now);
         }
+    }
+    true
+}
+
+/// Remove every trace of a runner identity: keys, client ids, sessions and
+/// assignments. Shared by agent deregistration and pool machine teardown.
+pub(crate) async fn purge_runner_identity(shared: &Arc<SharedState>, runner_id: i64) {
+    let mut inner = shared.state.inner.lock().await;
+    if !purge_runner_identity_locked(&mut inner, runner_id) {
+        return;
     }
     shared
         .state
@@ -505,6 +504,47 @@ pub(crate) async fn purge_runner_identity(shared: &Arc<SharedState>, runner_id: 
             "failed to persist purged runner identity"
         );
     }
+    shared.state.message_notify.notify_waiters();
+}
+
+/// A server restart destroys every process-owned ephemeral VM. Their durable
+/// runner registrations and sessions cannot reconnect, so purge them as one
+/// transaction before serving or they masquerade as idle capacity forever.
+pub(crate) async fn purge_restored_ephemeral_runners(shared: &Arc<SharedState>) {
+    let runner_ids: Vec<i64> = {
+        let inner = shared.state.inner.lock().await;
+        inner
+            .runners
+            .values()
+            .filter(|runner| runner.ephemeral)
+            .map(|runner| runner.id)
+            .collect()
+    };
+    if runner_ids.is_empty() {
+        return;
+    }
+
+    let mut inner = shared.state.inner.lock().await;
+    for runner_id in &runner_ids {
+        purge_runner_identity_locked(&mut inner, *runner_id);
+    }
+    shared
+        .state
+        .queue_depth
+        .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
+    runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
+    drop(inner);
+    if let Err(error) = persist_full_state(shared).await {
+        tracing::warn!(
+            count = runner_ids.len(),
+            ?error,
+            "failed to persist purged restored ephemeral runners"
+        );
+    }
+    info!(
+        count = runner_ids.len(),
+        "purged restored ephemeral runner identities"
+    );
     shared.state.message_notify.notify_waiters();
 }
 

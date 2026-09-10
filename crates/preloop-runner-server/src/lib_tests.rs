@@ -22452,6 +22452,53 @@ async fn purge_requeues_claimed_unfinished_job_to_another_runner() {
         "machine B receives the requeued job: {delivered}"
     );
 }
+#[tokio::test]
+async fn startup_purge_removes_only_restored_ephemeral_runners() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = pool_managed_state(&temp).await;
+    let app = app(state.clone(), CancellationToken::new());
+
+    let ephemeral = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runners",
+        json!({
+            "name": "pool-machine",
+            "labels": ["self-hosted"],
+            "ephemeral": true
+        }),
+    )
+    .await;
+    let ephemeral_id = ephemeral["id"].as_i64().unwrap();
+    let (external_id, _) =
+        register_runner_with_token(&app, "external-machine", &["self-hosted"], None).await;
+    {
+        let inner = state.inner.lock().await;
+        assert!(inner.runners[&ephemeral_id].ephemeral);
+        assert!(!inner.runners[&external_id].ephemeral);
+    }
+    drop(app);
+    drop(state);
+
+    let restored_state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    {
+        let inner = restored_state.inner.lock().await;
+        assert!(inner.runners[&ephemeral_id].ephemeral);
+        assert!(inner.runners.contains_key(&external_id));
+    }
+    let restored_shared = Arc::new(SharedState {
+        state: restored_state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+    crate::runner_lifecycle::purge_restored_ephemeral_runners(&restored_shared).await;
+    drop(restored_shared);
+    drop(restored_state);
+
+    let final_state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let inner = final_state.inner.lock().await;
+    assert!(!inner.runners.contains_key(&ephemeral_id));
+    assert!(inner.runners.contains_key(&external_id));
+}
 
 #[tokio::test]
 async fn purge_of_finished_runner_does_not_requeue() {

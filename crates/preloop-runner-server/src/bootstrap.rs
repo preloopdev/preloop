@@ -1317,6 +1317,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         state: state.clone(),
         shutdown: shutdown.clone(),
     });
+    crate::runner_lifecycle::purge_restored_ephemeral_runners(&shared).await;
 
     // 5s sampler — clone needed state under lock, release, then publish.
     let sampler_shared = shared.clone();
