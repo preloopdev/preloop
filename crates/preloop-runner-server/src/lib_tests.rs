@@ -10698,6 +10698,41 @@ async fn queued_job_with_no_runner_is_failed_after_the_grace_window() {
 }
 
 #[tokio::test]
+async fn restored_job_without_enqueue_timestamp_is_not_granted_new_grace_window() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+    let accepted = submit_simple_run(&app).await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    {
+        let mut inner = state.inner.lock().await;
+        inner
+            .queue
+            .front_mut()
+            .expect("submitted job must be ready")
+            .enqueued_at_unix_nanos = 0;
+        inner.queued_at.clear();
+    }
+    reap_once(&shared).await;
+
+    let inner = state.inner.lock().await;
+    assert!(
+        inner.queue.is_empty(),
+        "a restored job with unknown age must not receive a fresh starvation grace window"
+    );
+    assert_eq!(
+        inner.runs.get(&run_id).unwrap().status,
+        ExecutionStatus::Failure
+    );
+}
+
+#[tokio::test]
 async fn liveness_sweep_requeues_job_of_deaf_runner() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -10773,6 +10808,43 @@ async fn liveness_sweep_requeues_job_of_deaf_runner() {
             "unfinished job must be requeued for a fresh machine"
         );
     }
+}
+
+#[tokio::test]
+async fn broker_session_keeps_registered_runner_from_phantom_reaping() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+    let (runner_id, _token) =
+        register_runner_with_token(&app, "broker-runner", &["self-hosted"], None).await;
+
+    {
+        let mut inner = state.inner.lock().await;
+        inner.runner_liveness_timeout = Duration::from_secs(600);
+        inner.runner_registered_at.insert(
+            runner_id,
+            std::time::Instant::now() - Duration::from_secs(3600),
+        );
+        // Modern broker sessions are tracked separately from the legacy
+        // AzDO session map. The runner must not be treated as a phantom when
+        // only that map proves its session exists.
+        inner
+            .broker_session_runners
+            .insert("broker-session".to_owned(), runner_id);
+    }
+
+    reap_once(&shared).await;
+
+    let inner = state.inner.lock().await;
+    assert!(
+        inner.runners.contains_key(&runner_id),
+        "a broker-backed runner must not be reaped as a phantom registration"
+    );
 }
 
 #[tokio::test]
@@ -12834,9 +12906,8 @@ impl WebhookDedupFixture {
     }
 
     /// Deliver the signed push payload under `delivery`. `event` is the
-    /// `x-github-event` header; `None` omits it, which is how this test makes
-    /// post-reservation processing fail (400) the way a transient server error
-    /// would.
+    /// `x-github-event` header; `None` omits it, so the handler rejects the
+    /// request before a durable delivery row is created.
     async fn post(&self, delivery: &str, event: Option<&str>) -> StatusCode {
         let app = self.app.clone();
         let payload_bytes = self.payload_bytes.clone();
@@ -12893,11 +12964,12 @@ async fn github_webhook_same_delivery_is_deduped_but_new_delivery_creates_run() 
 }
 
 #[tokio::test]
-async fn github_webhook_failed_delivery_is_accepted_on_redelivery() {
+async fn github_webhook_missing_event_does_not_poison_delivery_id() {
     let temp = tempfile::tempdir().unwrap();
     let fixture = WebhookDedupFixture::new(&temp).await;
 
-    // First attempt fails after the delivery was reserved for dedup.
+    // The first request is rejected before durable enqueue because its event
+    // header is missing.
     assert_eq!(
         fixture.post("delivery-retry", None).await,
         StatusCode::BAD_REQUEST
@@ -12906,12 +12978,12 @@ async fn github_webhook_failed_delivery_is_accepted_on_redelivery() {
         let inner = fixture.state.inner.lock().await;
         assert!(
             inner.runs.is_empty(),
-            "a failed delivery must not create a run"
+            "a rejected request must not create a run"
         );
     }
 
-    // GitHub redelivers after an error response; the retry must be processed
-    // rather than dropped as a duplicate.
+    // A later valid request with the same delivery id must still be accepted
+    // and processed rather than being mistaken for an active duplicate.
     assert_eq!(
         fixture.post("delivery-retry", Some("push")).await,
         StatusCode::ACCEPTED
@@ -12921,7 +12993,7 @@ async fn github_webhook_failed_delivery_is_accepted_on_redelivery() {
     assert_eq!(
         inner.runs.len(),
         1,
-        "a redelivery of a failed delivery must create the run"
+        "a retry after pre-enqueue rejection must create the run"
     );
 }
 
@@ -12956,10 +13028,11 @@ async fn github_webhook_dedup_survives_restart() {
         StatusCode::ACCEPTED
     );
     fixture.drain().await;
-    {
+    let original_run_id = {
         let inner = fixture.state.inner.lock().await;
         assert_eq!(inner.runs.len(), 1);
-    }
+        *inner.runs.keys().next().unwrap()
+    };
 
     // Restart the server: new state instance on the same persisted database.
     let mut restarted_state = AppState::new(temp.path().join("state").to_path_buf())
@@ -12986,18 +13059,148 @@ async fn github_webhook_dedup_survives_restart() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let response_body =
+        serde_json::from_slice::<Value>(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(
+        response_body["status"], "duplicate",
+        "restart redelivery should report the retained delivery as duplicate"
+    );
 
     let shared = Arc::new(SharedState {
         state: restarted_state.clone(),
         shutdown: CancellationToken::new(),
     });
+    let claimed = restarted_state
+        .store
+        .claim_webhook_deliveries(1, 60)
+        .await
+        .unwrap();
+    assert!(
+        claimed.is_empty(),
+        "a completed delivery must not be claimed after restart"
+    );
     crate::github::drain_webhook_queue(&shared).await.unwrap();
 
     let inner = restarted_state.inner.lock().await;
+    assert!(
+        inner.runs.contains_key(&original_run_id),
+        "restart redelivery must preserve the original run identity"
+    );
     assert_eq!(
         inner.runs.len(),
         1,
         "a redelivery arriving after restart must be deduped rather than creating a second run"
+    );
+}
+#[tokio::test]
+async fn github_webhook_run_reservation_survives_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = WebhookDedupFixture::new(&temp).await;
+    let payload: Value = serde_json::from_slice(&fixture.payload_bytes).unwrap();
+    let event_sha = payload["after"].as_str().unwrap().to_owned();
+    let workflow_yaml =
+        fs::read_to_string(temp.path().join("ws/.github/workflows/build.yml")).unwrap();
+    let signature_header = fixture.signature_header.clone();
+    let payload_bytes = fixture.payload_bytes.clone();
+    let shared = Arc::new(SharedState {
+        state: fixture.state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+
+    assert_eq!(
+        fixture
+            .post("delivery-reservation-restart", Some("push"))
+            .await,
+        StatusCode::ACCEPTED
+    );
+    let accepted = crate::runs::submit_run_inner_with_webhook_delivery(
+        &shared,
+        preloop_gha_protocol::WorkflowSubmission {
+            workflow_yaml,
+            event: "push".to_owned(),
+            payload,
+            repository: "owner/repo".to_owned(),
+            git_ref: "refs/heads/main".to_owned(),
+            workflow_path: Some(".github/workflows/build.yml".to_owned()),
+            workflow_file: Some("build.yml".to_owned()),
+            sha: event_sha.clone(),
+            resolved_sha: Some(event_sha),
+            changed_paths: vec!["src/main.rs".to_owned()],
+            changed_paths_known: true,
+            ..Default::default()
+        },
+        Some("delivery-reservation-restart"),
+    )
+    .await
+    .unwrap();
+    let original_run_id = accepted.run_id;
+    let claimed = fixture
+        .state
+        .store
+        .claim_webhook_deliveries(1, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        claimed.len(),
+        1,
+        "the simulated crash must leave the delivery in processing"
+    );
+    drop(shared);
+    drop(fixture);
+
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    let mut restarted_state = AppState::new(temp.path().join("state").to_path_buf())
+        .await
+        .unwrap();
+    restarted_state.webhook_secret = Some("super-secret".to_owned());
+    restarted_state.local_workspace = Some(temp.path().join("ws"));
+    assert_eq!(
+        restarted_state
+            .store
+            .recover_webhook_deliveries()
+            .await
+            .unwrap(),
+        1,
+        "restart must release the uncompleted delivery lease"
+    );
+    let restarted_app = app(restarted_state.clone(), CancellationToken::new());
+    let response = restarted_app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/github/webhooks")
+                .header("x-github-delivery", "delivery-reservation-restart")
+                .header("x-hub-signature-256", signature_header)
+                .header("x-github-event", "push")
+                .header("content-type", "application/json")
+                .body(Body::from(payload_bytes))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let response_body =
+        serde_json::from_slice::<Value>(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(response_body["status"], "duplicate");
+
+    let restarted_shared = Arc::new(SharedState {
+        state: restarted_state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+    crate::github::drain_webhook_queue(&restarted_shared)
+        .await
+        .unwrap();
+    let inner = restarted_state.inner.lock().await;
+    assert!(
+        inner.runs.contains_key(&original_run_id),
+        "replayed processing must reuse the run restored from the reservation"
+    );
+    assert_eq!(
+        inner.runs.len(),
+        1,
+        "a replay after restart must not create a second run"
     );
 }
 

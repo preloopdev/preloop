@@ -221,12 +221,13 @@ impl PgStore {
         let value = run_record_value(run)?;
         let sealed = self.cipher.seal(&serde_json::to_vec(&value)?)?;
         tx.execute(
-            "INSERT INTO runs(run_id, repository, workflow_path, status, run_number,
-                              run_attempt, created_at_us, completed_at_us, record_blob)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            "INSERT INTO runs(run_id, repository, workflow_path, webhook_delivery_id, status,
+                              run_number, run_attempt, created_at_us, completed_at_us, record_blob)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              ON CONFLICT(run_id) DO UPDATE SET
                repository = EXCLUDED.repository,
                workflow_path = EXCLUDED.workflow_path,
+               webhook_delivery_id = EXCLUDED.webhook_delivery_id,
                status = EXCLUDED.status,
                run_number = EXCLUDED.run_number,
                run_attempt = EXCLUDED.run_attempt,
@@ -237,6 +238,7 @@ impl PgStore {
                 &run.run_id.to_string(),
                 &run.submission.repository.clone(),
                 &run.workflow_path_str.clone(),
+                &run.webhook_delivery_id.clone(),
                 &status_string(run.status),
                 &(run.run_number as i64),
                 &(run.run_attempt as i64),
@@ -505,6 +507,7 @@ impl Store for PgStore {
             }
         }
 
+        let restored_at = std::time::Instant::now();
         let rows = client
             .query(
                 "SELECT runner_id, name, ephemeral, runner_group_id, runner_group_name,
@@ -529,6 +532,7 @@ impl Store for PgStore {
                     .as_ref()
                     .map(|key| (runner.id, key.clone())),
             );
+            inner.runner_registered_at.insert(runner.id, restored_at);
             inner.runners.insert(runner.id, runner);
         }
         // Restore typed RSA public keys so post-restart sessions can be
@@ -1137,7 +1141,16 @@ impl Store for PgStore {
                      delivery_id, event, payload_blob, received_at_us, state, attempts,
                      lease_until_us, lease_token, last_error
                  ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                 ON CONFLICT (delivery_id) DO NOTHING",
+                 ON CONFLICT (delivery_id) DO UPDATE SET
+                     event = EXCLUDED.event,
+                     payload_blob = EXCLUDED.payload_blob,
+                     received_at_us = EXCLUDED.received_at_us,
+                     state = 'received',
+                     attempts = 0,
+                     lease_until_us = NULL,
+                     lease_token = NULL,
+                     last_error = NULL
+                 WHERE webhook_deliveries.state = 'failed'",
                 &[
                     &delivery.delivery_id,
                     &delivery.event,
@@ -1165,13 +1178,13 @@ impl Store for PgStore {
 
         let rows = tx
             .query(
-                "SELECT delivery_id, event, payload_blob, received_at_us, state, attempts, lease_until_us, last_error
+                "SELECT delivery_id, event, payload_blob, received_at_us, attempts, last_error
                  FROM webhook_deliveries
                  WHERE (state = 'received' AND (lease_until_us IS NULL OR lease_until_us <= $1))
                     OR (state = 'processing' AND lease_until_us IS NOT NULL AND lease_until_us < $1)
                  ORDER BY received_at_us ASC
-                 FOR UPDATE
-                 LIMIT $2",
+                 LIMIT $2
+                 FOR UPDATE SKIP LOCKED",
                 &[&now, &(limit as i64)],
             )
             .await?;
@@ -1182,10 +1195,31 @@ impl Store for PgStore {
             let event: String = row.get(1);
             let payload_blob: Vec<u8> = row.get(2);
             let received_at_us: i64 = row.get(3);
-            let attempts: i64 = row.get(5);
-            let last_error: Option<String> = row.get(7);
+            let attempts: i64 = row.get(4);
+            let last_error: Option<String> = row.get(5);
 
-            let payload = self.cipher.unseal(&payload_blob)?;
+            let payload = match self.cipher.unseal(&payload_blob) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    let last_error = format!("failed to decrypt webhook payload: {error}");
+                    tx.execute(
+                        "UPDATE webhook_deliveries
+                         SET state = 'failed', lease_until_us = NULL, lease_token = NULL,
+                             attempts = attempts + 1, last_error = $2
+                         WHERE delivery_id = $1
+                           AND (
+                               (state = 'received' AND
+                                (lease_until_us IS NULL OR lease_until_us <= $3))
+                               OR
+                               (state = 'processing' AND
+                                lease_until_us IS NOT NULL AND lease_until_us <= $3)
+                           )",
+                        &[&delivery_id, &last_error, &now],
+                    )
+                    .await?;
+                    continue;
+                }
+            };
             let new_attempts = (attempts as u32).saturating_add(1);
             let lease_token = uuid::Uuid::new_v4().to_string();
 
@@ -1225,13 +1259,15 @@ impl Store for PgStore {
         lease_duration_secs: u64,
     ) -> anyhow::Result<bool> {
         let client = self.connection.lock().await;
-        let lease_until = now_us() + (lease_duration_secs as i64 * 1_000_000);
+        let now = now_us();
+        let lease_until = now + (lease_duration_secs as i64 * 1_000_000);
         let rows_affected = client
             .execute(
                 "UPDATE webhook_deliveries
                  SET lease_until_us = $1
-                 WHERE delivery_id = $2 AND state = 'processing' AND lease_token = $3",
-                &[&lease_until, &delivery_id, &lease_token],
+                 WHERE delivery_id = $2 AND state = 'processing' AND lease_token = $3
+                   AND lease_until_us IS NOT NULL AND lease_until_us > $4",
+                &[&lease_until, &delivery_id, &lease_token, &now],
             )
             .await?;
         Ok(rows_affected > 0)
@@ -1242,12 +1278,14 @@ impl Store for PgStore {
         lease_token: &str,
     ) -> anyhow::Result<bool> {
         let client = self.connection.lock().await;
+        let now = now_us();
         let rows_affected = client
             .execute(
                 "UPDATE webhook_deliveries
                  SET state = 'done', lease_until_us = NULL, lease_token = NULL, last_error = NULL
-                 WHERE delivery_id = $1 AND state = 'processing' AND lease_token = $2",
-                &[&delivery_id, &lease_token],
+                 WHERE delivery_id = $1 AND state = 'processing' AND lease_token = $2
+                   AND lease_until_us IS NOT NULL AND lease_until_us > $3",
+                &[&delivery_id, &lease_token, &now],
             )
             .await?;
         Ok(rows_affected > 0)
@@ -1262,23 +1300,26 @@ impl Store for PgStore {
         retry_delay_secs: Option<u64>,
     ) -> anyhow::Result<bool> {
         let client = self.connection.lock().await;
+        let now = now_us();
         let rows_affected = if permanent {
             client
                 .execute(
                     "UPDATE webhook_deliveries
                      SET state = 'failed', lease_until_us = NULL, lease_token = NULL, last_error = $2
-                     WHERE delivery_id = $1 AND state = 'processing' AND lease_token = $3",
-                    &[&delivery_id, &error, &lease_token],
+                     WHERE delivery_id = $1 AND state = 'processing' AND lease_token = $3
+                       AND lease_until_us IS NOT NULL AND lease_until_us > $4",
+                    &[&delivery_id, &error, &lease_token, &now],
                 )
                 .await?
         } else {
-            let lease_until = retry_delay_secs.map(|delay| now_us() + (delay as i64 * 1_000_000));
+            let lease_until = retry_delay_secs.map(|delay| now + (delay as i64 * 1_000_000));
             client
                 .execute(
                     "UPDATE webhook_deliveries
                      SET state = 'received', lease_until_us = $2, lease_token = NULL, last_error = $3
-                     WHERE delivery_id = $1 AND state = 'processing' AND lease_token = $4",
-                    &[&delivery_id, &lease_until, &error, &lease_token],
+                     WHERE delivery_id = $1 AND state = 'processing' AND lease_token = $4
+                       AND lease_until_us IS NOT NULL AND lease_until_us > $5",
+                    &[&delivery_id, &lease_until, &error, &lease_token, &now],
                 )
                 .await?
         };
@@ -1599,5 +1640,15 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         7,
         "webhook-delivery-lease-fencing",
         "ALTER TABLE webhook_deliveries ADD COLUMN lease_token TEXT;",
+    ),
+    (
+        8,
+        "webhook-run-reservation",
+        r#"
+        ALTER TABLE runs ADD COLUMN webhook_delivery_id TEXT;
+        CREATE UNIQUE INDEX IF NOT EXISTS runs_webhook_delivery_workflow_idx
+          ON runs (webhook_delivery_id, workflow_path)
+          WHERE webhook_delivery_id IS NOT NULL;
+        "#,
     ),
 ];

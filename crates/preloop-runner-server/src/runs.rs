@@ -257,6 +257,25 @@ fn submission_allows_secrets(submission: &WorkflowSubmission) -> bool {
         .unwrap_or(true)
 }
 
+fn existing_webhook_run(
+    inner: &InnerState,
+    delivery_id: &str,
+    workflow_path: &str,
+) -> Option<RunAccepted> {
+    inner
+        .runs
+        .values()
+        .find(|run| {
+            run.webhook_delivery_id.as_deref() == Some(delivery_id)
+                && run.workflow_path_str == workflow_path
+        })
+        .map(|run| RunAccepted {
+            run_id: run.run_id,
+            run_number: run.run_number,
+            queued_jobs: run.jobs.len(),
+        })
+}
+
 pub(crate) async fn submit_run_inner(
     shared: &Arc<SharedState>,
     submission: WorkflowSubmission,
@@ -282,27 +301,16 @@ pub(crate) async fn submit_run_inner_with_webhook_delivery(
     ) {
         let existing = {
             let inner = shared.state.inner.lock().await;
-            inner
-                .runs
-                .values()
-                .find(|run| {
-                    run.webhook_delivery_id.as_deref() == Some(delivery_id)
-                        && run.workflow_path_str == workflow_path
-                })
-                .map(|run| (run.run_id, run.run_number, run.jobs.len()))
+            existing_webhook_run(&inner, delivery_id, workflow_path)
         };
-        if let Some((run_id, run_number, queued_jobs)) = existing {
+        if let Some(existing) = existing {
             tracing::info!(
                 %delivery_id,
                 %workflow_path,
-                %run_id,
+                run_id = %existing.run_id,
                 "reusing run for replayed webhook delivery"
             );
-            return Ok(RunAccepted {
-                run_id,
-                run_number,
-                queued_jobs,
-            });
+            return Ok(existing);
         }
     }
 
@@ -1120,6 +1128,25 @@ pub(crate) async fn submit_run_inner_with_webhook_delivery(
 
     {
         let mut inner = shared.state.inner.lock().await;
+        // The first lookup avoids rebuilding a replayed submission, but it
+        // cannot close the race between two workers that both pass that
+        // lookup. Recheck while holding the same lock as the insertion so
+        // run creation is one atomic state transition.
+        if let (Some(delivery_id), Some(workflow_path)) = (
+            webhook_delivery_id.as_deref(),
+            submission.workflow_path.as_deref(),
+        ) {
+            if let Some(existing) = existing_webhook_run(&inner, delivery_id, workflow_path) {
+                tracing::info!(
+                    %delivery_id,
+                    %workflow_path,
+                    run_id = %existing.run_id,
+                    "reusing run after webhook reservation race"
+                );
+                drop(inner);
+                return Ok(existing);
+            }
+        }
         let created_at = chrono::Utc::now();
         let event = submission.event.clone();
         let github = github;

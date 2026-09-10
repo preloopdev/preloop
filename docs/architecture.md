@@ -144,8 +144,8 @@ Known limitations:
 | ----------------------- | ----------------------------------------------------------------------- |
 | `routes.rs`             | All axum route definitions and middleware wiring                        |
 | `auth.rs`               | Bearer token extraction and auth middleware                             |
-| `state.rs`              | `AppState`, `SharedState`, OIDC/HMAC key loading, runtime token minting |
-| `models.rs`             | `InnerState`, `QueuedJob`, `WebhookDeliveryRecord`, run/job state       |
+| `state.rs`              | `AppState`, `SharedState`, `InnerState`, OIDC/HMAC key loading, runtime tokens |
+| `models.rs`             | `QueuedJob`, `WebhookDeliveryRecord` and wire-facing run/job models       |
 | `runs.rs`               | `/api/v1/runs` handlers: submit, get, cancel, rerun, events             |
 | `github.rs`             | GitHub webhook receiver, durable queue worker, check runs               |
 | `runtime_scheduling.rs` | Job dispatch/pairing, claim eligibility, binding ceiling & reaper       |

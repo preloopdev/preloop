@@ -79,8 +79,9 @@ pub(crate) trait Store: Send + Sync {
     async fn delete_log(&self, key: &str) -> anyhow::Result<()>;
     /// Append a control event (`run_accepted` / `run_status` / `job_status`).
     async fn append_event(&self, event: &NdjsonEvent) -> anyhow::Result<()>;
-    /// Enqueue a webhook delivery atomically. Returns `Ok(true)` if newly inserted,
-    /// or `Ok(false)` if a row with this `delivery_id` already exists (deduplicated).
+    /// Enqueue a webhook delivery atomically. Returns `Ok(true)` if newly
+    /// inserted or if a retained failed row was reopened for redelivery.
+    /// Returns `Ok(false)` when an active or completed delivery is deduplicated.
     async fn enqueue_webhook_delivery(
         &self,
         delivery: &WebhookDeliveryRecord,
@@ -867,6 +868,14 @@ pub(crate) fn restore_run_record(cipher: &Envelope, blob: &[u8]) -> anyhow::Resu
     let value: serde_json::Value = serde_json::from_slice(&cipher.unseal(blob)?)?;
     let mut run: RunRecord = serde_json::from_value(value.clone())?;
     if let Some(object) = value.as_object() {
+        run.webhook_delivery_id = serde_json::from_value(
+            object
+                .get("webhook_delivery_id")
+                .cloned()
+                .unwrap_or_default(),
+        )?;
+    }
+    if let Some(object) = value.as_object() {
         run.job_needs = object
             .get("job_needs")
             .cloned()
@@ -1430,6 +1439,7 @@ impl SqliteStore {
             }
         }
 
+        let restored_at = Instant::now();
         let mut runner_stmt = connection.prepare(
             "SELECT runner_id, name, ephemeral, runner_group_id, runner_group_name,
                     public_key, rsa_public_key
@@ -1453,6 +1463,7 @@ impl SqliteStore {
                     .as_ref()
                     .map(|key| (runner.id, key.clone())),
             );
+            inner.runner_registered_at.insert(runner.id, restored_at);
             inner.runners.insert(runner.id, runner);
         }
         // Restore typed RSA public keys so post-restart sessions can be
@@ -1832,13 +1843,14 @@ impl SqliteStore {
                 .cipher
                 .seal(&serde_json::to_vec(&run_record_value(run)?)?)?;
             tx.execute(
-                "INSERT INTO runs(run_id, repository, workflow_path, status, run_number,
-                                  run_attempt, created_at_us, completed_at_us, record_blob)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO runs(run_id, repository, workflow_path, webhook_delivery_id, status,
+                                  run_number, run_attempt, created_at_us, completed_at_us, record_blob)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     run.run_id.to_string(),
                     run.submission.repository.clone(),
                     run.workflow_path_str.clone(),
+                    run.webhook_delivery_id.clone(),
                     status_string(run.status),
                     run.run_number as i64,
                     run.run_attempt as i64,
@@ -2067,12 +2079,13 @@ impl SqliteStore {
     fn store_run_tx(&self, tx: &Transaction<'_>, run: &RunRecord) -> anyhow::Result<()> {
         let value = run_record_value(run)?;
         tx.execute(
-            "INSERT INTO runs(run_id, repository, workflow_path, status, run_number,
-                              run_attempt, created_at_us, completed_at_us, record_blob)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO runs(run_id, repository, workflow_path, webhook_delivery_id, status,
+                              run_number, run_attempt, created_at_us, completed_at_us, record_blob)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(run_id) DO UPDATE SET
                repository = excluded.repository,
                workflow_path = excluded.workflow_path,
+               webhook_delivery_id = excluded.webhook_delivery_id,
                status = excluded.status,
                run_number = excluded.run_number,
                run_attempt = excluded.run_attempt,
@@ -2083,6 +2096,7 @@ impl SqliteStore {
                 run.run_id.to_string(),
                 run.submission.repository.clone(),
                 run.workflow_path_str.clone(),
+                run.webhook_delivery_id.clone(),
                 status_string(run.status),
                 run.run_number as i64,
                 run.run_attempt as i64,
@@ -2315,7 +2329,16 @@ impl SqliteStore {
                  delivery_id, event, payload_blob, received_at_us, state, attempts,
                  lease_until_us, lease_token, last_error
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-             ON CONFLICT(delivery_id) DO NOTHING",
+             ON CONFLICT(delivery_id) DO UPDATE SET
+                 event = excluded.event,
+                 payload_blob = excluded.payload_blob,
+                 received_at_us = excluded.received_at_us,
+                 state = 'received',
+                 attempts = 0,
+                 lease_until_us = NULL,
+                 lease_token = NULL,
+                 last_error = NULL
+             WHERE webhook_deliveries.state = 'failed'",
             params![
                 delivery.delivery_id,
                 delivery.event,
@@ -2350,14 +2373,12 @@ impl SqliteStore {
             event: String,
             payload_blob: Vec<u8>,
             received_at_us: i64,
-            state: String,
             attempts: i64,
-            lease_until_us: Option<i64>,
             last_error: Option<String>,
         }
 
         let mut stmt = tx.prepare(
-            "SELECT delivery_id, event, payload_blob, received_at_us, state, attempts, lease_until_us, last_error
+            "SELECT delivery_id, event, payload_blob, received_at_us, attempts, last_error
              FROM webhook_deliveries
              WHERE (state = 'received' AND (lease_until_us IS NULL OR lease_until_us <= ?1))
                 OR (state = 'processing' AND lease_until_us IS NOT NULL AND lease_until_us < ?1)
@@ -2372,10 +2393,8 @@ impl SqliteStore {
                     event: row.get(1)?,
                     payload_blob: row.get(2)?,
                     received_at_us: row.get(3)?,
-                    state: row.get(4)?,
-                    attempts: row.get(5)?,
-                    lease_until_us: row.get(6)?,
-                    last_error: row.get(7)?,
+                    attempts: row.get(4)?,
+                    last_error: row.get(5)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -2383,7 +2402,27 @@ impl SqliteStore {
 
         let mut records = Vec::with_capacity(rows.len());
         for row in rows {
-            let payload = self.cipher.unseal(&row.payload_blob)?;
+            let payload = match self.cipher.unseal(&row.payload_blob) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    let last_error = format!("failed to decrypt webhook payload: {error}");
+                    tx.execute(
+                        "UPDATE webhook_deliveries
+                         SET state = 'failed', lease_until_us = NULL, lease_token = NULL,
+                             attempts = attempts + 1, last_error = ?2
+                         WHERE delivery_id = ?1
+                           AND (
+                               (state = 'received' AND
+                                (lease_until_us IS NULL OR lease_until_us <= ?3))
+                               OR
+                               (state = 'processing' AND
+                                lease_until_us IS NOT NULL AND lease_until_us <= ?3)
+                           )",
+                        params![row.delivery_id, last_error, now],
+                    )?;
+                    continue;
+                }
+            };
             let new_attempts = (row.attempts as u32).saturating_add(1);
             let lease_token = uuid::Uuid::new_v4().to_string();
             tx.execute(
@@ -2425,12 +2464,14 @@ impl SqliteStore {
             .connection
             .lock()
             .map_err(|_| anyhow::anyhow!("sqlite lock poisoned"))?;
-        let lease_until = now_us() + (lease_duration_secs as i64 * 1_000_000);
+        let now = now_us();
+        let lease_until = now + (lease_duration_secs as i64 * 1_000_000);
         let rows_affected = connection.execute(
             "UPDATE webhook_deliveries
              SET lease_until_us = ?1
-             WHERE delivery_id = ?2 AND state = 'processing' AND lease_token = ?3",
-            params![lease_until, delivery_id, lease_token],
+             WHERE delivery_id = ?2 AND state = 'processing' AND lease_token = ?3
+               AND lease_until_us IS NOT NULL AND lease_until_us > ?4",
+            params![lease_until, delivery_id, lease_token, now],
         )?;
         Ok(rows_affected > 0)
     }
@@ -2444,11 +2485,13 @@ impl SqliteStore {
             .lock()
             .map_err(|_| anyhow::anyhow!("sqlite lock poisoned"))?;
         let tx = connection.transaction()?;
+        let now = now_us();
         let rows_affected = tx.execute(
             "UPDATE webhook_deliveries
              SET state = 'done', lease_until_us = NULL, lease_token = NULL, last_error = NULL
-             WHERE delivery_id = ?1 AND state = 'processing' AND lease_token = ?2",
-            params![delivery_id, lease_token],
+             WHERE delivery_id = ?1 AND state = 'processing' AND lease_token = ?2
+               AND lease_until_us IS NOT NULL AND lease_until_us > ?3",
+            params![delivery_id, lease_token, now],
         )?;
         tx.commit()?;
         self.maybe_checkpoint_wal(&connection)?;
@@ -2468,20 +2511,23 @@ impl SqliteStore {
             .lock()
             .map_err(|_| anyhow::anyhow!("sqlite lock poisoned"))?;
         let tx = connection.transaction()?;
+        let now = now_us();
         let rows_affected = if permanent {
             tx.execute(
                 "UPDATE webhook_deliveries
                  SET state = 'failed', lease_until_us = NULL, lease_token = NULL, last_error = ?2
-                 WHERE delivery_id = ?1 AND state = 'processing' AND lease_token = ?3",
-                params![delivery_id, error, lease_token],
+                 WHERE delivery_id = ?1 AND state = 'processing' AND lease_token = ?3
+                   AND lease_until_us IS NOT NULL AND lease_until_us > ?4",
+                params![delivery_id, error, lease_token, now],
             )?
         } else {
-            let lease_until = retry_delay_secs.map(|delay| now_us() + (delay as i64 * 1_000_000));
+            let lease_until = retry_delay_secs.map(|delay| now + (delay as i64 * 1_000_000));
             tx.execute(
                 "UPDATE webhook_deliveries
                  SET state = 'received', lease_until_us = ?2, lease_token = NULL, last_error = ?3
-                 WHERE delivery_id = ?1 AND state = 'processing' AND lease_token = ?4",
-                params![delivery_id, lease_until, error, lease_token],
+                 WHERE delivery_id = ?1 AND state = 'processing' AND lease_token = ?4
+                   AND lease_until_us IS NOT NULL AND lease_until_us > ?5",
+                params![delivery_id, lease_until, error, lease_token, now],
             )?
         };
         tx.commit()?;
@@ -3051,6 +3097,16 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         "webhook-delivery-lease-fencing",
         r#"
         ALTER TABLE webhook_deliveries ADD COLUMN lease_token TEXT;
+        "#,
+    ),
+    (
+        8,
+        "webhook-run-reservation",
+        r#"
+        ALTER TABLE runs ADD COLUMN webhook_delivery_id TEXT;
+        CREATE UNIQUE INDEX IF NOT EXISTS runs_webhook_delivery_workflow_idx
+          ON runs (webhook_delivery_id, workflow_path)
+          WHERE webhook_delivery_id IS NOT NULL;
         "#,
     ),
 ];

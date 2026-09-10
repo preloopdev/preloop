@@ -234,6 +234,21 @@ pub(crate) async fn report_check_run_queued(
     job_id: &JobId,
     run_id: RunId,
 ) {
+    // Webhook delivery is at-least-once. A replay can find a run whose
+    // queued check was already persisted before the worker crashed; PATCH
+    // that check instead of POSTing a second one.
+    let existing_check_run_id = {
+        let inner = shared.state.inner.lock().await;
+        inner
+            .runs
+            .get(&run_id)
+            .and_then(|run| run.job_check_run_ids.get(job_id).copied())
+    };
+    if let Some(check_run_id) = existing_check_run_id {
+        report_existing_check_run_queued(shared, repo, job_id, run_id, check_run_id).await;
+        return;
+    }
+
     let token = resolve_check_run_token(shared, repo).await;
     let mut check_run_id = None;
 
@@ -1189,13 +1204,17 @@ async fn process_check_run_rerequest(
 enum WebhookOutcome {
     Success,
     TransientError(String),
-    PermanentError {
+    PermanentErrors {
         repo: String,
-        sha: Option<String>,
-        check_name: String,
-        error: String,
+        failures: Vec<WebhookFailure>,
     },
     Unreportable(String),
+}
+#[derive(Debug)]
+struct WebhookFailure {
+    sha: Option<String>,
+    check_name: String,
+    error: String,
 }
 
 /// Renew a claimed delivery while its workflow evaluation is in flight.
@@ -1208,40 +1227,79 @@ async fn run_webhook_lease_heartbeat(
     shared: Arc<SharedState>,
     delivery_id: String,
     lease_token: String,
+    lease_lost: tokio_util::sync::CancellationToken,
 ) {
     let mut interval =
         tokio::time::interval(Duration::from_secs(WEBHOOK_LEASE_RENEW_INTERVAL_SECS));
+    let mut lease_deadline = Instant::now() + Duration::from_secs(WEBHOOK_LEASE_DURATION_SECS);
+    let mut deadline = Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(
+        lease_deadline,
+    )));
     interval.tick().await;
     loop {
         tokio::select! {
-            _ = shared.shutdown.cancelled() => return,
+            _ = shared.shutdown.cancelled() => {
+                lease_lost.cancel();
+                return;
+            }
+            _ = &mut deadline => {
+                warn!(
+                    delivery = %delivery_id,
+                    "webhook delivery lease expired while renewal was unavailable"
+                );
+                lease_lost.cancel();
+                return;
+            }
             _ = interval.tick() => {
-                match shared
-                    .state
-                    .store
-                    .renew_webhook_delivery(
-                        &delivery_id,
-                        &lease_token,
-                        WEBHOOK_LEASE_DURATION_SECS,
-                    )
-                    .await
-                {
-                    Ok(true) => {
+                let renewal = tokio::time::timeout(
+                    Duration::from_secs(WEBHOOK_LEASE_RENEW_INTERVAL_SECS),
+                    shared
+                        .state
+                        .store
+                        .renew_webhook_delivery(
+                            &delivery_id,
+                            &lease_token,
+                            WEBHOOK_LEASE_DURATION_SECS,
+                        ),
+                )
+                .await;
+                match renewal {
+                    Ok(Ok(true)) => {
                         debug!(delivery = %delivery_id, "renewed webhook delivery lease");
+                        lease_deadline =
+                            Instant::now() + Duration::from_secs(WEBHOOK_LEASE_DURATION_SECS);
+                        deadline
+                            .as_mut()
+                            .reset(tokio::time::Instant::from_std(lease_deadline));
                     }
-                    Ok(false) => {
+                    Ok(Ok(false)) => {
                         warn!(
                             delivery = %delivery_id,
                             "webhook delivery lease was fenced while processing"
                         );
+                        lease_lost.cancel();
                         return;
                     }
-                    Err(error) => {
+                    Ok(Err(error)) => {
                         warn!(
                             delivery = %delivery_id,
                             ?error,
                             "failed to renew webhook delivery lease"
                         );
+                        if Instant::now() >= lease_deadline {
+                            lease_lost.cancel();
+                            return;
+                        }
+                    }
+                    Err(_) => {
+                        warn!(
+                            delivery = %delivery_id,
+                            "timed out renewing webhook delivery lease"
+                        );
+                        if Instant::now() >= lease_deadline {
+                            lease_lost.cancel();
+                            return;
+                        }
                     }
                 }
             }
@@ -1250,7 +1308,14 @@ async fn run_webhook_lease_heartbeat(
 }
 
 /// Background task that continuously drains the durable webhook queue.
-pub(crate) async fn run_webhook_queue_worker(shared: Arc<SharedState>) {
+pub(crate) async fn run_webhook_queue_worker(
+    shared: Arc<SharedState>,
+    heartbeat: preloop_observability::HeartbeatHandle,
+) {
+    // Registering happens before the task is spawned so a panic during
+    // startup remains visible to readiness checks. Beat before recovery and
+    // again on every loop; a stuck queue worker must not look healthy.
+    heartbeat.beat();
     // Crash recovery: on boot, reset processing rows whose lease has expired back to received.
     if let Err(error) = shared.state.store.recover_webhook_deliveries().await {
         warn!(
@@ -1261,6 +1326,7 @@ pub(crate) async fn run_webhook_queue_worker(shared: Arc<SharedState>) {
     let mut last_prune = Instant::now();
 
     loop {
+        heartbeat.beat();
         if shared.shutdown.is_cancelled() {
             break;
         }
@@ -1331,27 +1397,53 @@ pub(crate) async fn process_one_delivery(
         );
         return;
     };
+    let lease_lost = tokio_util::sync::CancellationToken::new();
     let heartbeat = tokio::spawn(run_webhook_lease_heartbeat(
         shared.clone(),
         delivery.delivery_id.clone(),
         lease_token.to_owned(),
+        lease_lost.clone(),
     ));
     // Isolate payload processing so a panic cannot strand the heartbeat task
-    // or leave the queue row in `processing` forever.
+    // or leave the queue row in `processing` forever. A fenced or expired
+    // lease cancels this task before it can report external side effects.
     let processing_shared = shared.clone();
     let processing_delivery = delivery.clone();
-    let outcome = match tokio::spawn(async move {
+    let mut processing = tokio::spawn(async move {
         process_delivery_payload(&processing_shared, &processing_delivery).await
-    })
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            WebhookOutcome::Unreportable(format!("webhook processing task failed: {error}"))
+    });
+    let outcome = tokio::select! {
+        _ = lease_lost.cancelled() => {
+            processing.abort();
+            let _ = processing.await;
+            None
         }
+        result = &mut processing => Some(match result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                WebhookOutcome::Unreportable(format!("webhook processing task failed: {error}"))
+            }
+        }),
     };
     heartbeat.abort();
     let _ = heartbeat.await;
+    let Some(outcome) = outcome else {
+        warn!(
+            delivery_id = %delivery.delivery_id,
+            "abandoned webhook processing after losing its lease"
+        );
+        return;
+    };
+    // The payload may have completed at the same instant the heartbeat
+    // observed fencing. Do not report checks or mutate the queue row after
+    // that point; the replacement worker owns the retry.
+    if lease_lost.is_cancelled() {
+        warn!(
+            delivery_id = %delivery.delivery_id,
+            "discarding webhook outcome after losing its lease"
+        );
+        return;
+    }
     let outcome = match outcome {
         WebhookOutcome::TransientError(error) if delivery.attempts >= WEBHOOK_MAX_ATTEMPTS => {
             WebhookOutcome::Unreportable(format!(
@@ -1418,25 +1510,45 @@ pub(crate) async fn process_one_delivery(
                 ),
             }
         }
-        WebhookOutcome::PermanentError {
-            repo,
-            sha,
-            check_name,
-            error: err,
-        } => {
+        WebhookOutcome::PermanentErrors { repo, failures } => {
+            let error = failures
+                .iter()
+                .map(|failure| format!("{}: {}", failure.check_name, failure.error))
+                .collect::<Vec<_>>()
+                .join("; ");
             error!(
                 delivery_id = %delivery.delivery_id,
                 %repo,
-                error = %err,
-                "permanent error processing webhook delivery; reporting failure check run"
+                error = %error,
+                failures = failures.len(),
+                "permanent errors processing webhook delivery; reporting failure check runs"
             );
-            if let Some(sha) = &sha {
-                report_check_run_permanent_failure(shared, &repo, sha, &check_name, &err).await;
+            for failure in &failures {
+                if lease_lost.is_cancelled() {
+                    warn!(
+                        delivery_id = %delivery.delivery_id,
+                        "stopped reporting webhook failures after losing lease"
+                    );
+                    return;
+                }
+                if let Some(sha) = &failure.sha {
+                    report_check_run_permanent_failure(
+                        shared,
+                        &repo,
+                        sha,
+                        &failure.check_name,
+                        &failure.error,
+                    )
+                    .await;
+                }
+            }
+            if lease_lost.is_cancelled() {
+                return;
             }
             match shared
                 .state
                 .store
-                .fail_webhook_delivery(&delivery.delivery_id, lease_token, &err, true, None)
+                .fail_webhook_delivery(&delivery.delivery_id, lease_token, &error, true, None)
                 .await
             {
                 Ok(true) => {}
@@ -1577,6 +1689,7 @@ async fn process_delivery_payload(
     let github_owned_workflows = configured_github_owned_workflows();
     let mut unmatched_workflows: Vec<String> = Vec::new();
     let mut triggered_count = 0usize;
+    let mut permanent_failures: Vec<WebhookFailure> = Vec::new();
 
     for effective in &effective_events {
         if effective.skip {
@@ -1723,12 +1836,17 @@ async fn process_delivery_payload(
                 Err(e) => {
                     let error_msg = format!("Failed to parse workflow file {filename}: {e:?}");
                     warn!("{error_msg}");
-                    return WebhookOutcome::PermanentError {
-                        repo: repo_full_name.clone(),
-                        sha: Some(resolved_sha.clone()),
+                    permanent_failures.push(WebhookFailure {
+                        sha: effective
+                            .status_check_sha
+                            .clone()
+                            .or_else(|| Some(resolved_sha.clone())),
                         check_name: filename.clone(),
                         error: error_msg,
-                    };
+                    });
+                    // A malformed file must not prevent other workflows at
+                    // the same commit from being evaluated and queued.
+                    continue;
                 }
             }
 
@@ -1902,6 +2020,12 @@ async fn process_delivery_payload(
             workflows = %unmatched_workflows.join(", "),
             "workflows evaluated but not triggered by this event"
         );
+    }
+    if !permanent_failures.is_empty() {
+        return WebhookOutcome::PermanentErrors {
+            repo: repo_full_name,
+            failures: permanent_failures,
+        };
     }
 
     WebhookOutcome::Success
@@ -2412,6 +2536,114 @@ mod tests {
         );
     }
 
+    /// A malformed workflow is reported permanently without preventing valid
+    /// workflows from the same webhook commit from being submitted.
+    #[tokio::test]
+    async fn malformed_workflow_does_not_abort_other_workflows() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = temp.path().join("ws");
+        std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
+        std::fs::write(
+            ws_dir.join(".github/workflows/a-malformed.yml"),
+            "on: [push\njobs:\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ws_dir.join(".github/workflows/z-valid.yml"),
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo valid\n",
+        )
+        .unwrap();
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+
+        assert_eq!(
+            fixture.post("delivery-malformed", Some("push")).await,
+            StatusCode::ACCEPTED
+        );
+        fixture.drain().await;
+
+        let record = fixture
+            .state
+            .store
+            .get_webhook_delivery("delivery-malformed")
+            .await
+            .unwrap()
+            .expect("delivery row exists");
+        assert_eq!(record.state, WebhookDeliveryStatus::Failed);
+        assert!(
+            record
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("a-malformed.yml")),
+            "permanent delivery error must identify malformed workflow"
+        );
+        let inner = fixture.state.inner.lock().await;
+        assert_eq!(
+            inner.runs.len(),
+            1,
+            "valid workflow must still be submitted after malformed workflow"
+        );
+        assert_eq!(
+            inner.runs.values().next().unwrap().workflow_path_str,
+            ".github/workflows/z-valid.yml"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_pull_request_workflow_reports_head_sha() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = temp.path().join("ws");
+        std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
+        std::fs::write(
+            ws_dir.join(".github/workflows/a-malformed.yml"),
+            "on: [push\njobs:\n",
+        )
+        .unwrap();
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        let base_sha = git_output(&fixture.workspace, &["rev-parse", "HEAD"]);
+        let payload = serde_json::json!({
+            "action": "opened",
+            "repository": {
+                "full_name": "owner/repo",
+                "default_branch": "main"
+            },
+            "pull_request": {
+                "base": { "ref": "main", "sha": base_sha },
+                "head": { "ref": "feature", "sha": "head-sha-456" }
+            }
+        });
+        let payload = serde_json::to_vec(&payload).unwrap();
+        assert_eq!(
+            fixture
+                .post_body(
+                    "delivery-pr-failure-sha",
+                    Some("pull_request_target"),
+                    &payload
+                )
+                .await,
+            StatusCode::ACCEPTED
+        );
+
+        let shared = Arc::new(SharedState {
+            state: fixture.state.clone(),
+            shutdown: CancellationToken::new(),
+        });
+        let claimed = fixture
+            .state
+            .store
+            .claim_webhook_deliveries(1, 60)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        let outcome = process_delivery_payload(&shared, &claimed[0]).await;
+        match outcome {
+            WebhookOutcome::PermanentErrors { failures, .. } => {
+                assert_eq!(failures.len(), 1);
+                assert_eq!(failures[0].sha.as_deref(), Some("head-sha-456"));
+            }
+            other => panic!("malformed pull request workflow must be permanent: {other:?}"),
+        }
+    }
+
     /// Regression guard: a workflow that simply is not triggered by the event
     /// is a *completed* delivery, not a failure.
     #[tokio::test]
@@ -2561,12 +2793,13 @@ mod tests {
         assert_eq!(claimed.len(), 1);
         let outcome = process_delivery_payload(&shared, &claimed[0]).await;
         assert!(matches!(outcome, WebhookOutcome::Success));
-        {
+        let (original_run_id, original_check_run_ids) = {
             let inner = fixture.state.inner.lock().await;
             assert_eq!(inner.runs.len(), 1);
             let run = inner.runs.values().next().unwrap();
             assert_eq!(run.webhook_delivery_id.as_deref(), Some("delivery-replay"));
-        }
+            (run.run_id, run.job_check_run_ids.clone())
+        };
 
         // Simulate a worker crash after run creation but before marking the
         // delivery done. The replay must reuse that persisted run.
@@ -2591,8 +2824,180 @@ mod tests {
             1,
             "replaying one delivery must not create a second run"
         );
+        let run = inner
+            .runs
+            .get(&original_run_id)
+            .expect("original run survives replay");
+        assert_eq!(
+            run.job_check_run_ids, original_check_run_ids,
+            "replaying a persisted run must reuse its GitHub check-run mapping"
+        );
+    }
+    #[tokio::test]
+    async fn failed_webhook_delivery_can_be_reopened_for_redelivery() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = WebhookFixture::new(&temp).await;
+        let delivery = WebhookDeliveryRecord {
+            delivery_id: "delivery-redelivery".to_owned(),
+            event: "push".to_owned(),
+            payload: fixture.payload_bytes.clone(),
+            received_at_us: crate::store::now_us(),
+            state: WebhookDeliveryStatus::Received,
+            attempts: 0,
+            lease_until_us: None,
+            lease_token: None,
+            last_error: None,
+        };
+        assert!(fixture
+            .state
+            .store
+            .enqueue_webhook_delivery(&delivery)
+            .await
+            .unwrap());
+        let claimed = fixture
+            .state
+            .store
+            .claim_webhook_deliveries(1, 60)
+            .await
+            .unwrap();
+        let lease_token = claimed[0].lease_token.as_deref().unwrap();
+        assert!(fixture
+            .state
+            .store
+            .fail_webhook_delivery(
+                &delivery.delivery_id,
+                lease_token,
+                "permanent test failure",
+                true,
+                None,
+            )
+            .await
+            .unwrap());
+
+        let failed = fixture
+            .state
+            .store
+            .get_webhook_delivery(&delivery.delivery_id)
+            .await
+            .unwrap()
+            .expect("failed delivery row exists");
+        assert_eq!(failed.state, WebhookDeliveryStatus::Failed);
+
+        let mut redelivery = delivery.clone();
+        redelivery.received_at_us = crate::store::now_us();
+        assert!(
+            fixture
+                .state
+                .store
+                .enqueue_webhook_delivery(&redelivery)
+                .await
+                .unwrap(),
+            "GitHub redelivery must reopen a retained failed row"
+        );
+        let reopened = fixture
+            .state
+            .store
+            .get_webhook_delivery(&delivery.delivery_id)
+            .await
+            .unwrap()
+            .expect("reopened delivery row exists");
+        assert_eq!(reopened.state, WebhookDeliveryStatus::Received);
+        assert_eq!(reopened.attempts, 0);
+        assert!(reopened.lease_token.is_none());
+        assert!(reopened.last_error.is_none());
+        assert!(
+            !fixture
+                .state
+                .store
+                .enqueue_webhook_delivery(&redelivery)
+                .await
+                .unwrap(),
+            "an active redelivery remains deduplicated"
+        );
     }
 
+    #[tokio::test]
+    async fn corrupt_webhook_payload_is_dead_lettered_without_wedging_queue() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = WebhookFixture::new(&temp).await;
+        let corrupt = WebhookDeliveryRecord {
+            delivery_id: "delivery-corrupt".to_owned(),
+            event: "push".to_owned(),
+            payload: fixture.payload_bytes.clone(),
+            received_at_us: crate::store::now_us() - 1,
+            state: WebhookDeliveryStatus::Received,
+            attempts: 0,
+            lease_until_us: None,
+            lease_token: None,
+            last_error: None,
+        };
+        let valid = WebhookDeliveryRecord {
+            delivery_id: "delivery-after-corrupt".to_owned(),
+            received_at_us: crate::store::now_us(),
+            ..corrupt.clone()
+        };
+        assert!(fixture
+            .state
+            .store
+            .enqueue_webhook_delivery(&corrupt)
+            .await
+            .unwrap());
+        assert!(fixture
+            .state
+            .store
+            .enqueue_webhook_delivery(&valid)
+            .await
+            .unwrap());
+
+        let db_path = temp.path().join("state").join("preloop.db");
+        let connection = rusqlite::Connection::open(db_path).unwrap();
+        connection
+            .execute(
+                "UPDATE webhook_deliveries SET payload_blob = ?1 WHERE delivery_id = ?2",
+                rusqlite::params![vec![0_u8, 1, 2], corrupt.delivery_id],
+            )
+            .unwrap();
+        drop(connection);
+
+        let claimed = fixture
+            .state
+            .store
+            .claim_webhook_deliveries(1, 60)
+            .await
+            .unwrap();
+        assert!(
+            claimed.is_empty(),
+            "corrupt payload is dead-lettered instead of returned to the worker"
+        );
+        assert_eq!(
+            fixture
+                .state
+                .store
+                .count_dead_letter_webhook_deliveries()
+                .await
+                .unwrap(),
+            1
+        );
+
+        let claimed = fixture
+            .state
+            .store
+            .claim_webhook_deliveries(1, 60)
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed.len(),
+            1,
+            "a corrupt FIFO row must not wedge later valid deliveries"
+        );
+        let lease_token = claimed[0].lease_token.as_deref().unwrap();
+        assert!(fixture
+            .state
+            .store
+            .complete_webhook_delivery(&valid.delivery_id, lease_token)
+            .await
+            .unwrap());
+    }
     #[tokio::test]
     async fn webhook_processing_lease_can_be_renewed() {
         let temp = tempfile::tempdir().unwrap();
@@ -2658,6 +3063,79 @@ mod tests {
             renewed.lease_until_us.unwrap() > crate::store::now_us() + 50_000_000,
             "renewal must move the lease beyond the original one-second claim"
         );
+    }
+    #[tokio::test]
+    async fn expired_webhook_lease_rejects_all_mutations() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = WebhookFixture::new(&temp).await;
+        let delivery = WebhookDeliveryRecord {
+            delivery_id: "delivery-expired-lease".to_owned(),
+            event: "push".to_owned(),
+            payload: fixture.payload_bytes.clone(),
+            received_at_us: crate::store::now_us(),
+            state: WebhookDeliveryStatus::Received,
+            attempts: 0,
+            lease_until_us: None,
+            lease_token: None,
+            last_error: None,
+        };
+        fixture
+            .state
+            .store
+            .enqueue_webhook_delivery(&delivery)
+            .await
+            .unwrap();
+        let claimed = fixture
+            .state
+            .store
+            .claim_webhook_deliveries(1, 0)
+            .await
+            .unwrap();
+        let lease_token = claimed[0].lease_token.as_deref().unwrap();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+
+        assert!(
+            !fixture
+                .state
+                .store
+                .renew_webhook_delivery(&delivery.delivery_id, lease_token, 60)
+                .await
+                .unwrap(),
+            "an expired lease must not be renewed by its old owner"
+        );
+        assert!(
+            !fixture
+                .state
+                .store
+                .complete_webhook_delivery(&delivery.delivery_id, lease_token)
+                .await
+                .unwrap(),
+            "an expired lease must not be completed by its old owner"
+        );
+        assert!(
+            !fixture
+                .state
+                .store
+                .fail_webhook_delivery(
+                    &delivery.delivery_id,
+                    lease_token,
+                    "stale failure",
+                    false,
+                    Some(0),
+                )
+                .await
+                .unwrap(),
+            "an expired lease must not be failed by its old owner"
+        );
+        let retained = fixture
+            .state
+            .store
+            .get_webhook_delivery(&delivery.delivery_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.state, WebhookDeliveryStatus::Processing);
+        assert_eq!(retained.lease_token.as_deref(), Some(lease_token));
     }
 
     #[tokio::test]

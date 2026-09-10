@@ -28,8 +28,8 @@ pub struct ServerConfig {
     pub next_job_runs_on: Option<Arc<std::sync::RwLock<Vec<String>>>>,
     /// Raised while a co-hosted runner pool is still preparing its
     /// immutable machine image (artifact download or build, golden prep)
-    /// and cannot register a runner yet. The starvation sweep pauses the
-    /// queued-job grace clock while it is set.
+    /// and cannot register a runner yet. The starvation sweep protects queued
+    /// jobs during this warm, bounded by the absolute queue-age ceiling.
     pub pool_preparing: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Enable privileged local/CI simulation endpoints.
     pub enable_test_api: bool,
@@ -237,22 +237,22 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
     // demand and external runners may register at any moment, so a job is
     // only failed after a grace window during which nothing matched its
     // labels. The `queued_at` map is maintained here, from the queue itself:
-    // first observation stamps the time, a match clears it, and jobs that
-    // left the queue drop their entry, so no enqueue-site coordination is
-    // needed and the map cannot go stale. While a co-hosted pool is still
-    // preparing its machine image (artifact download or build, golden prep)
-    // or booting a runner it cannot register a runner no matter how long the
-    // job waits, so the clock is reset for the whole warm: a job queued
-    // mid-warm gets a full grace window once provisioning actually starts.
-    // The reset is bounded by MAX_QUEUED_GRACE (see below) so continuous
-    // provisioning cannot pause the clock forever.
+    // its first observation uses the persisted ready-enqueue time when
+    // available, and entries are dropped when jobs leave the queue. This
+    // avoids enqueue-site coordination and preserves queue age across
+    // restarts. While a co-hosted pool is still preparing its machine image
+    // (artifact download or build, golden prep) or booting a runner it cannot
+    // register a runner no matter how long the job waits, so keep the job
+    // protected during that warm. The protection is bounded by
+    // MAX_QUEUED_GRACE (see below), measured from ready-enqueue, so continuous
+    // provisioning cannot protect an unschedulable job forever.
     const QUEUED_JOB_GRACE: Duration = Duration::from_secs(120);
     // Absolute backstop, measured from ready-enqueue, on how long
-    // provisioning/preparing may pause a job's starvation clock. It protects
-    // a job whose runner is genuinely on the way, but keeps continuous
-    // successor prebuilds or a provision that fails and retries forever from
-    // masking an unschedulable job (bad `runs-on`, or a persistently broken
-    // provision) indefinitely.
+    // provisioning/preparing may protect a job from starvation failure. It
+    // protects a job whose runner is genuinely on the way, but keeps
+    // continuous successor prebuilds or a provision that fails and retries
+    // forever from masking an unschedulable job (bad `runs-on`, or a
+    // persistently broken provision) indefinitely.
     const MAX_QUEUED_GRACE: Duration = Duration::from_secs(600);
     let pool_status = shared.state.pool_status.snapshot();
     let pool_preparing = shared
@@ -293,6 +293,12 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
             inner.queued_at.remove(&key);
             continue;
         }
+        let enqueued_at = (job.enqueued_at_unix_nanos > 0).then(|| {
+            SystemTime::UNIX_EPOCH + Duration::from_nanos(job.enqueued_at_unix_nanos as u64)
+        });
+        let enqueue_age_expired = enqueued_at
+            .and_then(|enqueued| now.duration_since(enqueued).ok())
+            .is_some_and(|age| age >= MAX_QUEUED_GRACE);
         let grace = if pool_preparing {
             // The pool is warming or booting a runner that may serve this
             // job, so hold the grace window rather than failing a job whose
@@ -300,18 +306,22 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
             // MAX_QUEUED_GRACE measured from ready-enqueue: once a job has
             // waited that long it starves even while the pool is still
             // preparing, so sustained provisioning cannot mask it forever.
-            let enqueued = if job.enqueued_at_unix_nanos > 0 {
-                SystemTime::UNIX_EPOCH + Duration::from_nanos(job.enqueued_at_unix_nanos as u64)
-            } else {
-                now
-            };
-            if now.duration_since(enqueued).unwrap_or_default() < MAX_QUEUED_GRACE {
+            if !enqueue_age_expired {
                 inner.queued_at.remove(&key);
                 continue;
             }
             MAX_QUEUED_GRACE
         } else {
-            let first_seen = *inner.queued_at.entry(key.clone()).or_insert(now);
+            // Seed the observation clock from the persisted ready-enqueue
+            // timestamp. Older snapshots have no timestamp; treat them as
+            // already past the grace window instead of granting fresh time at
+            // every restart.
+            let first_seen = *inner.queued_at.entry(key.clone()).or_insert_with(|| {
+                enqueued_at.unwrap_or_else(|| {
+                    now.checked_sub(QUEUED_JOB_GRACE)
+                        .unwrap_or(SystemTime::UNIX_EPOCH)
+                })
+            });
             if now.duration_since(first_seen).unwrap_or_default() < QUEUED_JOB_GRACE {
                 continue;
             }
@@ -460,14 +470,18 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
             .filter(|(_, seen)| now.duration_since(**seen) > inner.runner_liveness_timeout)
             .filter_map(|(session_id, _)| inner.runner_id_for_session(session_id))
             .collect();
-        // Fix 5: reap phantom registrations (runners registered with no active session
-        // or that never polled within the liveness timeout).
+        // Reap registrations with no active AzDO or broker session and no
+        // successful poll within the liveness timeout.
         let phantom: std::collections::BTreeSet<i64> = inner
             .runner_registered_at
             .iter()
             .filter(|(runner_id, registered_at)| {
                 now.duration_since(**registered_at) > inner.runner_liveness_timeout
                     && !inner.sessions.values().any(|s| s.runner_id == **runner_id)
+                    && !inner
+                        .broker_session_runners
+                        .values()
+                        .any(|session_runner_id| *session_runner_id == **runner_id)
             })
             .map(|(runner_id, _)| *runner_id)
             .collect();
@@ -1256,9 +1270,14 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         run_background_reaper(checker_shared).await;
     });
 
+    let webhook_worker_heartbeat = state.observability.heartbeat().clone();
+    let webhook_worker_handle = webhook_worker_heartbeat.register(
+        "webhook_queue_worker",
+        preloop_observability::Criticality::Critical,
+    );
     let webhook_worker_shared = shared.clone();
     tokio::spawn(async move {
-        crate::github::run_webhook_queue_worker(webhook_worker_shared).await;
+        crate::github::run_webhook_queue_worker(webhook_worker_shared, webhook_worker_handle).await;
     });
 
     // Claims held by machines the restart destroyed can never be completed by

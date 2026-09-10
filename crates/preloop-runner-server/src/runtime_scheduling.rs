@@ -1526,18 +1526,18 @@ fn claim_permitted(inner: &InnerState, job: &QueuedJob, verified_runner_id: Opti
     let key = (job.run_id, job.job_id.clone());
     let now = std::time::SystemTime::now();
 
-    // Absolute ceiling on binding exclusivity anchored on the job enqueue time:
-    // sustained runner churn or repeated waitlist re-marking must never be able
-    // to starve a verified, capable idle runner past the binding window.
-    let enqueued_at = if job.enqueued_at_unix_nanos > 0 {
-        std::time::UNIX_EPOCH + std::time::Duration::from_nanos(job.enqueued_at_unix_nanos as u64)
+    // Older persisted jobs may not carry an enqueue timestamp. Treat that
+    // unknown age as already past the ceiling rather than resetting it to
+    // restart time and allowing strict-pool work to starve indefinitely.
+    let enqueue_ceiling_expired = if job.enqueued_at_unix_nanos > 0 {
+        let enqueued_at = std::time::UNIX_EPOCH
+            + std::time::Duration::from_nanos(job.enqueued_at_unix_nanos as u64);
+        now.duration_since(enqueued_at)
+            .map(|age| age >= CLAIM_BINDING_TTL)
+            .unwrap_or(false)
     } else {
-        now
+        true
     };
-    let enqueue_ceiling_expired = now
-        .duration_since(enqueued_at)
-        .map(|age| age >= CLAIM_BINDING_TTL)
-        .unwrap_or(false);
 
     if let Some(record) = inner.job_assignments.get(&key) {
         if !binding_fresh(record.first_at, now) || enqueue_ceiling_expired {
@@ -1767,6 +1767,26 @@ pub(crate) fn pair_registered_runner(inner: &mut InnerState, runner_id: i64) {
 /// no runner is actively polling.
 pub(crate) fn sweep_stale_bindings(inner: &mut InnerState, now: std::time::SystemTime) -> usize {
     let mut swept = 0;
+    let queued_keys: std::collections::BTreeSet<(RunId, JobId)> = inner
+        .queue
+        .iter()
+        .map(|job| (job.run_id, job.job_id.clone()))
+        .collect();
+    if inner.pool_assignments_enabled {
+        // Pairing state only has meaning for ready jobs. Drop restored or
+        // cancelled entries before the stale-binding pass so that releasing
+        // a dead assignment cannot recreate an orphaned pending marker.
+        let initial_assignments = inner.job_assignments.len();
+        inner
+            .job_assignments
+            .retain(|key, _| queued_keys.contains(key));
+        swept += initial_assignments - inner.job_assignments.len();
+        let initial_pending = inner.pool_pending.len();
+        inner
+            .pool_pending
+            .retain(|key, _| queued_keys.contains(key));
+        swept += initial_pending - inner.pool_pending.len();
+    }
     if !inner.require_job_assignments && !inner.pool_assignments_enabled {
         let initial_assignments = inner.job_assignments.len();
         let initial_pending = inner.pool_pending.len();
@@ -1799,7 +1819,7 @@ pub(crate) fn sweep_stale_bindings(inner: &mut InnerState, now: std::time::Syste
                         job_id = %key.1.0,
                         "stale binding released on timer; job requeued at back of pool waitlist"
                     );
-                    if inner.pool_assignments_enabled {
+                    if inner.pool_assignments_enabled && queued_keys.contains(&key) {
                         inner.pool_pending.insert(key, now);
                     }
                     inner.released_bindings_count = inner.released_bindings_count.saturating_add(1);
@@ -3491,6 +3511,63 @@ mod assignment_tests {
         );
 
         assert_eq!(inner.queue.len(), 2);
+    }
+
+    #[test]
+    fn restored_ready_job_without_enqueue_timestamp_is_not_held_by_fresh_pool_mark() {
+        let mut inner = InnerState {
+            pool_assignments_enabled: true,
+            require_job_assignments: true,
+            ..Default::default()
+        };
+        let job = test_queued_job("restored");
+        let key = (job.run_id, job.job_id.clone());
+        inner.queue.push_back(job);
+        inner.pool_pending.insert(key, std::time::SystemTime::now());
+
+        let claimed = take_matching_job(&mut inner, &self_hosted_caps(), Some(42));
+        assert!(
+            claimed.is_some(),
+            "a restored job without a ready timestamp must not receive a new pool grace window"
+        );
+    }
+
+    #[test]
+    fn stale_pool_pending_entries_for_removed_jobs_are_pruned() {
+        let mut inner = InnerState {
+            pool_assignments_enabled: true,
+            require_job_assignments: true,
+            ..Default::default()
+        };
+        let queued = test_queued_job("queued");
+        let queued_key = (queued.run_id, queued.job_id.clone());
+        let orphan = test_queued_job("orphan");
+        let orphan_key = (orphan.run_id, orphan.job_id.clone());
+        inner.queue.push_back(queued);
+        inner
+            .pool_pending
+            .insert(queued_key.clone(), std::time::SystemTime::now());
+        inner
+            .pool_pending
+            .insert(orphan_key.clone(), std::time::SystemTime::now());
+        let stale = std::time::SystemTime::UNIX_EPOCH;
+        inner.job_assignments.insert(
+            orphan_key.clone(),
+            AssignmentRecord {
+                runner_id: Some(5),
+                at: stale,
+                first_at: stale,
+            },
+        );
+
+        let swept = sweep_stale_bindings(&mut inner, std::time::SystemTime::now());
+        assert_eq!(
+            swept, 2,
+            "orphaned assignment and pending entries should both be swept"
+        );
+        assert!(inner.pool_pending.contains_key(&queued_key));
+        assert!(!inner.pool_pending.contains_key(&orphan_key));
+        assert!(!inner.job_assignments.contains_key(&orphan_key));
     }
 
     #[test]
