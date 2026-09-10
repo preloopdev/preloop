@@ -350,10 +350,15 @@ jobs:
   build-and-publish-golden-macos:
     name: Build & Publish aarch64 Golden (macOS)
     if: (github.event_name == 'workflow_dispatch' && !inputs.reuse_previous_goldens) || (github.event_name == 'release' && contains(github.event.release.body, '<!-- preloop:build-golden -->'))
-    # Hosted Apple Silicon builds this golden (proved through v0.29.6);
-    # 7f18e8a0 repointed it at a self-hosted Mac that was never registered,
-    # so every run since sat unassigned until GitHub's 24h ceiling.
-    runs-on: macos-15
+    # Hosted Apple Silicon builds this golden: macos-14 produced the last
+    # working aarch64 golden (v0.29.6, 2026-08-09). 7f18e8a0 then repointed
+    # it at a self-hosted Mac that was never registered, so every run since
+    # sat unassigned until GitHub's 24h ceiling.
+    #
+    # Pinned to macos-14 deliberately, not macos-latest: macos-15 fails at
+    # `krun_start_enter -22 (EINVAL)` during VmCreate even with the TSI
+    # backend below, so the runner image is load-bearing here.
+    runs-on: macos-14
     timeout-minutes: 180
     env:
       # GitHub's hosted macOS guests reject libkrun's virtio-net device under
