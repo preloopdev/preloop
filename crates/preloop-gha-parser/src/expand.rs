@@ -70,13 +70,13 @@ fn defaults_run_token(run: &crate::DefaultsRun) -> Value {
     if let Some(shell) = &run.shell {
         map.push(serde_json::json!({
             "Key": { "type": 0, "file": 1, "line": 1, "col": 1, "lit": "shell" },
-            "Value": { "type": 0, "file": 1, "line": 1, "col": 1, "lit": shell }
+            "Value": crate::job_builder::template_token(&Value::String(shell.clone()))
         }));
     }
     if let Some(wd) = &run.working_directory {
         map.push(serde_json::json!({
             "Key": { "type": 0, "file": 1, "line": 1, "col": 1, "lit": "working-directory" },
-            "Value": { "type": 0, "file": 1, "line": 1, "col": 1, "lit": wd }
+            "Value": crate::job_builder::template_token(&Value::String(wd.clone()))
         }));
     }
     serde_json::json!({
@@ -294,6 +294,36 @@ fn resolve_deferred_number(
         }
     }
 }
+fn resolve_step_timeout(
+    job_id: &str,
+    step_label: &str,
+    value: Option<&DeferredNumber>,
+    matrix: &IndexMap<String, Value>,
+    inputs: Option<&BTreeMap<String, Value>>,
+    matrix_deferred: bool,
+) -> Result<Option<u32>, ParserError> {
+    let resolved = if matrix_deferred {
+        match value {
+            Some(DeferredNumber::Literal(value)) => Some(*value),
+            Some(DeferredNumber::Expression(_)) => None,
+            None => None,
+        }
+    } else {
+        resolve_deferred_number(value, matrix, inputs)?
+    };
+    let Some(value) = resolved else {
+        return Ok(None);
+    };
+    if !(1..=360).contains(&value) {
+        return Err(ParserError::InvalidStepTimeout {
+            job_id: job_id.to_owned(),
+            step: step_label.to_owned(),
+            message: format!("expected a value from 1 through 360, got {value}"),
+        });
+    }
+    Ok(Some(value as u32))
+}
+
 
 /// Omit empty `services: {}` to match `EmitDefaultValue=false` behavior.
 fn non_empty_services(services: Option<serde_json::Value>) -> Option<serde_json::Value> {
@@ -546,7 +576,18 @@ fn job_plan_from_job(
         .steps
         .iter()
         .cloned()
-        .map(|step| step_plan(step, &job.defaults, &matrix, inputs, matrix_deferred))
+        .enumerate()
+        .map(|(step_index, step)| {
+            step_plan(
+                job_id,
+                step_index,
+                step,
+                &job.defaults,
+                &matrix,
+                inputs,
+                matrix_deferred,
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let mut defaults = Vec::new();
     if let Some(wf_defaults) = workflow_defaults {
@@ -1224,12 +1265,26 @@ fn normalize_reusable_path(uses: &str) -> String {
 }
 
 fn step_plan(
+    job_id: &str,
+    step_index: usize,
     step: Step,
     defaults: &Option<JobDefaults>,
     matrix: &IndexMap<String, Value>,
     inputs: Option<&BTreeMap<String, Value>>,
     matrix_deferred: bool,
 ) -> Result<StepPlan, ParserError> {
+    let step_label = step
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("step #{step_index}"));
+    let timeout_in_minutes = resolve_step_timeout(
+        job_id,
+        &step_label,
+        step.timeout_minutes.as_ref(),
+        matrix,
+        inputs,
+        matrix_deferred,
+    )?;
     // Merge job-level defaults into step — step values take precedence.
     let working_directory = step.working_directory.or_else(|| {
         defaults
@@ -1265,7 +1320,7 @@ fn step_plan(
                 resolve_deferred_bool(Some(value), matrix, inputs, false).map(Some)
             }
         })?,
-        timeout_in_minutes: step.timeout_minutes,
+        timeout_in_minutes,
     })
 }
 

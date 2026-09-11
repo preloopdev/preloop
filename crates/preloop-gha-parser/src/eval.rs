@@ -278,6 +278,15 @@ const CTX_STEP_IF: &[&str] = &[
     "success",
     "hashfiles",
 ];
+const CTX_STEP_TIMEOUT: &[&str] = &[
+    "github",
+    "inputs",
+    "vars",
+    "needs",
+    "strategy",
+    "matrix",
+    "env",
+];
 const CTX_STEP_ENV: &[&str] = &[
     "github",
     "inputs",
@@ -316,6 +325,28 @@ fn validate_container_expressions(value: &Value) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_run_defaults(
+    defaults: &crate::models::JobDefaults,
+    label: &str,
+) -> Result<(), ParserError> {
+    let Some(run) = &defaults.run else {
+        return Ok(());
+    };
+    for (field, value) in [
+        ("shell", run.shell.as_ref()),
+        ("working-directory", run.working_directory.as_ref()),
+    ] {
+        if let Some(value) = value {
+            validate_expressions_in_string(value, false, Some(CTX_JOB_DEFAULTS_RUN)).map_err(
+                |error| {
+                    ParserError::InvalidExpression(format!("{label}.run.{field}: {error}"))
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Validate all `${{ }}` expressions in a workflow.
 pub fn validate_workflow_expressions(workflow: &Workflow) -> Result<(), ParserError> {
     if let Some(run_name) = &workflow.run_name {
@@ -324,6 +355,9 @@ pub fn validate_workflow_expressions(workflow: &Workflow) -> Result<(), ParserEr
     }
     validate_env_expressions(&workflow.env, Some(CTX_WORKFLOW_ENV))
         .map_err(ParserError::InvalidExpression)?;
+    if let Some(defaults) = &workflow.defaults {
+        validate_run_defaults(defaults, "workflow defaults")?;
+    }
 
     if let Some(concurrency) = &workflow.concurrency {
         validate_expressions_in_string(&concurrency.group, false, Some(CTX_WORKFLOW_CONCURRENCY))
@@ -425,28 +459,7 @@ pub fn validate_workflow_expressions(workflow: &Workflow) -> Result<(), ParserEr
             }
         }
         if let Some(defaults) = &job.defaults {
-            if let Some(run) = &defaults.run {
-                if let Some(shell) = &run.shell {
-                    validate_expressions_in_string(shell, false, Some(CTX_JOB_DEFAULTS_RUN))
-                        .map_err(|e| {
-                            ParserError::InvalidExpression(format!(
-                                "job `{job_id}` defaults.run.shell: {e}"
-                            ))
-                        })?;
-                }
-                if let Some(working_directory) = &run.working_directory {
-                    validate_expressions_in_string(
-                        working_directory,
-                        false,
-                        Some(CTX_JOB_DEFAULTS_RUN),
-                    )
-                    .map_err(|e| {
-                        ParserError::InvalidExpression(format!(
-                            "job `{job_id}` defaults.run.working-directory: {e}"
-                        ))
-                    })?;
-                }
-            }
+            validate_run_defaults(defaults, &format!("job `{job_id}` defaults"))?;
         }
         for (output_name, output) in &job.outputs {
             validate_value_expressions(output, Some(CTX_RUNNER)).map_err(|e| {
@@ -481,6 +494,17 @@ pub fn validate_workflow_expressions(workflow: &Workflow) -> Result<(), ParserEr
                     |e| {
                         ParserError::InvalidExpression(format!(
                             "job `{job_id}` {step_ref} continue-on-error: {e}"
+                        ))
+                    },
+                )?;
+            }
+            if let Some(crate::models::DeferredNumber::Expression(expression)) =
+                &step.timeout_minutes
+            {
+                validate_expressions_in_string(expression, false, Some(CTX_STEP_TIMEOUT)).map_err(
+                    |e| {
+                        ParserError::InvalidExpression(format!(
+                            "job `{job_id}` {step_ref} timeout-minutes: {e}"
                         ))
                     },
                 )?;

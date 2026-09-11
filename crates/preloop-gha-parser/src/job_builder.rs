@@ -66,7 +66,7 @@ fn job_outputs_token(outputs: &BTreeMap<String, String>) -> Option<Value> {
     }))
 }
 
-fn template_string_token(raw: &str) -> Value {
+pub(crate) fn template_string_token(raw: &str) -> Value {
     let location = || json!({"file": 1, "line": 1, "col": 1});
     let trimmed = raw.trim();
     if let Some(expression_source) = trimmed.strip_prefix("${{") {
@@ -124,7 +124,7 @@ fn template_string_token(raw: &str) -> Value {
     })
 }
 
-fn template_token(value: &Value) -> Value {
+pub(crate) fn template_token(value: &Value) -> Value {
     let location = || json!({"file": 1, "line": 1, "col": 1});
     match value {
         Value::Object(object) => {

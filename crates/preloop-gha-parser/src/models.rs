@@ -17,7 +17,16 @@ pub enum ParserError {
     /// Expression syntax or function error.
     #[error("invalid expression in workflow: {0}")]
     InvalidExpression(String),
-    /// Workflow did not define jobs.
+    /// A resolved step timeout is missing or outside GitHub's accepted range.
+    #[error("invalid timeout-minutes for job `{job_id}` step `{step}`: {message}")]
+    InvalidStepTimeout {
+        /// Expanded or source job id.
+        job_id: String,
+        /// Step display name or ordinal.
+        step: String,
+        /// Validation detail.
+        message: String,
+    },
     #[error("workflow does not define any jobs")]
     EmptyJobs,
     /// A job references a dependency that does not exist after expansion.
@@ -994,9 +1003,9 @@ pub struct Step {
     /// Whether to continue on error.
     #[serde(default, rename = "continue-on-error")]
     pub continue_on_error: Option<DeferredBool>,
-    /// Step timeout in minutes.
+    /// Step timeout in minutes; expressions resolve during expansion.
     #[serde(default, rename = "timeout-minutes")]
-    pub timeout_minutes: Option<u32>,
+    pub timeout_minutes: Option<DeferredNumber>,
 }
 
 /// Action metadata from `action.yml` or `action.yaml`.

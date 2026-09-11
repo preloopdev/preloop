@@ -2065,6 +2065,64 @@ jobs:
 }
 
 #[test]
+fn workflow_defaults_run_working_directory_rejects_secrets() {
+    let result = parse_workflow(
+        r#"on: push
+defaults:
+  run:
+    working-directory: ${{ secrets.WORKING_DIR }}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#,
+    );
+
+    match result {
+        Err(ParserError::InvalidExpression(message)) => {
+            assert!(message.contains("workflow defaults.run.working-directory"));
+            assert!(message.contains("secrets"));
+        }
+        other => panic!("expected invalid workflow defaults expression, got {other:?}"),
+    }
+}
+
+#[test]
+fn step_timeout_expression_resolves_and_range_is_checked() {
+    let workflow = parse_workflow(
+        r#"on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        timeout: [5]
+    steps:
+      - name: bounded
+        timeout-minutes: ${{ matrix.timeout }}
+        run: echo ok
+"#,
+    )
+    .unwrap();
+    let jobs = expand_jobs(&workflow).unwrap();
+    assert_eq!(jobs[0].steps[0].timeout_in_minutes, Some(5));
+
+    for (value, expected) in [(0, "1 through 360"), (361, "1 through 360")] {
+        let workflow = parse_workflow(&format!(
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - name: bounded\n        timeout-minutes: {value}\n        run: echo ok\n"
+        ))
+        .unwrap();
+        match expand_jobs(&workflow) {
+            Err(ParserError::InvalidStepTimeout { message, .. }) => {
+                assert!(message.contains(expected));
+            }
+            other => panic!("expected invalid timeout for {value}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn concurrency_bare_string_shorthand() {
     let wf = parse_workflow(
         r#"
