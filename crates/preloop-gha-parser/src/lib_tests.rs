@@ -2107,8 +2107,9 @@ jobs:
     )
     .unwrap();
     let plan = &expand_jobs(&workflow).unwrap()[0];
-    assert_eq!(plan.defaults[0]["Value"]["type"], 3);
-    assert_eq!(plan.defaults[0]["Value"]["expr"], "matrix.shell");
+    let value = &plan.defaults[0]["map"][0]["Value"]["map"][0]["Value"];
+    assert_eq!(value["type"], 3);
+    assert_eq!(value["expr"], "matrix.shell");
 }
 
 #[test]

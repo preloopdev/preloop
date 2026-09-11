@@ -399,6 +399,9 @@ pub(crate) struct QueuedJob {
     /// Explicit runner group from object-valued `runs-on`.
     pub(crate) runner_group: Option<String>,
     pub(crate) message: azdo::AgentJobRequestMessage,
+    /// Original `environment:` value, retained until `needs` is hydrated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) environment: Option<serde_json::Value>,
     /// Raw job-level concurrency (evaluated when the job becomes ready).
     pub(crate) concurrency: Option<preloop_gha_parser::Concurrency>,
     /// Matrix values for this expansion (for concurrency expression eval).

@@ -616,17 +616,27 @@ async fn run_runner_e2e(
     // this harness flaky for reasons unrelated to what it is testing. Match
     // the minute-scale allowance `benchmarks/conformance/run.sh` uses, and
     // fail loudly with the server's exit status when it actually died.
-    let mut ready = false;
-    for _ in 0..600 {
-        if let Some(status) = server.try_wait()? {
-            anyhow::bail!("preloop-runner-server exited during startup ({status})");
+    let ready = match tokio::time::timeout(Duration::from_secs(60), async {
+        for _ in 0..600 {
+            if let Some(status) = server.try_wait()? {
+                anyhow::bail!("preloop-runner-server exited during startup ({status})");
+            }
+            if client.get(&server_url).send().await.is_ok() {
+                return Ok::<bool, anyhow::Error>(true);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        if client.get(&server_url).send().await.is_ok() {
-            ready = true;
-            break;
+        Ok::<bool, anyhow::Error>(false)
+    })
+    .await
+    {
+        Ok(Ok(ready)) => ready,
+        Ok(Err(error)) => {
+            let _ = server.kill().await;
+            return Err(error);
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+        Err(_) => false,
+    };
     if !ready {
         let _ = server.kill().await;
         anyhow::bail!("preloop-runner-server did not become ready on port {port} within 60s");

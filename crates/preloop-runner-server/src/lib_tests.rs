@@ -1664,6 +1664,7 @@ jobs:
   deploy:
     needs: [build]
     runs-on: ubuntu-latest
+    environment: ${{ needs.build.outputs.environment }}
     steps:
       - run: echo deploy
 "#,
@@ -1682,7 +1683,7 @@ jobs:
             "run_id": run_id,
             "job_id": "build",
             "status": "success",
-            "outputs": {"artifact": "dist.tgz"}
+            "outputs": {"artifact": "dist.tgz", "environment": "staging"}
         }),
     )
     .await;
@@ -1694,6 +1695,14 @@ jobs:
         .find(|job| job.job_id.0 == "deploy")
         .expect("deploy job should be promoted");
     let needs = deploy.message.context_data.get("needs").unwrap();
+    assert_eq!(
+        deploy
+            .message
+            .actions_environment
+            .as_ref()
+            .map(|environment| environment.name.as_str()),
+        Some("staging")
+    );
     let azdo::PipelineContextData::Dict(needs) = needs else {
         panic!("needs context should be a dict");
     };

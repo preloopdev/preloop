@@ -27,6 +27,7 @@ pub enum ParserError {
         /// Validation detail.
         message: String,
     },
+    /// Workflow has no jobs to expand.
     #[error("workflow does not define any jobs")]
     EmptyJobs,
     /// A job references a dependency that does not exist after expansion.
