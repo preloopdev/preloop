@@ -784,12 +784,17 @@ async fn guest_environment_tracks_control_socket_and_debug_dir_independently() {
             .collect();
         let machine_name = format!("PRELOOP_MACHINE_NAME={runner}");
         let path = format!("PATH={}", preloop_orchestrator::guest_runner_path(&config));
-        let mut want = vec!["/usr/bin/env", path.as_str(), machine_name.as_str()];
+        let want_base = vec!["/usr/bin/env", path.as_str(), machine_name.as_str()];
+        // Unconditional toolchain homes come last in the prefix (fixed
+        // system addresses shared by root and switched runners).
+        let want_tail = [
+            "RUSTUP_HOME=/usr/local/rustup",
+            "CARGO_HOME=/usr/local/cargo",
+        ];
+        let mut want = want_base;
         want.extend(expected);
-        assert_eq!(
-            prefix, want,
-            "socket={with_socket} debug_dir={with_debug_dir}"
-        );
+        want.extend(want_tail);
+        assert_eq!(prefix, want,);
     }
 }
 

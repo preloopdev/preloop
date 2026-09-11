@@ -1774,10 +1774,9 @@ async fn write_bake_manifest<P: VmProvider>(
 /// (nodejs/ci: `EACCES: permission denied, stat '/root/.cargo/bin/git'`).
 /// Absent directories cost nothing.
 pub fn guest_runner_path(_config: &RunnerPoolConfig) -> String {
-    format!(
-        "/usr/local/cargo/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:\
-         /usr/sbin:/usr/bin:/sbin:/bin"
-    )
+    "/usr/local/cargo/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:\
+     /usr/sbin:/usr/bin:/sbin:/bin"
+        .to_owned()
 }
 
 /// `env` prefix for guest runner invocations, empty when nothing needs setting.
@@ -1788,15 +1787,6 @@ pub fn guest_runner_path(_config: &RunnerPoolConfig) -> String {
 fn guest_env_prefix(config: &RunnerPoolConfig, name: &MachineName) -> Vec<String> {
     let mut env = Vec::new();
     env.push(format!("PATH={}", guest_runner_path(config)));
-    // Rust toolchain homes. rustup resolves toolchains under RUSTUP_HOME and
-    // shims under CARGO_HOME, both defaulting to the *calling* user's $HOME.
-    // The bake installs as root while job steps run as the unprivileged
-    // runner user, so a $HOME-derived location is invisible across that
-    // boundary (/root is 0700). The bake therefore installs to these fixed
-    // system addresses (see ToolchainLayer::Rust install_commands), and they
-    // are exported here so every user resolves the identical toolchain.
-    env.push("RUSTUP_HOME=/usr/local/rustup".to_owned());
-    env.push("CARGO_HOME=/usr/local/cargo".to_owned());
     // The guest needs its own VM name so a debug session can tell a controller
     // which machine to open a shell into. Nothing else in the guest knows it.
     env.push(format!("PRELOOP_MACHINE_NAME={}", name.as_str()));
@@ -1825,6 +1815,17 @@ fn guest_env_prefix(config: &RunnerPoolConfig, name: &MachineName) -> Vec<String
         env.push(format!("PRELOOP_FAILURE_MARKER={GUEST_FAILURE_MARKER}"));
         env.push(format!("PRELOOP_PAUSE_MARKER={GUEST_PAUSE_MARKER}"));
     }
+    // Rust toolchain homes. rustup resolves toolchains under RUSTUP_HOME and
+    // shims under CARGO_HOME, both defaulting to the *calling* user's $HOME.
+    // The bake installs as root while job steps run as the unprivileged
+    // runner user, so a $HOME-derived location is invisible across that
+    // boundary (/root is 0700). The bake therefore installs to these fixed
+    // system addresses (see ToolchainLayer::Rust install_commands), and they
+    // are exported here so every user resolves the identical toolchain.
+    // Order is irrelevant (env entries are independent); they sit last so
+    // the historical PATH/MACHINE_NAME-first prefix is undisturbed.
+    env.push("RUSTUP_HOME=/usr/local/rustup".to_owned());
+    env.push("CARGO_HOME=/usr/local/cargo".to_owned());
     if !env.is_empty() {
         env.insert(0, "/usr/bin/env".to_owned());
     }
