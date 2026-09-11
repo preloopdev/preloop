@@ -65,6 +65,38 @@ fn validate_reusable_workflow_tree(
     Ok(())
 }
 
+fn defaults_run_token(run: &crate::DefaultsRun) -> Value {
+    let mut map = Vec::new();
+    if let Some(shell) = &run.shell {
+        map.push(serde_json::json!({
+            "Key": { "type": 0, "file": 1, "line": 1, "col": 1, "lit": "shell" },
+            "Value": { "type": 0, "file": 1, "line": 1, "col": 1, "lit": shell }
+        }));
+    }
+    if let Some(wd) = &run.working_directory {
+        map.push(serde_json::json!({
+            "Key": { "type": 0, "file": 1, "line": 1, "col": 1, "lit": "working-directory" },
+            "Value": { "type": 0, "file": 1, "line": 1, "col": 1, "lit": wd }
+        }));
+    }
+    serde_json::json!({
+        "type": 2,
+        "file": 1,
+        "line": 1,
+        "col": 1,
+        "map": [{
+            "Key": { "type": 0, "file": 1, "line": 1, "col": 1, "lit": "run" },
+            "Value": {
+                "type": 2,
+                "file": 1,
+                "line": 1,
+                "col": 1,
+                "map": map
+            }
+        }]
+    })
+}
+
 /// GitHub display name for one expanded job.
 ///
 /// When the job declares `name:`, expressions are resolved against the
@@ -451,6 +483,7 @@ pub fn expand_jobs(workflow: &Workflow) -> Result<Vec<JobPlan>, ParserError> {
                 env,
                 oidc_environment,
                 workflow.permissions.as_ref(),
+                workflow.defaults.as_ref(),
                 None,
                 matrix_deferred,
             )?;
@@ -473,6 +506,7 @@ fn job_plan_from_job(
     env: BTreeMap<String, String>,
     oidc_environment: Option<String>,
     workflow_permissions: Option<&Value>,
+    workflow_defaults: Option<&JobDefaults>,
     inputs: Option<&BTreeMap<String, Value>>,
     matrix_deferred: bool,
 ) -> Result<JobPlan, ParserError> {
@@ -514,6 +548,17 @@ fn job_plan_from_job(
         .cloned()
         .map(|step| step_plan(step, &job.defaults, &matrix, inputs, matrix_deferred))
         .collect::<Result<Vec<_>, _>>()?;
+    let mut defaults = Vec::new();
+    if let Some(wf_defaults) = workflow_defaults {
+        if let Some(run) = &wf_defaults.run {
+            defaults.push(defaults_run_token(run));
+        }
+    }
+    if let Some(job_defaults) = &job.defaults {
+        if let Some(run) = &job_defaults.run {
+            defaults.push(defaults_run_token(run));
+        }
+    }
     let name = resolved_job_name(job.name.as_deref(), &expanded_id, &matrix, inputs);
     Ok(JobPlan {
         id: JobId(expanded_id),
@@ -552,6 +597,8 @@ fn job_plan_from_job(
         permissions: resolve_permissions(job.permissions.as_ref(), workflow_permissions),
         oidc_environment,
         oidc_job_workflow_ref: None,
+        environment: job.environment.clone(),
+        defaults,
         concurrency_group,
         concurrency_cancel_in_progress,
         concurrency_queue,
@@ -861,6 +908,8 @@ fn expand_jobs_with_reusables_internal(
                     ),
                     oidc_environment: None,
                     oidc_job_workflow_ref: None,
+                    environment: job.environment.clone(),
+                    defaults: Vec::new(),
                     // Caller/embedded concurrency is gated as a JobSet from
                     // ReusableCallMetadata at runtime; the placeholder node
                     // itself must not take a job-level gate.
@@ -905,6 +954,7 @@ fn expand_jobs_with_reusables_internal(
                 env,
                 oidc_environment,
                 workflow.permissions.as_ref(),
+                workflow.defaults.as_ref(),
                 inputs,
                 matrix_deferred,
             )?;
@@ -1215,6 +1265,7 @@ fn step_plan(
                 resolve_deferred_bool(Some(value), matrix, inputs, false).map(Some)
             }
         })?,
+        timeout_in_minutes: step.timeout_minutes,
     })
 }
 
@@ -1359,6 +1410,7 @@ pub fn expand_deferred_matrix_job(
             env,
             oidc_environment,
             workflow.permissions.as_ref(),
+            workflow.defaults.as_ref(),
             inputs,
             false,
         )?;

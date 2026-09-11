@@ -177,6 +177,9 @@ pub struct Workflow {
     pub concurrency: Option<Concurrency>,
     /// Job definitions.
     pub jobs: IndexMap<String, Job>,
+    /// Workflow-level defaults (`defaults.run`).
+    #[serde(default)]
+    pub defaults: Option<JobDefaults>,
 }
 
 impl Workflow {
@@ -991,6 +994,9 @@ pub struct Step {
     /// Whether to continue on error.
     #[serde(default, rename = "continue-on-error")]
     pub continue_on_error: Option<DeferredBool>,
+    /// Step timeout in minutes.
+    #[serde(default, rename = "timeout-minutes")]
+    pub timeout_minutes: Option<u32>,
 }
 
 /// Action metadata from `action.yml` or `action.yaml`.

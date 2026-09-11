@@ -323,6 +323,8 @@ mod tests {
             permissions: None,
             oidc_environment: None,
             oidc_job_workflow_ref: None,
+            environment: None,
+            defaults: vec![],
             concurrency_group: None,
             concurrency_cancel_in_progress: None,
             concurrency_queue: None,

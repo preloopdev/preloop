@@ -119,6 +119,14 @@ pub struct AgentJobRequestMessage {
     #[serde(rename = "jobOutputs", default)]
     pub job_outputs: Option<serde_json::Value>,
 
+    /// Deployment environment metadata (`actionsEnvironment`).
+    #[serde(
+        rename = "actionsEnvironment",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub actions_environment: Option<ActionsEnvironment>,
+
     /// Whether the debugger is enabled for this job.
     /// Mirrors `AgentJobRequestMessage.EnableDebugger` in `actions/runner` v2.335.0+.
     #[serde(rename = "enableDebugger", default, skip_serializing_if = "is_false")]
@@ -292,6 +300,14 @@ pub struct DebuggerTunnelInfo {
     pub port: u16,
 }
 
+/// Deployment environment metadata (`actionsEnvironment`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ActionsEnvironment {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<serde_json::Value>,
+}
+
 /// Task step — a single unit of work within a job.
 #[derive(Debug, Clone)]
 pub struct TaskStep {
@@ -382,7 +398,16 @@ impl Serialize for TaskStep {
         if let Some(working_directory) = &self.working_directory {
             map.serialize_entry("workingDirectory", working_directory)?;
         }
-        map.serialize_entry("timeoutInMinutes", &self.timeout_in_minutes)?;
+        let timeout_in_minutes = self.timeout_in_minutes.map(|value| {
+            serde_json::json!({
+                "type": 6,
+                "file": 1,
+                "line": 0,
+                "col": 0,
+                "num": value
+            })
+        });
+        map.serialize_entry("timeoutInMinutes", &timeout_in_minutes)?;
         map.end()
     }
 }
@@ -444,10 +469,11 @@ impl<'de> Deserialize<'de> for TaskStep {
                 .get("workingDirectory")
                 .and_then(|v| v.as_str())
                 .map(str::to_owned),
-            timeout_in_minutes: obj
-                .get("timeoutInMinutes")
-                .and_then(|v| v.as_u64())
-                .map(|n| n as u32),
+            timeout_in_minutes: obj.get("timeoutInMinutes").and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.get("num").and_then(serde_json::Value::as_u64))
+                    .map(|n| n as u32)
+            }),
         })
     }
 }

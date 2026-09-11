@@ -598,6 +598,32 @@ fn bool_from_template_token(value: &serde_json::Value) -> bool {
     }
 }
 
+/// Read a number out of a TemplateToken.
+///
+/// GitHub never sends `timeoutInMinutes` as a bare JSON number: it is a
+/// number token (`{"type":6,"file":_,"line":_,"col":_,"num":1}`). Reading it
+/// with `as_u64()` silently yields `None`, which drops the step timeout
+/// entirely — the step then runs unbounded until the job timeout. Accept the
+/// bare form too so older/hand-built messages keep working.
+fn num_from_template_token(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Number(_) => value.as_u64(),
+        serde_json::Value::String(s) => s.trim().parse().ok(),
+        serde_json::Value::Object(map) => {
+            if let Some(n) = map.get("num").and_then(serde_json::Value::as_u64) {
+                return Some(n);
+            }
+            if let Some(n) = map.get("number").and_then(serde_json::Value::as_u64) {
+                return Some(n);
+            }
+            map.get("lit")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|lit| lit.trim().parse().ok())
+        }
+        _ => None,
+    }
+}
+
 /// Build the ordered step list from the job message steps.
 pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Value) -> Vec<Step> {
     let mut result = Vec::new();
@@ -667,7 +693,9 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
             .map(bool_from_template_token)
             .unwrap_or(false);
 
-        let timeout_minutes = step.get("timeoutInMinutes").and_then(|v| v.as_u64());
+        let timeout_minutes = step
+            .get("timeoutInMinutes")
+            .and_then(num_from_template_token);
 
         // Official ActionStep.Background (DTPipelines) — wire `background: true`.
         let is_background = step
@@ -953,38 +981,46 @@ fn parse_job_defaults(job_message: &serde_json::Value) -> (Option<String>, Optio
         None => return (None, None),
     };
 
-    // defaults can be an array of typed-dict entries or a plain object
-    let run_value = if let Some(arr) = defaults.as_array() {
-        // Walk the array looking for a "run" key in each typed-dict map
-        arr.iter().find_map(|entry| {
-            let map = entry.get("map").and_then(|v| v.as_array())?;
-            map.iter().find_map(|kv| {
+    // `defaults` is an ordered array of typed-dict entries, outermost first:
+    // GitHub sends `[workflow-level, job-level]`. Later entries override
+    // earlier ones per key, so the array must be folded in order — taking the
+    // first match instead silently discards a job-level `defaults.run` that
+    // overrides the workflow-level one. A plain object is the single-scope
+    // form.
+    let mut working_dir = None;
+    let mut shell = None;
+    let mut apply = |run_value: &serde_json::Value| {
+        let run_map = extract_template_map(run_value);
+        if let Some(value) = run_map.get("working-directory") {
+            working_dir = Some(value.clone());
+        }
+        if let Some(value) = run_map.get("shell") {
+            shell = Some(value.clone());
+        }
+    };
+
+    if let Some(entries) = defaults.as_array() {
+        for entry in entries {
+            let Some(map) = entry.get("map").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for kv in map {
                 let key = kv
                     .get("Key")
                     .or_else(|| kv.get("key"))
-                    .and_then(template_scalar)?;
-                if key == "run" {
-                    kv.get("Value").or_else(|| kv.get("value")).cloned()
-                } else {
-                    None
+                    .and_then(template_scalar);
+                if key.as_deref() != Some("run") {
+                    continue;
                 }
-            })
-        })
-    } else if let Some(obj) = defaults.as_object() {
-        obj.get("run").cloned()
-    } else {
-        None
-    };
+                if let Some(run_value) = kv.get("Value").or_else(|| kv.get("value")) {
+                    apply(run_value);
+                }
+            }
+        }
+    } else if let Some(run_value) = defaults.as_object().and_then(|obj| obj.get("run")) {
+        apply(run_value);
+    }
 
-    let run_value = match run_value {
-        Some(v) => v,
-        None => return (None, None),
-    };
-
-    // Extract working-directory and shell from the run value
-    let run_map = extract_template_map(&run_value);
-    let working_dir = run_map.get("working-directory").cloned();
-    let shell = run_map.get("shell").cloned();
     (working_dir, shell)
 }
 

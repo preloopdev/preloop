@@ -474,8 +474,11 @@ pub fn build_agent_job_message_with_normalized_context(
         .map(|(k, v)| {
             serde_json::json!({
                 "type": 2,
+                "file": 1,
+                "line": 1,
+                "col": 1,
                 "map": [{
-                    "Key": { "type": 0, "lit": k },
+                    "Key": { "type": 0, "file": 1, "line": 1, "col": 1, "lit": k },
                     "Value": template_string_token(v)
                 }]
             })
@@ -612,6 +615,28 @@ pub fn build_agent_job_message_with_normalized_context(
 
     let request_id: i64 = 1;
 
+    let actions_environment = plan.environment.as_ref().and_then(|env| match env {
+        Value::String(name) => {
+            let resolved_name =
+                resolve_string(name, &job_expr_context).unwrap_or_else(|_| name.clone());
+            Some(preloop_gha_protocol::azdo::ActionsEnvironment {
+                name: resolved_name,
+                url: None,
+            })
+        }
+        Value::Object(map) => {
+            let name = map.get("name")?.as_str()?;
+            let resolved_name =
+                resolve_string(name, &job_expr_context).unwrap_or_else(|_| name.to_string());
+            let url = map.get("url").map(template_token);
+            Some(preloop_gha_protocol::azdo::ActionsEnvironment {
+                name: resolved_name,
+                url,
+            })
+        }
+        _ => None,
+    });
+
     Ok(AgentJobRequestMessage {
         message_type: None,
         job_id,
@@ -634,7 +659,7 @@ pub fn build_agent_job_message_with_normalized_context(
         locked_until: "0001-01-01T00:00:00".to_owned(),
         billing_owner_id: None,
         file_table: Vec::new(),
-        defaults: Vec::new(),
+        defaults: plan.defaults.clone(),
         environment_variables,
         snapshot: None,
         condition: plan.if_condition.as_deref().map(runner_condition),
@@ -649,6 +674,7 @@ pub fn build_agent_job_message_with_normalized_context(
         job_container: plan.container.as_ref().map(template_token),
         job_service_containers: non_empty_services(plan.services.as_ref()),
         job_outputs: job_outputs_token(&plan.job_outputs),
+        actions_environment,
         enable_debugger: false,
         debugger_tunnel: None,
         debugger_welcome_message: None,
@@ -941,7 +967,7 @@ fn build_task_step(step: &crate::StepPlan, context: &Context) -> TaskStep {
             .working_directory
             .as_ref()
             .map(|wd| resolve_string(wd, context).unwrap_or_else(|_| wd.clone())),
-        timeout_in_minutes: None,
+        timeout_in_minutes: step.timeout_in_minutes,
     }
 }
 

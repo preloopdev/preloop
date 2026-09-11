@@ -1420,3 +1420,95 @@ fn load_golden_acquirejob(scenario: &str) -> Option<serde_json::Value> {
     }
     None
 }
+
+/// `defaults` arrives as an ordered array, outermost scope first: GitHub
+/// sends `[workflow-level, job-level]` (see the `104-job-defaults-env-cascade`
+/// golden, whose entries carry source lines 8 then 19). Job-level must win.
+///
+/// Reading only the first entry regressed silently against github.com,
+/// because preloop's own server additionally flattens job defaults onto each
+/// step — so a preloop-driven job looked correct while the same runner
+/// ignored job-level defaults when driven by GitHub.
+#[test]
+fn job_level_defaults_override_workflow_level_defaults() {
+    let run_map = |wd: &str, shell: &str| {
+        serde_json::json!({
+            "type": 2,
+            "map": [{
+                "Key": {"type": 0, "lit": "run"},
+                "Value": {"type": 2, "map": [
+                    {"Key": {"type": 0, "lit": "working-directory"},
+                     "Value": {"type": 0, "lit": wd}},
+                    {"Key": {"type": 0, "lit": "shell"},
+                     "Value": {"type": 0, "lit": shell}},
+                ]}
+            }]
+        })
+    };
+    let message = serde_json::json!({
+        "defaults": [run_map("/workflow-dir", "sh"), run_map("/job-dir", "bash")]
+    });
+
+    let (working_dir, shell) = parse_job_defaults(&message);
+
+    assert_eq!(working_dir.as_deref(), Some("/job-dir"));
+    assert_eq!(shell.as_deref(), Some("bash"));
+}
+
+/// A job scope that sets only one key must not erase the workflow-level value
+/// for the other: the scopes merge per key rather than replacing wholesale.
+#[test]
+fn job_defaults_merge_per_key_across_scopes() {
+    let message = serde_json::json!({
+        "defaults": [
+            {"type": 2, "map": [{
+                "Key": {"type": 0, "lit": "run"},
+                "Value": {"type": 2, "map": [
+                    {"Key": {"type": 0, "lit": "working-directory"},
+                     "Value": {"type": 0, "lit": "/workflow-dir"}},
+                    {"Key": {"type": 0, "lit": "shell"},
+                     "Value": {"type": 0, "lit": "bash"}},
+                ]}
+            }]},
+            {"type": 2, "map": [{
+                "Key": {"type": 0, "lit": "run"},
+                "Value": {"type": 2, "map": [
+                    {"Key": {"type": 0, "lit": "working-directory"},
+                     "Value": {"type": 0, "lit": "/job-dir"}},
+                ]}
+            }]},
+        ]
+    });
+
+    let (working_dir, shell) = parse_job_defaults(&message);
+
+    assert_eq!(working_dir.as_deref(), Some("/job-dir"));
+    assert_eq!(
+        shell.as_deref(),
+        Some("bash"),
+        "workflow shell must survive"
+    );
+}
+
+/// GitHub never sends `timeoutInMinutes` as a bare number — it is a number
+/// token. Reading it with `as_u64()` yielded `None`, so `timeout-minutes:`
+/// was silently dropped and the step ran unbounded.
+#[test]
+fn step_timeout_is_read_from_a_number_token() {
+    let steps = vec![serde_json::json!({
+        "type": "action",
+        "reference": {"type": "script"},
+        "id": "00000000-0000-0000-0000-000000000001",
+        "name": "__run",
+        "contextName": "__run",
+        "inputs": {"type": 2, "map": [
+            {"Key": {"type": 0, "lit": "script"}, "Value": {"type": 0, "lit": "sleep 120"}}
+        ]},
+        "timeoutInMinutes": {"type": 6, "file": 1, "line": 8, "col": 26, "num": 1}
+    })];
+
+    let built = build_step_list(&steps, &serde_json::json!({}));
+
+    assert_eq!(built.len(), 1);
+    assert_eq!(built[0].timeout_minutes, Some(1));
+}

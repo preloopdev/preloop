@@ -459,6 +459,12 @@ pub struct JobPlan {
     /// Executing reusable workflow reference, when this job came from one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oidc_job_workflow_ref: Option<String>,
+    /// Raw deployment environment configuration (`environment:`), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<serde_json::Value>,
+    /// TemplateToken-encoded defaults (workflow and job level).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub defaults: Vec<serde_json::Value>,
     /// Raw job-level concurrency group expression/string (server-evaluated).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency_group: Option<String>,
@@ -573,6 +579,9 @@ pub struct StepPlan {
     /// Whether to continue on error.
     #[serde(default)]
     pub continue_on_error: Option<bool>,
+    /// Timeout in minutes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_in_minutes: Option<u32>,
 }
 
 /// Context material sent to a runner.
