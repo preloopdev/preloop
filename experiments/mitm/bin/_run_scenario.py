@@ -5,6 +5,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -70,6 +71,64 @@ def match_event(event: str, flows: list[dict]) -> bool:
     return False
 
 
+def declared_job_ids(workflow_path: Path) -> set[str]:
+    """Job ids declared by this scenario, read without a YAML dependency."""
+    ids: set[str] = set()
+    for path in sorted(workflow_path.parent.rglob("*.y*ml")):
+        in_jobs = False
+        for line in path.read_text().splitlines():
+            if line.startswith("jobs:"):
+                in_jobs = True
+                continue
+            if in_jobs and line and not line[0].isspace() and not line.startswith("#"):
+                in_jobs = False
+            if in_jobs:
+                match = re.match(r"^  ([A-Za-z_][A-Za-z0-9_-]*):\s*$", line)
+                if match:
+                    ids.add(match.group(1))
+    return ids
+
+
+def assert_capture_is_our_job(capture_dir: Path, workflow_path: Path) -> None:
+    """Fail the recording if the runner acquired someone else's job.
+
+    The runner is a generic `self-hosted` agent in a shared repo: it asks for
+    work and GitHub hands it the head of the queue, which need not be the job
+    just dispatched. A `needs:`-gated job from the previous scenario queues
+    only after that scenario stopped recording, so it lands here instead.
+    Three goldens were contaminated exactly this way and shipped as preloop
+    divergences for months (see `.runner-watch/quarantine.toml`). Recording a
+    bad capture is recoverable; committing one silently is not.
+    """
+    declared = declared_job_ids(workflow_path)
+    if not declared:
+        return
+    for flow in load_flows(capture_dir):
+        if "acquirejob" not in (flow.get("path") or ""):
+            continue
+        body = flow.get("response_body_json")
+        if not isinstance(body, dict):
+            continue
+        display = body.get("jobDisplayName") or ""
+        if not display:
+            continue
+        source = workflow_path.parent
+        text = "".join(p.read_text() for p in sorted(source.rglob("*.y*ml")))
+        # A matrix cell renders as `build (ubuntu-latest, 18)`; an explicit
+        # `name:` renders as that name, which appears in the workflow source.
+        if any(display == i or display.startswith(f"{i} (") for i in declared):
+            return
+        if display in text:
+            return
+        log(
+            f"captured job {display!r} is not declared by this scenario "
+            f"(declares {', '.join(sorted(declared))}) — the runner acquired "
+            f"another scenario's job; drain the queue and re-record",
+            "err",
+        )
+        sys.exit(12)
+
+
 def wait_for_event(
     event: str, capture_dir: Path, timeout: int, after_flow_index: int = 0
 ) -> bool:
@@ -102,18 +161,42 @@ def submit_workflow_official(workflow_path: str) -> str | None:
         "ALL_PROXY",
     ):
         gh_env.pop(key, None)
+
+    # Record the newest existing run *before* dispatching. `gh run list
+    # --limit 1` returns whatever is newest, which is not necessarily the run
+    # just dispatched: GitHub takes a moment to register it, and an unrelated
+    # run can be newer. Adopting the wrong run id silently binds the capture
+    # to another workflow — the same class of mistake that contaminated three
+    # goldens (see .runner-watch/quarantine.toml).
+    def newest_run() -> str | None:
+        result = subprocess.run(
+            ["gh", "run", "list", "-R", f"{owner}/{repo}", "--workflow", basename,
+             "--limit", "1", "--json", "databaseId", "--jq", ".[0].databaseId"],
+            check=True, capture_output=True, text=True, env=gh_env,
+        )
+        return result.stdout.strip() or None
+
+    before = newest_run()
     log(f"submitting workflow {basename} to {owner}/{repo}@{ref}")
     subprocess.run(
         ["gh", "workflow", "run", basename, "-R", f"{owner}/{repo}", "--ref", ref],
         check=True,
         env=gh_env,
     )
-    time.sleep(3)
-    result = subprocess.run(
-        ["gh", "run", "list", "-R", f"{owner}/{repo}", "--workflow", basename, "--limit", "1", "--json", "databaseId", "--jq", ".[0].databaseId"],
-        check=True, capture_output=True, text=True, env=gh_env,
-    )
-    run_id = result.stdout.strip()
+
+    # Poll until a genuinely new run id appears, rather than sleeping a fixed
+    # three seconds and hoping.
+    deadline = time.time() + 120
+    run_id = None
+    while time.time() < deadline:
+        time.sleep(2)
+        candidate = newest_run()
+        if candidate and candidate != before:
+            run_id = candidate
+            break
+    if run_id is None:
+        log(f"dispatched {basename} but no new run id appeared within 120s", "err")
+        sys.exit(11)
     log(f"run id: {run_id}", "ok")
     return run_id
 
@@ -244,6 +327,7 @@ def main():
     capture_dir = Path(args.capture_dir)
     mitm_dir = Path(args.mitm_dir)
     last_run_id = None
+    last_workflow_path: Path | None = None
     event_cursor = 0
     deadline = time.time() + duration
 
@@ -282,6 +366,7 @@ def main():
                 log(f"step {i}: missing path", "err")
                 sys.exit(9)
             wf_path = scenario_path.parent / wf
+            last_workflow_path = wf_path
             if args.backend == "official":
                 last_run_id = submit_workflow_official(str(wf_path))
             elif args.backend == "preloop":
@@ -303,6 +388,10 @@ def main():
         else:
             log(f"step {i}: unknown kind '{kind}'", "err")
             sys.exit(8)
+
+    # The capture is only meaningful if it is a capture of *this* scenario.
+    if args.backend == "official" and last_workflow_path is not None:
+        assert_capture_is_our_job(capture_dir, last_workflow_path)
 
     log("scenario complete", "ok")
 
