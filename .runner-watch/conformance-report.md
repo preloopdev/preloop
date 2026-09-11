@@ -1,6 +1,6 @@
 # runner-watch conformance report
 
-✅ All 39 scenario(s) matched recorded baseline responses (see replay caveats below).
+✅ All 36 scenario(s) matched recorded baseline responses (see replay caveats below).
 
 - [01-register-and-idle](.runner-watch/conformance/v2.336.0/01-register-and-idle.md)
 - [02-trivial-job](.runner-watch/conformance/v2.336.0/02-trivial-job.md)
@@ -13,7 +13,6 @@
 - [09-matrix-fan-out](.runner-watch/conformance/v2.336.0/09-matrix-fan-out.md)
 - [10-uses-checkout](.runner-watch/conformance/v2.336.0/10-uses-checkout.md)
 - [101-dynamic-matrix-dataflow](.runner-watch/conformance/v2.336.0/101-dynamic-matrix-dataflow.md)
-- [102-mask-and-secret-propagation](.runner-watch/conformance/v2.336.0/102-mask-and-secret-propagation.md)
 - [103-composite-nested-post](.runner-watch/conformance/v2.336.0/103-composite-nested-post.md)
 - [104-job-defaults-env-cascade](.runner-watch/conformance/v2.336.0/104-job-defaults-env-cascade.md)
 - [105-concurrency-cancellation-group](.runner-watch/conformance/v2.336.0/105-concurrency-cancellation-group.md)
@@ -26,13 +25,11 @@
 - [112-service-container-health-ports](.runner-watch/conformance/v2.336.0/112-service-container-health-ports.md)
 - [113-artifact-v4-multi-pattern](.runner-watch/conformance/v2.336.0/113-artifact-v4-multi-pattern.md)
 - [114-step-timeout-graceful-kill](.runner-watch/conformance/v2.336.0/114-step-timeout-graceful-kill.md)
-- [115-cache-v2-restore-fallback](.runner-watch/conformance/v2.336.0/115-cache-v2-restore-fallback.md)
 - [12-artifact](.runner-watch/conformance/v2.336.0/12-artifact.md)
 - [13-composite-action](.runner-watch/conformance/v2.336.0/13-composite-action.md)
 - [14-annotations](.runner-watch/conformance/v2.336.0/14-annotations.md)
 - [15-oidc-id-token](.runner-watch/conformance/v2.336.0/15-oidc-id-token.md)
 - [16-container-job](.runner-watch/conformance/v2.336.0/16-container-job.md)
-- [163-reusable-caller](.runner-watch/conformance/v2.336.0/163-reusable-caller.md)
 - [17-service-container](.runner-watch/conformance/v2.336.0/17-service-container.md)
 - [30-container-job-basic](.runner-watch/conformance/v2.336.0/30-container-job-basic.md)
 - [31-container-with-services](.runner-watch/conformance/v2.336.0/31-container-with-services.md)
