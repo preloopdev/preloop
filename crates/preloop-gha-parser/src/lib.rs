@@ -20,7 +20,8 @@ pub use expand::{
     expand_jobs, expand_jobs_with_reusables, expand_jobs_with_reusables_and_shas,
     expand_jobs_with_reusables_and_shas_and_inputs,
     expand_jobs_with_reusables_and_shas_and_inputs_and_event, expand_reusable_call,
-    DEFAULT_TOKEN_PERMISSIONS, PERMISSION_SCOPES,
+    DEFAULT_TOKEN_PERMISSIONS, MAX_REUSABLE_WORKFLOW_DEPTH, MAX_UNIQUE_REUSABLE_WORKFLOWS,
+    MAX_WORKFLOW_DEPTH, PERMISSION_SCOPES,
 };
 pub use models::*;
 pub use trigger::TriggerMismatch;

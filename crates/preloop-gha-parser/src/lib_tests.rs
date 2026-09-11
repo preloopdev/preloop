@@ -1463,6 +1463,53 @@ jobs:
 }
 
 #[test]
+fn reusable_workflow_up_to_max_depth_succeeds() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  call1:
+    uses: ./.github/workflows/level1.yml
+"#,
+    )
+    .unwrap();
+
+    let mut reusable = BTreeMap::new();
+    for i in 1..9 {
+        reusable.insert(
+            format!(".github/workflows/level{i}.yml"),
+            format!("on: {{ workflow_call: {{}} }}\njobs:\n  call{}:\n    uses: ./.github/workflows/level{}.yml", i + 1, i + 1),
+        );
+    }
+    // Level 9 is the 9th nested reusable workflow (10th level overall) — it has leaf steps.
+    reusable.insert(
+        ".github/workflows/level9.yml".to_owned(),
+        "on: { workflow_call: {} }\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo leaf"
+            .to_owned(),
+    );
+
+    let root = expand_jobs_with_reusables(&caller, &reusable).unwrap();
+    assert_eq!(root.jobs.len(), 1);
+    let mut node = root.jobs[0].clone();
+
+    for level in 1..=8 {
+        let called =
+            parse_workflow(&reusable[&format!(".github/workflows/level{level}.yml")]).unwrap();
+        let expanded =
+            crate::expand_reusable_call(&called, &node, &reusable, &BTreeMap::new()).unwrap();
+        node = expanded.jobs[0].clone();
+        assert!(node.reusable_call.is_some());
+    }
+
+    // Expand level 9 leaf jobs
+    let level9 = parse_workflow(&reusable[".github/workflows/level9.yml"]).unwrap();
+    let expanded =
+        crate::expand_reusable_call(&level9, &node, &reusable, &BTreeMap::new()).unwrap();
+    assert_eq!(expanded.jobs.len(), 1);
+    assert!(expanded.jobs[0].reusable_call.is_none());
+}
+
+#[test]
 fn reusable_workflow_max_depth_exceeded() {
     let caller = parse_workflow(
         r#"
@@ -1475,49 +1522,124 @@ jobs:
     .unwrap();
 
     let mut reusable = BTreeMap::new();
-    reusable.insert(
-        ".github/workflows/level1.yml".to_owned(),
-        "on: { workflow_call: {} }\njobs:\n  call2:\n    uses: ./.github/workflows/level2.yml"
-            .to_owned(),
-    );
-    reusable.insert(
-        ".github/workflows/level2.yml".to_owned(),
-        "on: { workflow_call: {} }\njobs:\n  call3:\n    uses: ./.github/workflows/level3.yml"
-            .to_owned(),
-    );
-    reusable.insert(
-        ".github/workflows/level3.yml".to_owned(),
-        "on: { workflow_call: {} }\njobs:\n  call4:\n    uses: ./.github/workflows/level4.yml"
-            .to_owned(),
-    );
-    reusable.insert(
-        ".github/workflows/level4.yml".to_owned(),
-        "on: { workflow_call: {} }\njobs:\n  call5:\n    uses: ./.github/workflows/level5.yml"
-            .to_owned(),
-    );
-    reusable.insert(
-            ".github/workflows/level5.yml".to_owned(),
-            "on: { workflow_call: {} }\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo leaf".to_owned(),
+    for i in 1..10 {
+        reusable.insert(
+            format!(".github/workflows/level{i}.yml"),
+            format!("on: {{ workflow_call: {{}} }}\njobs:\n  call{}:\n    uses: ./.github/workflows/level{}.yml", i + 1, i + 1),
         );
+    }
+    reusable.insert(
+        ".github/workflows/level10.yml".to_owned(),
+        "on: { workflow_call: {} }\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo leaf"
+            .to_owned(),
+    );
 
-    // Deferred materialization: the root expansion emits a single caller node.
-    // Depth is enforced when each nested caller's subtree is expanded at
-    // runtime — the fifth nested call exceeds the limit of four.
-    let root = expand_jobs_with_reusables(&caller, &reusable).unwrap();
-    assert_eq!(root.jobs.len(), 1);
-    let mut node = root.jobs[0].clone();
+    // 10 levels of nested reusable workflows means 11 workflow levels total, which exceeds the max depth of 10.
+    let root_res = expand_jobs_with_reusables(&caller, &reusable);
+    assert!(matches!(
+        root_res.unwrap_err(),
+        ParserError::MaxNestingDepthExceeded
+    ));
+}
 
-    for level in 1..=3 {
-        let called =
-            parse_workflow(&reusable[&format!(".github/workflows/level{level}.yml")]).unwrap();
-        let expanded =
-            crate::expand_reusable_call(&called, &node, &reusable, &BTreeMap::new()).unwrap();
-        node = expanded.jobs[0].clone();
-        assert!(node.reusable_call.is_some());
+#[test]
+fn reusable_workflow_max_unique_succeeds() {
+    // Caller references 50 unique reusable workflows across 50 jobs.
+    let mut caller_yaml = "on: push\njobs:\n".to_owned();
+    let mut reusable = BTreeMap::new();
+    for i in 1..=50 {
+        caller_yaml.push_str(&format!(
+            "  job{i}:\n    uses: ./.github/workflows/sub{i}.yml\n"
+        ));
+        reusable.insert(
+            format!(".github/workflows/sub{i}.yml"),
+            "on: { workflow_call: {} }\njobs:\n  leaf:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok".to_owned(),
+        );
     }
 
-    let level4 = parse_workflow(&reusable[".github/workflows/level4.yml"]).unwrap();
-    let res = crate::expand_reusable_call(&level4, &node, &reusable, &BTreeMap::new());
+    let caller = parse_workflow(&caller_yaml).unwrap();
+    let root = expand_jobs_with_reusables(&caller, &reusable);
+    assert!(root.is_ok(), "50 unique reusable workflows must be allowed");
+    assert_eq!(root.unwrap().jobs.len(), 50);
+}
+
+#[test]
+fn reusable_workflow_max_unique_exceeded() {
+    // Caller references 51 unique reusable workflows across 51 jobs.
+    let mut caller_yaml = "on: push\njobs:\n".to_owned();
+    let mut reusable = BTreeMap::new();
+    for i in 1..=51 {
+        caller_yaml.push_str(&format!(
+            "  job{i}:\n    uses: ./.github/workflows/sub{i}.yml\n"
+        ));
+        reusable.insert(
+            format!(".github/workflows/sub{i}.yml"),
+            "on: { workflow_call: {} }\njobs:\n  leaf:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok".to_owned(),
+        );
+    }
+
+    let caller = parse_workflow(&caller_yaml).unwrap();
+    let res = expand_jobs_with_reusables(&caller, &reusable);
+    assert!(matches!(
+        res.unwrap_err(),
+        ParserError::MaxReusableWorkflowsExceeded {
+            count: 51,
+            limit: 50
+        }
+    ));
+}
+
+#[test]
+fn reusable_workflow_duplicate_calls_do_not_count_towards_unique_limit() {
+    // Caller calls 2 unique reusable workflows across 60 jobs.
+    let mut caller_yaml = "on: push\njobs:\n".to_owned();
+    let mut reusable = BTreeMap::new();
+    reusable.insert(
+        ".github/workflows/subA.yml".to_owned(),
+        "on: { workflow_call: {} }\njobs:\n  leaf:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo A".to_owned(),
+    );
+    reusable.insert(
+        ".github/workflows/subB.yml".to_owned(),
+        "on: { workflow_call: {} }\njobs:\n  leaf:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo B".to_owned(),
+    );
+    for i in 1..=60 {
+        let target = if i % 2 == 0 { "subA" } else { "subB" };
+        caller_yaml.push_str(&format!(
+            "  job{i}:\n    uses: ./.github/workflows/{target}.yml\n"
+        ));
+    }
+
+    let caller = parse_workflow(&caller_yaml).unwrap();
+    let root = expand_jobs_with_reusables(&caller, &reusable);
+    assert!(root.is_ok(), "60 calls to 2 unique workflows must succeed");
+    assert_eq!(root.unwrap().jobs.len(), 60);
+}
+
+#[test]
+fn reusable_workflow_cycle_detected() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  call1:
+    uses: ./.github/workflows/cycleA.yml
+"#,
+    )
+    .unwrap();
+
+    let mut reusable = BTreeMap::new();
+    reusable.insert(
+        ".github/workflows/cycleA.yml".to_owned(),
+        "on: { workflow_call: {} }\njobs:\n  callB:\n    uses: ./.github/workflows/cycleB.yml"
+            .to_owned(),
+    );
+    reusable.insert(
+        ".github/workflows/cycleB.yml".to_owned(),
+        "on: { workflow_call: {} }\njobs:\n  callA:\n    uses: ./.github/workflows/cycleA.yml"
+            .to_owned(),
+    );
+
+    let res = expand_jobs_with_reusables(&caller, &reusable);
     assert!(matches!(
         res.unwrap_err(),
         ParserError::MaxNestingDepthExceeded

@@ -79,9 +79,19 @@ pub enum ParserError {
     /// `on:` names an event GitHub does not recognize.
     #[error("invalid workflow trigger event `{0}`")]
     InvalidTriggerEvent(String),
-    /// Maximum nesting depth for reusable workflows exceeded.
-    #[error("maximum nested reusable workflows depth (4) exceeded")]
+    /// Maximum nesting depth for reusable workflows exceeded (maximum 10 connected workflow levels).
+    #[error("maximum nested reusable workflows depth (10) exceeded")]
     MaxNestingDepthExceeded,
+    /// Maximum unique reusable workflows limit exceeded in workflow tree.
+    #[error(
+        "maximum unique reusable workflows ({limit}) exceeded in workflow tree: found {count}"
+    )]
+    MaxReusableWorkflowsExceeded {
+        /// Number of unique reusable workflows found.
+        count: usize,
+        /// Maximum allowed unique reusable workflows.
+        limit: usize,
+    },
     /// Called workflow does not declare `on: workflow_call` trigger.
     #[error("called workflow does not declare `on: workflow_call` trigger")]
     MissingWorkflowCallTrigger,

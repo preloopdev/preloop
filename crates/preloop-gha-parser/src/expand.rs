@@ -15,6 +15,56 @@ use crate::{
     MatrixValue, ParserError, ReusableCallMetadata, Step, Workflow,
 };
 
+/// Maximum number of workflow levels that may be connected (1 top-level caller + up to 9 nested reusable workflows).
+pub const MAX_WORKFLOW_DEPTH: usize = 10;
+/// Maximum nesting depth for called reusable workflows (up to 9 levels of reusable workflows below the top-level caller).
+pub const MAX_REUSABLE_WORKFLOW_DEPTH: usize = MAX_WORKFLOW_DEPTH - 1;
+/// Maximum unique reusable workflows that may be referenced in a single workflow run tree.
+pub const MAX_UNIQUE_REUSABLE_WORKFLOWS: usize = 50;
+
+fn validate_reusable_workflow_tree(
+    workflow: &Workflow,
+    reusable_workflows: &BTreeMap<String, String>,
+    depth: usize,
+    call_chain: &mut Vec<String>,
+    unique_workflows: &mut std::collections::BTreeSet<String>,
+) -> Result<(), ParserError> {
+    for job in workflow.jobs.values() {
+        if let Some(uses) = &job.uses {
+            if depth >= MAX_REUSABLE_WORKFLOW_DEPTH {
+                return Err(ParserError::MaxNestingDepthExceeded);
+            }
+            let path = normalize_reusable_path(uses);
+            if call_chain.contains(&path) {
+                return Err(ParserError::MaxNestingDepthExceeded);
+            }
+            unique_workflows.insert(path.clone());
+            if unique_workflows.len() > MAX_UNIQUE_REUSABLE_WORKFLOWS {
+                return Err(ParserError::MaxReusableWorkflowsExceeded {
+                    count: unique_workflows.len(),
+                    limit: MAX_UNIQUE_REUSABLE_WORKFLOWS,
+                });
+            }
+            if let Some(yaml) = reusable_workflows
+                .get(uses)
+                .or_else(|| reusable_workflows.get(&path))
+            {
+                let called = parse_workflow(yaml)?;
+                call_chain.push(path);
+                validate_reusable_workflow_tree(
+                    &called,
+                    reusable_workflows,
+                    depth + 1,
+                    call_chain,
+                    unique_workflows,
+                )?;
+                call_chain.pop();
+            }
+        }
+    }
+    Ok(())
+}
+
 /// GitHub display name for one expanded job.
 ///
 /// When the job declares `name:`, expressions are resolved against the
@@ -621,7 +671,7 @@ fn expand_jobs_with_reusables_internal(
     let global_env = workflow.env.clone().into_strings();
     for (job_id, job) in &workflow.jobs {
         if let Some(uses) = &job.uses {
-            if depth >= 4 {
+            if depth >= MAX_REUSABLE_WORKFLOW_DEPTH {
                 return Err(ParserError::MaxNestingDepthExceeded);
             }
             let path = normalize_reusable_path(uses);
@@ -919,6 +969,16 @@ pub fn expand_jobs_with_reusables_and_shas_and_inputs_and_event(
     dispatch_inputs: Option<&BTreeMap<String, serde_json::Value>>,
     event_name: Option<&str>,
 ) -> Result<ExpandedWorkflows, ParserError> {
+    let mut unique_workflows = std::collections::BTreeSet::new();
+    let mut call_chain = Vec::new();
+    validate_reusable_workflow_tree(
+        workflow,
+        reusable_workflows,
+        0,
+        &mut call_chain,
+        &mut unique_workflows,
+    )?;
+
     let mut reusable_calls = BTreeMap::new();
     let mut plans = expand_jobs_with_reusables_internal(
         workflow,
