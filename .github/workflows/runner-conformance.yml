@@ -34,9 +34,9 @@ jobs:
           if-no-files-found: error
 
   runner-deep:
-    name: Runner deep conformance
+    name: Runner deep conformance on GitHub-hosted KVM
     if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && vars.PRELOOP_CONFORMANCE_DEEP == '1'
-    runs-on: [self-hosted, Linux, X64, smolvm-host]
+    runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
       GH_REPO: ${{ vars.RUNNER_CONFORMANCE_REPO || 'preloopdev/preloop-conformance' }}
