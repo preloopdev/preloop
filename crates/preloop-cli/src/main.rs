@@ -1980,7 +1980,7 @@ fn runner_pool_labels() -> Vec<String> {
 }
 
 /// vCPUs given to each runner VM, honouring `PRELOOP_RUNNER_CPUS`.
-const RUNNER_CPUS: u16 = 4;
+const RUNNER_CPUS: u16 = 8;
 /// Low-memory on-demand provisioning is the default; opt into idle warm VMs.
 const DEFAULT_RUNNER_POOL_ENABLED: bool = false;
 /// Published or locally cached packed images avoid cold OCI bootstrap per job.

@@ -22,9 +22,9 @@ jobs:
     runs-on: [self-hosted, preloop-cpane]
     timeout-minutes: 60
     env:
-      CARGO_BUILD_JOBS: "2"
+      CARGO_BUILD_JOBS: "6"
       PROPTEST_CASES: "8"
-      RUST_TEST_THREADS: "2"
+      RUST_TEST_THREADS: "6"
       RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
