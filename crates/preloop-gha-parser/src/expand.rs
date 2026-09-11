@@ -324,7 +324,6 @@ fn resolve_step_timeout(
     Ok(Some(value as u32))
 }
 
-
 /// Omit empty `services: {}` to match `EmitDefaultValue=false` behavior.
 fn non_empty_services(services: Option<serde_json::Value>) -> Option<serde_json::Value> {
     match &services {

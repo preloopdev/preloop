@@ -432,6 +432,7 @@ fn arb_job() -> impl Strategy<Value = AgentJobRequestMessage> {
             prop::option::of(arb_text().prop_map(|value| json!({"type": 0, "lit": value}))),
             prop::option::of(arb_text().prop_map(|value| json!({"type": 2, "lit": value}))),
             prop::option::of(arb_text().prop_map(|value| json!({"type": 2, "lit": value}))),
+            prop::option::of(arb_text().prop_map(|name| ActionsEnvironment { name, url: None })),
         ),
         (
             any::<bool>(),
@@ -463,6 +464,7 @@ fn arb_job() -> impl Strategy<Value = AgentJobRequestMessage> {
                     job_container,
                     job_service_containers,
                     job_outputs,
+                    actions_environment,
                 ),
                 (enable_debugger, debugger_welcome_message, has_tunnel, key_bytes),
             )| AgentJobRequestMessage {
@@ -502,7 +504,7 @@ fn arb_job() -> impl Strategy<Value = AgentJobRequestMessage> {
                 job_container,
                 job_service_containers,
                 job_outputs,
-                actions_environment: None,
+                actions_environment,
                 enable_debugger,
                 debugger_tunnel: has_tunnel.then_some(DebuggerTunnelInfo {
                     tunnel_id: "tunnel".to_owned(),

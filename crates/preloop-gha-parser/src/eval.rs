@@ -279,13 +279,7 @@ const CTX_STEP_IF: &[&str] = &[
     "hashfiles",
 ];
 const CTX_STEP_TIMEOUT: &[&str] = &[
-    "github",
-    "inputs",
-    "vars",
-    "needs",
-    "strategy",
-    "matrix",
-    "env",
+    "github", "inputs", "vars", "needs", "strategy", "matrix", "env",
 ];
 const CTX_STEP_ENV: &[&str] = &[
     "github",
@@ -338,9 +332,7 @@ fn validate_run_defaults(
     ] {
         if let Some(value) = value {
             validate_expressions_in_string(value, false, Some(CTX_JOB_DEFAULTS_RUN)).map_err(
-                |error| {
-                    ParserError::InvalidExpression(format!("{label}.run.{field}: {error}"))
-                },
+                |error| ParserError::InvalidExpression(format!("{label}.run.{field}: {error}")),
             )?;
         }
     }

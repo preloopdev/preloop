@@ -294,10 +294,31 @@ pub struct DebuggerTunnelInfo {
     pub tunnel_id: String,
     #[serde(rename = "clusterId", default)]
     pub cluster_id: String,
+
     #[serde(rename = "hostToken", default)]
     pub host_token: String,
     #[serde(rename = "port", default)]
     pub port: u16,
+}
+/// Read an unsigned integer from the TemplateToken shapes used by GitHub.
+///
+/// Live runner payloads use `num`; older captures and compatibility payloads
+/// also use `number`, `lit`, a JSON number, or a numeric string.
+pub fn number_from_template_token(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Number(_) => value.as_u64(),
+        serde_json::Value::String(value) => value.trim().parse().ok(),
+        serde_json::Value::Object(map) => map
+            .get("num")
+            .or_else(|| map.get("number"))
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| {
+                map.get("lit")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| value.trim().parse().ok())
+            }),
+        _ => None,
+    }
 }
 
 /// Deployment environment metadata (`actionsEnvironment`).
@@ -398,6 +419,9 @@ impl Serialize for TaskStep {
         if let Some(working_directory) = &self.working_directory {
             map.serialize_entry("workingDirectory", working_directory)?;
         }
+        // The parser model does not retain YAML source spans, so generated
+        // tokens use synthetic coordinates. The runner consumes only `num`;
+        // preserving real line/column data requires source-span plumbing.
         let timeout_in_minutes = self.timeout_in_minutes.map(|value| {
             serde_json::json!({
                 "type": 6,
@@ -469,11 +493,10 @@ impl<'de> Deserialize<'de> for TaskStep {
                 .get("workingDirectory")
                 .and_then(|v| v.as_str())
                 .map(str::to_owned),
-            timeout_in_minutes: obj.get("timeoutInMinutes").and_then(|v| {
-                v.as_u64()
-                    .or_else(|| v.get("num").and_then(serde_json::Value::as_u64))
-                    .map(|n| n as u32)
-            }),
+            timeout_in_minutes: obj
+                .get("timeoutInMinutes")
+                .and_then(number_from_template_token)
+                .and_then(|value| u32::try_from(value).ok()),
         })
     }
 }
@@ -846,6 +869,19 @@ mod tests {
             step.inputs.get("script"),
             Some(&"${{ format('echo {0}', github.repository) }}".to_owned())
         );
+    }
+
+    #[test]
+    fn timeout_token_reader_accepts_all_numeric_shapes() {
+        for token in [
+            serde_json::json!(5),
+            serde_json::json!("5"),
+            serde_json::json!({"num": 5}),
+            serde_json::json!({"number": 5}),
+            serde_json::json!({"lit": "5"}),
+        ] {
+            assert_eq!(number_from_template_token(&token), Some(5));
+        }
     }
 
     /// The snapshot credential must never appear in Debug output of the job

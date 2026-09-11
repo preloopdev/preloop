@@ -598,32 +598,6 @@ fn bool_from_template_token(value: &serde_json::Value) -> bool {
     }
 }
 
-/// Read a number out of a TemplateToken.
-///
-/// GitHub never sends `timeoutInMinutes` as a bare JSON number: it is a
-/// number token (`{"type":6,"file":_,"line":_,"col":_,"num":1}`). Reading it
-/// with `as_u64()` silently yields `None`, which drops the step timeout
-/// entirely — the step then runs unbounded until the job timeout. Accept the
-/// bare form too so older/hand-built messages keep working.
-fn num_from_template_token(value: &serde_json::Value) -> Option<u64> {
-    match value {
-        serde_json::Value::Number(_) => value.as_u64(),
-        serde_json::Value::String(s) => s.trim().parse().ok(),
-        serde_json::Value::Object(map) => {
-            if let Some(n) = map.get("num").and_then(serde_json::Value::as_u64) {
-                return Some(n);
-            }
-            if let Some(n) = map.get("number").and_then(serde_json::Value::as_u64) {
-                return Some(n);
-            }
-            map.get("lit")
-                .and_then(serde_json::Value::as_str)
-                .and_then(|lit| lit.trim().parse().ok())
-        }
-        _ => None,
-    }
-}
-
 /// Build the ordered step list from the job message steps.
 pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Value) -> Vec<Step> {
     let mut result = Vec::new();
@@ -647,7 +621,6 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
         };
 
         // F029: Split wire ID (GUID) from context name (human-readable key).
-        // Live GitHub sends both `id` (GUID) and `contextName` (__run, __run_2, etc.).
         // aksh-native payloads may only have `id` (which IS the context name).
         let raw_context_name = step.get("contextName").and_then(|v| v.as_str());
         let raw_id = step.get("id").and_then(|v| v.as_str());
@@ -695,7 +668,7 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
 
         let timeout_minutes = step
             .get("timeoutInMinutes")
-            .and_then(num_from_template_token);
+            .and_then(preloop_gha_protocol::azdo::number_from_template_token);
 
         // Official ActionStep.Background (DTPipelines) — wire `background: true`.
         let is_background = step

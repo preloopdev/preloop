@@ -2089,6 +2089,29 @@ jobs:
 }
 
 #[test]
+fn defaults_run_expression_is_encoded_as_template_token() {
+    let workflow = parse_workflow(
+        r#"on: push
+defaults:
+  run:
+    shell: ${{ matrix.shell }}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        shell: [bash]
+    steps:
+      - run: echo ok
+"#,
+    )
+    .unwrap();
+    let plan = &expand_jobs(&workflow).unwrap()[0];
+    assert_eq!(plan.defaults[0]["Value"]["type"], 3);
+    assert_eq!(plan.defaults[0]["Value"]["expr"], "matrix.shell");
+}
+
+#[test]
 fn step_timeout_expression_resolves_and_range_is_checked() {
     let workflow = parse_workflow(
         r#"on: push
