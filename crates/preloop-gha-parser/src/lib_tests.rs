@@ -1649,7 +1649,7 @@ jobs:
 #[test]
 fn reusable_workflow_dollar_slash_alias_canonicalized() {
     // Caller calls 50 workflows, mixing `./` and `$/` prefixes for the same 50 workflow files.
-    // E.g., 25 called with `./` and 25 with `$/` across 100 jobs, referring to 50 distinct files.
+    // E.g., 50 called with `./` and 50 with `$/` across 100 jobs, referring to 50 distinct files.
     let mut caller_yaml = "on: push\njobs:\n".to_owned();
     let mut reusable = BTreeMap::new();
     for i in 1..=50 {
