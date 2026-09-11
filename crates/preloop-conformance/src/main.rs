@@ -516,6 +516,41 @@ fn preseed_private_actions(
     Ok(())
 }
 
+/// Pick the `target/{release,debug}` build of `name` that was built most
+/// recently, and say which one was chosen.
+///
+/// Preferring `release` merely because the file *exists* silently pins the
+/// harness to a stale artifact: a months-old release binary outranks a debug
+/// build from seconds ago, so an e2e run reports on code that is not in the
+/// working tree. Comparing mtimes keeps the speed win when release is current
+/// without the staleness trap, and the log line makes the choice auditable.
+fn select_built_binary(name: &str) -> anyhow::Result<String> {
+    let release = format!("target/release/{name}");
+    let debug = format!("target/debug/{name}");
+    let mtime = |path: &str| {
+        std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok()
+    };
+    let chosen = match (mtime(&release), mtime(&debug)) {
+        (Some(r), Some(d)) => {
+            if r >= d {
+                release
+            } else {
+                debug
+            }
+        }
+        (Some(_), None) => release,
+        (None, Some(_)) => debug,
+        (None, None) => anyhow::bail!(
+            "{name} not built: run `cargo build -p preloop-runner-server -p preloop-runner-client` \
+             (looked in target/release and target/debug)"
+        ),
+    };
+    println!("conformance: using {chosen}");
+    Ok(chosen)
+}
+
 async fn run_runner_e2e(
     runner_bin: PathBuf,
     workflow: PathBuf,
@@ -534,25 +569,8 @@ async fn run_runner_e2e(
         anyhow::bail!("workflow file not found: {}", workflow.display());
     }
 
-    let server_bin = if std::path::Path::new("target/release/preloop-server").exists() {
-        "target/release/preloop-server"
-    } else {
-        "target/debug/preloop-server"
-    };
-    if !std::path::Path::new(server_bin).exists() {
-        anyhow::bail!(
-            "server binary not found at {server_bin}: build it with `cargo build -p preloop-runner-server`"
-        );
-    }
-
-    let client_bin = if std::path::Path::new("target/release/preloop-runner-client").exists() {
-        "target/release/preloop-runner-client"
-    } else {
-        "target/debug/preloop-runner-client"
-    };
-    if !std::path::Path::new(client_bin).exists() {
-        anyhow::bail!("client binary not found: please build preloop-runner-client");
-    }
+    let server_bin = select_built_binary("preloop-server")?;
+    let client_bin = select_built_binary("preloop-runner-client")?;
 
     // Temporary directories
     let temp_dir = tempfile::TempDir::new()?;
@@ -592,8 +610,17 @@ async fn run_runner_e2e(
         .user_agent("preloop-conformance")
         .build()
         .expect("HTTP client");
+    // Fresh state generates the runner-session and OIDC RSA keypairs before
+    // the listener binds. Prime generation is nondeterministic and routinely
+    // exceeds a second or two even on an idle host, so a short window makes
+    // this harness flaky for reasons unrelated to what it is testing. Match
+    // the minute-scale allowance `benchmarks/conformance/run.sh` uses, and
+    // fail loudly with the server's exit status when it actually died.
     let mut ready = false;
-    for _ in 0..30 {
+    for _ in 0..600 {
+        if let Some(status) = server.try_wait()? {
+            anyhow::bail!("preloop-runner-server exited during startup ({status})");
+        }
         if client.get(&server_url).send().await.is_ok() {
             ready = true;
             break;
@@ -602,7 +629,7 @@ async fn run_runner_e2e(
     }
     if !ready {
         let _ = server.kill().await;
-        anyhow::bail!("preloop-runner-server failed to start on port {port}");
+        anyhow::bail!("preloop-runner-server did not become ready on port {port} within 60s");
     }
 
     // Configure the runner
