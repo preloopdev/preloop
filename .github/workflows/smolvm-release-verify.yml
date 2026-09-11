@@ -15,14 +15,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: smolvm-host
+  group: github-hosted-kvm
   cancel-in-progress: false
 
 jobs:
   verify:
-    name: Verify smolvm release on smolvm-host
-    if: (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'renovate/')) && vars.SMOLVM_VERIFY_HOST_WORKSPACE != ''
-    runs-on: [self-hosted, smolvm-host]
+    name: Verify smolvm release on GitHub-hosted KVM
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'renovate/')
+    runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
