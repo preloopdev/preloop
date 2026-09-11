@@ -415,8 +415,34 @@ pub(crate) async fn delete_agent(
 
 /// Remove every trace of a runner identity: keys, client ids, sessions and
 /// assignments. Shared by agent deregistration and pool machine teardown.
+pub(crate) async fn purge_phantom_runner(shared: &Arc<SharedState>, runner_id: i64) -> bool {
+    purge_runner_identity_with_phantom_check(shared, runner_id, true).await
+}
+
 pub(crate) async fn purge_runner_identity(shared: &Arc<SharedState>, runner_id: i64) {
+    purge_runner_identity_with_phantom_check(shared, runner_id, false).await;
+}
+
+async fn purge_runner_identity_with_phantom_check(
+    shared: &Arc<SharedState>,
+    runner_id: i64,
+    only_if_phantom: bool,
+) -> bool {
     let mut inner = shared.state.inner.lock().await;
+    if only_if_phantom {
+        let has_session = inner.sessions.values().any(|s| s.runner_id == runner_id)
+            || inner
+                .broker_session_runners
+                .values()
+                .any(|id| *id == runner_id);
+        if has_session {
+            tracing::info!(
+                runner_id,
+                "runner established session before phantom purge; skipping cleanup"
+            );
+            return false;
+        }
+    }
     if inner.runners.remove(&runner_id).is_none()
         && inner.runner_client_ids.values().all(|id| *id != runner_id)
     {
@@ -510,6 +536,7 @@ pub(crate) async fn purge_runner_identity(shared: &Arc<SharedState>, runner_id: 
     runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
     drop(inner);
     shared.state.message_notify.notify_waiters();
+    true
 }
 
 /// DELETE /runner/server/_apis/distributedtask/pools/:pool_id/sessions (no session_id)

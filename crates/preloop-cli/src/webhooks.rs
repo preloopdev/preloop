@@ -73,7 +73,12 @@ async fn get(path: &str) -> anyhow::Result<serde_json::Value> {
 }
 
 async fn request(method: reqwest::Method, path: &str) -> anyhow::Result<serde_json::Value> {
-    let url = format!("{}{path}", crate::server_url());
+    let base = crate::server_url();
+    let url = format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    );
     let mut builder = crate::build_client().request(method, &url);
     if let Some(token) = crate::api_token() {
         builder = builder.bearer_auth(token);
@@ -93,7 +98,11 @@ async fn request(method: reqwest::Method, path: &str) -> anyhow::Result<serde_js
             .unwrap_or(body);
         anyhow::bail!("server returned {status}: {detail}");
     }
-    Ok(serde_json::from_str(&body).unwrap_or(serde_json::Value::Null))
+    if body.trim().is_empty() {
+        Ok(serde_json::Value::Null)
+    } else {
+        Ok(serde_json::from_str(&body)?)
+    }
 }
 
 fn human_age(seconds: f64) -> String {

@@ -247,7 +247,15 @@ async fn reconcile_repository(
             continue;
         }
         outcome.candidates += 1;
-        if run_exists(shared, repository, &candidate.head_sha).await {
+        if run_exists(
+            shared,
+            repository,
+            candidate.event,
+            &candidate.git_ref,
+            &candidate.head_sha,
+        )
+        .await
+        {
             outcome.skipped_existing += 1;
             continue;
         }
@@ -284,18 +292,29 @@ async fn reconcile_repository(
             lease_token: None,
             last_error: None,
         };
-        if shared.state.store.enqueue_webhook_delivery(&record).await? {
-            outcome.synthesized += 1;
-            shared.state.webhook_queue_notify.notify_one();
-            tracing::warn!(
-                %repository,
-                event = candidate.event,
-                git_ref = %candidate.git_ref,
-                sha = %candidate.head_sha,
-                "synthesized a webhook delivery from repository state"
-            );
-        } else {
-            outcome.skipped_existing += 1;
+        match shared.state.store.enqueue_webhook_delivery(&record).await {
+            Ok(true) => {
+                outcome.synthesized += 1;
+                shared.state.webhook_queue_notify.notify_one();
+                tracing::warn!(
+                    %repository,
+                    event = candidate.event,
+                    git_ref = %candidate.git_ref,
+                    sha = %candidate.head_sha,
+                    "synthesized a webhook delivery from repository state"
+                );
+            }
+            Ok(false) => {
+                outcome.skipped_existing += 1;
+            }
+            Err(error) => {
+                let _ = shared
+                    .state
+                    .store
+                    .clear_synthetic_webhook_reservation(&key)
+                    .await;
+                return Err(error);
+            }
         }
     }
     Ok(outcome)
@@ -306,12 +325,20 @@ async fn reconcile_repository(
 /// A fast path only: `RunRecord::head_sha` is not persisted, so after a
 /// restart this answers "no" for runs that do exist. The durable
 /// reservation, not this check, is what actually guarantees at-most-once.
-async fn run_exists(shared: &Arc<SharedState>, repository: &str, head_sha: &str) -> bool {
+async fn run_exists(
+    shared: &Arc<SharedState>,
+    repository: &str,
+    event: &str,
+    git_ref: &str,
+    head_sha: &str,
+) -> bool {
     let inner = shared.state.inner.lock().await;
-    inner
-        .runs
-        .values()
-        .any(|run| run.submission.repository == repository && run.head_sha == head_sha)
+    inner.runs.values().any(|run| {
+        run.submission.repository == repository
+            && run.submission.event == event
+            && run.submission.git_ref == git_ref
+            && run.head_sha == head_sha
+    })
 }
 
 /// Credential ladder identical to the webhook path: App installation token
@@ -462,7 +489,7 @@ async fn open_pull_request_candidates(
                         .get("head")
                         .and_then(|head| head.get("repo"))
                         .cloned()
-                        .unwrap_or_else(|| json!({"full_name": repository, "fork": false})),
+                        .unwrap_or_else(|| json!({"full_name": "unknown/unknown", "fork": true})),
                 },
                 "base": { "ref": base_ref, "sha": base_sha },
             },

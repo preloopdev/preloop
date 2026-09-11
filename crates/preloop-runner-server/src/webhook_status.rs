@@ -49,6 +49,10 @@ impl AppWebhookConfigStatus {
         self.error.is_none()
             && self.missing_events.is_empty()
             && self.missing_permissions.is_empty()
+            && self
+                .hook_url
+                .as_deref()
+                .is_some_and(|u| !u.trim().is_empty())
             && !self.url_drifted()
     }
 }

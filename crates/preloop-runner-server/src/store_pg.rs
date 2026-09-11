@@ -1684,6 +1684,17 @@ impl Store for PgStore {
             .await?;
         Ok(rows_affected > 0)
     }
+
+    async fn clear_synthetic_webhook_reservation(&self, key: &str) -> anyhow::Result<()> {
+        let client = self.connection.lock().await;
+        client
+            .execute(
+                "DELETE FROM webhook_synthetic_events WHERE idempotency_key = $1",
+                &[&key],
+            )
+            .await?;
+        Ok(())
+    }
 }
 
 /// Decode one `webhook_redeliveries` row. A `reason` the enum does not know

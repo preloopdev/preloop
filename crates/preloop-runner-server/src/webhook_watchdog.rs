@@ -294,7 +294,7 @@ async fn poll_app(
     let mut newest_examined: Option<i64> = None;
     let mut cursor: Option<String> = None;
     let mut reached_watermark = false;
-
+    let mut has_more_pages = false;
     for _page in 0..max_pages() {
         let (items, next_cursor) = list_deliveries(shared, &api_base, &jwt, cursor.as_deref())
             .await
@@ -311,7 +311,7 @@ async fn poll_app(
                 // delivery on every poll forever.
                 continue;
             };
-            if watermark.is_some_and(|mark| delivered_at_us <= mark) {
+            if watermark.is_some_and(|mark| delivered_at_us < mark) {
                 reached_watermark = true;
                 continue;
             }
@@ -361,19 +361,32 @@ async fn poll_app(
         }
 
         if reached_watermark {
+            has_more_pages = false;
             break;
         }
         match next_cursor {
-            Some(next) => cursor = Some(next),
-            None => break,
+            Some(next) => {
+                cursor = Some(next);
+                has_more_pages = true;
+            }
+            None => {
+                has_more_pages = false;
+                break;
+            }
         }
     }
 
     let now = now_us();
-    let advanced = match (watermark, newest_examined) {
-        (Some(mark), Some(newest)) => Some(mark.max(newest)),
-        (None, Some(newest)) => Some(newest),
-        (mark, None) => mark,
+    let advanced = if reached_watermark || !has_more_pages {
+        match (watermark, newest_examined) {
+            (Some(mark), Some(newest)) => Some(mark.max(newest)),
+            (None, Some(newest)) => Some(newest),
+            (mark, None) => mark,
+        }
+    } else {
+        // Truncated at max_pages(): do not advance the watermark across an
+        // unvisited range, otherwise skipped older deliveries are permanently lost.
+        watermark
     };
     shared
         .state

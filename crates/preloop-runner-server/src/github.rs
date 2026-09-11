@@ -236,7 +236,7 @@ pub(crate) async fn report_check_run_queued(
     sha: &str,
     job_id: &JobId,
     run_id: RunId,
-) {
+) -> anyhow::Result<Option<u64>> {
     // Webhook delivery is at-least-once. A replay can find a run whose
     // queued check was already persisted before the worker crashed; PATCH
     // that check instead of POSTing a second one.
@@ -248,8 +248,8 @@ pub(crate) async fn report_check_run_queued(
             .and_then(|run| run.job_check_run_ids.get(job_id).copied())
     };
     if let Some(check_run_id) = existing_check_run_id {
-        report_existing_check_run_queued(shared, repo, job_id, run_id, check_run_id).await;
-        return;
+        report_existing_check_run_queued(shared, repo, job_id, run_id, check_run_id).await?;
+        return Ok(Some(check_run_id));
     }
 
     let token = resolve_check_run_token(shared, repo).await;
@@ -290,6 +290,7 @@ pub(crate) async fn report_check_run_queued(
             }
             Err(e) => {
                 warn!(%run_id, %job_id, error = %e, "Failed to create GitHub check run");
+                return Err(e);
             }
         }
     } else {
@@ -318,6 +319,7 @@ pub(crate) async fn report_check_run_queued(
                 .await;
         }
     }
+    Ok(check_run_id)
 }
 
 /// Move an existing GitHub check run back to the queue after a rerequest.
@@ -327,7 +329,7 @@ pub(crate) async fn report_existing_check_run_queued(
     job_id: &JobId,
     run_id: RunId,
     check_run_id: u64,
-) {
+) -> anyhow::Result<()> {
     let token = resolve_check_run_token(shared, repo).await;
     if let Some(token) = &token {
         let mut body = serde_json::json!({
@@ -354,6 +356,7 @@ pub(crate) async fn report_existing_check_run_queued(
                 %error,
                 "Failed to requeue GitHub check run"
             );
+            return Err(error);
         }
     } else {
         info!(
@@ -363,6 +366,7 @@ pub(crate) async fn report_existing_check_run_queued(
             "Mock requeued GitHub check run"
         );
     }
+    Ok(())
 }
 /// Report a permanent failure check run to GitHub (e.g. invalid workflow YAML, expression failure).
 pub(crate) async fn report_check_run_permanent_failure(
@@ -423,7 +427,7 @@ pub(crate) async fn report_check_runs_for_run(
     for job_id in jobs {
         if let Some((reused_job_id, check_run_id)) = &reused_check_run {
             if reused_job_id == &job_id {
-                report_existing_check_run_queued(
+                let _ = report_existing_check_run_queued(
                     shared,
                     &repository,
                     &job_id,
@@ -432,10 +436,10 @@ pub(crate) async fn report_check_runs_for_run(
                 )
                 .await;
             } else {
-                report_check_run_queued(shared, &repository, &sha, &job_id, run_id).await;
+                let _ = report_check_run_queued(shared, &repository, &sha, &job_id, run_id).await;
             }
         } else {
-            report_check_run_queued(shared, &repository, &sha, &job_id, run_id).await;
+            let _ = report_check_run_queued(shared, &repository, &sha, &job_id, run_id).await;
         }
 
         let status = {
@@ -838,10 +842,18 @@ async fn fetch_remote_workflows(
                         .header("Authorization", format!("Bearer {}", token)),
                 )
                 .await?;
-                if file_res.status().is_success() {
-                    let content = file_res.text().await?;
-                    workflows.insert(item.name.clone(), content);
+                if !file_res.status().is_success() {
+                    let status = file_res.status();
+                    let err_text = file_res.text().await.unwrap_or_default();
+                    anyhow::bail!(
+                        "failed to download workflow file {}: GitHub returned {} ({})",
+                        item.name,
+                        status,
+                        err_text
+                    );
                 }
+                let content = file_res.text().await?;
+                workflows.insert(item.name.clone(), content);
             }
         }
     }
@@ -1453,7 +1465,11 @@ pub(crate) async fn run_webhook_queue_worker(
     let mut last_stats_refresh = Instant::now();
     // Publish once before the first drain: the boot snapshot is built while
     // this task is still starting, and every later snapshot reads the cache.
-    refresh_webhook_queue_stats(&shared.state).await;
+    if !refresh_webhook_queue_stats(&shared.state).await {
+        // Startup refresh failed; keep it due immediately on the next loop
+        // rather than treating the unpopulated cache as fresh for 60 seconds.
+        last_stats_refresh = Instant::now() - WEBHOOK_STATS_REFRESH_INTERVAL;
+    }
 
     loop {
         heartbeat.beat();
@@ -2241,13 +2257,19 @@ async fn process_delivery_payload_with_lease(
                         for job_id in jobs {
                             tokio::select! {
                                 _ = lease_lost.cancelled() => return WebhookOutcome::Success,
-                                _ = report_check_run_queued(
+                                res = report_check_run_queued(
                                     shared,
                                     &repo_full_name,
                                     &sha,
                                     &job_id,
                                     run_id,
-                                ) => {}
+                                ) => {
+                                    if let Err(error) = res {
+                                        return WebhookOutcome::TransientError(format!(
+                                            "failed to report check run for {job_id:?}: {error:?}"
+                                        ));
+                                    }
+                                }
                             }
                             let status = tokio::select! {
                                 _ = lease_lost.cancelled() => return WebhookOutcome::Success,

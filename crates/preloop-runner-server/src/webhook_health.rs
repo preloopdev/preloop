@@ -85,10 +85,14 @@ pub(crate) async fn check_webhook_config_once(
             .set_app_config(Vec::new(), now_us());
         return Vec::new();
     }
-    if shared.state.github_breaker.is_open() {
-        // A probe during a known outage would overwrite a good verdict with
-        // a transport error and add load to a failing dependency.
-        tracing::debug!("GitHub breaker open; skipping App webhook health check");
+    if let Err(retry_after) = shared.state.github_breaker.acquire() {
+        // A probe during a known outage or while a half-open probe is live
+        // would overwrite a good verdict with a transport error and add load
+        // to a failing dependency.
+        tracing::debug!(
+            retry_in_secs = retry_after.as_secs(),
+            "GitHub breaker open or probe in progress; skipping App webhook health check"
+        );
         return shared.state.webhook_status.app_config();
     }
 

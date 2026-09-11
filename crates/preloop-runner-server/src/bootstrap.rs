@@ -496,7 +496,7 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
             runner_id,
             "liveness sweep: reaping phantom registration (no session created within timeout)"
         );
-        purge_runner_identity(shared, runner_id).await;
+        crate::runner_lifecycle::purge_phantom_runner(shared, runner_id).await;
     }
 
     // Notify if cancellations or starvation failures occurred
@@ -723,7 +723,7 @@ fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
 /// the builder learning how to read a database.
 #[derive(Debug, Default, Clone)]
 struct WebhookConditionInputs {
-    stats: crate::models::WebhookQueueStats,
+    stats: Option<crate::models::WebhookQueueStats>,
     watchdog: crate::webhook_status::WatchdogStatus,
     reconciler: crate::webhook_status::ReconcilerStatus,
     breaker: crate::github_breaker::BreakerSnapshot,
@@ -751,23 +751,34 @@ fn webhook_conditions(
         exemplars: Vec::new(),
     };
     let mut conditions = Vec::new();
-    if inputs.stats.failed > 0 {
-        conditions.push(condition(
-            "webhook_dead_letter",
-            "warning",
-            format!(
-                "{} webhook deliveries failed with unreportable or permanent errors",
-                inputs.stats.failed
-            ),
-        ));
-    }
-    if let Some(oldest) = inputs.stats.oldest_pending_received_at_us {
-        let age = crate::webhook_status::age_seconds(oldest, now_us);
-        if age > WEBHOOK_QUEUE_STALL_SECONDS {
+    match &inputs.stats {
+        Some(stats) => {
+            if stats.failed > 0 {
+                conditions.push(condition(
+                    "webhook_dead_letter",
+                    "warning",
+                    format!(
+                        "{} webhook deliveries failed with unreportable or permanent errors",
+                        stats.failed
+                    ),
+                ));
+            }
+            if let Some(oldest) = stats.oldest_pending_received_at_us {
+                let age = crate::webhook_status::age_seconds(oldest, now_us);
+                if age > WEBHOOK_QUEUE_STALL_SECONDS {
+                    conditions.push(condition(
+                        "webhook_queue_stalled",
+                        "warning",
+                        format!("oldest unprocessed webhook delivery is {age:.0}s old"),
+                    ));
+                }
+            }
+        }
+        None => {
             conditions.push(condition(
-                "webhook_queue_stalled",
+                "webhook_queue_stats_unavailable",
                 "warning",
-                format!("oldest unprocessed webhook delivery is {age:.0}s old"),
+                "webhook queue statistics have not been published by the queue worker".to_owned(),
             ));
         }
     }
@@ -793,7 +804,9 @@ fn webhook_conditions(
             }
             // Never succeeded: only alarming once the process has been up
             // long enough for a poll to have happened and finished.
-            None => inputs.watchdog.last_poll_at_us.is_some(),
+            None => inputs.watchdog.last_poll_at_us.is_some_and(|poll| {
+                crate::webhook_status::age_seconds(poll, now_us) > WEBHOOK_WATCHDOG_STALE_SECONDS
+            }),
         };
         if stale {
             conditions.push(condition(
@@ -1077,7 +1090,7 @@ async fn publish_snapshot(
 /// worker publishes them, so the 5s tick never takes the store's connection.
 fn collect_webhook_condition_inputs(state: &AppState) -> WebhookConditionInputs {
     WebhookConditionInputs {
-        stats: state.webhook_status.queue_stats().unwrap_or_default(),
+        stats: state.webhook_status.queue_stats(),
         watchdog: state.webhook_status.watchdog(),
         reconciler: state.webhook_status.reconciler(),
         breaker: state.github_breaker.snapshot(),

@@ -213,6 +213,8 @@ pub(crate) trait Store: Send + Sync {
         head_sha: &str,
         now_us: i64,
     ) -> anyhow::Result<bool>;
+    /// Clear a synthetic webhook event reservation if subsequent enqueueing failed.
+    async fn clear_synthetic_webhook_reservation(&self, key: &str) -> anyhow::Result<()>;
 }
 
 /// Decorator that records `preloop.store.operation.duration` for every
@@ -617,6 +619,15 @@ impl Store for InstrumentedStore {
             self.inner
                 .reserve_synthetic_webhook_event(key, repository, event, git_ref, head_sha, now_us)
                 .await,
+        )
+    }
+
+    async fn clear_synthetic_webhook_reservation(&self, key: &str) -> anyhow::Result<()> {
+        let start = Instant::now();
+        self.record(
+            "clear_synthetic_webhook_reservation",
+            start,
+            self.inner.clear_synthetic_webhook_reservation(key).await,
         )
     }
 }
@@ -3224,6 +3235,21 @@ impl SqliteStore {
         self.maybe_checkpoint_wal(&connection)?;
         Ok(rows_affected > 0)
     }
+
+    pub(crate) fn clear_synthetic_webhook_reservation(&self, key: &str) -> anyhow::Result<()> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sqlite lock poisoned"))?;
+        let tx = connection.transaction()?;
+        tx.execute(
+            "DELETE FROM webhook_synthetic_events WHERE idempotency_key = ?1",
+            params![key],
+        )?;
+        tx.commit()?;
+        self.maybe_checkpoint_wal(&connection)?;
+        Ok(())
+    }
 }
 
 /// Decode one `webhook_redeliveries` row.
@@ -3608,6 +3634,16 @@ impl Store for SqliteStore {
         })
         .await
         .map_err(|error| anyhow::anyhow!("reserve synthetic webhook task panicked: {error}"))?
+    }
+
+    async fn clear_synthetic_webhook_reservation(&self, key: &str) -> anyhow::Result<()> {
+        let store = self.clone();
+        let key = key.to_owned();
+        tokio::task::spawn_blocking(move || store.clear_synthetic_webhook_reservation(&key))
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("clear synthetic reservation task panicked: {error}")
+            })?
     }
 }
 

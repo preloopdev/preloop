@@ -1018,12 +1018,11 @@ pub(crate) async fn submit_run_inner_with_webhook_delivery(
         );
     }
 
-    // ── Build job messages before the atomic insertion ───────────────────
-    //
-    // Message construction allocates request IDs and token material, but it
-    // stays inside the state lock so a replay cannot reserve a run number
-    // while the winning delivery is still being built. The lock is released
-    // before persistence and notifications.
+    // Release the state lock while building messages, token material and OIDC
+    // contexts for all jobs in the matrix. Holding the global lock during
+    // serialization of a 100-job matrix blocks unrelated runners and polls;
+    // the lock is reacquired only for atomic insertion into `inner.runs`.
+    drop(inner);
     let base_url = runner_base_url();
     let normalized_github = preloop_gha_parser::job_builder::normalize_github_context(&github);
     let secrets_exposed: BTreeMap<String, String> =
@@ -1144,6 +1143,18 @@ pub(crate) async fn submit_run_inner_with_webhook_delivery(
     }
 
     {
+        let mut inner = shared.state.inner.lock().await;
+        if let Some(delivery_id) = webhook_delivery_id.as_deref() {
+            if let Some(existing) = existing_webhook_run(&inner, delivery_id, &workflow_path) {
+                tracing::info!(
+                    %delivery_id,
+                    %workflow_path,
+                    run_id = %existing.run_id,
+                    "reusing run after webhook race during message building"
+                );
+                return Ok(existing);
+            }
+        }
         let created_at = chrono::Utc::now();
         let event = submission.event.clone();
         let github = github;
@@ -1868,8 +1879,14 @@ pub(crate) async fn submit_run(
                 )
             };
             for job_id in &jobs {
-                crate::github::report_check_run_queued(&shared, &repository, &sha, job_id, run_id)
-                    .await;
+                let _ = crate::github::report_check_run_queued(
+                    &shared,
+                    &repository,
+                    &sha,
+                    job_id,
+                    run_id,
+                )
+                .await;
                 let status = {
                     let inner = shared.state.inner.lock().await;
                     inner

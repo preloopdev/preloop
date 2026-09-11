@@ -144,8 +144,21 @@ impl GithubBreaker {
     /// Unlike [`GithubBreaker::acquire`] this reserves nothing, so the queue
     /// worker can use it to decide whether to claim a row at all.
     pub(crate) fn retry_after(&self) -> Option<Duration> {
+        let now = Instant::now();
         let inner = self.inner.lock();
-        Self::remaining(&inner, Instant::now())
+        if let Some(remaining) = Self::remaining(&inner, now) {
+            return Some(remaining);
+        }
+        if inner.open_until.is_some() {
+            if let Some(started) = inner.probe_started {
+                if let Some(elapsed) = now.checked_duration_since(started) {
+                    if elapsed < self.config.probe_timeout {
+                        return Some(self.config.probe_timeout - elapsed);
+                    }
+                }
+            }
+        }
+        None
     }
 
     pub(crate) fn is_open(&self) -> bool {
@@ -346,7 +359,13 @@ fn header_str<'headers>(headers: &'headers HeaderMap, name: &str) -> Option<&'he
 pub(crate) async fn send_observed(
     breaker: &GithubBreaker,
     request: reqwest::RequestBuilder,
-) -> reqwest::Result<reqwest::Response> {
+) -> anyhow::Result<reqwest::Response> {
+    if let Err(remaining) = breaker.acquire() {
+        anyhow::bail!(
+            "GitHub circuit breaker is open (retry after {}s)",
+            remaining.as_secs_f64()
+        );
+    }
     match request.send().await {
         Ok(response) => {
             breaker.observe_status(response.status(), response.headers());
@@ -354,7 +373,7 @@ pub(crate) async fn send_observed(
         }
         Err(error) => {
             breaker.observe_transport_error(&error);
-            Err(error)
+            Err(error.into())
         }
     }
 }
@@ -403,10 +422,15 @@ mod tests {
         std::thread::sleep(Duration::from_millis(80));
         assert!(breaker.acquire().is_ok(), "probe must be admitted");
         assert!(
+            breaker.retry_after().is_some(),
+            "retry_after must report remaining probe timeout while probe is live"
+        );
+        assert!(
             breaker.acquire().is_err(),
             "a second caller must wait for the probe verdict"
         );
         breaker.record_success();
+        assert!(breaker.retry_after().is_none());
         assert!(breaker.acquire().is_ok());
         assert!(!breaker.snapshot().open);
     }

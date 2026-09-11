@@ -228,14 +228,18 @@ mod tests {
     use super::*;
     use crate::models::WebhookDeliveryRecord;
 
-    async fn shared_state() -> Arc<SharedState> {
+    async fn shared_state() -> (Arc<SharedState>, tempfile::TempDir) {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.keep();
-        let state = crate::AppState::new(path).await.unwrap();
-        Arc::new(SharedState {
-            state,
-            shutdown: tokio_util::sync::CancellationToken::new(),
-        })
+        let state = crate::AppState::new(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        (
+            Arc::new(SharedState {
+                state,
+                shutdown: tokio_util::sync::CancellationToken::new(),
+            }),
+            temp,
+        )
     }
 
     async fn enqueue(shared: &Arc<SharedState>, id: &str) {
@@ -310,7 +314,7 @@ mod tests {
 
     #[tokio::test]
     async fn listing_filters_by_state_and_never_returns_payloads() {
-        let shared = shared_state().await;
+        let (shared, _temp) = shared_state().await;
         enqueue(&shared, "queued-one").await;
         enqueue(&shared, "dead-one").await;
         dead_letter(&shared, "dead-one").await;
@@ -349,7 +353,7 @@ mod tests {
 
     #[tokio::test]
     async fn replaying_a_dead_letter_requeues_it_for_the_worker() {
-        let shared = shared_state().await;
+        let (shared, _temp) = shared_state().await;
         enqueue(&shared, "dead-two").await;
         dead_letter(&shared, "dead-two").await;
 
@@ -374,7 +378,7 @@ mod tests {
 
     #[tokio::test]
     async fn replay_distinguishes_unknown_from_already_queued() {
-        let shared = shared_state().await;
+        let (shared, _temp) = shared_state().await;
         enqueue(&shared, "queued-two").await;
 
         let unknown = replay_webhook_delivery(State(shared.clone()), Path("nope".to_owned()))
@@ -390,7 +394,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_reports_queue_watchdog_and_breaker_in_one_document() {
-        let shared = shared_state().await;
+        let (shared, _temp) = shared_state().await;
         enqueue(&shared, "health-one").await;
 
         let health = webhook_health(State(shared.clone())).await.unwrap();

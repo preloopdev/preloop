@@ -408,7 +408,7 @@ pub(crate) async fn push_run_to_github(
                 .is_some_and(|run| run.job_check_run_ids.contains_key(job_id))
         };
         if !has_check_run {
-            crate::github::report_check_run_queued(
+            let _ = crate::github::report_check_run_queued(
                 shared,
                 &repository,
                 &effective_sha,
