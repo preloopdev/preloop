@@ -721,11 +721,11 @@ fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
             runner_idle += 1;
         }
     }
-    // Live runner -> job pairings, inverted from the assignment table keyed
-    // by (run, job). This is what answers "which job is on which runner";
-    // counts alone cannot distinguish a busy pool from a stalled one.
+    // Live runner -> job pairings, sourced from claimed job requests (each
+    // carries its claiming runner). NOT from the assignment table, which
+    // holds only pre-claim reservations removed at claim time.
     let assignments = crate::runtime_scheduling::live_runner_assignments(
-        &inner.job_assignments,
+        &inner.job_requests,
         std::time::SystemTime::now(),
     );
 

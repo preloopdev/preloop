@@ -15,6 +15,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 const REQUIRED_CHECKS: &[&str] = &[
+    "rust-lint",
     "rust shard 1 of 4",
     "rust shard 2 of 4",
     "rust shard 3 of 4",

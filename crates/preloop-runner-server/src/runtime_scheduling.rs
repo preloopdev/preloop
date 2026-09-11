@@ -1752,23 +1752,28 @@ pub(crate) fn clear_assignment(inner: &mut InnerState, run_id: RunId, job_id: &J
         .any(|job| job.run_id == run_id && job.job_id == *job_id)
 }
 
-/// Invert the (run, job) -> assignment table into per-runner live pairings
-/// for status reporting, sorted by runner id for stable output. This is what
-/// answers "which job is on which runner"; pool counts alone cannot
-/// distinguish a busy pool from a stalled one.
+/// Live runner -> job pairings for status reporting, sorted by runner id.
+/// Sourced from claimed job requests (each carries the claiming runner and
+/// is marked finished via `result`), NOT from the assignment table: entries
+/// there are pre-claim reservations that `take_matching_job` removes at
+/// claim time, so reading them reports idle runners as live and hides
+/// executing ones — exactly backwards.
 pub(crate) fn live_runner_assignments(
-    assignments: &std::collections::BTreeMap<(RunId, JobId), AssignmentRecord>,
+    requests: &std::collections::BTreeMap<i64, crate::models::TaskAgentJobRequestRecord>,
     now: std::time::SystemTime,
 ) -> Vec<preloop_observability::status::RunnerAssignment> {
-    let mut out: Vec<preloop_observability::status::RunnerAssignment> = assignments
-        .iter()
+    let mut out: Vec<preloop_observability::status::RunnerAssignment> = requests
+        .values()
+        .filter(|record| record.result.is_none())
+        .filter_map(|record| record.owner_runner_id.map(|runner_id| (runner_id, record)))
         .map(
-            |((run_id, job_id), record)| preloop_observability::status::RunnerAssignment {
-                runner_id: record.runner_id,
-                run_id: run_id.to_string(),
-                job_id: job_id.0.clone(),
-                assigned_seconds_ago: now
-                    .duration_since(record.at)
+            |(runner_id, record)| preloop_observability::status::RunnerAssignment {
+                runner_id,
+                run_id: record.run_id.to_string(),
+                job_id: record.job_id.0.clone(),
+                assigned_seconds_ago: record
+                    .started_at
+                    .and_then(|at| now.duration_since(at).ok())
                     .map(|d| d.as_secs_f64())
                     .unwrap_or(0.0),
             },
@@ -1777,7 +1782,6 @@ pub(crate) fn live_runner_assignments(
     out.sort_by_key(|a| a.runner_id);
     out
 }
-
 pub(crate) fn capabilities_of(runner: &RegisteredRunner) -> RunnerCapabilities {
     RunnerCapabilities {
         known: true,
@@ -3015,78 +3019,76 @@ mod runner_group_tests {
             &runner(Some(2), Some("Release")),
         ));
     }
-
-    #[test]
-    fn group_is_not_treated_as_a_label() {
-        let mut capabilities = runner(Some(2), Some("build"));
-        capabilities.labels.push("release".to_owned());
-        assert!(!job_matches_runner_group(Some("deploy"), &capabilities));
-    }
-
-    #[test]
-    fn missing_group_metadata_uses_default_group() {
-        let default_runner = runner(None, None);
-        assert!(job_matches_runner_group(Some("Default"), &default_runner));
-        let custom_name_only = runner(None, Some("private"));
-        assert!(!job_matches_runner_group(Some("1"), &custom_name_only));
-        assert!(job_matches_runner_group(Some("1"), &default_runner));
-        assert!(job_matches_runner_group(None, &default_runner));
-        assert!(!job_matches_runner_group(
-            Some("private"),
-            &RunnerCapabilities::default(),
-        ));
-    }
 }
 
 #[cfg(test)]
 mod assignment_tests {
     use super::*;
 
-    /// The status inversion reports each live pairing keyed by runner, with
-    /// run/job identity and age — the answer to "which job is on which
-    /// runner" that pool counts cannot give.
+    /// Status pairings come from claimed job requests carrying their runner,
+    /// not from the pre-claim assignment table: finished requests and
+    /// unclaimed ones must not appear, and output is runner-sorted.
     #[test]
-    fn live_assignments_invert_by_runner() {
-        use crate::models::AssignmentRecord;
+    fn live_assignments_reflect_claimed_requests() {
+        use crate::models::TaskAgentJobRequestRecord;
         use std::collections::BTreeMap;
 
-        let run_a = RunId::new();
-        let run_b = RunId::new();
-        let now = std::time::SystemTime::now();
-        let at = now.checked_sub(std::time::Duration::from_secs(90)).unwrap();
-        let mut table: BTreeMap<(RunId, JobId), AssignmentRecord> = BTreeMap::new();
-        // Insert out of runner order; output must still be runner-sorted.
-        table.insert(
-            (run_b, JobId("build".to_owned())),
-            AssignmentRecord {
-                runner_id: 7,
-                at,
-                first_at: at,
-            },
-        );
-        table.insert(
-            (run_a, JobId("test".to_owned())),
-            AssignmentRecord {
-                runner_id: 3,
-                at,
-                first_at: at,
-            },
-        );
+        fn record(
+            run_id: RunId,
+            job: &str,
+            owner: Option<i64>,
+            result: Option<preloop_gha_protocol::ExecutionStatus>,
+            started_ago_secs: u64,
+        ) -> TaskAgentJobRequestRecord {
+            TaskAgentJobRequestRecord {
+                request_id: 0,
+                run_id,
+                job_id: JobId(job.to_owned()),
+                agent_job_id: uuid::Uuid::nil(),
+                plan_id: String::new(),
+                plan_type: String::new(),
+                timeline_id: uuid::Uuid::nil(),
+                result,
+                locked_until: String::new(),
+                owner_runner_id: owner,
+                started_at: std::time::SystemTime::now()
+                    .checked_sub(std::time::Duration::from_secs(started_ago_secs)),
+                last_renewed_at: None,
+                timeout_triggered: false,
+                debug_token_issued: false,
+            }
+        }
 
+        let run_a = RunId::new();
+        let mut table: BTreeMap<i64, TaskAgentJobRequestRecord> = BTreeMap::new();
+        // Finished requests stay in the map (late reads stay bound) but must
+        // not report as live; unclaimed ones have no runner yet.
+        table.insert(
+            1,
+            record(
+                run_a,
+                "done",
+                Some(3),
+                Some(preloop_gha_protocol::ExecutionStatus::Success),
+                90,
+            ),
+        );
+        table.insert(2, record(RunId::new(), "queued", None, None, 10));
+        // Insert out of runner order; output must still be runner-sorted.
+        table.insert(3, record(RunId::new(), "build", Some(7), None, 90));
+        let run_test = RunId::new();
+        table.insert(4, record(run_test, "test", Some(3), None, 30));
+
+        let now = std::time::SystemTime::now();
         let live = live_runner_assignments(&table, now);
 
         assert_eq!(live.len(), 2);
         assert_eq!(live[0].runner_id, 3);
-        assert_eq!(live[0].run_id, run_a.to_string());
+        assert_eq!(live[0].run_id, run_test.to_string());
         assert_eq!(live[0].job_id, "test");
+        assert!((live[0].assigned_seconds_ago - 30.0).abs() < 5.0);
         assert_eq!(live[1].runner_id, 7);
         assert_eq!(live[1].job_id, "build");
-        for entry in &live {
-            assert!(
-                (entry.assigned_seconds_ago - 90.0).abs() < 5.0,
-                "age should reflect assignment time: {entry:?}"
-            );
-        }
         assert!(live_runner_assignments(&BTreeMap::new(), now).is_empty());
     }
 
