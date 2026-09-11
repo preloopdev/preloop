@@ -1752,6 +1752,32 @@ pub(crate) fn clear_assignment(inner: &mut InnerState, run_id: RunId, job_id: &J
         .any(|job| job.run_id == run_id && job.job_id == *job_id)
 }
 
+/// Invert the (run, job) -> assignment table into per-runner live pairings
+/// for status reporting, sorted by runner id for stable output. This is what
+/// answers "which job is on which runner"; pool counts alone cannot
+/// distinguish a busy pool from a stalled one.
+pub(crate) fn live_runner_assignments(
+    assignments: &std::collections::BTreeMap<(RunId, JobId), AssignmentRecord>,
+    now: std::time::SystemTime,
+) -> Vec<preloop_observability::status::RunnerAssignment> {
+    let mut out: Vec<preloop_observability::status::RunnerAssignment> = assignments
+        .iter()
+        .map(
+            |((run_id, job_id), record)| preloop_observability::status::RunnerAssignment {
+                runner_id: record.runner_id,
+                run_id: run_id.to_string(),
+                job_id: job_id.0.clone(),
+                assigned_seconds_ago: now
+                    .duration_since(record.at)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0),
+            },
+        )
+        .collect();
+    out.sort_by_key(|a| a.runner_id);
+    out
+}
+
 pub(crate) fn capabilities_of(runner: &RegisteredRunner) -> RunnerCapabilities {
     RunnerCapabilities {
         known: true,
@@ -3015,6 +3041,54 @@ mod runner_group_tests {
 #[cfg(test)]
 mod assignment_tests {
     use super::*;
+
+    /// The status inversion reports each live pairing keyed by runner, with
+    /// run/job identity and age — the answer to "which job is on which
+    /// runner" that pool counts cannot give.
+    #[test]
+    fn live_assignments_invert_by_runner() {
+        use crate::models::AssignmentRecord;
+        use std::collections::BTreeMap;
+
+        let run_a = RunId::new();
+        let run_b = RunId::new();
+        let now = std::time::SystemTime::now();
+        let at = now.checked_sub(std::time::Duration::from_secs(90)).unwrap();
+        let mut table: BTreeMap<(RunId, JobId), AssignmentRecord> = BTreeMap::new();
+        // Insert out of runner order; output must still be runner-sorted.
+        table.insert(
+            (run_b, JobId("build".to_owned())),
+            AssignmentRecord {
+                runner_id: 7,
+                at,
+                first_at: at,
+            },
+        );
+        table.insert(
+            (run_a, JobId("test".to_owned())),
+            AssignmentRecord {
+                runner_id: 3,
+                at,
+                first_at: at,
+            },
+        );
+
+        let live = live_runner_assignments(&table, now);
+
+        assert_eq!(live.len(), 2);
+        assert_eq!(live[0].runner_id, 3);
+        assert_eq!(live[0].run_id, run_a.to_string());
+        assert_eq!(live[0].job_id, "test");
+        assert_eq!(live[1].runner_id, 7);
+        assert_eq!(live[1].job_id, "build");
+        for entry in &live {
+            assert!(
+                (entry.assigned_seconds_ago - 90.0).abs() < 5.0,
+                "age should reflect assignment time: {entry:?}"
+            );
+        }
+        assert!(live_runner_assignments(&BTreeMap::new(), now).is_empty());
+    }
 
     fn self_hosted_caps() -> RunnerCapabilities {
         RunnerCapabilities {

@@ -3633,6 +3633,29 @@ fn render_status_human(status: &serde_json::Value, runs: &[serde_json::Value], l
             .map(|v| format!("{v:.1}s"))
             .unwrap_or_else(|| "-".to_owned())
     );
+    // Live runner -> job pairings: which job each busy runner executes.
+    // Counts alone cannot distinguish a busy pool from a stalled one.
+    if let Some(list) = runners.get("assignments").and_then(|v| v.as_array()) {
+        for entry in list {
+            let runner = entry
+                .get("runner_id")
+                .and_then(|v| v.as_i64())
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "?".to_owned());
+            let run = entry
+                .get("run_id")
+                .and_then(|v| v.as_str())
+                .map(|v| v.get(..8).unwrap_or(v).to_owned())
+                .unwrap_or_else(|| "?".to_owned());
+            let job = entry.get("job_id").and_then(|v| v.as_str()).unwrap_or("?");
+            let age = entry
+                .get("assigned_seconds_ago")
+                .and_then(|v| v.as_f64())
+                .map(|v| format!("{v:.0}s"))
+                .unwrap_or_else(|| "-".to_owned());
+            println!("  runner {runner}: {run} / {job} ({age})");
+        }
+    }
 
     // 5. VM fleet stub
     println!("\n== vm fleet ==");

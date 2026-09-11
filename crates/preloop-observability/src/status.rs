@@ -99,6 +99,21 @@ pub struct RunnersSnapshot {
     pub stale: u32,
     pub max_poll_age_seconds: Option<f64>,
     pub max_lease_age_seconds: Option<f64>,
+    /// Live runner -> job pairings. Empty when nothing is executing; this is
+    /// the answer to "which job is on which runner" that pool counts alone
+    /// cannot give.
+    #[serde(default)]
+    pub assignments: Vec<RunnerAssignment>,
+}
+
+/// One live runner -> job pairing: which job a busy runner is executing and
+/// for how long. Inverted from the assignment table at snapshot time.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RunnerAssignment {
+    pub runner_id: i64,
+    pub run_id: String,
+    pub job_id: String,
+    pub assigned_seconds_ago: f64,
 }
 
 // ---------------------------------------------------------------------------

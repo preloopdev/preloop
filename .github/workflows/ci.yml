@@ -18,9 +18,46 @@ on:
         default: "fast"
 
 jobs:
-  rust:
+  rust-lint:
+    runs-on: [self-hosted, preloop-cpane]
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: "6"
+      RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+          lfs: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "1.97"
+          components: rustfmt,clippy
+      - name: Install lld linker
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends lld
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo fmt --all --check
+      - run: |
+          cargo clippy --locked -p preloop-gha-protocol -p preloop-gha-parser -p preloop-gha-expressions -p preloop-cache -p preloop-artifacts -p runner-watch -p preloop-conformance --all-targets -- -D warnings
+          cargo clippy --locked -p preloop-runner -p preloop-runner-server -p preloop-runner-client -p preloop-dap --all-targets
+      # nextest does not run doctests; keep them on the lint job (seconds).
+      - run: cargo test --locked --workspace --doc
+        env:
+          RUSTFLAGS: "-A warnings -C link-arg=-fuse-ld=lld"
+
+  rust-test:
+    # Sharded unit/integration suite. Each shard runs 1/4 of the tests (split
+    # by test-name hash, so no manual bookkeeping) on its own runner; wall
+    # clock is setup + slowest shard instead of setup + everything.
+    # NOTE: these display names are load-bearing — the `main` ruleset gates
+    # on them. Renaming a shard name requires updating the ruleset to match.
+    name: rust shard ${{ matrix.shard }} of 4
     runs-on: [self-hosted, preloop-cpane]
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     env:
       CARGO_BUILD_JOBS: "6"
       PROPTEST_CASES: "8"
@@ -44,17 +81,12 @@ jobs:
         with:
           toolchain: "1.97"
           components: rustfmt,clippy
-
       - name: Install lld linker
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends lld
-
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-
-      - run: cargo fmt --all --check
-      - run: |
-          cargo clippy --locked -p preloop-gha-protocol -p preloop-gha-parser -p preloop-gha-expressions -p preloop-cache -p preloop-artifacts -p runner-watch -p preloop-conformance --all-targets -- -D warnings
-          cargo clippy --locked -p preloop-runner -p preloop-runner-server -p preloop-runner-client -p preloop-dap --all-targets
-      - run: cargo test --locked --workspace
+      - name: Install cargo-nextest
+        run: cargo install cargo-nextest --locked
+      - run: cargo nextest run --locked --workspace --partition hash:${{ matrix.shard }}/4
         env:
           RUSTFLAGS: "-A warnings -C link-arg=-fuse-ld=lld"
 

@@ -546,6 +546,7 @@ struct SnapshotInputs {
     runner_idle: u32,
     runner_busy: u32,
     runner_stale: u32,
+    runner_assignments: Vec<preloop_observability::status::RunnerAssignment>,
     oldest_ready_seconds: Option<f64>,
     oldest_ready_run_id: Option<String>,
     oldest_ready_job_id: Option<String>,
@@ -720,6 +721,13 @@ fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
             runner_idle += 1;
         }
     }
+    // Live runner -> job pairings, inverted from the assignment table keyed
+    // by (run, job). This is what answers "which job is on which runner";
+    // counts alone cannot distinguish a busy pool from a stalled one.
+    let assignments = crate::runtime_scheduling::live_runner_assignments(
+        &inner.job_assignments,
+        std::time::SystemTime::now(),
+    );
 
     // Live debug sessions: count open sessions and the age of the oldest.
     let debug_sessions = inner.debug_sessions.list();
@@ -768,6 +776,7 @@ fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
         runner_idle,
         runner_busy,
         runner_stale,
+        runner_assignments: assignments,
         oldest_ready_seconds,
         oldest_ready_run_id: oldest_ready.map(|job| job.run_id.to_string()),
         oldest_ready_job_id: oldest_ready.map(|job| job.job_id.0.clone()),
@@ -949,6 +958,7 @@ fn build_operational_snapshot_sync(
             stale: inputs.runner_stale,
             max_poll_age_seconds: None,
             max_lease_age_seconds: None,
+            assignments: inputs.runner_assignments,
         },
         pool: pool_snapshot,
         vms: {

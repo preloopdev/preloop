@@ -279,7 +279,7 @@ pub(crate) async fn report_check_run_queued(
             "status": "queued",
             "output": {
                 "title": job_name,
-                "summary": "Waiting for a preloop runner."
+                "summary": format!("Waiting for a preloop runner.\n\njob_id: `{}`", job_id.0)
             }
         });
         if let Some(url) = details_url {
@@ -512,6 +512,7 @@ fn check_summary(
     conclusion: &str,
     steps: &[crate::models::StepRecord],
     global_issues: &[String],
+    job_id: &JobId,
 ) -> String {
     let mut summary = format!("Job completed with status: **{conclusion}**");
     if !steps.is_empty() {
@@ -535,6 +536,11 @@ fn check_summary(
         summary.push_str("\n\n### Failure details\n");
         summary.push_str(&global_issues.join("\n"));
     }
+    // Map the display name back to the workflow job id: required status
+    // checks match on this exact display string, so a rename that breaks
+    // the ruleset is diagnosable from the check page itself instead of
+    // presenting as "Expected" forever with no explanation.
+    summary.push_str(&format!("\n\njob_id: `{}`", job_id.0));
     summary
 }
 
@@ -648,7 +654,7 @@ pub(crate) async fn report_check_run_completed(
         ExecutionStatus::Skipped => "skipped",
         _ => "failure",
     };
-    let summary = check_summary(conclusion, &steps, &global_issues);
+    let summary = check_summary(conclusion, &steps, &global_issues, job_id);
 
     let token = resolve_check_run_token(shared, &repo).await;
     if let Some(token) = &token {
@@ -2008,11 +2014,17 @@ mod tests {
         test.started_at = setup.finished_at;
         test.finished_at = Some(start + chrono::Duration::milliseconds(3250));
 
-        let summary = check_summary("failure", &[setup, test], &["- exit code 1".to_owned()]);
+        let summary = check_summary(
+            "failure",
+            &[setup, test],
+            &["- exit code 1".to_owned()],
+            &preloop_gha_protocol::JobId("test".to_owned()),
+        );
         assert!(summary.contains("| Set up \\| tools | success | 1.2s |"));
         assert!(summary.contains("| Run tests | failure | 2.0s |"));
         assert!(summary.contains("**Failed step:** `Run tests`"));
         assert!(summary.contains("exit code 1"));
+        assert!(summary.contains("job_id: `test`"));
     }
 
     #[tokio::test]
