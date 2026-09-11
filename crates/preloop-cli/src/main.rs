@@ -1940,7 +1940,7 @@ fn local_runner_pool_config(
             .ok()
             .and_then(|v| v.parse().ok()),
         debug_dir: Some(home.join("state").join("debug")),
-        runner_key_dir: Some(home.join("runner-keys")),
+        runner_key_dir: None,
         // Warm the golden with the images this project's workflows declare,
         // so `container:`/`services:` jobs do not re-pull on every run.
         preload_images: preloop_orchestrator::environment::scan_workflow_images(
