@@ -1758,7 +1758,6 @@ async fn write_bake_manifest<P: VmProvider>(
 }
 
 /// PATH the guest runner process exports to every step.
-///
 /// Hosted images carry the toolchain bin directories on the runner's own PATH,
 /// which is what makes `cargo install`-style actions work: `taiki-e/install-action`
 /// drops `cargo-hack` in `$CARGO_HOME/bin` and the next step runs `cargo hack`.
@@ -1766,20 +1765,17 @@ async fn write_bake_manifest<P: VmProvider>(
 /// has to install rustup itself, so on an image that already has rustup — ours,
 /// and GitHub's — the directory is on PATH or the tool is simply unreachable.
 ///
-/// The cargo bin dir must match the user the runner executes steps as: a root
-/// runner (no switching) installs into `/root/.cargo`, a switched runner into
-/// `/home/<user>/.cargo`. The root-only path must never be exported to an
-/// unprivileged runner — `/root` is 0700, so every tool lookup stats it and
-/// gets EACCES (nodejs/ci: `EACCES: permission denied, stat
-/// '/root/.cargo/bin/git'`), and the Go layer untars into the world-readable
-/// `/usr/local/go`. Absent directories cost nothing.
-pub fn guest_runner_path(config: &RunnerPoolConfig) -> String {
-    let cargo_bin = match config.runner_user.as_deref() {
-        None | Some("root") => "/root/.cargo/bin".to_owned(),
-        Some(user) => format!("/home/{user}/.cargo/bin"),
-    };
+/// The cargo bin dir is the fixed system address `/usr/local/cargo/bin`,
+/// matching the exported `CARGO_HOME` (see `guest_env_prefix`): it is
+/// identical for root and switched runners by construction. A per-user
+/// `$HOME/.cargo/bin` here would reintroduce the EACCES trap the homes fix
+/// removes — `/root` is 0700, so exporting `/root/.cargo/bin` to an
+/// unprivileged runner makes every tool lookup fail statting it
+/// (nodejs/ci: `EACCES: permission denied, stat '/root/.cargo/bin/git'`).
+/// Absent directories cost nothing.
+pub fn guest_runner_path(_config: &RunnerPoolConfig) -> String {
     format!(
-        "{cargo_bin}:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:\
+        "/usr/local/cargo/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:\
          /usr/sbin:/usr/bin:/sbin:/bin"
     )
 }
@@ -1792,6 +1788,15 @@ pub fn guest_runner_path(config: &RunnerPoolConfig) -> String {
 fn guest_env_prefix(config: &RunnerPoolConfig, name: &MachineName) -> Vec<String> {
     let mut env = Vec::new();
     env.push(format!("PATH={}", guest_runner_path(config)));
+    // Rust toolchain homes. rustup resolves toolchains under RUSTUP_HOME and
+    // shims under CARGO_HOME, both defaulting to the *calling* user's $HOME.
+    // The bake installs as root while job steps run as the unprivileged
+    // runner user, so a $HOME-derived location is invisible across that
+    // boundary (/root is 0700). The bake therefore installs to these fixed
+    // system addresses (see ToolchainLayer::Rust install_commands), and they
+    // are exported here so every user resolves the identical toolchain.
+    env.push("RUSTUP_HOME=/usr/local/rustup".to_owned());
+    env.push("CARGO_HOME=/usr/local/cargo".to_owned());
     // The guest needs its own VM name so a debug session can tell a controller
     // which machine to open a shell into. Nothing else in the guest knows it.
     env.push(format!("PRELOOP_MACHINE_NAME={}", name.as_str()));
@@ -5559,9 +5564,21 @@ chmod +x "$dest/bin/node"
             .expect("the runner is launched with an explicit PATH");
         let entries: Vec<&str> = path.split(':').collect();
         assert!(
-            entries.contains(&"/root/.cargo/bin"),
+            entries.contains(&"/usr/local/cargo/bin"),
             "cargo-installed binaries must be reachable: {path}"
         );
+        // Toolchain homes are fixed system addresses, identical for root
+        // and switched runners: a $HOME-derived location would be invisible
+        // across the bake-user/step-user boundary (/root is 0700).
+        for expected in [
+            "RUSTUP_HOME=/usr/local/rustup",
+            "CARGO_HOME=/usr/local/cargo",
+        ] {
+            assert!(
+                env.iter().any(|entry| entry == expected),
+                "guest env must pin {expected}: {env:?}"
+            );
+        }
         assert!(
             entries.contains(&"/usr/local/go/bin"),
             "the go layer untars into /usr/local/go: {path}"
