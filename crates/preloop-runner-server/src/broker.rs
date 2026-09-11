@@ -114,7 +114,10 @@ pub(crate) fn format_reusable_workflow_ref(
     workflow_ref: &str,
     caller_ref: &str,
 ) -> String {
-    if let Some(path) = workflow_ref.strip_prefix("./") {
+    let local_path = workflow_ref
+        .strip_prefix("./")
+        .or_else(|| workflow_ref.strip_prefix("$/"));
+    if let Some(path) = local_path {
         let (path, git_ref) = path.split_once('@').unwrap_or((path, caller_ref));
         return format!("{repository}/{path}@{git_ref}");
     }

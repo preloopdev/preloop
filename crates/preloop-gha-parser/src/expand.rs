@@ -1162,7 +1162,10 @@ fn merge_job_conditions(outer: Option<&str>, inner: Option<&str>) -> Option<Stri
 }
 fn normalize_reusable_path(uses: &str) -> String {
     let without_ref = uses.split('@').next().unwrap_or(uses);
-    let path = without_ref.strip_prefix("./").unwrap_or(without_ref);
+    let path = without_ref
+        .strip_prefix("./")
+        .or_else(|| without_ref.strip_prefix("$/"))
+        .unwrap_or(without_ref);
     Path::new(path)
         .components()
         .collect::<PathBuf>()

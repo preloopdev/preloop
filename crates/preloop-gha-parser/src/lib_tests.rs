@@ -1647,6 +1647,31 @@ jobs:
 }
 
 #[test]
+fn reusable_workflow_dollar_slash_alias_canonicalized() {
+    // Caller calls 50 workflows, mixing `./` and `$/` prefixes for the same 50 workflow files.
+    // E.g., 25 called with `./` and 25 with `$/` across 100 jobs, referring to 50 distinct files.
+    let mut caller_yaml = "on: push\njobs:\n".to_owned();
+    let mut reusable = BTreeMap::new();
+    for i in 1..=50 {
+        caller_yaml.push_str(&format!(
+            "  job_dot_{i}:\n    uses: ./.github/workflows/sub{i}.yml\n  job_dollar_{i}:\n    uses: $/.github/workflows/sub{i}.yml\n"
+        ));
+        reusable.insert(
+            format!(".github/workflows/sub{i}.yml"),
+            "on: { workflow_call: {} }\njobs:\n  leaf:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok".to_owned(),
+        );
+    }
+
+    let caller = parse_workflow(&caller_yaml).unwrap();
+    let root = expand_jobs_with_reusables(&caller, &reusable);
+    assert!(
+        root.is_ok(),
+        "Mixing ./ and $/ for the same 50 files must canonicalize to 50 unique workflows, not 100"
+    );
+    assert_eq!(root.unwrap().jobs.len(), 100);
+}
+
+#[test]
 fn reusable_workflow_outer_needs_propagated() {
     let caller = parse_workflow(
         r#"
