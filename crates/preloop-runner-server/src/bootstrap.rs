@@ -485,6 +485,13 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
                 reason: Some(reason.clone()),
             })
             .await;
+        crate::github::report_check_run_completed(
+            shared,
+            *run_id,
+            job_id,
+            ExecutionStatus::Failure,
+        )
+        .await;
     }
 
     // Process completions for disconnected runners
