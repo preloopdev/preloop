@@ -2990,6 +2990,29 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     .unwrap_or("unknown")
             )));
         }
+        // Pre-bake the runner account, toolcache, and permissions into the
+        // golden rootfs so cloned microVMs inherit them with zero runtime setup.
+        let runner_user = self.config.runner_user.as_deref().unwrap_or("runner");
+        let runner_uid = self.config.runner_uid.unwrap_or(1001);
+        let user_prep_command = format!(
+            "getent passwd {runner_user} >/dev/null 2>&1 || useradd -m -u {runner_uid} {runner_user} 2>/dev/null; \
+             printf '%s\\n' '{runner_user} ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/preloop-{runner_user} \
+               && chmod 0440 /etc/sudoers.d/preloop-{runner_user}; \
+             mkdir -p /run/user/{runner_uid} /opt/hostedtoolcache; \
+             chown {runner_uid}:{runner_uid} /run/user/{runner_uid} {root} 2>/dev/null; \
+             chmod -R 777 /opt/hostedtoolcache 2>/dev/null; \
+             grep -q AGENT_TOOLSDIRECTORY /etc/environment 2>/dev/null || \
+               printf 'AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\\nRUNNER_TOOL_CACHE=/opt/hostedtoolcache\\n' >> /etc/environment; \
+             getent group docker >/dev/null 2>&1 && usermod -aG docker {runner_user} 2>/dev/null || true",
+            root = RUNNER_ROOT
+        );
+        let _ = self
+            .provider
+            .exec(
+                &name,
+                &["sh".to_owned(), "-c".to_owned(), user_prep_command],
+            )
+            .await;
         let env_spec = EnvironmentSpec::for_base(self.config.base_image.clone());
         if let Err(error) = write_bake_manifest(self.provider.as_ref(), &name, &env_spec).await {
             // Provenance is an audit aid, not a build gate.
