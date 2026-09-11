@@ -152,19 +152,34 @@ those details.
 
 ## 1. Current fidelity scorecard
 
-**Evidence basis (latest, 2026-07-28):** runner-watch conformance replay of all 24
-official-runner v2.336.0 golden scenarios against preloop. All 24 pass: status codes,
-request body schemas, and acquirejob response schemas match on every
-conformance-checked endpoint. `benchmarks/conformance/check_corpus.py` fails closed
-when any scenario definition lacks a non-empty, version-matched capture.
+**Evidence basis (latest, 2026-09-11):** runner-watch conformance replay of the
+36 gated official-runner v2.336.0 golden scenarios against preloop. Three
+further captures (`102-mask-and-secret-propagation`,
+`115-cache-v2-restore-fallback`, `163-reusable-caller`) are quarantined in
+`.runner-watch/quarantine.toml`: the recorder acquired another scenario's job,
+so those captures describe a job their own workflow never declares.
+`benchmarks/conformance/check_corpus.py` fails closed when a capture is
+missing, version-mismatched, or contaminated — the latter via two invariants
+(no orchestration plan GUID may appear in two captures; a capture's acquired
+job must be declared by its own workflow).
+
+> **Correction (2026-09-11).** This section previously claimed "all 24
+> v2.336.0 golden scenarios … All 24 pass" dated 2026-07-28. No 24-scenario
+> v2.336.0 corpus ever existed: the golden directory was empty until
+> `fd8f62fa` (2026-07-30) imported all 39 captures at once, and the revision
+> of `conformance-report.md` immediately prior (`d93e1fd7`, 2026-07-23)
+> recorded "10 of 11 scenario(s) diverged". `fd8f62fa` also wrote
+> "✅ All 39 scenario(s) matched" in the same commit that created the corpus,
+> which is why six real divergences stayed invisible until #243. The report is
+> generated output and must not be hand-edited.
 
 **Evidence basis (live E2E, 2026-07-10):** official `actions/runner` v2.335.1 run against both
 GitHub Actions and preloop server in independent smolVMs. 12 conformance scenarios tested.
 Job-level match: 11/12 (92%). Full match (job + step): 6/12 (50%).
 See `benchmarks/real-world/results/server-compare/COMPARISON-REPORT.md` for details.
 
-- Golden scenarios: all 24 definitions under `experiments/mitm/scenarios/`, all
-passing conformance replay.
+- Golden scenarios: 39 definitions under `experiments/mitm/scenarios/`; 36
+gated and passing, 3 quarantined pending re-record against a drained queue.
 
 Rough completeness against "100% faithful control plane (v2.336.0)": **~95%**
 (v2.336.0 runner deltas and protocol corpus current; BackgroundStepCoordinator incomplete).
@@ -229,7 +244,7 @@ deprecation warnings, job-level annotations, and background step control-flow.
 | Runner config refresh                                           | `RunnerRefreshConfig` acknowledged with log; dynamic config updates not implemented                                                                                                                                                                                                                                                                                                                                                                                                  | ❌ missing                                            |
 | Server-enforced runner settings                                 | `RunnerServerSettings` DTO; `GET /_apis/v1/settings/runner` endpoint; broker acquire injects `runnerSettings` defaults                                                                                                                                                                                                                                                                                                                                                               | ✅ good                                               |
 | `run-name` expressions                                          | parsed via `Workflow.run_name`; evaluated with `github`/`inputs`/`vars` contexts at submit time; stored in `RunRecord`                                                                                                                                                                                                                                                                                                                                                               | ✅ good                                               |
-| Reusable workflows                                              | parsing, `secrets: inherit`, required secrets/inputs, input type validation, OIDC `environment` propagation, `oidc_job_workflow_ref`; depth limit = 4                                                                                                                                                                                                                                                                                                                                | ✅ good                                               |
+| Reusable workflows                                              | parsing, `secrets: inherit`, required secrets/inputs, input type validation, OIDC `environment` propagation, `oidc_job_workflow_ref`; 10 connected workflow levels, max 50 unique reusable workflows per run tree                                                                                                                                                                                                                                                                                                                                | ✅ good                                               |
 | Node 20→24 migration/deprecation warnings                       | implemented: flag source precedence, conflict warning, ARM32 fallback (Plan 008)                                                                                                                                                                                                                                                                                                                                                                                                     | ✅ good                                               |
 
 > **Externals pin divergence (v2.336.0 vs v2.337.0):** preloop ships `node24_externals_version = 24.19.0` and `node20_externals_version = 20.20.2` (the final Node 20 release) while the `v2.336.0` golden pins Node 24 `24.18.0`. The `24.19.0` patch is a secure forward-port matching the `v2.337.0` externals with no wire-protocol change; conformance is unaffected.
@@ -276,13 +291,13 @@ Pre-existing on main (unrelated): preloop-orchestrator
 `published_node_externals_are_traversable_by_other_users` fails — its mock
 SHASUMS still pin node-v20.19.0 while the pin moved to v20.20.2 (48386439).
 
-## 1a. v2.336.0 conformance replay status (2026-07-28)
+## 1a. v2.336.0 conformance replay status (2026-09-11)
 
 ### 1a.1 What the conformance replay proves
 
-runner-watch replays all 24 golden scenarios against preloop and compares wire output.
-**All 24 scenarios pass**: status codes match, request body schemas match, and
-acquirejob response body schemas match for all conformance-checked endpoints.
+runner-watch replays the 36 gated golden scenarios against preloop and
+compares wire output. Status codes, request body schemas, and acquirejob
+response body schemas match on every conformance-checked endpoint.
 
 The conformance gate checks:
 
@@ -292,15 +307,33 @@ The conformance gate checks:
 
 Body-value diffs (different URLs, IDs, tokens) are expected and not gated.
 
-> **Stale as of 2026-09-02.** CI's `server-light` job reports
-> `conformance failed for 6 scenario(s)` on this replay. Verified as
-> pre-existing rather than a regression: `main` at `c9a6d89e` and
-> `Bnjoroge/step-manifest` at `110266ec` fail the same job with the same
-> count. The failing scenario names are only in the run's preserved
-> artifacts, which live in the ephemeral runner VM and are gone by the time
-> the job reports, so they are not yet identified here — that artifact
-> retention is itself worth fixing, since a conformance failure currently
-> cannot be diagnosed after the fact from the log alone.
+> **Resolved (2026-09-11), previously "stale as of 2026-09-02".** The
+> `conformance failed for 6 scenario(s)` that CI reported was correctly
+> identified as pre-existing rather than a regression, but the six were never
+> named because `conformance-fail.toml` — the only file listing them — was
+> not part of the uploaded artifact, and the replay log prints just the count.
+> Both are fixed: the workflow now echoes the failing scenarios into the log
+> (which outlives the ephemeral runner VM) and uploads that manifest.
+>
+> The six split two ways. Three were real, never-implemented protocol gaps,
+> now fixed: `actionsEnvironment` was absent entirely (110), `timeout-minutes`
+> was never parsed so step timeouts were silently ignored (114), and
+> `defaults` was hardcoded empty so workflow-level `defaults.run` never
+> reached the runner (104). Fixing the wire was not sufficient — the runner
+> independently mis-read two of them in ways that also broke it against
+> github.com, not just preloop.
+>
+> The other three were contaminated captures, not divergences, and are now
+> quarantined: see `.runner-watch/quarantine.toml`.
+>
+> Fixing the v2.336.0 gate exposed a second failure it had been masking:
+> `run.sh` uses `set -e`, so it aborted before reaching the optional
+> `v2.337.0/gh-official` cell. All 27 of those captures were committed
+> without the scenario manifests they replay from — no
+> `experiments/mitm/scenarios/2xx-*/scenario.toml` has ever existed in any
+> commit — so that cell errors on its first scenario. It is now skipped with
+> a loud notice rather than failing the build or being silently counted as
+> covered. Committing the 27 definitions brings it back into the gate.
 
 ### 1a.2 Scenario coverage
 
@@ -673,7 +706,7 @@ Paths are in this repo. Updated 2026-07-18 after deep source review.
   - ✅ `permissions` parsed at workflow and job level; `id-token: write` evaluated for OIDC.
   - ✅ `environment` parsed at job level with matrix expression resolution.
   - ✅ `container` / `services` parsed as raw `Value`.
-  - ✅ Reusable workflows with `secrets: inherit`, input types, depth limit = 4.
+  - ✅ Reusable workflows with `secrets: inherit`, input types, 10 connected workflow levels, max 50 unique per run tree.
   - ✅ `run-name` parsed via `Workflow.run_name` (`#[serde(rename = "run-name")]`); evaluated with expression contexts at submit time.
 - `preloop-gha-expressions/src/`
   - ✅ Pratt parser + evaluator; all 12 functions.
@@ -716,7 +749,7 @@ Paths are in this repo. Updated 2026-07-18 after deep source review.
 - `runner-watch`
   - ✅ Records/diffs upstream runner releases and emits `.runner-watch/delta.json`.
   - ✅ Generates protocol-sync specs under `.runner-watch/specs/v{version}/`.
-  - ✅ Replays the complete v2.336.0 corpus into preloop: all 24 scenarios pass.
+  - ✅ Replays the gated v2.336.0 corpus into preloop: 36 scenarios pass, 3 quarantined (see `.runner-watch/quarantine.toml`).
 
 ### 3a. Concurrency &amp; cancellation audit (2026-07-13, resolved 2026-07-18)
 

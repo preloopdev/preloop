@@ -74,9 +74,28 @@ curl -fsS "$REPLAY_URL/healthz" >/dev/null ||
 cargo run --quiet -p runner-watch -- conform --runner "v$RUNNER_VERSION" \
   --preloop-url "$REPLAY_URL" --skip-cargo-test
 
-if [[ -d ".runner-watch/golden/v2.337.0/gh-official" ]]; then
-  cargo run --quiet -p runner-watch -- conform --runner "2.337.0/gh-official" \
-    --preloop-url "$REPLAY_URL" --skip-cargo-test
+# The v2.337.0 `gh-official` captures were committed without the scenario
+# manifests they replay from (`experiments/mitm/scenarios/2xx-*/scenario.toml`
+# has never existed in any commit), so this cell errors on the first
+# scenario. It went unnoticed because `set -e` aborted at the v2.336.0 gate
+# above long before reaching here. Replay it only when its definitions are
+# present, and say so loudly otherwise rather than reporting a pass that
+# covered 36 scenarios and silently skipped 27.
+GH_OFFICIAL_ROOT=".runner-watch/golden/v2.337.0/gh-official"
+if [[ -d "$GH_OFFICIAL_ROOT" ]]; then
+  missing=0
+  for capture in "$GH_OFFICIAL_ROOT"/*/; do
+    scenario="$(basename "$capture")"
+    [[ -f "experiments/mitm/scenarios/$scenario/scenario.toml" ]] || missing=$((missing + 1))
+  done
+  if [[ $missing -gt 0 ]]; then
+    echo "conform: SKIPPING v2.337.0/gh-official — $missing capture(s) have no" >&2
+    echo "conform: scenario manifest under experiments/mitm/scenarios/." >&2
+    echo "conform: commit the definitions to bring this cell back into the gate." >&2
+  else
+    cargo run --quiet -p runner-watch -- conform --runner "2.337.0/gh-official" \
+      --preloop-url "$REPLAY_URL" --skip-cargo-test
+  fi
 fi
 
 kill "$SERVER_PID" >/dev/null 2>&1 || true
