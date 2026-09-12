@@ -615,27 +615,26 @@ pub fn build_agent_job_message_with_normalized_context(
 
     let request_id: i64 = 1;
 
-    let actions_environment = plan.environment.as_ref().and_then(|env| match env {
-        Value::String(name) => {
-            let resolved_name =
-                resolve_string(name, &job_expr_context).unwrap_or_else(|_| name.clone());
-            Some(preloop_gha_protocol::azdo::ActionsEnvironment {
-                name: resolved_name,
-                url: None,
-            })
-        }
-        Value::Object(map) => {
-            let name = map.get("name")?.as_str()?;
-            let resolved_name =
-                resolve_string(name, &job_expr_context).unwrap_or_else(|_| name.to_string());
-            let url = map.get("url").map(template_token);
-            Some(preloop_gha_protocol::azdo::ActionsEnvironment {
-                name: resolved_name,
-                url,
-            })
-        }
+    // Same rule as the job `env` path above: GitHub fails the workflow when a
+    // deployment-environment expression cannot be evaluated. Shipping the raw
+    // template would name the deployment `${{ … }}` in the runner and in every
+    // downstream environment record.
+    let actions_environment = match plan.environment.as_ref() {
+        Some(Value::String(name)) => Some(preloop_gha_protocol::azdo::ActionsEnvironment {
+            name: resolve_environment_name(name, &job_expr_context, &plan.name)?,
+            url: None,
+        }),
+        Some(Value::Object(map)) => match map.get("name").and_then(Value::as_str) {
+            Some(name) => Some(preloop_gha_protocol::azdo::ActionsEnvironment {
+                name: resolve_environment_name(name, &job_expr_context, &plan.name)?,
+                // The URL is evaluated by the runner after the job's steps
+                // produce it, so it ships as an unevaluated template token.
+                url: map.get("url").map(template_token),
+            }),
+            None => None,
+        },
         _ => None,
-    });
+    };
 
     Ok(AgentJobRequestMessage {
         message_type: None,
@@ -685,6 +684,17 @@ pub fn build_agent_job_message_with_normalized_context(
         preloop_snapshot_token_steps: None,
         preloop_snapshot_origin_rewrite: None,
     })
+}
+
+/// Resolve a deployment-environment name, failing the job when its expression
+/// cannot be evaluated rather than shipping the raw `${{ … }}` template.
+fn resolve_environment_name(
+    name: &str,
+    context: &Context,
+    job_name: &str,
+) -> Result<String, String> {
+    resolve_string(name, context)
+        .map_err(|error| format!("job `{job_name}` environment failed to evaluate: {error}"))
 }
 
 /// Omit empty `services: {}` to match `EmitDefaultValue=false` behavior.
@@ -1056,6 +1066,38 @@ jobs:
         assert_eq!(
             step["reference"],
             serde_json::json!({"type": "containerRegistry", "image": "alpine:3.20"})
+        );
+    }
+
+    /// A deployment environment whose expression cannot be evaluated must fail
+    /// the job, exactly as an unevaluable job `env:` value does. Shipping the
+    /// raw template would name the deployment `${{ … }}` on the wire.
+    #[test]
+    fn unevaluable_environment_expression_fails_the_job() {
+        let workflow = parse_workflow(
+            r#"
+on: push
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ nosuchfunction('prod') }}
+    steps:
+      - run: echo deploy
+"#,
+        )
+        .unwrap();
+        let plan = &crate::expand_jobs(&workflow).unwrap()[0];
+        let error = build_agent_job_message(
+            plan,
+            &serde_json::json!({"event_name": "push"}),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .expect_err("an unevaluable environment expression must fail the job");
+        assert!(
+            error.contains("environment failed to evaluate"),
+            "error must name the environment: {error}"
         );
     }
 
