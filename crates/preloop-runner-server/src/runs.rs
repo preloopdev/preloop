@@ -1953,6 +1953,7 @@ pub(crate) fn build_job_artifacts(
         .map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
 
     agent_msg.preloop_preserve_on_failure = submission.preserve_on_failure.then_some(true);
+    agent_msg.preloop_debug_on_failure = submission.debug_on_failure.then_some(true);
 
     // The message builder already wrote the declared permission set into the
     // wire variable; for a fork-restricted job that set must be restated as

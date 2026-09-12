@@ -269,9 +269,12 @@ pub struct WorkflowSubmission {
     /// Explicit base ref for the run (populates `github.base_ref`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_ref: Option<String>,
-    /// Keep the failed job VM alive for interactive debugging.
+    /// Keep the failed job VM alive after the job ends for `preloop shell`.
     #[serde(default)]
     pub preserve_on_failure: bool,
+    /// Open a live retry/debug session when a step fails.
+    #[serde(default)]
+    pub debug_on_failure: bool,
     /// Push-back requested after the run completes. Absent means the run is
     /// a plain local submission with no GitHub interaction.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -2585,7 +2585,14 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             armed: true,
         };
         ensure_host_externals(&self.config)?;
-        if self.config.use_packed_artifact || self.config.control_socket.is_none() {
+        // A backend whose packs are not host files (AgentENV keeps them as
+        // server-side snapshots) has no artifact to build, download, or
+        // relocate: its golden is prepared directly from the base image
+        // below, and building a pack first would boot and discard a whole
+        // extra VM for nothing.
+        if self.provider.capabilities().file_packs
+            && (self.config.use_packed_artifact || self.config.control_socket.is_none())
+        {
             self.prepare_artifact(true).await?;
         }
         self.remove_stale_machines().await?;
@@ -3320,13 +3327,15 @@ impl Drop for ClearPreparingOnDrop {
     }
 }
 
+/// How long an unattached AgentENV debug VM stays running before suspension.
+const DEBUG_SUSPEND_IDLE: Duration = Duration::from_secs(15);
+
 /// How often the pool probes a running machine's pause marker.
 ///
 /// Latency here is how long a slot stays pinned after a job pauses: the
 /// probe cadence bounds it, and one exec per interval per active machine is
 /// negligible against the guest work happening anyway.
 const PAUSE_POLL_INTERVAL: Duration = Duration::from_secs(2);
-
 /// Watch a machine's guest pause marker and release its pool concurrency
 /// permit for the duration of a debug-session pause.
 ///
@@ -3337,6 +3346,7 @@ const PAUSE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// [`GUEST_PAUSE_MARKER`] when a session opens and removes it when it
 /// closes; this hands the permit back while the marker is present and
 /// re-acquires it on resume. Runs forever; the caller aborts it.
+#[cfg(test)]
 async fn watch_guest_pause<P: VmProvider + 'static>(
     provider: Arc<P>,
     name: MachineName,
@@ -3344,22 +3354,74 @@ async fn watch_guest_pause<P: VmProvider + 'static>(
     semaphore: Arc<tokio::sync::Semaphore>,
     poll_interval: Duration,
 ) {
+    watch_guest_pause_with_suspension(
+        provider,
+        name,
+        permit,
+        semaphore,
+        None,
+        Duration::ZERO,
+        poll_interval,
+    )
+    .await;
+}
+
+/// Watch a debug pause and, for a state-preserving provider, suspend the VM
+/// while no controller is attached. The host marker is deliberately separate
+/// from the guest pause marker: the latter becomes unreachable once AgentENV
+/// pauses the sandbox.
+async fn watch_guest_pause_with_suspension<P: VmProvider + 'static>(
+    provider: Arc<P>,
+    name: MachineName,
+    permit: Arc<std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
+    semaphore: Arc<tokio::sync::Semaphore>,
+    debug_dir: Option<PathBuf>,
+    suspend_after: Duration,
+    poll_interval: Duration,
+) {
     let probe = [
         "test".to_owned(),
         "-f".to_owned(),
         GUEST_PAUSE_MARKER.to_owned(),
     ];
+    let can_suspend = suspend_after > Duration::ZERO
+        && debug_dir.is_some()
+        && provider.capabilities().preserves_runtime_state_on_suspend;
     let mut was_paused = false;
+    let mut paused_since: Option<tokio::time::Instant> = None;
+    let mut suspended = false;
     let mut last_probe_warn: Option<tokio::time::Instant> = None;
     loop {
         tokio::time::sleep(poll_interval).await;
-        // `smolvm machine exec` propagates the guest exit code as its own
-        // exit code, so the normal absent-marker probe surfaces as
-        // `VmError::Command` with exit 1 — a real result, not a transport
-        // failure; `test -f` only ever exits 0 or 1. Any other error says
-        // nothing about the pause state: treating it as "resumed" would
-        // re-pin the permit mid-pause and revive the starvation this
-        // watcher exists to remove, so preserve the last known state.
+
+        // Once the VM is suspended, the guest marker cannot be probed. An
+        // active host marker is the attach request and is the only signal
+        // needed to resume it.
+        if suspended {
+            if debug_marker_active(debug_dir.as_deref(), &name) {
+                match provider.start(&name).await {
+                    Ok(()) => {
+                        suspended = false;
+                        info!(
+                            machine = name.as_str(),
+                            "debug controller attached — resumed VM"
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            machine = name.as_str(),
+                            %error,
+                            "could not resume suspended debug VM"
+                        );
+                    }
+                }
+            }
+            continue;
+        }
+
+        // `smolvm machine exec` propagates the guest exit code as its own exit
+        // code, so the normal absent-marker probe surfaces as `VmError::Command`
+        // with exit 1 — a real result, not a transport failure.
         let paused = match provider.exec(&name, &probe).await {
             Ok(output) => output.exit_code == 0,
             Err(VmError::Command {
@@ -3381,25 +3443,61 @@ async fn watch_guest_pause<P: VmProvider + 'static>(
                 was_paused
             }
         };
-        if paused == was_paused {
-            continue;
-        }
-        if paused {
-            let released = { permit.lock().unwrap().take() }.is_some();
-            if released {
-                info!(
-                    machine = name.as_str(),
-                    "job paused in debug session — released pool concurrency permit"
-                );
+
+        if paused && !was_paused {
+            paused_since = Some(tokio::time::Instant::now());
+            if let Some(debug_dir) = debug_dir.as_deref() {
+                let marker = debug_dir.join(name.as_str());
+                if !marker.exists() {
+                    if let Err(error) = std::fs::create_dir_all(debug_dir)
+                        .and_then(|()| std::fs::write(&marker, DEBUG_MARKER_IDLE))
+                    {
+                        warn!(
+                            machine = name.as_str(),
+                            path = %marker.display(),
+                            %error,
+                            "could not create debug attach marker"
+                        );
+                    }
+                }
             }
-        } else {
-            // Re-acquire before treating the machine as active again, so
-            // future forks stay bounded by `max_concurrent` plus whatever is
-            // genuinely paused. The guest resumes on its own after the
-            // verdict, so this acquire can transiently lag the resume by up
-            // to a poll interval — the over-subscription window is bounded
-            // and short. A hard gate needs a host/worker resume handshake;
-            // until then, a slow acquire is surfaced here.
+        } else if !paused {
+            paused_since = None;
+        }
+
+        if paused {
+            if !was_paused {
+                let released = { permit.lock().unwrap().take() }.is_some();
+                if released {
+                    info!(
+                        machine = name.as_str(),
+                        "job paused in debug session — released pool concurrency permit"
+                    );
+                }
+            }
+
+            let attached = debug_marker_active(debug_dir.as_deref(), &name);
+            if can_suspend
+                && !attached
+                && paused_since.is_some_and(|started| started.elapsed() >= suspend_after)
+            {
+                match provider.stop(&name).await {
+                    Ok(()) => {
+                        suspended = true;
+                        info!(
+                            machine = name.as_str(),
+                            idle_secs = suspend_after.as_secs(),
+                            "debug VM suspended while unattached"
+                        );
+                    }
+                    Err(error) => warn!(
+                        machine = name.as_str(),
+                        %error,
+                        "could not suspend idle debug VM"
+                    ),
+                }
+            }
+        } else if was_paused {
             let started = tokio::time::Instant::now();
             let fresh = semaphore
                 .clone()
@@ -3411,8 +3509,7 @@ async fn watch_guest_pause<P: VmProvider + 'static>(
                 warn!(
                     machine = name.as_str(),
                     waited_ms = waited.as_millis(),
-                    "resumed job waited for a pool permit — active VMs may have \
-                     transiently exceeded max_concurrent"
+                    "resumed job waited for a pool permit — active VMs may have transiently exceeded max_concurrent"
                 );
             }
             permit.lock().unwrap().replace(fresh);
@@ -3425,6 +3522,21 @@ async fn watch_guest_pause<P: VmProvider + 'static>(
     }
 }
 
+fn debug_marker_active(debug_dir: Option<&Path>, name: &MachineName) -> bool {
+    let Some(debug_dir) = debug_dir else {
+        return false;
+    };
+    let marker = debug_dir.join(name.as_str());
+    std::fs::read_to_string(&marker).ok().is_some_and(|state| {
+        state.trim() == DEBUG_MARKER_ACTIVE
+            && std::fs::metadata(marker)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age < DEBUG_HEARTBEAT_WINDOW)
+    })
+}
+
 /// Single-shot on-demand runner: provision, run exactly one job, clean up.
 #[allow(clippy::too_many_arguments)]
 async fn run_on_demand_slot<P: VmProvider + 'static>(
@@ -3434,17 +3546,13 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     shutdown: CancellationToken,
     golden_registry: Arc<GoldenRegistry>,
     handles: PoolHandles,
-    provisioning: Arc<std::sync::Mutex<usize>>,
+    _slot_provisioning: Arc<std::sync::Mutex<usize>>,
     semaphore: Arc<tokio::sync::Semaphore>,
     permit: Arc<std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
 ) -> Result<(), OrchestratorError> {
-    let mut config = config;
-    if golden_registry.is_packed_disabled() {
-        config.use_packed_artifact = false;
-        config.use_fork = false;
-    }
+    let provisioning = handles.provisioning.clone();
     let preparing = PreparingGuard::enter(
-        provisioning,
+        provisioning.clone(),
         config.preparing_signal.clone(),
         config.pool_status.clone(),
     );
@@ -3528,16 +3636,18 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     // Run exactly one job — no successor pre-provisioning. While the job
     // runs, watch the guest pause marker: a debug-session pause must hand
     // the concurrency permit back to the pool instead of pinning it.
-    let pause_watch = (config.debug_dir.is_some()).then(|| {
+    let pause_watch = config.debug_dir.clone().map(|debug_dir| {
         let provider = provider.clone();
         let name = runner.name.clone();
         let permit = permit.clone();
         let semaphore = semaphore.clone();
-        tokio::spawn(watch_guest_pause(
+        tokio::spawn(watch_guest_pause_with_suspension(
             provider,
             name,
             permit,
             semaphore,
+            Some(debug_dir),
+            DEBUG_SUSPEND_IDLE,
             PAUSE_POLL_INTERVAL,
         ))
     });
@@ -3966,8 +4076,6 @@ async fn run_one_runner<P: VmProvider + 'static>(
         // Booting a VM costs real CPU, and it would be spent alongside the job
         // that just started, so build exactly as many replacements as the
         // backlog needs and no more.
-        //
-        // The shortfall is queued work the remaining idle runners cannot
         // absorb. Every claiming slot computes it, so a reservation counter
         // decides which of them actually build: without it, a matrix one job
         // wider than the pool had all four slots boot a replacement to serve a
@@ -4071,7 +4179,7 @@ async fn run_one_runner<P: VmProvider + 'static>(
     };
 
     if let Some(debug_dir) = preserved {
-        hold_for_debugging(name, &debug_dir, &shutdown).await;
+        hold_for_debugging(&provider, name, &debug_dir, &shutdown).await;
         notify_runner_gone(config, name).await;
         vm_telemetry_deregister(config, name);
         if let Err(error) = provider.delete(name).await {
@@ -4502,9 +4610,17 @@ async fn provision_runner<P: VmProvider + 'static>(
         // writes into clones — so those forks must install the baseline
         // themselves. Treating an env golden as packed skipped that install
         // and provisioned runners without the curated baseline.
-        let golden_is_packed =
-            config.use_packed_artifact && golden.as_str() == plain_packed_golden_name(config);
-        if golden_is_packed {
+        // A fork arrives already baked in two cases: it came from the packed
+        // artifact (the bake is inside the flattened rootfs), or the backend's
+        // snapshot carries the golden's post-boot writes. AgentENV does the
+        // latter; SmolVM does neither for an environment golden, which is why
+        // that case still installs the baseline per fork. Getting this wrong
+        // on a write-inheriting backend re-runs the whole bake (apt baseline,
+        // rust, go, docker tooling) inside every single-use runner.
+        let golden_is_baked = (config.use_packed_artifact
+            && golden.as_str() == plain_packed_golden_name(config))
+            || provider.capabilities().fork_inherits_guest_writes;
+        if golden_is_baked {
             // The pack carries the apt baseline, but not necessarily apt's
             // indices — restore them before any workflow apt-installs. A
             // custom base is used as-is: no apt assumptions.
@@ -4813,16 +4929,19 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
     // runner and setpriv below self-drops to the same uid (no privilege
     // change needed).
     let provisioning = format!(
-        "getent passwd {user} >/dev/null 2>&1 || useradd -m -u {uid} {user} 2>/dev/null; \
-         printf '%s\\n' '{user} ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/preloop-{user} \
-           && chmod 0440 /etc/sudoers.d/preloop-{user}; \
+        "PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH; \
+         getent passwd {user} >/dev/null 2>&1 || useradd -m -u {uid} {user} 2>/dev/null || true; \
+         mkdir -p /etc/sudoers.d; \
+         printf '%s\\n' '{user} ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/preloop-{user} 2>/dev/null \
+           || true; \
+         chmod 0440 /etc/sudoers.d/preloop-{user} 2>/dev/null || true; \
          mkdir -p /run/user/{uid} /opt/hostedtoolcache; \
-         chown {uid}:{uid} /run/user/{uid} /var/lib/preloop-runner 2>/dev/null; \
-         chmod -R 777 /opt/hostedtoolcache 2>/dev/null; \
+         chown {uid}:{uid} /run/user/{uid} /var/lib/preloop-runner 2>/dev/null || true; \
+         chmod -R 777 /opt/hostedtoolcache 2>/dev/null || true; \
          grep -q AGENT_TOOLSDIRECTORY /etc/environment 2>/dev/null || \
            printf 'AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\\nRUNNER_TOOL_CACHE=/opt/hostedtoolcache\\n' >> /etc/environment; \
-         chmod 777 /run/preloop-control 2>/dev/null; \
-         getent group docker >/dev/null 2>&1 && usermod -aG docker {user} 2>/dev/null"
+         mkdir -p /run/preloop-control 2>/dev/null; chmod 777 /run/preloop-control 2>/dev/null; \
+         getent group docker >/dev/null 2>&1 && usermod -aG docker {user} 2>/dev/null; true"
     );
     // setpriv requires a groups mode: --init-groups (setgroups) only works
     // as root, so the exec-as-image-user branch (official golden: USER
@@ -4905,9 +5024,16 @@ async fn stage_runner_key(
 /// Hold a failed runner's VM open so `preloop shell` can attach.
 ///
 /// The marker file is the session handle: `preloop shell` refreshes its mtime
-/// while attached and removes it on exit, which releases the slot immediately
-/// instead of stranding it until the idle deadline.
-async fn hold_for_debugging(name: &MachineName, debug_dir: &Path, shutdown: &CancellationToken) {
+/// while attached and demotes it to IDLE on exit. An attach on a
+/// state-preserving backend resumes a suspended sandbox (and renews its TTL
+/// keepalive); detach re-suspends it. The idle deadline, not the shell exit,
+/// is what ends the hold — cleanup deletes the VM afterwards.
+async fn hold_for_debugging<P: VmProvider + 'static>(
+    provider: &Arc<P>,
+    name: &MachineName,
+    debug_dir: &Path,
+    shutdown: &CancellationToken,
+) {
     let marker = debug_dir.join(name.as_str());
     if let Err(error) =
         std::fs::create_dir_all(debug_dir).and_then(|()| std::fs::write(&marker, DEBUG_MARKER_IDLE))
@@ -4920,6 +5046,15 @@ async fn hold_for_debugging(name: &MachineName, debug_dir: &Path, shutdown: &Can
         );
         return;
     }
+    if provider.capabilities().preserves_runtime_state_on_suspend {
+        if let Err(error) = provider.stop(name).await {
+            warn!(
+                machine = name.as_str(),
+                %error,
+                "could not suspend preserved AgentENV VM; leaving it running"
+            );
+        }
+    }
 
     warn!(
         machine = name.as_str(),
@@ -4928,6 +5063,7 @@ async fn hold_for_debugging(name: &MachineName, debug_dir: &Path, shutdown: &Can
     );
 
     let mut deadline = tokio::time::Instant::now() + DEBUG_IDLE_TIMEOUT;
+    let mut attached = false;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -4942,24 +5078,49 @@ async fn hold_for_debugging(name: &MachineName, debug_dir: &Path, shutdown: &Can
             _ = tokio::time::sleep(remaining.min(DEBUG_POLL_INTERVAL)) => {}
         }
         let Ok(state) = std::fs::read_to_string(&marker) else {
-            // `preloop shell` removed the marker: the session is over.
+            // The marker was removed externally: the session is over.
             info!(
                 machine = name.as_str(),
                 "debug session ended — deleting preserved VM"
             );
             break;
         };
-        // Only a live `preloop shell` heartbeat extends the window. Matching on
+        // Only a live `preloop shell` heartbeat counts as attached. Matching on
         // mtime alone would let this function's own initial write renew it.
-        if state.trim() == DEBUG_MARKER_ACTIVE
+        let now_attached = state.trim() == DEBUG_MARKER_ACTIVE
             && std::fs::metadata(&marker)
                 .and_then(|meta| meta.modified())
                 .ok()
                 .and_then(|modified| modified.elapsed().ok())
-                .is_some_and(|age| age < DEBUG_HEARTBEAT_WINDOW)
-        {
+                .is_some_and(|age| age < DEBUG_HEARTBEAT_WINDOW);
+        if provider.capabilities().preserves_runtime_state_on_suspend {
+            if now_attached && !attached {
+                // Resume the suspended sandbox — and, when it is already
+                // running, restart the TTL keepalive that the engine-side
+                // pause cancelled. Idempotent either way.
+                if let Err(error) = provider.start(name).await {
+                    warn!(
+                        machine = name.as_str(),
+                        %error,
+                        "could not resume preserved AgentENV VM for attach"
+                    );
+                }
+            } else if !now_attached && attached {
+                // The shell detached: park the sandbox for the retained
+                // window instead of burning host resources while idle.
+                if let Err(error) = provider.stop(name).await {
+                    warn!(
+                        machine = name.as_str(),
+                        %error,
+                        "could not re-suspend preserved AgentENV VM after detach"
+                    );
+                }
+            }
+        }
+        if now_attached {
             deadline = tokio::time::Instant::now() + DEBUG_IDLE_TIMEOUT;
         }
+        attached = now_attached;
     }
     let _ = std::fs::remove_file(&marker);
 }
@@ -4996,7 +5157,7 @@ mod lifecycle_tests {
     use super::*;
     use async_trait::async_trait;
     use base64::Engine as _;
-    use preloop_vm::{ExecOutput, OutputChunk};
+    use preloop_vm::{ExecOutput, OutputChunk, ProviderCapabilities};
     use std::collections::HashMap;
     use std::os::unix::fs::PermissionsExt as _;
     use std::process::Command;
@@ -5064,6 +5225,9 @@ mod lifecycle_tests {
         /// When set, the pause-marker probe fails like a wedged VM
         /// (transport error), which the watcher must not read as "resumed".
         probe_transport_error: std::sync::atomic::AtomicBool,
+        /// Whether this provider claims runtime-preserving suspension. When
+        /// set, the debug watcher may park the machine via `stop`.
+        suspends: bool,
     }
 
     impl TestProvider {
@@ -5093,7 +5257,13 @@ mod lifecycle_tests {
                 absent_binary: Mutex::new(None),
                 pause_marker: std::sync::atomic::AtomicBool::new(false),
                 probe_transport_error: std::sync::atomic::AtomicBool::new(false),
+                suspends: false,
             }
+        }
+
+        fn that_suspends(mut self) -> Self {
+            self.suspends = true;
+            self
         }
 
         fn with_configure_gate(mut self, gate: Arc<tokio::sync::Notify>) -> Self {
@@ -5263,6 +5433,112 @@ mod lifecycle_tests {
             .store(false, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(60)).await;
         assert!(permit.lock().unwrap().is_none());
+
+        watch.abort();
+        let _ = watch.await;
+    }
+    /// An AgentENV-style debug pause must suspend the sandbox while no
+    /// controller is attached, and resume it the moment a live `preloop
+    /// debug`/`preloop shell` marker appears — the money story: nobody
+    /// attached, nobody paying for a running VM.
+    #[tokio::test]
+    async fn unattached_debug_pause_suspends_and_attach_resumes() {
+        use std::sync::atomic::Ordering;
+
+        let provider =
+            Arc::new(TestProvider::new(false, false, false, false, false).that_suspends());
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::new(std::sync::Mutex::new(Some(
+            semaphore.clone().acquire_owned().await.unwrap(),
+        )));
+        let name = MachineName::new("preloop-runner-suspend".to_owned()).unwrap();
+        let debug_dir = tempfile::tempdir().unwrap();
+
+        let watch = tokio::spawn(watch_guest_pause_with_suspension(
+            provider.clone(),
+            name.clone(),
+            permit.clone(),
+            semaphore.clone(),
+            Some(debug_dir.path().to_path_buf()),
+            Duration::from_millis(30),
+            Duration::from_millis(10),
+        ));
+
+        // The job pauses. The permit is handed back and the idle grace starts.
+        provider.pause_marker.store(true, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            permit.lock().unwrap().is_none(),
+            "a paused job must not pin a pool permit"
+        );
+        // Unattached past the grace window: the sandbox is suspended.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            provider
+                .events()
+                .await
+                .contains(&format!("stop:{}", name.as_str())),
+            "an unattached paused VM must be suspended, events: {:?}",
+            provider.events().await
+        );
+
+        // A controller attaches: the watcher resumes it and stops parking.
+        let marker = debug_dir.path().join(name.as_str());
+        std::fs::write(&marker, DEBUG_MARKER_ACTIVE).unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            provider
+                .events()
+                .await
+                .contains(&format!("start:{}", name.as_str())),
+            "an attached debug VM must be resumed, events: {:?}",
+            provider.events().await
+        );
+
+        watch.abort();
+        let _ = watch.await;
+    }
+
+    /// A backend without runtime-preserving suspension must never be parked
+    /// by the debug watcher: SmolVM's `stop` is a real shutdown that would
+    /// throw away the live workspace the session exists to debug.
+    #[tokio::test]
+    async fn non_suspending_backends_never_park_a_debug_vm() {
+        use std::sync::atomic::Ordering;
+
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::new(std::sync::Mutex::new(Some(
+            semaphore.clone().acquire_owned().await.unwrap(),
+        )));
+        let name = MachineName::new("preloop-runner-nosuspend".to_owned()).unwrap();
+        let debug_dir = tempfile::tempdir().unwrap();
+
+        let watch = tokio::spawn(watch_guest_pause_with_suspension(
+            provider.clone(),
+            name.clone(),
+            permit.clone(),
+            semaphore.clone(),
+            Some(debug_dir.path().to_path_buf()),
+            Duration::from_millis(20),
+            Duration::from_millis(10),
+        ));
+
+        provider.pause_marker.store(true, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            permit.lock().unwrap().is_none(),
+            "the permit handback is backend-independent"
+        );
+        assert!(
+            !provider
+                .events()
+                .await
+                .iter()
+                .any(|event| event.starts_with("stop:")),
+            "a SmolVM-style backend must not be parked mid-session, events: {:?}",
+            provider.events().await
+        );
 
         watch.abort();
         let _ = watch.await;
@@ -5588,6 +5864,10 @@ chmod +x "$dest/bin/node"
             entries.contains(&"/usr/local/bin") && entries.contains(&"/usr/bin"),
             "the system PATH must survive: {path}"
         );
+        assert!(
+            env.contains(&"RUSTUP_HOME=/usr/local/rustup".to_owned()),
+            "the shared rustup metadata must be selected: {env:?}"
+        );
     }
 
     #[test]
@@ -5670,6 +5950,47 @@ chmod +x "$dest/bin/node"
         assert!(
             all.contains("PRELOOP_RUNNER_USER=runner PRELOOP_RUNNER_UID=1001"),
             "{all}"
+        );
+    }
+
+    /// A base that is not the official runner image may lack `sudo`
+    /// entirely, so `/etc/sudoers.d` does not exist and `useradd` is not on
+    /// the exec shell's default PATH. Every best-effort provisioning step
+    /// must tolerate that instead of aborting the script: verified live on
+    /// AgentENV, where the bare `ubuntu:24.04` sandbox hit exactly this and
+    /// the runner came up with an unchowned root and no account.
+    #[test]
+    fn runner_user_wrapper_survives_a_sudoless_bare_base() {
+        let mut config = test_config(false);
+        config.runner_user = Some("runner".to_owned());
+        config.runner_uid = Some(1001);
+        let argv = vec![
+            "/opt/preloop/bin/preloop-runner".to_owned(),
+            "run".to_owned(),
+        ];
+        let script = &as_runner_user(&config, &argv)[2];
+
+        // The exec shell's PATH lacks /usr/sbin; the account tools live there.
+        assert!(
+            script.contains("PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH"),
+            "provisioning must pin sbin into PATH, got: {script}"
+        );
+        // A missing /etc/sudoers.d (no sudo installed) must not abort the
+        // provisioning chain at the redirect.
+        assert!(script.contains("mkdir -p /etc/sudoers.d"), "{script}");
+        assert!(
+            script.contains("/etc/sudoers.d/preloop-runner 2>/dev/null \\\n") || {
+                let decoded = script.split("| base64 -d | sh").next().unwrap_or("");
+                decoded.contains("/etc/sudoers.d/preloop-runner 2>/dev/null")
+            },
+            "the sudoers write must tolerate a missing directory, got: {script}"
+        );
+        // The chown that hands the runner root to the account is the step
+        // whose loss silently broke configure on the live host; it must be
+        // best-effort too, and must run before the inner script.
+        assert!(
+            script.contains("chown 1001:1001 /run/user/1001 /var/lib/preloop-runner"),
+            "{script}"
         );
     }
 
@@ -5990,6 +6311,13 @@ chmod +x "$dest/bin/node"
 
     #[async_trait]
     impl VmProvider for TestProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                preserves_runtime_state_on_suspend: self.suspends,
+                ..ProviderCapabilities::default()
+            }
+        }
+
         async fn create(&self, spec: &MachineSpec) -> Result<(), VmError> {
             self.machines
                 .lock()

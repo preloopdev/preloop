@@ -170,6 +170,14 @@ pub struct AgentJobRequestMessage {
     )]
     pub preloop_preserve_on_failure: Option<bool>,
 
+    /// Preloop extension: open a live debug session when a step fails.
+    #[serde(
+        rename = "preloopDebugOnFailure",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub preloop_debug_on_failure: Option<bool>,
+
     /// aksh extension: commit of the immutable workspace snapshot this job
     /// checked out.
     ///

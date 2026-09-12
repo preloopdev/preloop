@@ -1645,6 +1645,7 @@ async fn process_github_webhook(
                 selected_jobs: vec![],
                 base_ref: None,
                 preserve_on_failure: false,
+                debug_on_failure: false,
                 push: None,
                 push_tree: None,
             };

@@ -16,12 +16,107 @@
 //!   frequently not in the last twenty lines.
 
 use std::io::{IsTerminal, Write};
+use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use preloop_gha_protocol::debug_session::{
     ChangeCategory, DebugSession, RevertPolicy, StepSummary, Verdict, VerdictRequest,
     WorkspaceChange,
 };
+
+/// Claims the engine's host-side attach marker for the duration of a
+/// controller attachment.
+///
+/// The orchestrator's debug watcher reads this marker as the attach signal:
+/// while it shows ACTIVE with a fresh mtime the VM stays running, and 15 s
+/// after it goes quiet a state-preserving backend suspends the sandbox.
+/// Every path that attaches a controller — the REPL, the inline failure
+/// prompt, a one-shot `--verdict` — must claim it for as long as it may
+/// touch the guest, or the watcher will suspend the sandbox out from under
+/// the session and, worse, a suspension it performed is only ever undone by
+/// seeing this marker.
+pub(crate) struct DebugAttach {
+    marker: PathBuf,
+    heartbeat: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl DebugAttach {
+    /// Write ACTIVE, start the heartbeat, and resume a suspended guest.
+    /// `None` when the session has no machine to guard.
+    pub(crate) async fn claim(machine: Option<&str>) -> Result<Option<Self>> {
+        let Some(machine) = machine else {
+            return Ok(None);
+        };
+        let marker = crate::preloop_home()
+            .join("state")
+            .join("debug")
+            .join(machine);
+        if let Some(parent) = marker.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&marker, preloop_orchestrator::DEBUG_MARKER_ACTIVE)?;
+        let heartbeat_marker = marker.clone();
+        let heartbeat = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                if std::fs::write(&heartbeat_marker, preloop_orchestrator::DEBUG_MARKER_ACTIVE)
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        // The ACTIVE marker also tells the engine's watcher to resume a
+        // suspended sandbox; resume_guest_if_needed is the fallback for an
+        // engine that is not watching (restart, different host).
+        crate::resume_guest_if_needed(machine)?;
+        Ok(Some(Self {
+            marker,
+            heartbeat: Some(heartbeat),
+        }))
+    }
+
+    /// Stop the heartbeat and demote the marker to IDLE.
+    ///
+    /// Demote, not remove: a missing marker is the engine's signal that a
+    /// preserved VM's hold is over and it can be deleted, while IDLE keeps
+    /// it discoverable for a reattach until the idle deadline.
+    pub(crate) async fn release(mut self) {
+        if let Some(heartbeat) = self.heartbeat.take() {
+            // Let the task observe its cancellation so a tick that fired
+            // just before the abort cannot rewrite ACTIVE over the demotion.
+            heartbeat.abort();
+            let _ = heartbeat.await;
+        }
+        if self.marker.exists() {
+            let _ = std::fs::write(&self.marker, preloop_orchestrator::DEBUG_MARKER_IDLE);
+        }
+    }
+
+    /// Release after a verdict was sent: wait until the worker left the
+    /// pause (the session is no longer open) and at least one watcher poll
+    /// interval has passed, so a suspended sandbox is resumed *by the
+    /// watcher* — its suspended state is only cleared by reading this
+    /// marker, and demoting too early would strand the pool permit.
+    async fn release_after_verdict(self, api: &Api, session_id: &str) {
+        if self.heartbeat.is_some() {
+            for _ in 0..30 {
+                match api.get(session_id).await {
+                    Ok(session) if !session.state.is_open() => break,
+                    Ok(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+                    // The engine is unreachable; nothing is watching the
+                    // marker, so holding it cannot help.
+                    Err(_) => break,
+                }
+            }
+            // The watcher polls every 2 s; make sure it read the ACTIVE
+            // marker before the marker is demoted.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+        self.release().await;
+    }
+}
 
 /// `preloop debug [session]`.
 #[derive(clap::Args, Debug)]
@@ -116,25 +211,39 @@ pub async fn run(
     }
 
     if let Some(verdict) = &args.verdict {
-        let verdict = parse_verdict(verdict)?;
-        let revert = parse_revert(&args.revert)?;
-        let revision = if args.sync {
-            Some(sync_workspace(&session, args.force)?)
-        } else {
-            None
-        };
-        let retry_from = if verdict == Verdict::Retry {
-            parse_retry_from(&session, args.from.as_deref(), args.from_start)?
-        } else {
-            if args.from.is_some() || args.from_start {
-                anyhow::bail!("--from/--from-start only apply to --verdict retry");
+        let attach = DebugAttach::claim(session.machine.as_deref()).await?;
+        let outcome: Result<()> = async {
+            let verdict = parse_verdict(verdict)?;
+            let revert = parse_revert(&args.revert)?;
+            let revision = if args.sync {
+                Some(sync_workspace(&session, args.force)?)
+            } else {
+                None
+            };
+            let retry_from = if verdict == Verdict::Retry {
+                parse_retry_from(&session, args.from.as_deref(), args.from_start)?
+            } else {
+                if args.from.is_some() || args.from_start {
+                    anyhow::bail!("--from/--from-start only apply to --verdict retry");
+                }
+                None
+            };
+            ctx.verdict(&session.session_id, verdict, revert, revision, retry_from)
+                .await?;
+            println!("{} → {}", session.session_id, verdict.as_str());
+            Ok(())
+        }
+        .await;
+        match attach {
+            Some(attach) if outcome.is_ok() => {
+                attach
+                    .release_after_verdict(&ctx, &session.session_id)
+                    .await;
             }
-            None
-        };
-        ctx.verdict(&session.session_id, verdict, revert, revision, retry_from)
-            .await?;
-        println!("{} → {}", session.session_id, verdict.as_str());
-        return Ok(());
+            Some(attach) => attach.release().await,
+            None => {}
+        }
+        return outcome;
     }
 
     print_banner(&session);
@@ -148,7 +257,12 @@ pub async fn run(
         return Ok(());
     }
 
-    repl(&ctx, session).await.map(|_| ())
+    let attach = DebugAttach::claim(session.machine.as_deref()).await?;
+    let result = repl(&ctx, session).await.map(|_| ());
+    if let Some(attach) = attach {
+        attach.release().await;
+    }
+    result
 }
 
 struct Api {
@@ -331,6 +445,10 @@ pub async fn prompt_at_failure(
         return Ok(false);
     }
 
+    // Attached from here on: the marker tells the engine's watcher this
+    // session is live, so a suspendable backend must not park the sandbox
+    // under the prompt.
+    let attach = DebugAttach::claim(session.machine.as_deref()).await?;
     loop {
         println!();
         println!("  → d  debug here      r  retry step");
@@ -341,26 +459,34 @@ pub async fn prompt_at_failure(
         let mut answer = String::new();
         if std::io::stdin().read_line(&mut answer)? == 0 {
             print_reattach(&session);
+            if let Some(attach) = attach {
+                attach.release().await;
+            }
             return Ok(false);
         }
         match answer.trim() {
             "d" | "" => {
-                return Ok(matches!(repl(&api, session).await?, ReplOutcome::Resumed));
+                let outcome = repl(&api, session).await;
+                if let Some(attach) = attach {
+                    attach.release().await;
+                }
+                return Ok(matches!(outcome?, ReplOutcome::Resumed));
             }
             "r" => {
-                api.verdict(
-                    &session.session_id,
-                    Verdict::Retry,
-                    RevertPolicy::None,
-                    None,
-                    None,
-                )
-                .await?;
+                let sent = api
+                    .verdict(
+                        &session.session_id,
+                        Verdict::Retry,
+                        RevertPolicy::None,
+                        None,
+                        None,
+                    )
+                    .await;
                 println!(
                     "  ⟳ retrying {}",
                     step_position_label(&session, session.step.index)
                 );
-                return Ok(true);
+                return finish_with_verdict(attach, &api, &session.session_id, sent, true).await;
             }
             "s" => {
                 let revision = match sync_workspace(&session, false) {
@@ -370,34 +496,63 @@ pub async fn prompt_at_failure(
                         continue;
                     }
                 };
-                api.verdict(
-                    &session.session_id,
-                    Verdict::Retry,
-                    RevertPolicy::None,
-                    revision,
-                    None,
-                )
-                .await?;
+                let sent = api
+                    .verdict(
+                        &session.session_id,
+                        Verdict::Retry,
+                        RevertPolicy::None,
+                        revision,
+                        None,
+                    )
+                    .await;
                 println!(
                     "  ⟳ retrying {}",
                     step_position_label(&session, session.step.index)
                 );
-                return Ok(true);
+                return finish_with_verdict(attach, &api, &session.session_id, sent, true).await;
             }
             "a" => {
-                api.verdict(
-                    &session.session_id,
-                    Verdict::Abort,
-                    RevertPolicy::None,
-                    None,
-                    None,
-                )
-                .await?;
+                let sent = api
+                    .verdict(
+                        &session.session_id,
+                        Verdict::Abort,
+                        RevertPolicy::None,
+                        None,
+                        None,
+                    )
+                    .await;
                 println!("  Run aborted.");
-                return Ok(false);
+                return finish_with_verdict(attach, &api, &session.session_id, sent, false).await;
             }
             other => println!("  `{other}` is not an option."),
         }
+    }
+}
+
+/// Release the attach guard after an inline verdict and map the verdict's
+/// result onto the caller's resume flag.
+///
+/// A sent verdict must release through [`DebugAttach::release_after_verdict`]:
+/// the worker is about to clear its pause, and the engine's watcher has to
+/// observe the ACTIVE marker and come out of its suspended state — otherwise
+/// it never re-acquires the pool concurrency permit the pause handed back.
+async fn finish_with_verdict(
+    attach: Option<DebugAttach>,
+    api: &Api,
+    session_id: &str,
+    sent: Result<DebugSession>,
+    resumed: bool,
+) -> Result<bool> {
+    match (attach, sent) {
+        (Some(attach), Ok(_session)) => {
+            attach.release_after_verdict(api, session_id).await;
+            Ok(resumed)
+        }
+        (Some(attach), Err(error)) => {
+            attach.release().await;
+            Err(error)
+        }
+        (None, result) => result.map(|_| resumed),
     }
 }
 
@@ -709,7 +864,7 @@ async fn repl(ctx: &Api, mut session: DebugSession) -> Result<ReplOutcome> {
         if std::io::stdin().read_line(&mut line)? == 0 {
             // Ctrl-D. Leaving must never destroy the session.
             println!();
-            println!("Detached — the job stays paused and the VM stays up.");
+            println!("Detached — the job stays paused; AgentENV may suspend the VM.");
             print_reattach(&session);
             return Ok(ReplOutcome::Detached);
         }
@@ -831,7 +986,7 @@ async fn repl(ctx: &Api, mut session: DebugSession) -> Result<ReplOutcome> {
                 Err(error) => println!("  sync failed: {error:#}"),
             },
             "detach" => {
-                println!("Detached — the job stays paused and the VM stays up.");
+                println!("Detached — the job stays paused; AgentENV may suspend the VM.");
                 print_reattach(&session);
                 return Ok(ReplOutcome::Detached);
             }
@@ -1151,8 +1306,8 @@ fn export_from_guest(session: &DebugSession, apply: bool) -> Result<()> {
 
     // Use a temporary index so `git add -N` can expose untracked files in the
     // patch without changing the guest workspace's real index.
-    let output = crate::smolvm_command()?
-        .args(["machine", "exec", "--name", machine, "--", "sh", "-lc"])
+    let output = crate::guest_exec_command(machine)?
+        .args(["sh", "-lc"])
         .arg(format!(
             "cd {} && \
              index=$(mktemp /var/tmp/preloop-export-index.XXXXXX) && \
@@ -1218,8 +1373,8 @@ fn guest_modified(
     candidates: &[String],
 ) -> Result<Vec<String>> {
     let quoted: Vec<String> = candidates.iter().map(|p| shell_quote(p)).collect();
-    let output = crate::smolvm_command()?
-        .args(["machine", "exec", "--name", machine, "--", "sh", "-lc"])
+    let output = crate::guest_exec_command(machine)?
+        .args(["sh", "-lc"])
         .arg(format!(
             "cd {} && git --literal-pathspecs status --porcelain -- {} 2>/dev/null || true",
             shell_quote(guest_workspace),
@@ -1349,15 +1504,9 @@ fn push_to_guest(machine: &str, local: &std::path::Path, remote: &str) -> Result
         .len();
 
     guest_check(machine, &format!("rm -f {}", shell_quote(remote)))?;
-    let output = crate::smolvm_command()?
-        .args([
-            "machine",
-            "cp",
-            &local.to_string_lossy(),
-            &format!("{machine}:{remote}"),
-        ])
+    let output = crate::guest_upload_command(machine, &local.to_string_lossy(), remote)?
         .output()
-        .context("running smolvm machine cp")?;
+        .context("copying a file into the guest")?;
     if !output.status.success() {
         anyhow::bail!(
             "copying into {machine} failed: {}",
@@ -1365,8 +1514,8 @@ fn push_to_guest(machine: &str, local: &std::path::Path, remote: &str) -> Result
         );
     }
 
-    let seen = crate::smolvm_command()?
-        .args(["machine", "exec", "--name", machine, "--", "sh", "-lc"])
+    let seen = crate::guest_exec_command(machine)?
+        .args(["sh", "-lc"])
         .arg(format!("wc -c < {} 2>/dev/null", shell_quote(remote)))
         .output()
         .context("measuring the copied file inside the machine")?;
@@ -1385,10 +1534,8 @@ fn push_to_guest(machine: &str, local: &std::path::Path, remote: &str) -> Result
 
 /// Run a command in the guest, failing loudly on a non-zero exit.
 fn guest_check(machine: &str, command: &str) -> Result<()> {
-    let output = crate::smolvm_command()?
-        .args([
-            "machine", "exec", "--name", machine, "--", "sh", "-lc", command,
-        ])
+    let output = crate::guest_exec_command(machine)?
+        .args(["sh", "-lc", command])
         .output()
         .context("running smolvm machine exec")?;
     if !output.status.success() {
@@ -1417,17 +1564,15 @@ fn run_in_guest(session: &DebugSession, command: &str) {
     };
     let workspace = session.workspace.as_deref().unwrap_or("/");
     let script = guest_command_script(workspace, command);
-    let mut command = match crate::smolvm_command() {
+    let mut guest = match crate::guest_exec_command(machine) {
         Ok(command) => command,
         Err(error) => {
-            println!("  Could not build the smolvm command: {error}");
+            println!("  Could not reach the guest: {error:#}");
             return;
         }
     };
-    let status = command
-        .args([
-            "machine", "exec", "--name", machine, "--", "sh", "-lc", &script,
-        ])
+    let status = guest
+        .args(["sh", "-lc", &script])
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
