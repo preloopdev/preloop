@@ -813,13 +813,40 @@ pub enum DeferredBool {
 }
 
 /// A workflow number that may be deferred as a GitHub Actions expression.
+///
+/// The official schema types every numeric workflow field as `number`
+/// (`workflow-v1.0.json`: `step-timeout-minutes` → `"number": {}`), and a
+/// template number is a double — so `timeout-minutes: 5.0` is as valid as
+/// `5`. Generated YAML routinely renders integers that way, and rejecting it
+/// here would fail the whole workflow at parse time over a value GitHub
+/// accepts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum DeferredNumber {
     /// Literal unsigned integer value.
     Literal(u64),
+    /// Literal number written in decimal form (`5.0`), as the schema allows.
+    Float(f64),
     /// Expression evaluated when the job is expanded.
     Expression(String),
+}
+
+impl DeferredNumber {
+    /// The literal value, when this is not a deferred expression.
+    ///
+    /// A decimal with a fractional part is not a whole number of minutes (or
+    /// of parallel jobs) and is rejected by the caller rather than silently
+    /// truncated.
+    pub fn literal(&self) -> Option<u64> {
+        match self {
+            DeferredNumber::Literal(value) => Some(*value),
+            DeferredNumber::Float(value) => {
+                (value.is_finite() && value.fract() == 0.0 && *value >= 0.0)
+                    .then_some(*value as u64)
+            }
+            DeferredNumber::Expression(_) => None,
+        }
+    }
 }
 
 /// A static matrix or an expression producing a matrix object.

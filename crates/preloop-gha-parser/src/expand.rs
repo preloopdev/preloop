@@ -282,7 +282,17 @@ fn resolve_deferred_number(
 ) -> Result<Option<u64>, ParserError> {
     let Some(value) = value else { return Ok(None) };
     match value {
-        DeferredNumber::Literal(value) => Ok(Some(*value)),
+        DeferredNumber::Literal(_) | DeferredNumber::Float(_) => {
+            value.literal().map(Some).ok_or_else(|| {
+                ParserError::InvalidExpression(format!(
+                    "expected a whole number, got {}",
+                    match value {
+                        DeferredNumber::Float(value) => value.to_string(),
+                        _ => unreachable!("literal variants only"),
+                    }
+                ))
+            })
+        }
         DeferredNumber::Expression(expression) => {
             let result = eval_expression(expression, &expression_context(matrix, inputs, None))
                 .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
@@ -304,9 +314,10 @@ fn resolve_step_timeout(
 ) -> Result<Option<u32>, ParserError> {
     let resolved = if matrix_deferred {
         match value {
-            Some(DeferredNumber::Literal(value)) => Some(*value),
-            Some(DeferredNumber::Expression(_)) => None,
-            None => None,
+            Some(value @ (DeferredNumber::Literal(_) | DeferredNumber::Float(_))) => {
+                value.literal()
+            }
+            Some(DeferredNumber::Expression(_)) | None => None,
         }
     } else {
         resolve_deferred_number(value, matrix, inputs)?
@@ -564,10 +575,10 @@ fn job_plan_from_job(
         resolve_deferred_bool(job.strategy.fail_fast.as_ref(), &matrix, inputs, true)?
     };
     let max_parallel = if matrix_deferred {
-        match job.strategy.max_parallel {
-            Some(DeferredNumber::Literal(value)) => Some(value),
-            _ => None,
-        }
+        job.strategy
+            .max_parallel
+            .as_ref()
+            .and_then(DeferredNumber::literal)
     } else {
         resolve_deferred_number(job.strategy.max_parallel.as_ref(), &matrix, inputs)?
     };

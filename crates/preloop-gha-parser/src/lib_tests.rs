@@ -2112,6 +2112,37 @@ jobs:
     assert_eq!(value["expr"], "matrix.shell");
 }
 
+/// The official schema types `timeout-minutes` as `number`
+/// (`workflow-v1.0.json`: `step-timeout-minutes` → `"number": {}`), and a
+/// template number is a double — so generated YAML rendering `5` as `5.0` is
+/// valid input. Rejecting it at deserialization failed the *entire* workflow,
+/// not just the field.
+#[test]
+fn decimal_step_timeout_is_accepted_and_fractions_are_rejected() {
+    let workflow_with = |timeout: &str| {
+        format!(
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n        timeout-minutes: {timeout}\n"
+        )
+    };
+
+    let workflow = parse_workflow(&workflow_with("5.0")).expect("`5.0` is a valid number");
+    let jobs = expand_jobs(&workflow).unwrap();
+    assert_eq!(jobs[0].steps[0].timeout_in_minutes, Some(5));
+
+    // A fraction is not a whole number of minutes; reject it rather than
+    // truncating a `2.5` into a two-minute timeout.
+    let workflow = parse_workflow(&workflow_with("2.5")).expect("`2.5` still parses as a number");
+    match expand_jobs(&workflow) {
+        Err(ParserError::InvalidExpression(message)) => {
+            assert!(
+                message.contains("2.5"),
+                "error must name the value: {message}"
+            );
+        }
+        other => panic!("expected a whole-number rejection, got {other:?}"),
+    }
+}
+
 #[test]
 fn step_timeout_expression_resolves_and_range_is_checked() {
     let workflow = parse_workflow(
