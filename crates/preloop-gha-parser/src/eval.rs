@@ -560,6 +560,11 @@ pub fn build_context(
     ctx.insert("matrix", Value::Object(matrix_value));
 
     ctx.insert("strategy", strategy.clone());
+    // `needs` is empty here by construction: the upstream jobs have not run
+    // when a job message is built. Because the resolver coalesces a missing
+    // property to "" instead of erroring, anything resolved against this
+    // context that reads `needs.*` silently becomes "". Callers must gate on
+    // [`resolves_after_job_build`] rather than resolving blindly.
     ctx.insert("needs", Value::Object(Map::new()));
 
     let secrets_value: Map<String, Value> = secrets
@@ -572,6 +577,25 @@ pub fn build_context(
         inputs.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     ctx.insert("inputs", Value::Object(inputs_value));
     ctx
+}
+
+/// Whether a `${{ }}` value reads a context that is not yet populated when the
+/// job message is built, and must therefore be left as a template for a later
+/// evaluation.
+///
+/// Two such contexts exist:
+///
+/// * `needs.*` — the upstream jobs have not run, so [`build_context`] supplies
+///   an empty map (the server fills the real one in once they complete).
+/// * `github.workspace` — the server has no runner work directory; only the
+///   runner knows the path.
+///
+/// Neither produces an evaluation *error*: the resolver coalesces a missing
+/// property to "". Resolving early therefore replaces a real value with an
+/// empty string, with nothing to catch it — which is exactly why this
+/// predicate exists instead of a `let _ = resolve(...)` at each call site.
+pub fn resolves_after_job_build(value: &str) -> bool {
+    value.contains("github.workspace") || value.contains("needs.") || value.contains("needs[")
 }
 
 #[cfg(test)]

@@ -404,14 +404,13 @@ pub fn build_agent_job_message_with_normalized_context(
     // a boolean literal) fail on first use.
     let mut resolved_env: BTreeMap<String, String> = BTreeMap::new();
     for (k, v) in &plan.env {
-        // Runtime-only context keys must survive job-build resolution:
-        // `github.workspace` is filled in by the runner at execution
-        // time (the server has no runner work directory), and the
-        // expression resolver turns a missing property into "" — so
-        // neovim's `BIN_DIR: ${{ github.workspace }}/bin` would silently
-        // collapse to `/bin` here. Leave those values untouched for the
-        // runner's step-time evaluation.
-        if v.contains("github.workspace") {
+        // Some contexts do not exist yet when the job message is built, and
+        // the resolver turns a missing property into "" rather than an error
+        // — so resolving them here silently destroys the value. Ship those
+        // untouched; `environment_variables` carries them as template tokens
+        // and the runner evaluates them at step time against the completed
+        // context. See [`resolves_after_job_build`].
+        if crate::eval::resolves_after_job_build(v) {
             resolved_env.insert(k.clone(), v.clone());
             continue;
         }
@@ -686,13 +685,21 @@ pub fn build_agent_job_message_with_normalized_context(
     })
 }
 
-/// Resolve a deployment-environment name, failing the job when its expression
-/// cannot be evaluated rather than shipping the raw `${{ … }}` template.
+/// Resolve a deployment-environment name.
+///
+/// A name reading a not-yet-populated context is left as a template: unlike
+/// `env:`, the runner never evaluates this field, so the server re-resolves it
+/// once `needs` completes (`hydrate_needs_context`). Everything else is
+/// resolved here, and a failure fails the job exactly as an unevaluable
+/// `env:` value does — the raw template must never become the deployment name.
 fn resolve_environment_name(
     name: &str,
     context: &Context,
     job_name: &str,
 ) -> Result<String, String> {
+    if crate::eval::resolves_after_job_build(name) {
+        return Ok(name.to_owned());
+    }
     resolve_string(name, context)
         .map_err(|error| format!("job `{job_name}` environment failed to evaluate: {error}"))
 }
@@ -1099,6 +1106,67 @@ jobs:
             error.contains("environment failed to evaluate"),
             "error must name the environment: {error}"
         );
+    }
+
+    /// `needs` is empty when the job message is built, and the resolver
+    /// coalesces a missing property to "" — so resolving a `needs`-reading
+    /// `env:` value here would replace the upstream output with an empty
+    /// string, and nothing downstream re-resolves it. The value must survive
+    /// as a template for the runner to evaluate against the hydrated context.
+    #[test]
+    fn needs_dependent_env_survives_as_a_template() {
+        let workflow = parse_workflow(
+            r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      target: ${{ steps.x.outputs.target }}
+    steps:
+      - id: x
+        run: echo target=prod >> $GITHUB_OUTPUT
+  deploy:
+    needs: [build]
+    runs-on: ubuntu-latest
+    env:
+      TARGET: ${{ needs.build.outputs.target }}
+    steps:
+      - run: echo $TARGET
+"#,
+        )
+        .unwrap();
+        let plans = crate::expand_jobs(&workflow).unwrap();
+        let deploy = plans.iter().find(|plan| plan.base_id == "deploy").unwrap();
+        let message = build_agent_job_message(
+            deploy,
+            &serde_json::json!({"event_name": "push"}),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            message
+                .variables
+                .get("TARGET")
+                .and_then(|variable| variable.value.clone()),
+            Some("${{ needs.build.outputs.target }}".to_owned()),
+            "a needs-dependent env value must not be resolved against the empty needs context"
+        );
+        // A deferred value must reach the wire as an *expression* token, which
+        // is what makes the runner evaluate it against the hydrated context.
+        let target = message
+            .environment_variables
+            .iter()
+            .find_map(|entry| {
+                let pair = entry.get("map")?.as_array()?.first()?;
+                (pair.get("Key")?.get("lit")?.as_str()? == "TARGET").then(|| pair["Value"].clone())
+            })
+            .expect("TARGET must be present on the wire");
+        assert_eq!(target["type"], 3, "expected an expression token: {target}");
+        assert_eq!(target["expr"], "needs.build.outputs.target");
     }
 
     /// Job/workflow-level `env:` must reach the wire as
