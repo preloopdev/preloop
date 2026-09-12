@@ -293,6 +293,15 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
             continue;
         }
         let grace = if pool_preparing {
+            // A restart restores the queue's original enqueue timestamps but
+            // destroys every pool VM. Give the replacement pool one process-
+            // local warm window before applying the durable queue-age ceiling;
+            // otherwise the first reaper tick fails every old queued job while
+            // the golden and its runners are demonstrably still starting.
+            if shared.state.started_at.elapsed() < MAX_QUEUED_GRACE {
+                inner.queued_at.remove(&key);
+                continue;
+            }
             // The pool is warming or booting a runner that may serve this
             // job, so hold the grace window rather than failing a job whose
             // runner is genuinely on the way. Bound the hold by
@@ -677,9 +686,11 @@ fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
         .collect();
 
     // Runner state: busy = an owned session holds an active job assignment;
-    // stale = no poll within the crate's staleness threshold; idle = neither.
-    // Busy and stale are independent predicates — a runner that stopped
-    // polling mid-job is both — so idle is the remainder, not the complement.
+    // stale = every owned session stopped polling; idle = at least one live
+    // session and neither busy nor stale. A registered runner with no session
+    // is only a pre-provisioned successor: it cannot poll until its slot starts.
+    // Busy and stale remain independent — a runner that stopped polling
+    // mid-job is both.
     let now = std::time::Instant::now();
     let mut runner_idle = 0u32;
     let mut runner_busy = 0u32;
@@ -717,7 +728,7 @@ fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
         if stale {
             runner_stale += 1;
         }
-        if !busy && !stale {
+        if !owned.is_empty() && !busy && !stale {
             runner_idle += 1;
         }
     }
@@ -1575,6 +1586,39 @@ mod tests {
             ExecutionStatus::Cancelled,
         ]);
         assert_eq!(counts, (1, 2, 4));
+    }
+
+    #[test]
+    fn registered_successor_without_a_session_is_not_idle_capacity() {
+        let mut inner = InnerState::default();
+        let runner_id = 7;
+        inner.runners.insert(
+            runner_id,
+            RegisteredRunner {
+                id: runner_id,
+                name: "prebuilt-successor".to_owned(),
+                labels: vec!["self-hosted".to_owned()],
+                ephemeral: true,
+                public_key: None,
+                runner_group_id: None,
+                runner_group_name: None,
+            },
+        );
+
+        assert_eq!(
+            collect_snapshot_inputs(&inner).runner_idle,
+            0,
+            "a configured successor cannot poll until its slot starts it"
+        );
+
+        inner
+            .broker_session_runners
+            .insert("live-session".to_owned(), runner_id);
+        assert_eq!(
+            collect_snapshot_inputs(&inner).runner_idle,
+            1,
+            "a session-backed runner with no active request is idle"
+        );
     }
 
     #[test]

@@ -11438,6 +11438,50 @@ async fn queued_job_survives_the_grace_window_while_the_pool_is_preparing() {
 }
 
 #[tokio::test]
+async fn restored_old_job_survives_the_restarted_pools_warm_window() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    state.pool_preparing = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+        true,
+    )));
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+
+    let accepted = submit_simple_run(&app).await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    {
+        let mut inner = state.inner.lock().await;
+        let cutoff = (SystemTime::now() - Duration::from_secs(700))
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        inner
+            .queue
+            .iter_mut()
+            .find(|job| job.run_id == run_id)
+            .unwrap()
+            .enqueued_at_unix_nanos = cutoff;
+    }
+
+    reap_once(&shared).await;
+
+    let inner = state.inner.lock().await;
+    assert_eq!(
+        inner.queue.len(),
+        1,
+        "durable queue age must not defeat the fresh process-local pool warm"
+    );
+    assert_eq!(
+        inner.runs[&run_id].jobs[&JobId("build".to_owned())],
+        ExecutionStatus::Queued
+    );
+}
+
+#[tokio::test]
 async fn queued_job_starves_past_the_ceiling_even_while_the_pool_is_preparing() {
     let temp = tempfile::tempdir().unwrap();
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -11452,6 +11496,7 @@ async fn queued_job_starves_past_the_ceiling_even_while_the_pool_is_preparing() 
     state.pool_preparing = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
         true,
     )));
+    state.started_at = std::time::Instant::now() - Duration::from_secs(700);
     let shared = Arc::new(SharedState {
         state: state.clone(),
         shutdown,
