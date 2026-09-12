@@ -1864,6 +1864,47 @@ pub(crate) fn hydrate_needs_context(job: &mut QueuedJob, run: &RunRecord) {
     job.message
         .context_data
         .insert("needs".to_owned(), azdo::PipelineContextData::Dict(needs));
+
+    // The environment name is the one field the runner never evaluates: it
+    // ships as a plain string, so a name reading `needs.*` was deliberately
+    // left as a template by the job builder and is finished here, now that the
+    // context is complete. Everything else needing `needs` travels as a
+    // template token and is evaluated in-VM against the map installed above.
+    let Some(environment) = job.environment.as_ref() else {
+        return;
+    };
+    let Some(name) = (match environment {
+        serde_json::Value::String(name) => Some(name.as_str()),
+        serde_json::Value::Object(map) => map.get("name").and_then(serde_json::Value::as_str),
+        _ => None,
+    }) else {
+        return;
+    };
+    if !preloop_gha_parser::eval::resolves_after_job_build(name) {
+        // Already resolved at build time against a complete context.
+        return;
+    }
+    let Some(actions_environment) = job.message.actions_environment.as_mut() else {
+        return;
+    };
+    let mut context = preloop_gha_expressions::Context::new();
+    for (key, value) in &job.message.context_data {
+        context.insert(key, value.to_json());
+    }
+    match preloop_gha_parser::eval::resolve_string(name, &context) {
+        Ok(resolved) => actions_environment.name = resolved,
+        Err(error) => {
+            // Nothing downstream re-resolves this, so a raw template would
+            // become the deployment's name in the environment record.
+            tracing::error!(
+                run_id = %job.run_id.0,
+                job = %job.job_id.0,
+                environment = %name,
+                %error,
+                "deployment environment expression failed to evaluate after needs completed"
+            );
+        }
+    }
 }
 pub(crate) fn needs_json_context(run: &RunRecord, needs: &[JobId]) -> serde_json::Value {
     let values = needs
@@ -2475,6 +2516,7 @@ fn register_expanded_jobs(
             max_parallel: plan.max_parallel,
             runs_on: plan.runs_on.clone(),
             runner_group: plan.runner_group.clone(),
+            environment: plan.environment.clone(),
             message: artifacts.agent_msg,
             concurrency: concurrency::concurrency_from_plan_fields(
                 plan.concurrency_group.as_deref(),
@@ -3037,6 +3079,7 @@ mod assignment_tests {
             max_parallel: None,
             runs_on: vec!["self-hosted".to_owned()],
             runner_group: None,
+            environment: None,
             message: serde_json::from_value(serde_json::json!({
                 "jobId": "00000000-0000-0000-0000-000000000001",
                 "requestId": 1,

@@ -1233,6 +1233,7 @@ pub(crate) async fn submit_run_inner(
                 max_parallel: job.max_parallel,
                 runs_on: job.runs_on.clone(),
                 runner_group: job.runner_group.clone(),
+                environment: job.environment.clone(),
                 message: agent_msg,
                 concurrency: concurrency::concurrency_from_plan_fields(
                     job.concurrency_group.as_deref(),
