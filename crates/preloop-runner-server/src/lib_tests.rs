@@ -11310,17 +11310,17 @@ async fn liveness_sweep_requeues_job_of_deaf_runner() {
     let job_id = JobId("build".to_owned());
     let message = poll_message(&app, &token, &session_id).await;
     assert!(!message.is_null(), "poll must claim the queued job");
-    {
+    let request_id = {
         let inner = state.inner.lock().await;
         assert!(
             inner.claimed_jobs.contains_key(&(run_id, job_id.clone())),
             "poll must record the claim in claimed_jobs"
         );
-        assert!(
-            inner.session_active_requests.contains_key(&session_id),
-            "poll must pin the claim to the session"
-        );
-    }
+        *inner
+            .session_active_requests
+            .get(&session_id)
+            .expect("poll must pin the claim to the session")
+    };
 
     // The runner goes deaf: backdate its last poll and shrink the timeout.
     {
@@ -11350,6 +11350,19 @@ async fn liveness_sweep_requeues_job_of_deaf_runner() {
         assert!(
             !inner.claimed_jobs.contains_key(&(run_id, job_id.clone())),
             "deaf claim must leave claimed_jobs"
+        );
+        assert_eq!(
+            inner.job_requests[&request_id].result,
+            Some(ExecutionStatus::Cancelled),
+            "the abandoned attempt must not remain live beside its retry"
+        );
+        assert!(
+            crate::runtime_scheduling::live_runner_assignments(
+                &inner.job_requests,
+                SystemTime::now()
+            )
+            .is_empty(),
+            "status must not report the purged runner as executing"
         );
         assert!(
             inner
