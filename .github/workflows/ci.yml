@@ -19,11 +19,6 @@ on:
 
 jobs:
   rust-lint:
-    # Fork PRs never execute on the persistent self-hosted runner: untrusted
-    # code with warm caches and network is a supply-chain risk the engine's
-    # token downgrade alone does not cover. Same guard as the conformance
-    # workflows; skipped required checks block fork merges by default.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, preloop-cpane]
     timeout-minutes: 20
     env:
@@ -57,7 +52,6 @@ jobs:
     # NOTE: these display names are load-bearing — the `main` ruleset gates
     # on them. Renaming a shard name requires updating the ruleset to match.
     name: rust shard ${{ matrix.shard }} of 4
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, preloop-cpane]
     timeout-minutes: 60
     strategy:
@@ -99,7 +93,7 @@ jobs:
   property-tests-fast:
     runs-on: [self-hosted, preloop-cpane]
     timeout-minutes: 30
-    if: github.event_name != 'schedule' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:

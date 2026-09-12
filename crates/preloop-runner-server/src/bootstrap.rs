@@ -737,6 +737,7 @@ fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
     // holds only pre-claim reservations removed at claim time.
     let assignments = crate::runtime_scheduling::live_runner_assignments(
         &inner.job_requests,
+        &inner.session_active_requests,
         std::time::SystemTime::now(),
     );
 

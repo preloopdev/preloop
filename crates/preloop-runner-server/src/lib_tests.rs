@@ -10856,6 +10856,96 @@ async fn a_dispatch_refused_by_the_mint_policy_fails_its_run_without_the_reaper(
     assert!(!inner.inflight_requests.contains_key(&request_id));
 }
 
+/// A settled attempt must not be acquirable. The broker retains
+/// `owner_runner_id` after completion so late protocol reads stay bound to the
+/// runner that ran the job, which means ownership alone cannot gate
+/// `acquirejob`: a runner that retries the call after reporting would be
+/// handed the job payload (and a freshly minted installation token) and would
+/// execute the same job's side effects twice, then fail to report because
+/// `renewjob` 409s and `completejob` ignores duplicates.
+#[tokio::test]
+async fn a_settled_attempt_cannot_be_acquired_again() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let registered = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/Agent/1/0",
+        json!({"name": "acquire-guard-runner", "version": "2.336.0"}),
+    )
+    .await;
+    let runner_id = registered["id"].as_i64().unwrap();
+    let runner_token = state
+        .local_jwt(json!({
+            "sub": format!("preloop-runner-listen-{runner_id}"),
+            "scp": "ActionsRuntime.RunnerListen",
+        }))
+        .unwrap();
+
+    submit_simple_run(&app).await;
+    let session = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/runner/server/session",
+        json!({}),
+        &runner_token,
+    )
+    .await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    let job_ref = request_json_with_bearer(
+        &app,
+        Method::GET,
+        &format!("/runner/server/message?sessionId={session_id}&status=Online&waitSeconds=0"),
+        Value::Null,
+        &runner_token,
+    )
+    .await;
+    let body: Value = serde_json::from_str(job_ref["body"].as_str().unwrap()).unwrap();
+    let job_message_id = body["runner_request_id"].as_str().unwrap().to_owned();
+    let request_id = {
+        let inner = state.inner.lock().await;
+        *inner.job_requests.keys().next().unwrap()
+    };
+    let acquire =
+        json!({"jobMessageId": job_message_id, "billingOwnerId": "local", "runnerOS": "Linux"});
+
+    // A live claim acquires normally: the guard must not break dispatch.
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &runner_token,
+            Method::POST,
+            &format!("/broker/{runner_id}/acquirejob"),
+            acquire.clone(),
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    request_json_with_bearer(
+        &app,
+        Method::PATCH,
+        &format!("/_apis/v1/AgentRequest/1/{request_id}"),
+        json!({"result": "Succeeded"}),
+        &runner_token,
+    )
+    .await;
+
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &runner_token,
+            Method::POST,
+            &format!("/broker/{runner_id}/acquirejob"),
+            acquire,
+        )
+        .await,
+        StatusCode::CONFLICT,
+        "a reported attempt must never be handed back to a runner"
+    );
+}
+
 #[tokio::test]
 async fn app_only_server_fetches_webhook_workflows_with_installation_token() {
     use crate::github_app::{GitHubAppCredentials, MintFailurePolicy};
@@ -11351,15 +11441,26 @@ async fn liveness_sweep_requeues_job_of_deaf_runner() {
             !inner.claimed_jobs.contains_key(&(run_id, job_id.clone())),
             "deaf claim must leave claimed_jobs"
         );
+        let request = &inner.job_requests[&request_id];
         assert_eq!(
-            inner.job_requests[&request_id].result,
-            Some(ExecutionStatus::Cancelled),
-            "the abandoned attempt must not remain live beside its retry"
+            request.result, None,
+            "the requeued request must remain completable"
+        );
+        assert_eq!(
+            request.owner_runner_id, None,
+            "the purged runner must lose request ownership"
+        );
+        assert_eq!(request.started_at, None);
+        assert_eq!(request.last_renewed_at, None);
+        assert!(
+            inner.inflight_requests.contains_key(&request_id),
+            "the request must remain inflight for its replacement"
         );
         assert!(
             crate::runtime_scheduling::live_runner_assignments(
                 &inner.job_requests,
-                SystemTime::now()
+                &inner.session_active_requests,
+                SystemTime::now(),
             )
             .is_empty(),
             "status must not report the purged runner as executing"
@@ -11372,6 +11473,40 @@ async fn liveness_sweep_requeues_job_of_deaf_runner() {
             "unfinished job must be requeued for a fresh machine"
         );
     }
+
+    // A replacement claims the same correlation, renews it, and completes the
+    // logical job. Settling the request before requeue would let the delivery
+    // happen but make both PATCHes no-ops.
+    let (replacement_id, replacement_token) =
+        register_runner_with_token(&app, "replacement-runner", &["self-hosted"], None).await;
+    let (_, replacement_session) =
+        create_disttask_session(&app, &replacement_token, replacement_id).await;
+    let replacement_session_id = replacement_session["sessionId"].as_str().unwrap();
+    let delivered = poll_message(&app, &replacement_token, replacement_session_id).await;
+    assert!(!delivered.is_null(), "replacement must receive the retry");
+    request_json_with_bearer(
+        &app,
+        Method::PATCH,
+        &format!("/_apis/v1/AgentRequest/1/{request_id}"),
+        json!({}),
+        &replacement_token,
+    )
+    .await;
+    request_json_with_bearer(
+        &app,
+        Method::PATCH,
+        &format!("/_apis/v1/AgentRequest/1/{request_id}"),
+        json!({"result": "Succeeded"}),
+        &replacement_token,
+    )
+    .await;
+    let inner = state.inner.lock().await;
+    assert_eq!(
+        inner.runs[&run_id].jobs[&job_id],
+        ExecutionStatus::Success,
+        "the replacement must be able to finish the retried job"
+    );
+    assert!(!inner.inflight_requests.contains_key(&request_id));
 }
 
 #[tokio::test]
@@ -11453,36 +11588,40 @@ async fn queued_job_survives_the_grace_window_while_the_pool_is_preparing() {
 #[tokio::test]
 async fn restored_old_job_survives_the_restarted_pools_warm_window() {
     let temp = tempfile::tempdir().unwrap();
-    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
-    let shutdown = CancellationToken::new();
-    let app = app(state.clone(), shutdown.clone());
-    state.pool_preparing = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+    let run_id = {
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+        let accepted = submit_simple_run(&app).await;
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+        {
+            let mut inner = state.inner.lock().await;
+            let cutoff = (SystemTime::now() - Duration::from_secs(700))
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as i64;
+            inner
+                .queue
+                .iter_mut()
+                .find(|job| job.run_id == run_id)
+                .unwrap()
+                .enqueued_at_unix_nanos = cutoff;
+            let snapshot = crate::store::StoreSnapshot::from_inner(&inner);
+            state.store.store_inner(&snapshot).await.unwrap();
+        }
+        run_id
+    };
+
+    let mut restored = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    restored.pool_preparing = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
         true,
     )));
     let shared = Arc::new(SharedState {
-        state: state.clone(),
-        shutdown,
+        state: restored.clone(),
+        shutdown: CancellationToken::new(),
     });
-
-    let accepted = submit_simple_run(&app).await;
-    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
-    {
-        let mut inner = state.inner.lock().await;
-        let cutoff = (SystemTime::now() - Duration::from_secs(700))
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as i64;
-        inner
-            .queue
-            .iter_mut()
-            .find(|job| job.run_id == run_id)
-            .unwrap()
-            .enqueued_at_unix_nanos = cutoff;
-    }
-
     reap_once(&shared).await;
 
-    let inner = state.inner.lock().await;
+    let inner = restored.inner.lock().await;
     assert_eq!(
         inner.queue.len(),
         1,
@@ -24346,10 +24485,10 @@ async fn startup_fails_claims_orphaned_by_a_restart() {
 }
 
 /// Versions before the runner-purge fix put the logical job back on the queue
-/// but left its claimed request live and detached from every session. Startup
-/// must migrate that persisted shape without failing the retry.
+/// but left its request owned by a dead runner and detached from every session.
+/// Startup must release that persisted correlation for a replacement runner.
 #[tokio::test]
-async fn startup_retires_an_orphaned_attempt_whose_job_was_requeued() {
+async fn startup_releases_an_orphaned_request_whose_job_was_requeued() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
@@ -24378,29 +24517,66 @@ async fn startup_retires_an_orphaned_attempt_whose_job_was_requeued() {
     let settled = crate::broker::reconcile_orphaned_claims(&shared).await;
     assert_eq!(settled, 1);
 
+    {
+        let inner = state.inner.lock().await;
+        let request = &inner.job_requests[&request_id];
+        assert_eq!(
+            request.result, None,
+            "the queued request must remain completable"
+        );
+        assert_eq!(
+            request.owner_runner_id, None,
+            "startup must release the dead runner owner"
+        );
+        assert_eq!(request.started_at, None);
+        assert_eq!(request.last_renewed_at, None);
+        assert!(
+            inner.inflight_requests.contains_key(&request_id),
+            "the request correlation must remain inflight"
+        );
+        assert!(
+            inner
+                .queue
+                .iter()
+                .any(|job| job.run_id == run_id && job.job_id == job_id),
+            "the replacement attempt remains queued"
+        );
+        assert_eq!(
+            inner.runs[&run_id].jobs[&job_id],
+            ExecutionStatus::Queued,
+            "releasing the old owner must not conclude its logical job"
+        );
+        assert!(crate::runtime_scheduling::live_runner_assignments(
+            &inner.job_requests,
+            &inner.session_active_requests,
+            SystemTime::now(),
+        )
+        .is_empty());
+    }
+
+    let (runner_id, token) =
+        register_runner_with_token(&app, "startup-replacement", &["self-hosted"], None).await;
+    let (_, session) = create_disttask_session(&app, &token, runner_id).await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    let delivered = poll_message(&app, &token, session_id).await;
+    assert!(
+        !delivered.is_null(),
+        "replacement must receive restored retry"
+    );
+    request_json_with_bearer(
+        &app,
+        Method::PATCH,
+        &format!("/_apis/v1/AgentRequest/1/{request_id}"),
+        json!({"result": "Succeeded"}),
+        &token,
+    )
+    .await;
     let inner = state.inner.lock().await;
     assert_eq!(
-        inner.job_requests[&request_id].result,
-        Some(ExecutionStatus::Cancelled),
-        "the abandoned attempt is terminal"
-    );
-    assert!(
-        inner
-            .queue
-            .iter()
-            .any(|job| job.run_id == run_id && job.job_id == job_id),
-        "the replacement attempt remains queued"
-    );
-    assert_eq!(
         inner.runs[&run_id].jobs[&job_id],
-        ExecutionStatus::Queued,
-        "retiring the old attempt must not conclude its logical job"
+        ExecutionStatus::Success,
+        "restored retry must complete through the retained correlation"
     );
-    assert!(crate::runtime_scheduling::live_runner_assignments(
-        &inner.job_requests,
-        SystemTime::now()
-    )
-    .is_empty());
 }
 
 // ---------------------------------------------------------------------------

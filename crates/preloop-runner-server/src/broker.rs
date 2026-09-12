@@ -836,6 +836,19 @@ pub(crate) async fn broker_acquire_job(
             .copied()
             .ok_or_else(|| ApiError::not_found("broker job message not found"))?;
         ensure_broker_request_owner(&inner, request_id, runner_id)?;
+        // A settled attempt is never acquirable. `renewjob` already 409s and
+        // `completejob` ignores such a record, so without this a late runner
+        // acquires a terminal job: the engine mints a fresh installation
+        // token and the runner executes side effects a second time, then
+        // cannot report the result. Requeue paths keep `result` unset (see
+        // `release_request_for_retry`), so a genuine retry still acquires.
+        if inner
+            .job_requests
+            .get(&request_id)
+            .is_some_and(|record| record.result.is_some())
+        {
+            return Err(ApiError::conflict("broker request already completed"));
+        }
         let message = inner
             .broker_messages
             .get(&request_id)
@@ -1278,11 +1291,11 @@ async fn fail_unclaimable_request(shared: &Arc<SharedState>, request_id: i64) {
 ///
 /// A claim still absent from the ready queue is irrecoverable and fails as
 /// before. A request whose logical job was already requeued by runner purge is
-/// only an abandoned attempt: settle that request without concluding the retry.
-/// The latter also migrates snapshots written by versions that requeued the job
-/// but left its request live.
+/// released for redelivery without concluding the retry. The latter also
+/// migrates snapshots written by versions that requeued the job but left its
+/// old runner ownership live.
 pub(crate) async fn reconcile_orphaned_claims(shared: &Arc<SharedState>) -> usize {
-    let (retired, unclaimable) = {
+    let (recovered, unclaimable) = {
         let mut inner = shared.state.inner.lock().await;
         let live_requests: std::collections::BTreeSet<i64> = inner
             .session_active_requests
@@ -1305,13 +1318,15 @@ pub(crate) async fn reconcile_orphaned_claims(shared: &Arc<SharedState>) -> usiz
             .map(|(request_id, record)| (*request_id, record.run_id, record.job_id.clone()))
             .collect();
 
-        let mut retired = 0usize;
+        let queued_jobs: std::collections::BTreeSet<(RunId, JobId)> = inner
+            .queue
+            .iter()
+            .map(|job| (job.run_id, job.job_id.clone()))
+            .collect();
+        let mut recovered = 0usize;
         let mut unclaimable = Vec::new();
         for (request_id, run_id, job_id) in claimed_requests {
-            let queued = inner
-                .queue
-                .iter()
-                .any(|job| job.run_id == run_id && job.job_id == job_id);
+            let queued = queued_jobs.contains(&(run_id, job_id.clone()));
             let terminal_status = inner
                 .runs
                 .get(&run_id)
@@ -1325,21 +1340,20 @@ pub(crate) async fn reconcile_orphaned_claims(shared: &Arc<SharedState>) -> usiz
                             | ExecutionStatus::Skipped
                     )
                 });
-            if queued || terminal_status.is_some() {
-                runtime_scheduling::settle_request(
-                    &mut inner,
-                    request_id,
-                    terminal_status.unwrap_or(ExecutionStatus::Cancelled),
-                );
-                retired += 1;
+            if queued {
+                runtime_scheduling::release_request_for_retry(&mut inner, request_id);
+                recovered += 1;
+            } else if let Some(status) = terminal_status {
+                runtime_scheduling::settle_request(&mut inner, request_id, status);
+                recovered += 1;
             } else {
                 unclaimable.push(request_id);
             }
         }
-        (retired, unclaimable)
+        (recovered, unclaimable)
     };
 
-    if retired > 0 {
+    if recovered > 0 {
         let _store_guard = shared.state.store_mutation.lock().await;
         let snapshot = {
             let inner = shared.state.inner.lock().await;
@@ -1347,14 +1361,14 @@ pub(crate) async fn reconcile_orphaned_claims(shared: &Arc<SharedState>) -> usiz
         };
         if let Err(error) = shared.state.store.store_inner(&snapshot).await {
             warn!(
-                retired,
+                recovered,
                 ?error,
-                "failed to persist retired orphaned attempts"
+                "failed to persist reconciled orphaned attempts"
             );
         }
         warn!(
-            retired,
-            "retired orphaned attempts whose jobs were requeued"
+            recovered,
+            "released orphaned retry attempts from dead runner ownership"
         );
     }
 
@@ -1367,7 +1381,7 @@ pub(crate) async fn reconcile_orphaned_claims(shared: &Arc<SharedState>) -> usiz
             "failed job claims orphaned by a control-plane restart"
         );
     }
-    retired + unclaimable.len()
+    recovered + unclaimable.len()
 }
 
 pub(crate) async fn mint_dispatch_github_token(

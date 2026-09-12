@@ -1753,17 +1753,18 @@ pub(crate) fn clear_assignment(inner: &mut InnerState, run_id: RunId, job_id: &J
 }
 
 /// Live runner -> job pairings for status reporting, sorted by runner id.
-/// Sourced from claimed job requests (each carries the claiming runner and
-/// is marked finished via `result`), NOT from the assignment table: entries
-/// there are pre-claim reservations that `take_matching_job` removes at
-/// claim time, so reading them reports idle runners as live and hides
-/// executing ones — exactly backwards.
+///
+/// Iterate only active session requests, not the historical request table.
+/// The latter retains completed records for late protocol reads and grows for
+/// the process lifetime.
 pub(crate) fn live_runner_assignments(
     requests: &std::collections::BTreeMap<i64, crate::models::TaskAgentJobRequestRecord>,
+    active_requests: &std::collections::BTreeMap<String, i64>,
     now: std::time::SystemTime,
 ) -> Vec<preloop_observability::status::RunnerAssignment> {
-    let mut out: Vec<preloop_observability::status::RunnerAssignment> = requests
+    let mut out: Vec<preloop_observability::status::RunnerAssignment> = active_requests
         .values()
+        .filter_map(|request_id| requests.get(request_id))
         .filter(|record| record.result.is_none())
         .filter_map(|record| record.owner_runner_id.map(|runner_id| (runner_id, record)))
         .map(
@@ -2649,10 +2650,10 @@ fn expandable_job_ids(inner: &InnerState, run_id: RunId) -> BTreeSet<JobId> {
     ids
 }
 
-/// Settle one abandoned request without concluding its logical job.
+/// Settle one request whose logical job is terminal.
 ///
-/// Requeue paths use this before minting a replacement attempt. Keeping the
-/// old request live lets its lease expiry race and fail the replacement.
+/// Completed request records remain addressable for late runner reads, but
+/// lose every live-session and renewable-credential association.
 pub(crate) fn settle_request(inner: &mut InnerState, request_id: i64, status: ExecutionStatus) {
     inner
         .session_active_requests
@@ -2662,6 +2663,26 @@ pub(crate) fn settle_request(inner: &mut InnerState, request_id: i64, status: Ex
     if let Some(record) = inner.job_requests.get_mut(&request_id) {
         if record.result.is_none() {
             record.result = Some(status);
+        }
+    }
+}
+/// Release an interrupted claim so the same request can be delivered again.
+///
+/// The queued job retains this request id and agent-job correlation. Keep its
+/// inflight and token records, but remove the dead owner before requeueing:
+/// the old runner is then rejected until a replacement session claims it, and
+/// that replacement can renew and complete the original request normally.
+pub(crate) fn release_request_for_retry(inner: &mut InnerState, request_id: i64) {
+    inner
+        .session_active_requests
+        .retain(|_, &mut rid| rid != request_id);
+    if let Some(record) = inner.job_requests.get_mut(&request_id) {
+        if record.result.is_none() {
+            record.owner_runner_id = None;
+            record.started_at = None;
+            record.last_renewed_at = None;
+            record.timeout_triggered = false;
+            record.locked_until = crate::distributed_task::agent_request_locked_until();
         }
     }
 }
@@ -3089,8 +3110,13 @@ mod assignment_tests {
         let run_test = RunId::new();
         table.insert(4, record(run_test, "test", Some(3), None, 30));
 
+        let active = BTreeMap::from([
+            ("finished".to_owned(), 1),
+            ("build".to_owned(), 3),
+            ("test".to_owned(), 4),
+        ]);
         let now = std::time::SystemTime::now();
-        let live = live_runner_assignments(&table, now);
+        let live = live_runner_assignments(&table, &active, now);
 
         assert_eq!(live.len(), 2);
         assert_eq!(live[0].runner_id, 3);
@@ -3099,7 +3125,7 @@ mod assignment_tests {
         assert!((live[0].assigned_seconds_ago - 30.0).abs() < 5.0);
         assert_eq!(live[1].runner_id, 7);
         assert_eq!(live[1].job_id, "build");
-        assert!(live_runner_assignments(&BTreeMap::new(), now).is_empty());
+        assert!(live_runner_assignments(&BTreeMap::new(), &BTreeMap::new(), now).is_empty());
     }
 
     fn self_hosted_caps() -> RunnerCapabilities {

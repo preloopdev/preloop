@@ -444,18 +444,13 @@ fn purge_runner_identity_locked(inner: &mut InnerState, runner_id: i64) -> bool 
                 .filter(|request| request.result.is_none())
                 .map(|request| (request.run_id, request.job_id.clone()));
             if let Some((run_id, job_id)) = pending {
-                // This attempt is abandoned, not live: retire its request
-                // before the same logical job is queued for a fresh attempt.
-                // Leaving `result` empty makes the lease reaper later fail the
-                // retried job and makes status report the dead runner forever.
-                runtime_scheduling::retire_node_requests(
-                    inner,
-                    run_id,
-                    &job_id,
-                    runtime_scheduling::RequestRetirement::Settle(ExecutionStatus::Cancelled),
-                );
                 let key = (run_id, job_id.clone());
                 if let Some(job) = inner.claimed_jobs.remove(&key) {
+                    // The queued job retains this request/message correlation.
+                    // Release its dead owner before requeueing so a replacement
+                    // can renew and complete it, while the old runner can no
+                    // longer acquire or report against the request.
+                    runtime_scheduling::release_request_for_retry(inner, request_id);
                     if let Some(run) = inner.runs.get_mut(&run_id) {
                         run.jobs.insert(job_id.clone(), ExecutionStatus::Queued);
                         run.status = runtime_scheduling::summarize_run(run.jobs.values().copied());

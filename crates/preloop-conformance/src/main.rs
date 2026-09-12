@@ -526,33 +526,25 @@ async fn run_runner_e2e(
     let server_url = format!("http://127.0.0.1:{port}");
     let listen = format!("127.0.0.1:{port}");
 
-    // Check binaries
-    if !runner_bin.exists() {
-        anyhow::bail!("runner binary not found: {}", runner_bin.display());
+    // Build the exact server/client binaries this command executes. Selecting
+    // whichever target artifact happens to exist (or has the newest mtime)
+    // can silently exercise code from another checkout state.
+    let build_status = Command::new("cargo")
+        .args([
+            "build",
+            "--locked",
+            "-p",
+            "preloop-runner-server",
+            "-p",
+            "preloop-runner-client",
+        ])
+        .status()
+        .await?;
+    if !build_status.success() {
+        anyhow::bail!("failed to build conformance server/client binaries");
     }
-    if !workflow.exists() {
-        anyhow::bail!("workflow file not found: {}", workflow.display());
-    }
-
-    let server_bin = if std::path::Path::new("target/release/preloop-server").exists() {
-        "target/release/preloop-server"
-    } else {
-        "target/debug/preloop-server"
-    };
-    if !std::path::Path::new(server_bin).exists() {
-        anyhow::bail!(
-            "server binary not found at {server_bin}: build it with `cargo build -p preloop-runner-server`"
-        );
-    }
-
-    let client_bin = if std::path::Path::new("target/release/preloop-runner-client").exists() {
-        "target/release/preloop-runner-client"
-    } else {
-        "target/debug/preloop-runner-client"
-    };
-    if !std::path::Path::new(client_bin).exists() {
-        anyhow::bail!("client binary not found: please build preloop-runner-client");
-    }
+    let server_bin = "target/debug/preloop-server";
+    let client_bin = "target/debug/preloop-runner-client";
 
     // Temporary directories
     let temp_dir = tempfile::TempDir::new()?;
@@ -593,8 +585,14 @@ async fn run_runner_e2e(
         .build()
         .expect("HTTP client");
     let mut ready = false;
+    let health_url = format!("{server_url}/healthz");
     for _ in 0..30 {
-        if client.get(&server_url).send().await.is_ok() {
+        if client
+            .get(&health_url)
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success())
+        {
             ready = true;
             break;
         }

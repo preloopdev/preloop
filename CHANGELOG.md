@@ -18,9 +18,9 @@ Releases before v0.27.0 predate the changelog.
   aarch64 golden bake use GitHub-hosted runners.
 - A restart no longer leaves the pool full of phantom capacity or fails old
   queued jobs while replacement VMs are warming. Persisted ephemeral runner
-  identities are purged before the server accepts traffic, unfinished jobs are
-  requeued with their abandoned attempts retired, and pre-provisioned
-  successors without polling sessions are no longer reported as idle. A run
+  identities are purged before the server accepts traffic, unfinished request
+  correlations are released from dead runner ownership before redelivery, and
+  pre-provisioned successors without polling sessions are no longer reported as idle. A run
   left `in_progress` with nothing executing it raises a
   `run_in_progress_without_execution` condition instead of vanishing from the
   operator's view.
