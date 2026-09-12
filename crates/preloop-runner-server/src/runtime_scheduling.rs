@@ -2649,6 +2649,23 @@ fn expandable_job_ids(inner: &InnerState, run_id: RunId) -> BTreeSet<JobId> {
     ids
 }
 
+/// Settle one abandoned request without concluding its logical job.
+///
+/// Requeue paths use this before minting a replacement attempt. Keeping the
+/// old request live lets its lease expiry race and fail the replacement.
+pub(crate) fn settle_request(inner: &mut InnerState, request_id: i64, status: ExecutionStatus) {
+    inner
+        .session_active_requests
+        .retain(|_, &mut rid| rid != request_id);
+    inner.inflight_requests.remove(&request_id);
+    inner.github_token_requests.remove(&request_id);
+    if let Some(record) = inner.job_requests.get_mut(&request_id) {
+        if record.result.is_none() {
+            record.result = Some(status);
+        }
+    }
+}
+
 /// Retire the request records an expandable node acquired at submit.
 ///
 /// MC-2: `runs.rs` mints a full set of correlation records for every
@@ -2672,23 +2689,16 @@ pub(crate) fn retire_node_requests(
         .map(|(id, _)| *id)
         .collect();
     for request_id in request_ids {
-        inner
-            .session_active_requests
-            .retain(|_, &mut rid| rid != request_id);
-        inner.inflight_requests.remove(&request_id);
-        // Terminal either way: a settled node stays in the run as a finished
-        // job and a purged one no longer exists, and neither can be claimed
-        // again. The deferred App-token request must not survive either.
-        inner.github_token_requests.remove(&request_id);
         match retirement {
             RequestRetirement::Settle(status) => {
-                if let Some(record) = inner.job_requests.get_mut(&request_id) {
-                    if record.result.is_none() {
-                        record.result = Some(status);
-                    }
-                }
+                settle_request(inner, request_id, status);
             }
             RequestRetirement::Purge => {
+                inner
+                    .session_active_requests
+                    .retain(|_, &mut rid| rid != request_id);
+                inner.inflight_requests.remove(&request_id);
+                inner.github_token_requests.remove(&request_id);
                 let Some(record) = inner.job_requests.remove(&request_id) else {
                     continue;
                 };

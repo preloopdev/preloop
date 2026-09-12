@@ -1274,45 +1274,100 @@ async fn fail_unclaimable_request(shared: &Arc<SharedState>, request_id: i64) {
     shared.state.message_notify.notify_waiters();
 }
 
-/// Fail job claims pinned to sessions that did not survive a restart.
+/// Reconcile job claims whose runner session did not survive a restart.
 ///
-/// Pool machines are ephemeral: a control-plane restart destroys their VMs,
-/// but `session_active_requests` is persisted. Those claims come back pinned
-/// to sessions that will never poll again, so no fresh machine can take the
-/// job — the run, and the GitHub check run it created, sit queued forever
-/// while the pool idles. Failing them once at startup makes the reported
-/// state honest and releases the concurrency slot.
-///
-/// Only claims whose session is gone are touched. A queued job that was never
-/// claimed still has its queue row and is dispatched normally, and a runner
-/// that outlived the control plane keeps a live session, so its job is left
-/// to the ordinary disconnect reaper.
+/// A claim still absent from the ready queue is irrecoverable and fails as
+/// before. A request whose logical job was already requeued by runner purge is
+/// only an abandoned attempt: settle that request without concluding the retry.
+/// The latter also migrates snapshots written by versions that requeued the job
+/// but left its request live.
 pub(crate) async fn reconcile_orphaned_claims(shared: &Arc<SharedState>) -> usize {
-    let orphaned: Vec<i64> = {
-        let inner = shared.state.inner.lock().await;
-        inner
+    let (retired, unclaimable) = {
+        let mut inner = shared.state.inner.lock().await;
+        let live_requests: std::collections::BTreeSet<i64> = inner
             .session_active_requests
             .iter()
-            .filter(|(session_id, _)| !inner.sessions.contains_key(*session_id))
+            .filter(|(session_id, _)| inner.sessions.contains_key(*session_id))
             .map(|(_, request_id)| *request_id)
-            .filter(|request_id| {
-                inner
-                    .job_requests
-                    .get(request_id)
-                    .is_some_and(|record| record.result.is_none())
+            .collect();
+        let claimed_requests: Vec<(i64, RunId, JobId)> = inner
+            .job_requests
+            .iter()
+            .filter(|(request_id, record)| {
+                record.result.is_none()
+                    && !live_requests.contains(request_id)
+                    && (record.owner_runner_id.is_some()
+                        || inner
+                            .session_active_requests
+                            .values()
+                            .any(|active| active == *request_id))
             })
-            .collect()
+            .map(|(request_id, record)| (*request_id, record.run_id, record.job_id.clone()))
+            .collect();
+
+        let mut retired = 0usize;
+        let mut unclaimable = Vec::new();
+        for (request_id, run_id, job_id) in claimed_requests {
+            let queued = inner
+                .queue
+                .iter()
+                .any(|job| job.run_id == run_id && job.job_id == job_id);
+            let terminal_status = inner
+                .runs
+                .get(&run_id)
+                .and_then(|run| run.jobs.get(&job_id).copied())
+                .filter(|status| {
+                    matches!(
+                        status,
+                        ExecutionStatus::Success
+                            | ExecutionStatus::Failure
+                            | ExecutionStatus::Cancelled
+                            | ExecutionStatus::Skipped
+                    )
+                });
+            if queued || terminal_status.is_some() {
+                runtime_scheduling::settle_request(
+                    &mut inner,
+                    request_id,
+                    terminal_status.unwrap_or(ExecutionStatus::Cancelled),
+                );
+                retired += 1;
+            } else {
+                unclaimable.push(request_id);
+            }
+        }
+        (retired, unclaimable)
     };
-    for request_id in &orphaned {
+
+    if retired > 0 {
+        let _store_guard = shared.state.store_mutation.lock().await;
+        let snapshot = {
+            let inner = shared.state.inner.lock().await;
+            crate::store::StoreSnapshot::from_inner(&inner)
+        };
+        if let Err(error) = shared.state.store.store_inner(&snapshot).await {
+            warn!(
+                retired,
+                ?error,
+                "failed to persist retired orphaned attempts"
+            );
+        }
+        warn!(
+            retired,
+            "retired orphaned attempts whose jobs were requeued"
+        );
+    }
+
+    for request_id in &unclaimable {
         fail_unclaimable_request(shared, *request_id).await;
     }
-    if !orphaned.is_empty() {
+    if !unclaimable.is_empty() {
         warn!(
-            count = orphaned.len(),
+            count = unclaimable.len(),
             "failed job claims orphaned by a control-plane restart"
         );
     }
-    orphaned.len()
+    retired + unclaimable.len()
 }
 
 pub(crate) async fn mint_dispatch_github_token(

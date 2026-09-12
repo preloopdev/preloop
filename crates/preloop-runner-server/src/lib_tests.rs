@@ -24345,6 +24345,64 @@ async fn startup_fails_claims_orphaned_by_a_restart() {
     );
 }
 
+/// Versions before the runner-purge fix put the logical job back on the queue
+/// but left its claimed request live and detached from every session. Startup
+/// must migrate that persisted shape without failing the retry.
+#[tokio::test]
+async fn startup_retires_an_orphaned_attempt_whose_job_was_requeued() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let accepted = submit_simple_run(&app).await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let job_id = JobId("build".to_owned());
+
+    let request_id = {
+        let mut inner = state.inner.lock().await;
+        let request_id = inner
+            .job_requests
+            .values()
+            .find(|record| record.run_id == run_id && record.job_id == job_id)
+            .map(|record| record.request_id)
+            .expect("queued job request");
+        let record = inner.job_requests.get_mut(&request_id).unwrap();
+        record.owner_runner_id = Some(99);
+        record.started_at = Some(SystemTime::now() - Duration::from_secs(300));
+        request_id
+    };
+
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+    let settled = crate::broker::reconcile_orphaned_claims(&shared).await;
+    assert_eq!(settled, 1);
+
+    let inner = state.inner.lock().await;
+    assert_eq!(
+        inner.job_requests[&request_id].result,
+        Some(ExecutionStatus::Cancelled),
+        "the abandoned attempt is terminal"
+    );
+    assert!(
+        inner
+            .queue
+            .iter()
+            .any(|job| job.run_id == run_id && job.job_id == job_id),
+        "the replacement attempt remains queued"
+    );
+    assert_eq!(
+        inner.runs[&run_id].jobs[&job_id],
+        ExecutionStatus::Queued,
+        "retiring the old attempt must not conclude its logical job"
+    );
+    assert!(crate::runtime_scheduling::live_runner_assignments(
+        &inner.job_requests,
+        SystemTime::now()
+    )
+    .is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // Submit-driven CI push-back (`--push`): the server verifies the tested tree,
 // creates the draft PR, and stays idempotent across replays.
