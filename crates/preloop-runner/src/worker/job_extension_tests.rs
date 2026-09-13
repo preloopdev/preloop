@@ -239,6 +239,11 @@ fn setup_workspace_derives_repo_layout_from_claim_repository() {
         assert!(resolved.contains(&repo));
         let _ = std::fs::remove_dir_all(std::env::current_dir().unwrap().join("_work").join(&repo));
     }
+    let work_root = std::env::current_dir().unwrap().join("_work");
+    for sibling in ["_temp", "_actions", "_tool"] {
+        let _ = std::fs::remove_dir(work_root.join(sibling));
+    }
+    let _ = std::fs::remove_dir(work_root);
 }
 
 #[test]
