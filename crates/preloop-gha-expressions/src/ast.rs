@@ -19,6 +19,13 @@ pub(crate) enum Expr {
         expr: Box<Expr>,
         path: Vec<String>,
     },
+    /// Dynamic index with an evaluated key, e.g. `env[matrix.target.options]`.
+    /// GitHub evaluates the bracket content as a full expression and uses
+    /// the result as the property name.
+    Index {
+        base: Box<Expr>,
+        key: Box<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
