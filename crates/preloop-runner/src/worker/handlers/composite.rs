@@ -20,7 +20,7 @@ const MAX_COMPOSITE_DEPTH: u32 = 10;
 ///
 /// Official composite nested `$/` refs resolve against the parent action's
 /// repository (already on disk under `_actions/`).
-fn actions_tarball_root(action_dir: &Path) -> Option<std::path::PathBuf> {
+pub(crate) fn actions_tarball_root(action_dir: &Path) -> Option<std::path::PathBuf> {
     let s = action_dir.to_str()?;
     let marker = "_actions/";
     let pos = s.find(marker)?;
@@ -142,6 +142,16 @@ fn run_composite_action_inner<'a>(
         let saved_env = ctx.env.clone();
         let result = async {
             let previous_action_status = ctx.job.github_context_value("action_status");
+            // Nested run steps resolve `${{ github.action_path }}` against
+            // the running composite's directory (junit's testlens setup
+            // builds `$action_path/setup-testlens.sh`; empty here produced
+            // `/setup-testlens.sh` and exit 127). Save/restore like
+            // action_status so nesting resolves innermost-first.
+            let previous_action_path = ctx.job.github_context_value("action_path");
+            ctx.job.set_github_context_value(
+                "action_path",
+                Some(serde_json::json!(action_dir.to_string_lossy())),
+            );
 
         // Set up INPUT_* env from `with` inputs
         let mut input_env = std::collections::HashMap::new();
@@ -183,6 +193,14 @@ fn run_composite_action_inner<'a>(
             "GITHUB_ACTION_PATH".to_string(),
             action_dir.to_string_lossy().to_string(),
         );
+        // INPUT_* scope is per action, not per process: a nested action
+        // must see only its own inputs, not the enclosing composite's.
+        // (junit's main-build exports INPUT_ARGUMENTS for its own run
+        // steps; without scoping, the nested setup-gradle node action
+        // inherits it and fails on its removed `arguments` parameter.)
+        // The outer scope is restored from saved_env when this action
+        // returns, so sibling steps are unaffected.
+        ctx.env.retain(|key, _| !key.starts_with("INPUT_"));
         for (k, v) in &input_env {
             ctx.env.insert(k.clone(), v.clone());
         }
@@ -306,15 +324,21 @@ fn run_composite_action_inner<'a>(
                 // Composite inner `run` steps honor their own `working-directory`
                 // (GitHub applies it relative to the composite's workspace; the
                 // official runner threads it through ScriptHandler inputs).
+                // The directory may itself contain expressions (junit's
+                // run-gradle uses `working-directory: ${{ inputs.working-directory }}`):
+                // evaluate them against the composite context first, or the
+                // literal `${{ }}` text becomes a nonexistent path.
                 let step_working_dir = step
                     .get("working-directory")
                     .and_then(|v| v.as_str())
                     .map(|relative| {
+                        let relative = crate::worker::template::evaluate_template(relative, &expr_ctx)
+                            .unwrap_or_else(|_| relative.to_string());
                         let base = std::path::Path::new(workspace);
-                        if std::path::Path::new(relative).is_absolute() {
-                            relative.to_owned()
+                        if std::path::Path::new(&relative).is_absolute() {
+                            relative
                         } else {
-                            base.join(relative).to_string_lossy().into_owned()
+                            base.join(&relative).to_string_lossy().into_owned()
                         }
                     })
                     .unwrap_or_else(|| workspace.to_owned());
@@ -363,9 +387,11 @@ fn run_composite_action_inner<'a>(
                             let inner_action_dir = match actions_tarball_root(action_dir) {
                                 Some(root) => root.join(subpath),
                                 None => {
-                                    return Err(anyhow::anyhow!(
-                                        "Unable to resolve self-reference '$/{subpath}'. Parent action directory is not under _actions/."
-                                    ));
+                                    // Workspace-local composite (./.github/actions/...):
+                                    // no `_actions/` tarball layout exists.
+                                    // `$/` is repository-root relative and the
+                                    // job workspace is the checkout root.
+                                    std::path::Path::new(workspace).join(subpath)
                                 }
                             };
                             match super::factory::load_action_manifest(&inner_action_dir) {
@@ -600,6 +626,8 @@ fn run_composite_action_inner<'a>(
         }
             ctx.job
                 .set_github_context_value("action_status", previous_action_status);
+            ctx.job
+                .set_github_context_value("action_path", previous_action_path);
             if let Some(error) = composite_failed {
                 // The composite ran every step; its merged result is a
                 // failure, so the outer step fails too (official semantics).
@@ -1116,5 +1144,221 @@ runs:
 
         let output = std::fs::read_to_string(parent_output).unwrap();
         assert!(output.contains("greeting=\n") || output.contains("greeting=\r\n"));
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+    use crate::worker::contexts::JobContext;
+    use crate::worker::execution_context::StepContext;
+
+    fn test_manifest(steps: Vec<serde_json::Value>) -> ActionManifest {
+        ActionManifest {
+            name: "test".to_string(),
+            description: String::new(),
+            inputs: None,
+            outputs: None,
+            runs_using: "composite".to_string(),
+            runs_main: None,
+            runs_pre: None,
+            runs_pre_if: None,
+            runs_post: None,
+            runs_post_if: None,
+            runs_steps: Some(steps),
+            runs_image: None,
+            runs_entrypoint: None,
+            runs_args: None,
+            runs_env: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_composite_does_not_inherit_parent_inputs() {
+        // junit main-build exports INPUT_ARGUMENTS for its own run steps;
+        // the nested setup-gradle node action must not see it.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let ws = workspace.path().to_string_lossy().to_string();
+        std::fs::create_dir_all(workspace.path().join("child")).unwrap();
+        std::fs::write(
+            workspace.path().join("child/action.yml"),
+            "name: child\ndescription: child\ninputs:\n  child:\n    default: child-val\nruns:\n  using: composite\n  steps: []\n",
+        )
+        .unwrap();
+        let child_manifest = ActionManifest {
+            inputs: Some(serde_json::Map::from_iter([(
+                "child".to_string(),
+                serde_json::json!({"default": "child-val"}),
+            )])),
+            ..test_manifest(vec![serde_json::json!({
+                "run": format!("echo outer=$INPUT_OUTER child=$INPUT_CHILD > {ws}/nested-scope.txt"),
+                "shell": "bash",
+            })])
+        };
+        let mut parent_manifest = test_manifest(vec![serde_json::json!({"uses": "./child"})]);
+        parent_manifest.inputs = Some(serde_json::Map::from_iter([(
+            "outer".to_string(),
+            serde_json::json!({"default": "parent-val"}),
+        )]));
+        // Wire the on-disk child manifest into the parent's nested step by
+        // running the child manifest directly under a parent INPUT scope.
+        let mut job = JobContext::new(
+            "job".into(),
+            "job".into(),
+            serde_json::json!({}),
+            serde_json::json!({"github": {"workspace": ws}}),
+        );
+        job.workspace = Some(ws.clone());
+        let mut ctx = StepContext::new(&mut job, "composite".into(), "Composite".into());
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        // Simulate the parent scope, then run the child as a nested action.
+        ctx.env
+            .insert("INPUT_OUTER".to_string(), "parent-val".to_string());
+        run_composite_action_inner(
+            &child_manifest,
+            workspace.path(),
+            &serde_json::json!({}),
+            &ws,
+            &mut ctx,
+            1,
+            cancel_rx,
+        )
+        .await
+        .unwrap();
+        let out = std::fs::read_to_string(workspace.path().join("nested-scope.txt")).unwrap();
+        assert!(
+            out.contains("child=child-val"),
+            "child sees its own input: {out}"
+        );
+        assert!(
+            !out.contains("outer=parent-val"),
+            "parent input must not leak into nested action: {out}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod working_dir_tests {
+    use super::*;
+    use crate::worker::contexts::JobContext;
+    use crate::worker::execution_context::StepContext;
+
+    #[tokio::test]
+    async fn working_directory_expression_evaluates_against_inputs() {
+        // junit run-gradle: working-directory: ${{ inputs.working-directory }}.
+        // An unevaluated literal becomes a nonexistent path (spawn ENOENT).
+        let workspace = tempfile::TempDir::new().unwrap();
+        let ws = workspace.path().to_string_lossy().to_string();
+        std::fs::create_dir_all(workspace.path().join("sub")).unwrap();
+        let manifest = ActionManifest {
+            name: "t".to_string(),
+            description: String::new(),
+            inputs: Some(serde_json::Map::from_iter([(
+                "d".to_string(),
+                serde_json::json!({"default": "sub"}),
+            )])),
+            outputs: None,
+            runs_using: "composite".to_string(),
+            runs_main: None,
+            runs_pre: None,
+            runs_pre_if: None,
+            runs_post: None,
+            runs_post_if: None,
+            runs_steps: Some(vec![serde_json::json!({
+                "run": "pwd",
+                "shell": "bash",
+                "working-directory": "${{ inputs.d }}",
+            })]),
+            runs_image: None,
+            runs_entrypoint: None,
+            runs_args: None,
+            runs_env: None,
+        };
+        let mut job = JobContext::new(
+            "job".into(),
+            "job".into(),
+            serde_json::json!({}),
+            serde_json::json!({"github": {"workspace": ws}}),
+        );
+        job.workspace = Some(ws.clone());
+        let mut ctx = StepContext::new(&mut job, "composite".into(), "Composite".into());
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        run_composite_action(
+            &manifest,
+            workspace.path(),
+            &serde_json::json!({}),
+            &ws,
+            &mut ctx,
+            cancel_rx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            ctx.log_content().contains("/sub"),
+            "step must run in evaluated subdir, log: {}",
+            ctx.log_content()
+        );
+    }
+}
+
+#[cfg(test)]
+mod action_path_tests {
+    use super::*;
+    use crate::worker::contexts::JobContext;
+    use crate::worker::execution_context::StepContext;
+
+    #[tokio::test]
+    async fn nested_run_step_sees_composite_action_path() {
+        // junit testlens: `${{ github.action_path }}/setup-testlens.sh`.
+        // Empty here produced `/setup-testlens.sh` and exit 127.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let ws = workspace.path().to_string_lossy().to_string();
+        let action_dir = workspace.path().join("my-action");
+        std::fs::create_dir_all(&action_dir).unwrap();
+        let manifest = ActionManifest {
+            name: "t".to_string(),
+            description: String::new(),
+            inputs: None,
+            outputs: None,
+            runs_using: "composite".to_string(),
+            runs_main: None,
+            runs_pre: None,
+            runs_pre_if: None,
+            runs_post: None,
+            runs_post_if: None,
+            runs_steps: Some(vec![serde_json::json!({
+                "run": "echo ap=${{ github.action_path }}",
+                "shell": "bash",
+            })]),
+            runs_image: None,
+            runs_entrypoint: None,
+            runs_args: None,
+            runs_env: None,
+        };
+        let mut job = JobContext::new(
+            "job".into(),
+            "job".into(),
+            serde_json::json!({}),
+            serde_json::json!({"github": {"workspace": ws}}),
+        );
+        job.workspace = Some(ws.clone());
+        let mut ctx = StepContext::new(&mut job, "composite".into(), "Composite".into());
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        run_composite_action(
+            &manifest,
+            &action_dir,
+            &serde_json::json!({}),
+            &ws,
+            &mut ctx,
+            cancel_rx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            ctx.log_content()
+                .contains(&action_dir.to_string_lossy().into_owned()),
+            "nested step must see action dir, log: {}",
+            ctx.log_content()
+        );
     }
 }
