@@ -1,0 +1,56 @@
+# Golden captures excluded from the conformance gate because the recording
+# itself is wrong, not because preloop diverges from it.
+#
+# The MITM recorder dispatches a workflow to GitHub, then starts a generic
+# `self-hosted` runner in a shared capture repo. That runner asks "got any
+# work?" — GitHub hands it whatever is at the head of the repo's queue, not
+# necessarily the job just dispatched. A scenario with a `needs:` edge only
+# queues its downstream job *after* its upstream finishes, i.e. after that
+# scenario's capture window closed. The next scenario's runner then picks up
+# the leftover. Contamination is therefore always N poisoning N+1, and only
+# from multi-job scenarios.
+#
+# Two independent proofs identified these three, and only these three, out of
+# 39 (see `benchmarks/conformance/check_corpus.py`, which now enforces both):
+#
+#   1. A GitHub orchestration plan GUID identifies exactly one workflow run,
+#      so the same GUID cannot legitimately appear in two scenario captures.
+#   2. A capture's acquired job must be a job its own workflow declares.
+#
+# Captures are preserved under `.runner-watch/quarantine/v<version>/` rather
+# than deleted: they are still real GitHub protocol output, just of the wrong
+# job, and they remain useful as wire-shape evidence.
+#
+# Removing an entry requires re-recording that scenario against a drained
+# queue. The invariants above then fail closed if contamination recurs.
+
+[["102-mask-and-secret-propagation"]]
+runner_version = "2.336.0"
+reason = "captured scenario 101's matrix job instead of its own"
+evidence = """
+Declares a single job `masking-test` with no matrix and no needs. The capture
+holds `build (ubuntu-latest, 18)` carrying matrix {os, node} and needs.setup —
+that is 101-dynamic-matrix-dataflow's downstream job. Both captures share plan
+GUID 7a371de3-9e43-4747-b288-3ef8cdda3cea.
+"""
+
+[["115-cache-v2-restore-fallback"]]
+runner_version = "2.336.0"
+reason = "captured a downstream job from scenario 113 instead of its own"
+evidence = """
+Declares a single job `cache-test` with no needs. The capture holds `download`
+with needs.upload. Shares plan GUID dbeff3c5-e45e-48ed-8ca8-0c4cd1b7db8f with
+113-artifact-v4-multi-pattern.
+"""
+
+[["163-reusable-caller"]]
+runner_version = "2.336.0"
+reason = "captured a job from scenario 161, which is not in the corpus"
+evidence = """
+Declares `call-reusable` -> `deploy`; the capture holds `job-1`. No shared plan
+GUID, because the polluting run (161-reusable-caller, per the agent name in the
+same capture) was never committed. Proven independently instead: the caller
+passes two inputs (deploy-target, enable-flags) and the callee declares
+outputs.status, so a correct capture must carry two inputs and a non-null
+jobOutputs. The golden has `inputs: {"d": []}` and `jobOutputs: null`.
+"""

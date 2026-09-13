@@ -66,7 +66,7 @@ fn job_outputs_token(outputs: &BTreeMap<String, String>) -> Option<Value> {
     }))
 }
 
-fn template_string_token(raw: &str) -> Value {
+pub(crate) fn template_string_token(raw: &str) -> Value {
     let location = || json!({"file": 1, "line": 1, "col": 1});
     let trimmed = raw.trim();
     if let Some(expression_source) = trimmed.strip_prefix("${{") {
@@ -124,7 +124,7 @@ fn template_string_token(raw: &str) -> Value {
     })
 }
 
-fn template_token(value: &Value) -> Value {
+pub(crate) fn template_token(value: &Value) -> Value {
     let location = || json!({"file": 1, "line": 1, "col": 1});
     match value {
         Value::Object(object) => {
@@ -404,14 +404,13 @@ pub fn build_agent_job_message_with_normalized_context(
     // a boolean literal) fail on first use.
     let mut resolved_env: BTreeMap<String, String> = BTreeMap::new();
     for (k, v) in &plan.env {
-        // Runtime-only context keys must survive job-build resolution:
-        // `github.workspace` is filled in by the runner at execution
-        // time (the server has no runner work directory), and the
-        // expression resolver turns a missing property into "" — so
-        // neovim's `BIN_DIR: ${{ github.workspace }}/bin` would silently
-        // collapse to `/bin` here. Leave those values untouched for the
-        // runner's step-time evaluation.
-        if v.contains("github.workspace") {
+        // Some contexts do not exist yet when the job message is built, and
+        // the resolver turns a missing property into "" rather than an error
+        // — so resolving them here silently destroys the value. Ship those
+        // untouched; `environment_variables` carries them as template tokens
+        // and the runner evaluates them at step time against the completed
+        // context. See [`resolves_after_job_build`].
+        if crate::eval::resolves_after_job_build(v) {
             resolved_env.insert(k.clone(), v.clone());
             continue;
         }
@@ -474,8 +473,11 @@ pub fn build_agent_job_message_with_normalized_context(
         .map(|(k, v)| {
             serde_json::json!({
                 "type": 2,
+                "file": 1,
+                "line": 1,
+                "col": 1,
                 "map": [{
-                    "Key": { "type": 0, "lit": k },
+                    "Key": { "type": 0, "file": 1, "line": 1, "col": 1, "lit": k },
                     "Value": template_string_token(v)
                 }]
             })
@@ -612,6 +614,27 @@ pub fn build_agent_job_message_with_normalized_context(
 
     let request_id: i64 = 1;
 
+    // Same rule as the job `env` path above: GitHub fails the workflow when a
+    // deployment-environment expression cannot be evaluated. Shipping the raw
+    // template would name the deployment `${{ … }}` in the runner and in every
+    // downstream environment record.
+    let actions_environment = match plan.environment.as_ref() {
+        Some(Value::String(name)) => Some(preloop_gha_protocol::azdo::ActionsEnvironment {
+            name: resolve_environment_name(name, &job_expr_context, &plan.name)?,
+            url: None,
+        }),
+        Some(Value::Object(map)) => match map.get("name").and_then(Value::as_str) {
+            Some(name) => Some(preloop_gha_protocol::azdo::ActionsEnvironment {
+                name: resolve_environment_name(name, &job_expr_context, &plan.name)?,
+                // The URL is evaluated by the runner after the job's steps
+                // produce it, so it ships as an unevaluated template token.
+                url: map.get("url").map(template_token),
+            }),
+            None => None,
+        },
+        _ => None,
+    };
+
     Ok(AgentJobRequestMessage {
         message_type: None,
         job_id,
@@ -634,7 +657,7 @@ pub fn build_agent_job_message_with_normalized_context(
         locked_until: "0001-01-01T00:00:00".to_owned(),
         billing_owner_id: None,
         file_table: Vec::new(),
-        defaults: Vec::new(),
+        defaults: plan.defaults.clone(),
         environment_variables,
         snapshot: None,
         condition: plan.if_condition.as_deref().map(runner_condition),
@@ -649,6 +672,7 @@ pub fn build_agent_job_message_with_normalized_context(
         job_container: plan.container.as_ref().map(template_token),
         job_service_containers: non_empty_services(plan.services.as_ref()),
         job_outputs: job_outputs_token(&plan.job_outputs),
+        actions_environment,
         enable_debugger: false,
         debugger_tunnel: None,
         debugger_welcome_message: None,
@@ -659,6 +683,25 @@ pub fn build_agent_job_message_with_normalized_context(
         preloop_snapshot_token_steps: None,
         preloop_snapshot_origin_rewrite: None,
     })
+}
+
+/// Resolve a deployment-environment name.
+///
+/// A name reading a not-yet-populated context is left as a template: unlike
+/// `env:`, the runner never evaluates this field, so the server re-resolves it
+/// once `needs` completes (`hydrate_needs_context`). Everything else is
+/// resolved here, and a failure fails the job exactly as an unevaluable
+/// `env:` value does — the raw template must never become the deployment name.
+fn resolve_environment_name(
+    name: &str,
+    context: &Context,
+    job_name: &str,
+) -> Result<String, String> {
+    if crate::eval::resolves_after_job_build(name) {
+        return Ok(name.to_owned());
+    }
+    resolve_string(name, context)
+        .map_err(|error| format!("job `{job_name}` environment failed to evaluate: {error}"))
 }
 
 /// Omit empty `services: {}` to match `EmitDefaultValue=false` behavior.
@@ -941,7 +984,7 @@ fn build_task_step(step: &crate::StepPlan, context: &Context) -> TaskStep {
             .working_directory
             .as_ref()
             .map(|wd| resolve_string(wd, context).unwrap_or_else(|_| wd.clone())),
-        timeout_in_minutes: None,
+        timeout_in_minutes: step.timeout_in_minutes,
     }
 }
 
@@ -1031,6 +1074,99 @@ jobs:
             step["reference"],
             serde_json::json!({"type": "containerRegistry", "image": "alpine:3.20"})
         );
+    }
+
+    /// A deployment environment whose expression cannot be evaluated must fail
+    /// the job, exactly as an unevaluable job `env:` value does. Shipping the
+    /// raw template would name the deployment `${{ … }}` on the wire.
+    #[test]
+    fn unevaluable_environment_expression_fails_the_job() {
+        let workflow = parse_workflow(
+            r#"
+on: push
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ nosuchfunction('prod') }}
+    steps:
+      - run: echo deploy
+"#,
+        )
+        .unwrap();
+        let plan = &crate::expand_jobs(&workflow).unwrap()[0];
+        let error = build_agent_job_message(
+            plan,
+            &serde_json::json!({"event_name": "push"}),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .expect_err("an unevaluable environment expression must fail the job");
+        assert!(
+            error.contains("environment failed to evaluate"),
+            "error must name the environment: {error}"
+        );
+    }
+
+    /// `needs` is empty when the job message is built, and the resolver
+    /// coalesces a missing property to "" — so resolving a `needs`-reading
+    /// `env:` value here would replace the upstream output with an empty
+    /// string, and nothing downstream re-resolves it. The value must survive
+    /// as a template for the runner to evaluate against the hydrated context.
+    #[test]
+    fn needs_dependent_env_survives_as_a_template() {
+        let workflow = parse_workflow(
+            r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      target: ${{ steps.x.outputs.target }}
+    steps:
+      - id: x
+        run: echo target=prod >> $GITHUB_OUTPUT
+  deploy:
+    needs: [build]
+    runs-on: ubuntu-latest
+    env:
+      TARGET: ${{ needs.build.outputs.target }}
+    steps:
+      - run: echo $TARGET
+"#,
+        )
+        .unwrap();
+        let plans = crate::expand_jobs(&workflow).unwrap();
+        let deploy = plans.iter().find(|plan| plan.base_id == "deploy").unwrap();
+        let message = build_agent_job_message(
+            deploy,
+            &serde_json::json!({"event_name": "push"}),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            message
+                .variables
+                .get("TARGET")
+                .and_then(|variable| variable.value.clone()),
+            Some("${{ needs.build.outputs.target }}".to_owned()),
+            "a needs-dependent env value must not be resolved against the empty needs context"
+        );
+        // A deferred value must reach the wire as an *expression* token, which
+        // is what makes the runner evaluate it against the hydrated context.
+        let target = message
+            .environment_variables
+            .iter()
+            .find_map(|entry| {
+                let pair = entry.get("map")?.as_array()?.first()?;
+                (pair.get("Key")?.get("lit")?.as_str()? == "TARGET").then(|| pair["Value"].clone())
+            })
+            .expect("TARGET must be present on the wire");
+        assert_eq!(target["type"], 3, "expected an expression token: {target}");
+        assert_eq!(target["expr"], "needs.build.outputs.target");
     }
 
     /// Job/workflow-level `env:` must reach the wire as

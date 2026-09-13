@@ -119,6 +119,14 @@ pub struct AgentJobRequestMessage {
     #[serde(rename = "jobOutputs", default)]
     pub job_outputs: Option<serde_json::Value>,
 
+    /// Deployment environment metadata (`actionsEnvironment`).
+    #[serde(
+        rename = "actionsEnvironment",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub actions_environment: Option<ActionsEnvironment>,
+
     /// Whether the debugger is enabled for this job.
     /// Mirrors `AgentJobRequestMessage.EnableDebugger` in `actions/runner` v2.335.0+.
     #[serde(rename = "enableDebugger", default, skip_serializing_if = "is_false")]
@@ -286,10 +294,39 @@ pub struct DebuggerTunnelInfo {
     pub tunnel_id: String,
     #[serde(rename = "clusterId", default)]
     pub cluster_id: String,
+
     #[serde(rename = "hostToken", default)]
     pub host_token: String,
     #[serde(rename = "port", default)]
     pub port: u16,
+}
+/// Read an unsigned integer from the TemplateToken shapes used by GitHub.
+///
+/// Live runner payloads use `num`; older captures and compatibility payloads
+/// also use `number`, `lit`, a JSON number, or a numeric string.
+pub fn number_from_template_token(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Number(_) => value.as_u64(),
+        serde_json::Value::String(value) => value.trim().parse().ok(),
+        serde_json::Value::Object(map) => map
+            .get("num")
+            .or_else(|| map.get("number"))
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| {
+                map.get("lit")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| value.trim().parse().ok())
+            }),
+        _ => None,
+    }
+}
+
+/// Deployment environment metadata (`actionsEnvironment`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ActionsEnvironment {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<serde_json::Value>,
 }
 
 /// Task step — a single unit of work within a job.
@@ -382,7 +419,19 @@ impl Serialize for TaskStep {
         if let Some(working_directory) = &self.working_directory {
             map.serialize_entry("workingDirectory", working_directory)?;
         }
-        map.serialize_entry("timeoutInMinutes", &self.timeout_in_minutes)?;
+        // The parser model does not retain YAML source spans, so generated
+        // tokens use synthetic coordinates. The runner consumes only `num`;
+        // preserving real line/column data requires source-span plumbing.
+        let timeout_in_minutes = self.timeout_in_minutes.map(|value| {
+            serde_json::json!({
+                "type": 6,
+                "file": 1,
+                "line": 0,
+                "col": 0,
+                "num": value
+            })
+        });
+        map.serialize_entry("timeoutInMinutes", &timeout_in_minutes)?;
         map.end()
     }
 }
@@ -444,10 +493,21 @@ impl<'de> Deserialize<'de> for TaskStep {
                 .get("workingDirectory")
                 .and_then(|v| v.as_str())
                 .map(str::to_owned),
+            // A value above `u32::MAX` is malformed, not a timeout. Truncating
+            // it would turn `4294967296` into `0` and silently change the
+            // step's deadline, so reject the message instead.
             timeout_in_minutes: obj
                 .get("timeoutInMinutes")
-                .and_then(|v| v.as_u64())
-                .map(|n| n as u32),
+                .and_then(number_from_template_token)
+                .map(|value| {
+                    u32::try_from(value).map_err(|_| {
+                        serde::de::Error::custom(format!(
+                            "timeoutInMinutes {value} exceeds the maximum of {}",
+                            u32::MAX
+                        ))
+                    })
+                })
+                .transpose()?,
         })
     }
 }
@@ -819,6 +879,38 @@ mod tests {
         assert_eq!(
             step.inputs.get("script"),
             Some(&"${{ format('echo {0}', github.repository) }}".to_owned())
+        );
+    }
+
+    #[test]
+    fn timeout_token_reader_accepts_all_numeric_shapes() {
+        for token in [
+            serde_json::json!(5),
+            serde_json::json!("5"),
+            serde_json::json!({"num": 5}),
+            serde_json::json!({"number": 5}),
+            serde_json::json!({"lit": "5"}),
+        ] {
+            assert_eq!(number_from_template_token(&token), Some(5));
+        }
+    }
+
+    /// Truncating an out-of-range timeout would turn `4294967296` into `0` and
+    /// silently redefine the step's deadline, so the message is rejected.
+    #[test]
+    fn out_of_range_timeout_is_rejected_rather_than_truncated() {
+        let wire = serde_json::json!({
+            "type": "action",
+            "reference": {"type": "script"},
+            "id": uuid::Uuid::nil(),
+            "name": "step",
+            "timeoutInMinutes": {"type": 6, "num": 4294967296u64},
+        });
+        let error = serde_json::from_value::<TaskStep>(wire)
+            .expect_err("a timeout above u32::MAX must not deserialize");
+        assert!(
+            error.to_string().contains("4294967296"),
+            "error must name the offending value: {error}"
         );
     }
 

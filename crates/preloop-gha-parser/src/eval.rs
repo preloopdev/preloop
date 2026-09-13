@@ -278,6 +278,9 @@ const CTX_STEP_IF: &[&str] = &[
     "success",
     "hashfiles",
 ];
+const CTX_STEP_TIMEOUT: &[&str] = &[
+    "github", "inputs", "vars", "needs", "strategy", "matrix", "env",
+];
 const CTX_STEP_ENV: &[&str] = &[
     "github",
     "inputs",
@@ -316,6 +319,26 @@ fn validate_container_expressions(value: &Value) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_run_defaults(
+    defaults: &crate::models::JobDefaults,
+    label: &str,
+) -> Result<(), ParserError> {
+    let Some(run) = &defaults.run else {
+        return Ok(());
+    };
+    for (field, value) in [
+        ("shell", run.shell.as_ref()),
+        ("working-directory", run.working_directory.as_ref()),
+    ] {
+        if let Some(value) = value {
+            validate_expressions_in_string(value, false, Some(CTX_JOB_DEFAULTS_RUN)).map_err(
+                |error| ParserError::InvalidExpression(format!("{label}.run.{field}: {error}")),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Validate all `${{ }}` expressions in a workflow.
 pub fn validate_workflow_expressions(workflow: &Workflow) -> Result<(), ParserError> {
     if let Some(run_name) = &workflow.run_name {
@@ -324,6 +347,9 @@ pub fn validate_workflow_expressions(workflow: &Workflow) -> Result<(), ParserEr
     }
     validate_env_expressions(&workflow.env, Some(CTX_WORKFLOW_ENV))
         .map_err(ParserError::InvalidExpression)?;
+    if let Some(defaults) = &workflow.defaults {
+        validate_run_defaults(defaults, "workflow defaults")?;
+    }
 
     if let Some(concurrency) = &workflow.concurrency {
         validate_expressions_in_string(&concurrency.group, false, Some(CTX_WORKFLOW_CONCURRENCY))
@@ -425,28 +451,7 @@ pub fn validate_workflow_expressions(workflow: &Workflow) -> Result<(), ParserEr
             }
         }
         if let Some(defaults) = &job.defaults {
-            if let Some(run) = &defaults.run {
-                if let Some(shell) = &run.shell {
-                    validate_expressions_in_string(shell, false, Some(CTX_JOB_DEFAULTS_RUN))
-                        .map_err(|e| {
-                            ParserError::InvalidExpression(format!(
-                                "job `{job_id}` defaults.run.shell: {e}"
-                            ))
-                        })?;
-                }
-                if let Some(working_directory) = &run.working_directory {
-                    validate_expressions_in_string(
-                        working_directory,
-                        false,
-                        Some(CTX_JOB_DEFAULTS_RUN),
-                    )
-                    .map_err(|e| {
-                        ParserError::InvalidExpression(format!(
-                            "job `{job_id}` defaults.run.working-directory: {e}"
-                        ))
-                    })?;
-                }
-            }
+            validate_run_defaults(defaults, &format!("job `{job_id}` defaults"))?;
         }
         for (output_name, output) in &job.outputs {
             validate_value_expressions(output, Some(CTX_RUNNER)).map_err(|e| {
@@ -481,6 +486,17 @@ pub fn validate_workflow_expressions(workflow: &Workflow) -> Result<(), ParserEr
                     |e| {
                         ParserError::InvalidExpression(format!(
                             "job `{job_id}` {step_ref} continue-on-error: {e}"
+                        ))
+                    },
+                )?;
+            }
+            if let Some(crate::models::DeferredNumber::Expression(expression)) =
+                &step.timeout_minutes
+            {
+                validate_expressions_in_string(expression, false, Some(CTX_STEP_TIMEOUT)).map_err(
+                    |e| {
+                        ParserError::InvalidExpression(format!(
+                            "job `{job_id}` {step_ref} timeout-minutes: {e}"
                         ))
                     },
                 )?;
@@ -544,6 +560,11 @@ pub fn build_context(
     ctx.insert("matrix", Value::Object(matrix_value));
 
     ctx.insert("strategy", strategy.clone());
+    // `needs` is empty here by construction: the upstream jobs have not run
+    // when a job message is built. Because the resolver coalesces a missing
+    // property to "" instead of erroring, anything resolved against this
+    // context that reads `needs.*` silently becomes "". Callers must gate on
+    // [`resolves_after_job_build`] rather than resolving blindly.
     ctx.insert("needs", Value::Object(Map::new()));
 
     let secrets_value: Map<String, Value> = secrets
@@ -556,6 +577,25 @@ pub fn build_context(
         inputs.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     ctx.insert("inputs", Value::Object(inputs_value));
     ctx
+}
+
+/// Whether a `${{ }}` value reads a context that is not yet populated when the
+/// job message is built, and must therefore be left as a template for a later
+/// evaluation.
+///
+/// Two such contexts exist:
+///
+/// * `needs.*` — the upstream jobs have not run, so [`build_context`] supplies
+///   an empty map (the server fills the real one in once they complete).
+/// * `github.workspace` — the server has no runner work directory; only the
+///   runner knows the path.
+///
+/// Neither produces an evaluation *error*: the resolver coalesces a missing
+/// property to "". Resolving early therefore replaces a real value with an
+/// empty string, with nothing to catch it — which is exactly why this
+/// predicate exists instead of a `let _ = resolve(...)` at each call site.
+pub fn resolves_after_job_build(value: &str) -> bool {
+    value.contains("github.workspace") || value.contains("needs.") || value.contains("needs[")
 }
 
 #[cfg(test)]

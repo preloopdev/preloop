@@ -621,7 +621,6 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
         };
 
         // F029: Split wire ID (GUID) from context name (human-readable key).
-        // Live GitHub sends both `id` (GUID) and `contextName` (__run, __run_2, etc.).
         // aksh-native payloads may only have `id` (which IS the context name).
         let raw_context_name = step.get("contextName").and_then(|v| v.as_str());
         let raw_id = step.get("id").and_then(|v| v.as_str());
@@ -667,7 +666,9 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
             .map(bool_from_template_token)
             .unwrap_or(false);
 
-        let timeout_minutes = step.get("timeoutInMinutes").and_then(|v| v.as_u64());
+        let timeout_minutes = step
+            .get("timeoutInMinutes")
+            .and_then(preloop_gha_protocol::azdo::number_from_template_token);
 
         // Official ActionStep.Background (DTPipelines) — wire `background: true`.
         let is_background = step
@@ -953,38 +954,46 @@ fn parse_job_defaults(job_message: &serde_json::Value) -> (Option<String>, Optio
         None => return (None, None),
     };
 
-    // defaults can be an array of typed-dict entries or a plain object
-    let run_value = if let Some(arr) = defaults.as_array() {
-        // Walk the array looking for a "run" key in each typed-dict map
-        arr.iter().find_map(|entry| {
-            let map = entry.get("map").and_then(|v| v.as_array())?;
-            map.iter().find_map(|kv| {
+    // `defaults` is an ordered array of typed-dict entries, outermost first:
+    // GitHub sends `[workflow-level, job-level]`. Later entries override
+    // earlier ones per key, so the array must be folded in order — taking the
+    // first match instead silently discards a job-level `defaults.run` that
+    // overrides the workflow-level one. A plain object is the single-scope
+    // form.
+    let mut working_dir = None;
+    let mut shell = None;
+    let mut apply = |run_value: &serde_json::Value| {
+        let run_map = extract_template_map(run_value);
+        if let Some(value) = run_map.get("working-directory") {
+            working_dir = Some(value.clone());
+        }
+        if let Some(value) = run_map.get("shell") {
+            shell = Some(value.clone());
+        }
+    };
+
+    if let Some(entries) = defaults.as_array() {
+        for entry in entries {
+            let Some(map) = entry.get("map").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for kv in map {
                 let key = kv
                     .get("Key")
                     .or_else(|| kv.get("key"))
-                    .and_then(template_scalar)?;
-                if key == "run" {
-                    kv.get("Value").or_else(|| kv.get("value")).cloned()
-                } else {
-                    None
+                    .and_then(template_scalar);
+                if key.as_deref() != Some("run") {
+                    continue;
                 }
-            })
-        })
-    } else if let Some(obj) = defaults.as_object() {
-        obj.get("run").cloned()
-    } else {
-        None
-    };
+                if let Some(run_value) = kv.get("Value").or_else(|| kv.get("value")) {
+                    apply(run_value);
+                }
+            }
+        }
+    } else if let Some(run_value) = defaults.as_object().and_then(|obj| obj.get("run")) {
+        apply(run_value);
+    }
 
-    let run_value = match run_value {
-        Some(v) => v,
-        None => return (None, None),
-    };
-
-    // Extract working-directory and shell from the run value
-    let run_map = extract_template_map(&run_value);
-    let working_dir = run_map.get("working-directory").cloned();
-    let shell = run_map.get("shell").cloned();
     (working_dir, shell)
 }
 

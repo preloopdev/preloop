@@ -65,6 +65,38 @@ fn validate_reusable_workflow_tree(
     Ok(())
 }
 
+fn defaults_run_token(run: &crate::DefaultsRun) -> Value {
+    let mut map = Vec::new();
+    if let Some(shell) = &run.shell {
+        map.push(serde_json::json!({
+            "Key": { "type": 0, "file": 1, "line": 1, "col": 1, "lit": "shell" },
+            "Value": crate::job_builder::template_token(&Value::String(shell.clone()))
+        }));
+    }
+    if let Some(wd) = &run.working_directory {
+        map.push(serde_json::json!({
+            "Key": { "type": 0, "file": 1, "line": 1, "col": 1, "lit": "working-directory" },
+            "Value": crate::job_builder::template_token(&Value::String(wd.clone()))
+        }));
+    }
+    serde_json::json!({
+        "type": 2,
+        "file": 1,
+        "line": 1,
+        "col": 1,
+        "map": [{
+            "Key": { "type": 0, "file": 1, "line": 1, "col": 1, "lit": "run" },
+            "Value": {
+                "type": 2,
+                "file": 1,
+                "line": 1,
+                "col": 1,
+                "map": map
+            }
+        }]
+    })
+}
+
 /// GitHub display name for one expanded job.
 ///
 /// When the job declares `name:`, expressions are resolved against the
@@ -250,7 +282,17 @@ fn resolve_deferred_number(
 ) -> Result<Option<u64>, ParserError> {
     let Some(value) = value else { return Ok(None) };
     match value {
-        DeferredNumber::Literal(value) => Ok(Some(*value)),
+        DeferredNumber::Literal(_) | DeferredNumber::Float(_) => {
+            value.literal().map(Some).ok_or_else(|| {
+                ParserError::InvalidExpression(format!(
+                    "expected a whole number, got {}",
+                    match value {
+                        DeferredNumber::Float(value) => value.to_string(),
+                        _ => unreachable!("literal variants only"),
+                    }
+                ))
+            })
+        }
         DeferredNumber::Expression(expression) => {
             let result = eval_expression(expression, &expression_context(matrix, inputs, None))
                 .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
@@ -261,6 +303,36 @@ fn resolve_deferred_number(
             })
         }
     }
+}
+fn resolve_step_timeout(
+    job_id: &str,
+    step_label: &str,
+    value: Option<&DeferredNumber>,
+    matrix: &IndexMap<String, Value>,
+    inputs: Option<&BTreeMap<String, Value>>,
+    matrix_deferred: bool,
+) -> Result<Option<u32>, ParserError> {
+    let resolved = if matrix_deferred {
+        match value {
+            Some(value @ (DeferredNumber::Literal(_) | DeferredNumber::Float(_))) => {
+                value.literal()
+            }
+            Some(DeferredNumber::Expression(_)) | None => None,
+        }
+    } else {
+        resolve_deferred_number(value, matrix, inputs)?
+    };
+    let Some(value) = resolved else {
+        return Ok(None);
+    };
+    if !(1..=360).contains(&value) {
+        return Err(ParserError::InvalidStepTimeout {
+            job_id: job_id.to_owned(),
+            step: step_label.to_owned(),
+            message: format!("expected a value from 1 through 360, got {value}"),
+        });
+    }
+    Ok(Some(value as u32))
 }
 
 /// Omit empty `services: {}` to match `EmitDefaultValue=false` behavior.
@@ -451,6 +523,7 @@ pub fn expand_jobs(workflow: &Workflow) -> Result<Vec<JobPlan>, ParserError> {
                 env,
                 oidc_environment,
                 workflow.permissions.as_ref(),
+                workflow.defaults.as_ref(),
                 None,
                 matrix_deferred,
             )?;
@@ -473,6 +546,7 @@ fn job_plan_from_job(
     env: BTreeMap<String, String>,
     oidc_environment: Option<String>,
     workflow_permissions: Option<&Value>,
+    workflow_defaults: Option<&JobDefaults>,
     inputs: Option<&BTreeMap<String, Value>>,
     matrix_deferred: bool,
 ) -> Result<JobPlan, ParserError> {
@@ -501,10 +575,10 @@ fn job_plan_from_job(
         resolve_deferred_bool(job.strategy.fail_fast.as_ref(), &matrix, inputs, true)?
     };
     let max_parallel = if matrix_deferred {
-        match job.strategy.max_parallel {
-            Some(DeferredNumber::Literal(value)) => Some(value),
-            _ => None,
-        }
+        job.strategy
+            .max_parallel
+            .as_ref()
+            .and_then(DeferredNumber::literal)
     } else {
         resolve_deferred_number(job.strategy.max_parallel.as_ref(), &matrix, inputs)?
     };
@@ -512,8 +586,33 @@ fn job_plan_from_job(
         .steps
         .iter()
         .cloned()
-        .map(|step| step_plan(step, &job.defaults, &matrix, inputs, matrix_deferred))
+        .enumerate()
+        .map(|(step_index, step)| {
+            step_plan(
+                job_id,
+                step_index,
+                step,
+                InheritedDefaults {
+                    job: job.defaults.as_ref(),
+                    workflow: workflow_defaults,
+                },
+                &matrix,
+                inputs,
+                matrix_deferred,
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
+    let mut defaults = Vec::new();
+    if let Some(wf_defaults) = workflow_defaults {
+        if let Some(run) = &wf_defaults.run {
+            defaults.push(defaults_run_token(run));
+        }
+    }
+    if let Some(job_defaults) = &job.defaults {
+        if let Some(run) = &job_defaults.run {
+            defaults.push(defaults_run_token(run));
+        }
+    }
     let name = resolved_job_name(job.name.as_deref(), &expanded_id, &matrix, inputs);
     Ok(JobPlan {
         id: JobId(expanded_id),
@@ -552,6 +651,8 @@ fn job_plan_from_job(
         permissions: resolve_permissions(job.permissions.as_ref(), workflow_permissions),
         oidc_environment,
         oidc_job_workflow_ref: None,
+        environment: job.environment.clone(),
+        defaults,
         concurrency_group,
         concurrency_cancel_in_progress,
         concurrency_queue,
@@ -861,6 +962,8 @@ fn expand_jobs_with_reusables_internal(
                     ),
                     oidc_environment: None,
                     oidc_job_workflow_ref: None,
+                    environment: job.environment.clone(),
+                    defaults: Vec::new(),
                     // Caller/embedded concurrency is gated as a JobSet from
                     // ReusableCallMetadata at runtime; the placeholder node
                     // itself must not take a job-level gate.
@@ -905,6 +1008,7 @@ fn expand_jobs_with_reusables_internal(
                 env,
                 oidc_environment,
                 workflow.permissions.as_ref(),
+                workflow.defaults.as_ref(),
                 inputs,
                 matrix_deferred,
             )?;
@@ -1173,26 +1277,54 @@ fn normalize_reusable_path(uses: &str) -> String {
         .into_owned()
 }
 
+/// The `defaults.run` levels a step inherits from, outermost last.
+///
+/// Precedence per key, matching GitHub: step > job > workflow. Both levels are
+/// also emitted on the wire `defaults` field for the official runner; this
+/// struct is what flattens them onto preloop's own `StepPlan`.
+#[derive(Clone, Copy)]
+struct InheritedDefaults<'a> {
+    job: Option<&'a JobDefaults>,
+    workflow: Option<&'a JobDefaults>,
+}
+
+impl InheritedDefaults<'_> {
+    fn pick(&self, field: fn(&crate::DefaultsRun) -> Option<String>) -> Option<String> {
+        [self.job, self.workflow]
+            .into_iter()
+            .flatten()
+            .filter_map(|defaults| defaults.run.as_ref())
+            .find_map(field)
+    }
+}
+
 fn step_plan(
+    job_id: &str,
+    step_index: usize,
     step: Step,
-    defaults: &Option<JobDefaults>,
+    defaults: InheritedDefaults<'_>,
     matrix: &IndexMap<String, Value>,
     inputs: Option<&BTreeMap<String, Value>>,
     matrix_deferred: bool,
 ) -> Result<StepPlan, ParserError> {
-    // Merge job-level defaults into step — step values take precedence.
-    let working_directory = step.working_directory.or_else(|| {
-        defaults
-            .as_ref()
-            .and_then(|d| d.run.as_ref())
-            .and_then(|r| r.working_directory.clone())
-    });
-    let shell = step.shell.or_else(|| {
-        defaults
-            .as_ref()
-            .and_then(|d| d.run.as_ref())
-            .and_then(|r| r.shell.clone())
-    });
+    let step_label = step
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("step #{step_index}"));
+    let timeout_in_minutes = resolve_step_timeout(
+        job_id,
+        &step_label,
+        step.timeout_minutes.as_ref(),
+        matrix,
+        inputs,
+        matrix_deferred,
+    )?;
+    let working_directory = step
+        .working_directory
+        .or_else(|| defaults.pick(|run| run.working_directory.clone()));
+    let shell = step
+        .shell
+        .or_else(|| defaults.pick(|run| run.shell.clone()));
     Ok(StepPlan {
         id: step.id,
         name: step.name,
@@ -1215,6 +1347,7 @@ fn step_plan(
                 resolve_deferred_bool(Some(value), matrix, inputs, false).map(Some)
             }
         })?,
+        timeout_in_minutes,
     })
 }
 
@@ -1359,6 +1492,7 @@ pub fn expand_deferred_matrix_job(
             env,
             oidc_environment,
             workflow.permissions.as_ref(),
+            workflow.defaults.as_ref(),
             inputs,
             false,
         )?;

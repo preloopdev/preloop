@@ -516,6 +516,41 @@ fn preseed_private_actions(
     Ok(())
 }
 
+/// Pick the `target/{release,debug}` build of `name` that was built most
+/// recently, and say which one was chosen.
+///
+/// Preferring `release` merely because the file *exists* silently pins the
+/// harness to a stale artifact: a months-old release binary outranks a debug
+/// build from seconds ago, so an e2e run reports on code that is not in the
+/// working tree. Comparing mtimes keeps the speed win when release is current
+/// without the staleness trap, and the log line makes the choice auditable.
+fn select_built_binary(name: &str) -> anyhow::Result<String> {
+    let release = format!("target/release/{name}");
+    let debug = format!("target/debug/{name}");
+    let mtime = |path: &str| {
+        std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok()
+    };
+    let chosen = match (mtime(&release), mtime(&debug)) {
+        (Some(r), Some(d)) => {
+            if r >= d {
+                release
+            } else {
+                debug
+            }
+        }
+        (Some(_), None) => release,
+        (None, Some(_)) => debug,
+        (None, None) => anyhow::bail!(
+            "{name} not built: run `cargo build -p preloop-runner-server -p preloop-runner-client` \
+             (looked in target/release and target/debug)"
+        ),
+    };
+    println!("conformance: using {chosen}");
+    Ok(chosen)
+}
+
 async fn run_runner_e2e(
     runner_bin: PathBuf,
     workflow: PathBuf,
@@ -526,25 +561,16 @@ async fn run_runner_e2e(
     let server_url = format!("http://127.0.0.1:{port}");
     let listen = format!("127.0.0.1:{port}");
 
-    // Build the exact server/client binaries this command executes. Selecting
-    // whichever target artifact happens to exist (or has the newest mtime)
-    // can silently exercise code from another checkout state.
-    let build_status = Command::new("cargo")
-        .args([
-            "build",
-            "--locked",
-            "-p",
-            "preloop-runner-server",
-            "-p",
-            "preloop-runner-client",
-        ])
-        .status()
-        .await?;
-    if !build_status.success() {
-        anyhow::bail!("failed to build conformance server/client binaries");
+    // Check binaries
+    if !runner_bin.exists() {
+        anyhow::bail!("runner binary not found: {}", runner_bin.display());
     }
-    let server_bin = "target/debug/preloop-server";
-    let client_bin = "target/debug/preloop-runner-client";
+    if !workflow.exists() {
+        anyhow::bail!("workflow file not found: {}", workflow.display());
+    }
+
+    let server_bin = select_built_binary("preloop-server")?;
+    let client_bin = select_built_binary("preloop-runner-client")?;
 
     // Temporary directories
     let temp_dir = tempfile::TempDir::new()?;
@@ -584,23 +610,36 @@ async fn run_runner_e2e(
         .user_agent("preloop-conformance")
         .build()
         .expect("HTTP client");
-    let mut ready = false;
-    let health_url = format!("{server_url}/healthz");
-    for _ in 0..30 {
-        if client
-            .get(&health_url)
-            .send()
-            .await
-            .is_ok_and(|response| response.status().is_success())
-        {
-            ready = true;
-            break;
+    // Fresh state generates the runner-session and OIDC RSA keypairs before
+    // the listener binds. Prime generation is nondeterministic and routinely
+    // exceeds a second or two even on an idle host, so a short window makes
+    // this harness flaky for reasons unrelated to what it is testing. Match
+    // the minute-scale allowance `benchmarks/conformance/run.sh` uses, and
+    // fail loudly with the server's exit status when it actually died.
+    let ready = match tokio::time::timeout(Duration::from_secs(60), async {
+        for _ in 0..600 {
+            if let Some(status) = server.try_wait()? {
+                anyhow::bail!("preloop-runner-server exited during startup ({status})");
+            }
+            if client.get(&server_url).send().await.is_ok() {
+                return Ok::<bool, anyhow::Error>(true);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+        Ok::<bool, anyhow::Error>(false)
+    })
+    .await
+    {
+        Ok(Ok(ready)) => ready,
+        Ok(Err(error)) => {
+            let _ = server.kill().await;
+            return Err(error);
+        }
+        Err(_) => false,
+    };
     if !ready {
         let _ = server.kill().await;
-        anyhow::bail!("preloop-runner-server failed to start on port {port}");
+        anyhow::bail!("preloop-runner-server did not become ready on port {port} within 60s");
     }
 
     // Configure the runner
