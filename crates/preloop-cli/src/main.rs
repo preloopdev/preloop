@@ -552,6 +552,29 @@ enum Command {
     /// Build a fresh packed microVM artifact for release automation.
     #[command(hide = true)]
     BuildGolden(BuildGoldenArgs),
+
+    /// Print the exact packed-golden artifact path the pool computes for a
+    /// base image (stem + server-side environment fingerprint). Campaign
+    /// harnesses symlink a prebuilt `.smolmachine` there so the pool
+    /// restores it instead of rebuilding from a registry pull.
+    #[command(hide = true)]
+    GoldenPath(GoldenPathArgs),
+}
+
+#[derive(Debug, Parser)]
+struct GoldenPathArgs {
+    /// State home holding `vms/`. Overrides PRELOOP_HOME.
+    #[arg(long, env = "PRELOOP_HOME")]
+    home: Option<PathBuf>,
+
+    /// OCI base image. Explicit CLI input overrides
+    /// PRELOOP_RUNNER_BASE_IMAGE.
+    #[arg(
+        long,
+        env = "PRELOOP_RUNNER_BASE_IMAGE",
+        default_value = DEFAULT_BASE_IMAGE
+    )]
+    base_image: String,
 }
 
 #[derive(Debug, Parser)]
@@ -810,6 +833,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve(args) => cmd_engine(args, observability.clone()).await,
         Command::Engine => cmd_engine(ServeArgs::default(), observability.clone()).await,
         Command::BuildGolden(args) => cmd_build_golden(args).await,
+        Command::GoldenPath(args) => cmd_golden_path(args).await,
         Command::Update(args) => update::run(args).await,
         // Local configuration commands must not spawn the engine.
         Command::Setup(args) => github_setup::cmd_setup(args).await,
@@ -840,6 +864,7 @@ async fn main() -> anyhow::Result<()> {
                     | Command::Serve(_)
                     | Command::Engine
                     | Command::BuildGolden(_)
+                    | Command::GoldenPath(_)
                     | Command::Version
                     | Command::Setup(_)
                     | Command::Doctor(_)
@@ -860,6 +885,22 @@ async fn main() -> anyhow::Result<()> {
 
 fn systemd_socket_activation_requested() -> bool {
     cfg!(target_os = "linux") && std::env::var_os("LISTEN_FDS").is_some()
+}
+
+async fn cmd_golden_path(args: GoldenPathArgs) -> anyhow::Result<()> {
+    // Same stem construction as the pool config: home/vms/preloop-<base>-<arch>.
+    let home = args.home.map(Ok).unwrap_or_else(|| {
+        std::env::var_os("PRELOOP_HOME")
+            .map(PathBuf::from)
+            .context("PRELOOP_HOME is not set (pass --home)")
+    })?;
+    let stem = home.join("vms").join(format!(
+        "preloop-{}-{}",
+        args.base_image.replace(['/', ':', '@'], "-"),
+        std::env::consts::ARCH
+    ));
+    println!("{}", artifact_payload(&stem, &args.base_image).display());
+    Ok(())
 }
 
 async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {

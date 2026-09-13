@@ -1,0 +1,200 @@
+2026-09-12T03:13:34.0615844Z Current runner version: '2.335.1'
+2026-09-12T03:13:34.0615844Z Runner name: 'repro-packfile-0-1'
+2026-09-12T03:13:34.0615844Z Runner group name: 'Default'
+2026-09-12T03:13:34.0615844Z Machine name: 'container'
+2026-09-12T03:13:34.0615844Z ##[group]GITHUB_TOKEN Permissions
+2026-09-12T03:13:34.0615844Z Contents: read
+2026-09-12T03:13:34.0615844Z Metadata: read
+2026-09-12T03:13:34.0615844Z Packages: read
+2026-09-12T03:13:34.0615844Z ##[endgroup]
+2026-09-12T03:13:34.0615844Z Secret source: Actions
+2026-09-12T03:13:34.0615844Z Prepare workflow directory
+2026-09-12T03:13:34.0615844Z Prepare all required actions
+2026-09-12T03:13:34.0615844Z Complete job name: full
+2026-09-12T03:13:34.1461921Z Syncing repository: snapshots/4c2bcb98-43b9-43aa-8bd0-3d448169dbf9
+2026-09-12T03:13:34.1462456Z ##[group]Getting Git version info
+2026-09-12T03:13:34.1462815Z Working directory is '/var/lib/preloop-runner/_work/default/default'
+2026-09-12T03:13:34.1486266Z [command]/usr/bin/git version
+2026-09-12T03:13:34.1559409Z git version 2.54.0
+2026-09-12T03:13:34.1566520Z ##[endgroup]
+2026-09-12T03:13:34.1571416Z Temporarily overriding HOME='/var/lib/preloop-runner/_work/_temp/57f391a6-e240-47d0-8aff-1e4afe324f32' before making global git config changes
+2026-09-12T03:13:34.1571835Z Adding repository directory to the temporary git global config as a safe directory
+2026-09-12T03:13:34.1573055Z [command]/usr/bin/git config --global --add safe.directory /var/lib/preloop-runner/_work/default/default
+2026-09-12T03:13:34.1587147Z Deleting the contents of '/var/lib/preloop-runner/_work/default/default'
+2026-09-12T03:13:34.1588349Z ##[group]Initializing the repository
+2026-09-12T03:13:34.1589923Z [command]/usr/bin/git init /var/lib/preloop-runner/_work/default/default
+2026-09-12T03:13:34.1627305Z hint: Using 'master' as the name for the initial branch. This default branch name
+2026-09-12T03:13:34.1627732Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+2026-09-12T03:13:34.1628120Z hint: to use in all of your new repositories, which will suppress this warning,
+2026-09-12T03:13:34.1628493Z hint: call:
+2026-09-12T03:13:34.1628849Z hint:
+2026-09-12T03:13:34.1629209Z hint: 	git config --global init.defaultBranch <name>
+2026-09-12T03:13:34.1629570Z hint:
+2026-09-12T03:13:34.1629924Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+2026-09-12T03:13:34.1630300Z hint: 'development'. The just-created branch can be renamed via this command:
+2026-09-12T03:13:34.1630664Z hint:
+2026-09-12T03:13:34.1631019Z hint: 	git branch -m <name>
+2026-09-12T03:13:34.1631371Z hint:
+2026-09-12T03:13:34.1631722Z hint: Disable this message with "git config set advice.defaultBranchName false"
+2026-09-12T03:13:34.1632169Z Initialized empty Git repository in /var/lib/preloop-runner/_work/default/default/.git/
+2026-09-12T03:13:34.1632966Z [command]/usr/bin/git remote add origin http://127.0.0.1:9198/snapshots/4c2bcb98-43b9-43aa-8bd0-3d448169dbf9
+2026-09-12T03:13:34.1641846Z ##[endgroup]
+2026-09-12T03:13:34.1642224Z ##[group]Disabling automatic garbage collection
+2026-09-12T03:13:34.1642999Z [command]/usr/bin/git config --local gc.auto 0
+2026-09-12T03:13:34.1649898Z ##[endgroup]
+2026-09-12T03:13:34.1650274Z ##[group]Setting up auth
+2026-09-12T03:13:34.1652034Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-09-12T03:13:34.1659618Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-09-12T03:13:34.1807718Z [command]/usr/bin/git config --local --name-only --get-regexp http\.http\:\/\/127\.0\.0\.1\:9198\/\.extraheader
+2026-09-12T03:13:34.1816764Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.http\:\/\/127\.0\.0\.1\:9198\/\.extraheader' && git config --local --unset-all 'http.http://127.0.0.1:9198/.extraheader' || :"
+2026-09-12T03:13:34.1871526Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-09-12T03:13:34.1879997Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-09-12T03:13:34.1936197Z [command]/usr/bin/git config --local http.http://127.0.0.1:9198/.extraheader AUTHORIZATION: basic ***
+2026-09-12T03:13:34.1947614Z ##[endgroup]
+2026-09-12T03:13:34.1947994Z ##[group]Fetching the repository
+2026-09-12T03:13:34.1951026Z [command]/usr/bin/git -c protocol.version=2 fetch --prune --no-recurse-submodules origin +refs/heads/*:refs/remotes/origin/* +refs/tags/*:refs/tags/*
+2026-09-12T03:13:34.5248664Z ##[error]fatal: expected 'packfile'
+2026-09-12T03:13:34.5252251Z The process '/usr/bin/git' failed with exit code 128
+2026-09-12T03:13:34.5252709Z Waiting 11 seconds before trying again
+2026-09-12T03:13:45.5393569Z [command]/usr/bin/git -c protocol.version=2 fetch --prune --no-recurse-submodules origin +refs/heads/*:refs/remotes/origin/* +refs/tags/*:refs/tags/*
+2026-09-12T03:13:45.6308307Z ##[error]fatal: expected 'packfile'
+2026-09-12T03:13:45.6312506Z The process '/usr/bin/git' failed with exit code 128
+2026-09-12T03:13:45.6312941Z Waiting 19 seconds before trying again
+2026-09-12T03:14:04.6385490Z [command]/usr/bin/git -c protocol.version=2 fetch --prune --no-recurse-submodules origin +refs/heads/*:refs/remotes/origin/* +refs/tags/*:refs/tags/*
+2026-09-12T03:14:04.7291058Z ##[error]fatal: expected 'packfile'
+2026-09-12T03:14:04.7295895Z ##[group]Removing auth
+2026-09-12T03:14:04.7298581Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-09-12T03:14:04.7309232Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-09-12T03:14:04.7364392Z [command]/usr/bin/git config --local --name-only --get-regexp http\.http\:\/\/127\.0\.0\.1\:9198\/\.extraheader
+2026-09-12T03:14:04.7370338Z http.http://127.0.0.1:9198/.extraheader
+2026-09-12T03:14:04.7373124Z [command]/usr/bin/git config --local --unset-all http.http://127.0.0.1:9198/.extraheader
+2026-09-12T03:14:04.7382209Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.http\:\/\/127\.0\.0\.1\:9198\/\.extraheader' && git config --local --unset-all 'http.http://127.0.0.1:9198/.extraheader' || :"
+2026-09-12T03:14:04.7440592Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-09-12T03:14:04.7448025Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-09-12T03:14:04.7497705Z ##[endgroup]
+2026-09-12T03:14:04.7500504Z ##[error]The process '/usr/bin/git' failed with exit code 128
+2026-09-12T03:14:04.7534762Z ##[error]node action exited with code 1
+2026-09-12T03:14:04.8119615Z [command]/usr/bin/git version
+2026-09-12T03:14:04.8131780Z git version 2.54.0
+2026-09-12T03:14:04.8144915Z Temporarily overriding HOME='/var/lib/preloop-runner/_work/_temp/40753425-d6d8-4752-ab58-920033a105e8' before making global git config changes
+2026-09-12T03:14:04.8145335Z Adding repository directory to the temporary git global config as a safe directory
+2026-09-12T03:14:04.8147030Z [command]/usr/bin/git config --global --add safe.directory /var/lib/preloop-runner/_work/default/default
+2026-09-12T03:14:04.8156664Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-09-12T03:14:04.8165931Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-09-12T03:14:04.8220539Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-09-12T03:14:04.8230142Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-09-12T03:14:04.8280534Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-09-12T03:14:04.8289110Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-09-12T03:14:04.8402158Z Cleaning up orphan processes
+2026-09-12T03:15:15.9334700Z Current runner version: '2.335.1'
+2026-09-12T03:15:15.9334700Z Runner name: 'repro-packfile-1-1'
+2026-09-12T03:15:15.9334700Z Runner group name: 'Default'
+2026-09-12T03:15:15.9334700Z Machine name: 'container'
+2026-09-12T03:15:15.9334700Z ##[group]GITHUB_TOKEN Permissions
+2026-09-12T03:15:15.9334700Z Contents: read
+2026-09-12T03:15:15.9334700Z Metadata: read
+2026-09-12T03:15:15.9334700Z Packages: read
+2026-09-12T03:15:15.9334700Z ##[endgroup]
+2026-09-12T03:15:15.9334700Z Secret source: Actions
+2026-09-12T03:15:15.9334700Z Prepare workflow directory
+2026-09-12T03:15:15.9334700Z Prepare all required actions
+2026-09-12T03:15:15.9334700Z Complete job name: shallow
+2026-09-12T03:15:16.0006753Z Syncing repository: snapshots/4c2bcb98-43b9-43aa-8bd0-3d448169dbf9
+2026-09-12T03:15:16.0007213Z ##[group]Getting Git version info
+2026-09-12T03:15:16.0007772Z Working directory is '/var/lib/preloop-runner/_work/default/default'
+2026-09-12T03:15:16.0008337Z [command]/usr/bin/git version
+2026-09-12T03:15:16.0071992Z git version 2.54.0
+2026-09-12T03:15:16.0080680Z ##[endgroup]
+2026-09-12T03:15:16.0085244Z Temporarily overriding HOME='/var/lib/preloop-runner/_work/_temp/4797bf2d-ad28-439b-880b-998f18483302' before making global git config changes
+2026-09-12T03:15:16.0085670Z Adding repository directory to the temporary git global config as a safe directory
+2026-09-12T03:15:16.0087222Z [command]/usr/bin/git config --global --add safe.directory /var/lib/preloop-runner/_work/default/default
+2026-09-12T03:15:16.0102204Z Deleting the contents of '/var/lib/preloop-runner/_work/default/default'
+2026-09-12T03:15:16.0103331Z ##[group]Initializing the repository
+2026-09-12T03:15:16.0104673Z [command]/usr/bin/git init /var/lib/preloop-runner/_work/default/default
+2026-09-12T03:15:16.0141847Z hint: Using 'master' as the name for the initial branch. This default branch name
+2026-09-12T03:15:16.0142310Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+2026-09-12T03:15:16.0142722Z hint: to use in all of your new repositories, which will suppress this warning,
+2026-09-12T03:15:16.0143115Z hint: call:
+2026-09-12T03:15:16.0143478Z hint:
+2026-09-12T03:15:16.0143845Z hint: 	git config --global init.defaultBranch <name>
+2026-09-12T03:15:16.0144207Z hint:
+2026-09-12T03:15:16.0144570Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+2026-09-12T03:15:16.0144947Z hint: 'development'. The just-created branch can be renamed via this command:
+2026-09-12T03:15:16.0145309Z hint:
+2026-09-12T03:15:16.0145665Z hint: 	git branch -m <name>
+2026-09-12T03:15:16.0146016Z hint:
+2026-09-12T03:15:16.0146373Z hint: Disable this message with "git config set advice.defaultBranchName false"
+2026-09-12T03:15:16.0146926Z Initialized empty Git repository in /var/lib/preloop-runner/_work/default/default/.git/
+2026-09-12T03:15:16.0147710Z [command]/usr/bin/git remote add origin http://127.0.0.1:9198/snapshots/4c2bcb98-43b9-43aa-8bd0-3d448169dbf9
+2026-09-12T03:15:16.0156844Z ##[endgroup]
+2026-09-12T03:15:16.0157225Z ##[group]Disabling automatic garbage collection
+2026-09-12T03:15:16.0158696Z [command]/usr/bin/git config --local gc.auto 0
+2026-09-12T03:15:16.0166844Z ##[endgroup]
+2026-09-12T03:15:16.0167220Z ##[group]Setting up auth
+2026-09-12T03:15:16.0169457Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-09-12T03:15:16.0177921Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-09-12T03:15:16.0325206Z [command]/usr/bin/git config --local --name-only --get-regexp http\.http\:\/\/127\.0\.0\.1\:9198\/\.extraheader
+2026-09-12T03:15:16.0333073Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.http\:\/\/127\.0\.0\.1\:9198\/\.extraheader' && git config --local --unset-all 'http.http://127.0.0.1:9198/.extraheader' || :"
+2026-09-12T03:15:16.0383007Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-09-12T03:15:16.0391237Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-09-12T03:15:16.0443190Z [command]/usr/bin/git config --local http.http://127.0.0.1:9198/.extraheader AUTHORIZATION: basic ***
+2026-09-12T03:15:16.0454143Z ##[endgroup]
+2026-09-12T03:15:16.0454579Z ##[group]Fetching the repository
+2026-09-12T03:15:16.0457108Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin 6b2de6eb160186cd946fb2f0929e2b265624cd61
+2026-09-12T03:15:16.1912834Z From http://127.0.0.1:9198/snapshots/4c2bcb98-43b9-43aa-8bd0-3d448169dbf9
+2026-09-12T03:15:16.1913328Z  * branch            6b2de6eb160186cd946fb2f0929e2b265624cd61 -> FETCH_HEAD
+2026-09-12T03:15:16.1935779Z ##[endgroup]
+2026-09-12T03:15:16.1936215Z ##[group]Determining the checkout info
+2026-09-12T03:15:16.1936872Z ##[endgroup]
+2026-09-12T03:15:16.1939089Z [command]/usr/bin/git sparse-checkout disable
+2026-09-12T03:15:16.1953541Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+2026-09-12T03:15:16.1960457Z ##[group]Checking out the ref
+2026-09-12T03:15:16.1961800Z [command]/usr/bin/git checkout --progress --force 6b2de6eb160186cd946fb2f0929e2b265624cd61
+2026-09-12T03:15:16.2333248Z Note: switching to '6b2de6eb160186cd946fb2f0929e2b265624cd61'.
+2026-09-12T03:15:16.2333687Z 
+2026-09-12T03:15:16.2334015Z You are in 'detached HEAD' state. You can look around, make experimental
+2026-09-12T03:15:16.2334350Z changes and commit them, and you can discard any commits you make in this
+2026-09-12T03:15:16.2334685Z state without impacting any branches by switching back to a branch.
+2026-09-12T03:15:16.2334997Z 
+2026-09-12T03:15:16.2335308Z If you want to create a new branch to retain commits you create, you may
+2026-09-12T03:15:16.2335746Z do so (now or later) by using -c with the switch command. Example:
+2026-09-12T03:15:16.2336077Z 
+2026-09-12T03:15:16.2336511Z   git switch -c <new-branch-name>
+2026-09-12T03:15:16.2336924Z 
+2026-09-12T03:15:16.2337254Z Or undo this operation with:
+2026-09-12T03:15:16.2337555Z 
+2026-09-12T03:15:16.2337858Z   git switch -
+2026-09-12T03:15:16.2338151Z 
+2026-09-12T03:15:16.2338455Z Turn off this advice by setting config variable advice.detachedHead to false
+2026-09-12T03:15:16.2338854Z 
+2026-09-12T03:15:16.2339197Z HEAD is now at 6b2de6e preloop workspace snapshot
+2026-09-12T03:15:16.2339978Z ##[endgroup]
+2026-09-12T03:15:16.2348226Z [command]/usr/bin/git log -1 --format=%H
+2026-09-12T03:15:16.2354087Z 6b2de6eb160186cd946fb2f0929e2b265624cd61
+2026-09-12T03:15:16.2356786Z ##[group]Removing auth
+2026-09-12T03:15:16.2358135Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-09-12T03:15:16.2365688Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-09-12T03:15:16.2423038Z [command]/usr/bin/git config --local --name-only --get-regexp http\.http\:\/\/127\.0\.0\.1\:9198\/\.extraheader
+2026-09-12T03:15:16.2429823Z http.http://127.0.0.1:9198/.extraheader
+2026-09-12T03:15:16.2432184Z [command]/usr/bin/git config --local --unset-all http.http://127.0.0.1:9198/.extraheader
+2026-09-12T03:15:16.2440951Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.http\:\/\/127\.0\.0\.1\:9198\/\.extraheader' && git config --local --unset-all 'http.http://127.0.0.1:9198/.extraheader' || :"
+2026-09-12T03:15:16.2496123Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-09-12T03:15:16.2504356Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-09-12T03:15:16.2556135Z ##[endgroup]
+2026-09-12T03:15:16.2643392Z ##[group]Run git log --oneline | wc -l
+2026-09-12T03:15:16.2643687Z [36;1mgit log --oneline | wc -l[0m
+2026-09-12T03:15:16.2644034Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-09-12T03:15:16.2644338Z ##[endgroup]
+2026-09-12T03:15:16.2691338Z 1
+2026-09-12T03:15:16.3268869Z [command]/usr/bin/git version
+2026-09-12T03:15:16.3281233Z git version 2.54.0
+2026-09-12T03:15:16.3294781Z Temporarily overriding HOME='/var/lib/preloop-runner/_work/_temp/c3f74867-00f7-4c3e-81fa-6acc15b0ac41' before making global git config changes
+2026-09-12T03:15:16.3295227Z Adding repository directory to the temporary git global config as a safe directory
+2026-09-12T03:15:16.3297063Z [command]/usr/bin/git config --global --add safe.directory /var/lib/preloop-runner/_work/default/default
+2026-09-12T03:15:16.3307342Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-09-12T03:15:16.3317199Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-09-12T03:15:16.3376277Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-09-12T03:15:16.3385875Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-09-12T03:15:16.3438039Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-09-12T03:15:16.3446117Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-09-12T03:15:16.3558183Z Cleaning up orphan processes
