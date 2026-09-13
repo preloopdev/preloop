@@ -592,7 +592,10 @@ fn job_plan_from_job(
                 job_id,
                 step_index,
                 step,
-                &job.defaults,
+                InheritedDefaults {
+                    job: job.defaults.as_ref(),
+                    workflow: workflow_defaults,
+                },
                 &matrix,
                 inputs,
                 matrix_deferred,
@@ -1274,11 +1277,32 @@ fn normalize_reusable_path(uses: &str) -> String {
         .into_owned()
 }
 
+/// The `defaults.run` levels a step inherits from, outermost last.
+///
+/// Precedence per key, matching GitHub: step > job > workflow. Both levels are
+/// also emitted on the wire `defaults` field for the official runner; this
+/// struct is what flattens them onto preloop's own `StepPlan`.
+#[derive(Clone, Copy)]
+struct InheritedDefaults<'a> {
+    job: Option<&'a JobDefaults>,
+    workflow: Option<&'a JobDefaults>,
+}
+
+impl InheritedDefaults<'_> {
+    fn pick(&self, field: fn(&crate::DefaultsRun) -> Option<String>) -> Option<String> {
+        [self.job, self.workflow]
+            .into_iter()
+            .flatten()
+            .filter_map(|defaults| defaults.run.as_ref())
+            .find_map(field)
+    }
+}
+
 fn step_plan(
     job_id: &str,
     step_index: usize,
     step: Step,
-    defaults: &Option<JobDefaults>,
+    defaults: InheritedDefaults<'_>,
     matrix: &IndexMap<String, Value>,
     inputs: Option<&BTreeMap<String, Value>>,
     matrix_deferred: bool,
@@ -1295,19 +1319,12 @@ fn step_plan(
         inputs,
         matrix_deferred,
     )?;
-    // Merge job-level defaults into step — step values take precedence.
-    let working_directory = step.working_directory.or_else(|| {
-        defaults
-            .as_ref()
-            .and_then(|d| d.run.as_ref())
-            .and_then(|r| r.working_directory.clone())
-    });
-    let shell = step.shell.or_else(|| {
-        defaults
-            .as_ref()
-            .and_then(|d| d.run.as_ref())
-            .and_then(|r| r.shell.clone())
-    });
+    let working_directory = step
+        .working_directory
+        .or_else(|| defaults.pick(|run| run.working_directory.clone()));
+    let shell = step
+        .shell
+        .or_else(|| defaults.pick(|run| run.shell.clone()));
     Ok(StepPlan {
         id: step.id,
         name: step.name,
