@@ -215,6 +215,51 @@ fn setup_workspace_clears_stale_repository() {
 }
 
 #[test]
+fn setup_workspace_derives_repo_layout_from_claim_repository() {
+    // (see tool_cache_prefers_hosted_dir below for the companion test)
+    // GitHub parity (`<work>/<repo>/<repo>`): with no fileTable, the
+    // workspace comes from contextData.github.repository. hugo's codegen
+    // test requires the absolute path to contain "hugo".
+    // The claim message carries the AzDO typed-dict encoding
+    // ({"t": 2, "d": [{"k", "v"}]}), not plain JSON — a plain lookup
+    // silently misses and falls back to default/default.
+    let repo = format!("probe{}", std::process::id());
+    for github in [
+        serde_json::json!({ "repository": format!("someowner/{repo}") }),
+        serde_json::json!({ "t": 2, "d": [{ "k": "repository", "v": format!("someowner/{repo}") }] }),
+    ] {
+        let message = serde_json::json!({ "contextData": { "github": github } });
+        let resolved = setup_workspace(&message).unwrap();
+        let expected = std::env::current_dir()
+            .unwrap()
+            .join("_work")
+            .join(&repo)
+            .join(&repo);
+        assert_eq!(resolved, expected.to_string_lossy());
+        assert!(resolved.contains(&repo));
+        let _ = std::fs::remove_dir_all(std::env::current_dir().unwrap().join("_work").join(&repo));
+    }
+}
+
+#[test]
+fn tool_cache_prefers_hosted_dir() {
+    // setup-* tarballs bake an absolute RUNPATH at /opt/hostedtoolcache and
+    // actions with update-environment:false rely on it; prefer the hosted
+    // dir when usable, else keep the workspace-local _tool default.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let hosted = tmp.path().join("hostedtoolcache");
+    std::fs::create_dir_all(&hosted).unwrap();
+    assert_eq!(
+        tool_cache_dir_for("/r/_work/o/r", &hosted),
+        hosted.to_string_lossy(),
+    );
+    assert_eq!(
+        tool_cache_dir_for("/r/_work/o/r", &tmp.path().join("absent")),
+        "/r/_work/_tool",
+    );
+}
+
+#[test]
 fn setup_workspace_rejects_workspace_outside_runner_root() {
     // Reproduction for cubic P0 (job_extension.rs:42): a crafted payload can
     // name any absolute path as the workspace. On the unfixed code the path

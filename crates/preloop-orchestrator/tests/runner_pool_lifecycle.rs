@@ -670,7 +670,7 @@ async fn runner_keeps_public_only_egress_and_wires_control_socket_and_environmen
                 // Node externals are mounted host-side, never baked into the
                 // machine image or downloaded per runner.
                 host: PathBuf::from("/tmp/test-externals/externals"),
-                guest: PathBuf::from("/var/lib/preloop-runner/externals"),
+                guest: PathBuf::from("/home/runner/externals"),
                 read_only: true,
             },
             VolumeMount {
@@ -735,8 +735,8 @@ async fn runner_keeps_public_only_egress_and_wires_control_socket_and_environmen
 async fn guest_environment_tracks_control_socket_and_debug_dir_independently() {
     const ORIGIN: &str = "PRELOOP_CONTROL_ORIGIN=https://preloop.example";
     const SOCKET: &str = "PRELOOP_CONTROL_SOCKET=/run/preloop-control/engine.sock";
-    const MARKER: &str = "PRELOOP_FAILURE_MARKER=/var/lib/preloop-runner/.preloop-job-failed";
-    const PAUSE_MARKER: &str = "PRELOOP_PAUSE_MARKER=/var/lib/preloop-runner/.preloop-job-paused";
+    const MARKER: &str = "PRELOOP_FAILURE_MARKER=/home/runner/.preloop-job-failed";
+    const PAUSE_MARKER: &str = "PRELOOP_PAUSE_MARKER=/home/runner/.preloop-job-paused";
 
     // `PRELOOP_MACHINE_NAME` is unconditional and slot-dependent, so each case
     // lists only the knob-driven tail.
