@@ -4,12 +4,12 @@
 #           flask, gin, json-c, nlohmann/json, node-fetch, bat, vite, uv,
 #           nextcloud, caddy, bento, agent-ci, openclaw, buzz, qm, runner,
 #           ripgrep, click, yq, axios, fd (lightweight wave 2026-08-29)
-# New picks (diverse, popular, ubuntu-latest dominated, lightweight):
-#   - ajeetdsouza/zoxide (Rust, 1 ubuntu)
-#   - junegunn/fzf (Go, 1 ubuntu-24.04)
-#   - golangci/golangci-lint (Go, 2 ubuntu)
-#   - jqlang/jq (C, 17 cross but ubuntu-latest)
-#   - starship/starship (Rust, 5 ubuntu)
+# New picks (varied, medium-to-large, and not covered by prior campaigns):
+#   - prometheus/prometheus (Go observability server)
+#   - helm/helm (Go package manager)
+#   - pypa/pip (Python packaging)
+#   - rails/rails (Ruby web framework)
+#   - webpack/webpack (Node/JavaScript bundler)
 set -Eeuo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 WORKSPACE_ROOT="${CONFORMANCE_WORKSPACE_ROOT:-/tmp/preloop-conformance-new5repos/workspaces}"
@@ -20,6 +20,7 @@ POLL_SECONDS="${CONFORMANCE_POLL_SECONDS:-10}"
 TIMEOUT_SECONDS="${CONFORMANCE_TIMEOUT_SECONDS:-7200}"
 POOL_SIZE="${PRELOOP_RUNNER_POOL_SIZE:-1}"
 HOST_HOME="${HOME:-}"
+SMOLVM_HOME_DIR="${SMOLVM_HOME_DIR:-$HOST_HOME/.smolvm/1.15.0}"
 SMOLVM_PROCESS_HOME="${CONFORMANCE_SMOLVM_HOME:-$CAMPAIGN_HOME/smolvm-home}"
 if [[ -z "${PRELOOP_SYSTEM_TOKEN:-}" ]]; then
   export PRELOOP_SYSTEM_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
@@ -35,48 +36,45 @@ SERVER_PID=""
 FAILED_TARGETS=""
 if [ "$(uname -s)" = Darwin ]; then
   if [ -z "${DYLD_FALLBACK_LIBRARY_PATH:-}" ]; then
-    export DYLD_FALLBACK_LIBRARY_PATH="$HOST_HOME/.smolvm/lib:/opt/homebrew/lib:/usr/lib"
+    export DYLD_FALLBACK_LIBRARY_PATH="$SMOLVM_HOME_DIR/lib:/opt/homebrew/lib:/usr/lib"
   else
     case ":$DYLD_FALLBACK_LIBRARY_PATH:" in
-      *":$HOST_HOME/.smolvm/lib:"*) ;;
-      *) export DYLD_FALLBACK_LIBRARY_PATH="$HOST_HOME/.smolvm/lib:$DYLD_FALLBACK_LIBRARY_PATH" ;;
+      *":$SMOLVM_HOME_DIR/lib:"*) ;;
+      *) export DYLD_FALLBACK_LIBRARY_PATH="$SMOLVM_HOME_DIR/lib:$DYLD_FALLBACK_LIBRARY_PATH" ;;
     esac
   fi
 fi
 usage() {
   cat <<'EOF'
-Usage: conformance-new5repos.sh [all|requests|axios|typescript|react|nextjs] [--workflow NAME]
+Usage: conformance-new5repos.sh [all|prometheus|helm|pip|rails|webpack] [--workflow NAME]
 EOF
 }
 fail() { echo "conformance-new5repos: $*" >&2; exit 1; }
 target_cfg() {
   case "$1" in
-    zoxide/ci)
-      echo "zoxide https://github.com/ajeetdsouza/zoxide.git main .github/workflows/ci.yml push refs/heads/main" ;;
-    fzf/ci)
-      echo "fzf https://github.com/junegunn/fzf.git master .github/workflows/linux.yml push refs/heads/master" ;;
-    golangci-lint/ci)
-      echo "golangci-lint https://github.com/golangci/golangci-lint.git main .github/workflows/pr-tests.yml push refs/heads/main" ;;
-    jq/ci)
-      echo "jq https://github.com/jqlang/jq.git master .github/workflows/ci.yml push refs/heads/master" ;;
-    starship/ci)
-      echo "starship https://github.com/starship/starship.git main .github/workflows/workflow.yml push refs/heads/main" ;;
-    cobra/ci)
-      echo "cobra https://github.com/spf13/cobra.git main .github/workflows/test.yml push refs/heads/main" ;;
+    prometheus/ci)
+      echo "prometheus https://github.com/prometheus/prometheus.git main .github/workflows/ci.yml push refs/heads/main" ;;
+    helm/build-test)
+      echo "helm https://github.com/helm/helm.git main .github/workflows/build-test.yml push refs/heads/main" ;;
+    pip/ci)
+      echo "pip https://github.com/pypa/pip.git main .github/workflows/ci.yml push refs/heads/main" ;;
+    rails/smoke)
+      echo "rails https://github.com/rails/rails.git main .github/workflows/devcontainer-smoke-test.yml push refs/heads/main" ;;
+    webpack/test)
+      echo "webpack https://github.com/webpack/webpack.git main .github/workflows/test.yml push refs/heads/main" ;;
     *) return 1 ;;
   esac
 }
 all_targets() {
-  echo "zoxide/ci fzf/ci golangci-lint/ci jq/ci starship/ci cobra/ci"
+  echo "prometheus/ci helm/build-test pip/ci rails/smoke webpack/test"
 }
 repo_targets() {
   case "$1" in
-    zoxide) echo "zoxide/ci" ;;
-    fzf) echo "fzf/ci" ;;
-    golangci-lint) echo "golangci-lint/ci" ;;
-    jq) echo "jq/ci" ;;
-    starship) echo "starship/ci" ;;
-    cobra) echo "cobra/ci" ;;
+    prometheus) echo "prometheus/ci" ;;
+    helm) echo "helm/build-test" ;;
+    pip) echo "pip/ci" ;;
+    rails) echo "rails/smoke" ;;
+    webpack) echo "webpack/test" ;;
     *) return 1 ;;
   esac
 }
@@ -138,6 +136,12 @@ start_server() {
   local log="$OUTPUT_ROOT/server.log"
   mkdir -p "$OUTPUT_ROOT" "$CAMPAIGN_HOME" "$SMOLVM_PROCESS_HOME"
   rm -f "$log"
+  mkdir -p "$CAMPAIGN_HOME/bin"
+  ln -sfn "$SMOLVM_HOME_DIR/smolvm" "$CAMPAIGN_HOME/bin/smolvm"
+  export PATH="$CAMPAIGN_HOME/bin:$PATH"
+  hash -r 2>/dev/null || true
+  command -v smolvm
+  smolvm --version
   if [ -z "${PRELOOP_GITHUB_TOKEN:-}" ] && command -v gh >/dev/null 2>&1; then
     PRELOOP_GITHUB_TOKEN="$(gh auth token 2>/dev/null || true)"
     export PRELOOP_GITHUB_TOKEN
@@ -145,8 +149,8 @@ start_server() {
   PRELOOP_HOME="$CAMPAIGN_HOME" \
   HOME="$SMOLVM_PROCESS_HOME" \
   SMOLVM_DATA_DIR="${SMOLVM_DATA_DIR:-$CAMPAIGN_HOME/smolvm}" \
-  SMOLVM_AGENT_ROOTFS="${SMOLVM_AGENT_ROOTFS:-$HOST_HOME/.smolvm/agent-rootfs}" \
-  SMOLVM_LIB_DIR="${SMOLVM_LIB_DIR:-$HOST_HOME/.smolvm/lib}" \
+  SMOLVM_AGENT_ROOTFS="${SMOLVM_AGENT_ROOTFS:-$SMOLVM_HOME_DIR/agent-rootfs}" \
+  SMOLVM_LIB_DIR="${SMOLVM_LIB_DIR:-$SMOLVM_HOME_DIR/lib}" \
   PRELOOP_RUNNER_BASE_IMAGE="$OFFICIAL_GOLDEN_BASE" \
   PRELOOP_RUNNER_BUNDLE="$GUEST_RUNNER_BUNDLE" \
   PRELOOP_RUNNER_NAME_PREFIX="conformance-new5repos" \
@@ -155,7 +159,7 @@ start_server() {
   PRELOOP_RUNNER_POOL_SIZE="$POOL_SIZE" \
   PRELOOP_USE_FORK=1 \
   PRELOOP_RUNNER_MEMORY_MIB="${PRELOOP_RUNNER_MEMORY_MIB:-8192}" \
-  PRELOOP_RUNNER_STORAGE_GB="${PRELOOP_RUNNER_STORAGE_GB:-160}" \
+  PRELOOP_RUNNER_STORAGE_GB="${PRELOOP_RUNNER_STORAGE_GB:-80}" \
   PRELOOP_RUNNER_LABELS="${PRELOOP_RUNNER_LABELS:-X64,ubuntu-arm64-small,ubuntu-x64-small,ubuntu-x64,ubuntu-latest,ubuntu-22.04,ubuntu-24.04,ubuntu-20.04}" \
   PRELOOP_PUBLIC_URL="http://127.0.0.1:$PORT" \
   RUST_LOG="${RUST_LOG:-info,preloop=info}" \
@@ -284,7 +288,7 @@ EOF
   echo "=== [$target] final status: $final_status ==="
   case "$final_status" in
     success|skipped) ;;
-    *) FAILED_TARGETS="${FAILED_TARGETS}${target}=${final_status}\n" ;;
+    *) FAILED_TARGETS="${FAILED_TARGETS:-}${target}=${final_status}\n" ;;
   esac
 }
 main() {

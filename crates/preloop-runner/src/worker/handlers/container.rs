@@ -220,6 +220,10 @@ fn container_action_env(
 ) -> Result<std::collections::HashMap<String, String>> {
     let mut env = ctx.build_env();
 
+    // Same per-action INPUT_* scoping as node actions: a nested docker
+    // action sees only its own inputs, never an enclosing composite's.
+    env.retain(|key, _| !key.starts_with("INPUT_"));
+
     for (key, value) in inputs {
         let env_key = format!("INPUT_{}", key.to_uppercase().replace(' ', "_"));
         env.insert(env_key, value.clone());

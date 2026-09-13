@@ -82,7 +82,7 @@ pub(crate) async fn blob_put(
     body: Body,
 ) -> StatusCode {
     // Early Content-Length check before buffering — avoids allocating 512 MiB
-    // for a block that will be rejected at 4 MiB.
+    // for a block that will be rejected at 8 MiB.
     if let Some(cl) = headers
         .get(CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
@@ -108,9 +108,9 @@ pub(crate) async fn blob_put(
     match query.comp.as_deref() {
         Some("block") => {
             // F5: buffer at most the per-block cap. The official runner stages
-            // 4 MiB blocks, so nothing legitimate is lost; `to_bytes` aborts
+            // 8 MiB blocks, so nothing legitimate is lost; `to_bytes` aborts
             // (413) once a streamed block exceeds the cap, so an attacker never
-            // materializes more than 4 MiB here.
+            // materializes more than 8 MiB here.
             let body = match axum::body::to_bytes(body, MAX_BLOCK_BYTES).await {
                 Ok(b) => b,
                 Err(_) => {

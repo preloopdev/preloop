@@ -1,0 +1,1010 @@
+2026-09-12T16:50:18.1965570Z Current runner version: '2.335.1'
+2026-09-12T16:50:18.1965570Z Runner name: 'nu-relabel-0-1'
+2026-09-12T16:50:18.1965570Z Runner group name: 'Default'
+2026-09-12T16:50:18.1965570Z Machine name: 'container'
+2026-09-12T16:50:18.1965570Z ##[group]GITHUB_TOKEN Permissions
+2026-09-12T16:50:18.1965570Z Contents: read
+2026-09-12T16:50:18.1965570Z ##[endgroup]
+2026-09-12T16:50:18.1965570Z Secret source: Actions
+2026-09-12T16:50:18.1965570Z Prepare workflow directory
+2026-09-12T16:50:18.1965570Z Prepare all required actions
+2026-09-12T16:50:18.1965570Z Complete job name: `cargo` in root (Ubuntu)
+2026-09-12T16:50:18.2703054Z Syncing repository: snapshots/d7718942-c807-44aa-ac57-545410a9ba83
+2026-09-12T16:50:18.2703507Z ##[group]Getting Git version info
+2026-09-12T16:50:18.2703916Z Working directory is '/var/lib/preloop-runner/_work/default/default'
+2026-09-12T16:50:18.2704598Z [command]/usr/bin/git version
+2026-09-12T16:50:18.2770333Z git version 2.54.0
+2026-09-12T16:50:18.2777659Z ##[endgroup]
+2026-09-12T16:50:18.2781764Z Temporarily overriding HOME='/var/lib/preloop-runner/_work/_temp/62495a75-ee0a-49f3-90bd-810de388fa3f' before making global git config changes
+2026-09-12T16:50:18.2782189Z Adding repository directory to the temporary git global config as a safe directory
+2026-09-12T16:50:18.2792173Z [command]/usr/bin/git config --global --add safe.directory /var/lib/preloop-runner/_work/default/default
+2026-09-12T16:50:18.2800297Z Deleting the contents of '/var/lib/preloop-runner/_work/default/default'
+2026-09-12T16:50:18.2801332Z ##[group]Determining repository object format
+2026-09-12T16:50:18.2801827Z ##[endgroup]
+2026-09-12T16:50:18.2802211Z ##[group]Initializing the repository
+2026-09-12T16:50:18.2803703Z [command]/usr/bin/git init /var/lib/preloop-runner/_work/default/default
+2026-09-12T16:50:18.2840448Z hint: Using 'master' as the name for the initial branch. This default branch name
+2026-09-12T16:50:18.2840876Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+2026-09-12T16:50:18.2841280Z hint: to use in all of your new repositories, which will suppress this warning,
+2026-09-12T16:50:18.2841665Z hint: call:
+2026-09-12T16:50:18.2842026Z hint:
+2026-09-12T16:50:18.2842395Z hint: 	git config --global init.defaultBranch <name>
+2026-09-12T16:50:18.2842765Z hint:
+2026-09-12T16:50:18.2843131Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+2026-09-12T16:50:18.2843516Z hint: 'development'. The just-created branch can be renamed via this command:
+2026-09-12T16:50:18.2843896Z hint:
+2026-09-12T16:50:18.2844261Z hint: 	git branch -m <name>
+2026-09-12T16:50:18.2844611Z hint:
+2026-09-12T16:50:18.2844977Z hint: Disable this message with "git config set advice.defaultBranchName false"
+2026-09-12T16:50:18.2845462Z Initialized empty Git repository in /var/lib/preloop-runner/_work/default/default/.git/
+2026-09-12T16:50:18.2846158Z [command]/usr/bin/git remote add origin http://127.0.0.1:9198/snapshots/d7718942-c807-44aa-ac57-545410a9ba83
+2026-09-12T16:50:18.2855148Z ##[endgroup]
+2026-09-12T16:50:18.2855529Z ##[group]Disabling automatic garbage collection
+2026-09-12T16:50:18.2856868Z [command]/usr/bin/git config --local gc.auto 0
+2026-09-12T16:50:18.2864684Z ##[endgroup]
+2026-09-12T16:50:18.2865066Z ##[group]Setting up auth
+2026-09-12T16:50:18.2865517Z Removing SSH command configuration
+2026-09-12T16:50:18.2867208Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-09-12T16:50:18.2875832Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-09-12T16:50:18.3016859Z Removing HTTP extra header
+2026-09-12T16:50:18.3018244Z [command]/usr/bin/git config --local --name-only --get-regexp http\.http\:\/\/127\.0\.0\.1\:9198\/\.extraheader
+2026-09-12T16:50:18.3025977Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.http\:\/\/127\.0\.0\.1\:9198\/\.extraheader' && git config --local --unset-all 'http.http://127.0.0.1:9198/.extraheader' || :"
+2026-09-12T16:50:18.3075081Z Removing includeIf entries pointing to credentials config files
+2026-09-12T16:50:18.3077066Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-09-12T16:50:18.3084884Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-09-12T16:50:18.3135398Z [command]/usr/bin/git config --file /var/lib/preloop-runner/_work/_temp/git-credentials-712f6cd8-e0b8-4e24-a903-d6862d83fdab.config http.http://127.0.0.1:9198/.extraheader AUTHORIZATION: basic ***
+2026-09-12T16:50:18.3148662Z [command]/usr/bin/git config --local includeIf.gitdir:/var/lib/preloop-runner/_work/default/default/.git.path /var/lib/preloop-runner/_work/_temp/git-credentials-712f6cd8-e0b8-4e24-a903-d6862d83fdab.config
+2026-09-12T16:50:18.3158072Z [command]/usr/bin/git config --local includeIf.gitdir:/var/lib/preloop-runner/_work/default/default/.git/worktrees/*.path /var/lib/preloop-runner/_work/_temp/git-credentials-712f6cd8-e0b8-4e24-a903-d6862d83fdab.config
+2026-09-12T16:50:18.3165839Z [command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-712f6cd8-e0b8-4e24-a903-d6862d83fdab.config
+2026-09-12T16:50:18.3174014Z [command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-712f6cd8-e0b8-4e24-a903-d6862d83fdab.config
+2026-09-12T16:50:18.3180562Z ##[endgroup]
+2026-09-12T16:50:18.3180943Z ##[group]Fetching the repository
+2026-09-12T16:50:18.3182897Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin efd3c5af0e7aa3962a79a309b4bfb5e492ee3b40
+2026-09-12T16:50:18.7140065Z From http://127.0.0.1:9198/snapshots/d7718942-c807-44aa-ac57-545410a9ba83
+2026-09-12T16:50:18.7140541Z  * branch            efd3c5af0e7aa3962a79a309b4bfb5e492ee3b40 -> FETCH_HEAD
+2026-09-12T16:50:18.7164289Z [command]/usr/bin/git rev-parse --verify --quiet efd3c5af0e7aa3962a79a309b4bfb5e492ee3b40^{object}
+2026-09-12T16:50:18.7171593Z efd3c5af0e7aa3962a79a309b4bfb5e492ee3b40
+2026-09-12T16:50:18.7172870Z ##[endgroup]
+2026-09-12T16:50:18.7173270Z ##[group]Determining the checkout info
+2026-09-12T16:50:18.7173777Z ##[endgroup]
+2026-09-12T16:50:18.7174786Z [command]/usr/bin/git sparse-checkout disable
+2026-09-12T16:50:18.7188374Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+2026-09-12T16:50:18.7195566Z ##[group]Checking out the ref
+2026-09-12T16:50:18.7197216Z [command]/usr/bin/git checkout --progress --force efd3c5af0e7aa3962a79a309b4bfb5e492ee3b40
+2026-09-12T16:50:18.7937214Z Note: switching to 'efd3c5af0e7aa3962a79a309b4bfb5e492ee3b40'.
+2026-09-12T16:50:18.7937696Z 
+2026-09-12T16:50:18.7938074Z You are in 'detached HEAD' state. You can look around, make experimental
+2026-09-12T16:50:18.7938459Z changes and commit them, and you can discard any commits you make in this
+2026-09-12T16:50:18.7938838Z state without impacting any branches by switching back to a branch.
+2026-09-12T16:50:18.7939195Z 
+2026-09-12T16:50:18.7939552Z If you want to create a new branch to retain commits you create, you may
+2026-09-12T16:50:18.7939924Z do so (now or later) by using -c with the switch command. Example:
+2026-09-12T16:50:18.7940276Z 
+2026-09-12T16:50:18.7940629Z   git switch -c <new-branch-name>
+2026-09-12T16:50:18.7940969Z 
+2026-09-12T16:50:18.7941311Z Or undo this operation with:
+2026-09-12T16:50:18.7941649Z 
+2026-09-12T16:50:18.7941990Z   git switch -
+2026-09-12T16:50:18.7942328Z 
+2026-09-12T16:50:18.7942673Z Turn off this advice by setting config variable advice.detachedHead to false
+2026-09-12T16:50:18.7943016Z 
+2026-09-12T16:50:18.7943359Z HEAD is now at efd3c5a preloop workspace snapshot
+2026-09-12T16:50:18.7944064Z ##[endgroup]
+2026-09-12T16:50:18.7952561Z [command]/usr/bin/git log -1 --format=%H
+2026-09-12T16:50:18.7959611Z efd3c5af0e7aa3962a79a309b4bfb5e492ee3b40
+2026-09-12T16:50:18.8049456Z ##[group]Run rustup target add x86_64-unknown-linux-gnu
+2026-09-12T16:50:18.8049785Z [36;1mrustup target add x86_64-unknown-linux-gnu[0m
+2026-09-12T16:50:18.8050078Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-09-12T16:50:18.8050362Z ##[endgroup]
+2026-09-12T16:50:18.8322936Z info: syncing channel updates for 1.96.1-aarch64-unknown-linux-gnu
+2026-09-12T16:50:19.1052016Z info: latest update on 2026-06-30 for version 1.96.1 (31fca3adb 2026-06-26)
+2026-09-12T16:50:19.1053626Z info: downloading 6 components
+2026-09-12T16:50:25.7231431Z info: downloading component rust-std
+2026-09-12T16:50:27.8952999Z Unexpected error attempting to determine if executable file exists '/usr/local/bin/rustc': Error: EACCES: permission denied, stat '/usr/local/bin/rustc'
+2026-09-12T16:50:27.9029626Z Unexpected error attempting to determine if executable file exists '/usr/local/bin/rustup': Error: EACCES: permission denied, stat '/usr/local/bin/rustup'
+2026-09-12T16:50:27.9062156Z Unexpected error attempting to determine if executable file exists '/usr/local/bin/rustup': Error: EACCES: permission denied, stat '/usr/local/bin/rustup'
+2026-09-12T16:50:27.9843262Z Unexpected error attempting to determine if executable file exists '/usr/local/bin/rustup': Error: EACCES: permission denied, stat '/usr/local/bin/rustup'
+2026-09-12T16:50:28.1603248Z Unexpected error attempting to determine if executable file exists '/usr/local/bin/cargo': Error: EACCES: permission denied, stat '/usr/local/bin/cargo'
+2026-09-12T16:50:28.1933287Z ##[group]Cache Configuration
+2026-09-12T16:50:28.1933727Z Cache Provider:
+2026-09-12T16:50:28.1934062Z     github
+2026-09-12T16:50:28.1934462Z Workspaces:
+2026-09-12T16:50:28.1934801Z     /var/lib/preloop-runner/_work/default/default
+2026-09-12T16:50:28.1935148Z Cache Paths:
+2026-09-12T16:50:28.1935534Z     /home/runner/.cargo/bin
+2026-09-12T16:50:28.1936013Z     /home/runner/.cargo/.crates.toml
+2026-09-12T16:50:28.1936345Z     /home/runner/.cargo/.crates2.json
+2026-09-12T16:50:28.1936666Z     /home/runner/.cargo/registry
+2026-09-12T16:50:28.1937007Z     /home/runner/.cargo/git
+2026-09-12T16:50:28.1937425Z     /var/lib/preloop-runner/_work/default/default/target
+2026-09-12T16:50:28.1937867Z Restore Key:
+2026-09-12T16:50:28.1938302Z     v0-rust-cargo-Linux-arm64-b588f60f
+2026-09-12T16:50:28.1938722Z Cache Key:
+2026-09-12T16:50:28.1939218Z     v0-rust-cargo-Linux-arm64-b588f60f-bffd680e
+2026-09-12T16:50:28.1939636Z .. Prefix:
+2026-09-12T16:50:28.1940023Z   - v0-rust-cargo-Linux-arm64
+2026-09-12T16:50:28.1940456Z .. Environment considered:
+2026-09-12T16:50:28.1940918Z   - Rust Versions:
+2026-09-12T16:50:28.1941339Z     - 1.96.1 aarch64-unknown-linux-gnu 31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd
+2026-09-12T16:50:28.1941717Z     - 1.97.1 aarch64-unknown-linux-gnu 8bab26f4f68e0e26f0bb7960be334d5b520ea452
+2026-09-12T16:50:28.1942038Z   - CARGO_INCREMENTAL
+2026-09-12T16:50:28.1942419Z .. Lockfiles considered:
+2026-09-12T16:50:28.1942734Z   - /var/lib/preloop-runner/_work/default/default/.cargo/config.toml
+2026-09-12T16:50:28.1943056Z   - /var/lib/preloop-runner/_work/default/default/Cargo.lock
+2026-09-12T16:50:28.1943370Z   - /var/lib/preloop-runner/_work/default/default/Cargo.toml
+2026-09-12T16:50:28.1943732Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_custom_values/Cargo.toml
+2026-09-12T16:50:28.1944058Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_example/Cargo.toml
+2026-09-12T16:50:28.1944433Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_formats/Cargo.toml
+2026-09-12T16:50:28.1944838Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_gstat/Cargo.toml
+2026-09-12T16:50:28.1945237Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_inc/Cargo.toml
+2026-09-12T16:50:28.1945581Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_polars/Cargo.toml
+2026-09-12T16:50:28.1946020Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_query/Cargo.toml
+2026-09-12T16:50:28.1946394Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_stress_internals/Cargo.toml
+2026-09-12T16:50:28.1946714Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-cli/Cargo.toml
+2026-09-12T16:50:28.1947029Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-cmd-base/Cargo.toml
+2026-09-12T16:50:28.1947426Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-cmd-extra/Cargo.toml
+2026-09-12T16:50:28.1947749Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-cmd-lang/Cargo.toml
+2026-09-12T16:50:28.1948241Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-cmd-plugin/Cargo.toml
+2026-09-12T16:50:28.1948621Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-color-config/Cargo.toml
+2026-09-12T16:50:28.1948955Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-command/Cargo.toml
+2026-09-12T16:50:28.1949312Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-config/Cargo.toml
+2026-09-12T16:50:28.1949668Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-derive-value/Cargo.toml
+2026-09-12T16:50:28.1950153Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-engine/Cargo.toml
+2026-09-12T16:50:28.1950470Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-experimental/Cargo.toml
+2026-09-12T16:50:28.1950822Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-explore/Cargo.toml
+2026-09-12T16:50:28.1951139Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-glob/Cargo.toml
+2026-09-12T16:50:28.1951507Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-heavy-utils/Cargo.toml
+2026-09-12T16:50:28.1951822Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-json/Cargo.toml
+2026-09-12T16:50:28.1952291Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-lsp/Cargo.toml
+2026-09-12T16:50:28.1952879Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-mcp/Cargo.toml
+2026-09-12T16:50:28.1953269Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-parser/Cargo.toml
+2026-09-12T16:50:28.1953699Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-parser/fuzz/rust-toolchain.toml
+2026-09-12T16:50:28.1954071Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-path/Cargo.toml
+2026-09-12T16:50:28.1954454Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-path/fuzz/rust-toolchain.toml
+2026-09-12T16:50:28.1954779Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-plugin-core/Cargo.toml
+2026-09-12T16:50:28.1955137Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-plugin-engine/Cargo.toml
+2026-09-12T16:50:28.1955567Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-plugin-protocol/Cargo.toml
+2026-09-12T16:50:28.1956009Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-plugin-test-support/Cargo.toml
+2026-09-12T16:50:28.1956333Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-plugin/Cargo.toml
+2026-09-12T16:50:28.1956679Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-pretty-hex/Cargo.toml
+2026-09-12T16:50:28.1956994Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-protocol/Cargo.toml
+2026-09-12T16:50:28.1957343Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-std/Cargo.toml
+2026-09-12T16:50:28.1957762Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-system/Cargo.toml
+2026-09-12T16:50:28.1958276Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-table/Cargo.toml
+2026-09-12T16:50:28.1958691Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-term-grid/Cargo.toml
+2026-09-12T16:50:28.1959032Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-test-support-macros/Cargo.toml
+2026-09-12T16:50:28.1959387Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-test-support/Cargo.toml
+2026-09-12T16:50:28.1959699Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-utils/Cargo.toml
+2026-09-12T16:50:28.1960047Z   - /var/lib/preloop-runner/_work/default/default/crates/nuon/Cargo.toml
+2026-09-12T16:50:28.1960359Z   - /var/lib/preloop-runner/_work/default/default/crates/testbins/Cargo.toml
+2026-09-12T16:50:28.1960698Z   - /var/lib/preloop-runner/_work/default/default/rust-toolchain.toml
+2026-09-12T16:50:28.1961210Z ##[endgroup]
+2026-09-12T16:50:28.1961580Z 
+2026-09-12T16:50:28.1961996Z ... Restoring cache ...
+2026-09-12T16:50:28.2008873Z No cache found.
+2026-09-12T16:50:28.2101029Z ##[group]Run git diff --quiet && git diff --cached --quiet
+2026-09-12T16:50:28.2101361Z [36;1mgit diff --quiet && git diff --cached --quiet[0m
+2026-09-12T16:50:28.2101654Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-09-12T16:50:28.2101944Z ##[endgroup]
+2026-09-12T16:50:28.3146097Z ##[group]Cache Configuration
+2026-09-12T16:50:28.3146751Z Cache Provider:
+2026-09-12T16:50:28.3147113Z     github
+2026-09-12T16:50:28.3147505Z Workspaces:
+2026-09-12T16:50:28.3147830Z     /var/lib/preloop-runner/_work/default/default
+2026-09-12T16:50:28.3148139Z Cache Paths:
+2026-09-12T16:50:28.3148669Z     /home/runner/.cargo/bin
+2026-09-12T16:50:28.3148994Z     /home/runner/.cargo/.crates.toml
+2026-09-12T16:50:28.3149307Z     /home/runner/.cargo/.crates2.json
+2026-09-12T16:50:28.3149669Z     /home/runner/.cargo/registry
+2026-09-12T16:50:28.3149981Z     /home/runner/.cargo/git
+2026-09-12T16:50:28.3150292Z     /var/lib/preloop-runner/_work/default/default/target
+2026-09-12T16:50:28.3150782Z Restore Key:
+2026-09-12T16:50:28.3151103Z     v0-rust-cargo-Linux-arm64-b588f60f
+2026-09-12T16:50:28.3151461Z Cache Key:
+2026-09-12T16:50:28.3151952Z     v0-rust-cargo-Linux-arm64-b588f60f-bffd680e
+2026-09-12T16:50:28.3152322Z .. Prefix:
+2026-09-12T16:50:28.3152878Z   - v0-rust-cargo-Linux-arm64
+2026-09-12T16:50:28.3153282Z .. Environment considered:
+2026-09-12T16:50:28.3153626Z   - Rust Versions:
+2026-09-12T16:50:28.3154009Z     - 1.96.1 aarch64-unknown-linux-gnu 31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd
+2026-09-12T16:50:28.3154527Z     - 1.97.1 aarch64-unknown-linux-gnu 8bab26f4f68e0e26f0bb7960be334d5b520ea452
+2026-09-12T16:50:28.3154861Z   - CARGO_INCREMENTAL
+2026-09-12T16:50:28.3155260Z .. Lockfiles considered:
+2026-09-12T16:50:28.3155721Z   - /var/lib/preloop-runner/_work/default/default/.cargo/config.toml
+2026-09-12T16:50:28.3156090Z   - /var/lib/preloop-runner/_work/default/default/Cargo.lock
+2026-09-12T16:50:28.3156592Z   - /var/lib/preloop-runner/_work/default/default/Cargo.toml
+2026-09-12T16:50:28.3156993Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_custom_values/Cargo.toml
+2026-09-12T16:50:28.3157388Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_example/Cargo.toml
+2026-09-12T16:50:28.3157788Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_formats/Cargo.toml
+2026-09-12T16:50:28.3158190Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_gstat/Cargo.toml
+2026-09-12T16:50:28.3158734Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_inc/Cargo.toml
+2026-09-12T16:50:28.3159100Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_polars/Cargo.toml
+2026-09-12T16:50:28.3159442Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_query/Cargo.toml
+2026-09-12T16:50:28.3159763Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_stress_internals/Cargo.toml
+2026-09-12T16:50:28.3160258Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-cli/Cargo.toml
+2026-09-12T16:50:28.3160592Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-cmd-base/Cargo.toml
+2026-09-12T16:50:28.3160998Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-cmd-extra/Cargo.toml
+2026-09-12T16:50:28.3161534Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-cmd-lang/Cargo.toml
+2026-09-12T16:50:28.3161869Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-cmd-plugin/Cargo.toml
+2026-09-12T16:50:28.3162184Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-color-config/Cargo.toml
+2026-09-12T16:50:28.3162685Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-command/Cargo.toml
+2026-09-12T16:50:28.3163005Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-config/Cargo.toml
+2026-09-12T16:50:28.3163410Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-derive-value/Cargo.toml
+2026-09-12T16:50:28.3163764Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-engine/Cargo.toml
+2026-09-12T16:50:28.3164182Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-experimental/Cargo.toml
+2026-09-12T16:50:28.3164538Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-explore/Cargo.toml
+2026-09-12T16:50:28.3164852Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-glob/Cargo.toml
+2026-09-12T16:50:28.3165347Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-heavy-utils/Cargo.toml
+2026-09-12T16:50:28.3165669Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-json/Cargo.toml
+2026-09-12T16:50:28.3165982Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-lsp/Cargo.toml
+2026-09-12T16:50:28.3166504Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-mcp/Cargo.toml
+2026-09-12T16:50:28.3166821Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-parser/Cargo.toml
+2026-09-12T16:50:28.3167137Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-parser/fuzz/rust-toolchain.toml
+2026-09-12T16:50:28.3167618Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-path/Cargo.toml
+2026-09-12T16:50:28.3167937Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-path/fuzz/rust-toolchain.toml
+2026-09-12T16:50:28.3168338Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-plugin-core/Cargo.toml
+2026-09-12T16:50:28.3168870Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-plugin-engine/Cargo.toml
+2026-09-12T16:50:28.3169203Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-plugin-protocol/Cargo.toml
+2026-09-12T16:50:28.3169520Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-plugin-test-support/Cargo.toml
+2026-09-12T16:50:28.3170054Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-plugin/Cargo.toml
+2026-09-12T16:50:28.3170459Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-pretty-hex/Cargo.toml
+2026-09-12T16:50:28.3170810Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-protocol/Cargo.toml
+2026-09-12T16:50:28.3171162Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-std/Cargo.toml
+2026-09-12T16:50:28.3171513Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-system/Cargo.toml
+2026-09-12T16:50:28.3171984Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-table/Cargo.toml
+2026-09-12T16:50:28.3172345Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-term-grid/Cargo.toml
+2026-09-12T16:50:28.3172699Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-test-support-macros/Cargo.toml
+2026-09-12T16:50:28.3173057Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-test-support/Cargo.toml
+2026-09-12T16:50:28.3173492Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-utils/Cargo.toml
+2026-09-12T16:50:28.3173824Z   - /var/lib/preloop-runner/_work/default/default/crates/nuon/Cargo.toml
+2026-09-12T16:50:28.3174134Z   - /var/lib/preloop-runner/_work/default/default/crates/testbins/Cargo.toml
+2026-09-12T16:50:28.3174470Z   - /var/lib/preloop-runner/_work/default/default/rust-toolchain.toml
+2026-09-12T16:50:28.3174976Z ##[endgroup]
+2026-09-12T16:50:28.3175276Z 
+2026-09-12T16:50:28.3175896Z Unexpected error attempting to determine if executable file exists '/usr/local/bin/cargo': Error: EACCES: permission denied, stat '/usr/local/bin/cargo'
+2026-09-12T16:50:38.1607744Z Unexpected error attempting to determine if executable file exists '/usr/local/bin/cargo': Error: EACCES: permission denied, stat '/usr/local/bin/cargo'
+2026-09-12T16:50:38.1741449Z ... Cleaning /var/lib/preloop-runner/_work/default/default/target ...
+2026-09-12T16:50:38.1743528Z ... Cleaning cargo registry (cache-all-crates: true) ...
+2026-09-12T16:50:38.2820390Z ... Cleaning cargo/bin ...
+2026-09-12T16:50:38.2823312Z ... Cleaning cargo git cache ...
+2026-09-12T16:50:38.2830786Z ... Saving cache ...
+2026-09-12T16:50:38.2896474Z [command]/usr/bin/tar --posix -cf cache.tzst --exclude cache.tzst -P -C /var/lib/preloop-runner/_work/default/default --files-from manifest.txt --use-compress-program zstdmt
+2026-09-12T16:50:40.4102697Z ##[warning]uploadCacheArchiveSDK: internal error uploading cache archive: 
+2026-09-12T16:50:40.4103423Z Sent 0 of 336949794 (0.0%), 0.0 MBs/sec
+2026-09-12T16:50:40.4103984Z ##[warning]Failed to save: 
+2026-09-12T16:50:40.4830201Z [command]/usr/bin/git version
+2026-09-12T16:50:40.4843122Z git version 2.54.0
+2026-09-12T16:50:40.4857131Z Temporarily overriding HOME='/var/lib/preloop-runner/_work/_temp/a5468113-3bff-4cad-bc07-c4cb2bd6613f' before making global git config changes
+2026-09-12T16:50:40.4857644Z Adding repository directory to the temporary git global config as a safe directory
+2026-09-12T16:50:40.4859797Z [command]/usr/bin/git config --global --add safe.directory /var/lib/preloop-runner/_work/default/default
+2026-09-12T16:50:40.4872176Z Removing SSH command configuration
+2026-09-12T16:50:40.4874477Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-09-12T16:50:40.4884439Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-09-12T16:50:40.4938097Z Removing HTTP extra header
+2026-09-12T16:50:40.4939627Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-09-12T16:50:40.4948504Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-09-12T16:50:40.4999862Z Removing includeIf entries pointing to credentials config files
+2026-09-12T16:50:40.5002215Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-09-12T16:50:40.5008214Z includeif.gitdir:/var/lib/preloop-runner/_work/default/default/.git.path
+2026-09-12T16:50:40.5008648Z includeif.gitdir:/var/lib/preloop-runner/_work/default/default/.git/worktrees/*.path
+2026-09-12T16:50:40.5009012Z includeif.gitdir:/github/workspace/.git.path
+2026-09-12T16:50:40.5009337Z includeif.gitdir:/github/workspace/.git/worktrees/*.path
+2026-09-12T16:50:40.5011187Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/var/lib/preloop-runner/_work/default/default/.git.path
+2026-09-12T16:50:40.5016690Z /var/lib/preloop-runner/_work/_temp/git-credentials-712f6cd8-e0b8-4e24-a903-d6862d83fdab.config
+2026-09-12T16:50:40.5019718Z [command]/usr/bin/git config --local --unset includeif.gitdir:/var/lib/preloop-runner/_work/default/default/.git.path \/var\/lib\/preloop\-runner\/_work\/_temp\/git\-credentials\-712f6cd8\-e0b8\-4e24\-a903\-d6862d83fdab\.config
+2026-09-12T16:50:40.5029152Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/var/lib/preloop-runner/_work/default/default/.git/worktrees/*.path
+2026-09-12T16:50:40.5035139Z /var/lib/preloop-runner/_work/_temp/git-credentials-712f6cd8-e0b8-4e24-a903-d6862d83fdab.config
+2026-09-12T16:50:40.5037989Z [command]/usr/bin/git config --local --unset includeif.gitdir:/var/lib/preloop-runner/_work/default/default/.git/worktrees/*.path \/var\/lib\/preloop\-runner\/_work\/_temp\/git\-credentials\-712f6cd8\-e0b8\-4e24\-a903\-d6862d83fdab\.config
+2026-09-12T16:50:40.5046639Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git.path
+2026-09-12T16:50:40.5052127Z /github/runner_temp/git-credentials-712f6cd8-e0b8-4e24-a903-d6862d83fdab.config
+2026-09-12T16:50:40.5054504Z [command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git.path \/github\/runner_temp\/git\-credentials\-712f6cd8\-e0b8\-4e24\-a903\-d6862d83fdab\.config
+2026-09-12T16:50:40.5066235Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git/worktrees/*.path
+2026-09-12T16:50:40.5071664Z /github/runner_temp/git-credentials-712f6cd8-e0b8-4e24-a903-d6862d83fdab.config
+2026-09-12T16:50:40.5074036Z [command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git/worktrees/*.path \/github\/runner_temp\/git\-credentials\-712f6cd8\-e0b8\-4e24\-a903\-d6862d83fdab\.config
+2026-09-12T16:50:40.5082522Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-09-12T16:50:40.5131918Z Removing credentials config '/var/lib/preloop-runner/_work/_temp/git-credentials-712f6cd8-e0b8-4e24-a903-d6862d83fdab.config'
+2026-09-12T16:50:40.5206788Z Cleaning up orphan processes
+2026-09-12T16:51:43.8348538Z Current runner version: '2.335.1'
+2026-09-12T16:51:43.8348538Z Runner name: 'nu-relabel-1-1'
+2026-09-12T16:51:43.8348538Z Runner group name: 'Default'
+2026-09-12T16:51:43.8348538Z Machine name: 'container'
+2026-09-12T16:51:43.8348538Z ##[group]GITHUB_TOKEN Permissions
+2026-09-12T16:51:43.8348538Z Contents: read
+2026-09-12T16:51:43.8348538Z ##[endgroup]
+2026-09-12T16:51:43.8348538Z Secret source: Actions
+2026-09-12T16:51:43.8348538Z Prepare workflow directory
+2026-09-12T16:51:43.8348538Z Prepare all required actions
+2026-09-12T16:51:43.8348538Z Complete job name: `cargo` in nu-parser/fuzz (Ubuntu)
+2026-09-12T16:51:43.9058475Z Syncing repository: snapshots/d7718942-c807-44aa-ac57-545410a9ba83
+2026-09-12T16:51:43.9059102Z ##[group]Getting Git version info
+2026-09-12T16:51:43.9059501Z Working directory is '/var/lib/preloop-runner/_work/default/default'
+2026-09-12T16:51:43.9060052Z [command]/usr/bin/git version
+2026-09-12T16:51:43.9120806Z git version 2.54.0
+2026-09-12T16:51:43.9129583Z ##[endgroup]
+2026-09-12T16:51:43.9131649Z Temporarily overriding HOME='/var/lib/preloop-runner/_work/_temp/8adcd508-1a99-4627-b07f-132e2bd525b1' before making global git config changes
+2026-09-12T16:51:43.9132071Z Adding repository directory to the temporary git global config as a safe directory
+2026-09-12T16:51:43.9135944Z [command]/usr/bin/git config --global --add safe.directory /var/lib/preloop-runner/_work/default/default
+2026-09-12T16:51:43.9149682Z Deleting the contents of '/var/lib/preloop-runner/_work/default/default'
+2026-09-12T16:51:43.9150610Z ##[group]Determining repository object format
+2026-09-12T16:51:43.9151046Z ##[endgroup]
+2026-09-12T16:51:43.9151545Z ##[group]Initializing the repository
+2026-09-12T16:51:43.9152974Z [command]/usr/bin/git init /var/lib/preloop-runner/_work/default/default
+2026-09-12T16:51:43.9192569Z hint: Using 'master' as the name for the initial branch. This default branch name
+2026-09-12T16:51:43.9193045Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+2026-09-12T16:51:43.9193457Z hint: to use in all of your new repositories, which will suppress this warning,
+2026-09-12T16:51:43.9193844Z hint: call:
+2026-09-12T16:51:43.9194204Z hint:
+2026-09-12T16:51:43.9194570Z hint: 	git config --global init.defaultBranch <name>
+2026-09-12T16:51:43.9194939Z hint:
+2026-09-12T16:51:43.9195302Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+2026-09-12T16:51:43.9195678Z hint: 'development'. The just-created branch can be renamed via this command:
+2026-09-12T16:51:43.9196042Z hint:
+2026-09-12T16:51:43.9196400Z hint: 	git branch -m <name>
+2026-09-12T16:51:43.9196757Z hint:
+2026-09-12T16:51:43.9197161Z hint: Disable this message with "git config set advice.defaultBranchName false"
+2026-09-12T16:51:43.9197764Z Initialized empty Git repository in /var/lib/preloop-runner/_work/default/default/.git/
+2026-09-12T16:51:43.9198447Z [command]/usr/bin/git remote add origin http://127.0.0.1:9198/snapshots/d7718942-c807-44aa-ac57-545410a9ba83
+2026-09-12T16:51:43.9208298Z ##[endgroup]
+2026-09-12T16:51:43.9208680Z ##[group]Disabling automatic garbage collection
+2026-09-12T16:51:43.9209436Z [command]/usr/bin/git config --local gc.auto 0
+2026-09-12T16:51:43.9216984Z ##[endgroup]
+2026-09-12T16:51:43.9217355Z ##[group]Setting up auth
+2026-09-12T16:51:43.9217849Z Removing SSH command configuration
+2026-09-12T16:51:43.9219277Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-09-12T16:51:43.9228062Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-09-12T16:51:43.9369509Z Removing HTTP extra header
+2026-09-12T16:51:43.9371378Z [command]/usr/bin/git config --local --name-only --get-regexp http\.http\:\/\/127\.0\.0\.1\:9198\/\.extraheader
+2026-09-12T16:51:43.9379471Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.http\:\/\/127\.0\.0\.1\:9198\/\.extraheader' && git config --local --unset-all 'http.http://127.0.0.1:9198/.extraheader' || :"
+2026-09-12T16:51:43.9429306Z Removing includeIf entries pointing to credentials config files
+2026-09-12T16:51:43.9431066Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-09-12T16:51:43.9439193Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-09-12T16:51:43.9488598Z [command]/usr/bin/git config --file /var/lib/preloop-runner/_work/_temp/git-credentials-5eacd212-c320-4e55-950c-5e2da77b95bf.config http.http://127.0.0.1:9198/.extraheader AUTHORIZATION: basic ***
+2026-09-12T16:51:43.9499224Z [command]/usr/bin/git config --local includeIf.gitdir:/var/lib/preloop-runner/_work/default/default/.git.path /var/lib/preloop-runner/_work/_temp/git-credentials-5eacd212-c320-4e55-950c-5e2da77b95bf.config
+2026-09-12T16:51:43.9508359Z [command]/usr/bin/git config --local includeIf.gitdir:/var/lib/preloop-runner/_work/default/default/.git/worktrees/*.path /var/lib/preloop-runner/_work/_temp/git-credentials-5eacd212-c320-4e55-950c-5e2da77b95bf.config
+2026-09-12T16:51:43.9516027Z [command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-5eacd212-c320-4e55-950c-5e2da77b95bf.config
+2026-09-12T16:51:43.9524145Z [command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-5eacd212-c320-4e55-950c-5e2da77b95bf.config
+2026-09-12T16:51:43.9530442Z ##[endgroup]
+2026-09-12T16:51:43.9530797Z ##[group]Fetching the repository
+2026-09-12T16:51:43.9533035Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin efd3c5af0e7aa3962a79a309b4bfb5e492ee3b40
+2026-09-12T16:51:44.1924805Z From http://127.0.0.1:9198/snapshots/d7718942-c807-44aa-ac57-545410a9ba83
+2026-09-12T16:51:44.1925307Z  * branch            efd3c5af0e7aa3962a79a309b4bfb5e492ee3b40 -> FETCH_HEAD
+2026-09-12T16:51:44.1935651Z [command]/usr/bin/git rev-parse --verify --quiet efd3c5af0e7aa3962a79a309b4bfb5e492ee3b40^{object}
+2026-09-12T16:51:44.1943163Z efd3c5af0e7aa3962a79a309b4bfb5e492ee3b40
+2026-09-12T16:51:44.1944261Z ##[endgroup]
+2026-09-12T16:51:44.1944651Z ##[group]Determining the checkout info
+2026-09-12T16:51:44.1945134Z ##[endgroup]
+2026-09-12T16:51:44.1946794Z [command]/usr/bin/git sparse-checkout disable
+2026-09-12T16:51:44.1960800Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+2026-09-12T16:51:44.1968461Z ##[group]Checking out the ref
+2026-09-12T16:51:44.1969966Z [command]/usr/bin/git checkout --progress --force efd3c5af0e7aa3962a79a309b4bfb5e492ee3b40
+2026-09-12T16:51:44.2723211Z Note: switching to 'efd3c5af0e7aa3962a79a309b4bfb5e492ee3b40'.
+2026-09-12T16:51:44.2723699Z 
+2026-09-12T16:51:44.2724091Z You are in 'detached HEAD' state. You can look around, make experimental
+2026-09-12T16:51:44.2724470Z changes and commit them, and you can discard any commits you make in this
+2026-09-12T16:51:44.2724842Z state without impacting any branches by switching back to a branch.
+2026-09-12T16:51:44.2725193Z 
+2026-09-12T16:51:44.2725555Z If you want to create a new branch to retain commits you create, you may
+2026-09-12T16:51:44.2725993Z do so (now or later) by using -c with the switch command. Example:
+2026-09-12T16:51:44.2726388Z 
+2026-09-12T16:51:44.2726773Z   git switch -c <new-branch-name>
+2026-09-12T16:51:44.2727112Z 
+2026-09-12T16:51:44.2727456Z Or undo this operation with:
+2026-09-12T16:51:44.2727798Z 
+2026-09-12T16:51:44.2728140Z   git switch -
+2026-09-12T16:51:44.2728504Z 
+2026-09-12T16:51:44.2728849Z Turn off this advice by setting config variable advice.detachedHead to false
+2026-09-12T16:51:44.2729194Z 
+2026-09-12T16:51:44.2729535Z HEAD is now at efd3c5a preloop workspace snapshot
+2026-09-12T16:51:44.2730287Z ##[endgroup]
+2026-09-12T16:51:44.2737408Z [command]/usr/bin/git log -1 --format=%H
+2026-09-12T16:51:44.2744536Z efd3c5af0e7aa3962a79a309b4bfb5e492ee3b40
+2026-09-12T16:51:44.2837565Z ##[group]Run rustup target add x86_64-unknown-linux-gnu
+2026-09-12T16:51:44.2837854Z [36;1mrustup target add x86_64-unknown-linux-gnu[0m
+2026-09-12T16:51:44.2838112Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-09-12T16:51:44.2838356Z ##[endgroup]
+2026-09-12T16:51:44.3098491Z info: syncing channel updates for nightly-aarch64-unknown-linux-gnu
+2026-09-12T16:51:44.5584446Z info: latest update on 2026-09-12 for version 1.100.0-nightly (0fc141305 2026-09-11)
+2026-09-12T16:51:44.5585494Z info: downloading 3 components
+2026-09-12T16:51:50.2358559Z info: downloading component rust-std
+2026-09-12T16:51:52.9238625Z Unexpected error attempting to determine if executable file exists '/usr/local/bin/rustc': Error: EACCES: permission denied, stat '/usr/local/bin/rustc'
+2026-09-12T16:51:59.4565372Z Unexpected error attempting to determine if executable file exists '/usr/local/bin/rustup': Error: EACCES: permission denied, stat '/usr/local/bin/rustup'
+2026-09-12T16:51:59.4600229Z Unexpected error attempting to determine if executable file exists '/usr/local/bin/rustup': Error: EACCES: permission denied, stat '/usr/local/bin/rustup'
+2026-09-12T16:51:59.5375999Z Unexpected error attempting to determine if executable file exists '/usr/local/bin/rustup': Error: EACCES: permission denied, stat '/usr/local/bin/rustup'
+2026-09-12T16:51:59.5442279Z Unexpected error attempting to determine if executable file exists '/usr/local/bin/rustup': Error: EACCES: permission denied, stat '/usr/local/bin/rustup'
+2026-09-12T16:51:59.5600808Z Unexpected error attempting to determine if executable file exists '/usr/local/bin/cargo': Error: EACCES: permission denied, stat '/usr/local/bin/cargo'
+2026-09-12T16:51:59.5722062Z ##[group]Cache Configuration
+2026-09-12T16:51:59.5722443Z Cache Provider:
+2026-09-12T16:51:59.5722854Z     github
+2026-09-12T16:51:59.5723190Z Workspaces:
+2026-09-12T16:51:59.5723789Z     /var/lib/preloop-runner/_work/default/default/crates/nu-parser/fuzz
+2026-09-12T16:51:59.5724240Z Cache Paths:
+2026-09-12T16:51:59.5724564Z     /home/runner/.cargo/bin
+2026-09-12T16:51:59.5724886Z     /home/runner/.cargo/.crates.toml
+2026-09-12T16:51:59.5725209Z     /home/runner/.cargo/.crates2.json
+2026-09-12T16:51:59.5725598Z     /home/runner/.cargo/registry
+2026-09-12T16:51:59.5726118Z     /home/runner/.cargo/git
+2026-09-12T16:51:59.5726554Z     /var/lib/preloop-runner/_work/default/default/crates/nu-parser/fuzz/target
+2026-09-12T16:51:59.5727004Z Restore Key:
+2026-09-12T16:51:59.5727441Z     v0-rust-cargo-Linux-arm64-d57f8dbb
+2026-09-12T16:51:59.5727865Z Cache Key:
+2026-09-12T16:51:59.5728254Z     v0-rust-cargo-Linux-arm64-d57f8dbb-d3791ff8
+2026-09-12T16:51:59.5728644Z .. Prefix:
+2026-09-12T16:51:59.5729129Z   - v0-rust-cargo-Linux-arm64
+2026-09-12T16:51:59.5729571Z .. Environment considered:
+2026-09-12T16:51:59.5729987Z   - Rust Versions:
+2026-09-12T16:51:59.5730398Z     - 1.100.0-nightly aarch64-unknown-linux-gnu 0fc141305da7a8a222f65aef1f1acc739c46282b
+2026-09-12T16:51:59.5730730Z     - 1.96.1 aarch64-unknown-linux-gnu 31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd
+2026-09-12T16:51:59.5731233Z     - 1.97.1 aarch64-unknown-linux-gnu 8bab26f4f68e0e26f0bb7960be334d5b520ea452
+2026-09-12T16:51:59.5731566Z   - CARGO_INCREMENTAL
+2026-09-12T16:51:59.5731874Z .. Lockfiles considered:
+2026-09-12T16:51:59.5732368Z   - /var/lib/preloop-runner/_work/default/default/.cargo/config.toml
+2026-09-12T16:51:59.5732742Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-parser/fuzz/Cargo.toml
+2026-09-12T16:51:59.5733219Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-parser/fuzz/rust-toolchain.toml
+2026-09-12T16:51:59.5733596Z   - /var/lib/preloop-runner/_work/default/default/rust-toolchain.toml
+2026-09-12T16:51:59.5734069Z ##[endgroup]
+2026-09-12T16:51:59.5734373Z 
+2026-09-12T16:51:59.5734669Z ... Restoring cache ...
+2026-09-12T16:51:59.5795009Z No cache found.
+2026-09-12T16:51:59.5886089Z ##[group]Run git diff --quiet && git diff --cached --quiet
+2026-09-12T16:51:59.5886418Z [36;1mgit diff --quiet && git diff --cached --quiet[0m
+2026-09-12T16:51:59.5886715Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-09-12T16:51:59.5887007Z ##[endgroup]
+2026-09-12T16:51:59.6948978Z ##[group]Cache Configuration
+2026-09-12T16:51:59.6949589Z Cache Provider:
+2026-09-12T16:51:59.6949929Z     github
+2026-09-12T16:51:59.6950327Z Workspaces:
+2026-09-12T16:51:59.6950670Z     /var/lib/preloop-runner/_work/default/default/crates/nu-parser/fuzz
+2026-09-12T16:51:59.6951075Z Cache Paths:
+2026-09-12T16:51:59.6951562Z     /home/runner/.cargo/bin
+2026-09-12T16:51:59.6951951Z     /home/runner/.cargo/.crates.toml
+2026-09-12T16:51:59.6952433Z     /home/runner/.cargo/.crates2.json
+2026-09-12T16:51:59.6952849Z     /home/runner/.cargo/registry
+2026-09-12T16:51:59.6953179Z     /home/runner/.cargo/git
+2026-09-12T16:51:59.6953546Z     /var/lib/preloop-runner/_work/default/default/crates/nu-parser/fuzz/target
+2026-09-12T16:51:59.6953941Z Restore Key:
+2026-09-12T16:51:59.6954419Z     v0-rust-cargo-Linux-arm64-d57f8dbb
+2026-09-12T16:51:59.6954769Z Cache Key:
+2026-09-12T16:51:59.6955087Z     v0-rust-cargo-Linux-arm64-d57f8dbb-d3791ff8
+2026-09-12T16:51:59.6955444Z .. Prefix:
+2026-09-12T16:51:59.6955760Z   - v0-rust-cargo-Linux-arm64
+2026-09-12T16:51:59.6956171Z .. Environment considered:
+2026-09-12T16:51:59.6956519Z   - Rust Versions:
+2026-09-12T16:51:59.6956988Z     - 1.100.0-nightly aarch64-unknown-linux-gnu 0fc141305da7a8a222f65aef1f1acc739c46282b
+2026-09-12T16:51:59.6957367Z     - 1.96.1 aarch64-unknown-linux-gnu 31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd
+2026-09-12T16:51:59.6957723Z     - 1.97.1 aarch64-unknown-linux-gnu 8bab26f4f68e0e26f0bb7960be334d5b520ea452
+2026-09-12T16:51:59.6958116Z   - CARGO_INCREMENTAL
+2026-09-12T16:51:59.6958426Z .. Lockfiles considered:
+2026-09-12T16:51:59.6958743Z   - /var/lib/preloop-runner/_work/default/default/.cargo/config.toml
+2026-09-12T16:51:59.6959067Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-parser/fuzz/Cargo.toml
+2026-09-12T16:51:59.6959533Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-parser/fuzz/rust-toolchain.toml
+2026-09-12T16:51:59.6959879Z   - /var/lib/preloop-runner/_work/default/default/rust-toolchain.toml
+2026-09-12T16:51:59.6960233Z ##[endgroup]
+2026-09-12T16:51:59.6960544Z 
+2026-09-12T16:51:59.6965047Z Unexpected error attempting to determine if executable file exists '/usr/local/bin/cargo': Error: EACCES: permission denied, stat '/usr/local/bin/cargo'
+2026-09-12T16:52:03.1826622Z Unexpected error attempting to determine if executable file exists '/usr/local/bin/cargo': Error: EACCES: permission denied, stat '/usr/local/bin/cargo'
+2026-09-12T16:52:03.1904577Z ... Cleaning /var/lib/preloop-runner/_work/default/default/crates/nu-parser/fuzz/target ...
+2026-09-12T16:52:03.1906491Z ... Cleaning cargo registry (cache-all-crates: true) ...
+2026-09-12T16:52:03.2337792Z ... Cleaning cargo/bin ...
+2026-09-12T16:52:03.2340812Z ... Cleaning cargo git cache ...
+2026-09-12T16:52:03.2343340Z ... Saving cache ...
+2026-09-12T16:52:03.2404862Z [command]/usr/bin/tar --posix -cf cache.tzst --exclude cache.tzst -P -C /var/lib/preloop-runner/_work/default/default --files-from manifest.txt --use-compress-program zstdmt
+2026-09-12T16:52:04.0257238Z Sent 92715975 of 92715975 (100.0%), 462.9 MBs/sec
+2026-09-12T16:52:04.1199659Z [command]/usr/bin/git version
+2026-09-12T16:52:04.1212299Z git version 2.54.0
+2026-09-12T16:52:04.1225526Z Temporarily overriding HOME='/var/lib/preloop-runner/_work/_temp/bac15353-deee-4a99-9d54-989c4225bb9b' before making global git config changes
+2026-09-12T16:52:04.1225959Z Adding repository directory to the temporary git global config as a safe directory
+2026-09-12T16:52:04.1227902Z [command]/usr/bin/git config --global --add safe.directory /var/lib/preloop-runner/_work/default/default
+2026-09-12T16:52:04.1239348Z Removing SSH command configuration
+2026-09-12T16:52:04.1241702Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-09-12T16:52:04.1252176Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-09-12T16:52:04.1306220Z Removing HTTP extra header
+2026-09-12T16:52:04.1307828Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-09-12T16:52:04.1317184Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-09-12T16:52:04.1373401Z Removing includeIf entries pointing to credentials config files
+2026-09-12T16:52:04.1375987Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-09-12T16:52:04.1382403Z includeif.gitdir:/var/lib/preloop-runner/_work/default/default/.git.path
+2026-09-12T16:52:04.1382847Z includeif.gitdir:/var/lib/preloop-runner/_work/default/default/.git/worktrees/*.path
+2026-09-12T16:52:04.1383208Z includeif.gitdir:/github/workspace/.git.path
+2026-09-12T16:52:04.1383538Z includeif.gitdir:/github/workspace/.git/worktrees/*.path
+2026-09-12T16:52:04.1385269Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/var/lib/preloop-runner/_work/default/default/.git.path
+2026-09-12T16:52:04.1390691Z /var/lib/preloop-runner/_work/_temp/git-credentials-5eacd212-c320-4e55-950c-5e2da77b95bf.config
+2026-09-12T16:52:04.1393581Z [command]/usr/bin/git config --local --unset includeif.gitdir:/var/lib/preloop-runner/_work/default/default/.git.path \/var\/lib\/preloop\-runner\/_work\/_temp\/git\-credentials\-5eacd212\-c320\-4e55\-950c\-5e2da77b95bf\.config
+2026-09-12T16:52:04.1403162Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/var/lib/preloop-runner/_work/default/default/.git/worktrees/*.path
+2026-09-12T16:52:04.1408746Z /var/lib/preloop-runner/_work/_temp/git-credentials-5eacd212-c320-4e55-950c-5e2da77b95bf.config
+2026-09-12T16:52:04.1411590Z [command]/usr/bin/git config --local --unset includeif.gitdir:/var/lib/preloop-runner/_work/default/default/.git/worktrees/*.path \/var\/lib\/preloop\-runner\/_work\/_temp\/git\-credentials\-5eacd212\-c320\-4e55\-950c\-5e2da77b95bf\.config
+2026-09-12T16:52:04.1419239Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git.path
+2026-09-12T16:52:04.1424459Z /github/runner_temp/git-credentials-5eacd212-c320-4e55-950c-5e2da77b95bf.config
+2026-09-12T16:52:04.1426675Z [command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git.path \/github\/runner_temp\/git\-credentials\-5eacd212\-c320\-4e55\-950c\-5e2da77b95bf\.config
+2026-09-12T16:52:04.1435261Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git/worktrees/*.path
+2026-09-12T16:52:04.1442099Z /github/runner_temp/git-credentials-5eacd212-c320-4e55-950c-5e2da77b95bf.config
+2026-09-12T16:52:04.1444375Z [command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git/worktrees/*.path \/github\/runner_temp\/git\-credentials\-5eacd212\-c320\-4e55\-950c\-5e2da77b95bf\.config
+2026-09-12T16:52:04.1452998Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-09-12T16:52:04.1502225Z Removing credentials config '/var/lib/preloop-runner/_work/_temp/git-credentials-5eacd212-c320-4e55-950c-5e2da77b95bf.config'
+2026-09-12T16:52:04.1586377Z Cleaning up orphan processes
+2026-09-12T16:53:20.9775567Z Current runner version: '2.335.1'
+2026-09-12T16:53:20.9775567Z Runner name: 'nu-relabel-2-1'
+2026-09-12T16:53:20.9775567Z Runner group name: 'Default'
+2026-09-12T16:53:20.9775567Z Machine name: 'container'
+2026-09-12T16:53:20.9775567Z ##[group]GITHUB_TOKEN Permissions
+2026-09-12T16:53:20.9775567Z Contents: read
+2026-09-12T16:53:20.9775567Z ##[endgroup]
+2026-09-12T16:53:20.9775567Z Secret source: Actions
+2026-09-12T16:53:20.9775567Z Prepare workflow directory
+2026-09-12T16:53:20.9775567Z Prepare all required actions
+2026-09-12T16:53:20.9775567Z Complete job name: `cargo` in root (WASM)
+2026-09-12T16:53:21.0496814Z Syncing repository: snapshots/d7718942-c807-44aa-ac57-545410a9ba83
+2026-09-12T16:53:21.0497377Z ##[group]Getting Git version info
+2026-09-12T16:53:21.0497769Z Working directory is '/var/lib/preloop-runner/_work/default/default'
+2026-09-12T16:53:21.0498417Z [command]/usr/bin/git version
+2026-09-12T16:53:21.0554641Z git version 2.54.0
+2026-09-12T16:53:21.0561714Z ##[endgroup]
+2026-09-12T16:53:21.0565638Z Temporarily overriding HOME='/var/lib/preloop-runner/_work/_temp/1f0017e1-4086-41fd-b490-b329fd60573f' before making global git config changes
+2026-09-12T16:53:21.0566084Z Adding repository directory to the temporary git global config as a safe directory
+2026-09-12T16:53:21.0570640Z [command]/usr/bin/git config --global --add safe.directory /var/lib/preloop-runner/_work/default/default
+2026-09-12T16:53:21.0585454Z Deleting the contents of '/var/lib/preloop-runner/_work/default/default'
+2026-09-12T16:53:21.0586502Z ##[group]Determining repository object format
+2026-09-12T16:53:21.0586951Z ##[endgroup]
+2026-09-12T16:53:21.0587342Z ##[group]Initializing the repository
+2026-09-12T16:53:21.0588880Z [command]/usr/bin/git init /var/lib/preloop-runner/_work/default/default
+2026-09-12T16:53:21.0627451Z hint: Using 'master' as the name for the initial branch. This default branch name
+2026-09-12T16:53:21.0627905Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+2026-09-12T16:53:21.0628318Z hint: to use in all of your new repositories, which will suppress this warning,
+2026-09-12T16:53:21.0628718Z hint: call:
+2026-09-12T16:53:21.0629083Z hint:
+2026-09-12T16:53:21.0629458Z hint: 	git config --global init.defaultBranch <name>
+2026-09-12T16:53:21.0629829Z hint:
+2026-09-12T16:53:21.0630200Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+2026-09-12T16:53:21.0630585Z hint: 'development'. The just-created branch can be renamed via this command:
+2026-09-12T16:53:21.0630957Z hint:
+2026-09-12T16:53:21.0631322Z hint: 	git branch -m <name>
+2026-09-12T16:53:21.0631683Z hint:
+2026-09-12T16:53:21.0632051Z hint: Disable this message with "git config set advice.defaultBranchName false"
+2026-09-12T16:53:21.0632606Z Initialized empty Git repository in /var/lib/preloop-runner/_work/default/default/.git/
+2026-09-12T16:53:21.0633396Z [command]/usr/bin/git remote add origin http://127.0.0.1:9198/snapshots/d7718942-c807-44aa-ac57-545410a9ba83
+2026-09-12T16:53:21.0641377Z ##[endgroup]
+2026-09-12T16:53:21.0641759Z ##[group]Disabling automatic garbage collection
+2026-09-12T16:53:21.0642531Z [command]/usr/bin/git config --local gc.auto 0
+2026-09-12T16:53:21.0649708Z ##[endgroup]
+2026-09-12T16:53:21.0650082Z ##[group]Setting up auth
+2026-09-12T16:53:21.0650549Z Removing SSH command configuration
+2026-09-12T16:53:21.0651844Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-09-12T16:53:21.0659784Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-09-12T16:53:21.0801255Z Removing HTTP extra header
+2026-09-12T16:53:21.0803043Z [command]/usr/bin/git config --local --name-only --get-regexp http\.http\:\/\/127\.0\.0\.1\:9198\/\.extraheader
+2026-09-12T16:53:21.0811193Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.http\:\/\/127\.0\.0\.1\:9198\/\.extraheader' && git config --local --unset-all 'http.http://127.0.0.1:9198/.extraheader' || :"
+2026-09-12T16:53:21.0857601Z Removing includeIf entries pointing to credentials config files
+2026-09-12T16:53:21.0859417Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-09-12T16:53:21.0867511Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-09-12T16:53:21.0917929Z [command]/usr/bin/git config --file /var/lib/preloop-runner/_work/_temp/git-credentials-aa07308c-4ef4-4384-8997-6ec19c7b96ea.config http.http://127.0.0.1:9198/.extraheader AUTHORIZATION: basic ***
+2026-09-12T16:53:21.0930477Z [command]/usr/bin/git config --local includeIf.gitdir:/var/lib/preloop-runner/_work/default/default/.git.path /var/lib/preloop-runner/_work/_temp/git-credentials-aa07308c-4ef4-4384-8997-6ec19c7b96ea.config
+2026-09-12T16:53:21.0938909Z [command]/usr/bin/git config --local includeIf.gitdir:/var/lib/preloop-runner/_work/default/default/.git/worktrees/*.path /var/lib/preloop-runner/_work/_temp/git-credentials-aa07308c-4ef4-4384-8997-6ec19c7b96ea.config
+2026-09-12T16:53:21.0946692Z [command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-aa07308c-4ef4-4384-8997-6ec19c7b96ea.config
+2026-09-12T16:53:21.0955211Z [command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-aa07308c-4ef4-4384-8997-6ec19c7b96ea.config
+2026-09-12T16:53:21.0962318Z ##[endgroup]
+2026-09-12T16:53:21.0962679Z ##[group]Fetching the repository
+2026-09-12T16:53:21.0964729Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin efd3c5af0e7aa3962a79a309b4bfb5e492ee3b40
+2026-09-12T16:53:21.3338471Z From http://127.0.0.1:9198/snapshots/d7718942-c807-44aa-ac57-545410a9ba83
+2026-09-12T16:53:21.3338992Z  * branch            efd3c5af0e7aa3962a79a309b4bfb5e492ee3b40 -> FETCH_HEAD
+2026-09-12T16:53:21.3349825Z [command]/usr/bin/git rev-parse --verify --quiet efd3c5af0e7aa3962a79a309b4bfb5e492ee3b40^{object}
+2026-09-12T16:53:21.3357592Z efd3c5af0e7aa3962a79a309b4bfb5e492ee3b40
+2026-09-12T16:53:21.3358859Z ##[endgroup]
+2026-09-12T16:53:21.3359267Z ##[group]Determining the checkout info
+2026-09-12T16:53:21.3359743Z ##[endgroup]
+2026-09-12T16:53:21.3360767Z [command]/usr/bin/git sparse-checkout disable
+2026-09-12T16:53:21.3375219Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+2026-09-12T16:53:21.3382396Z ##[group]Checking out the ref
+2026-09-12T16:53:21.3383835Z [command]/usr/bin/git checkout --progress --force efd3c5af0e7aa3962a79a309b4bfb5e492ee3b40
+2026-09-12T16:53:21.4134969Z Note: switching to 'efd3c5af0e7aa3962a79a309b4bfb5e492ee3b40'.
+2026-09-12T16:53:21.4135432Z 
+2026-09-12T16:53:21.4135827Z You are in 'detached HEAD' state. You can look around, make experimental
+2026-09-12T16:53:21.4136273Z changes and commit them, and you can discard any commits you make in this
+2026-09-12T16:53:21.4136662Z state without impacting any branches by switching back to a branch.
+2026-09-12T16:53:21.4137027Z 
+2026-09-12T16:53:21.4137389Z If you want to create a new branch to retain commits you create, you may
+2026-09-12T16:53:21.4137802Z do so (now or later) by using -c with the switch command. Example:
+2026-09-12T16:53:21.4138213Z 
+2026-09-12T16:53:21.4138576Z   git switch -c <new-branch-name>
+2026-09-12T16:53:21.4138927Z 
+2026-09-12T16:53:21.4139289Z Or undo this operation with:
+2026-09-12T16:53:21.4139638Z 
+2026-09-12T16:53:21.4139991Z   git switch -
+2026-09-12T16:53:21.4140389Z 
+2026-09-12T16:53:21.4140796Z Turn off this advice by setting config variable advice.detachedHead to false
+2026-09-12T16:53:21.4141180Z 
+2026-09-12T16:53:21.4141557Z HEAD is now at efd3c5a preloop workspace snapshot
+2026-09-12T16:53:21.4142304Z ##[endgroup]
+2026-09-12T16:53:21.4149590Z [command]/usr/bin/git log -1 --format=%H
+2026-09-12T16:53:21.4157230Z efd3c5af0e7aa3962a79a309b4bfb5e492ee3b40
+2026-09-12T16:53:21.4260928Z ##[group]Run rustup target add wasm32-unknown-unknown
+2026-09-12T16:53:21.4261262Z [36;1mrustup target add wasm32-unknown-unknown[0m
+2026-09-12T16:53:21.4261560Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-09-12T16:53:21.4261851Z ##[endgroup]
+2026-09-12T16:53:21.4540801Z info: syncing channel updates for 1.96.1-aarch64-unknown-linux-gnu
+2026-09-12T16:53:21.7196353Z info: latest update on 2026-06-30 for version 1.96.1 (31fca3adb 2026-06-26)
+2026-09-12T16:53:21.7197576Z info: downloading 6 components
+2026-09-12T16:53:28.7643761Z info: downloading component rust-std
+2026-09-12T16:53:30.4314471Z Unexpected error attempting to determine if executable file exists '/usr/local/bin/rustc': Error: EACCES: permission denied, stat '/usr/local/bin/rustc'
+2026-09-12T16:53:30.4391273Z Unexpected error attempting to determine if executable file exists '/usr/local/bin/rustup': Error: EACCES: permission denied, stat '/usr/local/bin/rustup'
+2026-09-12T16:53:30.4421196Z Unexpected error attempting to determine if executable file exists '/usr/local/bin/rustup': Error: EACCES: permission denied, stat '/usr/local/bin/rustup'
+2026-09-12T16:53:30.5224560Z Unexpected error attempting to determine if executable file exists '/usr/local/bin/rustup': Error: EACCES: permission denied, stat '/usr/local/bin/rustup'
+2026-09-12T16:53:30.6953022Z Unexpected error attempting to determine if executable file exists '/usr/local/bin/cargo': Error: EACCES: permission denied, stat '/usr/local/bin/cargo'
+2026-09-12T16:53:30.7271602Z ##[group]Cache Configuration
+2026-09-12T16:53:30.7272050Z Cache Provider:
+2026-09-12T16:53:30.7272458Z     github
+2026-09-12T16:53:30.7272811Z Workspaces:
+2026-09-12T16:53:30.7273140Z     /var/lib/preloop-runner/_work/default/default
+2026-09-12T16:53:30.7273540Z Cache Paths:
+2026-09-12T16:53:30.7273890Z     /home/runner/.cargo/bin
+2026-09-12T16:53:30.7274219Z     /home/runner/.cargo/.crates.toml
+2026-09-12T16:53:30.7274549Z     /home/runner/.cargo/.crates2.json
+2026-09-12T16:53:30.7274878Z     /home/runner/.cargo/registry
+2026-09-12T16:53:30.7275452Z     /home/runner/.cargo/git
+2026-09-12T16:53:30.7275911Z     /var/lib/preloop-runner/_work/default/default/target
+2026-09-12T16:53:30.7276339Z Restore Key:
+2026-09-12T16:53:30.7276747Z     v0-rust-cargo-Linux-arm64-b588f60f
+2026-09-12T16:53:30.7277154Z Cache Key:
+2026-09-12T16:53:30.7277531Z     v0-rust-cargo-Linux-arm64-b588f60f-bffd680e
+2026-09-12T16:53:30.7277964Z .. Prefix:
+2026-09-12T16:53:30.7278364Z   - v0-rust-cargo-Linux-arm64
+2026-09-12T16:53:30.7278788Z .. Environment considered:
+2026-09-12T16:53:30.7279322Z   - Rust Versions:
+2026-09-12T16:53:30.7279764Z     - 1.96.1 aarch64-unknown-linux-gnu 31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd
+2026-09-12T16:53:30.7280120Z     - 1.97.1 aarch64-unknown-linux-gnu 8bab26f4f68e0e26f0bb7960be334d5b520ea452
+2026-09-12T16:53:30.7280520Z   - CARGO_INCREMENTAL
+2026-09-12T16:53:30.7280839Z .. Lockfiles considered:
+2026-09-12T16:53:30.7281161Z   - /var/lib/preloop-runner/_work/default/default/.cargo/config.toml
+2026-09-12T16:53:30.7281545Z   - /var/lib/preloop-runner/_work/default/default/Cargo.lock
+2026-09-12T16:53:30.7281877Z   - /var/lib/preloop-runner/_work/default/default/Cargo.toml
+2026-09-12T16:53:30.7282258Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_custom_values/Cargo.toml
+2026-09-12T16:53:30.7282604Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_example/Cargo.toml
+2026-09-12T16:53:30.7282945Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_formats/Cargo.toml
+2026-09-12T16:53:30.7283425Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_gstat/Cargo.toml
+2026-09-12T16:53:30.7283828Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_inc/Cargo.toml
+2026-09-12T16:53:30.7284204Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_polars/Cargo.toml
+2026-09-12T16:53:30.7284648Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_query/Cargo.toml
+2026-09-12T16:53:30.7285005Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_stress_internals/Cargo.toml
+2026-09-12T16:53:30.7285331Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-cli/Cargo.toml
+2026-09-12T16:53:30.7285715Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-cmd-base/Cargo.toml
+2026-09-12T16:53:30.7286044Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-cmd-extra/Cargo.toml
+2026-09-12T16:53:30.7286498Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-cmd-lang/Cargo.toml
+2026-09-12T16:53:30.7286919Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-cmd-plugin/Cargo.toml
+2026-09-12T16:53:30.7287282Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-color-config/Cargo.toml
+2026-09-12T16:53:30.7287614Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-command/Cargo.toml
+2026-09-12T16:53:30.7288097Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-config/Cargo.toml
+2026-09-12T16:53:30.7288470Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-derive-value/Cargo.toml
+2026-09-12T16:53:30.7288849Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-engine/Cargo.toml
+2026-09-12T16:53:30.7289173Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-experimental/Cargo.toml
+2026-09-12T16:53:30.7289494Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-explore/Cargo.toml
+2026-09-12T16:53:30.7289867Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-glob/Cargo.toml
+2026-09-12T16:53:30.7290205Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-heavy-utils/Cargo.toml
+2026-09-12T16:53:30.7290571Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-json/Cargo.toml
+2026-09-12T16:53:30.7290893Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-lsp/Cargo.toml
+2026-09-12T16:53:30.7291257Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-mcp/Cargo.toml
+2026-09-12T16:53:30.7291578Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-parser/Cargo.toml
+2026-09-12T16:53:30.7292096Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-parser/fuzz/rust-toolchain.toml
+2026-09-12T16:53:30.7292534Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-path/Cargo.toml
+2026-09-12T16:53:30.7292972Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-path/fuzz/rust-toolchain.toml
+2026-09-12T16:53:30.7293355Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-plugin-core/Cargo.toml
+2026-09-12T16:53:30.7293786Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-plugin-engine/Cargo.toml
+2026-09-12T16:53:30.7294119Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-plugin-protocol/Cargo.toml
+2026-09-12T16:53:30.7294474Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-plugin-test-support/Cargo.toml
+2026-09-12T16:53:30.7294798Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-plugin/Cargo.toml
+2026-09-12T16:53:30.7295230Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-pretty-hex/Cargo.toml
+2026-09-12T16:53:30.7295562Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-protocol/Cargo.toml
+2026-09-12T16:53:30.7295881Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-std/Cargo.toml
+2026-09-12T16:53:30.7296249Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-system/Cargo.toml
+2026-09-12T16:53:30.7296614Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-table/Cargo.toml
+2026-09-12T16:53:30.7296938Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-term-grid/Cargo.toml
+2026-09-12T16:53:30.7297458Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-test-support-macros/Cargo.toml
+2026-09-12T16:53:30.7297832Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-test-support/Cargo.toml
+2026-09-12T16:53:30.7298286Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-utils/Cargo.toml
+2026-09-12T16:53:30.7298645Z   - /var/lib/preloop-runner/_work/default/default/crates/nuon/Cargo.toml
+2026-09-12T16:53:30.7298964Z   - /var/lib/preloop-runner/_work/default/default/crates/testbins/Cargo.toml
+2026-09-12T16:53:30.7299317Z   - /var/lib/preloop-runner/_work/default/default/rust-toolchain.toml
+2026-09-12T16:53:30.7299672Z ##[endgroup]
+2026-09-12T16:53:30.7299981Z 
+2026-09-12T16:53:30.7300389Z ... Restoring cache ...
+2026-09-12T16:53:30.7352101Z No cache found.
+2026-09-12T16:53:30.7447121Z ##[group]Run git diff --quiet && git diff --cached --quiet
+2026-09-12T16:53:30.7447459Z [36;1mgit diff --quiet && git diff --cached --quiet[0m
+2026-09-12T16:53:30.7447755Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-09-12T16:53:30.7448045Z ##[endgroup]
+2026-09-12T16:53:30.8530097Z ##[group]Cache Configuration
+2026-09-12T16:53:30.8530745Z Cache Provider:
+2026-09-12T16:53:30.8531162Z     github
+2026-09-12T16:53:30.8531509Z Workspaces:
+2026-09-12T16:53:30.8531833Z     /var/lib/preloop-runner/_work/default/default
+2026-09-12T16:53:30.8532152Z Cache Paths:
+2026-09-12T16:53:30.8532469Z     /home/runner/.cargo/bin
+2026-09-12T16:53:30.8533015Z     /home/runner/.cargo/.crates.toml
+2026-09-12T16:53:30.8533347Z     /home/runner/.cargo/.crates2.json
+2026-09-12T16:53:30.8533854Z     /home/runner/.cargo/registry
+2026-09-12T16:53:30.8534177Z     /home/runner/.cargo/git
+2026-09-12T16:53:30.8534494Z     /var/lib/preloop-runner/_work/default/default/target
+2026-09-12T16:53:30.8534984Z Restore Key:
+2026-09-12T16:53:30.8535346Z     v0-rust-cargo-Linux-arm64-b588f60f
+2026-09-12T16:53:30.8535742Z Cache Key:
+2026-09-12T16:53:30.8536210Z     v0-rust-cargo-Linux-arm64-b588f60f-bffd680e
+2026-09-12T16:53:30.8536631Z .. Prefix:
+2026-09-12T16:53:30.8536942Z   - v0-rust-cargo-Linux-arm64
+2026-09-12T16:53:30.8537431Z .. Environment considered:
+2026-09-12T16:53:30.8537751Z   - Rust Versions:
+2026-09-12T16:53:30.8538134Z     - 1.96.1 aarch64-unknown-linux-gnu 31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd
+2026-09-12T16:53:30.8538633Z     - 1.97.1 aarch64-unknown-linux-gnu 8bab26f4f68e0e26f0bb7960be334d5b520ea452
+2026-09-12T16:53:30.8538977Z   - CARGO_INCREMENTAL
+2026-09-12T16:53:30.8539387Z .. Lockfiles considered:
+2026-09-12T16:53:30.8539939Z   - /var/lib/preloop-runner/_work/default/default/.cargo/config.toml
+2026-09-12T16:53:30.8540338Z   - /var/lib/preloop-runner/_work/default/default/Cargo.lock
+2026-09-12T16:53:30.8540782Z   - /var/lib/preloop-runner/_work/default/default/Cargo.toml
+2026-09-12T16:53:30.8541338Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_custom_values/Cargo.toml
+2026-09-12T16:53:30.8541702Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_example/Cargo.toml
+2026-09-12T16:53:30.8542114Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_formats/Cargo.toml
+2026-09-12T16:53:30.8542646Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_gstat/Cargo.toml
+2026-09-12T16:53:30.8543018Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_inc/Cargo.toml
+2026-09-12T16:53:30.8543385Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_polars/Cargo.toml
+2026-09-12T16:53:30.8543729Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_query/Cargo.toml
+2026-09-12T16:53:30.8544231Z   - /var/lib/preloop-runner/_work/default/default/crates/nu_plugin_stress_internals/Cargo.toml
+2026-09-12T16:53:30.8544558Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-cli/Cargo.toml
+2026-09-12T16:53:30.8544889Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-cmd-base/Cargo.toml
+2026-09-12T16:53:30.8545416Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-cmd-extra/Cargo.toml
+2026-09-12T16:53:30.8545842Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-cmd-lang/Cargo.toml
+2026-09-12T16:53:30.8546191Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-cmd-plugin/Cargo.toml
+2026-09-12T16:53:30.8546562Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-color-config/Cargo.toml
+2026-09-12T16:53:30.8546968Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-command/Cargo.toml
+2026-09-12T16:53:30.8547319Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-config/Cargo.toml
+2026-09-12T16:53:30.8547836Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-derive-value/Cargo.toml
+2026-09-12T16:53:30.8548217Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-engine/Cargo.toml
+2026-09-12T16:53:30.8548585Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-experimental/Cargo.toml
+2026-09-12T16:53:30.8549132Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-explore/Cargo.toml
+2026-09-12T16:53:30.8549509Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-glob/Cargo.toml
+2026-09-12T16:53:30.8549840Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-heavy-utils/Cargo.toml
+2026-09-12T16:53:30.8550333Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-json/Cargo.toml
+2026-09-12T16:53:30.8550656Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-lsp/Cargo.toml
+2026-09-12T16:53:30.8550977Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-mcp/Cargo.toml
+2026-09-12T16:53:30.8551506Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-parser/Cargo.toml
+2026-09-12T16:53:30.8551837Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-parser/fuzz/rust-toolchain.toml
+2026-09-12T16:53:30.8552191Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-path/Cargo.toml
+2026-09-12T16:53:30.8552700Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-path/fuzz/rust-toolchain.toml
+2026-09-12T16:53:30.8553129Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-plugin-core/Cargo.toml
+2026-09-12T16:53:30.8553557Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-plugin-engine/Cargo.toml
+2026-09-12T16:53:30.8554087Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-plugin-protocol/Cargo.toml
+2026-09-12T16:53:30.8554481Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-plugin-test-support/Cargo.toml
+2026-09-12T16:53:30.8554851Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-plugin/Cargo.toml
+2026-09-12T16:53:30.8555210Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-pretty-hex/Cargo.toml
+2026-09-12T16:53:30.8555570Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-protocol/Cargo.toml
+2026-09-12T16:53:30.8556053Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-std/Cargo.toml
+2026-09-12T16:53:30.8556414Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-system/Cargo.toml
+2026-09-12T16:53:30.8556772Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-table/Cargo.toml
+2026-09-12T16:53:30.8557127Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-term-grid/Cargo.toml
+2026-09-12T16:53:30.8557633Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-test-support-macros/Cargo.toml
+2026-09-12T16:53:30.8557994Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-test-support/Cargo.toml
+2026-09-12T16:53:30.8558352Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-utils/Cargo.toml
+2026-09-12T16:53:30.8558845Z   - /var/lib/preloop-runner/_work/default/default/crates/nuon/Cargo.toml
+2026-09-12T16:53:30.8559166Z   - /var/lib/preloop-runner/_work/default/default/crates/testbins/Cargo.toml
+2026-09-12T16:53:30.8559487Z   - /var/lib/preloop-runner/_work/default/default/rust-toolchain.toml
+2026-09-12T16:53:30.8559835Z ##[endgroup]
+2026-09-12T16:53:30.8560142Z 
+2026-09-12T16:53:30.8560751Z Unexpected error attempting to determine if executable file exists '/usr/local/bin/cargo': Error: EACCES: permission denied, stat '/usr/local/bin/cargo'
+2026-09-12T16:53:40.8024386Z Unexpected error attempting to determine if executable file exists '/usr/local/bin/cargo': Error: EACCES: permission denied, stat '/usr/local/bin/cargo'
+2026-09-12T16:53:40.8161081Z ... Cleaning /var/lib/preloop-runner/_work/default/default/target ...
+2026-09-12T16:53:40.8163337Z ... Cleaning cargo registry (cache-all-crates: true) ...
+2026-09-12T16:53:40.9247152Z ... Cleaning cargo/bin ...
+2026-09-12T16:53:40.9250272Z ... Cleaning cargo git cache ...
+2026-09-12T16:53:40.9258485Z ... Saving cache ...
+2026-09-12T16:53:40.9327043Z [command]/usr/bin/tar --posix -cf cache.tzst --exclude cache.tzst -P -C /var/lib/preloop-runner/_work/default/default --files-from manifest.txt --use-compress-program zstdmt
+2026-09-12T16:53:43.0557865Z ##[warning]Cache reservation failed: cache upload already reserved
+2026-09-12T16:53:43.0558482Z Failed to save: Unable to reserve cache with key v0-rust-cargo-Linux-arm64-b588f60f-bffd680e, another job may be creating this cache.
+2026-09-12T16:53:43.1301287Z [command]/usr/bin/git version
+2026-09-12T16:53:43.1314165Z git version 2.54.0
+2026-09-12T16:53:43.1326737Z Temporarily overriding HOME='/var/lib/preloop-runner/_work/_temp/5364198a-6844-4105-8cb6-00c145b31298' before making global git config changes
+2026-09-12T16:53:43.1327168Z Adding repository directory to the temporary git global config as a safe directory
+2026-09-12T16:53:43.1329030Z [command]/usr/bin/git config --global --add safe.directory /var/lib/preloop-runner/_work/default/default
+2026-09-12T16:53:43.1339744Z Removing SSH command configuration
+2026-09-12T16:53:43.1341961Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-09-12T16:53:43.1352654Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-09-12T16:53:43.1406770Z Removing HTTP extra header
+2026-09-12T16:53:43.1408502Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-09-12T16:53:43.1418294Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-09-12T16:53:43.1471530Z Removing includeIf entries pointing to credentials config files
+2026-09-12T16:53:43.1473975Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-09-12T16:53:43.1480367Z includeif.gitdir:/var/lib/preloop-runner/_work/default/default/.git.path
+2026-09-12T16:53:43.1480811Z includeif.gitdir:/var/lib/preloop-runner/_work/default/default/.git/worktrees/*.path
+2026-09-12T16:53:43.1481177Z includeif.gitdir:/github/workspace/.git.path
+2026-09-12T16:53:43.1481514Z includeif.gitdir:/github/workspace/.git/worktrees/*.path
+2026-09-12T16:53:43.1483430Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/var/lib/preloop-runner/_work/default/default/.git.path
+2026-09-12T16:53:43.1488890Z /var/lib/preloop-runner/_work/_temp/git-credentials-aa07308c-4ef4-4384-8997-6ec19c7b96ea.config
+2026-09-12T16:53:43.1491943Z [command]/usr/bin/git config --local --unset includeif.gitdir:/var/lib/preloop-runner/_work/default/default/.git.path \/var\/lib\/preloop\-runner\/_work\/_temp\/git\-credentials\-aa07308c\-4ef4\-4384\-8997\-6ec19c7b96ea\.config
+2026-09-12T16:53:43.1500970Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/var/lib/preloop-runner/_work/default/default/.git/worktrees/*.path
+2026-09-12T16:53:43.1506665Z /var/lib/preloop-runner/_work/_temp/git-credentials-aa07308c-4ef4-4384-8997-6ec19c7b96ea.config
+2026-09-12T16:53:43.1509335Z [command]/usr/bin/git config --local --unset includeif.gitdir:/var/lib/preloop-runner/_work/default/default/.git/worktrees/*.path \/var\/lib\/preloop\-runner\/_work\/_temp\/git\-credentials\-aa07308c\-4ef4\-4384\-8997\-6ec19c7b96ea\.config
+2026-09-12T16:53:43.1517315Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git.path
+2026-09-12T16:53:43.1522652Z /github/runner_temp/git-credentials-aa07308c-4ef4-4384-8997-6ec19c7b96ea.config
+2026-09-12T16:53:43.1524800Z [command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git.path \/github\/runner_temp\/git\-credentials\-aa07308c\-4ef4\-4384\-8997\-6ec19c7b96ea\.config
+2026-09-12T16:53:43.1539274Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git/worktrees/*.path
+2026-09-12T16:53:43.1546964Z /github/runner_temp/git-credentials-aa07308c-4ef4-4384-8997-6ec19c7b96ea.config
+2026-09-12T16:53:43.1549706Z [command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git/worktrees/*.path \/github\/runner_temp\/git\-credentials\-aa07308c\-4ef4\-4384\-8997\-6ec19c7b96ea\.config
+2026-09-12T16:53:43.1562325Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-09-12T16:53:43.1627067Z Removing credentials config '/var/lib/preloop-runner/_work/_temp/git-credentials-aa07308c-4ef4-4384-8997-6ec19c7b96ea.config'
+2026-09-12T16:53:43.1723715Z Cleaning up orphan processes
+2026-09-12T16:54:49.7457617Z Current runner version: '2.335.1'
+2026-09-12T16:54:49.7457617Z Runner name: 'nu-relabel-3-1'
+2026-09-12T16:54:49.7457617Z Runner group name: 'Default'
+2026-09-12T16:54:49.7457617Z Machine name: 'container'
+2026-09-12T16:54:49.7457617Z ##[group]GITHUB_TOKEN Permissions
+2026-09-12T16:54:49.7457617Z Contents: read
+2026-09-12T16:54:49.7457617Z ##[endgroup]
+2026-09-12T16:54:49.7457617Z Secret source: Actions
+2026-09-12T16:54:49.7457617Z Prepare workflow directory
+2026-09-12T16:54:49.7457617Z Prepare all required actions
+2026-09-12T16:54:49.7457617Z Complete job name: `cargo` in nu-parser/fuzz (WASM)
+2026-09-12T16:54:49.8144733Z Syncing repository: snapshots/d7718942-c807-44aa-ac57-545410a9ba83
+2026-09-12T16:54:49.8145314Z ##[group]Getting Git version info
+2026-09-12T16:54:49.8145691Z Working directory is '/var/lib/preloop-runner/_work/default/default'
+2026-09-12T16:54:49.8146260Z [command]/usr/bin/git version
+2026-09-12T16:54:49.8202409Z git version 2.54.0
+2026-09-12T16:54:49.8209886Z ##[endgroup]
+2026-09-12T16:54:49.8214075Z Temporarily overriding HOME='/var/lib/preloop-runner/_work/_temp/ac5099d0-c1a0-4f11-b911-318c2f9b220a' before making global git config changes
+2026-09-12T16:54:49.8214491Z Adding repository directory to the temporary git global config as a safe directory
+2026-09-12T16:54:49.8219261Z [command]/usr/bin/git config --global --add safe.directory /var/lib/preloop-runner/_work/default/default
+2026-09-12T16:54:49.8233131Z Deleting the contents of '/var/lib/preloop-runner/_work/default/default'
+2026-09-12T16:54:49.8234247Z ##[group]Determining repository object format
+2026-09-12T16:54:49.8234687Z ##[endgroup]
+2026-09-12T16:54:49.8235056Z ##[group]Initializing the repository
+2026-09-12T16:54:49.8236797Z [command]/usr/bin/git init /var/lib/preloop-runner/_work/default/default
+2026-09-12T16:54:49.8273317Z hint: Using 'master' as the name for the initial branch. This default branch name
+2026-09-12T16:54:49.8273767Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+2026-09-12T16:54:49.8274194Z hint: to use in all of your new repositories, which will suppress this warning,
+2026-09-12T16:54:49.8274579Z hint: call:
+2026-09-12T16:54:49.8274930Z hint:
+2026-09-12T16:54:49.8275291Z hint: 	git config --global init.defaultBranch <name>
+2026-09-12T16:54:49.8275648Z hint:
+2026-09-12T16:54:49.8276003Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+2026-09-12T16:54:49.8276373Z hint: 'development'. The just-created branch can be renamed via this command:
+2026-09-12T16:54:49.8276731Z hint:
+2026-09-12T16:54:49.8277078Z hint: 	git branch -m <name>
+2026-09-12T16:54:49.8277420Z hint:
+2026-09-12T16:54:49.8277769Z hint: Disable this message with "git config set advice.defaultBranchName false"
+2026-09-12T16:54:49.8278299Z Initialized empty Git repository in /var/lib/preloop-runner/_work/default/default/.git/
+2026-09-12T16:54:49.8279072Z [command]/usr/bin/git remote add origin http://127.0.0.1:9198/snapshots/d7718942-c807-44aa-ac57-545410a9ba83
+2026-09-12T16:54:49.8288600Z ##[endgroup]
+2026-09-12T16:54:49.8288977Z ##[group]Disabling automatic garbage collection
+2026-09-12T16:54:49.8289910Z [command]/usr/bin/git config --local gc.auto 0
+2026-09-12T16:54:49.8297828Z ##[endgroup]
+2026-09-12T16:54:49.8298194Z ##[group]Setting up auth
+2026-09-12T16:54:49.8298656Z Removing SSH command configuration
+2026-09-12T16:54:49.8300055Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-09-12T16:54:49.8308299Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-09-12T16:54:49.8461862Z Removing HTTP extra header
+2026-09-12T16:54:49.8463350Z [command]/usr/bin/git config --local --name-only --get-regexp http\.http\:\/\/127\.0\.0\.1\:9198\/\.extraheader
+2026-09-12T16:54:49.8471044Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.http\:\/\/127\.0\.0\.1\:9198\/\.extraheader' && git config --local --unset-all 'http.http://127.0.0.1:9198/.extraheader' || :"
+2026-09-12T16:54:49.8518411Z Removing includeIf entries pointing to credentials config files
+2026-09-12T16:54:49.8519858Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-09-12T16:54:49.8527553Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-09-12T16:54:49.8582896Z [command]/usr/bin/git config --file /var/lib/preloop-runner/_work/_temp/git-credentials-8e86a251-d350-4f7e-ae84-a1361c96e99b.config http.http://127.0.0.1:9198/.extraheader AUTHORIZATION: basic ***
+2026-09-12T16:54:49.8594013Z [command]/usr/bin/git config --local includeIf.gitdir:/var/lib/preloop-runner/_work/default/default/.git.path /var/lib/preloop-runner/_work/_temp/git-credentials-8e86a251-d350-4f7e-ae84-a1361c96e99b.config
+2026-09-12T16:54:49.8604791Z [command]/usr/bin/git config --local includeIf.gitdir:/var/lib/preloop-runner/_work/default/default/.git/worktrees/*.path /var/lib/preloop-runner/_work/_temp/git-credentials-8e86a251-d350-4f7e-ae84-a1361c96e99b.config
+2026-09-12T16:54:49.8614034Z [command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-8e86a251-d350-4f7e-ae84-a1361c96e99b.config
+2026-09-12T16:54:49.8622458Z [command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-8e86a251-d350-4f7e-ae84-a1361c96e99b.config
+2026-09-12T16:54:49.8629769Z ##[endgroup]
+2026-09-12T16:54:49.8630142Z ##[group]Fetching the repository
+2026-09-12T16:54:49.8632486Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin efd3c5af0e7aa3962a79a309b4bfb5e492ee3b40
+2026-09-12T16:54:50.1079562Z From http://127.0.0.1:9198/snapshots/d7718942-c807-44aa-ac57-545410a9ba83
+2026-09-12T16:54:50.1080039Z  * branch            efd3c5af0e7aa3962a79a309b4bfb5e492ee3b40 -> FETCH_HEAD
+2026-09-12T16:54:50.1090377Z [command]/usr/bin/git rev-parse --verify --quiet efd3c5af0e7aa3962a79a309b4bfb5e492ee3b40^{object}
+2026-09-12T16:54:50.1097499Z efd3c5af0e7aa3962a79a309b4bfb5e492ee3b40
+2026-09-12T16:54:50.1098405Z ##[endgroup]
+2026-09-12T16:54:50.1098848Z ##[group]Determining the checkout info
+2026-09-12T16:54:50.1099273Z ##[endgroup]
+2026-09-12T16:54:50.1100226Z [command]/usr/bin/git sparse-checkout disable
+2026-09-12T16:54:50.1113564Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+2026-09-12T16:54:50.1121336Z ##[group]Checking out the ref
+2026-09-12T16:54:50.1122826Z [command]/usr/bin/git checkout --progress --force efd3c5af0e7aa3962a79a309b4bfb5e492ee3b40
+2026-09-12T16:54:50.2011611Z Note: switching to 'efd3c5af0e7aa3962a79a309b4bfb5e492ee3b40'.
+2026-09-12T16:54:50.2012052Z 
+2026-09-12T16:54:50.2012450Z You are in 'detached HEAD' state. You can look around, make experimental
+2026-09-12T16:54:50.2012825Z changes and commit them, and you can discard any commits you make in this
+2026-09-12T16:54:50.2013189Z state without impacting any branches by switching back to a branch.
+2026-09-12T16:54:50.2013540Z 
+2026-09-12T16:54:50.2013887Z If you want to create a new branch to retain commits you create, you may
+2026-09-12T16:54:50.2014253Z do so (now or later) by using -c with the switch command. Example:
+2026-09-12T16:54:50.2014636Z 
+2026-09-12T16:54:50.2015005Z   git switch -c <new-branch-name>
+2026-09-12T16:54:50.2015389Z 
+2026-09-12T16:54:50.2015729Z Or undo this operation with:
+2026-09-12T16:54:50.2016057Z 
+2026-09-12T16:54:50.2016389Z   git switch -
+2026-09-12T16:54:50.2016712Z 
+2026-09-12T16:54:50.2017045Z Turn off this advice by setting config variable advice.detachedHead to false
+2026-09-12T16:54:50.2017406Z 
+2026-09-12T16:54:50.2017739Z HEAD is now at efd3c5a preloop workspace snapshot
+2026-09-12T16:54:50.2018451Z ##[endgroup]
+2026-09-12T16:54:50.2026121Z [command]/usr/bin/git log -1 --format=%H
+2026-09-12T16:54:50.2032908Z efd3c5af0e7aa3962a79a309b4bfb5e492ee3b40
+2026-09-12T16:54:50.2131136Z ##[group]Run rustup target add wasm32-unknown-unknown
+2026-09-12T16:54:50.2131427Z [36;1mrustup target add wasm32-unknown-unknown[0m
+2026-09-12T16:54:50.2131689Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-09-12T16:54:50.2131939Z ##[endgroup]
+2026-09-12T16:54:50.2379068Z info: syncing channel updates for nightly-aarch64-unknown-linux-gnu
+2026-09-12T16:54:50.5242529Z info: latest update on 2026-09-12 for version 1.100.0-nightly (0fc141305 2026-09-11)
+2026-09-12T16:54:50.5243866Z info: downloading 3 components
+2026-09-12T16:54:56.2106586Z info: downloading component rust-std
+2026-09-12T16:54:58.3747315Z Unexpected error attempting to determine if executable file exists '/usr/local/bin/rustc': Error: EACCES: permission denied, stat '/usr/local/bin/rustc'
+2026-09-12T16:55:06.8428569Z Unexpected error attempting to determine if executable file exists '/usr/local/bin/rustup': Error: EACCES: permission denied, stat '/usr/local/bin/rustup'
+2026-09-12T16:55:06.8459542Z Unexpected error attempting to determine if executable file exists '/usr/local/bin/rustup': Error: EACCES: permission denied, stat '/usr/local/bin/rustup'
+2026-09-12T16:55:07.0703615Z Unexpected error attempting to determine if executable file exists '/usr/local/bin/rustup': Error: EACCES: permission denied, stat '/usr/local/bin/rustup'
+2026-09-12T16:55:07.0769007Z Unexpected error attempting to determine if executable file exists '/usr/local/bin/rustup': Error: EACCES: permission denied, stat '/usr/local/bin/rustup'
+2026-09-12T16:55:07.0928454Z Unexpected error attempting to determine if executable file exists '/usr/local/bin/cargo': Error: EACCES: permission denied, stat '/usr/local/bin/cargo'
+2026-09-12T16:55:07.1051076Z ##[group]Cache Configuration
+2026-09-12T16:55:07.1051469Z Cache Provider:
+2026-09-12T16:55:07.1051867Z     github
+2026-09-12T16:55:07.1052227Z Workspaces:
+2026-09-12T16:55:07.1052630Z     /var/lib/preloop-runner/_work/default/default/crates/nu-parser/fuzz
+2026-09-12T16:55:07.1053114Z Cache Paths:
+2026-09-12T16:55:07.1053517Z     /home/runner/.cargo/bin
+2026-09-12T16:55:07.1053999Z     /home/runner/.cargo/.crates.toml
+2026-09-12T16:55:07.1054320Z     /home/runner/.cargo/.crates2.json
+2026-09-12T16:55:07.1054643Z     /home/runner/.cargo/registry
+2026-09-12T16:55:07.1054961Z     /home/runner/.cargo/git
+2026-09-12T16:55:07.1055290Z     /var/lib/preloop-runner/_work/default/default/crates/nu-parser/fuzz/target
+2026-09-12T16:55:07.1055610Z Restore Key:
+2026-09-12T16:55:07.1056006Z     v0-rust-cargo-Linux-arm64-d57f8dbb
+2026-09-12T16:55:07.1056426Z Cache Key:
+2026-09-12T16:55:07.1056822Z     v0-rust-cargo-Linux-arm64-d57f8dbb-d3791ff8
+2026-09-12T16:55:07.1057218Z .. Prefix:
+2026-09-12T16:55:07.1057724Z   - v0-rust-cargo-Linux-arm64
+2026-09-12T16:55:07.1058107Z .. Environment considered:
+2026-09-12T16:55:07.1058499Z   - Rust Versions:
+2026-09-12T16:55:07.1058971Z     - 1.100.0-nightly aarch64-unknown-linux-gnu 0fc141305da7a8a222f65aef1f1acc739c46282b
+2026-09-12T16:55:07.1059404Z     - 1.96.1 aarch64-unknown-linux-gnu 31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd
+2026-09-12T16:55:07.1059798Z     - 1.97.1 aarch64-unknown-linux-gnu 8bab26f4f68e0e26f0bb7960be334d5b520ea452
+2026-09-12T16:55:07.1060229Z   - CARGO_INCREMENTAL
+2026-09-12T16:55:07.1060574Z .. Lockfiles considered:
+2026-09-12T16:55:07.1060940Z   - /var/lib/preloop-runner/_work/default/default/.cargo/config.toml
+2026-09-12T16:55:07.1061265Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-parser/fuzz/Cargo.toml
+2026-09-12T16:55:07.1061639Z   - /var/lib/preloop-runner/_work/default/default/crates/nu-parser/fuzz/rust-toolchain.toml
+2026-09-12T16:55:07.1061964Z   - /var/lib/preloop-runner/_work/default/default/rust-toolchain.toml
+2026-09-12T16:55:07.1062410Z ##[endgroup]
+2026-09-12T16:55:07.1062748Z 
+2026-09-12T16:55:07.1063084Z ... Restoring cache ...
+2026-09-12T16:55:07.1189784Z Cache hit for: v0-rust-cargo-Linux-arm64-d57f8dbb-d3791ff8
+2026-09-12T16:55:07.2880086Z Cache Size: ~88 MB (92715975 B)
+2026-09-12T16:55:07.2898277Z [command]/usr/bin/tar -xf /var/lib/preloop-runner/_work/_temp/e0d50c6d-afdc-42f7-a714-c314ae0ea689/cache.tzst -P -C /var/lib/preloop-runner/_work/default/default --use-compress-program unzstd
+2026-09-12T16:55:07.6056545Z Cache restored successfully
+2026-09-12T16:55:07.6078677Z Restored from cache key "v0-rust-cargo-Linux-arm64-d57f8dbb-d3791ff8" full match: true.
+2026-09-12T16:55:07.6194261Z ##[group]Run git diff --quiet && git diff --cached --quiet
+2026-09-12T16:55:07.6194555Z [36;1mgit diff --quiet && git diff --cached --quiet[0m
+2026-09-12T16:55:07.6194812Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-09-12T16:55:07.6195056Z ##[endgroup]
+2026-09-12T16:55:07.7276291Z Cache up-to-date.
+2026-09-12T16:55:07.7930829Z [command]/usr/bin/git version
+2026-09-12T16:55:07.7943012Z git version 2.54.0
+2026-09-12T16:55:07.7956659Z Temporarily overriding HOME='/var/lib/preloop-runner/_work/_temp/9a3584cd-24eb-4a36-a3ef-7076d7910ee9' before making global git config changes
+2026-09-12T16:55:07.7957110Z Adding repository directory to the temporary git global config as a safe directory
+2026-09-12T16:55:07.7958953Z [command]/usr/bin/git config --global --add safe.directory /var/lib/preloop-runner/_work/default/default
+2026-09-12T16:55:07.7970202Z Removing SSH command configuration
+2026-09-12T16:55:07.7972502Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-09-12T16:55:07.7983007Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-09-12T16:55:07.8039146Z Removing HTTP extra header
+2026-09-12T16:55:07.8041174Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-09-12T16:55:07.8051052Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-09-12T16:55:07.8102500Z Removing includeIf entries pointing to credentials config files
+2026-09-12T16:55:07.8104717Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-09-12T16:55:07.8110820Z includeif.gitdir:/var/lib/preloop-runner/_work/default/default/.git.path
+2026-09-12T16:55:07.8111245Z includeif.gitdir:/var/lib/preloop-runner/_work/default/default/.git/worktrees/*.path
+2026-09-12T16:55:07.8111603Z includeif.gitdir:/github/workspace/.git.path
+2026-09-12T16:55:07.8111929Z includeif.gitdir:/github/workspace/.git/worktrees/*.path
+2026-09-12T16:55:07.8113779Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/var/lib/preloop-runner/_work/default/default/.git.path
+2026-09-12T16:55:07.8119172Z /var/lib/preloop-runner/_work/_temp/git-credentials-8e86a251-d350-4f7e-ae84-a1361c96e99b.config
+2026-09-12T16:55:07.8122247Z [command]/usr/bin/git config --local --unset includeif.gitdir:/var/lib/preloop-runner/_work/default/default/.git.path \/var\/lib\/preloop\-runner\/_work\/_temp\/git\-credentials\-8e86a251\-d350\-4f7e\-ae84\-a1361c96e99b\.config
+2026-09-12T16:55:07.8132232Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/var/lib/preloop-runner/_work/default/default/.git/worktrees/*.path
+2026-09-12T16:55:07.8137744Z /var/lib/preloop-runner/_work/_temp/git-credentials-8e86a251-d350-4f7e-ae84-a1361c96e99b.config
+2026-09-12T16:55:07.8140603Z [command]/usr/bin/git config --local --unset includeif.gitdir:/var/lib/preloop-runner/_work/default/default/.git/worktrees/*.path \/var\/lib\/preloop\-runner\/_work\/_temp\/git\-credentials\-8e86a251\-d350\-4f7e\-ae84\-a1361c96e99b\.config
+2026-09-12T16:55:07.8148866Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git.path
+2026-09-12T16:55:07.8154411Z /github/runner_temp/git-credentials-8e86a251-d350-4f7e-ae84-a1361c96e99b.config
+2026-09-12T16:55:07.8156904Z [command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git.path \/github\/runner_temp\/git\-credentials\-8e86a251\-d350\-4f7e\-ae84\-a1361c96e99b\.config
+2026-09-12T16:55:07.8164826Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git/worktrees/*.path
+2026-09-12T16:55:07.8171746Z /github/runner_temp/git-credentials-8e86a251-d350-4f7e-ae84-a1361c96e99b.config
+2026-09-12T16:55:07.8174126Z [command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git/worktrees/*.path \/github\/runner_temp\/git\-credentials\-8e86a251\-d350\-4f7e\-ae84\-a1361c96e99b\.config
+2026-09-12T16:55:07.8182311Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-09-12T16:55:07.8238185Z Removing credentials config '/var/lib/preloop-runner/_work/_temp/git-credentials-8e86a251-d350-4f7e-ae84-a1361c96e99b.config'
+2026-09-12T16:55:07.8327254Z Cleaning up orphan processes

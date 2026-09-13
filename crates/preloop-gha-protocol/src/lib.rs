@@ -24,6 +24,38 @@ pub mod debug_session;
 /// Protocol version exposed by this crate's runner-compatible DTOs.
 pub const PROTOCOL_VERSION: &str = "2026-06-25.preloop.v1";
 
+/// Runner-relative job workspace directory for a repository slug.
+///
+/// GitHub-hosted parity: the official runner lays out
+/// `<work>/<repo>/<repo>` (`/home/runner/work/hugo/hugo`), and workflows
+/// observe it — hugo's codegen test panics unless the absolute checkout
+/// path contains `"hugo"`. Derive both segments from the `owner/repo`
+/// basename so every consumer (worker setup, local-run preseeding) agrees.
+/// Returns `None` when the slug is missing or not a plain repo name, in
+/// which case callers keep the historical `_work/default/default`.
+pub fn workspace_dir_for_repository(repository: Option<&str>) -> Option<std::path::PathBuf> {
+    let repository = repository?.trim();
+    let mut parts = repository.split('/');
+    let (owner, name) = match (parts.next(), parts.next(), parts.next()) {
+        (Some(owner), Some(name), None) => (owner, name),
+        _ => return None,
+    };
+    if owner.is_empty()
+        || name.is_empty()
+        || [".", ".."].contains(&owner)
+        || [".", ".."].contains(&name)
+        || !owner
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    {
+        return None;
+    }
+    Some(std::path::PathBuf::from("_work").join(name).join(name))
+}
+
 /// Line a runner prints on stdout the moment it accepts a job.
 ///
 /// An ephemeral runner is single-use, so the orchestrator supervising it can
@@ -975,6 +1007,20 @@ pub struct LiveLogFeedLinesWrapper {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_dir_derives_github_layout_from_repo_basename() {
+        // `<work>/<repo>/<repo>`, matching /home/runner/work/hugo/hugo.
+        assert_eq!(
+            workspace_dir_for_repository(Some("spf13/hugo")),
+            Some(std::path::PathBuf::from("_work/hugo/hugo"))
+        );
+        assert_eq!(workspace_dir_for_repository(None), None);
+        assert_eq!(workspace_dir_for_repository(Some("")), None);
+        assert_eq!(workspace_dir_for_repository(Some("owner/..")), None);
+        assert_eq!(workspace_dir_for_repository(Some("owner/a b")), None);
+        assert_eq!(workspace_dir_for_repository(Some("owner/a/b")), None);
+    }
 
     #[test]
     fn secret_debug_display_and_json_are_redacted() {

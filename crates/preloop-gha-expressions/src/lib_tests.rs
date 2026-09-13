@@ -782,3 +782,35 @@ mod official_semantics {
         }
     }
 }
+
+#[test]
+fn bracket_expression_key_indexes_dynamically() {
+    // nushell ci.yml: ${{ env[matrix.target.options] }}
+    let mut context = Context::default();
+    context.insert("matrix", json!({"target": {"options": "--workspace"}}));
+    context.insert("env", json!({"--workspace": "--workspace", "other": "x"}));
+
+    assert_eq!(
+        eval_expression("${{ env[matrix.target.options] }}", &context).unwrap(),
+        Value::String("--workspace".to_owned())
+    );
+    // Missing key coalesces to null like other failed lookups.
+    assert_eq!(
+        eval_expression("${{ env[matrix.target.missing] }}", &context).unwrap(),
+        Value::Null
+    );
+    // Literal keys keep the historical Path shape and value.
+    assert_eq!(
+        eval_expression("${{ env['other'] }}", &context).unwrap(),
+        Value::String("x".to_owned())
+    );
+    assert_eq!(
+        eval_expression("${{ env[other] }}", &context).unwrap(),
+        Value::String("x".to_owned())
+    );
+    // Chained indexing past a dynamic key.
+    assert_eq!(
+        eval_expression("${{ matrix[matrix.target.options] }}", &context).unwrap(),
+        Value::Null
+    );
+}

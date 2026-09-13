@@ -21,6 +21,7 @@ pub const MAX_WORKFLOW_DEPTH: usize = 10;
 pub const MAX_REUSABLE_WORKFLOW_DEPTH: usize = MAX_WORKFLOW_DEPTH - 1;
 /// Maximum unique reusable workflows that may be referenced in a single workflow run tree.
 pub const MAX_UNIQUE_REUSABLE_WORKFLOWS: usize = 50;
+const DEFERRED_MATRIX_SPEC_PREFIX: &str = "__preloop_deferred_matrix_spec__:";
 
 fn validate_reusable_workflow_tree(
     workflow: &Workflow,
@@ -1410,6 +1411,21 @@ fn expand_matrix(
             ));
         }
     };
+
+    // `strategy.matrix` itself is often static YAML while one axis is a
+    // needs-dependent expression:
+    //
+    //   matrix:
+    //     module: ${{ fromJSON(needs.detect.outputs.modules) }}
+    //
+    // Keep the whole spec deferred. Treating that scalar as an ordinary
+    // matrix value leaks the literal expression into the expanded job id
+    // (`lint (${{ ... }})`), which is not a runnable GitHub matrix cell.
+    if matrix_contains_needs_expression(&matrix) {
+        return Ok(MatrixExpansion::Deferred(encode_deferred_matrix_spec(
+            &matrix,
+        )?));
+    }
     for (field, values) in [
         ("include", &mut matrix.include),
         ("exclude", &mut matrix.exclude),
@@ -1439,6 +1455,28 @@ fn expand_matrix(
             .map(|combination| combination.values)
             .collect(),
     ))
+}
+
+fn matrix_contains_needs_expression(matrix: &crate::Matrix) -> bool {
+    fn contains(value: &Value) -> bool {
+        match value {
+            Value::String(value) => {
+                value.contains("${{") && (value.contains("needs.") || value.contains("needs["))
+            }
+            Value::Array(values) => values.iter().any(contains),
+            Value::Object(values) => values.values().any(contains),
+            _ => false,
+        }
+    }
+    matrix.axes.values().any(contains)
+        || matrix.include.iter().any(contains)
+        || matrix.exclude.iter().any(contains)
+}
+
+fn encode_deferred_matrix_spec(matrix: &crate::Matrix) -> Result<String, ParserError> {
+    let value = serde_json::to_string(matrix)
+        .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
+    Ok(format!("{DEFERRED_MATRIX_SPEC_PREFIX}{value}"))
 }
 
 /// Dynamically expand a deferred matrix job given resolved `needs` outputs.
@@ -1554,13 +1592,51 @@ fn resolve_deferred_matrix_cells(
         ctx.insert("inputs", Value::Object(inputs_map));
     }
 
-    let value = eval_expression(expression, &ctx)
-        .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
+    let value = if let Some(encoded) = expression.strip_prefix(DEFERRED_MATRIX_SPEC_PREFIX) {
+        let mut spec: Value = serde_json::from_str(encoded)
+            .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
+        resolve_matrix_spec_templates(&mut spec, &ctx)?;
+        spec
+    } else {
+        eval_expression(expression, &ctx)
+            .map_err(|error| ParserError::InvalidExpression(error.to_string()))?
+    };
     let spec = matrix_expand::value_to_matrix_spec(job_id, &value)?;
     Ok(matrix_expand::try_expand_matrix_spec(job_id, &spec)?
         .into_iter()
         .map(|combination| combination.values)
         .collect())
+}
+
+fn resolve_matrix_spec_templates(value: &mut Value, context: &Context) -> Result<(), ParserError> {
+    match value {
+        Value::String(raw) if raw.contains("${{") => {
+            let expression = raw
+                .trim()
+                .strip_prefix("${{")
+                .and_then(|value| value.strip_suffix("}}"))
+                .map(str::trim)
+                .ok_or_else(|| {
+                    ParserError::InvalidExpression(format!(
+                        "invalid deferred matrix expression `{raw}`"
+                    ))
+                })?;
+            *value = eval_expression(expression, context)
+                .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
+        }
+        Value::Array(values) => {
+            for value in values {
+                resolve_matrix_spec_templates(value, context)?;
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values_mut() {
+                resolve_matrix_spec_templates(value, context)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Expand a deferred reusable-workflow caller whose matrix depends on
@@ -1635,6 +1711,31 @@ pub fn expand_deferred_reusable_call(
         cell_plan.matrix = cell;
         cell_plan.matrix_index = (matrix_count > 1).then_some(matrix_index + 1);
         cell_plan.deferred_matrix = None;
+        // The caller's `with:` values are evaluated in the caller context,
+        // which includes the resolved matrix cell. The parse-time placeholder
+        // cannot do that yet, so replace the raw matrix references before
+        // expanding the reusable callee.
+        if let Some(caller_job) = caller_workflow.jobs.get(&cell_plan.base_id).or_else(|| {
+            cell_plan
+                .base_id
+                .rsplit_once('/')
+                .and_then(|(_, tail)| caller_workflow.jobs.get(tail))
+        }) {
+            for (name, value) in &caller_job.with {
+                if let Value::String(raw) = value {
+                    if raw.contains("${{") {
+                        let resolved = crate::eval::resolve_string(
+                            raw,
+                            &expression_context(&cell_plan.matrix, Some(&caller_plan.inputs), None),
+                        )
+                        .map_err(ParserError::InvalidExpression)?;
+                        cell_plan
+                            .inputs
+                            .insert(name.clone(), Value::String(resolved));
+                    }
+                }
+            }
+        }
         let expanded = expand_reusable_call(
             called,
             &cell_plan,
