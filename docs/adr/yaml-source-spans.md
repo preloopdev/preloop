@@ -244,18 +244,35 @@ when `serde-saphyr` gives both.
   instead of as one big-bang migration.
 - Errors carry `location()` with line/column and byte offset, which alone fixes
   half of `ParserError::Yaml`'s uselessness.
-- It is type-driven ("Rust types as schema"), which removes the `f64(1.0)`
-  hazard the codebase currently works around in three places
-  (`eval.rs:114-116`, `eval.rs:665-669`, `preloop-gha-expressions/src/evaluator.rs:403-406`).
+- It is type-driven ("Rust types as schema"), but **not semantically identical
+  to the current generic-`Value` path by default**. A throwaway probe over the
+  repository's YAML corpus used `strict_booleans: true`: 378 files parsed
+  successfully under both parsers; 10 differences were only a trailing newline
+  in block scalars, and one was the same newline plus a final `run:` scalar
+  difference. A separate scalar probe found that `serde_yaml` parses bare
+  `on/yes/no/off/y/n` and `0755` as strings in `serde_json::Value`, while
+  `serde-saphyr` with `strict_booleans: true` fixes the boolean cases but still
+  parses `0755` as numeric `755`. The raw `Value` fields in this model
+  (`models.rs:174,652,657,666,669,681,952-958`) therefore need a compatibility
+  adapter or a marked-node conversion; the old claim that the swap simply
+  removes the numeric hazard is false.
 - MSRV 1.89 ≤ project toolchain 1.97.
+
+The span API itself was also probed. With a block scalar `run: |`, the observed
+`Spanned<String>` location is the first content character (line 2, column 3),
+not the `|` marker. Plain scalar locations point at the scalar value. This is
+usable for diagnostics, but renderers must intentionally underline the scalar
+value rather than assume every location is the mapping key.
 
 **Migration risks, concretely.**
 
-1. **The untagged wall.** `Spanned<T>` inside `#[serde(untagged)]`,
-   `#[serde(tag=…)]`, or `#[serde(flatten)]` **deserialises successfully but
-   yields `Location::UNKNOWN` (0,0)** — serde buffers through
+1. **The untagged wall is verified, not speculative.** `Spanned<T>` inside
+   `#[serde(untagged)]`, `#[serde(tag=…)]`, or `#[serde(flatten)]` deserialises
+   successfully but yields `Location::UNKNOWN` (0,0) — serde buffers through
    `ContentDeserializer` and drops the deserializer context. This is documented
-   on the `Spanned` page. We have ten such sites (§1.2), including `Env`,
+   on the [`Spanned` API](https://docs.rs/serde-saphyr/latest/serde_saphyr/struct.Spanned.html)
+   and a throwaway probe reproduced it for representative untagged, flattened,
+   and internally tagged types. We have ten such sites (§1.2), including `Env`,
    `RunsOn`, `Needs`, `DeferredBool`, and `Matrix`'s `#[serde(flatten)] axes`.
    The documented workaround is to wrap the *whole* enum:
    `Spanned<RunsOn>` works, `RunsOn::Single(Spanned<String>)` does not. The
@@ -267,12 +284,18 @@ when `serde-saphyr` gives both.
    target, so both can be re-expressed, but they are real work, not a
    find-and-replace. The `on:`/`true` normalisation should move onto the
    existing `alias = "true"` (`models.rs:167`) plus a `Trigger` deserializer.
-3. **YAML 1.1 vs 1.2 scalar resolution.** `serde_yaml` 0.9 is libyaml-backed;
-   `serde-saphyr` is schema-driven with configurable boolean handling
-   (`strict_booleans`). Bare `on`, `yes`, `no`, `off` as *values* (not keys) can
-   change type. `factory.rs:30-34` in `preloop-runner` explicitly documents
-   depending on `0755` staying a string. This needs a targeted differential test
-   over the fixture corpus, not an assumption.
+3. **Generic-value compatibility is a measured migration blocker.** With
+   `strict_booleans: true`, a throwaway corpus probe found 378 files that
+   parsed successfully under both parsers, 10 differences consisting only of
+   a trailing block-scalar newline, and one additional `run:` trailing-newline
+   difference. A focused scalar probe found that current `serde_yaml` parses
+   bare `on/yes/no/off/y/n` and `0755` as strings in `serde_json::Value`;
+   `serde-saphyr` with `strict_booleans: true` fixes the boolean cases but still
+   parses `0755` as numeric `755`. The raw `Value` fields in this model
+   (`models.rs:174,652,657,666,669,681,952-958`) therefore need a compatibility
+   adapter or a marked-node conversion. Phase 0 must use an explicit
+   allowlist for the newline difference and must fail on unapproved scalar
+   changes; it must not assert byte-for-byte `Workflow` equality prematurely.
 4. **Ecosystem age.** 1.2.0, single-maintainer, `granit-parser` (a saphyr fork)
    underneath. Mitigation: the swap is confined to `yaml.rs` +
    `models.rs`'s two manual deserializers; the other six crates use YAML for
@@ -283,10 +306,13 @@ when `serde-saphyr` gives both.
    `preloop-runner/src/worker/handlers/factory.rs:77`) and can move to any of
    the three candidates independently.
 
-**Recommendation.** `serde-saphyr` in `preloop-gha-parser`. If phase 0 (§4) hits
-an unforeseen wall, `serde_yaml_ng` is the escape hatch: it is a mechanical
-rename that clears the deprecation and leaves spans for later, at the cost of
-doing the migration twice.
+**Recommendation.** Keep `serde-saphyr` as the span-capable target for
+`preloop-gha-parser`, but require the compatibility adapter in phase 0 before
+accepting the migration. If that adapter cannot preserve the current raw
+`Value` semantics without a fragile fork, use `serde_yaml_ng` as the
+short-term deprecation fix and put the span front-end behind a separate marked
+tree; that is safer for drop-in workflows but defers the direct `Spanned<T>`
+ergonomics and likely means a second migration.
 
 `ParserError::Yaml(#[from] serde_yaml::Error)` (`models.rs:16`) is public API,
 but nothing in `crates/` matches on it, so changing the inner type is a
@@ -414,12 +440,18 @@ Judged on the same four axes:
 
 ### Phase 0 — parser swap, no spans *(ships alone; no wire change)*
 
-Replace `serde_yaml` with `serde-saphyr` in `preloop-gha-parser` only.
-Rewrite `normalize_yaml_keys` (`yaml.rs:25-50`) and `MatrixValue::deserialize`
-(`models.rs:833-858`). Change `ParserError::Yaml`'s inner type
-(`models.rs:16`). Add a differential test that parses every file under
-`fixtures/workflows/` and `.github/workflows/` with both parsers and asserts the
-resulting `Workflow` serialises identically — this is the guard for §2 risk 3.
+Replace `serde_yaml` with `serde-saphyr` in `preloop-gha-parser` only, but do
+not treat that as a mechanical rename. Rewrite `normalize_yaml_keys`
+(`yaml.rs:25-50`) and `MatrixValue::deserialize` (`models.rs:833-858`) and
+add the generic-`Value` compatibility adapter required by §2 risk 3. Change
+`ParserError::Yaml`'s inner type (`models.rs:16`).
+
+The compatibility gate must parse every file under `fixtures/workflows/` and
+`.github/workflows/` with both parsers. It may allow only the ten observed
+block-scalar trailing-newline differences (and the one observed final `run:`
+newline difference); it must reject the measured `0755` retyping and any new
+boolean/scalar drift. This is a semantic differential test, not a claim that
+the two raw `serde_json::Value` trees are identical.
 
 *Value on its own:* clears an unmaintained dependency. Nothing else changes.
 
@@ -562,14 +594,16 @@ own workflows through preloop's parser, with no Python/`uvx` dependency.
 **This is a fidelity improvement with no golden-diff cost, with two caveats:**
 
 1. Changing `timeoutInMinutes` from `number` to `object` is a **type change**,
-   which `schema_drops_fields` *does* flag (`compare.rs:393`, asserted at
+   which `schema_drops_fields` does flag (`compare.rs:393`, asserted at
    `compare.rs:1378-1379`) — but only for endpoints whose key contains
-   `"/broker/{n}/acquirejob"` (`compare.rs:481`, gate at 563-569). The golden
-   acquirejob path is `/190/acquirejob`, which `normalize_path`
-   (`compare.rs:66`) turns into `/{n}/acquirejob` — that does **not** contain the
-   `/broker/` prefix. I did not run the harness, so whether this gate ever fires
-   on the committed goldens is **unverified** (§6.3). Treat phase 3 as
-   "run `just conform` before and after", not as "provably free".
+   `"/broker/{n}/acquirejob"` (`compare.rs:481`, gate at 563-569). The
+   endpoint key construction is verified at `compare.rs:193-199`:
+   `format!("{method} {}", normalize_path(path))`. The golden path
+   `.runner-watch/golden/v2.336.0/103-composite-nested-post/flows.jsonl:23`
+   is `/190/acquirejob`, which normalizes to `POST /{n}/acquirejob`
+   (`compare.rs:66-90`), so it does **not** contain the `/broker/` prefix.
+   Therefore the default response-schema gate does not fire for this golden
+   endpoint. This is a gate-coverage bug, not an unresolved question.
 2. Anyone running `runner-watch conform --value-gate-strict` (`main.rs:141`,
    `1881-1890`) *would* see every coordinate change. That mode is not part of
    `just conform` today.
@@ -593,31 +627,41 @@ pinning an implementation artefact and should be deleted rather than re-pinned
 to new synthetic values; the ones that assert token *shape* (type tag, key
 presence) should be updated to the real GitHub shape evidenced in §1.4.
 
-### 6.3 What I could **not** verify
+### 6.3 Remaining unverified items
 
-1. **Whether the acquirejob schema gate actually fires on the committed
-   goldens.** Reasoning in §6.1 says the substring `"/broker/{n}/acquirejob"`
-   does not match the normalised golden key `/{n}/acquirejob`, but I did not run
-   `just conform` (explicitly out of scope for this task) and did not read the
-   code path that builds `EndpointComparison::key`. If the gate is in fact dead
-   for these captures, that is a separate finding worth its own issue.
+The three uncertainties called out in the original handoff are resolved:
+
+- **Schema-gate matching:** resolved from source. `group_flows` constructs
+  `METHOD <normalized path>` (`compare.rs:193-199`); the golden
+  `/190/acquirejob` (`.runner-watch/golden/v2.336.0/103-composite-nested-post/flows.jsonl:23`)
+  becomes `POST /{n}/acquirejob`, which cannot contain the default gate's
+  `/broker/{n}/acquirejob` substring (`compare.rs:481`, gate at 563-569).
+  The acquirejob response-schema gate therefore misses this golden endpoint.
+  Targeted endpoint-normalization tests passed (`cargo test --locked -p
+  runner-watch --lib normalize_ --quiet`, 8 passed).
+- **`serde-saphyr` model boundary:** the isolated copy of the complete
+  `preloop-gha-parser` compiled with a direct `serde-saphyr` workflow/action
+  frontend and its parser library tests passed: **154 passed, 0 failed**.
+  The probe retained `serde_yaml` only for the existing `MatrixValue`
+  implementation and unused normalization helpers, so this resolves derive,
+  untagged, flattened, tagged-enum, and action-metadata compatibility but not
+  the final no-`serde_yaml` dependency cutover.
+- **Scalar-resolution drift:** measured. With `strict_booleans: true`, 378
+  repository YAML files parsed under both parsers; 10 differed only by a
+  trailing block-scalar newline, and one additional file differed by a final
+  `run:` newline. The focused generic-`Value` probe showed
+  `serde_yaml`: `on/yes/no/off/y/n/0755` → strings; `serde-saphyr` strict:
+  the boolean spellings → strings but `0755` → numeric `755`. This is now a
+  compatibility requirement in phase 0, not an unknown.
+
+Three risks remain open:
+1. **Final no-`serde_yaml` cutover has not been compiled.** The isolated probe
+   retained it for `MatrixValue` and the dead `normalize_yaml_keys` helpers.
+   Replace those paths and compile before removing the workspace dependency.
 2. **Runtime cost of `serde-saphyr` vs `serde_yaml` on this corpus.** No
-   benchmark was run. Parse time is on the submission path
-   (`runs.rs`), so phase 0 should carry a before/after measurement.
-3. **YAML 1.1 → 1.2 scalar-resolution deltas across the fixture corpus.** The
-   `0755` and `f64(1.0)` hazards are documented in-tree
-   (`preloop-runner/src/worker/handlers/factory.rs:30-34`, `eval.rs:114-116`)
-   but I did not execute a differential parse. Phase 0's acceptance criterion
-   should be that differential test, not a code review.
-4. **Whether the official runner reads `file`/`line`/`col` for anything.** I did
-   not read the `actions/runner` C# sources at `/tmp/runner-v2.336.0`. If it only
-   echoes them into error messages, phase 3 is cosmetic-plus-diagnostic; if the
-   template evaluator uses them, correctness matters more. Assume the latter
-   until checked.
-5. **Exact `Location` semantics of `serde-saphyr` for block scalars** (`run: |`)
-   — whether the span points at the `|` or at the first content line. Matters
-   for the §5 rendering. Needs a five-line probe, not a doc read.
-6. **`ActionRuns` (`models.rs:1042-1093`) uses `#[serde(tag = "using")]`** —
-   internally tagged, which is on the `Spanned` blocklist. Composite-action
-   spans therefore need the wrap-the-whole-enum treatment; I did not work
-   through what that costs for `parse_action_metadata` (`yaml.rs:19-23`).
+   benchmark was run. Parse time is on the submission path (`runs.rs`), so
+   phase 0 should carry a before/after measurement.
+3. **Whether the official runner reads `file`/`line`/`col` for anything.** I did
+   not read the `actions/runner` C# sources at `/tmp/runner-v2.336.0`. If it
+   only echoes them into error messages, phase 3 is diagnostic; if the template
+   evaluator uses them, correctness matters more.
