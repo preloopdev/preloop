@@ -2793,13 +2793,13 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         building: Arc<AtomicUsize>,
     ) -> Result<(), OrchestratorError> {
         let max_concurrent = {
-            // Leave one runner's CPU share for the golden fork base and the
-            // host itself: filling every core with runner VMs starves the
-            // clone agents on fork readiness probes (EAGAIN), which rolls
-            // the fork back and spends the golden's retained checkpoint.
+            // The memory term below reserves the golden and host headroom.
+            // Do not subtract another CPU slot here: with four vCPUs on an
+            // eight-thread host that forced max_concurrent=1, serializing
+            // matrix jobs even though a second 1.15.0 CoW fork is cheap.
             let parallelism = std::thread::available_parallelism().map_or(2, |value| value.get());
             let per_runner = usize::from(self.config.cpus.max(1));
-            let by_cpu = (parallelism / per_runner).saturating_sub(1).max(1);
+            let by_cpu = (parallelism / per_runner).max(1);
             // memory term: every on-demand fork inherits the golden's
             // committed footprint and grows toward `memory_mib` as the guest
             // runs. On a small host (the production 6-core/22 GiB machine)
