@@ -20,6 +20,23 @@ All 10 repos are NEW (no overlap with the 41 previously covered). Real
 
 ## Rerun with fixes (2026-09-12/13)
 
+- Full workflow reruns on the final stack: hugo's Ubuntu jobs are green;
+  pytest's `package` job is green (including the `fetch-depth: 0` checkout
+  and hynek build); jekyll's profiler test is green; nushell's relabeled
+  std-lib workflow is green 5/5. The pytest tox matrix still has no signal
+  for its unavailable platform cells because this host has one serialized
+  Linux runner.
+- Django remains 1/4 (scripts green; Chrome-dependent JavaScript and
+  free-threaded Python environment gaps; Windows unavailable). Laravel has
+  one Linux matrix failure plus cancelled siblings and unavailable Windows
+  cells; the remaining Linux failure is workflow/environment-level after the
+  services-PATH fix. fmt still has the gcc-4.9 failure followed by fail-fast
+  cancellation. JUnit has six green jobs; OpenJ9, CodeQL/zizmor credentials,
+  and unavailable Windows/macOS account for the rest.
+- Testcontainers now expands its dynamic module matrix correctly:
+  `lint (modules/compose)` is materialized and runs. Its remaining failure
+  is `make generate` returning non-zero; the old literal
+  `${{ fromJSON(...) }}` job-name/dynamic-matrix gap is closed.
 - pytest `package` checkout now succeeds in the real workflow (fetch +
   `checkout --force`); hugo codegen panic gone (`_work/hugo/hugo` in full
   logs); jekyll keeps the identical single profiler assert (rename applied,
