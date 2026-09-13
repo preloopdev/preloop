@@ -1099,7 +1099,17 @@ pub(crate) async fn complete_job_inner(
         })
         .await;
     if record.status.is_terminal() {
-        discard_workspace_snapshot(&shared.state.state_dir, completion.run_id).await;
+        let state_dir = shared.state.state_dir.clone();
+        // Keep the immutable Git snapshot briefly after terminal status. A
+        // runner can be slow to claim a job (or reconnect after a control
+        // plane restart), and deleting the repository immediately makes the
+        // otherwise-valid checkout fail with "workspace snapshot not found".
+        // The retention is bounded housekeeping; it does not change run
+        // semantics and keeps object-cache reuse intact.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(30 * 60)).await;
+            discard_workspace_snapshot(&state_dir, completion.run_id).await;
+        });
         // Off the completion path on purpose: this is housekeeping, and the
         // runner is waiting on this response before its slot can turn over.
         let state_dir = shared.state.state_dir.clone();
