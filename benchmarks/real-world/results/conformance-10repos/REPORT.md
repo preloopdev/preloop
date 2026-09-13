@@ -18,7 +18,7 @@ All 10 repos are NEW (no overlap with the 41 previously covered). Real
 | grpc/grpc-go | testing.yml | **7/8 PASS** (vet-proto, static-checks, extras, latest, latest-1, -race, arm64); i386 red (env) |
 | pytest-dev/pytest | test.yml | **`package` fully green** (fetch-depth:0 checkout + hynek build via fixes #12/#16); 15 ubuntu tox legs starved on pool serialization (no test signal); macos/windows starved (expected) |
 
-## Rerun with both fixes (2026-09-12, incomplete)
+## Rerun with fixes (2026-09-12/13)
 
 - pytest `package` checkout now succeeds in the real workflow (fetch +
   `checkout --force`); hugo codegen panic gone (`_work/hugo/hugo` in full
@@ -41,7 +41,7 @@ All 10 repos are NEW (no overlap with the 41 previously covered). Real
 | nushell/nushell | ci.yml | 0 runnable — all jobs pinned to Incredibuild custom fleet; submit fixed |
 | jekyll/jekyll | ci.yml | profiler assert fixed (single-test proof `0 failures` + Ruby 2.7 Linux green in rerun); 3.3/3.4/profile/rubocop never scheduled (pool starvation); JRuby red (locale); windows starved |
 | junit-team/junit5 | ci.yml | **6 green post-fix** (Build/Linux, docs, openjdk 26/27/28, reproducibility); windows/macOS starved; CodeQL+zizmor creds; openJ9 TBD; status cascade-correct |
-| testcontainers-go | ci.yml | 1 green (detect-modules); 9 skipped + 1 failed (dynamic matrix gap) |
+| testcontainers-go | ci.yml | dynamic matrix now expands to `modules/compose`; lint runs and fails in `make generate` (generated-file/workflow environment issue), remaining platform jobs skip |
 
 ## Bugs found & fixed (branch, all with regression tests)
 
@@ -117,8 +117,6 @@ All 10 repos are NEW (no overlap with the 41 previously covered). Real
 
 ## Fidelity findings for follow-up (not fixed)
 
-- **P1 — dynamic matrix from `needs.<job>.outputs` never expands**
-  (testcontainers): literal `${{ fromJSON(...) }}` job names; 9 skips.
 - **P1 — snapshot lifecycle vs queue wait**: `repository not found` when jobs
   claim ~10 min after submit.
 - **P1 — builder-stop EAGAIN exits the whole server** (seen once).
