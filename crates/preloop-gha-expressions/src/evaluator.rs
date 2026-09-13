@@ -47,7 +47,7 @@ pub(super) fn validate_function_calls(expr: &Expr) -> Result<(), ExpressionError
     }
 }
 
-/// Collect all top-level context names referenced in an expression AST.
+/// Collect top-level data contexts and context-sensitive function names.
 pub(super) fn collect_contexts_from_expr(expr: &Expr, out: &mut std::collections::HashSet<String>) {
     match expr {
         Expr::Path(path) => {
@@ -63,7 +63,13 @@ pub(super) fn collect_contexts_from_expr(expr: &Expr, out: &mut std::collections
             collect_contexts_from_expr(left, out);
             collect_contexts_from_expr(right, out);
         }
-        Expr::Call { args, .. } => {
+        Expr::Call { name, args } => {
+            if matches!(
+                name.to_ascii_lowercase().as_str(),
+                "always" | "success" | "failure" | "cancelled" | "hashfiles"
+            ) {
+                out.insert(name.to_ascii_lowercase());
+            }
             for arg in args {
                 collect_contexts_from_expr(arg, out);
             }

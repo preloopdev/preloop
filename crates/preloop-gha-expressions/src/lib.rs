@@ -114,7 +114,8 @@ pub fn validate_expression(input: &str) -> Result<(), ExpressionError> {
     validate_function_calls(&expr)
 }
 
-/// Collect top-level context names (e.g. "github", "matrix") from an expression string.
+/// Collect top-level data contexts and context-sensitive functions (e.g.
+/// `github`, `matrix`, `success`, and `hashFiles`) from an expression string.
 pub fn collect_contexts(input: &str) -> Result<std::collections::HashSet<String>, ExpressionError> {
     let trimmed = trim_expression_markers(input);
     let expr = parse_cached(trimmed)?;

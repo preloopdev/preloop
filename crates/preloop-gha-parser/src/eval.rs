@@ -249,16 +249,19 @@ const CTX_JOB_IF: &[&str] = &[
     "success",
 ];
 const CTX_JOB_RUNS_ON: &[&str] = &["github", "inputs", "vars", "needs", "matrix", "strategy"];
-const CTX_STRATEGY: &[&str] = &["github", "inputs", "vars", "needs", "matrix", "strategy"];
+const CTX_STRATEGY: &[&str] = &["github", "inputs", "vars", "needs"];
 const CTX_JOB_ENV: &[&str] = &[
-    "github", "inputs", "vars", "needs", "strategy", "matrix", "secrets", "env",
+    "github", "inputs", "vars", "needs", "strategy", "matrix", "secrets",
 ];
 const CTX_JOB_CONCURRENCY: &[&str] = &["github", "inputs", "vars", "needs", "strategy", "matrix"];
-const CTX_JOB_DEFAULTS_RUN: &[&str] = &["github", "strategy", "matrix", "needs", "env", "vars"];
-const CTX_JOB_CONTAINER: &[&str] = &["github", "inputs", "needs", "strategy", "matrix", "vars"];
-const CTX_CONTAINER_CREDENTIALS: &[&str] = &["secrets", "env", "github", "vars"];
+const CTX_JOB_DEFAULTS_RUN: &[&str] = &[
+    "github", "inputs", "vars", "strategy", "matrix", "needs", "env",
+];
+const CTX_JOB_CONTAINER: &[&str] = &["github", "inputs", "vars", "needs", "strategy", "matrix"];
+const CTX_CONTAINER_CREDENTIALS: &[&str] = &["github", "inputs", "vars", "secrets", "env"];
 const CTX_RUNNER: &[&str] = &[
-    "github", "needs", "strategy", "matrix", "secrets", "steps", "job", "runner", "env", "vars",
+    "github", "inputs", "vars", "needs", "strategy", "matrix", "secrets", "steps", "job", "runner",
+    "env",
 ];
 const CTX_STEP_IF: &[&str] = &[
     "github",
@@ -267,7 +270,6 @@ const CTX_STEP_IF: &[&str] = &[
     "needs",
     "strategy",
     "matrix",
-    "secrets",
     "steps",
     "job",
     "runner",
@@ -279,7 +281,18 @@ const CTX_STEP_IF: &[&str] = &[
     "hashfiles",
 ];
 const CTX_STEP_TIMEOUT: &[&str] = &[
-    "github", "inputs", "vars", "needs", "strategy", "matrix", "env",
+    "github",
+    "inputs",
+    "vars",
+    "needs",
+    "strategy",
+    "matrix",
+    "secrets",
+    "steps",
+    "job",
+    "runner",
+    "env",
+    "hashfiles",
 ];
 const CTX_STEP_ENV: &[&str] = &[
     "github",
@@ -295,6 +308,7 @@ const CTX_STEP_ENV: &[&str] = &[
     "env",
     "hashfiles",
 ];
+const CTX_STEP_CONTINUE_ON_ERROR: &[&str] = CTX_STEP_ENV;
 const CTX_STEP_WITH: &[&str] = CTX_STEP_ENV;
 const CTX_STEP_RUN: &[&str] = CTX_STEP_ENV;
 const CTX_STEP_NAME: &[&str] = CTX_STEP_ENV;
@@ -482,13 +496,12 @@ pub fn validate_workflow_expressions(workflow: &Workflow) -> Result<(), ParserEr
             if let Some(crate::models::DeferredBool::Expression(expression)) =
                 &step.continue_on_error
             {
-                validate_expressions_in_string(expression, false, Some(CTX_STEP_IF)).map_err(
-                    |e| {
+                validate_expressions_in_string(expression, false, Some(CTX_STEP_CONTINUE_ON_ERROR))
+                    .map_err(|e| {
                         ParserError::InvalidExpression(format!(
                             "job `{job_id}` {step_ref} continue-on-error: {e}"
                         ))
-                    },
-                )?;
+                    })?;
             }
             if let Some(crate::models::DeferredNumber::Expression(expression)) =
                 &step.timeout_minutes

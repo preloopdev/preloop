@@ -2009,6 +2009,212 @@ jobs:
 }
 
 #[test]
+fn step_timeout_accepts_schema_contexts() {
+    for expression in [
+        "${{ secrets.TIMEOUT }}",
+        "${{ steps.previous.outputs.timeout }}",
+        "${{ job.status }}",
+        "${{ runner.os }}",
+        "${{ hashFiles('*.rs') }}",
+    ] {
+        let workflow = r#"on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - id: previous
+        run: echo ok
+      - run: echo ok
+        timeout-minutes: "TIMEOUT_EXPRESSION"
+"#
+        .replace("TIMEOUT_EXPRESSION", expression);
+        parse_workflow(&workflow).unwrap_or_else(|error| {
+            panic!("timeout expression {expression:?} was rejected: {error}")
+        });
+    }
+}
+
+#[test]
+fn container_and_service_credentials_accept_inputs_context() {
+    let workflow = parse_workflow(
+        r#"on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:latest
+      credentials:
+        username: "${{ inputs.registry_user }}"
+    services:
+      redis:
+        image: redis:latest
+        credentials:
+          username: "${{ inputs.registry_user }}"
+    steps:
+      - run: echo ok
+"#,
+    )
+    .expect("inputs context is allowed in container credentials");
+    assert!(workflow.jobs["build"].container.is_some());
+    assert!(workflow.jobs["build"].services.is_some());
+}
+
+#[test]
+fn runner_context_fields_accept_inputs_context() {
+    let workflow = parse_workflow(
+        r#"on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:latest
+      env:
+        FROM_INPUT: "${{ inputs.container_value }}"
+    services:
+      redis:
+        image: redis:latest
+        env:
+          FROM_INPUT: "${{ inputs.service_value }}"
+    outputs:
+      value: "${{ inputs.output_value }}"
+    steps:
+      - run: echo ok
+"#,
+    )
+    .expect("inputs context is allowed in runner-context fields");
+    assert_eq!(
+        workflow.jobs["build"].outputs["value"],
+        "${{ inputs.output_value }}"
+    );
+}
+
+#[test]
+fn job_defaults_run_accepts_inputs_context() {
+    let workflow = parse_workflow(
+        r#"on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: "${{ inputs.shell }}"
+    steps:
+      - run: echo ok
+"#,
+    )
+    .expect("inputs context is allowed in job defaults.run");
+    assert_eq!(
+        workflow.jobs["build"]
+            .defaults
+            .as_ref()
+            .and_then(|defaults| defaults.run.as_ref())
+            .and_then(|run| run.shell.as_deref()),
+        Some("${{ inputs.shell }}")
+    );
+}
+
+#[test]
+fn job_env_rejects_env_context() {
+    let result = parse_workflow(
+        r#"on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      LOOP: "${{ env.LOOP }}"
+    steps:
+      - run: echo ok
+"#,
+    );
+
+    match result {
+        Err(ParserError::InvalidExpression(message)) => {
+            assert!(message.contains("job `build` env"));
+            assert!(message.contains("context \"env\""));
+        }
+        other => panic!("expected job env context rejection, got {other:?}"),
+    }
+}
+
+#[test]
+fn strategy_fields_reject_strategy_and_matrix_contexts() {
+    for (field, expression) in [
+        ("fail-fast", "${{ matrix.fast }}"),
+        ("max-parallel", "${{ strategy.limit }}"),
+    ] {
+        let workflow = r#"on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      FIELD: "EXPRESSION"
+    steps:
+      - run: echo ok
+"#
+        .replace("FIELD", field)
+        .replace("EXPRESSION", expression);
+        match parse_workflow(&workflow) {
+            Err(ParserError::InvalidExpression(message)) => {
+                assert!(message.contains("strategy"));
+                assert!(message.contains("context"));
+            }
+            other => panic!("expected strategy context rejection, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn step_if_rejects_secrets_but_continue_on_error_uses_its_schema_contexts() {
+    let invalid = parse_workflow(
+        r#"on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - if: "${{ secrets.SKIP }}"
+        run: echo ok
+"#,
+    );
+    match invalid {
+        Err(ParserError::InvalidExpression(message)) => {
+            assert!(message.contains("if condition"));
+            assert!(message.contains("context \"secrets\""));
+        }
+        other => panic!("expected step if context rejection, got {other:?}"),
+    }
+
+    let invalid_function = parse_workflow(
+        r#"on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - continue-on-error: "${{ success() }}"
+        run: echo ok
+"#,
+    );
+    match invalid_function {
+        Err(ParserError::InvalidExpression(message)) => {
+            assert!(message.contains("continue-on-error"));
+            assert!(message.contains("context \"success\""));
+        }
+        other => panic!("expected continue-on-error function rejection, got {other:?}"),
+    }
+
+    parse_workflow(
+        r#"on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - continue-on-error: "${{ secrets.ALLOW }}"
+        run: echo ok
+"#,
+    )
+    .expect("secrets context is allowed for step continue-on-error");
+}
+
+#[test]
 fn job_defaults_run_working_directory_rejects_secrets_and_accepts_matrix() {
     let invalid = parse_workflow(
         r#"on: push
@@ -2315,7 +2521,7 @@ jobs:
   test:
     strategy:
       matrix: ${{ fromJSON(inputs.test-matrix) }}
-      fail-fast: ${{ matrix.os == 'ubuntu-latest' }}
+      fail-fast: true
     runs-on: ${{ matrix.os }}
     steps:
       - run: echo ${{ matrix.os }}
@@ -2331,32 +2537,6 @@ jobs:
             .jobs;
     assert_eq!(jobs.len(), 2);
     assert!(jobs.iter().all(|job| job.matrix.get("os").is_some()));
-}
-
-#[test]
-fn strategy_expression_scalars_are_preserved_and_resolved() {
-    let workflow = parse_workflow(
-        r#"
-on: push
-jobs:
-  build:
-    strategy:
-      fail-fast: ${{ matrix.experimental }}
-      max-parallel: ${{ matrix.parallelism }}
-      matrix:
-        include:
-          - experimental: true
-            parallelism: 3
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo ok
-"#,
-    )
-    .unwrap();
-    let plans = expand_jobs(&workflow).unwrap();
-    assert_eq!(plans.len(), 1);
-    assert!(plans[0].fail_fast);
-    assert_eq!(plans[0].max_parallel, Some(3));
 }
 
 #[test]
@@ -2680,13 +2860,12 @@ jobs:
 }
 
 /// A needs-deferred matrix leaves a single un-suffixed placeholder node whose
-/// matrix is intentionally empty. Matrix-dependent `fail-fast`, `max-parallel`
-/// and `continue-on-error` expressions cannot be evaluated against that empty
-/// placeholder — they resolve to null and are rejected at parse time — so the
-/// placeholder defers them: defaults apply until the runtime fan-out builds
-/// the concrete combinations and re-resolves them per cell.
+/// matrix is intentionally empty. The matrix-dependent `continue-on-error`
+/// expression cannot be evaluated against that empty placeholder — it resolves
+/// to null and is rejected at parse time — so the placeholder defers it until
+/// runtime fan-out builds the concrete combinations and re-resolves it per cell.
 #[test]
-fn deferred_matrix_placeholder_defers_strategy_scalars() {
+fn deferred_matrix_placeholder_defers_continue_on_error() {
     let workflow = parse_workflow(
         r#"
 on: push
@@ -2700,8 +2879,6 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
-      fail-fast: ${{ matrix.experimental }}
-      max-parallel: ${{ matrix.parallelism }}
     continue-on-error: ${{ matrix.experimental }}
     steps:
       - run: echo ${{ matrix.os }}
@@ -2715,7 +2892,6 @@ jobs:
         build.fail_fast,
         "placeholder keeps the default until fan-out"
     );
-    assert_eq!(build.max_parallel, None);
     assert!(!build.continue_on_error);
 
     // The runtime fan-out resolves the scalars per concrete combination.
@@ -2723,7 +2899,7 @@ jobs:
     let mut setup_outputs = BTreeMap::new();
     setup_outputs.insert(
         "matrix".to_string(),
-        json!("{\"include\": [{\"os\": \"ubuntu-latest\", \"experimental\": true, \"parallelism\": 3}]}"),
+        json!("{\"include\": [{\"os\": \"ubuntu-latest\", \"experimental\": true}]}"),
     );
     needs_outputs.insert("setup".to_string(), setup_outputs);
     let plans = crate::expand_deferred_matrix_job(
@@ -2736,7 +2912,6 @@ jobs:
     .unwrap();
     assert_eq!(plans.len(), 1);
     assert!(plans[0].fail_fast);
-    assert_eq!(plans[0].max_parallel, Some(3));
 }
 
 /// A needs-deferred matrix reusable caller nested inside another reusable
