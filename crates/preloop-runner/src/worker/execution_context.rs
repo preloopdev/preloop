@@ -410,6 +410,17 @@ impl<'a> StepContext<'a> {
             // git (submodule foreach → git-sh-setup → uname) fail the same
             // way.
             ensure_path(&mut env, std::env::var("PATH").ok().as_deref());
+            // Rust toolchains installed by the orchestrator run as the
+            // unprivileged runner user. Keep their shims visible to every
+            // subsequent step without relying on a profile file
+            // (`bash --noprofile --norc` is the official invocation).
+            let cargo_bin = "/home/runner/.cargo/bin";
+            if std::path::Path::new(cargo_bin).is_dir() {
+                let path = env.get("PATH").cloned().unwrap_or_default();
+                if !path.split(':').any(|entry| entry == cargo_bin) {
+                    env.insert("PATH".to_owned(), format!("{cargo_bin}:{path}"));
+                }
+            }
             // GitHub-hosted parity: hosted runners run steps as a dedicated
             // user in a systemd session, so USER/LOGNAME (the runner account)
             // and XDG_RUNTIME_DIR (to /run/user/<uid>, existing) are present
