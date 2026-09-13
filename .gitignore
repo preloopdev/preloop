@@ -142,6 +142,10 @@ skills-lock.json
 /plans/
 /logo.png
 /logo-square.png
-
-.wrangler/
+.ori/
 .pi/
+.pi/extensions/entire/index.ts
+dist-packages
+# Supply-chain gate: parked until the cargo vet backlog is dealt with
+/.github/workflows/supply-chain.yml
+.wrangler/
