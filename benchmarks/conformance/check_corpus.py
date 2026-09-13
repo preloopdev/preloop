@@ -65,14 +65,26 @@ def load_quarantine(version: str) -> dict[str, str]:
 
 
 def acquirejob_response(flows_path: Path) -> dict | None:
+    """The acquirejob response that actually carries an assignment.
+
+    A runner may poll `acquirejob` and get an empty body before the assignment
+    lands. Returning that first empty response would make the ownership checks
+    below skip the capture entirely, so keep scanning for one that names a job.
+    """
+    fallback: dict | None = None
     with flows_path.open() as flows:
         for line in flows:
             if not line.strip():
                 continue
             flow = json.loads(line)
-            if "acquirejob" in (flow.get("path") or ""):
-                return flow.get("response_body_json") or {}
-    return None
+            if "acquirejob" not in (flow.get("path") or ""):
+                continue
+            body = flow.get("response_body_json") or {}
+            if body.get("jobDisplayName") or body.get("plan"):
+                return body
+            if fallback is None:
+                fallback = body
+    return fallback
 
 
 def declared_jobs(scenario: str) -> tuple[set[str], str]:

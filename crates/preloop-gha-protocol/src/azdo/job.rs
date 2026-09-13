@@ -493,10 +493,21 @@ impl<'de> Deserialize<'de> for TaskStep {
                 .get("workingDirectory")
                 .and_then(|v| v.as_str())
                 .map(str::to_owned),
+            // A value above `u32::MAX` is malformed, not a timeout. Truncating
+            // it would turn `4294967296` into `0` and silently change the
+            // step's deadline, so reject the message instead.
             timeout_in_minutes: obj
                 .get("timeoutInMinutes")
                 .and_then(number_from_template_token)
-                .and_then(|value| u32::try_from(value).ok()),
+                .map(|value| {
+                    u32::try_from(value).map_err(|_| {
+                        serde::de::Error::custom(format!(
+                            "timeoutInMinutes {value} exceeds the maximum of {}",
+                            u32::MAX
+                        ))
+                    })
+                })
+                .transpose()?,
         })
     }
 }
@@ -882,6 +893,25 @@ mod tests {
         ] {
             assert_eq!(number_from_template_token(&token), Some(5));
         }
+    }
+
+    /// Truncating an out-of-range timeout would turn `4294967296` into `0` and
+    /// silently redefine the step's deadline, so the message is rejected.
+    #[test]
+    fn out_of_range_timeout_is_rejected_rather_than_truncated() {
+        let wire = serde_json::json!({
+            "type": "action",
+            "reference": {"type": "script"},
+            "id": uuid::Uuid::nil(),
+            "name": "step",
+            "timeoutInMinutes": {"type": 6, "num": 4294967296u64},
+        });
+        let error = serde_json::from_value::<TaskStep>(wire)
+            .expect_err("a timeout above u32::MAX must not deserialize");
+        assert!(
+            error.to_string().contains("4294967296"),
+            "error must name the offending value: {error}"
+        );
     }
 
     /// The snapshot credential must never appear in Debug output of the job

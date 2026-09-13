@@ -2112,6 +2112,53 @@ jobs:
     assert_eq!(value["expr"], "matrix.shell");
 }
 
+/// Workflow-level `defaults.run` must reach each `StepPlan`, not only the wire
+/// `defaults` field: preloop's own runner executes from the flattened plan, so
+/// omitting it runs scripts with the wrong shell and working directory.
+/// Precedence is step > job defaults > workflow defaults, per key.
+#[test]
+fn workflow_defaults_run_flattens_onto_steps_beneath_job_defaults() {
+    let workflow = parse_workflow(
+        r#"on: push
+defaults:
+  run:
+    shell: bash
+    working-directory: /workflow
+jobs:
+  inherits:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+  overrides:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: /job
+    steps:
+      - run: echo hi
+      - run: echo hi
+        working-directory: /step
+"#,
+    )
+    .unwrap();
+    let plans = expand_jobs(&workflow).unwrap();
+    let job = |id: &str| plans.iter().find(|plan| plan.base_id == id).unwrap();
+
+    let inherited = &job("inherits").steps[0];
+    assert_eq!(inherited.shell.as_deref(), Some("bash"));
+    assert_eq!(inherited.working_directory.as_deref(), Some("/workflow"));
+
+    // The job overrides only `working-directory`; `shell` still falls through.
+    let overridden = &job("overrides").steps[0];
+    assert_eq!(overridden.shell.as_deref(), Some("bash"));
+    assert_eq!(overridden.working_directory.as_deref(), Some("/job"));
+
+    assert_eq!(
+        job("overrides").steps[1].working_directory.as_deref(),
+        Some("/step")
+    );
+}
+
 /// The official schema types `timeout-minutes` as `number`
 /// (`workflow-v1.0.json`: `step-timeout-minutes` → `"number": {}`), and a
 /// template number is a double — so generated YAML rendering `5` as `5.0` is
