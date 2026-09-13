@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d9265401d765384d05badfbd842489095fad86411c58bcedabadd2b1a43af3f6 # shrinks to specs = [LifecycleSpec { has_pre: false, has_post: false, explicit_pre_if: false, explicit_post_if: false, supported: false, manifest_present: false, local: false, metadata: "A", continue_on_error: false, timeout_minutes: None }]

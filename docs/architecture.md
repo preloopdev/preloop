@@ -167,6 +167,7 @@ Known limitations:
 | `action_preparation.rs` | Remote action download/resolution                                       |
 | `helpers.rs`            | Shared utilities (timestamps, endpoint extraction)                      |
 | `steps_runner.rs`       | Sequential step execution, condition evaluation, container init         |
+| `background_steps.rs`   | Background-step concurrency, control flow, cancellation, deferred state  |
 | `job_extension.rs`      | Workspace setup, GITHUB_* env injection, step ordering                  |
 | `contexts.rs`           | `JobContext` — all sub-contexts and accumulated state                   |
 | `execution_context.rs`  | `StepContext` — per-step env, logging, annotations                      |

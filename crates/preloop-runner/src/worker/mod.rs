@@ -6,6 +6,7 @@
 
 pub mod action_preparation;
 pub mod actions;
+pub mod background_steps;
 pub mod commands;
 pub mod completion;
 pub mod container_ops;

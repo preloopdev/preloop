@@ -1075,7 +1075,10 @@ fn lifecycle_fixture(
             timeout_minutes: spec.timeout_minutes,
             env,
             raw: serde_json::json!({"generated": index, "metadata": spec.metadata}),
-            is_background: index % 2 == 0,
+            // Foreground: these fixtures pin lifecycle ordering, and a
+            // background step would inject the implicit wait-all (covered by
+            // the dedicated background-step tests).
+            is_background: false,
         });
     }
 

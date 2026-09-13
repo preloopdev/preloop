@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use super::http::HttpClient;
 
 /// Client for run-service endpoints.
+#[derive(Clone)]
 pub struct RunServiceClient {
     http: HttpClient,
     base_url: String,
