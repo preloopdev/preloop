@@ -382,7 +382,16 @@ impl Serialize for TaskStep {
         if let Some(working_directory) = &self.working_directory {
             map.serialize_entry("workingDirectory", working_directory)?;
         }
-        map.serialize_entry("timeoutInMinutes", &self.timeout_in_minutes)?;
+        let timeout = self.timeout_in_minutes.map(|value| {
+            serde_json::json!({
+                "type": 6,
+                "file": 1,
+                "line": 0,
+                "col": 0,
+                "num": value
+            })
+        });
+        map.serialize_entry("timeoutInMinutes", &timeout)?;
         map.end()
     }
 }
@@ -446,7 +455,10 @@ impl<'de> Deserialize<'de> for TaskStep {
                 .map(str::to_owned),
             timeout_in_minutes: obj
                 .get("timeoutInMinutes")
-                .and_then(|v| v.as_u64())
+                .and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.get("num").and_then(serde_json::Value::as_u64))
+                })
                 .map(|n| n as u32),
         })
     }

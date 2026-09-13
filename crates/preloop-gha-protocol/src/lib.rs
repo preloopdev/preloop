@@ -568,6 +568,11 @@ pub struct StepPlan {
     #[serde(default)]
     pub working_directory: Option<String>,
     /// Shell override for `run` steps.
+    /// Optional step timeout in minutes, retained as a literal string or
+    /// unresolved expression until the job message is built.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_minutes: Option<String>,
+    /// Shell override for `run` steps.
     #[serde(default)]
     pub shell: Option<String>,
     /// Whether to continue on error.

@@ -169,6 +169,9 @@ pub struct Workflow {
     /// Global environment.
     #[serde(default)]
     pub env: Env,
+    /// Workflow-level defaults for run steps.
+    #[serde(default)]
+    pub defaults: Option<JobDefaults>,
     /// Workflow-level permissions.
     #[serde(default)]
     pub permissions: Option<Value>,
@@ -985,6 +988,9 @@ pub struct Step {
     /// Working directory override.
     #[serde(default, rename = "working-directory")]
     pub working_directory: Option<String>,
+    /// Optional step timeout in minutes, literal or expression.
+    #[serde(default, rename = "timeout-minutes")]
+    pub timeout_minutes: Option<DeferredNumber>,
     /// Shell override.
     #[serde(default)]
     pub shell: Option<String>,

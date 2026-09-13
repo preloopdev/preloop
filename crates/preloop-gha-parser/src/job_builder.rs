@@ -941,7 +941,11 @@ fn build_task_step(step: &crate::StepPlan, context: &Context) -> TaskStep {
             .working_directory
             .as_ref()
             .map(|wd| resolve_string(wd, context).unwrap_or_else(|_| wd.clone())),
-        timeout_in_minutes: None,
+        timeout_in_minutes: step
+            .timeout_minutes
+            .as_ref()
+            .and_then(|raw| resolve_string(raw, context).ok())
+            .and_then(|value| value.parse::<u32>().ok()),
     }
 }
 

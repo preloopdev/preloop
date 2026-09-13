@@ -2009,59 +2009,30 @@ jobs:
 }
 
 #[test]
-fn job_defaults_run_working_directory_rejects_secrets_and_accepts_matrix() {
-    let invalid = parse_workflow(
-        r#"on: push
+fn job_defaults_run_rejects_all_expressions() {
+    for expression in ["secrets.WORKING_DIR", "matrix.directory"] {
+        let result = parse_workflow(&format!(
+            r#"on: push
 jobs:
   build:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: ${{ secrets.WORKING_DIR }}
+        working-directory: ${{{{ {expression} }}}}
     steps:
       - run: echo ok
-"#,
-    );
-
-    match invalid {
-        Err(ParserError::InvalidExpression(message)) => {
-            assert!(
-                message.contains("working-directory"),
-                "working-directory field context missing from error: {message}"
-            );
-            assert!(
-                message.contains("secrets"),
-                "forbidden context missing from error: {message}"
-            );
+"#
+        ));
+        match result {
+            Err(ParserError::InvalidExpression(message)) => {
+                assert!(
+                    message.contains("working-directory"),
+                    "working-directory field context missing from error: {message}"
+                );
+            }
+            other => panic!("expected invalid defaults expression, got {other:?}"),
         }
-        other => panic!("expected invalid defaults expression, got {other:?}"),
     }
-
-    let workflow = parse_workflow(
-        r#"on: push
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        directory: [workspace]
-    defaults:
-      run:
-        working-directory: ${{ matrix.directory }}
-    steps:
-      - run: echo ok
-"#,
-    )
-    .expect("matrix context is allowed in job defaults.run.working-directory");
-
-    assert_eq!(
-        workflow.jobs["build"]
-            .defaults
-            .as_ref()
-            .and_then(|defaults| defaults.run.as_ref())
-            .and_then(|run| run.working_directory.as_deref()),
-        Some("${{ matrix.directory }}")
-    );
 }
 
 #[test]

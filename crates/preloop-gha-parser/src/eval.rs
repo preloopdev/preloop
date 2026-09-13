@@ -254,7 +254,7 @@ const CTX_JOB_ENV: &[&str] = &[
     "github", "inputs", "vars", "needs", "strategy", "matrix", "secrets", "env",
 ];
 const CTX_JOB_CONCURRENCY: &[&str] = &["github", "inputs", "vars", "needs", "strategy", "matrix"];
-const CTX_JOB_DEFAULTS_RUN: &[&str] = &["github", "strategy", "matrix", "needs", "env", "vars"];
+const CTX_NO_EXPRESSIONS: &[&str] = &[];
 const CTX_JOB_CONTAINER: &[&str] = &["github", "inputs", "needs", "strategy", "matrix", "vars"];
 const CTX_CONTAINER_CREDENTIALS: &[&str] = &["secrets", "env", "github", "vars"];
 const CTX_RUNNER: &[&str] = &[
@@ -296,6 +296,10 @@ const CTX_STEP_WITH: &[&str] = CTX_STEP_ENV;
 const CTX_STEP_RUN: &[&str] = CTX_STEP_ENV;
 const CTX_STEP_NAME: &[&str] = CTX_STEP_ENV;
 const CTX_STEP_WORKING_DIR: &[&str] = CTX_STEP_ENV;
+const CTX_STEP_TIMEOUT: &[&str] = &[
+    "github", "inputs", "vars", "needs", "strategy", "matrix", "env", "secrets", "steps", "job",
+    "runner",
+];
 
 /// Validate a job container or service value. Container images/options inherit
 /// the job-container context, while `credentials` and `env` have their own
@@ -324,6 +328,23 @@ pub fn validate_workflow_expressions(workflow: &Workflow) -> Result<(), ParserEr
     }
     validate_env_expressions(&workflow.env, Some(CTX_WORKFLOW_ENV))
         .map_err(ParserError::InvalidExpression)?;
+    if let Some(defaults) = &workflow.defaults {
+        if let Some(run) = &defaults.run {
+            if let Some(shell) = &run.shell {
+                validate_expressions_in_string(shell, false, Some(CTX_NO_EXPRESSIONS)).map_err(
+                    |e| ParserError::InvalidExpression(format!("workflow defaults.run.shell: {e}")),
+                )?;
+            }
+            if let Some(working_directory) = &run.working_directory {
+                validate_expressions_in_string(working_directory, false, Some(CTX_NO_EXPRESSIONS))
+                    .map_err(|e| {
+                        ParserError::InvalidExpression(format!(
+                            "workflow defaults.run.working-directory: {e}"
+                        ))
+                    })?;
+            }
+        }
+    }
 
     if let Some(concurrency) = &workflow.concurrency {
         validate_expressions_in_string(&concurrency.group, false, Some(CTX_WORKFLOW_CONCURRENCY))
@@ -427,7 +448,7 @@ pub fn validate_workflow_expressions(workflow: &Workflow) -> Result<(), ParserEr
         if let Some(defaults) = &job.defaults {
             if let Some(run) = &defaults.run {
                 if let Some(shell) = &run.shell {
-                    validate_expressions_in_string(shell, false, Some(CTX_JOB_DEFAULTS_RUN))
+                    validate_expressions_in_string(shell, false, Some(CTX_NO_EXPRESSIONS))
                         .map_err(|e| {
                             ParserError::InvalidExpression(format!(
                                 "job `{job_id}` defaults.run.shell: {e}"
@@ -438,7 +459,7 @@ pub fn validate_workflow_expressions(workflow: &Workflow) -> Result<(), ParserEr
                     validate_expressions_in_string(
                         working_directory,
                         false,
-                        Some(CTX_JOB_DEFAULTS_RUN),
+                        Some(CTX_NO_EXPRESSIONS),
                     )
                     .map_err(|e| {
                         ParserError::InvalidExpression(format!(
@@ -503,6 +524,17 @@ pub fn validate_workflow_expressions(workflow: &Workflow) -> Result<(), ParserEr
                     |e| {
                         ParserError::InvalidExpression(format!(
                             "job `{job_id}` {step_ref} working-directory: {e}"
+                        ))
+                    },
+                )?;
+            }
+            if let Some(crate::models::DeferredNumber::Expression(expression)) =
+                &step.timeout_minutes
+            {
+                validate_expressions_in_string(expression, false, Some(CTX_STEP_TIMEOUT)).map_err(
+                    |e| {
+                        ParserError::InvalidExpression(format!(
+                            "job `{job_id}` {step_ref} timeout-minutes: {e}"
                         ))
                     },
                 )?;

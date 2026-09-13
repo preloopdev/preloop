@@ -452,6 +452,7 @@ pub fn expand_jobs(workflow: &Workflow) -> Result<Vec<JobPlan>, ParserError> {
                 oidc_environment,
                 workflow.permissions.as_ref(),
                 None,
+                workflow.defaults.as_ref(),
                 matrix_deferred,
             )?;
             plan.deferred_matrix = deferred_matrix.clone();
@@ -474,6 +475,7 @@ fn job_plan_from_job(
     oidc_environment: Option<String>,
     workflow_permissions: Option<&Value>,
     inputs: Option<&BTreeMap<String, Value>>,
+    workflow_defaults: Option<&JobDefaults>,
     matrix_deferred: bool,
 ) -> Result<JobPlan, ParserError> {
     let (concurrency_group, concurrency_cancel_in_progress, concurrency_queue) =
@@ -508,11 +510,12 @@ fn job_plan_from_job(
     } else {
         resolve_deferred_number(job.strategy.max_parallel.as_ref(), &matrix, inputs)?
     };
+    let defaults = job.defaults.as_ref().or(workflow_defaults);
     let steps = job
         .steps
         .iter()
         .cloned()
-        .map(|step| step_plan(step, &job.defaults, &matrix, inputs, matrix_deferred))
+        .map(|step| step_plan(step, defaults, &matrix, inputs, matrix_deferred))
         .collect::<Result<Vec<_>, _>>()?;
     let name = resolved_job_name(job.name.as_deref(), &expanded_id, &matrix, inputs);
     Ok(JobPlan {
@@ -906,6 +909,7 @@ fn expand_jobs_with_reusables_internal(
                 oidc_environment,
                 workflow.permissions.as_ref(),
                 inputs,
+                workflow.defaults.as_ref(),
                 matrix_deferred,
             )?;
             plan.deferred_matrix = deferred_matrix.clone();
@@ -1175,7 +1179,7 @@ fn normalize_reusable_path(uses: &str) -> String {
 
 fn step_plan(
     step: Step,
-    defaults: &Option<JobDefaults>,
+    defaults: Option<&JobDefaults>,
     matrix: &IndexMap<String, Value>,
     inputs: Option<&BTreeMap<String, Value>>,
     matrix_deferred: bool,
@@ -1183,15 +1187,17 @@ fn step_plan(
     // Merge job-level defaults into step — step values take precedence.
     let working_directory = step.working_directory.or_else(|| {
         defaults
-            .as_ref()
             .and_then(|d| d.run.as_ref())
             .and_then(|r| r.working_directory.clone())
     });
     let shell = step.shell.or_else(|| {
         defaults
-            .as_ref()
             .and_then(|d| d.run.as_ref())
             .and_then(|r| r.shell.clone())
+    });
+    let timeout_minutes = step.timeout_minutes.as_ref().map(|value| match value {
+        DeferredNumber::Literal(value) => value.to_string(),
+        DeferredNumber::Expression(expression) => format!("${{{{ {expression} }}}}"),
     });
     Ok(StepPlan {
         id: step.id,
@@ -1215,6 +1221,7 @@ fn step_plan(
                 resolve_deferred_bool(Some(value), matrix, inputs, false).map(Some)
             }
         })?,
+        timeout_minutes,
     })
 }
 
@@ -1360,6 +1367,7 @@ pub fn expand_deferred_matrix_job(
             oidc_environment,
             workflow.permissions.as_ref(),
             inputs,
+            workflow.defaults.as_ref(),
             false,
         )?;
         if let Some(prefix) = &needs_prefix {
