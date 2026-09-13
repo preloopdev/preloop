@@ -463,6 +463,26 @@ fn purge_runner_identity_locked(inner: &mut InnerState, runner_id: i64) -> bool 
                     );
                     runtime_scheduling::on_job_enqueued(inner, &job);
                     inner.queue.push_back(job);
+                } else {
+                    // A restarted process may restore the durable request
+                    // without restoring the in-memory claimed job. Do not
+                    // leave that request permanently InProgress: settle the
+                    // abandoned attempt and make the run terminal.
+                    runtime_scheduling::settle_request(
+                        inner,
+                        request_id,
+                        ExecutionStatus::Cancelled,
+                    );
+                    if let Some(run) = inner.runs.get_mut(&run_id) {
+                        run.jobs.insert(job_id.clone(), ExecutionStatus::Cancelled);
+                        run.status = runtime_scheduling::summarize_run(run.jobs.values().copied());
+                    }
+                    warn!(
+                        runner_id,
+                        %run_id,
+                        job_id = %job_id.0,
+                        "settled purged request with no restored claimed job"
+                    );
                 }
             }
         }

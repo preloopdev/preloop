@@ -2009,59 +2009,30 @@ jobs:
 }
 
 #[test]
-fn job_defaults_run_working_directory_rejects_secrets_and_accepts_matrix() {
-    let invalid = parse_workflow(
-        r#"on: push
+fn job_defaults_run_rejects_all_expressions() {
+    for expression in ["secrets.WORKING_DIR", "matrix.directory"] {
+        let result = parse_workflow(&format!(
+            r#"on: push
 jobs:
   build:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: ${{ secrets.WORKING_DIR }}
+        working-directory: ${{{{ {expression} }}}}
     steps:
       - run: echo ok
-"#,
-    );
-
-    match invalid {
-        Err(ParserError::InvalidExpression(message)) => {
-            assert!(
-                message.contains("working-directory"),
-                "working-directory field context missing from error: {message}"
-            );
-            assert!(
-                message.contains("secrets"),
-                "forbidden context missing from error: {message}"
-            );
+"#
+        ));
+        match result {
+            Err(ParserError::InvalidExpression(message)) => {
+                assert!(
+                    message.contains("working-directory"),
+                    "working-directory field context missing from error: {message}"
+                );
+            }
+            other => panic!("expected invalid defaults expression, got {other:?}"),
         }
-        other => panic!("expected invalid defaults expression, got {other:?}"),
     }
-
-    let workflow = parse_workflow(
-        r#"on: push
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        directory: [workspace]
-    defaults:
-      run:
-        working-directory: ${{ matrix.directory }}
-    steps:
-      - run: echo ok
-"#,
-    )
-    .expect("matrix context is allowed in job defaults.run.working-directory");
-
-    assert_eq!(
-        workflow.jobs["build"]
-            .defaults
-            .as_ref()
-            .and_then(|defaults| defaults.run.as_ref())
-            .and_then(|run| run.working_directory.as_deref()),
-        Some("${{ matrix.directory }}")
-    );
 }
 
 #[test]
@@ -2089,8 +2060,8 @@ jobs:
 }
 
 #[test]
-fn defaults_run_expression_is_encoded_as_template_token() {
-    let workflow = parse_workflow(
+fn workflow_defaults_run_rejects_matrix_expressions() {
+    let result = parse_workflow(
         r#"on: push
 defaults:
   run:
@@ -2098,18 +2069,14 @@ defaults:
 jobs:
   build:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        shell: [bash]
     steps:
       - run: echo ok
 "#,
-    )
-    .unwrap();
-    let plan = &expand_jobs(&workflow).unwrap()[0];
-    let value = &plan.defaults[0]["map"][0]["Value"]["map"][0]["Value"];
-    assert_eq!(value["type"], 3);
-    assert_eq!(value["expr"], "matrix.shell");
+    );
+    assert!(
+        matches!(result, Err(ParserError::InvalidExpression(message)) if
+        message.contains("workflow defaults.run.shell"))
+    );
 }
 
 /// Workflow-level `defaults.run` must reach each `StepPlan`, not only the wire

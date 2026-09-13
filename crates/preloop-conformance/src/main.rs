@@ -1,5 +1,7 @@
 //! Conformance harness for comparing aksh with ChristopherHX/runner.server.
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 
@@ -560,6 +562,18 @@ async fn run_runner_e2e(
     use std::time::Duration;
     let server_url = format!("http://127.0.0.1:{port}");
     let listen = format!("127.0.0.1:{port}");
+    let runner_metadata = std::fs::metadata(&runner_bin)
+        .with_context(|| format!("runner executable not found: {}", runner_bin.display()))?;
+    if !runner_metadata.is_file() {
+        anyhow::bail!(
+            "runner path is not a regular file: {}",
+            runner_bin.display()
+        );
+    }
+    #[cfg(unix)]
+    if runner_metadata.permissions().mode() & 0o111 == 0 {
+        anyhow::bail!("runner path is not executable: {}", runner_bin.display());
+    }
 
     // Check binaries
     if !runner_bin.exists() {
@@ -643,7 +657,7 @@ async fn run_runner_e2e(
     }
 
     // Configure the runner
-    let configure_status = Command::new(&runner_bin)
+    let configure_status = match Command::new(&runner_bin)
         .arg("--runner-root")
         .arg(&runner_root)
         .arg("configure")
@@ -661,7 +675,14 @@ async fn run_runner_e2e(
             "--replace",
         ])
         .status()
-        .await?;
+        .await
+    {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = server.kill().await;
+            return Err(error.into());
+        }
+    };
     if !configure_status.success() {
         let _ = server.kill().await;
         anyhow::bail!("runner configure failed");

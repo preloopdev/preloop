@@ -573,15 +573,15 @@ pub struct StepPlan {
     /// Working directory for `run` steps.
     #[serde(default)]
     pub working_directory: Option<String>,
+    /// Optional timeout in minutes for this step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_in_minutes: Option<u32>,
     /// Shell override for `run` steps.
     #[serde(default)]
     pub shell: Option<String>,
     /// Whether to continue on error.
     #[serde(default)]
     pub continue_on_error: Option<bool>,
-    /// Timeout in minutes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_in_minutes: Option<u32>,
 }
 
 /// Context material sent to a runner.

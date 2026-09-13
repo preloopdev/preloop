@@ -179,6 +179,9 @@ pub struct Workflow {
     /// Global environment.
     #[serde(default)]
     pub env: Env,
+    /// Workflow-level defaults for run steps.
+    #[serde(default)]
+    pub defaults: Option<JobDefaults>,
     /// Workflow-level permissions.
     #[serde(default)]
     pub permissions: Option<Value>,
@@ -187,9 +190,6 @@ pub struct Workflow {
     pub concurrency: Option<Concurrency>,
     /// Job definitions.
     pub jobs: IndexMap<String, Job>,
-    /// Workflow-level defaults (`defaults.run`).
-    #[serde(default)]
-    pub defaults: Option<JobDefaults>,
 }
 
 impl Workflow {
@@ -1025,15 +1025,15 @@ pub struct Step {
     /// Working directory override.
     #[serde(default, rename = "working-directory")]
     pub working_directory: Option<String>,
+    /// Optional step timeout in minutes, literal or expression.
+    #[serde(default, rename = "timeout-minutes")]
+    pub timeout_minutes: Option<DeferredNumber>,
     /// Shell override.
     #[serde(default)]
     pub shell: Option<String>,
     /// Whether to continue on error.
     #[serde(default, rename = "continue-on-error")]
     pub continue_on_error: Option<DeferredBool>,
-    /// Step timeout in minutes; expressions resolve during expansion.
-    #[serde(default, rename = "timeout-minutes")]
-    pub timeout_minutes: Option<DeferredNumber>,
 }
 
 /// Action metadata from `action.yml` or `action.yaml`.
