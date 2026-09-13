@@ -679,9 +679,9 @@ mod tests {
         let command = ToolchainLayer::Rust("1.97".into()).verify_command();
         assert!(
             command.starts_with(
-                "export RUSTUP_HOME=/home/runner/.rustup CARGO_HOME=/home/runner/.cargo && "
+                "export RUSTUP_HOME=/home/runner/.rustup CARGO_HOME=/home/runner/.cargo PATH=/home/runner/.cargo/bin:$PATH && "
             ),
-            "verification must resolve the baked toolchain, not /root/.rustup: {command}"
+            "verification must resolve the runner-owned toolchain homes: {command}"
         );
         assert!(command.contains("rustup run 1.97 rustc --version"));
     }
