@@ -34,6 +34,7 @@ cleanup() {
 trap cleanup EXIT
 
 python3 benchmarks/conformance/check_corpus.py
+python3 benchmarks/conformance/check_schema_contexts.py
 
 # The CI recipe already runs the workspace tests. Standalone conformance builds
 # only the server it executes; runner-watch is told not to repeat the suite.

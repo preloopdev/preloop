@@ -1,0 +1,10 @@
+{
+  "description": "Authoritative GitHub Actions workflow schema, vendored so the context diff is reproducible.",
+  "repo": "actions/languageservices",
+  "path": "workflow-parser/src/workflow-v1.0.json",
+  "commit": "880ac43bc39b0fd7b735ff7976044289bbea3724",
+  "committed": "2026-08-04T00:53:44Z",
+  "raw_url": "https://raw.githubusercontent.com/actions/languageservices/880ac43bc39b0fd7b735ff7976044289bbea3724/workflow-parser/src/workflow-v1.0.json",
+  "sha256": "ba07953f8becf1eae45c56efdbc2577b8121db9f57ed065a4c43edbfaf444c66",
+  "vendored": "2026-09-12"
+}
