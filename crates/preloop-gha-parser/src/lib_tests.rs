@@ -874,6 +874,79 @@ jobs:
         Some(&json!("modules/compose"))
     );
 }
+
+#[test]
+fn deferred_reusable_matrix_resolves_with_values_per_cell() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  generator:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo gen
+  lint:
+    needs: generator
+    strategy:
+      matrix:
+        module: ${{ fromJSON(needs.generator.outputs.modules) }}
+    uses: ./.github/workflows/lint.yml
+    with:
+      project-directory: ${{ matrix.module }}
+"#,
+    )
+    .unwrap();
+    let called = parse_workflow(
+        r#"
+on:
+  workflow_call:
+    inputs:
+      project-directory:
+        required: true
+        type: string
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo check
+"#,
+    )
+    .unwrap();
+    let parsed = expand_jobs_with_reusables(
+        &caller,
+        &BTreeMap::from([(
+            "./.github/workflows/lint.yml".to_owned(),
+            serde_yaml::to_string(&called).unwrap(),
+        )]),
+    )
+    .unwrap();
+    let placeholder = parsed
+        .jobs
+        .iter()
+        .find(|job| job.base_id == "lint")
+        .unwrap();
+    let needs_outputs = BTreeMap::from([(
+        "generator".to_owned(),
+        BTreeMap::from([("modules".to_owned(), json!(r#"["modules/compose"]"#))]),
+    )]);
+    let expanded = expand_deferred_reusable_call(
+        &called,
+        &caller,
+        placeholder,
+        &needs_outputs,
+        &BTreeMap::from([(
+            "./.github/workflows/lint.yml".to_owned(),
+            serde_yaml::to_string(&called).unwrap(),
+        )]),
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(expanded.jobs.len(), 1);
+    assert_eq!(
+        expanded.jobs[0].inputs.get("project-directory"),
+        Some(&json!("modules/compose"))
+    );
+}
 #[test]
 fn evaluates_job_continue_on_error_for_each_matrix_cell() {
     let workflow = parse_workflow(

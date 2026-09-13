@@ -1711,6 +1711,31 @@ pub fn expand_deferred_reusable_call(
         cell_plan.matrix = cell;
         cell_plan.matrix_index = (matrix_count > 1).then_some(matrix_index + 1);
         cell_plan.deferred_matrix = None;
+        // The caller's `with:` values are evaluated in the caller context,
+        // which includes the resolved matrix cell. The parse-time placeholder
+        // cannot do that yet, so replace the raw matrix references before
+        // expanding the reusable callee.
+        if let Some(caller_job) = caller_workflow.jobs.get(&cell_plan.base_id).or_else(|| {
+            cell_plan
+                .base_id
+                .rsplit_once('/')
+                .and_then(|(_, tail)| caller_workflow.jobs.get(tail))
+        }) {
+            for (name, value) in &caller_job.with {
+                if let Value::String(raw) = value {
+                    if raw.contains("${{") {
+                        let resolved = crate::eval::resolve_string(
+                            raw,
+                            &expression_context(&cell_plan.matrix, Some(&caller_plan.inputs), None),
+                        )
+                        .map_err(ParserError::InvalidExpression)?;
+                        cell_plan
+                            .inputs
+                            .insert(name.clone(), Value::String(resolved));
+                    }
+                }
+            }
+        }
         let expanded = expand_reusable_call(
             called,
             &cell_plan,
