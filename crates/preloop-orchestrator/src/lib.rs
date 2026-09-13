@@ -2998,9 +2998,17 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         if stock_base || official_base {
             for layer in curated_toolchains() {
                 for command in layer.install_commands() {
-                    if let Err(error) = self.provider.exec(&name, &command).await {
+                    let output = self.provider.exec(&name, &command).await?;
+                    if output.exit_code != 0 {
                         let _ = self.provider.delete(&name).await;
-                        return Err(error.into());
+                        return Err(OrchestratorError::Config(format!(
+                            "toolchain install failed for {layer} (exit {}): {}",
+                            output.exit_code,
+                            String::from_utf8_lossy(&output.stderr)
+                                .lines()
+                                .last()
+                                .unwrap_or("unknown error")
+                        )));
                     }
                 }
             }
