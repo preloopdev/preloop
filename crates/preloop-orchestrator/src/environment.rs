@@ -208,19 +208,17 @@ impl ToolchainLayer {
                          [ -n \"$VERSION\" ] || {{ echo \"no go release matching $WANT\" >&2; exit 1; }}\n\
                          arch=$(uname -m)\n\
                          case \"$arch\" in aarch64) arch=arm64 ;; x86_64) arch=amd64 ;; esac\n\
-                         curl -fsSL \"https://go.dev/dl/$VERSION.linux-$arch.tar.gz\" | tar -C /usr/local -xzf -",
+                         curl -fsSL \"https://go.dev/dl/$VERSION.linux-$arch.tar.gz\" | tar -C /home/runner -xzf -",
                         safe_component(version)
                     ),
                 ],
                 vec![
                     "sh".into(),
                     "-c".into(),
-                    // The Go tarball extracts to /usr/local/go/bin, which is
-                    // not on the default system PATH. Run steps execute with
-                    // `bash --noprofile --norc`, so profile.d PATH exports
-                    // are never sourced; symlink the binaries into
-                    // /usr/local/bin like the Rust layer does for cargo.
-                    "ln -sf /usr/local/go/bin/go /usr/local/bin/go; ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt".into(),
+                    // The Go tarball is installed as the runner user at
+                    // `/home/runner/go`; StepContext adds its bin directory
+                    // to PATH for subsequent steps.
+                    "true".into(),
                 ],
             ],
         }
@@ -251,6 +249,9 @@ impl ToolchainLayer {
                      rustup run {channel} cargo-fmt --version >/dev/null && \
                      rustup run {channel} cargo-clippy --version >/dev/null"
                 )
+            }
+            Self::Go(_) => {
+                "export PATH=/home/runner/go/bin:$PATH && command -v go >/dev/null".to_owned()
             }
             _ => format!("command -v {} >/dev/null", self.verify_binary()),
         }
@@ -569,21 +570,18 @@ mod tests {
         let script = commands[0].join(" ");
         assert!(script.contains("go.dev/dl/?mode=json"));
         assert!(script.contains("$VERSION.linux"));
+        assert!(script.contains("tar -C /home/runner -xzf -"));
         assert!(!script.contains("go1.24.linux")); // never a raw minimum
     }
 
     #[test]
     fn go_layer_puts_binary_on_default_path() {
-        // The Go tarball extracts to /usr/local/go/bin, which is not on the
-        // default PATH of `bash --noprofile --norc` step shells (the same
-        // problem the Rust layer's symlinks solve), so `go`/`gofmt` would be
-        // unresolvable in job steps. The layer must link them into
-        // /usr/local/bin.
+        // The Go tarball is installed in the runner-owned home; the runner
+        // adds its bin directory to each step's PATH.
         let commands = ToolchainLayer::Go("1.24".into()).install_commands();
         assert_eq!(commands.len(), 2);
         let script = commands[1].join(" ");
-        assert!(script.contains("ln -sf /usr/local/go/bin/go /usr/local/bin/go"));
-        assert!(script.contains("ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt"));
+        assert_eq!(script, "sh -c true");
     }
 
     #[test]

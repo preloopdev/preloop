@@ -421,6 +421,13 @@ impl<'a> StepContext<'a> {
                     env.insert("PATH".to_owned(), format!("{cargo_bin}:{path}"));
                 }
             }
+            let go_bin = "/home/runner/go/bin";
+            if std::path::Path::new(go_bin).is_dir() {
+                let path = env.get("PATH").cloned().unwrap_or_default();
+                if !path.split(':').any(|entry| entry == go_bin) {
+                    env.insert("PATH".to_owned(), format!("{go_bin}:{path}"));
+                }
+            }
             // GitHub-hosted parity: hosted runners run steps as a dedicated
             // user in a systemd session, so USER/LOGNAME (the runner account)
             // and XDG_RUNTIME_DIR (to /run/user/<uid>, existing) are present
