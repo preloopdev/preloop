@@ -91,17 +91,15 @@ prepare_golden_home() {
   sudo umount -f "$CAMPAIGN_HOME/externals" 2>/dev/null || true
   rm -rf "$CAMPAIGN_HOME" || true
   [ -f "$OFFICIAL_GOLDEN_ARTIFACT" ] || fail "missing 9GB official golden: $OFFICIAL_GOLDEN_ARTIFACT"
-  local bytes expected fingerprint
+  local bytes expected
   bytes="$(file_size "$OFFICIAL_GOLDEN_ARTIFACT")"
   [ "$bytes" -ge 8589934592 ] || fail "golden is ${bytes} bytes, not the required ~9GB"
-  fingerprint="$(python3 - "$OFFICIAL_GOLDEN_BASE" <<'INNERPY'
-import hashlib, json, sys, platform
-rosetta = platform.system() == "Darwin" and platform.machine() in ("arm64", "aarch64")
-normalized = {"base": sys.argv[1], "toolchains": [], "curated": False, "bake": "", "rosetta_libs": rosetta}
-print(hashlib.sha256(json.dumps(normalized, separators=(",", ":")).encode()).hexdigest())
-INNERPY
-)"
-  expected="$CAMPAIGN_HOME/vms/$OFFICIAL_GOLDEN_NAME-$fingerprint"
+  # Ask the CLI for the same fingerprinted payload path the server computes.
+  # Reimplementing EnvironmentSpec here drifted when runner-root and smolvm
+  # inputs changed, silently causing a fresh multi-GiB image pull.
+  expected="$(PRELOOP_HOME="$CAMPAIGN_HOME" \
+    PRELOOP_RUNNER_BASE_IMAGE="$OFFICIAL_GOLDEN_BASE" \
+    "$SERVER_BIN" golden-path)" || fail "could not compute golden payload path"
   mkdir -p "$(dirname "$expected")"
   ln -sfn "$OFFICIAL_GOLDEN_ARTIFACT" "$expected"
   [ -f "$expected" ] || fail "failed to expose official golden at $expected"
