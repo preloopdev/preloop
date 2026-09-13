@@ -816,6 +816,64 @@ jobs:
     assert_eq!(dynamic_plans[0].id.0, "downstream (ubuntu-latest)");
     assert_eq!(dynamic_plans[1].id.0, "downstream (macos-latest)");
 }
+
+#[test]
+fn expands_needs_expression_inside_matrix_axis() {
+    let yaml = r#"
+name: dynamic-axis
+on: push
+jobs:
+  generator:
+    runs-on: ubuntu-latest
+    steps:
+      - id: modules
+        run: echo 'modules=["modules/compose"]' >> "$GITHUB_OUTPUT"
+  lint:
+    needs: generator
+    uses: ./.github/workflows/lint.yml
+    strategy:
+      matrix:
+        module: ${{ fromJSON(needs.generator.outputs.modules) }}
+"#;
+    let workflow = parse_workflow(yaml).unwrap();
+    let jobs = expand_jobs_with_reusables(
+        &workflow,
+        &BTreeMap::from([(
+            "./.github/workflows/lint.yml".to_owned(),
+            r#"
+on:
+  workflow_call:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo check
+"#
+            .to_owned(),
+        )]),
+    )
+    .unwrap();
+    let caller = jobs.jobs.iter().find(|job| job.base_id == "lint").unwrap();
+    assert!(caller.deferred_matrix.is_some());
+    let mut outputs = BTreeMap::new();
+    outputs.insert(
+        "generator".to_owned(),
+        BTreeMap::from([("modules".to_owned(), json!(r#"["modules/compose"]"#))]),
+    );
+    let expanded = expand_deferred_matrix_job(
+        &workflow,
+        "lint",
+        caller.deferred_matrix.as_deref().unwrap(),
+        &outputs,
+        None,
+    )
+    .unwrap();
+    assert_eq!(expanded.len(), 1);
+    assert_eq!(
+        expanded[0].matrix.get("module"),
+        Some(&json!("modules/compose"))
+    );
+}
 #[test]
 fn evaluates_job_continue_on_error_for_each_matrix_cell() {
     let workflow = parse_workflow(
