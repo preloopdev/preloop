@@ -159,7 +159,7 @@ impl ToolchainLayer {
                            aarch64|arm64) RUST_ARCH=aarch64 ;;\n\
                            *) echo \"unsupported arch: $arch\" >&2; exit 1 ;;\n\
                          esac\n\
-                         export RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo\n\
+                         export RUSTUP_HOME=/home/runner/.rustup CARGO_HOME=/home/runner/.cargo\n\
                          curl -fsSL \"https://static.rust-lang.org/rustup/archive/{}/$RUST_ARCH-unknown-linux-gnu/rustup-init\" -o /tmp/rustup-init\n\
                          chmod +x /tmp/rustup-init\n\
                          /tmp/rustup-init -y --profile minimal --default-toolchain {} --component rustfmt,clippy\n\
@@ -171,16 +171,9 @@ impl ToolchainLayer {
                 vec![
                     "sh".into(),
                     "-c".into(),
-                    // Run steps execute with `bash --noprofile --norc`, so
-                    // profile.d PATH exports are never sourced. The toolchain
-                    // lives at fixed system addresses (see RUSTUP_HOME /
-                    // CARGO_HOME above), deliberately outside every user's
-                    // home: bake runs as root while job steps run as the
-                    // unprivileged runner user, and a $HOME-derived location
-                    // would be invisible across that boundary (/root is
-                    // 0700). Symlink the shims into /usr/local/bin so they
-                    // are on the default system PATH for every step shell.
-                    "ln -sf /usr/local/cargo/bin/cargo /usr/local/bin/cargo; ln -sf /usr/local/cargo/bin/cargo-fmt /usr/local/bin/cargo-fmt; ln -sf /usr/local/cargo/bin/cargo-clippy /usr/local/bin/cargo-clippy; ln -sf /usr/local/cargo/bin/rustc /usr/local/bin/rustc; ln -sf /usr/local/cargo/bin/rustdoc /usr/local/bin/rustdoc; ln -sf /usr/local/cargo/bin/rustup /usr/local/bin/rustup".into(),
+                    // The toolchain is installed as the runner user, so
+                    // StepContext adds `/home/runner/.cargo/bin` to PATH.
+                    "true".into(),
                 ],
             ],
             Self::Python(version) => {
@@ -252,7 +245,7 @@ impl ToolchainLayer {
             Self::Rust(channel) => {
                 let channel = safe_component(channel);
                 format!(
-                    "export RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo && \
+                    "export RUSTUP_HOME=/home/runner/.rustup CARGO_HOME=/home/runner/.cargo && \
                      command -v cargo >/dev/null && \
                      rustup run {channel} rustc --version >/dev/null && \
                      rustup run {channel} cargo-fmt --version >/dev/null && \
@@ -700,7 +693,7 @@ mod tests {
         let command = ToolchainLayer::Rust("1.97".into()).verify_command();
         assert!(
             command.starts_with(
-                "export RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo && "
+                "export RUSTUP_HOME=/home/runner/.rustup CARGO_HOME=/home/runner/.cargo && "
             ),
             "verification must resolve the baked toolchain, not /root/.rustup: {command}"
         );
