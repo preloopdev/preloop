@@ -118,9 +118,17 @@ pub async fn invoke<'a>(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    let mut child = cmd
-        .group_spawn()
-        .with_context(|| format!("spawning {program}"))?;
+    let mut child = cmd.group_spawn().with_context(|| {
+        let cwd_exists = cwd.exists();
+        let path = env
+            .get("PATH")
+            .map(String::as_str)
+            .unwrap_or("<PATH unset>");
+        format!(
+            "spawning {program} (cwd={} exists={cwd_exists} PATH={path})",
+            cwd.display()
+        )
+    })?;
 
     // Capture the group id now, while the handle still reports one: the wait
     // loop below reaps the leader the moment it exits, and a reaped handle

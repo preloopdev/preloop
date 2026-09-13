@@ -38,13 +38,13 @@ use tracing::{debug, error, info, warn};
 
 const GUEST_CONTROL_DIR: &str = "/run/preloop-control";
 const GUEST_CONTROL_SOCKET: &str = "/run/preloop-control/engine.sock";
-const GUEST_FAILURE_MARKER: &str = "/var/lib/preloop-runner/.preloop-job-failed";
+const GUEST_FAILURE_MARKER: &str = "/home/runner/.preloop-job-failed";
 /// Written by the worker while a job is paused in a debug session and removed
 /// when the session closes. The pool probes it to release the slot's
 /// concurrency permit for the pause's duration — without it a paused job
 /// pins a permit (and with `max_concurrent` permits total, eventually the
 /// whole pool) until the session ends or the pause credit expires.
-const GUEST_PAUSE_MARKER: &str = "/var/lib/preloop-runner/.preloop-job-paused";
+const GUEST_PAUSE_MARKER: &str = "/home/runner/.preloop-job-paused";
 /// Guest variable `preloop-runner configure` reads a pre-generated keypair from.
 /// Must match `preloop_runner::configure::RSA_PARAMS_ENV`.
 const RUNNER_RSA_PARAMS_ENV: &str = "PRELOOP_RUNNER_RSA_PARAMS";
@@ -1109,7 +1109,12 @@ const DOCKER_DATA_ROOT: &str = "/storage/docker";
 /// Standard loopback entries for `/etc/hosts`.
 /// Runner root inside the guest. Must match the `--runner-root` argument
 /// passed to configure at provision time.
-const RUNNER_ROOT: &str = "/var/lib/preloop-runner";
+/// Lives under the runner user's home, matching the GitHub-hosted layout
+/// (`/home/runner/...`). A `/var/lib/...` root tripped path-assuming
+/// workflows: jekyll's profiler regex carries an unanchored `/lib`
+/// alternative that matches `var/lib` and mis-normalizes every theme path,
+/// while hosted runners have no `/lib` prefix to catch on.
+const RUNNER_ROOT: &str = "/home/runner";
 
 /// Standard loopback entries for `/etc/hosts`.
 ///
@@ -4741,7 +4746,7 @@ async fn provision_runner<P: VmProvider + 'static>(
         "--labels".into(),
         labels,
         "--runner-root".into(),
-        "/var/lib/preloop-runner".into(),
+        RUNNER_ROOT.into(),
         "--unattended".into(),
         "--replace".into(),
         "--ephemeral".into(),
@@ -4851,7 +4856,7 @@ async fn provision_runner<P: VmProvider + 'static>(
         "run".into(),
         "--once".into(),
         "--runner-root".into(),
-        "/var/lib/preloop-runner".into(),
+        RUNNER_ROOT.into(),
     ]);
     Ok(as_runner_user(config, &run))
 }
@@ -4902,12 +4907,17 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
          printf '%s\\n' '{user} ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/preloop-{user} \
            && chmod 0440 /etc/sudoers.d/preloop-{user}; \
          mkdir -p /run/user/{uid} /opt/hostedtoolcache; \
-         chown {uid}:{uid} /run/user/{uid} /var/lib/preloop-runner 2>/dev/null; \
+         chown {uid}:{uid} /run/user/{uid} /home/runner 2>/dev/null; \
          chmod -R 777 /opt/hostedtoolcache 2>/dev/null; \
          grep -q AGENT_TOOLSDIRECTORY /etc/environment 2>/dev/null || \
            printf 'AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\\nRUNNER_TOOL_CACHE=/opt/hostedtoolcache\\n' >> /etc/environment; \
          chmod 777 /run/preloop-control 2>/dev/null; \
-         getent group docker >/dev/null 2>&1 && usermod -aG docker {user} 2>/dev/null"
+         getent group docker >/dev/null 2>&1 && usermod -aG docker {user} 2>/dev/null; \
+         if command -v mountpoint >/dev/null 2>&1 && mountpoint -q /tmp 2>/dev/null && \
+            [ \"$(stat -f -c %T /tmp 2>/dev/null)\" = tmpfs ]; then \
+           umount /tmp 2>/dev/null || mount -o remount,size=75% /tmp 2>/dev/null || true; \
+         fi; \
+         mkdir -p /tmp && chmod 1777 /tmp 2>/dev/null || true"
     );
     // setpriv requires a groups mode: --init-groups (setgroups) only works
     // as root, so the exec-as-image-user branch (official golden: USER
