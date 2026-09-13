@@ -3012,6 +3012,33 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     }
                 }
             }
+            // Toolchain installation runs as root and recreates writable
+            // rustup state beneath these homes. Re-apply runner ownership
+            // after every layer; doing it only in the base script leaves
+            // `/usr/local/rustup/tmp` root-owned and job-time rustup updates
+            // fail with EACCES.
+            let output = self
+                .provider
+                .exec(
+                    &name,
+                    &[
+                        "sh".to_owned(),
+                        "-c".to_owned(),
+                        runner_account_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID),
+                    ],
+                )
+                .await?;
+            if output.exit_code != 0 {
+                let _ = self.provider.delete(&name).await;
+                return Err(OrchestratorError::Config(format!(
+                    "final runner-account ownership failed (exit {}): {}",
+                    output.exit_code,
+                    String::from_utf8_lossy(&output.stderr)
+                        .lines()
+                        .last()
+                        .unwrap_or("unknown error")
+                )));
+            }
         }
         // Bake the externals *pointer*, not the externals: the packed rootfs
         // gets `<root>/externals -> /opt/preloop/bin/externals` so node rides
