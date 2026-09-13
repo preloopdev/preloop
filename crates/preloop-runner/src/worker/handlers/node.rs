@@ -11,6 +11,36 @@ use crate::worker::execution_context::StepContext;
 const FORCE_NODE24: &str = "FORCE_JAVASCRIPT_ACTIONS_TO_NODE24";
 const ALLOW_UNSECURE_NODE: &str = "ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION";
 
+/// Pre-`/home/runner` goldens baked node externals at this absolute path.
+/// The upward walk from a new-layout workspace can never reach it, so it
+/// serves as a last-resort search root (probed, never assumed).
+const LEGACY_BAKED_EXTERNALS_ROOT: &str = "/var/lib/preloop-runner";
+
+/// Find the runner root whose `externals/` holds the bundled node runtimes:
+/// walk up from the workspace, falling back to the legacy baked location
+/// (pre-root-move goldens), then to the workspace grandparent.
+fn runner_root_for_externals(workspace: &Path, legacy_root: &Path) -> std::path::PathBuf {
+    let mut runner_root = workspace.to_path_buf();
+    while !runner_root.join("externals").exists() {
+        if let Some(parent) = runner_root.parent() {
+            runner_root = parent.to_path_buf();
+        } else {
+            break;
+        }
+    }
+    if !runner_root.join("externals").exists() && legacy_root.join("externals").exists() {
+        return legacy_root.to_path_buf();
+    }
+    if runner_root.join("externals").exists() {
+        return runner_root;
+    }
+    workspace
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap_or(Path::new("."))
+        .to_path_buf()
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct NodeSelection {
     version: &'static str,
@@ -183,15 +213,22 @@ pub async fn run_node_action(
         anyhow::bail!("action entry point not found: {}", entry_point.display());
     }
 
-    // Validate that the canonical entry point path stays within the action directory
+    // Contain the canonical entry point in the action's repository root.
+    // Real actions keep entry points outside their own subdir: gradle's
+    // setup-gradle runs `../dist/...`, codeql's init runs `../lib/...`
+    // (both resolve inside the repo). The official runner performs no such
+    // check; bounding by repo root instead of the action subdir keeps the
+    // sandbox while matching legitimate layouts.
+    let containment_root = super::composite::actions_tarball_root(action_dir)
+        .unwrap_or_else(|| action_dir.to_path_buf());
     if let (Ok(canonical_dir), Ok(canonical_entry)) =
-        (action_dir.canonicalize(), entry_point.canonicalize())
+        (containment_root.canonicalize(), entry_point.canonicalize())
     {
         if !canonical_entry.starts_with(&canonical_dir) {
             anyhow::bail!(
                 "action entry point {} escapes action directory {}",
                 entry_point.display(),
-                action_dir.display()
+                containment_root.display()
             );
         }
     }
@@ -207,6 +244,14 @@ pub async fn run_node_action(
 
     // Build environment with INPUT_* variables, evaluating any ${{ }} expressions.
     let mut env = ctx.build_env();
+    // INPUT_* scope is per action step: strip anything inherited from an
+    // enclosing composite so a nested action never sees the parent's
+    // inputs. (junit's run-gradle composite exports INPUT_ARGUMENTS for
+    // its own run steps; without scoping, the nested setup-gradle node
+    // action inherits it and fails on its removed `arguments` parameter.)
+    // The step's own `with:` inputs and manifest defaults are added back
+    // below; composite RUN steps are unaffected (script path).
+    env.retain(|key, _| !key.starts_with("INPUT_"));
     let use_node24_by_default = ctx
         .job
         .get_variable_bool("actions.runner.usenode24bydefault");
@@ -299,19 +344,8 @@ pub async fn run_node_action(
         }
     }
 
-    let mut runner_root = Path::new(workspace).to_path_buf();
-    while !runner_root.join("externals").exists() {
-        if let Some(parent) = runner_root.parent() {
-            runner_root = parent.to_path_buf();
-        } else {
-            runner_root = Path::new(workspace)
-                .parent()
-                .and_then(|p| p.parent())
-                .unwrap_or(Path::new("."))
-                .to_path_buf();
-            break;
-        }
-    }
+    let runner_root =
+        runner_root_for_externals(Path::new(workspace), Path::new(LEGACY_BAKED_EXTERNALS_ROOT));
     let bundled_node = if cfg!(target_os = "windows") {
         runner_root
             .join("externals")
@@ -739,6 +773,38 @@ mod tests {
 
     const NODE20_WARNING_SUBSTR: &str =
         "Node 20 actions are deprecated and support ends soon; migrate actions to node24.";
+
+    #[test]
+    fn externals_search_prefers_walk_falls_back_to_legacy() {
+        // New-layout workspace (`<root>/_work/<repo>/<repo>`) whose ancestors
+        // carry no externals, with a legacy baked tree elsewhere: the legacy
+        // root wins over the workspace-grandparent fallback.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp
+            .path()
+            .join("home")
+            .join("runner")
+            .join("_work")
+            .join("repo")
+            .join("repo");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let legacy = tmp.path().join("legacyroot");
+        std::fs::create_dir_all(legacy.join("externals")).unwrap();
+        assert_eq!(runner_root_for_externals(&workspace, &legacy), legacy,);
+        // Walk hit still wins when present.
+        let rooted = tmp.path().join("rooted");
+        let ws2 = rooted.join("_work").join("r").join("r");
+        std::fs::create_dir_all(rooted.join("externals")).unwrap();
+        std::fs::create_dir_all(&ws2).unwrap();
+        assert_eq!(runner_root_for_externals(&ws2, &legacy), rooted);
+        // Neither: workspace grandparent, as before.
+        let bare = tmp.path().join("bare").join("_work").join("r").join("r");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert_eq!(
+            runner_root_for_externals(&bare, &tmp.path().join("nolegacy")),
+            tmp.path().join("bare").join("_work"),
+        );
+    }
 
     fn setup_externals_with_shim(root: &std::path::Path) {
         for version in ["node20", "node24"] {

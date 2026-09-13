@@ -87,7 +87,16 @@ impl<'a> StepContext<'a> {
                 .get("ACTIONS_STEP_DEBUG")
                 .is_some_and(|v| is_debug(v))
             || job.env.get("RUNNER_DEBUG").is_some_and(|v| is_debug(v));
-        let translate_container_path = job.container_state.is_some();
+        // Only steps executing INSIDE a job container (`container:`) take
+        // the container path: service containers alone leave steps on the
+        // host, where the host PATH fallback must stay. (A services-only
+        // job took the container branch, so the first GITHUB_PATH write
+        // replaced the whole PATH with extras-only and every later spawn
+        // failed — laravel's setup-php-project composite.)
+        let translate_container_path = job
+            .container_state
+            .as_ref()
+            .is_some_and(|state| state.job_container_id.is_some());
         let temp_file = tempfile::tempfile().expect("failed to create log temp file");
         let log_file = Arc::new(Mutex::new(BufWriter::new(temp_file)));
         let keep_in_memory = cfg!(test);
@@ -485,8 +494,16 @@ pub(crate) const DEFAULT_PATH: &str =
 /// the step env supplies one. Prefers the worker's own PATH (the machine
 /// env) and falls back to the platform default — never an empty value.
 pub(crate) fn ensure_path(env: &mut HashMap<String, String>, worker_path: Option<&str>) {
-    if env.contains_key("PATH") {
+    // An empty PATH spawns nothing by name; treat it as missing. (A
+    // GITHUB_ENV `PATH=` write with an empty value otherwise wedges every
+    // later step with `spawning bash: No such file`, as seen in laravel's
+    // setup-php-project composite. The writer is still unknown — this is
+    // defense, and it logs.)
+    if env.get("PATH").is_some_and(|path| !path.trim().is_empty()) {
         return;
+    }
+    if env.contains_key("PATH") {
+        tracing::warn!("step PATH is empty; falling back to worker/platform PATH");
     }
     let path = worker_path
         .filter(|path| !path.trim().is_empty())
@@ -1070,5 +1087,67 @@ mod tests {
             assert!(lines[0].ends_with(" ##[error]first"));
             assert_eq!(lines[1], "##[warning]second");
         });
+    }
+}
+
+#[cfg(test)]
+mod empty_path_tests {
+    use super::*;
+
+    #[test]
+    fn empty_path_falls_back_instead_of_wedging_spawns() {
+        let mut env = HashMap::new();
+        env.insert("PATH".to_string(), String::new());
+        ensure_path(&mut env, Some("/usr/bin:/bin"));
+        assert_eq!(env["PATH"], "/usr/bin:/bin");
+    }
+}
+
+#[cfg(test)]
+mod services_path_tests {
+    use super::*;
+    use crate::worker::container_ops::ContainerState;
+    use crate::worker::contexts::JobContext;
+
+    fn services_only_job() -> JobContext {
+        let mut job = JobContext::new(
+            "j1".into(),
+            "Test".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        job.container_state = Some(ContainerState {
+            label: "abc123".to_string(),
+            network: "github_network_test".to_string(),
+            job_container_id: None,
+            job_container_name: None,
+            service_containers: vec![("redis".to_string(), "cid".to_string(), "cname".to_string())],
+        });
+        job.extra_path.push("/tool/bin".into());
+        job
+    }
+
+    #[test]
+    fn services_only_job_keeps_host_path_fallback() {
+        // laravel: services without `container:` run steps on the host.
+        // Taking the container branch dropped the host PATH base, so the
+        // first GITHUB_PATH write replaced PATH with extras-only and every
+        // later spawn failed with ENOENT.
+        let mut job = services_only_job();
+        let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        assert!(
+            !ctx.translate_container_path,
+            "services-only steps execute on the host"
+        );
+        let env = ctx.build_env();
+        let path = env.get("PATH").expect("host steps need a PATH");
+        assert!(
+            path.starts_with("/tool/bin:"),
+            "extras must prepend, got: {path}"
+        );
+        assert!(
+            path.contains("/usr/bin") || path.contains("/bin"),
+            "host PATH base must survive, got: {path}"
+        );
     }
 }
