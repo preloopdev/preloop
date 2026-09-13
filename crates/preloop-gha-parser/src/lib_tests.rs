@@ -2036,6 +2036,166 @@ jobs:
 }
 
 #[test]
+fn workflow_defaults_run_working_directory_rejects_secrets() {
+    let result = parse_workflow(
+        r#"on: push
+defaults:
+  run:
+    working-directory: ${{ secrets.WORKING_DIR }}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#,
+    );
+
+    match result {
+        Err(ParserError::InvalidExpression(message)) => {
+            assert!(message.contains("workflow defaults.run.working-directory"));
+            assert!(message.contains("secrets"));
+        }
+        other => panic!("expected invalid workflow defaults expression, got {other:?}"),
+    }
+}
+
+#[test]
+fn defaults_run_expression_is_encoded_as_template_token() {
+    let workflow = parse_workflow(
+        r#"on: push
+defaults:
+  run:
+    shell: ${{ matrix.shell }}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        shell: [bash]
+    steps:
+      - run: echo ok
+"#,
+    )
+    .unwrap();
+    let plan = &expand_jobs(&workflow).unwrap()[0];
+    let value = &plan.defaults[0]["map"][0]["Value"]["map"][0]["Value"];
+    assert_eq!(value["type"], 3);
+    assert_eq!(value["expr"], "matrix.shell");
+}
+
+/// Workflow-level `defaults.run` must reach each `StepPlan`, not only the wire
+/// `defaults` field: preloop's own runner executes from the flattened plan, so
+/// omitting it runs scripts with the wrong shell and working directory.
+/// Precedence is step > job defaults > workflow defaults, per key.
+#[test]
+fn workflow_defaults_run_flattens_onto_steps_beneath_job_defaults() {
+    let workflow = parse_workflow(
+        r#"on: push
+defaults:
+  run:
+    shell: bash
+    working-directory: /workflow
+jobs:
+  inherits:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+  overrides:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: /job
+    steps:
+      - run: echo hi
+      - run: echo hi
+        working-directory: /step
+"#,
+    )
+    .unwrap();
+    let plans = expand_jobs(&workflow).unwrap();
+    let job = |id: &str| plans.iter().find(|plan| plan.base_id == id).unwrap();
+
+    let inherited = &job("inherits").steps[0];
+    assert_eq!(inherited.shell.as_deref(), Some("bash"));
+    assert_eq!(inherited.working_directory.as_deref(), Some("/workflow"));
+
+    // The job overrides only `working-directory`; `shell` still falls through.
+    let overridden = &job("overrides").steps[0];
+    assert_eq!(overridden.shell.as_deref(), Some("bash"));
+    assert_eq!(overridden.working_directory.as_deref(), Some("/job"));
+
+    assert_eq!(
+        job("overrides").steps[1].working_directory.as_deref(),
+        Some("/step")
+    );
+}
+
+/// The official schema types `timeout-minutes` as `number`
+/// (`workflow-v1.0.json`: `step-timeout-minutes` → `"number": {}`), and a
+/// template number is a double — so generated YAML rendering `5` as `5.0` is
+/// valid input. Rejecting it at deserialization failed the *entire* workflow,
+/// not just the field.
+#[test]
+fn decimal_step_timeout_is_accepted_and_fractions_are_rejected() {
+    let workflow_with = |timeout: &str| {
+        format!(
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n        timeout-minutes: {timeout}\n"
+        )
+    };
+
+    let workflow = parse_workflow(&workflow_with("5.0")).expect("`5.0` is a valid number");
+    let jobs = expand_jobs(&workflow).unwrap();
+    assert_eq!(jobs[0].steps[0].timeout_in_minutes, Some(5));
+
+    // A fraction is not a whole number of minutes; reject it rather than
+    // truncating a `2.5` into a two-minute timeout.
+    let workflow = parse_workflow(&workflow_with("2.5")).expect("`2.5` still parses as a number");
+    match expand_jobs(&workflow) {
+        Err(ParserError::InvalidExpression(message)) => {
+            assert!(
+                message.contains("2.5"),
+                "error must name the value: {message}"
+            );
+        }
+        other => panic!("expected a whole-number rejection, got {other:?}"),
+    }
+}
+
+#[test]
+fn step_timeout_expression_resolves_and_range_is_checked() {
+    let workflow = parse_workflow(
+        r#"on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        timeout: [5]
+    steps:
+      - name: bounded
+        timeout-minutes: ${{ matrix.timeout }}
+        run: echo ok
+"#,
+    )
+    .unwrap();
+    let jobs = expand_jobs(&workflow).unwrap();
+    assert_eq!(jobs[0].steps[0].timeout_in_minutes, Some(5));
+
+    for (value, expected) in [(0, "1 through 360"), (361, "1 through 360")] {
+        let workflow = parse_workflow(&format!(
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - name: bounded\n        timeout-minutes: {value}\n        run: echo ok\n"
+        ))
+        .unwrap();
+        match expand_jobs(&workflow) {
+            Err(ParserError::InvalidStepTimeout { message, .. }) => {
+                assert!(message.contains(expected));
+            }
+            other => panic!("expected invalid timeout for {value}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn concurrency_bare_string_shorthand() {
     let wf = parse_workflow(
         r#"

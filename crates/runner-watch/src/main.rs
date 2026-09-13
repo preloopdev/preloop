@@ -3106,15 +3106,32 @@ fn write_conformance_summary(
         ));
     }
     lines.push(String::new());
+    // List the diverging scenarios first and mark them inline. Previously
+    // every scenario was listed identically, so a red report told a reader
+    // the count but not which ones — and the only file naming them
+    // (conformance-fail.toml) was not part of the uploaded CI artifact.
+    let failed: std::collections::BTreeSet<&str> = failures
+        .iter()
+        .map(|(scenario, _)| scenario.as_str())
+        .collect();
+    if !failed.is_empty() {
+        lines.push("Diverging:".to_string());
+        for scenario in &failed {
+            lines.push(format!("- ❌ {scenario}"));
+        }
+        lines.push(String::new());
+    }
     for report in reports {
-        lines.push(format!(
-            "- [{}]({})",
-            report
-                .file_stem()
-                .and_then(OsStr::to_str)
-                .unwrap_or("scenario"),
-            report.display()
-        ));
+        let scenario = report
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .unwrap_or("scenario");
+        let mark = if failed.contains(scenario) {
+            "❌ "
+        } else {
+            ""
+        };
+        lines.push(format!("- {mark}[{scenario}]({})", report.display()));
     }
     lines.push(String::new());
     lines.push("## Replay methodology and known gaps".to_string());

@@ -268,6 +268,32 @@ fn install_script_is_valid_shell() {
     );
 }
 
+/// The runner account lives in the bake script, not in a post-bake `exec`.
+///
+/// The fingerprint hashes `base_install_script`, and nothing else about the
+/// bake. Preparing the account outside it left the fingerprint unchanged, so a
+/// pool adopted the previous golden and served jobs an account the new code no
+/// longer matched — the `/usr/local/rustup` EACCES that failed every Rust job.
+#[test]
+fn install_script_prepares_the_runner_account_and_toolchain_homes() {
+    let script = base_install_script();
+    assert!(
+        script.contains("useradd -m -u 1001 -s /bin/bash runner"),
+        "the unprivileged runner account must be baked, not created at runtime"
+    );
+    // `ToolchainLayer::Rust` installs these as root at the addresses
+    // `guest_env_prefix` exports; without ownership the runner cannot write
+    // them and `rustup toolchain install` dies before any build starts.
+    assert!(
+        script.contains("chown -R 1001:1001 /usr/local/rustup /usr/local/cargo"),
+        "the exported RUSTUP_HOME/CARGO_HOME must be owned by the runner account"
+    );
+    assert!(
+        script.contains("/etc/sudoers.d/preloop-runner"),
+        "steps run `sudo apt-get install`, so the account needs NOPASSWD sudo"
+    );
+}
+
 /// Hosted images keep their apt package lists, so real workflows install
 /// system packages with a bare `sudo apt-get install <pkg>` and no preceding
 /// `apt-get update` — uv's musl cell (`apt-get install musl-tools`) is one.

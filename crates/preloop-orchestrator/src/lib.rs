@@ -1359,6 +1359,41 @@ fn node_externals_at(runner_root: &str) -> Vec<Vec<String>> {
     .collect()
 }
 
+/// Default unprivileged account the guest runner drops into, matching the
+/// hosted `runner` user. [`RunnerPoolConfig::runner_user`] may override it.
+pub const DEFAULT_RUNNER_USER: &str = "runner";
+/// Default UID for [`DEFAULT_RUNNER_USER`], matching the hosted image.
+pub const DEFAULT_RUNNER_UID: u32 = 1001;
+
+/// Create the unprivileged runner account and hand it every path a job writes.
+///
+/// Part of [`base_install_script`] — and therefore of the environment
+/// fingerprint — on purpose. Run as a separate post-bake `exec`, a change here
+/// left the fingerprint untouched, so the pool adopted the previous golden and
+/// silently served jobs an account the new code no longer matched. Keep every
+/// step idempotent: the same script runs against an already-prepared rootfs.
+///
+/// The Rust homes are the subtle ones. `ToolchainLayer::Rust` installs them as
+/// root at fixed system addresses (`/usr/local/rustup`, `/usr/local/cargo`)
+/// that `guest_env_prefix` exports to every user, so without this ownership
+/// the runner cannot write them and `rustup toolchain install` dies with
+/// `could not create home directory`.
+pub fn runner_account_script(user: &str, uid: u32) -> String {
+    format!(
+        "getent passwd {user} >/dev/null 2>&1 || useradd -m -u {uid} -s /bin/bash {user} 2>/dev/null; \
+         printf '%s\\n' '{user} ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/preloop-{user} \
+           && chmod 0440 /etc/sudoers.d/preloop-{user}; \
+         mkdir -p /run/user/{uid} /opt/hostedtoolcache /usr/local/rustup /usr/local/cargo; \
+         chown {uid}:{uid} /run/user/{uid} {root} 2>/dev/null; \
+         chown -R {uid}:{uid} /usr/local/rustup /usr/local/cargo 2>/dev/null; \
+         chmod -R 777 /opt/hostedtoolcache 2>/dev/null; \
+         grep -q AGENT_TOOLSDIRECTORY /etc/environment 2>/dev/null || \
+           printf 'AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\\nRUNNER_TOOL_CACHE=/opt/hostedtoolcache\\n' >> /etc/environment; \
+         getent group docker >/dev/null 2>&1 && usermod -aG docker {user} 2>/dev/null || true",
+        root = RUNNER_ROOT
+    )
+}
+
 /// The guest bootstrap script, one shell round trip.
 ///
 /// Every `exec` is a host process spawn plus a vsock round trip, and this runs
@@ -1504,8 +1539,10 @@ pub fn base_install_script() -> String {
          install -d -m 0777 /opt/hostedtoolcache && \
          printf 'AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\\nRUNNER_TOOL_CACHE=/opt/hostedtoolcache\\n' >> /etc/environment && \
          (useradd -m -u 1000 -s /bin/bash ubuntu 2>/dev/null || true) && \
+         ({runner_account}) && \
          apt-get clean && \
          rm -rf /usr/share/doc/* /usr/share/man/* /usr/share/info/*",
+        runner_account = runner_account_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID),
         docker_packages = docker_apt_packages(),
         compiler_packages = compiler_apt_packages(),
         base_packages_pinned = base_packages_pinned()
@@ -2961,11 +2998,46 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         if stock_base || official_base {
             for layer in curated_toolchains() {
                 for command in layer.install_commands() {
-                    if let Err(error) = self.provider.exec(&name, &command).await {
+                    let output = self.provider.exec(&name, &command).await?;
+                    if output.exit_code != 0 {
                         let _ = self.provider.delete(&name).await;
-                        return Err(error.into());
+                        return Err(OrchestratorError::Config(format!(
+                            "toolchain install failed for {layer} (exit {}): {}",
+                            output.exit_code,
+                            String::from_utf8_lossy(&output.stderr)
+                                .lines()
+                                .last()
+                                .unwrap_or("unknown error")
+                        )));
                     }
                 }
+            }
+            // Toolchain installation runs as root and recreates writable
+            // rustup state beneath these homes. Re-apply runner ownership
+            // after every layer; doing it only in the base script leaves
+            // `/usr/local/rustup/tmp` root-owned and job-time rustup updates
+            // fail with EACCES.
+            let output = self
+                .provider
+                .exec(
+                    &name,
+                    &[
+                        "sh".to_owned(),
+                        "-c".to_owned(),
+                        runner_account_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID),
+                    ],
+                )
+                .await?;
+            if output.exit_code != 0 {
+                let _ = self.provider.delete(&name).await;
+                return Err(OrchestratorError::Config(format!(
+                    "final runner-account ownership failed (exit {}): {}",
+                    output.exit_code,
+                    String::from_utf8_lossy(&output.stderr)
+                        .lines()
+                        .last()
+                        .unwrap_or("unknown error")
+                )));
             }
         }
         // Bake the externals *pointer*, not the externals: the packed rootfs
@@ -2996,29 +3068,42 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     .unwrap_or("unknown")
             )));
         }
-        // Pre-bake the runner account, toolcache, and permissions into the
-        // golden rootfs so cloned microVMs inherit them with zero runtime setup.
-        let runner_user = self.config.runner_user.as_deref().unwrap_or("runner");
-        let runner_uid = self.config.runner_uid.unwrap_or(1001);
-        let user_prep_command = format!(
-            "getent passwd {runner_user} >/dev/null 2>&1 || useradd -m -u {runner_uid} {runner_user} 2>/dev/null; \
-             printf '%s\\n' '{runner_user} ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/preloop-{runner_user} \
-               && chmod 0440 /etc/sudoers.d/preloop-{runner_user}; \
-             mkdir -p /run/user/{runner_uid} /opt/hostedtoolcache; \
-             chown {runner_uid}:{runner_uid} /run/user/{runner_uid} {root} 2>/dev/null; \
-             chmod -R 777 /opt/hostedtoolcache 2>/dev/null; \
-             grep -q AGENT_TOOLSDIRECTORY /etc/environment 2>/dev/null || \
-               printf 'AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\\nRUNNER_TOOL_CACHE=/opt/hostedtoolcache\\n' >> /etc/environment; \
-             getent group docker >/dev/null 2>&1 && usermod -aG docker {runner_user} 2>/dev/null || true",
-            root = RUNNER_ROOT
-        );
-        let _ = self
-            .provider
-            .exec(
-                &name,
-                &["sh".to_owned(), "-c".to_owned(), user_prep_command],
-            )
-            .await;
+        // `base_install_script` already prepared the default account, and that
+        // fragment is fingerprinted. Re-run it here only for a configured
+        // non-default user, whose identity the fingerprint cannot know: the
+        // script is idempotent, so the default case is a cheap no-op skip.
+        let runner_user = self
+            .config
+            .runner_user
+            .as_deref()
+            .unwrap_or(DEFAULT_RUNNER_USER);
+        let runner_uid = self.config.runner_uid.unwrap_or(DEFAULT_RUNNER_UID);
+        if runner_user != DEFAULT_RUNNER_USER || runner_uid != DEFAULT_RUNNER_UID {
+            let output = self
+                .provider
+                .exec(
+                    &name,
+                    &[
+                        "sh".to_owned(),
+                        "-c".to_owned(),
+                        runner_account_script(runner_user, runner_uid),
+                    ],
+                )
+                .await?;
+            if output.exit_code != 0 {
+                // A golden whose runner account is wrong cannot run a job:
+                // every step fails on permissions, which reads as flaky CI.
+                let _ = self.provider.delete(&name).await;
+                return Err(OrchestratorError::Config(format!(
+                    "baking runner account {runner_user} failed (exit {}): {}",
+                    output.exit_code,
+                    String::from_utf8_lossy(&output.stderr)
+                        .lines()
+                        .last()
+                        .unwrap_or("unknown")
+                )));
+            }
+        }
         let env_spec = EnvironmentSpec::for_base(self.config.base_image.clone());
         if let Err(error) = write_bake_manifest(self.provider.as_ref(), &name, &env_spec).await {
             // Provenance is an audit aid, not a build gate.

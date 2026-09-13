@@ -252,7 +252,8 @@ impl ToolchainLayer {
             Self::Rust(channel) => {
                 let channel = safe_component(channel);
                 format!(
-                    "command -v cargo >/dev/null && \
+                    "export RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo && \
+                     command -v cargo >/dev/null && \
                      rustup run {channel} rustc --version >/dev/null && \
                      rustup run {channel} cargo-fmt --version >/dev/null && \
                      rustup run {channel} cargo-clippy --version >/dev/null"
@@ -688,6 +689,22 @@ mod tests {
         ] {
             assert!(!layer.install_commands().is_empty());
         }
+    }
+
+    /// Rust is baked into fixed system homes, while bare provider `exec`
+    /// commands run as root with HOME=/root. Verification must select the same
+    /// homes as installation and job execution or it falsely reports the
+    /// installed toolchain missing, reinstalls it, then fails the same probe.
+    #[test]
+    fn rust_verification_uses_the_baked_system_homes() {
+        let command = ToolchainLayer::Rust("1.97".into()).verify_command();
+        assert!(
+            command.starts_with(
+                "export RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo && "
+            ),
+            "verification must resolve the baked toolchain, not /root/.rustup: {command}"
+        );
+        assert!(command.contains("rustup run 1.97 rustc --version"));
     }
 
     /// The Go layer emits an inline Python resolver whose body must survive

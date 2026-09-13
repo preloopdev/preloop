@@ -79,7 +79,7 @@ jobs:
       - name: Run Pullfrog (via GHES-compatible fork)
         if: steps.diff_filter.outputs.skip != 'true'
         continue-on-error: true
-        uses: Bnjoroge1/pullfrog@09dde428a88245ab3c448ff3dcadb8325e4e1d05 # ghes-url-support
+        uses: preloopdev/pullfrog@ee5bcaf5557b069f78177ec0a33381c9e5477cf4 # main
         with:
           prompt: ${{ inputs.prompt || toJSON(github.event) }}
           model: openai/gpt-5.6-terra

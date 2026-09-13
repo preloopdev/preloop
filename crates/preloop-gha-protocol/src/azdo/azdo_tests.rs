@@ -223,15 +223,7 @@ fn expected_step_wire(step: &TaskStep) -> Value {
     object.insert(
         "timeoutInMinutes".to_owned(),
         step.timeout_in_minutes
-            .map(|value| {
-                serde_json::json!({
-                    "type": 6,
-                    "file": 1,
-                    "line": 0,
-                    "col": 0,
-                    "num": value
-                })
-            })
+            .map(|value| json!({"type": 6, "file": 1, "line": 0, "col": 0, "num": value}))
             .unwrap_or(Value::Null),
     );
     Value::Object(object)
@@ -347,6 +339,9 @@ fn expected_job_wire(job: &AgentJobRequestMessage) -> Value {
         json!(job.job_service_containers),
     );
     object.insert("jobOutputs".to_owned(), json!(job.job_outputs));
+    if let Some(value) = &job.actions_environment {
+        object.insert("actionsEnvironment".to_owned(), json!(value));
+    }
     if job.enable_debugger {
         object.insert("enableDebugger".to_owned(), json!(true));
     }
@@ -437,6 +432,7 @@ fn arb_job() -> impl Strategy<Value = AgentJobRequestMessage> {
             prop::option::of(arb_text().prop_map(|value| json!({"type": 0, "lit": value}))),
             prop::option::of(arb_text().prop_map(|value| json!({"type": 2, "lit": value}))),
             prop::option::of(arb_text().prop_map(|value| json!({"type": 2, "lit": value}))),
+            prop::option::of(arb_text().prop_map(|name| ActionsEnvironment { name, url: None })),
         ),
         (
             any::<bool>(),
@@ -468,6 +464,7 @@ fn arb_job() -> impl Strategy<Value = AgentJobRequestMessage> {
                     job_container,
                     job_service_containers,
                     job_outputs,
+                    actions_environment,
                 ),
                 (enable_debugger, debugger_welcome_message, has_tunnel, key_bytes),
             )| AgentJobRequestMessage {
@@ -507,6 +504,7 @@ fn arb_job() -> impl Strategy<Value = AgentJobRequestMessage> {
                 job_container,
                 job_service_containers,
                 job_outputs,
+                actions_environment,
                 enable_debugger,
                 debugger_tunnel: has_tunnel.then_some(DebuggerTunnelInfo {
                     tunnel_id: "tunnel".to_owned(),
@@ -629,20 +627,9 @@ fn arb_literal_step() -> impl Strategy<Value = TaskStep> {
         prop::option::of(arb_text()),
         prop::option::of(arb_text()),
         prop::option::of(arb_text()),
-        prop::option::of(0u32..=1000),
     )
         .prop_map(
-            |(
-                has_script,
-                script,
-                inputs,
-                env,
-                name,
-                context_name,
-                display_name,
-                condition,
-                timeout_in_minutes,
-            )| {
+            |(has_script, script, inputs, env, name, context_name, display_name, condition)| {
                 let display_name_token = Some(json!({
                     "type": 1,
                     "lit": display_name.clone().unwrap_or_default()
@@ -661,7 +648,7 @@ fn arb_literal_step() -> impl Strategy<Value = TaskStep> {
                     continue_on_error: Some(false),
                     shell: None,
                     working_directory: None,
-                    timeout_in_minutes,
+                    timeout_in_minutes: None,
                 }
             },
         )

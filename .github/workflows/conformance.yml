@@ -27,6 +27,21 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Replay official runner flows
         run: bash ./benchmarks/conformance/run.sh
+      - name: Name the diverging scenarios
+        if: failure()
+        # `run.sh` prints only "conformance failed for N scenario(s)". The
+        # scenario names live in conformance-fail.toml, which previously was
+        # not uploaded either — so a red build could not be diagnosed at all
+        # without re-running the replay locally. Echo them into the log, which
+        # outlives the ephemeral runner VM.
+        run: |
+          if [ -f .runner-watch/conformance-fail.toml ]; then
+            echo "::group::Diverging scenarios"
+            cat .runner-watch/conformance-fail.toml
+            echo "::endgroup::"
+          else
+            echo "no conformance-fail.toml written — the replay failed before the gate"
+          fi
       - name: Upload light report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -35,4 +50,5 @@ jobs:
           path: |
             .runner-watch/conformance/**
             .runner-watch/conformance-report.md
+            .runner-watch/conformance-fail.toml
           if-no-files-found: error
