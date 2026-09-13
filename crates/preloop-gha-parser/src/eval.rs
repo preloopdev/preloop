@@ -254,7 +254,7 @@ const CTX_JOB_ENV: &[&str] = &[
     "github", "inputs", "vars", "needs", "strategy", "matrix", "secrets", "env",
 ];
 const CTX_JOB_CONCURRENCY: &[&str] = &["github", "inputs", "vars", "needs", "strategy", "matrix"];
-const CTX_JOB_DEFAULTS_RUN: &[&str] = &["github", "strategy", "matrix", "needs", "env", "vars"];
+const CTX_NO_EXPRESSIONS: &[&str] = &[];
 const CTX_JOB_CONTAINER: &[&str] = &["github", "inputs", "needs", "strategy", "matrix", "vars"];
 const CTX_CONTAINER_CREDENTIALS: &[&str] = &["secrets", "env", "github", "vars"];
 const CTX_RUNNER: &[&str] = &[
@@ -331,7 +331,7 @@ fn validate_run_defaults(
         ("working-directory", run.working_directory.as_ref()),
     ] {
         if let Some(value) = value {
-            validate_expressions_in_string(value, false, Some(CTX_JOB_DEFAULTS_RUN)).map_err(
+            validate_expressions_in_string(value, false, Some(CTX_NO_EXPRESSIONS)).map_err(
                 |error| ParserError::InvalidExpression(format!("{label}.run.{field}: {error}")),
             )?;
         }

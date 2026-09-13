@@ -2060,8 +2060,8 @@ jobs:
 }
 
 #[test]
-fn defaults_run_expression_is_encoded_as_template_token() {
-    let workflow = parse_workflow(
+fn workflow_defaults_run_rejects_matrix_expressions() {
+    let result = parse_workflow(
         r#"on: push
 defaults:
   run:
@@ -2069,18 +2069,14 @@ defaults:
 jobs:
   build:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        shell: [bash]
     steps:
       - run: echo ok
 "#,
-    )
-    .unwrap();
-    let plan = &expand_jobs(&workflow).unwrap()[0];
-    let value = &plan.defaults[0]["map"][0]["Value"]["map"][0]["Value"];
-    assert_eq!(value["type"], 3);
-    assert_eq!(value["expr"], "matrix.shell");
+    );
+    assert!(
+        matches!(result, Err(ParserError::InvalidExpression(message)) if
+        message.contains("workflow defaults.run.shell"))
+    );
 }
 
 /// Workflow-level `defaults.run` must reach each `StepPlan`, not only the wire
