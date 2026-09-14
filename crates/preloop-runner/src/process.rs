@@ -45,6 +45,11 @@ const CHUNK_CHANNEL_CAPACITY: usize = 1024;
 /// Size of the read buffer for raw byte chunks from stdout/stderr.
 const READ_BUF_SIZE: usize = 65536; // 64 KB
 
+/// R1-12: maximum lines retained per invocation when `keep_lines` is set
+/// (docker invocations, e.g. `docker logs` at service teardown). Without a
+/// cap, a chatty subprocess grows the line vecs without bound.
+const MAX_KEPT_LINES: usize = 100_000;
+
 // ProcessInvoker.cs v2.335.1 waits five seconds for redirected streams after
 // the parent exits, then kills the remaining process tree.
 #[cfg(not(test))]
@@ -330,6 +335,11 @@ fn push_chunk(
         let target: &mut Vec<String> = if is_stdout { stdout_lines } else { lines };
         for segment in bytes.split(|&b| b == b'\n') {
             if !segment.is_empty() {
+                // R1-12: stop retaining lines past the cap instead of growing
+                // the vec without bound.
+                if target.len() >= MAX_KEPT_LINES {
+                    continue;
+                }
                 match std::str::from_utf8(segment) {
                     Ok(s) => target.push(s.to_string()),
                     Err(_) => {
@@ -341,6 +351,9 @@ fn push_chunk(
         if is_stdout {
             for segment in bytes.split(|&b| b == b'\n') {
                 if !segment.is_empty() {
+                    if lines.len() >= MAX_KEPT_LINES {
+                        continue;
+                    }
                     match std::str::from_utf8(segment) {
                         Ok(s) => lines.push(s.to_string()),
                         Err(_) => {
