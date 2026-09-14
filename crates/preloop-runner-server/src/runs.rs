@@ -2381,6 +2381,27 @@ pub(crate) fn build_job_artifacts(
         job.oidc_id_token_granted,
     );
 
+    // M4: the environment registry. `environment:` names an
+    // operator-registered deployment tier; a workflow claiming an
+    // unregistered name gets nothing — no environment secrets, no
+    // environment OIDC subject — and the job fails closed rather than
+    // minting a token for a never-created, never-approved environment.
+    // This check runs ahead of `policy.allows_secrets` because the OIDC
+    // subject is minted for jobs even when secret injection is disabled.
+    if let Some(env_name) = job.oidc_environment.as_deref() {
+        if !shared
+            .state
+            .secrets
+            .read()
+            .is_environment_registered(&submission.repository, env_name)
+        {
+            return Err(ApiError::bad_request(format!(
+                "environment '{env_name}' is not registered for repository '{}'; register it under [environments]",
+                submission.repository
+            )));
+        }
+    }
+
     // Environment secrets are per-job: a job's `environment:` selects the
     // tier, so the overlay happens here, not in the submission-level merge.
     // Precedence per name: submission-provided > environment > repo > global,
@@ -3903,5 +3924,90 @@ mod tests {
         );
 
         std::env::remove_var("PRELOOP_GITHUB_API_URL");
+    }
+
+    /// Submit a run through the public API against a config-file registry.
+    async fn submit_push_run(config_toml: &str, workflow_yaml: &str) -> (StatusCode, String) {
+        use axum::body::Body;
+        use axum::http::{header, Method, Request};
+        use tower::ServiceExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(&config_path, config_toml).unwrap();
+        let state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
+            .await
+            .unwrap();
+        let app = crate::app(state, CancellationToken::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/runs")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {DEFAULT_PRELOOP_SYSTEM_TOKEN}"),
+                    )
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "workflow_yaml": workflow_yaml,
+                            "event": "push",
+                            "repository": "owner/repo",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
+        (status, body)
+    }
+
+    const ENV_WORKFLOW: &str = "on: push\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    environment: production\n    steps:\n      - run: echo hi\n";
+
+    /// M4: `environment:` is an unvalidated string. A workflow claiming an
+    /// environment the operator never registered must fail closed — even
+    /// when that environment has secrets configured (the pentest shape: env
+    /// secret injected + OIDC `sub` asserting the unregistered environment).
+    #[tokio::test]
+    async fn unregistered_environment_rejects_run_submission() {
+        use axum::http::StatusCode;
+        let (status, body) = submit_push_run(
+            "[env_secrets.\"owner/repo\".production]\nDEPLOY_KEY = \"env-secret\"\n",
+            ENV_WORKFLOW,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a job claiming an unregistered environment must fail closed, got: {body}"
+        );
+        assert!(
+            body.contains("not registered"),
+            "the rejection must name the missing registration, got: {body}"
+        );
+    }
+
+    /// M4: an environment the operator registered in `[environments]` keeps
+    /// working — the registry gates existence, not legitimate use.
+    #[tokio::test]
+    async fn registered_environment_accepts_run_submission() {
+        use axum::http::StatusCode;
+        let (status, body) = submit_push_run(
+            "[environments]\n\"owner/repo\" = [\"production\"]\n[env_secrets.\"owner/repo\".production]\nDEPLOY_KEY = \"env-secret\"\n",
+            ENV_WORKFLOW,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a job claiming a registered environment must be accepted, got: {body}"
+        );
     }
 }

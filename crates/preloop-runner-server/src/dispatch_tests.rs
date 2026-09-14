@@ -1028,41 +1028,66 @@ fn two_app_registry() -> (crate::github_app::GitHubApps, rsa::RsaPrivateKey) {
     (registry, second_key)
 }
 
+/// Extract the App JWT `iss` claim from an Authorization header.
+fn extract_iss(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .split('.')
+        .nth(1)
+        .and_then(|claims| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(claims)
+                .ok()
+        })
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|claims| claims["iss"].as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
 /// M3: each registered secret is accepted only for repositories covered by
 /// the App that owns it. A payload signed by App 525's secret claiming
 /// org-a/repo (App 424's installation) is a cross-App forgery and must be
-/// rejected, even though the signature itself is valid.
+/// rejected, even though the signature itself is valid. Coverage is exact:
+/// App 525's selected-repository installation on org-b covers
+/// org-b/allowed-repo but not the sibling org-b/other-repo.
 #[tokio::test]
 async fn webhook_signer_is_bound_to_the_claimed_repository() {
     use axum::routing::get;
 
-    // Installation discovery, routed by the App JWT's `iss`: App 525 is
-    // installed on org-b, App 424 on org-a.
-    let stub = Router::new().route(
-        "/app/installations",
-        get(|headers: axum::http::HeaderMap| async move {
-            let auth = headers
-                .get("authorization")
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or_default();
-            let iss = auth
-                .split('.')
-                .nth(1)
-                .and_then(|claims| {
-                    base64::engine::general_purpose::URL_SAFE_NO_PAD
-                        .decode(claims)
-                        .ok()
-                })
-                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-                .and_then(|claims| claims["iss"].as_str().map(str::to_owned))
-                .unwrap_or_default();
-            let account = if iss == "525" { "org-b" } else { "org-a" };
-            Json(json!([{
-                "id": 1,
-                "account": { "login": account },
-            }]))
-        }),
-    );
+    // Exact-repository installation lookup, routed by the App JWT's `iss`:
+    // App 525 covers only org-b/allowed-repo (selected repositories);
+    // App 424 covers org-a/repo.
+    let stub = Router::new()
+        .route(
+            "/repos/org-b/allowed-repo/installation",
+            get(|headers: axum::http::HeaderMap| async move {
+                let iss = extract_iss(&headers);
+                if iss == "525" {
+                    (StatusCode::OK, Json(json!({"id": 1, "app_id": 525})))
+                } else {
+                    (StatusCode::NOT_FOUND, Json(json!({"message": "Not Found"})))
+                }
+            }),
+        )
+        .route(
+            "/repos/org-a/repo/installation",
+            get(|headers: axum::http::HeaderMap| async move {
+                let iss = extract_iss(&headers);
+                if iss == "424" {
+                    (StatusCode::OK, Json(json!({"id": 2, "app_id": 424})))
+                } else {
+                    (StatusCode::NOT_FOUND, Json(json!({"message": "Not Found"})))
+                }
+            }),
+        )
+        .route(
+            "/repos/org-b/other-repo/installation",
+            get(|_headers: axum::http::HeaderMap| async move {
+                (StatusCode::NOT_FOUND, Json(json!({"message": "Not Found"})))
+            }),
+        );
     let (base, handle) = spawn_github_stub(stub).await;
     let _env = pin_api_base(&base).await;
 
@@ -1077,10 +1102,17 @@ async fn webhook_signer_is_bound_to_the_claimed_repository() {
 
     let ping = |repo: &str| json!({ "repository": { "full_name": repo } });
 
-    // App 525's secret for org-b/repo (its own installation) → accepted.
+    // App 525's secret for org-b/allowed-repo (its own installation) → accepted.
     assert_eq!(
-        deliver_webhook(&app, "ping", &ping("org-b/repo"), "second-secret").await,
-        StatusCode::OK
+        deliver_webhook(&app, "ping", &ping("org-b/allowed-repo"), "second-secret").await,
+        StatusCode::ACCEPTED
+    );
+    // App 525's secret for org-b/other-repo: same owner, but the
+    // selected-repository installation does not cover it → 403.
+    assert_eq!(
+        deliver_webhook(&app, "ping", &ping("org-b/other-repo"), "second-secret").await,
+        StatusCode::FORBIDDEN,
+        "M3: same-owner sibling repo outside the installation must be rejected"
     );
     // App 525's secret for org-a/repo (App 424's installation) → 403.
     assert_eq!(
@@ -1091,17 +1123,17 @@ async fn webhook_signer_is_bound_to_the_claimed_repository() {
     // Legacy secret: no App identity, no binding — accepted as before.
     assert_eq!(
         deliver_webhook(&app, "ping", &ping("org-a/repo"), "legacy-secret").await,
-        StatusCode::OK
+        StatusCode::ACCEPTED
     );
     // Unknown secret → 401.
     assert_eq!(
-        deliver_webhook(&app, "ping", &ping("org-b/repo"), "wrong-secret").await,
+        deliver_webhook(&app, "ping", &ping("org-b/allowed-repo"), "wrong-secret").await,
         StatusCode::UNAUTHORIZED
     );
     // No repository claimed: nothing to bind → accepted.
     assert_eq!(
         deliver_webhook(&app, "ping", &json!({}), "second-secret").await,
-        StatusCode::OK
+        StatusCode::ACCEPTED
     );
 
     handle.abort();

@@ -233,6 +233,15 @@ pub(crate) async fn set_secret(
                 .entry(env.clone())
                 .or_default()
                 .insert(name.clone(), value.clone());
+            // Storing an environment secret creates the environment, as on
+            // GitHub: the environment becomes claimable by `environment:`.
+            // Only this operator-held endpoint can register names this way;
+            // workflow authors cannot self-approve an environment (M4).
+            config
+                .environments
+                .entry(repo.clone())
+                .or_default()
+                .insert(env.clone());
         }
         (Some(repo), None) => {
             config
@@ -263,6 +272,13 @@ pub(crate) async fn set_secret(
                 .entry(env.clone())
                 .or_default()
                 .insert(name, value);
+            // Mirror the persisted registration above: storing an
+            // environment secret creates the environment (M4).
+            store
+                .environments
+                .entry(repo.clone())
+                .or_default()
+                .insert(env.clone());
         }
         (Some(repo), None) => {
             store
