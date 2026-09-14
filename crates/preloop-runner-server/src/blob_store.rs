@@ -35,6 +35,57 @@ fn release_blob_lock(kind: &str, token: &str, arc: Arc<Mutex<()>>) {
 
 // ─── Azure Block Blob compat blob store ───────────────────────────────────────
 //
+
+/// Blob kinds the `/twirp-blob/:kind/:token` route serves. Anything else is
+/// rejected before touching the filesystem (R1-2).
+pub(crate) const BLOB_KINDS: &[&str] = &["cache", "artifact", "diag"];
+
+/// Validate an already-decoded blob token: non-empty, restricted charset, no
+/// `..` segments. The charset excludes `/` and `\`, so no validated token can
+/// escape `<state_dir>/blobs/{kind}/` via path joining.
+pub(crate) fn is_valid_blob_token(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && !token.contains("..")
+        && !token.starts_with('.')
+        && !token.ends_with('.')
+}
+
+/// Parse and validate a raw `/twirp-blob/{kind}/{token}` request path.
+///
+/// Decode-then-validate: the token is percent-decoded *first*, so encoded
+/// separators (`%2f`, `%2e%2e`, double-encoded `%252e`) are caught by the same
+/// checks as literal ones. Returns the canonical `(kind, token)` with any
+/// `.zip` artifact-download suffix removed, or `None` when the path is
+/// malformed or the kind is not allowlisted.
+pub(crate) fn parse_blob_path(path: &str) -> Option<(String, String)> {
+    let rest = path.strip_prefix("/twirp-blob/")?;
+    let (kind, raw_token) = rest.split_once('/')?;
+    if raw_token.contains('/') {
+        return None;
+    }
+    if !BLOB_KINDS.contains(&kind) {
+        return None;
+    }
+    let mut token = raw_token.to_string();
+    // Artifact download URLs append `.zip` for toolkit content-type
+    // detection; strip it before validation and map lookup (mirrors blob_get).
+    if kind == "artifact" {
+        if let Some(stripped) = token.strip_suffix(".zip") {
+            token = stripped.to_string();
+        }
+    }
+    let decoded = percent_encoding::percent_decode_str(&token)
+        .decode_utf8()
+        .ok()?
+        .into_owned();
+    if !is_valid_blob_token(&decoded) {
+        return None;
+    }
+    Some((kind.to_string(), decoded))
+}
 // Both actions/cache@v4 and actions/upload-artifact@v4 upload via the Azure SDK
 // (BlockBlobClient).  The protocol is:
 //   • Single-shot: PUT /twirp-blob/{kind}/{token}                  → 201
@@ -81,6 +132,14 @@ pub(crate) async fn blob_put(
     headers: HeaderMap,
     body: Body,
 ) -> StatusCode {
+    // Defense in depth: the middleware gate validates first, but the blob
+    // root is built by joining these segments — never join unsanitized ones.
+    // (The extractor already percent-decoded `token`; the gate validated the
+    // raw path with decode-then-validate.)
+    if !BLOB_KINDS.contains(&kind.as_str()) || !is_valid_blob_token(&token) {
+        warn!(kind, token, "rejected blob PUT with invalid kind/token");
+        return StatusCode::BAD_REQUEST;
+    }
     // Early Content-Length check before buffering — avoids allocating 512 MiB
     // for a block that will be rejected at 8 MiB.
     if let Some(cl) = headers
@@ -336,6 +395,12 @@ pub(crate) async fn blob_get(
     // Artifact download URLs end in .zip for toolkit zip-detection.
     if kind == "artifact" && token.ends_with(".zip") {
         token.truncate(token.len() - 4);
+    }
+    // Defense in depth: the middleware gate validates first — never serve
+    // outside the allowlisted kinds or join an unsanitized token.
+    if !BLOB_KINDS.contains(&kind.as_str()) || !is_valid_blob_token(&token) {
+        warn!(kind, token, "rejected blob GET with invalid kind/token");
+        return StatusCode::BAD_REQUEST.into_response();
     }
 
     if kind == "cache" {

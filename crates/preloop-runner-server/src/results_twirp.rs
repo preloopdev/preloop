@@ -177,6 +177,7 @@ pub(crate) async fn twirp_get_job_logs_signed_blob_url(
 }
 
 pub(crate) async fn twirp_get_job_diag_logs_signed_blob_url(
+    State(shared): State<Arc<SharedState>>,
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<JobLogsSignedBlobUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -186,6 +187,24 @@ pub(crate) async fn twirp_get_job_diag_logs_signed_blob_url(
         &request.workflow_job_run_backend_id,
     )?;
     let token = uuid::Uuid::new_v4();
+    // Bind the bearerless upload token to the owning job so the blob gate
+    // can reject writes from any other job (R1-2). The runner PUTs to this
+    // URL without a bearer (Azure SDK compat), so registration — not a
+    // bearer — is the credential here.
+    {
+        let job_id = match &identity {
+            crate::auth::ResultsIdentity::Job(job) => job.job_id.to_string(),
+            crate::auth::ResultsIdentity::System => String::new(),
+        };
+        let mut inner = shared.state.inner.lock().await;
+        inner.diag_upload_tokens.insert(
+            token.to_string(),
+            DiagUploadToken {
+                job_id,
+                created_unix: now_unix(),
+            },
+        );
+    }
     Ok(Json(json!({
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
         "diag_logs_url": format!("{}/twirp-blob/diag/{token}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig=dummy", runner_base_url()),

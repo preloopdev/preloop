@@ -89,6 +89,13 @@ pub(crate) async fn require_results_bearer(
         }
         return Ok(next.run(request).await);
     }
+    if path.starts_with("/twirp-blob/") {
+        // R1-2: this route used to fall through the `!/twirp/` check below
+        // with zero authentication, and blob_put/blob_get joined the raw
+        // segments into the filesystem. The gate now owns both problems.
+        let path = path.to_owned();
+        return authorize_blob_request(&shared.state, path, request, next).await;
+    }
     if !path.starts_with("/twirp/") {
         return Ok(next.run(request).await);
     }
@@ -102,6 +109,103 @@ pub(crate) async fn require_results_bearer(
     // re-parsing a bearer string independently.
     request.extensions_mut().insert(identity);
     Ok(next.run(request).await)
+}
+
+/// Authorize `/twirp-blob/{kind}/{token}` requests (R1-2).
+///
+/// The blob endpoints are bearerless by protocol design — the Azure SDK in
+/// `actions/upload-artifact` / `actions/cache` PUTs to the signed upload URL
+/// without attaching the job bearer — so the gate cannot simply require a
+/// bearer without breaking wire compatibility with the official toolkit.
+/// Instead it enforces three properties:
+///   1. the kind is allowlisted and the token is decode-then-validated, so no
+///      request can address outside `<state_dir>/blobs/{kind}/`;
+///   2. the token must have been minted by the server (a pending upload, a
+///      cache download token, a diag reservation, or a finalized artifact) —
+///      arbitrary tokens address nothing, which kills the unauthenticated
+///      PUT-to-anything repro;
+///   3. when a bearer IS present it is verified, and on writes the blob token
+///      must be owned by the bearer's job: a job's token may only write its
+///      own job's blobs.
+///
+/// Reads stay bearer-optional — the unguessable, server-minted URL is the
+/// credential, the same SAS-style model as `/replay/results/*` — because the
+/// download clients are equally bearerless.
+async fn authorize_blob_request(
+    state: &AppState,
+    path: String,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let Some((kind, token)) = crate::blob_store::parse_blob_path(&path) else {
+        return Err(ApiError::bad_request("invalid blob path"));
+    };
+    let is_write = request.method() == axum::http::Method::PUT;
+
+    // Owner recorded at mint time ("" = minted via the system credential).
+    // Reads additionally honor cache download tokens and finalized artifacts,
+    // whose mint-time handlers already scoped the URL that was issued.
+    let (write_owner, readable) = {
+        let inner = state.inner.lock().await;
+        let write_owner: Option<String> = match kind.as_str() {
+            "artifact" => inner
+                .artifact_v2_pending
+                .get(&token)
+                .map(|pending| pending.job_backend_id.clone()),
+            "cache" => inner
+                .cache_v2_pending
+                .get(&token)
+                .map(|pending| pending.job_backend_id.clone()),
+            "diag" => inner
+                .diag_upload_tokens
+                .get(&token)
+                .map(|reserved| reserved.job_id.clone()),
+            _ => None,
+        };
+        let readable = write_owner.is_some()
+            || inner.cache_v2_dl_tokens.contains_key(&token)
+            || inner
+                .artifact_v2_registry
+                .values()
+                .any(|entry| entry.blob_token == token);
+        (write_owner, readable)
+    };
+
+    match bearer_from_headers(request.headers()) {
+        Some(bearer) if bearer == state.system_token => Ok(next.run(request).await),
+        Some(bearer) => {
+            let job_id = match results_identity(state, bearer) {
+                Ok(ResultsIdentity::Job(identity)) => identity.job_id.to_string(),
+                _ => return Err(ApiError::unauthorized("results-service job token required")),
+            };
+            if is_write {
+                match write_owner {
+                    Some(owner) if !owner.is_empty() && owner == job_id => {
+                        Ok(next.run(request).await)
+                    }
+                    _ => Err(ApiError::forbidden("blob token is not owned by this job")),
+                }
+            } else if readable {
+                Ok(next.run(request).await)
+            } else {
+                Err(ApiError::not_found("blob not found"))
+            }
+        }
+        // Bearerless Azure-SDK-style flow: the unguessable, server-minted
+        // token is the credential.
+        None => {
+            let known = if is_write {
+                write_owner.is_some()
+            } else {
+                readable
+            };
+            if known {
+                Ok(next.run(request).await)
+            } else {
+                Err(ApiError::not_found("blob not found"))
+            }
+        }
+    }
 }
 
 pub(crate) async fn require_test_api_token(

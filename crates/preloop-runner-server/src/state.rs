@@ -1587,6 +1587,11 @@ pub(crate) struct InnerState {
     pub(crate) log_order: VecDeque<String>,
     /// Artifact v2 Twirp pending uploads: upload_token → registry_key.
     pub(crate) artifact_v2_pending: BTreeMap<String, ArtifactV2Pending>,
+    /// Diagnostic-log upload tokens: token → owner. In-memory only; minted
+    /// by `GetJobDiagLogsSignedBlobURL` and consumed bearerless by the runner
+    /// (Azure SDK compat), so the blob gate binds the token to the owning
+    /// job instead of relying on a bearer.
+    pub(crate) diag_upload_tokens: BTreeMap<String, DiagUploadToken>,
     /// Artifact v2 finalized registry: registry_key → metadata.
     pub(crate) artifact_v2_registry: BTreeMap<String, ArtifactV2Entry>,
     /// Monotonic artifact v2 ID counter.
