@@ -716,7 +716,9 @@ pub async fn cleanup_containers(state: &ContainerState, log: &mut Vec<String>) -
     // 2. Per-service: print logs, then remove
     for (alias, container_id, container_name) in &state.service_containers {
         log.push(format!("Print service container logs: {container_name}"));
-        let _ = docker_cmd(&["logs", "--details", container_id], log).await;
+        // R1-12: bound the logs pulled into memory at teardown; a chatty
+        // service would otherwise have its whole log buffered by the runner.
+        let _ = docker_cmd(&["logs", "--details", "--tail", "5000", container_id], log).await;
 
         log.push(format!("Stop and remove container: {container_name}"));
         let _ = docker_cmd(&["rm", "--force", container_id], log).await;

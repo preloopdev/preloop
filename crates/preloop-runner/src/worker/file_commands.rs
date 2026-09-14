@@ -14,6 +14,27 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tracing::debug;
 
+/// R1-12: file-command inputs (GITHUB_ENV/OUTPUT/STATE/PATH) are bounded
+/// like step summaries already are (1 MiB). A step can otherwise grow these
+/// files without limit and have the runner read them whole into memory.
+const FILE_COMMAND_MAX_BYTES: u64 = 1_048_576;
+
+/// R1-12: reject an overlarge file-command input before reading it.
+fn check_file_command_size(path: &Path) -> Result<()> {
+    let len = std::fs::metadata(path)
+        .with_context(|| format!("reading {}", path.display()))?
+        .len();
+    if len > FILE_COMMAND_MAX_BYTES {
+        bail!(
+            "{} exceeds the {} KiB file-command size limit (got {} KiB)",
+            path.display(),
+            FILE_COMMAND_MAX_BYTES / 1024,
+            len / 1024
+        );
+    }
+    Ok(())
+}
+
 /// Paths to the file command temp files for a step.
 pub struct FileCommandPaths {
     pub env_file: PathBuf,
@@ -156,6 +177,8 @@ pub fn parse_kv_file(path: &Path) -> Result<HashMap<String, String>> {
     if !path.exists() {
         return Ok(HashMap::new());
     }
+    // R1-12: size-gate before reading the file whole.
+    check_file_command_size(path)?;
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
 
@@ -261,6 +284,8 @@ pub fn parse_path_file(path: &Path) -> Result<Vec<String>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
+    // R1-12: size-gate before reading the file whole.
+    check_file_command_size(path)?;
     let content =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
 
@@ -571,9 +596,16 @@ fn make_file_subject(
         bail!("file '{declared_path}' does not exist");
     }
 
-    let content = std::fs::read(&file_path)
+    // R1-12: stream the file through the hasher instead of reading it whole
+    // into memory. The declared path is attacker-chosen (absolute paths are
+    // allowed) and may be gigabytes; a 2 GiB sparse file previously added
+    // ~2 GiB to RSS.
+    let mut file = std::fs::File::open(&file_path)
         .with_context(|| format!("reading artifact file {}", file_path.display()))?;
-    let digest = format!("sha256:{:x}", sha2::Sha256::digest(&content));
+    let mut hasher = sha2::Sha256::new();
+    std::io::copy(&mut file, &mut hasher)
+        .with_context(|| format!("hashing artifact file {}", file_path.display()))?;
+    let digest = format!("sha256:{:x}", hasher.finalize());
     let name = file_path
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
@@ -654,6 +686,29 @@ mod tests {
         std::fs::write(&path, "/usr/local/bin\n/opt/bin\n").unwrap();
         let result = parse_path_file(&path).unwrap();
         assert_eq!(result, vec!["/usr/local/bin", "/opt/bin"]);
+    }
+
+    /// R1-12: artifact file subjects are hashed by streaming, not by reading
+    /// the whole file into memory. Uses a 512 MiB sparse file (instant to
+    /// create); the digest must match a streaming reference hash.
+    #[test]
+    fn artifact_file_subject_streams_large_file() {
+        use sha2::Digest as _;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("big.bin");
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(512 * 1024 * 1024).unwrap();
+        drop(f);
+        let subject = make_file_subject(path.to_str().unwrap(), None).unwrap();
+        // Reference: stream 512 MiB of zeros through SHA-256.
+        let mut hasher = sha2::Sha256::new();
+        let zeros = [0u8; 65536];
+        for _ in 0..(512 * 1024 * 1024 / 65536) {
+            hasher.update(zeros);
+        }
+        let expected = format!("sha256:{:x}", hasher.finalize());
+        assert_eq!(subject.digest, expected);
+        assert_eq!(subject.kind, "file");
     }
 
     #[test]

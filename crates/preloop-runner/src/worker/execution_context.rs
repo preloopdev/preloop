@@ -35,6 +35,34 @@ fn format_stdout_line(timestamp: &str, line: &str, prefix: bool) -> String {
     }
 }
 
+/// R1-12: maximum bytes retained for a newline-free partial output line.
+/// A step printing 64 MiB without a `\n` (progress bars, binary dumps)
+/// would otherwise be retained 1:1 in memory for the whole step.
+const MAX_LINE_BUFFER_BYTES: usize = 1024 * 1024;
+/// R1-12: maximum bytes of a single completed output line passed through
+/// masking/logging. Longer lines are truncated with a marker instead of
+/// being copied whole several times over.
+const MAX_LOG_LINE_BYTES: usize = 10 * 1024 * 1024;
+/// R1-12: maximum bytes `log_content` rematerializes from the step log
+/// file. The whole file was previously read into a String at step end.
+const LOG_CONTENT_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// R1-12: truncate an overlong completed log line, keeping the head so the
+/// start of the output stays visible.
+fn truncate_log_line(line: &str) -> std::borrow::Cow<'_, str> {
+    if line.len() <= MAX_LOG_LINE_BYTES {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    let mut end = MAX_LOG_LINE_BYTES;
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = String::with_capacity(end + 64);
+    truncated.push_str(&line[..end]);
+    truncated.push_str(&format!("…[line truncated at {MAX_LOG_LINE_BYTES} bytes]"));
+    std::borrow::Cow::Owned(truncated)
+}
+
 pub struct StepContext<'a> {
     pub job: &'a mut JobContext,
     pub step_id: String,
@@ -62,6 +90,9 @@ pub struct StepContext<'a> {
     pub log_file: Arc<Mutex<BufWriter<std::fs::File>>>,
     /// Line buffer for accumulating partial lines from process output chunks.
     line_buffer: Arc<Mutex<Vec<u8>>>,
+    /// R1-12: set when the partial-line buffer overflowed its cap and the
+    /// head was dropped; surfaced as a truncation warning on the next flush.
+    line_buffer_truncated: bool,
     /// Whether to also accumulate log lines in memory (for tests).
     pub keep_in_memory: bool,
     /// Whether continuation lines in a multiline stdout chunk omit the
@@ -108,6 +139,7 @@ impl<'a> StepContext<'a> {
             telemetry_errors: Vec::new(),
             log_file,
             line_buffer: Arc::new(Mutex::new(Vec::new())),
+            line_buffer_truncated: false,
             keep_in_memory,
             disable_stdout_multiline_log_prefixing: disable_stdout_multiline_log_prefixing(),
             stdout_partial_is_continuation: std::sync::atomic::AtomicBool::new(false),
@@ -125,12 +157,25 @@ impl<'a> StepContext<'a> {
         let mut buf = self.line_buffer.lock();
         buf.extend_from_slice(chunk);
 
+        // R1-12: bound the partial-line buffer. Newline-free output (a step
+        // dumping megabytes without `\n`) would otherwise be retained 1:1 in
+        // memory for the whole step. Keep the tail so a later newline still
+        // terminates the line; the dropped head is reported below.
+        if buf.len() > MAX_LINE_BUFFER_BYTES {
+            let drop = buf.len() - MAX_LINE_BUFFER_BYTES;
+            buf.drain(..drop);
+            self.line_buffer_truncated = true;
+        }
+
         // Process all complete lines (ending with \n)
         let mut complete_lines = Vec::new();
         while let Some(newline_pos) = buf.iter().position(|&b| b == b'\n') {
             // Extract the line (without the newline)
             let line_bytes: Vec<u8> = buf.drain(..=newline_pos).collect();
             let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len() - 1]);
+            // R1-12: cap absurd single lines before the masking pass copies
+            // them several times over.
+            let line = truncate_log_line(&line);
             complete_lines.push(line.into_owned());
         }
 
@@ -144,6 +189,14 @@ impl<'a> StepContext<'a> {
                 .store(false, std::sync::atomic::Ordering::Relaxed);
         }
         drop(buf);
+
+        // R1-12: surface a swallowed head instead of silently dropping output.
+        if self.line_buffer_truncated {
+            self.line_buffer_truncated = false;
+            self.log(
+                "##[warning]Step output exceeded the 1 MiB partial-line buffer; output was truncated",
+            );
+        }
 
         for (index, line) in complete_lines.into_iter().enumerate() {
             let masked = self.job.mask_secrets(&line);
@@ -164,15 +217,34 @@ impl<'a> StepContext<'a> {
     pub fn flush_line_buffer(&mut self) {
         let mut buf = self.line_buffer.lock();
         if buf.is_empty() {
+            // R1-12: the buffer may have overflowed and been capped while no
+            // newline ever arrived; still surface the truncation warning.
+            let truncated = self.line_buffer_truncated;
+            self.line_buffer_truncated = false;
+            drop(buf);
+            if truncated {
+                self.log(
+                    "##[warning]Step output exceeded the 1 MiB partial-line buffer; output was truncated",
+                );
+            }
             return;
         }
         let line = String::from_utf8_lossy(&buf).into_owned();
+        let truncated = self.line_buffer_truncated;
+        self.line_buffer_truncated = false;
+        // R1-12: cap the flushed partial line like completed lines above.
+        let line = truncate_log_line(&line).into_owned();
         let masked = self.job.mask_secrets(&line);
         let is_continuation = self
             .stdout_partial_is_continuation
             .swap(false, std::sync::atomic::Ordering::Relaxed);
         buf.clear();
         drop(buf);
+        if truncated {
+            self.log(
+                "##[warning]Step output exceeded the 1 MiB partial-line buffer; output was truncated",
+            );
+        }
         self.stdout_prefix_override =
             Some(!self.disable_stdout_multiline_log_prefixing || !is_continuation);
         self.log(&line);
@@ -469,7 +541,11 @@ impl<'a> StepContext<'a> {
             use std::io::{Read, Seek, SeekFrom};
             let mut content = String::new();
             let _ = cloned.seek(SeekFrom::Start(0));
-            let _ = cloned.read_to_string(&mut content);
+            // R1-12: never rematerialize the whole log file in memory; the
+            // callers only scan for `##[group]…` markers near the head.
+            let _ = cloned
+                .take(LOG_CONTENT_MAX_BYTES)
+                .read_to_string(&mut content);
             content
         } else {
             String::new()
