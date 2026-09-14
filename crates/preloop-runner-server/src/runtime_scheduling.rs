@@ -2310,8 +2310,40 @@ where
     let secrets_exposed = preloop_gha_protocol::masking::expose_all(&ctx.submission.secrets);
     // PATs are static: embed at build time. App installation tokens are minted
     // by the broker at dispatch.
+    //
+    // H3: the expansion pipeline is synchronous, so it cannot introspect the
+    // PAT's OAuth scopes itself; it enforces from the process-wide scope
+    // cache warmed by submission-time introspection. On a cold cache the
+    // scopes are unverifiable — warn loudly and mark the token unverified
+    // (the wire variable says so honestly) rather than blocking the executor
+    // on network I/O.
     let pat_override = if shared.state.github_app.is_none() {
-        shared.state.static_github_pat()
+        match shared.state.static_github_pat() {
+            Some(pat) => match crate::runs::cached_pat_scopes(&pat) {
+                Some(scopes) => {
+                    crate::runs::enforce_pat_permissions(plans, &ctx.submission, &scopes).map_err(
+                        |error| {
+                            tracing::warn!(
+                                run_id = %ctx.run_id,
+                                ?error,
+                                "refusing expansion: static PAT exceeds declared job permissions"
+                            );
+                            ExecutionStatus::Failure
+                        },
+                    )?;
+                    Some(crate::runs::PatToken::with_scopes(pat, scopes))
+                }
+                None => {
+                    tracing::warn!(
+                        run_id = %ctx.run_id,
+                        "expanding jobs with a PAT whose OAuth scopes have not been introspected: \
+                         workflow `permissions:` blocks are NOT enforced in PAT mode"
+                    );
+                    Some(crate::runs::PatToken::unverified(pat))
+                }
+            },
+            None => None,
+        }
     } else {
         None
     };
