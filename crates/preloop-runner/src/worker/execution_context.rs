@@ -502,6 +502,47 @@ impl<'a> StepContext<'a> {
             String::new()
         }
     }
+
+    /// Re-apply the current mask set to log output already written.
+    ///
+    /// `::add-mask::` registers the value for future lines; without this
+    /// pass, anything printed earlier in the step stays unmasked in the
+    /// durable log (the tempfile) and in the in-memory buffer. Re-masking is
+    /// idempotent: earlier masks already replaced their values with `***`,
+    /// and the mask set only ever grows, so already-masked lines are
+    /// unaffected. Uses the same [`JobContext::mask_secrets`] (raw value
+    /// plus each trimmed CR/LF-delimited line) as the write path.
+    ///
+    /// Lines already streamed over the live-log WebSocket cannot be
+    /// recalled; this covers the durable record.
+    pub fn retroactive_mask(&mut self) {
+        for line in &mut self.log_lines {
+            *line = self.job.mask_secrets(line);
+        }
+        // Rewrite the durable log file in place. The tempfile is exclusively
+        // owned by this step context, so a read/mask/rewrite under the file
+        // lock is safe. The BufWriter is flushed first, so its internal
+        // buffer is empty and direct writes on the file keep the position
+        // consistent for subsequent log appends.
+        let mut lock = self.log_file.lock();
+        let _ = lock.flush();
+        let file = lock.get_mut();
+        use std::io::{Read, Seek, SeekFrom, Write};
+        if file.seek(SeekFrom::Start(0)).is_err() {
+            return;
+        }
+        let mut content = Vec::new();
+        if file.read_to_end(&mut content).is_err() {
+            return;
+        }
+        let masked = self.job.mask_secrets(&String::from_utf8_lossy(&content));
+        if file.seek(SeekFrom::Start(0)).is_err() {
+            return;
+        }
+        let _ = file.set_len(0);
+        let _ = file.write_all(masked.as_bytes());
+        let _ = file.sync_all();
+    }
 }
 
 /// Platform-default PATH, matching the Ubuntu golden's `/etc/environment`.
