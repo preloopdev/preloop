@@ -7,8 +7,7 @@ mod keys;
 pub mod node_externals;
 
 use crate::environment::{
-    curated_toolchains, is_official_runner_image, is_stock_base_image, EnvironmentSpec,
-    ToolchainLayer,
+    curated_toolchains, is_stock_base_image, EnvironmentSpec, ToolchainLayer,
 };
 use crate::keys::{KeyPool, StagedKey};
 use preloop_gha_protocol::RUNNER_BUSY_SENTINEL;
@@ -2990,17 +2989,16 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         self.provider.create(&spec).await?;
         self.provider.start(&name).await?;
         // Plain Ubuntu needs the hosted-runner package baseline. Official
-        // runner snapshots already contain it. Both receive the small,
-        // repository-pinned toolchain layer once while the artifact is built.
+        // runner snapshots already contain it and workflow setup actions own
+        // language-toolchain selection.
         let stock_base = is_stock_base_image(&self.config.base_image);
-        let official_base = is_official_runner_image(&self.config.base_image);
         if stock_base {
             if let Err(error) = install_base_dependencies(self.provider.as_ref(), &name).await {
                 let _ = self.provider.delete(&name).await;
                 return Err(error);
             }
         }
-        if stock_base || official_base {
+        if stock_base {
             for layer in curated_toolchains() {
                 for command in layer.install_commands() {
                     let output = self.provider.exec(&name, &command).await?;
@@ -4613,12 +4611,13 @@ async fn provision_runner<P: VmProvider + 'static>(
         // bakes via guest `exec`, and SmolVM's forkable snapshot does NOT
         // carry post-create exec writes into clones (verified empirically),
         // so an env-golden fork boots the bare stock base image. Install the
-        // apt baseline and toolchains into the fork itself — it is the job's
-        // single-use machine, so the writes persist for its lifetime.
+        // apt baseline into the fork itself — it is the job's single-use
+        // machine, so the writes persist for its lifetime. Language versions
+        // remain the workflow's setup action responsibility.
         // Only the plain `{prefix}-golden` fork base is created from the
         // packed artifact (`prepare_packed_golden` at pool startup), whose
-        // rootfs already carries the apt baseline and toolchains that forks
-        // inherit. Fingerprint-suffixed goldens are baked by
+        // rootfs already carries the apt baseline that forks inherit.
+        // Fingerprint-suffixed goldens are baked by
         // `prepare_golden_for_env` from the job's OCI image via guest exec,
         // and SmolVM's forkable snapshot does NOT carry post-create exec
         // writes into clones — so those forks must install the baseline
@@ -4637,33 +4636,6 @@ async fn provision_runner<P: VmProvider + 'static>(
                         %error, "apt list refresh failed; workflow apt installs may not resolve"
                     );
                 }
-            }
-            // A pack is only as baked as whoever produced it: `prepare_artifact`
-            // bakes the workspace toolchains, but `download_prebaked_golden`
-            // short-circuits that path, and a published pack can predate (or
-            // simply omit) the toolchain the workspace now asks for. Probing
-            // beats assuming — a fork missing cargo runs the job anyway and
-            // cargo-dist dies with "you don't appear to have cargo installed",
-            // blaming the workflow for a broken machine. A fully baked pack
-            // pays one `command -v` per layer.
-            for layer in &environment.toolchains {
-                if verify_toolchain_installed(provider.as_ref(), name, layer)
-                    .await
-                    .is_ok()
-                {
-                    continue;
-                }
-                warn!(
-                    machine = name.as_str(),
-                    toolchain = %layer,
-                    "packed golden lacks toolchain; installing into the fork"
-                );
-                for command in layer.install_commands() {
-                    if let Err(error) = provider.exec(name, &command).await {
-                        return Err(error.into());
-                    }
-                }
-                verify_toolchain_installed(provider.as_ref(), name, layer).await?;
             }
         } else if environment.curated {
             install_base_dependencies(provider.as_ref(), name).await?;
@@ -6904,51 +6876,6 @@ chmod +x "$dest/bin/node"
         );
     }
 
-    /// A published pack can be older than the workspace's toolchain pin, so a
-    /// fork of the packed golden must not be trusted to already have cargo:
-    /// cargo-dist's plan job installs no toolchain of its own and fails with
-    /// "you don't appear to have cargo installed" on a bare machine.
-    #[tokio::test]
-    async fn packed_golden_fork_installs_a_toolchain_the_pack_lacks() {
-        let provider = Arc::new(TestProvider::without_binary("cargo"));
-        let config = packed_fork_config();
-        let golden = MachineName::new("lifecycle-test-golden").unwrap();
-        let name = MachineName::new("lifecycle-test-0-1").unwrap();
-
-        provision_runner(
-            &provider,
-            &config,
-            &name,
-            Some(&golden),
-            &Arc::new(KeyPool::new()),
-            &test_runner_environment(
-                config.base_image.clone(),
-                vec![ToolchainLayer::Rust("1.97".to_owned())],
-                true,
-            ),
-        )
-        .await
-        .expect("the fork installs the toolchain its pack lacks");
-
-        let events = provider.events().await;
-        assert!(
-            events
-                .iter()
-                .any(|event| event.contains("command -v cargo")),
-            "the fork must probe for the toolchain: {events:?}"
-        );
-        assert!(
-            events.iter().any(|event| event.contains("rustup-init")),
-            "a probe miss must install the toolchain: {events:?}"
-        );
-        assert!(
-            !events
-                .iter()
-                .any(|event| event.contains("--no-install-recommends")),
-            "the pack already carries the apt baseline: {events:?}"
-        );
-    }
-
     /// A pack published before the baseline stopped wiping `/var/lib/apt/lists`
     /// boots without apt indices, and `sudo apt-get install <pkg>` — how real
     /// workflows install system packages — then resolves nothing.
@@ -6977,42 +6904,6 @@ chmod +x "$dest/bin/node"
                 && event.contains("update")
                 && event.contains("timeout 120")),
             "the fork must restore apt indices when the pack has none: {events:?}"
-        );
-    }
-
-    /// The probe is the whole cost on a pack that is already baked: no reinstall.
-    #[tokio::test]
-    async fn packed_golden_fork_keeps_a_baked_toolchain() {
-        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
-        let config = packed_fork_config();
-        let golden = MachineName::new("lifecycle-test-golden").unwrap();
-        let name = MachineName::new("lifecycle-test-0-2").unwrap();
-
-        provision_runner(
-            &provider,
-            &config,
-            &name,
-            Some(&golden),
-            &Arc::new(KeyPool::new()),
-            &test_runner_environment(
-                config.base_image.clone(),
-                vec![ToolchainLayer::Rust("1.97".to_owned())],
-                true,
-            ),
-        )
-        .await
-        .expect("provisioning succeeds");
-
-        let events = provider.events().await;
-        assert!(
-            events
-                .iter()
-                .any(|event| event.contains("command -v cargo")),
-            "the fork must probe for the toolchain: {events:?}"
-        );
-        assert!(
-            !events.iter().any(|event| event.contains("rustup-init")),
-            "a baked toolchain must not be reinstalled: {events:?}"
         );
     }
 

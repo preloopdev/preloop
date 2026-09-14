@@ -298,15 +298,6 @@ pub fn is_stock_base_image(image_ref: &str) -> bool {
     )
 }
 
-/// Whether an image is one of Preloop's official GitHub runner snapshots.
-pub fn is_official_runner_image(image_ref: &str) -> bool {
-    matches!(
-        base_name(image_ref),
-        "ghcr.io/preloopdev/runner-images:ubuntu24-runner-large-latest"
-            | "ghcr.io/preloopdev/runner-images:ubuntu24-arm64-runner-large-latest"
-    )
-}
-
 /// Resolved base image and toolchains for one job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentSpec {
@@ -329,11 +320,11 @@ impl EnvironmentSpec {
     /// Resolve the environment for a base image.
     ///
     /// Stock Ubuntu bases receive the complete Preloop package bake. Official
-    /// runner snapshots already contain that package set, so they receive only
-    /// the repository-pinned toolchains. Other custom images are used as-is.
+    /// runner snapshots and other custom images are used as-is; workflow
+    /// `setup-*` actions select exact language-tool versions at job time.
     pub fn for_base(base: String) -> Self {
         let curated = is_stock_base_image(&base);
-        let toolchains = if curated || is_official_runner_image(&base) {
+        let toolchains = if curated {
             curated_toolchains()
         } else {
             Vec::new()
@@ -612,8 +603,8 @@ mod tests {
         );
     }
 
-    /// Stock bases get Preloop's complete bake, official runner snapshots get
-    /// only pinned toolchains, and arbitrary custom images stay untouched.
+    /// Stock bases get Preloop's complete bake, while official runner
+    /// snapshots and arbitrary custom images stay untouched.
     #[test]
     fn for_base_selects_only_required_layers() {
         let stock = EnvironmentSpec::for_base(UBUNTU_24_04_PIN.to_owned());
@@ -625,7 +616,10 @@ mod tests {
             !official.curated,
             "official images already contain packages"
         );
-        assert_eq!(official.toolchains, curated_toolchains());
+        assert!(
+            official.toolchains.is_empty(),
+            "official runner images must resolve workflow toolchains through setup actions"
+        );
 
         let custom = EnvironmentSpec::for_base("ghcr.io/acme/runner:latest".to_owned());
         assert!(!custom.curated, "custom bases must not be curated");
