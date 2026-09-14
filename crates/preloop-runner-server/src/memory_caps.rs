@@ -481,6 +481,15 @@ pub(crate) fn sweep_pending_uploads(inner: &mut InnerState, now_unix_secs: i64) 
             .cache_v2_dl_tokens_order
             .retain(|queued| queued != &token);
     }
+    let stale_diag: Vec<String> = inner
+        .diag_upload_tokens
+        .iter()
+        .filter(|(_, pending)| pending.created_unix > 0 && pending.created_unix < cutoff)
+        .map(|(token, _)| token.clone())
+        .collect();
+    for token in stale_diag {
+        inner.diag_upload_tokens.remove(&token);
+    }
     // Compact order deque if it grew with stale entries while under cap.
     if inner.cache_v2_dl_tokens_order.len() > inner.cache_v2_dl_tokens.len() + 1024 {
         let live: std::collections::HashSet<String> =

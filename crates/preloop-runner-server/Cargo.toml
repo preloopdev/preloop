@@ -31,6 +31,7 @@ preloop-gha-expressions = { path = "../preloop-gha-expressions" }
 preloop-gha-protocol = { path = "../preloop-gha-protocol" }
 preloop-socket-activation = { path = "../preloop-socket-activation" }
 serde_urlencoded = "0.7"
+percent-encoding = "2"
 serde.workspace = true
 serde_json.workspace = true
 futures.workspace = true

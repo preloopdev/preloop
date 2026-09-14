@@ -7072,7 +7072,22 @@ async fn blob_single_shot_streams_to_disk_and_roundtrips() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
-    let token = state.mint_runtime_token("plan-blob", &uuid::Uuid::new_v4());
+    let job_id = uuid::Uuid::new_v4();
+    let token = state.mint_runtime_token("plan-blob", &job_id);
+
+    // R1-2: the blob gate requires the token to be server-minted. Register
+    // the pending artifact upload the way CreateArtifactV2 would.
+    {
+        let mut inner = state.inner.lock().await;
+        inner.artifact_v2_pending.insert(
+            "single-shot-tok".to_owned(),
+            crate::models::ArtifactV2Pending {
+                registry_key: format!("run/{job_id}/single-shot"),
+                job_backend_id: job_id.to_string(),
+                created_unix: 0,
+            },
+        );
+    }
 
     // A 3 MiB single-shot upload is streamed to a temp file, never buffered
     // whole in memory, and must round-trip byte-for-byte.
@@ -7113,8 +7128,23 @@ async fn blob_blocklist_commits_are_serialized_and_survive_concurrency() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
-    let token = state.mint_runtime_token("plan-blob", &uuid::Uuid::new_v4());
+    let job_id = uuid::Uuid::new_v4();
+    let token = state.mint_runtime_token("plan-blob", &job_id);
     let bearer = format!("Bearer {token}");
+
+    // R1-2: the blob gate requires the token to be server-minted. Register
+    // the pending artifact upload the way CreateArtifactV2 would.
+    {
+        let mut inner = state.inner.lock().await;
+        inner.artifact_v2_pending.insert(
+            "concurrent-tok".to_owned(),
+            crate::models::ArtifactV2Pending {
+                registry_key: format!("run/{job_id}/concurrent"),
+                job_backend_id: job_id.to_string(),
+                created_unix: 0,
+            },
+        );
+    }
     let put_uri = "/twirp-blob/artifact/concurrent-tok";
 
     // Stage two 1 MiB blocks (ids are base64-safe, so they survive
@@ -25693,4 +25723,145 @@ async fn flow_recording_redacts_credentials() {
     assert!(!flow.contains("system-secret"));
     assert!(!flow.contains("provision-secret"));
     assert!(flow.matches("[REDACTED]").count() >= 2);
+}
+
+// ─── R1-2: /twirp-blob/:kind/:token authentication & path validation ───
+
+#[tokio::test]
+async fn r1_2_blob_rejects_unregistered_token() {
+    // The finding's repro: an unauthenticated PUT to an arbitrary token must
+    // not create a blob. The gate returns 404 (not 401) so unregistered
+    // tokens are indistinguishable from missing blobs.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let put = app
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/twirp-blob/artifact/attacker-chosen-token")
+                .body(Body::from(vec![b'x'; 16]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn r1_2_blob_rejects_wrong_job_write() {
+    // A job's bearer must not write another job's blob token.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let owner_job = uuid::Uuid::new_v4();
+    let other_job = uuid::Uuid::new_v4();
+    let other_token = state.mint_runtime_token("plan-blob", &other_job);
+    {
+        let mut inner = state.inner.lock().await;
+        inner.artifact_v2_pending.insert(
+            "owned-tok".to_owned(),
+            crate::models::ArtifactV2Pending {
+                registry_key: format!("run/{owner_job}/owned"),
+                job_backend_id: owner_job.to_string(),
+                created_unix: 0,
+            },
+        );
+    }
+
+    let put = app
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/twirp-blob/artifact/owned-tok")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {other_token}"),
+                )
+                .body(Body::from(vec![b'x'; 16]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn r1_2_blob_rejects_path_traversal() {
+    // Raw and percent-encoded separators / traversal must be rejected with
+    // 400 before touching the filesystem.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    for uri in [
+        "/twirp-blob/artifact/..%2F..%2Fsecret",
+        "/twirp-blob/artifact/%2e%2e%2fsecret",
+        "/twirp-blob/evil-kind/some-token",
+    ] {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(uri)
+                    .body(Body::from(vec![b'x'; 8]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "uri: {uri}");
+    }
+    // An empty token doesn't match the route's :token segment at all, so the
+    // router 404s before the gate runs — also safe.
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/twirp-blob/artifact/")
+                .body(Body::from(vec![b'x'; 8]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[test]
+fn r1_2_parse_blob_path_allowlist() {
+    use crate::blob_store::{is_valid_blob_token, parse_blob_path};
+
+    // Valid paths parse.
+    assert_eq!(
+        parse_blob_path("/twirp-blob/artifact/abc123"),
+        Some(("artifact".to_owned(), "abc123".to_owned()))
+    );
+    assert_eq!(
+        parse_blob_path("/twirp-blob/cache/deadbeef-1234"),
+        Some(("cache".to_owned(), "deadbeef-1234".to_owned()))
+    );
+    // Artifact .zip suffix is accepted and stripped.
+    assert_eq!(
+        parse_blob_path("/twirp-blob/artifact/abc123.zip"),
+        Some(("artifact".to_owned(), "abc123".to_owned()))
+    );
+
+    // Unknown kinds, traversal, and malformed tokens are rejected.
+    assert_eq!(parse_blob_path("/twirp-blob/evil/abc123"), None);
+    assert_eq!(parse_blob_path("/twirp-blob/artifact/..%2Fsecret"), None);
+    assert_eq!(
+        parse_blob_path("/twirp-blob/artifact/%2e%2e%2fsecret"),
+        None
+    );
+    assert_eq!(parse_blob_path("/twirp-blob/artifact/"), None);
+    assert_eq!(parse_blob_path("/twirp-blob/artifact"), None);
+
+    // Token charset: alphanumerics, dash, underscore, dot only.
+    assert!(is_valid_blob_token("abcXYZ-123_.9"));
+    assert!(!is_valid_blob_token(""));
+    assert!(!is_valid_blob_token("has space"));
+    assert!(!is_valid_blob_token("has/slash"));
+    assert!(!is_valid_blob_token("../traversal"));
 }
