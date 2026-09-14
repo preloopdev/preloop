@@ -285,27 +285,47 @@ impl GitHubApps {
         &self.apps[self.default_index]
     }
 
-    /// Every webhook secret registered across the registry, plus the legacy
-    /// `AppState::webhook_secret`, deduplicated.
-    pub(crate) fn webhook_secrets(&self, legacy: Option<&str>) -> Vec<String> {
-        let mut secrets: Vec<String> = Vec::new();
-        if let Some(legacy) = legacy {
-            // An empty secret makes `X-Hub-Signature-256` verification pass
-            // for the empty key — forgeable by anyone — so blank values are
-            // never registered.
-            if !legacy.is_empty() {
-                secrets.push(legacy.to_owned());
-            }
+    /// Every registered webhook secret paired with the signer it belongs
+    /// to (M3). Each App's secret maps to that App; the legacy
+    /// `AppState::webhook_secret` (if set) maps to [`WebhookSigner::Legacy`].
+    /// Deduplicated: a secret equal to the legacy secret is attributed to
+    /// the legacy signer, since it is not uniquely the App's.
+    pub(crate) fn webhook_signers(&self, legacy: Option<&str>) -> Vec<(String, WebhookSigner)> {
+        let mut signers: Vec<(String, WebhookSigner)> = Vec::new();
+        // An empty secret makes `X-Hub-Signature-256` verification pass
+        // for the empty key — forgeable by anyone — so blank values are
+        // never registered.
+        if let Some(legacy) = legacy.filter(|secret| !secret.is_empty()) {
+            signers.push((legacy.to_owned(), WebhookSigner::Legacy));
         }
         for app in &self.apps {
             if let Some(secret) = &app.webhook_secret {
-                if !secret.is_empty() && !secrets.iter().any(|have| have == secret) {
-                    secrets.push(secret.clone());
+                if !secret.is_empty() && !signers.iter().any(|(have, _)| have == secret) {
+                    signers.push((secret.clone(), WebhookSigner::App(Box::new(app.clone()))));
                 }
             }
         }
-        secrets
+        signers
     }
+}
+
+/// Identity of the credential that verified a webhook payload's signature
+/// (M3). The signature alone only proves *some* registered credential sent
+/// the payload; the signer binds the claimed repository to the sender's
+/// installation coverage before any event is processed.
+///
+/// `Debug` is deliberately not derived: the `App` variant carries the App's
+/// private key, which must never appear in logs.
+#[derive(Clone)]
+pub(crate) enum WebhookSigner {
+    /// A registered GitHub App's webhook secret, boxed to keep the enum
+    /// small. The claimed repository must lie within this App's
+    /// installation coverage.
+    App(Box<GitHubAppCredentials>),
+    /// The legacy single `webhook_secret`: no App identity, no binding —
+    /// with no registry there is no cross-App confusion, and a legacy
+    /// secret alongside a registry is the operator's own credential.
+    Legacy,
 }
 
 /// One minted installation token, as recorded in [`MintLedger`].
