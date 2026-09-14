@@ -11,8 +11,8 @@
 //!
 //! Then flow 20: GET codeload.github.com/{owner}/{repo}/tar.gz/{resolved_sha}
 //!
-//! Fallback: If the launch endpoint is unavailable (local aksh), falls back
-//! to api.github.com/repos/{o}/{r}/tarball/{ref} for compatibility.
+//! M2: no api.github.com fallback — if the launch endpoint does not resolve
+//! the ref to a SHA-pinned URL, the runner refuses the download.
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
