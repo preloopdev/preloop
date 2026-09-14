@@ -374,7 +374,7 @@ impl PgStore {
         }
         tx.execute("DELETE FROM broker_messages", &[]).await?;
         for (session_id, message_id, payload) in inflight {
-            let payload_json = serde_json::to_string(payload)?;
+            let payload_json = crate::store::seal_message_payload(&self.cipher, payload)?;
             tx.execute(
                 "INSERT INTO broker_messages(session_id, message_id, payload_json, written_at_us)
                  VALUES ($1, $2, $3, $4)",
@@ -384,7 +384,7 @@ impl PgStore {
         }
         tx.execute("DELETE FROM job_request_messages", &[]).await?;
         for (request_id, payload) in broker_request_messages {
-            let payload_json = serde_json::to_string(payload)?;
+            let payload_json = crate::store::seal_message_payload(&self.cipher, payload)?;
             tx.execute(
                 "INSERT INTO job_request_messages(request_id, payload_json, written_at_us)
                  VALUES ($1, $2, $3)",
@@ -642,7 +642,10 @@ impl Store for PgStore {
             let session_id: String = row.get(0);
             let message_id: i64 = row.get(1);
             let payload_json: String = row.get(2);
-            match serde_json::from_str::<azdo::TaskAgentMessage>(&payload_json) {
+            match crate::store::unseal_message_payload::<azdo::TaskAgentMessage>(
+                &self.cipher,
+                &payload_json,
+            ) {
                 Ok(message) => {
                     inner
                         .inflight_messages
@@ -667,7 +670,10 @@ impl Store for PgStore {
         for row in rows {
             let request_id: i64 = row.get(0);
             let payload_json: String = row.get(1);
-            match serde_json::from_str::<azdo::AgentJobRequestMessage>(&payload_json) {
+            match crate::store::unseal_message_payload::<azdo::AgentJobRequestMessage>(
+                &self.cipher,
+                &payload_json,
+            ) {
                 Ok(message) => {
                     inner.broker_messages.insert(request_id, message);
                 }

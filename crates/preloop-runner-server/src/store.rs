@@ -18,6 +18,7 @@ use crate::models::{
     WebhookDeliveryRecord, WebhookDeliveryStatus, WebhookDeliverySummary, WebhookQueueStats,
     WebhookRedeliveryRecord, WebhookRepairReason, WebhookWatchdogCursor,
 };
+use anyhow::Context;
 use async_trait::async_trait;
 use preloop_gha_protocol::SessionId;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -906,6 +907,44 @@ impl Envelope {
     }
 }
 
+/// Seal a broker/job-request message payload for the `payload_json` columns.
+///
+/// These payloads carry live runtime tokens (e.g. the `SystemVssConnection`
+/// authorization parameters broker.rs attaches before persisting), so they
+/// must not sit recoverable in database rows. The columns carry a
+/// `json_valid(...)` CHECK constraint, so the sealed bytes are stored as a
+/// JSON string (base64 of the envelope) rather than a binary blob — no
+/// schema migration needed. Readers distinguish sealed rows by JSON type
+/// and fall back to plaintext for pre-fix rows; all new writes are sealed.
+pub(crate) fn seal_message_payload<T: serde::Serialize>(
+    cipher: &Envelope,
+    value: &T,
+) -> anyhow::Result<String> {
+    let sealed = cipher.seal(&serde_json::to_vec(value)?)?;
+    Ok(serde_json::to_string(&BASE64_STANDARD.encode(&sealed))?)
+}
+
+/// Read a `payload_json` cell written by [`seal_message_payload`], falling
+/// back to legacy plaintext JSON rows written before sealing existed. A
+/// sealed row that fails authentication is an error, never silent garbage —
+/// the caller decides whether to drop the message.
+pub(crate) fn unseal_message_payload<T: serde::de::DeserializeOwned>(
+    cipher: &Envelope,
+    raw: &str,
+) -> anyhow::Result<T> {
+    let parsed: serde_json::Value = serde_json::from_str(raw)?;
+    if let serde_json::Value::String(encoded) = parsed {
+        let sealed = BASE64_STANDARD
+            .decode(&encoded)
+            .context("sealed message payload is not valid base64")?;
+        let plaintext = cipher.unseal(&sealed)?;
+        Ok(serde_json::from_slice(&plaintext)?)
+    } else {
+        // Legacy row: plaintext JSON (always an object for these tables).
+        Ok(serde_json::from_value(parsed)?)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct MetaSnapshot {
     #[serde(default)]
@@ -1787,7 +1826,7 @@ impl SqliteStore {
             ))
         })? {
             let (session_id, message_id, payload_json) = row?;
-            match serde_json::from_str::<azdo::TaskAgentMessage>(&payload_json) {
+            match unseal_message_payload::<azdo::TaskAgentMessage>(&self.cipher, &payload_json) {
                 Ok(message) => {
                     inner
                         .inflight_messages
@@ -1810,7 +1849,10 @@ impl SqliteStore {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })? {
             let (request_id, payload_json) = row?;
-            match serde_json::from_str::<azdo::AgentJobRequestMessage>(&payload_json) {
+            match unseal_message_payload::<azdo::AgentJobRequestMessage>(
+                &self.cipher,
+                &payload_json,
+            ) {
                 Ok(message) => {
                     inner.broker_messages.insert(request_id, message);
                 }
@@ -2470,7 +2512,7 @@ impl SqliteStore {
         }
         tx.execute("DELETE FROM broker_messages", [])?;
         for (session_id, message_id, payload) in inflight {
-            let payload_json = serde_json::to_string(payload)?;
+            let payload_json = seal_message_payload(&self.cipher, payload)?;
             tx.execute(
                 "INSERT INTO broker_messages(session_id, message_id, payload_json, written_at_us) VALUES (?1, ?2, ?3, ?4)",
                 params![session_id, *message_id, payload_json, now_us()],
@@ -2478,7 +2520,7 @@ impl SqliteStore {
         }
         tx.execute("DELETE FROM job_request_messages", [])?;
         for (request_id, payload) in broker_request_messages {
-            let payload_json = serde_json::to_string(payload)?;
+            let payload_json = seal_message_payload(&self.cipher, payload)?;
             tx.execute(
                 "INSERT INTO job_request_messages(request_id, payload_json, written_at_us) VALUES (?1, ?2, ?3)",
                 params![*request_id, payload_json, now_us()],
@@ -4179,5 +4221,123 @@ mod tests {
             error.contains("predates the `job_steps.revision` column"),
             "the error must name the cause and the fix, got: {error}"
         );
+    }
+
+    // --- R1-11: broker/job-request payloads sealed at rest ---
+
+    fn token_message() -> azdo::TaskAgentMessage {
+        azdo::TaskAgentMessage {
+            message_id: 7,
+            message_type: azdo::message_type::PIPELINE_AGENT_JOB_REQUEST.to_string(),
+            // Mirrors what broker.rs persists: the SystemVssConnection
+            // authorization parameters, including the live AccessToken.
+            body: "SystemVssConnection AccessToken=live-runtime-token-abc123".to_string(),
+            iv: None,
+        }
+    }
+
+    /// New writes are sealed JSON strings: valid JSON (the `json_valid`
+    /// CHECK keeps passing), but the token is not recoverable from the row.
+    #[test]
+    fn broker_payloads_are_sealed_at_rest() {
+        let cipher = Envelope::new(b"test-root-key");
+        let sealed = seal_message_payload(&cipher, &token_message()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&sealed).unwrap();
+        assert!(
+            parsed.is_string(),
+            "sealed payload must be a JSON string, got: {sealed}"
+        );
+        assert!(
+            !sealed.contains("live-runtime-token-abc123"),
+            "token recoverable from sealed row: {sealed}"
+        );
+        let back: azdo::TaskAgentMessage = unseal_message_payload(&cipher, &sealed).unwrap();
+        assert_eq!(back.body, token_message().body);
+        assert_eq!(back.message_id, 7);
+    }
+
+    /// Pre-fix rows held plaintext JSON objects; they must keep loading.
+    #[test]
+    fn broker_payloads_read_legacy_plaintext_rows() {
+        let cipher = Envelope::new(b"test-root-key");
+        let legacy = serde_json::to_string(&token_message()).unwrap();
+        assert!(legacy.contains("live-runtime-token-abc123"));
+        let back: azdo::TaskAgentMessage = unseal_message_payload(&cipher, &legacy).unwrap();
+        assert_eq!(back.body, token_message().body);
+    }
+
+    /// A sealed row under the wrong host key fails closed — the HMAC
+    /// rejects it instead of yielding a garbled message.
+    #[test]
+    fn broker_payloads_fail_closed_on_wrong_key() {
+        let sealed = seal_message_payload(&Envelope::new(b"key-a"), &token_message()).unwrap();
+        let result =
+            unseal_message_payload::<azdo::TaskAgentMessage>(&Envelope::new(b"key-b"), &sealed);
+        assert!(result.is_err(), "sealed payload unsealed with wrong key");
+    }
+
+    /// End-to-end through SQLite: the row on disk holds no plaintext token,
+    /// and a restart-style load restores the message.
+    #[test]
+    fn sqlite_broker_rows_hold_no_plaintext_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let store = SqliteStore::open(&db_path, Envelope::new(b"test-root-key")).unwrap();
+        {
+            let mut connection = store.connection.lock().unwrap();
+            let tx = connection.transaction().unwrap();
+            store
+                .write_claim_state_tx(
+                    &tx,
+                    &[],
+                    &[("session-1".to_string(), 7, token_message())],
+                    &[],
+                )
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        let raw: String = {
+            let connection = store.connection.lock().unwrap();
+            connection
+                .query_row("SELECT payload_json FROM broker_messages", [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        assert!(
+            !raw.contains("live-runtime-token-abc123"),
+            "token in plaintext row: {raw}"
+        );
+        // Still valid JSON, so the json_valid CHECK constraint is satisfied.
+        assert!(serde_json::from_str::<serde_json::Value>(&raw).is_ok());
+        // Restart: load_into unseals the row back into the live message.
+        let mut inner = InnerState::default();
+        store.load_into(&mut inner).unwrap();
+        let restored = &inner.inflight_messages["session-1"][&7];
+        assert_eq!(restored.body, token_message().body);
+    }
+
+    /// A legacy plaintext row already in the database loads fine after the
+    /// change — no migration needed, no silent drops.
+    #[test]
+    fn sqlite_broker_rows_read_legacy_plaintext() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let store = SqliteStore::open(&db_path, Envelope::new(b"test-root-key")).unwrap();
+        let legacy = serde_json::to_string(&token_message()).unwrap();
+        {
+            let connection = store.connection.lock().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO broker_messages(session_id, message_id, payload_json, written_at_us)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params!["session-1", 7, legacy, 0],
+                )
+                .unwrap();
+        }
+        let mut inner = InnerState::default();
+        store.load_into(&mut inner).unwrap();
+        let restored = &inner.inflight_messages["session-1"][&7];
+        assert_eq!(restored.body, token_message().body);
     }
 }
