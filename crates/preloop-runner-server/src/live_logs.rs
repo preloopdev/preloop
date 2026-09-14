@@ -307,9 +307,32 @@ pub(crate) fn close_live_log(inner: &mut InnerState, key: &str) {
 pub(crate) async fn ws_live_logs(
     State(shared): State<Arc<SharedState>>,
     Path(job_id): Path<String>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_live_log_socket(socket, job_id, shared))
+) -> Result<impl IntoResponse, ApiError> {
+    // R1-8: bind the ingest target to the caller's identity. The generic
+    // protocol bearer admits any job's runtime credential, which would let one
+    // job stream into another job's buffer — forging its live log, or wiping
+    // its retained tail (reopening a feed clears the closed mark and history).
+    // The runner connects with its own job's runtime credential against the
+    // agent job id in its `FeedStreamUrl`; the system credential bypasses.
+    let bearer = crate::auth::bearer_from_headers(&headers)
+        .ok_or_else(|| ApiError::unauthorized("runner or job protocol token required"))?;
+    if bearer != shared.state.system_token {
+        let agent_job_id = job_id
+            .parse::<uuid::Uuid>()
+            .map_err(|_| ApiError::forbidden("live-log ingest job mismatch"))?;
+        let request = {
+            let inner = shared.state.inner.lock().await;
+            inner
+                .agent_job_requests
+                .get(&agent_job_id)
+                .copied()
+                .and_then(|request_id| inner.job_requests.get(&request_id).cloned())
+        };
+        crate::auth::authorize_reporting_request(&shared.state, &headers, request.as_ref())?;
+    }
+    Ok(ws.on_upgrade(move |socket| handle_live_log_socket(socket, job_id, shared)))
 }
 
 pub(crate) async fn handle_live_log_socket(
