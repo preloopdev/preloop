@@ -445,6 +445,55 @@ async fn resolve_cache_repository(
     }
 }
 
+/// Default branch ref for the GitHub-style cache read fallback: a job may
+/// restore caches written on its own ref or on the default branch, never on
+/// an unrelated branch.
+pub(crate) const DEFAULT_BRANCH_REF: &str = "refs/heads/main";
+
+/// R1-5: bind the cache *write* scope to the token's job. The scope is the
+/// job's own git ref from the run submission — never the client-supplied
+/// scope — so a branch run cannot claim `refs/heads/main` and poison the
+/// default branch's cache namespace (first write wins). The system token
+/// (the engine itself) has no job behind it and keeps the client-supplied
+/// scope. A job token that resolves to no live run fails closed inside
+/// `job_git_ref_from_headers`.
+async fn resolve_cache_write_scope(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    client_scope: Option<&str>,
+) -> Result<Option<String>, ApiError> {
+    match crate::auth::job_git_ref_from_headers(state, headers).await? {
+        Some(git_ref) => Ok(Some(git_ref)),
+        None => Ok(client_scope.map(str::to_owned)),
+    }
+}
+
+/// R1-5: scopes a job token may *read*, GitHub-style: its own ref, plus the
+/// default branch as fallback. Caches written on unrelated branches stay
+/// invisible, so a malicious branch cannot harvest (or rely on poisoning)
+/// another branch's entries. The system token keeps the client-supplied
+/// scopes; with none supplied, the unscoped default is tried once.
+async fn resolve_cache_read_scopes(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    client_scopes: &[String],
+) -> Result<Vec<Option<String>>, ApiError> {
+    match crate::auth::job_git_ref_from_headers(state, headers).await? {
+        Some(git_ref) => {
+            let mut scopes = vec![Some(git_ref.clone())];
+            if git_ref != DEFAULT_BRANCH_REF {
+                scopes.push(Some(DEFAULT_BRANCH_REF.to_owned()));
+            }
+            Ok(scopes)
+        }
+        None => Ok(if client_scopes.is_empty() {
+            vec![None]
+        } else {
+            client_scopes.iter().map(|s| Some(s.clone())).collect()
+        }),
+    }
+}
+
 /// SHA-256 digest of a scoped cache key + version. The cache key is
 /// workflow-controlled content; log the digest (plus `version_len`) instead
 /// of the raw key/version so entries correlate across the create/finalize
@@ -704,8 +753,13 @@ pub(crate) async fn twirp_cache_v2_create(
         cache_request_fields(&headers, &body, CacheRequestKind::Create)?;
     // R1-3: the repository comes from the token's job, never the request body.
     let repository = resolve_cache_repository(&shared.state, &headers, client_repository).await?;
-    let scope = scopes.first().map(String::as_str);
-    let storage_key = scoped_cache_key(key.as_str(), scope, Some(repository.as_str()));
+    let client_scope = scopes.first().map(String::as_str);
+    // R1-5: the write scope is the token's job's git ref, never the
+    // client-supplied scope — a branch run cannot claim `refs/heads/main`
+    // and poison the default branch's cache namespace.
+    let scope = resolve_cache_write_scope(&shared.state, &headers, client_scope).await?;
+    let storage_key = scoped_cache_key(key.as_str(), scope.as_deref(), Some(repository.as_str()));
+
     if shared
         .state
         .cache
@@ -841,8 +895,13 @@ pub(crate) async fn twirp_cache_v2_finalize(
         cache_request_fields(&headers, &body, CacheRequestKind::Finalize)?;
     // R1-3: the repository comes from the token's job, never the request body.
     let repository = resolve_cache_repository(&shared.state, &headers, client_repository).await?;
-    let scope = scopes.first().map(String::as_str);
-    let storage_key = scoped_cache_key(key.as_str(), scope, Some(repository.as_str()));
+    let client_scope = scopes.first().map(String::as_str);
+    // R1-5: the write scope is the token's job's git ref, never the
+    // client-supplied scope — a branch run cannot claim `refs/heads/main`
+    // and poison the default branch's cache namespace.
+    let scope = resolve_cache_write_scope(&shared.state, &headers, client_scope).await?;
+    let storage_key = scoped_cache_key(key.as_str(), scope.as_deref(), Some(repository.as_str()));
+
     // Find the pending upload token matching key+version.
     let token = {
         let inner = shared.state.inner.lock().await;
@@ -958,15 +1017,13 @@ pub(crate) async fn twirp_cache_v2_get_dl_url(
         cache_request_fields(&headers, &body, CacheRequestKind::GetDownloadUrl)?;
     // R1-3: the repository comes from the token's job, never the request body.
     let repository = resolve_cache_repository(&shared.state, &headers, client_repository).await?;
-    // Try each scope in wire order until a cache hit. This preserves
-    // authorization through any later scope: a download authorized via
-    // `refs/heads/feature` must not fail because `refs/heads/main` was first
-    // and misses. If no scopes were supplied, try the unscoped default once.
-    let primary_scopes: Vec<Option<String>> = if scopes.is_empty() {
-        vec![None]
-    } else {
-        scopes.into_iter().map(Some).collect()
-    };
+    // R1-5: a job token may only read its own ref's scope, plus the default
+    // branch as fallback (GitHub semantics). Unrelated branches' caches stay
+    // invisible even if the client lists them first. The system token keeps
+    // the client-supplied scopes; with none supplied, the unscoped default
+    // is tried once.
+    let primary_scopes = resolve_cache_read_scopes(&shared.state, &headers, &scopes).await?;
+
     let mut hit: Option<(preloop_cache::CacheEntry, Vec<u8>)> = None;
     let mut lookup_ms: u128 = 0;
     for primary in &primary_scopes {
@@ -1204,6 +1261,9 @@ mod cache_pb_tests {
         );
     }
 
+    // ── R1-5 regression tests: cache namespace is bound to the job's git
+    // ref, so one branch cannot poison another branch's cache entries. ──
+
     fn bearer_headers(token: &str) -> axum::http::HeaderMap {
         axum::http::HeaderMap::from_iter([(
             axum::http::header::AUTHORIZATION,
@@ -1284,6 +1344,190 @@ mod cache_pb_tests {
         );
     }
 
+    /// Bind a job token to a live run whose submission carries `repository`
+    /// and `git_ref`, mirroring the server-side job → run → submission chain.
+    async fn bind_job_to_ref(
+        state: &AppState,
+        job_id: uuid::Uuid,
+        request_id: i64,
+        repository: &str,
+        git_ref: &str,
+    ) {
+        let run_id = RunId::new();
+        let mut inner = state.inner.lock().await;
+        inner.agent_job_requests.insert(job_id, request_id);
+        inner.job_requests.insert(
+            request_id,
+            TaskAgentJobRequestRecord {
+                request_id,
+                run_id,
+                job_id: JobId("build".to_owned()),
+                agent_job_id: job_id,
+                plan_id: job_id.to_string(),
+                plan_type: "plan".to_owned(),
+                timeline_id: uuid::Uuid::new_v4(),
+                result: None,
+                locked_until: String::new(),
+                owner_runner_id: None,
+                started_at: None,
+                last_renewed_at: None,
+                timeout_triggered: false,
+                debug_token_issued: false,
+            },
+        );
+        inner.runs.insert(
+            run_id,
+            RunRecord {
+                run_id,
+                run_name: None,
+                submission: Arc::new(WorkflowSubmission {
+                    repository: repository.to_owned(),
+                    git_ref: git_ref.to_owned(),
+                    ..Default::default()
+                }),
+                jobs: BTreeMap::new(),
+                status: ExecutionStatus::InProgress,
+                job_outputs: BTreeMap::new(),
+                job_base_ids: BTreeMap::new(),
+                job_needs: BTreeMap::new(),
+                caller_plans: BTreeMap::new(),
+                job_names: BTreeMap::new(),
+                github: serde_json::Value::Null,
+                head_sha: String::new(),
+                workflow_ref: String::new(),
+                workspace_snapshot: None,
+                job_fail_fast: BTreeMap::new(),
+                job_continue_on_error: BTreeMap::new(),
+                job_check_run_ids: BTreeMap::new(),
+                reusable_calls: BTreeMap::new(),
+                jobs_list: Vec::new(),
+                created_at: chrono::Utc::now(),
+                started_at: None,
+                completed_at: None,
+                run_number: 1,
+                run_attempt: 1,
+                workflow_path_str: String::new(),
+                event: "push".to_owned(),
+                conclusion: None,
+                push_state: None,
+                snapshot_timing: None,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_write_scope_binds_to_job_ref_not_client_scope() {
+        // R1-5: the write scope comes from the token's job's git ref. A
+        // feature-branch job claiming `refs/heads/main` must still land in
+        // its own ref's namespace — otherwise it could poison the default
+        // branch's cache (first write wins).
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let job_id = uuid::Uuid::new_v4();
+        bind_job_to_ref(&state, job_id, 1, "owner/repo", "refs/heads/feature").await;
+        let headers = bearer_headers(&job_token(&state, &job_id));
+
+        let scope = resolve_cache_write_scope(&state, &headers, Some("refs/heads/main"))
+            .await
+            .expect("job-bound token resolves its run's git ref");
+        assert_eq!(
+            scope.as_deref(),
+            Some("refs/heads/feature"),
+            "spoofed client scope must not move the write namespace"
+        );
+
+        // A job token with no live run behind it fails closed.
+        let orphan = bearer_headers(&job_token(&state, &uuid::Uuid::new_v4()));
+        assert!(
+            resolve_cache_write_scope(&state, &orphan, Some("refs/heads/main"))
+                .await
+                .is_err(),
+            "unresolvable job token must fail closed"
+        );
+
+        // The system token (the engine itself) has no job behind it, so it
+        // keeps the client-supplied scope.
+        let system = bearer_headers(&state.system_token);
+        let scope = resolve_cache_write_scope(&state, &system, Some("refs/heads/main"))
+            .await
+            .unwrap();
+        assert_eq!(scope.as_deref(), Some("refs/heads/main"));
+        let scope = resolve_cache_write_scope(&state, &system, None)
+            .await
+            .unwrap();
+        assert_eq!(scope, None);
+    }
+
+    #[tokio::test]
+    async fn cache_read_scopes_allow_own_ref_and_default_branch_only() {
+        // R1-5: a job may read its own ref's scope plus the default branch
+        // fallback (GitHub semantics). Unrelated branches stay invisible even
+        // when the client lists them first.
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let job_id = uuid::Uuid::new_v4();
+        bind_job_to_ref(&state, job_id, 1, "owner/repo", "refs/heads/feature").await;
+        let headers = bearer_headers(&job_token(&state, &job_id));
+
+        let scopes = resolve_cache_read_scopes(
+            &state,
+            &headers,
+            &["refs/heads/main".to_owned(), "refs/heads/other".to_owned()],
+        )
+        .await
+        .expect("job-bound token resolves its read scopes");
+        assert_eq!(
+            scopes,
+            vec![
+                Some("refs/heads/feature".to_owned()),
+                Some("refs/heads/main".to_owned()),
+            ],
+            "read scopes must be own ref + default branch, never client-supplied branches"
+        );
+
+        // A job on the default branch reads just its own ref (no duplicate).
+        let main_job = uuid::Uuid::new_v4();
+        bind_job_to_ref(&state, main_job, 2, "owner/repo", "refs/heads/main").await;
+        let main_headers = bearer_headers(&job_token(&state, &main_job));
+        let scopes = resolve_cache_read_scopes(&state, &main_headers, &[])
+            .await
+            .unwrap();
+        assert_eq!(scopes, vec![Some("refs/heads/main".to_owned())]);
+
+        // The system token keeps the client-supplied scopes; with none
+        // supplied, the unscoped default is tried once.
+        let system = bearer_headers(&state.system_token);
+        let scopes = resolve_cache_read_scopes(&state, &system, &["refs/heads/other".to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(scopes, vec![Some("refs/heads/other".to_owned())]);
+        let scopes = resolve_cache_read_scopes(&state, &system, &[])
+            .await
+            .unwrap();
+        assert_eq!(scopes, vec![None]);
+    }
+
+    #[test]
+    fn legacy_cache_namespace_includes_git_ref() {
+        // R1-5: the legacy artifactcache namespace binds repository + ref.
+        assert_eq!(
+            crate::cache_artifacts::ref_scoped_namespace(
+                Some("owner/repo".to_owned()),
+                Some("refs/heads/feature".to_owned()),
+            ),
+            "owner/repo\0refs/heads/feature"
+        );
+        // The system token (no job) keeps the historical repository-only
+        // namespace.
+        assert_eq!(
+            crate::cache_artifacts::ref_scoped_namespace(Some("owner/repo".to_owned()), None),
+            "owner/repo"
+        );
+        assert_eq!(
+            crate::cache_artifacts::ref_scoped_namespace(None, None),
+            String::new()
+        );
+    }
     #[tokio::test]
     async fn cache_repository_binds_to_job_not_request_body() {
         // R1-3: the cache namespace binds to the token's job. A spoofed
