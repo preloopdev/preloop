@@ -737,6 +737,154 @@ mod official_semantics {
         let _ = std::fs::remove_dir_all(&workspace);
         assert!(result.is_err(), "unknown hashFiles flags must fail");
     }
+    /// R1-7: absolute patterns are rejected outright, never used as-is —
+    /// otherwise hashFiles('/etc/passwd') is a file-content oracle for
+    /// anything the runner can read. Silent remapping would hide intent.
+    #[test]
+    fn hash_files_absolute_pattern_rejected() {
+        let base =
+            std::env::temp_dir().join(format!("preloop-hashfiles-r17-{}", std::process::id()));
+        let workspace = base.join("ws");
+        std::fs::create_dir_all(workspace.join("sub")).unwrap();
+        std::fs::write(
+            workspace.join("sub").join("secret.txt"),
+            b"workspace secret",
+        )
+        .unwrap();
+        let context = Context::default().with_workspace(workspace.to_string_lossy().into_owned());
+
+        for expr in ["hashFiles('/sub/secret.txt')", "hashFiles('/etc/hostname')"] {
+            let result = eval_expression(expr, &context);
+            assert!(
+                matches!(result, Err(ExpressionError::HashFilesDisallowedPattern(_))),
+                "absolute pattern must be rejected, got {result:?}: {expr}"
+            );
+        }
+
+        // Workspace-relative patterns still work.
+        let hashed = eval_expression("hashFiles('sub/secret.txt')", &context).unwrap();
+        assert!(
+            matches!(&hashed, Value::String(s) if s.len() == 64),
+            "relative pattern should still hash, got {hashed:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// R1-7: `../` traversal in a pattern is rejected outright, not silently
+    /// skipped — the workflow author must see the failure.
+    #[test]
+    fn hash_files_dotdot_traversal_rejected() {
+        let base =
+            std::env::temp_dir().join(format!("preloop-hashfiles-r17b-{}", std::process::id()));
+        let workspace = base.join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(base.join("outside.txt"), b"must not be hashed").unwrap();
+        let context = Context::default().with_workspace(workspace.to_string_lossy().into_owned());
+
+        for expr in [
+            "hashFiles('../outside.txt')",
+            "hashFiles('sub/../../outside.txt')",
+        ] {
+            let result = eval_expression(expr, &context);
+            assert!(
+                matches!(result, Err(ExpressionError::HashFilesDisallowedPattern(_))),
+                ".. traversal must be rejected, got {result:?}: {expr}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// R1-7: hashing more than 100 MiB of input fails with HashFilesTooLarge
+    /// instead of loading it all into memory.
+    #[test]
+    fn hash_files_total_byte_cap_rejects_huge_input() {
+        let base =
+            std::env::temp_dir().join(format!("preloop-hashfiles-r17d-{}", std::process::id()));
+        let workspace = base.join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        // Sparse file: instant to create, reads as zeros.
+        let big = std::fs::File::create(workspace.join("big.bin")).unwrap();
+        big.set_len(101 * 1024 * 1024).unwrap();
+        drop(big);
+        let context = Context::default().with_workspace(workspace.to_string_lossy().into_owned());
+
+        let result = eval_expression("hashFiles('big.bin')", &context);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            matches!(result, Err(ExpressionError::HashFilesTooLarge(_))),
+            "expected HashFilesTooLarge, got {result:?}"
+        );
+    }
+
+    /// R1-7: symlinks escaping the workspace are skipped even with
+    /// --follow-symbolic-links; in-workspace symlinks are only followed
+    /// when the flag is passed.
+    #[test]
+    fn hash_files_escaping_symlink_skipped() {
+        let base =
+            std::env::temp_dir().join(format!("preloop-hashfiles-r17c-{}", std::process::id()));
+        let workspace = base.join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("real.txt"), b"real").unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", workspace.join("escape-link")).unwrap();
+        std::os::unix::fs::symlink(workspace.join("real.txt"), workspace.join("inner-link"))
+            .unwrap();
+        let context = Context::default().with_workspace(workspace.to_string_lossy().into_owned());
+
+        // Escaping symlink is never hashed, flag or not.
+        for expr in [
+            "hashFiles('escape-link')",
+            "hashFiles('--follow-symbolic-links', 'escape-link')",
+        ] {
+            let result = eval_expression(expr, &context).unwrap();
+            assert_eq!(
+                result,
+                Value::String(String::new()),
+                "escaping symlink must be skipped: {expr}"
+            );
+        }
+
+        // In-workspace symlink: skipped without the flag, hashed with it.
+        let no_flag = eval_expression("hashFiles('inner-link')", &context).unwrap();
+        assert_eq!(no_flag, Value::String(String::new()));
+        let with_flag = eval_expression(
+            "hashFiles('--follow-symbolic-links', 'inner-link')",
+            &context,
+        )
+        .unwrap();
+        assert!(
+            matches!(&with_flag, Value::String(s) if s.len() == 64),
+            "in-workspace symlink should be followed with the flag"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// R1-7: matching more than the file cap is a clear error, not silent
+    /// truncation or unbounded hashing.
+    #[test]
+    fn hash_files_too_many_files_errors() {
+        let base =
+            std::env::temp_dir().join(format!("preloop-hashfiles-r17d-{}", std::process::id()));
+        let workspace = base.join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        for i in 0..10_001 {
+            std::fs::write(workspace.join(format!("f{i}.txt")), b"x").unwrap();
+        }
+        let context = Context::default().with_workspace(workspace.to_string_lossy().into_owned());
+
+        let result = eval_expression("hashFiles('*.txt')", &context);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            matches!(
+                result,
+                Err(crate::ExpressionError::HashFilesTooManyFiles(10_000))
+            ),
+            "expected HashFilesTooManyFiles error, got {result:?}"
+        );
+    }
 
     /// Deeply nested parens overflow the parser's stack instead of returning
     /// an error: 100k `(` from a 200 KB expression aborted the process before
