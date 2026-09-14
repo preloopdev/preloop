@@ -33,6 +33,12 @@ impl AppState {
         claims.insert("iat".to_owned(), json!(now));
         claims.insert("nbf".to_owned(), json!(now));
         claims.insert("exp".to_owned(), json!(expires_at));
+        // R1-10: every minted token gets a unique id so identical claims
+        // minted in the same second do not produce byte-identical tokens.
+        // Callers that already set `jti` (e.g. the OAuth flow) keep theirs.
+        if !claims.contains_key("jti") {
+            claims.insert("jti".to_owned(), json!(uuid::Uuid::new_v4().to_string()));
+        }
         let header = json!({
             "alg": "HS256",
             "typ": "JWT",

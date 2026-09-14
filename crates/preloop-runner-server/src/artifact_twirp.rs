@@ -152,6 +152,15 @@ pub(crate) async fn twirp_artifact_v2_create(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Validate the JWT signature and claims before taking the global state lock.
     let job = artifact_v2_job_from_headers(&shared.state, &headers)?;
+    // R1-10: reject writes from completed/unknown jobs.
+    let identity = match job {
+        None => crate::auth::ResultsIdentity::System,
+        Some(job_id) => crate::auth::ResultsIdentity::Job(crate::auth::ResultsJobIdentity {
+            plan_id: String::new(),
+            job_id,
+        }),
+    };
+    crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let canonical_run = {
         let inner = shared.state.inner.lock().await;
         artifact_v2_canonical_run_scope(&inner, &request.workflow_run_backend_id, job)?
@@ -239,6 +248,15 @@ pub(crate) async fn twirp_artifact_v2_finalize(
     Json(request): Json<ArtifactV2FinalizeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let job = artifact_v2_job_from_headers(&shared.state, &headers)?;
+    // R1-10: reject writes from completed/unknown jobs.
+    let identity = match job {
+        None => crate::auth::ResultsIdentity::System,
+        Some(job_id) => crate::auth::ResultsIdentity::Job(crate::auth::ResultsJobIdentity {
+            plan_id: String::new(),
+            job_id,
+        }),
+    };
+    crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let canonical_run = {
         let inner = shared.state.inner.lock().await;
         artifact_v2_canonical_run_scope(&inner, &request.workflow_run_backend_id, job)?
@@ -414,6 +432,15 @@ pub(crate) async fn twirp_artifact_v2_delete(
     Json(request): Json<ArtifactV2DeleteRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let job = artifact_v2_job_from_headers(&shared.state, &headers)?;
+    // R1-10: reject writes from completed/unknown jobs.
+    let identity = match job {
+        None => crate::auth::ResultsIdentity::System,
+        Some(job_id) => crate::auth::ResultsIdentity::Job(crate::auth::ResultsJobIdentity {
+            plan_id: String::new(),
+            job_id,
+        }),
+    };
+    crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let canonical_run = {
         let inner = shared.state.inner.lock().await;
         artifact_v2_canonical_run_scope(&inner, &request.workflow_run_backend_id, job)?
