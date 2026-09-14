@@ -5158,8 +5158,6 @@ mod lifecycle_tests {
         /// When set, `exec_with_secret_env` (the configure step) blocks until
         /// notified, so a test can observe the pool mid-provision.
         configure_gate: Option<Arc<tokio::sync::Notify>>,
-        /// Binary that `command -v` cannot find until its toolchain installs.
-        absent_binary: Mutex<Option<&'static str>>,
         /// Guest pause marker state: when set, the exec probe for the debug
         /// pause marker succeeds, so `watch_guest_pause` sees a paused job.
         pause_marker: std::sync::atomic::AtomicBool,
@@ -5192,7 +5190,6 @@ mod lifecycle_tests {
                 fail_delete,
                 announce_busy: false,
                 configure_gate: None,
-                absent_binary: Mutex::new(None),
                 pause_marker: std::sync::atomic::AtomicBool::new(false),
                 probe_transport_error: std::sync::atomic::AtomicBool::new(false),
             }
@@ -5235,15 +5232,6 @@ mod lifecycle_tests {
         fn drain_live_forks_after(mut self, n: u32) -> Self {
             *self.drain_live_forks_after.get_mut() = n;
             self
-        }
-
-        /// A provider whose guests lack `binary` until an install command for
-        /// it runs — a pack baked without the workspace's toolchain.
-        fn without_binary(binary: &'static str) -> Self {
-            Self {
-                absent_binary: Mutex::new(Some(binary)),
-                ..Self::new(false, false, false, false, false)
-            }
         }
 
         async fn has_machine(&self, name: &MachineName) -> bool {
@@ -6260,18 +6248,6 @@ chmod +x "$dest/bin/node"
                     message: "test -f: marker absent".to_owned(),
                 });
             }
-            let mut absent = self.absent_binary.lock().await;
-            if let Some(binary) = *absent {
-                let probe = format!("command -v {binary}");
-                if argv.iter().any(|arg| arg.contains(&probe)) {
-                    return Err(test_error("binary-not-found"));
-                }
-                // An install command that names the binary lands it on PATH.
-                if argv.iter().any(|arg| arg.contains(binary)) {
-                    *absent = None;
-                }
-            }
-            drop(absent);
             if self.fail_install && argv.iter().any(|arg| arg.contains("apt-get")) {
                 return Err(test_error("install-failure"));
             }

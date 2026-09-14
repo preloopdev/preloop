@@ -35,8 +35,8 @@ Four different kinds of image appear in the execution path:
 
 ## What the golden contains
 
-A golden is a pre-provisioned microVM image: the OCI base, `preloop-runner`,
-and the curated toolchain baseline, provisioned once and packed by smolvm
+A stock golden is a pre-provisioned microVM image: the OCI base,
+`preloop-runner`, and the curated toolchain baseline, provisioned once and packed by smolvm
 into a single bootable, architecture-specific file. The pool boots it
 directly, and the fork pool runs the same artifact as host processes without
 starting a VM at all.
@@ -50,13 +50,16 @@ The stock golden contains:
 2. **The runner**: `preloop-runner` cross-built for `aarch64-unknown-linux-gnu`
 (`cargo-zigbuild`), fidelity-tracked against the official `actions/runner`
 (see `versions.toml`).
-3. **Curated toolchains**: a fixed toolchain set is baked into every golden, currently Rust stable, plus the GitHub-hosted parity toolset in
-`base_install_script` (node/python/go toolcaches, git, git-lfs, docker, nvm, yarn). `setup-*` actions download any version a job asks for at job time, the same model GitHub-hosted runners use.
+3. **Curated toolchains**: a fixed Rust/Go baseline is baked into **stock
+Ubuntu goldens** for workflows that invoke those tools implicitly. An
+official GitHub runner-image golden is used as-is; `setup-*` actions resolve
+the exact language version requested by each workflow at job time.
 4. **Base dependencies**: the apt set `install_base_dependencies` installs
 git, curl, build-essential, python3, jq, unzip/zip, locales, …).
 5. **Docker**: daemon + CLI, so `container:` / `services:` jobs work.
 
-Because the toolchain set is fixed, the same stock golden serves every project. 
+Because setup actions own version selection, the same golden serves every
+project without baking a repository-specific language version.
 
 ## Building a golden
 
@@ -454,9 +457,9 @@ GitHub maintains first-party setup actions for Node
 (`actions/setup-go`), Java (`actions/setup-java`), and .NET
 (`actions/setup-dotnet`). Those toolchains do not need every hosted-image
 version baked for correctness; their actions install a requested version.
-The golden therefore does not pre-populate versioned Node, Python, or Go
-toolcaches. It provides a runner-writable `/opt/hostedtoolcache` for those
-actions, plus system Node and Python for workflows that invoke them directly.
+Official runner-image goldens therefore do not receive an extra preloop
+Rust/Go version. They provide a runner-writable `/opt/hostedtoolcache` for
+setup actions, plus the system tools already present in the image.
 
 The following have ecosystem-owned setup actions: Ruby (`ruby/setup-ruby`),
 Julia (`julia-actions/setup-julia`), Haskell (`haskell-actions/setup`), PHP
