@@ -24219,6 +24219,218 @@ async fn cache_upload_payload_stays_out_of_the_runtime_snapshot() {
     );
 }
 
+/// R1-6: the legacy upload endpoint appended every PATCH body with no
+/// running total, so a job could grow server RAM without bound (~500
+/// requests/GiB at the 2 MiB default body limit). Each reservation is now
+/// capped at MAX_CACHE_UPLOAD_BYTES; the refusal happens before the buffer
+/// grows, so the 413 itself allocates nothing.
+#[tokio::test]
+async fn cache_upload_rejects_chunks_past_the_per_upload_cap() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+
+    let cache_id = 7i64;
+    {
+        let mut inner = state.inner.lock().await;
+        inner.pending_caches.insert(
+            cache_id,
+            PendingCache {
+                key: "k".into(),
+                namespace: "owner/repo".into(),
+                version: "v1".into(),
+                job_backend_id: String::new(), // system-owned reservation
+                bytes: vec![0u8; (MAX_CACHE_UPLOAD_BYTES - 8) as usize],
+                created_unix: now_unix(),
+            },
+        );
+    }
+
+    let headers = axum::http::HeaderMap::from_iter([(
+        axum::http::header::AUTHORIZATION,
+        format!("Bearer {}", state.system_token).parse().unwrap(),
+    )]);
+
+    // A chunk that still fits under the cap is accepted.
+    let ok = cache_upload(
+        axum::extract::State(shared.clone()),
+        headers.clone(),
+        axum::extract::Path(cache_id),
+        axum::body::Bytes::from(vec![0u8; 8]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ok, StatusCode::ACCEPTED);
+
+    // A chunk pushing past the cap is refused with 413.
+    let err = cache_upload(
+        axum::extract::State(shared.clone()),
+        headers,
+        axum::extract::Path(cache_id),
+        axum::body::Bytes::from(vec![0u8; 1]),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let inner = state.inner.lock().await;
+    assert_eq!(
+        inner.pending_caches.get(&cache_id).unwrap().bytes.len() as u64,
+        MAX_CACHE_UPLOAD_BYTES,
+        "the refused chunk must not grow the buffer"
+    );
+}
+
+/// R1-6: a job could accumulate unbounded legacy cache reservations — only
+/// `cache_commit` freed them. Reservations are now capped per job (mirroring
+/// the v2 path's MAX_PENDING_PER_JOB) and stamped so the TTL sweeper frees
+/// abandoned ones.
+#[tokio::test]
+async fn cache_reserve_rejects_past_the_per_job_pending_cap() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+
+    let job_id = uuid::Uuid::new_v4();
+    // Bind the job token to a live run so `cache_reserve`'s repository
+    // resolution passes and the test exercises the cap, not auth.
+    {
+        let run_id = RunId::new();
+        let request_id = 1i64;
+        let mut inner = state.inner.lock().await;
+        inner.agent_job_requests.insert(job_id, request_id);
+        inner.job_requests.insert(
+            request_id,
+            TaskAgentJobRequestRecord {
+                request_id,
+                run_id,
+                job_id: JobId("build".to_owned()),
+                agent_job_id: job_id,
+                plan_id: job_id.to_string(),
+                plan_type: "plan".to_owned(),
+                timeline_id: uuid::Uuid::new_v4(),
+                result: None,
+                locked_until: String::new(),
+                owner_runner_id: None,
+                started_at: None,
+                last_renewed_at: None,
+                timeout_triggered: false,
+                claimed_at: None,
+                debug_token_issued: false,
+            },
+        );
+        inner.runs.insert(
+            run_id,
+            RunRecord {
+                run_id,
+                webhook_delivery_id: None,
+                run_name: None,
+                submission: Arc::new(WorkflowSubmission {
+                    repository: "owner/repo".to_owned(),
+                    ..Default::default()
+                }),
+                jobs: BTreeMap::new(),
+                status: ExecutionStatus::InProgress,
+                job_outputs: BTreeMap::new(),
+                job_base_ids: BTreeMap::new(),
+                job_needs: BTreeMap::new(),
+                caller_plans: BTreeMap::new(),
+                job_names: BTreeMap::new(),
+                github: serde_json::Value::Null,
+                head_sha: String::new(),
+                workflow_ref: String::new(),
+                workspace_snapshot: None,
+                job_fail_fast: BTreeMap::new(),
+                job_continue_on_error: BTreeMap::new(),
+                job_check_run_ids: BTreeMap::new(),
+                reusable_calls: BTreeMap::new(),
+                jobs_list: Vec::new(),
+                created_at: chrono::Utc::now(),
+                started_at: None,
+                completed_at: None,
+                run_number: 1,
+                run_attempt: 1,
+                workflow_path_str: String::new(),
+                event: "push".to_owned(),
+                conclusion: None,
+                push_state: None,
+                snapshot_timing: None,
+            },
+        );
+        for i in 0..MAX_PENDING_PER_JOB {
+            inner.pending_caches.insert(
+                1000 + i as i64,
+                PendingCache {
+                    key: format!("k-{i}"),
+                    namespace: "owner/repo".into(),
+                    version: "v1".into(),
+                    job_backend_id: job_id.to_string(),
+                    bytes: Vec::new(),
+                    created_unix: now_unix(),
+                },
+            );
+        }
+    }
+
+    let token = state.mint_runtime_token("plan-1", &job_id);
+    let headers = axum::http::HeaderMap::from_iter([(
+        axum::http::header::AUTHORIZATION,
+        format!("Bearer {token}").parse().unwrap(),
+    )]);
+    let request: CacheReserveRequest =
+        serde_json::from_value(serde_json::json!({"key": "one-too-many", "version": "v1"}))
+            .unwrap();
+    let err = cache_reserve(
+        axum::extract::State(shared.clone()),
+        headers,
+        axum::Json(request),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        err.message().contains("pending cache uploads"),
+        "unexpected message: {}",
+        err.message()
+    );
+}
+
+/// R1-6: abandoned legacy reservations held their bytes in RAM forever. The
+/// TTL sweeper now frees them alongside the v2 pending maps.
+#[test]
+fn sweep_pending_uploads_frees_abandoned_legacy_reservations() {
+    let mut inner = InnerState::default();
+    let now = now_unix();
+    let stale_at = now - PENDING_UPLOAD_TTL.as_secs() as i64 - 1;
+    for (cache_id, created_unix) in [(1i64, stale_at), (2i64, now)] {
+        inner.pending_caches.insert(
+            cache_id,
+            PendingCache {
+                key: "k".into(),
+                namespace: "owner/repo".into(),
+                version: "v1".into(),
+                job_backend_id: "j".into(),
+                bytes: vec![0u8; 1024],
+                created_unix,
+            },
+        );
+    }
+    sweep_pending_uploads(&mut inner, now);
+    assert!(
+        !inner.pending_caches.contains_key(&1),
+        "the abandoned reservation must be freed"
+    );
+    assert!(
+        inner.pending_caches.contains_key(&2),
+        "the fresh reservation must survive"
+    );
+}
+
 /// Two servers booting against one Postgres database must both start.
 /// `CREATE TABLE IF NOT EXISTS` is not race-safe in Postgres: the existence
 /// check and the `pg_type` insert are separate, so an unguarded migration makes

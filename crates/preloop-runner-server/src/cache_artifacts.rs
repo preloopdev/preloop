@@ -137,6 +137,21 @@ pub(crate) async fn cache_reserve(
         .map(|claims| claims.job_id.to_string())
         .unwrap_or_default();
     let mut inner = shared.state.inner.lock().await;
+    // R1-6: bound in-flight legacy reservations per job, mirroring the v2
+    // path's MAX_PENDING_PER_JOB. Without it a job could accumulate
+    // unbounded reservation state in server RAM.
+    if !job_backend_id.is_empty() {
+        let in_flight = inner
+            .pending_caches
+            .values()
+            .filter(|pending| pending.job_backend_id == job_backend_id)
+            .count();
+        if in_flight >= MAX_PENDING_PER_JOB {
+            return Err(ApiError::bad_request(format!(
+                "job has {in_flight} pending cache uploads (cap {MAX_PENDING_PER_JOB})"
+            )));
+        }
+    }
     inner.next_cache_id += 1;
     let cache_id = inner.next_cache_id;
     inner.pending_caches.insert(
@@ -150,6 +165,10 @@ pub(crate) async fn cache_reserve(
             version: request.version,
             bytes: Vec::new(),
             job_backend_id,
+            // R1-6: stamp the reservation so the TTL sweeper can free it if
+            // the job never commits (previously abandoned reservations held
+            // their bytes forever).
+            created_unix: crate::memory_caps::now_unix(),
         },
     );
     let meta = crate::store::build_meta_snapshot(&inner);
@@ -178,6 +197,16 @@ pub(crate) async fn cache_upload(
         return Err(ApiError::forbidden(
             "cache reservation belongs to another job",
         ));
+    }
+    // R1-6: cap each in-flight upload's running total. Without this check a
+    // job could grow server RAM without bound by PATCHing chunks forever
+    // (~500 requests/GiB at the 2 MiB default body limit). The check runs
+    // before the vector grows so the refusal itself allocates nothing.
+    if pending.bytes.len() as u64 + bytes.len() as u64 > MAX_CACHE_UPLOAD_BYTES {
+        return Err(ApiError::payload_too_large(format!(
+            "cache upload exceeds the {} MiB per-upload cap",
+            MAX_CACHE_UPLOAD_BYTES / (1024 * 1024)
+        )));
     }
     pending.bytes.extend_from_slice(&bytes);
     // No write-through here on purpose: the in-flight payload is not durable
