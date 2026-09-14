@@ -1100,6 +1100,23 @@ fn run_verifier(binary: &str, args: &[&str], what: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Anonymous liveness probe for the local engine (H4).
+///
+/// `/healthz` is a public, unauthenticated endpoint — the handler never reads
+/// credentials — so the probe must not attach the API bearer token. Sending
+/// it would leak the credential (process logs, local proxies, a compromised
+/// loopback listener) for zero benefit, and a token-bearing probe could mask
+/// a misconfigured auth layer by succeeding where an anonymous probe would
+/// not. Authenticated readiness is checked against `/readyz` separately.
+async fn probe_engine_health(client: &reqwest::Client, url: &str) -> bool {
+    client
+        .get(format!("{url}/healthz"))
+        .timeout(Duration::from_millis(500))
+        .send()
+        .await
+        .is_ok()
+}
+
 async fn ensure_engine_running() -> anyhow::Result<()> {
     if std::env::var("PRELOOP_URL").is_ok() {
         return Ok(());
@@ -1108,13 +1125,8 @@ async fn ensure_engine_running() -> anyhow::Result<()> {
     let client = build_client();
     let url = server_url();
 
-    let mut health_req = client
-        .get(format!("{url}/healthz"))
-        .timeout(Duration::from_millis(500));
-    if let Some(token) = api_token() {
-        health_req = health_req.bearer_auth(token);
-    }
-    if health_req.send().await.is_ok() {
+    // H4: the liveness probe is anonymous — see `probe_engine_health`.
+    if probe_engine_health(&client, &url).await {
         return Ok(());
     }
 
@@ -5592,5 +5604,50 @@ mod tests {
             Some("http://localhost:9090")
         );
         assert_eq!(mounted_control_origin("https://preloop.preloop.dev"), None);
+    }
+
+    /// H4: the engine liveness probe must never carry the API bearer token.
+    /// `/healthz` is public and unauthenticated, so an `Authorization`
+    /// header on the probe only leaks the credential. Failing first: with
+    /// `PRELOOP_TOKEN` set (so `api_token()` resolves to a real secret),
+    /// the probe must still arrive without an `Authorization` header.
+    #[tokio::test]
+    async fn health_probe_sends_no_authorization_header() {
+        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _env_guard = ENV_LOCK.lock().await;
+        let saw_authorization = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_authorization_clone = std::sync::Arc::clone(&saw_authorization);
+        let app = axum::Router::new().route(
+            "/healthz",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let saw_authorization = std::sync::Arc::clone(&saw_authorization_clone);
+                async move {
+                    saw_authorization.store(
+                        headers.contains_key(axum::http::header::AUTHORIZATION),
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                    "ok"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let previous_token = std::env::var_os("PRELOOP_TOKEN");
+        std::env::set_var("PRELOOP_TOKEN", "dummy-api-token");
+        let healthy = probe_engine_health(&build_client(), &base).await;
+        match previous_token {
+            Some(previous) => std::env::set_var("PRELOOP_TOKEN", previous),
+            None => std::env::remove_var("PRELOOP_TOKEN"),
+        }
+
+        assert!(healthy, "stub /healthz should answer the probe");
+        assert!(
+            !saw_authorization.load(std::sync::atomic::Ordering::SeqCst),
+            "H4: the /healthz probe must not send an Authorization header"
+        );
     }
 }
