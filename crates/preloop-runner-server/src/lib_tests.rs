@@ -2615,6 +2615,119 @@ async fn live_log_websocket_cross_job_attempt_preserves_history() {
     server.abort();
 }
 
+async fn open_protocol_live(app: &axum::Router, uri: String, bearer: &str) -> Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// M5: the protocol live-log read route must not let one job's runtime
+/// credential read another job's output. A job may read its own feed.
+#[tokio::test]
+async fn live_log_sse_accepts_own_job_credential() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let (logical_a, plan_a, agent_a) = (jobs[0].0.clone(), jobs[0].1.clone(), jobs[0].2.clone());
+    let credential_a = state
+        .local_jwt(json!({
+            "sub": format!("preloop-job-{agent_a}"),
+            "scp": format!("Actions.Results:{plan_a}:{agent_a}"),
+        }))
+        .unwrap();
+
+    // Own logical job name.
+    let response = open_protocol_live(
+        &app,
+        format!("/api/v1/runs/{run_id}/jobs/{logical_a}/logs/live"),
+        &credential_a,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Own concrete agent-job UUID.
+    let response = open_protocol_live(
+        &app,
+        format!("/api/v1/runs/{run_id}/jobs/{agent_a}/logs/live"),
+        &credential_a,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// M5: a job's runtime credential must not read another job's live log,
+/// whether addressed by logical name or by concrete agent-job UUID.
+#[tokio::test]
+async fn live_log_sse_rejects_other_job_credential() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let (plan_a, agent_a) = (jobs[0].1.clone(), jobs[0].2.clone());
+    let (logical_b, agent_b) = (jobs[1].0.clone(), jobs[1].2.clone());
+    let credential_a = state
+        .local_jwt(json!({
+            "sub": format!("preloop-job-{agent_a}"),
+            "scp": format!("Actions.Results:{plan_a}:{agent_a}"),
+        }))
+        .unwrap();
+
+    let response = open_protocol_live(
+        &app,
+        format!("/api/v1/runs/{run_id}/jobs/{logical_b}/logs/live"),
+        &credential_a,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "cross-job read by logical name must be rejected"
+    );
+
+    // A UUID target is rejected without resolving it, so the mismatch never
+    // reveals whether the target exists.
+    let response = open_protocol_live(
+        &app,
+        format!("/api/v1/runs/{run_id}/jobs/{agent_b}/logs/live"),
+        &credential_a,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "cross-job read by concrete job id must be rejected"
+    );
+}
+
+/// M5: the system credential keeps full read access; first-party readers are
+/// unaffected by the per-job ownership check.
+#[tokio::test]
+async fn live_log_sse_system_credential_still_reads() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let logical_b = jobs[1].0.clone();
+    let system_credential = state.system_token.clone();
+
+    let response = open_protocol_live(
+        &app,
+        format!("/api/v1/runs/{run_id}/jobs/{logical_b}/logs/live"),
+        &system_credential,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
 #[tokio::test]
 async fn live_log_websocket_survives_malformed_payload() {
     let temp = tempfile::tempdir().unwrap();
