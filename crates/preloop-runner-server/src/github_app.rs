@@ -639,6 +639,73 @@ pub(crate) async fn candidate_apps_for_repo(
     candidates
 }
 
+/// Whether `app`'s installation covers the exact `repository` (M3).
+///
+/// `GET /repos/{owner}/{repo}/installation` authenticated with the App's JWT
+/// returns the installation of *that App* on *that repository*, or 404 when
+/// the App is not installed there. Owner-granularity checks
+/// ([`installation_id_for`]/[`candidate_apps_for_repo`]) are insufficient
+/// for webhook signer binding: a selected-repository installation on owner
+/// `acme` covering only `acme/repo1` still passes an owner check for
+/// `acme/repo2`, letting a payload signed by that App's secret claim a
+/// repository outside its installation.
+///
+/// Fail-closed: any transport error, unexpected status, or app-id mismatch
+/// returns false (the caller rejects with 403). Webhook deliveries are
+/// low-volume relative to App rate limits, so this lookup is not cached; the
+/// owner-granularity installation id it complements stays cached per App.
+pub(crate) async fn app_covers_repository(app: &GitHubAppCredentials, repository: &str) -> bool {
+    let (owner, repo) = match split_repository(repository) {
+        Ok(parts) => parts,
+        Err(_) => return false,
+    };
+    let api_base = api_base();
+    let app_jwt = match sign_app_jwt(&app.app_id, &app.private_key) {
+        Ok(jwt) => jwt,
+        Err(_) => return false,
+    };
+    let url = format!("{api_base}/repos/{owner}/{repo}/installation");
+    let response = match CLIENT
+        .get(&url)
+        .header("User-Agent", "preloop")
+        .header("Authorization", format!("Bearer {app_jwt}"))
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            warn!(app_id = %app.app_id, repository = %repository, ?error, "M3: repository installation lookup failed");
+            return false;
+        }
+    };
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return false;
+    }
+    if !response.status().is_success() {
+        warn!(app_id = %app.app_id, repository = %repository, status = %response.status(), "M3: repository installation lookup returned unexpected status");
+        return false;
+    }
+    let body: serde_json::Value = match response.json().await {
+        Ok(body) => body,
+        Err(error) => {
+            warn!(app_id = %app.app_id, repository = %repository, ?error, "M3: cannot parse repository installation response");
+            return false;
+        }
+    };
+    // Defense in depth: App-JWT auth already scopes GitHub's response to
+    // the calling App, but verify the app id matches anyway.
+    let covers = body
+        .get("app_id")
+        .and_then(serde_json::Value::as_u64)
+        .map(|id| id.to_string() == app.app_id)
+        .unwrap_or(false);
+    if !covers {
+        warn!(app_id = %app.app_id, repository = %repository, "M3: repository installation belongs to a different App");
+    }
+    covers
+}
+
 /// Select the App whose installation covers `repository`'s owner (D6).
 ///
 /// Installation discovery is cached per App, so steady state is one cached

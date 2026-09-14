@@ -13,7 +13,7 @@
 use crate::credential_store::{CredentialRef, CredentialStore, OsCredentialStore, SecretString};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -321,6 +321,15 @@ pub struct ConfigFile {
     /// global secret of the same name for jobs in that environment.
     #[serde(default)]
     pub env_secrets: BTreeMap<String, BTreeMap<String, BTreeMap<String, String>>>,
+    /// Registered environments (`[environments]` mapping `owner/repo` to a
+    /// list of environment names), mirroring GitHub's environment registry.
+    /// A job's `environment:` name must be registered for its repository, or
+    /// the job fails closed: no environment secrets are injected and no
+    /// environment OIDC subject is minted. Required reviewers, wait timers,
+    /// and deployment-branch policies are not enforced yet; the registry
+    /// currently gates existence.
+    #[serde(default)]
+    pub environments: BTreeMap<String, BTreeSet<String>>,
     /// Secrets-store mode: `file` (default; values persist in this file,
     /// mode 0600) or `memory` (values exist only in engine memory for the
     /// current process lifetime — nothing is ever written to the config
@@ -426,11 +435,12 @@ impl std::fmt::Debug for ConfigFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ConfigFile {{ github: {:?}, secrets: {} names, repo_secrets: {} repos, env_secrets: {} repos }}",
+            "ConfigFile {{ github: {:?}, secrets: {} names, repo_secrets: {} repos, env_secrets: {} repos, environments: {} repos }}",
             self.github,
             self.secrets.len(),
             self.repo_secrets.len(),
-            self.env_secrets.len()
+            self.env_secrets.len(),
+            self.environments.len()
         )
     }
 }
@@ -650,6 +660,7 @@ mod tests {
                     BTreeMap::from([("DEPLOY_KEY".into(), "env-secret".into())]),
                 )]),
             )]),
+            environments: BTreeMap::from([("owner/repo".into(), BTreeSet::from(["prod".into()]))]),
             secrets_store: None,
         }
     }

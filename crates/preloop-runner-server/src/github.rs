@@ -1402,14 +1402,13 @@ pub(crate) async fn handle_github_webhook(
     // rerequests alike). The signature only proves *some* registered
     // credential sent the payload — without binding, a payload signed by
     // App B's secret could claim App A's repository and trigger runs
-    // there under App A's credentials.
+    // there under App A's credentials. Coverage is verified at exact
+    // repository granularity: an owner-granularity check would pass a
+    // selected-repository installation for a sibling repo under the same
+    // owner that the installation does not cover.
     if let crate::github_app::WebhookSigner::App(app) = &signer {
         if let Some(claimed) = claimed_repository(&body) {
-            let candidates = crate::github_app::candidate_apps_for_repo(&shared, &claimed).await;
-            if !candidates
-                .iter()
-                .any(|candidate| candidate.app_id == app.app_id)
-            {
+            if !crate::github_app::app_covers_repository(app, &claimed).await {
                 warn!(
                     app_id = %app.app_id,
                     repository = %claimed,
