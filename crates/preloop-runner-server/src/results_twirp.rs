@@ -1301,6 +1301,7 @@ mod cache_pb_tests {
                 started_at: None,
                 last_renewed_at: None,
                 timeout_triggered: false,
+                claimed_at: None,
                 debug_token_issued: false,
             },
         );
@@ -1312,6 +1313,7 @@ mod cache_pb_tests {
             run_id,
             RunRecord {
                 run_id,
+                webhook_delivery_id: None,
                 run_name: None,
                 submission: Arc::new(submission),
                 jobs: BTreeMap::new(),
@@ -1372,6 +1374,7 @@ mod cache_pb_tests {
                 started_at: None,
                 last_renewed_at: None,
                 timeout_triggered: false,
+                claimed_at: None,
                 debug_token_issued: false,
             },
         );
@@ -1379,6 +1382,7 @@ mod cache_pb_tests {
             run_id,
             RunRecord {
                 run_id,
+                webhook_delivery_id: None,
                 run_name: None,
                 submission: Arc::new(WorkflowSubmission {
                     repository: repository.to_owned(),
