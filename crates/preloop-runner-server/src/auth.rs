@@ -208,6 +208,57 @@ async fn authorize_blob_request(
     }
 }
 
+/// R1-10: require the calling job to be live before a Results write.
+///
+/// Resolves the job's request record and rejects when the job is unknown
+/// (purged) or has settled/projected to a terminal status — the stale
+/// credential replay window. The system identity (engine) bypasses: it
+/// manages the lifecycle itself. Reads are unaffected; each handler decides
+/// whether it is a write.
+pub(crate) async fn require_live_results_job(
+    state: &AppState,
+    identity: &ResultsIdentity,
+) -> Result<(), ApiError> {
+    let job_uuid = match identity {
+        ResultsIdentity::Job(job) => job.job_id,
+        ResultsIdentity::System => return Ok(()),
+    };
+    require_live_job(state, job_uuid).await
+}
+
+/// R1-10: require a job UUID to be live before a write, for handlers that
+/// authenticate from headers rather than a typed [`ResultsIdentity`]
+/// (the legacy `/_apis/artifactcache` cache write path). Same rule as
+/// [`require_live_results_job`]: the system identity bypasses, so callers
+/// must skip this helper for the system bearer themselves.
+pub(crate) async fn require_live_job(
+    state: &AppState,
+    job_uuid: uuid::Uuid,
+) -> Result<(), ApiError> {
+    let inner = state.inner.lock().await;
+    let live = inner
+        .agent_job_requests
+        .get(&job_uuid)
+        .copied()
+        .and_then(|request_id| inner.job_requests.get(&request_id))
+        .is_some_and(|record| {
+            let settled = matches!(record.result, Some(status) if status.is_terminal());
+            let projected = inner
+                .runs
+                .get(&record.run_id)
+                .and_then(|run| run.jobs.get(&record.job_id))
+                .is_some_and(|status| status.is_terminal());
+            !settled && !projected
+        });
+    if live {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden(
+            "job is not live; writes are rejected for completed or unknown jobs",
+        ))
+    }
+}
+
 pub(crate) async fn require_test_api_token(
     State(expected): State<Arc<str>>,
     request: Request,

@@ -140,6 +140,19 @@ pub(crate) async fn blob_put(
         warn!(kind, token, "rejected blob PUT with invalid kind/token");
         return StatusCode::BAD_REQUEST;
     }
+    // R1-10: if a bearer is present and verifies as a job identity, require
+    // the job to be live. Bearerless PUTs (Azure SDK compat) cannot be
+    // attributed; their liveness is enforced at URL-mint time.
+    if let Some(bearer) = crate::auth::bearer_from_headers(&headers) {
+        if let Ok(identity) = crate::auth::results_identity(&shared.state, bearer) {
+            if crate::auth::require_live_results_job(&shared.state, &identity)
+                .await
+                .is_err()
+            {
+                return StatusCode::FORBIDDEN;
+            }
+        }
+    }
     // Early Content-Length check before buffering — avoids allocating 512 MiB
     // for a block that will be rejected at 4 MiB.
     if let Some(cl) = headers
