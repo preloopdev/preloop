@@ -109,8 +109,50 @@ impl IntoIterator for LiveLogBuffer {
 pub(crate) async fn live_logs_sse(
     State(shared): State<Arc<SharedState>>,
     Path((run_id, job_id)): Path<(RunId, String)>,
+    headers: HeaderMap,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
+    authorize_live_log_read(&shared, &headers, run_id, &job_id).await?;
     live_log_stream(&shared, run_id, &job_id).await
+}
+
+/// M5: the protocol live-log read route must not let one job's runtime
+/// credential read another job's output. The caller's credential must identify
+/// the exact job being read; the system credential bypasses (first-party
+/// CLI/UI read through the separate native route).
+async fn authorize_live_log_read(
+    shared: &Arc<SharedState>,
+    headers: &HeaderMap,
+    run_id: RunId,
+    job_id: &str,
+) -> Result<(), ApiError> {
+    let bearer = crate::auth::bearer_from_headers(headers)
+        .ok_or_else(|| ApiError::unauthorized("runner or job protocol token required"))?;
+    if bearer == shared.state.system_token {
+        return Ok(());
+    }
+    let caller = shared
+        .state
+        .job_uuid_from_token(bearer)
+        .ok_or_else(|| ApiError::forbidden("live-log read job mismatch"))?;
+    // A UUID target that is not the caller's job is rejected without resolving
+    // it, so a mismatch never reveals whether the target exists.
+    if let Ok(target) = job_id.parse::<uuid::Uuid>() {
+        if target != caller {
+            return Err(ApiError::forbidden("live-log read job mismatch"));
+        }
+    } else {
+        // Otherwise the path carries a logical job key: resolve it to the
+        // concrete agent job and compare against the caller.
+        let key = {
+            let inner = shared.state.inner.lock().await;
+            live_log_key_for_job(&inner, run_id, job_id)
+        }
+        .ok_or_else(|| ApiError::not_found("job not found"))?;
+        if key != caller.to_string() {
+            return Err(ApiError::forbidden("live-log read job mismatch"));
+        }
+    }
+    Ok(())
 }
 
 /// Job selector for the native live-log route.
